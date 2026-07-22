@@ -750,17 +750,29 @@ def bind_direct_child_until(
         open_handle = partial(
             open_process_handle, pid, expected_parent_pid=expected_parent_pid
         )
+    initial_facts = proc_stat_facts(pid)
+    if (
+        initial_facts is None
+        or initial_facts[0] == "Z"
+        or pid not in proc_children(expected_parent_pid)
+    ):
+        raise EvidenceError("process disappeared before identity binding")
+    initial_start_ticks = initial_facts[2]
     while True:
         handle = open_handle()
         if handle is not None:
+            if handle[0] != initial_start_ticks:
+                os.close(handle[1])
+                raise EvidenceError("process identity changed before binding")
             return handle
         facts = proc_stat_facts(pid)
         if (
             facts is None
             or facts[0] == "Z"
+            or facts[2] != initial_start_ticks
             or pid not in proc_children(expected_parent_pid)
         ):
-            raise EvidenceError("process disappeared before identity binding")
+            raise EvidenceError("process identity changed before binding")
         if time.monotonic() >= deadline:
             raise EvidenceError("process identity did not stabilize in time")
         time.sleep(0.005)
@@ -5583,6 +5595,40 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             )
         finally:
             os.close(retry_handle[1])
+        replacement_descriptor = os.open(os.devnull, os.O_RDONLY)
+        try:
+            try:
+                bind_direct_child_until(
+                    pdeath_child_pid,
+                    pdeath_launcher.pid,
+                    time.monotonic() + 30.0,
+                    open_handle=lambda: (
+                        pdeath_handle[0] + 1,
+                        replacement_descriptor,
+                    ),
+                )
+            except EvidenceError as exc:
+                require(
+                    str(exc) == "process identity changed before binding",
+                    "replacement direct-child identity did not fail closed",
+                )
+            else:
+                raise EvidenceError("replacement direct-child identity was accepted")
+            try:
+                os.fstat(replacement_descriptor)
+            except OSError as exc:
+                require(
+                    exc.errno == errno.EBADF,
+                    "replacement direct-child handle closed unexpectedly",
+                )
+            else:
+                raise EvidenceError("replacement direct-child handle was not closed")
+        finally:
+            try:
+                os.close(replacement_descriptor)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
         deadline = time.monotonic() + 5.0
         while True:
             pdeath_facts = proc_stat_facts(pdeath_child_pid)
