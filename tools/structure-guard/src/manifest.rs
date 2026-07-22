@@ -34,7 +34,7 @@ fn unquote(v: &str) -> Option<&str> {
     let inner = v.strip_prefix('"')?.strip_suffix('"')?;
     // The current manifest contract deliberately has no TOML escape processing. Failing
     // closed is safer than comparing an unexpanded path against the filesystem.
-    (!inner.contains('\\')).then_some(inner)
+    (!inner.contains(['\\', '"'])).then_some(inner)
 }
 
 fn strip_comment(raw: &str) -> Result<&str, &'static str> {
@@ -138,10 +138,16 @@ fn dependency_path(value: &str) -> Result<Option<String>, &'static str> {
     };
     let mut path: Option<String> = None;
     let mut seen = BTreeSet::new();
-    for field in split_table_fields(inner)? {
+    let fields = split_table_fields(inner)?;
+    let mut field_count = 0_usize;
+    for (idx, field) in fields.iter().enumerate() {
         if field.is_empty() {
-            continue;
+            if idx + 1 == fields.len() && field_count != 0 {
+                continue; // TOML permits one trailing comma.
+            }
+            return Err("dependency table contains an empty field");
         }
+        field_count += 1;
         let (key, raw_value) = field
             .split_once('=')
             .ok_or("dependency table field must be `key = value`")?;
@@ -151,11 +157,10 @@ fn dependency_path(value: &str) -> Result<Option<String>, &'static str> {
         }
         match key {
             "path" => {
-                path = Some(
-                    unquote(raw_value.trim())
-                        .ok_or("dependency path must be an unescaped quoted string")?
-                        .to_string(),
-                );
+                let value = unquote(raw_value.trim())
+                    .filter(|value| !value.is_empty())
+                    .ok_or("dependency path must be a non-empty unescaped quoted string")?;
+                path = Some(value.to_string());
             }
             // These keys alter compilation but not the package source identity. Parse
             // their complete constrained shapes so malformed TOML cannot be accepted by
@@ -407,6 +412,8 @@ mod tests {
 
         let malformed = format!("{OK}\n[features]\niron = [\"ok\",, \"bad\"]\n");
         assert!(parse(&malformed, "t").is_err());
+        let adjacent_strings = format!("{OK}\n[features]\niron = [\"one\" \"two\"]\n");
+        assert!(parse(&adjacent_strings, "t").is_err());
         let duplicate = format!("{OK}\n[features]\niron = [\"same\", \"same\"]\n");
         assert!(parse(&duplicate, "t").is_err());
     }
@@ -433,6 +440,22 @@ mod tests {
             "{OK}fln-core = {{ path = \"../fln-core\", features = [\"same\", \"same\"] }}\n"
         );
         assert!(parse(&duplicate_feature, "t").is_err());
+
+        let trailing_comma = format!("{OK}fln-core = {{ path = \"../fln-core\", }}\n");
+        assert!(parse(&trailing_comma, "t").is_ok());
+        for malformed_table in [
+            "{}",
+            "{, path = \"../fln-core\"}",
+            "{path = \"../fln-core\",, optional = true}",
+            "{path = \"\"}",
+            "{path = \"../fln-core\" \"../fln-hash\"}",
+        ] {
+            let malformed = format!("{OK}fln-core = {malformed_table}\n");
+            assert!(
+                parse(&malformed, "t").is_err(),
+                "accepted {malformed_table}"
+            );
+        }
     }
 
     #[test]
