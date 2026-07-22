@@ -107,7 +107,7 @@ set_final() { FINAL_SET=1; FINAL_VERDICT="$1"; FINAL_REASON="$2"; FINAL_EXIT="$3
 # Invoked from signal handling; bounded so publication cannot hang indefinitely.
 # shellcheck disable=SC2317
 stop_active_runner() {
-  local name="$1" pid="$ACTIVE_RUNNER_PID" state
+  local name="$1" pid="$ACTIVE_RUNNER_PID" state cleanup_rc=0
   [ -n "$pid" ] || return 0
   kill -s "$name" "$pid" 2>/dev/null || true
   for _ in $(seq 1 500); do
@@ -120,9 +120,13 @@ stop_active_runner() {
     state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
     if [ "$state" != Z ]; then
       if [ -f "$ACTIVE_READINESS" ]; then
-        python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
+        if ! python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
           --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STEP" \
-          >/dev/null 2>&1 || true
+          >/dev/null 2>&1; then
+          cleanup_rc=1
+        fi
+      else
+        cleanup_rc=1
       fi
       kill -KILL "$pid" 2>/dev/null || true
     fi
@@ -130,6 +134,7 @@ stop_active_runner() {
   wait "$pid" 2>/dev/null || true
   ACTIVE_RUNNER_PID=""
   ACTIVE_READINESS=""
+  return "$cleanup_rc"
 }
 
 # Invoked indirectly by trap.
@@ -146,7 +151,10 @@ on_signal() {
     return 0
   fi
   if [ -n "$ACTIVE_RUNNER_PID" ]; then
-    stop_active_runner "$name"
+    if ! stop_active_runner "$name"; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
   fi
   set_final cancelled "signal_$name" "$exit_code"
   exit "$exit_code"
@@ -209,7 +217,7 @@ on_exit() {
     final_root="unavailable"
     set_final internal_fault final_workspace_hash_unavailable 2
   elif [ "$FINAL_VERDICT" = pass ] && [ "$final_root" != "$INPUT_ROOT" ]; then
-    set_final fail final_workspace_changed 1
+    set_final inconclusive final_workspace_changed 3
   fi
   if [ "$FINAL_VERDICT" != pass ]; then first_divergence="$FINAL_REASON"; fi
   if [ "$TERMINAL_EMITTED" -eq 0 ]; then
@@ -453,9 +461,9 @@ run_pass_step() {
   fi
   if [ "$SUBJECT_BEFORE" != "$SUBJECT_AFTER" ] || \
      [ "$GLOBAL_BEFORE" != "$GLOBAL_AFTER" ]; then
-    note "FAIL step=$step: governed_inputs_changed"
-    set_final fail "$step:governed_inputs_changed" 1
-    exit 1
+    note "INCONCLUSIVE step=$step: governed_inputs_changed"
+    set_final inconclusive "$step:governed_inputs_changed" 3
+    exit 3
   fi
   record_step "$step" pass pass/wrapper=0/child=0 pass/wrapper=0/child=0 \
     not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
@@ -493,9 +501,9 @@ guard_step() {
   fi
   if [ "$SUBJECT_BEFORE" != "$SUBJECT_AFTER" ] || \
      [ "$GLOBAL_BEFORE" != "$GLOBAL_AFTER" ]; then
-    note "FAIL step=$step: governed_inputs_changed"
-    set_final fail "$step:governed_inputs_changed" 1
-    exit 1
+    note "INCONCLUSIVE step=$step: governed_inputs_changed"
+    set_final inconclusive "$step:governed_inputs_changed" 3
+    exit 3
   fi
   if ! python3 "$EVIDENCE" validate-guard --file "$LAST_OUT" \
     --expected-exit "$expected_exit" --expected-verdict "$expected_verdict" \

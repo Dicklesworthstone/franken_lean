@@ -52,6 +52,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-hash"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-hound"

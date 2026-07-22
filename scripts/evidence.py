@@ -285,6 +285,40 @@ def write_new(path: Path, data: bytes, mode: int = 0o644) -> None:
         os.close(parent_fd)
 
 
+def write_atomic_new(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Publish complete bytes at an absent final name in one atomic link step."""
+    if not hasattr(os, "O_TMPFILE"):
+        raise EvidenceError("atomic evidence publication requires Linux O_TMPFILE")
+    absolute = lexical_absolute(path)
+    _parent, parent_fd = open_directory_nofollow(absolute.parent, create=True)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            ".",
+            os.O_WRONLY | os.O_TMPFILE | os.O_CLOEXEC,
+            mode,
+            dir_fd=parent_fd,
+        )
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise EvidenceError(f"short atomic write while publishing {absolute}")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.link(
+            f"/proc/self/fd/{descriptor}",
+            absolute.name,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=True,
+        )
+        os.fsync(parent_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 def append_record(
     path: Path, record: dict[str, Any], *, must_be_new: bool = False
 ) -> None:
@@ -752,12 +786,12 @@ def run_supervised(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        if not remember_process(proc.pid, known_descendants):
-            raise EvidenceError("cannot bind child process lifetime")
         child_facts = proc_stat_facts(proc.pid)
         wrapper_facts = proc_stat_facts(os.getpid())
         if child_facts is None or wrapper_facts is None:
             raise EvidenceError("cannot capture process identity facts for readiness")
+        if child_facts[0] != "Z" and not remember_process(proc.pid, known_descendants):
+            raise EvidenceError("cannot bind child process lifetime")
         write_new(
             readiness_path,
             canonical_json(
@@ -2567,6 +2601,13 @@ def emergency_kill(
                 signal_process_handle(pid, handles[pid], signal.SIGKILL)
             time.sleep(0.01)
         raise EvidenceError(f"emergency kill left live processes: {sorted(live)}")
+    except BaseException:
+        # Escalation was already authorized by this command. If a verification step
+        # fails after pidfds were bound, kill only those exact lifetimes before
+        # surfacing the failure; never leave a deliberately stopped descendant tree.
+        for pid, handle in list(handles.items()):
+            signal_process_handle(pid, handle, signal.SIGKILL)
+        raise
     finally:
         close_process_handles(handles)
 
@@ -2855,6 +2896,46 @@ def validate_manifest(
         raise EvidenceError("manifest digest sidecar mismatch")
 
 
+def durably_sync_manifested_bundle(
+    art_dir: Path, manifest_path: Path, digest_path: Path
+) -> None:
+    """Order every manifested artifact durably before the bundle marker."""
+    art_dir = lexical_absolute(art_dir)
+    manifest = read_json_object(manifest_path)
+    files = [
+        require_within(art_dir / entry["path"], art_dir, label="durable artifact")
+        for entry in manifest["artifacts"]
+        if entry["role"] != "directory"
+    ]
+    files.extend((manifest_path, digest_path))
+    directories = {art_dir}
+    for path in files:
+        _absolute, descriptor = open_regular_nofollow(path)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        parent = path.parent
+        while parent != art_dir:
+            directories.add(parent)
+            parent = parent.parent
+    for entry in manifest["artifacts"]:
+        if entry["role"] == "directory":
+            directories.add(
+                require_within(
+                    art_dir / entry["path"], art_dir, label="durable directory"
+                )
+            )
+    for directory in sorted(
+        directories, key=lambda path: len(path.parts), reverse=True
+    ):
+        _absolute, descriptor = open_directory_nofollow(directory, create=False)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def complete_bundle(
     art_dir: Path,
     manifest_path: Path,
@@ -2900,8 +2981,16 @@ def complete_bundle(
     }
     validate_marker_bindings(marker, manifest, terminal, initial_bindings)
     marker_data = canonical_json(marker)
-    # Repeat the whole bundle validation before committing. Any cross-read or
-    # inventory race must stabilize before the marker can exist.
+    current_root = tree_hash(
+        governed_root,
+        governed_paths,
+        inventory_path=inventory_path,
+        vendor_path=vendor_path,
+    )
+    if current_root != expected_root or current_root != manifest.get("final_root"):
+        raise EvidenceError("governed inputs changed before bundle commit")
+    # The governed hash can be long. Revalidate every artifact after it, then prove
+    # both sides stable across another full pass before publishing the marker.
     validate_manifest(art_dir, manifest_path, digest_path)
     repeated_bindings = (
         sha256_file(run_log),
@@ -2916,16 +3005,47 @@ def complete_bundle(
         load_ndjson(run_log)[-1],
         repeated_bindings,
     )
-    current_root = tree_hash(
+    repeated_root = tree_hash(
         governed_root,
         governed_paths,
         inventory_path=inventory_path,
         vendor_path=vendor_path,
     )
-    if current_root != expected_root or current_root != manifest.get("final_root"):
-        raise EvidenceError("governed inputs changed before bundle commit")
+    if repeated_root != current_root:
+        raise EvidenceError("governed inputs changed during prospective validation")
+    durably_sync_manifested_bundle(art_dir, manifest_path, digest_path)
+    validate_manifest(art_dir, manifest_path, digest_path)
+    durable_bindings = (
+        sha256_file(run_log),
+        sha256_file(manifest_path),
+        sha256_file(digest_path),
+    )
+    if durable_bindings != initial_bindings:
+        raise EvidenceError("bundle bindings changed during durable synchronization")
+    final_root = tree_hash(
+        governed_root,
+        governed_paths,
+        inventory_path=inventory_path,
+        vendor_path=vendor_path,
+    )
+    if final_root != current_root:
+        raise EvidenceError("governed inputs changed before durable bundle commit")
+    validate_manifest(art_dir, manifest_path, digest_path)
+    final_bindings = (
+        sha256_file(run_log),
+        sha256_file(manifest_path),
+        sha256_file(digest_path),
+    )
+    if final_bindings != initial_bindings:
+        raise EvidenceError("bundle bindings changed before durable bundle commit")
+    validate_marker_bindings(
+        marker,
+        read_json_object(manifest_path),
+        load_ndjson(run_log)[-1],
+        final_bindings,
+    )
     # This durable, exclusive publication is deliberately the final operation.
-    write_new(output, marker_data)
+    write_atomic_new(output, marker_data)
     return marker
 
 

@@ -64,6 +64,7 @@ crate structure-guard   kind=tool
 # ---- acknowledged dependency edges ----------------------------------------------------
 # every future edge lands here in the same change as its Cargo.toml counterpart
 edge fln-conformance -> fln-core   # C0 core-observable fixture diff harness (franken_lean-p8a)
+edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.

@@ -39,6 +39,10 @@ FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
 FINALIZING=0
+FINALIZER_PID=""
+FINALIZATION_SIGNAL=""
+FINALIZATION_SIGNAL_EXIT=0
+FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
   vendor/NOTICE
@@ -110,15 +114,19 @@ bounded_readiness_wait() {
 # Invoked from signal handling; bounded so publication cannot hang indefinitely.
 # shellcheck disable=SC2317
 stop_active_runner() {
-  local name="$1" pid="$ACTIVE_RUNNER_PID"
+  local name="$1" pid="$ACTIVE_RUNNER_PID" cleanup_rc=0
   [ -n "$pid" ] || return 0
   bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" || true
   kill -s "$name" "$pid" 2>/dev/null || true
   if ! bounded_pid_exit_wait "$pid" "$((READY_WAIT_MS + 3 * GRACE_MS))"; then
     if [ -s "$ACTIVE_READINESS" ]; then
-      python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
+      if ! python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
         --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STEP" \
-        >/dev/null 2>&1 || true
+        >/dev/null 2>&1; then
+        cleanup_rc=1
+      fi
+    else
+      cleanup_rc=1
     fi
     kill -KILL "$pid" 2>/dev/null || true
     bounded_pid_exit_wait "$pid" "$GRACE_MS" || true
@@ -126,6 +134,7 @@ stop_active_runner() {
   if bounded_pid_exit_wait "$pid" 20; then wait "$pid" 2>/dev/null || true; fi
   ACTIVE_RUNNER_PID=""
   ACTIVE_READINESS=""
+  return "$cleanup_rc"
 }
 
 # Invoked indirectly by trap.
@@ -141,34 +150,78 @@ on_signal() {
     trap 'on_signal TERM 143' TERM
     return 0
   fi
-  if [ -n "$ACTIVE_RUNNER_PID" ]; then stop_active_runner "$name"; fi
+  if [ -n "$ACTIVE_RUNNER_PID" ]; then
+    if ! stop_active_runner "$name"; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
+  fi
   set_final cancelled "signal_$name" "$exit_code"
   exit "$exit_code"
+}
+
+# shellcheck disable=SC2317
+on_finalizer_signal() {
+  local name="$1" exit_code="$2"
+  if [ -z "$FINALIZATION_SIGNAL" ]; then
+    FINALIZATION_SIGNAL="$name"
+    FINALIZATION_SIGNAL_EXIT="$exit_code"
+  fi
+  if [ -n "$FINALIZER_PID" ]; then
+    kill -s "$name" "$FINALIZER_PID" 2>/dev/null || true
+  fi
+}
+
+# shellcheck disable=SC2317
+run_finalizer_command() {
+  local rc=0
+  [ -z "$FINALIZATION_SIGNAL" ] || return 125
+  "$@" &
+  FINALIZER_PID=$!
+  wait "$FINALIZER_PID" || rc=$?
+  FINALIZER_PID=""
+  return "$rc"
+}
+
+# shellcheck disable=SC2317
+abort_if_finalizer_signalled() {
+  if [ -n "$FINALIZATION_SIGNAL" ]; then
+    note "CANCELLED: signal_$FINALIZATION_SIGNAL before evidence bundle commit: $ART_DIR"
+    exit "$FINALIZATION_SIGNAL_EXIT"
+  fi
 }
 
 # Invoked indirectly by trap.
 # shellcheck disable=SC2317
 on_exit() {
   local observed_rc="$1" final_root="unavailable" first_divergence="none"
-  local publish_rc=0 hash_rc=0
-  trap - EXIT; trap '' HUP INT TERM; set +e
+  local publish_rc=0 hash_rc=0 bundle_rc=0
+  trap - EXIT
+  trap 'on_finalizer_signal HUP 129' HUP
+  trap 'on_finalizer_signal INT 130' INT
+  trap 'on_finalizer_signal TERM 143' TERM
+  set +e
   if [ "$FINALIZING" -ne 0 ]; then exit 2; fi
   FINALIZING=1
   if [ "$FINAL_SET" -eq 0 ]; then
     set_final internal_fault "$([ "$observed_rc" -eq 0 ] && printf uncommitted_success || printf unexpected_shell_exit)" 2
   fi
-  final_root="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
-    --vendor-path "$VENDOR_PATH" 2>/dev/null)" \
-    || hash_rc=$?
+  run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$ROOT" \
+    "${HASH_ARGS[@]}" --vendor-path "$VENDOR_PATH" \
+    --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" 2>/dev/null || hash_rc=$?
+  abort_if_finalizer_signalled
+  if [ "$hash_rc" -eq 0 ]; then
+    IFS= read -r final_root < "$FINAL_ROOT_FILE" || hash_rc=2
+  fi
   if [ "$hash_rc" -ne 0 ]; then
     final_root="unavailable"
     set_final internal_fault final_workspace_hash_unavailable 2
   elif [ "$FINAL_VERDICT" = pass ] && [ "$final_root" != "$INPUT_ROOT" ]; then
-    set_final fail final_workspace_changed 1
+    set_final inconclusive final_workspace_changed 3
   fi
   if [ "$FINAL_VERDICT" != pass ]; then first_divergence="$FINAL_REASON"; fi
   if [ "$TERMINAL_EMITTED" -eq 0 ]; then
-    if emit_event --string event run_end --string verdict "$FINAL_VERDICT" \
+    if run_finalizer_command emit_event --string event run_end --string verdict "$FINAL_VERDICT" \
       --string reason_code "$FINAL_REASON" --integer process_exit "$FINAL_EXIT" \
       --string active_step "$ACTIVE_STEP" \
       --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
@@ -182,31 +235,38 @@ on_exit() {
     else
       publish_rc=2
     fi
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
+    run_finalizer_command python3 "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
       --expected-verdict "$FINAL_VERDICT" --artifact-root "$ART_DIR" \
       --output "$ART_DIR/run.validation.json" || publish_rc=2
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
+    run_finalizer_command python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" --digest-output "$ART_DIR/manifest.digest" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
       --verdict "$FINAL_VERDICT" --input-root "$INPUT_ROOT" --final-root "$final_root" \
       || publish_rc=2
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
+    run_finalizer_command python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
-      --vendor-path "$VENDOR_PATH" || publish_rc=2
-  fi
-  if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
-      --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
-      --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
-      >/dev/null || publish_rc=2
+      --vendor-path "$VENDOR_PATH" || bundle_rc=$?
+    if [ -e "$ART_DIR/bundle.complete.json" ]; then
+      trap '' HUP INT TERM
+      python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+        --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
+        --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
+        >/dev/null || publish_rc=2
+    else
+      [ "$bundle_rc" -eq 0 ] || publish_rc=2
+      abort_if_finalizer_signalled
+    fi
   fi
   if [ "$publish_rc" -ne 0 ]; then
     note "INTERNAL FAULT: incomplete bundle $ART_DIR"
@@ -405,8 +465,10 @@ propagate_supervisor_taxonomy() {
   local step="$1" permitted_wrapper="$2"
   case "$LAST_RC" in
     2)
-      set_final internal_fault "$step:$LAST_REASON" 2
-      exit 2
+      if [ "$permitted_wrapper" != 2 ]; then
+        set_final internal_fault "$step:$LAST_REASON" 2
+        exit 2
+      fi
       ;;
     3)
       if [ "$permitted_wrapper" != 3 ]; then
@@ -469,8 +531,8 @@ run_pass_step() {
   fi
   if [ "$SUBJECT_BEFORE" != "$SUBJECT_AFTER" ] || \
      [ "$GLOBAL_BEFORE" != "$GLOBAL_AFTER" ]; then
-    record_contract_failure "$step" governed_inputs_changed pass 0 0 \
-      "$SUBJECT_BEFORE" "$SUBJECT_AFTER" "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+    set_final inconclusive "$step:governed_inputs_changed" 3
+    exit 3
   fi
   record_step "$step" pass pass/wrapper=0/child=0 pass/wrapper=0/child=0 \
     not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
@@ -482,23 +544,22 @@ guard_step() {
   local -a findings=("$@") validate_args=()
   local validation="$ART_DIR/$step.validation.json" expected_classification expected_wrapper
   for finding in "${findings[@]}"; do validate_args+=(--finding "$finding"); done
-  if [ "$expected_exit" -eq 0 ]; then
-    expected_classification=pass
-    expected_wrapper=0
-  else
-    expected_classification=fail
-    expected_wrapper=1
-  fi
+  case "$expected_exit:$expected_verdict" in
+    0:pass) expected_classification=pass; expected_wrapper=0 ;;
+    1:fail) expected_classification=fail; expected_wrapper=1 ;;
+    2:setup_error) expected_classification=internal_fault; expected_wrapper=2 ;;
+    *) set_final internal_fault "$step:unsupported_guard_expectation" 2; exit 2 ;;
+  esac
   snapshot_before "$fixture_root" "$step"
   note "running guard step=$step root=$fixture_root expected=$expected_verdict/$expected_exit"
-  if [ "$expected_exit" -eq 0 ]; then
+  if [ "$expected_exit" -eq 0 ] || [ "$expected_exit" -eq 2 ]; then
     supervise "$step" "$FROZEN_GUARD" --root "$fixture_root" --robot
   else
     supervise "$step" --semantic-failure-exit "$expected_exit" \
       "$FROZEN_GUARD" --root "$fixture_root" --robot
   fi
   inspect_supervisor "$step"
-  propagate_supervisor_taxonomy "$step" none
+  propagate_supervisor_taxonomy "$step" "$expected_wrapper"
   snapshot_after "$fixture_root" "$step"
   if [ "$LAST_CLASSIFICATION" != "$expected_classification" ] || \
      [ "$LAST_RC" -ne "$expected_wrapper" ] || \
@@ -510,9 +571,8 @@ guard_step() {
   fi
   if [ "$SUBJECT_BEFORE" != "$SUBJECT_AFTER" ] || \
      [ "$GLOBAL_BEFORE" != "$GLOBAL_AFTER" ]; then
-    record_contract_failure "$step" governed_inputs_changed \
-      "$expected_classification" "$expected_wrapper" "$expected_exit" \
-      "$SUBJECT_BEFORE" "$SUBJECT_AFTER" "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+    set_final inconclusive "$step:governed_inputs_changed" 3
+    exit 3
   fi
   if ! python3 "$EVIDENCE" validate-guard --file "$LAST_OUT" \
     --expected-exit "$expected_exit" --expected-verdict "$expected_verdict" \
@@ -585,8 +645,8 @@ resource_exhaustion_step() {
   fi
   if [ "$SUBJECT_BEFORE" != "$SUBJECT_AFTER" ] || \
      [ "$GLOBAL_BEFORE" != "$GLOBAL_AFTER" ]; then
-    set_final internal_fault "$step:governed_inputs_changed" 2
-    exit 2
+    set_final inconclusive "$step:governed_inputs_changed" 3
+    exit 3
   fi
   record_step "$step" pass inconclusive/output_budget_exhausted/wrapper=3/child=0 \
     "$LAST_CLASSIFICATION/$LAST_REASON/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
@@ -668,8 +728,8 @@ cancellation_step() {
   fi
   if [ "$SUBJECT_BEFORE" != "$SUBJECT_AFTER" ] || \
      [ "$GLOBAL_BEFORE" != "$GLOBAL_AFTER" ]; then
-    set_final internal_fault "$step:governed_inputs_changed" 2
-    exit 2
+    set_final inconclusive "$step:governed_inputs_changed" 3
+    exit 3
   fi
   record_step "$step" pass cancelled/process_tree_contained/wrapper=4/child=null \
     "$LAST_CLASSIFICATION/$LAST_REASON/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
