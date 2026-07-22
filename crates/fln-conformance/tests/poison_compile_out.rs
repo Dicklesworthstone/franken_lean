@@ -55,6 +55,14 @@ fn no_crate_outside_fln_conformance_names_the_poison_tag() {
         let mut files = Vec::new();
         collect_rs_files(&crate_dir.join("src"), &mut files);
         collect_rs_files(&crate_dir.join("tests"), &mut files);
+        // Every other place cargo compiles code from: a leak must not be able to
+        // hide in a build script, bench, or example.
+        collect_rs_files(&crate_dir.join("benches"), &mut files);
+        collect_rs_files(&crate_dir.join("examples"), &mut files);
+        let build_rs = crate_dir.join("build.rs");
+        if build_rs.exists() {
+            files.push(build_rs);
+        }
         for file in files {
             scanned += 1;
             let source = fs::read_to_string(&file).expect("readable source");
