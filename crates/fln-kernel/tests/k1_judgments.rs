@@ -924,3 +924,59 @@ fn kr112_kr204_parameterized_structure_projection() {
         "the projected field has type A, not B: {wrong:?}"
     );
 }
+
+#[test]
+fn fl_inv_01_kernel_verdicts_are_deterministic() {
+    // FL-INV-01 at the kernel: the same (environment, declaration, budget) yields a
+    // byte-identical verdict INCLUDING its consumption profile, run after run — no
+    // hidden nondeterminism (map iteration order, fresh-fvar counter leakage, etc.).
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let env = admit(&env, &axiom("B", sort1()));
+
+    // A checked declaration: the polymorphic identity again (nontrivial traversal).
+    let ty = Expr::forall_e(
+        n("alpha"),
+        sort1(),
+        Expr::forall_e(
+            n("x"),
+            Expr::bvar(0).expect("packs"),
+            Expr::bvar(1).expect("packs"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let value = Expr::lam(
+        n("alpha"),
+        sort1(),
+        Expr::lam(
+            n("x"),
+            Expr::bvar(0).expect("packs"),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let decl = defn("id", ty, value);
+    let first = check(&env, &decl, Budget::DEFAULT);
+    for _ in 0..8 {
+        assert_eq!(
+            check(&env, &decl, Budget::DEFAULT),
+            first,
+            "kernel acceptance verdict + consumption must be deterministic"
+        );
+    }
+    assert!(first.is_accepted());
+
+    // A rejection verdict is likewise stable (class, message, consumption).
+    let a = Expr::const_(n("A"), vec![]);
+    let b = Expr::const_(n("B"), vec![]);
+    let neq = check_def_eq(&env, &[], &a, &b, Budget::DEFAULT);
+    for _ in 0..8 {
+        assert_eq!(
+            check_def_eq(&env, &[], &a, &b, Budget::DEFAULT),
+            neq,
+            "kernel rejection verdict + consumption must be deterministic"
+        );
+    }
+    assert_eq!(reject_class(&neq), Some(RejectClass::NotDefEq));
+}

@@ -17,9 +17,30 @@ use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
 
-use crate::constants::{ConstantInfo, ReducibilityHints};
-use crate::extensions::{ExtensionDescriptor, ExtensionState};
+use crate::constants::{ConstantInfo, DefinitionSafety, QuotKind, ReducibilityHints};
+use crate::extensions::{
+    CheckpointSemantics, ExtensionDescriptor, ExtensionState, MergeSemantics, PayloadProvenance,
+};
 use crate::pmap::{PKey, PMap};
+
+/// Stable `Domain::DeclContent` tags. These are schema values, not Rust enum
+/// discriminants: changing them requires an explicit identity/epoch decision.
+fn definition_safety_tag(safety: DefinitionSafety) -> u8 {
+    match safety {
+        DefinitionSafety::Unsafe => 0,
+        DefinitionSafety::Safe => 1,
+        DefinitionSafety::Partial => 2,
+    }
+}
+
+fn quot_kind_tag(kind: QuotKind) -> u8 {
+    match kind {
+        QuotKind::Type => 0,
+        QuotKind::Ctor => 1,
+        QuotKind::Lift => 2,
+        QuotKind::Ind => 3,
+    }
+}
 
 impl PKey for Name {
     fn key_hash(&self) -> u64 {
@@ -178,7 +199,7 @@ impl Environment {
                         w.u32(h);
                     }
                 }
-                w.u8(v.safety as u8);
+                w.u8(definition_safety_tag(v.safety));
                 w.u64(v.all.len() as u64);
                 for n in &v.all {
                     n.write_body(&mut w);
@@ -194,8 +215,12 @@ impl Environment {
             ConstantInfo::Opaque(v) => {
                 v.value.write_body(&mut w);
                 w.bool(v.is_unsafe);
+                w.u64(v.all.len() as u64);
+                for n in &v.all {
+                    n.write_body(&mut w);
+                }
             }
-            ConstantInfo::Quot(v) => w.u8(v.kind as u8),
+            ConstantInfo::Quot(v) => w.u8(quot_kind_tag(v.kind)),
             ConstantInfo::Induct(v) => {
                 w.u32(v.num_params);
                 w.u32(v.num_indices);
@@ -255,7 +280,20 @@ impl Environment {
         }
         for (name, state) in self.extensions.iter() {
             let mut w = CanonWriter::new();
-            w.u64(state.entries().len() as u64);
+            match state.descriptor.merge {
+                MergeSemantics::AppendOrdered => w.u8(0),
+                MergeSemantics::SetUnion => w.u8(1),
+                MergeSemantics::ConflictsRequireReview => w.u8(2),
+            }
+            match state.descriptor.checkpoint {
+                CheckpointSemantics::JournalSuffix => w.u8(0),
+                CheckpointSemantics::FullJournal => w.u8(1),
+            }
+            match state.descriptor.provenance {
+                PayloadProvenance::Understood => w.u8(0),
+                PayloadProvenance::Opaque => w.u8(1),
+            }
+            w.u64(state.len() as u64);
             for entry in state.entries() {
                 w.bytes(&entry.payload);
             }
@@ -277,7 +315,6 @@ impl Environment {
 mod tests {
     use super::*;
     use crate::constants::{AxiomVal, ConstantVal};
-    use crate::extensions::{CheckpointSemantics, MergeSemantics, PayloadProvenance};
     use fln_core::expr::Expr;
     use fln_core::level::Level;
     use fln_core::options::DataValue;
@@ -381,7 +418,6 @@ mod tests {
             .extension(&n("simpExt"))
             .expect("registered")
             .entries()
-            .iter()
             .map(|e| &*e.payload)
             .collect();
         assert_eq!(entries, vec![b"e1".as_slice(), b"e2"]);
@@ -390,6 +426,69 @@ mod tests {
             env.push_extension_entry(&n("ghost"), &b"x"[..]),
             Err(EnvError::UnknownExtension { name: n("ghost") })
         );
+    }
+
+    #[test]
+    fn extension_contracts_enter_the_logical_root() {
+        let root = |merge, checkpoint, provenance| {
+            let descriptor = ExtensionDescriptor {
+                name: n("contractExt"),
+                merge,
+                checkpoint,
+                provenance,
+            };
+            Environment::new()
+                .register_extension(descriptor)
+                .and_then(|env| env.push_extension_entry(&n("contractExt"), &b"entry"[..]))
+                .expect("extension environment builds")
+                .logical_root(&KVMap::new())
+        };
+
+        let append = root(
+            MergeSemantics::AppendOrdered,
+            CheckpointSemantics::JournalSuffix,
+            PayloadProvenance::Understood,
+        );
+        let append_again = root(
+            MergeSemantics::AppendOrdered,
+            CheckpointSemantics::JournalSuffix,
+            PayloadProvenance::Understood,
+        );
+        assert_eq!(
+            append, append_again,
+            "identical extension contracts and journals have stable identity"
+        );
+
+        let set_union = root(
+            MergeSemantics::SetUnion,
+            CheckpointSemantics::JournalSuffix,
+            PayloadProvenance::Understood,
+        );
+        let review = root(
+            MergeSemantics::ConflictsRequireReview,
+            CheckpointSemantics::JournalSuffix,
+            PayloadProvenance::Understood,
+        );
+        assert_ne!(append, set_union, "merge semantics enter the root");
+        assert_ne!(append, review, "merge semantics enter the root");
+        assert_ne!(
+            set_union, review,
+            "every merge variant has distinct identity"
+        );
+
+        let full_journal = root(
+            MergeSemantics::AppendOrdered,
+            CheckpointSemantics::FullJournal,
+            PayloadProvenance::Understood,
+        );
+        assert_ne!(append, full_journal, "checkpoint semantics enter the root");
+
+        let opaque = root(
+            MergeSemantics::AppendOrdered,
+            CheckpointSemantics::JournalSuffix,
+            PayloadProvenance::Opaque,
+        );
+        assert_ne!(append, opaque, "payload provenance enters the root");
     }
 
     #[test]
@@ -406,7 +505,7 @@ mod tests {
         let state = with_decl
             .extension(&n("simpExt"))
             .expect("extension state survives add_decl");
-        assert_eq!(state.entries().len(), 1);
+        assert_eq!(state.len(), 1);
         // And the delta still reaches the logical root after the decl lands.
         let opts = KVMap::new();
         let bare = Environment::new()
@@ -437,9 +536,68 @@ mod tests {
     }
 
     #[test]
+    fn declaration_identity_enum_tags_are_explicit_and_distinct() {
+        use crate::constants::{DefinitionVal, QuotVal};
+
+        assert_eq!(definition_safety_tag(DefinitionSafety::Unsafe), 0);
+        assert_eq!(definition_safety_tag(DefinitionSafety::Safe), 1);
+        assert_eq!(definition_safety_tag(DefinitionSafety::Partial), 2);
+        assert_eq!(quot_kind_tag(QuotKind::Type), 0);
+        assert_eq!(quot_kind_tag(QuotKind::Ctor), 1);
+        assert_eq!(quot_kind_tag(QuotKind::Lift), 2);
+        assert_eq!(quot_kind_tag(QuotKind::Ind), 3);
+
+        let base = || ConstantVal {
+            name: n("tagged"),
+            level_params: vec![],
+            type_: Expr::sort(Level::zero()),
+        };
+        let definition = |safety| {
+            ConstantInfo::Defn(DefinitionVal {
+                base: base(),
+                value: Expr::sort(Level::zero()),
+                hints: ReducibilityHints::Opaque,
+                safety,
+                all: vec![n("tagged")],
+            })
+        };
+        let quotient = |kind| ConstantInfo::Quot(QuotVal { base: base(), kind });
+        let assert_pairwise_distinct = |infos: Vec<ConstantInfo>| {
+            let digests: Vec<Digest> = infos.iter().map(Environment::decl_content_digest).collect();
+            for (index, lhs) in digests.iter().enumerate() {
+                for rhs in &digests[index + 1..] {
+                    assert_ne!(lhs, rhs, "distinct schema tags must change identity");
+                }
+            }
+        };
+        assert_pairwise_distinct(vec![
+            definition(DefinitionSafety::Unsafe),
+            definition(DefinitionSafety::Safe),
+            definition(DefinitionSafety::Partial),
+        ]);
+        assert_pairwise_distinct(vec![
+            quotient(QuotKind::Type),
+            quotient(QuotKind::Ctor),
+            quotient(QuotKind::Lift),
+            quotient(QuotKind::Ind),
+        ]);
+
+        let options = KVMap::new();
+        let root = Environment::new()
+            .add_decl(definition(DefinitionSafety::Safe))
+            .expect("tagged definition is valid")
+            .logical_root(&options);
+        let repeated = Environment::new()
+            .add_decl(definition(DefinitionSafety::Safe))
+            .expect("same tagged definition is valid")
+            .logical_root(&options);
+        assert_eq!(root, repeated, "explicit tags are stable across rebuilds");
+    }
+
+    #[test]
     fn mutual_block_membership_changes_the_content_digest() {
         use crate::constants::{
-            DefinitionSafety, DefinitionVal, InductiveVal, RecursorRule, RecursorVal,
+            DefinitionSafety, DefinitionVal, InductiveVal, OpaqueVal, RecursorRule, RecursorVal,
             ReducibilityHints, TheoremVal,
         };
         // Every kind that carries an `all` (mutual block) must fold it into its
@@ -466,6 +624,14 @@ mod tests {
             ConstantInfo::Thm(TheoremVal {
                 base: ty(),
                 value: body(),
+                all,
+            })
+        };
+        let opaque = |all: Vec<Name>| {
+            ConstantInfo::Opaque(OpaqueVal {
+                base: ty(),
+                value: body(),
+                is_unsafe: false,
                 all,
             })
         };
@@ -500,19 +666,43 @@ mod tests {
             })
         };
 
-        for make in [
-            &defn as &dyn Fn(Vec<Name>) -> ConstantInfo,
-            &thm,
-            &induct,
-            &rec,
+        for (kind, make) in [
+            ("definition", &defn as &dyn Fn(Vec<Name>) -> ConstantInfo),
+            ("theorem", &thm),
+            ("opaque", &opaque),
+            ("inductive", &induct),
+            ("recursor", &rec),
         ] {
             let solo = Environment::decl_content_digest(&make(vec![n("d")]));
             let grouped = Environment::decl_content_digest(&make(vec![n("d"), n("e")]));
+            let reordered = Environment::decl_content_digest(&make(vec![n("e"), n("d")]));
+            let renamed = Environment::decl_content_digest(&make(vec![n("d"), n("f")]));
             assert_ne!(
                 solo, grouped,
-                "mutual-block membership must change the content digest"
+                "{kind} mutual-block membership must change the content digest"
+            );
+            assert_ne!(
+                grouped, reordered,
+                "{kind} mutual-block order must change the content digest"
+            );
+            assert_ne!(
+                grouped, renamed,
+                "{kind} mutual-block names must change the content digest"
             );
         }
+
+        let options = KVMap::new();
+        let solo = Environment::new()
+            .add_decl(opaque(vec![n("d")]))
+            .expect("solo opaque declaration is valid");
+        let grouped = Environment::new()
+            .add_decl(opaque(vec![n("d"), n("e")]))
+            .expect("grouped opaque declaration is valid");
+        assert_ne!(
+            solo.logical_root(&options),
+            grouped.logical_root(&options),
+            "opaque mutual-block membership must propagate into logical snapshot identity"
+        );
     }
 
     #[test]

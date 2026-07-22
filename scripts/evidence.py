@@ -31,8 +31,9 @@ import subprocess
 import sys
 import threading
 import time
+from functools import partial
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 PASS = 0
@@ -724,9 +725,9 @@ def open_process_handle(
         return None
     repeated = proc_stat_facts(pid)
     if (
-        repeated != facts
-        or repeated is None
+        repeated is None
         or repeated[0] == "Z"
+        or repeated[2] != facts[2]
         or (
             expected_parent_pid is not None
             and pid not in proc_children(expected_parent_pid)
@@ -735,6 +736,34 @@ def open_process_handle(
         os.close(descriptor)
         return None
     return facts[2], descriptor
+
+
+def bind_direct_child_until(
+    pid: int,
+    expected_parent_pid: int,
+    deadline: float,
+    *,
+    open_handle: Callable[[], tuple[int, int] | None] | None = None,
+) -> tuple[int, int]:
+    """Retry a lifetime bind while the same live direct child is still unreaped."""
+    if open_handle is None:
+        open_handle = partial(
+            open_process_handle, pid, expected_parent_pid=expected_parent_pid
+        )
+    while True:
+        handle = open_handle()
+        if handle is not None:
+            return handle
+        facts = proc_stat_facts(pid)
+        if (
+            facts is None
+            or facts[0] == "Z"
+            or pid not in proc_children(expected_parent_pid)
+        ):
+            raise EvidenceError("process disappeared before identity binding")
+        if time.monotonic() >= deadline:
+            raise EvidenceError("process identity did not stabilize in time")
+        time.sleep(0.005)
 
 
 def close_process_handles(handles: ProcessHandles) -> None:
@@ -1599,6 +1628,7 @@ def validate_run(
             "self-test-driver",
             "self-test-plant",
             "self-test-cancellation",
+            "finalizer-self-test",
             "evidence-manifest-self-test",
         }
         if schema == "fln.check/2"
@@ -1608,14 +1638,18 @@ def validate_run(
         raise EvidenceError(f"{path}: unknown run profile {profile!r}")
     if schema == "fln.check/2" and not isinstance(records[0].get("planted"), str):
         raise EvidenceError(f"{path}: planted-stage binding must be a string")
-    if schema == "fln.check/2" and profile != "evidence-manifest-self-test":
+    binding_free_profiles = {
+        "evidence-manifest-self-test",
+        "finalizer-self-test",
+    }
+    if schema == "fln.check/2" and profile not in binding_free_profiles:
         if records[0].get("ubs_inventory") != "ubs-inventory.json":
             raise EvidenceError(f"{path}: quality gate lacks its UBS inventory binding")
         validate_ubs_inventory(
             path.parent / "ubs-inventory.json",
             Path(records[0]["cwd"]) if live_context else None,
         )
-    if schema == "fln.e2e/2" or profile != "evidence-manifest-self-test":
+    if schema == "fln.e2e/2" or profile not in binding_free_profiles:
         if records[0].get("vendor_binding") != "vendor-binding.json":
             raise EvidenceError(f"{path}: run lacks its Reference vendor binding")
         recorded_binding = read_json_object(path.parent / "vendor-binding.json")
@@ -1866,6 +1900,17 @@ def validate_run(
             ]
             if len(actual_ids) != len(exercised):
                 raise EvidenceError(f"{path}: check self-test contains foreign events")
+        elif profile == "finalizer-self-test":
+            expected_ids = ["finalizer-probe"]
+            actual_ids = [
+                str(record.get("stage"))
+                for record in exercised
+                if record.get("event") == "self_test"
+            ]
+            if len(actual_ids) != len(exercised):
+                raise EvidenceError(
+                    f"{path}: finalizer self-test contains foreign events"
+                )
         else:
             expected_ids = CHECK_STAGE_ORDER
             actual_ids = [
@@ -4227,17 +4272,15 @@ def cmd_emergency_kill(args: argparse.Namespace) -> int:
 
 
 def cmd_process_start_ticks(args: argparse.Namespace) -> int:
-    if args.wait_ms < 0 or args.wait_ms > 5000:
-        raise EvidenceError("process identity wait must be between 0 and 5000 ms")
+    if args.wait_ms < 0 or args.wait_ms > 30_000:
+        raise EvidenceError("process identity wait must be between 0 and 30000 ms")
     if args.pid == os.getpid():
         raise EvidenceError("process identity target cannot be the binder itself")
-    handle = open_process_handle(
-        args.pid, expected_parent_pid=args.expected_parent_pid
+    deadline = time.monotonic() + args.wait_ms / 1000
+    handle = bind_direct_child_until(
+        args.pid, args.expected_parent_pid, deadline
     )
-    if handle is None:
-        raise EvidenceError("process disappeared before identity binding")
     try:
-        deadline = time.monotonic() + args.wait_ms / 1000
         while True:
             facts = proc_stat_facts(args.pid)
             if (
@@ -4539,6 +4582,250 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         )
         meta = read_json_object(metadata)
         return rc, meta, root
+
+    def run_shell_finalizer_probe(
+        point: str,
+        signal_number: int,
+        expected_exit: int,
+        *,
+        expect_committed_bundle: bool,
+    ) -> dict[str, Any]:
+        repo = Path(__file__).resolve().parent.parent
+        check_script = repo / "scripts" / "check.sh"
+        probe_root = art_dir / f"shell_finalizer_{point}"
+        control_root = Path(f"{probe_root}.control")
+        require(
+            not probe_root.exists()
+            and not probe_root.is_symlink()
+            and not control_root.exists()
+            and not control_root.is_symlink(),
+            f"finalizer probe paths already exist: {point}",
+        )
+        probe_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("FLN_CHECK_")
+            and not key.startswith("FLN_FINALIZER_")
+        }
+        probe_environment.update(
+            {
+                "FLN_CHECK_ART_DIR": str(probe_root),
+                "FLN_FINALIZER_TEST_POINT": point,
+            }
+        )
+        child = subprocess.Popen(
+            ["bash", str(check_script), "--finalizer-probe"],
+            cwd=repo,
+            env=probe_environment,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        child_handle: tuple[int, int] | None = None
+        finalizer_handle: tuple[int, int] | None = None
+        finalizer_pid = 0
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                child_handle = open_process_handle(
+                    child.pid, expected_parent_pid=os.getpid()
+                )
+                child_facts = proc_stat_facts(child.pid)
+                if (
+                    child_handle is not None
+                    and child_facts is not None
+                    and child_facts[1] == child.pid
+                    and child_facts[2] == child_handle[0]
+                ):
+                    break
+                if child_handle is not None:
+                    os.close(child_handle[1])
+                    child_handle = None
+                time.sleep(0.005)
+            else:
+                raise EvidenceError(f"finalizer probe shell was not bindable: {point}")
+
+            ready_path = control_root / "ready"
+            ready_timeout_s = 180.0 if point == "post_decision" else 60.0
+            deadline = time.monotonic() + ready_timeout_s
+            ready_values: tuple[int, int] | None = None
+            while time.monotonic() < deadline:
+                if child.poll() is not None:
+                    raise EvidenceError(
+                        f"finalizer probe exited before readiness: {point}={child.returncode}"
+                    )
+                try:
+                    payload, _size, _digest = stable_file_facts(
+                        ready_path, max_bytes=128
+                    )
+                    values = tuple(
+                        int(value) for value in payload.decode("ascii").split()
+                    )
+                    if len(values) == 2:
+                        ready_values = (values[0], values[1])
+                        break
+                except (EvidenceError, FileNotFoundError, UnicodeError, ValueError):
+                    pass
+                time.sleep(0.005)
+            if ready_values is None:
+                raise EvidenceError(f"finalizer probe readiness timed out: {point}")
+            finalizer_pid, finalizer_ticks = ready_values
+            if point == "post_decision":
+                require(
+                    ready_values == (0, 0),
+                    "post-decision probe unexpectedly retained an active finalizer",
+                )
+            else:
+                require(finalizer_pid > 1, f"invalid finalizer probe PID: {point}")
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    finalizer_handle = open_process_handle(
+                        finalizer_pid, expected_parent_pid=child.pid
+                    )
+                    finalizer_facts = proc_stat_facts(finalizer_pid)
+                    if (
+                        finalizer_handle is not None
+                        and finalizer_facts is not None
+                        and finalizer_facts[1] == finalizer_pid
+                        and finalizer_facts[2] == finalizer_handle[0]
+                        and (
+                            (
+                                point == "spawn_bind"
+                                and finalizer_ticks == 0
+                                and finalizer_facts[0] in {"T", "t"}
+                            )
+                            or (
+                                point != "spawn_bind"
+                                and finalizer_ticks > 0
+                                and finalizer_handle[0] == finalizer_ticks
+                                and finalizer_facts[0] not in {"T", "t", "Z"}
+                            )
+                        )
+                    ):
+                        break
+                    if finalizer_handle is not None:
+                        os.close(finalizer_handle[1])
+                        finalizer_handle = None
+                    time.sleep(0.005)
+                else:
+                    raise EvidenceError(
+                        f"finalizer probe child was not precisely bound: {point}"
+                    )
+
+            require(
+                signal_process_handle(child.pid, child_handle, signal_number),
+                f"finalizer probe shell disappeared before signal: {point}",
+            )
+            if point == "post_decision":
+                ack_path = control_root / "signal-ack"
+                deadline = time.monotonic() + 60.0
+                while time.monotonic() < deadline:
+                    try:
+                        ack, _size, _digest = stable_file_facts(
+                            ack_path, max_bytes=32
+                        )
+                    except (EvidenceError, FileNotFoundError):
+                        time.sleep(0.005)
+                        continue
+                    require(
+                        hmac.compare_digest(
+                            ack.decode("ascii").strip(),
+                            signal.Signals(signal_number).name.removeprefix("SIG"),
+                        ),
+                        "post-decision probe acknowledged the wrong signal",
+                    )
+                    break
+                else:
+                    raise EvidenceError("post-decision signal was not acknowledged")
+                write_new(control_root / "release", b"release\n")
+
+            communicate_timeout_s = 180 if point == "post_decision" else 120
+            _stdout, stderr = child.communicate(timeout=communicate_timeout_s)
+            require(
+                child.returncode == expected_exit,
+                f"finalizer probe {point} exited {child.returncode}: {stderr[-1000:]!r}",
+            )
+            if not expect_committed_bundle:
+                decision, _size, _digest = stable_file_facts(
+                    probe_root / "bundle.decision", max_bytes=1
+                )
+                require(
+                    decision == b"",
+                    f"pre-decision finalizer probe crossed its decision: {point}",
+                )
+            if point in {"spawn_bind", "active_wait"}:
+                require(
+                    b"CANCELLED: signal_" in stderr,
+                    f"finalizer cancellation lacked its terminal reason: {point}",
+                )
+            if point == "helper_failure":
+                require(
+                    b"process-tree cleanup was not proven" in stderr,
+                    "helper-failure probe did not exercise cleanup uncertainty",
+                )
+            if finalizer_handle is not None:
+                deadline = time.monotonic() + 5.0
+                while True:
+                    reap_adopted_children()
+                    finalizer_facts = proc_stat_facts(finalizer_pid)
+                    if (
+                        finalizer_facts is None
+                        or finalizer_facts[2] != finalizer_handle[0]
+                    ):
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.005)
+                require(
+                    (finalizer_facts := proc_stat_facts(finalizer_pid)) is None
+                    or finalizer_facts[2] != finalizer_handle[0],
+                    f"finalizer probe left its bound lifetime unreaped: {point}",
+                )
+            commit_path = probe_root / "bundle.complete.json"
+            if expect_committed_bundle:
+                validate_run(
+                    probe_root / "run.ndjson",
+                    "fln.check/2",
+                    "pass",
+                    live_context=False,
+                )
+                validate_bundle(
+                    probe_root,
+                    probe_root / "manifest.json",
+                    probe_root / "manifest.digest",
+                    commit_path,
+                )
+            else:
+                require(
+                    not commit_path.exists(),
+                    f"pre-decision finalizer probe committed a bundle: {point}",
+                )
+        finally:
+            if child.poll() is None:
+                if child_handle is not None:
+                    signal_process_handle(child.pid, child_handle, signal.SIGKILL)
+                else:
+                    child.kill()
+                child.communicate(timeout=10)
+            if finalizer_handle is not None:
+                try:
+                    if process_handle_alive(finalizer_pid, finalizer_handle):
+                        signal_process_handle(
+                            finalizer_pid, finalizer_handle, signal.SIGKILL
+                        )
+                finally:
+                    os.close(finalizer_handle[1])
+            if child_handle is not None:
+                os.close(child_handle[1])
+            reap_adopted_children()
+        return {
+            "case": f"shell_finalizer_{point}",
+            "ok": True,
+            "signal": signal.Signals(signal_number).name,
+            "process_exit": expected_exit,
+            "artifact": str(probe_root),
+        }
 
     flood_size = 32_768
     flood_program = (
@@ -5272,6 +5559,30 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             pdeath_child_pid, expected_parent_pid=pdeath_launcher.pid
         )
         require(pdeath_handle is not None, "stopped-exec child identity was unbound")
+        retry_attempts = 0
+
+        def delayed_identity_open() -> tuple[int, int] | None:
+            nonlocal retry_attempts
+            retry_attempts += 1
+            if retry_attempts == 1:
+                return None
+            return open_process_handle(
+                pdeath_child_pid, expected_parent_pid=pdeath_launcher.pid
+            )
+
+        retry_handle = bind_direct_child_until(
+            pdeath_child_pid,
+            pdeath_launcher.pid,
+            time.monotonic() + 30.0,
+            open_handle=delayed_identity_open,
+        )
+        try:
+            require(
+                retry_attempts == 2 and retry_handle[0] == pdeath_handle[0],
+                "direct-child identity binding did not retry the same lifetime",
+            )
+        finally:
+            os.close(retry_handle[1])
         deadline = time.monotonic() + 5.0
         while True:
             pdeath_facts = proc_stat_facts(pdeath_child_pid)
@@ -5294,6 +5605,35 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             and pdeath_facts[1] == pdeath_child_pid
             and pdeath_facts[2] == pdeath_handle[0],
             "stopped-exec child did not reach its inert session state",
+        )
+        identity_probe = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "process-start-ticks",
+                "--pid",
+                str(pdeath_child_pid),
+                "--expected-parent-pid",
+                str(pdeath_launcher.pid),
+                "--wait-ms",
+                "30000",
+                "--session-leader",
+                "--stopped",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        require(
+            identity_probe.returncode == PASS,
+            "declared readiness budget was rejected by identity binding: "
+            f"{identity_probe.stderr[-1000:]!r}",
+        )
+        require(
+            identity_probe.stdout.decode("ascii").strip()
+            == str(pdeath_handle[0]),
+            "readiness-budget identity probe returned the wrong lifetime",
         )
         pdeath_launcher.kill()
         pdeath_launcher.communicate(timeout=10)
@@ -5326,6 +5666,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "ok": True,
             "launcher_pid": published_pids[0],
             "child_pid": pdeath_child_pid,
+            "identity_wait_budget_ms": 30_000,
+            "identity_bind_attempts": retry_attempts,
         }
     )
 
@@ -5393,7 +5735,14 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         }
     )
 
-    case_dir("bound_group_stale_identity")
+    bound_group_root = case_dir("bound_group_stale_identity")
+    bound_group_member_file = bound_group_root / "member.pid"
+    bound_group_program = (
+        "import pathlib,subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        f"pathlib.Path({str(bound_group_member_file)!r}).write_text(str(p.pid));"
+        "time.sleep(60)"
+    )
     bound_group_child = subprocess.Popen(
         [
             sys.executable,
@@ -5404,15 +5753,32 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "--",
             sys.executable,
             "-c",
-            "import time;time.sleep(60)",
+            bound_group_program,
         ],
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    bound_group_sentinel = subprocess.Popen(
+        [sys.executable, "-c", "import time;time.sleep(60)"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     bound_group_handle: tuple[int, int] | None = None
+    bound_group_member_handle: tuple[int, int] | None = None
+    bound_group_sentinel_handle: tuple[int, int] | None = None
+    bound_group_member_pid = 0
     try:
+        bound_group_sentinel_handle = open_process_handle(
+            bound_group_sentinel.pid, expected_parent_pid=os.getpid()
+        )
+        require(
+            bound_group_sentinel_handle is not None,
+            "unrelated process-group sentinel was not bindable",
+        )
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             bound_group_handle = open_process_handle(
@@ -5442,6 +5808,53 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             process_handle_alive(bound_group_child.pid, bound_group_handle),
             "stale start-time cleanup signalled the bound process group",
         )
+        require(
+            process_handle_alive(
+                bound_group_sentinel.pid, bound_group_sentinel_handle
+            ),
+            "stale start-time cleanup signalled the unrelated sentinel",
+        )
+        require(
+            signal_process_handle(
+                bound_group_child.pid, bound_group_handle, signal.SIGCONT
+            ),
+            "bound-group child disappeared before descendant launch",
+        )
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                member_data, _size, _digest = stable_file_facts(
+                    bound_group_member_file, max_bytes=64
+                )
+                candidate_pid = int(member_data.decode("ascii"))
+            except (EvidenceError, FileNotFoundError, UnicodeError, ValueError):
+                time.sleep(0.005)
+                continue
+            candidate_handle = open_process_handle(
+                candidate_pid, expected_parent_pid=bound_group_child.pid
+            )
+            candidate_facts = proc_stat_facts(candidate_pid)
+            if (
+                candidate_handle is not None
+                and candidate_facts is not None
+                and candidate_facts[0] != "Z"
+                and candidate_facts[1] == bound_group_child.pid
+                and candidate_facts[2] == candidate_handle[0]
+            ):
+                bound_group_member_pid = candidate_pid
+                bound_group_member_handle = candidate_handle
+                break
+            if candidate_handle is not None:
+                os.close(candidate_handle[1])
+            time.sleep(0.005)
+        else:
+            raise EvidenceError("bound process-group descendant was not bindable")
+        require(
+            {bound_group_child.pid, bound_group_member_pid}.issubset(
+                live_process_group_members(bound_group_child.pid)
+            ),
+            "bound process-group topology omitted its descendant",
+        )
         kill_bound_process_group(
             bound_group_child.pid,
             bound_group_handle[0],
@@ -5449,11 +5862,58 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         )
         require(
             not process_handle_alive(bound_group_child.pid, bound_group_handle),
-            "exact process-group cleanup left its bound lifetime live",
+            "exact process-group cleanup left its leader live",
+        )
+        require(
+            not process_handle_alive(
+                bound_group_member_pid, bound_group_member_handle
+            ),
+            "exact process-group cleanup left its descendant live",
+        )
+        require(
+            process_handle_alive(
+                bound_group_sentinel.pid, bound_group_sentinel_handle
+            ),
+            "exact process-group cleanup signalled the unrelated sentinel",
         )
         bound_group_child.communicate(timeout=10)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            reap_adopted_children()
+            member_facts = proc_stat_facts(bound_group_member_pid)
+            if (
+                member_facts is None
+                or member_facts[2] != bound_group_member_handle[0]
+            ):
+                break
+            time.sleep(0.005)
+        require(
+            (member_facts := proc_stat_facts(bound_group_member_pid)) is None
+            or member_facts[2] != bound_group_member_handle[0],
+            "exact process-group cleanup left its descendant unreaped",
+        )
+        exact_sentinel_rc = cmd_kill_direct_child(
+            argparse.Namespace(
+                pid=bound_group_sentinel.pid,
+                expected_parent_pid=os.getpid(),
+                wait_ms=5000,
+            )
+        )
+        require(exact_sentinel_rc == PASS, "sentinel cleanup failed")
+        bound_group_sentinel.communicate(timeout=10)
     finally:
         try:
+            if (
+                bound_group_member_handle is not None
+                and process_handle_alive(
+                    bound_group_member_pid, bound_group_member_handle
+                )
+            ):
+                signal_process_handle(
+                    bound_group_member_pid,
+                    bound_group_member_handle,
+                    signal.SIGKILL,
+                )
             if bound_group_child.poll() is None:
                 if bound_group_handle is not None:
                     signal_process_handle(
@@ -5462,15 +5922,65 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 else:
                     bound_group_child.kill()
                 bound_group_child.communicate(timeout=10)
+            if bound_group_sentinel.poll() is None:
+                if bound_group_sentinel_handle is not None:
+                    signal_process_handle(
+                        bound_group_sentinel.pid,
+                        bound_group_sentinel_handle,
+                        signal.SIGKILL,
+                    )
+                else:
+                    bound_group_sentinel.kill()
+                bound_group_sentinel.communicate(timeout=10)
+            reap_adopted_children()
         finally:
+            if bound_group_member_handle is not None:
+                os.close(bound_group_member_handle[1])
+            if bound_group_sentinel_handle is not None:
+                os.close(bound_group_sentinel_handle[1])
             if bound_group_handle is not None:
                 os.close(bound_group_handle[1])
     cases.append(
         {
             "case": "bound_group_stale_identity",
             "ok": True,
-            "child_pid": bound_group_child.pid,
+            "leader_pid": bound_group_child.pid,
+            "member_pid": bound_group_member_pid,
+            "sentinel_pid": bound_group_sentinel.pid,
         }
+    )
+
+    cases.append(
+        run_shell_finalizer_probe(
+            "spawn_bind",
+            signal.SIGHUP,
+            129,
+            expect_committed_bundle=False,
+        )
+    )
+    cases.append(
+        run_shell_finalizer_probe(
+            "active_wait",
+            signal.SIGINT,
+            130,
+            expect_committed_bundle=False,
+        )
+    )
+    cases.append(
+        run_shell_finalizer_probe(
+            "helper_failure",
+            signal.SIGTERM,
+            SETUP_FAILURE,
+            expect_committed_bundle=False,
+        )
+    )
+    cases.append(
+        run_shell_finalizer_probe(
+            "post_decision",
+            signal.SIGTERM,
+            PASS,
+            expect_committed_bundle=True,
+        )
     )
 
     collision_root = case_dir("artifact_publication_failure")
@@ -5729,6 +6239,53 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     else:
         raise EvidenceError("write-once bundle marker was overwritten")
     cases.append({"case": "write_once_manifest", "ok": True})
+
+    relocated_root = case_dir("relocated_bundle_validation")
+    source_manifest = read_json_object(manifest_root / "manifest.json")
+    directory_entries = sorted(
+        (
+            entry
+            for entry in source_manifest["artifacts"]
+            if entry["role"] == "directory"
+        ),
+        key=lambda entry: (
+            len(Path(entry["path"]).parts),
+            entry["path"].encode("utf-8"),
+        ),
+    )
+    for entry in directory_entries:
+        (relocated_root / entry["path"]).mkdir()
+    for entry in source_manifest["artifacts"]:
+        if entry["role"] == "directory":
+            continue
+        source = manifest_root / entry["path"]
+        data, _size, _digest = stable_file_facts(source)
+        write_new(relocated_root / entry["path"], data)
+    for control_name in (
+        "manifest.json",
+        "manifest.digest",
+        "bundle.decision",
+        "bundle.complete.json",
+    ):
+        data, _size, _digest = stable_file_facts(manifest_root / control_name)
+        write_new(relocated_root / control_name, data)
+    for identity_name in (
+        "run.ndjson",
+        "manifest.json",
+        "bundle.complete.json",
+    ):
+        require(
+            (manifest_root / identity_name).stat().st_ino
+            != (relocated_root / identity_name).stat().st_ino,
+            f"relocated bundle reused source inode: {identity_name}",
+        )
+    validate_bundle(
+        relocated_root,
+        relocated_root / "manifest.json",
+        relocated_root / "manifest.digest",
+        relocated_root / "bundle.complete.json",
+    )
+    cases.append({"case": "relocated_bundle_validation", "ok": True})
 
     cancellation_root = case_dir("bundle_decision_cancellation")
     cancellation_decision = cancellation_root / "bundle.decision"

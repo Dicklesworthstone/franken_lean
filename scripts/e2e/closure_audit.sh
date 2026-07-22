@@ -320,7 +320,8 @@ run_finalizer_command() {
   FINALIZER_PID=$!
   FINALIZER_START_TICKS="$(
     setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
-      --expected-parent-pid "$$" --wait-ms 5000 --session-leader --stopped \
+      --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
+      --session-leader --stopped \
       2>/dev/null
   )" || true
   case "$FINALIZER_START_TICKS" in ''|*[!0-9]*) binding_valid=0 ;; esac
@@ -546,7 +547,7 @@ supervise() {
   ACTIVE_RUNNER_PID=$!
   if ! ACTIVE_RUNNER_START_TICKS="$(
     setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
-      --expected-parent-pid "$$" --wait-ms 5000 --session-leader \
+      --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" --session-leader \
       2>/dev/null
   )"; then
     if ! terminate_unreleased_runner "$ACTIVE_RUNNER_PID"; then

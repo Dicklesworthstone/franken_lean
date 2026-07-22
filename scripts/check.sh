@@ -13,12 +13,14 @@
 
 set -Eeuo pipefail
 
+FINALIZER_PROBE=0
 case "${1:-}" in
   --help|-h)
     sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   --self-test|"") ;;
+  --finalizer-probe) FINALIZER_PROBE=1 ;;
   *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
 esac
 
@@ -48,7 +50,14 @@ STAGE_TIMEOUT_MS="${FLN_CHECK_STAGE_TIMEOUT_MS:-1200000}"
 KILL_GRACE_MS="${FLN_CHECK_KILL_GRACE_MS:-2000}"
 READY_WAIT_MS="${FLN_CHECK_READY_WAIT_MS:-30000}"
 PLANT="${FLN_CHECK_PLANT:-}"
-if [ -n "${FLN_CHECK_PROFILE:-}" ]; then
+FINALIZER_TEST_POINT="${FLN_FINALIZER_TEST_POINT:-}"
+if [ "$FINALIZER_PROBE" -eq 1 ]; then
+  case "$FINALIZER_TEST_POINT" in
+    spawn_bind|active_wait|helper_failure|post_decision) ;;
+    *) echo "invalid finalizer probe point: $FINALIZER_TEST_POINT" >&2; exit 2 ;;
+  esac
+  PROFILE=finalizer-self-test
+elif [ -n "${FLN_CHECK_PROFILE:-}" ]; then
   PROFILE="$FLN_CHECK_PROFILE"
 elif [ "${1:-}" = --self-test ]; then
   PROFILE=self-test-driver
@@ -89,6 +98,10 @@ FINALIZATION_SIGNAL=""
 FINALIZATION_SIGNAL_EXIT=0
 FINALIZATION_SIGNAL_GENERATION=0
 FINALIZATION_DECISION="$ART_DIR/bundle.decision"
+FINALIZER_TEST_CONTROL="$ART_DIR.control"
+FINALIZER_TEST_READY="$FINALIZER_TEST_CONTROL/ready"
+FINALIZER_TEST_RELEASE="$FINALIZER_TEST_CONTROL/release"
+FINALIZER_TEST_ACK="$FINALIZER_TEST_CONTROL/signal-ack"
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 EVENT_COMMAND=()
 INPUT_PATHS=(
@@ -101,6 +114,10 @@ INPUT_PATHS=(
   scripts/e2e/env_snapshots.sh scripts/e2e/bignum_vectors.sh
   scripts/extract/gen_core_fixtures.sh scripts/extract/gen_core_fixtures.lean
   scripts/extract/convert_blake3_vectors.py scripts/extract/gen_bignum_vectors.py
+  scripts/extract/gen_abi_contract.py scripts/extract/gen_olean_contract.py
+  scripts/extract/gen_extern_census.sh scripts/extract/gen_extern_census.lean
+  scripts/e2e/contract_drift.sh
+  contracts ABI_CONTRACT.md OLEAN_CONTRACT.md rustfmt.toml
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
   tribunal
   .github/workflows/ci.yml
@@ -117,27 +134,48 @@ UBS_SCOPE="${FLN_UBS_SCOPE:-changed}"
 UBS_INVENTORY="$ART_DIR/ubs-inventory.json"
 VENDOR_PATH="vendor/lean4-src"
 VENDOR_BINDING="$ART_DIR/vendor-binding.json"
+GOVERNED_ROOT="$REPO"
+HASH_CONTEXT_ARGS=(--inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH")
+BUNDLE_CONTEXT_ARGS=(--inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH")
+UBS_INVENTORY_BINDING=ubs-inventory.json
+VENDOR_BINDING_BINDING=vendor-binding.json
 mkdir -p "$(dirname "$ART_DIR")"
 if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
   echo "[check] setup failure: refusing reused evidence directory: $ART_DIR" >&2
   exit 2
 fi
 mkdir "$ART_DIR"
-python3 "$EVIDENCE" ubs-inventory --root "$REPO" --scope "$UBS_SCOPE" \
-  --output "$UBS_INVENTORY" --artifact-root "$ART_DIR" || {
-    echo "[check] setup failure: cannot inventory UBS inputs" >&2
+if [ "$FINALIZER_PROBE" -eq 1 ]; then
+  if [ -e "$FINALIZER_TEST_CONTROL" ] || [ -L "$FINALIZER_TEST_CONTROL" ]; then
+    echo "[check] setup failure: refusing reused probe control directory" >&2
     exit 2
-  }
-python3 "$EVIDENCE" vendor-binding --root "$REPO" --vendor-path "$VENDOR_PATH" \
-  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" || {
-    echo "[check] setup failure: cannot verify the pinned Reference tree" >&2
-    exit 2
-  }
-INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$REPO" "${HASH_ARGS[@]}" \
-  --inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH")" || {
-    echo "[check] setup failure: cannot hash governed inputs" >&2
-    exit 2
-  }
+  fi
+  mkdir "$FINALIZER_TEST_CONTROL"
+  printf 'finalizer-probe\n' > "$ART_DIR/probe-input"
+  GOVERNED_ROOT="$ART_DIR"
+  HASH_ARGS=(--path probe-input)
+  GOVERNED_ARGS=(--governed-path probe-input)
+  HASH_CONTEXT_ARGS=()
+  BUNDLE_CONTEXT_ARGS=()
+  UBS_INVENTORY_BINDING=not_applicable_finalizer_self_test
+  VENDOR_BINDING_BINDING=not_applicable_finalizer_self_test
+else
+  python3 "$EVIDENCE" ubs-inventory --root "$REPO" --scope "$UBS_SCOPE" \
+    --output "$UBS_INVENTORY" --artifact-root "$ART_DIR" || {
+      echo "[check] setup failure: cannot inventory UBS inputs" >&2
+      exit 2
+    }
+  python3 "$EVIDENCE" vendor-binding --root "$REPO" --vendor-path "$VENDOR_PATH" \
+    --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" || {
+      echo "[check] setup failure: cannot verify the pinned Reference tree" >&2
+      exit 2
+    }
+fi
+INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
+  "${HASH_ARGS[@]}" "${HASH_CONTEXT_ARGS[@]}")" || {
+  echo "[check] setup failure: cannot hash governed inputs" >&2
+  exit 2
+}
 HOST_FACTS_JSON="$(python3 - <<'PY'
 import json, platform
 print(json.dumps({
@@ -192,6 +230,37 @@ mark_process_tree_cleanup_unproven() {
   PROCESS_TREE_CLEANUP_UNPROVEN=1
   trap '' HUP INT TERM
   set_final internal_fault process_tree_cleanup_unproven 2
+}
+
+# shellcheck disable=SC2317
+finalizer_test_publish() {
+  local path="$1" payload="$2" noclobber_was_set=0
+  [ "$FINALIZER_PROBE" -eq 1 ] || return 0
+  case $- in *C*) noclobber_was_set=1 ;; esac
+  set -o noclobber
+  printf '%s\n' "$payload" 2>/dev/null > "$path" || {
+    [ "$noclobber_was_set" -eq 1 ] || set +o noclobber
+    return 1
+  }
+  [ "$noclobber_was_set" -eq 1 ] || set +o noclobber
+}
+
+# shellcheck disable=SC2317
+finalizer_test_checkpoint() {
+  local point="$1" deadline
+  [ "$FINALIZER_PROBE" -eq 1 ] || return 0
+  [ "$FINALIZER_TEST_POINT" = "$point" ] || return 0
+  finalizer_test_publish "$FINALIZER_TEST_READY" \
+    "${FINALIZER_PID:-0} ${FINALIZER_START_TICKS:-0}" || return 1
+  deadline=$((SECONDS + 120))
+  while [ ! -s "$FINALIZER_TEST_RELEASE" ]; do
+    if [ -n "$FINALIZATION_SIGNAL" ] \
+        || [ "$PROCESS_TREE_CLEANUP_UNPROVEN" -ne 0 ]; then
+      return 0
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    :
+  done
 }
 
 # Called from the EXIT-trap finalizer.
@@ -361,6 +430,14 @@ on_signal() {
 
 # shellcheck disable=SC2317
 contain_bound_finalizer() {
+  if [ "$FINALIZER_PROBE" -eq 1 ] \
+      && [ "$FINALIZER_TEST_POINT" = helper_failure ] \
+      && [ -n "$FINALIZATION_SIGNAL" ]; then
+    FINALIZER_CLEANUP_UNPROVEN=1
+    FINALIZER_WAIT_UNSAFE=1
+    mark_process_tree_cleanup_unproven
+    return 1
+  fi
   if [ -z "$FINALIZER_PID" ] || [ -z "$FINALIZER_START_TICKS" ]; then
     FINALIZER_CLEANUP_UNPROVEN=1
     FINALIZER_WAIT_UNSAFE=1
@@ -398,6 +475,7 @@ on_finalizer_signal() {
   [ "$noclobber_was_set" -eq 1 ] || set +o noclobber
   FINALIZATION_SIGNAL_GENERATION=$((FINALIZATION_SIGNAL_GENERATION + 1))
   if [ -s "$FINALIZATION_DECISION" ]; then
+    finalizer_test_publish "$FINALIZER_TEST_ACK" "$name" || true
     trap '' HUP INT TERM
     return 0
   fi
@@ -430,9 +508,19 @@ run_finalizer_command() {
   setsid -- python3 "$EVIDENCE" stopped-exec \
     --expected-parent-pid "$$" -- "$@" &
   FINALIZER_PID=$!
+  if ! finalizer_test_checkpoint spawn_bind; then
+    if ! terminate_unreleased_runner "$FINALIZER_PID"; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+      FINALIZER_WAIT_UNSAFE=1
+      mark_process_tree_cleanup_unproven
+    fi
+    FINALIZER_PID=""
+    return 2
+  fi
   FINALIZER_START_TICKS="$(
     setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
-      --expected-parent-pid "$$" --wait-ms 5000 --session-leader --stopped \
+      --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
+      --session-leader --stopped \
       2>/dev/null
   )" || true
   case "$FINALIZER_START_TICKS" in ''|*[!0-9]*) binding_valid=0 ;; esac
@@ -455,6 +543,13 @@ run_finalizer_command() {
         --pid "$FINALIZER_PID" \
         --expected-start-ticks "$FINALIZER_START_TICKS" \
         --expected-parent-pid "$$"; then
+      contain_bound_finalizer || wait_safe=0
+      resume_failed=1
+    fi
+  fi
+  if [ "$resume_failed" -eq 0 ]; then
+    if ! finalizer_test_checkpoint active_wait \
+        || ! finalizer_test_checkpoint helper_failure; then
       contain_bound_finalizer || wait_safe=0
       resume_failed=1
     fi
@@ -527,9 +622,18 @@ on_exit() {
       set_final internal_fault unexpected_shell_exit 2
     fi
   fi
-  run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$REPO" \
-    "${HASH_ARGS[@]}" --inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH" \
-    --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" 2>/dev/null || hash_rc=$?
+  if [ "$FINALIZER_PROBE" -eq 1 ] && {
+    [ "$FINALIZER_TEST_POINT" = active_wait ] \
+      || [ "$FINALIZER_TEST_POINT" = helper_failure ];
+  }; then
+    run_finalizer_command python3 -c 'import time; time.sleep(60)' \
+      2>/dev/null || hash_rc=$?
+  else
+    run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
+      "${HASH_ARGS[@]}" "${HASH_CONTEXT_ARGS[@]}" \
+      --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" \
+      2>/dev/null || hash_rc=$?
+  fi
   abort_if_finalizer_signalled
   if [ "$hash_rc" -eq 0 ]; then
     IFS= read -r final_root < "$FINAL_ROOT_FILE" || hash_rc=2
@@ -568,9 +672,10 @@ on_exit() {
   if [ "$publish_rc" -eq 0 ]; then
     run_finalizer_command python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
-      --output "$ART_DIR/bundle.complete.json" --governed-root "$REPO" \
+      --output "$ART_DIR/bundle.complete.json" --governed-root "$GOVERNED_ROOT" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
-      --inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH" || true
+      "${BUNDLE_CONTEXT_ARGS[@]}" || true
+    if ! finalizer_test_checkpoint post_decision; then publish_rc=2; fi
     if run_finalizer_command python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
         --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
         --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
@@ -624,12 +729,21 @@ emit_event \
   --string seed "$SEED" \
   --string cache_state "$CACHE_STATE" \
   --string input_root "$INPUT_ROOT" \
-  --string ubs_inventory ubs-inventory.json \
-  --string vendor_binding vendor-binding.json \
+  --string ubs_inventory "$UBS_INVENTORY_BINDING" \
+  --string vendor_binding "$VENDOR_BINDING_BINDING" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"stage_timeout_ms\":$STAGE_TIMEOUT_MS,\"kill_grace_ms\":$KILL_GRACE_MS}" \
   --string rustc "$(rustc --version 2>/dev/null || printf unknown)" \
   --string planted "$PLANT"
 : > "$HUMAN"
+
+if [ "$FINALIZER_PROBE" -eq 1 ]; then
+  ACTIVE_STAGE=finalizer-probe
+  emit_event --string event self_test --string stage finalizer-probe \
+    --boolean ok true --integer planted_exit 0 \
+    --string artifact finalizer-probe
+  set_final pass finalizer_probe_complete 0
+  exit 0
+fi
 
 read_meta_field() {
   python3 - "$1" "$2" <<'PY'
@@ -690,7 +804,7 @@ run_stage() {
   ACTIVE_RUNNER_PID=$!
   if ! ACTIVE_RUNNER_START_TICKS="$(
     setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
-      --expected-parent-pid "$$" --wait-ms 5000 --session-leader \
+      --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" --session-leader \
       2>/dev/null
   )"; then
     if ! terminate_unreleased_runner "$ACTIVE_RUNNER_PID"; then
@@ -849,7 +963,8 @@ self_test() {
     ACTIVE_RUNNER_PID="$child_pid"
     if ! ACTIVE_RUNNER_START_TICKS="$(
       setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
-        --expected-parent-pid "$$" --wait-ms 5000 --session-leader 2>/dev/null
+        --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
+        --session-leader 2>/dev/null
     )"; then
       if ! terminate_unreleased_runner "$child_pid"; then
         mark_process_tree_cleanup_unproven
@@ -970,7 +1085,8 @@ self_test() {
   ACTIVE_RUNNER_PID="$child_pid"
   if ! ACTIVE_RUNNER_START_TICKS="$(
     setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
-      --expected-parent-pid "$$" --wait-ms 5000 --session-leader 2>/dev/null
+      --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
+      --session-leader 2>/dev/null
   )"; then
     if ! terminate_unreleased_runner "$child_pid"; then
       mark_process_tree_cleanup_unproven
@@ -1099,6 +1215,7 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh \
   scripts/e2e/env_snapshots.sh scripts/e2e/bignum_vectors.sh \
+  scripts/e2e/contract_drift.sh scripts/extract/gen_extern_census.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets

@@ -684,7 +684,7 @@ impl Drop for Expr {
         let mut pending = vec![root];
         let mut drained = 0usize;
         while let Some(node) = pending.pop() {
-            let Ok(node) = Arc::try_unwrap(node) else {
+            let Some(node) = Arc::into_inner(node) else {
                 continue;
             };
             drained += 1;
