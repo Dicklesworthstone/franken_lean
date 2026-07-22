@@ -129,6 +129,17 @@ impl std::hash::Hash for Level {
     }
 }
 
+/// Borrowed constructor view (see [`Level::view`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelView<'a> {
+    Zero,
+    Succ(&'a Level),
+    Max(&'a Level, &'a Level),
+    IMax(&'a Level, &'a Level),
+    Param(&'a Name),
+    MVar(&'a LMVarId),
+}
+
 const SEED_ZERO: u64 = 2221;
 const SEED_MVAR: u64 = 2237;
 const SEED_PARAM: u64 = 2239;
@@ -239,6 +250,19 @@ impl Level {
 
     pub fn is_zero(&self) -> bool {
         matches!(&*self.node, Node::Zero)
+    }
+
+    /// Borrowed structural view — the constructor-inventory access canonical codecs
+    /// and pretty-printers need without exposing the internal representation.
+    pub fn view(&self) -> LevelView<'_> {
+        match &*self.node {
+            Node::Zero => LevelView::Zero,
+            Node::Succ(u) => LevelView::Succ(u),
+            Node::Max(u, v) => LevelView::Max(u, v),
+            Node::IMax(u, v) => LevelView::IMax(u, v),
+            Node::Param(n) => LevelView::Param(n),
+            Node::MVar(m) => LevelView::MVar(m),
+        }
     }
 
     // ---- structure ---------------------------------------------------------------------

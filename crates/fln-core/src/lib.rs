@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod diag;
 pub mod expr;
 pub mod ids;
 pub mod lean_hash;

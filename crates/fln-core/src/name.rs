@@ -122,6 +122,16 @@ impl Name {
         matches!(&self.0, Repr::Num(node) if node.overflowed)
     }
 
+    /// Borrowed view of the leaf component — the structural access canonical codecs
+    /// and pretty-printers need without exposing the internal representation.
+    pub fn leaf_view(&self) -> LeafView<'_> {
+        match &self.0 {
+            Repr::Anonymous => LeafView::Anonymous,
+            Repr::Str(node) => LeafView::Str(&node.component),
+            Repr::Num(node) => LeafView::Num(node.component),
+        }
+    }
+
     /// Build `a.b.c`-style names from string components (test/tooling convenience).
     pub fn from_components<'a>(components: impl IntoIterator<Item = &'a str>) -> Name {
         components.into_iter().fold(Name::anonymous(), Name::str)
@@ -162,6 +172,15 @@ impl Default for Name {
     fn default() -> Name {
         Name::anonymous()
     }
+}
+
+/// Borrowed leaf-component view (see [`Name::leaf_view`]). An overflowed `num`
+/// component still reports [`Name::component_overflowed`] separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafView<'a> {
+    Anonymous,
+    Str(&'a str),
+    Num(u64),
 }
 
 /// `Name.cmp` (vendor: src/Lean/Data/Name.lean:67-81) IS this type's `Ord`:
