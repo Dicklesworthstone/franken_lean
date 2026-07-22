@@ -596,3 +596,41 @@ fn kr901_projection_cannot_leak_data_out_of_prop() {
         "projecting a Prop field from a Prop box is fine: {ok:?}"
     );
 }
+
+#[test]
+fn kr310_same_constant_defeq_iff_levels_are_equivalent() {
+    // F.{u} : Sort u — a universe-polymorphic axiom.
+    let poly = Declaration::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: n("F"),
+            level_params: vec![n("u")],
+            type_: Expr::sort(Level::param(n("u"))),
+        },
+        is_unsafe: false,
+    });
+    let env = admit(&Environment::new(), &poly);
+    let u = Level::param(n("u"));
+
+    // SOUNDNESS: F.{0} : Sort 0 and F.{1} : Sort 1 are DISTINCT constants; equating
+    // them would be unsound. Kills a KR-310 that skips the per-level equivalence check.
+    let f0 = Expr::const_(n("F"), vec![Level::zero()]);
+    let f1 = Expr::const_(n("F"), vec![Level::one()]);
+    let verdict = check_def_eq(&env, &[], &f0, &f1, Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::NotDefEq),
+        "F.<0> and F.<1> must not be definitionally equal — UNSOUND: {verdict:?}"
+    );
+
+    // DISCRIMINATING: equivalent levels ARE defeq (max u u ≡ u), so KR-310 is not a
+    // blanket rejection of same-name constants.
+    let f_maxuu = Expr::const_(
+        n("F"),
+        vec![Level::max(u.clone(), u.clone()).expect("packs")],
+    );
+    let f_u = Expr::const_(n("F"), vec![u.clone()]);
+    assert!(
+        check_def_eq(&env, &[n("u")], &f_maxuu, &f_u, Budget::DEFAULT).is_accepted(),
+        "F.<max u u> and F.<u> should be defeq (max u u normalizes to u)"
+    );
+}
