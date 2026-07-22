@@ -29,6 +29,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-conformance"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-core"
