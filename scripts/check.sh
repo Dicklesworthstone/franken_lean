@@ -98,9 +98,9 @@ INPUT_PATHS=(
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh scripts/e2e/core_observables.sh
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh
-  scripts/e2e/env_snapshots.sh
+  scripts/e2e/env_snapshots.sh scripts/e2e/bignum_vectors.sh
   scripts/extract/gen_core_fixtures.sh scripts/extract/gen_core_fixtures.lean
-  scripts/extract/convert_blake3_vectors.py
+  scripts/extract/convert_blake3_vectors.py scripts/extract/gen_bignum_vectors.py
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
   tribunal
   .github/workflows/ci.yml
@@ -359,10 +359,12 @@ on_signal() {
   exit "$exit_code"
 }
 
+# shellcheck disable=SC2317
 contain_bound_finalizer() {
   if [ -z "$FINALIZER_PID" ] || [ -z "$FINALIZER_START_TICKS" ]; then
     FINALIZER_CLEANUP_UNPROVEN=1
     FINALIZER_WAIT_UNSAFE=1
+    mark_process_tree_cleanup_unproven
     return 1
   fi
   if ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
@@ -370,12 +372,14 @@ contain_bound_finalizer() {
       --expected-parent-pid "$$" >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
     FINALIZER_WAIT_UNSAFE=1
+    mark_process_tree_cleanup_unproven
     return 1
   fi
   if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
       --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
     FINALIZER_WAIT_UNSAFE=1
+    mark_process_tree_cleanup_unproven
     return 1
   fi
   return 0
@@ -402,7 +406,14 @@ on_finalizer_signal() {
     FINALIZATION_SIGNAL_EXIT="$exit_code"
   fi
   if [ -n "$FINALIZER_PID" ]; then
-    contain_bound_finalizer || true
+    if [ -n "$FINALIZER_START_TICKS" ]; then
+      if ! contain_bound_finalizer; then return 0; fi
+    elif ! terminate_unreleased_runner "$FINALIZER_PID"; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+      FINALIZER_WAIT_UNSAFE=1
+      mark_process_tree_cleanup_unproven
+      return 0
+    fi
   fi
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
@@ -426,10 +437,13 @@ run_finalizer_command() {
   )" || true
   case "$FINALIZER_START_TICKS" in ''|*[!0-9]*) binding_valid=0 ;; esac
   if [ "$binding_valid" -eq 0 ]; then
-    # Without the binder's start ticks, no numeric PID/PGID action is authorized.
-    # The stopped launcher has a parent-death SIGKILL and cannot exec before resume.
-    FINALIZER_CLEANUP_UNPROVEN=1
-    FINALIZER_WAIT_UNSAFE=1
+    # Without the binder's start ticks, only the exact direct-child pidfd helper
+    # may act. The launch gate proves this child has not forked or execed yet.
+    if ! terminate_unreleased_runner "$FINALIZER_PID"; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+      FINALIZER_WAIT_UNSAFE=1
+      mark_process_tree_cleanup_unproven
+    fi
     FINALIZER_PID=""
     FINALIZER_START_TICKS=""
     return 2
@@ -1084,7 +1098,7 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh \
   scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh \
-  scripts/e2e/env_snapshots.sh \
+  scripts/e2e/env_snapshots.sh scripts/e2e/bignum_vectors.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets
