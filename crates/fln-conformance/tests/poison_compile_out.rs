@@ -35,35 +35,79 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn no_crate_outside_fln_conformance_names_the_poison_tag() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    let mut violations = Vec::new();
-    let mut scanned = 0usize;
-    for entry in fs::read_dir(workspace.join("crates"))
-        .expect("crates/")
-        .flatten()
-    {
-        let crate_dir = entry.path();
-        let crate_name = entry.file_name().to_string_lossy().into_owned();
-        if !crate_dir.is_dir() || crate_name == "fln-conformance" {
+/// The reviewed workspace member directories, taken from the root `Cargo.toml`
+/// `members` list — so the scan follows EVERY place cargo compiles a workspace
+/// member (`crates/*` AND `tools/*`, and any member location added later), not just
+/// `crates/`. A leak hiding under `tools/` (e.g. `tools/structure-guard`) would
+/// otherwise evade the compile-out check.
+fn workspace_member_dirs(workspace: &Path) -> Vec<PathBuf> {
+    let manifest = fs::read_to_string(workspace.join("Cargo.toml")).expect("root Cargo.toml");
+    let members_body = manifest
+        .split_once("members")
+        .and_then(|(_, rest)| rest.split_once('['))
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(body, _)| body)
+        .expect("[workspace] members array");
+    let mut dirs = Vec::new();
+    for raw in members_body.split(',') {
+        let pattern = raw.trim().trim_matches('"').trim();
+        if pattern.is_empty() {
             continue;
         }
-        let mut files = Vec::new();
-        collect_rs_files(&crate_dir.join("src"), &mut files);
-        collect_rs_files(&crate_dir.join("tests"), &mut files);
-        // Every other place cargo compiles code from: a leak must not be able to
-        // hide in a build script, bench, or example.
-        collect_rs_files(&crate_dir.join("benches"), &mut files);
-        collect_rs_files(&crate_dir.join("examples"), &mut files);
-        let build_rs = crate_dir.join("build.rs");
-        if build_rs.exists() {
-            files.push(build_rs);
+        if let Some(prefix) = pattern.strip_suffix("/*") {
+            // Glob member: enumerate immediate subdirectories.
+            if let Ok(entries) = fs::read_dir(workspace.join(prefix)) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        dirs.push(p);
+                    }
+                }
+            }
+        } else {
+            let p = workspace.join(pattern);
+            if p.is_dir() {
+                dirs.push(p);
+            }
         }
-        for file in files {
+    }
+    dirs.sort();
+    dirs
+}
+
+/// Every place a workspace member compiles code from: src, tests, benches, examples,
+/// and the build script.
+fn member_source_files(member_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_rs_files(&member_dir.join("src"), &mut files);
+    collect_rs_files(&member_dir.join("tests"), &mut files);
+    collect_rs_files(&member_dir.join("benches"), &mut files);
+    collect_rs_files(&member_dir.join("examples"), &mut files);
+    let build_rs = member_dir.join("build.rs");
+    if build_rs.exists() {
+        files.push(build_rs);
+    }
+    files
+}
+
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+}
+
+#[test]
+fn no_workspace_member_outside_fln_conformance_names_the_poison_tag() {
+    let workspace = workspace_root();
+    let mut violations = Vec::new();
+    let mut scanned = 0usize;
+    for member_dir in workspace_member_dirs(workspace) {
+        // fln-conformance is the one crate allowed to name the tag.
+        if member_dir.file_name().and_then(|n| n.to_str()) == Some("fln-conformance") {
+            continue;
+        }
+        for file in member_source_files(&member_dir) {
             scanned += 1;
             let source = fs::read_to_string(&file).expect("readable source");
             for (idx, line) in source.lines().enumerate() {
@@ -78,6 +122,32 @@ fn no_crate_outside_fln_conformance_names_the_poison_tag() {
         violations.is_empty(),
         "the poison tag leaked outside fln-conformance:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn the_scan_covers_tools_members_not_just_crates() {
+    // Regression for the fln-euo review finding: compiled Rust under tools/ (e.g.
+    // tools/structure-guard) must be inside the ORACLE_FALLBACK scan, else a leak
+    // there would evade the workspace-wide compile-out claim.
+    let workspace = workspace_root();
+    let members = workspace_member_dirs(workspace);
+    let tools_root = workspace.join("tools");
+    let tools_members: Vec<&PathBuf> = members
+        .iter()
+        .filter(|m| m.starts_with(&tools_root))
+        .collect();
+    assert!(
+        !tools_members.is_empty(),
+        "workspace member scan must include tools/ members: {members:?}"
+    );
+    let tools_source_files: usize = tools_members
+        .iter()
+        .map(|m| member_source_files(m).len())
+        .sum();
+    assert!(
+        tools_source_files > 0,
+        "at least one tools/ member must contribute source files to the scan"
     );
 }
 

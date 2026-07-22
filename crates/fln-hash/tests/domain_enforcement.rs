@@ -45,35 +45,77 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn no_crate_outside_fln_hash_names_the_raw_hasher() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("workspace root");
-    let crates_dir = workspace.join("crates");
+        .expect("workspace root")
+}
+
+/// The reviewed workspace member directories, from the root `Cargo.toml` `members`
+/// list — so the scan follows EVERY place cargo compiles a member (`crates/*` AND
+/// `tools/*`, and any member location added later), not just `crates/`. A raw-hasher
+/// reference hiding under `tools/` (e.g. `tools/structure-guard`) would otherwise
+/// evade the registry-enforcement check.
+fn workspace_member_dirs(workspace: &Path) -> Vec<PathBuf> {
+    let manifest = fs::read_to_string(workspace.join("Cargo.toml")).expect("root Cargo.toml");
+    let members_body = manifest
+        .split_once("members")
+        .and_then(|(_, rest)| rest.split_once('['))
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(body, _)| body)
+        .expect("[workspace] members array");
+    let mut dirs = Vec::new();
+    for raw in members_body.split(',') {
+        let pattern = raw.trim().trim_matches('"').trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        if let Some(prefix) = pattern.strip_suffix("/*") {
+            if let Ok(entries) = fs::read_dir(workspace.join(prefix)) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        dirs.push(p);
+                    }
+                }
+            }
+        } else {
+            let p = workspace.join(pattern);
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+/// Every place a workspace member compiles code from.
+fn member_source_files(member_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_rs_files(&member_dir.join("src"), &mut files);
+    collect_rs_files(&member_dir.join("tests"), &mut files);
+    collect_rs_files(&member_dir.join("benches"), &mut files);
+    collect_rs_files(&member_dir.join("examples"), &mut files);
+    let build_rs = member_dir.join("build.rs");
+    if build_rs.exists() {
+        files.push(build_rs);
+    }
+    files
+}
+
+#[test]
+fn no_workspace_member_outside_fln_hash_names_the_raw_hasher() {
+    let workspace = workspace_root();
     let mut violations = Vec::new();
     let mut scanned = 0usize;
 
-    let crate_dirs = fs::read_dir(&crates_dir).expect("crates/ exists");
-    for entry in crate_dirs.flatten() {
-        let crate_dir = entry.path();
-        let crate_name = entry.file_name().to_string_lossy().into_owned();
-        if !crate_dir.is_dir() || crate_name == "fln-hash" {
+    for member_dir in workspace_member_dirs(workspace) {
+        if member_dir.file_name().and_then(|n| n.to_str()) == Some("fln-hash") {
             continue;
         }
-        let mut files = Vec::new();
-        collect_rs_files(&crate_dir.join("src"), &mut files);
-        collect_rs_files(&crate_dir.join("tests"), &mut files);
-        // Every other place cargo compiles code from: a violation must not be able
-        // to hide in a build script, bench, or example.
-        collect_rs_files(&crate_dir.join("benches"), &mut files);
-        collect_rs_files(&crate_dir.join("examples"), &mut files);
-        let build_rs = crate_dir.join("build.rs");
-        if build_rs.exists() {
-            files.push(build_rs);
-        }
-        for file in files {
+        for file in member_source_files(&member_dir) {
             scanned += 1;
             let source = fs::read_to_string(&file).expect("readable source");
             for (line, text) in raw_hash_references(&source) {
@@ -87,6 +129,30 @@ fn no_crate_outside_fln_hash_names_the_raw_hasher() {
         violations.is_empty(),
         "unregistered hashing outside fln-hash (use fln_hash::domain instead):\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn the_scan_covers_tools_members_not_just_crates() {
+    // Same coverage law as the poison scan: compiled Rust under tools/ (e.g.
+    // tools/structure-guard) must be inside the raw-hasher scan.
+    let workspace = workspace_root();
+    let tools_root = workspace.join("tools");
+    let tools_members: Vec<PathBuf> = workspace_member_dirs(workspace)
+        .into_iter()
+        .filter(|m| m.starts_with(&tools_root))
+        .collect();
+    assert!(
+        !tools_members.is_empty(),
+        "workspace member scan must include tools/ members"
+    );
+    let tools_source_files: usize = tools_members
+        .iter()
+        .map(|m| member_source_files(m).len())
+        .sum();
+    assert!(
+        tools_source_files > 0,
+        "at least one tools/ member must contribute source files to the scan"
     );
 }
 
