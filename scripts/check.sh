@@ -26,6 +26,10 @@ command -v python3 >/dev/null 2>&1 || {
   echo "[check] setup failure: python3 is required by the evidence harness" >&2
   exit 2
 }
+command -v setsid >/dev/null 2>&1 || {
+  echo "[check] setup failure: setsid is required by the evidence finalizer" >&2
+  exit 2
+}
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
@@ -75,13 +79,16 @@ FINALIZER_PID=""
 FINALIZATION_SIGNAL=""
 FINALIZATION_SIGNAL_EXIT=0
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
+EVENT_COMMAND=()
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
   vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh scripts/e2e/core_observables.sh
+  scripts/e2e/hash_identity.sh
   scripts/extract/gen_core_fixtures.sh scripts/extract/gen_core_fixtures.lean
+  scripts/extract/convert_blake3_vectors.py
   .github/workflows/ci.yml
 )
 HASH_ARGS=()
@@ -137,10 +144,10 @@ print(json.dumps(argv, separators=(",", ":")))
 PY
 )"
 
-emit_event() {
+build_event_command() {
   local sequence="$SEQ"
   SEQ=$((SEQ + 1))
-  python3 "$EVIDENCE" emit --file "$NDJSON" --artifact-root "$ART_DIR" \
+  EVENT_COMMAND=(python3 "$EVIDENCE" emit --file "$NDJSON" --artifact-root "$ART_DIR" \
     --string schema "$SCHEMA" \
     --string run_id "$RUN_ID" \
     --string bead "$BEAD" \
@@ -148,7 +155,12 @@ emit_event() {
     --integer sequence "$sequence" \
     --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" \
-    "$@"
+    "$@")
+}
+
+emit_event() {
+  build_event_command "$@"
+  "${EVENT_COMMAND[@]}"
 }
 
 note() {
@@ -164,10 +176,10 @@ set_final() {
 
 # Called from the EXIT-trap finalizer.
 # shellcheck disable=SC2317
-emit_terminal() {
+build_terminal_command() {
   local final_root="$1" first_divergence=none
   if [ "$FINAL_VERDICT" != pass ]; then first_divergence="$FINAL_REASON"; fi
-  emit_event \
+  build_event_command \
     --string event run_end \
     --string verdict "$FINAL_VERDICT" \
     --string reason_code "$FINAL_REASON" \
@@ -208,8 +220,12 @@ stop_active_runner() {
       else
         cleanup_rc=1
       fi
-      kill -KILL "$pid" 2>/dev/null || true
     fi
+  fi
+  if [ "$cleanup_rc" -ne 0 ]; then
+    ACTIVE_RUNNER_PID=""
+    ACTIVE_READINESS=""
+    return "$cleanup_rc"
   fi
   wait "$pid" 2>/dev/null || true
   ACTIVE_RUNNER_PID=""
@@ -250,17 +266,29 @@ on_finalizer_signal() {
     FINALIZATION_SIGNAL_EXIT="$exit_code"
   fi
   if [ -n "$FINALIZER_PID" ]; then
+    kill -s "$name" -- "-$FINALIZER_PID" 2>/dev/null || true
     kill -s "$name" "$FINALIZER_PID" 2>/dev/null || true
   fi
 }
 
 # shellcheck disable=SC2317
 run_finalizer_command() {
-  local rc=0
+  local rc=0 state
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
-  "$@" &
+  setsid -- "$@" &
   FINALIZER_PID=$!
-  wait "$FINALIZER_PID" || rc=$?
+  while true; do
+    wait "$FINALIZER_PID" && rc=0 || rc=$?
+    if [ ! -r "/proc/$FINALIZER_PID/stat" ]; then break; fi
+    state="$(awk '{print $3}' "/proc/$FINALIZER_PID/stat" 2>/dev/null || printf X)"
+    if [ "$state" = Z ]; then
+      wait "$FINALIZER_PID" && rc=0 || rc=$?
+      break
+    fi
+    if [ -n "$FINALIZATION_SIGNAL" ]; then
+      kill -s "$FINALIZATION_SIGNAL" -- "-$FINALIZER_PID" 2>/dev/null || true
+    fi
+  done
   FINALIZER_PID=""
   return "$rc"
 }
@@ -307,7 +335,8 @@ on_exit() {
     set_final inconclusive final_workspace_changed 3
   fi
   if [ "$TERMINAL_EMITTED" -eq 0 ]; then
-    if run_finalizer_command emit_terminal "$final_root"; then
+    build_terminal_command "$final_root"
+    if run_finalizer_command "${EVENT_COMMAND[@]}"; then
       TERMINAL_EMITTED=1
     else
       publish_rc=2
@@ -336,7 +365,7 @@ on_exit() {
       --output "$ART_DIR/bundle.complete.json" --governed-root "$REPO" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
       --inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH" || bundle_rc=$?
-    if [ -e "$ART_DIR/bundle.complete.json" ]; then
+    if [ "$bundle_rc" -eq 0 ] && [ -e "$ART_DIR/bundle.complete.json" ]; then
       # Marker publication is the linearization point. From here, signals are
       # post-commit and validation decides whether that marker is complete.
       trap '' HUP INT TERM
@@ -345,8 +374,8 @@ on_exit() {
         --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
         >/dev/null || publish_rc=2
     else
-      [ "$bundle_rc" -eq 0 ] || publish_rc=2
       abort_if_finalizer_signalled
+      publish_rc=2
     fi
   fi
   if [ "$publish_rc" -ne 0 ]; then
@@ -619,7 +648,8 @@ run_stage evidence-self-test python3 scripts/evidence.py self-test \
   --art-dir "$ART_DIR/evidence-self-test"
 run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh \
-  scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh
+  scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \
+  scripts/e2e/hash_identity.sh
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets
 run_stage clippy cargo clippy --locked --all-targets -- -D warnings

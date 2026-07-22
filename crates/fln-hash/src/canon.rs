@@ -50,7 +50,11 @@ pub struct CanonError {
 
 impl std::fmt::Display for CanonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "canonical decode failed at byte {}: {}", self.at, self.what)
+        write!(
+            f,
+            "canonical decode failed at byte {}: {}",
+            self.at, self.what
+        )
     }
 }
 
@@ -740,7 +744,10 @@ mod tests {
         for _ in 0..200 {
             let name = generator.name(6);
             let bytes = name.to_canonical_bytes();
-            assert_eq!(Name::from_canonical_bytes(&bytes).expect("round-trip"), name);
+            assert_eq!(
+                Name::from_canonical_bytes(&bytes).expect("round-trip"),
+                name
+            );
         }
     }
 

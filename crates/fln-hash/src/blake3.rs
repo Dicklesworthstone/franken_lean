@@ -129,8 +129,8 @@ fn first_8_words(compression_output: [u32; 16]) -> [u32; 8] {
 /// Interpret a 64-byte block as 16 little-endian message words (spec §2.2).
 fn words_from_le_block(block: &[u8; BLOCK_LEN]) -> [u32; 16] {
     let mut words = [0u32; 16];
-    for (word, chunk) in words.iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for (word, chunk) in words.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*chunk);
     }
     words
 }
@@ -138,8 +138,8 @@ fn words_from_le_block(block: &[u8; BLOCK_LEN]) -> [u32; 16] {
 /// Interpret a 32-byte key as 8 little-endian key words (spec §2.3).
 fn words_from_le_key(key: &[u8; KEY_LEN]) -> [u32; 8] {
     let mut words = [0u32; 8];
-    for (word, chunk) in words.iter_mut().zip(key.chunks_exact(4)) {
-        *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for (word, chunk) in words.iter_mut().zip(key.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*chunk);
     }
     words
 }
@@ -185,7 +185,7 @@ impl Output {
 
 /// Incremental state for one 1024-byte chunk (spec §2.1): sixteen 64-byte
 /// blocks chained with CHUNK_START on the first and CHUNK_END on the last.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ChunkState {
     chaining_value: [u32; 8],
     chunk_counter: u64,
@@ -212,7 +212,11 @@ impl ChunkState {
     }
 
     fn start_flag(&self) -> u32 {
-        if self.blocks_compressed == 0 { CHUNK_START } else { 0 }
+        if self.blocks_compressed == 0 {
+            CHUNK_START
+        } else {
+            0
+        }
     }
 
     fn update(&mut self, mut input: &[u8]) {
