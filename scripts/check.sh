@@ -359,6 +359,28 @@ on_signal() {
   exit "$exit_code"
 }
 
+contain_bound_finalizer() {
+  if [ -z "$FINALIZER_PID" ] || [ -z "$FINALIZER_START_TICKS" ]; then
+    FINALIZER_CLEANUP_UNPROVEN=1
+    FINALIZER_WAIT_UNSAFE=1
+    return 1
+  fi
+  if ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+      --expected-start-ticks "$FINALIZER_START_TICKS" \
+      --expected-parent-pid "$$" >/dev/null 2>&1; then
+    FINALIZER_CLEANUP_UNPROVEN=1
+    FINALIZER_WAIT_UNSAFE=1
+    return 1
+  fi
+  if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
+      --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
+    FINALIZER_CLEANUP_UNPROVEN=1
+    FINALIZER_WAIT_UNSAFE=1
+    return 1
+  fi
+  return 0
+}
+
 # Invoked only while the EXIT finalizer is active. A signal before the shared bundle
 # decision interrupts the current publication command and leaves it uncommitted.
 # shellcheck disable=SC2317
@@ -380,18 +402,7 @@ on_finalizer_signal() {
     FINALIZATION_SIGNAL_EXIT="$exit_code"
   fi
   if [ -n "$FINALIZER_PID" ]; then
-    if [ -n "$FINALIZER_START_TICKS" ] && \
-        ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
-          --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1; then
-      FINALIZER_CLEANUP_UNPROVEN=1
-    fi
-    kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
-    kill -KILL "$FINALIZER_PID" 2>/dev/null || true
-    if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
-        --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
-      FINALIZER_CLEANUP_UNPROVEN=1
-      FINALIZER_WAIT_UNSAFE=1
-    fi
+    contain_bound_finalizer || true
   fi
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
@@ -415,35 +426,10 @@ run_finalizer_command() {
   )" || true
   case "$FINALIZER_START_TICKS" in ''|*[!0-9]*) binding_valid=0 ;; esac
   if [ "$binding_valid" -eq 0 ]; then
-    # The still-unwaited numeric PID is our direct setsid child. Its unreaped
-    # lifetime pins the PGID while the whole finalizer group is killed and checked.
-    kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
-    kill -KILL "$FINALIZER_PID" 2>/dev/null || true
-    if ! python3 "$EVIDENCE" assert-process-group-empty \
-        --pgid "$FINALIZER_PID" --wait-ms 2000; then
-      note "INTERNAL FAULT: finalizer process-group cleanup remained unproven"
-      FINALIZER_CLEANUP_UNPROVEN=1
-      FINALIZER_WAIT_UNSAFE=1
-      wait_safe=0
-    fi
-    if [ "$wait_safe" -eq 1 ]; then
-      while true; do
-        generation="$FINALIZATION_SIGNAL_GENERATION"
-        wait "$FINALIZER_PID" 2>/dev/null && rc=0 || rc=$?
-        if [ "$FINALIZER_WAIT_UNSAFE" -ne 0 ]; then
-          rc=2
-          break
-        fi
-        case "$rc" in
-          129|130|143)
-            if [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ]; then
-              continue
-            fi
-            ;;
-        esac
-        break
-      done
-    fi
+    # Without the binder's start ticks, no numeric PID/PGID action is authorized.
+    # The stopped launcher has a parent-death SIGKILL and cannot exec before resume.
+    FINALIZER_CLEANUP_UNPROVEN=1
+    FINALIZER_WAIT_UNSAFE=1
     FINALIZER_PID=""
     FINALIZER_START_TICKS=""
     return 2
@@ -455,34 +441,12 @@ run_finalizer_command() {
         --pid "$FINALIZER_PID" \
         --expected-start-ticks "$FINALIZER_START_TICKS" \
         --expected-parent-pid "$$"; then
-      if ! python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
-          --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1; then
-        FINALIZER_CLEANUP_UNPROVEN=1
-      fi
-      kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
-      kill -KILL "$FINALIZER_PID" 2>/dev/null || true
-      if ! python3 "$EVIDENCE" assert-process-group-empty \
-          --pgid "$FINALIZER_PID" --wait-ms 2000; then
-        FINALIZER_CLEANUP_UNPROVEN=1
-        FINALIZER_WAIT_UNSAFE=1
-        wait_safe=0
-      fi
+      contain_bound_finalizer || wait_safe=0
       resume_failed=1
     fi
   fi
   if [ -n "$FINALIZATION_SIGNAL" ] && [ -n "$FINALIZER_START_TICKS" ]; then
-    if ! python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
-        --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1; then
-      FINALIZER_CLEANUP_UNPROVEN=1
-    fi
-    kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
-    kill -KILL "$FINALIZER_PID" 2>/dev/null || true
-    if ! python3 "$EVIDENCE" assert-process-group-empty \
-        --pgid "$FINALIZER_PID" --wait-ms 2000; then
-      FINALIZER_CLEANUP_UNPROVEN=1
-      FINALIZER_WAIT_UNSAFE=1
-      wait_safe=0
-    fi
+    contain_bound_finalizer || wait_safe=0
   fi
   if [ "$wait_safe" -eq 1 ]; then
     while true; do
