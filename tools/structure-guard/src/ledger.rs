@@ -106,7 +106,7 @@ fn marker_id(line: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone)]
-struct Token {
+struct Lexeme {
     text: String,
     line: usize,
     delimiter_depth: usize,
@@ -117,7 +117,7 @@ struct Attribute {
     line: usize,
     inner: bool,
     delimiter_depth: usize,
-    tokens: Vec<Token>,
+    lexemes: Vec<Lexeme>,
 }
 
 fn raw_string_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
@@ -139,7 +139,7 @@ fn raw_string_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
     Some((cursor + 1, cursor - hashes_start))
 }
 
-fn rust_tokens(text: &str) -> Vec<Token> {
+fn rust_lexemes(text: &str) -> Vec<Lexeme> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut cursor = 0;
@@ -250,14 +250,14 @@ fn rust_tokens(text: &str) -> Vec<Token> {
             {
                 cursor += 1;
             }
-            out.push(Token {
+            out.push(Lexeme {
                 text: text[start..cursor].to_string(),
                 line,
                 delimiter_depth,
             });
             continue;
         }
-        out.push(Token {
+        out.push(Lexeme {
             text: (byte as char).to_string(),
             line,
             delimiter_depth,
@@ -273,30 +273,30 @@ fn rust_tokens(text: &str) -> Vec<Token> {
 }
 
 fn attributes(text: &str) -> Vec<Attribute> {
-    let tokens = rust_tokens(text);
+    let lexemes = rust_lexemes(text);
     let mut out = Vec::new();
     let mut cursor = 0;
-    while cursor < tokens.len() {
-        if tokens[cursor].text != "#" {
+    while cursor < lexemes.len() {
+        if lexemes[cursor].text != "#" {
             cursor += 1;
             continue;
         }
-        let line = tokens[cursor].line;
-        let delimiter_depth = tokens[cursor].delimiter_depth;
+        let line = lexemes[cursor].line;
+        let delimiter_depth = lexemes[cursor].delimiter_depth;
         let mut next = cursor + 1;
-        let inner = tokens.get(next).is_some_and(|tk| tk.text == "!");
+        let inner = lexemes.get(next).is_some_and(|lexeme| lexeme.text == "!");
         if inner {
             next += 1;
         }
-        if !tokens.get(next).is_some_and(|tk| tk.text == "[") {
+        if !lexemes.get(next).is_some_and(|lexeme| lexeme.text == "[") {
             cursor += 1;
             continue;
         }
         next += 1;
         let body_start = next;
         let mut depth = 1_u32;
-        while next < tokens.len() && depth != 0 {
-            match tokens[next].text.as_str() {
+        while next < lexemes.len() && depth != 0 {
+            match lexemes[next].text.as_str() {
                 "[" => depth += 1,
                 "]" => depth -= 1,
                 _ => {}
@@ -308,7 +308,7 @@ fn attributes(text: &str) -> Vec<Attribute> {
                 line,
                 inner,
                 delimiter_depth,
-                tokens: tokens[body_start..next - 1].to_vec(),
+                lexemes: lexemes[body_start..next - 1].to_vec(),
             });
             cursor = next;
         } else {
@@ -319,29 +319,29 @@ fn attributes(text: &str) -> Vec<Attribute> {
 }
 
 fn attribute_contains_lint_call(attribute: &Attribute, level: &str, lint: &str) -> bool {
-    attribute.tokens.windows(2).enumerate().any(|(idx, pair)| {
+    attribute.lexemes.windows(2).enumerate().any(|(idx, pair)| {
         pair[0].text == level
             && pair[1].text == "("
-            && attribute.tokens[idx + 2..]
+            && attribute.lexemes[idx + 2..]
                 .iter()
-                .take_while(|tk| tk.text != ")")
-                .any(|tk| tk.text == lint)
+                .take_while(|lexeme| lexeme.text != ")")
+                .any(|lexeme| lexeme.text == lint)
     })
 }
 
 fn attribute_sets_lint_directly(attribute: &Attribute, level: &str, lint: &str) -> bool {
     attribute
-        .tokens
+        .lexemes
         .first()
-        .is_some_and(|token| token.text == level)
+        .is_some_and(|lexeme| lexeme.text == level)
         && attribute
-            .tokens
+            .lexemes
             .get(1)
-            .is_some_and(|token| token.text == "(")
-        && attribute.tokens[2..]
+            .is_some_and(|lexeme| lexeme.text == "(")
+        && attribute.lexemes[2..]
             .iter()
-            .take_while(|token| token.text != ")")
-            .any(|token| token.text == lint)
+            .take_while(|lexeme| lexeme.text != ")")
+            .any(|lexeme| lexeme.text == lint)
 }
 
 #[derive(Debug, Default)]
@@ -378,9 +378,9 @@ pub struct LocatedExportSite {
 }
 
 pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
-    let tokens = rust_tokens(text);
+    let lexemes = rust_lexemes(text);
     let mut sites = Vec::new();
-    for pair in tokens.windows(2) {
+    for pair in lexemes.windows(2) {
         if pair[0].text == "include" && pair[1].text == "!" {
             sites.push(ExportSite {
                 line: pair[0].line,
@@ -390,7 +390,7 @@ pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
     }
     for attribute in attributes(text) {
         if attribute
-            .tokens
+            .lexemes
             .windows(2)
             .any(|pair| pair[0].text == "path" && pair[1].text == "=")
         {
@@ -409,12 +409,12 @@ pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
 /// a boundary crate has no externally public Rust or symbol export at all. This is a strict
 /// subset of the final membrane and therefore cannot create an unsafe admission path.
 pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
-    let tokens = rust_tokens(text);
+    let lexemes = rust_lexemes(text);
     let mut sites = source_escape_sites(text);
-    for (idx, tk) in tokens.iter().enumerate() {
-        if tk.text == "pub" && !tokens.get(idx + 1).is_some_and(|next| next.text == "(") {
+    for (idx, lexeme) in lexemes.iter().enumerate() {
+        if lexeme.text == "pub" && !lexemes.get(idx + 1).is_some_and(|next| next.text == "(") {
             sites.push(ExportSite {
-                line: tk.line,
+                line: lexeme.line,
                 detail: "externally public item",
             });
         }
@@ -425,7 +425,7 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
             ("no_mangle", "unmangled symbol export"),
             ("export_name", "named symbol export"),
         ] {
-            if attribute.tokens.iter().any(|tk| tk.text == name) {
+            if attribute.lexemes.iter().any(|lexeme| lexeme.text == name) {
                 sites.push(ExportSite {
                     line: attribute.line,
                     detail,
@@ -436,25 +436,25 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
     // Once another fail-closed export/source finding exists, macro-expansion risk cannot
     // widen the accepted surface and a duplicate finding would only obscure diagnostics.
     if sites.is_empty() {
-        for (idx, token) in tokens.iter().enumerate() {
-            let declarative_definition = token.text == "macro_rules"
-                && tokens.get(idx + 1).is_some_and(|next| next.text == "!");
-            let macro_invocation = token.text == "!"
+        for (idx, lexeme) in lexemes.iter().enumerate() {
+            let declarative_definition = lexeme.text == "macro_rules"
+                && lexemes.get(idx + 1).is_some_and(|next| next.text == "!");
+            let macro_invocation = lexeme.text == "!"
                 && idx > 0
-                && tokens[idx - 1].text != "include"
-                && tokens
+                && lexemes[idx - 1].text != "include"
+                && lexemes
                     .get(idx + 1)
                     .is_some_and(|next| matches!(next.text.as_str(), "(" | "[" | "{"))
-                && tokens[idx - 1]
+                && lexemes[idx - 1]
                     .text
                     .chars()
                     .next()
                     .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
             let macro_two_definition =
-                token.text == "macro" && tokens.get(idx + 1).is_some_and(|next| next.text != "!");
+                lexeme.text == "macro" && lexemes.get(idx + 1).is_some_and(|next| next.text != "!");
             if declarative_definition || macro_invocation || macro_two_definition {
                 sites.push(ExportSite {
-                    line: token.line,
+                    line: lexeme.line,
                     detail: "macro expansion can synthesize an unsafe allowance or external export",
                 });
             }
