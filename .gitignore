@@ -13,6 +13,8 @@ a.out
 *.flnpack
 /ledger-store/
 *.olean
+# Pinned Tribunal C3 compatibility fixtures are source evidence, not build outputs.
+!/tribunal/fixtures/c3/*.olean
 *.ilean
 *.olean-next
 
