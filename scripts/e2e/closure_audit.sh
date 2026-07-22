@@ -35,14 +35,20 @@ FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
 FINALIZING=0
+FINALIZER_PID=""
+FINALIZATION_SIGNAL=""
+FINALIZATION_SIGNAL_EXIT=0
+FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
-  vendor/lean4-src
+  vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh .github/workflows/ci.yml
 )
 SUBJECT_PATHS=(Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools)
+VENDOR_PATH="vendor/lean4-src"
+VENDOR_BINDING="$ART_DIR/vendor-binding.json"
 HASH_ARGS=()
 GOVERNED_ARGS=()
 for input_path in "${INPUT_PATHS[@]}"; do
@@ -56,7 +62,8 @@ done
 
 # Hash the complete governed input before creating an artifact directory. A broken
 # preflight therefore cannot leave a directory that resembles a typed evidence run.
-if ! INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}")"; then
+if ! INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+  --vendor-path "$VENDOR_PATH")"; then
   echo "[closure_audit] setup failure: cannot hash governed inputs" >&2
   exit 2
 fi
@@ -77,6 +84,11 @@ if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
   exit 2
 fi
 mkdir "$ART_DIR"
+python3 "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
+  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" || {
+    echo "[closure_audit] setup failure: cannot verify the pinned Reference tree" >&2
+    exit 2
+  }
 
 note() { printf '[closure_audit] %s\n' "$*" | tee -a "$HUMAN" >&2; }
 
@@ -140,19 +152,59 @@ on_signal() {
   exit "$exit_code"
 }
 
+# shellcheck disable=SC2317
+on_finalizer_signal() {
+  local name="$1" exit_code="$2"
+  if [ -z "$FINALIZATION_SIGNAL" ]; then
+    FINALIZATION_SIGNAL="$name"
+    FINALIZATION_SIGNAL_EXIT="$exit_code"
+  fi
+  if [ -n "$FINALIZER_PID" ]; then
+    kill -s "$name" "$FINALIZER_PID" 2>/dev/null || true
+  fi
+}
+
+# shellcheck disable=SC2317
+run_finalizer_command() {
+  local rc=0
+  [ -z "$FINALIZATION_SIGNAL" ] || return 125
+  "$@" &
+  FINALIZER_PID=$!
+  wait "$FINALIZER_PID" || rc=$?
+  FINALIZER_PID=""
+  return "$rc"
+}
+
+# shellcheck disable=SC2317
+abort_if_finalizer_signalled() {
+  if [ -n "$FINALIZATION_SIGNAL" ]; then
+    note "CANCELLED: signal_$FINALIZATION_SIGNAL before evidence bundle commit: $ART_DIR"
+    exit "$FINALIZATION_SIGNAL_EXIT"
+  fi
+}
+
 # Invoked indirectly by trap.
 # shellcheck disable=SC2317
 on_exit() {
-  local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0
+  local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0 bundle_rc=0
   local first_divergence=none
-  trap - EXIT; trap '' HUP INT TERM; set +e
+  trap - EXIT
+  trap 'on_finalizer_signal HUP 129' HUP
+  trap 'on_finalizer_signal INT 130' INT
+  trap 'on_finalizer_signal TERM 143' TERM
+  set +e
   if [ "$FINALIZING" -ne 0 ]; then exit 2; fi
   FINALIZING=1
   if [ "$FINAL_SET" -eq 0 ]; then
     set_final internal_fault "$([ "$observed_rc" -eq 0 ] && printf uncommitted_success || printf unexpected_shell_exit)" 2
   fi
-  final_root="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" 2>/dev/null)" \
-    || hash_rc=$?
+  run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$ROOT" \
+    "${HASH_ARGS[@]}" --vendor-path "$VENDOR_PATH" \
+    --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" 2>/dev/null || hash_rc=$?
+  abort_if_finalizer_signalled
+  if [ "$hash_rc" -eq 0 ]; then
+    IFS= read -r final_root < "$FINAL_ROOT_FILE" || hash_rc=2
+  fi
   if [ "$hash_rc" -ne 0 ]; then
     final_root="unavailable"
     set_final internal_fault final_workspace_hash_unavailable 2
@@ -161,7 +213,7 @@ on_exit() {
   fi
   if [ "$FINAL_VERDICT" != pass ]; then first_divergence="$FINAL_REASON"; fi
   if [ "$TERMINAL_EMITTED" -eq 0 ]; then
-    if emit_event --string event run_end --string verdict "$FINAL_VERDICT" \
+    if run_finalizer_command emit_event --string event run_end --string verdict "$FINAL_VERDICT" \
       --string reason_code "$FINAL_REASON" --integer process_exit "$FINAL_EXIT" \
       --string active_step "$ACTIVE_STEP" \
       --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
@@ -176,35 +228,38 @@ on_exit() {
     else
       publish_rc=2
     fi
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
+    run_finalizer_command python3 "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
       --expected-verdict "$FINAL_VERDICT" --artifact-root "$ART_DIR" \
       --output "$ART_DIR/run.validation.json" || publish_rc=2
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
+    run_finalizer_command python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" --digest-output "$ART_DIR/manifest.digest" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
       --verdict "$FINAL_VERDICT" --input-root "$INPUT_ROOT" --final-root "$final_root" \
       || publish_rc=2
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" validate-manifest --art-dir "$ART_DIR" \
-      --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
-      || publish_rc=2
-  fi
-  if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
+    run_finalizer_command python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
-      "${GOVERNED_ARGS[@]}" --expected-root "$final_root" || publish_rc=2
-  fi
-  if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
-      --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
-      --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
-      >/dev/null || publish_rc=2
+      "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
+      --vendor-path "$VENDOR_PATH" || bundle_rc=$?
+    if [ -e "$ART_DIR/bundle.complete.json" ]; then
+      trap '' HUP INT TERM
+      python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+        --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
+        --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
+        >/dev/null || publish_rc=2
+    else
+      [ "$bundle_rc" -eq 0 ] || publish_rc=2
+      abort_if_finalizer_signalled
+    fi
   fi
   if [ "$publish_rc" -ne 0 ]; then
     note "INTERNAL FAULT: incomplete bundle $ART_DIR"
@@ -233,6 +288,7 @@ emit_event --new-log --string event run_start \
   --json-value host_facts "$HOST_FACTS_JSON" \
   --string seed deterministic-fixture-v1 --string cache_state "${FLN_E2E_CACHE_STATE:-uncontrolled}" \
   --string input_root "$INPUT_ROOT" \
+  --string vendor_binding vendor-binding.json \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS}"
 : > "$HUMAN"
 
@@ -245,7 +301,8 @@ PY
 }
 
 hash_governed() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}"
+  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+    --vendor-path "$VENDOR_PATH"
 }
 
 hash_subject() {

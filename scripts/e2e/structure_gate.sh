@@ -41,12 +41,14 @@ TERMINAL_EMITTED=0
 FINALIZING=0
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
-  vendor/lean4-src
+  vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh .github/workflows/ci.yml
 )
 SUBJECT_PATHS=(Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools)
+VENDOR_PATH="vendor/lean4-src"
+VENDOR_BINDING="$ART_DIR/vendor-binding.json"
 HASH_ARGS=()
 GOVERNED_ARGS=()
 for input_path in "${INPUT_PATHS[@]}"; do
@@ -155,7 +157,8 @@ on_exit() {
   if [ "$FINAL_SET" -eq 0 ]; then
     set_final internal_fault "$([ "$observed_rc" -eq 0 ] && printf uncommitted_success || printf unexpected_shell_exit)" 2
   fi
-  final_root="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" 2>/dev/null)" \
+  final_root="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+    --vendor-path "$VENDOR_PATH" 2>/dev/null)" \
     || hash_rc=$?
   if [ "$hash_rc" -ne 0 ]; then
     final_root="unavailable"
@@ -196,7 +199,8 @@ on_exit() {
     python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
-      "${GOVERNED_ARGS[@]}" --expected-root "$final_root" || publish_rc=2
+      "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
+      --vendor-path "$VENDOR_PATH" || publish_rc=2
   fi
   if [ "$publish_rc" -eq 0 ]; then
     python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
@@ -217,7 +221,8 @@ on_exit() {
 
 # Hash the complete governed input before creating an artifact directory. A broken
 # preflight therefore cannot leave a directory that resembles a typed evidence run.
-if ! INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}")"; then
+if ! INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+  --vendor-path "$VENDOR_PATH")"; then
   echo "[structure_gate] setup failure: cannot hash governed inputs" >&2
   exit 2
 fi
@@ -227,6 +232,11 @@ if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
   exit 2
 fi
 mkdir "$ART_DIR"
+python3 "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
+  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" || {
+    echo "[structure_gate] setup failure: cannot verify the pinned Reference tree" >&2
+    exit 2
+  }
 
 # From the first artifact write onward every exit is typed. In particular, the
 # human log is initialized only after run_start has committed successfully.
@@ -253,6 +263,7 @@ emit_event --new-log --string event run_start \
   --integer thread_count 1 \
   --string seed deterministic-fixture-v1 --string cache_state "${FLN_E2E_CACHE_STATE:-uncontrolled}" \
   --string input_root "$INPUT_ROOT" \
+  --string vendor_binding vendor-binding.json \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"readiness_wait_ms\":$READY_WAIT_MS}"
 
 : > "$HUMAN"
@@ -281,7 +292,8 @@ PY
 }
 
 hash_governed() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}"
+  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+    --vendor-path "$VENDOR_PATH"
 }
 
 hash_subject() {

@@ -54,6 +54,7 @@ const GRAPH: &str = "\
 	crate fln-core rank=0 kind=ordinary
 	crate fln-hash rank=1 kind=ordinary
 	crate fln-bignum rank=1 kind=ordinary
+	crate fln-libm rank=1 kind=ordinary
 	crate fln-unsafe-abi rank=2 kind=unsafe-boundary
 	crate fln-unsafe-region rank=2 kind=unsafe-boundary
 	crate fln-rt rank=3 kind=ordinary
@@ -61,7 +62,26 @@ const GRAPH: &str = "\
 	crate fln-olean rank=5 kind=ordinary
 	crate fln-kernel rank=6 kind=ordinary
 	crate fln-checker rank=6 kind=ordinary
+	crate fln-syntax rank=7 kind=ordinary
+	crate fln-parse rank=8 kind=ordinary
+	crate fln-elab rank=9 kind=ordinary
+	crate fln-comp rank=10 kind=ordinary
+	crate fln-vm rank=11 kind=ordinary
 	crate fln-unsafe-jit rank=12 kind=unsafe-boundary
+	crate fln-verdict rank=13 kind=ordinary
+	crate fln-anvil rank=14 kind=ordinary
+	crate fln-ledger rank=15 kind=ordinary
+	crate fln-lake rank=16 kind=ordinary
+	crate fln-server rank=17 kind=ordinary
+	crate fln-trace rank=18 kind=ordinary
+	crate fln rank=19 kind=ordinary
+	crate fln-hound rank=20 kind=ordinary
+	crate fln-doc rank=20 kind=ordinary
+	crate fln-mcp rank=20 kind=ordinary
+	crate fln-tui rank=20 kind=ordinary
+	crate fln-cli rank=21 kind=ordinary
+	crate fln-wasm rank=21 kind=ordinary
+	crate fln-conformance rank=22 kind=ordinary
 	prohibit fln-unsafe-* ->* fln-kernel
 	prohibit fln-unsafe-* ->* fln-checker
 	prohibit fln-kernel ->* fln-checker
@@ -98,6 +118,7 @@ fn base_files() -> Vec<(String, String)> {
         ("fln-core", false),
         ("fln-hash", false),
         ("fln-bignum", false),
+        ("fln-libm", false),
         ("fln-unsafe-abi", true),
         ("fln-unsafe-region", true),
         ("fln-rt", false),
@@ -105,7 +126,26 @@ fn base_files() -> Vec<(String, String)> {
         ("fln-olean", false),
         ("fln-kernel", false),
         ("fln-checker", false),
+        ("fln-syntax", false),
+        ("fln-parse", false),
+        ("fln-elab", false),
+        ("fln-comp", false),
+        ("fln-vm", false),
         ("fln-unsafe-jit", true),
+        ("fln-verdict", false),
+        ("fln-anvil", false),
+        ("fln-ledger", false),
+        ("fln-lake", false),
+        ("fln-server", false),
+        ("fln-trace", false),
+        ("fln", false),
+        ("fln-hound", false),
+        ("fln-doc", false),
+        ("fln-mcp", false),
+        ("fln-tui", false),
+        ("fln-cli", false),
+        ("fln-wasm", false),
+        ("fln-conformance", false),
     ];
     let mut files = vec![
         (

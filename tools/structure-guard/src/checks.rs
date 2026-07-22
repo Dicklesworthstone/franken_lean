@@ -30,7 +30,7 @@ use crate::graph::{self, CrateKind, GraphFile};
 use crate::ledger::{self, AllowSite};
 use crate::manifest::{self, Manifest};
 use crate::report::fnv1a64;
-use crate::{GRAPH_FILE, LEDGER_FILE};
+use crate::{ALLOWLIST_FILE, GRAPH_FILE, LEDGER_FILE, LOCK_FILE, SUITE_LOCK_FILE, TOOLCHAIN_FILE};
 
 #[derive(Debug)]
 pub struct Finding {
@@ -55,13 +55,22 @@ struct DiscoveredCrate {
     manifest: Option<Manifest>,
 }
 
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 fn discover(
     root: &Path,
     subdir: &'static str,
     out: &mut Vec<DiscoveredCrate>,
 ) -> Result<(), String> {
     let dir = root.join(subdir);
-    if !dir.is_dir() {
+    let metadata = match fs::symlink_metadata(&dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {subdir}/: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(());
     }
     let mut entries: Vec<_> = fs::read_dir(&dir)
@@ -71,7 +80,10 @@ fn discover(
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() && path.join("Cargo.toml").is_file() {
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+        if file_type.is_dir() && is_regular_file(&path.join("Cargo.toml")) {
             let name = entry.file_name().to_string_lossy().into_owned();
             out.push(DiscoveredCrate {
                 rel: format!("{subdir}/{name}"),
@@ -85,11 +97,82 @@ fn discover(
     Ok(())
 }
 
+fn scan_symlinks(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            findings.push(Finding {
+                code: "FLN-STRUCT-016",
+                path: rel,
+                detail: "symlinks are forbidden in governed workspace inputs; they can escape or cycle around structural scans"
+                    .to_string(),
+            });
+        } else if file_type.is_dir() {
+            scan_symlinks(root, &path, findings)?;
+        }
+    }
+    Ok(())
+}
+
+fn audit_governed_symlinks(root: &Path, findings: &mut Vec<Finding>) -> Result<(), String> {
+    for rel in [
+        "Cargo.toml",
+        LOCK_FILE,
+        SUITE_LOCK_FILE,
+        TOOLCHAIN_FILE,
+        GRAPH_FILE,
+        LEDGER_FILE,
+        ALLOWLIST_FILE,
+        "crates",
+        "tools",
+    ] {
+        let path = root.join(rel);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => findings.push(Finding {
+                code: "FLN-STRUCT-016",
+                path: rel.to_string(),
+                detail: "symlinks are forbidden for governed workspace inputs".to_string(),
+            }),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {rel}: {error}")),
+        }
+    }
+    scan_symlinks(root, &root.join("crates"), findings)?;
+    scan_symlinks(root, &root.join("tools"), findings)
+}
+
 /// Count covenant-relevant lines: non-blank, not starting with `//` after trim.
 /// Block comments count as code — the covenant is deliberately conservative.
 fn count_loc(dir: &Path) -> Result<usize, String> {
     let mut total = 0;
-    if !dir.is_dir() {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(0);
     }
     let mut stack = vec![dir.to_path_buf()];
@@ -101,9 +184,15 @@ fn count_loc(dir: &Path) -> Result<usize, String> {
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let p = entry.path();
-            if p.is_dir() {
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect {}: {e}", p.display()))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(p);
-            } else if p.extension().is_some_and(|e| e == "rs") {
+            } else if file_type.is_file() && p.extension().is_some_and(|e| e == "rs") {
                 let text = fs::read_to_string(&p)
                     .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
                 total += text
@@ -121,7 +210,12 @@ fn count_loc(dir: &Path) -> Result<usize, String> {
 
 /// Root files whose lint posture is checked: whichever of `src/lib.rs`/`src/main.rs` exist.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    if !dir.is_dir() {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(());
     }
     let mut entries: Vec<_> = fs::read_dir(dir)
@@ -131,9 +225,16 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_rs_files(&path, out)?;
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+        } else if file_type.is_file() && path.extension().is_some_and(|extension| extension == "rs")
+        {
             out.push(path);
         }
     }
@@ -144,10 +245,10 @@ fn crate_roots(c: &DiscoveredCrate) -> Result<Vec<PathBuf>, String> {
     let mut roots: Vec<PathBuf> = ["lib.rs", "main.rs"]
         .iter()
         .map(|file| c.dir.join("src").join(file))
-        .filter(|path| path.is_file())
+        .filter(|path| is_regular_file(path))
         .collect();
     let build_script = c.dir.join("build.rs");
-    if build_script.is_file() {
+    if is_regular_file(&build_script) {
         roots.push(build_script);
     }
     for target_dir in ["src/bin", "tests", "examples", "benches"] {
@@ -193,17 +294,23 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
         ("fln-conformance", 22),
     ];
     for (name, expected_rank) in plan_ranks {
-        if let Some(decl) = g.crates.get(name)
-            && decl.rank != Some(expected_rank)
-        {
-            findings.push(Finding {
+        match g.crates.get(name) {
+            None => findings.push(Finding {
+                code: "FLN-STRUCT-024",
+                path: GRAPH_FILE.to_string(),
+                detail: format!(
+                    "plan-defined crate `{name}` is missing; amend the plan before removing it from the constitutional crate map"
+                ),
+            }),
+            Some(decl) if decl.rank != Some(expected_rank) => findings.push(Finding {
                 code: "FLN-STRUCT-024",
                 path: GRAPH_FILE.to_string(),
                 detail: format!(
                     "plan-defined rank for `{name}` is {expected_rank}, found {:?}; amend the plan before its constitutional rank",
                     decl.rank
                 ),
-            });
+            }),
+            Some(_) => {}
         }
     }
     let expected_boundaries: BTreeSet<&str> =
@@ -317,6 +424,11 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
 
 pub fn run(root: &Path) -> Result<RunOutcome, String> {
     let mut findings: Vec<Finding> = Vec::new();
+
+    // Reject links before any recursive scanner runs. Git can store symlinks, and
+    // following one here could omit authoritative code from a covenant, authorize a
+    // boundary site under the wrong path, escape the workspace, or recurse forever.
+    audit_governed_symlinks(root, &mut findings)?;
 
     // ---- load the reviewed files -------------------------------------------------------
     let graph_path = root.join(GRAPH_FILE);
@@ -716,13 +828,26 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         if !is_boundary {
             continue;
         }
-        let src = c.dir.join("src");
-        if src.is_dir() {
-            ledger::scan_allow_sites(&src, &format!("{}/src", c.rel), &mut sites)?;
+        if c.dir.is_dir() {
+            // Every Rust target in a boundary package is project-authored boundary code:
+            // library/modules, bins, integration tests, examples, benches, and any
+            // auto-discovered build script. None gets an unledgered lowering lane.
+            ledger::scan_allow_sites(&c.dir, &c.rel, &mut sites)?;
         }
     }
     let mut used_ids: BTreeMap<&str, usize> = BTreeMap::new();
     for site in &sites {
+        if site.level != "allow" {
+            findings.push(Finding {
+                code: "FLN-STRUCT-013",
+                path: format!("{}:{}", site.path, site.line),
+                detail: format!(
+                    "{}(unsafe_code) lowers the boundary root's deny; use only a narrow, ledgered allow(unsafe_code) site",
+                    site.level
+                ),
+            });
+            continue;
+        }
         if site.inner {
             findings.push(Finding {
                 code: "FLN-STRUCT-013",

@@ -208,7 +208,9 @@ def open_regular_nofollow(path: Path) -> tuple[Path, int]:
     return absolute, descriptor
 
 
-def stable_file_facts(path: Path, *, max_bytes: int | None = None) -> tuple[bytes, int, str]:
+def stable_file_facts(
+    path: Path, *, max_bytes: int | None = None
+) -> tuple[bytes, int, str]:
     """Read one immutable snapshot and reject concurrent mutation."""
     absolute, descriptor = open_regular_nofollow(path)
     try:
@@ -262,11 +264,7 @@ def write_new(path: Path, data: bytes, mode: int = 0o644) -> None:
     try:
         descriptor = os.open(
             absolute.name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_NOFOLLOW
-            | os.O_CLOEXEC,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
             mode,
             dir_fd=parent_fd,
         )
@@ -287,7 +285,9 @@ def write_new(path: Path, data: bytes, mode: int = 0o644) -> None:
         os.close(parent_fd)
 
 
-def append_record(path: Path, record: dict[str, Any], *, must_be_new: bool = False) -> None:
+def append_record(
+    path: Path, record: dict[str, Any], *, must_be_new: bool = False
+) -> None:
     """Append and fsync one canonically encoded NDJSON record."""
     data = canonical_json(record)
     if len(data) > MAX_RECORD_BYTES:
@@ -398,7 +398,9 @@ class BoundedCapture:
                 raise EvidenceError("internal capture bound violation")
             return data, head_len, tail_len
 
-    def facts(self, artifact: str, retained: int, head: int, tail: int) -> dict[str, Any]:
+    def facts(
+        self, artifact: str, retained: int, head: int, tail: int
+    ) -> dict[str, Any]:
         return {
             "artifact": artifact,
             "sha256": self.digest.hexdigest(),
@@ -504,22 +506,90 @@ def live_process_group_members(pgid: int) -> set[int]:
     return members
 
 
-def signal_pid(pid: int, signum: int) -> bool:
+ProcessHandles = dict[int, tuple[int, int]]
+
+
+def open_process_handle(pid: int) -> tuple[int, int] | None:
+    """Bind a Linux PID to its lifetime before it can be signalled."""
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise EvidenceError("process supervision requires Linux pidfd support")
+    facts = proc_stat_facts(pid)
+    if facts is None or facts[0] == "Z":
+        return None
     try:
-        os.kill(pid, signum)
+        descriptor = os.pidfd_open(pid, 0)
+    except ProcessLookupError:
+        return None
+    repeated = proc_stat_facts(pid)
+    if repeated != facts or repeated is None or repeated[0] == "Z":
+        os.close(descriptor)
+        return None
+    return facts[2], descriptor
+
+
+def close_process_handles(handles: ProcessHandles) -> None:
+    for _start_ticks, descriptor in handles.values():
+        os.close(descriptor)
+    handles.clear()
+
+
+def process_handle_alive(pid: int, handle: tuple[int, int]) -> bool:
+    facts = proc_stat_facts(pid)
+    return facts is not None and facts[0] != "Z" and facts[2] == handle[0]
+
+
+def remember_process(pid: int, handles: ProcessHandles) -> bool:
+    current = handles.get(pid)
+    if current is not None:
+        if process_handle_alive(pid, current):
+            return True
+        os.close(current[1])
+        del handles[pid]
+    opened = open_process_handle(pid)
+    if opened is None:
+        return False
+    handles[pid] = opened
+    return True
+
+
+def signal_process_handle(
+    pid: int, handle: tuple[int, int], signum: int
+) -> bool:
+    if not process_handle_alive(pid, handle):
+        return False
+    try:
+        signal.pidfd_send_signal(handle[1], signum, None, 0)
         return True
     except ProcessLookupError:
         return False
 
 
-def live_tree_members(root_pid: int, known: set[int]) -> set[int]:
+def live_tree_members(root_pid: int, known: ProcessHandles) -> set[int]:
     # While the leader lives, walk beneath it. Once an intermediate exits, Linux's
     # subreaper reparents its surviving descendants directly to this process.
-    roots = {root_pid} if process_alive(root_pid) else set()
+    for pid, handle in list(known.items()):
+        if not process_handle_alive(pid, handle):
+            os.close(handle[1])
+            del known[pid]
+    roots: set[int] = set()
+    if root_pid in known and process_handle_alive(root_pid, known[root_pid]):
+        roots.add(root_pid)
     roots.update(proc_children(os.getpid()))
-    known.update(roots)
-    known.update(descendant_closure(roots))
-    return {pid for pid in known if pid != os.getpid() and process_alive(pid)}
+    pending = list(roots)
+    visited: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid == os.getpid() or pid in visited or not remember_process(pid, known):
+            continue
+        visited.add(pid)
+        for child in proc_children(pid):
+            if child not in visited:
+                pending.append(child)
+    return {
+        pid
+        for pid, handle in known.items()
+        if pid != os.getpid() and process_handle_alive(pid, handle)
+    }
 
 
 def reap_adopted_children() -> None:
@@ -536,50 +606,56 @@ def terminate_tree(
     proc: subprocess.Popen[bytes],
     first_signal: int,
     grace_s: float,
-    known: set[int],
+    known: ProcessHandles,
 ) -> tuple[bool, bool, list[int]]:
     term_sent = False
     kill_sent = False
-    pgid = proc.pid
     live = live_tree_members(proc.pid, known)
-    try:
-        os.killpg(pgid, first_signal)
-        term_sent = True
-    except ProcessLookupError:
-        pass
     for pid in live:
-        term_sent = signal_pid(pid, first_signal) or term_sent
+        term_sent = signal_process_handle(pid, known[pid], first_signal) or term_sent
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
         proc.poll()
         reap_adopted_children()
         live = live_tree_members(proc.pid, known)
-        group_live = live_process_group_members(pgid)
-        if not live and not group_live:
+        if not live:
             break
         for pid in live:
-            signal_pid(pid, first_signal)
+            signal_process_handle(pid, known[pid], first_signal)
         time.sleep(0.02)
     live = live_tree_members(proc.pid, known)
-    group_live = live_process_group_members(pgid)
-    if live or group_live:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-            kill_sent = True
-        except ProcessLookupError:
-            pass
+    if live:
+        # Freeze the bound tree before forced termination. Once every discovered
+        # process is stopped, no member can fork across the final descendant scan.
+        freeze_deadline = time.monotonic() + max(0.25, grace_s)
+        while time.monotonic() < freeze_deadline:
+            for pid in live:
+                signal_process_handle(pid, known[pid], signal.SIGSTOP)
+            time.sleep(0.01)
+            repeated = live_tree_members(proc.pid, known)
+            all_stopped = all(
+                (facts := proc_stat_facts(pid)) is not None
+                and facts[0] in {"T", "t"}
+                and facts[2] == known[pid][0]
+                for pid in repeated
+            )
+            if repeated == live and all_stopped:
+                live = repeated
+                break
+            live = repeated
         for pid in live:
-            kill_sent = signal_pid(pid, signal.SIGKILL) or kill_sent
+            kill_sent = (
+                signal_process_handle(pid, known[pid], signal.SIGKILL) or kill_sent
+            )
         kill_deadline = time.monotonic() + max(0.25, grace_s)
         while time.monotonic() < kill_deadline:
             proc.poll()
             reap_adopted_children()
             live = live_tree_members(proc.pid, known)
-            group_live = live_process_group_members(pgid)
-            if not live and not group_live:
+            if not live:
                 break
             for pid in live:
-                signal_pid(pid, signal.SIGKILL)
+                signal_process_handle(pid, known[pid], signal.SIGKILL)
             time.sleep(0.02)
     survivors = sorted(live_tree_members(proc.pid, known))
     return term_sent, kill_sent, survivors
@@ -614,7 +690,9 @@ def run_supervised(
         if value <= 0:
             raise EvidenceError(f"{label} must be positive")
     if output_budget_bytes < capture_bytes:
-        raise EvidenceError("output budget must be at least the per-stream capture bound")
+        raise EvidenceError(
+            "output budget must be at least the per-stream capture bound"
+        )
     semantic_exits = sorted(set(semantic_failure_exits))
     if any(
         not isinstance(value, int)
@@ -623,7 +701,9 @@ def run_supervised(
         or value > 255
         for value in semantic_exits
     ):
-        raise EvidenceError("semantic failure exits must be unique integers from 1 through 255")
+        raise EvidenceError(
+            "semantic failure exits must be unique integers from 1 through 255"
+        )
     artifact_root = lexical_absolute(artifact_root)
     for label, path in (
         ("metadata", metadata_path),
@@ -646,8 +726,11 @@ def run_supervised(
     proc: subprocess.Popen[bytes] | None = None
     child_exit: int | None = None
     child_signal: str | None = None
-    old_handlers: dict[int, Any] = {}
-    known_descendants: set[int] = set()
+    watched_signals = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+    old_handlers: dict[int, Any] = {
+        signum: signal.getsignal(signum) for signum in watched_signals
+    }
+    known_descendants: ProcessHandles = {}
     survivors: list[int] = []
     readiness_published = False
 
@@ -659,8 +742,7 @@ def run_supervised(
     rendered_argv, had_redaction = redacted_argv(argv)
     try:
         enable_child_subreaper()
-        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-            old_handlers[signum] = signal.getsignal(signum)
+        for signum in watched_signals:
             signal.signal(signum, remember_signal)
         proc = subprocess.Popen(
             list(argv),
@@ -670,7 +752,8 @@ def run_supervised(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        known_descendants.add(proc.pid)
+        if not remember_process(proc.pid, known_descendants):
+            raise EvidenceError("cannot bind child process lifetime")
         child_facts = proc_stat_facts(proc.pid)
         wrapper_facts = proc_stat_facts(os.getpid())
         if child_facts is None or wrapper_facts is None:
@@ -707,10 +790,12 @@ def run_supervised(
         err_thread.start()
         deadline_ns = started_ns + timeout_ms * 1_000_000
         synthetic_cancel_ns = (
-            started_ns + cancel_after_ms * 1_000_000 if cancel_after_ms is not None else None
+            started_ns + cancel_after_ms * 1_000_000
+            if cancel_after_ms is not None
+            else None
         )
         while proc.poll() is None:
-            known_descendants.update(descendant_closure({proc.pid}))
+            live_tree_members(proc.pid, known_descendants)
             now_ns = time.monotonic_ns()
             if cancel_signal is not None:
                 termination_reason = "signal"
@@ -801,38 +886,15 @@ def run_supervised(
                 f"readiness publication failure: {type(error).__name__}: {error}"
             )
 
+    # Block cancellation while terminal artifacts are selected and published. The
+    # disposition change to SIG_IGN below is the single linearization point: signals
+    # pending before it are reflected as cancellation; signals after it are post-commit.
+    previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
     ended_ns = time.monotonic_ns()
     usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
     if survivors and not any("termination left survivors" in error for error in errors):
         errors.append(f"process-tree termination left survivors: {survivors}")
-    classification = "pass"
-    reason_code = "exit_zero"
-    wrapper_exit = PASS
-    if errors:
-        classification = "internal_fault"
-        reason_code = "supervisor_or_capture_failure"
-        wrapper_exit = SETUP_FAILURE
-    elif cancel_signal is not None:
-        classification = "cancelled"
-        reason_code = f"signal_{signal.Signals(cancel_signal).name}"
-        wrapper_exit = CANCELLED
-    elif termination_reason in {"timeout", "output_budget_exhausted"}:
-        classification = "inconclusive"
-        reason_code = termination_reason
-        wrapper_exit = INCONCLUSIVE
-    elif child_signal is not None:
-        classification = "inconclusive"
-        reason_code = f"child_signal_{child_signal}"
-        wrapper_exit = INCONCLUSIVE
-    elif child_exit in semantic_exits:
-        classification = "fail"
-        reason_code = "child_exit_semantic_failure"
-        wrapper_exit = FAIL
-    elif child_exit != 0:
-        classification = "internal_fault"
-        reason_code = "unexpected_child_exit"
-        wrapper_exit = SETUP_FAILURE
-
+    capture_publication_failed = False
     try:
         out_data, out_head, out_tail = stdout_capture.render()
         err_data, err_head, err_tail = stderr_capture.render()
@@ -840,11 +902,38 @@ def run_supervised(
         write_new(stderr_path, err_data)
     except BaseException as error:
         errors.append(f"capture publication failure: {type(error).__name__}: {error}")
-        classification = "internal_fault"
-        reason_code = "artifact_publication_failure"
-        wrapper_exit = SETUP_FAILURE
+        capture_publication_failed = True
         out_data, out_head, out_tail = b"", 0, 0
         err_data, err_head, err_tail = b"", 0, 0
+
+    pending = signal.sigpending()
+    if cancel_signal is None:
+        cancel_signal = next(
+            (signum for signum in watched_signals if signum in pending), None
+        )
+
+    def classify_terminal() -> tuple[str, str, int]:
+        if capture_publication_failed:
+            return "internal_fault", "artifact_publication_failure", SETUP_FAILURE
+        if errors:
+            return "internal_fault", "supervisor_or_capture_failure", SETUP_FAILURE
+        if cancel_signal is not None:
+            return (
+                "cancelled",
+                f"signal_{signal.Signals(cancel_signal).name}",
+                CANCELLED,
+            )
+        if termination_reason in {"timeout", "output_budget_exhausted"}:
+            return "inconclusive", termination_reason, INCONCLUSIVE
+        if child_signal is not None:
+            return "inconclusive", f"child_signal_{child_signal}", INCONCLUSIVE
+        if child_exit in semantic_exits:
+            return "fail", "child_exit_semantic_failure", FAIL
+        if child_exit != 0:
+            return "internal_fault", "unexpected_child_exit", SETUP_FAILURE
+        return "pass", "exit_zero", PASS
+
+    classification, reason_code, wrapper_exit = classify_terminal()
 
     metadata: dict[str, Any] = {
         "schema": "fln.supervisor/1",
@@ -872,11 +961,13 @@ def run_supervised(
             "kill_grace_ms": grace_ms,
             "total_output_bytes": stdout_capture.total + stderr_capture.total,
             "user_cpu_seconds": max(0.0, usage_after.ru_utime - usage_before.ru_utime),
-            "system_cpu_seconds": max(0.0, usage_after.ru_stime - usage_before.ru_stime),
+            "system_cpu_seconds": max(
+                0.0, usage_after.ru_stime - usage_before.ru_stime
+            ),
             "max_rss_kib_observed": usage_after.ru_maxrss,
             "term_sent": term_sent,
             "kill_sent": kill_sent,
-            "process_tree_scope": "linux_subreaper_plus_process_group",
+            "process_tree_scope": "linux_subreaper_plus_pidfd",
             "surviving_pids": survivors,
         },
         "stdout": stdout_capture.facts(
@@ -895,8 +986,24 @@ def run_supervised(
     }
     metadata["stdout"]["retained_sha256"] = hashlib.sha256(out_data).hexdigest()
     metadata["stderr"]["retained_sha256"] = hashlib.sha256(err_data).hexdigest()
+    metadata_data = canonical_json(metadata)
+    # Account for a signal that became pending while the terminal object was built.
+    pending = signal.sigpending()
+    if cancel_signal is None:
+        cancel_signal = next(
+            (signum for signum in watched_signals if signum in pending), None
+        )
+        if cancel_signal is not None:
+            classification, reason_code, wrapper_exit = classify_terminal()
+            metadata["classification"] = classification
+            metadata["reason_code"] = reason_code
+            metadata["wrapper_exit"] = wrapper_exit
+            metadata["cancel_signal"] = signal.Signals(cancel_signal).name
+            metadata_data = canonical_json(metadata)
+    for signum in watched_signals:
+        signal.signal(signum, signal.SIG_IGN)
     try:
-        write_new(metadata_path, canonical_json(metadata))
+        write_new(metadata_path, metadata_data)
     except BaseException as error:
         fallback = {
             "schema": "fln.supervisor/1",
@@ -908,14 +1015,13 @@ def run_supervised(
         sys.stderr.buffer.write(canonical_json(fallback))
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        close_process_handles(known_descendants)
         return SETUP_FAILURE
-    late_cancel = cancel_signal
     for signum, handler in old_handlers.items():
         signal.signal(signum, handler)
-    if late_cancel is not None and classification != "cancelled":
-        # The immutable metadata was already committed. Return a non-success code so
-        # the enclosing run records a fail-closed wrapper/metadata disagreement.
-        return CANCELLED
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+    close_process_handles(known_descendants)
     return wrapper_exit
 
 
@@ -993,7 +1099,9 @@ def validate_guard(
             raise EvidenceError(f"{path}:{index}: non-finding inside guard run")
         if record.get("severity") != "error":
             raise EvidenceError(f"{path}:{index}: guard finding severity is not error")
-        if not isinstance(record.get("code"), str) or not isinstance(record.get("path"), str):
+        if not isinstance(record.get("code"), str) or not isinstance(
+            record.get("path"), str
+        ):
             raise EvidenceError(f"{path}:{index}: malformed guard finding identity")
         if not isinstance(record.get("detail"), str) or not record["detail"]:
             raise EvidenceError(f"{path}:{index}: guard finding lacks detail")
@@ -1023,7 +1131,7 @@ def validate_guard(
         raise EvidenceError(f"{path}: reported and observed exits disagree")
     return {
         "schema": "fln.validation/1",
-        "subject": str(path),
+        "subject": path.name,
         "valid": True,
         "exit_code": expected_exit,
         "verdict": expected_verdict,
@@ -1039,6 +1147,7 @@ def validate_run(
     *,
     expected_active_stage: str | None = None,
     expected_planted_stage: str | None = None,
+    live_context: bool = True,
 ) -> dict[str, Any]:
     if schema not in RUN_SCHEMAS:
         raise EvidenceError(f"unsupported run schema: {schema!r}")
@@ -1051,7 +1160,12 @@ def validate_run(
         raise EvidenceError(f"{path}: expected exactly one final run_end")
     run_id = records[0].get("run_id")
     bead = records[0].get("bead")
-    if not isinstance(run_id, str) or not run_id or not isinstance(bead, str) or not bead:
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or not isinstance(bead, str)
+        or not bead
+    ):
         raise EvidenceError(f"{path}: invalid run identity")
     scenario = records[0].get("scenario")
     if not isinstance(scenario, str) or not scenario:
@@ -1104,8 +1218,10 @@ def validate_run(
         raise EvidenceError(f"{path}: run_start missing fields {missing!r}")
     for key in ("claim_ids", "invariant_ids", "gate_ids"):
         value = records[0][key]
-        if not isinstance(value, list) or not value or not all(
-            isinstance(item, str) and item for item in value
+        if (
+            not isinstance(value, list)
+            or not value
+            or not all(isinstance(item, str) and item for item in value)
         ):
             raise EvidenceError(f"{path}: {key} must be a non-empty string array")
     if not isinstance(records[0]["argv"], list) or not all(
@@ -1115,9 +1231,13 @@ def validate_run(
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(records[0]["input_root"])):
         raise EvidenceError(f"{path}: input_root is not a canonical SHA-256 tree root")
     budgets = records[0]["budgets"]
-    if not isinstance(budgets, dict) or not budgets or not all(
-        isinstance(value, int) and not isinstance(value, bool) and value > 0
-        for value in budgets.values()
+    if (
+        not isinstance(budgets, dict)
+        or not budgets
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in budgets.values()
+        )
     ):
         raise EvidenceError(f"{path}: budgets must be positive integer facts")
     host_facts = records[0]["host_facts"]
@@ -1126,9 +1246,10 @@ def validate_run(
         for key in ("system", "release", "machine", "python")
     ):
         raise EvidenceError(f"{path}: host facts are incomplete")
-    if not isinstance(records[0]["parity_ledger_row"], str) or not records[0][
-        "parity_ledger_row"
-    ]:
+    if (
+        not isinstance(records[0]["parity_ledger_row"], str)
+        or not records[0]["parity_ledger_row"]
+    ):
         raise EvidenceError(f"{path}: parity ledger classification is missing")
     if (
         not isinstance(records[0]["thread_count"], int)
@@ -1138,7 +1259,14 @@ def validate_run(
         raise EvidenceError(f"{path}: thread count must be a positive integer")
     profile = records[0]["profile"]
     allowed_profiles = (
-        {"local", "ci", "self-test-driver", "self-test-plant", "self-test-cancellation", "evidence-manifest-self-test"}
+        {
+            "local",
+            "ci",
+            "self-test-driver",
+            "self-test-plant",
+            "self-test-cancellation",
+            "evidence-manifest-self-test",
+        }
         if schema == "fln.check/2"
         else {"e2e"}
     )
@@ -1149,7 +1277,21 @@ def validate_run(
     if schema == "fln.check/2" and profile != "evidence-manifest-self-test":
         if records[0].get("ubs_inventory") != "ubs-inventory.json":
             raise EvidenceError(f"{path}: quality gate lacks its UBS inventory binding")
-        validate_ubs_inventory(path.parent / "ubs-inventory.json", Path(records[0]["cwd"]))
+        validate_ubs_inventory(
+            path.parent / "ubs-inventory.json",
+            Path(records[0]["cwd"]) if live_context else None,
+        )
+    if schema == "fln.e2e/2" or profile != "evidence-manifest-self-test":
+        if records[0].get("vendor_binding") != "vendor-binding.json":
+            raise EvidenceError(f"{path}: run lacks its Reference vendor binding")
+        recorded_binding = read_json_object(path.parent / "vendor-binding.json")
+        validate_vendor_binding_document(recorded_binding)
+        if live_context:
+            live_binding = verify_vendor_binding(
+                Path(records[0]["cwd"]), "vendor/lean4-src"
+            )
+            if recorded_binding != live_binding:
+                raise EvidenceError(f"{path}: Reference vendor binding is stale")
     terminal_required = {
         "reason_code",
         "process_exit",
@@ -1179,29 +1321,44 @@ def validate_run(
         raise EvidenceError(f"{path}: verdict and process_exit disagree")
     if not isinstance(terminal.get("duration_ns"), int) or terminal["duration_ns"] < 0:
         raise EvidenceError(f"{path}: terminal duration is malformed")
-    for key in ("reason_code", "active_stage" if schema == "fln.check/2" else "active_step"):
+    for key in (
+        "reason_code",
+        "active_stage" if schema == "fln.check/2" else "active_step",
+    ):
         if not isinstance(terminal.get(key), str) or not terminal[key]:
             raise EvidenceError(f"{path}: terminal {key} is malformed")
     if terminal.get("cleanup_status") != "retained_by_policy":
         raise EvidenceError(f"{path}: terminal cleanup policy is unknown")
-    if expected_verdict == "pass" and terminal.get("final_state") != records[0]["input_root"]:
+    if (
+        expected_verdict == "pass"
+        and terminal.get("final_state") != records[0]["input_root"]
+    ):
         raise EvidenceError(f"{path}: passing run changed its canonical input root")
     if terminal.get("logical_root") != terminal.get("final_state"):
         raise EvidenceError(f"{path}: terminal logical root disagrees with final state")
-    if not isinstance(terminal.get("receipt_root"), str) or not terminal["receipt_root"]:
+    if (
+        not isinstance(terminal.get("receipt_root"), str)
+        or not terminal["receipt_root"]
+    ):
         raise EvidenceError(f"{path}: terminal receipt-root classification is missing")
     if expected_verdict == "pass" and terminal.get("first_divergence") != "none":
         raise EvidenceError(f"{path}: passing run claims a first divergence")
-    if expected_verdict != "pass" and not isinstance(terminal.get("first_divergence"), str):
+    if expected_verdict != "pass" and not isinstance(
+        terminal.get("first_divergence"), str
+    ):
         raise EvidenceError(f"{path}: failing run lacks first-divergence data")
     if expected_verdict != "pass" and terminal.get("first_divergence") != terminal.get(
         "reason_code"
     ):
-        raise EvidenceError(f"{path}: first divergence does not identify the terminal reason")
+        raise EvidenceError(
+            f"{path}: first divergence does not identify the terminal reason"
+        )
     if terminal.get("evidence_state") != "pending_bundle_commit":
         raise EvidenceError(f"{path}: run terminal must declare pending bundle commit")
     if terminal.get("bundle_commit") != "bundle.complete.json":
-        raise EvidenceError(f"{path}: run terminal names an unknown bundle commit marker")
+        raise EvidenceError(
+            f"{path}: run terminal names an unknown bundle commit marker"
+        )
     if expected_active_stage is not None:
         active = terminal.get("active_stage", terminal.get("active_step"))
         if active != expected_active_stage:
@@ -1234,15 +1391,27 @@ def validate_run(
                         or record.get("reason_code") != "missing_supervisor_metadata"
                         or record.get("wrapper_exit") != SETUP_FAILURE
                     ):
-                        raise EvidenceError(f"{path}:{index}: invalid missing-supervisor event")
+                        raise EvidenceError(
+                            f"{path}:{index}: invalid missing-supervisor event"
+                        )
                 else:
                     validate_supervisor_object(
-                        path, index, record.get("supervisor"), expected_stage_id=event_id
+                        path,
+                        index,
+                        record.get("supervisor"),
+                        expected_stage_id=event_id,
                     )
                     if record["supervisor"]["classification"] != record["outcome"]:
-                        raise EvidenceError(f"{path}:{index}: stage/supervisor outcome mismatch")
-                    if record.get("wrapper_exit") != record["supervisor"]["wrapper_exit"]:
-                        raise EvidenceError(f"{path}:{index}: stage/supervisor exit mismatch")
+                        raise EvidenceError(
+                            f"{path}:{index}: stage/supervisor outcome mismatch"
+                        )
+                    if (
+                        record.get("wrapper_exit")
+                        != record["supervisor"]["wrapper_exit"]
+                    ):
+                        raise EvidenceError(
+                            f"{path}:{index}: stage/supervisor exit mismatch"
+                        )
             elif (
                 event_id != "ubs"
                 or records[0]["profile"] == "ci"
@@ -1282,26 +1451,48 @@ def validate_run(
             if record["assertion"] not in {"pass", "fail"}:
                 raise EvidenceError(f"{path}:{index}: unknown assertion outcome")
             if record["assertion"] == "pass":
-                if supervisor["classification"] != record["expected_supervisor_classification"]:
-                    raise EvidenceError(f"{path}:{index}: unexpected supervisor classification")
+                if (
+                    supervisor["classification"]
+                    != record["expected_supervisor_classification"]
+                ):
+                    raise EvidenceError(
+                        f"{path}:{index}: unexpected supervisor classification"
+                    )
                 if supervisor["wrapper_exit"] != record["expected_wrapper_exit"]:
-                    raise EvidenceError(f"{path}:{index}: unexpected supervisor wrapper exit")
+                    raise EvidenceError(
+                        f"{path}:{index}: unexpected supervisor wrapper exit"
+                    )
                 if supervisor["child_exit"] != record["expected_child_exit"]:
-                    raise EvidenceError(f"{path}:{index}: unexpected supervised child exit")
-            for root_key in ("input_root", "final_state", "subject_root", "subject_final_state"):
+                    raise EvidenceError(
+                        f"{path}:{index}: unexpected supervised child exit"
+                    )
+            for root_key in (
+                "input_root",
+                "final_state",
+                "subject_root",
+                "subject_final_state",
+            ):
                 if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(record[root_key])):
-                    raise EvidenceError(f"{path}:{index}: {root_key} is not a canonical tree root")
+                    raise EvidenceError(
+                        f"{path}:{index}: {root_key} is not a canonical tree root"
+                    )
             if record["subject_root"] != record["subject_final_state"]:
-                raise EvidenceError(f"{path}:{index}: step subject changed during assertion")
+                raise EvidenceError(
+                    f"{path}:{index}: step subject changed during assertion"
+                )
             if record["assertion"] == "pass" and (
                 record["input_root"] != records[0]["input_root"]
                 or record["final_state"] != records[0]["input_root"]
             ):
-                raise EvidenceError(f"{path}:{index}: passing step used a foreign global root")
+                raise EvidenceError(
+                    f"{path}:{index}: passing step used a foreign global root"
+                )
             validation_artifact = record["validation_artifact"]
             if validation_artifact != "not_applicable":
                 candidate = require_within(
-                    path.parent / str(validation_artifact), path.parent, label="validation artifact"
+                    path.parent / str(validation_artifact),
+                    path.parent,
+                    label="validation artifact",
                 )
                 stable_file_facts(candidate)
         elif event == "self_test":
@@ -1329,7 +1520,9 @@ def validate_run(
                 if record.get("event") == "stage"
             ]
             if len(actual_ids) != len(exercised):
-                raise EvidenceError(f"{path}: manifest self-test contains foreign events")
+                raise EvidenceError(
+                    f"{path}: manifest self-test contains foreign events"
+                )
         elif profile == "self-test-driver":
             expected_ids = CHECK_SELF_TEST_ORDER
             actual_ids = [
@@ -1386,38 +1579,62 @@ def validate_run(
         if len(actual_ids) != len(exercised):
             raise EvidenceError(f"{path}: E2E run contains foreign events")
         if actual_ids != expected_ids[: len(actual_ids)]:
-            raise EvidenceError(f"{path}: non-canonical E2E obligation order: {actual_ids!r}")
+            raise EvidenceError(
+                f"{path}: non-canonical E2E obligation order: {actual_ids!r}"
+            )
         if expected_verdict == "pass" and actual_ids != expected_ids:
-            raise EvidenceError(f"{path}: passing E2E run omitted mandatory obligations")
+            raise EvidenceError(
+                f"{path}: passing E2E run omitted mandatory obligations"
+            )
     if expected_verdict == "pass":
         if not records[1:-1]:
-            raise EvidenceError(f"{path}: passing run contains no exercised obligations")
+            raise EvidenceError(
+                f"{path}: passing run contains no exercised obligations"
+            )
         for index, record in enumerate(records[1:-1], 2):
-            if record.get("event") == "stage" and record.get("outcome") not in {"pass", "skipped"}:
-                raise EvidenceError(f"{path}:{index}: passing run contains failed stage")
+            if record.get("event") == "stage" and record.get("outcome") not in {
+                "pass",
+                "skipped",
+            }:
+                raise EvidenceError(
+                    f"{path}:{index}: passing run contains failed stage"
+                )
             if record.get("event") == "step" and record.get("assertion") != "pass":
-                raise EvidenceError(f"{path}:{index}: passing run contains failed assertion")
+                raise EvidenceError(
+                    f"{path}:{index}: passing run contains failed assertion"
+                )
             if record.get("event") == "self_test" and record.get("ok") is not True:
-                raise EvidenceError(f"{path}:{index}: passing run contains failed self-test")
+                raise EvidenceError(
+                    f"{path}:{index}: passing run contains failed self-test"
+                )
     if expected_planted_stage is not None:
         matching = [
             record
             for record in records[1:-1]
-            if record.get("event") == "stage" and record.get("stage") == expected_planted_stage
+            if record.get("event") == "stage"
+            and record.get("stage") == expected_planted_stage
         ]
         if len(matching) != 1:
             raise EvidenceError(f"{path}: expected exactly one planted stage event")
         planted_record = matching[0]
-        if planted_record.get("outcome") != "fail" or planted_record["supervisor"].get("planted") is not True:
+        if (
+            planted_record.get("outcome") != "fail"
+            or planted_record["supervisor"].get("planted") is not True
+        ):
             raise EvidenceError(f"{path}: requested stage is not the planted failure")
         for record in records[1 : records.index(planted_record)]:
-            if record.get("event") == "stage" and record.get("outcome") not in {"pass", "skipped"}:
-                raise EvidenceError(f"{path}: an earlier stage failed before the requested plant")
+            if record.get("event") == "stage" and record.get("outcome") not in {
+                "pass",
+                "skipped",
+            }:
+                raise EvidenceError(
+                    f"{path}: an earlier stage failed before the requested plant"
+                )
         if records[0].get("planted") != expected_planted_stage:
             raise EvidenceError(f"{path}: run start does not bind the requested plant")
     return {
         "schema": "fln.validation/1",
-        "subject": str(path),
+        "subject": path.name,
         "valid": True,
         "records": len(records),
         "run_id": run_id,
@@ -1458,12 +1675,20 @@ def validate_supervisor_object(
     missing = sorted(key for key in required if key not in value)
     if missing:
         raise EvidenceError(f"{path}:{record_number}: supervisor missing {missing!r}")
-    if not isinstance(value["argv"], list) or not all(isinstance(item, str) for item in value["argv"]):
-        raise EvidenceError(f"{path}:{record_number}: supervisor argv is not a string array")
+    if not isinstance(value["argv"], list) or not all(
+        isinstance(item, str) for item in value["argv"]
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: supervisor argv is not a string array"
+        )
     if value["stage_id"] != expected_stage_id:
-        raise EvidenceError(f"{path}:{record_number}: supervisor stage identity mismatch")
+        raise EvidenceError(
+            f"{path}:{record_number}: supervisor stage identity mismatch"
+        )
     if not isinstance(value["planted"], bool):
-        raise EvidenceError(f"{path}:{record_number}: supervisor planted flag is not boolean")
+        raise EvidenceError(
+            f"{path}:{record_number}: supervisor planted flag is not boolean"
+        )
     semantic_exits = value["semantic_failure_exits"]
     if (
         not isinstance(semantic_exits, list)
@@ -1478,7 +1703,11 @@ def validate_supervisor_object(
     ):
         raise EvidenceError(f"{path}:{record_number}: malformed semantic failure exits")
     for key in ("monotonic_start_ns", "monotonic_end_ns", "duration_ns"):
-        if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0:
+        if (
+            not isinstance(value[key], int)
+            or isinstance(value[key], bool)
+            or value[key] < 0
+        ):
             raise EvidenceError(f"{path}:{record_number}: malformed supervisor timing")
     if value["monotonic_end_ns"] - value["monotonic_start_ns"] != value["duration_ns"]:
         raise EvidenceError(f"{path}:{record_number}: supervisor duration mismatch")
@@ -1490,23 +1719,45 @@ def validate_supervisor_object(
         "cancelled": 4,
     }
     classification = value["classification"]
-    if classification not in expected_wrapper or value["wrapper_exit"] != expected_wrapper[classification]:
-        raise EvidenceError(f"{path}:{record_number}: supervisor classification/exit mismatch")
-    if classification == "pass" and (value["child_exit"] != 0 or value["child_signal"] is not None):
-        raise EvidenceError(f"{path}:{record_number}: passing supervisor has nonzero child")
+    if (
+        classification not in expected_wrapper
+        or value["wrapper_exit"] != expected_wrapper[classification]
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: supervisor classification/exit mismatch"
+        )
+    if classification == "pass" and (
+        value["child_exit"] != 0 or value["child_signal"] is not None
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: passing supervisor has nonzero child"
+        )
     if classification == "fail" and (
         value["child_exit"] not in semantic_exits or value["child_signal"] is not None
     ):
-        raise EvidenceError(f"{path}:{record_number}: failed supervisor lacks semantic failure")
-    if classification == "inconclusive" and value["reason_code"].startswith("child_signal_"):
-        if not isinstance(value["child_signal"], str) or value["child_exit"] is not None:
-            raise EvidenceError(f"{path}:{record_number}: child signal is not typed inconclusive")
+        raise EvidenceError(
+            f"{path}:{record_number}: failed supervisor lacks semantic failure"
+        )
+    if classification == "inconclusive" and value["reason_code"].startswith(
+        "child_signal_"
+    ):
+        if (
+            not isinstance(value["child_signal"], str)
+            or value["child_exit"] is not None
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: child signal is not typed inconclusive"
+            )
     if classification == "internal_fault" and value["child_exit"] not in {None, 0}:
         if value["child_exit"] in semantic_exits:
-            raise EvidenceError(f"{path}:{record_number}: semantic child failure was marked internal")
+            raise EvidenceError(
+                f"{path}:{record_number}: semantic child failure was marked internal"
+            )
     resource_facts = value["resource"]
     if not isinstance(resource_facts, dict):
-        raise EvidenceError(f"{path}:{record_number}: supervisor resource facts missing")
+        raise EvidenceError(
+            f"{path}:{record_number}: supervisor resource facts missing"
+        )
     positive_integer_facts = (
         "capture_bytes_per_stream",
         "output_budget_bytes",
@@ -1516,13 +1767,20 @@ def validate_supervisor_object(
     for key in positive_integer_facts:
         fact = resource_facts.get(key)
         if not isinstance(fact, int) or isinstance(fact, bool) or fact <= 0:
-            raise EvidenceError(f"{path}:{record_number}: malformed resource fact {key}")
-    if resource_facts["output_budget_bytes"] < resource_facts["capture_bytes_per_stream"]:
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed resource fact {key}"
+            )
+    if (
+        resource_facts["output_budget_bytes"]
+        < resource_facts["capture_bytes_per_stream"]
+    ):
         raise EvidenceError(f"{path}:{record_number}: impossible output budget")
     for key in ("total_output_bytes", "max_rss_kib_observed"):
         fact = resource_facts.get(key)
         if not isinstance(fact, int) or isinstance(fact, bool) or fact < 0:
-            raise EvidenceError(f"{path}:{record_number}: malformed resource fact {key}")
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed resource fact {key}"
+            )
     for key in ("user_cpu_seconds", "system_cpu_seconds"):
         fact = resource_facts.get(key)
         if (
@@ -1531,11 +1789,15 @@ def validate_supervisor_object(
             or not float(fact) >= 0.0
             or not float(fact) < float("inf")
         ):
-            raise EvidenceError(f"{path}:{record_number}: malformed resource fact {key}")
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed resource fact {key}"
+            )
     for key in ("term_sent", "kill_sent"):
         if not isinstance(resource_facts.get(key), bool):
-            raise EvidenceError(f"{path}:{record_number}: malformed resource fact {key}")
-    if resource_facts.get("process_tree_scope") != "linux_subreaper_plus_process_group":
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed resource fact {key}"
+            )
+    if resource_facts.get("process_tree_scope") != "linux_subreaper_plus_pidfd":
         raise EvidenceError(f"{path}:{record_number}: unknown process-tree scope")
     if resource_facts.get("surviving_pids") != []:
         raise EvidenceError(f"{path}:{record_number}: supervisor left live descendants")
@@ -1543,9 +1805,10 @@ def validate_supervisor_object(
         path.parent / str(value["readiness"]), path.parent, label="readiness artifact"
     )
     readiness = read_json_object(readiness_path)
-    if readiness.get("schema") != "fln.supervisor-readiness/1" or readiness.get(
-        "stage_id"
-    ) != expected_stage_id:
+    if (
+        readiness.get("schema") != "fln.supervisor-readiness/1"
+        or readiness.get("stage_id") != expected_stage_id
+    ):
         raise EvidenceError(f"{path}:{record_number}: malformed readiness artifact")
     readiness_status = readiness.get("status")
     if readiness_status == "spawn_failed" and classification != "internal_fault":
@@ -1562,7 +1825,9 @@ def validate_supervisor_object(
         or isinstance(wrapper_ticks, bool)
         or wrapper_ticks <= 0
     ):
-        raise EvidenceError(f"{path}:{record_number}: malformed wrapper readiness identity")
+        raise EvidenceError(
+            f"{path}:{record_number}: malformed wrapper readiness identity"
+        )
     if readiness_status == "ready":
         child_pid = readiness.get("child_pid")
         child_pgid = readiness.get("child_pgid")
@@ -1576,12 +1841,16 @@ def validate_supervisor_object(
             or isinstance(child_ticks, bool)
             or child_ticks <= 0
         ):
-            raise EvidenceError(f"{path}:{record_number}: malformed child readiness identity")
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed child readiness identity"
+            )
     elif any(
         readiness.get(key) is not None
         for key in ("child_pid", "child_pgid", "child_start_ticks")
     ):
-        raise EvidenceError(f"{path}:{record_number}: spawn-failed readiness names a child")
+        raise EvidenceError(
+            f"{path}:{record_number}: spawn-failed readiness names a child"
+        )
     stream_artifacts: set[str] = set()
     for stream in ("stdout", "stderr"):
         facts = value[stream]
@@ -1598,9 +1867,13 @@ def validate_supervisor_object(
             "truncated",
         ):
             if key not in facts:
-                raise EvidenceError(f"{path}:{record_number}: incomplete {stream} facts")
+                raise EvidenceError(
+                    f"{path}:{record_number}: incomplete {stream} facts"
+                )
         if not isinstance(facts["artifact"], str) or not facts["artifact"]:
-            raise EvidenceError(f"{path}:{record_number}: malformed {stream} artifact name")
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed {stream} artifact name"
+            )
         if facts["artifact"] in stream_artifacts:
             raise EvidenceError(f"{path}:{record_number}: streams share an artifact")
         stream_artifacts.add(facts["artifact"])
@@ -1611,38 +1884,59 @@ def validate_supervisor_object(
         for key in ("total_bytes", "retained_bytes", "head_bytes", "tail_bytes"):
             fact = facts[key]
             if not isinstance(fact, int) or isinstance(fact, bool) or fact < 0:
-                raise EvidenceError(f"{path}:{record_number}: malformed {stream} size facts")
+                raise EvidenceError(
+                    f"{path}:{record_number}: malformed {stream} size facts"
+                )
         if not isinstance(facts["truncated"], bool):
-            raise EvidenceError(f"{path}:{record_number}: malformed {stream} truncation flag")
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed {stream} truncation flag"
+            )
         if facts["retained_bytes"] > resource_facts["capture_bytes_per_stream"]:
-            raise EvidenceError(f"{path}:{record_number}: {stream} capture exceeded bound")
+            raise EvidenceError(
+                f"{path}:{record_number}: {stream} capture exceeded bound"
+            )
         if facts["total_bytes"] < facts["retained_bytes"]:
-            raise EvidenceError(f"{path}:{record_number}: {stream} retained more than produced")
+            raise EvidenceError(
+                f"{path}:{record_number}: {stream} retained more than produced"
+            )
         if facts["head_bytes"] + facts["tail_bytes"] > facts["retained_bytes"]:
-            raise EvidenceError(f"{path}:{record_number}: impossible {stream} head/tail facts")
+            raise EvidenceError(
+                f"{path}:{record_number}: impossible {stream} head/tail facts"
+            )
         if not facts["truncated"] and (
             facts["total_bytes"] != facts["retained_bytes"]
             or facts["head_bytes"] != facts["retained_bytes"]
             or facts["tail_bytes"] != 0
             or facts["sha256"] != facts["retained_sha256"]
         ):
-            raise EvidenceError(f"{path}:{record_number}: inconsistent untruncated {stream}")
+            raise EvidenceError(
+                f"{path}:{record_number}: inconsistent untruncated {stream}"
+            )
         if facts["truncated"] and facts["total_bytes"] <= facts["retained_bytes"]:
-            raise EvidenceError(f"{path}:{record_number}: inconsistent truncated {stream}")
+            raise EvidenceError(
+                f"{path}:{record_number}: inconsistent truncated {stream}"
+            )
         artifact = require_within(
-            path.parent / str(facts["artifact"]), path.parent, label=f"{stream} artifact"
+            path.parent / str(facts["artifact"]),
+            path.parent,
+            label=f"{stream} artifact",
         )
         _data, size, digest = stable_file_facts(artifact)
         if size != facts["retained_bytes"] or digest != facts["retained_sha256"]:
-            raise EvidenceError(f"{path}:{record_number}: {stream} artifact facts disagree")
+            raise EvidenceError(
+                f"{path}:{record_number}: {stream} artifact facts disagree"
+            )
     if resource_facts.get("total_output_bytes") != (
         value["stdout"]["total_bytes"] + value["stderr"]["total_bytes"]
     ):
         raise EvidenceError(f"{path}:{record_number}: total output accounting mismatch")
-    if classification in {"pass", "fail"} and resource_facts["total_output_bytes"] > resource_facts[
-        "output_budget_bytes"
-    ]:
-        raise EvidenceError(f"{path}:{record_number}: conclusive stage exceeded output budget")
+    if (
+        classification in {"pass", "fail"}
+        and resource_facts["total_output_bytes"] > resource_facts["output_budget_bytes"]
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: conclusive stage exceeded output budget"
+        )
 
 
 def sha256_file(path: Path) -> str:
@@ -1664,7 +1958,9 @@ def iter_tree_files(root: Path, requested: Sequence[str]) -> Iterable[tuple[str,
         candidate_mode = candidate.lstat().st_mode
         paths = [candidate]
         if stat.S_ISDIR(candidate_mode):
-            paths = sorted(candidate.rglob("*"), key=lambda item: item.as_posix().encode())
+            paths = sorted(
+                candidate.rglob("*"), key=lambda item: item.as_posix().encode()
+            )
         elif not (stat.S_ISREG(candidate_mode) or stat.S_ISLNK(candidate_mode)):
             raise EvidenceError(f"special file is not a canonical input: {candidate}")
         for path in paths:
@@ -1722,16 +2018,36 @@ def ubs_inventory_binding(inventory: dict[str, Any]) -> dict[str, Any]:
 
 
 def tree_hash(
-    root: Path, requested: Sequence[str], *, inventory_path: Path | None = None
+    root: Path,
+    requested: Sequence[str],
+    *,
+    inventory_path: Path | None = None,
+    vendor_path: str | None = None,
 ) -> str:
     previous: str | None = None
     for _attempt in range(6):
-        current = tree_hash_once(root, requested)
+        vendor_before = (
+            verify_vendor_binding(root, vendor_path) if vendor_path else None
+        )
+        tree_root = tree_hash_once(root, requested)
+        vendor_after = verify_vendor_binding(root, vendor_path) if vendor_path else None
+        if vendor_before != vendor_after:
+            previous = None
+            continue
+        components: dict[str, Any] = {
+            "schema": "fln-canonical-input/2",
+            "tree_root": tree_root,
+        }
+        if vendor_before is not None:
+            components["vendor_binding"] = vendor_before
         if inventory_path is not None:
             inventory = validate_ubs_inventory(inventory_path, root)
-            digest = hashlib.sha256(b"fln-canonical-tree-with-ubs/1\0")
-            digest.update(current.encode("ascii"))
-            digest.update(canonical_json(ubs_inventory_binding(inventory)))
+            components["ubs_inventory"] = ubs_inventory_binding(inventory)
+        if len(components) == 2:
+            current = tree_root
+        else:
+            digest = hashlib.sha256(b"fln-canonical-input/2\0")
+            digest.update(canonical_json(components))
             current = f"sha256:{digest.hexdigest()}"
         if current == previous:
             return current
@@ -1756,18 +2072,274 @@ def split_git_nul(data: bytes, *, subject: str) -> list[str]:
 
 
 def git_paths(root: Path, args: Sequence[str], *, subject: str) -> list[str]:
+    return split_git_nul(run_git(root, args, subject=subject), subject=subject)
+
+
+def run_git(
+    root: Path,
+    args: Sequence[str],
+    *,
+    subject: str,
+    accepted_exits: set[int] | None = None,
+) -> bytes:
+    root = lexical_absolute(root)
+    git_dir = root / ".git"
+    try:
+        git_mode = git_dir.lstat().st_mode
+    except FileNotFoundError as error:
+        raise EvidenceError(f"{subject} requires an explicit repository .git directory") from error
+    if stat.S_ISLNK(git_mode) or not stat.S_ISDIR(git_mode):
+        raise EvidenceError(f"{subject} requires a real repository .git directory")
+    git_environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    git_environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    command = [
+        "git",
+        f"--git-dir={git_dir}",
+        f"--work-tree={root}",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.ignoreStat=false",
+        "-c",
+        "core.filemode=true",
+        *args,
+    ]
     completed = subprocess.run(
-        ["git", *args],
+        command,
         cwd=root,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=git_environment,
     )
-    if completed.returncode != 0:
+    permitted = accepted_exits or {0}
+    if completed.returncode not in permitted:
         detail = completed.stderr.decode("utf-8", errors="replace")[-1000:]
-        raise EvidenceError(f"{subject} failed with exit {completed.returncode}: {detail}")
-    return split_git_nul(completed.stdout, subject=subject)
+        raise EvidenceError(
+            f"{subject} failed with exit {completed.returncode}: {detail}"
+        )
+    if len(completed.stdout) > MAX_LOG_BYTES or len(completed.stderr) > MAX_LOG_BYTES:
+        raise EvidenceError(f"{subject} exceeded the Git output budget")
+    return completed.stdout
+
+
+def git_text(root: Path, args: Sequence[str], *, subject: str) -> str:
+    data = run_git(root, args, subject=subject)
+    try:
+        value = data.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"{subject} produced non-ASCII identity data") from error
+    if not value or "\n" in value:
+        raise EvidenceError(f"{subject} produced malformed identity data")
+    return value
+
+
+def parse_reference_lock(root: Path) -> dict[str, str]:
+    data, _size, _digest = stable_file_facts(
+        root / "SUITE.lock", max_bytes=MAX_RECORD_BYTES
+    )
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise EvidenceError("SUITE.lock is not UTF-8") from error
+    rows = [line.split() for line in lines if line.startswith("reference ")]
+    if len(rows) != 1 or len(rows[0]) != 5:
+        raise EvidenceError("SUITE.lock must contain exactly one strict Reference row")
+    directive, repository, tag_field, commit_field, tree_field, *extra = rows[0]
+    if directive != "reference" or extra:
+        raise EvidenceError("SUITE.lock Reference row is malformed")
+    fields = {
+        "repository": repository,
+        "tag": tag_field.removeprefix("tag="),
+        "commit": commit_field.removeprefix("commit="),
+        "tree": tree_field.removeprefix("tree="),
+    }
+    if (
+        fields["repository"] != "leanprover/lean4"
+        or tag_field == fields["tag"]
+        or commit_field == fields["commit"]
+        or tree_field == fields["tree"]
+        or not re.fullmatch(r"[0-9a-f]{40}", fields["commit"])
+        or not re.fullmatch(r"[0-9a-f]{40}", fields["tree"])
+    ):
+        raise EvidenceError("SUITE.lock Reference identity is malformed")
+    return fields
+
+
+def verify_vendor_binding(root: Path, vendor_path: str) -> dict[str, Any]:
+    root = lexical_absolute(root)
+    if vendor_path != "vendor/lean4-src":
+        raise EvidenceError(
+            "only the constitutional vendor/lean4-src binding is supported"
+        )
+    vendor = require_within(root / vendor_path, root, label="Reference vendor tree")
+    mode = vendor.lstat().st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise EvidenceError("Reference vendor tree must be a real directory")
+    for required in (vendor / "LICENSE", vendor / "LICENSES", root / "vendor/NOTICE"):
+        _data, _size, _digest = stable_file_facts(required, max_bytes=MAX_LOG_BYTES)
+    if os.path.lexists(vendor / ".git"):
+        raise EvidenceError(
+            "nested Git metadata is forbidden in the Reference vendor tree"
+        )
+    reference = parse_reference_lock(root)
+
+    def repository_state() -> tuple[str, str]:
+        toplevel = git_text(
+            root, ["rev-parse", "--show-toplevel"], subject="repository top level"
+        )
+        if lexical_absolute(Path(toplevel)) != root:
+            raise EvidenceError(
+                f"repository top level mismatch: expected={root} actual={toplevel}"
+            )
+        head = git_text(root, ["rev-parse", "HEAD"], subject="repository HEAD")
+        tree = git_text(
+            root,
+            ["rev-parse", f"{head}:{vendor_path}"],
+            subject="Reference HEAD subtree",
+        )
+        if tree != reference["tree"]:
+            raise EvidenceError(
+                f"Reference HEAD tree mismatch: expected={reference['tree']} actual={tree}"
+            )
+        run_git(
+            root,
+            [
+                "diff",
+                "--cached",
+                "--quiet",
+                "--no-ext-diff",
+                "--ignore-submodules=none",
+                head,
+                "--",
+                vendor_path,
+            ],
+            subject="Reference staged-index diff",
+        )
+        return head, tree
+
+    def scan_index_and_worktree() -> None:
+        unmerged = run_git(
+            root,
+            ["ls-files", "-u", "-z", "--", vendor_path],
+            subject="Reference unmerged-index scan",
+        )
+        if unmerged:
+            raise EvidenceError("Reference vendor tree contains unmerged index entries")
+        flags = split_git_nul(
+            run_git(
+                root,
+                ["ls-files", "-v", "-z", "--", vendor_path],
+                subject="Reference index-flag scan",
+            ),
+            subject="Reference index-flag scan",
+        )
+        for value in flags:
+            if len(value) < 3 or value[1] != " ":
+                raise EvidenceError(
+                    "Reference index-flag scan produced a malformed row"
+                )
+            if value[0] == "S" or value[0].islower():
+                raise EvidenceError(
+                    "Reference index entry carries a hidden-worktree flag: "
+                    f"{value[2:]}"
+                )
+        run_git(
+            root,
+            [
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--ignore-submodules=none",
+                "--",
+                vendor_path,
+            ],
+            subject="Reference worktree diff",
+        )
+        if run_git(
+            root,
+            ["ls-files", "--others", "-z", "--", vendor_path],
+            subject="Reference untracked scan",
+        ):
+            raise EvidenceError("Reference vendor tree contains untracked files")
+        if run_git(
+            root,
+            [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+                vendor_path,
+            ],
+            subject="Reference ignored-file scan",
+        ):
+            raise EvidenceError(
+                "Reference vendor tree contains ignored untracked files"
+            )
+
+    first_head, first_tree = repository_state()
+    scan_index_and_worktree()
+    second_head, second_tree = repository_state()
+    scan_index_and_worktree()
+    third_head, third_tree = repository_state()
+    if not (
+        (first_head, first_tree)
+        == (second_head, second_tree)
+        == (third_head, third_tree)
+    ):
+        raise EvidenceError("Reference repository state changed during verification")
+    object_format = git_text(
+        root, ["rev-parse", "--show-object-format"], subject="Git object format"
+    )
+    if object_format != "sha1":
+        raise EvidenceError(
+            f"unexpected Git object format for pinned Reference tree: {object_format}"
+        )
+    return {
+        "schema": "fln.git-tree-binding/1",
+        "path": vendor_path,
+        "repository": reference["repository"],
+        "tag": reference["tag"],
+        "commit": reference["commit"],
+        "object_format": object_format,
+        "tree": first_tree,
+    }
+
+
+def validate_vendor_binding_document(binding: Any) -> dict[str, Any]:
+    if not isinstance(binding, dict) or set(binding) != {
+        "schema",
+        "path",
+        "repository",
+        "tag",
+        "commit",
+        "object_format",
+        "tree",
+    }:
+        raise EvidenceError("Reference vendor binding has unknown or missing fields")
+    if (
+        binding.get("schema") != "fln.git-tree-binding/1"
+        or binding.get("path") != "vendor/lean4-src"
+        or binding.get("repository") != "leanprover/lean4"
+        or binding.get("object_format") != "sha1"
+        or not isinstance(binding.get("tag"), str)
+        or not binding["tag"]
+        or not re.fullmatch(r"[0-9a-f]{40}", str(binding.get("commit")))
+        or not re.fullmatch(r"[0-9a-f]{40}", str(binding.get("tree")))
+    ):
+        raise EvidenceError("Reference vendor binding is malformed")
+    return binding
 
 
 def inventory_root(rows: Sequence[dict[str, Any]]) -> str:
@@ -1804,7 +2376,11 @@ def collect_ubs_inventory(root: Path, scope: str) -> dict[str, Any]:
     selected: set[str] = set()
     for rel in candidates:
         rel_path = Path(rel)
-        if rel_path.is_absolute() or ".." in rel_path.parts or rel.startswith("vendor/"):
+        if (
+            rel_path.is_absolute()
+            or ".." in rel_path.parts
+            or rel.startswith("vendor/")
+        ):
             if rel.startswith("vendor/"):
                 continue
             raise EvidenceError(f"non-canonical UBS path: {rel!r}")
@@ -1816,7 +2392,9 @@ def collect_ubs_inventory(root: Path, scope: str) -> dict[str, Any]:
         except FileNotFoundError:
             continue
         if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-            raise EvidenceError(f"UBS input is not a regular no-follow file: {candidate}")
+            raise EvidenceError(
+                f"UBS input is not a regular no-follow file: {candidate}"
+            )
         selected.add(rel_path.as_posix())
     rows: list[dict[str, Any]] = []
     for rel in sorted(selected, key=lambda value: value.encode("utf-8")):
@@ -1831,14 +2409,18 @@ def collect_ubs_inventory(root: Path, scope: str) -> dict[str, Any]:
     }
 
 
-def validate_ubs_inventory(path: Path, root: Path) -> dict[str, Any]:
-    root = lexical_absolute(root)
-    _root, descriptor = open_directory_nofollow(root, create=False)
-    os.close(descriptor)
-    inventory = read_json_object(path)
-    if set(inventory) != {"schema", "scope", "count", "inventory_root", "files"}:
+def validate_ubs_inventory_document(inventory: Any) -> dict[str, Any]:
+    if not isinstance(inventory, dict) or set(inventory) != {
+        "schema",
+        "scope",
+        "count",
+        "inventory_root",
+        "files",
+    }:
         raise EvidenceError("UBS inventory has unknown or missing fields")
-    if inventory.get("schema") != "fln.ubs-inventory/1" or inventory.get("scope") not in {
+    if inventory.get("schema") != "fln.ubs-inventory/1" or inventory.get(
+        "scope"
+    ) not in {
         "changed",
         "all-tracked",
     }:
@@ -1860,26 +2442,59 @@ def validate_ubs_inventory(path: Path, root: Path) -> dict[str, Any]:
             or not rel.endswith((".rs", ".toml", ".py"))
         ):
             raise EvidenceError(f"UBS inventory path is non-canonical: {rel!r}")
-        candidate = require_within(root / rel, root, label="UBS inventory input")
-        mode = candidate.lstat().st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-            raise EvidenceError(f"UBS inventory input is not regular: {candidate}")
-        _data, size, digest = stable_file_facts(candidate)
-        if row.get("bytes") != size or row.get("sha256") != digest:
-            raise EvidenceError(f"UBS inventory input changed: {rel}")
+        if (
+            not isinstance(row.get("bytes"), int)
+            or isinstance(row.get("bytes"), bool)
+            or row["bytes"] < 0
+            or not SHA256_HEX.fullmatch(str(row.get("sha256")))
+        ):
+            raise EvidenceError(f"UBS inventory facts are malformed: {rel}")
         expected_paths.append(rel)
-    if expected_paths != sorted(set(expected_paths), key=lambda value: value.encode("utf-8")):
+    if expected_paths != sorted(
+        set(expected_paths), key=lambda value: value.encode("utf-8")
+    ):
         raise EvidenceError("UBS inventory paths are duplicate or unsorted")
     if inventory.get("inventory_root") != inventory_root(rows):
         raise EvidenceError("UBS inventory root is inconsistent")
     return inventory
 
 
-def emergency_kill(readiness_path: Path, expected_wrapper_pid: int, expected_stage_id: str) -> None:
+def validate_ubs_inventory(path: Path, root: Path | None) -> dict[str, Any]:
+    inventory = validate_ubs_inventory_document(read_json_object(path))
+    if root is None:
+        return inventory
+    root = lexical_absolute(root)
+    _root, descriptor = open_directory_nofollow(root, create=False)
+    os.close(descriptor)
+    recomputed = collect_ubs_inventory(root, inventory["scope"])
+    if recomputed != inventory:
+        raise EvidenceError(
+            "UBS inventory does not exactly cover its declared live repository scope"
+        )
+    for row in inventory["files"]:
+        rel = row["path"]
+        candidate = require_within(root / rel, root, label="UBS inventory input")
+        mode = candidate.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise EvidenceError(f"UBS inventory input is not regular: {candidate}")
+        _data, size, digest = stable_file_facts(candidate)
+        if row["bytes"] != size or row["sha256"] != digest:
+            raise EvidenceError(f"UBS inventory input changed: {rel}")
+    if collect_ubs_inventory(root, inventory["scope"]) != inventory:
+        raise EvidenceError("UBS inventory scope changed during validation")
+    return inventory
+
+
+def emergency_kill(
+    readiness_path: Path, expected_wrapper_pid: int, expected_stage_id: str
+) -> None:
     readiness = read_json_object(readiness_path)
     if readiness.get("schema") != "fln.supervisor-readiness/1":
         raise EvidenceError("emergency kill readiness schema mismatch")
-    if readiness.get("status") != "ready" or readiness.get("stage_id") != expected_stage_id:
+    if (
+        readiness.get("status") != "ready"
+        or readiness.get("stage_id") != expected_stage_id
+    ):
         raise EvidenceError("emergency kill readiness identity mismatch")
     wrapper_pid = readiness.get("wrapper_pid")
     child_pid = readiness.get("child_pid")
@@ -1904,11 +2519,56 @@ def emergency_kill(readiness_path: Path, expected_wrapper_pid: int, expected_sta
         or os.getpgid(child_pid) != child_pgid
     ):
         raise EvidenceError("emergency kill readiness is stale")
-    # Re-read immediately before the signal to narrow PID reuse races to the kernel
-    # operation itself; a mismatched second snapshot fails closed.
-    if proc_stat_facts(child_pid) != child_facts or proc_stat_facts(wrapper_pid) != wrapper_facts:
-        raise EvidenceError("emergency kill process identity changed")
-    os.killpg(child_pgid, signal.SIGKILL)
+    handles: ProcessHandles = {}
+    try:
+        if not remember_process(wrapper_pid, handles) or not remember_process(
+            child_pid, handles
+        ):
+            raise EvidenceError("emergency kill could not bind process lifetimes")
+        if (
+            handles[wrapper_pid][0] != wrapper_facts[2]
+            or handles[child_pid][0] != child_facts[2]
+        ):
+            raise EvidenceError("emergency kill process identity changed")
+
+        # Freeze the wrapper-owned subreaper tree before killing it. This catches
+        # descendants that created their own sessions and prevents any bound parent
+        # from forking across the final scan. Pidfds make every signal lifetime-safe.
+        live = live_tree_members(wrapper_pid, handles)
+        if wrapper_pid not in live or child_pid not in live:
+            raise EvidenceError("emergency kill readiness tree is incomplete")
+        freeze_deadline = time.monotonic() + 1.0
+        while time.monotonic() < freeze_deadline:
+            for pid in live:
+                signal_process_handle(pid, handles[pid], signal.SIGSTOP)
+            time.sleep(0.01)
+            repeated = live_tree_members(wrapper_pid, handles)
+            all_stopped = all(
+                (facts := proc_stat_facts(pid)) is not None
+                and facts[0] in {"T", "t"}
+                and facts[2] == handles[pid][0]
+                for pid in repeated
+            )
+            if repeated == live and all_stopped:
+                live = repeated
+                break
+            live = repeated
+        else:
+            raise EvidenceError("emergency kill could not freeze the complete tree")
+
+        for pid in sorted(live, key=lambda value: value == wrapper_pid):
+            signal_process_handle(pid, handles[pid], signal.SIGKILL)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            live = live_tree_members(wrapper_pid, handles)
+            if not live:
+                return
+            for pid in live:
+                signal_process_handle(pid, handles[pid], signal.SIGKILL)
+            time.sleep(0.01)
+        raise EvidenceError(f"emergency kill left live processes: {sorted(live)}")
+    finally:
+        close_process_handles(handles)
 
 
 def artifact_role(rel: str) -> str:
@@ -1928,6 +2588,10 @@ def artifact_role(rel: str) -> str:
         return "supervisor_readiness"
     if rel.endswith(".validation.json"):
         return "validation_report"
+    if rel == "vendor-binding.json":
+        return "reference_tree_binding"
+    if rel == "ubs-inventory.json":
+        return "ubs_inventory"
     return "artifact"
 
 
@@ -1942,7 +2606,9 @@ def artifact_inventory_once(
         try:
             mode = path.lstat().st_mode
         except FileNotFoundError as error:
-            raise EvidenceError(f"artifact disappeared during inventory: {path}") from error
+            raise EvidenceError(
+                f"artifact disappeared during inventory: {path}"
+            ) from error
         if stat.S_ISLNK(mode):
             raise EvidenceError(f"artifact symlink is forbidden: {path}")
         rel = path.relative_to(art_dir).as_posix()
@@ -1981,7 +2647,9 @@ def artifact_inventory(art_dir: Path, *, excluded: set[Path]) -> list[dict[str, 
         if current == previous:
             return current
         previous = current
-    raise EvidenceError("artifact inventory did not stabilize across consecutive snapshots")
+    raise EvidenceError(
+        "artifact inventory did not stabilize across consecutive snapshots"
+    )
 
 
 def generate_manifest(
@@ -2035,7 +2703,9 @@ def generate_manifest(
     present = {entry["path"] for entry in entries}
     required = {"run.ndjson", "run.validation.json"}
     if not required.issubset(present):
-        raise EvidenceError(f"manifest is missing required artifacts: {sorted(required - present)!r}")
+        raise EvidenceError(
+            f"manifest is missing required artifacts: {sorted(required - present)!r}"
+        )
     manifest = {
         "schema": "fln.evidence-manifest/1",
         "run_schema": run_schema,
@@ -2057,7 +2727,13 @@ def generate_manifest(
     return manifest
 
 
-def validate_manifest(art_dir: Path, manifest_path: Path, digest_path: Path) -> None:
+def validate_manifest(
+    art_dir: Path,
+    manifest_path: Path,
+    digest_path: Path,
+    *,
+    live_context: bool = True,
+) -> None:
     art_dir = lexical_absolute(art_dir)
     _root, root_fd = open_directory_nofollow(art_dir, create=False)
     os.close(root_fd)
@@ -2068,7 +2744,13 @@ def validate_manifest(art_dir: Path, manifest_path: Path, digest_path: Path) -> 
         raise EvidenceError("wrong evidence manifest schema")
     if manifest.get("run_schema") not in RUN_SCHEMAS:
         raise EvidenceError("manifest run schema is unsupported")
-    if manifest.get("verdict") not in {"pass", "fail", "internal_fault", "inconclusive", "cancelled"}:
+    if manifest.get("verdict") not in {
+        "pass",
+        "fail",
+        "internal_fault",
+        "inconclusive",
+        "cancelled",
+    }:
         raise EvidenceError("manifest verdict is unsupported")
     for key in ("input_root", "final_root"):
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(manifest.get(key))):
@@ -2096,8 +2778,13 @@ def validate_manifest(art_dir: Path, manifest_path: Path, digest_path: Path) -> 
         if entry.get("role") == "directory":
             _directory, descriptor = open_directory_nofollow(path, create=False)
             os.close(descriptor)
-            expected_directory_digest = hashlib.sha256(b"fln-artifact-directory/1").hexdigest()
-            if entry.get("bytes") != 0 or entry.get("sha256") != expected_directory_digest:
+            expected_directory_digest = hashlib.sha256(
+                b"fln-artifact-directory/1"
+            ).hexdigest()
+            if (
+                entry.get("bytes") != 0
+                or entry.get("sha256") != expected_directory_digest
+            ):
                 raise EvidenceError(f"manifest directory facts mismatch: {rel}")
         else:
             _data, size, digest = stable_file_facts(path)
@@ -2114,8 +2801,13 @@ def validate_manifest(art_dir: Path, manifest_path: Path, digest_path: Path) -> 
         manifest.get("input_root") == manifest.get("final_root")
     ):
         raise EvidenceError("manifest final-state assertion is inconsistent")
-    if manifest.get("verdict") == "pass" and manifest.get("final_state_matches_input") is not True:
-        raise EvidenceError("passing manifest does not preserve its canonical input root")
+    if (
+        manifest.get("verdict") == "pass"
+        and manifest.get("final_state_matches_input") is not True
+    ):
+        raise EvidenceError(
+            "passing manifest does not preserve its canonical input root"
+        )
     actual_entries = artifact_inventory(
         art_dir,
         excluded={manifest_path, digest_path, art_dir / "bundle.complete.json"},
@@ -2126,9 +2818,16 @@ def validate_manifest(art_dir: Path, manifest_path: Path, digest_path: Path) -> 
         )
     required = {"run.ndjson", "run.validation.json"}
     if not required.issubset(seen_paths):
-        raise EvidenceError(f"manifest is missing required artifacts: {sorted(required - seen_paths)!r}")
+        raise EvidenceError(
+            f"manifest is missing required artifacts: {sorted(required - seen_paths)!r}"
+        )
     run_log = art_dir / "run.ndjson"
-    run_report = validate_run(run_log, manifest["run_schema"], str(manifest.get("verdict")))
+    run_report = validate_run(
+        run_log,
+        manifest["run_schema"],
+        str(manifest.get("verdict")),
+        live_context=live_context,
+    )
     if read_json_object(art_dir / "run.validation.json") != run_report:
         raise EvidenceError("manifested run validation report is stale or forged")
     terminal = load_ndjson(run_log)[-1]
@@ -2166,6 +2865,7 @@ def complete_bundle(
     governed_paths: Sequence[str],
     expected_root: str,
     inventory_path: Path | None = None,
+    vendor_path: str | None = None,
 ) -> dict[str, Any]:
     art_dir = lexical_absolute(art_dir)
     output = require_within(output, art_dir, label="bundle commit")
@@ -2210,11 +2910,17 @@ def complete_bundle(
     )
     if repeated_bindings != initial_bindings:
         raise EvidenceError("bundle bindings changed during prospective validation")
-    validate_marker_bindings(marker, read_json_object(manifest_path), load_ndjson(run_log)[-1], repeated_bindings)
+    validate_marker_bindings(
+        marker,
+        read_json_object(manifest_path),
+        load_ndjson(run_log)[-1],
+        repeated_bindings,
+    )
     current_root = tree_hash(
         governed_root,
         governed_paths,
         inventory_path=inventory_path,
+        vendor_path=vendor_path,
     )
     if current_root != expected_root or current_root != manifest.get("final_root"):
         raise EvidenceError("governed inputs changed before bundle commit")
@@ -2243,7 +2949,10 @@ def validate_marker_bindings(
         "manifest_digest",
     }:
         raise EvidenceError("bundle marker has unknown or missing fields")
-    if marker.get("schema") != "fln.evidence-bundle-commit/1" or marker.get("status") != "committed":
+    if (
+        marker.get("schema") != "fln.evidence-bundle-commit/1"
+        or marker.get("status") != "committed"
+    ):
         raise EvidenceError("invalid evidence bundle commit marker")
     for key in ("run_id", "bead", "scenario", "verdict"):
         if marker.get(key) != manifest.get(key):
@@ -2282,7 +2991,7 @@ def validate_bundle(
         or commit_path.name != "bundle.complete.json"
     ):
         raise EvidenceError("bundle uses non-canonical artifact names")
-    validate_manifest(art_dir, manifest_path, digest_path)
+    validate_manifest(art_dir, manifest_path, digest_path, live_context=False)
     manifest = read_json_object(manifest_path)
     marker = read_json_object(commit_path)
     run_log = art_dir / "run.ndjson"
@@ -2340,7 +3049,9 @@ def add_fields(record: dict[str, Any], args: argparse.Namespace) -> None:
         if key in occupied:
             raise EvidenceError(f"duplicate field: {key}")
         occupied.add(key)
-        data, _size, _digest = stable_file_facts(Path(path_raw), max_bytes=MAX_RECORD_BYTES)
+        data, _size, _digest = stable_file_facts(
+            Path(path_raw), max_bytes=MAX_RECORD_BYTES
+        )
         record[key] = parse_json(data, subject=path_raw)
 
 
@@ -2385,7 +3096,9 @@ def cmd_validate_guard(args: argparse.Namespace) -> int:
         args.observed_exit,
     )
     if args.output:
-        require_within(Path(args.output), Path(args.artifact_root), label="guard validation")
+        require_within(
+            Path(args.output), Path(args.artifact_root), label="guard validation"
+        )
         write_new(Path(args.output), canonical_json(report))
     else:
         sys.stdout.buffer.write(canonical_json(report))
@@ -2399,9 +3112,12 @@ def cmd_validate_run(args: argparse.Namespace) -> int:
         args.expected_verdict,
         expected_active_stage=args.expected_active_stage,
         expected_planted_stage=args.expected_planted_stage,
+        live_context=not args.offline,
     )
     if args.output:
-        require_within(Path(args.output), Path(args.artifact_root), label="run validation")
+        require_within(
+            Path(args.output), Path(args.artifact_root), label="run validation"
+        )
         write_new(Path(args.output), canonical_json(report))
     else:
         sys.stdout.buffer.write(canonical_json(report))
@@ -2410,7 +3126,33 @@ def cmd_validate_run(args: argparse.Namespace) -> int:
 
 def cmd_hash_tree(args: argparse.Namespace) -> int:
     inventory_path = Path(args.inventory) if args.inventory else None
-    print(tree_hash(Path(args.root), args.path, inventory_path=inventory_path))
+    root = tree_hash(
+        Path(args.root),
+        args.path,
+        inventory_path=inventory_path,
+        vendor_path=args.vendor_path,
+    )
+    if args.output:
+        if not args.artifact_root:
+            raise EvidenceError("hash-tree --output requires --artifact-root")
+        require_within(
+            Path(args.output), Path(args.artifact_root), label="tree-hash output"
+        )
+        write_new(Path(args.output), f"{root}\n".encode())
+    else:
+        print(root)
+    return PASS
+
+
+def cmd_vendor_binding(args: argparse.Namespace) -> int:
+    binding = verify_vendor_binding(Path(args.root), args.vendor_path)
+    if args.output:
+        require_within(
+            Path(args.output), Path(args.artifact_root), label="vendor binding"
+        )
+        write_new(Path(args.output), canonical_json(binding))
+    else:
+        sys.stdout.buffer.write(canonical_json(binding))
     return PASS
 
 
@@ -2443,7 +3185,9 @@ def cmd_exec_ubs_inventory(args: argparse.Namespace) -> int:
 
 
 def cmd_emergency_kill(args: argparse.Namespace) -> int:
-    emergency_kill(Path(args.readiness), args.expected_wrapper_pid, args.expected_stage_id)
+    emergency_kill(
+        Path(args.readiness), args.expected_wrapper_pid, args.expected_stage_id
+    )
     return PASS
 
 
@@ -2463,7 +3207,12 @@ def cmd_manifest(args: argparse.Namespace) -> int:
 
 
 def cmd_validate_manifest(args: argparse.Namespace) -> int:
-    validate_manifest(Path(args.art_dir), Path(args.manifest), Path(args.digest))
+    validate_manifest(
+        Path(args.art_dir),
+        Path(args.manifest),
+        Path(args.digest),
+        live_context=not args.offline,
+    )
     return PASS
 
 
@@ -2477,6 +3226,7 @@ def cmd_complete_bundle(args: argparse.Namespace) -> int:
         governed_paths=args.governed_path,
         expected_root=args.expected_root,
         inventory_path=Path(args.inventory) if args.inventory else None,
+        vendor_path=args.vendor_path,
     )
     return PASS
 
@@ -2496,8 +3246,12 @@ def cmd_validate_bundle(args: argparse.Namespace) -> int:
         except ValueError:
             pass
         else:
-            raise EvidenceError("bundle validation output cannot mutate the committed bundle")
-        require_within(Path(args.output), Path(args.artifact_root), label="bundle validation")
+            raise EvidenceError(
+                "bundle validation output cannot mutate the committed bundle"
+            )
+        require_within(
+            Path(args.output), Path(args.artifact_root), label="bundle validation"
+        )
         write_new(Path(args.output), canonical_json(report))
     else:
         sys.stdout.buffer.write(canonical_json(report))
@@ -2579,8 +3333,13 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         capture=4096,
         budget=262_144,
     )
-    require(rc == PASS and meta["classification"] == "pass", "large output changed exit")
-    require(meta["stdout"]["truncated"] and meta["stderr"]["truncated"], "flood not truncated")
+    require(
+        rc == PASS and meta["classification"] == "pass", "large output changed exit"
+    )
+    require(
+        meta["stdout"]["truncated"] and meta["stderr"]["truncated"],
+        "flood not truncated",
+    )
     out_data, out_size, _out_digest = stable_file_facts(root / "stage.out")
     err_data, err_size, _err_digest = stable_file_facts(root / "stage.err")
     require(out_size <= 4096, "stdout capture exceeded bound")
@@ -2588,17 +3347,35 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     require(out_data.endswith(b"OUT_TAIL"), "stdout tail lost")
     require(err_data.endswith(b"ERR_TAIL"), "stderr tail lost")
     serialized = canonical_json(meta)
-    require(b"supersecret" not in serialized and b"<redacted>" in serialized, "secret leaked")
-    cases.append({"case": "large_output_pass", "ok": True, "metadata": str(root / "stage.meta.json")})
+    require(
+        b"supersecret" not in serialized and b"<redacted>" in serialized,
+        "secret leaked",
+    )
+    cases.append(
+        {
+            "case": "large_output_pass",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
 
     rc, meta, root = run_case(
         "semantic_failure",
         [sys.executable, "-c", "raise SystemExit(7)"],
         semantic_exits=[7],
     )
-    require(rc == FAIL and meta["classification"] == "fail", "semantic exit was not a failure")
+    require(
+        rc == FAIL and meta["classification"] == "fail",
+        "semantic exit was not a failure",
+    )
     require(meta["child_exit"] == 7, "semantic child exit was not retained")
-    cases.append({"case": "semantic_failure", "ok": True, "metadata": str(root / "stage.meta.json")})
+    cases.append(
+        {
+            "case": "semantic_failure",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
 
     rc, meta, root = run_case(
         "unexpected_child_exit",
@@ -2608,7 +3385,13 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         rc == SETUP_FAILURE and meta["classification"] == "internal_fault",
         "unexpected child exit was mislabeled semantic",
     )
-    cases.append({"case": "unexpected_child_exit", "ok": True, "metadata": str(root / "stage.meta.json")})
+    cases.append(
+        {
+            "case": "unexpected_child_exit",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
 
     rc, meta, root = run_case(
         "unexpected_child_signal",
@@ -2618,7 +3401,13 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         rc == INCONCLUSIVE and meta["classification"] == "inconclusive",
         "unexpected child signal was mislabeled semantic",
     )
-    cases.append({"case": "unexpected_child_signal", "ok": True, "metadata": str(root / "stage.meta.json")})
+    cases.append(
+        {
+            "case": "unexpected_child_signal",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
 
     endless_output = "import os; b=b'x'*65536\nwhile True: os.write(1,b); os.write(2,b)"
     rc, meta, root = run_case(
@@ -2630,8 +3419,17 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
     require(rc == INCONCLUSIVE, "output exhaustion did not return inconclusive")
     require(meta["classification"] == "inconclusive", "output exhaustion misclassified")
-    require(meta["reason_code"] == "output_budget_exhausted", "wrong output exhaustion reason")
-    cases.append({"case": "output_budget_exhausted", "ok": True, "metadata": str(root / "stage.meta.json")})
+    require(
+        meta["reason_code"] == "output_budget_exhausted",
+        "wrong output exhaustion reason",
+    )
+    cases.append(
+        {
+            "case": "output_budget_exhausted",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
 
     rc, meta, root = run_case(
         "spawn_failure",
@@ -2642,8 +3440,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     require(rc == SETUP_FAILURE, "spawn failure did not return internal-fault exit")
     require(meta["classification"] == "internal_fault", "spawn failure misclassified")
     spawn_ready = read_json_object(root / "stage.ready.json")
-    require(spawn_ready["status"] == "spawn_failed", "spawn failure readiness is untyped")
-    cases.append({"case": "spawn_failure", "ok": True, "metadata": str(root / "stage.meta.json")})
+    require(
+        spawn_ready["status"] == "spawn_failed", "spawn failure readiness is untyped"
+    )
+    cases.append(
+        {"case": "spawn_failure", "ok": True, "metadata": str(root / "stage.meta.json")}
+    )
 
     pid_file = art_dir / "timeout-pids.txt"
     tree_program = (
@@ -2660,11 +3462,23 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         budget=65_536,
         timeout=250,
     )
-    require(rc == INCONCLUSIVE and meta["reason_code"] == "timeout", "timeout misclassified")
+    require(
+        rc == INCONCLUSIVE and meta["reason_code"] == "timeout", "timeout misclassified"
+    )
     pids = [int(value) for value in pid_file.read_text(encoding="utf-8").splitlines()]
     time.sleep(0.1)
-    require(not any(process_alive(pid) for pid in pids), "timeout left a live process-tree member")
-    cases.append({"case": "timeout", "ok": True, "metadata": str(root / "stage.meta.json"), "pids": pids})
+    require(
+        not any(process_alive(pid) for pid in pids),
+        "timeout left a live process-tree member",
+    )
+    cases.append(
+        {
+            "case": "timeout",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+            "pids": pids,
+        }
+    )
 
     leader_root = case_dir("leader_exit_with_inherited_pipe")
     leader_pid_file = leader_root / "pids.txt"
@@ -2690,7 +3504,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         planted=False,
     )
     leader_meta = read_json_object(leader_root / "stage.meta.json")
-    require(rc == SETUP_FAILURE, "leader-first descendant leak was not an internal fault")
+    require(
+        rc == SETUP_FAILURE, "leader-first descendant leak was not an internal fault"
+    )
     leader_pids = [
         int(value) for value in leader_pid_file.read_text(encoding="utf-8").splitlines()
     ]
@@ -2760,16 +3576,37 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     ):
         time.sleep(0.02)
     require(cancel_pid_file.exists(), "cancellation child did not publish PIDs")
-    require((cancel_root / "stage.ready.json").exists(), "supervisor readiness was not published")
+    require(
+        (cancel_root / "stage.ready.json").exists(),
+        "supervisor readiness was not published",
+    )
     wrapper.send_signal(signal.SIGTERM)
     _wrapper_out, wrapper_err = wrapper.communicate(timeout=5)
-    require(wrapper.returncode == CANCELLED, f"cancellation wrapper exit {wrapper.returncode}: {wrapper_err!r}")
+    require(
+        wrapper.returncode == CANCELLED,
+        f"cancellation wrapper exit {wrapper.returncode}: {wrapper_err!r}",
+    )
     cancel_meta = read_json_object(cancel_root / "stage.meta.json")
-    require(cancel_meta["classification"] == "cancelled", "TERM was not typed as cancellation")
-    cancel_pids = [int(value) for value in cancel_pid_file.read_text(encoding="utf-8").splitlines()]
+    require(
+        cancel_meta["classification"] == "cancelled",
+        "TERM was not typed as cancellation",
+    )
+    cancel_pids = [
+        int(value) for value in cancel_pid_file.read_text(encoding="utf-8").splitlines()
+    ]
     time.sleep(0.1)
-    require(not any(process_alive(pid) for pid in cancel_pids), "TERM left a live process-tree member")
-    cases.append({"case": "cancel_term", "ok": True, "metadata": str(cancel_root / "stage.meta.json"), "pids": cancel_pids})
+    require(
+        not any(process_alive(pid) for pid in cancel_pids),
+        "TERM left a live process-tree member",
+    )
+    cases.append(
+        {
+            "case": "cancel_term",
+            "ok": True,
+            "metadata": str(cancel_root / "stage.meta.json"),
+            "pids": cancel_pids,
+        }
+    )
 
     collision_root = case_dir("artifact_publication_failure")
     collision = collision_root / "not-a-directory"
@@ -2792,9 +3629,17 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
     meta = read_json_object(metadata)
     require(rc == SETUP_FAILURE, "artifact publication failure returned success")
-    require(meta["classification"] == "internal_fault", "artifact failure was not internal fault")
-    require(meta["reason_code"] == "artifact_publication_failure", "artifact failure reason lost")
-    cases.append({"case": "artifact_publication_failure", "ok": True, "metadata": str(metadata)})
+    require(
+        meta["classification"] == "internal_fault",
+        "artifact failure was not internal fault",
+    )
+    require(
+        meta["reason_code"] == "artifact_publication_failure",
+        "artifact failure reason lost",
+    )
+    cases.append(
+        {"case": "artifact_publication_failure", "ok": True, "metadata": str(metadata)}
+    )
 
     malformed_root = case_dir("malformed_evidence")
     malformed = malformed_root / "malformed.ndjson"
@@ -3013,7 +3858,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "cases": cases,
     }
     write_new(art_dir / "self-test.json", canonical_json(report))
-    print(f"evidence self-test: PASS ({len(cases)} cases); artifacts: {art_dir}", file=sys.stderr)
+    print(
+        f"evidence self-test: PASS ({len(cases)} cases); artifacts: {art_dir}",
+        file=sys.stderr,
+    )
     return PASS
 
 
@@ -3034,7 +3882,9 @@ def build_parser() -> argparse.ArgumentParser:
     emit_parser.add_argument("--json-file", nargs=2, action="append")
     emit_parser.set_defaults(func=cmd_emit)
 
-    run_parser = subparsers.add_parser("run", help="run one command under bounded capture")
+    run_parser = subparsers.add_parser(
+        "run", help="run one command under bounded capture"
+    )
     run_parser.add_argument("--cwd", required=True)
     run_parser.add_argument("--metadata", required=True)
     run_parser.add_argument("--stdout", required=True)
@@ -3075,25 +3925,42 @@ def build_parser() -> argparse.ArgumentParser:
     run_validation.add_argument("--expected-planted-stage")
     run_validation.add_argument("--artifact-root", required=True)
     run_validation.add_argument("--output")
+    run_validation.add_argument("--offline", action="store_true")
     run_validation.set_defaults(func=cmd_validate_run)
 
     hash_parser = subparsers.add_parser("hash-tree", help="hash canonical input files")
     hash_parser.add_argument("--root", required=True)
     hash_parser.add_argument("--path", action="append", required=True)
     hash_parser.add_argument("--inventory")
+    hash_parser.add_argument("--vendor-path")
+    hash_parser.add_argument("--output")
+    hash_parser.add_argument("--artifact-root")
     hash_parser.set_defaults(func=cmd_hash_tree)
+
+    vendor_parser = subparsers.add_parser(
+        "vendor-binding",
+        help="verify and publish the pinned Reference Git-tree binding",
+    )
+    vendor_parser.add_argument("--root", required=True)
+    vendor_parser.add_argument("--vendor-path", required=True)
+    vendor_parser.add_argument("--output")
+    vendor_parser.add_argument("--artifact-root")
+    vendor_parser.set_defaults(func=cmd_vendor_binding)
 
     inventory_parser = subparsers.add_parser(
         "ubs-inventory", help="publish an exact project-authored UBS file inventory"
     )
     inventory_parser.add_argument("--root", required=True)
-    inventory_parser.add_argument("--scope", required=True, choices=("changed", "all-tracked"))
+    inventory_parser.add_argument(
+        "--scope", required=True, choices=("changed", "all-tracked")
+    )
     inventory_parser.add_argument("--output", required=True)
     inventory_parser.add_argument("--artifact-root", required=True)
     inventory_parser.set_defaults(func=cmd_ubs_inventory)
 
     inventory_validation = subparsers.add_parser(
-        "validate-ubs-inventory", help="verify an exact UBS inventory against the workspace"
+        "validate-ubs-inventory",
+        help="verify an exact UBS inventory against the workspace",
     )
     inventory_validation.add_argument("--root", required=True)
     inventory_validation.add_argument("--inventory", required=True)
@@ -3115,7 +3982,9 @@ def build_parser() -> argparse.ArgumentParser:
     emergency_parser.add_argument("--expected-stage-id", required=True)
     emergency_parser.set_defaults(func=cmd_emergency_kill)
 
-    manifest_parser = subparsers.add_parser("manifest", help="publish an evidence manifest")
+    manifest_parser = subparsers.add_parser(
+        "manifest", help="publish an evidence manifest"
+    )
     manifest_parser.add_argument("--art-dir", required=True)
     manifest_parser.add_argument("--output", required=True)
     manifest_parser.add_argument("--digest-output", required=True)
@@ -3128,11 +3997,13 @@ def build_parser() -> argparse.ArgumentParser:
     manifest_parser.set_defaults(func=cmd_manifest)
 
     manifest_validation = subparsers.add_parser(
-        "validate-manifest", help="verify every manifested artifact and terminal binding"
+        "validate-manifest",
+        help="verify every manifested artifact and terminal binding",
     )
     manifest_validation.add_argument("--art-dir", required=True)
     manifest_validation.add_argument("--manifest", required=True)
     manifest_validation.add_argument("--digest", required=True)
+    manifest_validation.add_argument("--offline", action="store_true")
     manifest_validation.set_defaults(func=cmd_validate_manifest)
 
     complete_parser = subparsers.add_parser(
@@ -3146,6 +4017,7 @@ def build_parser() -> argparse.ArgumentParser:
     complete_parser.add_argument("--governed-path", action="append", required=True)
     complete_parser.add_argument("--expected-root", required=True)
     complete_parser.add_argument("--inventory")
+    complete_parser.add_argument("--vendor-path")
     complete_parser.set_defaults(func=cmd_complete_bundle)
 
     bundle_validation = subparsers.add_parser(
@@ -3171,7 +4043,14 @@ def main() -> int:
     try:
         args = build_parser().parse_args()
         return int(args.func(args))
-    except (EvidenceError, OSError, ValueError, TypeError, KeyError, IndexError) as error:
+    except (
+        EvidenceError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+    ) as error:
         print(f"evidence: {error}", file=sys.stderr)
         return SETUP_FAILURE
 

@@ -71,12 +71,18 @@ FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
 FINALIZING=0
+FINALIZER_PID=""
+FINALIZATION_SIGNAL=""
+FINALIZATION_SIGNAL_EXIT=0
+FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
-  vendor/lean4-src
+  vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
-  scripts/e2e/structural_gate.sh .github/workflows/ci.yml
+  scripts/e2e/structural_gate.sh scripts/e2e/core_observables.sh
+  scripts/extract/gen_core_fixtures.sh scripts/extract/gen_core_fixtures.lean
+  .github/workflows/ci.yml
 )
 HASH_ARGS=()
 GOVERNED_ARGS=()
@@ -88,6 +94,8 @@ done
 UBS_SCOPE="${FLN_UBS_SCOPE:-changed}"
 [ "${CI:-}" = true ] && UBS_SCOPE="${FLN_UBS_SCOPE:-all-tracked}"
 UBS_INVENTORY="$ART_DIR/ubs-inventory.json"
+VENDOR_PATH="vendor/lean4-src"
+VENDOR_BINDING="$ART_DIR/vendor-binding.json"
 mkdir -p "$(dirname "$ART_DIR")"
 if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
   echo "[check] setup failure: refusing reused evidence directory: $ART_DIR" >&2
@@ -99,8 +107,13 @@ python3 "$EVIDENCE" ubs-inventory --root "$REPO" --scope "$UBS_SCOPE" \
     echo "[check] setup failure: cannot inventory UBS inputs" >&2
     exit 2
   }
+python3 "$EVIDENCE" vendor-binding --root "$REPO" --vendor-path "$VENDOR_PATH" \
+  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" || {
+    echo "[check] setup failure: cannot verify the pinned Reference tree" >&2
+    exit 2
+  }
 INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$REPO" "${HASH_ARGS[@]}" \
-  --inventory "$UBS_INVENTORY")" || {
+  --inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH")" || {
     echo "[check] setup failure: cannot hash governed inputs" >&2
     exit 2
   }
@@ -219,12 +232,47 @@ on_signal() {
   exit "$exit_code"
 }
 
+# Invoked only while the EXIT finalizer is active. A signal before the bundle marker
+# interrupts the current publication command and leaves the evidence uncommitted.
+# shellcheck disable=SC2317
+on_finalizer_signal() {
+  local name="$1" exit_code="$2"
+  if [ -z "$FINALIZATION_SIGNAL" ]; then
+    FINALIZATION_SIGNAL="$name"
+    FINALIZATION_SIGNAL_EXIT="$exit_code"
+  fi
+  if [ -n "$FINALIZER_PID" ]; then
+    kill -s "$name" "$FINALIZER_PID" 2>/dev/null || true
+  fi
+}
+
+# shellcheck disable=SC2317
+run_finalizer_command() {
+  local rc=0
+  [ -z "$FINALIZATION_SIGNAL" ] || return 125
+  "$@" &
+  FINALIZER_PID=$!
+  wait "$FINALIZER_PID" || rc=$?
+  FINALIZER_PID=""
+  return "$rc"
+}
+
+# shellcheck disable=SC2317
+abort_if_finalizer_signalled() {
+  if [ -n "$FINALIZATION_SIGNAL" ]; then
+    note "CANCELLED: signal_$FINALIZATION_SIGNAL before evidence bundle commit: $ART_DIR"
+    exit "$FINALIZATION_SIGNAL_EXIT"
+  fi
+}
+
 # Invoked indirectly by trap.
 # shellcheck disable=SC2317
 on_exit() {
-  local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0
+  local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0 bundle_rc=0
   trap - EXIT
-  trap '' HUP INT TERM
+  trap 'on_finalizer_signal HUP 129' HUP
+  trap 'on_finalizer_signal INT 130' INT
+  trap 'on_finalizer_signal TERM 143' TERM
   set +e
   if [ "$FINALIZING" -ne 0 ]; then
     exit 2
@@ -237,9 +285,13 @@ on_exit() {
       set_final internal_fault unexpected_shell_exit 2
     fi
   fi
-  final_root="$(python3 "$EVIDENCE" hash-tree --root "$REPO" "${HASH_ARGS[@]}" \
-    --inventory "$UBS_INVENTORY" 2>/dev/null)" \
-    || hash_rc=$?
+  run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$REPO" \
+    "${HASH_ARGS[@]}" --inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH" \
+    --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" 2>/dev/null || hash_rc=$?
+  abort_if_finalizer_signalled
+  if [ "$hash_rc" -eq 0 ]; then
+    IFS= read -r final_root < "$FINAL_ROOT_FILE" || hash_rc=2
+  fi
   if [ "$hash_rc" -ne 0 ]; then
     final_root="unavailable"
     set_final internal_fault final_workspace_hash_unavailable 2
@@ -247,34 +299,47 @@ on_exit() {
     set_final fail final_workspace_changed 1
   fi
   if [ "$TERMINAL_EMITTED" -eq 0 ]; then
-    if emit_terminal "$final_root"; then TERMINAL_EMITTED=1; else publish_rc=2; fi
+    if run_finalizer_command emit_terminal "$final_root"; then
+      TERMINAL_EMITTED=1
+    else
+      publish_rc=2
+    fi
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" validate-run \
+    run_finalizer_command python3 "$EVIDENCE" validate-run \
       --file "$NDJSON" --schema "$SCHEMA" --expected-verdict "$FINAL_VERDICT" \
       --artifact-root "$ART_DIR" --output "$ART_DIR/run.validation.json" || publish_rc=2
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" manifest \
+    run_finalizer_command python3 "$EVIDENCE" manifest \
       --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" \
       --digest-output "$ART_DIR/manifest.digest" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario quality_gate \
       --verdict "$FINAL_VERDICT" --input-root "$INPUT_ROOT" --final-root "$final_root" \
       || publish_rc=2
+    abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
+    run_finalizer_command python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$REPO" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
-      --inventory "$UBS_INVENTORY" || publish_rc=2
-  fi
-  if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
-      --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
-      --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
-      >/dev/null || publish_rc=2
+      --inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH" || bundle_rc=$?
+    if [ -e "$ART_DIR/bundle.complete.json" ]; then
+      # Marker publication is the linearization point. From here, signals are
+      # post-commit and validation decides whether that marker is complete.
+      trap '' HUP INT TERM
+      python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+        --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
+        --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
+        >/dev/null || publish_rc=2
+    else
+      [ "$bundle_rc" -eq 0 ] || publish_rc=2
+      abort_if_finalizer_signalled
+    fi
   fi
   if [ "$publish_rc" -ne 0 ]; then
     note "INTERNAL FAULT: evidence bundle did not publish completely: $ART_DIR"
@@ -318,6 +383,7 @@ emit_event \
   --string cache_state "$CACHE_STATE" \
   --string input_root "$INPUT_ROOT" \
   --string ubs_inventory ubs-inventory.json \
+  --string vendor_binding vendor-binding.json \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"stage_timeout_ms\":$STAGE_TIMEOUT_MS,\"kill_grace_ms\":$KILL_GRACE_MS}" \
   --string rustc "$(rustc --version 2>/dev/null || printf unknown)" \
   --string planted "$PLANT"
@@ -544,7 +610,8 @@ fi
 run_stage evidence-self-test python3 scripts/evidence.py self-test \
   --art-dir "$ART_DIR/evidence-self-test"
 run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
-  scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh
+  scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh \
+  scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets
 run_stage clippy cargo clippy --locked --all-targets -- -D warnings

@@ -86,13 +86,35 @@ schema fln-workspace-graph/1
 crate fln-core       rank=0  kind=ordinary
 crate fln-hash       rank=1  kind=ordinary
 crate fln-bignum     rank=1  kind=ordinary
+crate fln-libm       rank=1  kind=ordinary
 crate fln-unsafe-abi rank=2  kind=unsafe-boundary
 crate fln-unsafe-region rank=2 kind=unsafe-boundary
+crate fln-rt         rank=3  kind=ordinary
 crate fln-env        rank=4  kind=ordinary
+crate fln-olean      rank=5  kind=ordinary
 crate fln-kernel     rank=6  kind=ordinary
 crate fln-checker    rank=6  kind=ordinary
+crate fln-syntax     rank=7  kind=ordinary
+crate fln-parse      rank=8  kind=ordinary
 crate fln-mid        rank=8  kind=ordinary
+crate fln-elab       rank=9  kind=ordinary
+crate fln-comp       rank=10 kind=ordinary
+crate fln-vm         rank=11 kind=ordinary
 crate fln-unsafe-jit rank=12 kind=unsafe-boundary
+crate fln-verdict    rank=13 kind=ordinary
+crate fln-anvil      rank=14 kind=ordinary
+crate fln-ledger     rank=15 kind=ordinary
+crate fln-lake       rank=16 kind=ordinary
+crate fln-server     rank=17 kind=ordinary
+crate fln-trace      rank=18 kind=ordinary
+crate fln            rank=19 kind=ordinary
+crate fln-hound      rank=20 kind=ordinary
+crate fln-doc        rank=20 kind=ordinary
+crate fln-mcp        rank=20 kind=ordinary
+crate fln-tui        rank=20 kind=ordinary
+crate fln-cli        rank=21 kind=ordinary
+crate fln-wasm       rank=21 kind=ordinary
+crate fln-conformance rank=22 kind=ordinary
 prohibit fln-unsafe-* ->* fln-kernel
 prohibit fln-unsafe-* ->* fln-checker
 prohibit fln-kernel ->* fln-checker
@@ -122,17 +144,39 @@ corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665
 
 /// The crates every base fixture materializes (name, is-boundary) — must stay in
 /// lockstep with BASE_GRAPH and base().
-const FIXTURE_CRATES: [(&str, bool); 10] = [
+const FIXTURE_CRATES: [(&str, bool); 32] = [
     ("fln-core", false),
     ("fln-hash", false),
     ("fln-bignum", false),
+    ("fln-libm", false),
     ("fln-unsafe-abi", true),
     ("fln-unsafe-region", true),
+    ("fln-rt", false),
     ("fln-env", false),
+    ("fln-olean", false),
     ("fln-kernel", false),
     ("fln-checker", false),
+    ("fln-syntax", false),
+    ("fln-parse", false),
     ("fln-mid", false),
+    ("fln-elab", false),
+    ("fln-comp", false),
+    ("fln-vm", false),
     ("fln-unsafe-jit", true),
+    ("fln-verdict", false),
+    ("fln-anvil", false),
+    ("fln-ledger", false),
+    ("fln-lake", false),
+    ("fln-server", false),
+    ("fln-trace", false),
+    ("fln", false),
+    ("fln-hound", false),
+    ("fln-doc", false),
+    ("fln-mcp", false),
+    ("fln-tui", false),
+    ("fln-cli", false),
+    ("fln-wasm", false),
+    ("fln-conformance", false),
 ];
 
 fn fixture_cargo_lock() -> String {
@@ -174,7 +218,8 @@ fn lib_rs(boundary: bool) -> &'static str {
     }
 }
 
-/// Baseline clean fixture: ten crates matching BASE_GRAPH, no edges, plus the
+/// Baseline clean fixture: the complete plan crate map plus one synthetic middle
+/// crate used by transitive-path tests, no edges, plus the
 /// closure-governance files (Cargo.lock ⇄ allowlist ⇄ SUITE.lock ⇄ toolchain pin)
 /// the D1 audit requires on every root.
 fn base(ws: &TempWs) {
@@ -212,7 +257,7 @@ fn clean_fixture_passes() {
     base(&ws);
     let out = ws.run();
     assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
-    assert_eq!(out.crate_count, 10);
+    assert_eq!(out.crate_count, FIXTURE_CRATES.len());
 }
 
 #[test]
@@ -384,6 +429,14 @@ fn unledgered_allow_site_is_flagged_and_ledgered_site_passes() {
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-013"]);
 
+    // The authorization comment is a canonical marker, not free-form prose that merely
+    // begins with an id.
+    ws.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "//! boundary stub\n#![deny(unsafe_code)]\n\n// UNSAFE-LEDGER: FLN-UL-0001 extra words\n#[allow(unsafe_code)]\nfn peek() {}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-013"]);
+
     // Recovery: marker + matching ledger row make the same site legal.
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
@@ -519,6 +572,75 @@ fn comments_and_raw_strings_cannot_spoof_root_lint() {
 }
 
 #[test]
+fn conditional_cfg_attr_cannot_spoof_unsafe_posture() {
+    let ordinary = TempWs::new("conditional-forbid");
+    base(&ordinary);
+    ordinary.write(
+        "crates/fln-hash/src/lib.rs",
+        "#![cfg_attr(any(), forbid(unsafe_code))]\n",
+    );
+    assert_eq!(codes(&ordinary.run()), vec!["FLN-STRUCT-011"]);
+
+    let boundary = TempWs::new("conditional-deny");
+    base(&boundary);
+    boundary.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "#![cfg_attr(any(), deny(unsafe_code))]\n",
+    );
+    assert_eq!(codes(&boundary.run()), vec!["FLN-STRUCT-012"]);
+}
+
+#[test]
+fn nested_inner_attribute_cannot_spoof_crate_root_posture() {
+    let ordinary = TempWs::new("nested-forbid");
+    base(&ordinary);
+    ordinary.write(
+        "crates/fln-hash/src/lib.rs",
+        "mod decoy { #![forbid(unsafe_code)] }\n",
+    );
+    assert_eq!(codes(&ordinary.run()), vec!["FLN-STRUCT-011"]);
+
+    let boundary = TempWs::new("nested-deny");
+    base(&boundary);
+    boundary.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "mod decoy { #![deny(unsafe_code)] }\n",
+    );
+    assert_eq!(codes(&boundary.run()), vec!["FLN-STRUCT-012"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_source_cannot_escape_or_cycle_around_scans() {
+    use std::os::unix::fs::symlink;
+
+    let escaped = TempWs::new("source-symlink");
+    base(&escaped);
+    escaped.write("outside.rs", "#[allow(unsafe_code)]\nfn hidden() {}\n");
+    let root = escaped
+        .materialize()
+        .expect("materialize retained symlink fixture");
+    symlink(
+        "../../../outside.rs",
+        root.join("crates/fln-kernel/src/linked.rs"),
+    )
+    .expect("create retained source symlink");
+    let out = checks::run(&root).expect("guard reports symlink without following it");
+    assert_eq!(codes(&out), vec!["FLN-STRUCT-016"]);
+    assert!(out.findings[0].detail.contains("symlinks are forbidden"));
+
+    let cycle = TempWs::new("directory-symlink-cycle");
+    base(&cycle);
+    let root = cycle
+        .materialize()
+        .expect("materialize retained symlink-cycle fixture");
+    symlink("..", root.join("crates/fln-kernel/src/cycle"))
+        .expect("create retained directory symlink");
+    let out = checks::run(&root).expect("guard reports cycle without recursing into it");
+    assert_eq!(codes(&out), vec!["FLN-STRUCT-016"]);
+}
+
+#[test]
 fn all_structural_allow_variants_are_ledgered() {
     let ws = TempWs::new("allow-variants");
     base(&ws);
@@ -528,6 +650,21 @@ fn all_structural_allow_variants_are_ledgered() {
     );
     let out = ws.run();
     assert_eq!(codes(&out), vec!["FLN-STRUCT-013", "FLN-STRUCT-013"]);
+}
+
+#[test]
+fn alternate_lint_levels_cannot_lower_boundary_deny() {
+    for (level, tag) in [("warn", "warn-lowering"), ("expect", "expect-lowering")] {
+        let ws = TempWs::new(tag);
+        base(&ws);
+        ws.write(
+            "crates/fln-unsafe-abi/src/lib.rs",
+            &format!("#![deny(unsafe_code)]\n#[{level}(unsafe_code)]\nfn lowered() {{}}\n"),
+        );
+        let out = ws.run();
+        assert_eq!(codes(&out), vec!["FLN-STRUCT-013"]);
+        assert!(out.findings[0].detail.contains(level));
+    }
 }
 
 #[test]
@@ -547,7 +684,7 @@ fn unsafe_boundary_exports_fail_closed_until_type_aware_classification() {
     base(&ws);
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "#![deny(unsafe_code)]\npub fn forge<T>() -> T { panic!(\"not executed\") }\n",
+        "#![deny(unsafe_code)]\npub fn forge<T>() -> T { loop {} }\n",
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-022"]);
 
@@ -558,6 +695,14 @@ fn unsafe_boundary_exports_fail_closed_until_type_aware_classification() {
         "#![deny(unsafe_code)]\npub(crate) fn local_only() {}\n",
     );
     assert!(local.run().findings.is_empty());
+
+    let macro_expansion = TempWs::new("macro-expansion");
+    base(&macro_expansion);
+    macro_expansion.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "#![deny(unsafe_code)]\nmacro_rules! hidden_policy { () => {} }\n",
+    );
+    assert_eq!(codes(&macro_expansion.run()), vec!["FLN-STRUCT-022"]);
 }
 
 #[test]
@@ -581,6 +726,15 @@ fn kernel_source_inclusion_cannot_escape_the_loc_covenant() {
     );
     ws.write("crates/fln-kernel/hidden.inc", "fn hidden() {}\n");
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-015"]);
+
+    let conditional = TempWs::new("kernel-conditional-path");
+    base(&conditional);
+    conditional.write(
+        "crates/fln-kernel/src/lib.rs",
+        "#![forbid(unsafe_code)]\n#[cfg_attr(not(any()), path = \"../hidden.rs\")]\nmod hidden;\n",
+    );
+    conditional.write("crates/fln-kernel/hidden.rs", "fn hidden() {}\n");
+    assert_eq!(codes(&conditional.run()), vec!["FLN-STRUCT-015"]);
 }
 
 #[test]
@@ -609,6 +763,37 @@ fn plan_rank_and_trust_allowlist_cannot_be_weakened() {
 }
 
 #[test]
+fn plan_defined_crate_cannot_disappear_from_graph_and_disk_together() {
+    let ws = TempWs::new("missing-plan-crate");
+    base(&ws);
+    ws.files
+        .borrow_mut()
+        .retain(|path, _| !path.starts_with("crates/fln-doc/"));
+    ws.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &BASE_GRAPH.replace("crate fln-doc        rank=20 kind=ordinary\n", ""),
+    );
+    ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock().replace(
+            "\n[[package]]\nname = \"fln-doc\"\nversion = \"0.0.0\"\n",
+            "",
+        ),
+    );
+    ws.write(
+        "ci/CLOSURE_ALLOWLIST.txt",
+        &fixture_allowlist()
+            .lines()
+            .filter(|line| !line.starts_with("package fln-doc "))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let out = ws.run();
+    assert_eq!(codes(&out), vec!["FLN-STRUCT-024"]);
+    assert!(out.findings[0].detail.contains("fln-doc"));
+}
+
+#[test]
 fn integration_targets_cannot_bypass_ordinary_unsafe_posture() {
     let ws = TempWs::new("integration-root-lint");
     base(&ws);
@@ -617,4 +802,12 @@ fn integration_targets_cannot_bypass_ordinary_unsafe_posture() {
         "fn integration_target_without_posture() {}\n",
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-011"]);
+
+    let boundary = TempWs::new("boundary-integration-allow");
+    base(&boundary);
+    boundary.write(
+        "crates/fln-unsafe-abi/tests/bypass.rs",
+        "#![deny(unsafe_code)]\n#[allow(unsafe_code)]\nfn bypass() {}\n",
+    );
+    assert_eq!(codes(&boundary.run()), vec!["FLN-STRUCT-013"]);
 }

@@ -71,12 +71,15 @@ pub fn parse(text: &str) -> Result<Ledger, String> {
     Ok(ledger)
 }
 
-/// One `#[allow(unsafe_code)]` (or inner `#![allow(unsafe_code)]`) occurrence.
+/// One lint-level attribute that can lower `unsafe_code`: `allow`, `warn`, or `expect`.
 #[derive(Debug)]
 pub struct AllowSite {
     /// Workspace-relative path, '/'-separated.
     pub path: String,
     pub line: usize,
+    /// Only canonical, ledgered `allow` is admissible. The other levels are retained
+    /// so the caller can report their attempt to lower the boundary root's `deny`.
+    pub level: &'static str,
     /// Ledger id from the `// UNSAFE-LEDGER: FLN-UL-NNNN` marker, if present on the
     /// same line or the nearest non-empty line above.
     pub id: Option<String>,
@@ -94,19 +97,26 @@ fn marker_id(line: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect();
-    if id.is_empty() { None } else { Some(id) }
+    let trailing = &rest[id.len()..];
+    if id.is_empty() || !trailing.trim().is_empty() {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Token {
     text: String,
     line: usize,
+    delimiter_depth: usize,
 }
 
 #[derive(Debug)]
 struct Attribute {
     line: usize,
     inner: bool,
+    delimiter_depth: usize,
     tokens: Vec<Token>,
 }
 
@@ -134,6 +144,7 @@ fn rust_tokens(text: &str) -> Vec<Token> {
     let mut out = Vec::new();
     let mut cursor = 0;
     let mut line = 1;
+    let mut delimiter_depth = 0_usize;
     while cursor < bytes.len() {
         let byte = bytes[cursor];
         if byte == b'\n' {
@@ -242,13 +253,20 @@ fn rust_tokens(text: &str) -> Vec<Token> {
             out.push(Token {
                 text: text[start..cursor].to_string(),
                 line,
+                delimiter_depth,
             });
             continue;
         }
         out.push(Token {
             text: (byte as char).to_string(),
             line,
+            delimiter_depth,
         });
+        match byte {
+            b'(' | b'[' | b'{' => delimiter_depth = delimiter_depth.saturating_add(1),
+            b')' | b']' | b'}' => delimiter_depth = delimiter_depth.saturating_sub(1),
+            _ => {}
+        }
         cursor += 1;
     }
     out
@@ -264,6 +282,7 @@ fn attributes(text: &str) -> Vec<Attribute> {
             continue;
         }
         let line = tokens[cursor].line;
+        let delimiter_depth = tokens[cursor].delimiter_depth;
         let mut next = cursor + 1;
         let inner = tokens.get(next).is_some_and(|tk| tk.text == "!");
         if inner {
@@ -288,6 +307,7 @@ fn attributes(text: &str) -> Vec<Attribute> {
             out.push(Attribute {
                 line,
                 inner,
+                delimiter_depth,
                 tokens: tokens[body_start..next - 1].to_vec(),
             });
             cursor = next;
@@ -298,7 +318,7 @@ fn attributes(text: &str) -> Vec<Attribute> {
     out
 }
 
-fn attribute_calls_lint(attribute: &Attribute, level: &str, lint: &str) -> bool {
+fn attribute_contains_lint_call(attribute: &Attribute, level: &str, lint: &str) -> bool {
     attribute.tokens.windows(2).enumerate().any(|(idx, pair)| {
         pair[0].text == level
             && pair[1].text == "("
@@ -307,6 +327,21 @@ fn attribute_calls_lint(attribute: &Attribute, level: &str, lint: &str) -> bool 
                 .take_while(|tk| tk.text != ")")
                 .any(|tk| tk.text == lint)
     })
+}
+
+fn attribute_sets_lint_directly(attribute: &Attribute, level: &str, lint: &str) -> bool {
+    attribute
+        .tokens
+        .first()
+        .is_some_and(|token| token.text == level)
+        && attribute
+            .tokens
+            .get(1)
+            .is_some_and(|token| token.text == "(")
+        && attribute.tokens[2..]
+            .iter()
+            .take_while(|token| token.text != ")")
+            .any(|token| token.text == lint)
 }
 
 #[derive(Debug, Default)]
@@ -319,10 +354,12 @@ pub fn lint_posture(text: &str) -> LintPosture {
     let mut posture = LintPosture::default();
     for attribute in attributes(text)
         .into_iter()
-        .filter(|attribute| attribute.inner)
+        .filter(|attribute| attribute.inner && attribute.delimiter_depth == 0)
     {
-        posture.forbid_unsafe |= attribute_calls_lint(&attribute, "forbid", "unsafe_code");
-        posture.deny_unsafe |= attribute_calls_lint(&attribute, "deny", "unsafe_code");
+        // A nested lint inside `cfg_attr` is conditional and may be inactive. Only an
+        // unconditional crate-level `forbid`/`deny` establishes the D3 root posture.
+        posture.forbid_unsafe |= attribute_sets_lint_directly(&attribute, "forbid", "unsafe_code");
+        posture.deny_unsafe |= attribute_sets_lint_directly(&attribute, "deny", "unsafe_code");
     }
     posture
 }
@@ -352,10 +389,14 @@ pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
         }
     }
     for attribute in attributes(text) {
-        if attribute.tokens.first().is_some_and(|tk| tk.text == "path") {
+        if attribute
+            .tokens
+            .windows(2)
+            .any(|pair| pair[0].text == "path" && pair[1].text == "=")
+        {
             sites.push(ExportSite {
                 line: attribute.line,
-                detail: "path-based module can hide authoritative code",
+                detail: "path-based or conditional path module can hide authoritative code",
             });
         }
     }
@@ -392,6 +433,33 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
             }
         }
     }
+    // Once another fail-closed export/source finding exists, macro-expansion risk cannot
+    // widen the accepted surface and a duplicate finding would only obscure diagnostics.
+    if sites.is_empty() {
+        for (idx, token) in tokens.iter().enumerate() {
+            let declarative_definition = token.text == "macro_rules"
+                && tokens.get(idx + 1).is_some_and(|next| next.text == "!");
+            let macro_invocation = token.text == "!"
+                && idx > 0
+                && tokens[idx - 1].text != "include"
+                && tokens
+                    .get(idx + 1)
+                    .is_some_and(|next| matches!(next.text.as_str(), "(" | "[" | "{"))
+                && tokens[idx - 1]
+                    .text
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
+            let macro_two_definition =
+                token.text == "macro" && tokens.get(idx + 1).is_some_and(|next| next.text != "!");
+            if declarative_definition || macro_invocation || macro_two_definition {
+                sites.push(ExportSite {
+                    line: token.line,
+                    detail: "macro expansion can synthesize an unsafe allowance or external export",
+                });
+            }
+        }
+    }
     sites.sort_by_key(|site| (site.line, site.detail));
     sites.dedup_by_key(|site| (site.line, site.detail));
     sites
@@ -402,6 +470,11 @@ pub fn scan_external_exports(
     rel_prefix: &str,
     out: &mut Vec<LocatedExportSite>,
 ) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("cannot inspect directory {rel_prefix}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
     let entries = fs::read_dir(dir)
         .map_err(|error| format!("cannot read directory {rel_prefix}: {error}"))?;
     let mut entries: Vec<_> = entries
@@ -412,9 +485,15 @@ pub fn scan_external_exports(
         let name = entry.file_name().to_string_lossy().into_owned();
         let rel = format!("{rel_prefix}/{name}");
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {rel}: {error}"))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             scan_external_exports(&path, &rel, out)?;
-        } else if name.ends_with(".rs") {
+        } else if file_type.is_file() && name.ends_with(".rs") {
             let text =
                 fs::read_to_string(&path).map_err(|error| format!("cannot read {rel}: {error}"))?;
             out.extend(
@@ -438,6 +517,11 @@ pub fn scan_allow_sites(
     rel_prefix: &str,
     out: &mut Vec<AllowSite>,
 ) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("cannot inspect directory {rel_prefix}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
     let entries =
         fs::read_dir(dir).map_err(|e| format!("cannot read directory {rel_prefix}: {e}"))?;
     let mut entries: Vec<_> = entries
@@ -449,31 +533,40 @@ pub fn scan_allow_sites(
         let name = entry.file_name().to_string_lossy().into_owned();
         let rel = format!("{rel_prefix}/{name}");
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {rel}: {error}"))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             scan_allow_sites(&path, &rel, out)?;
-        } else if name.ends_with(".rs") {
+        } else if file_type.is_file() && name.ends_with(".rs") {
             let text = fs::read_to_string(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
             let lines: Vec<&str> = text.lines().collect();
-            for attribute in attributes(&text)
-                .into_iter()
-                .filter(|attribute| attribute_calls_lint(attribute, "allow", "unsafe_code"))
-            {
-                let i = attribute.line.saturating_sub(1);
-                let mut id = None;
-                // The marker must be the nearest preceding non-empty, comment-only line.
-                for above in lines[..i].iter().rev() {
-                    if above.trim().is_empty() {
+            for attribute in attributes(&text) {
+                for level in ["allow", "warn", "expect"] {
+                    if !attribute_contains_lint_call(&attribute, level, "unsafe_code") {
                         continue;
                     }
-                    id = marker_id(above);
-                    break;
+                    let i = attribute.line.saturating_sub(1);
+                    let mut id = None;
+                    // The marker must be the nearest preceding non-empty, comment-only line.
+                    for above in lines[..i].iter().rev() {
+                        if above.trim().is_empty() {
+                            continue;
+                        }
+                        id = marker_id(above);
+                        break;
+                    }
+                    out.push(AllowSite {
+                        path: rel.clone(),
+                        line: attribute.line,
+                        level,
+                        id,
+                        inner: attribute.inner,
+                    });
                 }
-                out.push(AllowSite {
-                    path: rel.clone(),
-                    line: attribute.line,
-                    id,
-                    inner: attribute.inner,
-                });
             }
         }
     }
@@ -509,9 +602,10 @@ mod tests {
     #[test]
     fn marker_extraction() {
         assert_eq!(
-            marker_id("// UNSAFE-LEDGER: FLN-UL-0042 layout"),
+            marker_id("// UNSAFE-LEDGER: FLN-UL-0042"),
             Some("FLN-UL-0042".to_string())
         );
+        assert_eq!(marker_id("// UNSAFE-LEDGER: FLN-UL-0042 layout"), None);
         assert_eq!(marker_id("no marker here"), None);
         assert_eq!(
             marker_id("let fake = \"// UNSAFE-LEDGER: FLN-UL-1\";"),
@@ -535,9 +629,36 @@ fn two() {}
         assert!(posture.deny_unsafe);
         let allows: Vec<_> = attributes(text)
             .into_iter()
-            .filter(|attribute| attribute_calls_lint(attribute, "allow", "unsafe_code"))
+            .filter(|attribute| attribute_contains_lint_call(attribute, "allow", "unsafe_code"))
             .collect();
         assert_eq!(allows.len(), 2);
+    }
+
+    #[test]
+    fn conditional_cfg_attr_cannot_spoof_root_lint_posture() {
+        let ordinary = lint_posture("#![cfg_attr(any(), forbid(unsafe_code))]\n");
+        assert!(!ordinary.forbid_unsafe);
+        assert!(!ordinary.deny_unsafe);
+
+        let boundary = lint_posture("#![cfg_attr(any(), deny(unsafe_code))]\n");
+        assert!(!boundary.forbid_unsafe);
+        assert!(!boundary.deny_unsafe);
+
+        let unconditional =
+            lint_posture("#![forbid(unsafe_code, warnings)]\n#![deny(unsafe_code, unused)]\n");
+        assert!(unconditional.forbid_unsafe);
+        assert!(unconditional.deny_unsafe);
+    }
+
+    #[test]
+    fn nested_or_macro_attributes_cannot_spoof_crate_root_posture() {
+        let nested = lint_posture("mod decoy { #![forbid(unsafe_code)] }\n");
+        assert!(!nested.forbid_unsafe);
+        assert!(!nested.deny_unsafe);
+
+        let macro_body = lint_posture("macro_rules! decoy { () => { #![deny(unsafe_code)] } }\n");
+        assert!(!macro_body.forbid_unsafe);
+        assert!(!macro_body.deny_unsafe);
     }
 
     #[test]
@@ -555,5 +676,23 @@ fn two() {}
             external_export_sites("#[path = \"outside.rs\"] mod outside;\n").len(),
             1
         );
+        assert_eq!(
+            external_export_sites("hidden_policy!(allow, unsafe_code);\n").len(),
+            1
+        );
+        assert_eq!(
+            external_export_sites("macro_rules! hidden { () => {} }\n").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn conditional_path_attribute_is_a_source_escape() {
+        let sites = source_escape_sites(
+            "#[cfg_attr(not(any()), path = \"../outside.rs\")]\nmod outside;\n",
+        );
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].line, 1);
+        assert!(sites[0].detail.contains("conditional path"));
     }
 }

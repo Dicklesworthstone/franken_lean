@@ -62,7 +62,8 @@ crate fln-conformance   rank=22 kind=ordinary
 crate structure-guard   kind=tool
 
 # ---- acknowledged dependency edges ----------------------------------------------------
-# (none yet — the workspace is stubs; every future edge lands here in the same change)
+# every future edge lands here in the same change as its Cargo.toml counterpart
+edge fln-conformance -> fln-core   # C0 core-observable fixture diff harness (franken_lean-p8a)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.
