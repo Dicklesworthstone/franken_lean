@@ -42,4 +42,4 @@ pub const LOCK_FILE: &str = "Cargo.lock";
 /// Workspace-relative path of the toolchain pin that must agree with SUITE.lock.
 pub const TOOLCHAIN_FILE: &str = "rust-toolchain.toml";
 /// NDJSON schema identifier for robot output.
-pub const NDJSON_SCHEMA: &str = "structure-guard/1";
+pub const NDJSON_SCHEMA: &str = "structure-guard/2";

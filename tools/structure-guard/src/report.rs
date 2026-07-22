@@ -73,15 +73,49 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
     ));
     lines.extend(outcome.findings.iter().map(finding_ndjson));
     lines.push(format!(
-        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"findings\":{},\"duration_ms\":{duration_ms}}}",
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"duration_ms\":{duration_ms}}}",
         if outcome.findings.is_empty() {
             "pass"
         } else {
             "fail"
         },
+        if outcome.findings.is_empty() { 0 } else { 1 },
         outcome.findings.len()
     ));
     lines.join("\n") + "\n"
+}
+
+/// Render a robot-visible setup failure. Robot mode must never move diagnostics to a
+/// human-only stream or omit its terminal record.
+pub fn render_setup_failure_ndjson(root_display: &str, error: &str, duration_ms: u128) -> String {
+    format!(
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"graph_digest\":null,\"crates\":null,\"edges\":null}}\n\
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+        json_escape(root_display),
+        json_escape(error)
+    )
+}
+
+/// Render a robot-visible CLI parse failure. The CLI did not reach workspace setup,
+/// but its request still receives a complete run envelope and terminal exit status.
+pub fn render_cli_failure_ndjson(root_display: &str, error: &str, duration_ms: u128) -> String {
+    format!(
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"graph_digest\":null,\"crates\":null,\"edges\":null}}\n\
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+        json_escape(root_display),
+        json_escape(error)
+    )
+}
+
+/// Render help without leaking human decoration into robot mode. Help is a successful
+/// request response, not a structural verdict, and is labeled accordingly.
+pub fn render_help_ndjson(usage: &str, duration_ms: u128) -> String {
+    format!(
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null}}\n\
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"help\",\"usage\":\"{}\"}}\n\
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
+        json_escape(usage)
+    )
 }
 
 #[cfg(test)]
@@ -97,5 +131,39 @@ mod tests {
     #[test]
     fn escaping() {
         assert_eq!(json_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn robot_setup_failure_is_terminal_and_escaped() {
+        let rendered = render_setup_failure_ndjson("a\"b", "bad\nroot", 7);
+        let lines: Vec<_> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\\\"b"));
+        assert!(lines[1].contains("\"verdict\":\"setup_error\""));
+        assert!(lines[1].contains("\"exit_code\":2"));
+        assert!(lines[1].contains("bad\\nroot"));
+    }
+
+    #[test]
+    fn robot_cli_failure_has_a_distinct_reason_code() {
+        let rendered = render_cli_failure_ndjson(".", "unknown `x`", 3);
+        let lines: Vec<_> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.contains(NDJSON_SCHEMA)));
+        assert!(lines[1].contains("\"reason_code\":\"cli_parse_failure\""));
+        assert!(lines[1].contains("\"exit_code\":2"));
+    }
+
+    #[test]
+    fn robot_help_is_machine_only_and_terminal() {
+        let rendered = render_help_ndjson("usage: x\n  --flag", 2);
+        let lines: Vec<_> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| line.starts_with('{')));
+        assert!(lines.iter().all(|line| line.contains(NDJSON_SCHEMA)));
+        assert!(lines[1].contains("\"event\":\"help\""));
+        assert!(lines[1].contains("usage: x\\n"));
+        assert!(lines[2].contains("\"reason_code\":\"help_requested\""));
+        assert!(lines[2].contains("\"exit_code\":0"));
     }
 }
