@@ -937,7 +937,7 @@ skip_stage() {
 
 self_test() {
   local failures=0 stage rc child="$ART_DIR" child_pid wrapper_ready
-  local wrapper_launch_ready wrapper_launch_release
+  local wrapper_launch_ready wrapper_launch_release cancel_meta
   for stage in evidence-self-test shellcheck fmt check clippy test structure-guard vendor-tree ubs; do
     echo "[check:self-test] planting failure in stage=$stage" >&2
     child="$ART_DIR/selftest-$stage"
@@ -1066,10 +1066,11 @@ self_test() {
   wrapper_ready="$ART_DIR/selftest-cancel-term.guardian.ready.json"
   wrapper_launch_ready="$ART_DIR/selftest-cancel-term.guardian.launch.ready.json"
   wrapper_launch_release="$ART_DIR/selftest-cancel-term.guardian.launch.release.json"
+  cancel_meta="$ART_DIR/selftest-cancel-term.guardian.meta.json"
   ACTIVE_STAGE=selftest-cancel-term
   SPAWNING=1
   setsid -- python3 "$EVIDENCE" run --cwd "$REPO" \
-    --metadata "$ART_DIR/selftest-cancel-term.guardian.meta.json" \
+    --metadata "$cancel_meta" \
     --stdout "$ART_DIR/selftest-cancel-term.console.out" \
     --stderr "$ART_DIR/selftest-cancel-term.console.err" \
     --readiness "$wrapper_ready" \
@@ -1077,7 +1078,7 @@ self_test() {
     --launch-release "$wrapper_launch_release" \
     --artifact-root "$ART_DIR" \
     --capture-bytes "$CAPTURE_BYTES" --output-budget-bytes "$OUTPUT_BUDGET_BYTES" \
-    --timeout-ms "$STAGE_TIMEOUT_MS" --grace-ms 60000 \
+    --timeout-ms "$STAGE_TIMEOUT_MS" --grace-ms 180000 \
     --stage-id selftest-cancel-term -- \
     env FLN_CHECK_ART_DIR="$child" FLN_CHECK_PROFILE=self-test-cancellation \
       bash "${BASH_SOURCE[0]}" &
@@ -1159,11 +1160,12 @@ self_test() {
     set_final cancelled "signal_$pending_name" "$pending_exit"
     exit "$pending_exit"
   fi
+  local child_stage_ready="$child/evidence-self-test.ready.json"
   for _ in $(seq 1 $((READY_WAIT_MS / 20))); do
-    if compgen -G "$child/*.ready.json" >/dev/null; then break; fi
+    if [ -s "$child_stage_ready" ]; then break; fi
     sleep 0.02
   done
-  if ! compgen -G "$child/*.ready.json" >/dev/null; then
+  if [ ! -s "$child_stage_ready" ]; then
     stop_active_runner TERM || true
     rc=2
   elif ! python3 "$EVIDENCE" signal-bound-process --pid "$child_pid" \
@@ -1179,7 +1181,11 @@ self_test() {
   ACTIVE_READINESS=""
   ACTIVE_RUNNER_PROTOCOL=""
   ACTIVE_RUNNER_ART_DIR=""
-  if [ "$rc" -eq 4 ] && python3 "$EVIDENCE" validate-run \
+  if [ "$rc" -eq 4 ] \
+    && [ "$(read_meta_field "$cancel_meta" classification)" = cancelled ] \
+    && [ "$(read_meta_field "$cancel_meta" wrapper_exit)" = 4 ] \
+    && [ "$(read_meta_field "$cancel_meta" child_exit)" = 143 ] \
+    && python3 "$EVIDENCE" validate-run \
     --file "$child/run.ndjson" --schema "$SCHEMA" --expected-verdict cancelled \
     --artifact-root "$ART_DIR" --output "$ART_DIR/selftest-cancel-term.validation.json" \
     && python3 "$EVIDENCE" validate-bundle --art-dir "$child" \
