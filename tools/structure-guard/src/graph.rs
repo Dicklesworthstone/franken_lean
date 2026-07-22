@@ -1,6 +1,6 @@
 //! Parser and model for `ci/WORKSPACE_GRAPH.txt` (grammar documented in that file).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrateKind {
@@ -68,9 +68,19 @@ fn valid_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+fn valid_pattern(s: &str) -> bool {
+    match s.strip_suffix('*') {
+        Some(prefix) => valid_name(prefix),
+        None => valid_name(s),
+    }
+}
+
 pub fn parse(text: &str) -> Result<GraphFile, String> {
     let mut g = GraphFile::default();
     let mut saw_schema = false;
+    let mut edges = BTreeSet::new();
+    let mut prohibits = BTreeSet::new();
+    let mut suite_deps = BTreeSet::new();
 
     for (idx, raw) in text.lines().enumerate() {
         let lineno = idx + 1;
@@ -108,11 +118,17 @@ pub fn parse(text: &str) -> Result<GraphFile, String> {
                 let mut kind: Option<CrateKind> = None;
                 for kv in &tokens[2..] {
                     if let Some(v) = kv.strip_prefix("rank=") {
+                        if rank.is_some() {
+                            return Err(err("duplicate rank attribute"));
+                        }
                         rank = Some(
                             v.parse::<u32>()
                                 .map_err(|_| err("rank must be a non-negative integer"))?,
                         );
                     } else if let Some(v) = kv.strip_prefix("kind=") {
+                        if kind.is_some() {
+                            return Err(err("duplicate kind attribute"));
+                        }
                         kind = Some(match v {
                             "ordinary" => CrateKind::Ordinary,
                             "unsafe-boundary" => CrateKind::UnsafeBoundary,
@@ -150,11 +166,26 @@ pub fn parse(text: &str) -> Result<GraphFile, String> {
                 if tokens.len() != 4 || tokens[2] != "->" {
                     return Err(err("expected `edge <from> -> <to>`"));
                 }
-                g.edges.push((tokens[1].to_string(), tokens[3].to_string()));
+                if !valid_name(tokens[1]) || !valid_name(tokens[3]) {
+                    return Err(err("edge endpoints must be valid crate names"));
+                }
+                let edge = (tokens[1].to_string(), tokens[3].to_string());
+                if !edges.insert(edge.clone()) {
+                    return Err(err("duplicate edge declaration"));
+                }
+                g.edges.push(edge);
             }
             "prohibit" => {
                 if tokens.len() != 4 || tokens[2] != "->*" {
                     return Err(err("expected `prohibit <pat> ->* <pat>`"));
+                }
+                if !valid_pattern(tokens[1]) || !valid_pattern(tokens[3]) {
+                    return Err(err(
+                        "prohibition endpoints must be valid exact or suffix-* patterns",
+                    ));
+                }
+                if !prohibits.insert((tokens[1].to_string(), tokens[3].to_string())) {
+                    return Err(err("duplicate prohibition declaration"));
                 }
                 g.prohibits
                     .push((Pattern::new(tokens[1]), Pattern::new(tokens[3])));
@@ -178,12 +209,18 @@ pub fn parse(text: &str) -> Result<GraphFile, String> {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .collect();
+                if deps.iter().any(|dep| !valid_name(dep)) {
+                    return Err(err("allow-direct entries must be valid crate names"));
+                }
+                if deps.iter().collect::<BTreeSet<_>>().len() != deps.len() {
+                    return Err(err("duplicate allow-direct entry"));
+                }
                 if g.allow_direct.insert(name.to_string(), deps).is_some() {
                     return Err(err("duplicate allow-direct declaration"));
                 }
             }
             "covenant" => {
-                if tokens.len() != 3 {
+                if tokens.len() != 3 || !valid_name(tokens[1]) {
                     return Err(err("expected `covenant <crate> max-loc=<n>`"));
                 }
                 let limit = tokens[2]
@@ -197,6 +234,9 @@ pub fn parse(text: &str) -> Result<GraphFile, String> {
             "suite-dep" => {
                 if tokens.len() != 2 || !valid_name(tokens[1]) {
                     return Err(err("expected `suite-dep <package>`"));
+                }
+                if !suite_deps.insert(tokens[1].to_string()) {
+                    return Err(err("duplicate suite-dep declaration"));
                 }
                 g.suite_deps.push(tokens[1].to_string());
             }
@@ -252,6 +292,38 @@ mod tests {
         let dup = "schema fln-workspace-graph/1\n\
                    crate a rank=0 kind=ordinary\ncrate a rank=1 kind=ordinary\n";
         assert!(parse(dup).is_err());
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_malformed_graph_directives() {
+        let schema = "schema fln-workspace-graph/1\n";
+        for directive in [
+            "crate a rank=0 rank=1 kind=ordinary",
+            "crate a rank=0 kind=ordinary kind=ordinary",
+            "edge bad/name -> good",
+            "edge good -> bad/name",
+            "prohibit * ->* good",
+            "prohibit good*bad ->* good",
+            "allow-direct good = valid, bad/name",
+            "allow-direct good = same, same",
+            "covenant bad/name max-loc=1",
+        ] {
+            assert!(
+                parse(&format!("{schema}{directive}\n")).is_err(),
+                "accepted {directive}"
+            );
+        }
+
+        for duplicated in [
+            "edge a -> b\nedge a -> b",
+            "prohibit a ->* b\nprohibit a ->* b",
+            "suite-dep asupersync\nsuite-dep asupersync",
+        ] {
+            assert!(
+                parse(&format!("{schema}{duplicated}\n")).is_err(),
+                "accepted duplicate directives: {duplicated}"
+            );
+        }
     }
 
     #[test]
