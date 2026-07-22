@@ -109,24 +109,79 @@ jobs:
           channel="$(python3 - <<'PY'
           import pathlib
           import re
+          import tomllib
 
-          text = pathlib.Path("rust-toolchain.toml").read_text()
-          match = re.search(r'^channel = "([^"]+)"$', text, re.MULTILINE)
-          if match is None:
-              raise SystemExit("rust-toolchain.toml has no exact channel")
-          print(match.group(1))
+          suite_rows = []
+          for raw in pathlib.Path("SUITE.lock").read_text(encoding="utf-8").splitlines():
+              line = raw.split("#", 1)[0].strip()
+              if not line:
+                  continue
+              tokens = line.split()
+              if tokens[0] == "rust-nightly":
+                  if len(tokens) != 2:
+                      raise SystemExit("SUITE.lock has a malformed rust-nightly row")
+                  suite_rows.append(tokens[1])
+          if len(suite_rows) != 1:
+              raise SystemExit(
+                  f"SUITE.lock must contain exactly one rust-nightly row; found {len(suite_rows)}"
+              )
+          expected = suite_rows[0]
+          if re.fullmatch(r"nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}", expected) is None:
+              raise SystemExit(f"SUITE.lock rust-nightly is not an exact dated pin: {expected!r}")
+
+          document = tomllib.loads(
+              pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8")
+          )
+          if set(document) != {"toolchain"} or not isinstance(document["toolchain"], dict):
+              raise SystemExit("rust-toolchain.toml must contain only one [toolchain] table")
+          toolchain = document["toolchain"]
+          allowed = {"channel", "components", "profile", "targets"}
+          unknown = sorted(set(toolchain) - allowed)
+          if unknown:
+              raise SystemExit(f"rust-toolchain.toml has unsupported keys: {unknown}")
+          actual = toolchain.get("channel")
+          if not isinstance(actual, str) or actual != expected:
+              raise SystemExit(
+                  f"rust-toolchain.toml channel {actual!r} != SUITE.lock rust-nightly {expected!r}"
+              )
+          for key in ("components", "targets"):
+              value = toolchain.get(key, [])
+              if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                  raise SystemExit(f"rust-toolchain.toml {key} must be an array of strings")
+          if "profile" in toolchain and not isinstance(toolchain["profile"], str):
+              raise SystemExit("rust-toolchain.toml profile must be a string")
+          print(actual)
           PY
           )"
           rustup toolchain install "$channel" --profile minimal \
             --component rustfmt --component clippy
-          python3 - <<'PY'
+          PINNED_RUST_CHANNEL="$channel" python3 - <<'PY'
+          import os
           import pathlib
           import subprocess
 
-          lock = pathlib.Path("SUITE.lock").read_text().splitlines()
-          expected = next(line.split()[1] for line in lock if line.startswith("rust-commit "))
+          commit_rows = []
+          for raw in pathlib.Path("SUITE.lock").read_text(encoding="utf-8").splitlines():
+              line = raw.split("#", 1)[0].strip()
+              if not line:
+                  continue
+              tokens = line.split()
+              if tokens[0] == "rust-commit":
+                  if len(tokens) != 2:
+                      raise SystemExit("SUITE.lock has a malformed rust-commit row")
+                  commit_rows.append(tokens[1])
+          if len(commit_rows) != 1:
+              raise SystemExit(
+                  f"SUITE.lock must contain exactly one rust-commit row; found {len(commit_rows)}"
+              )
+          expected = commit_rows[0]
+          if len(expected) != 40 or any(char not in "0123456789abcdef" for char in expected):
+              raise SystemExit(f"SUITE.lock rust-commit is not a 40-hex hash: {expected!r}")
           verbose = subprocess.run(
-              ["rustc", "-Vv"], check=True, text=True, capture_output=True
+              ["rustup", "run", os.environ["PINNED_RUST_CHANNEL"], "rustc", "-Vv"],
+              check=True,
+              text=True,
+              capture_output=True,
           ).stdout.splitlines()
           actual = next(line.split(": ", 1)[1] for line in verbose if line.startswith("commit-hash: "))
           if actual != expected:
