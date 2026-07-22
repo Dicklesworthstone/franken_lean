@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -161,6 +162,18 @@ def require_within(path: Path, root: Path, *, label: str) -> Path:
     return absolute
 
 
+def require_exact_artifact_path(
+    path: Path, art_dir: Path, filename: str, *, label: str
+) -> Path:
+    """Bind a canonical bundle control file to the artifact-directory root."""
+    root = lexical_absolute(art_dir)
+    absolute = require_within(path, root, label=label)
+    expected = root / filename
+    if absolute != expected:
+        raise EvidenceError(f"{label} must be exactly {expected}")
+    return absolute
+
+
 def open_directory_nofollow(path: Path, *, create: bool) -> tuple[Path, int]:
     """Open a directory through no-follow dirfds, optionally creating components."""
     absolute = lexical_absolute(path)
@@ -285,35 +298,142 @@ def write_new(path: Path, data: bytes, mode: int = 0o644) -> None:
         os.close(parent_fd)
 
 
-def write_atomic_new(path: Path, data: bytes, mode: int = 0o644) -> None:
-    """Publish complete bytes at an absent final name in one atomic link step."""
+def prepare_atomic_file(parent_fd: int, data: bytes, mode: int = 0o644) -> int:
     if not hasattr(os, "O_TMPFILE"):
         raise EvidenceError("atomic evidence publication requires Linux O_TMPFILE")
-    absolute = lexical_absolute(path)
-    _parent, parent_fd = open_directory_nofollow(absolute.parent, create=True)
-    descriptor: int | None = None
+    descriptor = os.open(
+        ".",
+        os.O_WRONLY | os.O_TMPFILE | os.O_CLOEXEC,
+        mode,
+        dir_fd=parent_fd,
+    )
     try:
-        descriptor = os.open(
-            ".",
-            os.O_WRONLY | os.O_TMPFILE | os.O_CLOEXEC,
-            mode,
-            dir_fd=parent_fd,
-        )
         view = memoryview(data)
         while view:
             written = os.write(descriptor, view)
             if written <= 0:
-                raise EvidenceError(f"short atomic write while publishing {absolute}")
+                raise EvidenceError("short write while preparing atomic evidence")
             view = view[written:]
         os.fsync(descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def link_prepared_atomic_file(
+    parent_fd: int,
+    descriptor: int,
+    name: str,
+    *,
+    test_fail_after_link: bool = False,
+) -> bool:
+    try:
         os.link(
             f"/proc/self/fd/{descriptor}",
-            absolute.name,
+            name,
             dst_dir_fd=parent_fd,
             follow_symlinks=True,
         )
-        os.fsync(parent_fd)
+    except FileExistsError:
+        return False
+    if test_fail_after_link:
+        raise EvidenceError("injected failure after atomic link")
+    os.fsync(parent_fd)
+    return True
+
+
+def write_atomic_new(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Publish complete bytes at an absent final name in one atomic link step."""
+    absolute = lexical_absolute(path)
+    _parent, parent_fd = open_directory_nofollow(absolute.parent, create=True)
+    descriptor: int | None = None
+    try:
+        descriptor = prepare_atomic_file(parent_fd, data, mode)
+        if not link_prepared_atomic_file(parent_fd, descriptor, absolute.name):
+            raise FileExistsError(absolute)
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
+def write_signal_committed_atomic_new(
+    path: Path,
+    data: bytes,
+    mode: int = 0o644,
+    *,
+    decision_path: Path | None = None,
+    restore_signal_state: bool = True,
+    test_fail_after_link: bool = False,
+) -> None:
+    """Race cancellation and commit on one write-once cross-process decision."""
+    absolute = lexical_absolute(path)
+    decision_absolute = (
+        lexical_absolute(decision_path) if decision_path is not None else None
+    )
+    if (
+        decision_absolute is not None
+        and decision_absolute.parent != absolute.parent
+    ):
+        raise EvidenceError("commit decision and final marker must share a directory")
+    _parent, parent_fd = open_directory_nofollow(absolute.parent, create=True)
+    descriptor: int | None = None
+    watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+    old_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    previous_mask: set[signal.Signals] | None = None
+    try:
+        descriptor = prepare_atomic_file(parent_fd, data, mode)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+        if any(signum in signal.sigpending() for signum in watched):
+            for signum in watched:
+                signal.signal(signum, signal.SIG_IGN)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            previous_mask = None
+            raise EvidenceError("signal arrived before atomic evidence commit")
+        # The pending-signal sample is the commit point. Later watched signals are
+        # blocked locally, while the shared decision path also arbitrates signals
+        # already observed by the parent shell.
+        for signum in watched:
+            signal.signal(signum, signal.SIG_IGN)
+        if decision_absolute is None:
+            if not link_prepared_atomic_file(
+                parent_fd,
+                descriptor,
+                absolute.name,
+                test_fail_after_link=test_fail_after_link,
+            ):
+                raise FileExistsError(absolute)
+        else:
+            decision_won = link_prepared_atomic_file(
+                parent_fd,
+                descriptor,
+                decision_absolute.name,
+                test_fail_after_link=test_fail_after_link,
+            )
+            if not decision_won:
+                decision_data, _size, _digest = stable_file_facts(decision_absolute)
+                if not hmac.compare_digest(decision_data, data):
+                    raise EvidenceError("cancellation won the bundle decision race")
+            try:
+                os.link(
+                    decision_absolute.name,
+                    absolute.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                marker_data, _size, _digest = stable_file_facts(absolute)
+                if not hmac.compare_digest(marker_data, data):
+                    raise EvidenceError("bundle marker disagrees with commit decision")
+            os.fsync(parent_fd)
+    finally:
+        if previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if restore_signal_state:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
         if descriptor is not None:
             os.close(descriptor)
         os.close(parent_fd)
@@ -472,9 +592,11 @@ def proc_stat_facts(pid: int) -> tuple[str, int, int] | None:
     """Return Linux process state, process group, and start ticks."""
     try:
         data = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-    except FileNotFoundError:
-        return None
-    except (OSError, UnicodeError) as error:
+    except OSError as error:
+        if error.errno in {errno.ENOENT, errno.ESRCH}:
+            return None
+        raise EvidenceError(f"cannot inspect process {pid}: {error}") from error
+    except UnicodeError as error:
         raise EvidenceError(f"cannot inspect process {pid}: {error}") from error
     close = data.rfind(")")
     if close < 0:
@@ -501,19 +623,34 @@ def enable_child_subreaper() -> None:
 
 
 def proc_children(pid: int) -> set[int]:
-    path = Path(f"/proc/{pid}/task/{pid}/children")
+    task_root = Path(f"/proc/{pid}/task")
     try:
-        raw = path.read_text(encoding="ascii").strip()
-    except FileNotFoundError:
-        return set()
-    except (OSError, UnicodeError) as error:
+        task_paths = list(task_root.iterdir())
+    except OSError as error:
+        if error.errno in {errno.ENOENT, errno.ESRCH}:
+            return set()
         raise EvidenceError(f"cannot inspect descendants of {pid}: {error}") from error
-    if not raw:
-        return set()
-    try:
-        return {int(value) for value in raw.split()}
-    except ValueError as error:
-        raise EvidenceError(f"malformed Linux children list for {pid}") from error
+    children: set[int] = set()
+    for task_path in task_paths:
+        try:
+            raw = (task_path / "children").read_text(encoding="ascii").strip()
+        except OSError as error:
+            if error.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            raise EvidenceError(
+                f"cannot inspect task descendants of {pid}: {error}"
+            ) from error
+        except UnicodeError as error:
+            raise EvidenceError(
+                f"cannot inspect task descendants of {pid}: {error}"
+            ) from error
+        if not raw:
+            continue
+        try:
+            children.update(int(value) for value in raw.split())
+        except ValueError as error:
+            raise EvidenceError(f"malformed Linux children list for {pid}") from error
+    return children
 
 
 def descendant_closure(roots: Iterable[int]) -> set[int]:
@@ -543,10 +680,16 @@ def live_process_group_members(pgid: int) -> set[int]:
 ProcessHandles = dict[int, tuple[int, int]]
 
 
-def open_process_handle(pid: int) -> tuple[int, int] | None:
+def open_process_handle(
+    pid: int, *, expected_parent_pid: int | None = None
+) -> tuple[int, int] | None:
     """Bind a Linux PID to its lifetime before it can be signalled."""
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         raise EvidenceError("process supervision requires Linux pidfd support")
+    if expected_parent_pid is not None and pid not in proc_children(
+        expected_parent_pid
+    ):
+        return None
     facts = proc_stat_facts(pid)
     if facts is None or facts[0] == "Z":
         return None
@@ -555,7 +698,15 @@ def open_process_handle(pid: int) -> tuple[int, int] | None:
     except ProcessLookupError:
         return None
     repeated = proc_stat_facts(pid)
-    if repeated != facts or repeated is None or repeated[0] == "Z":
+    if (
+        repeated != facts
+        or repeated is None
+        or repeated[0] == "Z"
+        or (
+            expected_parent_pid is not None
+            and pid not in proc_children(expected_parent_pid)
+        )
+    ):
         os.close(descriptor)
         return None
     return facts[2], descriptor
@@ -572,7 +723,9 @@ def process_handle_alive(pid: int, handle: tuple[int, int]) -> bool:
     return facts is not None and facts[0] != "Z" and facts[2] == handle[0]
 
 
-def remember_process(pid: int, handles: ProcessHandles) -> bool:
+def remember_process(
+    pid: int, handles: ProcessHandles, *, expected_parent_pid: int | None = None
+) -> bool:
     current = handles.get(pid)
     if current is not None:
         if process_handle_alive(pid, current):
@@ -581,6 +734,9 @@ def remember_process(pid: int, handles: ProcessHandles) -> bool:
         del handles[pid]
     opened = open_process_handle(pid)
     if opened is None:
+        return False
+    if expected_parent_pid is not None and pid not in proc_children(expected_parent_pid):
+        os.close(opened[1])
         return False
     handles[pid] = opened
     return True
@@ -613,12 +769,32 @@ def live_tree_members(root_pid: int, known: ProcessHandles) -> set[int]:
     visited: set[int] = set()
     while pending:
         pid = pending.pop()
-        if pid == os.getpid() or pid in visited or not remember_process(pid, known):
+        if pid == os.getpid() or pid in visited:
+            continue
+        if pid == root_pid and pid in known and process_handle_alive(pid, known[pid]):
+            visited.add(pid)
+            for child in proc_children(pid):
+                if child not in visited:
+                    pending.append(child)
+            continue
+        parent_pid = next(
+            (
+                candidate
+                for candidate in ({root_pid, os.getpid()} | visited)
+                if pid in proc_children(candidate)
+            ),
+            None,
+        )
+        if parent_pid is None or not remember_process(
+            pid, known, expected_parent_pid=parent_pid
+        ):
             continue
         visited.add(pid)
         for child in proc_children(pid):
             if child not in visited:
                 pending.append(child)
+    # Once a lifetime was admitted through a proven parent edge, keep it in scope
+    # across subreaper/init reparenting until its pidfd-bound identity is dead.
     return {
         pid
         for pid, handle in known.items()
@@ -626,14 +802,14 @@ def live_tree_members(root_pid: int, known: ProcessHandles) -> set[int]:
     }
 
 
-def reap_adopted_children() -> None:
-    while True:
+def reap_adopted_children(exclude_pid: int | None = None) -> None:
+    for child_pid in proc_children(os.getpid()):
+        if child_pid == exclude_pid:
+            continue
         try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
+            os.waitpid(child_pid, os.WNOHANG)
         except ChildProcessError:
-            return
-        if pid <= 0:
-            return
+            continue
 
 
 def terminate_tree(
@@ -650,7 +826,7 @@ def terminate_tree(
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
         proc.poll()
-        reap_adopted_children()
+        reap_adopted_children(proc.pid)
         live = live_tree_members(proc.pid, known)
         if not live:
             break
@@ -684,7 +860,7 @@ def terminate_tree(
         kill_deadline = time.monotonic() + max(0.25, grace_s)
         while time.monotonic() < kill_deadline:
             proc.poll()
-            reap_adopted_children()
+            reap_adopted_children(proc.pid)
             live = live_tree_members(proc.pid, known)
             if not live:
                 break
@@ -712,6 +888,11 @@ def run_supervised(
     planted: bool,
     semantic_failure_exits: Sequence[int] = (),
     cancel_after_ms: int | None = None,
+    restore_signal_state: bool = True,
+    test_terminal_delay_ms: int = 0,
+    test_terminal_ready_path: Path | None = None,
+    guardian_identity: tuple[int, int] | None = None,
+    initial_signal_mask: set[signal.Signals] | None = None,
 ) -> int:
     if not argv:
         raise EvidenceError("supervisor requires a non-empty argv")
@@ -726,6 +907,14 @@ def run_supervised(
     if output_budget_bytes < capture_bytes:
         raise EvidenceError(
             "output budget must be at least the per-stream capture bound"
+        )
+    if test_terminal_delay_ms < 0:
+        raise EvidenceError("test terminal delay must be non-negative")
+    if test_terminal_ready_path is not None:
+        test_terminal_ready_path = require_within(
+            test_terminal_ready_path,
+            artifact_root,
+            label="test terminal readiness",
         )
     semantic_exits = sorted(set(semantic_failure_exits))
     if any(
@@ -767,6 +956,16 @@ def run_supervised(
     known_descendants: ProcessHandles = {}
     survivors: list[int] = []
     readiness_published = False
+    supervisor_pid = os.getpid()
+    supervisor_initial_facts = proc_stat_facts(supervisor_pid)
+    supervisor_start_ticks = (
+        supervisor_initial_facts[2] if supervisor_initial_facts is not None else 0
+    )
+    wrapper_pid, wrapper_start_ticks = (
+        guardian_identity
+        if guardian_identity is not None
+        else (supervisor_pid, supervisor_start_ticks)
+    )
 
     def remember_signal(signum: int, _frame: Any) -> None:
         nonlocal cancel_signal
@@ -778,6 +977,8 @@ def run_supervised(
         enable_child_subreaper()
         for signum in watched_signals:
             signal.signal(signum, remember_signal)
+        if initial_signal_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, initial_signal_mask)
         proc = subprocess.Popen(
             list(argv),
             cwd=cwd,
@@ -787,8 +988,15 @@ def run_supervised(
             start_new_session=True,
         )
         child_facts = proc_stat_facts(proc.pid)
-        wrapper_facts = proc_stat_facts(os.getpid())
-        if child_facts is None or wrapper_facts is None:
+        supervisor_facts = proc_stat_facts(supervisor_pid)
+        wrapper_facts = proc_stat_facts(wrapper_pid)
+        if (
+            child_facts is None
+            or supervisor_facts is None
+            or supervisor_facts[2] != supervisor_start_ticks
+            or wrapper_facts is None
+            or wrapper_facts[2] != wrapper_start_ticks
+        ):
             raise EvidenceError("cannot capture process identity facts for readiness")
         if child_facts[0] != "Z" and not remember_process(proc.pid, known_descendants):
             raise EvidenceError("cannot bind child process lifetime")
@@ -798,8 +1006,10 @@ def run_supervised(
                 {
                     "schema": "fln.supervisor-readiness/1",
                     "stage_id": stage_id,
-                    "wrapper_pid": os.getpid(),
-                    "wrapper_start_ticks": wrapper_facts[2],
+                    "wrapper_pid": wrapper_pid,
+                    "wrapper_start_ticks": wrapper_start_ticks,
+                    "supervisor_pid": supervisor_pid,
+                    "supervisor_start_ticks": supervisor_start_ticks,
                     "child_pid": proc.pid,
                     "child_pgid": os.getpgid(proc.pid),
                     "child_start_ticks": child_facts[2],
@@ -902,10 +1112,10 @@ def run_supervised(
                     {
                         "schema": "fln.supervisor-readiness/1",
                         "stage_id": stage_id,
-                        "wrapper_pid": os.getpid(),
-                        "wrapper_start_ticks": (
-                            proc_stat_facts(os.getpid()) or ("", 0, 0)
-                        )[2],
+                        "wrapper_pid": wrapper_pid,
+                        "wrapper_start_ticks": wrapper_start_ticks,
+                        "supervisor_pid": supervisor_pid,
+                        "supervisor_start_ticks": supervisor_start_ticks,
                         "child_pid": None,
                         "child_pgid": None,
                         "child_start_ticks": None,
@@ -946,15 +1156,15 @@ def run_supervised(
             (signum for signum in watched_signals if signum in pending), None
         )
 
-    def classify_terminal() -> tuple[str, str, int]:
+    def classify_terminal(observed_cancel: int | None) -> tuple[str, str, int]:
         if capture_publication_failed:
             return "internal_fault", "artifact_publication_failure", SETUP_FAILURE
         if errors:
             return "internal_fault", "supervisor_or_capture_failure", SETUP_FAILURE
-        if cancel_signal is not None:
+        if observed_cancel is not None:
             return (
                 "cancelled",
-                f"signal_{signal.Signals(cancel_signal).name}",
+                f"signal_{signal.Signals(observed_cancel).name}",
                 CANCELLED,
             )
         if termination_reason in {"timeout", "output_budget_exhausted"}:
@@ -967,7 +1177,7 @@ def run_supervised(
             return "internal_fault", "unexpected_child_exit", SETUP_FAILURE
         return "pass", "exit_zero", PASS
 
-    classification, reason_code, wrapper_exit = classify_terminal()
+    classification, reason_code, wrapper_exit = classify_terminal(cancel_signal)
 
     metadata: dict[str, Any] = {
         "schema": "fln.supervisor/1",
@@ -1001,7 +1211,11 @@ def run_supervised(
             "max_rss_kib_observed": usage_after.ru_maxrss,
             "term_sent": term_sent,
             "kill_sent": kill_sent,
-            "process_tree_scope": "linux_subreaper_plus_pidfd",
+            "process_tree_scope": (
+                "linux_nested_subreapers_pidfd_procfs_best_effort"
+                if guardian_identity is not None
+                else "linux_subreaper_pidfd_procfs_best_effort"
+            ),
             "surviving_pids": survivors,
         },
         "stdout": stdout_capture.facts(
@@ -1020,24 +1234,78 @@ def run_supervised(
     }
     metadata["stdout"]["retained_sha256"] = hashlib.sha256(out_data).hexdigest()
     metadata["stderr"]["retained_sha256"] = hashlib.sha256(err_data).hexdigest()
-    metadata_data = canonical_json(metadata)
-    # Account for a signal that became pending while the terminal object was built.
-    pending = signal.sigpending()
-    if cancel_signal is None:
-        cancel_signal = next(
-            (signum for signum in watched_signals if signum in pending), None
+    candidate_data: dict[int, bytes] = {}
+    base_key = 0
+
+    def candidate_for(observed_cancel: int | None) -> bytes:
+        candidate = dict(metadata)
+        candidate_class, candidate_reason, candidate_exit = classify_terminal(
+            observed_cancel
         )
-        if cancel_signal is not None:
-            classification, reason_code, wrapper_exit = classify_terminal()
-            metadata["classification"] = classification
-            metadata["reason_code"] = reason_code
-            metadata["wrapper_exit"] = wrapper_exit
-            metadata["cancel_signal"] = signal.Signals(cancel_signal).name
-            metadata_data = canonical_json(metadata)
+        candidate["classification"] = candidate_class
+        candidate["reason_code"] = candidate_reason
+        candidate["wrapper_exit"] = candidate_exit
+        candidate["cancel_signal"] = (
+            signal.Signals(observed_cancel).name
+            if observed_cancel is not None
+            else None
+        )
+        return canonical_json(candidate)
+
+    candidate_data[base_key] = candidate_for(cancel_signal)
     for signum in watched_signals:
-        signal.signal(signum, signal.SIG_IGN)
+        candidate_data[signum] = candidate_for(cancel_signal or signum)
+
+    metadata_parent, metadata_parent_fd = open_directory_nofollow(
+        metadata_path.parent, create=True
+    )
+    del metadata_parent
+    prepared: dict[int, int] = {}
+    winner: list[int] = []
+    commit_errors: list[BaseException] = []
     try:
-        write_new(metadata_path, metadata_data)
+        for key, data in candidate_data.items():
+            prepared[key] = prepare_atomic_file(metadata_parent_fd, data)
+        if test_terminal_ready_path is not None:
+            write_atomic_new(test_terminal_ready_path, b"candidates_ready\n")
+        if test_terminal_delay_ms:
+            time.sleep(test_terminal_delay_ms / 1000)
+
+        def commit_signal(signum: int, _frame: Any) -> None:
+            if winner or commit_errors:
+                return
+            key = signum if signum in prepared else base_key
+            try:
+                if link_prepared_atomic_file(
+                    metadata_parent_fd, prepared[key], metadata_path.name
+                ):
+                    winner.append(key)
+            except BaseException as error:
+                commit_errors.append(error)
+
+        for signum in watched_signals:
+            signal.signal(signum, commit_signal)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        if not winner and not commit_errors:
+            initial_key = cancel_signal or base_key
+            if link_prepared_atomic_file(
+                metadata_parent_fd, prepared[initial_key], metadata_path.name
+            ):
+                winner.append(initial_key)
+        signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
+        for signum in watched_signals:
+            signal.signal(signum, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        if commit_errors:
+            raise commit_errors[0]
+        if len(winner) != 1:
+            raise EvidenceError("metadata atomic publication had no unique winner")
+        selected = parse_json(candidate_data[winner[0]], subject="metadata candidate")
+        if not isinstance(selected, dict):
+            raise EvidenceError("metadata candidate is not an object")
+        classification = str(selected["classification"])
+        reason_code = str(selected["reason_code"])
+        wrapper_exit = int(selected["wrapper_exit"])
     except BaseException as error:
         fallback = {
             "schema": "fln.supervisor/1",
@@ -1047,14 +1315,21 @@ def run_supervised(
             "error": f"{type(error).__name__}: {error}",
         }
         sys.stderr.buffer.write(canonical_json(fallback))
+        if restore_signal_state:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        close_process_handles(known_descendants)
+        return SETUP_FAILURE
+    finally:
+        for descriptor in prepared.values():
+            os.close(descriptor)
+        os.close(metadata_parent_fd)
+    if restore_signal_state:
+        signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
-        close_process_handles(known_descendants)
-        return SETUP_FAILURE
-    for signum, handler in old_handlers.items():
-        signal.signal(signum, handler)
-    signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
     close_process_handles(known_descendants)
     return wrapper_exit
 
@@ -1831,7 +2106,10 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: malformed resource fact {key}"
             )
-    if resource_facts.get("process_tree_scope") != "linux_subreaper_plus_pidfd":
+    if resource_facts.get("process_tree_scope") not in {
+        "linux_nested_subreapers_pidfd_procfs_best_effort",
+        "linux_subreaper_pidfd_procfs_best_effort",
+    }:
         raise EvidenceError(f"{path}:{record_number}: unknown process-tree scope")
     if resource_facts.get("surviving_pids") != []:
         raise EvidenceError(f"{path}:{record_number}: supervisor left live descendants")
@@ -1839,8 +2117,25 @@ def validate_supervisor_object(
         path.parent / str(value["readiness"]), path.parent, label="readiness artifact"
     )
     readiness = read_json_object(readiness_path)
+    readiness_keys = {
+        "schema",
+        "stage_id",
+        "wrapper_pid",
+        "wrapper_start_ticks",
+        "supervisor_pid",
+        "supervisor_start_ticks",
+        "child_pid",
+        "child_pgid",
+        "child_start_ticks",
+        "monotonic_ns",
+        "status",
+    }
     if (
-        readiness.get("schema") != "fln.supervisor-readiness/1"
+        set(readiness) != readiness_keys
+        or not isinstance(readiness.get("monotonic_ns"), int)
+        or isinstance(readiness.get("monotonic_ns"), bool)
+        or readiness.get("monotonic_ns", 0) <= 0
+        or readiness.get("schema") != "fln.supervisor-readiness/1"
         or readiness.get("stage_id") != expected_stage_id
     ):
         raise EvidenceError(f"{path}:{record_number}: malformed readiness artifact")
@@ -1851,6 +2146,8 @@ def validate_supervisor_object(
         raise EvidenceError(f"{path}:{record_number}: unknown readiness status")
     wrapper_pid = readiness.get("wrapper_pid")
     wrapper_ticks = readiness.get("wrapper_start_ticks")
+    supervisor_pid = readiness.get("supervisor_pid")
+    supervisor_ticks = readiness.get("supervisor_start_ticks")
     if (
         not isinstance(wrapper_pid, int)
         or isinstance(wrapper_pid, bool)
@@ -1858,9 +2155,27 @@ def validate_supervisor_object(
         or not isinstance(wrapper_ticks, int)
         or isinstance(wrapper_ticks, bool)
         or wrapper_ticks <= 0
+        or not isinstance(supervisor_pid, int)
+        or isinstance(supervisor_pid, bool)
+        or supervisor_pid <= 1
+        or not isinstance(supervisor_ticks, int)
+        or isinstance(supervisor_ticks, bool)
+        or supervisor_ticks <= 0
+        or (
+            supervisor_pid == wrapper_pid and supervisor_ticks != wrapper_ticks
+        )
     ):
         raise EvidenceError(
             f"{path}:{record_number}: malformed wrapper readiness identity"
+        )
+    expected_scope = (
+        "linux_nested_subreapers_pidfd_procfs_best_effort"
+        if supervisor_pid != wrapper_pid
+        else "linux_subreaper_pidfd_procfs_best_effort"
+    )
+    if resource_facts.get("process_tree_scope") != expected_scope:
+        raise EvidenceError(
+            f"{path}:{record_number}: readiness/process-tree scope mismatch"
         )
     if readiness_status == "ready":
         child_pid = readiness.get("child_pid")
@@ -1874,6 +2189,7 @@ def validate_supervisor_object(
             or not isinstance(child_ticks, int)
             or isinstance(child_ticks, bool)
             or child_ticks <= 0
+            or child_pid in {wrapper_pid, supervisor_pid}
         ):
             raise EvidenceError(
                 f"{path}:{record_number}: malformed child readiness identity"
@@ -1941,7 +2257,9 @@ def validate_supervisor_object(
             facts["total_bytes"] != facts["retained_bytes"]
             or facts["head_bytes"] != facts["retained_bytes"]
             or facts["tail_bytes"] != 0
-            or facts["sha256"] != facts["retained_sha256"]
+            or not hmac.compare_digest(
+                str(facts["sha256"]), str(facts["retained_sha256"])
+            )
         ):
             raise EvidenceError(
                 f"{path}:{record_number}: inconsistent untruncated {stream}"
@@ -1956,7 +2274,9 @@ def validate_supervisor_object(
             label=f"{stream} artifact",
         )
         _data, size, digest = stable_file_facts(artifact)
-        if size != facts["retained_bytes"] or digest != facts["retained_sha256"]:
+        if size != facts["retained_bytes"] or not hmac.compare_digest(
+            digest, str(facts["retained_sha256"])
+        ):
             raise EvidenceError(
                 f"{path}:{record_number}: {stream} artifact facts disagree"
             )
@@ -2512,7 +2832,7 @@ def validate_ubs_inventory(path: Path, root: Path | None) -> dict[str, Any]:
         if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
             raise EvidenceError(f"UBS inventory input is not regular: {candidate}")
         _data, size, digest = stable_file_facts(candidate)
-        if row["bytes"] != size or row["sha256"] != digest:
+        if row["bytes"] != size or not hmac.compare_digest(row["sha256"], digest):
             raise EvidenceError(f"UBS inventory input changed: {rel}")
     if collect_ubs_inventory(root, inventory["scope"]) != inventory:
         raise EvidenceError("UBS inventory scope changed during validation")
@@ -2531,36 +2851,49 @@ def emergency_kill(
     ):
         raise EvidenceError("emergency kill readiness identity mismatch")
     wrapper_pid = readiness.get("wrapper_pid")
+    supervisor_pid = readiness.get("supervisor_pid")
     child_pid = readiness.get("child_pid")
     child_pgid = readiness.get("child_pgid")
     if wrapper_pid != expected_wrapper_pid or child_pid != child_pgid:
         raise EvidenceError("emergency kill PID binding mismatch")
     if not all(
         isinstance(value, int) and not isinstance(value, bool) and value > 1
-        for value in (wrapper_pid, child_pid)
+        for value in (wrapper_pid, supervisor_pid, child_pid)
     ):
         raise EvidenceError("emergency kill PIDs are malformed")
     wrapper_facts = proc_stat_facts(wrapper_pid)
+    supervisor_facts = proc_stat_facts(supervisor_pid)
     child_facts = proc_stat_facts(child_pid)
     if (
         wrapper_facts is None
+        or supervisor_facts is None
         or child_facts is None
         or wrapper_facts[0] == "Z"
+        or supervisor_facts[0] == "Z"
         or child_facts[0] == "Z"
         or wrapper_facts[2] != readiness.get("wrapper_start_ticks")
+        or supervisor_facts[2] != readiness.get("supervisor_start_ticks")
         or child_facts[2] != readiness.get("child_start_ticks")
         or child_facts[1] != child_pgid
         or os.getpgid(child_pid) != child_pgid
     ):
         raise EvidenceError("emergency kill readiness is stale")
     handles: ProcessHandles = {}
+    frozen_scope: set[int] | None = None
     try:
-        if not remember_process(wrapper_pid, handles) or not remember_process(
-            child_pid, handles
-        ):
+        if not remember_process(wrapper_pid, handles):
             raise EvidenceError("emergency kill could not bind process lifetimes")
+        if supervisor_pid != wrapper_pid and not remember_process(
+            supervisor_pid, handles, expected_parent_pid=wrapper_pid
+        ):
+            raise EvidenceError("emergency kill could not bind supervisor lifetime")
+        if not remember_process(
+            child_pid, handles, expected_parent_pid=supervisor_pid
+        ):
+            raise EvidenceError("emergency kill could not bind child lifetime")
         if (
             handles[wrapper_pid][0] != wrapper_facts[2]
+            or handles[supervisor_pid][0] != supervisor_facts[2]
             or handles[child_pid][0] != child_facts[2]
         ):
             raise EvidenceError("emergency kill process identity changed")
@@ -2569,7 +2902,11 @@ def emergency_kill(
         # descendants that created their own sessions and prevents any bound parent
         # from forking across the final scan. Pidfds make every signal lifetime-safe.
         live = live_tree_members(wrapper_pid, handles)
-        if wrapper_pid not in live or child_pid not in live:
+        if (
+            wrapper_pid not in live
+            or supervisor_pid not in live
+            or child_pid not in live
+        ):
             raise EvidenceError("emergency kill readiness tree is incomplete")
         freeze_deadline = time.monotonic() + 1.0
         while time.monotonic() < freeze_deadline:
@@ -2585,6 +2922,7 @@ def emergency_kill(
             )
             if repeated == live and all_stopped:
                 live = repeated
+                frozen_scope = set(repeated)
                 break
             live = repeated
         else:
@@ -2602,14 +2940,122 @@ def emergency_kill(
             time.sleep(0.01)
         raise EvidenceError(f"emergency kill left live processes: {sorted(live)}")
     except BaseException:
-        # Escalation was already authorized by this command. If a verification step
-        # fails after pidfds were bound, kill only those exact lifetimes before
-        # surfacing the failure; never leave a deliberately stopped descendant tree.
-        for pid, handle in list(handles.items()):
-            signal_process_handle(pid, handle, signal.SIGKILL)
+        if frozen_scope is None:
+            # Until a complete fixed point is proven, killing the guardian could
+            # orphan an unbound descendant. Resume anything tentatively stopped and
+            # leave the outer guardian alive to retain the subreaper boundary.
+            for pid, handle in list(handles.items()):
+                signal_process_handle(pid, handle, signal.SIGCONT)
+        else:
+            # Once the whole scope is frozen, finish the authorized teardown with
+            # descendants/inner supervisor first and the outer guardian last.
+            for pid in sorted(
+                frozen_scope, key=lambda value: value == wrapper_pid
+            ):
+                handle = handles.get(pid)
+                if handle is not None:
+                    signal_process_handle(pid, handle, signal.SIGKILL)
         raise
     finally:
         close_process_handles(handles)
+
+
+def kill_bound_process_group(pid: int, expected_start_ticks: int) -> None:
+    """SIGKILL one exact session leader and its current process group."""
+    if pid <= 1 or expected_start_ticks <= 0:
+        raise EvidenceError("bound process-group identity is malformed")
+    opened = open_process_handle(pid)
+    if opened is None:
+        return
+    handle = opened
+    try:
+        facts = proc_stat_facts(pid)
+        if facts is None or facts[2] != expected_start_ticks:
+            return
+        if handle[0] != expected_start_ticks or facts[1] != pid:
+            raise EvidenceError("bound process is not the expected session leader")
+        if not signal_process_handle(pid, handle, signal.SIGSTOP):
+            return
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            repeated = proc_stat_facts(pid)
+            if repeated is None or repeated[2] != expected_start_ticks:
+                return
+            if repeated[0] in {"T", "t"}:
+                break
+            time.sleep(0.005)
+        else:
+            raise EvidenceError("bound process group could not be frozen")
+        # The exact leader is stopped and unreaped, so its process-group identifier
+        # cannot be recycled between this verification and the group kill.
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        signal_process_handle(pid, handle, signal.SIGKILL)
+    finally:
+        os.close(handle[1])
+
+
+def signal_bound_process(pid: int, expected_start_ticks: int, signum: int) -> None:
+    """Signal one exact Linux process lifetime without numeric-PID reuse risk."""
+    if pid <= 1 or expected_start_ticks <= 0:
+        raise EvidenceError("bound process identity is malformed")
+    handle = open_process_handle(pid)
+    if handle is None:
+        return
+    try:
+        if handle[0] != expected_start_ticks:
+            return
+        signal_process_handle(pid, handle, signum)
+    finally:
+        os.close(handle[1])
+
+
+def cleanup_guardian_descendants(worker_pid: int, grace_s: float = 1.0) -> list[int]:
+    """Contain descendants adopted after an inner supervisor exits unexpectedly."""
+    known: ProcessHandles = {}
+    try:
+        live = live_tree_members(worker_pid, known)
+        if not live:
+            time.sleep(0.01)
+            live = live_tree_members(worker_pid, known)
+        if not live:
+            reap_adopted_children()
+            return []
+
+        freeze_deadline = time.monotonic() + grace_s
+        while time.monotonic() < freeze_deadline:
+            for pid in live:
+                signal_process_handle(pid, known[pid], signal.SIGSTOP)
+            time.sleep(0.01)
+            repeated = live_tree_members(worker_pid, known)
+            all_stopped = all(
+                (facts := proc_stat_facts(pid)) is not None
+                and facts[0] in {"T", "t"}
+                and facts[2] == known[pid][0]
+                for pid in repeated
+            )
+            if repeated == live and all_stopped:
+                live = repeated
+                break
+            live = repeated
+
+        for pid in live:
+            signal_process_handle(pid, known[pid], signal.SIGKILL)
+        kill_deadline = time.monotonic() + grace_s
+        while time.monotonic() < kill_deadline:
+            reap_adopted_children()
+            live = live_tree_members(worker_pid, known)
+            if not live:
+                reap_adopted_children()
+                return []
+            for pid in live:
+                signal_process_handle(pid, known[pid], signal.SIGKILL)
+            time.sleep(0.01)
+        return sorted(live)
+    finally:
+        close_process_handles(known)
 
 
 def artifact_role(rel: str) -> str:
@@ -2707,8 +3153,12 @@ def generate_manifest(
     art_dir = lexical_absolute(art_dir)
     _root, root_fd = open_directory_nofollow(art_dir, create=False)
     os.close(root_fd)
-    output = require_within(output, art_dir, label="manifest output")
-    digest_output = require_within(digest_output, art_dir, label="manifest digest")
+    output = require_exact_artifact_path(
+        output, art_dir, "manifest.json", label="manifest output"
+    )
+    digest_output = require_exact_artifact_path(
+        digest_output, art_dir, "manifest.digest", label="manifest digest"
+    )
     run_log = art_dir / "run.ndjson"
     run_records = load_ndjson(run_log)
     run_schema = run_records[0].get("schema")
@@ -2740,7 +3190,15 @@ def generate_manifest(
     validation_path = art_dir / "run.validation.json"
     if read_json_object(validation_path) != run_report:
         raise EvidenceError("run validation report does not match the manifested run")
-    entries = artifact_inventory(art_dir, excluded={output, digest_output})
+    entries = artifact_inventory(
+        art_dir,
+        excluded={
+            output,
+            digest_output,
+            art_dir / "bundle.decision",
+            art_dir / "bundle.complete.json",
+        },
+    )
     present = {entry["path"] for entry in entries}
     required = {"run.ndjson", "run.validation.json"}
     if not required.issubset(present):
@@ -2778,8 +3236,12 @@ def validate_manifest(
     art_dir = lexical_absolute(art_dir)
     _root, root_fd = open_directory_nofollow(art_dir, create=False)
     os.close(root_fd)
-    manifest_path = require_within(manifest_path, art_dir, label="manifest")
-    digest_path = require_within(digest_path, art_dir, label="manifest digest")
+    manifest_path = require_exact_artifact_path(
+        manifest_path, art_dir, "manifest.json", label="manifest"
+    )
+    digest_path = require_exact_artifact_path(
+        digest_path, art_dir, "manifest.digest", label="manifest digest"
+    )
     manifest = read_json_object(manifest_path)
     if manifest.get("schema") != "fln.evidence-manifest/1":
         raise EvidenceError("wrong evidence manifest schema")
@@ -2824,14 +3286,16 @@ def validate_manifest(
             ).hexdigest()
             if (
                 entry.get("bytes") != 0
-                or entry.get("sha256") != expected_directory_digest
+                or not hmac.compare_digest(
+                    str(entry.get("sha256")), expected_directory_digest
+                )
             ):
                 raise EvidenceError(f"manifest directory facts mismatch: {rel}")
         else:
             _data, size, digest = stable_file_facts(path)
             if entry.get("bytes") != size:
                 raise EvidenceError(f"manifest byte count mismatch: {rel}")
-            if entry.get("sha256") != digest:
+            if not hmac.compare_digest(str(entry.get("sha256")), digest):
                 raise EvidenceError(f"manifest digest mismatch: {rel}")
         if entry.get("complete") is not True:
             raise EvidenceError(f"manifest artifact is not complete: {rel}")
@@ -2851,7 +3315,12 @@ def validate_manifest(
         )
     actual_entries = artifact_inventory(
         art_dir,
-        excluded={manifest_path, digest_path, art_dir / "bundle.complete.json"},
+        excluded={
+            manifest_path,
+            digest_path,
+            art_dir / "bundle.decision",
+            art_dir / "bundle.complete.json",
+        },
     )
     if entries != actual_entries:
         raise EvidenceError(
@@ -2897,10 +3366,23 @@ def validate_manifest(
 
 
 def durably_sync_manifested_bundle(
-    art_dir: Path, manifest_path: Path, digest_path: Path
+    art_dir: Path,
+    manifest_path: Path,
+    digest_path: Path,
+    commit_path: Path | None = None,
 ) -> None:
-    """Order every manifested artifact durably before the bundle marker."""
+    """Order every artifact and directory-creation edge before the bundle marker."""
     art_dir = lexical_absolute(art_dir)
+    manifest_path = require_exact_artifact_path(
+        manifest_path, art_dir, "manifest.json", label="manifest"
+    )
+    digest_path = require_exact_artifact_path(
+        digest_path, art_dir, "manifest.digest", label="manifest digest"
+    )
+    if commit_path is not None:
+        commit_path = require_exact_artifact_path(
+            commit_path, art_dir, "bundle.complete.json", label="bundle commit"
+        )
     manifest = read_json_object(manifest_path)
     files = [
         require_within(art_dir / entry["path"], art_dir, label="durable artifact")
@@ -2908,6 +3390,17 @@ def durably_sync_manifested_bundle(
         if entry["role"] != "directory"
     ]
     files.extend((manifest_path, digest_path))
+    if commit_path is not None:
+        files.append(
+            require_within(commit_path, art_dir, label="durable bundle commit")
+        )
+        files.append(
+            require_within(
+                commit_path.with_name("bundle.decision"),
+                art_dir,
+                label="durable bundle decision",
+            )
+        )
     directories = {art_dir}
     for path in files:
         _absolute, descriptor = open_regular_nofollow(path)
@@ -2917,6 +3410,10 @@ def durably_sync_manifested_bundle(
             os.close(descriptor)
         parent = path.parent
         while parent != art_dir:
+            if parent == parent.parent or art_dir not in parent.parents:
+                raise EvidenceError(
+                    f"durable artifact parent escapes artifact root: {path}"
+                )
             directories.add(parent)
             parent = parent.parent
     for entry in manifest["artifacts"]:
@@ -2926,6 +3423,15 @@ def durably_sync_manifested_bundle(
                     art_dir / entry["path"], art_dir, label="durable directory"
                 )
             )
+    # The shells create a fresh per-attempt artifact directory.  Syncing only that
+    # directory persists its children but not its own name in the parent.  Include
+    # the complete ancestor chain so first-run ART_ROOT creation is durable too.
+    ancestor = art_dir.parent
+    while True:
+        directories.add(ancestor)
+        if ancestor == ancestor.parent:
+            break
+        ancestor = ancestor.parent
     for directory in sorted(
         directories, key=lambda path: len(path.parts), reverse=True
     ):
@@ -2947,11 +3453,19 @@ def complete_bundle(
     expected_root: str,
     inventory_path: Path | None = None,
     vendor_path: str | None = None,
+    restore_signal_state: bool = True,
+    test_fail_after_link: bool = False,
 ) -> dict[str, Any]:
     art_dir = lexical_absolute(art_dir)
-    output = require_within(output, art_dir, label="bundle commit")
-    if output.name != "bundle.complete.json":
-        raise EvidenceError("bundle commit marker must be named bundle.complete.json")
+    manifest_path = require_exact_artifact_path(
+        manifest_path, art_dir, "manifest.json", label="manifest"
+    )
+    digest_path = require_exact_artifact_path(
+        digest_path, art_dir, "manifest.digest", label="manifest digest"
+    )
+    output = require_exact_artifact_path(
+        output, art_dir, "bundle.complete.json", label="bundle commit"
+    )
     validate_manifest(art_dir, manifest_path, digest_path)
     manifest = read_json_object(manifest_path)
     run_log = art_dir / "run.ndjson"
@@ -3045,7 +3559,13 @@ def complete_bundle(
         final_bindings,
     )
     # This durable, exclusive publication is deliberately the final operation.
-    write_atomic_new(output, marker_data)
+    write_signal_committed_atomic_new(
+        output,
+        marker_data,
+        decision_path=output.with_name("bundle.decision"),
+        restore_signal_state=restore_signal_state,
+        test_fail_after_link=test_fail_after_link,
+    )
     return marker
 
 
@@ -3090,7 +3610,7 @@ def validate_marker_bindings(
             not isinstance(value, dict)
             or set(value) != {"path", "sha256"}
             or value.get("path") != expected_name
-            or value.get("sha256") != expected_digest
+            or not hmac.compare_digest(str(value.get("sha256")), expected_digest)
         ):
             raise EvidenceError(f"bundle marker has invalid {key} binding")
 
@@ -3102,26 +3622,80 @@ def validate_bundle(
     commit_path: Path,
 ) -> dict[str, Any]:
     art_dir = lexical_absolute(art_dir)
-    manifest_path = require_within(manifest_path, art_dir, label="manifest")
-    digest_path = require_within(digest_path, art_dir, label="manifest digest")
-    commit_path = require_within(commit_path, art_dir, label="bundle commit")
-    if (
-        manifest_path.name != "manifest.json"
-        or digest_path.name != "manifest.digest"
-        or commit_path.name != "bundle.complete.json"
-    ):
-        raise EvidenceError("bundle uses non-canonical artifact names")
+    manifest_path = require_exact_artifact_path(
+        manifest_path, art_dir, "manifest.json", label="manifest"
+    )
+    digest_path = require_exact_artifact_path(
+        digest_path, art_dir, "manifest.digest", label="manifest digest"
+    )
+    commit_path = require_exact_artifact_path(
+        commit_path, art_dir, "bundle.complete.json", label="bundle commit"
+    )
+    run_log = art_dir / "run.ndjson"
     validate_manifest(art_dir, manifest_path, digest_path, live_context=False)
     manifest = read_json_object(manifest_path)
-    marker = read_json_object(commit_path)
-    run_log = art_dir / "run.ndjson"
     terminal = load_ndjson(run_log)[-1]
+    bindings = (
+        sha256_file(run_log),
+        sha256_file(manifest_path),
+        sha256_file(digest_path),
+    )
+    decision_path = art_dir / "bundle.decision"
+    decision_marker = read_json_object(decision_path)
+    validate_marker_bindings(decision_marker, manifest, terminal, bindings)
+    _parent, parent_fd = open_directory_nofollow(art_dir, create=False)
+    try:
+        try:
+            os.link(
+                decision_path.name,
+                commit_path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            pass
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    decision_data, _size, _digest = stable_file_facts(decision_path)
+    commit_data, _size, _digest = stable_file_facts(commit_path)
+    if not hmac.compare_digest(decision_data, commit_data):
+        raise EvidenceError("bundle marker does not match its commit decision")
+    marker = read_json_object(commit_path)
     validate_marker_bindings(
         marker,
         manifest,
         terminal,
-        (sha256_file(run_log), sha256_file(manifest_path), sha256_file(digest_path)),
+        bindings,
     )
+    # A publisher can die after the commit decision wins but before the canonical
+    # marker link/fsync. A validator recovers that marker, durably orders the whole
+    # bundle, and revalidates the adopted bytes before reporting commitment.
+    durably_sync_manifested_bundle(
+        art_dir, manifest_path, digest_path, commit_path=commit_path
+    )
+    validate_manifest(art_dir, manifest_path, digest_path, live_context=False)
+    manifest = read_json_object(manifest_path)
+    decision_marker = read_json_object(decision_path)
+    marker = read_json_object(commit_path)
+    terminal = load_ndjson(run_log)[-1]
+    bindings = (
+        sha256_file(run_log),
+        sha256_file(manifest_path),
+        sha256_file(digest_path),
+    )
+    validate_marker_bindings(decision_marker, manifest, terminal, bindings)
+    validate_marker_bindings(
+        marker,
+        manifest,
+        terminal,
+        bindings,
+    )
+    decision_data, _size, _digest = stable_file_facts(decision_path)
+    commit_data, _size, _digest = stable_file_facts(commit_path)
+    if not hmac.compare_digest(decision_data, commit_data):
+        raise EvidenceError("durable bundle marker changed from its commit decision")
     return {
         "schema": "fln.bundle-validation/1",
         "valid": True,
@@ -3183,7 +3757,11 @@ def cmd_emit(args: argparse.Namespace) -> int:
     return PASS
 
 
-def cmd_run(args: argparse.Namespace) -> int:
+def run_supervised_from_args(
+    args: argparse.Namespace,
+    guardian_identity: tuple[int, int] | None = None,
+    initial_signal_mask: set[signal.Signals] | None = None,
+) -> int:
     argv = list(args.command)
     if argv and argv[0] == "--":
         argv = argv[1:]
@@ -3203,7 +3781,126 @@ def cmd_run(args: argparse.Namespace) -> int:
         planted=args.planted,
         semantic_failure_exits=args.semantic_failure_exit or [],
         cancel_after_ms=args.cancel_after_ms,
+        restore_signal_state=False,
+        test_terminal_delay_ms=args.test_terminal_delay_ms,
+        test_terminal_ready_path=(
+            Path(args.test_terminal_ready) if args.test_terminal_ready else None
+        ),
+        guardian_identity=guardian_identity,
+        initial_signal_mask=initial_signal_mask,
     )
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Keep an outer subreaper alive if the inner supervisor is hard-killed."""
+    enable_child_subreaper()
+    guardian_facts = proc_stat_facts(os.getpid())
+    if guardian_facts is None or guardian_facts[0] == "Z":
+        raise EvidenceError("cannot bind guardian process identity")
+    guardian_identity = (os.getpid(), guardian_facts[2])
+    preflight_handle = open_process_handle(os.getpid())
+    if preflight_handle is None:
+        raise EvidenceError("cannot preflight guardian pidfd support")
+    os.close(preflight_handle[1])
+    watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    worker_pid = os.fork()
+    if worker_pid == 0:
+        try:
+            try:
+                worker_exit = run_supervised_from_args(
+                    args,
+                    guardian_identity,
+                    initial_signal_mask=previous_mask,
+                )
+            except BaseException as error:
+                sys.stderr.write(
+                    f"evidence worker: {type(error).__name__}: {error}\n"
+                )
+                worker_exit = SETUP_FAILURE
+            os._exit(worker_exit)
+        except BaseException:
+            os._exit(SETUP_FAILURE)
+
+    worker_handle: tuple[int, int] | None = None
+    waited_status: int | None = None
+    waited_pid = 0
+    setup_error: BaseException | None = None
+    try:
+        if args.test_fail_guardian_pidfd_open:
+            readiness = Path(args.readiness)
+            deadline = time.monotonic() + 15.0
+            while not readiness.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise OSError(errno.EMFILE, "injected post-fork pidfd_open failure")
+        worker_handle = open_process_handle(worker_pid)
+        if worker_handle is None:
+            waited_pid, status = os.waitpid(worker_pid, os.WNOHANG)
+            if waited_pid == worker_pid:
+                waited_status = status
+            else:
+                raise EvidenceError("cannot bind live inner supervisor")
+
+        def forward_signal(signum: int, _frame: Any) -> None:
+            if worker_handle is not None:
+                signal_process_handle(worker_pid, worker_handle, signum)
+
+        for signum in watched:
+            signal.signal(signum, forward_signal)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        while waited_status is None:
+            try:
+                waited_pid, waited_status = os.waitpid(worker_pid, 0)
+            except InterruptedError:
+                continue
+            if waited_pid != worker_pid:
+                raise EvidenceError("guardian reaped an unexpected process")
+    except BaseException as error:
+        setup_error = error
+        signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+        for signum in watched:
+            signal.signal(signum, signal.SIG_IGN)
+        if waited_status is None:
+            if worker_handle is not None:
+                signal_process_handle(worker_pid, worker_handle, signal.SIGKILL)
+            else:
+                try:
+                    # W is still our unreaped direct child, so this numeric PID
+                    # cannot be recycled before the following waitpid.
+                    os.kill(worker_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            while True:
+                try:
+                    waited_pid, waited_status = os.waitpid(worker_pid, 0)
+                    break
+                except InterruptedError:
+                    continue
+                except ChildProcessError:
+                    break
+            if waited_pid not in {0, worker_pid}:
+                setup_error = EvidenceError(
+                    "guardian lost the failed inner supervisor"
+                )
+    finally:
+        if worker_handle is not None:
+            os.close(worker_handle[1])
+
+    survivors = cleanup_guardian_descendants(worker_pid)
+    if survivors:
+        raise EvidenceError(
+            f"guardian containment remained unproven for PIDs {survivors}"
+        )
+    if setup_error is not None:
+        raise EvidenceError(
+            f"guardian setup failed after fork: {type(setup_error).__name__}: {setup_error}"
+        ) from setup_error
+    if waited_status is None:
+        raise EvidenceError("guardian lost inner supervisor status")
+    worker_exit = os.waitstatus_to_exitcode(waited_status)
+    if worker_exit in {PASS, FAIL, SETUP_FAILURE, INCONCLUSIVE, CANCELLED}:
+        return worker_exit
+    raise EvidenceError(f"inner supervisor died unexpectedly with status {worker_exit}")
 
 
 def cmd_validate_guard(args: argparse.Namespace) -> int:
@@ -3311,6 +4008,53 @@ def cmd_emergency_kill(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_process_start_ticks(args: argparse.Namespace) -> int:
+    if args.wait_ms < 0 or args.wait_ms > 5000:
+        raise EvidenceError("process identity wait must be between 0 and 5000 ms")
+    if args.pid == os.getpid():
+        raise EvidenceError("process identity target cannot be the binder itself")
+    handle = open_process_handle(
+        args.pid, expected_parent_pid=args.expected_parent_pid
+    )
+    if handle is None:
+        raise EvidenceError("process disappeared before identity binding")
+    try:
+        deadline = time.monotonic() + args.wait_ms / 1000
+        while True:
+            facts = proc_stat_facts(args.pid)
+            if (
+                facts is None
+                or facts[0] == "Z"
+                or facts[2] != handle[0]
+                or args.pid not in proc_children(args.expected_parent_pid)
+            ):
+                raise EvidenceError("process disappeared before session binding")
+            if not args.session_leader or facts[1] == args.pid:
+                print(handle[0])
+                return PASS
+            if time.monotonic() >= deadline:
+                signal_process_handle(args.pid, handle, signal.SIGKILL)
+                raise EvidenceError("process did not become a session leader in time")
+            time.sleep(0.005)
+    finally:
+        os.close(handle[1])
+
+
+def cmd_kill_bound_group(args: argparse.Namespace) -> int:
+    kill_bound_process_group(args.pid, args.expected_start_ticks)
+    return PASS
+
+
+def cmd_signal_bound_process(args: argparse.Namespace) -> int:
+    signum = {
+        "HUP": signal.SIGHUP,
+        "INT": signal.SIGINT,
+        "TERM": signal.SIGTERM,
+    }[args.signal]
+    signal_bound_process(args.pid, args.expected_start_ticks, signum)
+    return PASS
+
+
 def cmd_manifest(args: argparse.Namespace) -> int:
     generate_manifest(
         Path(args.art_dir),
@@ -3347,6 +4091,8 @@ def cmd_complete_bundle(args: argparse.Namespace) -> int:
         expected_root=args.expected_root,
         inventory_path=Path(args.inventory) if args.inventory else None,
         vendor_path=args.vendor_path,
+        restore_signal_state=False,
+        test_fail_after_link=args.test_fail_after_link,
     )
     return PASS
 
@@ -3411,7 +4157,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         *,
         capture: int = 4096,
         budget: int = 262_144,
-        timeout: int = 5000,
+        timeout: int = 30_000,
         cancel_after: int | None = None,
         stdout_override: Path | None = None,
         semantic_exits: Sequence[int] = (),
@@ -3535,7 +4281,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         [sys.executable, "-c", endless_output],
         capture=4096,
         budget=8192,
-        timeout=5000,
+        timeout=30_000,
     )
     require(rc == INCONCLUSIVE, "output exhaustion did not return inconclusive")
     require(meta["classification"] == "inconclusive", "output exhaustion misclassified")
@@ -3580,7 +4326,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         [sys.executable, "-c", tree_program],
         capture=4096,
         budget=65_536,
-        timeout=250,
+        timeout=5000,
     )
     require(
         rc == INCONCLUSIVE and meta["reason_code"] == "timeout", "timeout misclassified"
@@ -3675,7 +4421,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "--output-budget-bytes",
             "65536",
             "--timeout-ms",
-            "5000",
+            "30000",
             "--grace-ms",
             "500",
             "--stage-id",
@@ -3688,7 +4434,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    wait_deadline = time.monotonic() + 3
+    wait_deadline = time.monotonic() + 15
     while (
         not (cancel_pid_file.exists() and (cancel_root / "stage.ready.json").exists())
         and wrapper.poll() is None
@@ -3701,7 +4447,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "supervisor readiness was not published",
     )
     wrapper.send_signal(signal.SIGTERM)
-    _wrapper_out, wrapper_err = wrapper.communicate(timeout=5)
+    _wrapper_out, wrapper_err = wrapper.communicate(timeout=30)
     require(
         wrapper.returncode == CANCELLED,
         f"cancellation wrapper exit {wrapper.returncode}: {wrapper_err!r}",
@@ -3725,6 +4471,366 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "ok": True,
             "metadata": str(cancel_root / "stage.meta.json"),
             "pids": cancel_pids,
+        }
+    )
+
+    for terminal_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal_name = signal.Signals(terminal_signal).name
+        terminal_root = case_dir(f"terminal_commit_{signal_name.lower()}")
+        child_done = terminal_root / "child.done"
+        terminal_ready = terminal_root / "terminal.ready"
+        terminal_wrapper = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "run",
+                "--cwd",
+                str(art_dir),
+                "--metadata",
+                str(terminal_root / "stage.meta.json"),
+                "--stdout",
+                str(terminal_root / "stage.out"),
+                "--stderr",
+                str(terminal_root / "stage.err"),
+                "--readiness",
+                str(terminal_root / "stage.ready.json"),
+                "--artifact-root",
+                str(art_dir),
+                "--capture-bytes",
+                "4096",
+                "--output-budget-bytes",
+                "65536",
+                "--timeout-ms",
+                "30000",
+                "--grace-ms",
+                "500",
+                "--stage-id",
+                f"terminal_commit_{signal_name.lower()}",
+                "--test-terminal-delay-ms",
+                "500",
+                "--test-terminal-ready",
+                str(terminal_ready),
+                "--",
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(child_done)!r}).write_text('done')",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        signal_deadline = time.monotonic() + 15
+        while (
+            not terminal_ready.exists()
+            and terminal_wrapper.poll() is None
+            and time.monotonic() < signal_deadline
+        ):
+            time.sleep(0.01)
+        require(
+            terminal_ready.exists(),
+            f"{signal_name} terminal candidates were not prepared",
+        )
+        terminal_wrapper.send_signal(terminal_signal)
+        _terminal_out, terminal_err = terminal_wrapper.communicate(timeout=30)
+        require(
+            terminal_wrapper.returncode == CANCELLED,
+            f"{signal_name} terminal wrapper exit {terminal_wrapper.returncode}: {terminal_err!r}",
+        )
+        terminal_meta = read_json_object(terminal_root / "stage.meta.json")
+        require(
+            terminal_meta["classification"] == "cancelled"
+            and hmac.compare_digest(
+                str(terminal_meta["cancel_signal"]), signal_name
+            ),
+            f"{signal_name} did not win terminal metadata publication",
+        )
+        cases.append(
+            {
+                "case": f"terminal_commit_{signal_name.lower()}",
+                "ok": True,
+                "metadata": str(terminal_root / "stage.meta.json"),
+            }
+        )
+
+    emergency_root = case_dir("emergency_kill_detached")
+    emergency_pid_file = emergency_root / "pids.txt"
+    emergency_program = (
+        "import os,pathlib,subprocess,sys,time;"
+        "code='import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)';"
+        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"
+        f"pathlib.Path({str(emergency_pid_file)!r}).write_text(str(os.getpid())+'\\n'+str(p.pid)+'\\n');"
+        "time.sleep(60)"
+    )
+    emergency_wrapper = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "run",
+            "--cwd",
+            str(art_dir),
+            "--metadata",
+            str(emergency_root / "stage.meta.json"),
+            "--stdout",
+            str(emergency_root / "stage.out"),
+            "--stderr",
+            str(emergency_root / "stage.err"),
+            "--readiness",
+            str(emergency_root / "stage.ready.json"),
+            "--artifact-root",
+            str(art_dir),
+            "--capture-bytes",
+            "4096",
+            "--output-budget-bytes",
+            "65536",
+            "--timeout-ms",
+            "30000",
+            "--grace-ms",
+            "500",
+            "--stage-id",
+            "emergency_kill_detached",
+            "--",
+            sys.executable,
+            "-c",
+            emergency_program,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    emergency_deadline = time.monotonic() + 15
+    while (
+        not (
+            emergency_pid_file.exists()
+            and (emergency_root / "stage.ready.json").exists()
+        )
+        and emergency_wrapper.poll() is None
+        and time.monotonic() < emergency_deadline
+    ):
+        time.sleep(0.01)
+    require(emergency_pid_file.exists(), "emergency-kill child did not publish PIDs")
+    os.kill(emergency_wrapper.pid, signal.SIGSTOP)
+    emergency_kill(
+        emergency_root / "stage.ready.json",
+        emergency_wrapper.pid,
+        "emergency_kill_detached",
+    )
+    _emergency_out, emergency_err = emergency_wrapper.communicate(timeout=30)
+    require(
+        emergency_wrapper.returncode == -signal.SIGKILL,
+        f"emergency wrapper exit {emergency_wrapper.returncode}: {emergency_err!r}",
+    )
+    emergency_pids = [
+        int(value)
+        for value in emergency_pid_file.read_text(encoding="utf-8").splitlines()
+    ]
+    time.sleep(0.1)
+    require(
+        not any(process_alive(pid) for pid in emergency_pids),
+        "emergency kill left a detached descendant",
+    )
+    cases.append(
+        {
+            "case": "emergency_kill_detached",
+            "ok": True,
+            "pids": emergency_pids,
+        }
+    )
+
+    forged_root = case_dir("emergency_kill_rejects_unrelated")
+    forged_wrapper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    forged_error: EvidenceError | None = None
+    forged_wrapper_survived = False
+    unrelated_survived = False
+    try:
+        forged_wrapper_facts = proc_stat_facts(forged_wrapper.pid)
+        unrelated_facts = proc_stat_facts(unrelated.pid)
+        require(
+            forged_wrapper_facts is not None and unrelated_facts is not None,
+            "forged-readiness processes disappeared during setup",
+        )
+        forged_readiness = forged_root / "stage.ready.json"
+        write_new(
+            forged_readiness,
+            canonical_json(
+                {
+                    "schema": "fln.supervisor-readiness/1",
+                    "status": "ready",
+                    "stage_id": "emergency_kill_rejects_unrelated",
+                    "wrapper_pid": forged_wrapper.pid,
+                    "wrapper_start_ticks": forged_wrapper_facts[2],
+                    "supervisor_pid": forged_wrapper.pid,
+                    "supervisor_start_ticks": forged_wrapper_facts[2],
+                    "child_pid": unrelated.pid,
+                    "child_pgid": unrelated.pid,
+                    "child_start_ticks": unrelated_facts[2],
+                }
+            ),
+        )
+        try:
+            emergency_kill(
+                forged_readiness,
+                forged_wrapper.pid,
+                "emergency_kill_rejects_unrelated",
+            )
+        except EvidenceError as error:
+            forged_error = error
+        time.sleep(0.05)
+        forged_wrapper_survived = process_alive(forged_wrapper.pid)
+        unrelated_survived = process_alive(unrelated.pid)
+    finally:
+        if forged_wrapper.poll() is None:
+            forged_wrapper.kill()
+        forged_wrapper.communicate(timeout=30)
+        forged_wrapper.wait(timeout=0)
+        if unrelated.poll() is None:
+            unrelated.kill()
+        unrelated.communicate(timeout=30)
+        unrelated.wait(timeout=0)
+    require(forged_error is not None, "forged readiness was accepted")
+    require(
+        forged_wrapper_survived,
+        "unproven emergency cleanup killed the outer guardian",
+    )
+    require(unrelated_survived, "forged readiness killed an unrelated process")
+    cases.append(
+        {
+            "case": "emergency_kill_rejects_unrelated",
+            "ok": True,
+            "error": str(forged_error),
+        }
+    )
+
+    guardian_root = case_dir("guardian_contains_wrapper_death")
+    guardian_pid_file = guardian_root / "pids.txt"
+    guardian_program = (
+        "import os,pathlib,signal,subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
+        "start_new_session=True);"
+        f"pathlib.Path({str(guardian_pid_file)!r}).write_text(str(os.getpid())+'\\n'+str(p.pid)+'\\n');"
+        "os.kill(os.getppid(),signal.SIGKILL);time.sleep(60)"
+    )
+    guardian_wrapper = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "run",
+            "--cwd",
+            str(art_dir),
+            "--metadata",
+            str(guardian_root / "stage.meta.json"),
+            "--stdout",
+            str(guardian_root / "stage.out"),
+            "--stderr",
+            str(guardian_root / "stage.err"),
+            "--readiness",
+            str(guardian_root / "stage.ready.json"),
+            "--artifact-root",
+            str(art_dir),
+            "--capture-bytes",
+            "4096",
+            "--output-budget-bytes",
+            "65536",
+            "--timeout-ms",
+            "30000",
+            "--grace-ms",
+            "500",
+            "--stage-id",
+            "guardian_contains_wrapper_death",
+            "--",
+            sys.executable,
+            "-c",
+            guardian_program,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _guardian_out, guardian_err = guardian_wrapper.communicate(timeout=30)
+    require(
+        guardian_wrapper.returncode == SETUP_FAILURE,
+        f"guardian wrapper exit {guardian_wrapper.returncode}: {guardian_err!r}",
+    )
+    require(guardian_pid_file.exists(), "wrapper-death child did not publish PIDs")
+    guardian_pids = [
+        int(value)
+        for value in guardian_pid_file.read_text(encoding="utf-8").splitlines()
+    ]
+    time.sleep(0.1)
+    require(
+        not any(process_alive(pid) for pid in guardian_pids),
+        "guardian left a process after inner-supervisor death",
+    )
+    cases.append(
+        {
+            "case": "guardian_contains_wrapper_death",
+            "ok": True,
+            "pids": guardian_pids,
+        }
+    )
+
+    guardian_fault_root = case_dir("guardian_pidfd_open_failure")
+    guardian_fault_ready = guardian_fault_root / "stage.ready.json"
+    guardian_fault_wrapper = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "run",
+            "--cwd",
+            str(art_dir),
+            "--metadata",
+            str(guardian_fault_root / "stage.meta.json"),
+            "--stdout",
+            str(guardian_fault_root / "stage.out"),
+            "--stderr",
+            str(guardian_fault_root / "stage.err"),
+            "--readiness",
+            str(guardian_fault_ready),
+            "--artifact-root",
+            str(art_dir),
+            "--capture-bytes",
+            "4096",
+            "--output-budget-bytes",
+            "65536",
+            "--timeout-ms",
+            "30000",
+            "--grace-ms",
+            "500",
+            "--stage-id",
+            "guardian_pidfd_open_failure",
+            "--test-fail-guardian-pidfd-open",
+            "--",
+            sys.executable,
+            "-c",
+            "import time;time.sleep(60)",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _fault_out, fault_err = guardian_fault_wrapper.communicate(timeout=30)
+    require(
+        guardian_fault_wrapper.returncode == SETUP_FAILURE,
+        f"guardian pidfd-fault exit {guardian_fault_wrapper.returncode}: {fault_err!r}",
+    )
+    guardian_fault_readiness = read_json_object(guardian_fault_ready)
+    guardian_fault_child = guardian_fault_readiness.get("child_pid")
+    require(
+        isinstance(guardian_fault_child, int)
+        and not isinstance(guardian_fault_child, bool)
+        and not process_alive(guardian_fault_child),
+        "post-fork guardian setup failure left its stage child alive",
+    )
+    cases.append(
+        {
+            "case": "guardian_pidfd_open_failure",
+            "ok": True,
+            "child_pid": guardian_fault_child,
         }
     )
 
@@ -3923,14 +5029,29 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         pass
     else:
         raise EvidenceError("bundle without a commit marker was accepted")
-    complete_bundle(
-        manifest_root,
-        manifest_root / "manifest.json",
-        manifest_root / "manifest.digest",
-        manifest_root / "bundle.complete.json",
-        governed_root=hash_root,
-        governed_paths=["a", "b"],
-        expected_root=first_hash,
+    relative_manifest_root = Path(os.path.relpath(manifest_root, Path.cwd()))
+    try:
+        complete_bundle(
+            relative_manifest_root,
+            relative_manifest_root / "manifest.json",
+            relative_manifest_root / "manifest.digest",
+            relative_manifest_root / "bundle.complete.json",
+            governed_root=hash_root,
+            governed_paths=["a", "b"],
+            expected_root=first_hash,
+            test_fail_after_link=True,
+        )
+    except EvidenceError as error:
+        require(
+            "injected failure after atomic link" in str(error),
+            "bundle link fault produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("bundle link fault injection unexpectedly returned success")
+    require(
+        (manifest_root / "bundle.decision").exists()
+        and not (manifest_root / "bundle.complete.json").exists(),
+        "bundle link fault did not exercise the recovery window",
     )
     validate_bundle(
         manifest_root,
@@ -3938,6 +5059,30 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         manifest_root / "manifest.digest",
         manifest_root / "bundle.complete.json",
     )
+    require(
+        (manifest_root / "bundle.complete.json").exists(),
+        "bundle validation did not recover the winning decision",
+    )
+    validate_bundle(
+        relative_manifest_root,
+        relative_manifest_root / "manifest.json",
+        relative_manifest_root / "manifest.digest",
+        relative_manifest_root / "bundle.complete.json",
+    )
+    try:
+        validate_bundle(
+            manifest_root,
+            manifest_root / "control" / "manifest.json",
+            manifest_root / "control" / "manifest.digest",
+            manifest_root / "bundle.complete.json",
+        )
+    except EvidenceError as error:
+        require(
+            "must be exactly" in str(error),
+            "nested control path produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("nested bundle control paths were accepted")
     try:
         write_new(manifest_root / "bundle.complete.json", b"overwrite\n")
     except FileExistsError:
@@ -3945,6 +5090,29 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     else:
         raise EvidenceError("write-once bundle marker was overwritten")
     cases.append({"case": "write_once_manifest", "ok": True})
+
+    cancellation_root = case_dir("bundle_decision_cancellation")
+    cancellation_decision = cancellation_root / "bundle.decision"
+    cancellation_marker = cancellation_root / "bundle.complete.json"
+    write_new(cancellation_decision, b"")
+    try:
+        write_signal_committed_atomic_new(
+            cancellation_marker,
+            b'{"status":"committed"}\n',
+            decision_path=cancellation_decision,
+        )
+    except EvidenceError as error:
+        require(
+            "cancellation won the bundle decision race" in str(error),
+            "bundle cancellation produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("bundle commit ignored the cancellation decision")
+    require(
+        not cancellation_marker.exists(),
+        "cancelled bundle decision still published a commit marker",
+    )
+    cases.append({"case": "bundle_decision_cancellation", "ok": True})
 
     race_root = case_dir("write_collision_race")
     race_path = race_root / "collision-race.txt"
@@ -4019,6 +5187,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--planted", action="store_true")
     run_parser.add_argument("--semantic-failure-exit", type=int, action="append")
     run_parser.add_argument("--cancel-after-ms", type=int)
+    run_parser.add_argument("--test-terminal-delay-ms", type=int, default=0)
+    run_parser.add_argument("--test-terminal-ready")
+    run_parser.add_argument(
+        "--test-fail-guardian-pidfd-open",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     run_parser.set_defaults(func=cmd_run)
 
@@ -4102,6 +5277,38 @@ def build_parser() -> argparse.ArgumentParser:
     emergency_parser.add_argument("--expected-stage-id", required=True)
     emergency_parser.set_defaults(func=cmd_emergency_kill)
 
+    process_identity_parser = subparsers.add_parser(
+        "process-start-ticks", help="bind one live session leader's Linux identity"
+    )
+    process_identity_parser.add_argument("--pid", type=int, required=True)
+    process_identity_parser.add_argument(
+        "--expected-parent-pid", type=int, required=True
+    )
+    process_identity_parser.add_argument("--wait-ms", type=int, default=0)
+    process_identity_parser.add_argument("--session-leader", action="store_true")
+    process_identity_parser.set_defaults(func=cmd_process_start_ticks)
+
+    bound_group_parser = subparsers.add_parser(
+        "kill-bound-group", help="SIGKILL one start-time-bound process group"
+    )
+    bound_group_parser.add_argument("--pid", type=int, required=True)
+    bound_group_parser.add_argument(
+        "--expected-start-ticks", type=int, required=True
+    )
+    bound_group_parser.set_defaults(func=cmd_kill_bound_group)
+
+    bound_process_parser = subparsers.add_parser(
+        "signal-bound-process", help="signal one start-time-bound process"
+    )
+    bound_process_parser.add_argument("--pid", type=int, required=True)
+    bound_process_parser.add_argument(
+        "--expected-start-ticks", type=int, required=True
+    )
+    bound_process_parser.add_argument(
+        "--signal", choices=("HUP", "INT", "TERM"), required=True
+    )
+    bound_process_parser.set_defaults(func=cmd_signal_bound_process)
+
     manifest_parser = subparsers.add_parser(
         "manifest", help="publish an evidence manifest"
     )
@@ -4138,6 +5345,7 @@ def build_parser() -> argparse.ArgumentParser:
     complete_parser.add_argument("--expected-root", required=True)
     complete_parser.add_argument("--inventory")
     complete_parser.add_argument("--vendor-path")
+    complete_parser.add_argument("--test-fail-after-link", action="store_true")
     complete_parser.set_defaults(func=cmd_complete_bundle)
 
     bundle_validation = subparsers.add_parser(

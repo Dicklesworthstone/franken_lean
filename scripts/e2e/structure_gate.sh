@@ -5,6 +5,15 @@
 
 set -Eeuo pipefail
 
+command -v python3 >/dev/null 2>&1 || {
+  echo "[structure_gate] setup failure: python3 is required" >&2
+  exit 2
+}
+command -v setsid >/dev/null 2>&1 || {
+  echo "[structure_gate] setup failure: setsid is required" >&2
+  exit 2
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 EVIDENCE="$ROOT/scripts/evidence.py"
@@ -22,11 +31,12 @@ CAPTURE_BYTES="${FLN_E2E_CAPTURE_BYTES:-262144}"
 OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-16777216}"
 TIMEOUT_MS="${FLN_E2E_TIMEOUT_MS:-300000}"
 GRACE_MS="${FLN_E2E_KILL_GRACE_MS:-2000}"
-READY_WAIT_MS="${FLN_E2E_READY_WAIT_MS:-5000}"
+READY_WAIT_MS="${FLN_E2E_READY_WAIT_MS:-30000}"
 START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
 SEQ=0
 ACTIVE_STEP="setup"
 ACTIVE_RUNNER_PID=""
+ACTIVE_RUNNER_START_TICKS=""
 ACTIVE_READINESS=""
 SPAWNING=0
 PENDING_SIGNAL=""
@@ -39,10 +49,15 @@ FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
 FINALIZING=0
+FINALIZER_TRANSITION=0
 FINALIZER_PID=""
+FINALIZER_START_TICKS=""
 FINALIZATION_SIGNAL=""
 FINALIZATION_SIGNAL_EXIT=0
+FINALIZATION_SIGNAL_GENERATION=0
+FINALIZATION_DECISION="$ART_DIR/bundle.decision"
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
+EVENT_COMMAND=()
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
   vendor/NOTICE
@@ -68,14 +83,19 @@ note() {
   printf '[structure_gate] %s\n' "$*" | tee -a "$HUMAN" >&2
 }
 
-emit_event() {
+build_event_command() {
   local sequence="$SEQ"
   SEQ=$((SEQ + 1))
-  python3 "$EVIDENCE" emit --file "$LOG" --artifact-root "$ART_DIR" \
+  EVENT_COMMAND=(python3 "$EVIDENCE" emit --file "$LOG" --artifact-root "$ART_DIR" \
     --string schema "$SCHEMA" --string run_id "$RUN_ID" --string bead "$BEAD" \
     --string scenario "$SCENARIO" --integer sequence "$sequence" \
     --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
-    --string wall_time_utc "$(date -u -Is)" "$@"
+    --string wall_time_utc "$(date -u -Is)" "$@")
+}
+
+emit_event() {
+  build_event_command "$@"
+  "${EVENT_COMMAND[@]}"
 }
 
 set_final() { FINAL_SET=1; FINAL_VERDICT="$1"; FINAL_REASON="$2"; FINAL_EXIT="$3"; }
@@ -114,25 +134,40 @@ bounded_readiness_wait() {
 # Invoked from signal handling; bounded so publication cannot hang indefinitely.
 # shellcheck disable=SC2317
 stop_active_runner() {
-  local name="$1" pid="$ACTIVE_RUNNER_PID" cleanup_rc=0
+  local name="$1" pid="$ACTIVE_RUNNER_PID" cleanup_rc=0 forced=0 guardian_rc=0
   [ -n "$pid" ] || return 0
-  bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" || true
-  kill -s "$name" "$pid" 2>/dev/null || true
+  if bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" \
+      && [ -n "$ACTIVE_RUNNER_START_TICKS" ]; then
+    python3 "$EVIDENCE" signal-bound-process --pid "$pid" \
+      --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal "$name" \
+      >/dev/null 2>&1 || true
+  fi
   if ! bounded_pid_exit_wait "$pid" "$((READY_WAIT_MS + 3 * GRACE_MS))"; then
     if [ -s "$ACTIVE_READINESS" ]; then
       if ! python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
         --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STEP" \
         >/dev/null 2>&1; then
         cleanup_rc=1
+      else
+        forced=1
       fi
     else
       cleanup_rc=1
     fi
-    kill -KILL "$pid" 2>/dev/null || true
-    bounded_pid_exit_wait "$pid" "$GRACE_MS" || true
+    if [ "$cleanup_rc" -eq 0 ]; then
+      bounded_pid_exit_wait "$pid" "$GRACE_MS" || true
+    fi
   fi
-  if bounded_pid_exit_wait "$pid" 20; then wait "$pid" 2>/dev/null || true; fi
+  if [ "$cleanup_rc" -eq 0 ] && bounded_pid_exit_wait "$pid" 20; then
+    wait "$pid" 2>/dev/null || guardian_rc=$?
+    if [ "$forced" -eq 0 ]; then
+    case "$guardian_rc" in 0|1|3|4) ;; *) cleanup_rc=1 ;; esac
+    fi
+  elif [ "$cleanup_rc" -eq 0 ]; then
+    cleanup_rc=1
+  fi
   ACTIVE_RUNNER_PID=""
+  ACTIVE_RUNNER_START_TICKS=""
   ACTIVE_READINESS=""
   return "$cleanup_rc"
 }
@@ -141,8 +176,12 @@ stop_active_runner() {
 # shellcheck disable=SC2317
 on_signal() {
   local name="$1" exit_code="$2"
+  if [ "$FINALIZER_TRANSITION" -eq 1 ]; then
+    on_finalizer_signal "$name" "$exit_code"
+    return 0
+  fi
   trap '' HUP INT TERM
-  if [ "$SPAWNING" -eq 1 ] && [ -z "$ACTIVE_RUNNER_PID" ]; then
+  if [ "$SPAWNING" -eq 1 ]; then
     PENDING_SIGNAL="$name"
     PENDING_SIGNAL_EXIT="$exit_code"
     trap 'on_signal HUP 129' HUP
@@ -162,31 +201,68 @@ on_signal() {
 
 # shellcheck disable=SC2317
 on_finalizer_signal() {
-  local name="$1" exit_code="$2"
+  local name="$1" exit_code="$2" noclobber_was_set=0
+  case $- in *C*) noclobber_was_set=1 ;; esac
+  set -o noclobber
+  : 2>/dev/null > "$FINALIZATION_DECISION" || true
+  [ "$noclobber_was_set" -eq 1 ] || set +o noclobber
+  FINALIZATION_SIGNAL_GENERATION=$((FINALIZATION_SIGNAL_GENERATION + 1))
+  if [ -s "$FINALIZATION_DECISION" ]; then
+    return 0
+  fi
   if [ -z "$FINALIZATION_SIGNAL" ]; then
     FINALIZATION_SIGNAL="$name"
     FINALIZATION_SIGNAL_EXIT="$exit_code"
   fi
-  if [ -n "$FINALIZER_PID" ]; then
-    kill -s "$name" "$FINALIZER_PID" 2>/dev/null || true
+  if [ -n "$FINALIZER_PID" ] && [ -n "$FINALIZER_START_TICKS" ]; then
+    python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+      --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1 || true
   fi
 }
 
 # shellcheck disable=SC2317
 run_finalizer_command() {
-  local rc=0
+  local rc=0 generation
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
-  "$@" &
+  setsid -- "$@" &
   FINALIZER_PID=$!
-  wait "$FINALIZER_PID" || rc=$?
+  if ! FINALIZER_START_TICKS="$(
+    python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
+      --expected-parent-pid "$$" --wait-ms 500 --session-leader \
+      2>/dev/null
+  )"; then
+    wait "$FINALIZER_PID" 2>/dev/null || true
+    FINALIZER_PID=""
+    return 2
+  fi
+  if [ -n "$FINALIZATION_SIGNAL" ] && [ -n "$FINALIZER_START_TICKS" ]; then
+    python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+      --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1 || true
+  fi
+  while true; do
+    generation="$FINALIZATION_SIGNAL_GENERATION"
+    wait "$FINALIZER_PID" && rc=0 || rc=$?
+    case "$rc" in
+      129|130|143)
+        if [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ]; then
+          continue
+        fi
+        ;;
+    esac
+    break
+  done
   FINALIZER_PID=""
+  FINALIZER_START_TICKS=""
   return "$rc"
 }
 
 # shellcheck disable=SC2317
 abort_if_finalizer_signalled() {
   if [ -n "$FINALIZATION_SIGNAL" ]; then
-    note "CANCELLED: signal_$FINALIZATION_SIGNAL before evidence bundle commit: $ART_DIR"
+    if [ -s "$FINALIZATION_DECISION" ]; then
+      return 0
+    fi
+    note "CANCELLED: signal_$FINALIZATION_SIGNAL won evidence bundle decision: $ART_DIR"
     exit "$FINALIZATION_SIGNAL_EXIT"
   fi
 }
@@ -195,11 +271,11 @@ abort_if_finalizer_signalled() {
 # shellcheck disable=SC2317
 on_exit() {
   local observed_rc="$1" final_root="unavailable" first_divergence="none"
-  local publish_rc=0 hash_rc=0 bundle_rc=0
-  trap - EXIT
+  local publish_rc=0 hash_rc=0
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
   trap 'on_finalizer_signal TERM 143' TERM
+  trap - EXIT
   set +e
   if [ "$FINALIZING" -ne 0 ]; then exit 2; fi
   FINALIZING=1
@@ -221,7 +297,7 @@ on_exit() {
   fi
   if [ "$FINAL_VERDICT" != pass ]; then first_divergence="$FINAL_REASON"; fi
   if [ "$TERMINAL_EMITTED" -eq 0 ]; then
-    if run_finalizer_command emit_event --string event run_end --string verdict "$FINAL_VERDICT" \
+    build_event_command --string event run_end --string verdict "$FINAL_VERDICT" \
       --string reason_code "$FINAL_REASON" --integer process_exit "$FINAL_EXIT" \
       --string active_step "$ACTIVE_STEP" \
       --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
@@ -230,7 +306,8 @@ on_exit() {
       --string first_divergence "$first_divergence" \
       --string evidence_manifest manifest.json \
       --string bundle_commit bundle.complete.json \
-      --string evidence_state pending_bundle_commit; then
+      --string evidence_state pending_bundle_commit
+    if run_finalizer_command "${EVENT_COMMAND[@]}"; then
       TERMINAL_EMITTED=1
     else
       publish_rc=2
@@ -256,16 +333,15 @@ on_exit() {
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
-      --vendor-path "$VENDOR_PATH" || bundle_rc=$?
-    if [ -e "$ART_DIR/bundle.complete.json" ]; then
-      trap '' HUP INT TERM
-      python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+      --vendor-path "$VENDOR_PATH" || true
+    if run_finalizer_command python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
         --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
         --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
-        >/dev/null || publish_rc=2
+        >/dev/null; then
+      trap '' HUP INT TERM
     else
-      [ "$bundle_rc" -eq 0 ] || publish_rc=2
       abort_if_finalizer_signalled
+      publish_rc=2
     fi
   fi
   if [ "$publish_rc" -ne 0 ]; then
@@ -303,7 +379,7 @@ python3 "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
 trap 'on_signal HUP 129' HUP
 trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
-trap 'on_exit $?' EXIT
+trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
 
 emit_event --new-log --string event run_start \
   --json-value argv '["scripts/e2e/structure_gate.sh"]' \
@@ -380,17 +456,31 @@ launch_supervisor() {
   ACTIVE_STEP="$step"
   ACTIVE_READINESS="$LAST_READY"
   SPAWNING=1
-  python3 "$EVIDENCE" run --cwd "$ROOT" --metadata "$LAST_META" \
+  setsid -- python3 "$EVIDENCE" run --cwd "$ROOT" --metadata "$LAST_META" \
     --stdout "$LAST_OUT" --stderr "$LAST_ERR" --readiness "$LAST_READY" \
     --artifact-root "$ART_DIR" --capture-bytes "$capture_bytes" \
     --output-budget-bytes "$output_budget" --timeout-ms "$timeout_ms" \
     --grace-ms "$GRACE_MS" --stage-id "$step" "${semantic_args[@]}" -- "$@" &
   ACTIVE_RUNNER_PID=$!
+  if ! ACTIVE_RUNNER_START_TICKS="$(
+    python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
+      --expected-parent-pid "$$" --wait-ms 5000 --session-leader \
+      2>/dev/null
+  )"; then
+    SPAWNING=0
+    wait "$ACTIVE_RUNNER_PID" 2>/dev/null || true
+    ACTIVE_RUNNER_PID=""
+    set_final internal_fault active_runner_identity_unproven 2
+    exit 2
+  fi
   SPAWNING=0
   if [ -n "$PENDING_SIGNAL" ]; then
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
     PENDING_SIGNAL=""
-    stop_active_runner "$pending_name"
+    if ! stop_active_runner "$pending_name"; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
     set_final cancelled "signal_$pending_name" "$pending_exit"
     exit "$pending_exit"
   fi
@@ -399,6 +489,7 @@ launch_supervisor() {
 await_supervisor() {
   if wait "$ACTIVE_RUNNER_PID"; then LAST_RC=0; else LAST_RC=$?; fi
   ACTIVE_RUNNER_PID=""
+  ACTIVE_RUNNER_START_TICKS=""
   ACTIVE_READINESS=""
 }
 
@@ -697,12 +788,22 @@ cancellation_step() {
     python3 -c "$parent_program" "$pid_path"
   runner_pid="$ACTIVE_RUNNER_PID"
   if ! cancel_arm_ready "$runner_pid" "$pid_path"; then
-    kill -TERM "$runner_pid" 2>/dev/null || true
-    await_supervisor
+    if ! stop_active_runner TERM; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
     set_final internal_fault "$step:cancellation_fixture_not_ready" 2
     exit 2
   fi
-  kill -TERM "$runner_pid"
+  if ! python3 "$EVIDENCE" signal-bound-process --pid "$runner_pid" \
+      --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal TERM; then
+    if ! stop_active_runner TERM; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
+    set_final internal_fault "$step:cancellation_runner_identity_changed" 2
+    exit 2
+  fi
   await_supervisor
   inspect_supervisor "$step"
   propagate_supervisor_taxonomy "$step" 4

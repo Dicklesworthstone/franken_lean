@@ -46,6 +46,7 @@ CAPTURE_BYTES="${FLN_CHECK_CAPTURE_BYTES:-262144}"
 OUTPUT_BUDGET_BYTES="${FLN_CHECK_OUTPUT_BUDGET_BYTES:-67108864}"
 STAGE_TIMEOUT_MS="${FLN_CHECK_STAGE_TIMEOUT_MS:-1200000}"
 KILL_GRACE_MS="${FLN_CHECK_KILL_GRACE_MS:-2000}"
+READY_WAIT_MS="${FLN_CHECK_READY_WAIT_MS:-30000}"
 PLANT="${FLN_CHECK_PLANT:-}"
 if [ -n "${FLN_CHECK_PROFILE:-}" ]; then
   PROFILE="$FLN_CHECK_PROFILE"
@@ -65,7 +66,10 @@ START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
 SEQ=0
 ACTIVE_STAGE="setup"
 ACTIVE_RUNNER_PID=""
+ACTIVE_RUNNER_START_TICKS=""
 ACTIVE_READINESS=""
+ACTIVE_RUNNER_PROTOCOL=""
+ACTIVE_RUNNER_ART_DIR=""
 SPAWNING=0
 PENDING_SIGNAL=""
 PENDING_SIGNAL_EXIT=0
@@ -75,11 +79,13 @@ FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
 FINALIZING=0
+FINALIZER_TRANSITION=0
 FINALIZER_PID=""
 FINALIZER_START_TICKS=""
 FINALIZATION_SIGNAL=""
 FINALIZATION_SIGNAL_EXIT=0
 FINALIZATION_SIGNAL_GENERATION=0
+FINALIZATION_DECISION="$ART_DIR/bundle.decision"
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 EVENT_COMMAND=()
 INPUT_PATHS=(
@@ -200,12 +206,34 @@ build_terminal_command() {
     --string evidence_state pending_bundle_commit
 }
 
+# A targeted signal is forwarded only after the nested supervisor has installed
+# its handlers and published the exact guardian/supervisor/child binding.
+# shellcheck disable=SC2317
+bounded_readiness_wait() {
+  local pid="$1" ready_path="$2" limit_ms="$3" state
+  local ticks=$(( (limit_ms + 19) / 20 )) index
+  for ((index = 0; index < ticks; index += 1)); do
+    if [ -s "$ready_path" ]; then return 0; fi
+    if [ ! -r "/proc/$pid/stat" ]; then return 1; fi
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
+    if [ "$state" = Z ]; then return 1; fi
+    sleep 0.02
+  done
+  return 1
+}
+
 # Invoked from signal handling; bounded so evidence publication cannot hang forever.
 # shellcheck disable=SC2317
 stop_active_runner() {
-  local name="$1" pid="$ACTIVE_RUNNER_PID" state cleanup_rc=0
+  local name="$1" pid="$ACTIVE_RUNNER_PID" state cleanup_rc=0 forced=0 runner_rc=0
+  local protocol="$ACTIVE_RUNNER_PROTOCOL" runner_art_dir="$ACTIVE_RUNNER_ART_DIR"
   [ -n "$pid" ] || return 0
-  kill -s "$name" "$pid" 2>/dev/null || true
+  if bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" \
+      && [ -n "$ACTIVE_RUNNER_START_TICKS" ]; then
+    python3 "$EVIDENCE" signal-bound-process --pid "$pid" \
+      --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal "$name" \
+      >/dev/null 2>&1 || true
+  fi
   for _ in $(seq 1 500); do
     if [ ! -r "/proc/$pid/stat" ]; then break; fi
     state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
@@ -220,6 +248,8 @@ stop_active_runner() {
           --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STAGE" \
           >/dev/null 2>&1; then
           cleanup_rc=1
+        else
+          forced=1
         fi
       else
         cleanup_rc=1
@@ -228,12 +258,44 @@ stop_active_runner() {
   fi
   if [ "$cleanup_rc" -ne 0 ]; then
     ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
     ACTIVE_READINESS=""
+    ACTIVE_RUNNER_PROTOCOL=""
+    ACTIVE_RUNNER_ART_DIR=""
     return "$cleanup_rc"
   fi
-  wait "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || runner_rc=$?
+  if [ "$forced" -eq 0 ]; then
+    case "$protocol" in
+      guardian)
+        case "$runner_rc" in 0|1|3|4) ;; *) cleanup_rc=1 ;; esac
+        ;;
+      nested-check)
+        case "$name" in HUP|INT|TERM) ;; *) cleanup_rc=1 ;; esac
+        if [ "$cleanup_rc" -eq 0 ] && {
+          [ "$runner_rc" -ne 4 ] \
+            || [ -z "$runner_art_dir" ] \
+            || ! python3 "$EVIDENCE" validate-run \
+              --file "$runner_art_dir/run.ndjson" --schema "$SCHEMA" \
+              --expected-verdict cancelled --artifact-root "$ART_DIR" \
+              >/dev/null 2>&1 \
+            || ! python3 "$EVIDENCE" validate-bundle --art-dir "$runner_art_dir" \
+              --manifest "$runner_art_dir/manifest.json" \
+              --digest "$runner_art_dir/manifest.digest" \
+              --commit "$runner_art_dir/bundle.complete.json" \
+              --artifact-root "$runner_art_dir" >/dev/null 2>&1;
+        }; then
+          cleanup_rc=1
+        fi
+        ;;
+      *) cleanup_rc=1 ;;
+    esac
+  fi
   ACTIVE_RUNNER_PID=""
+  ACTIVE_RUNNER_START_TICKS=""
   ACTIVE_READINESS=""
+  ACTIVE_RUNNER_PROTOCOL=""
+  ACTIVE_RUNNER_ART_DIR=""
   return "$cleanup_rc"
 }
 
@@ -241,8 +303,12 @@ stop_active_runner() {
 # shellcheck disable=SC2317
 on_signal() {
   local name="$1" exit_code="$2"
+  if [ "$FINALIZER_TRANSITION" -eq 1 ]; then
+    on_finalizer_signal "$name" "$exit_code"
+    return 0
+  fi
   trap '' HUP INT TERM
-  if [ "$SPAWNING" -eq 1 ] && [ -z "$ACTIVE_RUNNER_PID" ]; then
+  if [ "$SPAWNING" -eq 1 ]; then
     PENDING_SIGNAL="$name"
     PENDING_SIGNAL_EXIT="$exit_code"
     trap 'on_signal HUP 129' HUP
@@ -260,12 +326,19 @@ on_signal() {
   exit "$exit_code"
 }
 
-# Invoked only while the EXIT finalizer is active. A signal before the bundle marker
-# interrupts the current publication command and leaves the evidence uncommitted.
+# Invoked only while the EXIT finalizer is active. A signal before the shared bundle
+# decision interrupts the current publication command and leaves it uncommitted.
 # shellcheck disable=SC2317
 on_finalizer_signal() {
-  local name="$1" exit_code="$2"
+  local name="$1" exit_code="$2" noclobber_was_set=0
+  case $- in *C*) noclobber_was_set=1 ;; esac
+  set -o noclobber
+  : 2>/dev/null > "$FINALIZATION_DECISION" || true
+  [ "$noclobber_was_set" -eq 1 ] || set +o noclobber
   FINALIZATION_SIGNAL_GENERATION=$((FINALIZATION_SIGNAL_GENERATION + 1))
+  if [ -s "$FINALIZATION_DECISION" ]; then
+    return 0
+  fi
   if [ -z "$FINALIZATION_SIGNAL" ]; then
     FINALIZATION_SIGNAL="$name"
     FINALIZATION_SIGNAL_EXIT="$exit_code"
@@ -282,9 +355,15 @@ run_finalizer_command() {
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
   setsid -- "$@" &
   FINALIZER_PID=$!
-  FINALIZER_START_TICKS="$(
-    python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" 2>/dev/null || true
-  )"
+  if ! FINALIZER_START_TICKS="$(
+    python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
+      --expected-parent-pid "$$" --wait-ms 500 --session-leader \
+      2>/dev/null
+  )"; then
+    wait "$FINALIZER_PID" 2>/dev/null || true
+    FINALIZER_PID=""
+    return 2
+  fi
   if [ -n "$FINALIZATION_SIGNAL" ] && [ -n "$FINALIZER_START_TICKS" ]; then
     python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
       --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1 || true
@@ -292,7 +371,14 @@ run_finalizer_command() {
   while true; do
     generation="$FINALIZATION_SIGNAL_GENERATION"
     wait "$FINALIZER_PID" && rc=0 || rc=$?
-    [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ] || break
+    case "$rc" in
+      129|130|143)
+        if [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ]; then
+          continue
+        fi
+        ;;
+    esac
+    break
   done
   FINALIZER_PID=""
   FINALIZER_START_TICKS=""
@@ -302,7 +388,10 @@ run_finalizer_command() {
 # shellcheck disable=SC2317
 abort_if_finalizer_signalled() {
   if [ -n "$FINALIZATION_SIGNAL" ]; then
-    note "CANCELLED: signal_$FINALIZATION_SIGNAL before evidence bundle commit: $ART_DIR"
+    if [ -s "$FINALIZATION_DECISION" ]; then
+      return 0
+    fi
+    note "CANCELLED: signal_$FINALIZATION_SIGNAL won evidence bundle decision: $ART_DIR"
     exit "$FINALIZATION_SIGNAL_EXIT"
   fi
 }
@@ -311,10 +400,10 @@ abort_if_finalizer_signalled() {
 # shellcheck disable=SC2317
 on_exit() {
   local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0
-  trap - EXIT
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
   trap 'on_finalizer_signal TERM 143' TERM
+  trap - EXIT
   set +e
   if [ "$FINALIZING" -ne 0 ]; then
     exit 2
@@ -371,13 +460,12 @@ on_exit() {
       --output "$ART_DIR/bundle.complete.json" --governed-root "$REPO" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
       --inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH" || true
-    if [ -e "$ART_DIR/bundle.complete.json" ] && \
-      python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+    if run_finalizer_command python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
         --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
         --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
         >/dev/null; then
-      # A complete linked marker is the logical winner. Validation durably adopts
-      # it if the publisher died or its parent-directory fsync returned an error.
+      # A complete decision is the logical winner. Validation durably adopts its
+      # canonical marker if the publisher died before linking or syncing it.
       trap '' HUP INT TERM
     else
       abort_if_finalizer_signalled
@@ -400,7 +488,7 @@ on_exit() {
 trap 'on_signal HUP 129' HUP
 trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
-trap 'on_exit $?' EXIT
+trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
 
 emit_event \
   --new-log \
@@ -483,14 +571,30 @@ run_stage() {
   [ "$planted" = true ] && runner+=(--planted)
   runner+=(-- "${argv[@]}")
   SPAWNING=1
-  "${runner[@]}" &
+  setsid -- "${runner[@]}" &
   ACTIVE_RUNNER_PID=$!
+  if ! ACTIVE_RUNNER_START_TICKS="$(
+    python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
+      --expected-parent-pid "$$" --wait-ms 5000 --session-leader \
+      2>/dev/null
+  )"; then
+    SPAWNING=0
+    wait "$ACTIVE_RUNNER_PID" 2>/dev/null || true
+    ACTIVE_RUNNER_PID=""
+    set_final internal_fault active_runner_identity_unproven 2
+    exit 2
+  fi
   ACTIVE_READINESS="$ready"
+  ACTIVE_RUNNER_PROTOCOL=guardian
+  ACTIVE_RUNNER_ART_DIR="$ART_DIR"
   SPAWNING=0
   if [ -n "$PENDING_SIGNAL" ]; then
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
     PENDING_SIGNAL=""
-    stop_active_runner "$pending_name"
+    if ! stop_active_runner "$pending_name"; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
     set_final cancelled "signal_$pending_name" "$pending_exit"
     exit "$pending_exit"
   fi
@@ -500,7 +604,10 @@ run_stage() {
     wrapper_rc=$?
   fi
   ACTIVE_RUNNER_PID=""
+  ACTIVE_RUNNER_START_TICKS=""
   ACTIVE_READINESS=""
+  ACTIVE_RUNNER_PROTOCOL=""
+  ACTIVE_RUNNER_ART_DIR=""
   if [ ! -f "$meta" ]; then
     emit_event --string event stage --string stage "$name" \
       --string outcome internal_fault --string reason_code missing_supervisor_metadata \
@@ -550,28 +657,54 @@ skip_stage() {
 }
 
 self_test() {
-  local failures=0 stage rc child="$ART_DIR" child_pid
+  local failures=0 stage rc child="$ART_DIR" child_pid wrapper_ready
   for stage in evidence-self-test shellcheck fmt check clippy test structure-guard vendor-tree ubs; do
     echo "[check:self-test] planting failure in stage=$stage" >&2
     child="$ART_DIR/selftest-$stage"
+    wrapper_ready="$ART_DIR/selftest-$stage.guardian.ready.json"
+    ACTIVE_STAGE="selftest-$stage"
     SPAWNING=1
-    FLN_CHECK_PLANT="$stage" FLN_CHECK_ART_DIR="$child" \
-      FLN_CHECK_PROFILE=self-test-plant bash "${BASH_SOURCE[0]}" \
-      > "$ART_DIR/selftest-$stage.console.out" \
-      2> "$ART_DIR/selftest-$stage.console.err" &
+    setsid -- python3 "$EVIDENCE" run --cwd "$REPO" \
+      --metadata "$ART_DIR/selftest-$stage.guardian.meta.json" \
+      --stdout "$ART_DIR/selftest-$stage.console.out" \
+      --stderr "$ART_DIR/selftest-$stage.console.err" \
+      --readiness "$wrapper_ready" --artifact-root "$ART_DIR" \
+      --capture-bytes "$CAPTURE_BYTES" --output-budget-bytes "$OUTPUT_BUDGET_BYTES" \
+      --timeout-ms "$STAGE_TIMEOUT_MS" --grace-ms 60000 \
+      --stage-id "selftest-$stage" --semantic-failure-exit 1 -- \
+      env FLN_CHECK_PLANT="$stage" FLN_CHECK_ART_DIR="$child" \
+        FLN_CHECK_PROFILE=self-test-plant bash "${BASH_SOURCE[0]}" &
     child_pid=$!
     ACTIVE_RUNNER_PID="$child_pid"
-    ACTIVE_READINESS=""
+    if ! ACTIVE_RUNNER_START_TICKS="$(
+      python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
+        --expected-parent-pid "$$" --wait-ms 5000 --session-leader 2>/dev/null
+    )"; then
+      SPAWNING=0
+      wait "$child_pid" 2>/dev/null || true
+      set_final internal_fault active_runner_identity_unproven 2
+      exit 2
+    fi
+    ACTIVE_READINESS="$wrapper_ready"
+    ACTIVE_RUNNER_PROTOCOL=nested-check
+    ACTIVE_RUNNER_ART_DIR="$child"
     SPAWNING=0
     if [ -n "$PENDING_SIGNAL" ]; then
       local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
       PENDING_SIGNAL=""
-      stop_active_runner "$pending_name"
+      if ! stop_active_runner "$pending_name"; then
+        set_final internal_fault process_tree_cleanup_unproven 2
+        exit 2
+      fi
       set_final cancelled "signal_$pending_name" "$pending_exit"
       exit "$pending_exit"
     fi
     if wait "$child_pid"; then rc=0; else rc=$?; fi
     ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    ACTIVE_READINESS=""
+    ACTIVE_RUNNER_PROTOCOL=""
+    ACTIVE_RUNNER_ART_DIR=""
     if [ "$rc" -eq 1 ] && python3 "$EVIDENCE" validate-run \
       --file "$child/run.ndjson" --schema "$SCHEMA" --expected-verdict fail \
       --expected-active-stage "$stage" --expected-planted-stage "$stage" \
@@ -592,36 +725,65 @@ self_test() {
 
   echo "[check:self-test] sending TERM during child run initialization" >&2
   child="$ART_DIR/selftest-cancel-term"
+  wrapper_ready="$ART_DIR/selftest-cancel-term.guardian.ready.json"
+  ACTIVE_STAGE=selftest-cancel-term
   SPAWNING=1
-  FLN_CHECK_ART_DIR="$child" FLN_CHECK_PROFILE=self-test-cancellation \
-    bash "${BASH_SOURCE[0]}" \
-    > "$ART_DIR/selftest-cancel-term.console.out" \
-    2> "$ART_DIR/selftest-cancel-term.console.err" &
+  setsid -- python3 "$EVIDENCE" run --cwd "$REPO" \
+    --metadata "$ART_DIR/selftest-cancel-term.guardian.meta.json" \
+    --stdout "$ART_DIR/selftest-cancel-term.console.out" \
+    --stderr "$ART_DIR/selftest-cancel-term.console.err" \
+    --readiness "$wrapper_ready" --artifact-root "$ART_DIR" \
+    --capture-bytes "$CAPTURE_BYTES" --output-budget-bytes "$OUTPUT_BUDGET_BYTES" \
+    --timeout-ms "$STAGE_TIMEOUT_MS" --grace-ms 60000 \
+    --stage-id selftest-cancel-term -- \
+    env FLN_CHECK_ART_DIR="$child" FLN_CHECK_PROFILE=self-test-cancellation \
+      bash "${BASH_SOURCE[0]}" &
   child_pid=$!
   ACTIVE_RUNNER_PID="$child_pid"
-  ACTIVE_READINESS=""
+  if ! ACTIVE_RUNNER_START_TICKS="$(
+    python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
+      --expected-parent-pid "$$" --wait-ms 5000 --session-leader 2>/dev/null
+  )"; then
+    SPAWNING=0
+    wait "$child_pid" 2>/dev/null || true
+    set_final internal_fault active_runner_identity_unproven 2
+    exit 2
+  fi
+  ACTIVE_READINESS="$wrapper_ready"
+  ACTIVE_RUNNER_PROTOCOL=nested-check
+  ACTIVE_RUNNER_ART_DIR="$child"
   SPAWNING=0
   if [ -n "$PENDING_SIGNAL" ]; then
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
     PENDING_SIGNAL=""
-    stop_active_runner "$pending_name"
+    if ! stop_active_runner "$pending_name"; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
     set_final cancelled "signal_$pending_name" "$pending_exit"
     exit "$pending_exit"
   fi
-  for _ in $(seq 1 500); do
+  for _ in $(seq 1 $((READY_WAIT_MS / 20))); do
     if compgen -G "$child/*.ready.json" >/dev/null; then break; fi
     sleep 0.02
   done
   if ! compgen -G "$child/*.ready.json" >/dev/null; then
-    kill -TERM "$child_pid" 2>/dev/null || true
-    wait "$child_pid" 2>/dev/null || true
+    stop_active_runner TERM || true
+    rc=2
+  elif ! python3 "$EVIDENCE" signal-bound-process --pid "$child_pid" \
+      --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal TERM \
+      >/dev/null 2>&1; then
+    stop_active_runner TERM || true
     rc=2
   else
-    kill -TERM "$child_pid" 2>/dev/null || true
     if wait "$child_pid"; then rc=0; else rc=$?; fi
   fi
   ACTIVE_RUNNER_PID=""
-  if [ "$rc" -eq 143 ] && python3 "$EVIDENCE" validate-run \
+  ACTIVE_RUNNER_START_TICKS=""
+  ACTIVE_READINESS=""
+  ACTIVE_RUNNER_PROTOCOL=""
+  ACTIVE_RUNNER_ART_DIR=""
+  if [ "$rc" -eq 4 ] && python3 "$EVIDENCE" validate-run \
     --file "$child/run.ndjson" --schema "$SCHEMA" --expected-verdict cancelled \
     --artifact-root "$ART_DIR" --output "$ART_DIR/selftest-cancel-term.validation.json" \
     && python3 "$EVIDENCE" validate-bundle --art-dir "$child" \
