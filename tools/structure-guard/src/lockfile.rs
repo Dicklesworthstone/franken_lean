@@ -391,6 +391,7 @@ pub fn parse_toolchain_channel(text: &str) -> Result<String, String> {
     let mut in_toolchain = false;
     let mut saw_toolchain = false;
     let mut channel: Option<String> = None;
+    let mut seen_keys = BTreeSet::new();
     for (idx, raw) in text.lines().enumerate() {
         let lineno = idx + 1;
         let line = match raw.find('#') {
@@ -419,7 +420,11 @@ pub fn parse_toolchain_channel(text: &str) -> Result<String, String> {
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| err("expected `key = value`"))?;
-        match key.trim() {
+        let key = key.trim();
+        if !seen_keys.insert(key) {
+            return Err(err("duplicate toolchain key"));
+        }
+        match key {
             "channel" => {
                 let value = value.trim();
                 let parsed = toolchain_quoted(value)
@@ -748,6 +753,18 @@ mod tests {
         assert!(
             parse_toolchain_channel(
                 "[toolchain]\nchannel = \"nightly-2026-07-13\"\ncomponents = [\"rustfmt\", \"rustfmt\"]\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_toolchain_channel(
+                "[toolchain]\nchannel = \"nightly-2026-07-13\"\ncomponents = [\"rustfmt\"]\ncomponents = [\"clippy\"]\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_toolchain_channel(
+                "[toolchain]\nchannel = \"nightly-2026-07-13\"\nprofile = \"minimal\"\nprofile = \"default\"\n"
             )
             .is_err()
         );
