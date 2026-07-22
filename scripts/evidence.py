@@ -622,6 +622,27 @@ def enable_child_subreaper() -> None:
         raise EvidenceError(f"cannot enable child subreaper: errno {error_number}")
 
 
+def arm_parent_death_kill(expected_parent_pid: int) -> None:
+    """Kill this process if its exact launching parent exits."""
+    if sys.platform != "linux":
+        raise EvidenceError("parent-death containment currently requires Linux")
+    if expected_parent_pid <= 1 or expected_parent_pid == os.getpid():
+        raise EvidenceError("parent-death identity is malformed")
+    if os.getppid() != expected_parent_pid:
+        raise EvidenceError("launcher parent changed before parent-death binding")
+    libc = ctypes.CDLL(None, use_errno=True)
+    # Linux prctl(PR_SET_PDEATHSIG, SIGKILL). The second parent check closes the
+    # race where the parent exits after the first check but before prctl.
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise EvidenceError(
+            f"cannot arm launcher parent-death signal: errno {error_number}"
+        )
+    if os.getppid() != expected_parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+        raise EvidenceError("launcher parent changed during parent-death binding")
+
+
 def proc_children(pid: int) -> set[int]:
     task_root = Path(f"/proc/{pid}/task")
     try:
@@ -3858,20 +3879,57 @@ def cmd_run(args: argparse.Namespace) -> int:
     waited_status: int | None = None
     waited_pid = 0
     setup_error: BaseException | None = None
+    cleanup_errors: list[str] = []
+    survivors: list[int] = []
     try:
         if args.test_fail_guardian_pidfd_open:
-            readiness = (
-                require_within(
+            if args.test_guardian_child_ready:
+                readiness = require_within(
                     Path(args.test_guardian_child_ready),
                     Path(args.artifact_root),
                     label="guardian fault child readiness",
                 )
-                if args.test_guardian_child_ready
-                else Path(args.readiness)
-            )
-            deadline = time.monotonic() + 15.0
-            while not readiness.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
+                deadline = time.monotonic() + 15.0
+                previous_payload: bytes | None = None
+                stable_reads = 0
+                while time.monotonic() < deadline:
+                    try:
+                        payload, _size, _digest = stable_file_facts(
+                            readiness, max_bytes=128
+                        )
+                        values = tuple(
+                            int(value)
+                            for value in payload.decode("ascii").splitlines()
+                        )
+                        if (
+                            len(values) == 2
+                            and len(set(values)) == 2
+                            and all(value > 1 for value in values)
+                        ):
+                            stable_reads = (
+                                stable_reads + 1 if payload == previous_payload else 1
+                            )
+                            previous_payload = payload
+                            if stable_reads >= 2:
+                                break
+                        else:
+                            stable_reads = 0
+                            previous_payload = None
+                    except (EvidenceError, FileNotFoundError, UnicodeError, ValueError):
+                        stable_reads = 0
+                        previous_payload = None
+                    time.sleep(0.01)
+                else:
+                    raise EvidenceError(
+                        "guardian fault child PID handshake did not stabilize"
+                    )
+            else:
+                readiness = Path(args.readiness)
+                deadline = time.monotonic() + 15.0
+                while not readiness.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not readiness.exists():
+                    raise EvidenceError("guardian fault readiness timed out")
             raise OSError(errno.EMFILE, "injected post-fork pidfd_open failure")
         worker_handle = open_process_handle(worker_pid)
         if worker_handle is None:
@@ -3897,26 +3955,54 @@ def cmd_run(args: argparse.Namespace) -> int:
                 raise EvidenceError("guardian reaped an unexpected process")
     except BaseException as error:
         setup_error = error
-        signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(f"cannot block cleanup signals: {cleanup_error}")
         for signum in watched:
-            signal.signal(signum, signal.SIG_IGN)
+            try:
+                signal.signal(signum, signal.SIG_IGN)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    f"cannot ignore cleanup signal {signum}: {cleanup_error}"
+                )
         if waited_status is None:
+            signalled = False
             if worker_handle is not None:
-                signal_process_handle(worker_pid, worker_handle, signal.SIGKILL)
-            else:
+                try:
+                    signalled = signal_process_handle(
+                        worker_pid, worker_handle, signal.SIGKILL
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(
+                        f"cannot signal failed inner supervisor by pidfd: {cleanup_error}"
+                    )
+            if not signalled:
                 try:
                     # W is still our unreaped direct child, so this numeric PID
                     # cannot be recycled before the following waitpid.
                     os.kill(worker_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(
+                        f"cannot signal failed inner supervisor by PID: {cleanup_error}"
+                    )
             while True:
                 try:
                     waited_pid, waited_status = os.waitpid(worker_pid, 0)
                     break
                 except InterruptedError:
                     continue
-                except ChildProcessError:
+                except ChildProcessError as cleanup_error:
+                    cleanup_errors.append(
+                        f"cannot reap failed inner supervisor: {cleanup_error}"
+                    )
+                    break
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(
+                        f"failed while reaping inner supervisor: {cleanup_error}"
+                    )
                     break
             if waited_pid not in {0, worker_pid}:
                 setup_error = EvidenceError(
@@ -3924,13 +4010,24 @@ def cmd_run(args: argparse.Namespace) -> int:
                 )
     finally:
         if worker_handle is not None:
-            os.close(worker_handle[1])
-
-    survivors = cleanup_guardian_descendants(worker_pid)
+            try:
+                os.close(worker_handle[1])
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    f"cannot close inner supervisor pidfd: {cleanup_error}"
+                )
+        try:
+            survivors = cleanup_guardian_descendants(worker_pid)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(
+                f"cannot prove guardian descendant cleanup: {cleanup_error}"
+            )
     if survivors:
         raise EvidenceError(
             f"guardian containment remained unproven for PIDs {survivors}"
         )
+    if cleanup_errors:
+        raise EvidenceError("; ".join(cleanup_errors))
     if setup_error is not None:
         raise EvidenceError(
             f"guardian setup failed after fork: {type(setup_error).__name__}: {setup_error}"
@@ -4041,6 +4138,18 @@ def cmd_exec_ubs_inventory(args: argparse.Namespace) -> int:
     raise EvidenceError("inventory execution unexpectedly returned")
 
 
+def cmd_stopped_exec(args: argparse.Namespace) -> int:
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise EvidenceError("stopped exec requires a command")
+    arm_parent_death_kill(args.expected_parent_pid)
+    os.kill(os.getpid(), signal.SIGSTOP)
+    os.execvp(command[0], command)
+    raise EvidenceError("stopped exec unexpectedly returned")
+
+
 def cmd_emergency_kill(args: argparse.Namespace) -> int:
     emergency_kill(
         Path(args.readiness), args.expected_wrapper_pid, args.expected_stage_id
@@ -4069,7 +4178,9 @@ def cmd_process_start_ticks(args: argparse.Namespace) -> int:
                 or args.pid not in proc_children(args.expected_parent_pid)
             ):
                 raise EvidenceError("process disappeared before session binding")
-            if not args.session_leader or facts[1] == args.pid:
+            session_ready = not args.session_leader or facts[1] == args.pid
+            stopped_ready = not args.stopped or facts[0] in {"T", "t"}
+            if session_ready and stopped_ready:
                 print(handle[0])
                 return PASS
             if time.monotonic() >= deadline:
@@ -4155,6 +4266,31 @@ def cmd_signal_bound_process(args: argparse.Namespace) -> int:
         "TERM": signal.SIGTERM,
     }[args.signal]
     signal_bound_process(args.pid, args.expected_start_ticks, signum)
+    return PASS
+
+
+def cmd_resume_bound_process(args: argparse.Namespace) -> int:
+    if args.pid == os.getpid():
+        raise EvidenceError("resume target cannot be the helper itself")
+    handle = open_process_handle(
+        args.pid, expected_parent_pid=args.expected_parent_pid
+    )
+    if handle is None or handle[0] != args.expected_start_ticks:
+        if handle is not None:
+            os.close(handle[1])
+        raise EvidenceError("stopped process changed before resume")
+    try:
+        facts = proc_stat_facts(args.pid)
+        if (
+            facts is None
+            or facts[0] not in {"T", "t"}
+            or facts[2] != args.expected_start_ticks
+        ):
+            raise EvidenceError("process was not stopped at resume linearization")
+        if not signal_process_handle(args.pid, handle, signal.SIGCONT):
+            raise EvidenceError("stopped process disappeared before resume")
+    finally:
+        os.close(handle[1])
     return PASS
 
 
@@ -4979,6 +5115,125 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         }
     )
 
+    pdeath_root = case_dir("stopped_exec_parent_death")
+    pdeath_pid_file = pdeath_root / "pids.txt"
+    pdeath_program = (
+        "import os,pathlib,subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,"
+        f"{str(Path(__file__).resolve())!r},'stopped-exec',"
+        "'--expected-parent-pid',str(os.getpid()),'--',sys.executable,'-c',"
+        "'import time;time.sleep(60)'],start_new_session=True,"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+        "stderr=subprocess.DEVNULL);"
+        f"pathlib.Path({str(pdeath_pid_file)!r}).write_text("
+        "str(os.getpid())+'\\n'+str(p.pid)+'\\n');"
+        "time.sleep(60)"
+    )
+    pdeath_launcher: subprocess.Popen[bytes] | None = None
+    pdeath_handle: tuple[int, int] | None = None
+    pdeath_child_pid = 0
+    try:
+        pdeath_launcher = subprocess.Popen(
+            [sys.executable, "-c", pdeath_program],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 15.0
+        previous_payload: bytes | None = None
+        stable_reads = 0
+        published_pids: tuple[int, ...] = ()
+        while time.monotonic() < deadline:
+            try:
+                payload, _size, _digest = stable_file_facts(
+                    pdeath_pid_file, max_bytes=128
+                )
+                values = tuple(
+                    int(value) for value in payload.decode("ascii").splitlines()
+                )
+                if (
+                    len(values) == 2
+                    and values[0] == pdeath_launcher.pid
+                    and values[1] > 1
+                    and values[0] != values[1]
+                ):
+                    stable_reads = (
+                        stable_reads + 1 if payload == previous_payload else 1
+                    )
+                    previous_payload = payload
+                    published_pids = values
+                    if stable_reads >= 2:
+                        break
+                else:
+                    stable_reads = 0
+                    previous_payload = None
+            except (EvidenceError, FileNotFoundError, UnicodeError, ValueError):
+                stable_reads = 0
+                previous_payload = None
+            time.sleep(0.01)
+        else:
+            raise EvidenceError("stopped-exec parent-death handshake timed out")
+        pdeath_child_pid = published_pids[1]
+        pdeath_handle = open_process_handle(
+            pdeath_child_pid, expected_parent_pid=pdeath_launcher.pid
+        )
+        require(pdeath_handle is not None, "stopped-exec child identity was unbound")
+        deadline = time.monotonic() + 5.0
+        while True:
+            pdeath_facts = proc_stat_facts(pdeath_child_pid)
+            if (
+                pdeath_facts is None
+                or pdeath_facts[0] == "Z"
+                or pdeath_facts[2] != pdeath_handle[0]
+            ):
+                raise EvidenceError("stopped-exec child changed before becoming inert")
+            if (
+                pdeath_facts[0] in {"T", "t"}
+                and pdeath_facts[1] == pdeath_child_pid
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise EvidenceError("stopped-exec child did not become inert in time")
+            time.sleep(0.005)
+        require(
+            pdeath_facts[0] in {"T", "t"}
+            and pdeath_facts[1] == pdeath_child_pid
+            and pdeath_facts[2] == pdeath_handle[0],
+            "stopped-exec child did not reach its inert session state",
+        )
+        pdeath_launcher.kill()
+        pdeath_launcher.communicate(timeout=10)
+        deadline = time.monotonic() + 5.0
+        while process_handle_alive(pdeath_child_pid, pdeath_handle):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        require(
+            not process_handle_alive(pdeath_child_pid, pdeath_handle),
+            "stopped-exec child survived its launching parent",
+        )
+    finally:
+        try:
+            if pdeath_launcher is not None and pdeath_launcher.poll() is None:
+                pdeath_launcher.kill()
+                pdeath_launcher.communicate(timeout=10)
+        finally:
+            if pdeath_handle is not None:
+                try:
+                    if process_handle_alive(pdeath_child_pid, pdeath_handle):
+                        signal_process_handle(
+                            pdeath_child_pid, pdeath_handle, signal.SIGKILL
+                        )
+                finally:
+                    os.close(pdeath_handle[1])
+    cases.append(
+        {
+            "case": "stopped_exec_parent_death",
+            "ok": True,
+            "launcher_pid": published_pids[0],
+            "child_pid": pdeath_child_pid,
+        }
+    )
+
     collision_root = case_dir("artifact_publication_failure")
     collision = collision_root / "not-a-directory"
     write_new(collision, b"collision\n")
@@ -5417,6 +5672,13 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_execution.add_argument("command", nargs=argparse.REMAINDER)
     inventory_execution.set_defaults(func=cmd_exec_ubs_inventory)
 
+    stopped_exec_parser = subparsers.add_parser(
+        "stopped-exec", help="stop before exec for parent-side identity binding"
+    )
+    stopped_exec_parser.add_argument("--expected-parent-pid", type=int, required=True)
+    stopped_exec_parser.add_argument("command", nargs=argparse.REMAINDER)
+    stopped_exec_parser.set_defaults(func=cmd_stopped_exec)
+
     emergency_parser = subparsers.add_parser(
         "emergency-kill", help="validate readiness and SIGKILL its bound child group"
     )
@@ -5434,6 +5696,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_identity_parser.add_argument("--wait-ms", type=int, default=0)
     process_identity_parser.add_argument("--session-leader", action="store_true")
+    process_identity_parser.add_argument("--stopped", action="store_true")
     process_identity_parser.set_defaults(func=cmd_process_start_ticks)
 
     launch_release_parser = subparsers.add_parser(
@@ -5474,6 +5737,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--signal", choices=("HUP", "INT", "TERM"), required=True
     )
     bound_process_parser.set_defaults(func=cmd_signal_bound_process)
+
+    resume_process_parser = subparsers.add_parser(
+        "resume-bound-process",
+        help="resume one exact stopped direct child after identity binding",
+    )
+    resume_process_parser.add_argument("--pid", type=int, required=True)
+    resume_process_parser.add_argument(
+        "--expected-start-ticks", type=int, required=True
+    )
+    resume_process_parser.add_argument(
+        "--expected-parent-pid", type=int, required=True
+    )
+    resume_process_parser.set_defaults(func=cmd_resume_bound_process)
 
     empty_group_parser = subparsers.add_parser(
         "assert-process-group-empty",

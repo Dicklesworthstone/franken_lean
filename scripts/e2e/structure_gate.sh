@@ -52,6 +52,8 @@ FINALIZING=0
 FINALIZER_TRANSITION=0
 FINALIZER_PID=""
 FINALIZER_START_TICKS=""
+FINALIZER_CLEANUP_UNPROVEN=0
+FINALIZER_WAIT_UNSAFE=0
 FINALIZATION_SIGNAL=""
 FINALIZATION_SIGNAL_EXIT=0
 FINALIZATION_SIGNAL_GENERATION=0
@@ -228,38 +230,55 @@ on_signal() {
 # shellcheck disable=SC2317
 on_finalizer_signal() {
   local name="$1" exit_code="$2" noclobber_was_set=0
+  trap '' HUP INT TERM
   case $- in *C*) noclobber_was_set=1 ;; esac
   set -o noclobber
   : 2>/dev/null > "$FINALIZATION_DECISION" || true
   [ "$noclobber_was_set" -eq 1 ] || set +o noclobber
   FINALIZATION_SIGNAL_GENERATION=$((FINALIZATION_SIGNAL_GENERATION + 1))
   if [ -s "$FINALIZATION_DECISION" ]; then
+    trap '' HUP INT TERM
     return 0
   fi
   if [ -z "$FINALIZATION_SIGNAL" ]; then
     FINALIZATION_SIGNAL="$name"
     FINALIZATION_SIGNAL_EXIT="$exit_code"
   fi
-  if [ -n "$FINALIZER_PID" ] && [ -n "$FINALIZER_START_TICKS" ]; then
-    python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
-      --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1 || true
+  if [ -n "$FINALIZER_PID" ]; then
+    if [ -n "$FINALIZER_START_TICKS" ] && \
+        ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+          --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+    fi
+    kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
+    kill -KILL "$FINALIZER_PID" 2>/dev/null || true
+    if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
+        --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+      FINALIZER_WAIT_UNSAFE=1
+    fi
   fi
+  trap 'on_finalizer_signal HUP 129' HUP
+  trap 'on_finalizer_signal INT 130' INT
+  trap 'on_finalizer_signal TERM 143' TERM
 }
 
 # shellcheck disable=SC2317
 run_finalizer_command() {
-  local rc=0 generation bind_rc=0 binding_valid=1
+  local rc=0 generation binding_valid=1 resume_failed=0 wait_safe=1
+  [ "$FINALIZER_CLEANUP_UNPROVEN" -eq 0 ] || return 2
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
-  setsid -- "$@" &
+  if [ -s "$FINALIZATION_DECISION" ]; then trap '' HUP INT TERM; fi
+  setsid -- python3 "$EVIDENCE" stopped-exec \
+    --expected-parent-pid "$$" -- "$@" &
   FINALIZER_PID=$!
   FINALIZER_START_TICKS="$(
     setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
-      --expected-parent-pid "$$" --wait-ms 500 --session-leader \
+      --expected-parent-pid "$$" --wait-ms 5000 --session-leader --stopped \
       2>/dev/null
-  )"
-  bind_rc=$?
+  )" || true
   case "$FINALIZER_START_TICKS" in ''|*[!0-9]*) binding_valid=0 ;; esac
-  if [ "$binding_valid" -eq 0 ] && [ ! -s "$FINALIZATION_DECISION" ]; then
+  if [ "$binding_valid" -eq 0 ]; then
     # The still-unwaited numeric PID is our direct setsid child. Its unreaped
     # lifetime pins the PGID while the whole finalizer group is killed and checked.
     kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
@@ -267,10 +286,76 @@ run_finalizer_command() {
     if ! python3 "$EVIDENCE" assert-process-group-empty \
         --pgid "$FINALIZER_PID" --wait-ms 2000; then
       note "INTERNAL FAULT: finalizer process-group cleanup remained unproven"
+      FINALIZER_CLEANUP_UNPROVEN=1
+      FINALIZER_WAIT_UNSAFE=1
+      wait_safe=0
     fi
+    if [ "$wait_safe" -eq 1 ]; then
+      while true; do
+        generation="$FINALIZATION_SIGNAL_GENERATION"
+        wait "$FINALIZER_PID" 2>/dev/null && rc=0 || rc=$?
+        if [ "$FINALIZER_WAIT_UNSAFE" -ne 0 ]; then
+          rc=2
+          break
+        fi
+        case "$rc" in
+          129|130|143)
+            if [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ]; then
+              continue
+            fi
+            ;;
+        esac
+        break
+      done
+    fi
+    FINALIZER_PID=""
+    FINALIZER_START_TICKS=""
+    return 2
+  fi
+  # A terminal trap can interrupt Bash's command-substitution wait after the
+  # isolated binder emitted a valid identity, so the canonical digits are the proof.
+  if [ -z "$FINALIZATION_SIGNAL" ]; then
+    if ! setsid -- python3 "$EVIDENCE" resume-bound-process \
+        --pid "$FINALIZER_PID" \
+        --expected-start-ticks "$FINALIZER_START_TICKS" \
+        --expected-parent-pid "$$"; then
+      if ! python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+          --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1; then
+        FINALIZER_CLEANUP_UNPROVEN=1
+      fi
+      kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
+      kill -KILL "$FINALIZER_PID" 2>/dev/null || true
+      if ! python3 "$EVIDENCE" assert-process-group-empty \
+          --pgid "$FINALIZER_PID" --wait-ms 2000; then
+        FINALIZER_CLEANUP_UNPROVEN=1
+        FINALIZER_WAIT_UNSAFE=1
+        wait_safe=0
+      fi
+      resume_failed=1
+    fi
+  fi
+  if [ -n "$FINALIZATION_SIGNAL" ] && [ -n "$FINALIZER_START_TICKS" ]; then
+    if ! python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+        --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+    fi
+    kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
+    kill -KILL "$FINALIZER_PID" 2>/dev/null || true
+    if ! python3 "$EVIDENCE" assert-process-group-empty \
+        --pgid "$FINALIZER_PID" --wait-ms 2000; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+      FINALIZER_WAIT_UNSAFE=1
+      wait_safe=0
+    fi
+  fi
+  if [ "$wait_safe" -eq 1 ]; then
     while true; do
       generation="$FINALIZATION_SIGNAL_GENERATION"
-      wait "$FINALIZER_PID" 2>/dev/null && rc=0 || rc=$?
+      wait "$FINALIZER_PID" && rc=0 || rc=$?
+      if [ "$FINALIZER_WAIT_UNSAFE" -ne 0 ]; then
+        rc=2
+        break
+      fi
       case "$rc" in
         129|130|143)
           if [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ]; then
@@ -280,42 +365,21 @@ run_finalizer_command() {
       esac
       break
     done
-    FINALIZER_PID=""
-    FINALIZER_START_TICKS=""
-    return 2
+  else
+    rc=2
   fi
-  # A terminal trap can interrupt Bash's command-substitution wait after the
-  # isolated binder already emitted a valid identity. Trust the canonical value;
-  # after a full decision, an unavailable binding may only be waited, never killed.
-  if [ "$binding_valid" -eq 1 ]; then
-    bind_rc=0
-  fi
-  if [ "$bind_rc" -ne 0 ] && [ -s "$FINALIZATION_DECISION" ]; then
-    FINALIZER_START_TICKS=""
-  fi
-  if [ -n "$FINALIZATION_SIGNAL" ] && [ -n "$FINALIZER_START_TICKS" ]; then
-    python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
-      --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1 || true
-  fi
-  while true; do
-    generation="$FINALIZATION_SIGNAL_GENERATION"
-    wait "$FINALIZER_PID" && rc=0 || rc=$?
-    case "$rc" in
-      129|130|143)
-        if [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ]; then
-          continue
-        fi
-        ;;
-    esac
-    break
-  done
   FINALIZER_PID=""
   FINALIZER_START_TICKS=""
+  if [ "$resume_failed" -ne 0 ]; then return 2; fi
   return "$rc"
 }
 
 # shellcheck disable=SC2317
 abort_if_finalizer_signalled() {
+  if [ "$FINALIZER_CLEANUP_UNPROVEN" -ne 0 ]; then
+    note "INTERNAL FAULT: finalizer cleanup was not proven"
+    exit 2
+  fi
   if [ -n "$FINALIZATION_SIGNAL" ]; then
     if [ -s "$FINALIZATION_DECISION" ]; then
       return 0
@@ -552,17 +616,27 @@ launch_supervisor() {
   fi
   if ! release_guardian_launch "$step" "$ACTIVE_RUNNER_PID" \
       "$ACTIVE_RUNNER_START_TICKS" "$launch_ready" "$launch_release"; then
+    local release_cleanup_failed=0
     if [ -s "$launch_release" ]; then
-      SPAWNING=0
       if ! stop_active_runner TERM; then
-        set_final internal_fault process_tree_cleanup_unproven 2
-        exit 2
+        release_cleanup_failed=1
       fi
     else
       terminate_unreleased_runner "$ACTIVE_RUNNER_PID"
-      SPAWNING=0
     fi
+    if [ "$release_cleanup_failed" -ne 0 ]; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
+    SPAWNING=0
     ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    if [ -n "$PENDING_SIGNAL" ]; then
+      local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+      PENDING_SIGNAL=""
+      set_final cancelled "signal_$pending_name" "$pending_exit"
+      exit "$pending_exit"
+    fi
     set_final internal_fault active_runner_launch_unproven 2
     exit 2
   fi
