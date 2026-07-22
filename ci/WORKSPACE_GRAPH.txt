@@ -71,6 +71,11 @@ edge fln-bignum -> fln-core        # loss-free NatLit interop, shared limb layou
 edge fln-kernel -> fln-core        # kernel terms are term-plane values (franken_lean-zht)
 edge fln-kernel -> fln-env         # check consults the environment read-only (franken_lean-zht)
 edge fln-olean -> fln-rt           # region reader consumes the generated ABI object model (franken_lean-y24)
+edge fln-olean -> fln-core         # declaration decoder builds term-plane values (franken_lean-z6c)
+edge fln-olean -> fln-env          # declaration decoder yields ConstantInfo (franken_lean-z6c)
+edge fln-conformance -> fln-env    # kernel replay builds environments from decoded modules (franken_lean-z6c)
+edge fln-conformance -> fln-kernel # kernel replay drives the one authority (franken_lean-z6c)
+edge fln-conformance -> fln-olean  # kernel replay decodes real Reference oleans (franken_lean-z6c)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.

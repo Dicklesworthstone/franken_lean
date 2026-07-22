@@ -5,5 +5,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod decl;
 pub mod format;
 pub mod region;

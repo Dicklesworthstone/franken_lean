@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use fln_core::name::Name;
 use fln_rt::abi;
 
 use crate::format;
@@ -155,16 +156,37 @@ pub struct ExtensionBlock {
     pub entries: u64,
 }
 
+/// One losslessly decoded `Lean.Import` row at the pinned epoch.
+///
+/// The field inventory and physical pointer/scalar split come from
+/// [`format::IMPORT_FIELDS`] plus the generated runtime ABI. Array order and
+/// duplicate rows are observable and are therefore preserved by
+/// [`ModuleDataView::imports`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleImport {
+    pub module: Name,
+    pub import_all: bool,
+    pub is_exported: bool,
+    pub is_meta: bool,
+}
+
 /// Decoded `ModuleData` view (fields per the generated `MODULE_DATA_FIELDS`
 /// wire order): counts everywhere, plus fully-decoded constant names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleDataView {
     pub is_module: bool,
-    pub imports: Vec<String>,
+    pub imports: Vec<ModuleImport>,
     pub const_names: Vec<String>,
     pub constants: u64,
     pub extra_const_names: u64,
     pub extensions: Vec<ExtensionBlock>,
+}
+
+/// `(file offset, length)` views of the ModuleData constant arrays.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ModuleArrays {
+    pub(crate) const_names: (u64, u64),
+    pub(crate) constants: (u64, u64),
 }
 
 /// A parsed olean file: header plus a bounds-checked view of the region bytes.
@@ -182,6 +204,92 @@ fn field_offset(name: &str) -> u64 {
         .find(|f| f.name == name)
         .map(|f| f.offset as u64)
         .unwrap_or(u64::MAX)
+}
+
+fn field_size(name: &str) -> u64 {
+    format::OLEAN_HEADER_FIELDS
+        .iter()
+        .find(|f| f.name == name)
+        .map(|f| f.size as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConstructorLayout {
+    pointer_fields: u8,
+    scalar_bytes: u16,
+    padded_bytes: u16,
+}
+
+/// Derive the compacted constructor layout from a generated Lean structure
+/// contract. The two structures decoded in this module contain heap-valued
+/// fields plus unboxed `Bool`s; an unknown scalar type is a contract change,
+/// not something the reader may guess at.
+fn constructor_layout(fields: &[format::LeanField]) -> Option<ConstructorLayout> {
+    let pointer_fields = fields
+        .iter()
+        .filter(|field| field.lean_type != "Bool")
+        .count();
+    let scalar_bytes = fields
+        .iter()
+        .filter(|field| field.lean_type == "Bool")
+        .count();
+    if pointer_fields.checked_add(scalar_bytes)? != fields.len() {
+        return None;
+    }
+
+    let word_bytes = field_size("base_addr");
+    let align = u64::try_from(abi::OBJECT_SIZE_DELTA).ok()?;
+    let pointer_bytes = word_bytes.checked_mul(u64::try_from(pointer_fields).ok()?)?;
+    let required = word_bytes
+        .checked_add(pointer_bytes)?
+        .checked_add(u64::try_from(scalar_bytes).ok()?)?;
+    let padded = required.checked_add(align.checked_sub(1)?)? / align * align;
+    Some(ConstructorLayout {
+        pointer_fields: u8::try_from(pointer_fields).ok()?,
+        scalar_bytes: u16::try_from(scalar_bytes).ok()?,
+        padded_bytes: u16::try_from(padded).ok()?,
+    })
+}
+
+fn bool_scalar_index(fields: &[format::LeanField], name: &str) -> Option<u64> {
+    fields
+        .iter()
+        .filter(|field| field.lean_type == "Bool")
+        .position(|field| field.name == name)
+        .and_then(|index| u64::try_from(index).ok())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodeBudget {
+    max_objects: u64,
+    visited: u64,
+}
+
+#[derive(Debug)]
+enum NameComponent {
+    Str(String),
+    Num(u64),
+}
+
+impl DecodeBudget {
+    fn new(budget: WalkBudget) -> Self {
+        Self {
+            max_objects: budget.max_objects,
+            visited: 0,
+        }
+    }
+
+    fn visit(&mut self) -> RResult<()> {
+        self.visited = self.visited.saturating_add(1);
+        if self.visited > self.max_objects {
+            return Err(RegionError::BudgetExhausted {
+                visited: self.visited,
+                budget: self.max_objects,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl<'a> OleanView<'a> {
@@ -228,7 +336,7 @@ impl<'a> OleanView<'a> {
         })
     }
 
-    fn read_u64(&self, off: u64) -> RResult<u64> {
+    pub(crate) fn read_u64(&self, off: u64) -> RResult<u64> {
         let end = off.checked_add(8).ok_or(RegionError::Truncated {
             wanted_end: u64::MAX,
             len: self.bytes.len() as u64,
@@ -244,7 +352,7 @@ impl<'a> OleanView<'a> {
         Ok(u64::from_le_bytes(b))
     }
 
-    fn read_bytes(&self, off: u64, len: u64) -> RResult<&'a [u8]> {
+    pub(crate) fn read_bytes(&self, off: u64, len: u64) -> RResult<&'a [u8]> {
         let end = off.checked_add(len).ok_or(RegionError::Truncated {
             wanted_end: u64::MAX,
             len: self.bytes.len() as u64,
@@ -260,7 +368,7 @@ impl<'a> OleanView<'a> {
 
     /// Resolve a stored pointer to a file offset: the compactor rewrote every
     /// interior pointer to `base_addr + file_offset` (OLEAN_CONTRACT §1).
-    fn deref(&self, ptr: u64) -> RResult<u64> {
+    pub(crate) fn deref(&self, ptr: u64) -> RResult<u64> {
         let resolved = ptr as i128 - self.header.base_addr as i128;
         let header_size = format::OLEAN_HEADER_SIZE as i128;
         if resolved < header_size || resolved >= self.bytes.len() as i128 {
@@ -275,7 +383,7 @@ impl<'a> OleanView<'a> {
     /// Read a compacted `lean_object` header at a file offset: `m_rc` (i32),
     /// then the packed bitfield word `m_cs_sz:16 | m_other:8 | m_tag:8`
     /// (low-to-high, per the generated `LEAN_OBJECT_FIELDS` order).
-    fn obj_header(&self, off: u64) -> RResult<(u8, u8, u16)> {
+    pub(crate) fn obj_header(&self, off: u64) -> RResult<(u8, u8, u16)> {
         let word = self.read_u64(off)?;
         let rc = (word & 0xffff_ffff) as u32 as i32;
         if rc != 0 {
@@ -416,6 +524,31 @@ impl<'a> OleanView<'a> {
         Ok(())
     }
 
+    /// Read the sign and little-endian 64-bit limbs of a compacted GMP mpz
+    /// object (limbs copied right after the object; one rewritten pointer).
+    pub(crate) fn mpz_limbs(&self, off: u64) -> RResult<(bool, Vec<u64>)> {
+        self.check_mpz(off)?;
+        let word = self.read_u64(off + 8)?;
+        let mpz_size = ((word >> 32) as u32) as i32;
+        let n = mpz_size.unsigned_abs() as u64;
+        let limb_off = self.deref(self.read_u64(off + 16)?)?;
+        let mut limbs = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            limbs.push(self.read_u64(limb_off + 8 * i)?);
+        }
+        Ok((mpz_size < 0, limbs))
+    }
+
+    /// Byte-window alias used by the declaration decoder.
+    pub(crate) fn read_bytes_at(&self, off: u64, len: u64) -> RResult<&'a [u8]> {
+        self.read_bytes(off, len)
+    }
+
+    /// String-object reader used by the declaration decoder.
+    pub(crate) fn read_string_at(&self, ptr: u64) -> RResult<String> {
+        self.read_string_obj(ptr)
+    }
+
     fn read_string_obj(&self, ptr: u64) -> RResult<String> {
         let off = self.deref(ptr)?;
         let (tag, _, _) = self.obj_header(off)?;
@@ -441,17 +574,9 @@ impl<'a> OleanView<'a> {
     /// Decode a `Name` chain (anonymous | str pre s | num pre i, each with a
     /// cached-hash scalar field) into dot-notation. Iterative on the `pre`
     /// chain; bounded by the budget to survive hostile self-references.
-    fn read_name(&self, mut ptr: u64, budget: WalkBudget) -> RResult<String> {
-        let mut components: Vec<String> = Vec::new();
-        let mut steps: u64 = 0;
+    fn read_name(&self, mut ptr: u64, budget: &mut DecodeBudget) -> RResult<Name> {
+        let mut components: Vec<NameComponent> = Vec::new();
         loop {
-            steps += 1;
-            if steps > budget.max_objects {
-                return Err(RegionError::BudgetExhausted {
-                    visited: steps,
-                    budget: budget.max_objects,
-                });
-            }
             if ptr & 1 == 1 {
                 // enum ctor without fields is boxed: Name.anonymous == box(0)
                 if ptr >> 1 != 0 {
@@ -462,6 +587,7 @@ impl<'a> OleanView<'a> {
                 }
                 break;
             }
+            budget.visit()?;
             let off = self.deref(ptr)?;
             let (tag, other, _) = self.obj_header(off)?;
             match tag {
@@ -473,8 +599,9 @@ impl<'a> OleanView<'a> {
                             reason: "Name.str arity",
                         });
                     }
+                    budget.visit()?;
                     let s = self.read_string_obj(self.read_u64(off + 16)?)?;
-                    components.push(s);
+                    components.push(NameComponent::Str(s));
                     ptr = self.read_u64(off + 8)?;
                 }
                 2 => {
@@ -486,12 +613,21 @@ impl<'a> OleanView<'a> {
                         });
                     }
                     let nat = self.read_u64(off + 16)?;
-                    if nat & 1 == 1 {
-                        components.push((nat >> 1).to_string());
+                    let component = if nat & 1 == 1 {
+                        nat >> 1
                     } else {
-                        // A bignum numeric component: flagged, never guessed.
-                        components.push("<mpz>".to_owned());
-                    }
+                        budget.visit()?;
+                        let nat_off = self.deref(nat)?;
+                        let (negative, limbs) = self.mpz_limbs(nat_off)?;
+                        if negative || limbs.len() > 1 {
+                            return Err(RegionError::DecodeShape {
+                                offset: nat_off,
+                                reason: "Name.num component exceeds u64",
+                            });
+                        }
+                        limbs.first().copied().unwrap_or(0)
+                    };
+                    components.push(NameComponent::Num(component));
                     ptr = self.read_u64(off + 8)?;
                 }
                 _ => {
@@ -503,25 +639,17 @@ impl<'a> OleanView<'a> {
             }
         }
         components.reverse();
-        Ok(components.join("."))
+        Ok(components
+            .into_iter()
+            .fold(Name::anonymous(), |name, component| match component {
+                NameComponent::Str(value) => Name::str(name, value),
+                NameComponent::Num(value) => Name::num(name, value),
+            }))
     }
 
-    fn array_view(&self, ptr: u64, what: &'static str) -> RResult<(u64, u64)> {
-        let off = self.deref(ptr)?;
-        let (tag, _, _) = self.obj_header(off)?;
-        if tag != abi::TAG_ARRAY {
-            return Err(RegionError::DecodeShape {
-                offset: off,
-                reason: what,
-            });
-        }
-        Ok((off, self.read_u64(off + 8)?))
-    }
-
-    /// Decode the root `ModuleData` object per the generated wire order:
-    /// pointer fields `imports, constNames, constants, extraConstNames,
-    /// entries`, then the `isModule` scalar byte.
-    pub fn module_data(&self, budget: WalkBudget) -> RResult<ModuleDataView> {
+    /// The `constNames`/`constants` array views of the root `ModuleData`,
+    /// as (file offset, length) pairs for the declaration decoder.
+    pub(crate) fn module_arrays(&self) -> RResult<ModuleArrays> {
         let n_ptr_fields = format::MODULE_DATA_FIELDS
             .iter()
             .filter(|f| f.lean_type != "Bool")
@@ -539,40 +667,172 @@ impl<'a> OleanView<'a> {
                 reason: "root is not a ModuleData constructor",
             });
         }
+        Ok(ModuleArrays {
+            const_names: self.array_view(self.read_u64(off + 16)?, "constNames not an array")?,
+            constants: self.array_view(self.read_u64(off + 24)?, "constants not an array")?,
+        })
+    }
+
+    fn array_view(&self, ptr: u64, what: &'static str) -> RResult<(u64, u64)> {
+        let off = self.deref(ptr)?;
+        let (tag, _, _) = self.obj_header(off)?;
+        if tag != abi::TAG_ARRAY {
+            return Err(RegionError::DecodeShape {
+                offset: off,
+                reason: what,
+            });
+        }
+        Ok((off, self.read_u64(off + 8)?))
+    }
+
+    fn decode_array_view(
+        &self,
+        ptr: u64,
+        what: &'static str,
+        budget: &mut DecodeBudget,
+    ) -> RResult<(u64, u64)> {
+        budget.visit()?;
+        self.array_view(ptr, what)
+    }
+
+    fn read_canonical_bool(&self, off: u64, reason: &'static str) -> RResult<bool> {
+        match self.read_bytes(off, 1)?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(RegionError::DecodeShape {
+                offset: off,
+                reason,
+            }),
+        }
+    }
+
+    /// Decode the root `ModuleData` object per the generated wire order:
+    /// pointer fields `imports, constNames, constants, extraConstNames,
+    /// entries`, then the `isModule` scalar byte.
+    pub fn module_data(&self, budget: WalkBudget) -> RResult<ModuleDataView> {
+        let module_layout =
+            constructor_layout(format::MODULE_DATA_FIELDS).ok_or(RegionError::RootShape {
+                reason: "unsupported ModuleData contract layout",
+            })?;
+        let mut budget = DecodeBudget::new(budget);
+        budget.visit()?;
+        let root = self.root_ptr()?;
+        if root & 1 == 1 {
+            return Err(RegionError::RootShape {
+                reason: "root is a scalar",
+            });
+        }
+        let off = self.deref(root)?;
+        let (tag, other, cs_sz) = self.obj_header(off)?;
+        if tag != 0 || other != module_layout.pointer_fields || cs_sz != module_layout.padded_bytes
+        {
+            return Err(RegionError::RootShape {
+                reason: "root is not a ModuleData constructor",
+            });
+        }
         let field = |i: u64| self.read_u64(off + 8 + 8 * i);
-        let is_module = self.read_bytes(off + 8 + 8 * n_ptr_fields as u64, 1)?[0] != 0;
+        let module_scalar_base = off + field_size("base_addr") * (1 + u64::from(other));
+        let is_module_index = bool_scalar_index(format::MODULE_DATA_FIELDS, "isModule").ok_or(
+            RegionError::RootShape {
+                reason: "ModuleData contract lacks isModule",
+            },
+        )?;
+        let is_module = self.read_canonical_bool(
+            module_scalar_base + is_module_index,
+            "noncanonical ModuleData.isModule Bool",
+        )?;
 
         // imports : Array Import — Import is a ctor with one Name pointer and
         // three scalar Bools (module, importAll, isExported, isMeta).
-        let (imp_off, imp_len) = self.array_view(field(0)?, "imports not an array")?;
+        let import_layout =
+            constructor_layout(format::IMPORT_FIELDS).ok_or(RegionError::DecodeShape {
+                offset: off,
+                reason: "unsupported Import contract layout",
+            })?;
+        if import_layout.pointer_fields != 1 || import_layout.scalar_bytes != 3 {
+            return Err(RegionError::DecodeShape {
+                offset: off,
+                reason: "unsupported Import contract field inventory",
+            });
+        }
+        let import_all_index = bool_scalar_index(format::IMPORT_FIELDS, "importAll").ok_or(
+            RegionError::DecodeShape {
+                offset: off,
+                reason: "Import contract lacks importAll",
+            },
+        )?;
+        let is_exported_index = bool_scalar_index(format::IMPORT_FIELDS, "isExported").ok_or(
+            RegionError::DecodeShape {
+                offset: off,
+                reason: "Import contract lacks isExported",
+            },
+        )?;
+        let is_meta_index =
+            bool_scalar_index(format::IMPORT_FIELDS, "isMeta").ok_or(RegionError::DecodeShape {
+                offset: off,
+                reason: "Import contract lacks isMeta",
+            })?;
+        let (imp_off, imp_len) =
+            self.decode_array_view(field(0)?, "imports not an array", &mut budget)?;
         let mut imports = Vec::new();
         for i in 0..imp_len {
+            budget.visit()?;
             let p = self.read_u64(imp_off + 24 + 8 * i)?;
             let io = self.deref(p)?;
-            let (itag, iother, _) = self.obj_header(io)?;
-            if itag != 0 || iother != 1 {
+            let (itag, iother, ics_sz) = self.obj_header(io)?;
+            if itag != 0
+                || iother != import_layout.pointer_fields
+                || ics_sz != import_layout.padded_bytes
+            {
                 return Err(RegionError::DecodeShape {
                     offset: io,
                     reason: "Import shape",
                 });
             }
-            imports.push(self.read_name(self.read_u64(io + 8)?, budget)?);
+            let scalar_base = io + field_size("base_addr") * (1 + u64::from(iother));
+            let module = self.read_name(self.read_u64(io + 8)?, &mut budget)?;
+            let import_all = self.read_canonical_bool(
+                scalar_base + import_all_index,
+                "noncanonical Import.importAll Bool",
+            )?;
+            let is_exported = self.read_canonical_bool(
+                scalar_base + is_exported_index,
+                "noncanonical Import.isExported Bool",
+            )?;
+            let is_meta = self.read_canonical_bool(
+                scalar_base + is_meta_index,
+                "noncanonical Import.isMeta Bool",
+            )?;
+            imports.push(ModuleImport {
+                module,
+                import_all,
+                is_exported,
+                is_meta,
+            });
         }
 
-        let (cn_off, cn_len) = self.array_view(field(1)?, "constNames not an array")?;
+        let (cn_off, cn_len) =
+            self.decode_array_view(field(1)?, "constNames not an array", &mut budget)?;
         let mut const_names = Vec::new();
         for i in 0..cn_len {
-            const_names.push(self.read_name(self.read_u64(cn_off + 24 + 8 * i)?, budget)?);
+            const_names.push(
+                self.read_name(self.read_u64(cn_off + 24 + 8 * i)?, &mut budget)?
+                    .to_display_string(),
+            );
         }
 
-        let (_, constants) = self.array_view(field(2)?, "constants not an array")?;
-        let (_, extra) = self.array_view(field(3)?, "extraConstNames not an array")?;
+        let (_, constants) =
+            self.decode_array_view(field(2)?, "constants not an array", &mut budget)?;
+        let (_, extra) =
+            self.decode_array_view(field(3)?, "extraConstNames not an array", &mut budget)?;
 
         // entries : Array (Name × Array EnvExtensionEntry) — the pair is a
         // two-field ctor; payloads stay opaque (counted, never interpreted).
-        let (en_off, en_len) = self.array_view(field(4)?, "entries not an array")?;
+        let (en_off, en_len) =
+            self.decode_array_view(field(4)?, "entries not an array", &mut budget)?;
         let mut extensions = Vec::new();
         for i in 0..en_len {
+            budget.visit()?;
             let p = self.read_u64(en_off + 24 + 8 * i)?;
             let po = self.deref(p)?;
             let (ptag, pother, _) = self.obj_header(po)?;
@@ -582,9 +842,14 @@ impl<'a> OleanView<'a> {
                     reason: "entries pair shape",
                 });
             }
-            let name = self.read_name(self.read_u64(po + 8)?, budget)?;
-            let (_, payloads) =
-                self.array_view(self.read_u64(po + 16)?, "extension payload not an array")?;
+            let name = self
+                .read_name(self.read_u64(po + 8)?, &mut budget)?
+                .to_display_string();
+            let (_, payloads) = self.decode_array_view(
+                self.read_u64(po + 16)?,
+                "extension payload not an array",
+                &mut budget,
+            )?;
             extensions.push(ExtensionBlock {
                 name,
                 entries: payloads,

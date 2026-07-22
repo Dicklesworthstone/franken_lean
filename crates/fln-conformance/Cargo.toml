@@ -12,3 +12,6 @@ oracle-fallback-dev = []
 
 [dependencies]
 fln-core = { path = "../fln-core" }
+fln-env = { path = "../fln-env" }
+fln-kernel = { path = "../fln-kernel" }
+fln-olean = { path = "../fln-olean" }

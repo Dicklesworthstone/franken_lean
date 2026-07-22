@@ -34,6 +34,9 @@ name = "fln-conformance"
 version = "0.0.0"
 dependencies = [
  "fln-core",
+ "fln-env",
+ "fln-kernel",
+ "fln-olean",
 ]
 
 [[package]]
@@ -95,6 +98,8 @@ version = "0.0.0"
 name = "fln-olean"
 version = "0.0.0"
 dependencies = [
+ "fln-core",
+ "fln-env",
  "fln-rt",
 ]
 
