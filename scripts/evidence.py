@@ -102,6 +102,11 @@ PROCESS_GROUP_FREEZE_ATTEMPTS = 8
 PROCESS_GROUP_FREEZE_TIMEOUT_S = 10.0
 PROCESS_GROUP_KILL_ATTEMPTS = 2000
 PROCESS_GROUP_KILL_TIMEOUT_S = 10.0
+MAX_PROCESS_IDENTITY_WAIT_MS = 30_000
+# A caller may consume one full identity-bind budget before starting two full
+# launch-release attempts.  The guardian must remain inert across that entire
+# bounded handoff, with a small scheduling margin, or equal deadlines race.
+GUARDIAN_LAUNCH_RELEASE_TIMEOUT_MS = MAX_PROCESS_IDENTITY_WAIT_MS * 3 + 5_000
 SECRET_KEY = re.compile(
     r"(?i)(authorization|bearer|password|passwd|secret|token|api[_-]?key|private[_-]?key)"
 )
@@ -3969,7 +3974,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             "guardian_start_ticks": guardian_identity[1],
         }
         write_atomic_new(launch_ready, canonical_json(launch_identity))
-        release_deadline = time.monotonic() + 30.0
+        release_deadline = (
+            time.monotonic() + GUARDIAN_LAUNCH_RELEASE_TIMEOUT_MS / 1000
+        )
         while True:
             try:
                 release = read_json_object(launch_release)
@@ -4284,7 +4291,7 @@ def cmd_emergency_kill(args: argparse.Namespace) -> int:
 
 
 def cmd_process_start_ticks(args: argparse.Namespace) -> int:
-    if args.wait_ms < 0 or args.wait_ms > 30_000:
+    if args.wait_ms < 0 or args.wait_ms > MAX_PROCESS_IDENTITY_WAIT_MS:
         raise EvidenceError("process identity wait must be between 0 and 30000 ms")
     if args.pid == os.getpid():
         raise EvidenceError("process identity target cannot be the binder itself")
@@ -4316,7 +4323,7 @@ def cmd_process_start_ticks(args: argparse.Namespace) -> int:
 
 
 def cmd_release_process_launch(args: argparse.Namespace) -> int:
-    if args.wait_ms < 0 or args.wait_ms > 30_000:
+    if args.wait_ms < 0 or args.wait_ms > MAX_PROCESS_IDENTITY_WAIT_MS:
         raise EvidenceError("guardian launch wait must be between 0 and 30000 ms")
     artifact_root = lexical_absolute(Path(args.artifact_root))
     ready_path = require_within(
@@ -4553,6 +4560,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     _created, created_fd = open_directory_nofollow(art_dir, create=True)
     os.close(created_fd)
     cases: list[dict[str, Any]] = []
+    require(
+        GUARDIAN_LAUNCH_RELEASE_TIMEOUT_MS > MAX_PROCESS_IDENTITY_WAIT_MS * 3,
+        "guardian launch window does not cover bind plus release retry budgets",
+    )
 
     def case_dir(name: str) -> Path:
         path = art_dir / name
