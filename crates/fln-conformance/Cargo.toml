@@ -2,7 +2,8 @@
 name = "fln-conformance"
 version = "0.0.0"
 edition = "2024"
-license = "MIT"
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 
 [dependencies]
+fln-core = { path = "../fln-core" }
