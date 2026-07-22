@@ -67,6 +67,7 @@ edge fln-conformance -> fln-core   # C0 core-observable fixture diff harness (fr
 edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)
 edge fln-env -> fln-core           # environment holds term-plane constants (fln-amv)
 edge fln-env -> fln-hash           # logical + operational roots over the identity layer (fln-amv)
+edge fln-bignum -> fln-core        # loss-free NatLit interop, shared limb layout (franken_lean-npl)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.
