@@ -128,11 +128,19 @@ pub fn compare(
         .find(|(_, (x, y))| x != y)
         .map(|(i, (x, y))| format!("line {}: ours `{x}` vs oracle `{y}`", i + 1))
         .unwrap_or_else(|| {
-            format!(
-                "length divergence: ours {} lines, oracle {} lines",
-                a.lines().count(),
-                b.lines().count()
-            )
+            let (ours_lines, oracle_lines) = (a.lines().count(), b.lines().count());
+            if ours_lines == oracle_lines {
+                // Every common line matched and the counts agree, yet the strings
+                // differ: the divergence is below line granularity (e.g. a missing
+                // final newline). Say so instead of a self-contradictory count.
+                format!(
+                    "sub-line divergence (line endings or trailing bytes): ours {} bytes, oracle {} bytes",
+                    a.len(),
+                    b.len()
+                )
+            } else {
+                format!("length divergence: ours {ours_lines} lines, oracle {oracle_lines} lines")
+            }
         });
     Ok(Some(first))
 }
@@ -202,6 +210,16 @@ mod tests {
                 .expect("missing normalizer surfaces")
                 .contains("requires normalizer")
         );
+    }
+
+    #[test]
+    fn sub_line_divergence_is_reported_meaningfully() {
+        // Same line content, differing only in the trailing newline: the finding
+        // must not claim a self-contradictory "length divergence" of equal counts.
+        let finding = compare(ComparisonClass::Exact, "a", "a\n", None)
+            .expect("law holds")
+            .expect("diverges");
+        assert!(finding.contains("sub-line divergence"), "{finding}");
     }
 
     #[test]

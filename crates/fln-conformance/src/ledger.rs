@@ -109,6 +109,8 @@ impl ClaimState {
 /// are typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
+    /// 1-based source line in the ledger file, for error reporting.
+    pub line: usize,
     pub surface: String,
     pub symbol: String,
     pub kind: String,
@@ -179,6 +181,7 @@ pub fn parse(text: &str) -> Result<Ledger, LedgerError> {
             return Err(err("every field must be non-empty"));
         }
         let row = Row {
+            line: lineno,
             surface: fields[0].to_string(),
             symbol: fields[1].to_string(),
             kind: fields[2].to_string(),
@@ -225,11 +228,11 @@ pub fn parse(text: &str) -> Result<Ledger, LedgerError> {
 /// Validate fixture references against the workspace root: every cited fixture must
 /// exist. A ledger citing a missing fixture is marketing, not evidence.
 pub fn validate_fixtures(ledger: &Ledger, root: &Path) -> Result<(), LedgerError> {
-    for (idx, row) in ledger.rows.iter().enumerate() {
+    for row in &ledger.rows {
         for fixture in &row.fixtures {
             if !root.join(fixture).exists() {
                 return Err(LedgerError {
-                    line: idx + 1,
+                    line: row.line,
                     what: format!("row for `{}` cites missing fixture `{fixture}`", row.symbol),
                 });
             }
@@ -326,6 +329,7 @@ mod tests {
             "crates/fln-conformance/fixtures/ghost.txt",
         );
         let bad = parse(&ghost).expect("parses");
-        assert!(validate_fixtures(&bad, root).is_err());
+        let err = validate_fixtures(&bad, root).expect_err("ghost fixture rejected");
+        assert_eq!(err.line, 2, "reports the row's source line, not its index");
     }
 }

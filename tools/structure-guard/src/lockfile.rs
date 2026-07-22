@@ -243,6 +243,16 @@ fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn is_exact_nightly(s: &str) -> bool {
+    let Some(date) = s.strip_prefix("nightly-") else {
+        return false;
+    };
+    date.len() == 10
+        && date.chars().enumerate().all(|(index, ch)| {
+            matches!(index, 4 | 7) && ch == '-' || !matches!(index, 4 | 7) && ch.is_ascii_digit()
+        })
+}
+
 pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
     let mut lock = SuiteLock::default();
     let mut saw_schema = false;
@@ -266,7 +276,15 @@ pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
         }
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens[0] {
-            "rust-nightly" if tokens.len() == 2 => lock.rust_nightly = tokens[1].to_string(),
+            "rust-nightly" if tokens.len() == 2 => {
+                if !lock.rust_nightly.is_empty() {
+                    return Err(err("duplicate rust-nightly row"));
+                }
+                if !is_exact_nightly(tokens[1]) {
+                    return Err(err("rust-nightly must be an exact nightly-YYYY-MM-DD pin"));
+                }
+                lock.rust_nightly = tokens[1].to_string();
+            }
             "rust-release" | "rust-commit" | "target" if tokens.len() == 2 => {}
             "suite" if tokens.len() == 4 => {
                 let commit = tokens[2]
@@ -709,6 +727,13 @@ mod tests {
             "commit=e464",
         );
         assert!(parse_suite_lock(&short_hash).is_err());
+        let duplicate_nightly = SUITE_OK.replace(
+            "rust-nightly nightly-2026-07-13",
+            "rust-nightly nightly-2026-07-13\nrust-nightly nightly-2026-07-14",
+        );
+        assert!(parse_suite_lock(&duplicate_nightly).is_err());
+        let undated_nightly = SUITE_OK.replace("nightly-2026-07-13", "nightly");
+        assert!(parse_suite_lock(&undated_nightly).is_err());
     }
 
     #[test]
