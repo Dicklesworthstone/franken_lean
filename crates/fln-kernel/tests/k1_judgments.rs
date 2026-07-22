@@ -338,6 +338,49 @@ fn kr306_proof_irrelevance_in_prop() {
 }
 
 #[test]
+fn kr306_proof_irrelevance_does_not_leak_to_type() {
+    // THE soundness boundary of KR-306: proof irrelevance must fire ONLY in Prop.
+    // T : Sort 1 (a genuine type, NOT a proposition); a b : T are DISTINCT data.
+    // If they were made defeq, the kernel would equate distinct inhabitants of a
+    // Type — an unsoundness. This kills any `is_prop` that admits Sort 1.
+    let env = admit(&Environment::new(), &axiom("T", sort1()));
+    let t = Expr::const_(n("T"), vec![]);
+    let env = admit(&env, &axiom("a", t.clone()));
+    let env = admit(&env, &axiom("b", t.clone()));
+    let a = Expr::const_(n("a"), vec![]);
+    let b = Expr::const_(n("b"), vec![]);
+    let verdict = check_def_eq(&env, &[], &a, &b, Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::NotDefEq),
+        "proof irrelevance leaked out of Prop into Type — UNSOUND: {verdict:?}"
+    );
+}
+
+#[test]
+fn kr306_proof_irrelevance_requires_defeq_propositions() {
+    // The other half of KR-306's guard: two proofs of DIFFERENT propositions are
+    // NOT definitionally equal. p and q are distinct Props; hp : p, hq : q. If the
+    // type-equality half of proof irrelevance were dropped, every proof would be
+    // defeq to every other — catastrophically unsound. `kr306_..._in_prop` cannot
+    // catch that (it uses one shared prop); this test does.
+    let env = admit(&Environment::new(), &axiom("p", prop()));
+    let env = admit(&env, &axiom("q", prop()));
+    let p = Expr::const_(n("p"), vec![]);
+    let q = Expr::const_(n("q"), vec![]);
+    let env = admit(&env, &axiom("hp", p.clone()));
+    let env = admit(&env, &axiom("hq", q.clone()));
+    let hp = Expr::const_(n("hp"), vec![]);
+    let hq = Expr::const_(n("hq"), vec![]);
+    let verdict = check_def_eq(&env, &[], &hp, &hq, Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::NotDefEq),
+        "proofs of distinct propositions were equated — UNSOUND: {verdict:?}"
+    );
+}
+
+#[test]
 fn distinct_axioms_are_not_defeq() {
     let env = admit(&Environment::new(), &axiom("A", sort1()));
     let env = admit(&env, &axiom("B", sort1()));
@@ -382,15 +425,18 @@ fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
         &defn("id", ty.clone(), value.clone()),
         tiny,
     );
-    match &verdict {
-        Verdict::Inconclusive {
-            reason,
-            consumption,
-        } => {
-            assert_eq!(*reason, ExhaustionReason::Steps);
-            assert!(consumption.steps_used >= 5);
-        }
-        other => panic!("FL-INV-07 violated: expected Inconclusive, got {other:?}"),
+    assert!(
+        matches!(
+            &verdict,
+            Verdict::Inconclusive {
+                reason: ExhaustionReason::Steps,
+                ..
+            }
+        ),
+        "FL-INV-07 violated: expected Steps-exhaustion Inconclusive, got {verdict:?}"
+    );
+    if let Verdict::Inconclusive { consumption, .. } = &verdict {
+        assert!(consumption.steps_used >= 5);
     }
     assert!(!verdict.is_rejected() && !verdict.is_accepted());
 
