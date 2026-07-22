@@ -357,6 +357,32 @@ pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
     Ok(lock)
 }
 
+fn toolchain_quoted(value: &str) -> Option<&str> {
+    value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .filter(|inner| !inner.is_empty() && !inner.contains(['"', '\\']))
+}
+
+fn toolchain_string_array(value: &str) -> Result<(), &'static str> {
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .ok_or("must be a one-line array")?;
+    if inner.trim().is_empty() {
+        return Ok(());
+    }
+    let mut seen = BTreeSet::new();
+    for item in inner.split(',') {
+        let parsed = toolchain_quoted(item.trim())
+            .ok_or("array entries must be non-empty unescaped quoted strings")?;
+        if !seen.insert(parsed) {
+            return Err("array entries must be unique");
+        }
+    }
+    Ok(())
+}
+
 /// Extract the one exact `channel = "..."` from the constrained
 /// `rust-toolchain.toml` shape. A section-insensitive search is not sufficient:
 /// Cargo/rustup could select a path or a later toolchain section while a decoy key
@@ -396,18 +422,20 @@ pub fn parse_toolchain_channel(text: &str) -> Result<String, String> {
         match key.trim() {
             "channel" => {
                 let value = value.trim();
-                let parsed = value
-                    .strip_prefix('"')
-                    .and_then(|inner| inner.strip_suffix('"'))
-                    .filter(|inner| !inner.is_empty() && !inner.contains(['"', '\\']))
+                let parsed = toolchain_quoted(value)
                     .ok_or_else(|| err("channel must be one non-empty unescaped quoted string"))?;
                 if channel.replace(parsed.to_string()).is_some() {
                     return Err(err("duplicate channel key"));
                 }
             }
-            "components" | "profile" | "targets" => {
-                if value.trim().is_empty() {
-                    return Err(err("toolchain option must have a value"));
+            "components" | "targets" => {
+                toolchain_string_array(value.trim()).map_err(&err)?;
+            }
+            "profile" => {
+                let profile = toolchain_quoted(value.trim())
+                    .ok_or_else(|| err("profile must be one unescaped quoted string"))?;
+                if !matches!(profile, "minimal" | "default" | "complete") {
+                    return Err(err("profile must be minimal|default|complete"));
                 }
             }
             "path" => return Err(err("path-based toolchains are forbidden; pin a channel")),
@@ -708,6 +736,24 @@ mod tests {
         assert!(
             parse_toolchain_channel(
                 "[toolchain]\nchannel = \"nightly-2026-07-13\"\nunknown = true\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_toolchain_channel(
+                "[toolchain]\nchannel = \"nightly-2026-07-13\"\ncomponents = \"rustfmt\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_toolchain_channel(
+                "[toolchain]\nchannel = \"nightly-2026-07-13\"\ncomponents = [\"rustfmt\", \"rustfmt\"]\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_toolchain_channel(
+                "[toolchain]\nchannel = \"nightly-2026-07-13\"\nprofile = \"fast\"\n"
             )
             .is_err()
         );
