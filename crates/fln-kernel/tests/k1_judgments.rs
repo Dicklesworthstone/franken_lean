@@ -751,3 +751,77 @@ fn kr200_unsafe_definitions_are_not_delta_unfolded() {
         "an unsafe definition must not be delta-unfolded by the kernel: {verdict:?}"
     );
 }
+
+#[test]
+fn kr204_projection_of_a_constructor_reduces_to_the_field() {
+    // D : Sort 1; d0, d1 : D; structure S : Sort 1 with mk : D → D → S.
+    // whnf reduces `proj S i (mk d0 d1)` to the i-th field, so it is defeq to di
+    // and NOT to the other field.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let d = Expr::const_(n("D"), vec![]);
+    let env = admit(&env, &axiom("d0", d.clone()));
+    let env = admit(&env, &axiom("d1", d.clone()));
+    let env = add_structure(&env, "S", "mk", sort1(), &[d.clone(), d.clone()]);
+
+    let d0 = Expr::const_(n("d0"), vec![]);
+    let d1 = Expr::const_(n("d1"), vec![]);
+    let mk_app = Expr::app(
+        Expr::app(Expr::const_(n("mk"), vec![]), d0.clone()),
+        d1.clone(),
+    );
+
+    // proj 0 reduces to d0; proj 1 reduces to d1.
+    let proj0 = Expr::proj(n("S"), 0, mk_app.clone());
+    let proj1 = Expr::proj(n("S"), 1, mk_app.clone());
+    assert!(
+        check_def_eq(&env, &[], &proj0, &d0, Budget::DEFAULT).is_accepted(),
+        "proj S 0 (mk d0 d1) should reduce to d0"
+    );
+    assert!(
+        check_def_eq(&env, &[], &proj1, &d1, Budget::DEFAULT).is_accepted(),
+        "proj S 1 (mk d0 d1) should reduce to d1"
+    );
+    // And it must NOT reduce to the wrong field.
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &proj0, &d1, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "proj S 0 must not equal the second field d1"
+    );
+}
+
+#[test]
+fn kr202_over_applied_lambda_beta_reduces_and_reapplies() {
+    // ((fun (x : Sort 1) => x) A) is `A` after beta; applied to an extra arg the
+    // spine machinery must re-apply the leftover. Here: (fun x => x) reduces so
+    // `(fun (x:Sort 1) => x) A ≟ A`, exercising batched beta over a collected spine.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let env = admit(
+        &env,
+        &axiom(
+            "f",
+            Expr::forall_e(n("_"), sort1(), sort1(), BinderInfo::Default),
+        ),
+    );
+    let a = Expr::const_(n("A"), vec![]);
+    // id := fun (x : Sort 1) => x
+    let id_lam = Expr::lam(
+        n("x"),
+        sort1(),
+        Expr::bvar(0).expect("packs"),
+        BinderInfo::Default,
+    );
+    // (id A) ≟ A  (single beta over a spine head that is itself a redex)
+    let applied = Expr::app(id_lam.clone(), a.clone());
+    assert!(
+        check_def_eq(&env, &[], &applied, &a, Budget::DEFAULT).is_accepted(),
+        "(fun x => x) A should beta-reduce to A"
+    );
+    // f (id A) ≟ f A — the redex under an application head reduces, congruence closes.
+    let f = Expr::const_(n("f"), vec![]);
+    let lhs = Expr::app(f.clone(), applied);
+    let rhs = Expr::app(f, a);
+    assert!(
+        check_def_eq(&env, &[], &lhs, &rhs, Budget::DEFAULT).is_accepted(),
+        "f ((fun x => x) A) should equal f A"
+    );
+}
