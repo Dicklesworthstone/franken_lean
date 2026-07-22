@@ -97,6 +97,10 @@ SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 MAX_RECORD_BYTES = 1_048_576
 MAX_LOG_BYTES = 67_108_864
+PROCESS_GROUP_FREEZE_ATTEMPTS = 8
+PROCESS_GROUP_FREEZE_TIMEOUT_S = 10.0
+PROCESS_GROUP_KILL_ATTEMPTS = 2000
+PROCESS_GROUP_KILL_TIMEOUT_S = 10.0
 SECRET_KEY = re.compile(
     r"(?i)(authorization|bearer|password|passwd|secret|token|api[_-]?key|private[_-]?key)"
 )
@@ -3005,9 +3009,11 @@ def kill_bound_process_group(
     handles: ProcessHandles = {pid: opened}
     frozen = False
     try:
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + PROCESS_GROUP_FREEZE_TIMEOUT_S
         prior_members: set[int] | None = None
-        while time.monotonic() < deadline:
+        for _attempt in range(PROCESS_GROUP_FREEZE_ATTEMPTS):
+            if time.monotonic() >= deadline:
+                break
             observed = live_process_group_members(pid)
             for member_pid in observed:
                 current = handles.get(member_pid)
@@ -3045,14 +3051,14 @@ def kill_bound_process_group(
                 frozen = True
                 break
             prior_members = repeated if repeated == bound_live and all_stopped else None
-        else:
+        if not frozen:
             raise EvidenceError("bound process group did not reach a frozen fixed point")
         for member_pid in sorted(handles, key=lambda value: value == pid):
             signal_process_handle(
                 member_pid, handles[member_pid], signal.SIGKILL
             )
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + PROCESS_GROUP_KILL_TIMEOUT_S
+        for _attempt in range(PROCESS_GROUP_KILL_ATTEMPTS):
             live = {
                 member_pid
                 for member_pid, member_handle in handles.items()
@@ -3064,6 +3070,8 @@ def kill_bound_process_group(
                 signal_process_handle(
                     member_pid, handles[member_pid], signal.SIGKILL
                 )
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.005)
         raise EvidenceError("bound process group remained live after pidfd SIGKILL")
     except BaseException:
@@ -5318,6 +5326,150 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "ok": True,
             "launcher_pid": published_pids[0],
             "child_pid": pdeath_child_pid,
+        }
+    )
+
+    case_dir("direct_child_cleanup_identity")
+    direct_child = subprocess.Popen(
+        [sys.executable, "-c", "import time;time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    direct_handle: tuple[int, int] | None = None
+    try:
+        direct_handle = open_process_handle(
+            direct_child.pid, expected_parent_pid=os.getpid()
+        )
+        require(direct_handle is not None, "direct child identity was unbound")
+        wrong_parent_pid = os.getppid()
+        require(
+            wrong_parent_pid > 1 and wrong_parent_pid != os.getpid(),
+            "direct child self-test lacks a distinct wrong parent",
+        )
+        wrong_parent_rc = cmd_kill_direct_child(
+            argparse.Namespace(
+                pid=direct_child.pid,
+                expected_parent_pid=wrong_parent_pid,
+                wait_ms=100,
+            )
+        )
+        require(wrong_parent_rc == PASS, "wrong-parent cleanup did not fail closed")
+        require(
+            process_handle_alive(direct_child.pid, direct_handle),
+            "wrong-parent cleanup signalled the direct child",
+        )
+        exact_rc = cmd_kill_direct_child(
+            argparse.Namespace(
+                pid=direct_child.pid,
+                expected_parent_pid=os.getpid(),
+                wait_ms=5000,
+            )
+        )
+        require(exact_rc == PASS, "exact direct-child cleanup failed")
+        require(
+            not process_handle_alive(direct_child.pid, direct_handle),
+            "exact direct-child cleanup left its bound lifetime live",
+        )
+        direct_child.communicate(timeout=10)
+    finally:
+        try:
+            if direct_child.poll() is None:
+                if direct_handle is not None:
+                    signal_process_handle(
+                        direct_child.pid, direct_handle, signal.SIGKILL
+                    )
+                else:
+                    direct_child.kill()
+                direct_child.communicate(timeout=10)
+        finally:
+            if direct_handle is not None:
+                os.close(direct_handle[1])
+    cases.append(
+        {
+            "case": "direct_child_cleanup_identity",
+            "ok": True,
+            "child_pid": direct_child.pid,
+        }
+    )
+
+    case_dir("bound_group_stale_identity")
+    bound_group_child = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "stopped-exec",
+            "--expected-parent-pid",
+            str(os.getpid()),
+            "--",
+            sys.executable,
+            "-c",
+            "import time;time.sleep(60)",
+        ],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    bound_group_handle: tuple[int, int] | None = None
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            bound_group_handle = open_process_handle(
+                bound_group_child.pid, expected_parent_pid=os.getpid()
+            )
+            bound_group_facts = proc_stat_facts(bound_group_child.pid)
+            if (
+                bound_group_handle is not None
+                and bound_group_facts is not None
+                and bound_group_facts[0] in {"T", "t"}
+                and bound_group_facts[1] == bound_group_child.pid
+                and bound_group_facts[2] == bound_group_handle[0]
+            ):
+                break
+            if bound_group_handle is not None:
+                os.close(bound_group_handle[1])
+                bound_group_handle = None
+            time.sleep(0.005)
+        else:
+            raise EvidenceError("bound-group child did not become inert in time")
+        kill_bound_process_group(
+            bound_group_child.pid,
+            bound_group_handle[0] + 1,
+            os.getpid(),
+        )
+        require(
+            process_handle_alive(bound_group_child.pid, bound_group_handle),
+            "stale start-time cleanup signalled the bound process group",
+        )
+        kill_bound_process_group(
+            bound_group_child.pid,
+            bound_group_handle[0],
+            os.getpid(),
+        )
+        require(
+            not process_handle_alive(bound_group_child.pid, bound_group_handle),
+            "exact process-group cleanup left its bound lifetime live",
+        )
+        bound_group_child.communicate(timeout=10)
+    finally:
+        try:
+            if bound_group_child.poll() is None:
+                if bound_group_handle is not None:
+                    signal_process_handle(
+                        bound_group_child.pid, bound_group_handle, signal.SIGKILL
+                    )
+                else:
+                    bound_group_child.kill()
+                bound_group_child.communicate(timeout=10)
+        finally:
+            if bound_group_handle is not None:
+                os.close(bound_group_handle[1])
+    cases.append(
+        {
+            "case": "bound_group_stale_identity",
+            "ok": True,
+            "child_pid": bound_group_child.pid,
         }
     )
 
