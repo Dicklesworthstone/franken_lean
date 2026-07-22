@@ -199,6 +199,12 @@ fn rules_push_anchor(rule: &mut Rule, anchor: &str, lineno: usize, problems: &mu
         problems.push(format!("line {lineno}: non-numeric anchor line"));
         return;
     };
+    if cited_line == 0 {
+        // Source line numbers are 1-based; `:0` is malformed (and would underflow
+        // the `cited_line - 1` index in `validate`).
+        problems.push(format!("line {lineno}: anchor line number must be >= 1"));
+        return;
+    }
     let token = tail
         .split_once("expect=\"")
         .and_then(|(_, rest)| rest.split_once('"'))
@@ -278,6 +284,17 @@ fn the_checker_detects_planted_drift_and_gaps() {
     assert!(
         has(&validate(&rules, root), "drifted"),
         "the production anchor-drift check must fire on planted drift"
+    );
+
+    // Malformed :0 anchor line is a parse-time problem, never a panic (a 1-based
+    // line of 0 would otherwise underflow the `cited_line - 1` index in validate).
+    let (_, problems) = parse_rules(
+        "### KR-000 · zero\n\
+         anchor: vendor/lean4-src/src/kernel/type_checker.cpp:0 (x) expect=\"reduce_nat\"\n",
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("must be >= 1")),
+        "a :0 anchor line must be flagged, not panic"
     );
 
     // Planted off-pin anchor: resolves fine, but points outside the pinned tree.

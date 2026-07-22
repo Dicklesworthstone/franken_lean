@@ -820,10 +820,27 @@ fn kr202_over_applied_lambda_beta_reduces_and_reapplies() {
     // f (id A) ≟ f A — the redex under an application head reduces, congruence closes.
     let f = Expr::const_(n("f"), vec![]);
     let lhs = Expr::app(f.clone(), applied);
-    let rhs = Expr::app(f, a);
+    let rhs = Expr::app(f.clone(), a.clone());
     assert!(
         check_def_eq(&env, &[], &lhs, &rhs, Budget::DEFAULT).is_accepted(),
         "f ((fun x => x) A) should equal f A"
+    );
+
+    // Genuine OVER-application: (fun (h : Sort 1 → Sort 1) => h) f A applies the
+    // function-identity to f (yielding f), then RE-APPLIES the leftover argument A —
+    // exercising the spine machinery's `args[consumed..]` re-application path, which
+    // the exact-application cases above never reach (their spines are fully consumed).
+    let arrow = Expr::forall_e(n("_"), sort1(), sort1(), BinderInfo::Default);
+    let fn_id = Expr::lam(
+        n("h"),
+        arrow,
+        Expr::bvar(0).expect("packs"),
+        BinderInfo::Default,
+    );
+    let over_applied = Expr::app(Expr::app(fn_id, f), a);
+    assert!(
+        check_def_eq(&env, &[], &over_applied, &rhs, Budget::DEFAULT).is_accepted(),
+        "(fun h => h) f A should reduce to f A (leftover arg re-applied)"
     );
 }
 
