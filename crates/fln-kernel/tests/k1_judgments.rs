@@ -825,3 +825,102 @@ fn kr202_over_applied_lambda_beta_reduces_and_reapplies() {
         "f ((fun x => x) A) should equal f A"
     );
 }
+
+#[test]
+fn kr112_kr204_parameterized_structure_projection() {
+    // A PARAMETERIZED structure exercises the param-instantiation loop in infer_proj
+    // and the num_params offset in reduce_proj — the most complex projection path.
+    //   Box (α : Sort 1) : Sort 1
+    //   mk  : ∀ (α : Sort 1) (x : α), Box α        -- num_params = 1, num_fields = 1
+    //   A : Sort 1, a : A
+    //   proj Box 0 (mk A a)  infers to A  and reduces to a.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_ty = Expr::const_(n("A"), vec![]);
+    let env = admit(&env, &axiom("a", a_ty.clone()));
+
+    // Box : ∀ (α : Sort 1), Sort 1
+    let box_ty = Expr::forall_e(n("alpha"), sort1(), sort1(), BinderInfo::Default);
+    let box_ind = ConstantInfo::Induct(InductiveVal {
+        base: ConstantVal {
+            name: n("Box"),
+            level_params: vec![],
+            type_: box_ty,
+        },
+        num_params: 1,
+        num_indices: 0,
+        all: vec![n("Box")],
+        ctors: vec![n("mkBox")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    });
+    let env = add_info(&env, box_ind);
+
+    // mkBox : ∀ (α : Sort 1) (x : α), Box α
+    let mk_ty = Expr::forall_e(
+        n("alpha"),
+        sort1(),
+        Expr::forall_e(
+            n("x"),
+            Expr::bvar(0).expect("packs"), // α
+            Expr::app(
+                Expr::const_(n("Box"), vec![]),
+                Expr::bvar(1).expect("packs"),
+            ), // Box α
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let mk_ctor = ConstantInfo::Ctor(ConstructorVal {
+        base: ConstantVal {
+            name: n("mkBox"),
+            level_params: vec![],
+            type_: mk_ty,
+        },
+        induct: n("Box"),
+        cidx: 0,
+        num_params: 1,
+        num_fields: 1,
+        is_unsafe: false,
+    });
+    let env = add_info(&env, mk_ctor);
+
+    let a = Expr::const_(n("a"), vec![]);
+    // mkBox A a : Box A
+    let mk_app = Expr::app(
+        Expr::app(Expr::const_(n("mkBox"), vec![]), a_ty.clone()),
+        a.clone(),
+    );
+
+    // Inference: proj Box 0 (mkBox A a) : A (the field type with α := A substituted).
+    let proj = Expr::proj(n("Box"), 0, mk_app.clone());
+    let inferred = check(
+        &env,
+        &defn("px", a_ty.clone(), proj.clone()),
+        Budget::DEFAULT,
+    );
+    assert!(
+        inferred.is_accepted(),
+        "proj of a parameterized structure infers the field type A: {inferred:?}"
+    );
+
+    // Reduction: proj Box 0 (mkBox A a) reduces to the stored field a.
+    assert!(
+        check_def_eq(&env, &[], &proj, &a, Budget::DEFAULT).is_accepted(),
+        "proj Box 0 (mkBox A a) should reduce to a"
+    );
+
+    // The param offset matters: asserting the wrong result type rejects.
+    let env2 = admit(&env, &axiom("B", sort1()));
+    let wrong = check(
+        &env2,
+        &defn("px_bad", Expr::const_(n("B"), vec![]), proj),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&wrong),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "the projected field has type A, not B: {wrong:?}"
+    );
+}
