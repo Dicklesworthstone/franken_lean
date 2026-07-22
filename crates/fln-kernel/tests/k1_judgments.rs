@@ -4,9 +4,10 @@
 
 #![forbid(unsafe_code)]
 
-use fln_core::expr::{BinderInfo, Expr};
+use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
+use fln_core::options::KVMap;
 use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
     InductiveVal, ReducibilityHints, TheoremVal,
@@ -979,4 +980,83 @@ fn fl_inv_01_kernel_verdicts_are_deterministic() {
         );
     }
     assert_eq!(reject_class(&neq), Some(RejectClass::NotDefEq));
+}
+
+#[test]
+fn kr110_literal_inference_maps_nat_and_string() {
+    // Nat/String literals infer to the constants `Nat`/`String`. Stand-in axioms
+    // provide those names (KR-110 returns the const without checking existence;
+    // the surrounding declaration's declared type is what forces the name lookup).
+    let env = admit(&Environment::new(), &axiom("Nat", sort1()));
+    let env = admit(&env, &axiom("String", sort1()));
+    let nat_ty = Expr::const_(n("Nat"), vec![]);
+    let str_ty = Expr::const_(n("String"), vec![]);
+
+    let nat_lit = Expr::lit(Literal::Nat(NatLit::from_u64(42)));
+    let str_lit = Expr::lit(Literal::Str("hi".to_string()));
+
+    assert!(
+        check(
+            &env,
+            &defn("a", nat_ty.clone(), nat_lit.clone()),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "a Nat literal has type Nat"
+    );
+    assert!(
+        check(
+            &env,
+            &defn("b", str_ty.clone(), str_lit.clone()),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "a String literal has type String"
+    );
+    // Cross-typed: a String literal ascribed type Nat must reject.
+    assert_eq!(
+        reject_class(&check(&env, &defn("c", nat_ty, str_lit), Budget::DEFAULT)),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "a String literal is not a Nat"
+    );
+}
+
+#[test]
+fn kr111_kr201_mdata_is_transparent_to_typing_and_reduction() {
+    // MData is metadata: `mdata m e` has e's type (KR-111) and whnf strips it
+    // (KR-201), so it is defeq to e.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_ty = Expr::const_(n("A"), vec![]);
+    let env = admit(&env, &axiom("x", a_ty.clone()));
+    let x = Expr::const_(n("x"), vec![]);
+    let wrapped = Expr::mdata(KVMap::new(), x.clone());
+
+    // Typing: mdata {} x : A.
+    assert!(
+        check(&env, &defn("f", a_ty, wrapped.clone()), Budget::DEFAULT).is_accepted(),
+        "mdata is transparent to typing"
+    );
+    // Reduction/defeq: mdata {} x ≟ x.
+    assert!(
+        check_def_eq(&env, &[], &wrapped, &x, Budget::DEFAULT).is_accepted(),
+        "whnf strips mdata"
+    );
+}
+
+#[test]
+fn kr303_sorts_are_defeq_iff_their_levels_are_equivalent() {
+    // KR-303: Sort u ≟ Sort v iff u ≡ v. Sort (max 1 1) ≟ Sort 1 holds (levels
+    // normalize equal); Sort 0 (Prop) ≟ Sort 1 does not.
+    let env = Environment::new();
+    let s1 = Expr::sort(Level::one());
+    let s_max = Expr::sort(Level::max(Level::one(), Level::one()).expect("packs"));
+    assert!(
+        check_def_eq(&env, &[], &s_max, &s1, Budget::DEFAULT).is_accepted(),
+        "Sort (max 1 1) and Sort 1 are defeq"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &prop(), &s1, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "Sort 0 (Prop) and Sort 1 are distinct sorts"
+    );
 }
