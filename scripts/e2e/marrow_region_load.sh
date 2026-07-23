@@ -230,5 +230,22 @@ else
     fail_run
 fi
 
+# ---- lane 8: hostile-region fuzz under resource budgets (R18) ---------------
+# Deterministic seed-replayable mutation fuzz over the whole engine: typed
+# totality, per-case time budget, relocation invariance on surviving
+# mutants, 1 MiB stack. The deep count here dwarfs the unit-run default.
+note "lane 8: hostile-region fuzz (deep campaign)"
+FUZZ_CASES="${FLN_E2E_FUZZ_CASES:-25000}"
+if CARGO_TARGET_DIR="$BUILD_TARGET" FLN_REGION_FUZZ_CASES="$FUZZ_CASES" \
+    cargo test --offline -q -p fln-rt --test region_fuzz -- --nocapture \
+    >"$ART_DIR/fuzz.log" 2>&1; then
+    survivors=$(grep -c "surviving operations" "$ART_DIR/fuzz.log" || true)
+    emit hostile_fuzz passed "\"cases_per_arm\":$FUZZ_CASES,\"arms_reporting\":$survivors,\"artifact\":\"fuzz.log\""
+else
+    emit hostile_fuzz failed "\"artifact\":\"fuzz.log\""
+    note "fuzz lane FAILED — see $ART_DIR/fuzz.log"
+    fail_run
+fi
+
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS — artifacts in $ART_DIR"
