@@ -3,12 +3,13 @@
 #
 # Real-path, no-mock: runs the real fln-env suite (persistent-map model tests,
 # snapshot isolation, logical-root determinism across thread counts), captures
-# detailed journal/checkpoint evidence through the real Environment APIs, then
-# seeds a REAL bug class into an overlay workspace — add_decl silently dropping
-# extension state — and proves the suite KILLS the mutant (a surviving mutant is
-# a failed scenario), then delegates the historical full-hash bucket
-# append-order proof to an authoritative nested fln.e2e/2 evidence bundle.
-# NDJSON under target/e2e/.
+# detailed journal/checkpoint and extension-merge evidence through the real
+# Environment APIs, then seeds REAL bug classes into an overlay workspace —
+# add_decl silently dropping extension state and SetUnion silently dropping raw
+# duplicates — and proves the suite KILLS both mutants (a surviving mutant is a
+# failed scenario), then delegates the historical full-hash bucket append-order
+# proof to an authoritative nested fln.e2e/2 evidence bundle. NDJSON under
+# target/e2e/.
 
 set -euo pipefail
 
@@ -79,7 +80,57 @@ awk 'index($0, "{\"schema\":\"fln.e2e.environment-state\",\"version\":1") == 1 {
   "$ART_DIR/environment_state.log" >> "$LOG"
 emit environment_state passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$evidence_count,\"artifact\":\"environment_state.log\""
 
-# ---- step 4: extension-state mutant must be killed -------------------------------------
+# ---- step 3: typed extension-merge refusals and clean recovery -------------------------
+note "capturing descriptor/history merge-refusal evidence"
+set +e
+( cd "$ROOT" && FLN_ENV_E2E_RUN_ID="$RUN_ID" CARGO_TARGET_DIR=target_local \
+    cargo test --locked -q -p fln-env \
+      extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence \
+      -- --exact --nocapture ) > "$ART_DIR/extension_merge_refusals.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit extension_merge_refusals failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"extension_merge_refusals.log\""
+  note "FAIL: typed extension-merge refusal scenario failed"
+  exit 1
+fi
+refusal_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.extension-merge-refusal\",\"version\":1") == 1 { count++ } END { print count + 0 }' "$ART_DIR/extension_merge_refusals.log")
+refusal_passed_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.extension-merge-refusal\",\"version\":1") == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' "$ART_DIR/extension_merge_refusals.log")
+if [ "$refusal_count" -ne 2 ] || [ "$refusal_passed_count" -ne 2 ]; then
+  emit extension_merge_refusals failed "\"expected_records\":2,\"actual_records\":$refusal_count,\"passed_records\":$refusal_passed_count,\"artifact\":\"extension_merge_refusals.log\""
+  note "FAIL: extension-merge refusal evidence was missing, malformed, or non-passing"
+  exit 1
+fi
+awk 'index($0, "{\"schema\":\"fln.e2e.extension-merge-refusal\",\"version\":1") == 1 { print }' \
+  "$ART_DIR/extension_merge_refusals.log" >> "$LOG"
+emit extension_merge_refusals passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$refusal_count,\"artifact\":\"extension_merge_refusals.log\""
+
+# ---- step 4: SetUnion raw/semantic split and branch permutation ------------------------
+note "capturing lossless SetUnion merge evidence"
+set +e
+( cd "$ROOT" && FLN_ENV_E2E_RUN_ID="$RUN_ID" CARGO_TARGET_DIR=target_local \
+    cargo test --locked -q -p fln-env \
+      extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
+      -- --exact --nocapture ) > "$ART_DIR/set_union.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit set_union failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"set_union.log\""
+  note "FAIL: lossless SetUnion scenario failed"
+  exit 1
+fi
+set_union_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 { count++ } END { print count + 0 }' "$ART_DIR/set_union.log")
+set_union_passed_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' "$ART_DIR/set_union.log")
+if [ "$set_union_count" -ne 4 ] || [ "$set_union_passed_count" -ne 4 ]; then
+  emit set_union failed "\"expected_records\":4,\"actual_records\":$set_union_count,\"passed_records\":$set_union_passed_count,\"artifact\":\"set_union.log\""
+  note "FAIL: SetUnion evidence was missing, malformed, or non-passing"
+  exit 1
+fi
+awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 { print }' \
+  "$ART_DIR/set_union.log" >> "$LOG"
+emit set_union passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$set_union_count,\"artifact\":\"set_union.log\""
+
+# ---- step 5: extension-state mutant must be killed -------------------------------------
 OVERLAY="$ART_DIR/overlay"
 mkdir -p "$OVERLAY"
 for crate in fln-core fln-hash fln-env; do
@@ -113,7 +164,7 @@ if [ "$rc" -eq 0 ]; then
 fi
 emit seeded_mutant passed "\"expected_exit\":\"nonzero\",\"actual_exit\":$rc,\"detected\":\"extension-state-dropping mutant killed\",\"artifact\":\"mutant.log\""
 
-# ---- step 5: extension-state recovery — pristine overlay passes ------------------------
+# ---- step 6: extension-state recovery — pristine overlay passes ------------------------
 sed -i 's/extensions: crate::pmap::PMap::new(),/extensions: self.extensions.clone(),/' \
   "$OVERLAY/fln-env/src/environment.rs"
 set +e
@@ -127,6 +178,74 @@ if [ "$rc" -ne 0 ]; then
   exit 1
 fi
 emit recovery passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"recovered.log\""
+
+# ---- step 7: one-sided SetUnion dedup mutant must be killed ----------------------------
+SET_UNION_OVERLAY_SOURCE="$OVERLAY/fln-env/src/extensions.rs"
+SET_UNION_PRISTINE_SOURCE="$ART_DIR/extensions.set-union.pristine.rs"
+cp -- "$SET_UNION_OVERLAY_SOURCE" "$SET_UNION_PRISTINE_SOURCE"
+if ! python3 - "$SET_UNION_OVERLAY_SOURCE" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_bytes()
+anchor = b"    merged.push_entry(Arc::clone(&entry.payload)) // FLN_SET_UNION_RAW_APPEND"
+replacement = b"    if merged.entries().any(|seen| seen == entry) { merged.clone() } else { merged.push_entry(Arc::clone(&entry.payload)) } // FLN_SET_UNION_RAW_APPEND"
+if source.count(anchor) != 1:
+    raise SystemExit("SetUnion mutation anchor count is not exactly one")
+path.write_bytes(source.replace(anchor, replacement, 1))
+PY
+then
+  emit set_union_mutant failed "\"detail\":\"mutation anchor did not match exactly once\""
+  note "FAIL: SetUnion mutation did not apply exactly once"
+  exit 2
+fi
+if cmp -s "$SET_UNION_OVERLAY_SOURCE" "$SET_UNION_PRISTINE_SOURCE"; then
+  emit set_union_mutant failed "\"detail\":\"mutation seed was a no-op\""
+  note "FAIL: SetUnion mutation did not change the overlay"
+  exit 2
+fi
+set +e
+( cd "$OVERLAY" && FLN_ENV_E2E_RUN_ID="$RUN_ID-set-union-mutant" \
+    CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
+      extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
+      -- --exact --nocapture ) > "$ART_DIR/set_union_mutant.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 101 ]; then
+  emit set_union_mutant failed "\"expected_exit\":101,\"actual_exit\":$rc,\"artifact\":\"set_union_mutant.log\""
+  note "FAIL: one-sided SetUnion dedup mutant was not killed by the exact test"
+  exit 1
+fi
+emit set_union_mutant passed "\"expected_exit\":101,\"actual_exit\":101,\"detected\":\"one-sided raw-entry dedup mutant killed\",\"artifact\":\"set_union_mutant.log\""
+
+# ---- step 8: SetUnion recovery — exact pristine bytes and evidence pass ----------------
+cp -- "$SET_UNION_PRISTINE_SOURCE" "$SET_UNION_OVERLAY_SOURCE"
+if ! cmp -s "$SET_UNION_OVERLAY_SOURCE" "$SET_UNION_PRISTINE_SOURCE"; then
+  emit set_union_recovery failed "\"detail\":\"recovered source differs from pristine bytes\""
+  note "FAIL: SetUnion recovery did not restore pristine bytes"
+  exit 3
+fi
+set +e
+( cd "$OVERLAY" && FLN_ENV_E2E_RUN_ID="$RUN_ID-set-union-recovery" \
+    CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
+      extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
+      -- --exact --nocapture ) > "$ART_DIR/set_union_recovered.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit set_union_recovery failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"set_union_recovered.log\""
+  note "FAIL: pristine SetUnion overlay did not recover"
+  exit 1
+fi
+set_union_recovered_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 { count++ } END { print count + 0 }' "$ART_DIR/set_union_recovered.log")
+set_union_recovered_passed_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' "$ART_DIR/set_union_recovered.log")
+if [ "$set_union_recovered_count" -ne 4 ] || [ "$set_union_recovered_passed_count" -ne 4 ]; then
+  emit set_union_recovery failed "\"expected_records\":4,\"actual_records\":$set_union_recovered_count,\"passed_records\":$set_union_recovered_passed_count,\"artifact\":\"set_union_recovered.log\""
+  note "FAIL: recovered SetUnion evidence was missing, malformed, or non-passing"
+  exit 1
+fi
+emit set_union_recovery passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$set_union_recovered_count,\"artifact\":\"set_union_recovered.log\",\"final_state\":\"clean_recovery\""
 
 # ---- nested fln-amv.10 collision evidence bundle --------------------------------------
 # Collision detail belongs exclusively to this authoritative fln.e2e/2 child. The
@@ -392,8 +511,8 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 source = path.read_bytes()
-anchor = b"new_entries.insert(pos, (key, value));"
-replacement = b"new_entries.push((key, value));"
+anchor = b"new_entries.insert(index, entry);"
+replacement = b"new_entries.push(entry);"
 if source.count(anchor) != 1:
     raise SystemExit("collision mutation anchor count is not exactly one")
 path.write_bytes(source.replace(anchor, replacement, 1))

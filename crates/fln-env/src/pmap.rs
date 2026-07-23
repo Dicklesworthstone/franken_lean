@@ -4,8 +4,9 @@
 //! Structure: a HAMT over the key's 64-bit hash with 5-bit fanout. Branches
 //! are bitmap-compressed 32-way nodes; the hash chunks are consumed
 //! least-significant-first at shifts `0, 5, …, 60` (13 branch levels cover
-//! all 64 bits), after which distinct keys can only share a leaf, which is a
-//! collision bucket (`Vec` of pairs).
+//! all 64 bits), after which distinct keys can only share a leaf. Collision
+//! buckets are canonically sorted inline arrays up to eight entries and
+//! persistent AVL trees above that threshold.
 //!
 //! Persistence: every node sits behind an [`Arc`]; `clone` copies the root
 //! pointer only, and [`PMap::insert`] / [`PMap::remove`] rebuild exactly the
@@ -73,11 +74,15 @@ pub enum CollisionResource {
 }
 
 /// Typed, atomic resource exhaustion from [`PMap::try_insert_with_budget`].
+///
+/// Limits and attempts use `u128` so an expanded-weight or platform-sized
+/// entry-count overflow is reported as the true mathematical overage instead
+/// of a wrapped or self-contradictory `attempted == limit` value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollisionExhausted {
     pub resource: CollisionResource,
-    pub limit: u64,
-    pub attempted: u64,
+    pub limit: u128,
+    pub attempted: u128,
     pub collision_hash: u64,
 }
 
@@ -131,6 +136,9 @@ struct CollisionNode<K, V> {
     expanded_weight: u64,
 }
 
+type CollisionLink<K, V> = Option<Arc<CollisionNode<K, V>>>;
+type CollisionRemoval<K, V> = Option<(CollisionLink<K, V>, CollisionEntry<K, V>)>;
+
 enum CollisionBucket<K, V> {
     Inline(Vec<CollisionEntry<K, V>>),
     Tree {
@@ -138,27 +146,6 @@ enum CollisionBucket<K, V> {
         len: usize,
         expanded_weight: u64,
     },
-}
-
-impl<K, V> Clone for CollisionBucket<K, V>
-where
-    K: Clone,
-    V: Clone,
-{
-    fn clone(&self) -> Self {
-        match self {
-            CollisionBucket::Inline(entries) => CollisionBucket::Inline(entries.clone()),
-            CollisionBucket::Tree {
-                root,
-                len,
-                expanded_weight,
-            } => CollisionBucket::Tree {
-                root: Arc::clone(root),
-                len: *len,
-                expanded_weight: *expanded_weight,
-            },
-        }
-    }
 }
 
 enum Node<K, V> {
@@ -191,23 +178,24 @@ struct MutationFacts {
     fresh_map_nodes: usize,
     fresh_collision_nodes: usize,
     cloned_inline_entries: usize,
-    required_fresh_nodes: usize,
     collision_entries: usize,
     expanded_weight: u64,
     tier: Option<CollisionTier>,
 }
 
 impl MutationFacts {
+    #[cfg(test)]
     fn actual_fresh_nodes(self) -> usize {
         self.fresh_map_nodes
             .saturating_add(self.fresh_collision_nodes)
     }
 }
 
-fn usize_as_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+fn usize_as_u128(value: usize) -> u128 {
+    value as u128
 }
 
+#[cfg(test)]
 fn ceil_log2(value: usize) -> usize {
     if value <= 1 {
         0
@@ -216,14 +204,39 @@ fn ceil_log2(value: usize) -> usize {
     }
 }
 
-/// A persistent AVL insertion/removal rebuilds one logarithmic search path and
-/// at most one constant-size rotation per level. This deliberately loose bound
-/// depends only on cardinality, so a resource verdict cannot change with the
-/// insertion schedule that produced the current balanced shape.
+/// Maximum possible AVL height for `cardinality` nodes.
+///
+/// The minimum node counts at successive heights are
+/// `N(0) = 0`, `N(1) = 1`, `N(h) = 1 + N(h - 1) + N(h - 2)`. Walking that
+/// recurrence avoids floating-point approximations and produces an upper bound
+/// that is valid at every `usize` width. Overflow means the next height
+/// requires more nodes than the platform can represent, so the current height
+/// is already the platform maximum.
+fn collision_tree_max_height(cardinality: usize) -> usize {
+    let mut height = 0usize;
+    let mut previous_minimum = 0usize;
+    let mut current_minimum = 1usize;
+    while current_minimum <= cardinality {
+        height = height.saturating_add(1);
+        let Some(next_minimum) = current_minimum
+            .checked_add(previous_minimum)
+            .and_then(|sum| sum.checked_add(1))
+        else {
+            break;
+        };
+        previous_minimum = current_minimum;
+        current_minimum = next_minimum;
+    }
+    height
+}
+
+/// A persistent AVL insertion allocates once for every node on its search path
+/// and at most two additional nodes for its single rebalancing site. The
+/// extra one covers insertion into a missing child. This bound depends only on
+/// cardinality, so a resource verdict cannot change with the insertion
+/// schedule that produced the current balanced shape.
 fn collision_tree_fresh_node_bound(cardinality: usize) -> usize {
-    3usize
-        .saturating_mul(ceil_log2(cardinality.saturating_add(1)))
-        .saturating_add(4)
+    collision_tree_max_height(cardinality).saturating_add(3)
 }
 
 fn collision_height<K, V>(node: Option<&Arc<CollisionNode<K, V>>>) -> u16 {
@@ -272,15 +285,8 @@ fn collision_balance<K: Clone, V: Clone>(
         let Some(left_root) = left else {
             return collision_node(entry, None, right, facts);
         };
-        if collision_height(left_root.left.as_ref())
-            >= collision_height(left_root.right.as_ref())
-        {
-            let new_right = collision_node(
-                entry,
-                left_root.right.clone(),
-                right,
-                facts,
-            );
+        if collision_height(left_root.left.as_ref()) >= collision_height(left_root.right.as_ref()) {
+            let new_right = collision_node(entry, left_root.right.clone(), right, facts);
             return collision_node(
                 left_root.entry.clone(),
                 left_root.left.clone(),
@@ -298,26 +304,15 @@ fn collision_balance<K: Clone, V: Clone>(
             facts,
         );
         let new_right = collision_node(entry, pivot.right.clone(), right, facts);
-        return collision_node(
-            pivot.entry.clone(),
-            Some(new_left),
-            Some(new_right),
-            facts,
-        );
+        return collision_node(pivot.entry.clone(), Some(new_left), Some(new_right), facts);
     }
     if right_height > left_height.saturating_add(1) {
         let Some(right_root) = right else {
             return collision_node(entry, left, None, facts);
         };
-        if collision_height(right_root.right.as_ref())
-            >= collision_height(right_root.left.as_ref())
+        if collision_height(right_root.right.as_ref()) >= collision_height(right_root.left.as_ref())
         {
-            let new_left = collision_node(
-                entry,
-                left,
-                right_root.left.clone(),
-                facts,
-            );
+            let new_left = collision_node(entry, left, right_root.left.clone(), facts);
             return collision_node(
                 right_root.entry.clone(),
                 Some(new_left),
@@ -335,12 +330,7 @@ fn collision_balance<K: Clone, V: Clone>(
             right_root.right.clone(),
             facts,
         );
-        return collision_node(
-            pivot.entry.clone(),
-            Some(new_left),
-            Some(new_right),
-            facts,
-        );
+        return collision_node(pivot.entry.clone(), Some(new_left), Some(new_right), facts);
     }
     collision_node(entry, left, right, facts)
 }
@@ -353,6 +343,21 @@ fn collision_find<'a, K: Ord, V>(
     let mut node = Some(root);
     while let Some(current) = node {
         facts.comparisons = facts.comparisons.saturating_add(1);
+        match key.cmp(&current.entry.key) {
+            std::cmp::Ordering::Less => node = current.left.as_ref(),
+            std::cmp::Ordering::Greater => node = current.right.as_ref(),
+            std::cmp::Ordering::Equal => return Some(&current.entry),
+        }
+    }
+    None
+}
+
+fn collision_find_unprofiled<'a, K: Ord, V>(
+    root: &'a Arc<CollisionNode<K, V>>,
+    key: &K,
+) -> Option<&'a CollisionEntry<K, V>> {
+    let mut node = Some(root);
+    while let Some(current) = node {
         match key.cmp(&current.entry.key) {
             std::cmp::Ordering::Less => node = current.left.as_ref(),
             std::cmp::Ordering::Greater => node = current.right.as_ref(),
@@ -412,7 +417,7 @@ fn collision_insert_node<K: Clone + Eq + Ord, V: Clone>(
 fn collision_remove_min<K: Clone, V: Clone>(
     node: &Arc<CollisionNode<K, V>>,
     facts: &mut MutationFacts,
-) -> (CollisionEntry<K, V>, Option<Arc<CollisionNode<K, V>>>) {
+) -> (CollisionEntry<K, V>, CollisionLink<K, V>) {
     let Some(left) = node.left.as_ref() else {
         return (node.entry.clone(), node.right.clone());
     };
@@ -432,15 +437,11 @@ fn collision_remove_node<K: Clone + Ord, V: Clone>(
     node: &Arc<CollisionNode<K, V>>,
     key: &K,
     facts: &mut MutationFacts,
-) -> Option<(
-    Option<Arc<CollisionNode<K, V>>>,
-    CollisionEntry<K, V>,
-)> {
+) -> CollisionRemoval<K, V> {
     facts.comparisons = facts.comparisons.saturating_add(1);
     match key.cmp(&node.entry.key) {
         std::cmp::Ordering::Less => {
-            let (new_left, removed) =
-                collision_remove_node(node.left.as_ref()?, key, facts)?;
+            let (new_left, removed) = collision_remove_node(node.left.as_ref()?, key, facts)?;
             Some((
                 Some(collision_balance(
                     node.entry.clone(),
@@ -452,8 +453,7 @@ fn collision_remove_node<K: Clone + Ord, V: Clone>(
             ))
         }
         std::cmp::Ordering::Greater => {
-            let (new_right, removed) =
-                collision_remove_node(node.right.as_ref()?, key, facts)?;
+            let (new_right, removed) = collision_remove_node(node.right.as_ref()?, key, facts)?;
             Some((
                 Some(collision_balance(
                     node.entry.clone(),
@@ -488,11 +488,12 @@ fn collision_tree_from_sorted<K: Clone, V: Clone>(
     entries: &[CollisionEntry<K, V>],
     facts: &mut MutationFacts,
 ) -> Option<Arc<CollisionNode<K, V>>> {
-    let (middle, rest) = entries.split_first()?;
-    let pivot = rest.len() / 2;
+    if entries.is_empty() {
+        return None;
+    }
+    let pivot = entries.len() / 2;
     let (left_entries, right_with_pivot) = entries.split_at(pivot);
     let (pivot_entry, right_entries) = right_with_pivot.split_first()?;
-    let _ = middle;
     Some(collision_node(
         pivot_entry.clone(),
         collision_tree_from_sorted(left_entries, facts),
@@ -563,8 +564,7 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
                 .and_then(|index| entries.get(index))
                 .map(|entry| &entry.value),
             CollisionBucket::Tree { root, .. } => {
-                let mut facts = MutationFacts::default();
-                collision_find(root, key, &mut facts).map(|entry| &entry.value)
+                collision_find_unprofiled(root, key).map(|entry| &entry.value)
             }
         }
     }
@@ -574,7 +574,7 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
         key: &K,
         expanded_weight: u64,
         facts: &mut MutationFacts,
-    ) -> Result<(bool, usize, u64), CollisionExhausted> {
+    ) -> Result<(bool, usize, u128), CollisionExhausted> {
         let previous_weight = match self {
             CollisionBucket::Inline(entries) => {
                 let result = entries.binary_search_by(|entry| {
@@ -591,19 +591,20 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
             }
         };
         let added = previous_weight.is_none();
-        let new_len = self.len().saturating_add(usize::from(added));
-        let Some(new_weight) = self
-            .expanded_weight()
-            .checked_sub(previous_weight.unwrap_or(0))
-            .and_then(|weight| weight.checked_add(expanded_weight))
-        else {
-            return Err(CollisionExhausted {
-                resource: CollisionResource::ExpandedWeight,
-                limit: u64::MAX,
-                attempted: u64::MAX,
-                collision_hash: 0,
-            });
+        let new_len = match self.len().checked_add(usize::from(added)) {
+            Some(len) => len,
+            None => {
+                return Err(CollisionExhausted {
+                    resource: CollisionResource::Entries,
+                    limit: usize_as_u128(usize::MAX),
+                    attempted: usize_as_u128(usize::MAX).saturating_add(1),
+                    collision_hash: 0,
+                });
+            }
         };
+        let new_weight = u128::from(self.expanded_weight())
+            .saturating_sub(u128::from(previous_weight.unwrap_or(0)))
+            .saturating_add(u128::from(expanded_weight));
         Ok((added, new_len, new_weight))
     }
 
@@ -622,29 +623,45 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
         let (bucket, added) = match self {
             CollisionBucket::Inline(entries) => {
                 let mut new_entries = entries.clone();
-                facts.cloned_inline_entries = facts
-                    .cloned_inline_entries
-                    .saturating_add(entries.len());
-                let added =
-                    match new_entries.binary_search_by(|stored| {
-                        facts.comparisons = facts.comparisons.saturating_add(1);
-                        stored.key.cmp(&entry.key)
-                    }) {
-                        Ok(index) => {
-                            debug_assert!(new_entries[index].key == entry.key);
-                            new_entries[index] = entry;
+                facts.cloned_inline_entries =
+                    facts.cloned_inline_entries.saturating_add(entries.len());
+                let added = match new_entries.binary_search_by(|stored| {
+                    facts.comparisons = facts.comparisons.saturating_add(1);
+                    stored.key.cmp(&entry.key)
+                }) {
+                    Ok(index) => {
+                        if let Some(slot) = new_entries.get_mut(index) {
+                            debug_assert!(slot.key == entry.key);
+                            *slot = entry;
                             false
-                        }
-                        Err(index) => {
-                            new_entries.insert(index, entry);
+                        } else {
+                            // Binary search only returns an in-bounds index.
+                            // If that library invariant is ever violated, keep
+                            // the incoming binding instead of indexing.
+                            new_entries.push(entry);
+                            new_entries.sort_by(|left, right| left.key.cmp(&right.key));
                             true
                         }
-                    };
+                    }
+                    Err(index) => {
+                        new_entries.insert(index, entry);
+                        true
+                    }
+                };
                 if new_entries.len() <= INLINE_COLLISION_MAX {
                     (CollisionBucket::Inline(new_entries), added)
                 } else {
-                    let root = collision_tree_from_sorted(&new_entries, facts)
-                        .unwrap_or_else(|| collision_node(new_entries[0].clone(), None, None, facts));
+                    let Some(root) = collision_tree_from_sorted(&new_entries, facts) else {
+                        // `new_entries` is known non-empty here. Preserve the
+                        // complete family if that internal invariant is ever
+                        // broken rather than indexing or dropping an entry.
+                        facts.collision_entries = new_entries.len();
+                        facts.expanded_weight = new_entries
+                            .iter()
+                            .fold(0u64, |sum, entry| sum.saturating_add(entry.expanded_weight));
+                        facts.tier = Some(CollisionTier::Inline);
+                        return (CollisionBucket::Inline(new_entries), added);
+                    };
                     (
                         CollisionBucket::Tree {
                             len: root.len,
@@ -673,11 +690,7 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
         (bucket, added)
     }
 
-    fn remove(
-        &self,
-        key: &K,
-        facts: &mut MutationFacts,
-    ) -> Option<Option<CollisionBucket<K, V>>> {
+    fn remove(&self, key: &K, facts: &mut MutationFacts) -> Option<Option<CollisionBucket<K, V>>> {
         match self {
             CollisionBucket::Inline(entries) => {
                 let index = entries
@@ -693,8 +706,13 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
                     .cloned_inline_entries
                     .saturating_add(entries.len().saturating_sub(1));
                 let mut kept = Vec::with_capacity(entries.len() - 1);
-                kept.extend(entries[..index].iter().cloned());
-                kept.extend(entries[index + 1..].iter().cloned());
+                kept.extend(
+                    entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(position, _)| *position != index)
+                        .map(|(_, entry)| entry.clone()),
+                );
                 facts.collision_entries = kept.len();
                 facts.expanded_weight = kept
                     .iter()
@@ -709,13 +727,12 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
                 };
                 if new_root.len <= INLINE_COLLISION_MAX {
                     let entries = collision_collect(&new_root);
-                    facts.cloned_inline_entries = facts
-                        .cloned_inline_entries
-                        .saturating_add(entries.len());
+                    facts.cloned_inline_entries =
+                        facts.cloned_inline_entries.saturating_add(entries.len());
                     facts.collision_entries = entries.len();
-                    facts.expanded_weight = entries.iter().fold(0u64, |sum, entry| {
-                        sum.saturating_add(entry.expanded_weight)
-                    });
+                    facts.expanded_weight = entries
+                        .iter()
+                        .fold(0u64, |sum, entry| sum.saturating_add(entry.expanded_weight));
                     facts.tier = Some(CollisionTier::Inline);
                     Some(Some(CollisionBucket::Inline(entries)))
                 } else {
@@ -763,10 +780,10 @@ impl<K: PKey, V: Clone> PMap<K, V> {
             match node.as_ref() {
                 Node::Leaf {
                     hash: leaf_hash,
-                    entries,
+                    bucket,
                 } => {
                     return if *leaf_hash == hash {
-                        entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+                        bucket.get(key)
                     } else {
                         None
                     };
@@ -791,21 +808,164 @@ impl<K: PKey, V: Clone> PMap<K, V> {
     /// Persistent insert: returns the map with `key` bound to `value`,
     /// overwriting any previous binding. The receiver is unchanged.
     pub fn insert(&self, key: K, value: V) -> Self {
+        self.insert_profiled_internal(key, value, 1).0
+    }
+
+    /// Resource-accounted persistent insertion.
+    ///
+    /// The caller supplies the expanded semantic weight because `PMap` cannot
+    /// infer it from generic values. Exhaustion is typed and atomic: `self`
+    /// remains unchanged and no candidate map is returned. The ordinary
+    /// [`PMap::insert`] remains the unbounded semantic operation, so a valid
+    /// key is never rejected merely because its 64-bit hash collides.
+    pub fn try_insert_with_budget(
+        &self,
+        key: K,
+        value: V,
+        expanded_weight: u64,
+        budget: CollisionBudget,
+    ) -> Result<Self, CollisionExhausted> {
         let hash = key.key_hash();
-        match &self.root {
-            None => PMap {
-                root: Some(Arc::new(Node::Leaf {
-                    hash,
-                    entries: vec![(key, value)],
-                })),
-                len: 1,
-            },
-            Some(root) => {
-                let (new_root, added) = insert_rec(root, 0, hash, key, value);
-                PMap {
-                    root: Some(new_root),
-                    len: self.len + usize::from(added),
+        let mut preflight = MutationFacts::default();
+        let (entries, total_weight, required_fresh_nodes) =
+            self.insertion_preflight(hash, &key, expanded_weight, &mut preflight)?;
+        if entries > budget.max_collision_entries {
+            return Err(CollisionExhausted {
+                resource: CollisionResource::Entries,
+                limit: usize_as_u128(budget.max_collision_entries),
+                attempted: usize_as_u128(entries),
+                collision_hash: hash,
+            });
+        }
+        if total_weight > u128::from(budget.max_expanded_weight) {
+            return Err(CollisionExhausted {
+                resource: CollisionResource::ExpandedWeight,
+                limit: u128::from(budget.max_expanded_weight),
+                attempted: total_weight,
+                collision_hash: hash,
+            });
+        }
+        if required_fresh_nodes > budget.max_fresh_nodes {
+            return Err(CollisionExhausted {
+                resource: CollisionResource::FreshNodes,
+                limit: usize_as_u128(budget.max_fresh_nodes),
+                attempted: usize_as_u128(required_fresh_nodes),
+                collision_hash: hash,
+            });
+        }
+        Ok(self.insert_profiled_internal(key, value, expanded_weight).0)
+    }
+
+    fn insertion_preflight(
+        &self,
+        hash: u64,
+        key: &K,
+        expanded_weight: u64,
+        facts: &mut MutationFacts,
+    ) -> Result<(usize, u128, usize), CollisionExhausted> {
+        let Some(mut node) = self.root.as_ref() else {
+            return Ok((1, u128::from(expanded_weight), 1));
+        };
+        let mut shift = 0u32;
+        let mut ancestor_branches = 0usize;
+        loop {
+            match node.as_ref() {
+                Node::Leaf {
+                    hash: leaf_hash,
+                    bucket,
+                } if *leaf_hash == hash => {
+                    let (_added, entries, total_weight) = bucket
+                        .insertion_shape(key, expanded_weight, facts)
+                        .map_err(|mut error| {
+                            error.collision_hash = hash;
+                            error
+                        })?;
+                    let collision_bound = match bucket {
+                        CollisionBucket::Inline(_) if entries > INLINE_COLLISION_MAX => entries,
+                        CollisionBucket::Tree { .. } => collision_tree_fresh_node_bound(entries),
+                        CollisionBucket::Inline(_) => 0,
+                    };
+                    return Ok((
+                        entries,
+                        total_weight,
+                        ancestor_branches
+                            .saturating_add(1)
+                            .saturating_add(collision_bound),
+                    ));
                 }
+                Node::Leaf {
+                    hash: leaf_hash, ..
+                } => {
+                    let split_shift = ((leaf_hash ^ hash).trailing_zeros() / BITS) * BITS;
+                    let branch_chain = split_shift.saturating_sub(shift) / BITS;
+                    return Ok((
+                        1,
+                        u128::from(expanded_weight),
+                        ancestor_branches
+                            .saturating_add(2)
+                            .saturating_add(branch_chain as usize),
+                    ));
+                }
+                Node::Branch { bitmap, children } => {
+                    let bit = 1u32 << chunk(hash, shift);
+                    if bitmap & bit == 0 {
+                        return Ok((
+                            1,
+                            u128::from(expanded_weight),
+                            ancestor_branches.saturating_add(2),
+                        ));
+                    }
+                    let position = (bitmap & (bit - 1)).count_ones() as usize;
+                    let Some(child) = children.get(position) else {
+                        return Ok((
+                            1,
+                            u128::from(expanded_weight),
+                            ancestor_branches.saturating_add(2),
+                        ));
+                    };
+                    node = child;
+                    ancestor_branches = ancestor_branches.saturating_add(1);
+                    shift = shift.saturating_add(BITS);
+                }
+            }
+        }
+    }
+
+    fn insert_profiled_internal(
+        &self,
+        key: K,
+        value: V,
+        expanded_weight: u64,
+    ) -> (Self, MutationFacts) {
+        let hash = key.key_hash();
+        let mut facts = MutationFacts::default();
+        match &self.root {
+            None => {
+                facts.fresh_map_nodes = 1;
+                facts.collision_entries = 1;
+                facts.expanded_weight = expanded_weight;
+                facts.tier = Some(CollisionTier::Inline);
+                (
+                    PMap {
+                        root: Some(Arc::new(Node::Leaf {
+                            hash,
+                            bucket: CollisionBucket::singleton(key, value, expanded_weight),
+                        })),
+                        len: 1,
+                    },
+                    facts,
+                )
+            }
+            Some(root) => {
+                let (new_root, added) =
+                    insert_rec(root, 0, hash, key, value, expanded_weight, &mut facts);
+                (
+                    PMap {
+                        root: Some(new_root),
+                        len: self.len.saturating_add(usize::from(added)),
+                    },
+                    facts,
+                )
             }
         }
     }
@@ -814,9 +974,10 @@ impl<K: PKey, V: Clone> PMap<K, V> {
     /// yields an unchanged O(1) clone of the receiver.
     pub fn remove(&self, key: &K) -> Self {
         let hash = key.key_hash();
+        let mut facts = MutationFacts::default();
         match &self.root {
             None => self.clone(),
-            Some(root) => match remove_rec(root, 0, hash, key) {
+            Some(root) => match remove_rec(root, 0, hash, key, &mut facts) {
                 None => self.clone(),
                 Some(new_root) => PMap {
                     root: new_root,
@@ -832,7 +993,10 @@ impl<K: PKey, V: Clone> PMap<K, V> {
         if let Some(root) = &self.root {
             stack.push((root.as_ref(), 0usize));
         }
-        Iter { stack }
+        Iter {
+            stack,
+            collision_stack: Vec::new(),
+        }
     }
 
     /// Total node count (branches + leaves); test-only sharing probe.
@@ -878,6 +1042,28 @@ impl<K: PKey, V: Clone> PMap<K, V> {
     #[cfg(test)]
     pub(crate) const fn insertion_replaced_node_bound() -> usize {
         MAX_DEPTH
+    }
+
+    #[cfg(test)]
+    fn insert_profiled(&self, key: K, value: V, expanded_weight: u64) -> (Self, MutationFacts) {
+        self.insert_profiled_internal(key, value, expanded_weight)
+    }
+
+    #[cfg(test)]
+    fn remove_profiled(&self, key: &K) -> (Self, MutationFacts) {
+        let hash = key.key_hash();
+        let mut facts = MutationFacts::default();
+        let map = match &self.root {
+            None => self.clone(),
+            Some(root) => match remove_rec(root, 0, hash, key, &mut facts) {
+                None => self.clone(),
+                Some(new_root) => PMap {
+                    root: new_root,
+                    len: self.len.saturating_sub(1),
+                },
+            },
+        };
+        (map, facts)
     }
 }
 
@@ -931,38 +1117,32 @@ fn insert_rec<K: PKey, V: Clone>(
     hash: u64,
     key: K,
     value: V,
+    expanded_weight: u64,
+    facts: &mut MutationFacts,
 ) -> (Arc<Node<K, V>>, bool) {
     match node.as_ref() {
         Node::Leaf {
             hash: leaf_hash,
-            entries,
+            bucket,
         } => {
             if *leaf_hash == hash {
-                let mut new_entries = entries.clone();
-                let added = match new_entries.binary_search_by(|(stored, _)| stored.cmp(&key)) {
-                    Ok(pos) => {
-                        // `PKey` requires `Ord` to be consistent with `Eq`; keep
-                        // the already-published key object and replace only its
-                        // value so overwrites cannot perturb bucket identity.
-                        debug_assert!(new_entries[pos].0 == key);
-                        new_entries[pos].1 = value;
-                        false
-                    }
-                    Err(pos) => {
-                        new_entries.insert(pos, (key, value));
-                        true
-                    }
-                };
-                (
-                    Arc::new(Node::Leaf {
-                        hash,
-                        entries: new_entries,
-                    }),
-                    added,
-                )
+                let (bucket, added) = bucket.insert(key, value, expanded_weight, facts);
+                facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
+                (Arc::new(Node::Leaf { hash, bucket }), added)
             } else {
                 (
-                    split_leaf(Arc::clone(node), *leaf_hash, shift, hash, key, value),
+                    split_leaf(
+                        Arc::clone(node),
+                        *leaf_hash,
+                        shift,
+                        hash,
+                        CollisionEntry {
+                            key,
+                            value,
+                            expanded_weight,
+                        },
+                        facts,
+                    ),
                     true,
                 )
             }
@@ -971,14 +1151,16 @@ fn insert_rec<K: PKey, V: Clone>(
             let bit = 1u32 << chunk(hash, shift);
             let pos = (bitmap & (bit - 1)).count_ones() as usize;
             if bitmap & bit == 0 {
+                facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
                 let new_leaf = Arc::new(Node::Leaf {
                     hash,
-                    entries: vec![(key, value)],
+                    bucket: CollisionBucket::singleton(key, value, expanded_weight),
                 });
                 let mut new_children = Vec::with_capacity(children.len() + 1);
                 new_children.extend(children.iter().take(pos).cloned());
                 new_children.push(new_leaf);
                 new_children.extend(children.iter().skip(pos).cloned());
+                facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
                 (
                     Arc::new(Node::Branch {
                         bitmap: bitmap | bit,
@@ -988,22 +1170,34 @@ fn insert_rec<K: PKey, V: Clone>(
                 )
             } else {
                 let (new_child, added) = match children.get(pos) {
-                    Some(child) => insert_rec(child, shift + BITS, hash, key, value),
+                    Some(child) => insert_rec(
+                        child,
+                        shift + BITS,
+                        hash,
+                        key,
+                        value,
+                        expanded_weight,
+                        facts,
+                    ),
                     // Unreachable by the bitmap/children invariant; repair
                     // with a fresh leaf rather than panic.
-                    None => (
-                        Arc::new(Node::Leaf {
-                            hash,
-                            entries: vec![(key, value)],
-                        }),
-                        true,
-                    ),
+                    None => {
+                        facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
+                        (
+                            Arc::new(Node::Leaf {
+                                hash,
+                                bucket: CollisionBucket::singleton(key, value, expanded_weight),
+                            }),
+                            true,
+                        )
+                    }
                 };
                 let mut new_children = children.clone();
                 match new_children.get_mut(pos) {
                     Some(slot) => *slot = new_child,
                     None => new_children.push(new_child),
                 }
+                facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
                 (
                     Arc::new(Node::Branch {
                         bitmap: *bitmap,
@@ -1025,17 +1219,18 @@ fn split_leaf<K: PKey, V: Clone>(
     old_hash: u64,
     shift: u32,
     hash: u64,
-    key: K,
-    value: V,
+    entry: CollisionEntry<K, V>,
+    facts: &mut MutationFacts,
 ) -> Arc<Node<K, V>> {
     let diff = old_hash ^ hash;
     debug_assert!(diff != 0, "split_leaf requires distinct hashes");
     let split_shift = (diff.trailing_zeros() / BITS) * BITS;
     let old_chunk = chunk(old_hash, split_shift);
     let new_chunk = chunk(hash, split_shift);
+    facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
     let new_leaf = Arc::new(Node::Leaf {
         hash,
-        entries: vec![(key, value)],
+        bucket: CollisionBucket::Inline(vec![entry]),
     });
     let bitmap = (1u32 << old_chunk) | (1u32 << new_chunk);
     let children = if old_chunk < new_chunk {
@@ -1043,10 +1238,12 @@ fn split_leaf<K: PKey, V: Clone>(
     } else {
         vec![new_leaf, old_leaf]
     };
+    facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
     let mut node = Arc::new(Node::Branch { bitmap, children });
     let mut s = split_shift;
     while s > shift {
         s -= BITS;
+        facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
         node = Arc::new(Node::Branch {
             bitmap: 1u32 << chunk(hash, s),
             children: vec![node],
@@ -1067,24 +1264,26 @@ fn remove_rec<K: PKey, V: Clone>(
     shift: u32,
     hash: u64,
     key: &K,
+    facts: &mut MutationFacts,
 ) -> Option<Option<Arc<Node<K, V>>>> {
     match node.as_ref() {
         Node::Leaf {
             hash: leaf_hash,
-            entries,
+            bucket,
         } => {
             if *leaf_hash != hash {
                 return None;
             }
-            entries.iter().position(|(k, _)| k == key)?;
-            if entries.len() == 1 {
-                return Some(None);
+            match bucket.remove(key, facts)? {
+                None => Some(None),
+                Some(bucket) => {
+                    facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
+                    Some(Some(Arc::new(Node::Leaf {
+                        hash: *leaf_hash,
+                        bucket,
+                    })))
+                }
             }
-            let kept: Vec<(K, V)> = entries.iter().filter(|(k, _)| k != key).cloned().collect();
-            Some(Some(Arc::new(Node::Leaf {
-                hash: *leaf_hash,
-                entries: kept,
-            })))
         }
         Node::Branch { bitmap, children } => {
             let bit = 1u32 << chunk(hash, shift);
@@ -1093,7 +1292,7 @@ fn remove_rec<K: PKey, V: Clone>(
             }
             let pos = (bitmap & (bit - 1)).count_ones() as usize;
             let child = children.get(pos)?;
-            match remove_rec(child, shift + BITS, hash, key)? {
+            match remove_rec(child, shift + BITS, hash, key, facts)? {
                 Some(new_child) => {
                     if children.len() == 1 && matches!(new_child.as_ref(), Node::Leaf { .. }) {
                         return Some(Some(new_child));
@@ -1103,6 +1302,7 @@ fn remove_rec<K: PKey, V: Clone>(
                         Some(slot) => *slot = new_child,
                         None => new_children.push(new_child),
                     }
+                    facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
                     Some(Some(Arc::new(Node::Branch {
                         bitmap: *bitmap,
                         children: new_children,
@@ -1123,6 +1323,7 @@ fn remove_rec<K: PKey, V: Clone>(
                     {
                         return Some(Some(Arc::clone(only)));
                     }
+                    facts.fresh_map_nodes = facts.fresh_map_nodes.saturating_add(1);
                     Some(Some(Arc::new(Node::Branch {
                         bitmap: bitmap & !bit,
                         children: kept,
@@ -1137,6 +1338,7 @@ fn remove_rec<K: PKey, V: Clone>(
 /// its next unvisited child (branch) or entry (leaf).
 struct Iter<'a, K, V> {
     stack: Vec<(&'a Node<K, V>, usize)>,
+    collision_stack: Vec<&'a CollisionNode<K, V>>,
 }
 
 impl<'a, K, V> Iterator for Iter<'a, K, V> {
@@ -1144,17 +1346,41 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if let Some(node) = self.collision_stack.pop() {
+                let mut cursor = node.right.as_deref();
+                while let Some(next) = cursor {
+                    self.collision_stack.push(next);
+                    cursor = next.left.as_deref();
+                }
+                return Some((&node.entry.key, &node.entry.value));
+            }
             let (node, idx) = *self.stack.last()?;
             match node {
-                Node::Leaf { entries, .. } => {
-                    if let Some((k, v)) = entries.get(idx) {
-                        if let Some(top) = self.stack.last_mut() {
-                            top.1 += 1;
+                Node::Leaf { bucket, .. } => match bucket {
+                    CollisionBucket::Inline(entries) => {
+                        if let Some(entry) = entries.get(idx) {
+                            if let Some(top) = self.stack.last_mut() {
+                                top.1 += 1;
+                            }
+                            return Some((&entry.key, &entry.value));
                         }
-                        return Some((k, v));
+                        self.stack.pop();
                     }
-                    self.stack.pop();
-                }
+                    CollisionBucket::Tree { root, .. } => {
+                        if idx == 0 {
+                            if let Some(top) = self.stack.last_mut() {
+                                top.1 = 1;
+                            }
+                            let mut cursor = Some(root.as_ref());
+                            while let Some(next) = cursor {
+                                self.collision_stack.push(next);
+                                cursor = next.left.as_deref();
+                            }
+                        } else {
+                            self.stack.pop();
+                        }
+                    }
+                },
                 Node::Branch { children, .. } => match children.get(idx) {
                     Some(child) => {
                         if let Some(top) = self.stack.last_mut() {
@@ -1232,6 +1458,123 @@ mod tests {
         fn key_hash(&self) -> u64 {
             self.hash
         }
+    }
+
+    fn collision_bucket_for<'a, K: PKey, V: Clone>(
+        map: &'a PMap<K, V>,
+        key: &K,
+    ) -> Option<&'a CollisionBucket<K, V>> {
+        let hash = key.key_hash();
+        let mut node = map.root.as_ref()?;
+        let mut shift = 0u32;
+        loop {
+            match node.as_ref() {
+                Node::Leaf {
+                    hash: leaf_hash,
+                    bucket,
+                } => return (*leaf_hash == hash).then_some(bucket),
+                Node::Branch { bitmap, children } => {
+                    let bit = 1u32 << chunk(hash, shift);
+                    if bitmap & bit == 0 {
+                        return None;
+                    }
+                    let position = (bitmap & (bit - 1)).count_ones() as usize;
+                    node = children.get(position)?;
+                    shift = shift.saturating_add(BITS);
+                }
+            }
+        }
+    }
+
+    fn assert_collision_tree_invariants<K: PKey + std::fmt::Debug, V: Clone>(
+        root: &Arc<CollisionNode<K, V>>,
+    ) {
+        fn walk<K: PKey + std::fmt::Debug, V: Clone>(
+            node: &Arc<CollisionNode<K, V>>,
+            lower: Option<&K>,
+            upper: Option<&K>,
+        ) -> (u16, usize, u64) {
+            if let Some(lower) = lower {
+                assert!(
+                    lower < &node.entry.key,
+                    "lower={lower:?}, node={:?}",
+                    node.entry.key
+                );
+            }
+            if let Some(upper) = upper {
+                assert!(
+                    &node.entry.key < upper,
+                    "node={:?}, upper={upper:?}",
+                    node.entry.key
+                );
+            }
+            let (left_height, left_len, left_weight) = node
+                .left
+                .as_ref()
+                .map_or((0, 0, 0), |left| walk(left, lower, Some(&node.entry.key)));
+            let (right_height, right_len, right_weight) = node
+                .right
+                .as_ref()
+                .map_or((0, 0, 0), |right| walk(right, Some(&node.entry.key), upper));
+            assert!(
+                left_height.abs_diff(right_height) <= 1,
+                "AVL imbalance at {:?}: left={left_height}, right={right_height}",
+                node.entry.key
+            );
+            let height = 1 + left_height.max(right_height);
+            let len = 1 + left_len + right_len;
+            let weight = node
+                .entry
+                .expanded_weight
+                .saturating_add(left_weight)
+                .saturating_add(right_weight);
+            assert_eq!(node.height, height);
+            assert_eq!(node.len, len);
+            assert_eq!(node.expanded_weight, weight);
+            (height, len, weight)
+        }
+        let _ = walk(root, None, None);
+    }
+
+    fn collision_node_ptrs<K, V>(root: &Arc<CollisionNode<K, V>>) -> HashSet<*const ()> {
+        let mut pointers = HashSet::new();
+        let mut stack = vec![Arc::clone(root)];
+        while let Some(node) = stack.pop() {
+            pointers.insert(Arc::as_ptr(&node).cast());
+            if let Some(left) = &node.left {
+                stack.push(Arc::clone(left));
+            }
+            if let Some(right) = &node.right {
+                stack.push(Arc::clone(right));
+            }
+        }
+        pointers
+    }
+
+    fn collision_lookup_comparisons<'a, K: PKey, V: Clone>(
+        map: &'a PMap<K, V>,
+        key: &K,
+    ) -> (Option<&'a V>, usize) {
+        let Some(bucket) = collision_bucket_for(map, key) else {
+            return (None, 0);
+        };
+        let mut facts = MutationFacts::default();
+        let value = match bucket {
+            CollisionBucket::Inline(entries) => {
+                let result = entries.binary_search_by(|entry| {
+                    facts.comparisons = facts.comparisons.saturating_add(1);
+                    entry.key.cmp(key)
+                });
+                result
+                    .ok()
+                    .and_then(|index| entries.get(index))
+                    .map(|entry| &entry.value)
+            }
+            CollisionBucket::Tree { root, .. } => {
+                collision_find(root, key, &mut facts).map(|entry| &entry.value)
+            }
+        };
+        (value, facts.comparisons)
     }
 
     fn sorted_contents(map: &PMap<HKey, u64>) -> Vec<(u64, u64)> {
@@ -1427,6 +1770,496 @@ mod tests {
         assert_eq!(contents, expected);
     }
 
+    #[test]
+    fn collision_tier_promotes_overwrites_and_demotes_by_cardinality() {
+        let mut map = PMap::new();
+        for key in 0..INLINE_COLLISION_MAX as u64 {
+            let (next, _) = map.insert_profiled(CollKey(key), key * 10, key + 1);
+            map = next;
+        }
+        let entries = collision_bucket_for(&map, &CollKey(0))
+            .and_then(|bucket| match bucket {
+                CollisionBucket::Inline(entries) => Some(entries),
+                CollisionBucket::Tree { .. } => None,
+            })
+            .expect("eight entries must remain in the inline tier");
+        assert_eq!(entries.len(), INLINE_COLLISION_MAX);
+
+        let frozen = map.clone();
+        let (promoted, promotion) =
+            map.insert_profiled(CollKey(INLINE_COLLISION_MAX as u64), 80, 9);
+        assert_eq!(promotion.tier, Some(CollisionTier::Tree));
+        assert_eq!(promotion.collision_entries, INLINE_COLLISION_MAX + 1);
+        assert_eq!(promotion.cloned_inline_entries, INLINE_COLLISION_MAX);
+        let (root, len, expanded_weight) = collision_bucket_for(&promoted, &CollKey(0))
+            .and_then(|bucket| match bucket {
+                CollisionBucket::Tree {
+                    root,
+                    len,
+                    expanded_weight,
+                } => Some((root, len, expanded_weight)),
+                CollisionBucket::Inline(_) => None,
+            })
+            .expect("the ninth colliding entry must promote");
+        assert_eq!(*len, INLINE_COLLISION_MAX + 1);
+        assert_eq!(*expanded_weight, 45);
+        assert_collision_tree_invariants(root);
+        assert_eq!(frozen.len(), INLINE_COLLISION_MAX);
+        assert_eq!(frozen.get(&CollKey(8)), None);
+
+        let (overwritten, overwrite) = promoted.insert_profiled(CollKey(4), 4_444, 100);
+        assert_eq!(overwritten.len(), promoted.len());
+        assert_eq!(overwritten.get(&CollKey(4)), Some(&4_444));
+        assert_eq!(promoted.get(&CollKey(4)), Some(&40));
+        assert_eq!(overwrite.tier, Some(CollisionTier::Tree));
+        assert_eq!(overwrite.expanded_weight, 140);
+
+        let (demoted, removal) = overwritten.remove_profiled(&CollKey(INLINE_COLLISION_MAX as u64));
+        assert_eq!(removal.tier, Some(CollisionTier::Inline));
+        assert_eq!(removal.collision_entries, INLINE_COLLISION_MAX);
+        let entries = collision_bucket_for(&demoted, &CollKey(0))
+            .and_then(|bucket| match bucket {
+                CollisionBucket::Inline(entries) => Some(entries),
+                CollisionBucket::Tree { .. } => None,
+            })
+            .expect("removal back to eight entries must demote");
+        assert_eq!(entries.len(), INLINE_COLLISION_MAX);
+        assert_eq!(
+            entries.iter().map(|entry| entry.key.0).collect::<Vec<_>>(),
+            (0..INLINE_COLLISION_MAX as u64).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collision_tree_collapses_through_inline_to_empty_without_touching_fork() {
+        const CARDINALITY: u64 = 65;
+        let insertion_order: Vec<u64> = (0..CARDINALITY).collect();
+        let original = collision_map(&insertion_order);
+        let frozen = original.clone();
+        let frozen_contents = collision_contents(&frozen);
+        let mut removal_order: Vec<u64> = (0..CARDINALITY).step_by(2).collect();
+        removal_order.extend((1..CARDINALITY).step_by(2));
+
+        let mut draining = original;
+        for (removed_count, key) in removal_order.into_iter().enumerate() {
+            let before_len = draining.len();
+            let (next, facts) = draining.remove_profiled(&CollKey(key));
+            assert_eq!(next.len(), before_len - 1);
+            assert_eq!(next.get(&CollKey(key)), None);
+            let remaining = CARDINALITY as usize - removed_count - 1;
+            if remaining == 0 {
+                assert!(next.is_empty());
+                assert!(next.root.is_none());
+                assert_eq!(facts.tier, None);
+            } else {
+                let bucket = collision_bucket_for(&next, &CollKey((key + 1) % CARDINALITY))
+                    .or_else(|| collision_bucket_for(&next, &CollKey(0)))
+                    .expect("a non-empty all-collision map retains its bucket");
+                if remaining <= INLINE_COLLISION_MAX {
+                    assert!(matches!(bucket, CollisionBucket::Inline(_)));
+                    assert_eq!(facts.tier, Some(CollisionTier::Inline));
+                } else {
+                    let (root, len) = match bucket {
+                        CollisionBucket::Tree { root, len, .. } => Some((root, len)),
+                        CollisionBucket::Inline(_) => None,
+                    }
+                    .expect("a family above the inline threshold remains a tree");
+                    assert_eq!(*len, remaining);
+                    assert_collision_tree_invariants(root);
+                    assert_eq!(facts.tier, Some(CollisionTier::Tree));
+                }
+            }
+            draining = next;
+        }
+
+        assert_eq!(collision_contents(&frozen), frozen_contents);
+        assert_eq!(frozen.len(), CARDINALITY as usize);
+        let frozen_root = frozen.root.as_ref().expect("frozen map has a root");
+        let (unchanged, absent_facts) = frozen.remove_profiled(&CollKey(CARDINALITY + 1));
+        assert_eq!(unchanged, frozen);
+        assert!(Arc::ptr_eq(
+            unchanged.root.as_ref().expect("unchanged map has a root"),
+            frozen_root
+        ));
+        assert_eq!(absent_facts.actual_fresh_nodes(), 0);
+    }
+
+    #[test]
+    fn collision_resource_budgets_are_typed_atomic_and_recoverable() {
+        let empty = PMap::<CollKey, u64>::new();
+        let empty_error = empty
+            .try_insert_with_budget(
+                CollKey(0),
+                0,
+                1,
+                CollisionBudget {
+                    max_collision_entries: 1,
+                    max_expanded_weight: 1,
+                    max_fresh_nodes: 0,
+                },
+            )
+            .expect_err("an empty-map insert still allocates its leaf");
+        assert_eq!(empty_error.resource, CollisionResource::FreshNodes);
+        assert_eq!(empty_error.attempted, 1);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(
+            empty
+                .try_insert_with_budget(
+                    CollKey(0),
+                    0,
+                    1,
+                    CollisionBudget {
+                        max_collision_entries: 1,
+                        max_expanded_weight: 1,
+                        max_fresh_nodes: 1,
+                    },
+                )
+                .expect("the exact empty-map allocation boundary is admitted")
+                .len(),
+            1
+        );
+
+        let mut map = PMap::new();
+        for key in 0..INLINE_COLLISION_MAX as u64 {
+            map = map.insert_profiled(CollKey(key), key, 1).0;
+        }
+        let before = collision_contents(&map);
+        let mut preflight = MutationFacts::default();
+        let (_, _, promotion_bound) = map
+            .insertion_preflight(CollKey(8).key_hash(), &CollKey(8), 1, &mut preflight)
+            .expect("promotion preflight succeeds");
+        assert_eq!(promotion_bound, INLINE_COLLISION_MAX + 2);
+
+        let entries_error = map
+            .try_insert_with_budget(
+                CollKey(8),
+                8,
+                1,
+                CollisionBudget {
+                    max_collision_entries: INLINE_COLLISION_MAX,
+                    max_expanded_weight: u64::MAX,
+                    max_fresh_nodes: usize::MAX,
+                },
+            )
+            .expect_err("ninth entry exceeds the eight-entry envelope");
+        assert_eq!(entries_error.resource, CollisionResource::Entries);
+        assert_eq!(entries_error.limit, INLINE_COLLISION_MAX as u128);
+        assert_eq!(entries_error.attempted, 9);
+        assert_eq!(collision_contents(&map), before);
+
+        let weight_error = map
+            .try_insert_with_budget(
+                CollKey(8),
+                8,
+                5,
+                CollisionBudget {
+                    max_collision_entries: 9,
+                    max_expanded_weight: 12,
+                    max_fresh_nodes: usize::MAX,
+                },
+            )
+            .expect_err("eight existing units plus five exceeds twelve");
+        assert_eq!(weight_error.resource, CollisionResource::ExpandedWeight);
+        assert_eq!(weight_error.limit, 12);
+        assert_eq!(weight_error.attempted, 13);
+        assert_eq!(collision_contents(&map), before);
+
+        let allocation_error = map
+            .try_insert_with_budget(
+                CollKey(8),
+                8,
+                1,
+                CollisionBudget {
+                    max_collision_entries: 9,
+                    max_expanded_weight: 9,
+                    max_fresh_nodes: promotion_bound - 1,
+                },
+            )
+            .expect_err("promotion requires the declared deterministic bound");
+        assert_eq!(allocation_error.resource, CollisionResource::FreshNodes);
+        assert_eq!(allocation_error.attempted, promotion_bound as u128);
+        assert_eq!(collision_contents(&map), before);
+
+        let exact = map
+            .try_insert_with_budget(
+                CollKey(8),
+                8,
+                1,
+                CollisionBudget {
+                    max_collision_entries: 9,
+                    max_expanded_weight: 9,
+                    max_fresh_nodes: promotion_bound,
+                },
+            )
+            .expect("the exact boundary is admitted");
+        assert_eq!(exact.len(), 9);
+        assert_eq!(exact.get(&CollKey(8)), Some(&8));
+        let (_, promotion_facts) = map.insert_profiled(CollKey(8), 8, 1);
+        assert_eq!(promotion_facts.actual_fresh_nodes(), promotion_bound);
+
+        let overflow_base = PMap::new().insert_profiled(CollKey(0), 0, u64::MAX).0;
+        let overflow = overflow_base
+            .try_insert_with_budget(CollKey(1), 1, 1, CollisionBudget::UNBOUNDED)
+            .expect_err("expanded-weight arithmetic must not wrap");
+        assert_eq!(overflow.resource, CollisionResource::ExpandedWeight);
+        assert_eq!(overflow.limit, u128::from(u64::MAX));
+        assert_eq!(overflow.attempted, u128::from(u64::MAX) + 1);
+        assert_eq!(overflow_base.len(), 1);
+
+        let recovered = map.insert(CollKey(8), 8);
+        assert_eq!(recovered.len(), 9);
+        assert_eq!(
+            collision_contents(&recovered),
+            (0..9).map(|key| (key, key)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collision_allocation_budget_is_schedule_independent_and_bounds_actual_work() {
+        const CARDINALITY: usize = 257;
+        let forward: Vec<u64> = (0..CARDINALITY as u64).collect();
+        let reverse: Vec<u64> = forward.iter().rev().copied().collect();
+        let mut shuffled = forward.clone();
+        let mut rng = 0xB0D6_E7ED_C011_1510u64;
+        for index in (1..shuffled.len()).rev() {
+            let swap_with = (lcg(&mut rng) % (index as u64 + 1)) as usize;
+            shuffled.swap(index, swap_with);
+        }
+
+        let mut declared_bound = None;
+        for order in [&forward, &reverse, &shuffled] {
+            let map = collision_map(order);
+            let key = CollKey(CARDINALITY as u64);
+            let mut preflight = MutationFacts::default();
+            let (entries, weight, required) = map
+                .insertion_preflight(key.key_hash(), &key, 1, &mut preflight)
+                .expect("bounded shape arithmetic does not overflow");
+            assert_eq!(entries, CARDINALITY + 1);
+            assert_eq!(weight, (CARDINALITY + 1) as u128);
+            match declared_bound {
+                None => declared_bound = Some(required),
+                Some(expected) => assert_eq!(
+                    required, expected,
+                    "resource verdict must not depend on AVL construction history"
+                ),
+            }
+
+            let refused = map
+                .try_insert_with_budget(
+                    key.clone(),
+                    CARDINALITY as u64,
+                    1,
+                    CollisionBudget {
+                        max_collision_entries: CARDINALITY + 1,
+                        max_expanded_weight: (CARDINALITY + 1) as u64,
+                        max_fresh_nodes: required - 1,
+                    },
+                )
+                .expect_err("one node below the declared bound is refused atomically");
+            assert_eq!(refused.resource, CollisionResource::FreshNodes);
+            assert_eq!(refused.attempted, required as u128);
+            assert_eq!(map.len(), CARDINALITY);
+            assert_eq!(map.get(&key), None);
+
+            let (profiled, actual) = map.insert_profiled(key.clone(), CARDINALITY as u64, 1);
+            assert!(
+                actual.actual_fresh_nodes() <= required,
+                "actual={} required={required}",
+                actual.actual_fresh_nodes()
+            );
+            assert_eq!(profiled.get(&key), Some(&(CARDINALITY as u64)));
+            let admitted = map
+                .try_insert_with_budget(
+                    key.clone(),
+                    CARDINALITY as u64,
+                    1,
+                    CollisionBudget {
+                        max_collision_entries: CARDINALITY + 1,
+                        max_expanded_weight: (CARDINALITY + 1) as u64,
+                        max_fresh_nodes: required,
+                    },
+                )
+                .expect("the schedule-independent declared boundary is admitted");
+            assert_eq!(collision_contents(&admitted), collision_contents(&profiled));
+        }
+    }
+
+    #[test]
+    fn all_collision_random_lifecycle_matches_btree_model_across_tiers() {
+        let mut rng = 0xA11C_0111_5100_0001u64;
+        let mut map = PMap::new();
+        let mut model = BTreeMap::new();
+        const KEY_SPACE: u64 = 512;
+        for step in 0..10_000u64 {
+            let key = lcg(&mut rng) % KEY_SPACE;
+            if lcg(&mut rng) % 100 < 61 {
+                let value = lcg(&mut rng);
+                let collision_key = CollKey(key);
+                let mut preflight = MutationFacts::default();
+                let (_, _, required_fresh_nodes) = map
+                    .insertion_preflight(
+                        collision_key.key_hash(),
+                        &collision_key,
+                        1,
+                        &mut preflight,
+                    )
+                    .expect("unit expanded weight cannot overflow");
+                let (next, facts) = map.insert_profiled(collision_key, value, 1);
+                assert!(
+                    facts.actual_fresh_nodes() <= required_fresh_nodes,
+                    "step={step}, actual={}, required={required_fresh_nodes}",
+                    facts.actual_fresh_nodes()
+                );
+                map = next;
+                model.insert(key, value);
+            } else {
+                map = map.remove(&CollKey(key));
+                model.remove(&key);
+            }
+            assert_eq!(map.len(), model.len(), "step={step}");
+            if step % 97 == 0 {
+                let actual = collision_contents(&map);
+                let expected = model
+                    .iter()
+                    .map(|(key, value)| (*key, *value))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "step={step}");
+                for probe in 0..32 {
+                    let key = (lcg(&mut rng) + probe) % KEY_SPACE;
+                    assert_eq!(map.get(&CollKey(key)), model.get(&key), "step={step}");
+                }
+                if let Some(CollisionBucket::Tree { root, .. }) =
+                    collision_bucket_for(&map, &CollKey(0))
+                {
+                    assert_collision_tree_invariants(root);
+                }
+            }
+        }
+    }
+
+    fn profiled_collision_family(cardinality: usize) -> (PMap<CollKey, u64>, MutationFacts) {
+        let mut map = PMap::new();
+        let mut total = MutationFacts::default();
+        for key in 0..cardinality as u64 {
+            let (next, facts) = map.insert_profiled(CollKey(key), key, 1);
+            total.comparisons = total.comparisons.saturating_add(facts.comparisons);
+            total.fresh_map_nodes = total.fresh_map_nodes.saturating_add(facts.fresh_map_nodes);
+            total.fresh_collision_nodes = total
+                .fresh_collision_nodes
+                .saturating_add(facts.fresh_collision_nodes);
+            total.cloned_inline_entries = total
+                .cloned_inline_entries
+                .saturating_add(facts.cloned_inline_entries);
+            map = next;
+        }
+        (map, total)
+    }
+
+    #[test]
+    fn collision_families_at_1k_and_10k_have_non_quadratic_exact_counters() {
+        for cardinality in [1_000usize, 10_000] {
+            let (map, facts) = profiled_collision_family(cardinality);
+            assert_eq!(map.len(), cardinality);
+            let (root, len) = collision_bucket_for(&map, &CollKey(0))
+                .and_then(|bucket| match bucket {
+                    CollisionBucket::Tree { root, len, .. } => Some((root, len)),
+                    CollisionBucket::Inline(_) => None,
+                })
+                .expect("large collision family must use the tree tier");
+            assert_eq!(*len, cardinality);
+            assert_collision_tree_invariants(root);
+
+            let log = ceil_log2(cardinality + 1);
+            let comparison_bound = cardinality.saturating_mul(2 * log + 4);
+            let allocation_bound =
+                cardinality.saturating_mul(collision_tree_fresh_node_bound(cardinality) + 1);
+            assert!(
+                facts.comparisons <= comparison_bound,
+                "cardinality={cardinality}, comparisons={}, bound={comparison_bound}",
+                facts.comparisons
+            );
+            assert!(
+                facts.actual_fresh_nodes() <= allocation_bound,
+                "cardinality={cardinality}, allocations={}, bound={allocation_bound}",
+                facts.actual_fresh_nodes()
+            );
+            assert!(
+                facts.cloned_inline_entries
+                    <= INLINE_COLLISION_MAX * (INLINE_COLLISION_MAX + 1) / 2,
+                "inline clone work must stop permanently after promotion"
+            );
+
+            let legacy_vec_copies = cardinality.saturating_mul(cardinality - 1) / 2;
+            assert!(
+                facts.actual_fresh_nodes().saturating_mul(8) < legacy_vec_copies,
+                "the planted whole-Vec-copy model must be decisively separated"
+            );
+
+            for probe in [0usize, cardinality / 2, cardinality - 1] {
+                let (actual, comparisons) =
+                    collision_lookup_comparisons(&map, &CollKey(probe as u64));
+                assert_eq!(actual, Some(&(probe as u64)));
+                assert!(
+                    comparisons <= 2 * log + 2,
+                    "cardinality={cardinality}, probe={probe}, comparisons={comparisons}"
+                );
+            }
+            let (missing, comparisons) =
+                collision_lookup_comparisons(&map, &CollKey(cardinality as u64 + 7));
+            assert_eq!(missing, None);
+            assert!(comparisons <= 2 * log + 2);
+
+            println!(
+                "collision complexity evidence: cardinality={cardinality} \
+                 comparisons={} fresh_map_nodes={} fresh_collision_nodes={} \
+                 cloned_inline_entries={} legacy_vec_copies={legacy_vec_copies}",
+                facts.comparisons,
+                facts.fresh_map_nodes,
+                facts.fresh_collision_nodes,
+                facts.cloned_inline_entries
+            );
+        }
+    }
+
+    #[test]
+    fn large_collision_snapshots_share_the_tree_and_mutate_one_log_path() {
+        let (map, _) = profiled_collision_family(10_000);
+        let root_arc = map.root.as_ref().expect("non-empty map");
+        let before = Arc::strong_count(root_arc);
+        let snapshot = map.clone();
+        assert_eq!(Arc::strong_count(root_arc), before + 1);
+
+        let root = collision_bucket_for(&map, &CollKey(0))
+            .and_then(|bucket| match bucket {
+                CollisionBucket::Tree { root, .. } => Some(root),
+                CollisionBucket::Inline(_) => None,
+            })
+            .expect("large family must be promoted");
+        let old_pointers = collision_node_ptrs(root);
+        let (mutated, facts) = map.insert_profiled(CollKey(10_000), 10_000, 1);
+        let new_root = collision_bucket_for(&mutated, &CollKey(0))
+            .and_then(|bucket| match bucket {
+                CollisionBucket::Tree { root, .. } => Some(root),
+                CollisionBucket::Inline(_) => None,
+            })
+            .expect("mutated family must remain promoted");
+        let new_pointers = collision_node_ptrs(new_root);
+        let shared = new_pointers
+            .iter()
+            .filter(|pointer| old_pointers.contains(pointer))
+            .count();
+        assert!(
+            shared >= 10_000 - collision_tree_fresh_node_bound(10_001),
+            "shared={shared}, fresh={}",
+            facts.fresh_collision_nodes
+        );
+        assert_eq!(snapshot.len(), 10_000);
+        assert_eq!(snapshot.get(&CollKey(10_000)), None);
+        assert_eq!(mutated.get(&CollKey(10_000)), Some(&10_000));
+        drop(snapshot);
+        assert_eq!(Arc::strong_count(root_arc), before);
+    }
+
     fn collision_map(order: &[u64]) -> PMap<CollKey, u64> {
         order.iter().fold(PMap::new(), |map, key| {
             map.insert(CollKey(*key), key.wrapping_mul(17))
@@ -1529,7 +2362,39 @@ mod tests {
                 canonical: 1,
                 hash: 1u64 << shift,
             };
-            let forward = PMap::new().insert(low.clone(), 0).insert(high.clone(), 1);
+            let singleton = PMap::new().insert(low.clone(), 0);
+            let mut preflight = MutationFacts::default();
+            let (_, _, required_fresh_nodes) = singleton
+                .insertion_preflight(high.key_hash(), &high, 1, &mut preflight)
+                .expect("unit expanded weight cannot overflow");
+            let (forward, actual) = singleton.insert_profiled(high.clone(), 1, 1);
+            assert_eq!(
+                actual.actual_fresh_nodes(),
+                required_fresh_nodes,
+                "shift={shift}"
+            );
+            let refused = singleton
+                .try_insert_with_budget(
+                    high.clone(),
+                    1,
+                    1,
+                    CollisionBudget {
+                        max_collision_entries: 1,
+                        max_expanded_weight: 1,
+                        max_fresh_nodes: required_fresh_nodes.saturating_sub(1),
+                    },
+                )
+                .expect_err("one below the exact split-path bound is refused");
+            assert_eq!(
+                refused.resource,
+                CollisionResource::FreshNodes,
+                "shift={shift}"
+            );
+            assert_eq!(
+                refused.attempted,
+                usize_as_u128(required_fresh_nodes),
+                "shift={shift}"
+            );
             let reverse = PMap::new().insert(high, 1).insert(low, 0);
             let expected_nodes = (shift / BITS) as usize + 3;
             assert_eq!(forward.node_count(), expected_nodes, "shift={shift}");
@@ -1769,6 +2634,442 @@ mod tests {
             }
             evidence
         })
+    }
+
+    struct CollisionResourceScheduleEvidence {
+        insertion_order: Vec<u64>,
+        enumeration: Vec<u64>,
+        environment_entries: usize,
+        environment_root: LogicalRoot,
+        recovery_root: LogicalRoot,
+        representation_tier: &'static str,
+        comparisons: usize,
+        fresh_map_nodes: usize,
+        fresh_collision_nodes: usize,
+        cloned_inline_entries: usize,
+        collision_nodes: usize,
+        snapshot_shared_map_root: bool,
+        snapshot_root_arc_bumps: usize,
+        snapshot_shared_collision_nodes: usize,
+        append_shared_collision_nodes: usize,
+        append_fresh_nodes: usize,
+        max_lookup_comparisons: usize,
+        required_fresh_nodes: usize,
+        refusal_resource: CollisionResource,
+        refusal_attempted: u128,
+    }
+
+    fn build_collision_resource_schedule(
+        order: &[u64],
+    ) -> Option<CollisionResourceScheduleEvidence> {
+        let mut enumeration = PMap::new();
+        let mut environment = Environment::new();
+        let mut totals = MutationFacts::default();
+        for component in order {
+            let name = colliding_environment_name(*component);
+            let (next, facts) = enumeration.insert_profiled(name.clone(), *component, 1);
+            totals.comparisons = totals.comparisons.saturating_add(facts.comparisons);
+            totals.fresh_map_nodes = totals.fresh_map_nodes.saturating_add(facts.fresh_map_nodes);
+            totals.fresh_collision_nodes = totals
+                .fresh_collision_nodes
+                .saturating_add(facts.fresh_collision_nodes);
+            totals.cloned_inline_entries = totals
+                .cloned_inline_entries
+                .saturating_add(facts.cloned_inline_entries);
+            enumeration = next;
+            environment = environment.add_decl(collision_axiom(name)).ok()?;
+        }
+
+        let probe = colliding_environment_name(0);
+        let CollisionBucket::Tree { root, len, .. } = collision_bucket_for(&enumeration, &probe)?
+        else {
+            return None;
+        };
+        let collision_nodes = *len;
+        let old_collision_pointers = collision_node_ptrs(root);
+        let map_root_refs_before = enumeration.root.as_ref().map_or(0, Arc::strong_count);
+        let snapshot = enumeration.clone();
+        let map_root_refs_after = enumeration.root.as_ref().map_or(0, Arc::strong_count);
+        let snapshot_root_arc_bumps = map_root_refs_after.saturating_sub(map_root_refs_before);
+        let snapshot_shared_map_root = match (&enumeration.root, &snapshot.root) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        let snapshot_shared_collision_nodes = match collision_bucket_for(&snapshot, &probe)? {
+            CollisionBucket::Tree {
+                root: snapshot_root,
+                len: snapshot_len,
+                ..
+            } if Arc::ptr_eq(root, snapshot_root) => *snapshot_len,
+            CollisionBucket::Tree {
+                root: snapshot_root,
+                ..
+            } => collision_node_ptrs(snapshot_root)
+                .intersection(&old_collision_pointers)
+                .count(),
+            CollisionBucket::Inline(_) => 0,
+        };
+
+        let next_component = order.len() as u64;
+        let next_name = colliding_environment_name(next_component);
+        let mut preflight = MutationFacts::default();
+        let (next_len, next_weight, required_fresh_nodes) = enumeration
+            .insertion_preflight(next_name.hash(), &next_name, 1, &mut preflight)
+            .ok()?;
+        let exact_budget = CollisionBudget {
+            max_collision_entries: next_len,
+            max_expanded_weight: u64::try_from(next_weight).ok()?,
+            max_fresh_nodes: required_fresh_nodes,
+        };
+        let refusal = enumeration
+            .try_insert_with_budget(
+                next_name.clone(),
+                next_component,
+                1,
+                CollisionBudget {
+                    max_fresh_nodes: required_fresh_nodes.saturating_sub(1),
+                    ..exact_budget
+                },
+            )
+            .err()?;
+        if refusal.resource != CollisionResource::FreshNodes
+            || refusal.attempted != usize_as_u128(required_fresh_nodes)
+            || enumeration.get(&next_name).is_some()
+        {
+            return None;
+        }
+
+        let admitted = enumeration
+            .try_insert_with_budget(next_name.clone(), next_component, 1, exact_budget)
+            .ok()?;
+        let (profiled, append_facts) =
+            enumeration.insert_profiled(next_name.clone(), next_component, 1);
+        if admitted != profiled || append_facts.actual_fresh_nodes() > required_fresh_nodes {
+            return None;
+        }
+        let CollisionBucket::Tree {
+            root: appended_root,
+            ..
+        } = collision_bucket_for(&profiled, &probe)?
+        else {
+            return None;
+        };
+        let appended_pointers = collision_node_ptrs(appended_root);
+        let append_shared_collision_nodes = appended_pointers
+            .intersection(&old_collision_pointers)
+            .count();
+
+        let mut max_lookup_comparisons = 0usize;
+        for component in [0, order.len() / 2, order.len().saturating_sub(1)] {
+            let key = colliding_environment_name(component as u64);
+            let (value, comparisons) = collision_lookup_comparisons(&enumeration, &key);
+            if value != Some(&(component as u64)) {
+                return None;
+            }
+            max_lookup_comparisons = max_lookup_comparisons.max(comparisons);
+        }
+        let missing = colliding_environment_name(next_component.saturating_add(17));
+        let (missing_value, missing_comparisons) =
+            collision_lookup_comparisons(&enumeration, &missing);
+        if missing_value.is_some() {
+            return None;
+        }
+        max_lookup_comparisons = max_lookup_comparisons.max(missing_comparisons);
+
+        let recovery = environment.add_decl(collision_axiom(next_name)).ok()?;
+        let result = CollisionResourceScheduleEvidence {
+            insertion_order: order.to_vec(),
+            enumeration: numeric_leaf_order(&enumeration)?,
+            environment_entries: environment.len(),
+            environment_root: environment.logical_root(&KVMap::new()),
+            recovery_root: recovery.logical_root(&KVMap::new()),
+            representation_tier: "persistent-avl",
+            comparisons: totals.comparisons,
+            fresh_map_nodes: totals.fresh_map_nodes,
+            fresh_collision_nodes: totals.fresh_collision_nodes,
+            cloned_inline_entries: totals.cloned_inline_entries,
+            collision_nodes,
+            snapshot_shared_map_root,
+            snapshot_root_arc_bumps,
+            snapshot_shared_collision_nodes,
+            append_shared_collision_nodes,
+            append_fresh_nodes: append_facts.actual_fresh_nodes(),
+            max_lookup_comparisons,
+            required_fresh_nodes,
+            refusal_resource: refusal.resource,
+            refusal_attempted: refusal.attempted,
+        };
+        drop(snapshot);
+        Some(result)
+    }
+
+    fn concurrent_collision_resource_evidence(
+        cardinality: usize,
+        threads: usize,
+    ) -> Vec<CollisionResourceScheduleEvidence> {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        let insertion_order =
+                            partitioned_insertion_order(cardinality, threads, worker);
+                        build_collision_resource_schedule(&insertion_order)
+                    })
+                })
+                .collect();
+            let mut evidence = Vec::with_capacity(threads);
+            for handle in handles {
+                if let Ok(Some(row)) = handle.join() {
+                    evidence.push(row);
+                }
+            }
+            evidence
+        })
+    }
+
+    fn json_usize_array(values: &[usize]) -> String {
+        let body = values
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{body}]")
+    }
+
+    fn json_u128_array(values: &[u128]) -> String {
+        let body = values
+            .iter()
+            .map(u128::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{body}]")
+    }
+
+    #[test]
+    fn environment_collision_resource_e2e_emits_detailed_evidence() {
+        const CARDINALITY: usize = 1_000;
+        const THREAD_MATRIX: [usize; 3] = [1, 8, 32];
+        let expected_order: Vec<u64> = (0..CARDINALITY as u64).collect();
+        let expected_comparison_bound =
+            CARDINALITY.saturating_mul(2 * ceil_log2(CARDINALITY + 1) + 4);
+        let expected_inline_clone_bound = INLINE_COLLISION_MAX * (INLINE_COLLISION_MAX + 1) / 2;
+        let expected_append_sharing =
+            CARDINALITY.saturating_sub(collision_tree_fresh_node_bound(CARDINALITY + 1));
+        let started = std::time::Instant::now();
+        let mut expected_root = None;
+        let mut expected_recovery_root = None;
+        let mut expected_required_fresh_nodes = None;
+        let mut run_id = std::env::var("FLN_ENV_E2E_RUN_ID")
+            .unwrap_or_else(|_| "unit".to_string())
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            .collect::<String>();
+        if run_id.is_empty() {
+            run_id.push_str("unit");
+        }
+        let artifact_fallback =
+            std::env::var("FLN_ENV_E2E_ARTIFACT").unwrap_or_else(|_| "stdout".to_string());
+        let stdout_artifact = std::env::var("FLN_ENV_E2E_STDOUT_ARTIFACT")
+            .unwrap_or_else(|_| artifact_fallback.clone());
+        let stderr_artifact =
+            std::env::var("FLN_ENV_E2E_STDERR_ARTIFACT").unwrap_or(artifact_fallback);
+        let cache_state =
+            std::env::var("FLN_ENV_E2E_CACHE_STATE").unwrap_or_else(|_| "uncontrolled".to_string());
+        let argv = std::env::var("FLN_ENV_E2E_ARGV").unwrap_or_else(|_| {
+            "cargo test -p fln-env pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence -- --exact --nocapture".to_string()
+        });
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let mut input_bytes = Vec::with_capacity(CARDINALITY * std::mem::size_of::<u64>());
+        for component in &expected_order {
+            input_bytes.extend_from_slice(&component.to_le_bytes());
+        }
+        let canonical_input_root = hash(Domain::Fixture, &input_bytes);
+
+        for threads in THREAD_MATRIX {
+            let schedule_started_us = started.elapsed().as_micros();
+            let schedules = concurrent_collision_resource_evidence(CARDINALITY, threads);
+            let schedule_finished_us = started.elapsed().as_micros();
+            assert_eq!(schedules.len(), threads, "threads={threads}");
+            let representative = schedules.first().expect("the matrix is non-empty");
+            let distinct_orders = schedules
+                .iter()
+                .map(|schedule| &schedule.insertion_order)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            assert_eq!(distinct_orders, threads, "threads={threads}");
+
+            for schedule in &schedules {
+                assert_eq!(schedule.enumeration, expected_order, "threads={threads}");
+                assert_eq!(schedule.environment_entries, CARDINALITY);
+                assert_eq!(schedule.representation_tier, "persistent-avl");
+                assert!(schedule.comparisons <= expected_comparison_bound);
+                assert!(schedule.cloned_inline_entries <= expected_inline_clone_bound);
+                assert_eq!(schedule.collision_nodes, CARDINALITY);
+                assert!(schedule.snapshot_shared_map_root);
+                assert_eq!(schedule.snapshot_root_arc_bumps, 1);
+                assert_eq!(schedule.snapshot_shared_collision_nodes, CARDINALITY);
+                assert!(schedule.append_shared_collision_nodes >= expected_append_sharing);
+                assert!(schedule.append_fresh_nodes <= schedule.required_fresh_nodes);
+                assert!(schedule.max_lookup_comparisons <= 2 * ceil_log2(CARDINALITY + 1) + 2);
+                assert_eq!(schedule.refusal_resource, CollisionResource::FreshNodes);
+                assert_eq!(
+                    schedule.refusal_attempted,
+                    usize_as_u128(schedule.required_fresh_nodes)
+                );
+                match expected_root {
+                    None => expected_root = Some(schedule.environment_root),
+                    Some(root) => assert_eq!(schedule.environment_root, root),
+                }
+                match expected_recovery_root {
+                    None => expected_recovery_root = Some(schedule.recovery_root),
+                    Some(root) => assert_eq!(schedule.recovery_root, root),
+                }
+                match expected_required_fresh_nodes {
+                    None => expected_required_fresh_nodes = Some(schedule.required_fresh_nodes),
+                    Some(required) => assert_eq!(schedule.required_fresh_nodes, required),
+                }
+            }
+
+            let comparison_counts: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.comparisons)
+                .collect();
+            let fresh_map_nodes: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.fresh_map_nodes)
+                .collect();
+            let fresh_collision_nodes: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.fresh_collision_nodes)
+                .collect();
+            let cloned_inline_entries: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.cloned_inline_entries)
+                .collect();
+            let snapshot_shared_nodes: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.snapshot_shared_collision_nodes)
+                .collect();
+            let snapshot_root_arc_bumps: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.snapshot_root_arc_bumps)
+                .collect();
+            let collision_node_counts: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.collision_nodes)
+                .collect();
+            let append_shared_nodes: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.append_shared_collision_nodes)
+                .collect();
+            let append_fresh_nodes: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.append_fresh_nodes)
+                .collect();
+            let lookup_comparisons: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.max_lookup_comparisons)
+                .collect();
+            let required_fresh_nodes: Vec<usize> = schedules
+                .iter()
+                .map(|schedule| schedule.required_fresh_nodes)
+                .collect();
+            let refusal_attempted: Vec<u128> = schedules
+                .iter()
+                .map(|schedule| schedule.refusal_attempted)
+                .collect();
+            let worker_roots: Vec<String> = schedules
+                .iter()
+                .map(|schedule| schedule.environment_root.to_string())
+                .collect();
+            let worker_recovery_roots: Vec<String> = schedules
+                .iter()
+                .map(|schedule| schedule.recovery_root.to_string())
+                .collect();
+            let root = expected_root.expect("at least one environment root");
+            let recovery_root =
+                expected_recovery_root.expect("at least one recovered environment root");
+            println!(
+                "{{\"schema\":\"fln.e2e.environment-collision-resource\",\"version\":1,\
+                 \"run_id\":{},\"bead\":\"fln-amv.13\",\
+                 \"claim_id\":\"fln-amv.13-resource-bounded-collisions\",\
+                 \"claim_type\":\"bounded_model\",\"invariant_id\":\"FL-INV-01\",\
+                 \"invariant_relation\":\"supports-local-pmap-slice\",\
+                 \"data_grade\":\"verified\",\"epoch\":\"lean-v4.32.0\",\
+                 \"mode\":\"sound\",\"profile\":\"e2e\",\"platform\":\"{}-{}\",\
+                 \"cache_state\":{},\"canonical_input_root\":\"fln-fixture:{canonical_input_root}\",\
+                 \"scenario\":\"collision-resource-schedule-matrix\",\
+                 \"schedule_id\":\"partitioned-{threads}\",\"status\":\"pass\",\
+                 \"cwd\":{},\"argv\":[{}],\"stdout_artifact\":{},\"stderr_artifact\":{},\
+                 \"collision_cardinality\":{CARDINALITY},\"collision_hash\":\"{:016x}\",\
+                 \"threads\":{threads},\"workers_built\":{},\"distinct_insertion_orders\":{distinct_orders},\
+                 \"representative_insertion_order\":{},\"expected_order\":{},\"actual_order\":{},\
+                 \"expected_root\":\"{root}\",\"actual_root\":\"{}\",\"worker_roots\":{},\
+                 \"expected_recovery_root\":\"{recovery_root}\",\"actual_recovery_root\":\"{}\",\
+                 \"worker_recovery_roots\":{},\"representation_tier\":\"persistent-avl\",\
+                 \"secondary_identity\":\"exact-PKey-Ord-with-Eq-consistency\",\
+                 \"secondary_hashing\":\"none\",\
+                 \"secondary_identity_collision_behavior\":\"Ord-equal-overwrites;Ord-distinct-path-copies\",\
+                 \"promotion_cardinality\":{},\"demotion_cardinality\":{},\
+                 \"comparisons\":{},\"fresh_map_nodes\":{},\"fresh_collision_nodes\":{},\
+                 \"cloned_inline_entries\":{},\"final_collision_nodes\":{},\
+                 \"snapshot_root_arc_bumps\":{},\"snapshot_shared_collision_nodes\":{},\
+                 \"append_shared_collision_nodes\":{},\"append_fresh_nodes\":{},\
+                 \"max_lookup_comparisons\":{},\
+                 \"budget\":{{\"max_collision_entries\":{},\"max_expanded_weight\":{},\
+                 \"required_fresh_nodes\":{},\"refusal_resource\":\"FreshNodes\",\
+                 \"refusal_attempted\":{},\"failure_atomic\":true,\"exact_boundary_recovery\":true}},\
+                 \"bounds\":{{\"construction_comparisons\":{expected_comparison_bound},\
+                 \"inline_cloned_entries\":{expected_inline_clone_bound},\
+                 \"append_minimum_shared_nodes\":{expected_append_sharing},\
+                 \"lookup_comparisons\":{}}},\
+                 \"resources\":{{\"expanded_weight\":{CARDINALITY},\
+                 \"environment_entries\":{CARDINALITY},\"timing_used_as_gate\":false}},\
+                 \"monotonic_start_us\":{schedule_started_us},\
+                 \"monotonic_end_us\":{schedule_finished_us},\"duration_us\":{},\
+                 \"process_exit\":0,\"first_divergence\":null,\
+                 \"cleanup_status\":\"retained_by_policy\",\
+                 \"final_state\":\"typed-refusal-followed-by-exact-bound-recovery\"}}",
+                json_string(&run_id),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                json_string(&cache_state),
+                json_string(&cwd),
+                json_string(&argv),
+                json_string(&stdout_artifact),
+                json_string(&stderr_artifact),
+                colliding_environment_name(0).hash(),
+                schedules.len(),
+                json_u64_array(&representative.insertion_order),
+                json_u64_array(&expected_order),
+                json_u64_array(&representative.enumeration),
+                representative.environment_root,
+                json_string_array(&worker_roots),
+                representative.recovery_root,
+                json_string_array(&worker_recovery_roots),
+                INLINE_COLLISION_MAX + 1,
+                INLINE_COLLISION_MAX,
+                json_usize_array(&comparison_counts),
+                json_usize_array(&fresh_map_nodes),
+                json_usize_array(&fresh_collision_nodes),
+                json_usize_array(&cloned_inline_entries),
+                json_usize_array(&collision_node_counts),
+                json_usize_array(&snapshot_root_arc_bumps),
+                json_usize_array(&snapshot_shared_nodes),
+                json_usize_array(&append_shared_nodes),
+                json_usize_array(&append_fresh_nodes),
+                json_usize_array(&lookup_comparisons),
+                CARDINALITY + 1,
+                CARDINALITY + 1,
+                json_usize_array(&required_fresh_nodes),
+                json_u128_array(&refusal_attempted),
+                2 * ceil_log2(CARDINALITY + 1) + 2,
+                schedule_finished_us - schedule_started_us,
+            );
+        }
     }
 
     #[test]

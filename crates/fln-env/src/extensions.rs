@@ -461,30 +461,105 @@ impl<'a> Iterator for JournalIter<'a> {
     }
 }
 
-/// First-occurrence projection of a raw extension journal into its semantic set.
-///
-/// A `BTreeSet<&[u8]>` makes membership exact, deterministic, and independent of
-/// hash collisions while iteration still follows the raw journal. This mirrors
-/// the pinned Reference's separation between serialized `Array α` entries and
-/// the extension-specific semantic state `σ` (`Lean/Environment.lean:1519-1620`,
-/// `Lean/EnvExtension.lean:17-59`).
-struct SemanticEntries<'a> {
-    records: JournalIter<'a>,
-    seen: BTreeSet<&'a [u8]>,
+/// Independent environment-boundary limits for exact SetUnion projection and
+/// merge. Limits cover the complete raw product, including duplicates, because
+/// every admitted raw entry remains authoritative replay evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetUnionLimits {
+    pub max_entries: usize,
+    pub max_payload_bytes: u128,
+    pub max_entry_bytes: usize,
 }
 
-impl<'a> Iterator for SemanticEntries<'a> {
-    type Item = &'a ExtensionEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for record in self.records.by_ref() {
-            let payload: &'a [u8] = record.entry.payload.as_ref();
-            if self.seen.insert(payload) {
-                return Some(&record.entry);
-            }
+impl SetUnionLimits {
+    pub const fn new(max_entries: usize, max_payload_bytes: u128, max_entry_bytes: usize) -> Self {
+        SetUnionLimits {
+            max_entries,
+            max_payload_bytes,
+            max_entry_bytes,
         }
-        None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetUnionResource {
+    Entries,
+    PayloadBytes,
+    EntryBytes,
+}
+
+/// Deterministic accounting for one SetUnion projection attempt.
+///
+/// Count and cumulative-byte limits are checked from cached journal facts in
+/// O(1), so their refusal consumes no entries. Once those limits admit the raw
+/// product, merge performs one length-only O(n) preflight before any payload
+/// comparison, at most one O(n) lexicographic suffix comparison, and an exact
+/// projection using `BTreeSet<&[u8]>`: O(n log u) exact-byte comparisons and
+/// O(u) borrowed keys for `n` raw entries and `u` first occurrences, with no
+/// payload-byte copies. `examined_*` records the logical raw-product extent of
+/// the terminal preflight or projection, not repeated iterator visits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetUnionFacts {
+    pub limits: SetUnionLimits,
+    pub raw_entries: usize,
+    pub raw_payload_bytes: u128,
+    pub examined_entries: usize,
+    pub examined_payload_bytes: u128,
+    pub maximum_entry_bytes: usize,
+    pub semantic_entries: usize,
+    pub duplicate_entries: usize,
+}
+
+impl SetUnionFacts {
+    fn new(limits: SetUnionLimits, raw_entries: usize, raw_payload_bytes: u128) -> Self {
+        SetUnionFacts {
+            limits,
+            raw_entries,
+            raw_payload_bytes,
+            examined_entries: 0,
+            examined_payload_bytes: 0,
+            maximum_entry_bytes: 0,
+            semantic_entries: 0,
+            duplicate_entries: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetUnionInconclusive {
+    pub extension: Name,
+    pub resource: SetUnionResource,
+    pub limit: u128,
+    pub actual: u128,
+}
+
+/// A bounded semantic projection. An inconclusive result exposes accounting but
+/// never exposes the partially built semantic view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetUnionProjection<'a> {
+    Complete {
+        entries: Vec<&'a ExtensionEntry>,
+        facts: SetUnionFacts,
+    },
+    Inconclusive {
+        reason: SetUnionInconclusive,
+        facts: SetUnionFacts,
+    },
+}
+
+/// The merge result keeps resource exhaustion structurally distinct from both a
+/// semantic conflict and a completed product (FL-INV-07). The inconclusive
+/// variant contains no state, so a partial journal/root cannot be published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionMergeOutcome {
+    Complete {
+        state: ExtensionState,
+        set_union_facts: Option<SetUnionFacts>,
+    },
+    Inconclusive {
+        reason: SetUnionInconclusive,
+        facts: SetUnionFacts,
+    },
 }
 
 /// The only checkpoint schema version this build accepts. Unknown versions are a
@@ -822,18 +897,17 @@ impl ExtensionState {
 
     /// Exact-byte semantic set projection in first raw-occurrence order.
     ///
-    /// Only [`MergeSemantics::SetUnion`] assigns semantic meaning to this view;
-    /// callers may still inspect it for the other contracts. [`Self::entries`]
-    /// remains the authoritative lossless replay journal.
-    pub fn semantic_entries(&self) -> impl Iterator<Item = &ExtensionEntry> {
-        SemanticEntries {
-            records: self.journal.records(),
-            seen: BTreeSet::new(),
-        }
-    }
-
-    pub fn semantic_len(&self) -> usize {
-        self.semantic_entries().count()
+    /// Only [`MergeSemantics::SetUnion`] assigns semantic meaning to this view.
+    /// The raw journal remains authoritative, and the view becomes observable
+    /// only after all independent limits admit the complete projection.
+    pub fn semantic_projection(&self, limits: SetUnionLimits) -> SetUnionProjection<'_> {
+        project_set_union_entries(
+            &self.descriptor.name,
+            self.journal.records().map(|record| &record.entry),
+            self.len(),
+            self.journal.payload_bytes,
+            limits,
+        )
     }
 
     /// Stable semantic identity for the extension contract and its exact ordered
@@ -1070,7 +1144,8 @@ impl ExtensionState {
         base: &ExtensionState,
         ours: &ExtensionState,
         theirs: &ExtensionState,
-    ) -> Result<ExtensionState, MergeConflict> {
+        set_union_limits: SetUnionLimits,
+    ) -> Result<ExtensionMergeOutcome, MergeConflict> {
         if base.descriptor != ours.descriptor || base.descriptor != theirs.descriptor {
             return Err(MergeConflict::DescriptorMismatch {
                 base: base.descriptor.clone(),
@@ -1104,15 +1179,52 @@ impl ExtensionState {
                 for entry in theirs.entries().skip(base.len()) {
                     merged = merged.push_entry(Arc::clone(&entry.payload));
                 }
-                Ok(merged)
+                Ok(ExtensionMergeOutcome::Complete {
+                    state: merged,
+                    set_union_facts: None,
+                })
             }
             MergeSemantics::SetUnion => {
+                let raw_entries = ours.len() + (theirs.len() - base.len());
+                let raw_payload_bytes = ours.journal.payload_bytes
+                    + (theirs.journal.payload_bytes - base.journal.payload_bytes);
+                let initial_facts =
+                    SetUnionFacts::new(set_union_limits, raw_entries, raw_payload_bytes);
+                if let Some((reason, facts)) =
+                    set_union_cached_limit_refusal(&base.descriptor.name, initial_facts)
+                {
+                    return Ok(ExtensionMergeOutcome::Inconclusive { reason, facts });
+                }
+                if let Some((reason, facts)) = set_union_entry_limit_refusal(
+                    &base.descriptor.name,
+                    ours.entries().chain(theirs.entries().skip(base.len())),
+                    initial_facts,
+                ) {
+                    return Ok(ExtensionMergeOutcome::Inconclusive { reason, facts });
+                }
+
                 let (first, second) = canonical_set_union_branch_order(base, ours, theirs);
+                let projection = project_set_union_entries(
+                    &base.descriptor.name,
+                    first.entries().chain(second.entries().skip(base.len())),
+                    raw_entries,
+                    raw_payload_bytes,
+                    set_union_limits,
+                );
+                let facts = match projection {
+                    SetUnionProjection::Complete { facts, .. } => facts,
+                    SetUnionProjection::Inconclusive { reason, facts } => {
+                        return Ok(ExtensionMergeOutcome::Inconclusive { reason, facts });
+                    }
+                };
                 let mut merged = first.clone();
                 for entry in second.entries().skip(base.len()) {
                     merged = append_set_union_raw_entry(&merged, entry);
                 }
-                Ok(merged)
+                Ok(ExtensionMergeOutcome::Complete {
+                    state: merged,
+                    set_union_facts: Some(facts),
+                })
             }
             MergeSemantics::ConflictsRequireReview => {
                 let ours_changed = ours.len() != base.len();
@@ -1122,12 +1234,117 @@ impl ExtensionState {
                         extension: base.descriptor.name.clone(),
                     })
                 } else if theirs_changed {
-                    Ok(theirs.clone())
+                    Ok(ExtensionMergeOutcome::Complete {
+                        state: theirs.clone(),
+                        set_union_facts: None,
+                    })
                 } else {
-                    Ok(ours.clone())
+                    Ok(ExtensionMergeOutcome::Complete {
+                        state: ours.clone(),
+                        set_union_facts: None,
+                    })
                 }
             }
         }
+    }
+}
+
+fn set_union_cached_limit_refusal(
+    extension: &Name,
+    facts: SetUnionFacts,
+) -> Option<(SetUnionInconclusive, SetUnionFacts)> {
+    if facts.raw_entries > facts.limits.max_entries {
+        return Some((
+            SetUnionInconclusive {
+                extension: extension.clone(),
+                resource: SetUnionResource::Entries,
+                limit: facts.limits.max_entries as u128,
+                actual: facts.raw_entries as u128,
+            },
+            facts,
+        ));
+    }
+    if facts.raw_payload_bytes > facts.limits.max_payload_bytes {
+        return Some((
+            SetUnionInconclusive {
+                extension: extension.clone(),
+                resource: SetUnionResource::PayloadBytes,
+                limit: facts.limits.max_payload_bytes,
+                actual: facts.raw_payload_bytes,
+            },
+            facts,
+        ));
+    }
+    None
+}
+
+fn set_union_entry_limit_refusal<'a>(
+    extension: &Name,
+    entries: impl Iterator<Item = &'a ExtensionEntry>,
+    mut facts: SetUnionFacts,
+) -> Option<(SetUnionInconclusive, SetUnionFacts)> {
+    for entry in entries {
+        let entry_bytes = entry.payload.len();
+        facts.examined_entries += 1;
+        facts.examined_payload_bytes += entry_bytes as u128;
+        facts.maximum_entry_bytes = facts.maximum_entry_bytes.max(entry_bytes);
+    }
+    if facts.maximum_entry_bytes > facts.limits.max_entry_bytes {
+        return Some((
+            SetUnionInconclusive {
+                extension: extension.clone(),
+                resource: SetUnionResource::EntryBytes,
+                limit: facts.limits.max_entry_bytes as u128,
+                actual: facts.maximum_entry_bytes as u128,
+            },
+            facts,
+        ));
+    }
+    None
+}
+
+fn project_set_union_entries<'a>(
+    extension: &Name,
+    entries: impl Iterator<Item = &'a ExtensionEntry>,
+    raw_entries: usize,
+    raw_payload_bytes: u128,
+    limits: SetUnionLimits,
+) -> SetUnionProjection<'a> {
+    let mut facts = SetUnionFacts::new(limits, raw_entries, raw_payload_bytes);
+    if let Some((reason, facts)) = set_union_cached_limit_refusal(extension, facts) {
+        return SetUnionProjection::Inconclusive { reason, facts };
+    }
+
+    let mut semantic = Vec::new();
+    let mut seen = BTreeSet::<&'a [u8]>::new();
+    for entry in entries {
+        let entry_bytes = entry.payload.len();
+        facts.examined_entries += 1;
+        facts.examined_payload_bytes += entry_bytes as u128;
+        facts.maximum_entry_bytes = facts.maximum_entry_bytes.max(entry_bytes);
+        if entry_bytes > limits.max_entry_bytes {
+            return SetUnionProjection::Inconclusive {
+                reason: SetUnionInconclusive {
+                    extension: extension.clone(),
+                    resource: SetUnionResource::EntryBytes,
+                    limit: limits.max_entry_bytes as u128,
+                    actual: entry_bytes as u128,
+                },
+                facts,
+            };
+        }
+        if seen.insert(entry.payload.as_ref()) {
+            semantic.push(entry);
+            facts.semantic_entries += 1;
+        } else {
+            facts.duplicate_entries += 1;
+        }
+    }
+    debug_assert_eq!(facts.examined_entries, raw_entries);
+    debug_assert_eq!(facts.examined_payload_bytes, raw_payload_bytes);
+    SetUnionProjection::Complete {
+        entries: semantic,
+        facts,
     }
 }
 
@@ -1297,6 +1514,20 @@ mod tests {
         Arc::from(v.to_vec().into_boxed_slice())
     }
 
+    fn merge_with_test_limits(
+        base: &ExtensionState,
+        ours: &ExtensionState,
+        theirs: &ExtensionState,
+    ) -> Result<ExtensionState, MergeConflict> {
+        Ok(
+            match ExtensionState::merge(base, ours, theirs, TEST_SET_UNION_LIMITS)? {
+                ExtensionMergeOutcome::Complete { state, .. } => Some(state),
+                ExtensionMergeOutcome::Inconclusive { .. } => None,
+            }
+            .expect("generous test limits must not be exhausted"),
+        )
+    }
+
     fn raw_payloads(state: &ExtensionState) -> Vec<Vec<u8>> {
         state
             .entries()
@@ -1305,10 +1536,22 @@ mod tests {
     }
 
     fn semantic_payloads(state: &ExtensionState) -> Vec<Vec<u8>> {
-        state
-            .semantic_entries()
-            .map(|entry| entry.payload.to_vec())
-            .collect()
+        match state.semantic_projection(TEST_SET_UNION_LIMITS) {
+            SetUnionProjection::Complete { entries, .. } => Some(entries),
+            SetUnionProjection::Inconclusive { .. } => None,
+        }
+        .expect("generous test limits must not be exhausted")
+        .into_iter()
+        .map(|entry| entry.payload.to_vec())
+        .collect()
+    }
+
+    fn semantic_len(state: &ExtensionState) -> usize {
+        match state.semantic_projection(TEST_SET_UNION_LIMITS) {
+            SetUnionProjection::Complete { entries, .. } => Some(entries.len()),
+            SetUnionProjection::Inconclusive { .. } => None,
+        }
+        .expect("generous test limits must not be exhausted")
     }
 
     fn stable_unique_model(raw: &[Vec<u8>]) -> Vec<Vec<u8>> {
@@ -1364,6 +1607,8 @@ mod tests {
     }
 
     const TEST_LIMITS: CheckpointLimits = CheckpointLimits::new(200_000, u128::MAX);
+    const TEST_SET_UNION_LIMITS: SetUnionLimits =
+        SetUnionLimits::new(200_000, u128::MAX, usize::MAX);
 
     fn evidence_order_hash<'a>(payloads: impl IntoIterator<Item = &'a [u8]>) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -1590,7 +1835,7 @@ mod tests {
                 MergeSemantics::AppendOrdered => {
                     let mut expected = ours_model;
                     expected.extend_from_slice(&theirs_model[base_len..]);
-                    let merged = ExtensionState::merge(&base, &ours, &theirs)
+                    let merged = merge_with_test_limits(&base, &ours, &theirs)
                         .expect("append-ordered generated merge succeeds");
                     assert_eq!(
                         merged
@@ -1607,9 +1852,9 @@ mod tests {
                         &ours_model[base_len..],
                         &theirs_model[base_len..],
                     );
-                    let merged = ExtensionState::merge(&base, &ours, &theirs)
+                    let merged = merge_with_test_limits(&base, &ours, &theirs)
                         .expect("set-union generated merge succeeds");
-                    let reversed = ExtensionState::merge(&base, &theirs, &ours)
+                    let reversed = merge_with_test_limits(&base, &theirs, &ours)
                         .expect("reversed set-union generated merge succeeds");
                     assert_eq!(
                         raw_payloads(&merged),
@@ -1634,7 +1879,7 @@ mod tests {
                 }
                 MergeSemantics::ConflictsRequireReview if ours_len > 0 && theirs_len > 0 => {
                     assert!(matches!(
-                        ExtensionState::merge(&base, &ours, &theirs),
+                        merge_with_test_limits(&base, &ours, &theirs),
                         Err(MergeConflict::ConcurrentChanges { .. })
                     ));
                 }
@@ -1644,7 +1889,7 @@ mod tests {
                     } else {
                         ours_model
                     };
-                    let merged = ExtensionState::merge(&base, &ours, &theirs)
+                    let merged = merge_with_test_limits(&base, &ours, &theirs)
                         .expect("one-sided generated review merge succeeds");
                     assert_eq!(
                         merged
@@ -1701,7 +1946,7 @@ mod tests {
         .push_entry(bytes(b"base"));
         let ours = base.push_entry(bytes(b"ours"));
         let theirs = base.push_entry(bytes(b"theirs"));
-        let merged = ExtensionState::merge(&base, &ours, &theirs).expect("append-ordered merges");
+        let merged = merge_with_test_limits(&base, &ours, &theirs).expect("append-ordered merges");
         let seen: Vec<&[u8]> = merged.entries().map(|e| &*e.payload).collect();
         assert_eq!(seen, vec![b"base".as_slice(), b"ours", b"theirs"]);
     }
@@ -1779,8 +2024,8 @@ mod tests {
             let theirs = append_all(base.clone(), &case.theirs);
             let base_before = raw_payloads(&base);
 
-            let merged = ExtensionState::merge(&base, &ours, &theirs).expect(case.name);
-            let reversed = ExtensionState::merge(&base, &theirs, &ours).expect(case.name);
+            let merged = merge_with_test_limits(&base, &ours, &theirs).expect(case.name);
+            let reversed = merge_with_test_limits(&base, &theirs, &ours).expect(case.name);
             let expected_raw = case
                 .expected_raw
                 .iter()
@@ -1801,7 +2046,7 @@ mod tests {
                 case.name
             );
             assert_eq!(
-                merged.semantic_len(),
+                semantic_len(&merged),
                 expected_semantic.len(),
                 "{}",
                 case.name
@@ -1848,7 +2093,7 @@ mod tests {
         .push_entry(bytes(b"base"));
         let ours = base.push_entry(bytes(b"x"));
         let theirs = base.push_entry(bytes(b"x")).push_entry(bytes(b"y"));
-        let actual = ExtensionState::merge(&base, &ours, &theirs).expect("set union merges");
+        let actual = merge_with_test_limits(&base, &ours, &theirs).expect("set union merges");
         let mut legacy_one_sided = raw_payloads(&ours);
         for payload in raw_payloads(&theirs).into_iter().skip(base.len()) {
             if !legacy_one_sided.contains(&payload) {
@@ -1860,6 +2105,239 @@ mod tests {
             legacy_one_sided,
             "the historical one-sided dedup mutant must lose the proof"
         );
+    }
+
+    #[test]
+    fn set_union_limits_are_independent_atomic_and_recoverable() {
+        fn set_state(payloads: &[&[u8]]) -> ExtensionState {
+            let mut state = ExtensionState::new(descriptor(
+                MergeSemantics::SetUnion,
+                PayloadProvenance::Understood,
+            ));
+            for payload in payloads {
+                state = state.push_entry(bytes(payload));
+            }
+            state
+        }
+
+        fn complete(
+            base: &ExtensionState,
+            ours: &ExtensionState,
+            theirs: &ExtensionState,
+            limits: SetUnionLimits,
+        ) -> (ExtensionState, SetUnionFacts) {
+            match ExtensionState::merge(base, ours, theirs, limits)
+                .expect("valid SetUnion histories do not conflict")
+            {
+                ExtensionMergeOutcome::Complete {
+                    state,
+                    set_union_facts: Some(facts),
+                } => Some((state, facts)),
+                _ => None,
+            }
+            .expect("SetUnion merge must complete")
+        }
+
+        fn inconclusive(
+            base: &ExtensionState,
+            ours: &ExtensionState,
+            theirs: &ExtensionState,
+            limits: SetUnionLimits,
+        ) -> (SetUnionInconclusive, SetUnionFacts) {
+            match ExtensionState::merge(base, ours, theirs, limits)
+                .expect("valid SetUnion histories do not conflict")
+            {
+                ExtensionMergeOutcome::Inconclusive { reason, facts } => Some((reason, facts)),
+                ExtensionMergeOutcome::Complete { .. } => None,
+            }
+            .expect("SetUnion merge must be inconclusive")
+        }
+
+        let empty = set_state(&[]);
+        let (empty_product, empty_facts) =
+            complete(&empty, &empty, &empty, SetUnionLimits::new(0, 0, 0));
+        assert!(empty_product.is_empty());
+        assert_eq!(empty_facts.raw_entries, 0);
+        assert_eq!(empty_facts.raw_payload_bytes, 0);
+        assert_eq!(empty_facts.examined_entries, 0);
+
+        let one_empty = empty.push_entry(bytes(b""));
+        let (one_empty_product, one_empty_facts) =
+            complete(&empty, &one_empty, &empty, SetUnionLimits::new(1, 0, 0));
+        assert_eq!(raw_payloads(&one_empty_product), vec![Vec::<u8>::new()]);
+        assert_eq!(one_empty_facts.semantic_entries, 1);
+        assert_eq!(one_empty_facts.maximum_entry_bytes, 0);
+
+        let (entry_reason, entry_facts) =
+            inconclusive(&empty, &one_empty, &empty, SetUnionLimits::new(0, 0, 0));
+        assert_eq!(entry_reason.resource, SetUnionResource::Entries);
+        assert_eq!((entry_reason.limit, entry_reason.actual), (0, 1));
+        assert_eq!(entry_facts.examined_entries, 0);
+        assert_eq!(entry_facts.examined_payload_bytes, 0);
+
+        let two_bytes = empty.push_entry(bytes(b"ab"));
+        let (_, exact_payload_facts) =
+            complete(&empty, &two_bytes, &empty, SetUnionLimits::new(1, 2, 2));
+        assert_eq!(exact_payload_facts.raw_payload_bytes, 2);
+        let (payload_reason, payload_facts) =
+            inconclusive(&empty, &two_bytes, &empty, SetUnionLimits::new(1, 1, 2));
+        assert_eq!(payload_reason.resource, SetUnionResource::PayloadBytes);
+        assert_eq!((payload_reason.limit, payload_reason.actual), (1, 2));
+        assert_eq!(payload_facts.examined_entries, 0);
+
+        let input_digests = (
+            empty.content_digest(),
+            two_bytes.content_digest(),
+            empty.content_digest(),
+        );
+        let (entry_bytes_reason, entry_bytes_facts) =
+            inconclusive(&empty, &two_bytes, &empty, SetUnionLimits::new(1, 2, 1));
+        assert_eq!(entry_bytes_reason.resource, SetUnionResource::EntryBytes);
+        assert_eq!(
+            (entry_bytes_reason.limit, entry_bytes_reason.actual),
+            (1, 2)
+        );
+        assert_eq!(entry_bytes_facts.examined_entries, 1);
+        assert_eq!(entry_bytes_facts.examined_payload_bytes, 2);
+        assert_eq!(entry_bytes_facts.maximum_entry_bytes, 2);
+        assert_eq!(
+            (
+                empty.content_digest(),
+                two_bytes.content_digest(),
+                empty.content_digest(),
+            ),
+            input_digests,
+            "inconclusive merge publishes no mutation or partial root"
+        );
+        let (recovered, recovered_facts) =
+            complete(&empty, &two_bytes, &empty, SetUnionLimits::new(1, 2, 2));
+        assert_eq!(raw_payloads(&recovered), vec![b"ab".to_vec()]);
+        assert_eq!(recovered_facts.examined_entries, 1);
+
+        let unequal_oversize_ours = empty.push_entry(bytes(b"xx"));
+        let unequal_oversize_theirs = empty.push_entry(bytes(b"yyyy"));
+        let unequal_oversize_limits = SetUnionLimits::new(2, 6, 1);
+        let unequal_oversize_forward = inconclusive(
+            &empty,
+            &unequal_oversize_ours,
+            &unequal_oversize_theirs,
+            unequal_oversize_limits,
+        );
+        let unequal_oversize_reverse = inconclusive(
+            &empty,
+            &unequal_oversize_theirs,
+            &unequal_oversize_ours,
+            unequal_oversize_limits,
+        );
+        assert_eq!(unequal_oversize_forward, unequal_oversize_reverse);
+        assert_eq!(unequal_oversize_forward.0.actual, 4);
+        assert_eq!(unequal_oversize_forward.1.examined_entries, 2);
+        assert_eq!(unequal_oversize_forward.1.examined_payload_bytes, 6);
+        assert_eq!(unequal_oversize_forward.1.maximum_entry_bytes, 4);
+
+        let duplicate_base = set_state(&[b"d", b"d"]);
+        let duplicate_ours = duplicate_base.push_entry(bytes(b"d"));
+        let duplicate_theirs = duplicate_base.push_entry(bytes(b"d"));
+        let duplicate_limits = SetUnionLimits::new(4, 4, 1);
+        let (duplicate_forward, duplicate_forward_facts) = complete(
+            &duplicate_base,
+            &duplicate_ours,
+            &duplicate_theirs,
+            duplicate_limits,
+        );
+        let (duplicate_reverse, duplicate_reverse_facts) = complete(
+            &duplicate_base,
+            &duplicate_theirs,
+            &duplicate_ours,
+            duplicate_limits,
+        );
+        assert_eq!(duplicate_forward, duplicate_reverse);
+        assert_eq!(duplicate_forward_facts, duplicate_reverse_facts);
+        assert_eq!(duplicate_forward_facts.semantic_entries, 1);
+        assert_eq!(duplicate_forward_facts.duplicate_entries, 3);
+
+        let unique_base = set_state(&[b"a"]);
+        let unique_ours = unique_base.push_entry(bytes(b"b"));
+        let unique_theirs = unique_base.push_entry(bytes(b"c"));
+        let unique_limits = SetUnionLimits::new(3, 3, 1);
+        let (unique_forward, unique_forward_facts) =
+            complete(&unique_base, &unique_ours, &unique_theirs, unique_limits);
+        let (unique_reverse, unique_reverse_facts) =
+            complete(&unique_base, &unique_theirs, &unique_ours, unique_limits);
+        assert_eq!(unique_forward, unique_reverse);
+        assert_eq!(unique_forward_facts, unique_reverse_facts);
+        assert_eq!(unique_forward_facts.semantic_entries, 3);
+        assert_eq!(unique_forward_facts.duplicate_entries, 0);
+
+        match two_bytes.semantic_projection(SetUnionLimits::new(1, 1, 2)) {
+            SetUnionProjection::Inconclusive { reason, facts } => {
+                assert_eq!(reason.resource, SetUnionResource::PayloadBytes);
+                assert_eq!(facts.examined_entries, 0);
+            }
+            other => assert!(
+                matches!(other, SetUnionProjection::Inconclusive { .. }),
+                "over-budget projection must be inconclusive"
+            ),
+        }
+        match two_bytes.semantic_projection(SetUnionLimits::new(1, 2, 2)) {
+            SetUnionProjection::Complete { entries, facts } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(facts.examined_payload_bytes, 2);
+            }
+            other => assert!(
+                matches!(other, SetUnionProjection::Complete { .. }),
+                "exact-limit projection must complete"
+            ),
+        }
+    }
+
+    #[test]
+    fn set_union_exact_byte_cost_model_matches_declared_large_fixtures() {
+        const LARGE_FIXTURE_ENTRIES: usize = 16_384;
+        const DUPLICATE_KEYS: usize = 257;
+        const PAYLOAD_BYTES: usize = 8;
+
+        for (fixture, key_count) in [
+            ("duplicate-heavy", DUPLICATE_KEYS),
+            ("unique-heavy", LARGE_FIXTURE_ENTRIES),
+        ] {
+            let mut state = ExtensionState::new(descriptor(
+                MergeSemantics::SetUnion,
+                PayloadProvenance::Understood,
+            ));
+            for index in 0..LARGE_FIXTURE_ENTRIES {
+                let key = (index % key_count) as u64;
+                state = state.push_entry(bytes(&key.to_le_bytes()));
+            }
+            let limits = SetUnionLimits::new(
+                LARGE_FIXTURE_ENTRIES,
+                (LARGE_FIXTURE_ENTRIES * PAYLOAD_BYTES) as u128,
+                PAYLOAD_BYTES,
+            );
+            let (entries, facts) = match state.semantic_projection(limits) {
+                SetUnionProjection::Complete { entries, facts } => Some((entries, facts)),
+                SetUnionProjection::Inconclusive { .. } => None,
+            }
+            .expect("declared large fixture must fit its exact limits");
+            assert_eq!(facts.raw_entries, LARGE_FIXTURE_ENTRIES);
+            assert_eq!(facts.examined_entries, LARGE_FIXTURE_ENTRIES);
+            assert_eq!(
+                facts.raw_payload_bytes,
+                (LARGE_FIXTURE_ENTRIES * PAYLOAD_BYTES) as u128
+            );
+            assert_eq!(facts.examined_payload_bytes, facts.raw_payload_bytes);
+            assert_eq!(facts.maximum_entry_bytes, PAYLOAD_BYTES);
+            assert_eq!(facts.semantic_entries, key_count);
+            assert_eq!(facts.duplicate_entries, LARGE_FIXTURE_ENTRIES - key_count);
+            assert_eq!(entries.len(), key_count);
+            println!(
+                "{{\"schema\":\"fln.test.set-union-cost-model\",\"version\":1,\"fixture\":\"{fixture}\",\"raw_entries\":{},\"payload_bytes\":{},\"semantic_entries\":{},\"duplicate_entries\":{},\"equality\":\"exact_bytes_btree\",\"time_complexity\":\"O(n_log_u_exact_byte_comparisons)\",\"space_complexity\":\"O(u_borrowed_keys)\",\"timing_used_as_gate\":false,\"status\":\"pass\"}}",
+                facts.raw_entries,
+                facts.raw_payload_bytes,
+                facts.semantic_entries,
+                facts.duplicate_entries,
+            );
+        }
     }
 
     #[test]
@@ -1942,10 +2420,30 @@ mod tests {
             .extension(&extension_name)
             .expect("theirs state exists");
 
-        let merged = ExtensionState::merge(base_state, ours_state, theirs_state)
-            .expect("real SetUnion merge succeeds");
-        let reversed = ExtensionState::merge(base_state, theirs_state, ours_state)
-            .expect("branch-permuted SetUnion merge succeeds");
+        let e2e_limits = SetUnionLimits::new(9, 13, 4);
+        let (merged, merge_facts) =
+            match ExtensionState::merge(base_state, ours_state, theirs_state, e2e_limits)
+                .expect("real SetUnion histories do not conflict")
+            {
+                ExtensionMergeOutcome::Complete {
+                    state,
+                    set_union_facts: Some(facts),
+                } => Some((state, facts)),
+                _ => None,
+            }
+            .expect("real SetUnion merge must complete");
+        let (reversed, reversed_facts) =
+            match ExtensionState::merge(base_state, theirs_state, ours_state, e2e_limits)
+                .expect("branch-permuted SetUnion histories do not conflict")
+            {
+                ExtensionMergeOutcome::Complete {
+                    state,
+                    set_union_facts: Some(facts),
+                } => Some((state, facts)),
+                _ => None,
+            }
+            .expect("branch-permuted SetUnion merge must complete");
+        assert_eq!(merge_facts, reversed_facts);
         assert!(
             ours_suffix < theirs_suffix,
             "the independent expected model fixes this case as ours then theirs"
@@ -1980,8 +2478,14 @@ mod tests {
         assert_eq!(reversed_root, expected_root);
 
         let duplicate_entries = actual_raw.len() - actual_semantic.len();
+        let configured_max_entries = merge_facts.limits.max_entries;
+        let configured_max_payload_bytes = merge_facts.limits.max_payload_bytes;
+        let configured_max_entry_bytes = merge_facts.limits.max_entry_bytes;
+        let consumed_entries = merge_facts.examined_entries;
+        let consumed_payload_bytes = merge_facts.examined_payload_bytes;
+        let consumed_maximum_entry_bytes = merge_facts.maximum_entry_bytes;
         println!(
-            "{{\"schema\":\"fln.e2e.set-union\",\"version\":1,\"run_id\":\"{run_id}\",\"bead\":\"fln-amv.6\",\"scenario\":\"raw-semantic-split\",\"status\":\"pass\",\"reference_pin\":\"leanprover/lean4@8c9756b28d64dab099da31a4c09229a9e6a2ef35\",\"reference_sources\":[\"vendor/lean4-src/src/Lean/Environment.lean:1519-1620\",\"vendor/lean4-src/src/Lean/EnvExtension.lean:17-59\"],\"fixture_sources\":[\"tribunal/fixtures/c3/FINDINGS.md\",\"tribunal/fixtures/c3/MANIFEST.txt\"],\"fixture_census\":{{\"modules\":2433,\"extension_entries\":832903,\"integrity_faults\":0}},\"equality_key\":\"exact_payload_bytes\",\"semantic_selection\":\"stable_first_occurrence\",\"raw_branch_order\":\"canonical_lexicographic_suffix\",\"case_branch_order\":\"ours_then_theirs\",\"base_raw\":{},\"ours_suffix\":{},\"theirs_suffix\":{},\"expected_raw\":{},\"actual_raw\":{},\"expected_semantic\":{},\"actual_semantic\":{},\"raw_entry_count\":{},\"semantic_entry_count\":{},\"duplicate_entries_replayed\":{duplicate_entries},\"expected_digest\":\"{}\",\"actual_digest\":\"{}\",\"expected_root\":\"{expected_root}\",\"actual_root\":\"{actual_root}\",\"final_state\":\"verified\"}}",
+            "{{\"schema\":\"fln.e2e.set-union\",\"version\":1,\"run_id\":\"{run_id}\",\"bead\":\"fln-amv.6\",\"scenario\":\"raw-semantic-split\",\"status\":\"pass\",\"reference_pin\":\"leanprover/lean4@8c9756b28d64dab099da31a4c09229a9e6a2ef35\",\"reference_sources\":[\"vendor/lean4-src/src/Lean/Environment.lean:1519-1620\",\"vendor/lean4-src/src/Lean/EnvExtension.lean:17-59\"],\"fixture_sources\":[\"tribunal/fixtures/c3/FINDINGS.md\",\"tribunal/fixtures/c3/MANIFEST.txt\"],\"fixture_census\":{{\"modules\":2433,\"extension_entries\":832903,\"integrity_faults\":0}},\"equality_key\":\"exact_payload_bytes\",\"semantic_selection\":\"stable_first_occurrence\",\"raw_branch_order\":\"canonical_lexicographic_suffix\",\"case_branch_order\":\"ours_then_theirs\",\"configured_resources\":{{\"max_entries\":{configured_max_entries},\"max_payload_bytes\":{configured_max_payload_bytes},\"max_entry_bytes\":{configured_max_entry_bytes}}},\"consumed_resources\":{{\"entries\":{consumed_entries},\"payload_bytes\":{consumed_payload_bytes},\"maximum_entry_bytes\":{consumed_maximum_entry_bytes}}},\"base_raw\":{},\"ours_suffix\":{},\"theirs_suffix\":{},\"expected_raw\":{},\"actual_raw\":{},\"expected_semantic\":{},\"actual_semantic\":{},\"raw_entry_count\":{},\"semantic_entry_count\":{},\"duplicate_entries_replayed\":{duplicate_entries},\"expected_digest\":\"{}\",\"actual_digest\":\"{}\",\"expected_root\":\"{expected_root}\",\"actual_root\":\"{actual_root}\",\"terminal_outcome\":\"complete\",\"final_state\":\"verified\"}}",
             json_payloads(
                 &base_payloads
                     .iter()
@@ -2019,6 +2523,55 @@ mod tests {
             "{{\"schema\":\"fln.e2e.set-union\",\"version\":1,\"run_id\":\"{run_id}\",\"bead\":\"fln-amv.6\",\"scenario\":\"branch-permutation\",\"status\":\"pass\",\"forward_raw\":{},\"reversed_raw\":{},\"forward_order_hash\":\"{forward_order_hash:016x}\",\"reversed_order_hash\":\"{reversed_order_hash:016x}\",\"forward_root\":\"{actual_root}\",\"reversed_root\":\"{reversed_root}\",\"product_equal\":true,\"root_equal\":true,\"final_state\":\"verified\"}}",
             json_payloads(&actual_raw),
             json_payloads(&reversed_raw),
+        );
+
+        let options = KVMap::new();
+        let base_root_before_exhaustion = base.logical_root(&options);
+        let ours_root_before_exhaustion = ours.logical_root(&options);
+        let theirs_root_before_exhaustion = theirs.logical_root(&options);
+        let exhaustion_limits = SetUnionLimits::new(9, 13, 3);
+        let (exhaustion_reason, exhaustion_facts) =
+            match ExtensionState::merge(base_state, ours_state, theirs_state, exhaustion_limits)
+                .expect("resource exhaustion is not a semantic conflict")
+            {
+                ExtensionMergeOutcome::Inconclusive { reason, facts } => Some((reason, facts)),
+                ExtensionMergeOutcome::Complete { .. } => None,
+            }
+            .expect("over-limit SetUnion merge must be inconclusive");
+        assert_eq!(exhaustion_reason.resource, SetUnionResource::EntryBytes);
+        assert_eq!((exhaustion_reason.limit, exhaustion_reason.actual), (3, 4));
+        assert_eq!(base.logical_root(&options), base_root_before_exhaustion);
+        assert_eq!(ours.logical_root(&options), ours_root_before_exhaustion);
+        assert_eq!(theirs.logical_root(&options), theirs_root_before_exhaustion);
+        let recovered_after_exhaustion =
+            match ExtensionState::merge(base_state, ours_state, theirs_state, e2e_limits)
+                .expect("within-budget recovery is not a semantic conflict")
+            {
+                ExtensionMergeOutcome::Complete { state, .. } => Some(state),
+                ExtensionMergeOutcome::Inconclusive { .. } => None,
+            }
+            .expect("within-budget retry must recover");
+        assert_eq!(recovered_after_exhaustion, merged);
+        let exhausted_max_entries = exhaustion_facts.limits.max_entries;
+        let exhausted_max_payload_bytes = exhaustion_facts.limits.max_payload_bytes;
+        let exhausted_max_entry_bytes = exhaustion_facts.limits.max_entry_bytes;
+        let exhausted_entries = exhaustion_facts.examined_entries;
+        let exhausted_payload_bytes = exhaustion_facts.examined_payload_bytes;
+        let exhausted_maximum_entry_bytes = exhaustion_facts.maximum_entry_bytes;
+        println!(
+            "{{\"schema\":\"fln.e2e.set-union\",\"version\":1,\"run_id\":\"{run_id}\",\"bead\":\"fln-amv.6\",\"scenario\":\"resource-exhaustion-clean-recovery\",\"status\":\"pass\",\"configured_resources\":{{\"max_entries\":{exhausted_max_entries},\"max_payload_bytes\":{exhausted_max_payload_bytes},\"max_entry_bytes\":{exhausted_max_entry_bytes}}},\"consumed_resources\":{{\"entries\":{exhausted_entries},\"payload_bytes\":{exhausted_payload_bytes},\"maximum_entry_bytes\":{exhausted_maximum_entry_bytes}}},\"raw_entry_count\":{},\"raw_payload_bytes\":{},\"partial_semantic_count\":{},\"partial_duplicate_decisions\":{},\"expected_outcome\":\"inconclusive\",\"actual_outcome\":\"inconclusive\",\"resource\":\"entry_bytes\",\"limit\":{},\"actual\":{},\"partial_product_published\":false,\"base_root_before\":\"{base_root_before_exhaustion}\",\"base_root_after\":\"{}\",\"ours_root_before\":\"{ours_root_before_exhaustion}\",\"ours_root_after\":\"{}\",\"theirs_root_before\":\"{theirs_root_before_exhaustion}\",\"theirs_root_after\":\"{}\",\"recovered_raw\":{},\"recovered_semantic\":{},\"recovered_root\":\"{actual_root}\",\"recovered_duplicate_decisions\":{},\"cleanup\":\"inputs_unchanged\",\"recovery_state\":\"within_budget_retry_complete\",\"terminal_outcome\":\"clean_recovery\",\"final_state\":\"clean_recovery\"}}",
+            exhaustion_facts.raw_entries,
+            exhaustion_facts.raw_payload_bytes,
+            exhaustion_facts.semantic_entries,
+            exhaustion_facts.duplicate_entries,
+            exhaustion_reason.limit,
+            exhaustion_reason.actual,
+            base.logical_root(&options),
+            ours.logical_root(&options),
+            theirs.logical_root(&options),
+            json_payloads(&actual_raw),
+            json_payloads(&actual_semantic),
+            merge_facts.duplicate_entries,
         );
 
         let mut one_sided_dedup_mutant = raw_payloads(ours_state);
@@ -2083,7 +2636,7 @@ mod tests {
         let base_root_before = base.logical_root(&options);
         let ours_root_before = ours.logical_root(&options);
         let mismatched_root_before = mismatched.logical_root(&options);
-        let descriptor_error = ExtensionState::merge(
+        let descriptor_error = merge_with_test_limits(
             base.extension(&extension_name)
                 .expect("base extension exists"),
             mismatched
@@ -2102,7 +2655,7 @@ mod tests {
         assert_eq!(ours.logical_root(&options), ours_root_before);
         assert_eq!(mismatched.logical_root(&options), mismatched_root_before);
 
-        let descriptor_recovered = ExtensionState::merge(
+        let descriptor_recovered = merge_with_test_limits(
             base.extension(&extension_name)
                 .expect("base extension exists"),
             ours.extension(&extension_name)
@@ -2143,7 +2696,7 @@ mod tests {
         let history_ours_root_before = history_ours.logical_root(&options);
         let invalid_theirs_root_before = invalid_theirs.logical_root(&options);
         let history_error =
-            ExtensionState::merge(history_base_state, history_ours_state, invalid_theirs_state)
+            merge_with_test_limits(history_base_state, history_ours_state, invalid_theirs_state)
                 .expect_err("unrelated history must be a typed refusal");
         assert!(
             matches!(&history_error, MergeConflict::HistoryMismatch { .. }),
@@ -2178,7 +2731,7 @@ mod tests {
             invalid_theirs_root_before
         );
 
-        let history_recovered = ExtensionState::merge(
+        let history_recovered = merge_with_test_limits(
             history_base_state,
             history_ours_state,
             valid_theirs
@@ -2214,7 +2767,7 @@ mod tests {
         ));
         let ours = base.push_entry(bytes(b"o"));
         let theirs = base.push_entry(bytes(b"t"));
-        let conflict = ExtensionState::merge(&base, &ours, &theirs).expect_err("both changed");
+        let conflict = merge_with_test_limits(&base, &ours, &theirs).expect_err("both changed");
         assert_eq!(
             conflict,
             MergeConflict::ConcurrentChanges {
@@ -2223,7 +2776,7 @@ mod tests {
         );
         // One-sided changes pass through unchanged.
         let one_sided =
-            ExtensionState::merge(&base, &ours, &base).expect("one-sided change is safe");
+            merge_with_test_limits(&base, &ours, &base).expect("one-sided change is safe");
         assert_eq!(one_sided.len(), 1);
     }
 
@@ -2255,7 +2808,7 @@ mod tests {
             let mismatched = ExtensionState::new(variant.clone()).push_entry(bytes(b"mismatched"));
             let before = (base.clone(), matching.clone(), mismatched.clone());
 
-            let ours_error = ExtensionState::merge(&base, &mismatched, &matching)
+            let ours_error = merge_with_test_limits(&base, &mismatched, &matching)
                 .expect_err("ours contract mismatch is refused");
             assert_eq!(
                 ours_error,
@@ -2266,7 +2819,7 @@ mod tests {
                 }
             );
 
-            let theirs_error = ExtensionState::merge(&base, &matching, &mismatched)
+            let theirs_error = merge_with_test_limits(&base, &matching, &mismatched)
                 .expect_err("theirs contract mismatch is refused");
             assert_eq!(
                 theirs_error,
@@ -2325,7 +2878,7 @@ mod tests {
         for (case, invalid, common_prefix) in invalid_histories {
             let before = (base.clone(), matching.clone(), invalid.clone());
             assert_eq!(
-                ExtensionState::merge(&base, &invalid, &matching)
+                merge_with_test_limits(&base, &invalid, &matching)
                     .expect_err("invalid ours history is refused"),
                 MergeConflict::HistoryMismatch {
                     extension: expected.name.clone(),
@@ -2338,7 +2891,7 @@ mod tests {
                 "{case}"
             );
             assert_eq!(
-                ExtensionState::merge(&base, &matching, &invalid)
+                merge_with_test_limits(&base, &matching, &invalid)
                     .expect_err("invalid theirs history is refused"),
                 MergeConflict::HistoryMismatch {
                     extension: expected.name.clone(),
@@ -2360,7 +2913,7 @@ mod tests {
         let invalid_ours = ExtensionState::new(expected.clone());
         let invalid_theirs = ExtensionState::new(expected.clone()).push_entry(bytes(b"x"));
         assert_eq!(
-            ExtensionState::merge(&base, &invalid_ours, &invalid_theirs)
+            merge_with_test_limits(&base, &invalid_ours, &invalid_theirs)
                 .expect_err("both invalid histories are refused together"),
             MergeConflict::HistoryMismatch {
                 extension: expected.name,
@@ -2792,7 +3345,7 @@ mod tests {
                     let theirs = restored.push_entry(bytes(b"same-branch-entry"));
                     match merge {
                         MergeSemantics::AppendOrdered => {
-                            let merged = ExtensionState::merge(&restored, &ours, &theirs)
+                            let merged = merge_with_test_limits(&restored, &ours, &theirs)
                                 .expect("restored append contract remains executable");
                             assert_eq!(merged.len(), restored.len() + 2);
                             assert_eq!(
@@ -2805,7 +3358,7 @@ mod tests {
                             );
                         }
                         MergeSemantics::SetUnion => {
-                            let merged = ExtensionState::merge(&restored, &ours, &theirs)
+                            let merged = merge_with_test_limits(&restored, &ours, &theirs)
                                 .expect("restored set-union contract remains executable");
                             assert_eq!(
                                 merged.len(),
@@ -2813,8 +3366,8 @@ mod tests {
                                 "raw replay retains both branch entries"
                             );
                             assert_eq!(
-                                merged.semantic_len(),
-                                restored.semantic_len() + 1,
+                                semantic_len(&merged),
+                                semantic_len(&restored) + 1,
                                 "the exact-byte semantic view collapses the duplicate"
                             );
                             assert_eq!(
@@ -2827,7 +3380,7 @@ mod tests {
                             );
                         }
                         MergeSemantics::ConflictsRequireReview => assert!(matches!(
-                            ExtensionState::merge(&restored, &ours, &theirs),
+                            merge_with_test_limits(&restored, &ours, &theirs),
                             Err(MergeConflict::ConcurrentChanges { .. })
                         )),
                     }
