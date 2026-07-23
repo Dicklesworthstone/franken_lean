@@ -1359,6 +1359,7 @@ impl<'a> Loader<'a> {
             ));
         }
         let projection_digest = projection_digest(&ids);
+        // ubs:ignore — public content-integrity digests, not authentication secrets.
         if header.projection_digest != projection_digest {
             return Err(self.failure(
                 OwnershipFailureKind::StaleBinding {
@@ -1440,6 +1441,7 @@ impl<'a> Loader<'a> {
                 self.location(input).at_line(line_number),
             ));
         }
+        // ubs:ignore — public parser delimiter, not secret data.
         if raw.bytes.last() == Some(&b'\r') {
             return Err(self.failure(
                 OwnershipFailureKind::Noncanonical {
@@ -1602,6 +1604,7 @@ impl<'a> Loader<'a> {
                     .at_record(record_number),
             ));
         }
+        // ubs:ignore — public JSON field name, not secret data.
         if root.first_key.as_ref().map(|key| key.value.as_str()) != Some("id") {
             return Err(self.failure(
                 OwnershipFailureKind::Noncanonical {
@@ -1649,7 +1652,7 @@ impl<'a> Loader<'a> {
         let canonical_prefix = bytes.starts_with(CANONICAL_ID_PREFIX)
             && bytes.get(CANONICAL_ID_PREFIX.len()..expected_prefix_len)
                 == Some(first_id.value.as_bytes())
-            && bytes.get(expected_prefix_len) == Some(&b'"');
+            && bytes.get(expected_prefix_len) == Some(&b'"'); // ubs:ignore — public parser delimiter, not secret data.
         if !canonical_prefix {
             return Err(self.failure(
                 OwnershipFailureKind::Noncanonical {
@@ -1666,6 +1669,7 @@ impl<'a> Loader<'a> {
         }
         let after_quote = expected_prefix_len + 1;
         if strict_manifest_record {
+            // ubs:ignore — public JSON syntax, not secret data.
             if bytes.get(after_quote..) != Some(&b"}"[..]) {
                 return Err(self.failure(
                     OwnershipFailureKind::Noncanonical {
@@ -1677,6 +1681,7 @@ impl<'a> Loader<'a> {
                 ));
             }
         } else if !matches!(bytes.get(after_quote), Some(b'}' | b','))
+            // ubs:ignore — public parser delimiter, not secret data.
             || bytes.last() != Some(&b'}')
         {
             return Err(self.failure(
@@ -1719,6 +1724,7 @@ pub fn load_kernel_contract_ownership(
     };
 
     if let OwnershipSourceMode::ManifestOnly(expected) = source_mode {
+        // ubs:ignore — public content-integrity digests, not authentication secrets.
         if expected.manifest_digest != binding.manifest_digest {
             return Err(loader.failure(
                 OwnershipFailureKind::StaleBinding {
@@ -1727,6 +1733,7 @@ pub fn load_kernel_contract_ownership(
                 loader.location(OwnershipInput::Manifest),
             ));
         }
+        // ubs:ignore — public content-integrity digests, not authentication secrets.
         if expected.projection_digest != binding.projection_digest {
             return Err(loader.failure(
                 OwnershipFailureKind::StaleBinding {
@@ -1871,6 +1878,7 @@ impl<'a> Iterator for PhysicalLines<'a> {
             return None;
         }
         let start = self.cursor;
+        // ubs:ignore — public parser delimiter, not secret data.
         if let Some(offset) = self.bytes[start..].iter().position(|byte| *byte == b'\n') {
             let end = start + offset;
             self.cursor = end + 1;
@@ -1986,7 +1994,7 @@ impl<'a> JsonParser<'a> {
         let mut member_index = 0_u64;
         loop {
             let key = self.parse_string(true)?.expect("captured key");
-            let is_id = key.value == "id";
+            let is_id = key.value == "id"; // ubs:ignore — public JSON field name, not secret data.
             if is_id {
                 root.id_occurrences = root.id_occurrences.saturating_add(1);
             }
@@ -2206,6 +2214,7 @@ impl<'a> JsonParser<'a> {
         let Some(end) = self.cursor.checked_add(literal.len()) else {
             return Err(self.syntax(MalformedReason::InvalidJson));
         };
+        // ubs:ignore — public JSON syntax, not secret data.
         if self.bytes.get(self.cursor..end) != Some(literal) {
             return Err(self.syntax(MalformedReason::InvalidJson));
         }
@@ -2321,15 +2330,17 @@ mod tests {
                 "fln-ownership-{}-{serial}-{label}",
                 std::process::id()
             ));
-            match fs::create_dir(&root) {
-                Ok(()) => {
-                    fs::create_dir(root.join("ci")).expect("create retained ci fixture");
-                    fs::create_dir(root.join(".beads")).expect("create retained beads fixture");
-                    return root;
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("create retained fixture root: {error}"),
+            let creation = fs::create_dir(&root);
+            if creation
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists)
+            {
+                continue;
             }
+            creation.expect("create retained fixture root");
+            fs::create_dir(root.join("ci")).expect("create retained ci fixture");
+            fs::create_dir(root.join(".beads")).expect("create retained beads fixture");
+            return root;
         }
     }
 
@@ -2928,7 +2939,7 @@ mod tests {
         let bad_hash = fixture_root("stale-hash");
         let digest = projection_digest(&ids).to_hex();
         let mut replacement = digest.clone().into_bytes();
-        replacement[0] = if replacement[0] == b'0' { b'1' } else { b'0' };
+        replacement[0] = if replacement[0] == b'0' { b'1' } else { b'0' }; // ubs:ignore — test-only public digest mutation, not secret data.
         let replacement = String::from_utf8(replacement).expect("ascii digest");
         let altered = canonical.replace(&digest, &replacement);
         write_at(&bad_hash, MANIFEST_RELATIVE_PATH, altered.as_bytes());
