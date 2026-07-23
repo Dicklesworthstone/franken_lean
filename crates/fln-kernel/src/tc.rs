@@ -729,15 +729,20 @@ impl<'a> TypeChecker<'a> {
 
     // ---- defeq (KR-300..312 subset) ----------------------------------------------------
 
-    fn is_def_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
-        self.step(depth)?; // KR-300 resource hook
+    /// KR-301/302/303 — the decisive head rules, extracted so they can re-run
+    /// on the REDUCED pair after every reduction stage (the pin re-runs its
+    /// quick check after whnf_core and inside every lazy-delta iteration; a
+    /// pair that only becomes Sort ≟ Sort or binder ≟ binder after reduction
+    /// must not fall through to rules that cannot decide it). `None` = this
+    /// pair's heads are not covered here — continue down the ladder.
+    fn quick_def_eq_rules(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<Option<bool>> {
         // KR-301 quick structural equality (data-word fast path inside Expr::eq).
         if t == s {
-            return Ok(true);
+            return Ok(Some(true));
         }
         // KR-303 sorts by level equivalence.
         if let (ExprNode::Sort { level: lt }, ExprNode::Sort { level: ls }) = (t.node(), s.node()) {
-            return Ok(lt.is_equiv(ls));
+            return Ok(Some(lt.is_equiv(ls)));
         }
         // KR-302 binder congruence.
         match (t.node(), s.node()) {
@@ -767,31 +772,44 @@ impl<'a> TypeChecker<'a> {
             ) => {
                 let (t1, b1, t2, b2) = (t1.clone(), b1.clone(), t2.clone(), b2.clone());
                 if !self.is_def_eq(&t1, &t2, depth + 1)? {
-                    return Ok(false);
+                    return Ok(Some(false));
                 }
                 let id = self.fresh_fvar(t1, None);
                 let ob1 = self.open_binder(&b1, &id, depth + 1)?;
                 let ob2 = self.open_binder(&b2, &id, depth + 1)?;
                 let result = self.is_def_eq(&ob1, &ob2, depth + 1);
                 self.drop_local();
-                return result;
+                Ok(Some(result?))
             }
-            _ => {}
+            _ => Ok(None),
         }
-        // KR-305: normalize both sides without delta.
+    }
+
+    fn is_def_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
+        self.step(depth)?; // KR-300 resource hook
+        if let Some(decided) = self.quick_def_eq_rules(t, s, depth)? {
+            return Ok(decided);
+        }
+        // KR-305: normalize both sides without delta, then RE-RUN the head
+        // rules on the reduced pair (beta/zeta/iota can expose Sort or binder
+        // heads whose levels are equivalent but not structurally equal).
         let tn = self.whnf_core(t, depth + 1)?;
         let sn = self.whnf_core(s, depth + 1)?;
-        if (tn != *t || sn != *s) && tn == sn {
-            return Ok(true);
+        if (tn != *t || sn != *s)
+            && let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)?
+        {
+            return Ok(decided);
         }
         // KR-306 definitional proof irrelevance in Prop.
         if self.proof_irrel_eq(&tn, &sn, depth + 1)? {
             return Ok(true);
         }
-        // KR-307/309 lazy delta by definitional height.
+        // KR-307/309 lazy delta by definitional height, then the head rules
+        // once more — delta is exactly how an abbrev (`outParam`, `ReaderT`,
+        // `Not`) exposes its Sort or Π structure.
         let (tn, sn) = self.lazy_delta(tn, sn, depth + 1)?;
-        if tn == sn {
-            return Ok(true);
+        if let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)? {
+            return Ok(decided);
         }
         // KR-310: same-name constants with equivalent levels.
         if let (
@@ -1011,7 +1029,15 @@ impl<'a> TypeChecker<'a> {
                 let (binder_type, body) = (binder_type.clone(), body.clone());
                 let a_type = self.infer_core(&a, depth + 1)?;
                 if !self.is_def_eq(&a_type, &binder_type, depth + 1)? {
-                    return reject(RejectClass::TypeMismatch, "application type mismatch");
+                    return reject(
+                        RejectClass::TypeMismatch,
+                        format!(
+                            "application type mismatch: argument `{}` has type `{}` but the function expects `{}`",
+                            brief_expr(&a, 4),
+                            brief_expr(&a_type, 5),
+                            brief_expr(&binder_type, 5)
+                        ),
+                    );
                 }
                 self.instantiate(&body, 0, &a, depth + 1)
             }
@@ -1452,6 +1478,89 @@ impl<'a> TypeChecker<'a> {
             );
         }
         Ok(result)
+    }
+}
+
+/// Bounded level rendering for rejection messages.
+fn brief_level(level: &Level, fuel: usize) -> String {
+    use fln_core::level::LevelView;
+    if fuel == 0 {
+        return "..".to_string();
+    }
+    match level.view() {
+        LevelView::Zero => "0".to_string(),
+        LevelView::Param(name) => name.to_display_string(),
+        LevelView::MVar(_) => "mvar".to_string(),
+        LevelView::Succ(inner) => format!("{}+1", brief_level(inner, fuel - 1)),
+        LevelView::Max(a, b) => format!(
+            "max({},{})",
+            brief_level(a, fuel - 1),
+            brief_level(b, fuel - 1)
+        ),
+        LevelView::IMax(a, b) => format!(
+            "imax({},{})",
+            brief_level(a, fuel - 1),
+            brief_level(b, fuel - 1)
+        ),
+    }
+}
+
+/// Crate-facing bounded rendering (lib.rs admission messages).
+pub(crate) fn brief_public(e: &Expr) -> String {
+    brief_expr(e, 5)
+}
+
+/// Bounded, allocation-light term rendering for rejection MESSAGES only —
+/// never part of a judgment. Fuel caps both depth and total size so adversarial
+/// terms cannot blow up diagnostics (FL-INV-07 discipline extends to logs).
+fn brief_expr(e: &Expr, fuel: usize) -> String {
+    if fuel == 0 {
+        return "..".to_string();
+    }
+    match e.node() {
+        ExprNode::BVar { idx } => format!("#{idx}"),
+        ExprNode::FVar { id } => format!("fvar:{}", id.0.to_display_string()),
+        ExprNode::MVar { .. } => "mvar".to_string(),
+        ExprNode::Sort { level } => format!("Sort<{}>", brief_level(level, fuel)),
+        ExprNode::Const { name, levels } => {
+            if levels.is_empty() {
+                name.to_display_string()
+            } else {
+                let rendered: Vec<String> = levels.iter().map(|l| brief_level(l, fuel)).collect();
+                format!("{}.{{{}}}", name.to_display_string(), rendered.join(","))
+            }
+        }
+        ExprNode::App { .. } => {
+            let (head, args) = app_spine(e);
+            let mut out = format!("({}", brief_expr(&head, fuel - 1));
+            for arg in &args {
+                out.push(' ');
+                out.push_str(&brief_expr(arg, fuel - 1));
+            }
+            out.push(')');
+            out
+        }
+        ExprNode::Lam { body, .. } => format!("(fun _ => {})", brief_expr(body, fuel - 1)),
+        ExprNode::ForallE {
+            binder_type, body, ..
+        } => format!(
+            "({} -> {})",
+            brief_expr(binder_type, fuel - 1),
+            brief_expr(body, fuel - 1)
+        ),
+        ExprNode::LetE { body, .. } => format!("(let _; {})", brief_expr(body, fuel - 1)),
+        ExprNode::MData { expr, .. } => brief_expr(expr, fuel),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } => format!(
+            "({}.{} {})",
+            struct_name.to_display_string(),
+            idx,
+            brief_expr(expr, fuel - 1)
+        ),
+        ExprNode::Lit { .. } => "lit".to_string(),
     }
 }
 

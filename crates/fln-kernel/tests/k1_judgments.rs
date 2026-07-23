@@ -2619,3 +2619,164 @@ fn kr316_parameterized_iota_takes_the_last_nfields_arguments() {
         "…and NOT the parameter AT (the fields-offset mutant's output)"
     );
 }
+
+// ---- defeq head rules re-run after reduction (KR-302/303/305; bead fln-d4x) ---------
+
+/// An `Abbrev` type definition, the `outParam`/`ReaderT` shape.
+fn abbrev(name: &str, type_: Expr, value: Expr) -> ConstantInfo {
+    ConstantInfo::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: n(name),
+            level_params: vec![],
+            type_,
+        },
+        value,
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![n(name)],
+    })
+}
+
+#[test]
+fn kr303_sort_equivalence_discovered_by_delta() {
+    // `M := Sort (max 2 2)` (an abbrev). `M ≟ Sort 2` holds only if the
+    // sort-equivalence rule re-runs AFTER lazy delta exposes the Sort — the
+    // levels are equivalent but not structurally equal, so quick equality can
+    // never catch it. This is the decoded `outParam`/motive-universe shape
+    // from the Init.Prelude replay (bead fln-d4x probe).
+    let two = Level::one().succ().expect("packs");
+    let max22 = Level::max(two.clone(), two.clone()).expect("packs");
+    let env = add_info(
+        &Environment::new(),
+        abbrev(
+            "M",
+            Expr::sort(max22.clone().succ().expect("packs")),
+            Expr::sort(max22),
+        ),
+    );
+    let verdict = check_def_eq(
+        &env,
+        &[],
+        &Expr::const_(n("M"), vec![]),
+        &Expr::sort(two),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "Sort equivalence must be re-checked after delta: {verdict:?}"
+    );
+}
+
+#[test]
+fn kr303_sort_equivalence_discovered_by_beta() {
+    // `(fun _ : D => Sort (max 2 2)) d ≟ Sort 2`: whnf_core beta exposes the
+    // Sort pair; the head rules must re-run on the REDUCED pair (the decoded
+    // `Lean.Name.below` motive shape from the replay probe).
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("D"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("d"),
+                level_params: vec![],
+                type_: Expr::const_(n("D"), vec![]),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let two = Level::one().succ().expect("packs");
+    let max22 = Level::max(two.clone(), two.clone()).expect("packs");
+    let redex = Expr::app(
+        Expr::lam(
+            n("x"),
+            Expr::const_(n("D"), vec![]),
+            Expr::sort(max22),
+            BinderInfo::Default,
+        ),
+        Expr::const_(n("d"), vec![]),
+    );
+    let verdict = check_def_eq(&env, &[], &redex, &Expr::sort(two), Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "Sort equivalence must be re-checked after whnf_core beta: {verdict:?}"
+    );
+}
+
+#[test]
+fn kr302_binder_congruence_discovered_by_delta() {
+    // `Id2 := D` and `Arr := D → Id2` (abbrevs). `Arr ≟ (D → D)` requires the
+    // binder-congruence rule to re-run after delta turns `Arr` into a Pi whose
+    // BODY still needs another unfolding — the decoded `ReaderT.pure` shape
+    // (a function-type abbrev compared against its expansion).
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("D"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let d = || Expr::const_(n("D"), vec![]);
+    let env = add_info(&env, abbrev("Id2", sort1(), d()));
+    let arr_value = Expr::forall_e(
+        n("x"),
+        d(),
+        Expr::const_(n("Id2"), vec![]),
+        BinderInfo::Default,
+    );
+    let env = add_info(&env, abbrev("Arr", sort1(), arr_value));
+    let plain = Expr::forall_e(n("x"), d(), d(), BinderInfo::Default);
+    let verdict = check_def_eq(
+        &env,
+        &[],
+        &Expr::const_(n("Arr"), vec![]),
+        &plain,
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "binder congruence must be re-checked after delta: {verdict:?}"
+    );
+    // Soundness guard: the re-run must not equate DIFFERENT function types.
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("E2"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let wrong = Expr::forall_e(
+        n("x"),
+        d(),
+        Expr::const_(n("E2"), vec![]),
+        BinderInfo::Default,
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::const_(n("Arr"), vec![]),
+            &wrong,
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "re-run congruence must stay sound"
+    );
+}

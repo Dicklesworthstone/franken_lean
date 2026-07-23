@@ -33,6 +33,55 @@ use fln_kernel::verdict::{Budget, Verdict};
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
 
+/// Bounded term-shape rendering for the `FLN_REPLAY_PROBE` lane (bead
+/// fln-d4x): enough to see how a rejected declaration's value is compiled —
+/// recursor application vs projections vs constructor eta — without dumping
+/// full proof terms. Fuel-bounded recursion, safe on real Reference terms.
+fn shape(e: &Expr, fuel: usize) -> String {
+    if fuel == 0 {
+        return "…".to_string();
+    }
+    match e.node() {
+        ExprNode::BVar { idx } => format!("#{idx}"),
+        ExprNode::FVar { .. } => "fvar".to_string(),
+        ExprNode::MVar { .. } => "mvar".to_string(),
+        ExprNode::Sort { .. } => "Sort".to_string(),
+        ExprNode::Const { name, .. } => name.to_display_string(),
+        ExprNode::App { .. } => {
+            let mut args = Vec::new();
+            let mut head = e.clone();
+            while let ExprNode::App { f, a } = head.node() {
+                args.push(a.clone());
+                let next = f.clone();
+                head = next;
+            }
+            args.reverse();
+            let mut out = format!("({}", shape(&head, fuel - 1));
+            for arg in &args {
+                out.push(' ');
+                out.push_str(&shape(arg, fuel - 1));
+            }
+            out.push(')');
+            out
+        }
+        ExprNode::Lam { body, .. } => format!("(fun _ => {})", shape(body, fuel - 1)),
+        ExprNode::ForallE { body, .. } => format!("(forall _, {})", shape(body, fuel - 1)),
+        ExprNode::LetE { body, .. } => format!("(let _ := ..; {})", shape(body, fuel - 1)),
+        ExprNode::MData { expr, .. } => shape(expr, fuel),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } => format!(
+            "({}.{} {})",
+            struct_name.to_display_string(),
+            idx,
+            shape(expr, fuel - 1)
+        ),
+        ExprNode::Lit { .. } => "lit".to_string(),
+    }
+}
+
 /// Collect every `Const` name reachable in a term. Iterative: real Reference
 /// proofs are deep enough to overflow a recursive walk.
 fn const_refs(expr: &Expr, out: &mut HashSet<Name>) {
@@ -307,6 +356,20 @@ fn prelude_replays_through_the_kernel() {
                     .or_default() += 1;
                 if rejected_names.len() < 20 {
                     rejected_names.push(format!("{} ({class:?})", info.name().to_display_string()));
+                }
+                // Probe lane (bead fln-d4x): FLN_REPLAY_PROBE is a comma list
+                // of declaration names; matching rejections dump bounded type
+                // and value shapes so a reduction-gap hypothesis can be
+                // anchored in the DECODED term, not guessed from the name.
+                if let Ok(probe) = std::env::var("FLN_REPLAY_PROBE") {
+                    let name = info.name().to_display_string();
+                    if probe.split(',').any(|entry| entry.trim() == name) {
+                        eprintln!("PROBE {name} [{class:?}: {message}]");
+                        eprintln!("  type  = {}", shape(&info.constant_val().type_, 6));
+                        if let ConstantInfo::Defn(defn) = &info {
+                            eprintln!("  value = {}", shape(&defn.value, 8));
+                        }
+                    }
                 }
             }
             Verdict::Inconclusive { .. } => inconclusive += 1,

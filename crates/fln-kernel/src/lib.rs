@@ -138,7 +138,11 @@ fn check_inner(
         if !checker.def_eq_public(&body_type, type_, 0)? {
             return Err(Stop::Reject(
                 RejectClass::DefinitionTypeMismatch,
-                "declaration body type does not match its declared type".to_string(),
+                format!(
+                    "declaration body type does not match its declared type: body has `{}`, declared `{}`",
+                    tc::brief_public(&body_type),
+                    tc::brief_public(type_)
+                ),
             ));
         }
     }
