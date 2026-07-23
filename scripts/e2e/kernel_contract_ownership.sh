@@ -14,6 +14,14 @@ export CARGO_TERM_COLOR=never
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# `git archive` replaces these markers only for the tracked export-subst path.
+# The strict RCH lane compares both values with its caller-bound expectation, so
+# a `.git`-free base archive cannot merely assert a commit/tree identity.
+# shellcheck disable=SC2016
+ARCHIVE_COMMIT_MARKER='$Format:%H$'
+# shellcheck disable=SC2016
+ARCHIVE_TREE_MARKER='$Format:%T$'
+
 DEFAULT_MAX_FILE_BYTES=8388608
 DEFAULT_MAX_LINE_BYTES=262144
 DEFAULT_MAX_RECORDS=100000
@@ -267,14 +275,16 @@ strict_validate_run_ndjson() {
   local expected_bead="$5"
   local expected_lane="$6"
   local expected_commit="$7"
-  local expected_manifest_hash="$8"
-  local expected_projection_hash="$9"
+  local expected_tree="$8"
+  local expected_manifest_hash="$9"
+  local expected_projection_hash="${10}"
   jq -s -e \
     --arg schema "$expected_schema" \
     --arg run_id "$expected_run_id" \
     --arg bead "$expected_bead" \
     --arg lane "$expected_lane" \
     --arg commit "$expected_commit" \
+    --arg tree "$expected_tree" \
     --arg expected_manifest_hash "$expected_manifest_hash" \
     --arg expected_projection_hash "$expected_projection_hash" \
     --argjson expected_records "$expected_records" '
@@ -330,6 +340,7 @@ strict_validate_run_ndjson() {
         end;
       ($lane == "local" or $lane == "clean" or $lane == "rch")
       and ($commit | test("^[0-9a-f]{40}$"))
+      and ($tree | test("^[0-9a-f]{40}$"))
       and ($expected_manifest_hash | test("^[0-9a-f]{64}$"))
       and ($expected_projection_hash | test("^[0-9a-f]{64}$"))
       and ($run_id | test(
@@ -368,8 +379,9 @@ strict_validate_run_ndjson() {
           "--test","kernel_contract","ownership_evidence_process_driver",
           "--","--exact","--nocapture"
         ]
-        and (.build | keys == ["commit","rustc_commit","target"])
+        and (.build | keys == ["commit","rustc_commit","target","tree"])
         and .build.commit == $commit
+        and .build.tree == $tree
         and (.build.rustc_commit | test("^[0-9a-f]{40}$"))
         and (.build.target | type == "string" and length > 0)
         and (.worker | keys == ["identity","remote_required"])
@@ -1148,6 +1160,7 @@ validate_existing_bundle() {
 
   local lane
   local commit
+  local tree
   local expected_manifest_hash
   local expected_projection_hash
   lane="$(
@@ -1160,6 +1173,12 @@ validate_existing_bundle() {
     jq -sr '
       if length > 0 and ([.[].build.commit] | unique | length) == 1
       then .[0].build.commit else empty end
+    ' "$run_log"
+  )" || return 1
+  tree="$(
+    jq -sr '
+      if length > 0 and ([.[].build.tree] | unique | length) == 1
+      then .[0].build.tree else empty end
     ' "$run_log"
   )" || return 1
   expected_manifest_hash="$(
@@ -1281,6 +1300,7 @@ validate_existing_bundle() {
     "franken_lean-79k.1" \
     "$lane" \
     "$commit" \
+    "$tree" \
     "$expected_manifest_hash" \
     "$expected_projection_hash" || return 1
   strict_validate_artifact_links \
@@ -1310,6 +1330,7 @@ validate_existing_bundle() {
         "franken_lean-79k.1" \
         "$lane" \
         "$commit" \
+        "$tree" \
         "$expected_manifest_hash" \
         "$expected_projection_hash" >/dev/null 2>&1; then
       return 1
@@ -1323,12 +1344,41 @@ validate_existing_bundle() {
 # named process-driver test itself. Unsetting the runner prevents recursive Cargo
 # invocations from re-entering this bridge.
 if [[ "${1:-}" == "--cargo-runner-rch" ]]; then
-  [[ "${FLN_OWNERSHIP_RCH_RUNNER:-}" == "1" && $# -ge 2 && -x "$2" ]] \
+  runner_binary="${2:-}"
+  runner_name="${runner_binary##*/}"
+  runner_dir=""
+  if [[ -n "$runner_binary" && -f "$runner_binary" \
+        && ! -L "$runner_binary" && -x "$runner_binary" ]]; then
+    runner_dir="$(cd "$(dirname "$runner_binary")" && pwd -P)"
+  fi
+  [[ "${FLN_OWNERSHIP_RCH_RUNNER:-}" == "1" \
+      && $# -eq 4 \
+      && "${3:-}" == "ownership_evidence_process_driver" \
+      && "${4:-}" == "--exact" \
+      && "$runner_name" =~ ^kernel_contract-[0-9a-f]+$ \
+      && "$runner_dir" == "$ROOT"/.rch-target-*/debug/deps ]] \
     || {
       echo "kernel_contract_ownership: invalid RCH Cargo-runner invocation" >&2
       exit 2
     }
-  unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER CARGO_BUILD_RUNNER
+
+  # Force every nested Cargo probe back onto the actual host target with a
+  # direct `env` runner. This target-specific environment override wins over
+  # repository, ancestor, and CARGO_HOME runner configuration and prevents the
+  # bridge from recursively re-entering itself.
+  runner_host="$(rustc -vV | sed -n 's/^host: //p')"
+  direct_runner="$(command -v env)"
+  [[ "$runner_host" =~ ^[A-Za-z0-9_.-]+$ \
+      && -n "$direct_runner" && -x "$direct_runner" ]] \
+    || {
+      echo "kernel_contract_ownership: cannot establish direct Cargo runner" >&2
+      exit 2
+    }
+  runner_env="CARGO_TARGET_${runner_host^^}_RUNNER"
+  runner_env="${runner_env//-/_}"
+  export CARGO_BUILD_TARGET="$runner_host"
+  export "$runner_env=$direct_runner"
+  unset CARGO_BUILD_RUNNER
   set -- --lane rch
 fi
 
@@ -1488,6 +1538,7 @@ if [[ "$LANE" == "rch" ]]; then
     [[ -z "$REMOTE_UNTRACKED" ]] \
       || { note "rch worker has untracked source drift"; exit 1; }
     COMMIT="$OBSERVED_COMMIT"
+    TREE="$OBSERVED_TREE"
   else
     [[ "${FLN_OWNERSHIP_RCH_ARCHIVE_BASE_ONLY:-}" == "1" \
         && ! -e "$ROOT/.git" && ! -L "$ROOT/.git" ]] \
@@ -1495,15 +1546,20 @@ if [[ "$LANE" == "rch" ]]; then
         note "rch worker lacks verifiable Git or clean base-only archive identity"
         exit 1
       }
-    # `rch exec --base COMMIT --clean-overlay --no-overlay` resolves and
-    # rechecks the commit locally, then materializes it with `git archive`.
-    # Such a worker root intentionally has no `.git`; the caller-supplied tree
-    # remains part of the daemon-authored strict-run receipt, while the exact
-    # manifest digest below binds the ownership artifact inside that archive.
-    COMMIT="$EXPECTED_COMMIT"
+    [[ "$ARCHIVE_COMMIT_MARKER" == "$EXPECTED_COMMIT" \
+        && "$ARCHIVE_TREE_MARKER" == "$EXPECTED_TREE" ]] \
+      || {
+        note "rch base archive commit/tree markers do not match expectation"
+        exit 1
+      }
+    # The tracked export-subst markers above are materialized by the same
+    # `git archive` operation that creates the base-only worker root.
+    COMMIT="$ARCHIVE_COMMIT_MARKER"
+    TREE="$ARCHIVE_TREE_MARKER"
   fi
 else
   COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+  TREE="$(git -C "$ROOT" rev-parse 'HEAD^{tree}')"
 fi
 if [[ "$LANE" == "clean" ]]; then
   [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ && "$COMMIT" == "$EXPECTED_COMMIT" ]] \
@@ -1596,6 +1652,7 @@ write_case_record() {
     --arg actual_class "$actual_class" \
     --argjson actual_exit "$actual_exit" \
     --arg commit "$COMMIT" \
+    --arg tree "$TREE" \
     --arg rustc_commit "$RUSTC_COMMIT" \
     --arg target "$TARGET_TRIPLE" \
     --arg worker "$WORKER_ID" \
@@ -1656,7 +1713,12 @@ write_case_record() {
         "--test","kernel_contract","ownership_evidence_process_driver",
         "--","--exact","--nocapture"
       ],
-      build:{commit:$commit,rustc_commit:$rustc_commit,target:$target},
+      build:{
+        commit:$commit,
+        rustc_commit:$rustc_commit,
+        target:$target,
+        tree:$tree
+      },
       worker:{identity:$worker,remote_required:$remote_required},
       expected:{classification:$expected_class,exit:$expected_exit},
       actual:{classification:$actual_class,exit_code:$actual_exit},
@@ -2002,6 +2064,7 @@ validate_ndjson() {
     "$BEAD" \
     "$LANE" \
     "$COMMIT" \
+    "$TREE" \
     "$EXPECTED_MANIFEST_HASH" \
     "$EXPECTED_PROJECTION_HASH"
 }
