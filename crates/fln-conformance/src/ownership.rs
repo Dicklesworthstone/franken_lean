@@ -19,7 +19,7 @@ pub const MANIFEST_RELATIVE_PATH: &str = "ci/KERNEL_CONTRACT_OWNERSHIP.jsonl";
 pub const SOURCE_RELATIVE_PATH: &str = ".beads/issues.jsonl";
 pub const MANIFEST_SCHEMA: &str = "fln.kernel-contract-ownership/1";
 pub const PROJECTION_SCHEMA: &str = "sorted-canonical-issue-ids-v1";
-pub const HASH_ALGORITHM: &str = "blake3-derived-key";
+pub const HASH_ALGORITHM: &str = "fln-domain-registry-v1";
 pub const HASH_DOMAIN: &str = "fln 2026 domain fixture/1";
 pub const PROJECTION_HASH_PREIMAGE: &str =
     "fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8";
@@ -1483,7 +1483,7 @@ impl<'a> Loader<'a> {
             "{\"schema\":\"fln.kernel-contract-ownership/1\",",
             "\"source\":\".beads/issues.jsonl\",",
             "\"projection\":\"sorted-canonical-issue-ids-v1\",",
-            "\"hash_algorithm\":\"blake3-derived-key\",",
+            "\"hash_algorithm\":\"fln-domain-registry-v1\",",
             "\"hash_domain\":\"fln 2026 domain fixture/1\",",
             "\"hash_preimage\":\"",
             "fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8\",",
@@ -3374,7 +3374,7 @@ mod tests {
         let first_manifest = manifest_bytes(&first);
         assert_eq!(
             manifest_digest(&first_manifest).to_hex(),
-            "c03bd8eeedf53b9093b92635e551063f711f2de6c65a5795adc598c4f7864198",
+            "5f3b6f6f91dd4a6d2e611f4a833049d9fb33b0fe0d0f5f7cc4c84f4c090b2de4",
             "the independently frozen exact-manifest vector changed"
         );
         assert_ne!(

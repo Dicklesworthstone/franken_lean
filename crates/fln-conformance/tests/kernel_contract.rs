@@ -35,16 +35,28 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// The pinned Reference source tree. Every kernel-rule anchor must live here: a rule
 /// "anchored" to our own code or anything outside the pin proves nothing.
 const PIN_TREE_PREFIX: &str = "vendor/lean4-src/";
 
 fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let current = env::current_dir().expect("current directory");
+        current
+            .ancestors()
+            .find(|candidate| {
+                candidate.join("KERNEL_CONTRACT.md").is_file()
+                    && candidate
+                        .join("crates/fln-conformance/Cargo.toml")
+                        .is_file()
+            })
+            .map(Path::to_path_buf)
+            .expect("workspace root above the test working directory")
+    })
+    .as_path()
 }
 
 /// The full production validation of the parsed rule set against the workspace: the
