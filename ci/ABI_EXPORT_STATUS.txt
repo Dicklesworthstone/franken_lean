@@ -26,7 +26,7 @@ schema fln-abi-export-status/1
 
 row lean_alloc_object | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | membrane big path (object.cpp:355-376); OOM = INTERNAL PANIC like the pin
 row lean_alloc_small | RawPlatform | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | raw prefixed small heap; slot-idx law asserted (lean.h:394-400)
-row lean_apply_1 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_1 | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | apply membrane: exact arm structure of apply.cpp:101-158 via the generic core
 row lean_apply_10 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
 row lean_apply_11 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
 row lean_apply_12 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
@@ -34,9 +34,9 @@ row lean_apply_13 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | clos
 row lean_apply_14 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
 row lean_apply_15 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
 row lean_apply_16 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
-row lean_apply_2 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
-row lean_apply_3 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
-row lean_apply_4 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_2 | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | incl. over-application curry+reapply (apply.cpp:160-215)
+row lean_apply_3 | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | as lean_apply_2
+row lean_apply_4 | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | as lean_apply_2
 row lean_apply_5 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
 row lean_apply_6 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
 row lean_apply_7 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
@@ -180,7 +180,7 @@ row lean_nat_log2 | Unsupported | fln-bignum shim | census (fln-rt::abi) | kerne
 row lean_nat_overflow_mul | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | scalar*scalar overflow path, normalized (object.cpp:1419-1421)
 row lean_nat_pow | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | exponent must be scalar <= UINT_MAX else the pin's INTERNAL PANIC (object.cpp:1577-1586)
 row lean_nat_shiftl | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_obj_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_obj_once_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | simple-atomic once cell + mark_persistent (object.cpp:2842-2851); wait/notify replaced by spin+yield (same lock)
 row lean_object_byte_size | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:242-259 branch structure kept literally
 row lean_object_data_byte_size | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:237-259 branch structure kept literally
 row lean_panic | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
@@ -223,15 +223,15 @@ row lean_task_pure | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once
 row lean_task_spawn_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_thunk_get_core | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_uint16_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | low-16 truncation (object.cpp:1809-1811)
-row lean_uint16_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_uint16_once_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | scalar once cell
 row lean_uint32_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | low-32 truncation (object.cpp:1813-1815)
-row lean_uint32_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_uint32_once_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | scalar once cell
 row lean_uint64_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | lowest limb = mpz::mod64 on non-negative (object.cpp:1817-1819)
-row lean_uint64_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_uint64_once_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | scalar once cell
 row lean_uint8_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | low-8 truncation = mpz::mod8 on non-negative (object.cpp:1805-1807)
-row lean_uint8_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_uint8_once_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | scalar once cell (object.cpp:2853-2861)
 row lean_usize_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | lowest limb = mpz::get_size_t (object.cpp:1825-1827, mpz.cpp:109-116)
-row lean_usize_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_usize_once_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); stage0 execution lane (marrow_stage0_gauntlet.sh) | scalar once cell
 row lean_utf8_n_strlen | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | bug-compatible get_utf8_size stepping (utf8.cpp:49-58)
 row lean_utf8_strlen | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | bug-compatible get_utf8_size stepping (utf8.cpp:16-43)
 support mi_free | RawPlatform | crates/fln-unsafe-abi/src/export.rs | small-heap prefix suite; gauntlet link lane | LEAN_MIMALLOC inline link demand (lean.h:436-441, 490-497); size-prefixed, mi_free null-safe

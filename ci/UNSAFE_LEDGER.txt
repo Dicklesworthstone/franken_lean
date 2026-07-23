@@ -221,3 +221,23 @@ row FLN-UL-0158 | crates/fln-unsafe-abi/src/export.rs | lean_string_eq inline sh
 row FLN-UL-0159 | crates/fln-unsafe-abi/src/export.rs | name_eq: pointer/hash fast paths (cached hash at scalar offset 16, lean.h:3003-3006) + exact prefix walk (object.cpp:2720-2750); only anonymous is scalar so hash reads hit ctors only | export name suite; gauntlet differential | none | no admission; boolean out
 row FLN-UL-0160 | crates/fln-unsafe-abi/src/tests.rs | test-only: big-nat arithmetic arms, normalization boundary, truncations, mod-zero retention | export_nat_big_arithmetic_normalization_and_truncation | cfg(test) only | no admission; test apparatus
 row FLN-UL-0161 | crates/fln-unsafe-abi/src/tests.rs | test-only: Name graph construction + exact eq walk | export_name_eq_walks_prefixes_exactly | cfg(test) only | no admission; test apparatus
+
+# ---- bead franken_lean-83r slice 4: closure application + once cells ----
+row FLN-UL-0162 | crates/fln-unsafe-abi/src/export.rs | curry dispatch: m_fun transmuted to the arity-shaped C fn pointer — the transmute IS the ABI contract (apply.cpp:77-98); every argument reference owned by the callee | export apply suites; stage0 execution lane | arity 0 is unreachable exactly as upstream | no admission; foreign call
+row FLN-UL-0163 | crates/fln-unsafe-abi/src/export.rs | fix_args: exclusive transfer + block-only release vs shared retain + yield (apply.cpp:12-38); every new slot initialized | export apply under-application test | none | no admission; closure out
+row FLN-UL-0164 | crates/fln-unsafe-abi/src/export.rs | apply core: scalar-f drops args (erased proof); exact/over/under arms settle ownership per the generated code; exclusive fast path only at arity <= 16 as upstream | export apply suites; stage0 execution lane | none | no admission; foreign call result out
+row FLN-UL-0165 | crates/fln-unsafe-abi/src/export.rs | lean_apply_1 via the core | export apply suites; gauntlet | none | no admission
+row FLN-UL-0166 | crates/fln-unsafe-abi/src/export.rs | lean_apply_2 via the core | export apply suites; gauntlet | none | no admission
+row FLN-UL-0167 | crates/fln-unsafe-abi/src/export.rs | lean_apply_3 via the core | export apply suites; gauntlet | none | no admission
+row FLN-UL-0168 | crates/fln-unsafe-abi/src/export.rs | lean_apply_4 via the core | export apply suites; gauntlet | none | no admission
+row FLN-UL-0169 | crates/fln-unsafe-abi/src/export.rs | once cell: C-owned {state,lock} i32 atomic pair addressed in place; simple-atomic lock (SeqCst) with spin+yield standing in for wait/notify; initializer runs exactly once | export once suites; stage0 execution lane | contended waiters spin on the scheduler | no admission; C-owned storage
+row FLN-UL-0170 | crates/fln-unsafe-abi/src/export.rs | obj_once_cold: init result stored then mark_persistent then state=1 (object.cpp:2842-2851) | export once suites; stage0 execution lane | none | no admission
+row FLN-UL-0171 | crates/fln-unsafe-abi/src/export.rs | uint8_once_cold scalar slot | export once suites | none | no admission
+row FLN-UL-0172 | crates/fln-unsafe-abi/src/export.rs | uint16_once_cold scalar slot | export once suites | none | no admission
+row FLN-UL-0173 | crates/fln-unsafe-abi/src/export.rs | uint32_once_cold scalar slot | export once suites | none | no admission
+row FLN-UL-0174 | crates/fln-unsafe-abi/src/export.rs | uint64_once_cold scalar slot | export once suites | none | no admission
+row FLN-UL-0175 | crates/fln-unsafe-abi/src/export.rs | usize_once_cold scalar slot | export once suites | none | no admission
+row FLN-UL-0176 | crates/fln-unsafe-abi/src/tests.rs | test-only: closure target minting a new closure (over-application subject) | export_apply_arms_match_generated_semantics | cfg(test) only | no admission; test apparatus
+row FLN-UL-0177 | crates/fln-unsafe-abi/src/tests.rs | test-only: apply arms over real extern C targets — exact/under/over/shared/erased | export_apply_arms_match_generated_semantics | cfg(test) only | no admission; test apparatus
+row FLN-UL-0178 | crates/fln-unsafe-abi/src/tests.rs | test-only: once-cell object initializer | export_once_cells_initialize_exactly_once | cfg(test) only | no admission; test apparatus
+row FLN-UL-0179 | crates/fln-unsafe-abi/src/tests.rs | test-only: stack-simulated C once cell + slots | export_once_cells_initialize_exactly_once | cfg(test) only | no admission; test apparatus

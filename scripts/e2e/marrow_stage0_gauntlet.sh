@@ -207,6 +207,40 @@ if diff -q "$ART_DIR/facts_corrupt.ndjson" "$ART_DIR/facts_marrow.ndjson" >/dev/
 fi
 emit corruption_control passed "\"detail\":\"seeded corruption detected\""
 
+# ---- lane 6b: stage0 EXECUTION — the membrane's proof --------------------------
+# The pinned tree's own generated Init/Prelude.c (compiled untouched in lane
+# 4) linked against Marrow's exported surface and EXECUTED: the module
+# initializer plus generated functions plus closure application through
+# generated instance objects. The same driver + the SAME object file against
+# libleanshared must emit byte-identical facts.
+note "lane 6b: stage0 Init/Prelude.o EXECUTES against Marrow (and the Reference)"
+DRIVER_SRC="$ROOT/tribunal/fixtures/c4/stage0_driver.c"
+driver_sha=$(sha256sum "$DRIVER_SRC" | cut -d' ' -f1)
+PRELUDE_OBJ="$ART_DIR/Init_Prelude.c.o"
+[ -f "$PRELUDE_OBJ" ] || fail stage0_exec_setup "\"detail\":\"lane-4 Prelude object missing\""
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$DRIVER_SRC" "$PRELUDE_OBJ" "$STATICLIB" -lpthread -ldl -lm \
+    -o "$ART_DIR/stage0_marrow" >"$ART_DIR/gcc_stage0_marrow.log" 2>&1; then
+    fail stage0_exec_link "\"artifact\":\"gcc_stage0_marrow.log\""
+fi
+if ! "$ART_DIR/stage0_marrow" >"$ART_DIR/facts_stage0_marrow.ndjson" 2>"$ART_DIR/stage0_marrow.err"; then
+    fail stage0_exec_run "\"artifact\":\"stage0_marrow.err\""
+fi
+emit stage0_exec_marrow passed "\"facts\":$(wc -l <"$ART_DIR/facts_stage0_marrow.ndjson"),\"driver_sha256\":\"$driver_sha\""
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$DRIVER_SRC" "$PRELUDE_OBJ" -L "$ELAN_TC/lib/lean" -lleanshared -Wl,-rpath,"$ELAN_TC/lib/lean" \
+    -o "$ART_DIR/stage0_reference" >"$ART_DIR/gcc_stage0_reference.log" 2>&1; then
+    fail stage0_exec_ref_link "\"artifact\":\"gcc_stage0_reference.log\""
+fi
+if ! "$ART_DIR/stage0_reference" >"$ART_DIR/facts_stage0_reference.ndjson" 2>"$ART_DIR/stage0_reference.err"; then
+    fail stage0_exec_ref_run "\"artifact\":\"stage0_reference.err\""
+fi
+if diff -u "$ART_DIR/facts_stage0_reference.ndjson" "$ART_DIR/facts_stage0_marrow.ndjson" >"$ART_DIR/stage0_facts.diff"; then
+    emit stage0_exec_differential passed "\"facts\":$(wc -l <"$ART_DIR/facts_stage0_marrow.ndjson"),\"artifact\":\"stage0_facts.diff\""
+else
+    fail stage0_exec_differential "\"artifact\":\"stage0_facts.diff\""
+fi
+
 # ---- lane 7: panic parity ------------------------------------------------------
 # Exit codes and the message line must match. The Reference appends an
 # address-nondeterministic backtrace block on the panic_fn path (varies

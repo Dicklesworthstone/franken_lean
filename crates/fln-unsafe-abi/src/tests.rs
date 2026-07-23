@@ -1287,3 +1287,136 @@ fn export_name_eq_walks_prefixes_exactly() {
         }
     }
 }
+
+// ================================================================ slice 4: apply membrane + once cells
+
+/// Closure targets for the apply tests: real extern "C" functions whose
+/// pointers live in closure objects exactly as compiled Lean code's would.
+mod apply_targets {
+    use crate::layout::LeanObject;
+    use crate::tagged;
+
+    pub(crate) extern "C" fn add2(a: *mut LeanObject, b: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(a) + tagged::unbox(b))
+    }
+    pub(crate) extern "C" fn pair_sum3(
+        a: *mut LeanObject,
+        b: *mut LeanObject,
+        c: *mut LeanObject,
+    ) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(a) * 100 + tagged::unbox(b) * 10 + tagged::unbox(c))
+    }
+    /// arity-1 returning a NEW closure (for the over-application arm).
+    pub(crate) extern "C" fn make_adder(a: *mut LeanObject) -> *mut LeanObject {
+        // UNSAFE-LEDGER: FLN-UL-0176
+        #[allow(unsafe_code)]
+        unsafe {
+            let c = crate::object::alloc_closure(add2 as *mut core::ffi::c_void, 2, 1);
+            crate::object::closure_set(c, 0, a);
+            c
+        }
+    }
+}
+
+#[test]
+fn export_apply_arms_match_generated_semantics() {
+    let _g = lock();
+    use crate::export::{export_lean_apply_1, export_lean_apply_2, export_lean_apply_3};
+    // UNSAFE-LEDGER: FLN-UL-0177
+    #[allow(unsafe_code)]
+    unsafe {
+        // Exact application, no fixed args.
+        let f = crate::object::alloc_closure(apply_targets::add2 as *mut core::ffi::c_void, 2, 0);
+        let r = export_lean_apply_2(f, tagged::boxi(30), tagged::boxi(12));
+        assert_eq!(tagged::unbox(r), 42);
+
+        // Under-application: fix one arg, then exact application of the rest.
+        let f =
+            crate::object::alloc_closure(apply_targets::pair_sum3 as *mut core::ffi::c_void, 3, 0);
+        let g = export_lean_apply_1(f, tagged::boxi(1)); // fixes a=1
+        let h = crate::rc::read_header(g);
+        assert_eq!(h.tag, contract::TAG_CLOSURE, "under-application curries");
+        let r = export_lean_apply_2(g, tagged::boxi(2), tagged::boxi(3));
+        assert_eq!(tagged::unbox(r), 123);
+
+        // Exact application through fixed args on a SHARED closure: fixed
+        // args are retained, the closure survives.
+        let f =
+            crate::object::alloc_closure(apply_targets::pair_sum3 as *mut core::ffi::c_void, 3, 1);
+        let boxed = crate::object::mk_string_unchecked(b"witness", 7); // rc-carrying fixed arg
+        crate::object::closure_set(f, 0, boxed);
+        crate::rc::inc_ref_n(f, 1); // shared
+        // pair_sum3 unboxes its first arg; use a boxed scalar instead:
+        // rebuild with scalar fixed arg for the arithmetic, keep `boxed`
+        // reachable via a second closure slot pattern instead.
+        crate::rc::dec_ref(f); // undo share of the string-carrying probe
+        crate::rc::dec_ref(f); // release it entirely (string freed too)
+        let f =
+            crate::object::alloc_closure(apply_targets::pair_sum3 as *mut core::ffi::c_void, 3, 1);
+        crate::object::closure_set(f, 0, tagged::boxi(9));
+        crate::rc::inc_ref_n(f, 1); // rc = 2: shared application path
+        let r = export_lean_apply_2(f, tagged::boxi(8), tagged::boxi(7));
+        assert_eq!(tagged::unbox(r), 987);
+        assert_eq!(
+            crate::rc::read_header(f).rc,
+            1,
+            "shared apply yields one ref"
+        );
+        crate::rc::dec_ref(f);
+
+        // Over-application: arity-1 closure applied to two args — curry
+        // then re-apply (apply.cpp else-if arm).
+        let f =
+            crate::object::alloc_closure(apply_targets::make_adder as *mut core::ffi::c_void, 1, 0);
+        let r = export_lean_apply_2(f, tagged::boxi(40), tagged::boxi(2));
+        assert_eq!(tagged::unbox(r), 42);
+
+        // Erased proof: scalar f returns itself, args dropped.
+        let s = crate::object::mk_string_unchecked(b"dropme", 6);
+        let r = export_lean_apply_3(tagged::boxi(0), s, tagged::boxi(1), tagged::boxi(2));
+        assert_eq!(tagged::unbox(r), 0);
+    }
+}
+
+#[test]
+fn export_once_cells_initialize_exactly_once() {
+    let _g = lock();
+    use crate::export::{export_lean_obj_once_cold, export_lean_uint64_once_cold};
+    use std::sync::atomic::{AtomicU64, Ordering as O};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    extern "C" fn init_u64() -> u64 {
+        CALLS.fetch_add(1, O::SeqCst);
+        0xFEED
+    }
+    extern "C" fn init_obj() -> *mut LeanObject {
+        // UNSAFE-LEDGER: FLN-UL-0178
+        #[allow(unsafe_code)]
+        unsafe {
+            crate::object::mk_string_unchecked(b"once", 4)
+        }
+    }
+    // UNSAFE-LEDGER: FLN-UL-0179
+    #[allow(unsafe_code)]
+    unsafe {
+        // The C-side static cell: {state: i32, lock: i32} zeroed.
+        let mut cell = [0i32; 2];
+        let mut slot = 0u64;
+        CALLS.store(0, O::SeqCst);
+        let a = export_lean_uint64_once_cold(&raw mut slot, (&raw mut cell).cast(), init_u64);
+        let b = export_lean_uint64_once_cold(&raw mut slot, (&raw mut cell).cast(), init_u64);
+        assert_eq!((a, b, slot), (0xFEED, 0xFEED, 0xFEED));
+        assert_eq!(CALLS.load(O::SeqCst), 1, "initializer ran exactly once");
+        assert_eq!(cell, [1, 0], "state set, lock released");
+
+        // Object cells persist their graph (rc = 0).
+        let mut ocell = [0i32; 2];
+        let mut oslot: *mut LeanObject = core::ptr::null_mut();
+        let o = export_lean_obj_once_cold(&raw mut oslot, (&raw mut ocell).cast(), init_obj);
+        assert_eq!(o, oslot);
+        assert_eq!(
+            crate::rc::read_header(o).rc,
+            0,
+            "once objects are persistent"
+        );
+    }
+}
