@@ -289,6 +289,53 @@ jobs:
             target/cargo
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
 
+      - name: ownership evidence — clean source-bound matrix
+        id: ownership_e2e
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          ownership_root="$RUNNER_TEMP/fln-ownership-evidence/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ -e "$ownership_root" || -L "$ownership_root" ]]; then
+            echo "ownership evidence root already exists: $ownership_root" >&2
+            exit 2
+          fi
+          mkdir -p "$ownership_root"
+          set +e
+          FLN_E2E_ART_ROOT="$ownership_root" \
+            FLN_OWNERSHIP_EXPECTED_COMMIT="$GITHUB_SHA" \
+            ./scripts/e2e/kernel_contract_ownership.sh --lane clean
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$ownership_root" -mindepth 1 -maxdepth 1 -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "ownership matrix published ${#bundles[@]} root entries; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+            if [[ -L "$artifact" || ! -d "$artifact" ]]; then
+              echo "ownership matrix entry is not a real directory: $artifact" >&2
+              capture_rc=2
+            elif ! ./scripts/e2e/kernel_contract_ownership.sh \
+                --validate-bundle "$artifact"; then
+              echo "independent ownership bundle validation failed: $artifact" >&2
+              capture_rc=1
+            fi
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( command_rc != 0 )); then
+            exit "$command_rc"
+          fi
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+
       - name: quality gate (scripts/check.sh)
         id: quality_gate
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
@@ -634,6 +681,16 @@ jobs:
               os.fsync(handle.fileno())
           print(f"sealed complete evidence attempt: {index_path} ({digest})")
           PY
+
+      - name: archive ownership evidence bundle
+        if: ${{ always() && steps.ownership_e2e.outcome != 'skipped' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ownership-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fln-ownership-evidence/${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
 
       - name: archive gate + e2e artifacts
         if: always()

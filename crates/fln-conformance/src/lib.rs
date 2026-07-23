@@ -24,6 +24,7 @@
 
 pub mod ledger;
 pub mod normalize;
+pub mod ownership;
 #[cfg(feature = "oracle-fallback-dev")]
 pub mod poison;
 pub mod precedence;

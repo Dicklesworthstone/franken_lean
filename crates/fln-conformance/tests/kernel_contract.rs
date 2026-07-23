@@ -25,11 +25,16 @@
 
 #![forbid(unsafe_code)]
 
+use fln_conformance::ownership::{
+    ExpectedManifestBinding, InputUsage, MANIFEST_RELATIVE_PATH, OwnershipEvidence,
+    OwnershipFailure, OwnershipFailureClass, OwnershipLimits, OwnershipSourceMode,
+    OwnershipSourceState, OwnershipUsage, SOURCE_RELATIVE_PATH, load_kernel_contract_ownership,
+};
 use std::collections::BTreeSet;
-use std::fs;
-use std::io;
-use std::path::Path;
-use std::path::PathBuf;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// The pinned Reference source tree. Every kernel-rule anchor must live here: a rule
 /// "anchored" to our own code or anything outside the pin proves nothing.
@@ -42,328 +47,35 @@ fn workspace_root() -> &'static Path {
         .expect("workspace root")
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum BeadEvidenceError {
-    Missing {
-        path: PathBuf,
-    },
-    Unreadable {
-        path: PathBuf,
-        kind: io::ErrorKind,
-    },
-    Corrupt {
-        path: PathBuf,
-        line: usize,
-        reason: &'static str,
-    },
-    Empty {
-        path: PathBuf,
-    },
-}
-
-impl BeadEvidenceError {
-    fn diagnostic(&self) -> String {
-        match self {
-            Self::Missing { path } => format!(
-                "[bead-evidence/missing] tracked ownership export `{}` is missing",
-                path.display()
-            ),
-            Self::Unreadable { path, kind } => format!(
-                "[bead-evidence/unreadable] tracked ownership export `{}` cannot be read ({kind:?})",
-                path.display()
-            ),
-            Self::Corrupt { path, line, reason } => format!(
-                "[bead-evidence/corrupt] tracked ownership export `{}` line {line} is invalid: {reason}",
-                path.display()
-            ),
-            Self::Empty { path } => format!(
-                "[bead-evidence/empty] tracked ownership export `{}` contains no issue ids",
-                path.display()
-            ),
-        }
-    }
-}
-
-struct JsonSyntax<'a> {
-    bytes: &'a [u8],
-    cursor: usize,
-}
-
-impl JsonSyntax<'_> {
-    fn skip_space(&mut self) {
-        while matches!(
-            self.bytes.get(self.cursor),
-            Some(b' ' | b'\n' | b'\r' | b'\t')
-        ) {
-            self.cursor += 1;
-        }
-    }
-
-    fn take(&mut self, expected: u8) -> bool {
-        if self.bytes.get(self.cursor) == Some(&expected) {
-            self.cursor += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn parse_value(&mut self, depth: usize) -> bool {
-        // The Beads export is generated metadata, not an unbounded semantic input.
-        // Bound parser recursion so corrupt hostile evidence still fails typed rather
-        // than threatening the test runner's stack.
-        if depth > 128 {
-            return false;
-        }
-        self.skip_space();
-        match self.bytes.get(self.cursor).copied() {
-            Some(b'{') => self.parse_object(depth + 1),
-            Some(b'[') => self.parse_array(depth + 1),
-            Some(b'"') => self.parse_string(),
-            Some(b't') => self.parse_literal(b"true"),
-            Some(b'f') => self.parse_literal(b"false"),
-            Some(b'n') => self.parse_literal(b"null"),
-            Some(b'-' | b'0'..=b'9') => self.parse_number(),
-            _ => false,
-        }
-    }
-
-    fn parse_object(&mut self, depth: usize) -> bool {
-        if !self.take(b'{') {
-            return false;
-        }
-        self.skip_space();
-        if self.take(b'}') {
-            return true;
-        }
-        loop {
-            if !self.parse_string() {
-                return false;
-            }
-            self.skip_space();
-            if !self.take(b':') || !self.parse_value(depth) {
-                return false;
-            }
-            self.skip_space();
-            if self.take(b'}') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-            self.skip_space();
-        }
-    }
-
-    fn parse_array(&mut self, depth: usize) -> bool {
-        if !self.take(b'[') {
-            return false;
-        }
-        self.skip_space();
-        if self.take(b']') {
-            return true;
-        }
-        loop {
-            if !self.parse_value(depth) {
-                return false;
-            }
-            self.skip_space();
-            if self.take(b']') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-            self.skip_space();
-        }
-    }
-
-    fn parse_string(&mut self) -> bool {
-        if !self.take(b'"') {
-            return false;
-        }
-        while let Some(byte) = self.bytes.get(self.cursor).copied() {
-            self.cursor += 1;
-            match byte {
-                b'"' => return true,
-                0..=31 => return false,
-                b'\\' => {
-                    let Some(escape) = self.bytes.get(self.cursor).copied() else {
-                        return false;
-                    };
-                    self.cursor += 1;
-                    match escape {
-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
-                        b'u' => {
-                            for _ in 0..4 {
-                                if !matches!(
-                                    self.bytes.get(self.cursor),
-                                    Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
-                                ) {
-                                    return false;
-                                }
-                                self.cursor += 1;
-                            }
-                        }
-                        _ => return false,
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    fn parse_literal(&mut self, literal: &[u8]) -> bool {
-        if self.bytes.get(self.cursor..self.cursor + literal.len()) == Some(literal) {
-            self.cursor += literal.len();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn parse_number(&mut self) -> bool {
-        self.take(b'-');
-        match self.bytes.get(self.cursor).copied() {
-            Some(b'0') => self.cursor += 1,
-            Some(b'1'..=b'9') => {
-                self.cursor += 1;
-                while matches!(self.bytes.get(self.cursor), Some(b'0'..=b'9')) {
-                    self.cursor += 1;
-                }
-            }
-            _ => return false,
-        }
-        if self.take(b'.') {
-            let start = self.cursor;
-            while matches!(self.bytes.get(self.cursor), Some(b'0'..=b'9')) {
-                self.cursor += 1;
-            }
-            if self.cursor == start {
-                return false;
-            }
-        }
-        if matches!(self.bytes.get(self.cursor), Some(b'e' | b'E')) {
-            self.cursor += 1;
-            if matches!(self.bytes.get(self.cursor), Some(b'+' | b'-')) {
-                self.cursor += 1;
-            }
-            let start = self.cursor;
-            while matches!(self.bytes.get(self.cursor), Some(b'0'..=b'9')) {
-                self.cursor += 1;
-            }
-            if self.cursor == start {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-fn is_json_object(line: &str) -> bool {
-    let mut parser = JsonSyntax {
-        bytes: line.as_bytes(),
-        cursor: 0,
-    };
-    parser.skip_space();
-    if parser.bytes.get(parser.cursor) != Some(&b'{') || !parser.parse_value(0) {
-        return false;
-    }
-    parser.skip_space();
-    parser.cursor == parser.bytes.len()
-}
-
-fn tracked_bead_ids_from_read(
-    path: &Path,
-    read: io::Result<String>,
-) -> Result<BTreeSet<String>, BeadEvidenceError> {
-    let text = match read {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(BeadEvidenceError::Missing {
-                path: path.to_path_buf(),
-            });
-        }
-        Err(error) => {
-            return Err(BeadEvidenceError::Unreadable {
-                path: path.to_path_buf(),
-                kind: error.kind(),
-            });
-        }
-    };
-
-    let mut ids = BTreeSet::new();
-    for (index, line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("{\"id\":\"") else {
-            return Err(BeadEvidenceError::Corrupt {
-                path: path.to_path_buf(),
-                line: line_number,
-                reason: "expected a canonical Beads JSON object beginning with a string id",
-            });
-        };
-        let Some(end) = rest.find('"') else {
-            return Err(BeadEvidenceError::Corrupt {
-                path: path.to_path_buf(),
-                line: line_number,
-                reason: "unterminated issue id",
-            });
-        };
-        let id = &rest[..end];
-        let canonical_id = id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
-        if id.is_empty() || !canonical_id || !is_json_object(line) {
-            return Err(BeadEvidenceError::Corrupt {
-                path: path.to_path_buf(),
-                line: line_number,
-                reason: "malformed issue object",
-            });
-        }
-        if !ids.insert(id.to_string()) {
-            return Err(BeadEvidenceError::Corrupt {
-                path: path.to_path_buf(),
-                line: line_number,
-                reason: "duplicate issue id",
-            });
-        }
-    }
-    if ids.is_empty() {
-        return Err(BeadEvidenceError::Empty {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(ids)
-}
-
-/// The set of tracked bead ids (from the exported JSONL), for proving a stub's owner
-/// actually exists. The export is a required evidence input: unavailable or malformed
-/// evidence is a typed validation failure, never permission to skip owner checks.
-fn tracked_bead_ids(root: &Path) -> Result<BTreeSet<String>, BeadEvidenceError> {
-    let path = root.join(".beads/issues.jsonl");
-    tracked_bead_ids_from_read(&path, fs::read_to_string(&path))
-}
-
 /// The full production validation of the parsed rule set against the workspace: the
 /// single source of truth both the real-contract test and the planted-mutation test
 /// run, so no check can be silently deleted without a test going red.
 fn validate(rules: &[Rule], root: &Path) -> Vec<String> {
-    validate_with_beads(rules, root, tracked_bead_ids(root))
+    let required_owners = required_stub_owners(rules);
+    let ownership = load_kernel_contract_ownership(
+        root,
+        &required_owners,
+        OwnershipSourceMode::RequireSource,
+        OwnershipLimits::default(),
+    );
+    validate_with_ownership(rules, root, ownership)
 }
 
-fn validate_with_beads(
+fn required_stub_owners(rules: &[Rule]) -> BTreeSet<String> {
+    rules
+        .iter()
+        .filter_map(|rule| rule.stub_owner.clone())
+        .collect()
+}
+
+fn validate_with_ownership(
     rules: &[Rule],
     root: &Path,
-    beads: Result<BTreeSet<String>, BeadEvidenceError>,
+    ownership: Result<OwnershipEvidence, OwnershipFailure>,
 ) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     let mut ids = BTreeSet::new();
-    if let Err(error) = &beads {
+    if let Err(error) = &ownership {
         failures.push(error.diagnostic());
     }
     for rule in rules {
@@ -409,8 +121,8 @@ fn validate_with_beads(
                 rule.id, rule.heading_line
             ));
         }
-        if let (Some(owner), Ok(beads)) = (&rule.stub_owner, &beads)
-            && !beads.contains(owner)
+        if let (Some(owner), Ok(evidence)) = (&rule.stub_owner, &ownership)
+            && !evidence.owners().contains(owner)
         {
             failures.push(format!(
                 "{}: stub owner `{owner}` is not a tracked bead",
@@ -609,15 +321,8 @@ fn the_checker_detects_planted_drift_and_gaps() {
          anchor: vendor/lean4-src/src/kernel/type_checker.cpp:609 (x) expect=\"reduce_nat\"\n\
          fixtures: stub owner=franken_lean-nonexistent-ZZZ\n",
     );
-    let tracked = tracked_bead_ids_from_read(
-        Path::new("/mutation-fixture/.beads/issues.jsonl"),
-        Ok("{\"id\":\"franken_lean-z6c\"}\n".to_string()),
-    );
     assert!(
-        has(
-            &validate_with_beads(&rules, root, tracked),
-            "not a tracked bead"
-        ),
+        has(&validate(&rules, root), "[bead-evidence/phantom-owner]"),
         "a stub owner that names no real bead must be rejected"
     );
 
@@ -650,80 +355,305 @@ fn the_checker_detects_planted_drift_and_gaps() {
 #[test]
 fn bead_ownership_evidence_failures_are_typed_and_fail_closed() {
     let root = workspace_root();
-    let evidence_path = Path::new("/evidence-root/.beads/issues.jsonl");
     let (rules, problems) = parse_rules(
         "### KR-993 · ownership evidence\n\
          anchor: vendor/lean4-src/src/kernel/type_checker.cpp:609 (x) expect=\"reduce_nat\"\n\
          fixtures: stub owner=franken_lean-z6c\n",
     );
     assert!(problems.is_empty());
+    let required = required_stub_owners(&rules);
 
-    let assert_failure = |evidence, class: &str| {
-        let failures = validate_with_beads(&rules, root, evidence);
-        assert!(
-            failures.iter().any(|failure| {
-                failure.contains(class) && failure.contains(&evidence_path.display().to_string())
-            }),
-            "ownership evidence failure must preserve its class and path: {failures:?}"
-        );
-    };
-
-    let missing =
-        tracked_bead_ids_from_read(evidence_path, Err(io::Error::from(io::ErrorKind::NotFound)));
-    assert!(matches!(&missing, Err(BeadEvidenceError::Missing { .. })));
-    assert_failure(missing, "[bead-evidence/missing]");
-
-    let unreadable = tracked_bead_ids_from_read(
-        evidence_path,
-        Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+    let missing = load_kernel_contract_ownership(
+        Path::new("/evidence-root-that-does-not-exist"),
+        &required,
+        OwnershipSourceMode::RequireSource,
+        OwnershipLimits::default(),
     );
-    assert!(matches!(
-        &unreadable,
-        Err(BeadEvidenceError::Unreadable { kind, .. })
-            if *kind == io::ErrorKind::PermissionDenied
-    ));
-    assert_failure(unreadable, "[bead-evidence/unreadable]");
-
-    let corrupt = tracked_bead_ids_from_read(
-        evidence_path,
-        Ok("{\"id\":\"franken_lean-z6c\", definitely-not-json}\n".to_string()),
+    let error = missing.as_ref().expect_err("missing evidence must refuse");
+    assert_eq!(error.class(), OwnershipFailureClass::Missing);
+    assert_eq!(error.binding(), None, "a missing input leaked a binding");
+    let failures = validate_with_ownership(&rules, root, missing);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("[bead-evidence/missing]") && failure.contains(MANIFEST_RELATIVE_PATH)
+        }),
+        "typed ownership failure must preserve class and path: {failures:?}"
     );
-    assert!(matches!(
-        &corrupt,
-        Err(BeadEvidenceError::Corrupt { line: 1, .. })
-    ));
-    assert_failure(corrupt, "[bead-evidence/corrupt]");
 
-    let noncanonical_id = tracked_bead_ids_from_read(
-        evidence_path,
-        Ok("{\"id\":\"not a bead id\"}\n".to_string()),
-    );
-    assert!(matches!(
-        &noncanonical_id,
-        Err(BeadEvidenceError::Corrupt { line: 1, .. })
-    ));
-    assert_failure(noncanonical_id, "[bead-evidence/corrupt]");
-
-    let empty = tracked_bead_ids_from_read(evidence_path, Ok(" \n\t\n".to_string()));
-    assert!(matches!(&empty, Err(BeadEvidenceError::Empty { .. })));
-    assert_failure(empty, "[bead-evidence/empty]");
-
-    let duplicate = tracked_bead_ids_from_read(
-        evidence_path,
-        Ok("{\"id\":\"franken_lean-z6c\"}\n{\"id\":\"franken_lean-z6c\"}\n".to_string()),
-    );
-    assert!(matches!(
-        &duplicate,
-        Err(BeadEvidenceError::Corrupt { line: 2, .. })
-    ));
-    assert_failure(duplicate, "[bead-evidence/corrupt]");
-
-    let tracked = tracked_bead_ids_from_read(
-        evidence_path,
-        Ok("{\"id\":\"franken_lean-z6c\"}\n".to_string()),
+    let tracked = load_kernel_contract_ownership(
+        root,
+        &required,
+        OwnershipSourceMode::RequireSource,
+        OwnershipLimits::default(),
     );
     assert!(
-        validate_with_beads(&rules, root, tracked).is_empty(),
+        validate_with_ownership(&rules, root, tracked).is_empty(),
         "a real owner in valid evidence must pass the production validator"
     );
+}
+
+const OWNERSHIP_RESULT_SCHEMA: &str = "fln.kernel-contract-ownership-result/1";
+const OWNERSHIP_PROBE_SCHEMA: &str = "fln.kernel-contract-ownership-probe/1";
+
+struct DriverConfiguration {
+    root: PathBuf,
+    required_owners: BTreeSet<String>,
+    source_mode: OwnershipSourceMode,
+    limits: OwnershipLimits,
+}
+
+fn required_env(name: &str) -> Result<String, String> {
+    env::var(name).map_err(|error| format!("{name} is required: {error}"))
+}
+
+fn required_env_u64(name: &str) -> Result<u64, String> {
+    required_env(name)?
+        .parse::<u64>()
+        .map_err(|error| format!("{name} must be an unsigned integer: {error}"))
+}
+
+fn driver_configuration() -> Result<DriverConfiguration, String> {
+    let root = PathBuf::from(required_env("FLN_OWNERSHIP_E2E_ROOT")?);
+    let required_owner = required_env("FLN_OWNERSHIP_E2E_REQUIRED_OWNER")?;
+    if required_owner.is_empty() {
+        return Err("FLN_OWNERSHIP_E2E_REQUIRED_OWNER must not be empty".to_string());
+    }
+    let required_owners = BTreeSet::from([required_owner]);
+    let diagnostic_bytes = usize::try_from(required_env_u64("FLN_OWNERSHIP_MAX_DIAGNOSTIC_BYTES")?)
+        .map_err(|_| "FLN_OWNERSHIP_MAX_DIAGNOSTIC_BYTES does not fit usize".to_string())?;
+    let limits = OwnershipLimits::try_new(
+        required_env_u64("FLN_OWNERSHIP_MAX_FILE_BYTES")?,
+        required_env_u64("FLN_OWNERSHIP_MAX_LINE_BYTES")?,
+        required_env_u64("FLN_OWNERSHIP_MAX_RECORDS")?,
+        required_env_u64("FLN_OWNERSHIP_MAX_ID_BYTES")?,
+        required_env_u64("FLN_OWNERSHIP_MAX_PARSE_DEPTH")?,
+        diagnostic_bytes,
+    )
+    .map_err(|error| error.to_string())?;
+    let source_mode = match required_env("FLN_OWNERSHIP_E2E_POLICY")?.as_str() {
+        "require-source" => OwnershipSourceMode::RequireSource,
+        "manifest-only" => OwnershipSourceMode::ManifestOnly(
+            ExpectedManifestBinding::from_lower_hex(
+                &required_env("FLN_OWNERSHIP_EXPECTED_MANIFEST_HASH")?,
+                &required_env("FLN_OWNERSHIP_EXPECTED_PROJECTION_HASH")?,
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        policy => {
+            return Err(format!(
+                "FLN_OWNERSHIP_E2E_POLICY must be require-source or manifest-only, got {policy:?}"
+            ));
+        }
+    };
+    Ok(DriverConfiguration {
+        root,
+        required_owners,
+        source_mode,
+        limits,
+    })
+}
+
+fn input_usage_json(usage: &InputUsage) -> String {
+    format!(
+        concat!(
+            "{{\"file_bytes\":{},",
+            "\"line_bytes\":{},",
+            "\"records\":{},",
+            "\"id_bytes\":{},",
+            "\"parse_depth\":{}}}"
+        ),
+        usage.file_bytes_observed(),
+        usage.max_line_bytes_observed(),
+        usage.records_observed(),
+        usage.max_id_bytes_observed(),
+        usage.max_parse_depth_observed()
+    )
+}
+
+fn ownership_usage_json(usage: &OwnershipUsage) -> String {
+    format!(
+        concat!(
+            "{{\"manifest\":{},",
+            "\"source\":{},",
+            "\"source_state\":\"{}\",",
+            "\"required_owners\":{}}}"
+        ),
+        input_usage_json(usage.manifest()),
+        input_usage_json(usage.source()),
+        usage.source_state().as_str(),
+        usage.required_owners()
+    )
+}
+
+fn ownership_limits_json(limits: OwnershipLimits) -> String {
+    format!(
+        concat!(
+            "{{\"max_file_bytes\":{},",
+            "\"max_line_bytes\":{},",
+            "\"max_records\":{},",
+            "\"max_id_bytes\":{},",
+            "\"max_parse_depth\":{},",
+            "\"max_diagnostic_bytes\":{}}}"
+        ),
+        limits.max_file_bytes(),
+        limits.max_line_bytes(),
+        limits.max_records(),
+        limits.max_id_bytes(),
+        limits.max_parse_depth(),
+        limits.max_diagnostic_bytes()
+    )
+}
+
+fn json_string_contents(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if control <= '\u{1f}' => {
+                write!(&mut escaped, "\\u{:04x}", u32::from(control))
+                    .expect("writing to String cannot fail");
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+fn ownership_result_json(
+    result: &Result<OwnershipEvidence, OwnershipFailure>,
+    limits: OwnershipLimits,
+) -> String {
+    let (classification, diagnostic, binding, usage) = match result {
+        Ok(evidence) => (
+            "ok",
+            String::new(),
+            Some(evidence.binding()),
+            evidence.usage(),
+        ),
+        Err(error) => (
+            error.result_classification(),
+            error.diagnostic(),
+            error.binding(),
+            error.usage(),
+        ),
+    };
+    let evidence_grade = if binding.is_some() {
+        match usage.source_state() {
+            OwnershipSourceState::PresentVerified => "source-bound",
+            OwnershipSourceState::Absent => "manifest-only",
+            OwnershipSourceState::NotAttempted
+            | OwnershipSourceState::Unavailable
+            | OwnershipSourceState::Present => "none",
+        }
+    } else {
+        "none"
+    };
+    let (manifest_hash, projection_hash) = binding
+        .map(|binding| {
+            (
+                binding.manifest_digest().to_hex(),
+                binding.projection_digest().to_hex(),
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        concat!(
+            "{{\"schema\":\"{}\",",
+            "\"classification\":\"{}\",",
+            "\"diagnostic\":\"{}\",",
+            "\"evidence_grade\":\"{}\",",
+            "\"limits\":{},",
+            "\"manifest_hash\":\"{}\",",
+            "\"manifest_path\":\"{}\",",
+            "\"projection_hash\":\"{}\",",
+            "\"source_path\":\"{}\",",
+            "\"usage\":{}}}\n"
+        ),
+        OWNERSHIP_RESULT_SCHEMA,
+        classification,
+        json_string_contents(&diagnostic),
+        evidence_grade,
+        ownership_limits_json(limits),
+        manifest_hash,
+        MANIFEST_RELATIVE_PATH,
+        projection_hash,
+        SOURCE_RELATIVE_PATH,
+        ownership_usage_json(usage)
+    )
+}
+
+fn write_new_result(path: &Path, contents: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("create ownership result {}: {error}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("write ownership result {}: {error}", path.display()))?;
+    file.flush()
+        .map_err(|error| format!("flush ownership result {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("sync ownership result {}: {error}", path.display()))
+}
+
+#[test]
+fn ownership_evidence_process_driver() -> Result<(), String> {
+    if env::var_os("FLN_OWNERSHIP_E2E_ROOT").is_none() {
+        return Ok(());
+    }
+    let configuration = driver_configuration()?;
+    let result = load_kernel_contract_ownership(
+        &configuration.root,
+        &configuration.required_owners,
+        configuration.source_mode,
+        configuration.limits,
+    );
+    let result_path = PathBuf::from(required_env("FLN_OWNERSHIP_E2E_RESULT")?);
+    write_new_result(
+        &result_path,
+        &ownership_result_json(&result, configuration.limits),
+    )?;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error.diagnostic()),
+    }
+}
+
+#[test]
+fn ownership_evidence_semantic_probe() -> Result<(), String> {
+    if env::var_os("FLN_OWNERSHIP_E2E_ROOT").is_none() {
+        return Ok(());
+    }
+    let configuration = driver_configuration()?;
+    let evidence = load_kernel_contract_ownership(
+        &configuration.root,
+        &configuration.required_owners,
+        configuration.source_mode,
+        configuration.limits,
+    )
+    .map_err(|error| error.diagnostic())?;
+    println!(
+        concat!(
+            "FLN_OWNERSHIP_PROBE ",
+            "{{\"schema\":\"{}\",",
+            "\"manifest_hash\":\"{}\",",
+            "\"projection_hash\":\"{}\",",
+            "\"record_count\":{},",
+            "\"source_state\":\"{}\"}}"
+        ),
+        OWNERSHIP_PROBE_SCHEMA,
+        evidence.binding().manifest_digest(),
+        evidence.binding().projection_digest(),
+        evidence.binding().record_count(),
+        evidence.usage().source_state().as_str()
+    );
+    Ok(())
 }
