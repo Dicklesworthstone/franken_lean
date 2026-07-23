@@ -113,6 +113,7 @@ name = "fln-rt"
 version = "0.0.0"
 dependencies = [
  "fln-unsafe-abi",
+ "fln-unsafe-region",
 ]
 
 [[package]]

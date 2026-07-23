@@ -20,6 +20,8 @@
 #![forbid(unsafe_code)]
 
 pub mod abi;
+pub mod region;
+mod region_contract;
 
 /// The safe CompatHeap object surface (see the crate docs).
 pub mod obj {

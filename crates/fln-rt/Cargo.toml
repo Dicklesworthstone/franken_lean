@@ -7,3 +7,4 @@ publish = false
 
 [dependencies]
 fln-unsafe-abi = { path = "../fln-unsafe-abi" }
+fln-unsafe-region = { path = "../fln-unsafe-region" }

@@ -43,6 +43,7 @@ SUITE_LOCK = ROOT / "SUITE.lock"
 INVENTORY_PATH = ROOT / "contracts" / "olean_inventory.json"
 CONTRACT_PATH = ROOT / "OLEAN_CONTRACT.md"
 RUST_PATH = ROOT / "crates" / "fln-olean" / "src" / "format.rs"
+REGION_RUST_PATH = ROOT / "crates" / "fln-rt" / "src" / "region_contract.rs"
 
 SCHEMA = "fln-olean-contract/1"
 SIZEOF_SIZE_T = 8  # the LP64 law; verified against the pin's static_assert below
@@ -348,6 +349,73 @@ def render_rust(inv: dict, digest: str) -> str:
     return "\n".join(w) + "\n"
 
 
+def render_rust_region_partition(inv: dict, digest: str) -> str:
+    """The region-envelope partition re-rendered for `fln-rt` (bead fln-wgp).
+
+    Marrow's region engine (§6.4) shares the compacted-region code path with
+    the Grimoire codec, and its tests parse the olean envelope to reach the
+    region payload — but fln-rt (rank 3) cannot import fln-olean's rendering
+    (rank 5, strictly-downward layering), so the envelope subset is rendered
+    twice from the same inventory: magic, header size/fields, accepted
+    versions, and the region alignment law. `pub(crate)`: the partition is
+    engine-internal; the codec surface stays fln-olean's.
+    """
+    pin = inv["pin"]
+    hdr = inv["header"]
+    mod_rel = "vendor/lean4-src/src/library/module.cpp"
+    w = []
+    w.append("//! Marrow's region-envelope contract partition — **@generated** by")
+    w.append("//! `scripts/extract/gen_olean_contract.py`. DO NOT EDIT.")
+    w.append("//!")
+    w.append(f"//! Extracted from the pinned Reference ({pin['repo']} {pin['tag']},")
+    w.append(f"//! commit {pin['commit']}). Envelope subset only (magic, header")
+    w.append("//! fields, accepted versions, region alignment); the full format")
+    w.append("//! contract is single-sourced in `fln-olean::format`. Rendered")
+    w.append("//! `pub(crate)` for the region engine; same inventory, same digest,")
+    w.append("//! drift-checked together with the other three artifacts.")
+    w.append("")
+    w.append("// Provenance-only items may be unused in some build profiles.")
+    w.append("#![allow(dead_code)]")
+    w.append("")
+    w.append("/// SHA-256 of `contracts/olean_inventory.json` this partition was rendered from.")
+    w.append(f'pub(crate) const INVENTORY_DIGEST: &str = "{digest}";')
+    w.append(f'pub(crate) const PIN_TAG: &str = "{pin["tag"]}";')
+    w.append(f'pub(crate) const PIN_COMMIT: &str = "{pin["commit"]}";')
+    w.append("")
+    w.append(f"/// `.olean` magic bytes — {mod_rel}:{hdr['line']}")
+    w.append(f'pub(crate) const OLEAN_MAGIC: [u8; {len(hdr["magic"])}] = *b"{hdr["magic"]}";')
+    w.append("/// Fixed header size in bytes on LP64 (verified against the pin's static_assert).")
+    w.append(f"pub(crate) const OLEAN_HEADER_SIZE: usize = {hdr['size']};")
+    versions = ", ".join(str(v) for v in inv["versions"]["accepted"])
+    w.append(f"/// Format versions the pinned loader accepts — {mod_rel}:{inv['versions']['acceptance_line']}")
+    w.append(f"pub(crate) const OLEAN_ACCEPTED_VERSIONS: &[u8] = &[{versions}];")
+    w.append(f"/// Region payload/base alignment — {mod_rel}:{inv['region_align']['line']}")
+    w.append(f"pub(crate) const REGION_ALIGN: usize = {inv['region_align']['value']};")
+    w.append("")
+    w.append("/// One fixed header field: byte offset, byte size, and provenance.")
+    w.append("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+    w.append("pub(crate) struct HeaderField {")
+    w.append("    pub(crate) name: &'static str,")
+    w.append("    pub(crate) c_type: &'static str,")
+    w.append("    pub(crate) offset: usize,")
+    w.append("    /// 0 marks the trailing flexible array member")
+    w.append("    pub(crate) size: usize,")
+    w.append(f"    /// 1-based line in `{mod_rel}`")
+    w.append("    pub(crate) line: u32,")
+    w.append("}")
+    w.append("")
+    w.append(f"/// The on-disk `olean_header` — {mod_rel}:{hdr['line']}, in file order.")
+    w.append("pub(crate) const OLEAN_HEADER_FIELDS: &[HeaderField] = &[")
+    for f in hdr["fields"]:
+        w.append(
+            f'    HeaderField {{ name: "{f["name"]}", c_type: "{f["c_type"]}", '
+            f"offset: {f['offset']}, size: {f['size']}, line: {f['line']} }},"
+        )
+    w.append("];")
+    w.append("")
+    return "\n".join(w) + "\n"
+
+
 def render_markdown(inv: dict, digest: str) -> str:
     pin = inv["pin"]
     hdr = inv["header"]
@@ -439,6 +507,7 @@ def main() -> int:
         (INVENTORY_PATH, inventory_text),
         (CONTRACT_PATH, render_markdown(inv, digest)),
         (RUST_PATH, render_rust(inv, digest)),
+        (REGION_RUST_PATH, render_rust_region_partition(inv, digest)),
     ]
     if check:
         for path, want in outputs:

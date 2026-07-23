@@ -285,6 +285,15 @@ impl Obj {
 
     // ---- reference discipline ------------------------------------------
 
+    /// Opaque object identity for sharing tables (the compactor's dedup key,
+    /// mirroring upstream's pointer-keyed `m_obj_table`). Distinct live
+    /// objects yield distinct tokens; scalars yield their tagged word.
+    /// NON-DETERMINISTIC across runs (address-derived) — a token must never
+    /// enter an artifact, digest, or ordering decision (CGSE law).
+    pub fn identity_token(&self) -> usize {
+        self.0 as usize
+    }
+
     /// Add one reference and return a second owned handle.
     pub fn clone_ref(&self) -> Obj {
         if !self.is_scalar() {

@@ -73,6 +73,7 @@ edge fln-kernel -> fln-env         # check consults the environment read-only (f
 edge fln-kernel -> fln-bignum      # owned kernel-grade bignum for literal reduction (§8; already in the allow-direct covenant)
 edge fln-olean -> fln-rt           # region reader consumes the generated ABI object model (franken_lean-y24)
 edge fln-rt -> fln-unsafe-abi      # safe Marrow surface over the CompatHeap membrane, BOUNDARY_API-governed (fln-lld)
+edge fln-rt -> fln-unsafe-region   # region engine drives the mmap/seal primitives, BOUNDARY_API-governed (fln-wgp)
 edge fln-olean -> fln-core         # declaration decoder builds term-plane values (franken_lean-z6c)
 edge fln-olean -> fln-env          # declaration decoder yields ConstantInfo (franken_lean-z6c)
 edge fln-conformance -> fln-env    # kernel replay builds environments from decoded modules (franken_lean-z6c)

@@ -78,3 +78,20 @@ row FLN-UL-0049 | crates/fln-unsafe-abi/src/handle.rs | Obj linear-ownership inv
 row FLN-UL-0050 | crates/fln-unsafe-abi/src/handle.rs | Drop surrenders exactly the one reference the handle owns | rc_clone_and_drop_balance; property suite | scalars are no-ops | no admission
 row FLN-UL-0051 | crates/fln-unsafe-abi/src/handle.rs | canned external finalizer: touches only an atomic counter, ignores data (vtable type demands unsafe extern fn) | external_finalizer_runs_exactly_once | body is safe code; unsafe is declaration-only | no admission; test-observability class only
 row FLN-UL-0052 | crates/fln-unsafe-abi/src/handle.rs | canned external foreach: no-op body (vtable type demands unsafe extern fn) | external_finalizer_runs_exactly_once | body is empty; unsafe is declaration-only | no admission; never invoked in slice 1
+
+# ---- bead fln-wgp slice 1: region mapping primitives (fln-unsafe-region) ----
+# Shared no-claim boundary: mapping primitives move and protect bytes; nothing
+# here interprets objects, and no output can enter kernel admission (D3 law b).
+# Shared evidence: fln-unsafe-region unit suite; fln-rt region round-trip and
+# real-olean suites; scripts/e2e/marrow_region_load.sh incl. fault lanes.
+
+row FLN-UL-0053 | crates/fln-unsafe-region/src/sys.rs | x86_64 syscall convention (rax nr, rdi..r9 args, rcx/r11 clobbered); callers are the three typed wrappers | mapping unit suite; e2e mmap lanes | kernel validates and returns -errno, surfaced as typed Err | no admission; raw kernel request
+row FLN-UL-0054 | crates/fln-unsafe-region/src/sys.rs | aarch64 syscall convention (x8 nr, x0..x5 args) | same as FLN-UL-0053 | same | no admission
+row FLN-UL-0055 | crates/fln-unsafe-region/src/sys.rs | mmap wrapper: len>0, page-aligned fixed bases, readable fd; returned range owned by caller until munmap | mapping unit suite (map/CoW/at-base lanes) | -errno surfaced as typed Err, never a fabricated mapping | no admission
+row FLN-UL-0056 | crates/fln-unsafe-region/src/sys.rs | mprotect wrapper: range within an owned mapping; narrowing during live borrows is the caller's burden (seal takes &mut) | seal unit tests; e2e sealed-write trap lane | -errno surfaced as typed Err | no admission
+row FLN-UL-0057 | crates/fln-unsafe-region/src/sys.rs | munmap wrapper: owned range, no live borrows (Drop-only caller) | mapping drop coverage in every suite | -errno surfaced (ignored only in Drop where nothing sound remains) | no admission
+row FLN-UL-0058 | crates/fln-unsafe-region/src/mapping.rs | map_common: regular file, len>0 checked; fixed bases page-aligned; fd outlives the call; range owned by the new RegionMapping | mapping unit suite; real-olean e2e | typed MapError on every failure path (Io/Empty/Sys/MisalignedBase) | no admission; bytes only
+row FLN-UL-0059 | crates/fln-unsafe-region/src/mapping.rs | as_slice: mapping live for len bytes, exclusively owned, immutable-artifact posture per module invariant | slice roundtrip tests; relocation walks read through it | none needed: borrow rules bound the view | no admission
+row FLN-UL-0060 | crates/fln-unsafe-region/src/mapping.rs | as_mut_slice: exclusivity via &mut self; refused after seal (typed Sealed) | CoW write tests; seal refusal test | typed Sealed error | no admission
+row FLN-UL-0061 | crates/fln-unsafe-region/src/mapping.rs | seal: owned range, &mut self proves no live borrow while protections narrow | seal tests; e2e hardened trap lane | typed Sys error on mprotect failure | no admission
+row FLN-UL-0062 | crates/fln-unsafe-region/src/mapping.rs | Drop munmap: owned range, borrows ended by drop rules | every suite's teardown | munmap failure unreachable for well-formed mappings; ignored in Drop | no admission
