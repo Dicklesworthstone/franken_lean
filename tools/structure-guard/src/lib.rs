@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod boundary_api;
 pub mod checks;
 pub mod graph;
 pub mod ledger;
@@ -33,6 +34,8 @@ pub mod report;
 pub const GRAPH_FILE: &str = "ci/WORKSPACE_GRAPH.txt";
 /// Workspace-relative path of the unsafe-boundary ledger.
 pub const LEDGER_FILE: &str = "ci/UNSAFE_LEDGER.txt";
+/// Workspace-relative path of the reviewed boundary-crate public-API allowlist.
+pub const BOUNDARY_API_FILE: &str = "ci/BOUNDARY_API.txt";
 /// Workspace-relative path of the governed dependency-closure allowlist (D1).
 pub const ALLOWLIST_FILE: &str = "ci/CLOSURE_ALLOWLIST.txt";
 /// Workspace-relative path of the one-ceremony pin file.

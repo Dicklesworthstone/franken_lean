@@ -29,11 +29,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::boundary_api;
 use crate::graph::{self, CrateKind, GraphFile};
 use crate::ledger::{self, AllowSite};
 use crate::manifest::{self, Manifest};
 use crate::report::fnv1a64;
-use crate::{ALLOWLIST_FILE, GRAPH_FILE, LEDGER_FILE, LOCK_FILE, SUITE_LOCK_FILE, TOOLCHAIN_FILE};
+use crate::{
+    ALLOWLIST_FILE, BOUNDARY_API_FILE, GRAPH_FILE, LEDGER_FILE, LOCK_FILE, SUITE_LOCK_FILE,
+    TOOLCHAIN_FILE,
+};
 
 #[derive(Debug)]
 pub struct Finding {
@@ -940,14 +944,31 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         }
     }
 
-    // D3 law (b), no-admission export covenant (bead fln-lld, replacing the fln-8mj
-    // fail-closed scaffold). Textual layer: a boundary crate has no bare-`pub` item,
-    // no symbol-export attribute, no macro definition, and no source escape.
-    // Expansion layer: if the crate INVOKES macros (D1 closes the macro universe to
-    // std's own), the fully expanded crate — every compiled cfg — must still satisfy
-    // the same export rules and must not synthesize `allow(unsafe_code)` beyond the
-    // ledgered source sites. Anything that cannot be verified (expansion failure,
-    // feature-conditional cfg unknowns) fails closed as FLN-STRUCT-025.
+    // D3 law (b), no-admission export covenant (bead fln-lld). Textual layer:
+    // a boundary crate has no symbol-export attribute, no macro definition, no
+    // source escape, and no kernel-admission token — and every bare-`pub` Rust
+    // item is matched item-by-item against the reviewed BOUNDARY_API allowlist
+    // (undeclared items AND stale rows both fail). Expansion layer: if the
+    // crate INVOKES macros (D1 closes the macro universe to std's own), the
+    // fully expanded crate — every compiled cfg — must satisfy the same
+    // export-attribute rules, may not synthesize `allow(unsafe_code)` beyond
+    // the ledgered source sites, and its expanded public items must be a
+    // SUBSET of the declared source items. Anything that cannot be verified
+    // (expansion failure, feature-conditional cfg unknowns, unrecognized
+    // public-item shapes) fails closed.
+    let boundary_rows = match boundary_api::load(root, BOUNDARY_API_FILE) {
+        Ok(Some(api)) => api.rows,
+        Ok(None) => Vec::new(),
+        Err(detail) => {
+            findings.push(Finding {
+                code: "FLN-STRUCT-016",
+                path: BOUNDARY_API_FILE.to_string(),
+                detail,
+            });
+            Vec::new()
+        }
+    };
+    let mut used_api_rows: BTreeSet<&str> = BTreeSet::new();
     for c in &discovered {
         let is_boundary = g
             .crates
@@ -960,9 +981,9 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         if !src.is_dir() {
             continue;
         }
+        let findings_before = findings.len();
         let mut exports = Vec::new();
         ledger::scan_external_exports(&src, &format!("{}/src", c.rel), &mut exports)?;
-        let textual_export_findings = !exports.is_empty();
         for site in exports {
             findings.push(Finding {
                 code: "FLN-STRUCT-022",
@@ -973,13 +994,76 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                 ),
             });
         }
+        // Public-API allowlist matching + admission-token tripwire, per file.
+        let mut sources = Vec::new();
+        collect_rs_files(&src, &mut sources)?;
+        sources.sort();
+        let mut source_pub: BTreeSet<(String, String)> = BTreeSet::new();
+        for path in &sources {
+            let text = fs::read_to_string(path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for site in ledger::admission_token_sites(&text) {
+                findings.push(Finding {
+                    code: "FLN-STRUCT-022",
+                    path: format!("{rel}:{}", site.line),
+                    detail: format!("{} in unsafe boundary `{}` (D3 law b)", site.detail, c.name),
+                });
+            }
+            for item in ledger::public_item_sites(&text) {
+                if item.kind == "unknown" {
+                    findings.push(Finding {
+                        code: "FLN-STRUCT-022",
+                        path: format!("{rel}:{}", item.line),
+                        detail: format!(
+                            "unrecognized public-item shape in unsafe boundary `{}`; the covenant cannot classify it (fail closed)",
+                            c.name
+                        ),
+                    });
+                    continue;
+                }
+                match boundary_rows
+                    .iter()
+                    .find(|row| row.path == rel && row.name == item.name && row.kind == item.kind)
+                {
+                    Some(row) => {
+                        used_api_rows.insert(row.id.as_str());
+                        source_pub.insert((item.kind.clone(), item.name.clone()));
+                    }
+                    None => findings.push(Finding {
+                        code: "FLN-STRUCT-022",
+                        path: format!("{rel}:{}", item.line),
+                        detail: format!(
+                            "undeclared public item `{} {}` in unsafe boundary `{}`; every exported item needs a reviewed {BOUNDARY_API_FILE} row (D3 law b)",
+                            item.kind, item.name, c.name
+                        ),
+                    }),
+                }
+            }
+        }
         // Expansion covenant trigger: any macro invocation in the crate's sources.
-        // Skipped when textual export findings already fail the crate (the source
-        // fix comes first, and the expansion would fail on the same surface).
-        if textual_export_findings {
+        // Skipped when textual findings already fail the crate (the source fix
+        // comes first, and the expansion would fail on the same surface).
+        if findings.len() > findings_before {
             continue;
         }
-        findings.extend(expansion_covenant(root, c)?);
+        findings.extend(expansion_covenant(root, c, &source_pub)?);
+    }
+    for row in &boundary_rows {
+        if !used_api_rows.contains(row.id.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-022",
+                path: BOUNDARY_API_FILE.to_string(),
+                detail: format!(
+                    "row `{}` ({} {} in {}) has no matching public item (stale)",
+                    row.id, row.kind, row.name, row.path
+                ),
+            });
+        }
     }
 
     // ---- line-count covenants ----------------------------------------------------------
@@ -1052,7 +1136,11 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
 /// whatever they produced is literal text and textual scanning is exact.
 /// Every failure mode (including a failed expansion run) is a finding,
 /// never a skip.
-fn expansion_covenant(root: &Path, c: &DiscoveredCrate) -> Result<Vec<Finding>, String> {
+fn expansion_covenant(
+    root: &Path,
+    c: &DiscoveredCrate,
+    source_pub: &BTreeSet<(String, String)>,
+) -> Result<Vec<Finding>, String> {
     let src = c.dir.join("src");
     let mut sources = Vec::new();
     collect_rs_files(&src, &mut sources)?;
@@ -1113,12 +1201,12 @@ fn expansion_covenant(root: &Path, c: &DiscoveredCrate) -> Result<Vec<Finding>, 
                 ),
             }),
             Ok(expanded) => {
-                // Export-surface scan applies to the shipped lib cfg only:
-                // the test harness itself synthesizes `pub` test descriptors
-                // (`#[rustc_test_marker]` items), and test targets never ship
-                // symbols — the laundering vector that remains live in test
-                // code is a synthesized unsafe allowance, which the count
-                // rule below still checks for every cfg.
+                // Export-surface and public-item subset scans apply to the
+                // shipped lib cfg only: the test harness itself synthesizes
+                // `pub` test descriptors (`#[rustc_test_marker]` items), and
+                // test targets never ship symbols — the laundering vector
+                // that remains live in test code is a synthesized unsafe
+                // allowance, which the count rule below checks for every cfg.
                 if !test_cfg {
                     for site in ledger::expanded_surface_violations(&expanded) {
                         findings.push(Finding {
@@ -1129,6 +1217,32 @@ fn expansion_covenant(root: &Path, c: &DiscoveredCrate) -> Result<Vec<Finding>, 
                                 site.detail, c.name
                             ),
                         });
+                    }
+                    for site in ledger::admission_token_sites(&expanded) {
+                        findings.push(Finding {
+                            code: "FLN-STRUCT-025",
+                            path: format!("{}/src (expanded:{label}:{})", c.rel, site.line),
+                            detail: format!(
+                                "{} of boundary `{}` (post-expansion)",
+                                site.detail, c.name
+                            ),
+                        });
+                    }
+                    // Subset rule: the expanded surface may not carry a public
+                    // item the declared source set does not — a macro that
+                    // synthesized one is a laundering attempt.
+                    for item in ledger::expanded_public_items(&expanded) {
+                        let key = (item.kind.clone(), item.name.clone());
+                        if item.kind == "unknown" || !source_pub.contains(&key) {
+                            findings.push(Finding {
+                                code: "FLN-STRUCT-025",
+                                path: format!("{}/src (expanded:{label}:{})", c.rel, item.line),
+                                detail: format!(
+                                    "expanded surface of boundary `{}` carries public item `{} {}` absent from the declared source set — macro-synthesized export",
+                                    c.name, item.kind, item.name
+                                ),
+                            });
+                        }
                     }
                 }
                 let expanded_allow_count = ledger::count_allow_unsafe_attributes(&expanded);

@@ -1,0 +1,78 @@
+# BOUNDARY_API.txt — the reviewed public-API allowlist of the unsafe boundary
+# crates (D3 law b; bead fln-lld slice 2).
+#
+# Every bare-`pub` item in a boundary crate MUST have a row here; stale rows
+# and undeclared items both fail CI (FLN-STRUCT-022), and the expansion
+# covenant (FLN-STRUCT-025) additionally requires the post-expansion public
+# item set to be a SUBSET of the rows below — a macro cannot synthesize an
+# export. There is no unclassified public item.
+#
+# Row grammar (six '|'-separated fields, all non-empty):
+#   row FLN-BX-NNNN | <path> | <kind> <name> | <surface type> | <evidence> | <no-admission argument>
+#
+# Shared no-admission ground: fln-unsafe-abi cannot name fln-kernel/fln-checker
+# types (FLN-STRUCT-008 prohibited paths + the admission-token tripwire), so no
+# output below is expressible as a kernel-checkable term; `Obj` is an opaque
+# linear handle whose contents only ever surface as plain data copies.
+
+schema fln-boundary-api/1
+
+# ---- crate facade (lib.rs) ----
+row FLN-BX-0001 | crates/fln-unsafe-abi/src/lib.rs | mod handle | module: safe RAII Obj surface | tests.rs suites; fln-rt marrow_surface | exposes only rows below
+row FLN-BX-0002 | crates/fln-unsafe-abi/src/lib.rs | mod rc | module: Header view only (raw RC fns stay pub(crate)) | layout suite | plain-int header snapshot
+row FLN-BX-0003 | crates/fln-unsafe-abi/src/lib.rs | mod shadow | module: ownership-shadow controls | shadow mutation suites | diagnostics only, never object access
+
+# ---- rc.rs: the loaded header view ----
+row FLN-BX-0004 | crates/fln-unsafe-abi/src/rc.rs | struct Header | { rc: i32, cs_sz: u16, other: u8, tag: u8 } | header_bitfield_packing; C4 header facts | copied plain integers, no pointer, no liveness claim
+row FLN-BX-0005 | crates/fln-unsafe-abi/src/rc.rs | field rc | i32 | C4 rc.* facts | value copy
+row FLN-BX-0006 | crates/fln-unsafe-abi/src/rc.rs | field cs_sz | u16 | C4 *.cs_sz facts | value copy
+row FLN-BX-0007 | crates/fln-unsafe-abi/src/rc.rs | field other | u8 | C4 ctor/sarray facts | value copy
+row FLN-BX-0008 | crates/fln-unsafe-abi/src/rc.rs | field tag | u8 | C4 tag facts | value copy
+
+# ---- shadow.rs: ownership-shadow controls (diagnostics plane) ----
+row FLN-BX-0009 | crates/fln-unsafe-abi/src/shadow.rs | enum EventKind | Alloc/Release/DoubleRelease/ForeignPointer/TraversalSkip | shadow mutation suites | classification enum, dataless
+row FLN-BX-0010 | crates/fln-unsafe-abi/src/shadow.rs | struct ShadowEvent | { seq, kind, tag, category, op } replay record | shadow_replay_is_deterministic | provenance tags, never addresses or objects
+row FLN-BX-0011 | crates/fln-unsafe-abi/src/shadow.rs | field seq | u64 event sequence | shadow_replay_is_deterministic | value copy
+row FLN-BX-0012 | crates/fln-unsafe-abi/src/shadow.rs | field kind | EventKind | shadow suites | value copy
+row FLN-BX-0013 | crates/fln-unsafe-abi/src/shadow.rs | field tag | Option<u64> allocation provenance | shadow suites | sequence number, not an address
+row FLN-BX-0014 | crates/fln-unsafe-abi/src/shadow.rs | field category | Option<u8> object tag | shadow suites | value copy
+row FLN-BX-0015 | crates/fln-unsafe-abi/src/shadow.rs | field op | &'static str operation label | shadow suites | static label
+row FLN-BX-0016 | crates/fln-unsafe-abi/src/shadow.rs | fn enabled | () -> bool | shadow suites | mode query
+row FLN-BX-0017 | crates/fln-unsafe-abi/src/shadow.rs | fn enable | () | shadow suites | arms bookkeeping; strictly narrows behavior (quarantine)
+row FLN-BX-0018 | crates/fln-unsafe-abi/src/shadow.rs | fn disable_and_drain | () -> (Vec<ShadowEvent>, usize) | shadow suites | replay records + leak count, data only
+
+# ---- handle.rs: the safe RAII surface ----
+row FLN-BX-0019 | crates/fln-unsafe-abi/src/handle.rs | static EXTERNAL_FINALIZED | AtomicUsize finalizer-run counter | external_finalizer_runs_exactly_once | diagnostics counter
+row FLN-BX-0020 | crates/fln-unsafe-abi/src/handle.rs | struct Obj | opaque owned CompatHeap reference (linear, !Send/!Sync) | full tests.rs suite; FLN-UL-0049/0050 | opaque handle; raw pointer never escapes; kernel types unnameable
+row FLN-BX-0021 | crates/fln-unsafe-abi/src/handle.rs | fn mk_nat | (usize) -> Obj | tagged_pointer_law; C4 box facts | tagged scalar, no heap
+row FLN-BX-0022 | crates/fln-unsafe-abi/src/handle.rs | fn mk_ctor | (u8, Vec<Obj>, &[u8]) -> Obj | ctor suites; C4 ctor facts | consumes owned handles; contract-bounded shape
+row FLN-BX-0023 | crates/fln-unsafe-abi/src/handle.rs | fn mk_string | (&str) -> Obj | string_facts_utf8; C4 string facts | byte container
+row FLN-BX-0024 | crates/fln-unsafe-abi/src/handle.rs | fn mk_array | (Vec<Obj>) -> Obj | array suites; C4 array facts | consumes owned handles
+row FLN-BX-0025 | crates/fln-unsafe-abi/src/handle.rs | fn mk_sarray | (u8, &[u8]) -> Obj | sarray suites; C4 sarray facts | byte container
+row FLN-BX-0026 | crates/fln-unsafe-abi/src/handle.rs | fn mk_closure | (u16, Vec<Obj>) -> Obj | closure suites; C4 closure facts | shell only; fun pointer dangling, never invoked in slice
+row FLN-BX-0027 | crates/fln-unsafe-abi/src/handle.rs | fn mk_ref | (Obj) -> Obj | ref suites | consumes the owned value
+row FLN-BX-0028 | crates/fln-unsafe-abi/src/handle.rs | fn mk_thunk_value | (Obj) -> Obj | thunk suites | evaluated form only (G0-1 item 10)
+row FLN-BX-0029 | crates/fln-unsafe-abi/src/handle.rs | fn mk_task_pure | (Obj) -> Obj | task suites | Finished state only (fln-3gv boundary)
+row FLN-BX-0030 | crates/fln-unsafe-abi/src/handle.rs | fn mk_mpz | (&[u64], bool) -> Obj | mpz_view roundtrip | structural container, no arithmetic
+row FLN-BX-0031 | crates/fln-unsafe-abi/src/handle.rs | fn mk_external_counting | () -> Obj | external_finalizer_runs_exactly_once | canned diagnostics class only
+row FLN-BX-0032 | crates/fln-unsafe-abi/src/handle.rs | fn is_scalar | (&self) -> bool | tagged_pointer_law | value query
+row FLN-BX-0033 | crates/fln-unsafe-abi/src/handle.rs | fn unbox | (&self) -> usize | tagged_pointer_law | value copy
+row FLN-BX-0034 | crates/fln-unsafe-abi/src/handle.rs | fn header | (&self) -> Header | header facts suites | plain-int snapshot
+row FLN-BX-0035 | crates/fln-unsafe-abi/src/handle.rs | fn obj_tag | (&self) -> usize | C4 tag facts | value copy
+row FLN-BX-0036 | crates/fln-unsafe-abi/src/handle.rs | fn byte_size | (&self) -> usize | byte-size assertions | value copy
+row FLN-BX-0037 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_child | (&self, usize) -> Obj | ctor suites | inc-before-escape; returns owned handle
+row FLN-BX-0038 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_retag | (&self, u8) | ctor_retag_and_scalar_write | ctor-range asserted
+row FLN-BX-0039 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_scalar_set_u64 | (&self, usize, u64) | ctor_retag_and_scalar_write | scalar-area write, offset law asserted
+row FLN-BX-0040 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_scalar_u64 | (&self, usize) -> u64 | ctor scalar suites; C4 scalar facts | value copy
+row FLN-BX-0041 | crates/fln-unsafe-abi/src/handle.rs | fn string_view | (&self) -> (usize, usize, usize, Vec<u8>) | string_facts_utf8 | data copies
+row FLN-BX-0042 | crates/fln-unsafe-abi/src/handle.rs | fn array_view | (&self) -> (usize, usize) | array suites | value copies
+row FLN-BX-0043 | crates/fln-unsafe-abi/src/handle.rs | fn array_child | (&self, usize) -> Obj | array suites | inc-before-escape; returns owned handle
+row FLN-BX-0044 | crates/fln-unsafe-abi/src/handle.rs | fn mpz_view | (&self) -> (i32, i32, Vec<u64>) | mpz roundtrip | limb copies
+row FLN-BX-0045 | crates/fln-unsafe-abi/src/handle.rs | fn closure_view | (&self) -> (u16, u16) | closure suites | value copies
+row FLN-BX-0046 | crates/fln-unsafe-abi/src/handle.rs | fn clone_ref | (&self) -> Obj | rc_clone_and_drop_balance | adds the reference it hands out
+row FLN-BX-0047 | crates/fln-unsafe-abi/src/handle.rs | fn make_persistent | (&self) | persistent suites; C4 rc.persistent facts | narrows RC behavior to immortal
+row FLN-BX-0048 | crates/fln-unsafe-abi/src/handle.rs | fn make_mt | (&self) | mark_mt suites; C4 rc.mt facts | switches to atomic lanes
+row FLN-BX-0049 | crates/fln-unsafe-abi/src/handle.rs | fn stress_mt | (&self, usize, usize) | mark_mt_negates_and_atomics_conserve | balanced scoped storm, handle outlives it
+row FLN-BX-0050 | crates/fln-unsafe-abi/src/handle.rs | fn probe_double_release | () | shadow_kills_double_release | scripted misuse, shadows-gated, self-contained
+row FLN-BX-0051 | crates/fln-unsafe-abi/src/handle.rs | fn probe_foreign_pointer | () | shadow_kills_foreign_pointer | scripted misuse, shadows-gated, self-contained
+row FLN-BX-0052 | crates/fln-unsafe-abi/src/handle.rs | fn probe_quarantine_poison | () -> u8 | shadow_quarantine_poisons_headers | scripted probe, shadows-gated

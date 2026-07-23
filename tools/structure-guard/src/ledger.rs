@@ -424,23 +424,19 @@ pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
     sites
 }
 
-/// D3 law (b) export rule for boundary crates: no externally public Rust item
-/// and no symbol export of any kind. Macro DEFINITIONS are likewise banned
-/// outright (they mint expansion surface other crates could invoke). Macro
-/// INVOCATIONS are no longer flagged textually — textual scanning cannot see
-/// through expansion, so they are verified by the expansion covenant instead
-/// ([`expanded_surface_violations`] over `-Zunpretty=expanded` output for
-/// every compiled cfg; bead fln-lld, replacing the fln-8mj scaffold).
+/// D3 law (b) export rule for boundary crates: no symbol export of any kind
+/// and no macro definition (they mint expansion surface other crates could
+/// invoke). Bare-`pub` Rust items are no longer flagged here unconditionally:
+/// since slice 2 of bead fln-lld they are matched item-by-item against the
+/// reviewed `ci/BOUNDARY_API.txt` allowlist ([`public_item_sites`] +
+/// `boundary_api`), with both directions (undeclared item, stale row)
+/// failing in `checks.rs`. Macro INVOCATIONS are verified by the expansion
+/// covenant ([`expanded_surface_violations`] + [`expanded_public_items`]
+/// over `-Zunpretty=expanded` output).
 pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
     let lexemes = rust_lexemes(text);
     let mut sites = source_escape_sites(text);
     for (idx, lexeme) in lexemes.iter().enumerate() {
-        if lexeme.text == "pub" && !lexemes.get(idx + 1).is_some_and(|next| next.text == "(") {
-            sites.push(ExportSite {
-                line: lexeme.line,
-                detail: "externally public item",
-            });
-        }
         let declarative_definition = lexeme.text == "macro_rules"
             && lexemes.get(idx + 1).is_some_and(|next| next.text == "!");
         // Macros 2.0: `macro name { .. }` — `macro` here is a keyword only when
@@ -512,9 +508,11 @@ pub fn macro_invocation_lines(text: &str) -> Vec<usize> {
 /// The expansion covenant's surface scan (bead fln-lld): run over the FULLY
 /// EXPANDED crate text (`rustc -Zunpretty=expanded`, one run per compiled
 /// cfg), where nothing can hide behind a macro any more. In expanded form a
-/// boundary crate must still contain: no bare `pub` item, no
-/// `macro_export`/`no_mangle`/`export_name` attribute, and no
-/// `global_asm!` (which can define symbols below the attribute layer).
+/// boundary crate must still contain no
+/// `macro_export`/`no_mangle`/`export_name` attribute and no `global_asm!`
+/// (which can define symbols below the attribute layer). Bare-`pub` items in
+/// the expanded surface are checked separately by the subset rule
+/// ([`expanded_public_items`] ⊆ declared source items, `checks.rs`).
 /// D1 closes the macro universe to `std`'s own macros (no proc-macro or
 /// third-party macro can even be named), so post-expansion text scanning is
 /// sound: whatever a macro synthesized is literal text here.
@@ -522,12 +520,6 @@ pub fn expanded_surface_violations(expanded: &str) -> Vec<ExportSite> {
     let lexemes = rust_lexemes(expanded);
     let mut sites = Vec::new();
     for (idx, lexeme) in lexemes.iter().enumerate() {
-        if lexeme.text == "pub" && !lexemes.get(idx + 1).is_some_and(|next| next.text == "(") {
-            sites.push(ExportSite {
-                line: lexeme.line,
-                detail: "externally public item in expanded surface",
-            });
-        }
         if lexeme.text == "global_asm" && lexemes.get(idx + 1).is_some_and(|next| next.text == "!")
         {
             sites.push(ExportSite {
@@ -564,6 +556,150 @@ pub fn count_allow_unsafe_attributes(text: &str) -> usize {
         .iter()
         .filter(|attribute| attribute_sets_lint_directly(attribute, "allow", "unsafe_code"))
         .count()
+}
+
+/// One bare-`pub` item found in boundary-crate source (or expanded output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PubItem {
+    pub line: usize,
+    /// `fn`/`struct`/`enum`/`union`/`trait`/`type`/`mod`/`const`/`static`/
+    /// `use`/`field` — or `unknown` when the shape after `pub` is not
+    /// recognized (fail closed: the caller reports it).
+    pub kind: String,
+    pub name: String,
+}
+
+/// Extract every bare-`pub` item declaration. Deliberately strict: modifiers
+/// (`unsafe`, `async`, `extern "C"`, `const fn`) are understood; `pub use`
+/// must export exactly one leaf (`pub use path::Item;` or `… as Alias;` —
+/// grouped re-exports come back as `unknown` and fail closed); a struct
+/// field `pub name: T` is kind `field`. Anything else after `pub` is
+/// `unknown`, which the caller must treat as a violation, never a skip.
+pub fn public_item_sites(text: &str) -> Vec<PubItem> {
+    let lexemes = rust_lexemes(text);
+    let mut items = Vec::new();
+    let is_ident = |t: &str| {
+        t.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    };
+    for (idx, lexeme) in lexemes.iter().enumerate() {
+        if lexeme.text != "pub" || lexemes.get(idx + 1).is_some_and(|next| next.text == "(") {
+            continue;
+        }
+        let mut j = idx + 1;
+        // Skip declaration modifiers. String literals (the ABI string in
+        // `extern "C"`) are not lexemes, so `extern` is directly followed by
+        // the item keyword.
+        while lexemes
+            .get(j)
+            .is_some_and(|l| matches!(l.text.as_str(), "unsafe" | "async" | "extern"))
+        {
+            j += 1;
+        }
+        let unknown = |line| PubItem {
+            line,
+            kind: "unknown".to_string(),
+            name: "?".to_string(),
+        };
+        let Some(head) = lexemes.get(j) else {
+            items.push(unknown(lexeme.line));
+            continue;
+        };
+        let item = match head.text.as_str() {
+            "const" => {
+                // `pub const fn name` vs `pub const NAME: T`.
+                match (lexemes.get(j + 1), lexemes.get(j + 2)) {
+                    (Some(next), _) if next.text == "fn" => lexemes.get(j + 2).map(|n| PubItem {
+                        line: lexeme.line,
+                        kind: "fn".to_string(),
+                        name: n.text.clone(),
+                    }),
+                    (Some(name), _) if is_ident(&name.text) => Some(PubItem {
+                        line: lexeme.line,
+                        kind: "const".to_string(),
+                        name: name.text.clone(),
+                    }),
+                    _ => None,
+                }
+            }
+            "fn" | "struct" | "enum" | "union" | "trait" | "type" | "mod" | "static" => lexemes
+                .get(j + 1)
+                .filter(|n| is_ident(&n.text))
+                .map(|n| PubItem {
+                    line: lexeme.line,
+                    kind: head.text.clone(),
+                    name: n.text.clone(),
+                }),
+            "use" => {
+                // Walk to the terminating `;`, rejecting grouped/glob forms.
+                let mut k = j + 1;
+                let mut last_ident: Option<String> = None;
+                let mut clean = true;
+                while let Some(l) = lexemes.get(k) {
+                    match l.text.as_str() {
+                        ";" => break,
+                        "{" | "}" | "*" | "," => {
+                            clean = false;
+                            break;
+                        }
+                        t if is_ident(t) => last_ident = Some(t.to_string()),
+                        "::" | ":" | "as" => {}
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if clean {
+                    last_ident.map(|name| PubItem {
+                        line: lexeme.line,
+                        kind: "use".to_string(),
+                        name,
+                    })
+                } else {
+                    None
+                }
+            }
+            name if is_ident(name) && lexemes.get(j + 1).is_some_and(|n| n.text == ":") => {
+                Some(PubItem {
+                    line: lexeme.line,
+                    kind: "field".to_string(),
+                    name: name.to_string(),
+                })
+            }
+            _ => None,
+        };
+        items.push(item.unwrap_or_else(|| unknown(lexeme.line)));
+    }
+    items
+}
+
+/// [`public_item_sites`] over expanded output — the covenant's subset rule:
+/// every (kind, name) here must exist in the declared source item set, or a
+/// macro synthesized a new public item.
+pub fn expanded_public_items(expanded: &str) -> Vec<PubItem> {
+    public_item_sites(expanded)
+}
+
+/// Kernel-admission token tripwire (D3 law b defense-in-depth): the boundary
+/// crates cannot even DEPEND on the trust base (FLN-STRUCT-008), so these
+/// identifiers appearing anywhere in boundary source or expanded output is
+/// unconditionally a finding — cheap string-level insurance against a
+/// laundering surface being prepared before the dependency edge exists.
+pub fn admission_token_sites(text: &str) -> Vec<ExportSite> {
+    let mut sites = Vec::new();
+    for lexeme in rust_lexemes(text) {
+        if matches!(
+            lexeme.text.as_str(),
+            "fln_kernel" | "fln_checker" | "CheckedExpr"
+        ) {
+            sites.push(ExportSite {
+                line: lexeme.line,
+                detail: "kernel-admission token in boundary code",
+            });
+        }
+    }
+    sites.dedup_by_key(|site| site.line);
+    sites
 }
 
 pub fn scan_external_exports(
@@ -766,10 +902,13 @@ fn two() {}
     fn conservative_export_scan_allows_restricted_visibility_only() {
         assert!(external_export_sites("pub(crate) fn local() {}\n").is_empty());
         assert!(external_export_sites("fn private(r#pub: u8) {}\n").is_empty());
+        // Bare-pub items are the BOUNDARY_API allowlist's job now (matched in
+        // checks.rs via public_item_sites); export attributes stay textual.
         let sites = external_export_sites(
             "pub fn outward() {}\n#[unsafe(no_mangle)]\nextern \"C\" fn symbol() {}\n",
         );
-        assert_eq!(sites.len(), 2);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].detail, "unmangled symbol export");
         assert_eq!(
             external_export_sites("include!(\"outside.inc\");\n").len(),
             1
@@ -802,21 +941,93 @@ fn two() {}
     /// a macro could synthesize must be caught by the post-expansion scan.
     #[test]
     fn expansion_covenant_kills_seeded_defects() {
-        // Macro-generated bare-pub export (incl. generic / associated-type
-        // shapes — visibility, not type structure, is the export axis).
+        // Macro-generated bare-pub exports (incl. generic / associated-type
+        // shapes) are caught by the SUBSET rule: expanded_public_items must
+        // all exist in the declared source set (checks.rs). The extractor
+        // must therefore classify them.
         assert_eq!(
-            expanded_surface_violations("pub fn launder() {}\n").len(),
-            1
+            public_item_sites("pub fn launder() {}\n"),
+            vec![PubItem {
+                line: 1,
+                kind: "fn".into(),
+                name: "launder".into()
+            }]
         );
         assert_eq!(
-            expanded_surface_violations("pub fn generic<T: Trait>(x: T) -> T::Out { x.out() }\n")
-                .len(),
-            1
+            public_item_sites("pub fn generic<T: Trait>(x: T) -> T::Out { x.out() }\n"),
+            vec![PubItem {
+                line: 1,
+                kind: "fn".into(),
+                name: "generic".into()
+            }]
         );
         assert_eq!(
-            expanded_surface_violations("pub struct Laundered(pub(crate) u8);\n").len(),
+            public_item_sites("pub struct Laundered(pub(crate) u8);\n"),
+            vec![PubItem {
+                line: 1,
+                kind: "struct".into(),
+                name: "Laundered".into()
+            }]
+        );
+        // Modifier chains, consts, fields, and single-leaf re-exports.
+        assert_eq!(
+            public_item_sites("pub unsafe extern \"C\" fn s() {}\n"),
+            vec![PubItem {
+                line: 1,
+                kind: "fn".into(),
+                name: "s".into()
+            }]
+        );
+        assert_eq!(
+            public_item_sites("pub const fn cf() {}\npub const K: usize = 1;\n"),
+            vec![
+                PubItem {
+                    line: 1,
+                    kind: "fn".into(),
+                    name: "cf".into()
+                },
+                PubItem {
+                    line: 2,
+                    kind: "const".into(),
+                    name: "K".into()
+                }
+            ]
+        );
+        assert_eq!(
+            public_item_sites("struct H { pub rc: i32 }\n"),
+            vec![PubItem {
+                line: 1,
+                kind: "field".into(),
+                name: "rc".into()
+            }]
+        );
+        assert_eq!(
+            public_item_sites("pub use rc::Header;\npub use shadow::enable as shadow_enable;\n"),
+            vec![
+                PubItem {
+                    line: 1,
+                    kind: "use".into(),
+                    name: "Header".into()
+                },
+                PubItem {
+                    line: 2,
+                    kind: "use".into(),
+                    name: "shadow_enable".into()
+                }
+            ]
+        );
+        // Grouped/glob re-exports cannot be classified — fail closed.
+        assert_eq!(public_item_sites("pub use m::{a, b};\n")[0].kind, "unknown");
+        assert_eq!(public_item_sites("pub use m::*;\n")[0].kind, "unknown");
+        // pub(crate) is not an export.
+        assert!(public_item_sites("pub(crate) fn local() {}\n").is_empty());
+        // Kernel-admission token tripwire.
+        assert_eq!(
+            admission_token_sites("fn f() { let x = fln_kernel::check; }\n").len(),
             1
         );
+        assert_eq!(admission_token_sites("type T = CheckedExpr;\n").len(), 1);
+        assert!(admission_token_sites("fn clean() {}\n").is_empty());
         // Macro-generated symbol exports.
         assert_eq!(
             expanded_surface_violations("#[no_mangle]\nextern \"C\" fn s() {}\n").len(),

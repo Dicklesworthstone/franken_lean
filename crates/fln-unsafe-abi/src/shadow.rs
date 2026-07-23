@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EventKind {
+pub enum EventKind {
     Alloc,
     Release,
     DoubleRelease,
@@ -35,12 +35,12 @@ pub(crate) enum EventKind {
 /// One deterministic replay event. `tag` is the allocation sequence number of
 /// the object involved (`None` when the pointer was never registered).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ShadowEvent {
-    pub(crate) seq: u64,
-    pub(crate) kind: EventKind,
-    pub(crate) tag: Option<u64>,
-    pub(crate) category: Option<u8>,
-    pub(crate) op: &'static str,
+pub struct ShadowEvent {
+    pub seq: u64,
+    pub kind: EventKind,
+    pub tag: Option<u64>,
+    pub category: Option<u8>,
+    pub op: &'static str,
 }
 
 #[derive(Default)]
@@ -56,13 +56,13 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static STATE: Mutex<Option<ShadowState>> = Mutex::new(None);
 
 #[inline(always)]
-pub(crate) fn enabled() -> bool {
+pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
 /// Enable shadow tracking with a fresh deterministic state. Tests serialize
 /// enable/drain around their operation scripts.
-pub(crate) fn enable() {
+pub fn enable() {
     let mut guard = STATE.lock().expect("shadow state poisoned");
     *guard = Some(ShadowState::default());
     ENABLED.store(true, Ordering::SeqCst);
@@ -70,7 +70,7 @@ pub(crate) fn enable() {
 
 /// Disable tracking and return the replay event stream plus the count of
 /// still-live (leaked) registrations.
-pub(crate) fn disable_and_drain() -> (Vec<ShadowEvent>, usize) {
+pub fn disable_and_drain() -> (Vec<ShadowEvent>, usize) {
     ENABLED.store(false, Ordering::SeqCst);
     let mut guard = STATE.lock().expect("shadow state poisoned");
     match guard.take() {

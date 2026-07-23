@@ -33,11 +33,11 @@ use core::sync::atomic::{AtomicI32, Ordering};
 /// A loaded object header (plain reads, mirroring the C fast paths' direct
 /// field access).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Header {
-    pub(crate) rc: i32,
-    pub(crate) cs_sz: u16,
-    pub(crate) other: u8,
-    pub(crate) tag: u8,
+pub struct Header {
+    pub rc: i32,
+    pub cs_sz: u16,
+    pub other: u8,
+    pub tag: u8,
 }
 
 /// Load the header of a live object.

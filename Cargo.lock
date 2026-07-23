@@ -74,6 +74,7 @@ version = "0.0.0"
 name = "fln-kernel"
 version = "0.0.0"
 dependencies = [
+ "fln-bignum",
  "fln-core",
  "fln-env",
 ]
@@ -110,6 +111,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-rt"
 version = "0.0.0"
+dependencies = [
+ "fln-unsafe-abi",
+]
 
 [[package]]
 name = "fln-server"

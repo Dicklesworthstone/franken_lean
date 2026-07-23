@@ -42,9 +42,9 @@ note() { printf 'marrow_abi_probes: %s\n' "$*" >&2; }
 
 emit run_start started "\"cwd\":\"$ROOT\",\"argv\":\"$0\",\"pin\":\"$PIN_TAG\",\"cargo_target\":\"$BUILD_TARGET\""
 
-# ---- lane 1: full unit/property/mutation suite ------------------------------
-note "lane 1: fln-unsafe-abi unit+property+mutation suites"
-if CARGO_TARGET_DIR="$BUILD_TARGET" cargo test --offline -q -p fln-unsafe-abi >"$ART_DIR/unit.log" 2>&1; then
+# ---- lane 1: full unit/property/mutation suite (boundary + safe surface) ----
+note "lane 1: fln-unsafe-abi + fln-rt unit/property/mutation suites"
+if CARGO_TARGET_DIR="$BUILD_TARGET" cargo test --offline -q -p fln-unsafe-abi -p fln-rt >"$ART_DIR/unit.log" 2>&1; then
     emit unit_suite passed "\"artifact\":\"unit.log\""
 else
     emit unit_suite failed "\"artifact\":\"unit.log\""

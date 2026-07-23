@@ -13,9 +13,15 @@
 //! ([`object`]), tri-state reference counting with iterative teardown
 //! ([`rc`]), tagged-pointer scalars ([`tagged`]), debug ownership shadows
 //! ([`shadow`]), and the safe RAII prototype of the eventual fln-rt surface
-//! ([`handle`]). Everything is `pub(crate)`: the exported `lean_*` symbol
-//! surface waits for the expansion-aware no-admission export covenant
-//! (slice 2, coordinated with the structure guard, bead fln-8mj follow-up).
+//! ([`handle`]). Slice 2 opens the reviewed Rust surface: [`handle`] (the
+//! safe RAII `Obj` API), [`rc`] (the `Header` view), and [`shadow`] (the
+//! ownership-shadow controls) are public, with every exported item carrying
+//! a reviewed row in `ci/BOUNDARY_API.txt` — the type-aware half of the D3
+//! no-admission export covenant, enforced both directions plus post-expansion
+//! by `tools/structure-guard` (FLN-STRUCT-022/025). The raw membrane
+//! (`membrane`/`object`/`tagged`/`contract`) stays crate-internal; the
+//! exported `lean_*` C symbol surface is a later slice (per-symbol census
+//! join, beads franken_lean-sno / franken_lean-83r).
 //!
 //! Slice-1 typed restrictions (tracked, never silent):
 //! * scheduled tasks/promises (`m_imp != NULL`) — bead fln-3gv (effects on
@@ -26,10 +32,6 @@
 //!   mpz arithmetic — the fln-bignum shim (Crucible workstream).
 
 #![deny(unsafe_code)]
-// Slice-1 state: the CompatHeap API is `pub(crate)` and consumed by the test
-// suites only — the fln-rt safe surface arrives with the slice-2 export
-// covenant, at which point this allowance must be removed.
-#![cfg_attr(not(test), allow(dead_code))]
 
 // The layout mirrors are exact only under the certified target shape: 64-bit,
 // little-endian (C bitfield unit `m_cs_sz:16|m_other:8|m_tag:8` byte-splits
@@ -41,12 +43,12 @@ compile_error!(
 );
 
 mod contract;
-mod handle;
+pub mod handle;
 mod layout;
 mod membrane;
 mod object;
-mod rc;
-mod shadow;
+pub mod rc;
+pub mod shadow;
 mod tagged;
 
 #[cfg(test)]
