@@ -43,18 +43,20 @@ pub trait PKey: Clone + Eq + Ord {
 /// boundary because a generic map cannot infer the expanded semantic weight of
 /// an opaque key/value pair. `max_fresh_nodes` is checked against a
 /// schedule-independent upper bound, not the history-dependent number of AVL
-/// rotations an individual insertion happened to need.
+/// rotations an individual insertion happened to need. Total weight is `u128`,
+/// so the unbounded envelope exactly represents the sum of `u64` entry weights
+/// across every family cardinality possible on the certified 64-bit platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollisionBudget {
     pub max_collision_entries: usize,
-    pub max_expanded_weight: u64,
+    pub max_expanded_weight: u128,
     pub max_fresh_nodes: usize,
 }
 
 impl CollisionBudget {
     pub const UNBOUNDED: CollisionBudget = CollisionBudget {
         max_collision_entries: usize::MAX,
-        max_expanded_weight: u64::MAX,
+        max_expanded_weight: u128::MAX,
         max_fresh_nodes: usize::MAX,
     };
 }
@@ -75,9 +77,9 @@ pub enum CollisionResource {
 
 /// Typed, atomic resource exhaustion from [`PMap::try_insert_with_budget`].
 ///
-/// Limits and attempts use `u128` so an expanded-weight or platform-sized
-/// entry-count overflow is reported as the true mathematical overage instead
-/// of a wrapped or self-contradictory `attempted == limit` value.
+/// Limits and attempts use `u128` so expanded-weight totals and
+/// platform-sized entry-count overages are reported exactly instead of wrapping
+/// or producing a self-contradictory `attempted == limit` value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollisionExhausted {
     pub resource: CollisionResource,
@@ -133,7 +135,7 @@ struct CollisionNode<K, V> {
     right: Option<Arc<CollisionNode<K, V>>>,
     height: u16,
     len: usize,
-    expanded_weight: u64,
+    expanded_weight: u128,
 }
 
 type CollisionLink<K, V> = Option<Arc<CollisionNode<K, V>>>;
@@ -144,7 +146,7 @@ enum CollisionBucket<K, V> {
     Tree {
         root: Arc<CollisionNode<K, V>>,
         len: usize,
-        expanded_weight: u64,
+        expanded_weight: u128,
     },
 }
 
@@ -179,7 +181,7 @@ struct MutationFacts {
     fresh_collision_nodes: usize,
     cloned_inline_entries: usize,
     collision_entries: usize,
-    expanded_weight: u64,
+    expanded_weight: u128,
     tier: Option<CollisionTier>,
 }
 
@@ -247,7 +249,7 @@ fn collision_len<K, V>(node: Option<&Arc<CollisionNode<K, V>>>) -> usize {
     node.map_or(0, |node| node.len)
 }
 
-fn collision_weight<K, V>(node: Option<&Arc<CollisionNode<K, V>>>) -> u64 {
+fn collision_weight<K, V>(node: Option<&Arc<CollisionNode<K, V>>>) -> u128 {
     node.map_or(0, |node| node.expanded_weight)
 }
 
@@ -259,10 +261,9 @@ fn collision_node<K: Clone, V: Clone>(
 ) -> Arc<CollisionNode<K, V>> {
     facts.fresh_collision_nodes = facts.fresh_collision_nodes.saturating_add(1);
     Arc::new(CollisionNode {
-        expanded_weight: entry
-            .expanded_weight
-            .saturating_add(collision_weight(left.as_ref()))
-            .saturating_add(collision_weight(right.as_ref())),
+        expanded_weight: u128::from(entry.expanded_weight)
+            + collision_weight(left.as_ref())
+            + collision_weight(right.as_ref()),
         height: 1 + collision_height(left.as_ref()).max(collision_height(right.as_ref())),
         len: 1usize
             .saturating_add(collision_len(left.as_ref()))
@@ -538,11 +539,12 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
         }
     }
 
-    fn expanded_weight(&self) -> u64 {
+    fn expanded_weight(&self) -> u128 {
         match self {
             CollisionBucket::Inline(entries) => entries
                 .iter()
-                .fold(0u64, |sum, entry| sum.saturating_add(entry.expanded_weight)),
+                .map(|entry| u128::from(entry.expanded_weight))
+                .sum(),
             CollisionBucket::Tree {
                 expanded_weight, ..
             } => *expanded_weight,
@@ -602,9 +604,8 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
                 });
             }
         };
-        let new_weight = u128::from(self.expanded_weight())
-            .saturating_sub(u128::from(previous_weight.unwrap_or(0)))
-            .saturating_add(u128::from(expanded_weight));
+        let new_weight = self.expanded_weight() - u128::from(previous_weight.unwrap_or(0))
+            + u128::from(expanded_weight);
         Ok((added, new_len, new_weight))
     }
 
@@ -658,7 +659,8 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
                         facts.collision_entries = new_entries.len();
                         facts.expanded_weight = new_entries
                             .iter()
-                            .fold(0u64, |sum, entry| sum.saturating_add(entry.expanded_weight));
+                            .map(|entry| u128::from(entry.expanded_weight))
+                            .sum();
                         facts.tier = Some(CollisionTier::Inline);
                         return (CollisionBucket::Inline(new_entries), added);
                     };
@@ -716,7 +718,8 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
                 facts.collision_entries = kept.len();
                 facts.expanded_weight = kept
                     .iter()
-                    .fold(0u64, |sum, entry| sum.saturating_add(entry.expanded_weight));
+                    .map(|entry| u128::from(entry.expanded_weight))
+                    .sum();
                 facts.tier = Some(CollisionTier::Inline);
                 Some(Some(CollisionBucket::Inline(kept)))
             }
@@ -732,7 +735,8 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
                     facts.collision_entries = entries.len();
                     facts.expanded_weight = entries
                         .iter()
-                        .fold(0u64, |sum, entry| sum.saturating_add(entry.expanded_weight));
+                        .map(|entry| u128::from(entry.expanded_weight))
+                        .sum();
                     facts.tier = Some(CollisionTier::Inline);
                     Some(Some(CollisionBucket::Inline(entries)))
                 } else {
@@ -837,10 +841,10 @@ impl<K: PKey, V: Clone> PMap<K, V> {
                 collision_hash: hash,
             });
         }
-        if total_weight > u128::from(budget.max_expanded_weight) {
+        if total_weight > budget.max_expanded_weight {
             return Err(CollisionExhausted {
                 resource: CollisionResource::ExpandedWeight,
-                limit: u128::from(budget.max_expanded_weight),
+                limit: budget.max_expanded_weight,
                 attempted: total_weight,
                 collision_hash: hash,
             });
@@ -943,7 +947,7 @@ impl<K: PKey, V: Clone> PMap<K, V> {
             None => {
                 facts.fresh_map_nodes = 1;
                 facts.collision_entries = 1;
-                facts.expanded_weight = expanded_weight;
+                facts.expanded_weight = u128::from(expanded_weight);
                 facts.tier = Some(CollisionTier::Inline);
                 (
                     PMap {
@@ -1493,7 +1497,7 @@ mod tests {
             node: &Arc<CollisionNode<K, V>>,
             lower: Option<&K>,
             upper: Option<&K>,
-        ) -> (u16, usize, u64) {
+        ) -> (u16, usize, u128) {
             if let Some(lower) = lower {
                 assert!(
                     lower < &node.entry.key,
@@ -1523,11 +1527,7 @@ mod tests {
             );
             let height = 1 + left_height.max(right_height);
             let len = 1 + left_len + right_len;
-            let weight = node
-                .entry
-                .expanded_weight
-                .saturating_add(left_weight)
-                .saturating_add(right_weight);
+            let weight = u128::from(node.entry.expanded_weight) + left_weight + right_weight;
             assert_eq!(node.height, height);
             assert_eq!(node.len, len);
             assert_eq!(node.expanded_weight, weight);
@@ -1817,6 +1817,7 @@ mod tests {
         let (demoted, removal) = overwritten.remove_profiled(&CollKey(INLINE_COLLISION_MAX as u64));
         assert_eq!(removal.tier, Some(CollisionTier::Inline));
         assert_eq!(removal.collision_entries, INLINE_COLLISION_MAX);
+        assert_eq!(removal.expanded_weight, 131);
         let entries = collision_bucket_for(&demoted, &CollKey(0))
             .and_then(|bucket| match bucket {
                 CollisionBucket::Inline(entries) => Some(entries),
@@ -1827,6 +1828,13 @@ mod tests {
         assert_eq!(
             entries.iter().map(|entry| entry.key.0).collect::<Vec<_>>(),
             (0..INLINE_COLLISION_MAX as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.expanded_weight)
+                .sum::<u64>(),
+            131
         );
     }
 
@@ -1924,6 +1932,7 @@ mod tests {
             map = map.insert_profiled(CollKey(key), key, 1).0;
         }
         let before = collision_contents(&map);
+        let before_root = Arc::clone(map.root.as_ref().expect("non-empty map has a root"));
         let mut preflight = MutationFacts::default();
         let (_, _, promotion_bound) = map
             .insertion_preflight(CollKey(8).key_hash(), &CollKey(8), 1, &mut preflight)
@@ -1937,7 +1946,7 @@ mod tests {
                 1,
                 CollisionBudget {
                     max_collision_entries: INLINE_COLLISION_MAX,
-                    max_expanded_weight: u64::MAX,
+                    max_expanded_weight: u128::MAX,
                     max_fresh_nodes: usize::MAX,
                 },
             )
@@ -1977,8 +1986,13 @@ mod tests {
             )
             .expect_err("promotion requires the declared deterministic bound");
         assert_eq!(allocation_error.resource, CollisionResource::FreshNodes);
+        assert_eq!(allocation_error.limit, (promotion_bound - 1) as u128);
         assert_eq!(allocation_error.attempted, promotion_bound as u128);
         assert_eq!(collision_contents(&map), before);
+        assert!(Arc::ptr_eq(
+            map.root.as_ref().expect("refused map retains its root"),
+            &before_root
+        ));
 
         let exact = map
             .try_insert_with_budget(
@@ -1997,14 +2011,105 @@ mod tests {
         let (_, promotion_facts) = map.insert_profiled(CollKey(8), 8, 1);
         assert_eq!(promotion_facts.actual_fresh_nodes(), promotion_bound);
 
-        let overflow_base = PMap::new().insert_profiled(CollKey(0), 0, u64::MAX).0;
-        let overflow = overflow_base
-            .try_insert_with_budget(CollKey(1), 1, 1, CollisionBudget::UNBOUNDED)
-            .expect_err("expanded-weight arithmetic must not wrap");
-        assert_eq!(overflow.resource, CollisionResource::ExpandedWeight);
-        assert_eq!(overflow.limit, u128::from(u64::MAX));
-        assert_eq!(overflow.attempted, u128::from(u64::MAX) + 1);
-        assert_eq!(overflow_base.len(), 1);
+        let exact_before = collision_contents(&exact);
+        let exact_root = Arc::clone(exact.root.as_ref().expect("promoted map has a root"));
+        let mut overwrite_preflight = MutationFacts::default();
+        let (overwrite_entries, overwrite_weight, overwrite_fresh_bound) = exact
+            .insertion_preflight(
+                CollKey(4).key_hash(),
+                &CollKey(4),
+                100,
+                &mut overwrite_preflight,
+            )
+            .expect("tree overwrite preflight succeeds");
+        assert_eq!(overwrite_entries, 9);
+        assert_eq!(overwrite_weight, 108);
+        let overwrite_error = exact
+            .try_insert_with_budget(
+                CollKey(4),
+                4_444,
+                100,
+                CollisionBudget {
+                    max_collision_entries: overwrite_entries,
+                    max_expanded_weight: 107,
+                    max_fresh_nodes: overwrite_fresh_bound,
+                },
+            )
+            .expect_err("replacement weight is charged after subtracting the old entry");
+        assert_eq!(overwrite_error.resource, CollisionResource::ExpandedWeight);
+        assert_eq!(overwrite_error.limit, 107);
+        assert_eq!(overwrite_error.attempted, 108);
+        assert_eq!(collision_contents(&exact), exact_before);
+        assert!(Arc::ptr_eq(
+            exact.root.as_ref().expect("refused overwrite retains root"),
+            &exact_root
+        ));
+        let overwritten = exact
+            .try_insert_with_budget(
+                CollKey(4),
+                4_444,
+                100,
+                CollisionBudget {
+                    max_collision_entries: overwrite_entries,
+                    max_expanded_weight: 108,
+                    max_fresh_nodes: overwrite_fresh_bound,
+                },
+            )
+            .expect("exact tree-overwrite boundaries are admitted");
+        assert_eq!(overwritten.len(), exact.len());
+        assert_eq!(overwritten.get(&CollKey(4)), Some(&4_444));
+        assert_eq!(exact.get(&CollKey(4)), Some(&4));
+
+        let wide_base = PMap::new()
+            .try_insert_with_budget(CollKey(0), 0, u64::MAX, CollisionBudget::UNBOUNDED)
+            .expect("one maximum-weight entry is representable");
+        let capped = wide_base
+            .try_insert_with_budget(
+                CollKey(1),
+                1,
+                1,
+                CollisionBudget {
+                    max_expanded_weight: u128::from(u64::MAX),
+                    ..CollisionBudget::UNBOUNDED
+                },
+            )
+            .expect_err("an explicit expanded-weight ceiling is enforced exactly");
+        assert_eq!(capped.resource, CollisionResource::ExpandedWeight);
+        assert_eq!(capped.limit, u128::from(u64::MAX));
+        assert_eq!(capped.attempted, u128::from(u64::MAX) + 1);
+        assert_eq!(wide_base.len(), 1);
+        let wide = wide_base
+            .try_insert_with_budget(CollKey(1), 1, u64::MAX, CollisionBudget::UNBOUNDED)
+            .expect("the unbounded envelope admits every representable family weight");
+        assert_eq!(wide.len(), 2);
+        let mut wide_preflight = MutationFacts::default();
+        let (_, wide_weight, _) = wide
+            .insertion_preflight(
+                CollKey(1).key_hash(),
+                &CollKey(1),
+                u64::MAX,
+                &mut wide_preflight,
+            )
+            .expect("wide overwrite preflight succeeds");
+        assert_eq!(wide_weight, 2 * u128::from(u64::MAX));
+        let mut wide_tree = PMap::new();
+        for key in 0..=INLINE_COLLISION_MAX as u64 {
+            wide_tree = wide_tree
+                .try_insert_with_budget(CollKey(key), key, u64::MAX, CollisionBudget::UNBOUNDED)
+                .expect("tree-tier weight aggregation remains exact above u64");
+        }
+        let wide_tree_weight = collision_bucket_for(&wide_tree, &CollKey(0))
+            .and_then(|bucket| match bucket {
+                CollisionBucket::Tree {
+                    expanded_weight, ..
+                } => Some(*expanded_weight),
+                CollisionBucket::Inline(_) => None,
+            })
+            .expect("nine maximum-weight entries promote to the tree tier");
+        assert_eq!(
+            wide_tree_weight,
+            (INLINE_COLLISION_MAX as u128 + 1) * u128::from(u64::MAX)
+        );
 
         let recovered = map.insert(CollKey(8), 8);
         assert_eq!(recovered.len(), 9);
@@ -2051,7 +2156,7 @@ mod tests {
                     1,
                     CollisionBudget {
                         max_collision_entries: CARDINALITY + 1,
-                        max_expanded_weight: (CARDINALITY + 1) as u64,
+                        max_expanded_weight: (CARDINALITY + 1) as u128,
                         max_fresh_nodes: required - 1,
                     },
                 )
@@ -2075,7 +2180,7 @@ mod tests {
                     1,
                     CollisionBudget {
                         max_collision_entries: CARDINALITY + 1,
-                        max_expanded_weight: (CARDINALITY + 1) as u64,
+                        max_expanded_weight: (CARDINALITY + 1) as u128,
                         max_fresh_nodes: required,
                     },
                 )
@@ -2183,10 +2288,14 @@ mod tests {
                 "cardinality={cardinality}, allocations={}, bound={allocation_bound}",
                 facts.actual_fresh_nodes()
             );
-            assert!(
-                facts.cloned_inline_entries
-                    <= INLINE_COLLISION_MAX * (INLINE_COLLISION_MAX + 1) / 2,
-                "inline clone work must stop permanently after promotion"
+            assert_eq!(
+                facts.fresh_map_nodes, cardinality,
+                "one all-collision insert must allocate exactly one HAMT leaf"
+            );
+            assert_eq!(
+                facts.cloned_inline_entries,
+                INLINE_COLLISION_MAX * (INLINE_COLLISION_MAX + 1) / 2,
+                "inline clone work is exact and stops permanently after promotion"
             );
 
             let legacy_vec_copies = cardinality.saturating_mul(cardinality - 1) / 2;
@@ -2556,6 +2665,14 @@ mod tests {
         format!("[{body}]")
     }
 
+    fn u64_sequence_root(values: &[u64]) -> String {
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        format!("fln-fixture:{}", hash(Domain::Fixture, &bytes))
+    }
+
     fn json_string(value: &str) -> String {
         let mut encoded = String::from("\"");
         for ch in value.chars() {
@@ -2656,6 +2773,7 @@ mod tests {
         max_lookup_comparisons: usize,
         required_fresh_nodes: usize,
         refusal_resource: CollisionResource,
+        refusal_limit: u128,
         refusal_attempted: u128,
     }
 
@@ -2719,7 +2837,7 @@ mod tests {
             .ok()?;
         let exact_budget = CollisionBudget {
             max_collision_entries: next_len,
-            max_expanded_weight: u64::try_from(next_weight).ok()?,
+            max_expanded_weight: next_weight,
             max_fresh_nodes: required_fresh_nodes,
         };
         let refusal = enumeration
@@ -2734,6 +2852,7 @@ mod tests {
             )
             .err()?;
         if refusal.resource != CollisionResource::FreshNodes
+            || refusal.limit != usize_as_u128(required_fresh_nodes.saturating_sub(1))
             || refusal.attempted != usize_as_u128(required_fresh_nodes)
             || enumeration.get(&next_name).is_some()
         {
@@ -2798,6 +2917,7 @@ mod tests {
             max_lookup_comparisons,
             required_fresh_nodes,
             refusal_resource: refusal.resource,
+            refusal_limit: refusal.limit,
             refusal_attempted: refusal.attempted,
         };
         drop(snapshot);
@@ -2851,11 +2971,14 @@ mod tests {
         const CARDINALITY: usize = 1_000;
         const THREAD_MATRIX: [usize; 3] = [1, 8, 32];
         let expected_order: Vec<u64> = (0..CARDINALITY as u64).collect();
+        let expected_avl_height = collision_tree_max_height(CARDINALITY);
         let expected_comparison_bound =
-            CARDINALITY.saturating_mul(2 * ceil_log2(CARDINALITY + 1) + 4);
+            CARDINALITY.saturating_mul(expected_avl_height.saturating_add(4));
+        let expected_lookup_bound = expected_avl_height;
         let expected_inline_clone_bound = INLINE_COLLISION_MAX * (INLINE_COLLISION_MAX + 1) / 2;
-        let expected_append_sharing =
-            CARDINALITY.saturating_sub(collision_tree_fresh_node_bound(CARDINALITY + 1));
+        let expected_tree_fresh_bound = collision_tree_fresh_node_bound(CARDINALITY + 1);
+        let expected_append_sharing = CARDINALITY.saturating_sub(expected_tree_fresh_bound);
+        let legacy_vector_copies = CARDINALITY.saturating_mul(CARDINALITY - 1) / 2;
         let started = std::time::Instant::now();
         let mut expected_root = None;
         let mut expected_recovery_root = None;
@@ -2882,17 +3005,17 @@ mod tests {
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "unknown".to_string());
-        let mut input_bytes = Vec::with_capacity(CARDINALITY * std::mem::size_of::<u64>());
-        for component in &expected_order {
-            input_bytes.extend_from_slice(&component.to_le_bytes());
-        }
-        let canonical_input_root = hash(Domain::Fixture, &input_bytes);
+        let canonical_input_root = u64_sequence_root(&expected_order);
 
         for threads in THREAD_MATRIX {
             let schedule_started_us = started.elapsed().as_micros();
             let schedules = concurrent_collision_resource_evidence(CARDINALITY, threads);
             let schedule_finished_us = started.elapsed().as_micros();
-            assert_eq!(schedules.len(), threads, "threads={threads}");
+            assert_eq!(
+                schedules.len(),
+                threads,
+                "collision resource schedule missing: threads={threads}"
+            );
             let representative = schedules.first().expect("the matrix is non-empty");
             let distinct_orders = schedules
                 .iter()
@@ -2906,15 +3029,20 @@ mod tests {
                 assert_eq!(schedule.environment_entries, CARDINALITY);
                 assert_eq!(schedule.representation_tier, "persistent-avl");
                 assert!(schedule.comparisons <= expected_comparison_bound);
-                assert!(schedule.cloned_inline_entries <= expected_inline_clone_bound);
+                assert_eq!(schedule.fresh_map_nodes, CARDINALITY);
+                assert_eq!(schedule.cloned_inline_entries, expected_inline_clone_bound);
                 assert_eq!(schedule.collision_nodes, CARDINALITY);
                 assert!(schedule.snapshot_shared_map_root);
                 assert_eq!(schedule.snapshot_root_arc_bumps, 1);
                 assert_eq!(schedule.snapshot_shared_collision_nodes, CARDINALITY);
                 assert!(schedule.append_shared_collision_nodes >= expected_append_sharing);
                 assert!(schedule.append_fresh_nodes <= schedule.required_fresh_nodes);
-                assert!(schedule.max_lookup_comparisons <= 2 * ceil_log2(CARDINALITY + 1) + 2);
+                assert!(schedule.max_lookup_comparisons <= expected_lookup_bound);
                 assert_eq!(schedule.refusal_resource, CollisionResource::FreshNodes);
+                assert_eq!(
+                    schedule.refusal_limit,
+                    usize_as_u128(schedule.required_fresh_nodes.saturating_sub(1))
+                );
                 assert_eq!(
                     schedule.refusal_attempted,
                     usize_as_u128(schedule.required_fresh_nodes)
@@ -2981,6 +3109,18 @@ mod tests {
                 .iter()
                 .map(|schedule| schedule.refusal_attempted)
                 .collect();
+            let refusal_limits: Vec<u128> = schedules
+                .iter()
+                .map(|schedule| schedule.refusal_limit)
+                .collect();
+            let worker_insertion_order_roots: Vec<String> = schedules
+                .iter()
+                .map(|schedule| u64_sequence_root(&schedule.insertion_order))
+                .collect();
+            let worker_enumeration_roots: Vec<String> = schedules
+                .iter()
+                .map(|schedule| u64_sequence_root(&schedule.enumeration))
+                .collect();
             let worker_roots: Vec<String> = schedules
                 .iter()
                 .map(|schedule| schedule.environment_root.to_string())
@@ -2993,20 +3133,25 @@ mod tests {
             let recovery_root =
                 expected_recovery_root.expect("at least one recovered environment root");
             println!(
-                "{{\"schema\":\"fln.e2e.environment-collision-resource\",\"version\":1,\
+                "{{\"schema\":\"fln.e2e.environment-resource-collision\",\"version\":1,\
                  \"run_id\":{},\"bead\":\"fln-amv.13\",\
                  \"claim_id\":\"fln-amv.13-resource-bounded-collisions\",\
                  \"claim_type\":\"bounded_model\",\"invariant_id\":\"FL-INV-01\",\
                  \"invariant_relation\":\"supports-local-pmap-slice\",\
+                 \"gate_id\":\"PG-5\",\"gate_relation\":\"partial-component-evidence\",\
+                 \"parity_ledger_row\":\"not_applicable_internal_data_structure_resource_bound\",\
                  \"data_grade\":\"verified\",\"epoch\":\"lean-v4.32.0\",\
                  \"mode\":\"sound\",\"profile\":\"e2e\",\"platform\":\"{}-{}\",\
-                 \"cache_state\":{},\"canonical_input_root\":\"fln-fixture:{canonical_input_root}\",\
+                 \"seed\":\"partition-rotation-v1\",\
+                 \"cache_state\":{},\"canonical_input_root\":\"{canonical_input_root}\",\
                  \"scenario\":\"collision-resource-schedule-matrix\",\
                  \"schedule_id\":\"partitioned-{threads}\",\"status\":\"pass\",\
                  \"cwd\":{},\"argv\":[{}],\"stdout_artifact\":{},\"stderr_artifact\":{},\
                  \"collision_cardinality\":{CARDINALITY},\"collision_hash\":\"{:016x}\",\
                  \"threads\":{threads},\"workers_built\":{},\"distinct_insertion_orders\":{distinct_orders},\
-                 \"representative_insertion_order\":{},\"expected_order\":{},\"actual_order\":{},\
+                 \"representative_insertion_order\":{},\"worker_insertion_order_roots\":{},\
+                 \"expected_order\":{},\"actual_order\":{},\
+                 \"worker_enumeration_roots\":{},\
                  \"expected_root\":\"{root}\",\"actual_root\":\"{}\",\"worker_roots\":{},\
                  \"expected_recovery_root\":\"{recovery_root}\",\"actual_recovery_root\":\"{}\",\
                  \"worker_recovery_roots\":{},\"representation_tier\":\"persistent-avl\",\
@@ -3020,17 +3165,22 @@ mod tests {
                  \"append_shared_collision_nodes\":{},\"append_fresh_nodes\":{},\
                  \"max_lookup_comparisons\":{},\
                  \"budget\":{{\"max_collision_entries\":{},\"max_expanded_weight\":{},\
-                 \"required_fresh_nodes\":{},\"refusal_resource\":\"FreshNodes\",\
+                 \"admission_max_fresh_nodes\":{},\"refusal_max_fresh_nodes\":{},\
+                 \"refusal_resource\":\"FreshNodes\",\
                  \"refusal_attempted\":{},\"failure_atomic\":true,\"exact_boundary_recovery\":true}},\
                  \"bounds\":{{\"construction_comparisons\":{expected_comparison_bound},\
                  \"inline_cloned_entries\":{expected_inline_clone_bound},\
                  \"append_minimum_shared_nodes\":{expected_append_sharing},\
-                 \"lookup_comparisons\":{}}},\
+                 \"lookup_comparisons\":{expected_lookup_bound},\
+                 \"maximum_avl_height\":{expected_avl_height},\
+                 \"tree_fresh_nodes_per_insert\":{expected_tree_fresh_bound},\
+                 \"legacy_vector_copies\":{legacy_vector_copies}}},\
                  \"resources\":{{\"expanded_weight\":{CARDINALITY},\
                  \"environment_entries\":{CARDINALITY},\"timing_used_as_gate\":false}},\
                  \"monotonic_start_us\":{schedule_started_us},\
                  \"monotonic_end_us\":{schedule_finished_us},\"duration_us\":{},\
-                 \"process_exit\":0,\"first_divergence\":null,\
+                 \"timing_used_as_gate\":false,\"process_exit\":0,\"signal\":null,\
+                 \"first_divergence\":null,\
                  \"cleanup_status\":\"retained_by_policy\",\
                  \"final_state\":\"typed-refusal-followed-by-exact-bound-recovery\"}}",
                 json_string(&run_id),
@@ -3044,8 +3194,10 @@ mod tests {
                 colliding_environment_name(0).hash(),
                 schedules.len(),
                 json_u64_array(&representative.insertion_order),
+                json_string_array(&worker_insertion_order_roots),
                 json_u64_array(&expected_order),
                 json_u64_array(&representative.enumeration),
+                json_string_array(&worker_enumeration_roots),
                 representative.environment_root,
                 json_string_array(&worker_roots),
                 representative.recovery_root,
@@ -3065,8 +3217,8 @@ mod tests {
                 CARDINALITY + 1,
                 CARDINALITY + 1,
                 json_usize_array(&required_fresh_nodes),
+                json_u128_array(&refusal_limits),
                 json_u128_array(&refusal_attempted),
-                2 * ceil_log2(CARDINALITY + 1) + 2,
                 schedule_finished_us - schedule_started_us,
             );
         }
