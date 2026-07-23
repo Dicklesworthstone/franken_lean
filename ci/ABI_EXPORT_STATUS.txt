@@ -53,8 +53,8 @@ row lean_big_int64_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi)
 row lean_big_int_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_big_int_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_big_size_t_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_big_uint64_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_big_usize_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_big_uint64_to_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | box iff <= MAX_SMALL_NAT (object.cpp:1371-1377)
+row lean_big_usize_to_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | box iff <= MAX_SMALL_NAT (object.cpp:1363-1369)
 row lean_byte_array_data | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | sarray to boxed-UInt8 array (object.cpp:2562-2573)
 row lean_byte_array_hash | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_byte_array_mk | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | boxed-UInt8 array to sarray (object.cpp:2549-2560)
@@ -64,7 +64,7 @@ row lean_copy_expand_array | Unsupported | franken_lean-83r | census (fln-rt::ab
 row lean_copy_expand_array_nonlinear | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_copy_float_array | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_cstr_to_int | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_cstr_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_cstr_to_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | decimal literal parse via owned bignum, normalized (object.cpp:1359-1361)
 row lean_dbg_sleep | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_dbg_trace | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_dbg_trace_if_shared | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
@@ -160,25 +160,25 @@ row lean_mk_string | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | expor
 row lean_mk_string_from_bytes | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | validate + lossy U+FFFD recovery, exact utf8.cpp semantics
 row lean_mk_string_from_bytes_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | utf8_n_strlen count, bug-compatible garbage stepping
 row lean_mk_string_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:1981-1987
-row lean_name_eq | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_nat_big_add | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_nat_big_div | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_name_eq | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | pointer/hash fast paths (cached hash at scalar offset 16) + exact prefix walk (object.cpp:2720-2750)
+row lean_nat_big_add | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | borrowed operands, owned _core result (object.cpp:1383-1391) over fln-bignum
+row lean_nat_big_div | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | x/0 returns the boxed-zero divisor; normalized (object.cpp:1423-1434)
 row lean_nat_big_div_exact | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_nat_big_eq | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_eq | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | representation invariant: scalar never equals mpz (object.cpp:1470-1481)
 row lean_nat_big_land | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_nat_big_le | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_le | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | scalar <= big always, big <= scalar never (object.cpp:1483-1494)
 row lean_nat_big_lor | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_nat_big_lt | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_nat_big_mod | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_nat_big_mul | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_lt | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | same invariant shape (object.cpp:1496-1507)
+row lean_nat_big_mod | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | scalar%big = scalar; x%0 returns retained input (object.cpp:1455-1472)
+row lean_nat_big_mul | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | scalar arms normalize (0 case), big*big stays mpz (object.cpp:1409-1417)
 row lean_nat_big_shiftr | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_nat_big_sub | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_sub | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | truncated sub; scalar-minus-big = 0; normalized (object.cpp:1393-1408)
 row lean_nat_big_succ | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_nat_big_xor | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_nat_gcd | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_nat_log2 | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_nat_overflow_mul | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_nat_pow | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_overflow_mul | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | scalar*scalar overflow path, normalized (object.cpp:1419-1421)
+row lean_nat_pow | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | exponent must be scalar <= UINT_MAX else the pin's INTERNAL PANIC (object.cpp:1577-1586)
 row lean_nat_shiftl | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_obj_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_object_byte_size | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:242-259 branch structure kept literally
@@ -207,7 +207,7 @@ row lean_string_hash | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | exp
 row lean_string_lt | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_memcmp | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_mk | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | List Char UTF-8 encode via the pin's push_unicode_scalar (utf8.cpp:300-320)
-row lean_string_of_usize | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_of_usize | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | decimal ASCII string (object.cpp:2456-2458)
 row lean_string_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_utf8_extract | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_utf8_get | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
@@ -222,15 +222,15 @@ row lean_task_map_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/
 row lean_task_pure | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_task_spawn_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_thunk_get_core | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_uint16_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_uint16_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | low-16 truncation (object.cpp:1809-1811)
 row lean_uint16_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
-row lean_uint32_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_uint32_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | low-32 truncation (object.cpp:1813-1815)
 row lean_uint32_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
-row lean_uint64_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_uint64_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | lowest limb = mpz::mod64 on non-negative (object.cpp:1817-1819)
 row lean_uint64_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
-row lean_uint8_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_uint8_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | low-8 truncation = mpz::mod8 on non-negative (object.cpp:1805-1807)
 row lean_uint8_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
-row lean_usize_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_usize_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | lowest limb = mpz::get_size_t (object.cpp:1825-1827, mpz.cpp:109-116)
 row lean_usize_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_utf8_n_strlen | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | bug-compatible get_utf8_size stepping (utf8.cpp:49-58)
 row lean_utf8_strlen | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | bug-compatible get_utf8_size stepping (utf8.cpp:16-43)

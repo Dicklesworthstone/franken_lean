@@ -137,6 +137,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-unsafe-abi"
 version = "0.0.0"
+dependencies = [
+ "fln-bignum",
+]
 
 [[package]]
 name = "fln-unsafe-jit"

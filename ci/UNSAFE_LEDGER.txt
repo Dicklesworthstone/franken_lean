@@ -186,3 +186,38 @@ row FLN-UL-0130 | crates/fln-unsafe-abi/src/export.rs | string_hash: borrowed sa
 row FLN-UL-0131 | crates/fln-unsafe-abi/src/tests.rs | test-only: list/array roundtrip + the exact push growth/sharing laws | export_array_list_roundtrip_and_push_laws | cfg(test) only | no admission; test apparatus
 row FLN-UL-0132 | crates/fln-unsafe-abi/src/tests.rs | test-only: byte-array family roundtrips + capacity law | export_byte_array_families_match_pin_laws | cfg(test) only | no admission; test apparatus
 row FLN-UL-0133 | crates/fln-unsafe-abi/src/tests.rs | test-only: string/list roundtrip + hash determinism | export_string_list_roundtrip_and_hash | cfg(test) only | no admission; test apparatus
+
+# ---- bead franken_lean-83r slice 3: bignum-backed Nat families ----
+# Shared ground: operands are BORROWED (@& Nat convention), results owned;
+# normalization law: mpz_to_nat boxes values <= MAX_SMALL_NAT, _core arms
+# stay mpz because their value cannot be small (mpz objects hold only values
+# > MAX_SMALL_NAT). Arithmetic is fln-bignum (owned, D1); the gauntlet
+# differential pins every arm against the GMP-backed Reference.
+row FLN-UL-0134 | crates/fln-unsafe-abi/src/export.rs | borrowed Nat operand to owned BigNat: scalar unbox or salient limb copy | export nat suites; gauntlet differential | debug-asserts non-negative mpz | no admission; value copy out
+row FLN-UL-0135 | crates/fln-unsafe-abi/src/export.rs | mpz_to_nat normalization: box iff <= MAX_SMALL_NAT (object.cpp:1352-1357) | export nat suites; gauntlet differential | none | no admission; Nat object out
+row FLN-UL-0136 | crates/fln-unsafe-abi/src/export.rs | mpz_to_nat_core: always mpz; smallness debug-asserted exactly as upstream lean_assert | export nat suites | debug assert | no admission; mpz out
+row FLN-UL-0137 | crates/fln-unsafe-abi/src/export.rs | lowest-limb read of a borrowed mpz (mpz_getlimbn semantics incl. empty=0) | export truncation suites | empty limbs degrade to 0 | no admission; integer out
+row FLN-UL-0138 | crates/fln-unsafe-abi/src/export.rs | nat_big_add: all arms _core (object.cpp:1383-1391) | export nat suites; gauntlet | none | no admission
+row FLN-UL-0139 | crates/fln-unsafe-abi/src/export.rs | nat_big_sub: scalar-minus-big=0; big arms truncated + normalized (object.cpp:1393-1408) | export nat suites; gauntlet | none | no admission
+row FLN-UL-0140 | crates/fln-unsafe-abi/src/export.rs | nat_big_mul: scalar arms normalize, big*big _core (object.cpp:1409-1417) | export nat suites; gauntlet | none | no admission
+row FLN-UL-0141 | crates/fln-unsafe-abi/src/export.rs | nat_overflow_mul: scalar overflow path normalized (object.cpp:1419-1421) | export nat suites; gauntlet | none | no admission
+row FLN-UL-0142 | crates/fln-unsafe-abi/src/export.rs | nat_big_div: scalar/big=0; x/0 returns boxed-zero divisor as upstream returns a2 (object.cpp:1423-1434) | export nat suites; gauntlet | none | no admission
+row FLN-UL-0143 | crates/fln-unsafe-abi/src/export.rs | nat_big_mod: scalar%big=scalar; x%0 returns RETAINED input per upstream lean_inc (object.cpp:1455-1472) | export nat suites; gauntlet | none | no admission; ownership plane per pin
+row FLN-UL-0144 | crates/fln-unsafe-abi/src/export.rs | nat_big_eq: representation invariant arms (object.cpp:1470-1481) | export nat suites; gauntlet | none | no admission; boolean out
+row FLN-UL-0145 | crates/fln-unsafe-abi/src/export.rs | nat_big_le: invariant arms (object.cpp:1483-1494) | export nat suites; gauntlet | none | no admission; boolean out
+row FLN-UL-0146 | crates/fln-unsafe-abi/src/export.rs | nat_big_lt: invariant arms (object.cpp:1496-1507) | export nat suites; gauntlet | none | no admission; boolean out
+row FLN-UL-0147 | crates/fln-unsafe-abi/src/export.rs | nat_pow: non-scalar or > UINT_MAX exponent = the pin's INTERNAL PANIC message (object.cpp:1577-1586) | export nat suites; gauntlet panic lane | termination per policy | no admission
+row FLN-UL-0148 | crates/fln-unsafe-abi/src/export.rs | cstr_to_nat: NUL-terminated digits per generated-code contract; malformed = internal fault termination, never a fabricated Nat | export nat suites; gauntlet | fail-loud on malformed | no admission
+row FLN-UL-0149 | crates/fln-unsafe-abi/src/export.rs | big_usize_to_nat: box iff <= MAX_SMALL_NAT (object.cpp:1363-1369) | export nat suites; gauntlet | none | no admission
+row FLN-UL-0150 | crates/fln-unsafe-abi/src/export.rs | big_uint64_to_nat: box iff <= MAX_SMALL_NAT (object.cpp:1371-1377) | export nat suites; gauntlet | none | no admission
+row FLN-UL-0151 | crates/fln-unsafe-abi/src/export.rs | uint8_of_big_nat: low-8 bits (mpz::mod8 non-negative) | export truncation suites; gauntlet | none | no admission
+row FLN-UL-0152 | crates/fln-unsafe-abi/src/export.rs | uint16_of_big_nat: low-16 bits | export truncation suites; gauntlet | none | no admission
+row FLN-UL-0153 | crates/fln-unsafe-abi/src/export.rs | uint32_of_big_nat: low-32 bits | export truncation suites; gauntlet | none | no admission
+row FLN-UL-0154 | crates/fln-unsafe-abi/src/export.rs | uint64_of_big_nat: lowest limb (mpz::mod64 non-negative) | export truncation suites; gauntlet | none | no admission
+row FLN-UL-0155 | crates/fln-unsafe-abi/src/export.rs | usize_of_big_nat: lowest limb (mpz::get_size_t, mpz.cpp:109-116) | export truncation suites; gauntlet | none | no admission
+row FLN-UL-0156 | crates/fln-unsafe-abi/src/export.rs | string_of_usize: ASCII decimal, byte count = codepoint count (object.cpp:2456-2458) | export nat suites; gauntlet | none | no admission; string out
+row FLN-UL-0157 | crates/fln-unsafe-abi/src/export.rs | lean_nat_eq inline shape: scalar fast path then the big arm (lean.h:1499) | export name suite | none | no admission; boolean out
+row FLN-UL-0158 | crates/fln-unsafe-abi/src/export.rs | lean_string_eq inline shape: identity, size, then cold bytes (lean.h:1262-1264) | export name suite | none | no admission; boolean out
+row FLN-UL-0159 | crates/fln-unsafe-abi/src/export.rs | name_eq: pointer/hash fast paths (cached hash at scalar offset 16, lean.h:3003-3006) + exact prefix walk (object.cpp:2720-2750); only anonymous is scalar so hash reads hit ctors only | export name suite; gauntlet differential | none | no admission; boolean out
+row FLN-UL-0160 | crates/fln-unsafe-abi/src/tests.rs | test-only: big-nat arithmetic arms, normalization boundary, truncations, mod-zero retention | export_nat_big_arithmetic_normalization_and_truncation | cfg(test) only | no admission; test apparatus
+row FLN-UL-0161 | crates/fln-unsafe-abi/src/tests.rs | test-only: Name graph construction + exact eq walk | export_name_eq_walks_prefixes_exactly | cfg(test) only | no admission; test apparatus

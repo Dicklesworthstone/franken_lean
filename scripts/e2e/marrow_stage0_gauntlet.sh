@@ -234,7 +234,10 @@ done
 note "lane 8: mutant drill 83r-M1 (lean_dec_ref_cold dropped in a copy)"
 MUT_WS="$ART_DIR/mutant-ws"
 mkdir -p "$MUT_WS"
+# The crate's path-dependency closure rides along (fln-bignum -> fln-core).
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-core" "$MUT_WS/fln-core"
 cp "$ROOT/rust-toolchain.toml" "$MUT_WS/"
 printf '\n[workspace]\n' >>"$MUT_WS/fln-unsafe-abi/Cargo.toml"
 real_sha_before=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)

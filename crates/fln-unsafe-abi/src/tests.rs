@@ -1132,3 +1132,158 @@ fn export_string_list_roundtrip_and_hash() {
         }
     }
 }
+
+// ================================================================ slice 3: bignum-backed Nat families
+
+#[test]
+fn export_nat_big_arithmetic_normalization_and_truncation() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_big_uint64_to_nat, export_lean_big_usize_to_nat, export_lean_cstr_to_nat,
+        export_lean_dec_ref_cold, export_lean_nat_big_add, export_lean_nat_big_div,
+        export_lean_nat_big_eq, export_lean_nat_big_le, export_lean_nat_big_lt,
+        export_lean_nat_big_mod, export_lean_nat_big_mul, export_lean_nat_big_sub,
+        export_lean_nat_overflow_mul, export_lean_string_of_usize, export_lean_uint8_of_big_nat,
+        export_lean_uint64_of_big_nat, export_lean_usize_of_big_nat,
+    };
+    // UNSAFE-LEDGER: FLN-UL-0160
+    #[allow(unsafe_code)]
+    unsafe {
+        // Boundary law: MAX_SMALL_NAT boxes, MAX_SMALL_NAT+1 mints mpz.
+        let max_small = tagged::MAX_SMALL_NAT;
+        assert!(tagged::is_scalar(export_lean_big_usize_to_nat(max_small)));
+        let big = export_lean_big_uint64_to_nat(u64::MAX);
+        assert!(!tagged::is_scalar(big), "2^64-1 exceeds MAX_SMALL_NAT");
+        let (_, sz, limbs) = crate::object::mpz_fields(big);
+        assert_eq!((sz, limbs.as_slice()), (1, &[u64::MAX][..]));
+
+        // add: big + 1 = 2^64 (stays mpz, _core arm).
+        let big2 = export_lean_nat_big_add(big, tagged::boxi(1));
+        let (_, sz2, limbs2) = crate::object::mpz_fields(big2);
+        assert_eq!((sz2, limbs2.as_slice()), (2, &[0, 1][..]));
+
+        // sub: 2^64 - (2^64-1) = 1 -> NORMALIZED to a boxed scalar.
+        let one = export_lean_nat_big_sub(big2, big);
+        assert!(tagged::is_scalar(one));
+        assert_eq!(tagged::unbox(one), 1);
+        // scalar - big = 0 (caller-guaranteed arm).
+        assert_eq!(
+            tagged::unbox(export_lean_nat_big_sub(tagged::boxi(5), big)),
+            0
+        );
+
+        // mul: 0 * big normalizes to 0; big * big stays mpz.
+        assert_eq!(
+            tagged::unbox(export_lean_nat_big_mul(tagged::boxi(0), big)),
+            0
+        );
+        let sq = export_lean_nat_big_mul(big, big);
+        assert!(!tagged::is_scalar(sq));
+
+        // div: scalar/big = 0; x/0 returns the boxed-zero divisor; big/big.
+        assert_eq!(
+            tagged::unbox(export_lean_nat_big_div(tagged::boxi(7), big)),
+            0
+        );
+        assert_eq!(
+            tagged::unbox(export_lean_nat_big_div(big, tagged::boxi(0))),
+            0
+        );
+        assert_eq!(tagged::unbox(export_lean_nat_big_div(big2, big)), 1);
+
+        // mod: scalar%big = the scalar; x%0 returns the RETAINED input.
+        assert_eq!(
+            tagged::unbox(export_lean_nat_big_mod(tagged::boxi(9), big)),
+            9
+        );
+        let before = crate::rc::read_header(big).rc;
+        let same = export_lean_nat_big_mod(big, tagged::boxi(0));
+        assert_eq!(same, big);
+        assert_eq!(crate::rc::read_header(big).rc, before + 1, "x%0 retains");
+        crate::rc::dec_ref(big);
+        assert_eq!(tagged::unbox(export_lean_nat_big_mod(big2, big)), 1);
+
+        // comparisons: representation-invariant arms + real big compares.
+        assert!(!export_lean_nat_big_eq(tagged::boxi(3), big));
+        assert!(export_lean_nat_big_eq(big, big));
+        assert!(export_lean_nat_big_le(tagged::boxi(3), big));
+        assert!(!export_lean_nat_big_le(big, tagged::boxi(3)));
+        assert!(export_lean_nat_big_lt(big, big2) && !export_lean_nat_big_lt(big2, big));
+
+        // overflow_mul: 2^40 * 2^40 = 2^80.
+        let of = export_lean_nat_overflow_mul(1 << 40, 1 << 40);
+        let (_, osz, olimbs) = crate::object::mpz_fields(of);
+        assert_eq!((osz, olimbs.as_slice()), (2, &[0, 1 << 16][..]));
+
+        // cstr parse: small and 2^128 + 1.
+        assert_eq!(tagged::unbox(export_lean_cstr_to_nat(c"123".as_ptr())), 123);
+        let c128 = export_lean_cstr_to_nat(c"340282366920938463463374607431768211457".as_ptr());
+        let (_, csz, climbs) = crate::object::mpz_fields(c128);
+        assert_eq!((csz, climbs.as_slice()), (3, &[1, 0, 1][..]));
+
+        // truncations: lowest limb / low bits.
+        assert_eq!(export_lean_uint64_of_big_nat(big), u64::MAX);
+        assert_eq!(export_lean_uint8_of_big_nat(big2), 0);
+        assert_eq!(export_lean_usize_of_big_nat(c128), 1);
+
+        // string_of_usize.
+        let s = export_lean_string_of_usize(9007199254740993);
+        let (ssz, _, slen, sbytes) = crate::object::string_fields(s);
+        assert_eq!((ssz, slen), (17, 16));
+        assert_eq!(&sbytes[..16], b"9007199254740993");
+
+        for o in [big, big2, sq, of, c128, s] {
+            export_lean_dec_ref_cold(o);
+        }
+    }
+}
+
+#[test]
+fn export_name_eq_walks_prefixes_exactly() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_big_uint64_to_nat, export_lean_dec_ref_cold, export_lean_name_eq,
+    };
+    // UNSAFE-LEDGER: FLN-UL-0161
+    #[allow(unsafe_code)]
+    unsafe {
+        // Name.str node: ctor tag 1, fields (parent, string), cached hash at
+        // scalar offset 16 (lean_name_hash_ptr law).
+        let mk_str_name = |parent: *mut LeanObject, text: &[u8], hash: u64| {
+            let s = crate::object::mk_string_unchecked(text, text.len());
+            let n = crate::object::alloc_ctor(1, 2, 8);
+            crate::object::ctor_set(n, 0, parent);
+            crate::object::ctor_set(n, 1, s);
+            crate::object::ctor_set_scalar::<u64>(n, 16, hash);
+            n
+        };
+        let anon = tagged::boxi(0);
+        let n1 = mk_str_name(anon, b"foo", 0x1234);
+        let n2 = mk_str_name(anon, b"foo", 0x1234);
+        let n3 = mk_str_name(anon, b"bar", 0x1234); // same hash, different text
+        let n4 = mk_str_name(anon, b"foo", 0x9999); // different hash: fast reject
+        assert_eq!(export_lean_name_eq(n1, n1), 1, "pointer fast path");
+        assert_eq!(export_lean_name_eq(n1, n2), 1, "structural equality");
+        assert_eq!(export_lean_name_eq(n1, n3), 0, "text differs despite hash");
+        assert_eq!(export_lean_name_eq(n1, n4), 0, "hash fast reject");
+        assert_eq!(export_lean_name_eq(anon, n1), 0, "scalar vs node");
+
+        // Name.num node (tag 2) with a BIG Nat component: the walk must use
+        // the big-eq arm.
+        let big_a = export_lean_big_uint64_to_nat(u64::MAX);
+        let big_b = export_lean_big_uint64_to_nat(u64::MAX);
+        let mk_num_name = |parent: *mut LeanObject, nat: *mut LeanObject, hash: u64| {
+            let n = crate::object::alloc_ctor(2, 2, 8);
+            crate::object::ctor_set(n, 0, parent);
+            crate::object::ctor_set(n, 1, nat);
+            crate::object::ctor_set_scalar::<u64>(n, 16, hash);
+            n
+        };
+        let m1 = mk_num_name(n1, big_a, 0x77);
+        let m2 = mk_num_name(n2, big_b, 0x77);
+        assert_eq!(export_lean_name_eq(m1, m2), 1, "big-nat component + prefix");
+        for o in [m1, m2] {
+            export_lean_dec_ref_cold(o);
+        }
+    }
+}

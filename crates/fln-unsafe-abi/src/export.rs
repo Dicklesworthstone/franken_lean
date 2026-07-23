@@ -1195,6 +1195,447 @@ pub(crate) extern "C" fn export_lean_string_hash(s: *mut LeanObject) -> u64 {
     }
 }
 
+// ---- slice 3: the bignum-backed Nat families ---------------------------------
+// Exact ports of object.cpp:1347-1600 / 1805-1830 over the owned bignum
+// (fln-bignum, D1 — Lean Nat semantics: truncated sub, x/0=0, x%0=x). The
+// pin's conventions, kept literally: operands are BORROWED (`@& Nat`), the
+// result is owned; `mpz_to_nat` arms normalize small results back to boxed
+// scalars while `mpz_to_nat_core` arms stay mpz (the value cannot be small
+// there — mpz objects hold only values > MAX_SMALL_NAT by invariant);
+// truncations read low bits exactly as the pin's `mpz_fdiv_r_2exp` /
+// lowest-limb accessors do for non-negative values.
+
+use fln_bignum::nat::BigNat;
+
+/// Borrowed Nat operand → owned `BigNat` value copy.
+///
+/// # Safety
+/// `o` is a live boxed scalar or mpz Nat object.
+// UNSAFE-LEDGER: FLN-UL-0134
+#[allow(unsafe_code)]
+unsafe fn nat_as_bignat(o: *mut LeanObject) -> BigNat {
+    if is_scalar(o) {
+        BigNat::from_u64(crate::tagged::unbox(o) as u64)
+    } else {
+        // SAFETY: live mpz object; |m_size| limbs are salient (Nat: >= 0).
+        let (_, size, limbs) = unsafe { object::mpz_fields(o) };
+        debug_assert!(size >= 0, "Nat mpz objects are non-negative");
+        BigNat::from_limbs_le(limbs)
+    }
+}
+
+/// `mpz_to_nat` (`object.cpp:1352-1357`): box when the value fits
+/// `MAX_SMALL_NAT`, else a fresh mpz object.
+///
+/// # Safety
+/// None beyond allocation; the constructor copies the limbs.
+// UNSAFE-LEDGER: FLN-UL-0135
+#[allow(unsafe_code)]
+unsafe fn nat_obj_from_bignat(n: &BigNat) -> *mut LeanObject {
+    match n.to_u64() {
+        Some(v) if (v as usize) <= crate::tagged::MAX_SMALL_NAT => crate::tagged::boxi(v as usize),
+        // SAFETY: fresh mpz object over an owned limb copy.
+        _ => unsafe { object::alloc_mpz(n.limbs_le(), false) },
+    }
+}
+
+/// `mpz_to_nat_core` (`object.cpp:1347-1350`): always an mpz object; the
+/// caller's arm guarantees the value cannot be small.
+///
+/// # Safety
+/// As [`nat_obj_from_bignat`].
+// UNSAFE-LEDGER: FLN-UL-0136
+#[allow(unsafe_code)]
+unsafe fn nat_obj_from_bignat_core(n: &BigNat) -> *mut LeanObject {
+    debug_assert!(
+        n.to_u64()
+            .is_none_or(|v| (v as usize) > crate::tagged::MAX_SMALL_NAT),
+        "mpz_to_nat_core on a small value (upstream lean_assert)"
+    );
+    // SAFETY: fresh mpz object over an owned limb copy.
+    unsafe { object::alloc_mpz(n.limbs_le(), false) }
+}
+
+/// Low-64 truncation of a borrowed mpz Nat (`mpz::mod64`/`get_size_t` on
+/// non-negative values = the lowest limb; zero-limb objects cannot occur
+/// for Nats but degrade to 0 exactly like `mpz_getlimbn`).
+///
+/// # Safety
+/// `a` live mpz object.
+// UNSAFE-LEDGER: FLN-UL-0137
+#[allow(unsafe_code)]
+unsafe fn big_nat_limb0(a: *mut LeanObject) -> u64 {
+    // SAFETY: live mpz per the contract.
+    let (_, _, limbs) = unsafe { object::mpz_fields(a) };
+    limbs.first().copied().unwrap_or(0)
+}
+
+/// `lean_nat_big_add` (`object.cpp:1383-1391`): every arm is `_core` — a
+/// big plus anything non-negative stays big.
+// UNSAFE-LEDGER: FLN-UL-0138
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_add")]
+pub(crate) extern "C" fn export_lean_nat_big_add(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        let r = nat_as_bignat(a1).add(&nat_as_bignat(a2));
+        nat_obj_from_bignat_core(&r)
+    }
+}
+
+/// `lean_nat_big_sub` (`object.cpp:1393-1408`): scalar-minus-big is 0 by
+/// the caller's guarantee; big arms normalize (the difference can shrink).
+// UNSAFE-LEDGER: FLN-UL-0139
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_sub")]
+pub(crate) extern "C" fn export_lean_nat_big_sub(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        if is_scalar(a1) {
+            return crate::tagged::boxi(0);
+        }
+        let n1 = nat_as_bignat(a1);
+        let n2 = nat_as_bignat(a2);
+        if !is_scalar(a2) && n1.ble(&n2) && !n2.ble(&n1) {
+            return crate::tagged::boxi(0);
+        }
+        nat_obj_from_bignat(&n1.sub(&n2))
+    }
+}
+
+/// `lean_nat_big_mul` (`object.cpp:1409-1417`): scalar arms normalize (the
+/// scalar can be 0), big·big stays `_core`.
+// UNSAFE-LEDGER: FLN-UL-0140
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_mul")]
+pub(crate) extern "C" fn export_lean_nat_big_mul(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        let r = nat_as_bignat(a1).mul(&nat_as_bignat(a2));
+        if is_scalar(a1) || is_scalar(a2) {
+            nat_obj_from_bignat(&r)
+        } else {
+            nat_obj_from_bignat_core(&r)
+        }
+    }
+}
+
+/// `lean_nat_overflow_mul` (`object.cpp:1419-1421`): the scalar·scalar
+/// overflow path, normalized.
+// UNSAFE-LEDGER: FLN-UL-0141
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_overflow_mul")]
+pub(crate) extern "C" fn export_lean_nat_overflow_mul(a1: usize, a2: usize) -> *mut LeanObject {
+    let r = BigNat::from_u64(a1 as u64).mul(&BigNat::from_u64(a2 as u64));
+    // SAFETY: fresh result object only.
+    unsafe { nat_obj_from_bignat(&r) }
+}
+
+/// `lean_nat_big_div` (`object.cpp:1423-1434`): scalar/big is 0 (caller
+/// law); n/0 returns the boxed-zero divisor exactly as upstream returns
+/// `a2`; big arms normalize.
+// UNSAFE-LEDGER: FLN-UL-0142
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_div")]
+pub(crate) extern "C" fn export_lean_nat_big_div(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        if is_scalar(a1) {
+            return crate::tagged::boxi(0);
+        }
+        if is_scalar(a2) && crate::tagged::unbox(a2) == 0 {
+            return a2;
+        }
+        let r = nat_as_bignat(a1).div(&nat_as_bignat(a2));
+        nat_obj_from_bignat(&r)
+    }
+}
+
+/// `lean_nat_big_mod` (`object.cpp:1455-1472` shape): scalar%big is the
+/// scalar itself (borrowed scalar returns as-is — no rc); n%0 returns `a1`
+/// RETAINED exactly as upstream's `lean_inc(a1)`; big arms normalize.
+// UNSAFE-LEDGER: FLN-UL-0143
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_mod")]
+pub(crate) extern "C" fn export_lean_nat_big_mod(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands; the x%0 arm returns the retained
+    // input exactly as upstream.
+    unsafe {
+        if is_scalar(a1) {
+            return a1;
+        }
+        if is_scalar(a2) && crate::tagged::unbox(a2) == 0 {
+            inc(a1);
+            return a1;
+        }
+        let r = nat_as_bignat(a1).rem(&nat_as_bignat(a2));
+        nat_obj_from_bignat(&r)
+    }
+}
+
+/// `lean_nat_big_eq` (`object.cpp:1470-1481`): a scalar can never equal an
+/// mpz object (representation invariant), the caller guarantees it.
+// UNSAFE-LEDGER: FLN-UL-0144
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_eq")]
+pub(crate) extern "C" fn export_lean_nat_big_eq(a1: *mut LeanObject, a2: *mut LeanObject) -> bool {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        if is_scalar(a1) || is_scalar(a2) {
+            return false;
+        }
+        nat_as_bignat(a1).beq(&nat_as_bignat(a2))
+    }
+}
+
+/// `lean_nat_big_le` (`object.cpp:1483-1494`): scalar <= big always, big <=
+/// scalar never (representation invariant).
+// UNSAFE-LEDGER: FLN-UL-0145
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_le")]
+pub(crate) extern "C" fn export_lean_nat_big_le(a1: *mut LeanObject, a2: *mut LeanObject) -> bool {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        if is_scalar(a1) {
+            return true;
+        }
+        if is_scalar(a2) {
+            return false;
+        }
+        nat_as_bignat(a1).ble(&nat_as_bignat(a2))
+    }
+}
+
+/// `lean_nat_big_lt` (`object.cpp:1496-1507`): same invariant shape.
+// UNSAFE-LEDGER: FLN-UL-0146
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_lt")]
+pub(crate) extern "C" fn export_lean_nat_big_lt(a1: *mut LeanObject, a2: *mut LeanObject) -> bool {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        if is_scalar(a1) {
+            return true;
+        }
+        if is_scalar(a2) {
+            return false;
+        }
+        let n1 = nat_as_bignat(a1);
+        let n2 = nat_as_bignat(a2);
+        n1.ble(&n2) && !n1.beq(&n2)
+    }
+}
+
+/// `lean_nat_pow` (`object.cpp:1577-1586`): the exponent must be a scalar
+/// `<= UINT_MAX` or the pin's INTERNAL PANIC fires; result normalized.
+// UNSAFE-LEDGER: FLN-UL-0147
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_pow")]
+pub(crate) extern "C" fn export_lean_nat_pow(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        if !is_scalar(a2) || crate::tagged::unbox(a2) > u32::MAX as usize {
+            internal_panic_impl("Nat.pow exponent is too big");
+        }
+        let r = nat_as_bignat(a1).pow(crate::tagged::unbox(a2) as u32);
+        nat_obj_from_bignat(&r)
+    }
+}
+
+/// `lean_cstr_to_nat` (`object.cpp:1359-1361`): decimal literal (generated
+/// code emits digits only) → normalized Nat.
+// UNSAFE-LEDGER: FLN-UL-0148
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_cstr_to_nat")]
+pub(crate) extern "C" fn export_lean_cstr_to_nat(n: *const c_char) -> *mut LeanObject {
+    // SAFETY: NUL-terminated digit string per the generated-code contract;
+    // a malformed literal is an internal fault, terminated per policy —
+    // never a fabricated Nat.
+    unsafe {
+        let text = core::ffi::CStr::from_ptr(n).to_string_lossy();
+        let Some(v) = BigNat::from_decimal(&text) else {
+            internal_panic_impl("lean_cstr_to_nat: malformed numeral");
+        };
+        nat_obj_from_bignat(&v)
+    }
+}
+
+/// `lean_big_usize_to_nat` (`object.cpp:1363-1369`).
+// UNSAFE-LEDGER: FLN-UL-0149
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_big_usize_to_nat")]
+pub(crate) extern "C" fn export_lean_big_usize_to_nat(n: usize) -> *mut LeanObject {
+    if n <= crate::tagged::MAX_SMALL_NAT {
+        crate::tagged::boxi(n)
+    } else {
+        // SAFETY: fresh mpz over one limb.
+        unsafe { nat_obj_from_bignat_core(&BigNat::from_u64(n as u64)) }
+    }
+}
+
+/// `lean_big_uint64_to_nat` (`object.cpp:1371-1377`).
+// UNSAFE-LEDGER: FLN-UL-0150
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_big_uint64_to_nat")]
+pub(crate) extern "C" fn export_lean_big_uint64_to_nat(n: u64) -> *mut LeanObject {
+    if (n as usize) <= crate::tagged::MAX_SMALL_NAT {
+        crate::tagged::boxi(n as usize)
+    } else {
+        // SAFETY: fresh mpz over one limb.
+        unsafe { nat_obj_from_bignat_core(&BigNat::from_u64(n)) }
+    }
+}
+
+/// `lean_uint8_of_big_nat` (`object.cpp:1805-1807`; `mpz::mod8`).
+// UNSAFE-LEDGER: FLN-UL-0151
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_uint8_of_big_nat")]
+pub(crate) extern "C" fn export_lean_uint8_of_big_nat(a: *mut LeanObject) -> u8 {
+    // SAFETY: borrowed live mpz.
+    unsafe { big_nat_limb0(a) as u8 }
+}
+
+/// `lean_uint16_of_big_nat` (`object.cpp:1809-1811`; `mpz::mod16`).
+// UNSAFE-LEDGER: FLN-UL-0152
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_uint16_of_big_nat")]
+pub(crate) extern "C" fn export_lean_uint16_of_big_nat(a: *mut LeanObject) -> u16 {
+    // SAFETY: borrowed live mpz.
+    unsafe { big_nat_limb0(a) as u16 }
+}
+
+/// `lean_uint32_of_big_nat` (`object.cpp:1813-1815`; `mpz::mod32`).
+// UNSAFE-LEDGER: FLN-UL-0153
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_uint32_of_big_nat")]
+pub(crate) extern "C" fn export_lean_uint32_of_big_nat(a: *mut LeanObject) -> u32 {
+    // SAFETY: borrowed live mpz.
+    unsafe { big_nat_limb0(a) as u32 }
+}
+
+/// `lean_uint64_of_big_nat` (`object.cpp:1817-1819`; `mpz::mod64`).
+// UNSAFE-LEDGER: FLN-UL-0154
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_uint64_of_big_nat")]
+pub(crate) extern "C" fn export_lean_uint64_of_big_nat(a: *mut LeanObject) -> u64 {
+    // SAFETY: borrowed live mpz.
+    unsafe { big_nat_limb0(a) }
+}
+
+/// `lean_usize_of_big_nat` (`object.cpp:1825-1827`; `mpz::get_size_t` =
+/// lowest limb).
+// UNSAFE-LEDGER: FLN-UL-0155
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_usize_of_big_nat")]
+pub(crate) extern "C" fn export_lean_usize_of_big_nat(a: *mut LeanObject) -> usize {
+    // SAFETY: borrowed live mpz.
+    unsafe { big_nat_limb0(a) as usize }
+}
+
+/// `lean_string_of_usize` (`object.cpp:2456-2458`).
+// UNSAFE-LEDGER: FLN-UL-0156
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_of_usize")]
+pub(crate) extern "C" fn export_lean_string_of_usize(n: usize) -> *mut LeanObject {
+    let text = n.to_string();
+    // SAFETY: ASCII digits; byte count = codepoint count.
+    unsafe { object::mk_string_unchecked(text.as_bytes(), text.len()) }
+}
+
+/// `lean_nat_eq` inline shape (`lean.h:1499`), needed by the Name walk.
+///
+/// # Safety
+/// Both live Nat operands, borrowed.
+// UNSAFE-LEDGER: FLN-UL-0157
+#[allow(unsafe_code)]
+unsafe fn nat_eq(a1: *mut LeanObject, a2: *mut LeanObject) -> bool {
+    if is_scalar(a1) && is_scalar(a2) {
+        return a1 == a2;
+    }
+    export_lean_nat_big_eq(a1, a2)
+}
+
+/// `lean_string_eq` inline shape (`lean.h:1262-1264`).
+///
+/// # Safety
+/// Both live string objects, borrowed.
+// UNSAFE-LEDGER: FLN-UL-0158
+#[allow(unsafe_code)]
+unsafe fn string_eq(s1: *mut LeanObject, s2: *mut LeanObject) -> bool {
+    if s1 == s2 {
+        return true;
+    }
+    // SAFETY: live strings; sizes read before the cold byte compare.
+    unsafe {
+        let (n1, _) = string_size_and_data(s1);
+        let (n2, _) = string_size_and_data(s2);
+        n1 == n2 && export_lean_string_eq_cold(s1, s2)
+    }
+}
+
+/// `lean_name_eq` (`object.cpp:2720-2750`): pointer/hash fast paths, then
+/// the prefix walk — the cached hash lives at scalar offset 16
+/// (`lean_name_hash_ptr`, `lean.h:3003-3006`); `str` components (tag 1)
+/// compare as strings, `num` components as Nats.
+// UNSAFE-LEDGER: FLN-UL-0159
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_name_eq")]
+pub(crate) extern "C" fn export_lean_name_eq(
+    mut n1: *mut LeanObject,
+    mut n2: *mut LeanObject,
+) -> u8 {
+    // SAFETY: borrowed live Name objects; the only scalar Name is anonymous,
+    // so the hash reads below are reached with ctor objects only.
+    unsafe {
+        if n1 == n2 {
+            return 1;
+        }
+        if is_scalar(n1) != is_scalar(n2)
+            || object::ctor_get_scalar::<u64>(n1, 16) != object::ctor_get_scalar::<u64>(n2, 16)
+        {
+            return 0;
+        }
+        loop {
+            let t1 = rc::read_header(n1).tag;
+            if t1 != rc::read_header(n2).tag {
+                return 0;
+            }
+            if t1 == 1 {
+                if !string_eq(object::ctor_get(n1, 1), object::ctor_get(n2, 1)) {
+                    return 0;
+                }
+            } else if !nat_eq(object::ctor_get(n1, 1), object::ctor_get(n2, 1)) {
+                return 0;
+            }
+            n1 = object::ctor_get(n1, 0);
+            n2 = object::ctor_get(n2, 0);
+            if n1 == n2 {
+                return 1;
+            }
+            if is_scalar(n1) != is_scalar(n2) {
+                return 0;
+            }
+        }
+    }
+}
+
 // ---- extern-census symbols (declared by generated C itself, not lean.h) ------
 // The stage0 demand audit surfaced these: generated C emits its own extern
 // declarations for @[extern] runtime symbols (contracts/extern_census.tsv

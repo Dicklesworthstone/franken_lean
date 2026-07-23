@@ -162,6 +162,72 @@ static void facts_mode(void) {
     fact("byte_array_data.elem3", (long long)lean_unbox(lean_array_cptr(bd)[3]));
     lean_dec(bd);
 
+    /* ---- slice 3: bignum-backed Nat families */
+    lean_object *big = lean_big_uint64_to_nat(0xFFFFFFFFFFFFFFFFull); /* 2^64-1 */
+    fact("nat.big.is_scalar", lean_is_scalar(big));
+    lean_object *big2 = lean_nat_big_add(big, lean_box(1)); /* 2^64, mpz */
+    fact("nat.add.is_scalar", lean_is_scalar(big2));
+    lean_object *one = lean_nat_big_sub(big2, big);
+    fact("nat.sub.normalized", lean_is_scalar(one));
+    fact("nat.sub.value", (long long)lean_unbox(one));
+    fact("nat.sub.underflow", (long long)lean_unbox(lean_nat_big_sub(lean_box(5), big)));
+    fact("nat.mul.zero", (long long)lean_unbox(lean_nat_big_mul(lean_box(0), big)));
+    lean_object *sq = lean_nat_big_mul(big, big);
+    fact("nat.mul.big_is_scalar", lean_is_scalar(sq));
+    fact("nat.div.small", (long long)lean_unbox(lean_nat_big_div(lean_box(7), big)));
+    fact("nat.div.by_zero", (long long)lean_unbox(lean_nat_big_div(big, lean_box(0))));
+    fact("nat.div.value", (long long)lean_unbox(lean_nat_big_div(big2, big)));
+    fact("nat.mod.small", (long long)lean_unbox(lean_nat_big_mod(lean_box(9), big)));
+    lean_object *modz = lean_nat_big_mod(big, lean_box(0)); /* retained input */
+    fact("nat.mod.by_zero.same", modz == big);
+    fact("nat.mod.by_zero.rc", big->m_rc);
+    lean_dec(modz);
+    fact("nat.mod.value", (long long)lean_unbox(lean_nat_big_mod(big2, big)));
+    fact("nat.eq.mixed", lean_nat_big_eq(lean_box(3), big));
+    fact("nat.eq.same", lean_nat_big_eq(big, big));
+    fact("nat.le.scalar_big", lean_nat_big_le(lean_box(3), big));
+    fact("nat.le.big_scalar", lean_nat_big_le(big, lean_box(3)));
+    fact("nat.lt.big_big", lean_nat_big_lt(big, big2));
+    lean_object *pw = lean_nat_pow(lean_box(2), lean_box(80));
+    fact("nat.pow.is_scalar", lean_is_scalar(pw));
+    uint64_t pw64 = lean_uint64_of_big_nat(pw);
+    fact("nat.pow.trunc64", (long long)pw64);
+    lean_object *of = lean_nat_overflow_mul((size_t)1 << 40, (size_t)1 << 40);
+    fact("nat.overflow_mul.is_scalar", lean_is_scalar(of));
+    fact("nat.overflow_mul.trunc64", (long long)lean_uint64_of_big_nat(of));
+    lean_object *c128 = lean_cstr_to_nat("340282366920938463463374607431768211457");
+    fact("nat.cstr.usize_trunc", (long long)lean_usize_of_big_nat(c128));
+    fact("nat.cstr.u8_trunc", lean_uint8_of_big_nat(c128));
+    uint64_t bt = lean_uint64_of_big_nat(big);
+    fact("nat.trunc64.hi", (long long)(bt >> 32));
+    fact("nat.trunc64.lo", (long long)(bt & 0xFFFFFFFFu));
+    lean_object *sou = lean_string_of_usize(9007199254740993);
+    fact("nat.string_of_usize.bytesum", bytesum(lean_string_cstr(sou), lean_string_size(sou)));
+    lean_dec(sou);
+    lean_dec(one); lean_dec(sq); lean_dec(pw); lean_dec(of); lean_dec(c128);
+    lean_dec(big2); lean_dec(big);
+
+    /* ---- slice 3: Name equality (hash at scalar offset 16, prefix walk) */
+    {
+        lean_object *anon = lean_box(0);
+        lean_object *s1 = lean_mk_string("foo");
+        lean_object *nm1 = lean_alloc_ctor(1, 2, 8);
+        lean_ctor_set(nm1, 0, anon); lean_ctor_set(nm1, 1, s1);
+        lean_ctor_set_uint64(nm1, 16, 0x1234);
+        lean_object *s2 = lean_mk_string("foo");
+        lean_object *nm2 = lean_alloc_ctor(1, 2, 8);
+        lean_ctor_set(nm2, 0, anon); lean_ctor_set(nm2, 1, s2);
+        lean_ctor_set_uint64(nm2, 16, 0x1234);
+        lean_object *s3 = lean_mk_string("bar");
+        lean_object *nm3 = lean_alloc_ctor(1, 2, 8);
+        lean_ctor_set(nm3, 0, anon); lean_ctor_set(nm3, 1, s3);
+        lean_ctor_set_uint64(nm3, 16, 0x1234);
+        fact("name.eq.structural", lean_name_eq(nm1, nm2));
+        fact("name.eq.text_differs", lean_name_eq(nm1, nm3));
+        fact("name.eq.scalar_vs_node", lean_name_eq(anon, nm1));
+        lean_dec(nm1); lean_dec(nm2); lean_dec(nm3);
+    }
+
     /* ---- slice 2: String ⇄ List Char + the hash */
     lean_object *sm = lean_mk_string("h\xc3\xa9llo");
     uint64_t hh = lean_string_hash(sm);

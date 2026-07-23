@@ -74,6 +74,7 @@ edge fln-kernel -> fln-bignum      # owned kernel-grade bignum for literal reduc
 edge fln-olean -> fln-rt           # region reader consumes the generated ABI object model (franken_lean-y24)
 edge fln-olean -> fln-unsafe-region # mmap-backed codec load over the shared region machinery, sealed (fln-20n/fln-wgp seam)
 edge fln-rt -> fln-unsafe-abi      # safe Marrow surface over the CompatHeap membrane, BOUNDARY_API-governed (fln-lld)
+edge fln-unsafe-abi -> fln-bignum  # exported lean_nat_big_* family over the owned bignum (franken_lean-83r; §8.4 shim)
 edge fln-rt -> fln-unsafe-region   # region engine drives the mmap/seal primitives, BOUNDARY_API-governed (fln-wgp)
 edge fln-olean -> fln-core         # declaration decoder builds term-plane values (franken_lean-z6c)
 edge fln-olean -> fln-env          # declaration decoder yields ConstantInfo (franken_lean-z6c)
