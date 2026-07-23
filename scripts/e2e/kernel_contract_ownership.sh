@@ -13,14 +13,7 @@ export LC_ALL=C
 export CARGO_TERM_COLOR=never
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-
-# `git archive` replaces these markers only for the tracked export-subst path.
-# The strict RCH lane compares both values with its caller-bound expectation, so
-# a `.git`-free base archive cannot merely assert a commit/tree identity.
-# shellcheck disable=SC2016
-ARCHIVE_COMMIT_MARKER='$Format:%H$'
-# shellcheck disable=SC2016
-ARCHIVE_TREE_MARKER='$Format:%T$'
+RCH_BRIDGE_ENTERED=false
 
 DEFAULT_MAX_FILE_BYTES=8388608
 DEFAULT_MAX_LINE_BYTES=262144
@@ -1379,6 +1372,7 @@ if [[ "${1:-}" == "--cargo-runner-rch" ]]; then
   export CARGO_BUILD_TARGET="$runner_host"
   export "$runner_env=$direct_runner"
   unset CARGO_BUILD_RUNNER
+  RCH_BRIDGE_ENTERED=true
   set -- --lane rch
 fi
 
@@ -1417,6 +1411,10 @@ case "$LANE" in
     exit 2
     ;;
 esac
+if [[ "$LANE" == "rch" && "$RCH_BRIDGE_ENTERED" != "true" ]]; then
+  echo "kernel_contract_ownership: rch lane requires the Cargo-runner bridge" >&2
+  exit 2
+fi
 
 BEAD="franken_lean-79k.1"
 SCHEMA="fln.e2e.kernel-contract-ownership/1"
@@ -1546,16 +1544,46 @@ if [[ "$LANE" == "rch" ]]; then
         note "rch worker lacks verifiable Git or clean base-only archive identity"
         exit 1
       }
-    [[ "$ARCHIVE_COMMIT_MARKER" == "$EXPECTED_COMMIT" \
-        && "$ARCHIVE_TREE_MARKER" == "$EXPECTED_TREE" ]] \
+    ART_ROOT_PHYSICAL="$(cd "$ART_ROOT" && pwd -P)" \
+      || { note "rch lane could not resolve its retained artifact root"; exit 1; }
+    case "$ART_ROOT_PHYSICAL/" in
+      "$ROOT"/*)
+        note "rch archive identity store must be outside the extracted source root"
+        exit 1
+        ;;
+    esac
+    ARCHIVE_IDENTITY_GIT_DIR="$ART_ROOT/archive-source-tree-$RUN_ID.git"
+    [[ ! -e "$ARCHIVE_IDENTITY_GIT_DIR" \
+        && ! -L "$ARCHIVE_IDENTITY_GIT_DIR" ]] \
       || {
-        note "rch base archive commit/tree markers do not match expectation"
+        note "rch archive identity store already exists"
         exit 1
       }
-    # The tracked export-subst markers above are materialized by the same
-    # `git archive` operation that creates the base-only worker root.
-    COMMIT="$ARCHIVE_COMMIT_MARKER"
-    TREE="$ARCHIVE_TREE_MARKER"
+    git init --bare -q "$ARCHIVE_IDENTITY_GIT_DIR" \
+      || { note "rch lane could not initialize its retained identity store"; exit 1; }
+    GIT_DIR="$ARCHIVE_IDENTITY_GIT_DIR" \
+      GIT_WORK_TREE="$ROOT" \
+      git -c core.autocrlf=false -c core.filemode=true \
+        add -f -A -- . \
+        ':(top,exclude,glob).rch-*' \
+        ':(top,exclude,glob).rch-*/**' \
+      || { note "rch lane could not index the extracted source tree"; exit 1; }
+    OBSERVED_TREE="$(
+      GIT_DIR="$ARCHIVE_IDENTITY_GIT_DIR" \
+        GIT_WORK_TREE="$ROOT" \
+        git write-tree
+    )" || { note "rch lane could not hash the extracted source tree"; exit 1; }
+    [[ "$OBSERVED_TREE" == "$EXPECTED_TREE" ]] \
+      || {
+        note "rch extracted source tree does not match expectation"
+        exit 1
+      }
+    # The retained bare object store is an independently inspectable snapshot
+    # of the exact extracted archive bytes and modes; the caller-bound commit is
+    # separately corroborated by the RCH daemon's clean-overlay receipt.
+    COMMIT="$EXPECTED_COMMIT"
+    TREE="$OBSERVED_TREE"
+    note "retained archive identity store: $ARCHIVE_IDENTITY_GIT_DIR"
   fi
 else
   COMMIT="$(git -C "$ROOT" rev-parse HEAD)"

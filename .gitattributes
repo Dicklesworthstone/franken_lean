@@ -1,1 +1,2 @@
-scripts/e2e/kernel_contract_ownership.sh export-subst
+# RCH clean-overlay archives must remain checkout-equivalent. In particular,
+# do not add export-ignore or export-subst attributes in this repository.
