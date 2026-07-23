@@ -855,6 +855,17 @@ fn payload_provenance_tag(provenance: PayloadProvenance) -> u8 {
     }
 }
 
+/// Write the stable descriptor prefix of `Domain::ExtensionDelta`.
+///
+/// Contract fields precede journal identity deliberately. The explicit tag helpers
+/// make additions fail compilation until their durable schema values are reviewed.
+fn write_descriptor_identity(w: &mut CanonWriter, descriptor: &ExtensionDescriptor) {
+    descriptor.name.write_body(w);
+    w.u8(merge_semantics_tag(descriptor.merge));
+    w.u8(checkpoint_semantics_tag(descriptor.checkpoint));
+    w.u8(payload_provenance_tag(descriptor.provenance));
+}
+
 /// The state of one extension inside an environment: its descriptor plus the
 /// append-only entry journal. Cloning is cheap (shared journal tail via `Arc`s in
 /// the persistent environment map).
@@ -916,10 +927,7 @@ impl ExtensionState {
         let mut w = CanonWriter::new();
         w.str("fln.extension-state");
         w.u16(1);
-        self.descriptor.name.write_body(&mut w);
-        w.u8(merge_semantics_tag(self.descriptor.merge));
-        w.u8(checkpoint_semantics_tag(self.descriptor.checkpoint));
-        w.u8(payload_provenance_tag(self.descriptor.provenance));
+        write_descriptor_identity(&mut w, &self.descriptor);
         w.u64(self.journal.len as u64);
         w.bytes(&self.journal.digest.0);
         hash(Domain::ExtensionDelta, &w.into_bytes())
@@ -1510,6 +1518,249 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct DescriptorIdentityCase {
+        merge: MergeSemantics,
+        checkpoint: CheckpointSemantics,
+        provenance: PayloadProvenance,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DescriptorDigestModel {
+        Canonical,
+        OmitMerge,
+        OmitCheckpoint,
+        OmitProvenance,
+        SwapMergeTagValues,
+        SwapMergeAndCheckpointFields,
+        DebugText,
+        DescriptorAfterJournal,
+    }
+
+    fn descriptor_identity_cases() -> Vec<DescriptorIdentityCase> {
+        let mut cases = Vec::with_capacity(12);
+        for merge in [
+            MergeSemantics::AppendOrdered,
+            MergeSemantics::SetUnion,
+            MergeSemantics::ConflictsRequireReview,
+        ] {
+            for checkpoint in [
+                CheckpointSemantics::JournalSuffix,
+                CheckpointSemantics::FullJournal,
+            ] {
+                for provenance in [PayloadProvenance::Understood, PayloadProvenance::Opaque] {
+                    cases.push(DescriptorIdentityCase {
+                        merge,
+                        checkpoint,
+                        provenance,
+                    });
+                }
+            }
+        }
+        cases
+    }
+
+    const fn modeled_merge_tag(semantics: MergeSemantics) -> u8 {
+        match semantics {
+            MergeSemantics::AppendOrdered => 0,
+            MergeSemantics::SetUnion => 1,
+            MergeSemantics::ConflictsRequireReview => 2,
+        }
+    }
+
+    const fn modeled_checkpoint_tag(semantics: CheckpointSemantics) -> u8 {
+        match semantics {
+            CheckpointSemantics::JournalSuffix => 0,
+            CheckpointSemantics::FullJournal => 1,
+        }
+    }
+
+    const fn modeled_provenance_tag(provenance: PayloadProvenance) -> u8 {
+        match provenance {
+            PayloadProvenance::Understood => 0,
+            PayloadProvenance::Opaque => 1,
+        }
+    }
+
+    const fn merge_label(semantics: MergeSemantics) -> &'static str {
+        match semantics {
+            MergeSemantics::AppendOrdered => "append_ordered",
+            MergeSemantics::SetUnion => "set_union",
+            MergeSemantics::ConflictsRequireReview => "conflicts_require_review",
+        }
+    }
+
+    const fn checkpoint_label(semantics: CheckpointSemantics) -> &'static str {
+        match semantics {
+            CheckpointSemantics::JournalSuffix => "journal_suffix",
+            CheckpointSemantics::FullJournal => "full_journal",
+        }
+    }
+
+    const fn provenance_label(provenance: PayloadProvenance) -> &'static str {
+        match provenance {
+            PayloadProvenance::Understood => "understood",
+            PayloadProvenance::Opaque => "opaque",
+        }
+    }
+
+    fn identity_descriptor(case: DescriptorIdentityCase, unique_name: bool) -> ExtensionDescriptor {
+        let name = if unique_name {
+            format!(
+                "identityExt.{}.{}.{}",
+                merge_label(case.merge),
+                checkpoint_label(case.checkpoint),
+                provenance_label(case.provenance)
+            )
+        } else {
+            "identityExt".to_owned()
+        };
+        ExtensionDescriptor {
+            name: Name::str(Name::anonymous(), name),
+            merge: case.merge,
+            checkpoint: case.checkpoint,
+            provenance: case.provenance,
+        }
+    }
+
+    fn write_modeled_descriptor(
+        w: &mut CanonWriter,
+        descriptor: &ExtensionDescriptor,
+        model: DescriptorDigestModel,
+    ) {
+        descriptor.name.write_body(w);
+        match model {
+            DescriptorDigestModel::Canonical | DescriptorDigestModel::DescriptorAfterJournal => {
+                w.u8(modeled_merge_tag(descriptor.merge));
+                w.u8(modeled_checkpoint_tag(descriptor.checkpoint));
+                w.u8(modeled_provenance_tag(descriptor.provenance));
+            }
+            DescriptorDigestModel::OmitMerge => {
+                w.u8(modeled_checkpoint_tag(descriptor.checkpoint));
+                w.u8(modeled_provenance_tag(descriptor.provenance));
+            }
+            DescriptorDigestModel::OmitCheckpoint => {
+                w.u8(modeled_merge_tag(descriptor.merge));
+                w.u8(modeled_provenance_tag(descriptor.provenance));
+            }
+            DescriptorDigestModel::OmitProvenance => {
+                w.u8(modeled_merge_tag(descriptor.merge));
+                w.u8(modeled_checkpoint_tag(descriptor.checkpoint));
+            }
+            DescriptorDigestModel::SwapMergeTagValues => {
+                let merge = match descriptor.merge {
+                    MergeSemantics::AppendOrdered => 1,
+                    MergeSemantics::SetUnion => 0,
+                    MergeSemantics::ConflictsRequireReview => 2,
+                };
+                w.u8(merge);
+                w.u8(modeled_checkpoint_tag(descriptor.checkpoint));
+                w.u8(modeled_provenance_tag(descriptor.provenance));
+            }
+            DescriptorDigestModel::SwapMergeAndCheckpointFields => {
+                w.u8(modeled_checkpoint_tag(descriptor.checkpoint));
+                w.u8(modeled_merge_tag(descriptor.merge));
+                w.u8(modeled_provenance_tag(descriptor.provenance));
+            }
+            DescriptorDigestModel::DebugText => {
+                w.str(&format!("{:?}", descriptor.merge));
+                w.str(&format!("{:?}", descriptor.checkpoint));
+                w.str(&format!("{:?}", descriptor.provenance));
+            }
+        }
+    }
+
+    fn write_modeled_journal_identity(w: &mut CanonWriter, state: &ExtensionState) {
+        w.u64(state.journal.len as u64);
+        w.bytes(&state.journal.digest.0);
+    }
+
+    /// Control-flow-independent model of the descriptor/journal layout. Primitive
+    /// canonical codecs and the registered extension domain are intentionally shared.
+    fn modeled_extension_content_digest(
+        state: &ExtensionState,
+        model: DescriptorDigestModel,
+    ) -> Digest {
+        let mut w = CanonWriter::new();
+        w.str("fln.extension-state");
+        w.u16(1);
+        if model == DescriptorDigestModel::DescriptorAfterJournal {
+            write_modeled_journal_identity(&mut w, state);
+            write_modeled_descriptor(&mut w, &state.descriptor, model);
+        } else {
+            write_modeled_descriptor(&mut w, &state.descriptor, model);
+            write_modeled_journal_identity(&mut w, state);
+        }
+        hash(Domain::ExtensionDelta, &w.into_bytes())
+    }
+
+    fn identity_state(case: DescriptorIdentityCase, unique_name: bool) -> ExtensionState {
+        ExtensionState::new(identity_descriptor(case, unique_name))
+            .push_entry(bytes(b"alpha"))
+            .push_entry(bytes(b"beta"))
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum IdentityJournalOrder {
+        AlphaThenBeta,
+        BetaThenAlpha,
+    }
+
+    fn identity_environment_with_journal(
+        cases: impl IntoIterator<Item = DescriptorIdentityCase>,
+        journal_order: IdentityJournalOrder,
+    ) -> Environment {
+        let entries: [&[u8]; 2] = match journal_order {
+            IdentityJournalOrder::AlphaThenBeta => [b"alpha".as_slice(), b"beta".as_slice()],
+            IdentityJournalOrder::BetaThenAlpha => [b"beta".as_slice(), b"alpha".as_slice()],
+        };
+        let mut environment = Environment::new();
+        for case in cases {
+            let descriptor = identity_descriptor(case, true);
+            let name = descriptor.name.clone();
+            environment = environment
+                .register_extension(descriptor)
+                .expect("identity fixture environment builds");
+            for entry in entries {
+                environment = environment
+                    .push_extension_entry(&name, bytes(entry))
+                    .expect("identity fixture journal entry appends");
+            }
+        }
+        environment
+    }
+
+    fn identity_environment(
+        cases: impl IntoIterator<Item = DescriptorIdentityCase>,
+    ) -> Environment {
+        identity_environment_with_journal(cases, IdentityJournalOrder::AlphaThenBeta)
+    }
+
+    fn permuted_descriptor_cases(
+        cases: &[DescriptorIdentityCase],
+        worker_index: usize,
+    ) -> Vec<DescriptorIdentityCase> {
+        let steps = [1usize, 5, 7, 11];
+        let start = worker_index % cases.len();
+        let step = steps[(worker_index / cases.len()) % steps.len()];
+        (0..cases.len())
+            .map(|offset| cases[(start + offset * step) % cases.len()])
+            .collect()
+    }
+
+    fn descriptor_order_id(cases: &[DescriptorIdentityCase]) -> Digest {
+        let mut w = CanonWriter::new();
+        w.str("fln.test.extension-descriptor-order");
+        w.u16(1);
+        w.u64(cases.len() as u64);
+        for case in cases {
+            w.str(merge_label(case.merge));
+            w.str(checkpoint_label(case.checkpoint));
+            w.str(provenance_label(case.provenance));
+        }
+        hash(Domain::Fixture, &w.into_bytes())
+    }
+
     fn bytes(v: &[u8]) -> Arc<[u8]> {
         Arc::from(v.to_vec().into_boxed_slice())
     }
@@ -1654,6 +1905,347 @@ mod tests {
             checkpoint.schema_version(),
             checkpoint.captured_entries()
         )
+    }
+
+    #[test]
+    fn descriptor_identity_tags_are_explicit_and_exhaustive() {
+        assert_eq!(merge_semantics_tag(MergeSemantics::AppendOrdered), 0);
+        assert_eq!(merge_semantics_tag(MergeSemantics::SetUnion), 1);
+        assert_eq!(
+            merge_semantics_tag(MergeSemantics::ConflictsRequireReview),
+            2
+        );
+        assert_eq!(
+            checkpoint_semantics_tag(CheckpointSemantics::JournalSuffix),
+            0
+        );
+        assert_eq!(
+            checkpoint_semantics_tag(CheckpointSemantics::FullJournal),
+            1
+        );
+        assert_eq!(payload_provenance_tag(PayloadProvenance::Understood), 0);
+        assert_eq!(payload_provenance_tag(PayloadProvenance::Opaque), 1);
+    }
+
+    #[test]
+    fn descriptor_identity_matrix_matches_model_and_logical_roots() {
+        let cases = descriptor_identity_cases();
+        assert_eq!(cases.len(), 12, "the complete 3×2×2 matrix is required");
+        let options = KVMap::new();
+        let mut digests = HashSet::with_capacity(cases.len());
+        let mut roots = HashSet::with_capacity(cases.len());
+
+        for case in cases {
+            let state = identity_state(case, false);
+            let actual_digest = state.content_digest();
+            let modeled_digest =
+                modeled_extension_content_digest(&state, DescriptorDigestModel::Canonical);
+            assert_eq!(
+                actual_digest, modeled_digest,
+                "descriptor identity diverged from the independent layout model"
+            );
+            assert_eq!(
+                actual_digest,
+                identity_state(case, false).content_digest(),
+                "identical descriptor and journal must have stable identity"
+            );
+
+            let descriptor = state.descriptor.clone();
+            let name = descriptor.name.clone();
+            let environment = Environment::new()
+                .register_extension(descriptor)
+                .and_then(|next| next.push_extension_entry(&name, bytes(b"alpha")))
+                .and_then(|next| next.push_extension_entry(&name, bytes(b"beta")))
+                .expect("single descriptor fixture builds");
+            let actual_root = environment.logical_root(&options);
+            let repeated_root = Environment::new()
+                .register_extension(state.descriptor.clone())
+                .and_then(|next| next.push_extension_entry(&name, bytes(b"alpha")))
+                .and_then(|next| next.push_extension_entry(&name, bytes(b"beta")))
+                .expect("repeated descriptor fixture builds")
+                .logical_root(&options);
+            assert_eq!(
+                actual_root, repeated_root,
+                "identical descriptor and journal must have stable logical identity"
+            );
+
+            let mut expected_root = fln_hash::root::LogicalRootBuilder::new();
+            expected_root.add_extension_delta(&name, actual_digest);
+            expected_root.set_options(&options);
+            assert_eq!(
+                actual_root,
+                expected_root.finalize(),
+                "descriptor digest must propagate exactly into the logical root"
+            );
+            assert!(
+                digests.insert(actual_digest),
+                "all 12 descriptor combinations must have distinct delta identity"
+            );
+            assert!(
+                roots.insert(actual_root),
+                "all 12 descriptor combinations must have distinct logical roots"
+            );
+
+            eprintln!(
+                "{{\"schema\":\"fln.unit.extension-descriptor-identity\",\"version\":1,\
+                 \"bead\":\"fln-amv.2\",\"claim_type\":\"bounded_model\",\
+                 \"merge\":\"{}\",\"merge_tag\":{},\
+                 \"checkpoint\":\"{}\",\"checkpoint_tag\":{},\
+                 \"provenance\":\"{}\",\"provenance_tag\":{},\
+                 \"journal_entries\":2,\"descriptor_position\":\"before_journal\",\
+                 \"delta_digest\":\"{actual_digest}\",\"logical_root\":\"{actual_root}\",\
+                 \"repeatability\":\"pass\",\"status\":\"pass\"}}",
+                merge_label(case.merge),
+                modeled_merge_tag(case.merge),
+                checkpoint_label(case.checkpoint),
+                modeled_checkpoint_tag(case.checkpoint),
+                provenance_label(case.provenance),
+                modeled_provenance_tag(case.provenance)
+            );
+        }
+
+        assert_eq!(digests.len(), 12);
+        assert_eq!(roots.len(), 12);
+    }
+
+    #[test]
+    fn descriptor_identity_named_mutants_are_discriminated() {
+        let mut always_killed = 0usize;
+        let mut swapped_merge_tag_values_killed = 0usize;
+        let mut swapped_merge_and_checkpoint_fields_killed = 0usize;
+        for case in descriptor_identity_cases() {
+            let state = identity_state(case, false);
+            let canonical = state.content_digest();
+            for (mutation, model) in [
+                ("omit_merge", DescriptorDigestModel::OmitMerge),
+                ("omit_checkpoint", DescriptorDigestModel::OmitCheckpoint),
+                ("omit_provenance", DescriptorDigestModel::OmitProvenance),
+                ("debug_text", DescriptorDigestModel::DebugText),
+                (
+                    "descriptor_after_journal",
+                    DescriptorDigestModel::DescriptorAfterJournal,
+                ),
+            ] {
+                let mutated = modeled_extension_content_digest(&state, model);
+                assert_ne!(
+                    canonical,
+                    mutated,
+                    "{mutation} mutant survived for {}/{}/{}",
+                    merge_label(case.merge),
+                    checkpoint_label(case.checkpoint),
+                    provenance_label(case.provenance)
+                );
+                always_killed += 1;
+            }
+
+            let swapped_merge_tag_values =
+                modeled_extension_content_digest(&state, DescriptorDigestModel::SwapMergeTagValues);
+            let merge_tag_swap_must_change = case.merge != MergeSemantics::ConflictsRequireReview;
+            assert_eq!(
+                swapped_merge_tag_values != canonical,
+                merge_tag_swap_must_change,
+                "single merge-tag value swap had the wrong effect for {}/{}/{}",
+                merge_label(case.merge),
+                checkpoint_label(case.checkpoint),
+                provenance_label(case.provenance)
+            );
+            swapped_merge_tag_values_killed += usize::from(merge_tag_swap_must_change);
+
+            let swapped_fields = modeled_extension_content_digest(
+                &state,
+                DescriptorDigestModel::SwapMergeAndCheckpointFields,
+            );
+            let field_swap_must_change =
+                modeled_merge_tag(case.merge) != modeled_checkpoint_tag(case.checkpoint);
+            assert_eq!(
+                swapped_fields != canonical,
+                field_swap_must_change,
+                "adjacent descriptor-field swap had the wrong effect for {}/{}/{}",
+                merge_label(case.merge),
+                checkpoint_label(case.checkpoint),
+                provenance_label(case.provenance)
+            );
+            swapped_merge_and_checkpoint_fields_killed += usize::from(field_swap_must_change);
+
+            eprintln!(
+                "{{\"schema\":\"fln.unit.extension-descriptor-mutants\",\"version\":1,\
+                 \"bead\":\"fln-amv.2\",\"claim_type\":\"bounded_model\",\
+                 \"merge\":\"{}\",\"checkpoint\":\"{}\",\"provenance\":\"{}\",\
+                 \"canonical_digest\":\"{canonical}\",\
+                 \"always_killed\":[\"omit_merge\",\"omit_checkpoint\",\"omit_provenance\",\
+                 \"debug_text\",\"descriptor_after_journal\"],\
+                 \"swap_merge_tag_values_changed\":{},\
+                 \"swap_merge_and_checkpoint_fields_changed\":{},\
+                 \"status\":\"pass\"}}",
+                merge_label(case.merge),
+                checkpoint_label(case.checkpoint),
+                provenance_label(case.provenance),
+                merge_tag_swap_must_change,
+                field_swap_must_change
+            );
+        }
+        assert_eq!(
+            always_killed, 60,
+            "five universally observable defects must be killed in all 12 cases"
+        );
+        assert_eq!(
+            swapped_merge_tag_values_killed, 8,
+            "swapping only the two affected merge-tag values changes 8 of 12 cases"
+        );
+        assert_eq!(
+            swapped_merge_and_checkpoint_fields_killed, 8,
+            "swapping adjacent equal tags is a no-op in 4 cases and changes the other 8"
+        );
+        eprintln!(
+            "{{\"schema\":\"fln.unit.extension-descriptor-mutants-summary\",\"version\":1,\
+             \"bead\":\"fln-amv.2\",\"claim_type\":\"bounded_model\",\
+             \"descriptor_cases\":12,\"universal_mutation_classes\":5,\
+             \"universal_discriminations\":{always_killed},\
+             \"swap_merge_tag_values_discriminations\":{swapped_merge_tag_values_killed},\
+             \"swap_adjacent_fields_discriminations\":\
+             {swapped_merge_and_checkpoint_fields_killed},\
+             \"total_discriminations\":{},\"status\":\"pass\"}}",
+            always_killed
+                + swapped_merge_tag_values_killed
+                + swapped_merge_and_checkpoint_fields_killed
+        );
+    }
+
+    #[test]
+    fn descriptor_identity_is_stable_across_1_8_32_concurrent_complete_builds() {
+        let cases = descriptor_identity_cases();
+        let options = KVMap::new();
+        let canonical_environment = identity_environment(cases.iter().copied());
+        let canonical_root = canonical_environment.logical_root(&options);
+
+        let mut expected_builder = fln_hash::root::LogicalRootBuilder::new();
+        for case in cases.iter().copied() {
+            let state = identity_state(case, true);
+            expected_builder.add_extension_delta(
+                &state.descriptor.name,
+                modeled_extension_content_digest(&state, DescriptorDigestModel::Canonical),
+            );
+        }
+        expected_builder.set_options(&options);
+        let expected_root = expected_builder.finalize();
+        assert_eq!(
+            canonical_root, expected_root,
+            "the full environment root must equal the explicit 12-descriptor model"
+        );
+
+        let omitted_root =
+            identity_environment(cases.iter().copied().skip(1)).logical_root(&options);
+        assert_ne!(
+            omitted_root, expected_root,
+            "omitting one descriptor must change the aggregate root"
+        );
+        let reversed_journal_root = identity_environment_with_journal(
+            cases.iter().copied(),
+            IdentityJournalOrder::BetaThenAlpha,
+        )
+        .logical_root(&options);
+        assert_ne!(
+            reversed_journal_root, expected_root,
+            "reversing every journal must change the aggregate root"
+        );
+
+        for worker_count in [1usize, 8, 32] {
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..worker_count)
+                    .map(|worker_index| {
+                        let permutation = permuted_descriptor_cases(&cases, worker_index);
+                        scope.spawn(move || {
+                            let order_id = descriptor_order_id(&permutation);
+                            let environment = identity_environment(permutation.iter().copied());
+                            let root = environment.logical_root(&KVMap::new());
+                            (order_id, environment, root)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("descriptor worker joins"))
+                    .collect::<Vec<_>>()
+            });
+
+            assert_eq!(
+                results.len(),
+                worker_count,
+                "every requested worker must build and hash a complete environment"
+            );
+            let order_ids: HashSet<_> = results.iter().map(|(order_id, _, _)| *order_id).collect();
+            assert_eq!(
+                order_ids.len(),
+                worker_count,
+                "every worker must receive a distinct full descriptor permutation"
+            );
+            for (worker_index, (order_id, environment, actual_root)) in results.iter().enumerate() {
+                assert_eq!(
+                    environment, &canonical_environment,
+                    "{worker_count}-worker environment diverged for order {order_id}"
+                );
+                assert_eq!(
+                    *actual_root, expected_root,
+                    "{worker_count}-worker root diverged for order {order_id}"
+                );
+                for case in cases.iter().copied() {
+                    let name = identity_descriptor(case, true).name;
+                    let state = environment
+                        .extension(&name)
+                        .expect("every worker retains every descriptor state");
+                    assert_eq!(
+                        state.len(),
+                        2,
+                        "every worker must retain the complete journal for {}",
+                        name.to_display_string()
+                    );
+                }
+                eprintln!(
+                    "{{\"schema\":\"fln.unit.extension-descriptor-concurrent-build\",\
+                     \"version\":1,\"bead\":\"fln-amv.2\",\
+                     \"claim_type\":\"bounded_model\",\
+                     \"execution_model\":\"independent_complete_build_per_worker\",\
+                     \"concurrent_worker_count\":{worker_count},\
+                     \"worker_index\":{worker_index},\
+                     \"input_order_id\":\"{order_id}\",\
+                     \"descriptor_cases\":12,\"journal_entries_per_descriptor\":2,\
+                     \"actual_logical_root\":\"{actual_root}\",\
+                     \"expected_logical_root\":\"{expected_root}\",\
+                     \"environment_relation\":\"equal\",\
+                     \"logical_root_relation\":\"equal\",\"status\":\"pass\"}}"
+                );
+            }
+
+            let mut sorted_order_ids: Vec<_> = order_ids.into_iter().collect();
+            sorted_order_ids.sort_unstable();
+            let mut order_set_writer = CanonWriter::new();
+            order_set_writer.str("fln.test.extension-descriptor-order-set");
+            order_set_writer.u16(1);
+            order_set_writer.u64(sorted_order_ids.len() as u64);
+            for order_id in sorted_order_ids {
+                order_set_writer.bytes(&order_id.0);
+            }
+            let order_set_hash = hash(Domain::Fixture, &order_set_writer.into_bytes());
+            eprintln!(
+                "{{\"schema\":\"fln.unit.extension-descriptor-concurrent-build-summary\",\
+                 \"version\":1,\
+                 \"bead\":\"fln-amv.2\",\"claim_type\":\"bounded_model\",\
+                 \"execution_model\":\"independent_complete_build_per_worker\",\
+                 \"concurrent_worker_count\":{worker_count},\"productive_workers\":{},\
+                 \"distinct_full_permutations\":{},\"descriptor_cases_per_worker\":12,\
+                 \"order_set_hash\":\"{order_set_hash}\",\
+                 \"expected_logical_root\":\"{expected_root}\",\
+                 \"omitted_descriptor_root\":\"{omitted_root}\",\
+                 \"reversed_journal_root\":\"{reversed_journal_root}\",\
+                 \"environment_relation\":\"equal\",\
+                 \"logical_root_relation\":\"equal\",\
+                 \"omission_negative_control\":\"pass\",\
+                 \"journal_order_negative_control\":\"pass\",\
+                 \"status\":\"pass\"}}",
+                results.len(),
+                worker_count
+            );
+        }
     }
 
     #[test]
