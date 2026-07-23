@@ -1077,6 +1077,8 @@ validate_retained_manifest_semantics() {
 validate_existing_bundle() {
   local requested_dir="$1"
   local validation_mode="${2:-complete}"
+  local externally_expected_commit="${3:-}"
+  local externally_expected_tree="${4:-}"
   case "$validation_mode" in
     complete|components) ;;
     *) return 1 ;;
@@ -1174,6 +1176,21 @@ validate_existing_bundle() {
       then .[0].build.tree else empty end
     ' "$run_log"
   )" || return 1
+  if [[ "$lane" == "rch" ]]; then
+    [[ "$externally_expected_commit" =~ ^[0-9a-f]{40}$ \
+        && "$externally_expected_tree" =~ ^[0-9a-f]{40}$ \
+        && "$commit" == "$externally_expected_commit" \
+        && "$tree" == "$externally_expected_tree" ]] \
+      || {
+        echo "rch bundle lacks matching external commit/tree expectations" >&2
+        return 1
+      }
+  elif [[ -n "$externally_expected_commit" \
+          || -n "$externally_expected_tree" ]]; then
+    [[ "$commit" == "$externally_expected_commit" \
+        && "$tree" == "$externally_expected_tree" ]] \
+      || return 1
+  fi
   expected_manifest_hash="$(
     jq -sr '
       [.[] | select(.scenario == "positive")]
@@ -1340,16 +1357,27 @@ if [[ "${1:-}" == "--cargo-runner-rch" ]]; then
   runner_binary="${2:-}"
   runner_name="${runner_binary##*/}"
   runner_dir=""
+  runner_target_dir=""
   if [[ -n "$runner_binary" && -f "$runner_binary" \
         && ! -L "$runner_binary" && -x "$runner_binary" ]]; then
     runner_dir="$(cd "$(dirname "$runner_binary")" && pwd -P)"
+  fi
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    case "$CARGO_TARGET_DIR" in
+      /*) runner_target_path="$CARGO_TARGET_DIR" ;;
+      *) runner_target_path="$ROOT/$CARGO_TARGET_DIR" ;;
+    esac
+    if [[ -d "$runner_target_path" && ! -L "$runner_target_path" ]]; then
+      runner_target_dir="$(cd "$runner_target_path" && pwd -P)"
+    fi
   fi
   [[ "${FLN_OWNERSHIP_RCH_RUNNER:-}" == "1" \
       && $# -eq 4 \
       && "${3:-}" == "ownership_evidence_process_driver" \
       && "${4:-}" == "--exact" \
       && "$runner_name" =~ ^kernel_contract-[0-9a-f]+$ \
-      && "$runner_dir" == "$ROOT"/.rch-target-*/debug/deps ]] \
+      && -n "$runner_target_dir" \
+      && "$runner_dir" == "$runner_target_dir/debug/deps" ]] \
     || {
       echo "kernel_contract_ownership: invalid RCH Cargo-runner invocation" >&2
       exit 2
@@ -1371,15 +1399,20 @@ if [[ "${1:-}" == "--cargo-runner-rch" ]]; then
   runner_env="${runner_env//-/_}"
   export CARGO_BUILD_TARGET="$runner_host"
   export "$runner_env=$direct_runner"
+  export RCH_CARGO_WRAPPER_BYPASS=1
   unset CARGO_BUILD_RUNNER
   RCH_BRIDGE_ENTERED=true
   set -- --lane rch
 fi
 
 if [[ "${1:-}" == "--validate-bundle" ]]; then
-  [[ $# -eq 2 ]] \
-    || { echo "usage: $0 --validate-bundle DIR" >&2; exit 2; }
-  if ! validate_existing_bundle "$2"; then
+  [[ $# -eq 2 || $# -eq 4 ]] \
+    || {
+      echo "usage: $0 --validate-bundle DIR [EXPECTED_COMMIT EXPECTED_TREE]" >&2
+      exit 2
+    }
+  if ! validate_existing_bundle \
+      "$2" complete "${3:-}" "${4:-}"; then
     echo "kernel_contract_ownership: bundle validation failed" >&2
     exit 1
   fi
@@ -1563,15 +1596,72 @@ if [[ "$LANE" == "rch" ]]; then
       || { note "rch lane could not initialize its retained identity store"; exit 1; }
     GIT_DIR="$ARCHIVE_IDENTITY_GIT_DIR" \
       GIT_WORK_TREE="$ROOT" \
-      git -c core.autocrlf=false -c core.filemode=true \
+      git -C "$ROOT" -c core.autocrlf=false -c core.filemode=true \
         add -f -A -- . \
         ':(top,exclude,glob).rch-*' \
         ':(top,exclude,glob).rch-*/**' \
       || { note "rch lane could not index the extracted source tree"; exit 1; }
+    RAW_PATHS="$ARCHIVE_IDENTITY_GIT_DIR/raw-regular-paths.txt"
+    RAW_EXPECTED="$ARCHIVE_IDENTITY_GIT_DIR/raw-expected-hashes.txt"
+    RAW_OBSERVED="$ARCHIVE_IDENTITY_GIT_DIR/raw-observed-hashes.txt"
+    : > "$RAW_PATHS"
+    : > "$RAW_EXPECTED"
+    while IFS= read -r -d '' index_entry; do
+      [[ "$index_entry" == *$'\t'* ]] \
+        || { note "rch source index contains a malformed entry"; exit 1; }
+      index_metadata="${index_entry%%$'\t'*}"
+      indexed_path="${index_entry#*$'\t'}"
+      [[ "$indexed_path" != *$'\n'* && "$indexed_path" != *$'\r'* ]] \
+        || { note "rch source index contains an unsupported path"; exit 1; }
+      read -r indexed_mode indexed_hash indexed_stage indexed_extra \
+        <<< "$index_metadata"
+      [[ "$indexed_mode" =~ ^(100644|100755|120000)$ \
+          && "$indexed_hash" =~ ^[0-9a-f]{40}$ \
+          && "$indexed_stage" == "0" \
+          && -z "$indexed_extra" ]] \
+        || { note "rch source index contains unsupported metadata"; exit 1; }
+      case "$indexed_mode" in
+        100644|100755)
+          [[ -f "$ROOT/$indexed_path" && ! -L "$ROOT/$indexed_path" ]] \
+            || { note "rch indexed regular file changed type"; exit 1; }
+          printf '%s\n' "$indexed_path" >> "$RAW_PATHS"
+          printf '%s\n' "$indexed_hash" >> "$RAW_EXPECTED"
+          ;;
+        120000)
+          [[ -L "$ROOT/$indexed_path" ]] \
+            || { note "rch indexed symlink changed type"; exit 1; }
+          indexed_link=""
+          IFS= read -r -d '' indexed_link \
+            < <(readlink -z -- "$ROOT/$indexed_path") \
+            || { note "rch lane could not read an indexed symlink"; exit 1; }
+          [[ "$indexed_link" != *$'\n'* && "$indexed_link" != *$'\r'* ]] \
+            || { note "rch source index contains an unsupported symlink"; exit 1; }
+          observed_link_hash="$(
+            printf '%s' "$indexed_link" | git hash-object --no-filters --stdin
+          )" || { note "rch lane could not hash an indexed symlink"; exit 1; }
+          [[ "$observed_link_hash" == "$indexed_hash" ]] \
+            || { note "rch indexed symlink bytes do not match"; exit 1; }
+          ;;
+      esac
+    done < <(
+      GIT_DIR="$ARCHIVE_IDENTITY_GIT_DIR" \
+        GIT_WORK_TREE="$ROOT" \
+        git -C "$ROOT" ls-files -s -z
+    )
+    (
+      cd "$ROOT"
+      git hash-object --no-filters --stdin-paths \
+        < "$RAW_PATHS" > "$RAW_OBSERVED"
+    ) || { note "rch lane could not hash raw extracted source bytes"; exit 1; }
+    cmp -s "$RAW_EXPECTED" "$RAW_OBSERVED" \
+      || {
+        note "rch extracted source bytes differ after Git attribute conversion"
+        exit 1
+      }
     OBSERVED_TREE="$(
       GIT_DIR="$ARCHIVE_IDENTITY_GIT_DIR" \
         GIT_WORK_TREE="$ROOT" \
-        git write-tree
+        git -C "$ROOT" write-tree
     )" || { note "rch lane could not hash the extracted source tree"; exit 1; }
     [[ "$OBSERVED_TREE" == "$EXPECTED_TREE" ]] \
       || {
@@ -2252,7 +2342,8 @@ if ! validate_artifact_manifest "$ARTIFACT_MANIFEST"; then
 fi
 
 if (( FAILURES == 0 )) \
-    && ! validate_existing_bundle "$ART_DIR" components; then
+    && ! validate_existing_bundle \
+      "$ART_DIR" components "$COMMIT" "$TREE"; then
   FAILURES=$((FAILURES + 1))
   note "independent read-only component validation failed"
 fi
