@@ -611,3 +611,100 @@ fn manifest_matches_fixture_bytes() {
     }
     assert_eq!(rows, 3, "C3 seed corpus is three fixtures");
 }
+
+// ---- the fln-20n × fln-wgp seam: shared engine + mmap path -----------------
+
+/// The mmap-backed production path must equal the by-value path observation
+/// for observation: same header, same ModuleData decode — and the mapping
+/// comes back sealed (region hygiene holds while the view is live).
+#[test]
+fn mapped_load_matches_by_value_load_and_is_sealed() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
+    if !path.exists() {
+        eprintln!("SKIP (typed limitation): c3 fixture olean not present");
+        return;
+    }
+    let mapped = fln_olean::region::MappedOlean::open(&path).expect("mmap load");
+    assert!(mapped.is_sealed(), "open() must seal after validation");
+    assert!(!mapped.is_empty());
+
+    let bytes = fixture("Init.SizeOfLemmas.olean");
+    let by_value = OleanView::parse(&bytes).expect("by-value parse");
+    assert_eq!(mapped.header(), &by_value.header, "headers agree");
+    assert_eq!(
+        mapped
+            .view()
+            .module_data(WalkBudget::default())
+            .expect("mmap decode"),
+        by_value
+            .module_data(WalkBudget::default())
+            .expect("by-value decode"),
+        "ModuleData decode is path-independent"
+    );
+}
+
+/// The shared full-surface audit accepts the real fixture and sees at least
+/// as many objects as the reachability walk (it validates the whole payload,
+/// reachable or not), with zero rewrites.
+#[test]
+fn shared_audit_covers_the_full_surface() {
+    let bytes = fixture("Init.SizeOfLemmas.olean");
+    let view = OleanView::parse(&bytes).expect("parse");
+    let audit = view.shared_audit().expect("shared audit");
+    let walk = view.walk(WalkBudget::default()).expect("walk");
+    assert_eq!(audit.pointers_fixed, 0, "audit never rewrites");
+    assert!(
+        audit.objects >= walk.objects,
+        "full-surface audit ({}) cannot see fewer objects than the reachable walk ({})",
+        audit.objects,
+        walk.objects
+    );
+}
+
+/// Corruption reaches the codec through the SHARED engine's laws: a hot rc
+/// in the first payload object and a wild pointer both fault typed via the
+/// mapped fault vocabulary, and MappedOlean::open refuses the artifact.
+#[test]
+fn shared_audit_rejects_corruption_typed() {
+    let bytes = fixture("Init.SizeOfLemmas.olean");
+    let header = fln_olean::format::OLEAN_HEADER_SIZE;
+
+    // Non-persistent rc in the first object (payload offset 8 → rc word).
+    let mut hot = bytes.clone();
+    hot[header + 8] = 1;
+    let view = OleanView::parse(&hot).expect("header still parses");
+    assert!(
+        matches!(
+            view.shared_audit(),
+            Err(RegionError::NonPersistentRc { .. })
+        ),
+        "hot rc must fault typed through the shared engine"
+    );
+
+    // Wild root pointer (payload offset 0).
+    let mut wild = bytes.clone();
+    let bogus = ((u64::MAX / 2) & !7).to_le_bytes();
+    wild[header..header + 8].copy_from_slice(&bogus);
+    let view = OleanView::parse(&wild).expect("header still parses");
+    assert!(
+        matches!(view.shared_audit(), Err(RegionError::PtrOutOfBounds { .. })),
+        "wild root must fault typed through the shared engine"
+    );
+
+    // The mmap door enforces the same laws before sealing.
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target_local/fln-olean-seam-tests");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let corrupt_path = dir.join(format!("corrupt-{}.olean", std::process::id()));
+    std::fs::write(&corrupt_path, &hot).expect("write corrupt fixture");
+    assert!(
+        matches!(
+            fln_olean::region::MappedOlean::open(&corrupt_path),
+            Err(fln_olean::region::MappedOleanError::Region(
+                RegionError::NonPersistentRc { .. }
+            ))
+        ),
+        "MappedOlean must refuse a corrupt artifact before sealing"
+    );
+}

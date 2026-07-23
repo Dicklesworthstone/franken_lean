@@ -72,6 +72,7 @@ edge fln-kernel -> fln-core        # kernel terms are term-plane values (franken
 edge fln-kernel -> fln-env         # check consults the environment read-only (franken_lean-zht)
 edge fln-kernel -> fln-bignum      # owned kernel-grade bignum for literal reduction (§8; already in the allow-direct covenant)
 edge fln-olean -> fln-rt           # region reader consumes the generated ABI object model (franken_lean-y24)
+edge fln-olean -> fln-unsafe-region # mmap-backed codec load over the shared region machinery, sealed (fln-20n/fln-wgp seam)
 edge fln-rt -> fln-unsafe-abi      # safe Marrow surface over the CompatHeap membrane, BOUNDARY_API-governed (fln-lld)
 edge fln-rt -> fln-unsafe-region   # region engine drives the mmap/seal primitives, BOUNDARY_API-governed (fln-wgp)
 edge fln-olean -> fln-core         # declaration decoder builds term-plane values (franken_lean-z6c)
@@ -79,6 +80,7 @@ edge fln-olean -> fln-env          # declaration decoder yields ConstantInfo (fr
 edge fln-conformance -> fln-env    # kernel replay builds environments from decoded modules (franken_lean-z6c)
 edge fln-conformance -> fln-kernel # kernel replay drives the one authority (franken_lean-z6c)
 edge fln-conformance -> fln-olean  # kernel replay decodes real Reference oleans (franken_lean-z6c)
+edge fln-conformance -> fln-hash   # kernel-replay evidence hashes fixture inputs canonically (evidence-runner lane)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.

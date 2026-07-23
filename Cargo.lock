@@ -35,6 +35,7 @@ version = "0.0.0"
 dependencies = [
  "fln-core",
  "fln-env",
+ "fln-hash",
  "fln-kernel",
  "fln-olean",
 ]
@@ -102,6 +103,7 @@ dependencies = [
  "fln-core",
  "fln-env",
  "fln-rt",
+ "fln-unsafe-region",
 ]
 
 [[package]]

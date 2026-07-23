@@ -9,3 +9,4 @@ publish = false
 fln-core = { path = "../fln-core" }
 fln-env = { path = "../fln-env" }
 fln-rt = { path = "../fln-rt" }
+fln-unsafe-region = { path = "../fln-unsafe-region" }

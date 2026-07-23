@@ -417,19 +417,13 @@ fn walk_step(buf: &[u8], offset: usize) -> RResult<WalkStep> {
     })
 }
 
-/// Rewrite one stored pointer word from `from`-based to `to`-based, with the
-/// full bounds/alignment law. Scalar words pass through.
-fn fix_word(
-    buf: &mut [u8],
-    field: usize,
-    from: u64,
-    to: u64,
-    len: usize,
-    fixed: &mut u64,
-) -> RResult<()> {
+/// The pointer-word law shared by [`relocate`] and [`audit`]: a scalar word
+/// passes (`None`); a pointer must land inside the region, 8-byte aligned
+/// (`Some(rel)`); anything else is the typed fault.
+fn checked_rel(buf: &[u8], field: usize, from: u64, len: usize) -> RResult<Option<u64>> {
     let v = read_u64(buf, field);
     if is_scalar_word(v) {
-        return Ok(());
+        return Ok(None);
     }
     let rel = v.wrapping_sub(from);
     if rel >= len as u64 {
@@ -444,7 +438,40 @@ fn fix_word(
             ptr: v,
         });
     }
-    if from != to {
+    Ok(Some(rel))
+}
+
+/// The mpz limb-pointer law shared by [`relocate`] and [`audit`]: the limb
+/// pointer must land inside this object's inline block, aligned.
+fn checked_limb_rel(
+    buf: &[u8],
+    field: usize,
+    from: u64,
+    offset: usize,
+    size: usize,
+) -> RResult<u64> {
+    let v = read_u64(buf, field);
+    let rel = v.wrapping_sub(from);
+    let block = (offset + MPZ_FIXED) as u64..(offset + size) as u64;
+    if !block.contains(&rel) || !rel.is_multiple_of(8) {
+        return Err(RegionFault::MpzIntegrity { offset });
+    }
+    Ok(rel)
+}
+
+/// Rewrite one stored pointer word from `from`-based to `to`-based, with the
+/// full bounds/alignment law. Scalar words pass through.
+fn fix_word(
+    buf: &mut [u8],
+    field: usize,
+    from: u64,
+    to: u64,
+    len: usize,
+    fixed: &mut u64,
+) -> RResult<()> {
+    if let Some(rel) = checked_rel(buf, field, from, len)?
+        && from != to
+    {
         write_u64(buf, field, to.wrapping_add(rel));
         *fixed += 1;
     }
@@ -474,12 +501,7 @@ pub fn relocate(buf: &mut [u8], from: u64, to: u64) -> RResult<RegionReport> {
         }
         if let Some(field) = step.limb_ptr {
             // The limb pointer must land INSIDE this object's inline block.
-            let v = read_u64(buf, field);
-            let rel = v.wrapping_sub(from);
-            let block = (offset + MPZ_FIXED) as u64..(offset + step.size) as u64;
-            if !block.contains(&rel) || !rel.is_multiple_of(8) {
-                return Err(RegionFault::MpzIntegrity { offset });
-            }
+            let rel = checked_limb_rel(buf, field, from, offset, step.size)?;
             if from != to {
                 write_u64(buf, field, to.wrapping_add(rel));
                 fixed += 1;
@@ -491,6 +513,39 @@ pub fn relocate(buf: &mut [u8], from: u64, to: u64) -> RResult<RegionReport> {
     Ok(RegionReport {
         objects,
         pointers_fixed: fixed,
+        root: read_u64(buf, 0),
+        bytes: len,
+    })
+}
+
+/// Read-only full-surface audit: exactly [`relocate`]'s walk and category
+/// laws at `from == to`, over an immutable buffer — the entry the olean
+/// codec runs on shared/sealed mappings where no mutable view exists (the
+/// §6.4 shared-code-path law). `base` is the payload's current pointer
+/// base; the report's `pointers_fixed` is always 0.
+pub fn audit(buf: &[u8], base: u64) -> RResult<RegionReport> {
+    if !buf.len().is_multiple_of(8) {
+        return Err(RegionFault::RaggedPayload { len: buf.len() });
+    }
+    need(buf, 0, 8)?;
+    let len = buf.len();
+    checked_rel(buf, 0, base, len)?;
+    let mut offset = 8usize;
+    let mut objects = 0u64;
+    while offset < len {
+        let step = walk_step(buf, offset)?;
+        for field in step.ptr_fields {
+            checked_rel(buf, field, base, len)?;
+        }
+        if let Some(field) = step.limb_ptr {
+            checked_limb_rel(buf, field, base, offset, step.size)?;
+        }
+        objects += 1;
+        offset += round8(step.size);
+    }
+    Ok(RegionReport {
+        objects,
+        pointers_fixed: 0,
         root: read_u64(buf, 0),
         bytes: len,
     })

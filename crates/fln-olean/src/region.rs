@@ -20,9 +20,11 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::path::Path;
 
 use fln_core::name::Name;
 use fln_rt::abi;
+use fln_unsafe_region::mapping::{MapError, RegionMapping};
 
 use crate::format;
 
@@ -103,6 +105,65 @@ impl fmt::Display for RegionError {
 }
 
 type RResult<T> = Result<T, RegionError>;
+
+/// Map a shared-engine [`fln_rt::region::RegionFault`] into this codec's
+/// [`RegionError`], shifting payload-relative offsets by `shift` (the file
+/// offset where the payload begins) so diagnostics stay file-addressed.
+fn shared_fault(
+    fault: fln_rt::region::RegionFault,
+    shift: u64,
+    base_addr: u64,
+    file_len: u64,
+) -> RegionError {
+    use fln_rt::region::RegionFault as F;
+    match fault {
+        F::Truncated { offset, wanted } => RegionError::Truncated {
+            wanted_end: shift + offset as u64 + wanted as u64,
+            len: file_len,
+        },
+        F::BadMagic => RegionError::BadMagic,
+        F::UnsupportedVersion(v) => RegionError::UnsupportedVersion(v),
+        F::MisalignedBase { base } => RegionError::MisalignedBase { base_addr: base },
+        F::RaggedPayload { len } => RegionError::DecodeShape {
+            offset: shift + len as u64,
+            reason: "region payload not word-aligned",
+        },
+        F::NonPersistentRc { offset, rc } => RegionError::NonPersistentRc {
+            offset: shift + offset as u64,
+            rc,
+        },
+        F::PtrOutOfBounds { offset: _, ptr } => RegionError::PtrOutOfBounds {
+            ptr,
+            resolved: ptr as i128 - base_addr as i128,
+        },
+        F::MisalignedPtr { offset: _, ptr } => RegionError::MisalignedPtr { ptr },
+        F::BadObjectSize { offset, .. } => RegionError::DecodeShape {
+            offset: shift + offset as u64,
+            reason: "impossible object size",
+        },
+        F::ForbiddenTag { offset, tag } => RegionError::ForbiddenTag {
+            offset: shift + offset as u64,
+            tag,
+        },
+        // The shared audit has no version context; closure support arrives
+        // with the plugin-door beads (sno/83r), so any closure is refused.
+        F::ClosureUnsupported { offset } => RegionError::ClosureInV2 {
+            offset: shift + offset as u64,
+        },
+        F::StringIntegrity { offset, reason } => RegionError::StringIntegrity {
+            offset: shift + offset as u64,
+            reason,
+        },
+        F::MpzIntegrity { offset } => RegionError::MpzIntegrity {
+            offset: shift + offset as u64,
+        },
+        F::UnsupportedCategory { tag, .. } => RegionError::ForbiddenTag { offset: shift, tag },
+        F::BuildShape { reason } => RegionError::DecodeShape {
+            offset: shift,
+            reason,
+        },
+    }
+}
 
 /// Traversal budget: hard cap on visited objects. Exhaustion is a typed
 /// outcome, never a partial "valid".
@@ -293,23 +354,16 @@ impl DecodeBudget {
 }
 
 impl<'a> OleanView<'a> {
-    /// Parse and validate the fixed header against the generated contract.
+    /// Parse and validate the fixed header. The envelope laws (length gate,
+    /// magic, accepted-version set, base alignment) are judged by the SHARED
+    /// region engine — `fln_rt::region::parse_olean_envelope`, the same code
+    /// path the runtime's mmap loader runs (§6.4 shared-code-path law); this
+    /// codec adds only the identity fields the runtime does not need
+    /// (`lean_version`, `githash`, `flags`), read at their generated-contract
+    /// offsets.
     pub fn parse(bytes: &'a [u8]) -> RResult<Self> {
-        let header_size = format::OLEAN_HEADER_SIZE as u64;
-        if (bytes.len() as u64) < header_size {
-            return Err(RegionError::Truncated {
-                wanted_end: header_size,
-                len: bytes.len() as u64,
-            });
-        }
-        let magic_off = field_offset("marker") as usize;
-        if bytes[magic_off..magic_off + format::OLEAN_MAGIC.len()] != format::OLEAN_MAGIC {
-            return Err(RegionError::BadMagic);
-        }
-        let version = bytes[field_offset("version") as usize];
-        if !format::OLEAN_ACCEPTED_VERSIONS.contains(&version) {
-            return Err(RegionError::UnsupportedVersion(version));
-        }
+        let envelope = fln_rt::region::parse_olean_envelope(bytes)
+            .map_err(|fault| shared_fault(fault, 0, 0, bytes.len() as u64))?;
         let flags = bytes[field_offset("flags") as usize];
         let read_str = |name: &str, len: usize| -> String {
             let off = field_offset(name) as usize;
@@ -317,22 +371,34 @@ impl<'a> OleanView<'a> {
             let end = raw.iter().position(|&b| b == 0).unwrap_or(len);
             String::from_utf8_lossy(&raw[..end]).into_owned()
         };
-        let base_off = field_offset("base_addr") as usize;
-        let mut base = [0u8; 8];
-        base.copy_from_slice(&bytes[base_off..base_off + 8]);
-        let base_addr = u64::from_le_bytes(base);
-        if base_addr % (format::REGION_ALIGN as u64) != 0 {
-            return Err(RegionError::MisalignedBase { base_addr });
-        }
         Ok(Self {
             bytes,
             header: OleanHeader {
-                version,
+                version: envelope.version,
                 flags,
                 lean_version: read_str("lean_version", 33),
                 githash: read_str("githash", 40),
-                base_addr,
+                base_addr: envelope.base_addr,
             },
+        })
+    }
+
+    /// Full-surface integrity audit through the SHARED region engine
+    /// (`fln_rt::region::audit`): every object in the payload — reachable or
+    /// not — checked against the category laws at the stored base, read-only.
+    /// [`walk`](Self::walk) remains the reachability/module-policy check;
+    /// this is the §6.4 single-code-path integrity authority the runtime's
+    /// own loader enforces.
+    pub fn shared_audit(&self) -> RResult<fln_rt::region::RegionReport> {
+        let header = format::OLEAN_HEADER_SIZE as u64;
+        let payload = self.read_bytes(header, self.bytes.len() as u64 - header)?;
+        fln_rt::region::audit(payload, self.header.base_addr + header).map_err(|fault| {
+            shared_fault(
+                fault,
+                header,
+                self.header.base_addr,
+                self.bytes.len() as u64,
+            )
         })
     }
 
@@ -873,5 +939,80 @@ impl<'a> OleanView<'a> {
             extra_const_names: extra,
             extensions,
         })
+    }
+}
+
+/// Typed failure of the mmap-backed load path: the mapping layer's fault or
+/// the codec's region fault, never a panic (FL-INV-07).
+#[derive(Debug)]
+pub enum MappedOleanError {
+    /// The mmap/seal primitive failed.
+    Map(MapError),
+    /// The envelope or region content failed validation.
+    Region(RegionError),
+}
+
+impl fmt::Display for MappedOleanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Map(e) => write!(f, "olean mapping: {e}"),
+            Self::Region(e) => write!(f, "olean region: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for MappedOleanError {}
+
+/// An olean held open through the production mmap path — the fln-20n ×
+/// fln-wgp seam (§6.4): the file is mapped privately via [`RegionMapping`]
+/// (untouched pages stay page-cache-shared with every other consumer of the
+/// same artifact — the PG-4/PG-6 mechanism), validated through the SHARED
+/// engine (envelope parse + full-surface audit), then SEALED read-only, so
+/// region hygiene holds while the view is live: hardened builds trap any
+/// write. The by-value decoders run over the mapping unchanged — stored
+/// pointers stay `base_addr`-relative because this path never relocates, so
+/// a load never dirties a shared page.
+pub struct MappedOlean {
+    mapping: RegionMapping,
+    header: OleanHeader,
+}
+
+impl MappedOlean {
+    /// Map, validate through the shared engine, and seal. Any failure
+    /// releases the mapping (no half-open state).
+    pub fn open(path: &Path) -> Result<MappedOlean, MappedOleanError> {
+        let mut mapping = RegionMapping::map_file_private(path).map_err(MappedOleanError::Map)?;
+        let header = {
+            let view = OleanView::parse(mapping.as_slice()).map_err(MappedOleanError::Region)?;
+            view.shared_audit().map_err(MappedOleanError::Region)?;
+            view.header
+        };
+        mapping.seal().map_err(MappedOleanError::Map)?;
+        Ok(MappedOlean { mapping, header })
+    }
+
+    pub fn header(&self) -> &OleanHeader {
+        &self.header
+    }
+
+    pub fn len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mapping.is_empty()
+    }
+
+    /// The mapping is sealed by construction; exposed for hygiene asserts.
+    pub fn is_sealed(&self) -> bool {
+        self.mapping.is_sealed()
+    }
+
+    /// Borrow the by-value decoding view over the sealed mapping.
+    pub fn view(&self) -> OleanView<'_> {
+        OleanView {
+            bytes: self.mapping.as_slice(),
+            header: self.header.clone(),
+        }
     }
 }
