@@ -1548,7 +1548,11 @@ if [[ "$LANE" == "rch" ]]; then
   EXPECTED_TREE="${FLN_OWNERSHIP_EXPECTED_TREE:-}"
   [[ "$EXPECTED_TREE" =~ ^[0-9a-f]{40}$ ]] \
     || { note "rch lane requires FLN_OWNERSHIP_EXPECTED_TREE"; exit 2; }
-  if OBSERVED_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"; then
+  if OBSERVED_TOPLEVEL="$(
+      git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null
+    )" \
+      && [[ "$(cd "$OBSERVED_TOPLEVEL" && pwd -P)" == "$ROOT" ]] \
+      && OBSERVED_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"; then
     OBSERVED_TREE="$(git -C "$ROOT" rev-parse 'HEAD^{tree}')" \
       || { note "rch lane could not resolve the worker tree"; exit 1; }
     [[ "$OBSERVED_COMMIT" == "$EXPECTED_COMMIT" \
