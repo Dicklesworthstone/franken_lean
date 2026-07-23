@@ -19,8 +19,11 @@ use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
 
 use crate::constants::{ConstantInfo, DefinitionSafety, QuotKind, ReducibilityHints};
 use crate::extensions::{
-    CheckpointSemantics, ExtensionDescriptor, ExtensionState, MergeSemantics, PayloadProvenance,
+    CheckpointError, CheckpointLimits, CheckpointSemantics, ExtensionCheckpoint,
+    ExtensionDescriptor, ExtensionState,
 };
+#[cfg(test)]
+use crate::extensions::{MergeSemantics, PayloadProvenance};
 use crate::pmap::{PKey, PMap};
 
 /// Stable `Domain::DeclContent` tags. These are schema values, not Rust enum
@@ -63,6 +66,7 @@ pub enum EnvError {
     UnknownExtension {
         name: Name,
     },
+    Checkpoint(CheckpointError),
 }
 
 impl std::fmt::Display for EnvError {
@@ -89,6 +93,7 @@ impl std::fmt::Display for EnvError {
                     name.to_display_string()
                 )
             }
+            EnvError::Checkpoint(error) => error.fmt(f),
         }
     }
 }
@@ -172,6 +177,75 @@ impl Environment {
 
     pub fn extension(&self, name: &Name) -> Option<&ExtensionState> {
         self.extensions.get(name).map(Arc::as_ref)
+    }
+
+    /// Capture one registered extension under its declared checkpoint contract.
+    /// A suffix base is another immutable environment snapshot; full-journal mode
+    /// requires `None` and carries no ambient extension history.
+    pub fn checkpoint_extension(
+        &self,
+        extension: &Name,
+        base: Option<&Environment>,
+        limits: CheckpointLimits,
+    ) -> Result<ExtensionCheckpoint, EnvError> {
+        let state = self
+            .extension(extension)
+            .ok_or_else(|| EnvError::UnknownExtension {
+                name: extension.clone(),
+            })?;
+        let base_state = match base {
+            Some(base) => {
+                Some(
+                    base.extension(extension)
+                        .ok_or_else(|| EnvError::UnknownExtension {
+                            name: extension.clone(),
+                        })?,
+                )
+            }
+            None => None,
+        };
+        state
+            .checkpoint(base_state, limits)
+            .map_err(EnvError::Checkpoint)
+    }
+
+    /// Apply a checkpoint to the matching registry slot and return a new isolated
+    /// environment snapshot. Declarations and unrelated extensions remain shared.
+    pub fn apply_extension_checkpoint(
+        &self,
+        checkpoint: &ExtensionCheckpoint,
+        limits: CheckpointLimits,
+    ) -> Result<Environment, EnvError> {
+        let name = &checkpoint.descriptor().name;
+        let registered = self
+            .extension(name)
+            .ok_or_else(|| EnvError::UnknownExtension { name: name.clone() })?;
+        if checkpoint.mode() == CheckpointSemantics::FullJournal
+            && registered.descriptor != *checkpoint.descriptor()
+        {
+            let error = if registered.descriptor.name != checkpoint.descriptor().name {
+                CheckpointError::ExtensionNameMismatch {
+                    expected: checkpoint.descriptor().name.clone(),
+                    actual: registered.descriptor.name.clone(),
+                }
+            } else {
+                CheckpointError::ContractMismatch {
+                    expected: checkpoint.descriptor().clone(),
+                    actual: registered.descriptor.clone(),
+                }
+            };
+            return Err(EnvError::Checkpoint(error));
+        }
+        let base = match checkpoint.mode() {
+            CheckpointSemantics::JournalSuffix => Some(registered),
+            CheckpointSemantics::FullJournal => None,
+        };
+        let restored =
+            ExtensionState::restore(base, checkpoint, limits).map_err(EnvError::Checkpoint)?;
+        Ok(Environment {
+            constants: self.constants.clone(),
+            extensions: self.extensions.insert(name.clone(), Arc::new(restored)),
+        })
     }
 
     /// The canonical content digest of one constant (Domain::DeclContent): the
@@ -279,25 +353,7 @@ impl Environment {
             builder.add_decl(name, Environment::decl_content_digest(info));
         }
         for (name, state) in self.extensions.iter() {
-            let mut w = CanonWriter::new();
-            match state.descriptor.merge {
-                MergeSemantics::AppendOrdered => w.u8(0),
-                MergeSemantics::SetUnion => w.u8(1),
-                MergeSemantics::ConflictsRequireReview => w.u8(2),
-            }
-            match state.descriptor.checkpoint {
-                CheckpointSemantics::JournalSuffix => w.u8(0),
-                CheckpointSemantics::FullJournal => w.u8(1),
-            }
-            match state.descriptor.provenance {
-                PayloadProvenance::Understood => w.u8(0),
-                PayloadProvenance::Opaque => w.u8(1),
-            }
-            w.u64(state.len() as u64);
-            for entry in state.entries() {
-                w.bytes(&entry.payload);
-            }
-            builder.add_extension_delta(name, hash(Domain::ExtensionDelta, &w.into_bytes()));
+            builder.add_extension_delta(name, state.content_digest());
         }
         builder.set_options(options);
         builder.finalize()
@@ -426,6 +482,96 @@ mod tests {
             env.push_extension_entry(&n("ghost"), &b"x"[..]),
             Err(EnvError::UnknownExtension { name: n("ghost") })
         );
+    }
+
+    #[test]
+    fn environment_checkpoint_apply_preserves_exact_roots_and_unrelated_state() {
+        let limits = CheckpointLimits::new(100, 10_000);
+        let base = Environment::new()
+            .add_decl(axiom("a"))
+            .and_then(|env| env.register_extension(descriptor("simpExt")))
+            .and_then(|env| env.register_extension(descriptor("otherExt")))
+            .and_then(|env| env.push_extension_entry(&n("simpExt"), &b"base"[..]))
+            .and_then(|env| env.push_extension_entry(&n("otherExt"), &b"other"[..]))
+            .expect("base environment builds");
+        let target = base
+            .push_extension_entry(&n("simpExt"), &b"suffix-a"[..])
+            .and_then(|env| env.push_extension_entry(&n("simpExt"), &b"suffix-b"[..]))
+            .expect("target environment builds");
+        let checkpoint = target
+            .checkpoint_extension(&n("simpExt"), Some(&base), limits)
+            .expect("environment suffix captures");
+        let restored = base
+            .apply_extension_checkpoint(&checkpoint, limits)
+            .expect("environment suffix applies");
+
+        assert_eq!(restored, target);
+        assert_eq!(
+            restored.logical_root(&KVMap::new()),
+            target.logical_root(&KVMap::new())
+        );
+        assert_eq!(restored.find(&n("a")), target.find(&n("a")));
+        assert_eq!(
+            restored.extension(&n("otherExt")),
+            target.extension(&n("otherExt"))
+        );
+
+        let divergent = Environment::new()
+            .add_decl(axiom("a"))
+            .and_then(|env| env.register_extension(descriptor("simpExt")))
+            .and_then(|env| env.register_extension(descriptor("otherExt")))
+            .and_then(|env| env.push_extension_entry(&n("simpExt"), &b"wrong"[..]))
+            .and_then(|env| env.push_extension_entry(&n("otherExt"), &b"other"[..]))
+            .expect("same-length divergent branch builds");
+        assert!(matches!(
+            divergent.apply_extension_checkpoint(&checkpoint, limits),
+            Err(EnvError::Checkpoint(
+                CheckpointError::BaseHistoryMismatch { .. }
+            ))
+        ));
+        assert_eq!(
+            divergent
+                .extension(&n("simpExt"))
+                .expect("still registered")
+                .entries()
+                .last()
+                .expect("one entry")
+                .payload
+                .as_ref(),
+            b"wrong"
+        );
+    }
+
+    #[test]
+    fn environment_full_checkpoint_replaces_only_the_registered_journal() {
+        let limits = CheckpointLimits::new(100, 10_000);
+        let full_descriptor = ExtensionDescriptor {
+            checkpoint: CheckpointSemantics::FullJournal,
+            ..descriptor("fullExt")
+        };
+        let destination = Environment::new()
+            .add_decl(axiom("a"))
+            .and_then(|env| env.register_extension(full_descriptor))
+            .expect("destination builds");
+        let source = destination
+            .push_extension_entry(&n("fullExt"), &b"one"[..])
+            .and_then(|env| env.push_extension_entry(&n("fullExt"), &b"two"[..]))
+            .expect("source builds");
+        let checkpoint = source
+            .checkpoint_extension(&n("fullExt"), None, limits)
+            .expect("full environment checkpoint captures");
+        let restored = destination
+            .apply_extension_checkpoint(&checkpoint, limits)
+            .expect("full checkpoint applies without a semantic base");
+        assert_eq!(restored, source);
+        assert_eq!(
+            restored.logical_root(&KVMap::new()),
+            source.logical_root(&KVMap::new())
+        );
+        assert!(matches!(
+            source.checkpoint_extension(&n("ghost"), None, limits),
+            Err(EnvError::UnknownExtension { .. })
+        ));
     }
 
     #[test]

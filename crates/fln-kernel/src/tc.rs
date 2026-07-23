@@ -6,12 +6,16 @@
 //! recursor dispatch (KR-205) — quotient computation (KR-955), inductive iota
 //! (KR-316) with K conversion (KR-317), Nat-literal-to-constructor, and
 //! structure-eta coercion — defeq with quick/bindings/levels/proof-irrelevance/
-//! lazy-delta/function-eta/app-congruence (KR-300..312 subset), and declaration
-//! admission for axioms, definitions, and theorems (KR-970..974). Nat/String
-//! acceleration (KR-313/314), unit-like eta (KR-315), structure eta in defeq
-//! (KR-903), opaque/mutual admission, and receipts are follow-up slices; none of
-//! their absence widens acceptance — an unimplemented reduction can only make
-//! defeq FAIL (a rejection), never succeed.
+//! lazy-delta/function-eta/app-congruence (KR-300..312 subset), Nat literal
+//! acceleration (KR-313: `reduce_nat` in the whnf loop plus the offset and
+//! Bool.true-reflection machinery in defeq, wired to fln-bignum), String literal
+//! expansion (KR-314: recursor major, projection scrutinee, and the defeq
+//! `String.ofList` rung), unit-like eta (KR-315), structure eta in defeq
+//! (KR-903), and declaration admission for axioms, definitions, and theorems
+//! (KR-970..974). `reduce_native` (`Lean.reduceBool`/`Lean.reduceNat` — the
+//! native_decide trust surface), opaque/mutual admission, and receipts are
+//! follow-up slices; none of their absence widens acceptance — an unimplemented
+//! reduction can only make defeq FAIL (a rejection), never succeed.
 //!
 //! Traversal discipline (§8.2c): every recursive descent charges the step budget
 //! and carries an explicit depth that is checked BEFORE descending, so
@@ -19,9 +23,11 @@
 //! fault. Flag pruning (loose-bvar ranges, has-level-param) keeps substitution
 //! linear in the touched region only.
 
+use fln_bignum::interop::{bignat_from_literal, literal_from_bignat};
+use fln_bignum::nat::BigNat;
 use fln_core::expr::{Expr, ExprNode, FVarId, Literal, NatLit};
 use fln_core::level::Level;
-use fln_core::name::Name;
+use fln_core::name::{LeafView, Name};
 use fln_env::constants::{
     ConstantInfo, DefinitionSafety, QuotKind, RecursorVal, ReducibilityHints,
 };
@@ -280,10 +286,18 @@ impl<'a> TypeChecker<'a> {
 
     // ---- whnf (KR-200..204) ------------------------------------------------------------
 
-    /// KR-200: whnf-core then delta, looped to a fixpoint.
+    /// KR-200: whnf-core then delta, looped to a fixpoint — with KR-313 literal
+    /// arithmetic (`reduce_nat`) tried on every whnf-core'd form before delta,
+    /// exactly the pin's loop order (type_checker.cpp:663). `reduce_native`
+    /// (`Lean.reduceBool`/`Lean.reduceNat`) is the native_decide surface, a
+    /// follow-up slice: its absence leaves those applications stuck —
+    /// under-acceptance, never over-acceptance.
     fn whnf(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
         let mut current = self.whnf_core(e, depth)?;
         loop {
+            if let Some(value) = self.reduce_nat(&current, depth)? {
+                return Ok(value);
+            }
             match self.unfold_definition(&current, depth)? {
                 Some(next) => current = self.whnf_core(&next, depth)?,
                 None => return Ok(current),
@@ -357,6 +371,19 @@ impl<'a> TypeChecker<'a> {
                 let struct_name = struct_name.clone();
                 let idx = *idx;
                 let scrutinee = self.whnf(&expr.clone(), depth + 1)?;
+                // KR-314 (pin reduce_proj_core, type_checker.cpp:358): a
+                // String-literal scrutinee expands to its constructor spine
+                // (whnf'd so `String.ofList` unfolds to the real constructor)
+                // before field extraction.
+                let scrutinee = if let ExprNode::Lit {
+                    literal: Literal::Str(value),
+                } = scrutinee.node()
+                {
+                    let expanded = string_lit_to_constructor(value);
+                    self.whnf(&expanded, depth + 1)?
+                } else {
+                    scrutinee
+                };
                 match self.reduce_proj(&struct_name, idx, &scrutinee) {
                     Some(field) => self.whnf_core(&field, depth + 1)?,
                     None => Expr::proj(struct_name, idx, scrutinee),
@@ -500,9 +527,8 @@ impl<'a> TypeChecker<'a> {
     /// Nat-literal-to-constructor / structure-eta coercion. The matching rule's
     /// right-hand side is instantiated with the recursor's levels and applied to
     /// params+motives+minors from the recursor spine, the constructor's fields,
-    /// and the trailing arguments. String-literal expansion (KR-314) is a
-    /// follow-up slice: an unexpanded literal only fails to reduce
-    /// (under-acceptance), never over-accepts.
+    /// and the trailing arguments. Literal majors convert first: Nat via
+    /// `nat_lit_to_constructor`, String via KR-314 expansion (inductive.h:93-95).
     fn inductive_reduce_rec(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
         let (head, rec_args) = app_spine(e);
         let ExprNode::Const { name, levels } = head.node() else {
@@ -530,8 +556,13 @@ impl<'a> TypeChecker<'a> {
                 major = nat_lit_to_constructor(value);
             }
             ExprNode::Lit {
-                literal: Literal::Str(_),
-            } => return Ok(None),
+                literal: Literal::Str(value),
+            } => {
+                // KR-314 (inductive.h:95): a String-literal major expands to its
+                // constructor spine, whnf'd so `String.ofList` delta-unfolds to
+                // the actual constructor application.
+                major = self.whnf(&string_lit_to_constructor(value), depth + 1)?;
+            }
             _ => major = self.major_to_cnstr_when_structure(&rec, &major, depth)?,
         }
         let (major_head, major_args) = app_spine(&major);
@@ -738,6 +769,13 @@ impl<'a> TypeChecker<'a> {
         if t == s {
             return Ok(Some(true));
         }
+        // KR-301's literal half (pin quick_is_def_eq, Lit case): a literal pair
+        // decides by value — and DECISIVELY, since two distinct literals are
+        // both normal forms no later rule can equate.
+        if let (ExprNode::Lit { literal: l1 }, ExprNode::Lit { literal: l2 }) = (t.node(), s.node())
+        {
+            return Ok(Some(l1 == l2));
+        }
         // KR-303 sorts by level equivalence.
         if let (ExprNode::Sort { level: lt }, ExprNode::Sort { level: ls }) = (t.node(), s.node()) {
             return Ok(Some(lt.is_equiv(ls)));
@@ -788,6 +826,19 @@ impl<'a> TypeChecker<'a> {
         if let Some(decided) = self.quick_def_eq_rules(t, s, depth)? {
             return Ok(decided);
         }
+        // KR-313's reflection fast path (pin type_checker.cpp:1062): `t` closed
+        // and `s` literally `Bool.true` — fully reduce `t` and compare. This is
+        // how `decide`-style proofs (`Eq.refl true : decide p = true`) close.
+        // One-sided at the pin; the symmetric case still closes through delta.
+        if !t.has_fvar()
+            && matches!(s.node(), ExprNode::Const { name, .. } if is_name2(name, "Bool", "true"))
+        {
+            let reduced = self.whnf(t, depth + 1)?;
+            if matches!(reduced.node(), ExprNode::Const { name, .. } if is_name2(name, "Bool", "true"))
+            {
+                return Ok(true);
+            }
+        }
         // KR-305: normalize both sides without delta, then RE-RUN the head
         // rules on the reduced pair (beta/zeta/iota can expose Sort or binder
         // heads whose levels are equivalent but not structurally equal).
@@ -802,10 +853,14 @@ impl<'a> TypeChecker<'a> {
         if self.proof_irrel_eq(&tn, &sn, depth + 1)? {
             return Ok(true);
         }
-        // KR-307/309 lazy delta by definitional height, then the head rules
-        // once more — delta is exactly how an abbrev (`outParam`, `ReaderT`,
-        // `Not`) exposes its Sort or Π structure.
-        let (tn, sn) = self.lazy_delta(tn, sn, depth + 1)?;
+        // KR-307/309 lazy delta by definitional height — with the KR-313 offset
+        // and literal-arithmetic machinery woven into every iteration, as at
+        // the pin — then the head rules once more: delta is exactly how an
+        // abbrev (`outParam`, `ReaderT`, `Not`) exposes its Sort or Π structure.
+        let (tn, sn) = match self.lazy_delta(tn, sn, depth + 1)? {
+            LazyDelta::Decided(decided) => return Ok(decided),
+            LazyDelta::Stuck(t, s) => (t, s),
+        };
         if let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)? {
             return Ok(decided);
         }
@@ -842,6 +897,12 @@ impl<'a> TypeChecker<'a> {
         // KR-903 structure eta, both directions (pin: try_eta_struct).
         if self.try_eta_struct(&tn, &sn, depth + 1)? || self.try_eta_struct(&sn, &tn, depth + 1)? {
             return Ok(true);
+        }
+        // KR-314 defeq half (pin try_string_lit_expansion, type_checker.cpp:1030):
+        // a String literal against a `String.ofList _` spine — decisive when the
+        // shape matches, either side.
+        if let Some(decided) = self.try_string_lit_expansion(&tn, &sn, depth + 1)? {
+            return Ok(decided);
         }
         // KR-315 unit-like structures (pin: is_def_eq_unit_like, one-sided).
         if self.is_def_eq_unit_like(&tn, &sn, depth + 1)? {
@@ -973,41 +1034,117 @@ impl<'a> TypeChecker<'a> {
         Ok(matches!(sort.node(), ExprNode::Sort { level } if level.is_equiv(&Level::zero())))
     }
 
-    /// KR-309: unfold the taller definition first; equal heights unfold both.
-    fn lazy_delta(&mut self, mut t: Expr, mut s: Expr, depth: u32) -> KResult<(Expr, Expr)> {
+    /// KR-309: unfold the taller definition first; equal heights unfold both —
+    /// with the pin's per-iteration literal machinery (`lazy_delta_reduction`,
+    /// type_checker.cpp:973): the KR-313 offset check and, on closed pairs,
+    /// literal arithmetic on either side run BEFORE every unfold step, so a
+    /// side that delta-exposes a literal (the decoded `OfNat.ofNat … ≟
+    /// Nat.zero` residual family) decides here instead of falling through.
+    fn lazy_delta(&mut self, mut t: Expr, mut s: Expr, depth: u32) -> KResult<LazyDelta> {
         loop {
             self.step(depth)?;
+            if let Some(decided) = self.is_def_eq_offset(&t, &s, depth)? {
+                return Ok(LazyDelta::Decided(decided));
+            }
+            if !t.has_fvar() && !s.has_fvar() {
+                if let Some(value) = self.reduce_nat(&t, depth)? {
+                    return Ok(LazyDelta::Decided(self.is_def_eq(&value, &s, depth + 1)?));
+                }
+                if let Some(value) = self.reduce_nat(&s, depth)? {
+                    return Ok(LazyDelta::Decided(self.is_def_eq(&t, &value, depth + 1)?));
+                }
+            }
+            // (`reduce_native` would run here at the pin — native_decide
+            // surface, follow-up slice; omission only under-reduces.)
             let ht = self.definition_height(&t);
             let hs = self.definition_height(&s);
             match (ht, hs) {
-                (None, None) => return Ok((t, s)),
+                (None, None) => return Ok(LazyDelta::Stuck(t, s)),
                 (Some(_), None) => match self.unfold_definition(&t, depth)? {
                     Some(next) => t = self.whnf_core(&next, depth)?,
-                    None => return Ok((t, s)),
+                    None => return Ok(LazyDelta::Stuck(t, s)),
                 },
                 (None, Some(_)) => match self.unfold_definition(&s, depth)? {
                     Some(next) => s = self.whnf_core(&next, depth)?,
-                    None => return Ok((t, s)),
+                    None => return Ok(LazyDelta::Stuck(t, s)),
                 },
                 (Some(a), Some(b)) => {
                     if a >= b {
                         match self.unfold_definition(&t, depth)? {
                             Some(next) => t = self.whnf_core(&next, depth)?,
-                            None => return Ok((t, s)),
+                            None => return Ok(LazyDelta::Stuck(t, s)),
                         }
                     }
                     if b >= a {
                         match self.unfold_definition(&s, depth)? {
                             Some(next) => s = self.whnf_core(&next, depth)?,
-                            None => return Ok((t, s)),
+                            None => return Ok(LazyDelta::Stuck(t, s)),
                         }
                     }
                     if t == s {
-                        return Ok((t, s));
+                        return Ok(LazyDelta::Stuck(t, s));
                     }
                 }
             }
         }
+    }
+
+    /// `is_def_eq_offset` (pin type_checker.cpp:961): both sides Nat-zero
+    /// (`Nat.zero` or literal `0`) — defeq; both `succ`-peelable (a positive
+    /// literal peels to its predecessor literal, `Nat.succ x` peels to `x`) —
+    /// defeq of the predecessors, decisively. `None`: not an offset pair.
+    fn is_def_eq_offset(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<Option<bool>> {
+        if is_nat_zero_expr(t) && is_nat_zero_expr(s) {
+            return Ok(Some(true));
+        }
+        match (nat_succ_peel(t), nat_succ_peel(s)) {
+            (Some(pt), Some(ps)) => Ok(Some(self.is_def_eq(&pt, &ps, depth + 1)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// KR-314 defeq half (`try_string_lit_expansion`, pin type_checker.cpp:1030):
+    /// tries both orientations of literal-vs-`String.ofList` spine.
+    fn try_string_lit_expansion(
+        &mut self,
+        t: &Expr,
+        s: &Expr,
+        depth: u32,
+    ) -> KResult<Option<bool>> {
+        if let Some(decided) = self.try_string_lit_expansion_core(t, s, depth)? {
+            return Ok(Some(decided));
+        }
+        self.try_string_lit_expansion_core(s, t, depth)
+    }
+
+    /// One orientation: `t` a String literal, `s` exactly `String.ofList _`
+    /// (a one-argument application of the levels-free constant, as the pin's
+    /// whole-expression comparison against `g_string_mk` requires). Expands the
+    /// literal (whnf'd, so `ofList` unfolds to the real constructor) and
+    /// recurses; the answer is decisive.
+    fn try_string_lit_expansion_core(
+        &mut self,
+        t: &Expr,
+        s: &Expr,
+        depth: u32,
+    ) -> KResult<Option<bool>> {
+        let ExprNode::Lit {
+            literal: Literal::Str(value),
+        } = t.node()
+        else {
+            return Ok(None);
+        };
+        let ExprNode::App { f, .. } = s.node() else {
+            return Ok(None);
+        };
+        let ExprNode::Const { name, levels } = f.node() else {
+            return Ok(None);
+        };
+        if !levels.is_empty() || !is_name2(name, "String", "ofList") {
+            return Ok(None);
+        }
+        let expanded = self.whnf(&string_lit_to_constructor(value), depth + 1)?;
+        Ok(Some(self.is_def_eq(&expanded, s, depth + 1)?))
     }
 
     /// KR-312 (function half): `t` a lambda, `s` not — eta-expand `s` through its

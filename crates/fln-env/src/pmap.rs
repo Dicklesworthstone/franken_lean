@@ -25,9 +25,8 @@ use std::sync::Arc;
 /// The hash must be a pure function of the key's `Eq` identity: equal keys
 /// must return equal hashes. `Ord` must be consistent with `Eq`; it is the CGSE
 /// tie-break for distinct keys with the same complete hash. Distinct keys may
-/// collide; collision-bucket lookup/removal is currently O(b), while insertion
-/// performs O(log b) comparisons plus O(b) clone/shift work. Resource-bounding
-/// adversarially large buckets is deliberately owned by follow-up `fln-amv.13`.
+/// collide; small collision families stay inline while larger families use a
+/// structurally shared balanced tree keyed by this exact order.
 ///
 /// `Name` uses its pinned Reference `Name.cmp` order through its `Ord`
 /// implementation, never allocation address, insertion order, or randomized
@@ -35,6 +34,64 @@ use std::sync::Arc;
 pub trait PKey: Clone + Eq + Ord {
     fn key_hash(&self) -> u64;
 }
+
+/// Resource envelope for one persistent insertion.
+///
+/// `max_collision_entries` and `max_expanded_weight` govern the target
+/// full-hash family. Entry weight is supplied by the owning decoder/admission
+/// boundary because a generic map cannot infer the expanded semantic weight of
+/// an opaque key/value pair. `max_fresh_nodes` is checked against a
+/// schedule-independent upper bound, not the history-dependent number of AVL
+/// rotations an individual insertion happened to need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollisionBudget {
+    pub max_collision_entries: usize,
+    pub max_expanded_weight: u64,
+    pub max_fresh_nodes: usize,
+}
+
+impl CollisionBudget {
+    pub const UNBOUNDED: CollisionBudget = CollisionBudget {
+        max_collision_entries: usize::MAX,
+        max_expanded_weight: u64::MAX,
+        max_fresh_nodes: usize::MAX,
+    };
+}
+
+impl Default for CollisionBudget {
+    fn default() -> Self {
+        Self::UNBOUNDED
+    }
+}
+
+/// The independently accounted dimension that refused a budgeted insertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollisionResource {
+    Entries,
+    ExpandedWeight,
+    FreshNodes,
+}
+
+/// Typed, atomic resource exhaustion from [`PMap::try_insert_with_budget`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollisionExhausted {
+    pub resource: CollisionResource,
+    pub limit: u64,
+    pub attempted: u64,
+    pub collision_hash: u64,
+}
+
+impl std::fmt::Display for CollisionExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "collision-family {:?} budget exhausted for hash {:016x}: attempted {}, limit {}",
+            self.resource, self.collision_hash, self.attempted, self.limit
+        )
+    }
+}
+
+impl std::error::Error for CollisionExhausted {}
 
 /// Bits of hash consumed per branch level.
 const BITS: u32 = 5;
@@ -46,11 +103,62 @@ const CHUNK_MASK: u64 = (1 << BITS) - 1;
 const MAX_SHIFT: u32 = 60;
 /// Maximum node-path length root→leaf: 13 branch levels plus the leaf.
 const MAX_DEPTH: usize = (MAX_SHIFT / BITS) as usize + 2;
+/// Inline collision families are deliberately tiny. The ninth entry promotes
+/// to the persistent tree; removal back to eight entries demotes. Using the
+/// same boundary in both directions makes the tier a function of cardinality,
+/// never construction history.
+const INLINE_COLLISION_MAX: usize = 8;
 
 /// The `BITS`-wide hash chunk at `shift`. Total (never shifts past the word),
 /// though callers only pass `shift <= MAX_SHIFT`.
 fn chunk(hash: u64, shift: u32) -> u32 {
     (hash.checked_shr(shift).unwrap_or(0) & CHUNK_MASK) as u32
+}
+
+#[derive(Clone)]
+struct CollisionEntry<K, V> {
+    key: K,
+    value: V,
+    expanded_weight: u64,
+}
+
+struct CollisionNode<K, V> {
+    entry: CollisionEntry<K, V>,
+    left: Option<Arc<CollisionNode<K, V>>>,
+    right: Option<Arc<CollisionNode<K, V>>>,
+    height: u16,
+    len: usize,
+    expanded_weight: u64,
+}
+
+enum CollisionBucket<K, V> {
+    Inline(Vec<CollisionEntry<K, V>>),
+    Tree {
+        root: Arc<CollisionNode<K, V>>,
+        len: usize,
+        expanded_weight: u64,
+    },
+}
+
+impl<K, V> Clone for CollisionBucket<K, V>
+where
+    K: Clone,
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            CollisionBucket::Inline(entries) => CollisionBucket::Inline(entries.clone()),
+            CollisionBucket::Tree {
+                root,
+                len,
+                expanded_weight,
+            } => CollisionBucket::Tree {
+                root: Arc::clone(root),
+                len: *len,
+                expanded_weight: *expanded_weight,
+            },
+        }
+    }
 }
 
 enum Node<K, V> {
@@ -63,9 +171,566 @@ enum Node<K, V> {
         children: Vec<Arc<Node<K, V>>>,
     },
     /// All entries whose key hashes to exactly `hash`. Invariant: non-empty,
-    /// keys pairwise distinct; entries beyond the first exist only under
-    /// full 64-bit hash collision.
-    Leaf { hash: u64, entries: Vec<(K, V)> },
+    /// keys pairwise distinct and canonically ordered by exact `PKey::Ord`.
+    /// The representation tier is a pure function of cardinality.
+    Leaf {
+        hash: u64,
+        bucket: CollisionBucket<K, V>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollisionTier {
+    Inline,
+    Tree,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MutationFacts {
+    comparisons: usize,
+    fresh_map_nodes: usize,
+    fresh_collision_nodes: usize,
+    cloned_inline_entries: usize,
+    required_fresh_nodes: usize,
+    collision_entries: usize,
+    expanded_weight: u64,
+    tier: Option<CollisionTier>,
+}
+
+impl MutationFacts {
+    fn actual_fresh_nodes(self) -> usize {
+        self.fresh_map_nodes
+            .saturating_add(self.fresh_collision_nodes)
+    }
+}
+
+fn usize_as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn ceil_log2(value: usize) -> usize {
+    if value <= 1 {
+        0
+    } else {
+        (usize::BITS - (value - 1).leading_zeros()) as usize
+    }
+}
+
+/// A persistent AVL insertion/removal rebuilds one logarithmic search path and
+/// at most one constant-size rotation per level. This deliberately loose bound
+/// depends only on cardinality, so a resource verdict cannot change with the
+/// insertion schedule that produced the current balanced shape.
+fn collision_tree_fresh_node_bound(cardinality: usize) -> usize {
+    3usize
+        .saturating_mul(ceil_log2(cardinality.saturating_add(1)))
+        .saturating_add(4)
+}
+
+fn collision_height<K, V>(node: Option<&Arc<CollisionNode<K, V>>>) -> u16 {
+    node.map_or(0, |node| node.height)
+}
+
+fn collision_len<K, V>(node: Option<&Arc<CollisionNode<K, V>>>) -> usize {
+    node.map_or(0, |node| node.len)
+}
+
+fn collision_weight<K, V>(node: Option<&Arc<CollisionNode<K, V>>>) -> u64 {
+    node.map_or(0, |node| node.expanded_weight)
+}
+
+fn collision_node<K: Clone, V: Clone>(
+    entry: CollisionEntry<K, V>,
+    left: Option<Arc<CollisionNode<K, V>>>,
+    right: Option<Arc<CollisionNode<K, V>>>,
+    facts: &mut MutationFacts,
+) -> Arc<CollisionNode<K, V>> {
+    facts.fresh_collision_nodes = facts.fresh_collision_nodes.saturating_add(1);
+    Arc::new(CollisionNode {
+        expanded_weight: entry
+            .expanded_weight
+            .saturating_add(collision_weight(left.as_ref()))
+            .saturating_add(collision_weight(right.as_ref())),
+        height: 1 + collision_height(left.as_ref()).max(collision_height(right.as_ref())),
+        len: 1usize
+            .saturating_add(collision_len(left.as_ref()))
+            .saturating_add(collision_len(right.as_ref())),
+        entry,
+        left,
+        right,
+    })
+}
+
+fn collision_balance<K: Clone, V: Clone>(
+    entry: CollisionEntry<K, V>,
+    left: Option<Arc<CollisionNode<K, V>>>,
+    right: Option<Arc<CollisionNode<K, V>>>,
+    facts: &mut MutationFacts,
+) -> Arc<CollisionNode<K, V>> {
+    let left_height = collision_height(left.as_ref());
+    let right_height = collision_height(right.as_ref());
+    if left_height > right_height.saturating_add(1) {
+        let Some(left_root) = left else {
+            return collision_node(entry, None, right, facts);
+        };
+        if collision_height(left_root.left.as_ref())
+            >= collision_height(left_root.right.as_ref())
+        {
+            let new_right = collision_node(
+                entry,
+                left_root.right.clone(),
+                right,
+                facts,
+            );
+            return collision_node(
+                left_root.entry.clone(),
+                left_root.left.clone(),
+                Some(new_right),
+                facts,
+            );
+        }
+        let Some(pivot) = left_root.right.as_ref() else {
+            return collision_node(entry, Some(left_root), right, facts);
+        };
+        let new_left = collision_node(
+            left_root.entry.clone(),
+            left_root.left.clone(),
+            pivot.left.clone(),
+            facts,
+        );
+        let new_right = collision_node(entry, pivot.right.clone(), right, facts);
+        return collision_node(
+            pivot.entry.clone(),
+            Some(new_left),
+            Some(new_right),
+            facts,
+        );
+    }
+    if right_height > left_height.saturating_add(1) {
+        let Some(right_root) = right else {
+            return collision_node(entry, left, None, facts);
+        };
+        if collision_height(right_root.right.as_ref())
+            >= collision_height(right_root.left.as_ref())
+        {
+            let new_left = collision_node(
+                entry,
+                left,
+                right_root.left.clone(),
+                facts,
+            );
+            return collision_node(
+                right_root.entry.clone(),
+                Some(new_left),
+                right_root.right.clone(),
+                facts,
+            );
+        }
+        let Some(pivot) = right_root.left.as_ref() else {
+            return collision_node(entry, left, Some(right_root), facts);
+        };
+        let new_left = collision_node(entry, left, pivot.left.clone(), facts);
+        let new_right = collision_node(
+            right_root.entry.clone(),
+            pivot.right.clone(),
+            right_root.right.clone(),
+            facts,
+        );
+        return collision_node(
+            pivot.entry.clone(),
+            Some(new_left),
+            Some(new_right),
+            facts,
+        );
+    }
+    collision_node(entry, left, right, facts)
+}
+
+fn collision_find<'a, K: Ord, V>(
+    root: &'a Arc<CollisionNode<K, V>>,
+    key: &K,
+    facts: &mut MutationFacts,
+) -> Option<&'a CollisionEntry<K, V>> {
+    let mut node = Some(root);
+    while let Some(current) = node {
+        facts.comparisons = facts.comparisons.saturating_add(1);
+        match key.cmp(&current.entry.key) {
+            std::cmp::Ordering::Less => node = current.left.as_ref(),
+            std::cmp::Ordering::Greater => node = current.right.as_ref(),
+            std::cmp::Ordering::Equal => return Some(&current.entry),
+        }
+    }
+    None
+}
+
+fn collision_insert_node<K: Clone + Eq + Ord, V: Clone>(
+    node: &Arc<CollisionNode<K, V>>,
+    entry: CollisionEntry<K, V>,
+    facts: &mut MutationFacts,
+) -> (Arc<CollisionNode<K, V>>, bool) {
+    facts.comparisons = facts.comparisons.saturating_add(1);
+    match entry.key.cmp(&node.entry.key) {
+        std::cmp::Ordering::Less => {
+            let (new_left, added) = match node.left.as_ref() {
+                Some(left) => collision_insert_node(left, entry, facts),
+                None => (collision_node(entry, None, None, facts), true),
+            };
+            (
+                collision_balance(
+                    node.entry.clone(),
+                    Some(new_left),
+                    node.right.clone(),
+                    facts,
+                ),
+                added,
+            )
+        }
+        std::cmp::Ordering::Greater => {
+            let (new_right, added) = match node.right.as_ref() {
+                Some(right) => collision_insert_node(right, entry, facts),
+                None => (collision_node(entry, None, None, facts), true),
+            };
+            (
+                collision_balance(
+                    node.entry.clone(),
+                    node.left.clone(),
+                    Some(new_right),
+                    facts,
+                ),
+                added,
+            )
+        }
+        std::cmp::Ordering::Equal => {
+            debug_assert!(entry.key == node.entry.key);
+            (
+                collision_node(entry, node.left.clone(), node.right.clone(), facts),
+                false,
+            )
+        }
+    }
+}
+
+fn collision_remove_min<K: Clone, V: Clone>(
+    node: &Arc<CollisionNode<K, V>>,
+    facts: &mut MutationFacts,
+) -> (CollisionEntry<K, V>, Option<Arc<CollisionNode<K, V>>>) {
+    let Some(left) = node.left.as_ref() else {
+        return (node.entry.clone(), node.right.clone());
+    };
+    let (entry, new_left) = collision_remove_min(left, facts);
+    (
+        entry,
+        Some(collision_balance(
+            node.entry.clone(),
+            new_left,
+            node.right.clone(),
+            facts,
+        )),
+    )
+}
+
+fn collision_remove_node<K: Clone + Ord, V: Clone>(
+    node: &Arc<CollisionNode<K, V>>,
+    key: &K,
+    facts: &mut MutationFacts,
+) -> Option<(
+    Option<Arc<CollisionNode<K, V>>>,
+    CollisionEntry<K, V>,
+)> {
+    facts.comparisons = facts.comparisons.saturating_add(1);
+    match key.cmp(&node.entry.key) {
+        std::cmp::Ordering::Less => {
+            let (new_left, removed) =
+                collision_remove_node(node.left.as_ref()?, key, facts)?;
+            Some((
+                Some(collision_balance(
+                    node.entry.clone(),
+                    new_left,
+                    node.right.clone(),
+                    facts,
+                )),
+                removed,
+            ))
+        }
+        std::cmp::Ordering::Greater => {
+            let (new_right, removed) =
+                collision_remove_node(node.right.as_ref()?, key, facts)?;
+            Some((
+                Some(collision_balance(
+                    node.entry.clone(),
+                    node.left.clone(),
+                    new_right,
+                    facts,
+                )),
+                removed,
+            ))
+        }
+        std::cmp::Ordering::Equal => match (&node.left, &node.right) {
+            (None, None) => Some((None, node.entry.clone())),
+            (Some(left), None) => Some((Some(Arc::clone(left)), node.entry.clone())),
+            (None, Some(right)) => Some((Some(Arc::clone(right)), node.entry.clone())),
+            (Some(left), Some(right)) => {
+                let (successor, new_right) = collision_remove_min(right, facts);
+                Some((
+                    Some(collision_balance(
+                        successor,
+                        Some(Arc::clone(left)),
+                        new_right,
+                        facts,
+                    )),
+                    node.entry.clone(),
+                ))
+            }
+        },
+    }
+}
+
+fn collision_tree_from_sorted<K: Clone, V: Clone>(
+    entries: &[CollisionEntry<K, V>],
+    facts: &mut MutationFacts,
+) -> Option<Arc<CollisionNode<K, V>>> {
+    let (middle, rest) = entries.split_first()?;
+    let pivot = rest.len() / 2;
+    let (left_entries, right_with_pivot) = entries.split_at(pivot);
+    let (pivot_entry, right_entries) = right_with_pivot.split_first()?;
+    let _ = middle;
+    Some(collision_node(
+        pivot_entry.clone(),
+        collision_tree_from_sorted(left_entries, facts),
+        collision_tree_from_sorted(right_entries, facts),
+        facts,
+    ))
+}
+
+fn collision_collect<K: Clone, V: Clone>(
+    root: &Arc<CollisionNode<K, V>>,
+) -> Vec<CollisionEntry<K, V>> {
+    let mut entries = Vec::with_capacity(root.len);
+    let mut stack = Vec::new();
+    let mut cursor = Some(root.as_ref());
+    while cursor.is_some() || !stack.is_empty() {
+        while let Some(node) = cursor {
+            stack.push(node);
+            cursor = node.left.as_deref();
+        }
+        let Some(node) = stack.pop() else {
+            break;
+        };
+        entries.push(node.entry.clone());
+        cursor = node.right.as_deref();
+    }
+    entries
+}
+
+impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
+    fn singleton(key: K, value: V, expanded_weight: u64) -> Self {
+        CollisionBucket::Inline(vec![CollisionEntry {
+            key,
+            value,
+            expanded_weight,
+        }])
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            CollisionBucket::Inline(entries) => entries.len(),
+            CollisionBucket::Tree { len, .. } => *len,
+        }
+    }
+
+    fn expanded_weight(&self) -> u64 {
+        match self {
+            CollisionBucket::Inline(entries) => entries
+                .iter()
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.expanded_weight)),
+            CollisionBucket::Tree {
+                expanded_weight, ..
+            } => *expanded_weight,
+        }
+    }
+
+    fn tier(&self) -> CollisionTier {
+        match self {
+            CollisionBucket::Inline(_) => CollisionTier::Inline,
+            CollisionBucket::Tree { .. } => CollisionTier::Tree,
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        match self {
+            CollisionBucket::Inline(entries) => entries
+                .binary_search_by(|entry| entry.key.cmp(key))
+                .ok()
+                .and_then(|index| entries.get(index))
+                .map(|entry| &entry.value),
+            CollisionBucket::Tree { root, .. } => {
+                let mut facts = MutationFacts::default();
+                collision_find(root, key, &mut facts).map(|entry| &entry.value)
+            }
+        }
+    }
+
+    fn insertion_shape(
+        &self,
+        key: &K,
+        expanded_weight: u64,
+        facts: &mut MutationFacts,
+    ) -> Result<(bool, usize, u64), CollisionExhausted> {
+        let previous_weight = match self {
+            CollisionBucket::Inline(entries) => {
+                let result = entries.binary_search_by(|entry| {
+                    facts.comparisons = facts.comparisons.saturating_add(1);
+                    entry.key.cmp(key)
+                });
+                result
+                    .ok()
+                    .and_then(|index| entries.get(index))
+                    .map(|entry| entry.expanded_weight)
+            }
+            CollisionBucket::Tree { root, .. } => {
+                collision_find(root, key, facts).map(|entry| entry.expanded_weight)
+            }
+        };
+        let added = previous_weight.is_none();
+        let new_len = self.len().saturating_add(usize::from(added));
+        let Some(new_weight) = self
+            .expanded_weight()
+            .checked_sub(previous_weight.unwrap_or(0))
+            .and_then(|weight| weight.checked_add(expanded_weight))
+        else {
+            return Err(CollisionExhausted {
+                resource: CollisionResource::ExpandedWeight,
+                limit: u64::MAX,
+                attempted: u64::MAX,
+                collision_hash: 0,
+            });
+        };
+        Ok((added, new_len, new_weight))
+    }
+
+    fn insert(
+        &self,
+        key: K,
+        value: V,
+        expanded_weight: u64,
+        facts: &mut MutationFacts,
+    ) -> (CollisionBucket<K, V>, bool) {
+        let entry = CollisionEntry {
+            key,
+            value,
+            expanded_weight,
+        };
+        let (bucket, added) = match self {
+            CollisionBucket::Inline(entries) => {
+                let mut new_entries = entries.clone();
+                facts.cloned_inline_entries = facts
+                    .cloned_inline_entries
+                    .saturating_add(entries.len());
+                let added =
+                    match new_entries.binary_search_by(|stored| {
+                        facts.comparisons = facts.comparisons.saturating_add(1);
+                        stored.key.cmp(&entry.key)
+                    }) {
+                        Ok(index) => {
+                            debug_assert!(new_entries[index].key == entry.key);
+                            new_entries[index] = entry;
+                            false
+                        }
+                        Err(index) => {
+                            new_entries.insert(index, entry);
+                            true
+                        }
+                    };
+                if new_entries.len() <= INLINE_COLLISION_MAX {
+                    (CollisionBucket::Inline(new_entries), added)
+                } else {
+                    let root = collision_tree_from_sorted(&new_entries, facts)
+                        .unwrap_or_else(|| collision_node(new_entries[0].clone(), None, None, facts));
+                    (
+                        CollisionBucket::Tree {
+                            len: root.len,
+                            expanded_weight: root.expanded_weight,
+                            root,
+                        },
+                        added,
+                    )
+                }
+            }
+            CollisionBucket::Tree { root, .. } => {
+                let (root, added) = collision_insert_node(root, entry, facts);
+                (
+                    CollisionBucket::Tree {
+                        len: root.len,
+                        expanded_weight: root.expanded_weight,
+                        root,
+                    },
+                    added,
+                )
+            }
+        };
+        facts.collision_entries = bucket.len();
+        facts.expanded_weight = bucket.expanded_weight();
+        facts.tier = Some(bucket.tier());
+        (bucket, added)
+    }
+
+    fn remove(
+        &self,
+        key: &K,
+        facts: &mut MutationFacts,
+    ) -> Option<Option<CollisionBucket<K, V>>> {
+        match self {
+            CollisionBucket::Inline(entries) => {
+                let index = entries
+                    .binary_search_by(|entry| {
+                        facts.comparisons = facts.comparisons.saturating_add(1);
+                        entry.key.cmp(key)
+                    })
+                    .ok()?;
+                if entries.len() == 1 {
+                    return Some(None);
+                }
+                facts.cloned_inline_entries = facts
+                    .cloned_inline_entries
+                    .saturating_add(entries.len().saturating_sub(1));
+                let mut kept = Vec::with_capacity(entries.len() - 1);
+                kept.extend(entries[..index].iter().cloned());
+                kept.extend(entries[index + 1..].iter().cloned());
+                facts.collision_entries = kept.len();
+                facts.expanded_weight = kept
+                    .iter()
+                    .fold(0u64, |sum, entry| sum.saturating_add(entry.expanded_weight));
+                facts.tier = Some(CollisionTier::Inline);
+                Some(Some(CollisionBucket::Inline(kept)))
+            }
+            CollisionBucket::Tree { root, .. } => {
+                let (new_root, _removed) = collision_remove_node(root, key, facts)?;
+                let Some(new_root) = new_root else {
+                    return Some(None);
+                };
+                if new_root.len <= INLINE_COLLISION_MAX {
+                    let entries = collision_collect(&new_root);
+                    facts.cloned_inline_entries = facts
+                        .cloned_inline_entries
+                        .saturating_add(entries.len());
+                    facts.collision_entries = entries.len();
+                    facts.expanded_weight = entries.iter().fold(0u64, |sum, entry| {
+                        sum.saturating_add(entry.expanded_weight)
+                    });
+                    facts.tier = Some(CollisionTier::Inline);
+                    Some(Some(CollisionBucket::Inline(entries)))
+                } else {
+                    facts.collision_entries = new_root.len;
+                    facts.expanded_weight = new_root.expanded_weight;
+                    facts.tier = Some(CollisionTier::Tree);
+                    Some(Some(CollisionBucket::Tree {
+                        len: new_root.len,
+                        expanded_weight: new_root.expanded_weight,
+                        root: new_root,
+                    }))
+                }
+            }
+        }
+    }
 }
 
 /// Persistent (immutable, structurally shared) hash map.
@@ -172,7 +837,7 @@ impl<K: PKey, V: Clone> PMap<K, V> {
 
     /// Total node count (branches + leaves); test-only sharing probe.
     #[cfg(test)]
-    fn node_count(&self) -> usize {
+    pub(crate) fn node_count(&self) -> usize {
         fn count<K, V>(node: &Node<K, V>) -> usize {
             match node {
                 Node::Leaf { .. } => 1,
@@ -186,7 +851,7 @@ impl<K: PKey, V: Clone> PMap<K, V> {
 
     /// Addresses of every node, for pointer-identity sharing checks.
     #[cfg(test)]
-    fn node_ptrs(&self) -> Vec<*const ()> {
+    pub(crate) fn node_ptrs(&self) -> Vec<*const ()> {
         fn walk<K, V>(node: &Arc<Node<K, V>>, out: &mut Vec<*const ()>) {
             out.push(Arc::as_ptr(node).cast());
             if let Node::Branch { children, .. } = node.as_ref() {
@@ -200,6 +865,19 @@ impl<K: PKey, V: Clone> PMap<K, V> {
             walk(root, &mut out);
         }
         out
+    }
+
+    /// Worst-case fresh nodes allocated by one insertion: a replacement path
+    /// plus, when two leaf hashes first diverge, one newly branched path.
+    #[cfg(test)]
+    pub(crate) const fn insertion_fresh_node_bound() -> usize {
+        2 * MAX_DEPTH
+    }
+
+    /// Existing nodes that one insertion may replace along its root-to-leaf path.
+    #[cfg(test)]
+    pub(crate) const fn insertion_replaced_node_bound() -> usize {
+        MAX_DEPTH
     }
 }
 

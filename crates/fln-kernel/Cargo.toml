@@ -6,5 +6,6 @@ license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 
 [dependencies]
+fln-bignum = { path = "../fln-bignum" }
 fln-core = { path = "../fln-core" }
 fln-env = { path = "../fln-env" }

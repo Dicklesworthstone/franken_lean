@@ -1079,20 +1079,50 @@ mod tests {
     // Test-only mutations used by the no-mock E2E lane. They deliberately restore
     // the exact bug class: syntax-depth recursion on a bounded worker stack. The
     // parent process must observe their fatal exit instead of accepting them.
-    fn recursive_level_encoder_mutant(level: &Level, w: &mut CanonWriter) {
+    #[derive(Clone, Copy)]
+    struct RecursiveLevelEncoder(fn(&Level, &mut CanonWriter, RecursiveLevelEncoder));
+
+    impl RecursiveLevelEncoder {
+        fn encode(self, level: &Level, w: &mut CanonWriter) {
+            (self.0)(level, w, self);
+        }
+    }
+
+    fn recursive_level_encoder_step(
+        level: &Level,
+        w: &mut CanonWriter,
+        recurse: RecursiveLevelEncoder,
+    ) {
         use fln_core::level::LevelView;
         match level.view() {
             LevelView::Zero => w.u8(LEVEL_ZERO),
             LevelView::Succ(inner) => {
                 w.u8(LEVEL_SUCC);
-                recursive_level_encoder_mutant(inner, w);
+                recurse.encode(inner, w);
                 std::hint::black_box(w.buf.len());
             }
             _ => panic!("the level mutation probe expects a Succ chain"),
         }
     }
 
-    fn recursive_expr_encoder_mutant(expr: &Expr, w: &mut CanonWriter) {
+    fn recursive_level_encoder_mutant(level: &Level, w: &mut CanonWriter) {
+        RecursiveLevelEncoder(recursive_level_encoder_step).encode(level, w);
+    }
+
+    #[derive(Clone, Copy)]
+    struct RecursiveExprEncoder(fn(&Expr, &mut CanonWriter, RecursiveExprEncoder));
+
+    impl RecursiveExprEncoder {
+        fn encode(self, expr: &Expr, w: &mut CanonWriter) {
+            (self.0)(expr, w, self);
+        }
+    }
+
+    fn recursive_expr_encoder_step(
+        expr: &Expr,
+        w: &mut CanonWriter,
+        recurse: RecursiveExprEncoder,
+    ) {
         match expr.node() {
             ExprNode::BVar { idx } => {
                 w.u8(EXPR_BVAR);
@@ -1100,12 +1130,16 @@ mod tests {
             }
             ExprNode::App { f, a } => {
                 w.u8(EXPR_APP);
-                recursive_expr_encoder_mutant(f, w);
-                recursive_expr_encoder_mutant(a, w);
+                recurse.encode(f, w);
+                recurse.encode(a, w);
                 std::hint::black_box(w.buf.len());
             }
             _ => panic!("the expression mutation probe expects an App chain"),
         }
+    }
+
+    fn recursive_expr_encoder_mutant(expr: &Expr, w: &mut CanonWriter) {
+        RecursiveExprEncoder(recursive_expr_encoder_step).encode(expr, w);
     }
 
     fn drop_pair_concurrently<T: Send + 'static>(left: T, right: T) {

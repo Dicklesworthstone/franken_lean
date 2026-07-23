@@ -2,10 +2,13 @@
 # env_snapshots.sh — shared E2E scenario for the Grimoire environment (bead fln-amv).
 #
 # Real-path, no-mock: runs the real fln-env suite (persistent-map model tests,
-# snapshot isolation, logical-root determinism across thread counts), then seeds a
-# REAL bug class into an overlay workspace — add_decl silently dropping extension
-# state — and proves the suite KILLS the mutant (a surviving mutant is a failed
-# scenario), then recovery on the pristine overlay. NDJSON under target/e2e/.
+# snapshot isolation, logical-root determinism across thread counts), captures
+# detailed journal/checkpoint evidence through the real Environment APIs, then
+# seeds a REAL bug class into an overlay workspace — add_decl silently dropping
+# extension state — and proves the suite KILLS the mutant (a surviving mutant is
+# a failed scenario), then delegates the historical full-hash bucket
+# append-order proof to an authoritative nested fln.e2e/2 evidence bundle.
+# NDJSON under target/e2e/.
 
 set -euo pipefail
 
@@ -51,7 +54,32 @@ if [ "$rc" -ne 0 ]; then
 fi
 emit suite passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"suite.log\""
 
-# ---- step 2: seeded mutant must be killed ----------------------------------------------
+# ---- step 2: detailed persistent-journal and checkpoint evidence -----------------------
+note "capturing real Environment journal/checkpoint evidence"
+set +e
+( cd "$ROOT" && FLN_ENV_E2E_RUN_ID="$RUN_ID" CARGO_TARGET_DIR=target_local \
+    cargo test --locked -q -p fln-env \
+      extensions::tests::environment_state_e2e_emits_detailed_real_path_evidence \
+      -- --exact --nocapture ) > "$ART_DIR/environment_state.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit environment_state failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"environment_state.log\""
+  note "FAIL: real environment-state scenario failed (see $ART_DIR/environment_state.log)"
+  exit 1
+fi
+evidence_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.environment-state\",\"version\":1") == 1 { count++ } END { print count + 0 }' "$ART_DIR/environment_state.log")
+passed_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.environment-state\",\"version\":1") == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' "$ART_DIR/environment_state.log")
+if [ "$evidence_count" -ne 4 ] || [ "$passed_count" -ne 4 ]; then
+  emit environment_state failed "\"expected_records\":4,\"actual_records\":$evidence_count,\"passed_records\":$passed_count,\"artifact\":\"environment_state.log\""
+  note "FAIL: environment-state evidence was missing, malformed, or non-passing"
+  exit 1
+fi
+awk 'index($0, "{\"schema\":\"fln.e2e.environment-state\",\"version\":1") == 1 { print }' \
+  "$ART_DIR/environment_state.log" >> "$LOG"
+emit environment_state passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$evidence_count,\"artifact\":\"environment_state.log\""
+
+# ---- step 4: extension-state mutant must be killed -------------------------------------
 OVERLAY="$ART_DIR/overlay"
 mkdir -p "$OVERLAY"
 for crate in fln-core fln-hash fln-env; do
@@ -85,7 +113,7 @@ if [ "$rc" -eq 0 ]; then
 fi
 emit seeded_mutant passed "\"expected_exit\":\"nonzero\",\"actual_exit\":$rc,\"detected\":\"extension-state-dropping mutant killed\",\"artifact\":\"mutant.log\""
 
-# ---- step 3: recovery — pristine overlay passes ----------------------------------------
+# ---- step 5: extension-state recovery — pristine overlay passes ------------------------
 sed -i 's/extensions: crate::pmap::PMap::new(),/extensions: self.extensions.clone(),/' \
   "$OVERLAY/fln-env/src/environment.rs"
 set +e

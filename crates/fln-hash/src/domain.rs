@@ -59,6 +59,10 @@ pub enum Domain {
     OperationalMeta,
     /// A canonical-serialization schema descriptor (self-describing corpora).
     CanonicalSchema,
+    /// Immutable module topology plus declaration/extension contribution
+    /// provenance. This is an explicit additional Ledger/receipt identity and is
+    /// deliberately separate from both `LogicalRoot` and `OperationalMeta`.
+    ModuleProvenance,
     /// Tribunal fixture and corpus identity (test apparatus only).
     Fixture,
 }
@@ -77,13 +81,14 @@ impl Domain {
             Domain::CacheKey => "fln 2026 domain cache-key/1",
             Domain::OperationalMeta => "fln 2026 domain operational-meta/1",
             Domain::CanonicalSchema => "fln 2026 domain canonical-schema/1",
+            Domain::ModuleProvenance => "fln 2026 domain module-provenance/1",
             Domain::Fixture => "fln 2026 domain fixture/1",
         }
     }
 
     /// Every registered domain, for registry-wide tests (pairwise distinctness,
     /// frozen-vector stability).
-    pub const ALL: [Domain; 10] = [
+    pub const ALL: [Domain; 12] = [
         Domain::DeclContent,
         Domain::LogicalRoot,
         Domain::ExtensionDelta,
@@ -92,7 +97,9 @@ impl Domain {
         Domain::TransparencyLeaf,
         Domain::TransparencyNode,
         Domain::CacheKey,
+        Domain::OperationalMeta,
         Domain::CanonicalSchema,
+        Domain::ModuleProvenance,
         Domain::Fixture,
     ];
 }

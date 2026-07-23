@@ -10,6 +10,10 @@
 //! * [`extensions`] — the extension registry: merge/checkpoint semantics declared by
 //!   contract; opaque payloads preserved losslessly, flagged, and conservatively
 //!   blocking (never guessed safe);
+//! * [`modules`] — lossless direct-import records and the immutable, resource-bounded
+//!   module DAG; effective closure and contribution provenance build on this substrate;
+//! * [`provenance`] — the separately rooted canonical module/declaration/extension
+//!   contribution identity used by invalidation and future Ledger receipts;
 //! * [`environment`] — the environment itself, with the logical root (declarations +
 //!   extension deltas + options, nothing else) and the separate operational-metadata
 //!   root of §7.1.
@@ -20,6 +24,9 @@
 #![forbid(unsafe_code)]
 
 pub mod constants;
+pub mod effective_imports;
 pub mod environment;
 pub mod extensions;
+pub mod modules;
 pub mod pmap;
+pub mod provenance;
