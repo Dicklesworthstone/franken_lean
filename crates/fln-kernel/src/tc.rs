@@ -465,6 +465,131 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Bulk budget charge for literal arithmetic whose result size is bounded in
+    /// advance: a computation whose OUTPUT would dwarf the step budget converts
+    /// to typed exhaustion BEFORE any allocation (FL-INV-07) — where the pin
+    /// simply grinds or exhausts memory (Behavior Note on franken_lean-irm).
+    fn charge_bulk(&mut self, units: u64) -> KResult<()> {
+        self.used.steps_used = self.used.steps_used.saturating_add(units);
+        if self.used.steps_used > self.budget.steps {
+            return Err(Stop::Exhausted(ExhaustionReason::Steps));
+        }
+        Ok(())
+    }
+
+    /// KR-313 (`reduce_nat`, pin type_checker.cpp:609): literal Nat arithmetic.
+    /// `Nat.succ` at one argument; at two, the pin's exact table — add sub mul
+    /// pow gcd mod div beq ble land lor xor shiftLeft shiftRight (divergence
+    /// note, pinned by test: no `Nat.blt` at this pin). Arguments are whnf'd and
+    /// accepted when literal or `Nat.zero` (`is_nat_lit_ext`); `pow` refuses
+    /// exponents above 2^24 (`ReducePowMaxExp`) exactly as the pin does;
+    /// `beq`/`ble` produce `Bool.true`/`Bool.false`. All arithmetic is
+    /// fln-bignum; results re-enter the term plane loss-free via interop.
+    fn reduce_nat(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
+        const REDUCE_POW_MAX_EXP: u64 = 1 << 24;
+        let (head, args) = app_spine(e);
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        let Some(op) = nat_op_leaf(name) else {
+            return Ok(None);
+        };
+        if args.len() == 1 {
+            if op != "succ" {
+                return Ok(None);
+            }
+            let arg = self.whnf(&args[0], depth + 1)?;
+            let Some(value) = nat_lit_ext_value(&arg) else {
+                return Ok(None);
+            };
+            return Ok(Some(nat_lit_expr(&value.add(&BigNat::from_u64(1)))));
+        }
+        if args.len() != 2
+            || !matches!(
+                op,
+                "add"
+                    | "sub"
+                    | "mul"
+                    | "pow"
+                    | "gcd"
+                    | "mod"
+                    | "div"
+                    | "beq"
+                    | "ble"
+                    | "land"
+                    | "lor"
+                    | "xor"
+                    | "shiftLeft"
+                    | "shiftRight"
+            )
+        {
+            return Ok(None);
+        }
+        let a = self.whnf(&args[0], depth + 1)?;
+        let Some(va) = nat_lit_ext_value(&a) else {
+            return Ok(None);
+        };
+        let b = self.whnf(&args[1], depth + 1)?;
+        let Some(vb) = nat_lit_ext_value(&b) else {
+            return Ok(None);
+        };
+        // Operand-proportional charge: the operands came from the term, so this
+        // is linear in input; result-proportional charges follow per op.
+        let limbs_a = va.limbs_le().len() as u64;
+        let limbs_b = vb.limbs_le().len() as u64;
+        self.charge_bulk(1 + limbs_a + limbs_b)?;
+        let result = match op {
+            "add" => va.add(&vb),
+            "sub" => va.sub(&vb),
+            "mul" => va.mul(&vb),
+            "pow" => {
+                // Pin cap first (exponents above it leave the term stuck) …
+                match vb.to_u64() {
+                    Some(exp) if exp <= REDUCE_POW_MAX_EXP => {
+                        // … then a result-size charge: ~bit_length(a)·exp bits.
+                        let result_limbs = (u128::from(va.bit_length()) * u128::from(exp) / 64)
+                            .try_into()
+                            .unwrap_or(u64::MAX);
+                        self.charge_bulk(result_limbs)?;
+                        va.pow(u32::try_from(exp).unwrap_or(u32::MAX))
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            "gcd" => va.gcd(&vb),
+            "mod" => va.rem(&vb),
+            "div" => va.div(&vb),
+            "beq" => return Ok(Some(bool_const_expr(va.beq(&vb)))),
+            "ble" => return Ok(Some(bool_const_expr(va.ble(&vb)))),
+            "land" => va.land(&vb),
+            "lor" => va.lor(&vb),
+            "xor" => va.lxor(&vb),
+            "shiftLeft" => {
+                // Result size is input bits + shift count: charge it up front.
+                let Some(count) = vb.to_u64() else {
+                    // A shift count beyond u64 is beyond any feasible memory:
+                    // typed exhaustion, never an attempted allocation.
+                    return Err(Stop::Exhausted(ExhaustionReason::Steps));
+                };
+                self.charge_bulk(count / 64 + 1)?;
+                va.shl(count)
+            }
+            "shiftRight" => match vb.to_u64() {
+                Some(count) => va.shr(count),
+                // Shifting right by more than u64::MAX zeroes any operand that
+                // fits in memory.
+                None => BigNat::zero(),
+            },
+            // The guard above closes the op list; a drift here degrades to
+            // under-reduction (stuck term), never a panic or a wrong value.
+            _ => return Ok(None),
+        };
+        Ok(Some(nat_lit_expr(&result)))
+    }
+
     // ---- recursor reduction (KR-205/316/317/955) ---------------------------------------
 
     /// KR-205 (`reduce_recursor`): when an application head is stable, try
@@ -881,6 +1006,28 @@ impl<'a> TypeChecker<'a> {
         {
             return Ok(true);
         }
+        // KR-310's projection half (pin is_def_eq_core:1101 via
+        // lazy_delta_proj_reduction): same-index projections close on defeq
+        // scrutinees. Not decisive on failure — the pin falls through to the
+        // rest of the ladder. (Our whnf_core reduces projections with full
+        // whnf, so the pin's deferred-projection retry is already spent by the
+        // time a Proj pair is stuck here — both scrutinees are maximally
+        // reduced non-constructors, e.g. recursors stuck on a free variable.)
+        if let (
+            ExprNode::Proj {
+                idx: i1, expr: e1, ..
+            },
+            ExprNode::Proj {
+                idx: i2, expr: e2, ..
+            },
+        ) = (tn.node(), sn.node())
+            && i1 == i2
+        {
+            let (e1, e2) = (e1.clone(), e2.clone());
+            if self.is_def_eq(&e1, &e2, depth + 1)? {
+                return Ok(true);
+            }
+        }
         // KR-311 application congruence.
         if let (ExprNode::App { f: f1, a: a1 }, ExprNode::App { f: f2, a: a2 }) =
             (tn.node(), sn.node())
@@ -1270,10 +1417,14 @@ impl<'a> TypeChecker<'a> {
                     return reject(
                         RejectClass::TypeMismatch,
                         format!(
-                            "application type mismatch: argument `{}` has type `{}` but the function expects `{}`",
+                            "application type mismatch: argument `{}` has type `{}` but the function expects `{}`{}",
                             brief_expr(&a, 4),
                             brief_expr(&a_type, 5),
-                            brief_expr(&binder_type, 5)
+                            brief_expr(&binder_type, 5),
+                            match first_divergence(&a_type, &binder_type) {
+                                Some(div) => format!(" (first structural divergence: {div})"),
+                                None => String::new(),
+                            }
                         ),
                     );
                 }
@@ -1748,6 +1899,207 @@ pub(crate) fn brief_public(e: &Expr) -> String {
     brief_expr(e, 5)
 }
 
+/// Structural first-divergence locator for mismatch DIAGNOSTICS only — never
+/// part of a judgment. Walks both terms in lockstep and reports the path to,
+/// and both sides of, the first place the trees differ, exposing exactly the
+/// differences the bounded renderer elides: metadata wrappers, binder names
+/// and infos, literal values, and level shapes. Equal subtrees prune via
+/// `Expr::eq`, so cost is linear in the shared prefix (bead franken_lean-irm;
+/// the d4x arc's level-aware messages are the precedent).
+fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
+    fn level_shape(l: &Level) -> String {
+        use fln_core::level::LevelView;
+        match l.view() {
+            LevelView::Zero => "0".to_string(),
+            LevelView::Param(p) => format!("param:{}", p.to_display_string()),
+            LevelView::Succ(inner) => format!("succ({})", level_shape(inner)),
+            LevelView::Max(a, b) => format!("max({},{})", level_shape(a), level_shape(b)),
+            LevelView::IMax(a, b) => format!("imax({},{})", level_shape(a), level_shape(b)),
+            LevelView::MVar(_) => "mvar".to_string(),
+        }
+    }
+    fn levels_diff(path: &str, l1: &[Level], l2: &[Level]) -> Option<String> {
+        if l1.len() != l2.len() {
+            return Some(format!("{path}: {} vs {} levels", l1.len(), l2.len()));
+        }
+        for (i, (a, b)) in l1.iter().zip(l2).enumerate() {
+            if a != b {
+                return Some(format!(
+                    "{path}.level[{i}]: {} vs {}",
+                    level_shape(a),
+                    level_shape(b)
+                ));
+            }
+        }
+        None
+    }
+    fn go(t: &Expr, s: &Expr, path: String) -> Option<String> {
+        if t == s {
+            return None;
+        }
+        match (t.node(), s.node()) {
+            (ExprNode::BVar { idx: i1 }, ExprNode::BVar { idx: i2 }) => {
+                Some(format!("{path}: #{i1} vs #{i2}"))
+            }
+            (ExprNode::FVar { id: id1 }, ExprNode::FVar { id: id2 }) => Some(format!(
+                "{path}: fvar {} vs {}",
+                id1.0.to_display_string(),
+                id2.0.to_display_string()
+            )),
+            (ExprNode::Sort { level: l1 }, ExprNode::Sort { level: l2 }) => Some(format!(
+                "{path}: Sort {} vs {}",
+                level_shape(l1),
+                level_shape(l2)
+            )),
+            (
+                ExprNode::Const {
+                    name: n1,
+                    levels: l1,
+                },
+                ExprNode::Const {
+                    name: n2,
+                    levels: l2,
+                },
+            ) => {
+                if n1 != n2 {
+                    Some(format!(
+                        "{path}: const {} vs {}",
+                        n1.to_display_string(),
+                        n2.to_display_string()
+                    ))
+                } else {
+                    levels_diff(&path, l1, l2)
+                        .or_else(|| Some(format!("{path}: consts differ undetectably")))
+                }
+            }
+            (ExprNode::App { f: f1, a: a1 }, ExprNode::App { f: f2, a: a2 }) => {
+                go(f1, f2, format!("{path}.fn")).or_else(|| go(a1, a2, format!("{path}.arg")))
+            }
+            (
+                ExprNode::Lam {
+                    binder_name: n1,
+                    binder_type: t1,
+                    body: b1,
+                    binder_info: i1,
+                },
+                ExprNode::Lam {
+                    binder_name: n2,
+                    binder_type: t2,
+                    body: b2,
+                    binder_info: i2,
+                },
+            )
+            | (
+                ExprNode::ForallE {
+                    binder_name: n1,
+                    binder_type: t1,
+                    body: b1,
+                    binder_info: i1,
+                },
+                ExprNode::ForallE {
+                    binder_name: n2,
+                    binder_type: t2,
+                    body: b2,
+                    binder_info: i2,
+                },
+            ) => {
+                if i1 != i2 {
+                    return Some(format!("{path}: binder info {i1:?} vs {i2:?}"));
+                }
+                if n1 != n2 {
+                    return Some(format!(
+                        "{path}: binder name {} vs {}",
+                        n1.to_display_string(),
+                        n2.to_display_string()
+                    ));
+                }
+                go(t1, t2, format!("{path}.binder_type"))
+                    .or_else(|| go(b1, b2, format!("{path}.body")))
+            }
+            (
+                ExprNode::LetE {
+                    type_: t1,
+                    value: v1,
+                    body: b1,
+                    ..
+                },
+                ExprNode::LetE {
+                    type_: t2,
+                    value: v2,
+                    body: b2,
+                    ..
+                },
+            ) => go(t1, t2, format!("{path}.let_type"))
+                .or_else(|| go(v1, v2, format!("{path}.let_value")))
+                .or_else(|| go(b1, b2, format!("{path}.let_body"))),
+            (ExprNode::MData { expr: e1, .. }, ExprNode::MData { expr: e2, .. }) => {
+                go(e1, e2, format!("{path}.mdata"))
+                    .or_else(|| Some(format!("{path}: metadata payloads differ")))
+            }
+            (ExprNode::MData { expr, .. }, _) => go(expr, s, path.clone())
+                .or_else(|| Some(format!("{path}: metadata wrapper on the left only"))),
+            (_, ExprNode::MData { expr, .. }) => go(t, expr, path.clone())
+                .or_else(|| Some(format!("{path}: metadata wrapper on the right only"))),
+            (
+                ExprNode::Proj {
+                    struct_name: n1,
+                    idx: i1,
+                    expr: e1,
+                },
+                ExprNode::Proj {
+                    struct_name: n2,
+                    idx: i2,
+                    expr: e2,
+                },
+            ) => {
+                if n1 != n2 || i1 != i2 {
+                    Some(format!(
+                        "{path}: proj {}.{} vs {}.{}",
+                        n1.to_display_string(),
+                        i1,
+                        n2.to_display_string(),
+                        i2
+                    ))
+                } else {
+                    go(e1, e2, format!("{path}.proj_expr"))
+                }
+            }
+            (ExprNode::Lit { literal: l1 }, ExprNode::Lit { literal: l2 }) => {
+                (l1 != l2).then(|| {
+                    format!(
+                        "{path}: literal {} vs {}",
+                        brief_expr(t, 1),
+                        brief_expr(s, 1)
+                    )
+                })
+            }
+            (t_node, s_node) => Some(format!(
+                "{path}: node kind {} vs {}",
+                node_kind_name(t_node),
+                node_kind_name(s_node)
+            )),
+        }
+    }
+    go(t, s, "root".to_string())
+}
+
+fn node_kind_name(node: &ExprNode) -> &'static str {
+    match node {
+        ExprNode::BVar { .. } => "bvar",
+        ExprNode::FVar { .. } => "fvar",
+        ExprNode::MVar { .. } => "mvar",
+        ExprNode::Sort { .. } => "sort",
+        ExprNode::Const { .. } => "const",
+        ExprNode::App { .. } => "app",
+        ExprNode::Lam { .. } => "lambda",
+        ExprNode::ForallE { .. } => "forall",
+        ExprNode::LetE { .. } => "let",
+        ExprNode::MData { .. } => "mdata",
+        ExprNode::Proj { .. } => "proj",
+        ExprNode::Lit { .. } => "literal",
+    }
+}
+
 /// Bounded, allocation-light term rendering for rejection MESSAGES only —
 /// never part of a judgment. Fuel caps both depth and total size so adversarial
 /// terms cannot blow up diagnostics (FL-INV-07 discipline extends to logs).
@@ -1798,7 +2150,25 @@ fn brief_expr(e: &Expr, fuel: usize) -> String {
             idx,
             brief_expr(expr, fuel - 1)
         ),
-        ExprNode::Lit { .. } => "lit".to_string(),
+        ExprNode::Lit {
+            literal: Literal::Nat(value),
+        } => {
+            // Small values render exactly (triage needs to SEE 0 vs 2); giants
+            // render by limb count so adversarial literals cannot blow up logs.
+            match value.to_u64() {
+                Some(v) => format!("lit:{v}"),
+                None => format!("lit:<{} limbs>", value.limbs_le().len()),
+            }
+        }
+        ExprNode::Lit {
+            literal: Literal::Str(value),
+        } => {
+            let mut shown: String = value.chars().take(16).collect();
+            if shown.len() < value.len() {
+                shown.push('…');
+            }
+            format!("lit:{shown:?}")
+        }
     }
 }
 
@@ -1815,14 +2185,29 @@ fn app_spine(e: &Expr) -> (Expr, Vec<Expr>) {
     (head, args)
 }
 
+/// Outcome of the lazy-delta loop: a decisive literal/offset verdict, or the
+/// maximally-unfolded pair for the rest of the ladder.
+enum LazyDelta {
+    Decided(bool),
+    Stuck(Expr, Expr),
+}
+
 /// `nat_lit_to_constructor` (inductive.cpp:1191): `0 ⟶ Nat.zero`,
-/// `n ⟶ Nat.succ (n-1 : literal)` for `n > 0`. The decrement is a plain limb
-/// borrow walk — value identity only, no bignum-arithmetic dependency.
+/// `n ⟶ Nat.succ (n-1 : literal)` for `n > 0`.
 fn nat_lit_to_constructor(value: &NatLit) -> Expr {
     let nat = Name::str(Name::anonymous(), "Nat");
     if value.to_u64() == Some(0) {
         return Expr::const_(Name::str(nat, "zero"), Vec::new());
     }
+    Expr::app(
+        Expr::const_(Name::str(nat, "succ"), Vec::new()),
+        Expr::lit(Literal::Nat(nat_lit_pred(value))),
+    )
+}
+
+/// The predecessor of a positive literal — a plain limb borrow walk; value
+/// identity only, no bignum-arithmetic dependency.
+fn nat_lit_pred(value: &NatLit) -> NatLit {
     let mut limbs = value.limbs_le().to_vec();
     for limb in limbs.iter_mut() {
         if *limb > 0 {
@@ -1831,11 +2216,128 @@ fn nat_lit_to_constructor(value: &NatLit) -> Expr {
         }
         *limb = u64::MAX;
     }
-    let pred = NatLit::from_limbs_le(limbs);
+    NatLit::from_limbs_le(limbs)
+}
+
+/// `string_lit_to_constructor` (inductive.cpp:1200): `"…"` ⟶
+/// `String.ofList (List.cons.{0} Char (Char.ofNat (c₀ : lit)) … (List.nil.{0}
+/// Char))` over the literal's Unicode code points. The pin's `g_string_mk` is
+/// the constant `String.ofList` at this pin (type_checker.cpp:1213,
+/// inductive.cpp:1226) — a definition, so recursor/projection consumers whnf
+/// the expansion down to the real constructor.
+fn string_lit_to_constructor(value: &str) -> Expr {
+    let char_const = Expr::const_(Name::str(Name::anonymous(), "Char"), Vec::new());
+    let list = Name::str(Name::anonymous(), "List");
+    let cons = Expr::app(
+        Expr::const_(Name::str(list.clone(), "cons"), vec![Level::zero()]),
+        char_const.clone(),
+    );
+    let nil = Expr::app(
+        Expr::const_(Name::str(list, "nil"), vec![Level::zero()]),
+        char_const.clone(),
+    );
+    let char_of_nat = Expr::const_(
+        Name::str(Name::str(Name::anonymous(), "Char"), "ofNat"),
+        Vec::new(),
+    );
+    let mut spine = nil;
+    for c in value.chars().rev() {
+        let code = Expr::lit(Literal::Nat(NatLit::from_u64(u64::from(u32::from(c)))));
+        spine = Expr::app(
+            Expr::app(cons.clone(), Expr::app(char_of_nat.clone(), code)),
+            spine,
+        );
+    }
     Expr::app(
-        Expr::const_(Name::str(nat, "succ"), Vec::new()),
-        Expr::lit(Literal::Nat(pred)),
+        Expr::const_(
+            Name::str(Name::str(Name::anonymous(), "String"), "ofList"),
+            Vec::new(),
+        ),
+        spine,
     )
+}
+
+/// Is `name` exactly `<root>.<leaf>` at the top level?
+fn is_name2(name: &Name, root: &str, leaf: &str) -> bool {
+    if !matches!(name.leaf_view(), LeafView::Str(s) if s == leaf) {
+        return false;
+    }
+    let parent = name.parent();
+    matches!(parent.leaf_view(), LeafView::Str(s) if s == root) && parent.parent().is_anonymous()
+}
+
+/// `Nat.<op>` recognition for the KR-313 dispatch table.
+fn nat_op_leaf(name: &Name) -> Option<&str> {
+    let LeafView::Str(leaf) = name.leaf_view() else {
+        return None;
+    };
+    let parent = name.parent();
+    let is_nat = matches!(parent.leaf_view(), LeafView::Str(s) if s == "Nat")
+        && parent.parent().is_anonymous();
+    if is_nat { Some(leaf) } else { None }
+}
+
+/// `is_nat_lit_ext` (pin type_checker.cpp:569): a Nat literal, or the bare
+/// constant `Nat.zero` (the pin compares whole expressions, so levels must be
+/// empty), as a bignum value.
+fn nat_lit_ext_value(e: &Expr) -> Option<BigNat> {
+    match e.node() {
+        ExprNode::Lit {
+            literal: Literal::Nat(value),
+        } => Some(bignat_from_literal(value)),
+        ExprNode::Const { name, levels } if levels.is_empty() && is_name2(name, "Nat", "zero") => {
+            Some(BigNat::zero())
+        }
+        _ => None,
+    }
+}
+
+/// `is_nat_zero` (pin type_checker.cpp:943): `Nat.zero` or the literal `0`.
+fn is_nat_zero_expr(e: &Expr) -> bool {
+    match e.node() {
+        ExprNode::Lit {
+            literal: Literal::Nat(value),
+        } => value.to_u64() == Some(0),
+        ExprNode::Const { name, levels } => levels.is_empty() && is_name2(name, "Nat", "zero"),
+        _ => false,
+    }
+}
+
+/// `is_nat_succ` (pin type_checker.cpp:947): a positive literal peels to its
+/// predecessor literal; `Nat.succ x` (exactly one argument — the outermost
+/// function must be the bare constant) peels to `x`.
+fn nat_succ_peel(e: &Expr) -> Option<Expr> {
+    if let ExprNode::Lit {
+        literal: Literal::Nat(value),
+    } = e.node()
+    {
+        if value.to_u64() == Some(0) {
+            return None;
+        }
+        return Some(Expr::lit(Literal::Nat(nat_lit_pred(value))));
+    }
+    if let ExprNode::App { f, a } = e.node()
+        && let ExprNode::Const { name, levels } = f.node()
+        && levels.is_empty()
+        && is_name2(name, "Nat", "succ")
+    {
+        return Some(a.clone());
+    }
+    None
+}
+
+/// `Bool.true` / `Bool.false` (pin `mk_bool_true`/`mk_bool_false`).
+fn bool_const_expr(value: bool) -> Expr {
+    let bool_name = Name::str(Name::anonymous(), "Bool");
+    Expr::const_(
+        Name::str(bool_name, if value { "true" } else { "false" }),
+        Vec::new(),
+    )
+}
+
+/// A bignum value back onto the term plane, loss-free.
+fn nat_lit_expr(value: &BigNat) -> Expr {
+    Expr::lit(Literal::Nat(literal_from_bignat(value)))
 }
 
 /// Level-parameter substitution (pure, structural).

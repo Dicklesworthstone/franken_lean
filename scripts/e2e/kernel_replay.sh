@@ -44,7 +44,7 @@ note "running the decoder suite and the kernel-replay rig"
 set +e
 ( cd "$ROOT" \
     && CARGO_TARGET_DIR=target_local cargo test -q -p fln-olean --test decl_decode \
-    && CARGO_TARGET_DIR=target_local cargo test -q -p fln-conformance --test kernel_replay ) \
+    && CARGO_TARGET_DIR=target_local cargo test -q -p fln-conformance --test kernel_replay -- --nocapture ) \
   > "$ART_DIR/suite.log" 2>&1
 rc=$?
 set -e
@@ -54,6 +54,19 @@ if [ "$rc" -ne 0 ]; then
   exit 1
 fi
 emit suite passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"suite.log\""
+
+# ---- lane 1b: verdict-census floor (bead franken_lean-irm) ------------------------------
+# The literal-acceleration slice closed the last Init.Prelude residuals: the
+# census is pinned at full acceptance and may only move by a deliberate,
+# bead-tracked change. A regression in any KR-31x/KR-30x rule trips this.
+census_line="$(grep -E '^kernel_replay census:' "$ART_DIR/suite.log" | tail -1 || true)"
+if [[ "$census_line" != *"accepted=1755"* || "$census_line" != *"rejected={}"* || "$census_line" != *"inconclusive=0"* ]]; then
+  emit census failed "\"expected\":\"checked=1755 accepted=1755 inconclusive=0 rejected={}\",\"actual\":\"${census_line//\"/\\\"}\",\"artifact\":\"suite.log\""
+  note "FAIL: Init.Prelude verdict census regressed: ${census_line:-<census line missing>}"
+  exit 1
+fi
+emit census passed "\"accepted\":1755,\"rejected\":0,\"inconclusive\":0,\"bead\":\"franken_lean-irm\""
+note "census floor: Init.Prelude 1755/1755 accepted, 0 rejected, 0 inconclusive"
 
 # ---- build the decode driver -----------------------------------------------------------
 ( cd "$ROOT" && CARGO_TARGET_DIR=target_local cargo build -q --locked -p fln-olean --example decode_olean ) \

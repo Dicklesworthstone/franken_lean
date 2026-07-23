@@ -6,14 +6,16 @@
 //! ```
 //!
 //! Covenant posture (§8.1): `forbid(unsafe_code)`; dependencies exactly the
-//! allow-direct set (fln-core, fln-env here; fln-hash/fln-bignum join with the
-//! receipt and literal slices); zero I/O, zero threads, zero global mutable state,
+//! allow-direct set (fln-core, fln-env, fln-bignum here; fln-hash joins with the
+//! receipt slice); zero I/O, zero threads, zero global mutable state,
 //! zero plugin hooks; the ≤ 12 KLOC covenant is CI-enforced by structure-guard.
 //!
-//! K1 slice scope (beads franken_lean-zht + franken_lean-5p2): typing
-//! KR-100..112, whnf KR-200..205 with recursor computation — quotient reduction
-//! KR-955, inductive iota KR-316, K conversion KR-317 — defeq subset KR-300..312,
-//! admission KR-970..974 for axioms/definitions/theorems. Every
+//! K1 slice scope (beads franken_lean-zht + franken_lean-5p2 + franken_lean-irm):
+//! typing KR-100..112, whnf KR-200..205 with recursor computation — quotient
+//! reduction KR-955, inductive iota KR-316, K conversion KR-317 — literal
+//! acceleration KR-313/KR-314 (fln-bignum-backed Nat arithmetic, String
+//! expansion), defeq subset KR-300..315 + KR-903, admission KR-970..974 for
+//! axioms/definitions/theorems. Every
 //! exhaustion is a typed [`verdict::Verdict::Inconclusive`] carrying its
 //! consumption profile (FL-INV-07); an unimplemented reduction can only cause a
 //! rejection, never an acceptance.

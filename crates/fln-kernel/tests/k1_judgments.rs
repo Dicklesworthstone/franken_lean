@@ -2909,3 +2909,972 @@ fn kr315_unit_like_values_are_defeq_when_their_types_are() {
         "a value of U is NOT defeq to the constructor of the DIFFERENT unit-like U2"
     );
 }
+
+// ---- KR-313 / KR-314: literal acceleration (bead franken_lean-irm) ------------------
+
+fn lit(v: u64) -> Expr {
+    Expr::lit(Literal::Nat(NatLit::from_u64(v)))
+}
+
+fn str_lit(s: &str) -> Expr {
+    Expr::lit(Literal::Str(s.to_string()))
+}
+
+fn nat_op_app(op: &str, a: Expr, b: Expr) -> Expr {
+    Expr::app(Expr::app(Expr::const_(nn("Nat", op), vec![]), a), b)
+}
+
+fn bool_true() -> Expr {
+    Expr::const_(nn("Bool", "true"), vec![])
+}
+
+fn bool_false() -> Expr {
+    Expr::const_(nn("Bool", "false"), vec![])
+}
+
+/// Every KR-313 name with an honest type, so any ladder rung that infers
+/// (proof irrelevance, eta, unit-like) stays total during these tests: `Nat`
+/// and `Bool` as opaque type constants, `Nat.zero : Nat`, `Nat.succ : Nat →
+/// Nat`, the binary operator table at `Nat → Nat → Nat`, and the comparison
+/// table (including the deliberately-unaccelerated `blt`) at `Nat → Nat →
+/// Bool`, plus `Bool.true`/`Bool.false`. KR-313 dispatches on NAMES, exactly
+/// as the pin's `g_nat_*` expression comparisons do — these axioms exist for
+/// the typing rungs, not for the reduction.
+fn add_nat_literal_axioms(env: &Environment) -> Environment {
+    let nat_c = || Expr::const_(n("Nat"), vec![]);
+    let bool_c = || Expr::const_(n("Bool"), vec![]);
+    let arrow = |a: Expr, b: Expr| Expr::forall_e(n("_x"), a, b, BinderInfo::Default);
+    let ax = |name: Name, type_: Expr| {
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name,
+                level_params: vec![],
+                type_,
+            },
+            is_unsafe: false,
+        })
+    };
+    let mut env = add_info(env, ax(n("Nat"), sort1()));
+    env = add_info(&env, ax(n("Bool"), sort1()));
+    env = add_info(&env, ax(nn("Bool", "true"), bool_c()));
+    env = add_info(&env, ax(nn("Bool", "false"), bool_c()));
+    env = add_info(&env, ax(nn("Nat", "zero"), nat_c()));
+    env = add_info(&env, ax(nn("Nat", "succ"), arrow(nat_c(), nat_c())));
+    for op in [
+        "add",
+        "sub",
+        "mul",
+        "pow",
+        "gcd",
+        "mod",
+        "div",
+        "land",
+        "lor",
+        "xor",
+        "shiftLeft",
+        "shiftRight",
+    ] {
+        env = add_info(
+            &env,
+            ax(nn("Nat", op), arrow(nat_c(), arrow(nat_c(), nat_c()))),
+        );
+    }
+    for op in ["beq", "ble", "blt"] {
+        env = add_info(
+            &env,
+            ax(nn("Nat", op), arrow(nat_c(), arrow(nat_c(), bool_c()))),
+        );
+    }
+    env
+}
+
+#[test]
+fn kr313_the_pin_operation_table_computes_literal_results() {
+    // The exact binary table of reduce_nat (pin type_checker.cpp:609), Lean
+    // semantics pinned per row — truncated sub, x/0 = 0, x%0 = x — plus a
+    // multi-limb carry so the fln-bignum wiring (not a u64 shortcut) is what
+    // computes. A wrong op mapping (div↔mod swap, xor↔lor, …) fails its row.
+    let env = add_nat_literal_axioms(&Environment::new());
+    let table: &[(&str, u64, u64, u64)] = &[
+        ("add", 2, 3, 5),
+        ("sub", 5, 2, 3),
+        ("sub", 2, 5, 0),
+        ("mul", 7, 6, 42),
+        ("div", 7, 2, 3),
+        ("div", 7, 0, 0),
+        ("mod", 7, 2, 1),
+        ("mod", 7, 0, 7),
+        ("gcd", 12, 18, 6),
+        ("pow", 2, 10, 1024),
+        ("pow", 7, 0, 1),
+        ("land", 6, 3, 2),
+        ("lor", 6, 3, 7),
+        ("xor", 6, 3, 5),
+        ("shiftLeft", 1, 8, 256),
+        ("shiftRight", 256, 3, 32),
+    ];
+    for (op, a, b, expected) in table {
+        assert!(
+            check_def_eq(
+                &env,
+                &[],
+                &nat_op_app(op, lit(*a), lit(*b)),
+                &lit(*expected),
+                Budget::DEFAULT
+            )
+            .is_accepted(),
+            "Nat.{op} {a} {b} must compute to {expected}"
+        );
+    }
+    // u64::MAX + 1 carries into a second limb: [0, 1].
+    let carried = Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1])));
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("add", lit(u64::MAX), lit(1)),
+            &carried,
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "literal arithmetic must carry across limbs"
+    );
+    // And a discriminating negative: the table must not over-accept.
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("add", lit(2), lit(3)),
+            &lit(6),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "2 + 3 is not 6"
+    );
+}
+
+#[test]
+fn kr313_comparisons_produce_bool_constants() {
+    // beq/ble land on `Bool.true`/`Bool.false` (the pin's mk_bool_true/false).
+    // The Bool.true rows also exercise the KR-313 reflection fast path (`t`
+    // closed, `s` literally Bool.true ⇒ whnf `t`), which is how decide-style
+    // proofs close. An inverted predicate fails the matching negative row.
+    let env = add_nat_literal_axioms(&Environment::new());
+    for (op, a, b, expected) in [
+        ("beq", 2u64, 2u64, true),
+        ("beq", 2, 3, false),
+        ("ble", 2, 3, true),
+        ("ble", 3, 3, true),
+        ("ble", 3, 2, false),
+    ] {
+        let want = if expected { bool_true() } else { bool_false() };
+        assert!(
+            check_def_eq(
+                &env,
+                &[],
+                &nat_op_app(op, lit(a), lit(b)),
+                &want,
+                Budget::DEFAULT
+            )
+            .is_accepted(),
+            "Nat.{op} {a} {b} must be Bool.{expected}"
+        );
+    }
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("beq", lit(2), lit(2)),
+            &bool_false(),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "2 == 2 is not Bool.false"
+    );
+}
+
+#[test]
+fn kr313_nat_zero_and_reduced_arguments_are_literal_operands() {
+    // `is_nat_lit_ext` (pin :569): the bare constant `Nat.zero` counts as a
+    // literal operand — and operands are whnf'd first, so an argument that is
+    // itself literal arithmetic (succ towers included) reduces on the way in.
+    let env = add_nat_literal_axioms(&Environment::new());
+    let nat_zero = Expr::const_(nn("Nat", "zero"), vec![]);
+    let succ = |e: Expr| Expr::app(Expr::const_(nn("Nat", "succ"), vec![]), e);
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("add", nat_zero.clone(), lit(3)),
+            &lit(3),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "Nat.zero is a literal operand"
+    );
+    assert!(
+        check_def_eq(&env, &[], &succ(nat_zero), &lit(1), Budget::DEFAULT).is_accepted(),
+        "Nat.succ Nat.zero computes to the literal 1"
+    );
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("add", lit(2), succ(succ(lit(1)))),
+            &lit(5),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "arguments reduce (succ (succ 1) ⟶ 3) before the outer operation"
+    );
+}
+
+#[test]
+fn kr313_pow_honors_the_reduce_pow_max_exp_cap() {
+    // The pin caps pow exponents at 2^24 (ReducePowMaxExp): at the cap the
+    // operation computes; one past it the term stays STUCK (not Inconclusive,
+    // not wrong) — killing a dropped-cap mutant, which would accept the
+    // second row.
+    let env = add_nat_literal_axioms(&Environment::new());
+    let cap = 1u64 << 24;
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("pow", lit(1), lit(cap)),
+            &lit(1),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "an exponent AT the cap computes"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("pow", lit(1), lit(cap + 1)),
+            &lit(1),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "an exponent past the cap leaves the term stuck"
+    );
+}
+
+#[test]
+fn kr313_no_nat_blt_at_this_pin() {
+    // Divergence note pinned as a test: the pin's reduce_nat table has NO
+    // Nat.blt (beq/ble only), so `Nat.blt 2 3` must stay stuck rather than
+    // compute to Bool.true. A table that helpfully adds blt diverges from the
+    // pin and fails here.
+    let env = add_nat_literal_axioms(&Environment::new());
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("blt", lit(2), lit(3)),
+            &bool_true(),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "Nat.blt is not accelerated at this pin"
+    );
+}
+
+#[test]
+fn kr313_dispatch_requires_bare_heads_and_exact_arity() {
+    // The pin compares whole head expressions (`f == *g_nat_add`), so a
+    // level-decorated head, an over-applied spine, or an unknown Nat-namespace
+    // name must all stay stuck.
+    let env = add_nat_literal_axioms(&Environment::new());
+    let leveled = Expr::app(
+        Expr::app(Expr::const_(nn("Nat", "add"), vec![Level::zero()]), lit(2)),
+        lit(3),
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &leveled, &lit(5), Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "a level-bearing Nat.add head is not the pin's constant"
+    );
+    let over_applied = Expr::app(nat_op_app("add", lit(2), lit(3)), lit(4));
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &over_applied,
+            &lit(5),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "three arguments is not the binary table's arity"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &nat_op_app("quux", lit(2), lit(3)),
+            &lit(5),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "an unknown Nat-namespace operator stays stuck"
+    );
+}
+
+#[test]
+fn kr313_offset_closes_literal_vs_constructor_forms() {
+    // The is_def_eq_offset machinery (pin :961): zero forms unify across the
+    // literal/constant boundary, positive literals peel against symbolic
+    // `Nat.succ` spines — in both orientations — and a peel that bottoms out
+    // unequal is decisively NOT defeq. This is exactly the boundary the
+    // kr316_nat_literal_majors comment marked as the KR-313 follow-up.
+    let env = add_nat_with_rec(&Environment::new());
+    let nat_zero = Expr::const_(nn("Nat", "zero"), vec![]);
+    let succ = |e: Expr| Expr::app(Expr::const_(nn("Nat", "succ"), vec![]), e);
+    assert!(
+        check_def_eq(&env, &[], &nat_zero, &lit(0), Budget::DEFAULT).is_accepted(),
+        "Nat.zero ≟ literal 0"
+    );
+    assert!(
+        check_def_eq(&env, &[], &lit(1), &succ(nat_zero.clone()), Budget::DEFAULT).is_accepted(),
+        "literal 1 ≟ Nat.succ Nat.zero"
+    );
+    assert!(
+        check_def_eq(&env, &[], &succ(lit(4)), &lit(5), Budget::DEFAULT).is_accepted(),
+        "Nat.succ (literal 4) ≟ literal 5 (symmetric orientation)"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &lit(2),
+            &succ(nat_zero),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "literal 2 peels to 1 against Nat.zero — decisively unequal"
+    );
+}
+
+#[test]
+fn kr313_delta_exposed_literals_decide_in_lazy_delta() {
+    // The decoded-residual mechanics from franken_lean-d4x: a definition
+    // unfolds to a literal only DURING lazy delta, so the offset/arithmetic
+    // machinery must run inside that loop (pin lazy_delta_reduction, :973) —
+    // running it only before delta leaves these stuck and false-rejects.
+    let env = add_nat_with_rec(&Environment::new());
+    let env = admit(
+        &env,
+        &defn("zeroDef", Expr::const_(n("Nat"), vec![]), lit(0)),
+    );
+    let env = admit(&env, &defn("two", Expr::const_(n("Nat"), vec![]), lit(2)));
+    let nat_zero = Expr::const_(nn("Nat", "zero"), vec![]);
+    let succ = |e: Expr| Expr::app(Expr::const_(nn("Nat", "succ"), vec![]), e);
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &Expr::const_(n("zeroDef"), vec![]),
+            &nat_zero,
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "zeroDef delta-exposes literal 0, which the offset rule closes against Nat.zero"
+    );
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &Expr::const_(n("two"), vec![]),
+            &succ(succ(Expr::const_(nn("Nat", "zero"), vec![]))),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "a symbolic succ tower computes to a literal inside lazy delta and matches `two`"
+    );
+}
+
+#[test]
+fn kr301_distinct_literals_are_decisively_not_defeq() {
+    // The literal half of the quick rules (pin quick_is_def_eq, Lit case):
+    // literal pairs decide by value with NO environment and NO reduction —
+    // including across the Nat/String literal kinds. A mutant equating
+    // distinct literals is an over-acceptance and dies here.
+    let env = Environment::new();
+    assert!(
+        check_def_eq(&env, &[], &lit(2), &lit(2), Budget::DEFAULT).is_accepted(),
+        "equal Nat literals are defeq"
+    );
+    for (t, s, label) in [
+        (lit(2), lit(3), "distinct Nat literals"),
+        (str_lit("a"), str_lit("b"), "distinct String literals"),
+        (lit(97), str_lit("a"), "a Nat literal vs a String literal"),
+    ] {
+        assert_eq!(
+            reject_class(&check_def_eq(&env, &[], &t, &s, Budget::DEFAULT)),
+            Some(RejectClass::NotDefEq),
+            "{label} must be decisively not defeq"
+        );
+    }
+}
+
+#[test]
+fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
+    // A shiftLeft whose RESULT would dwarf the step budget converts to typed
+    // Inconclusive BEFORE any allocation — never a rejection, never an
+    // acceptance, never an abort (FL-INV-07). The pin has no such guard (it
+    // grinds or exhausts memory); Behavior Note recorded on franken_lean-irm.
+    let env = add_nat_literal_axioms(&Environment::new());
+    let huge_count = nat_op_app("shiftLeft", lit(1), lit(1u64 << 40));
+    let verdict = check_def_eq(&env, &[], &huge_count, &lit(0), Budget::DEFAULT);
+    assert!(
+        verdict.is_inconclusive() && !verdict.is_rejected() && !verdict.is_accepted(),
+        "an infeasible shift is a verdict about the RUN, got {verdict:?}"
+    );
+    // A count beyond u64 entirely (2^64, limbs [0,1]) takes the same typed path.
+    let beyond_u64 = nat_op_app(
+        "shiftLeft",
+        lit(1),
+        Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
+    );
+    let verdict = check_def_eq(&env, &[], &beyond_u64, &lit(0), Budget::DEFAULT);
+    assert!(
+        verdict.is_inconclusive(),
+        "a beyond-u64 shift count is typed exhaustion, got {verdict:?}"
+    );
+    // shiftRight only shrinks: the same beyond-u64 count simply zeroes.
+    let shr_all = nat_op_app(
+        "shiftRight",
+        lit(7),
+        Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
+    );
+    assert!(
+        check_def_eq(&env, &[], &shr_all, &lit(0), Budget::DEFAULT).is_accepted(),
+        "shifting right past every bit is zero"
+    );
+}
+
+/// The KR-314 world at this pin, miniaturized honestly. At the pin, `String`
+/// is ByteArray-backed (`ofByteArray ::`, Prelude:3505) and `String.ofList` is
+/// a DEFINITION (Prelude:3525) — so every literal-expansion consumer must whnf
+/// the generated `String.ofList …` spine down to the real constructor. This
+/// fixture preserves exactly that must-unfold property: the constructor is
+/// `String.mk (data : List.{0} Char)` and `String.ofList := fun data =>
+/// String.mk data` is a Safe Regular definition. Builds on
+/// `add_nat_literal_axioms` (Char.ofNat consumes Nat).
+fn add_string_fixture(env: &Environment) -> Environment {
+    let u = n("u");
+    let sort_u1 = || Expr::sort(Level::param(n("u")).succ().expect("packs"));
+    let list_u =
+        |alpha: Expr| Expr::app(Expr::const_(n("List"), vec![Level::param(n("u"))]), alpha);
+    let list0_char = || {
+        Expr::app(
+            Expr::const_(n("List"), vec![Level::zero()]),
+            Expr::const_(n("Char"), vec![]),
+        )
+    };
+    let string_c = || Expr::const_(n("String"), vec![]);
+    let ax = |name: Name, level_params: Vec<Name>, type_: Expr| {
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name,
+                level_params,
+                type_,
+            },
+            is_unsafe: false,
+        })
+    };
+    let mut env = add_info(env, ax(n("Char"), vec![], sort1()));
+    env = add_info(
+        &env,
+        ax(
+            nn("Char", "ofNat"),
+            vec![],
+            Expr::forall_e(
+                n("_x"),
+                Expr::const_(n("Nat"), vec![]),
+                Expr::const_(n("Char"), vec![]),
+                BinderInfo::Default,
+            ),
+        ),
+    );
+    // List.{u} : Sort (u+1) → Sort (u+1)
+    env = add_info(
+        &env,
+        ax(
+            n("List"),
+            vec![u.clone()],
+            Expr::forall_e(n("_a"), sort_u1(), sort_u1(), BinderInfo::Default),
+        ),
+    );
+    // List.cons.{u} : ∀ (α : Sort (u+1)), α → List.{u} α → List.{u} α
+    env = add_info(
+        &env,
+        ax(
+            nn("List", "cons"),
+            vec![u.clone()],
+            Expr::forall_e(
+                n("a"),
+                sort_u1(),
+                Expr::forall_e(
+                    n("_h"),
+                    Expr::bvar(0).expect("packs"),
+                    Expr::forall_e(
+                        n("_t"),
+                        list_u(Expr::bvar(1).expect("packs")),
+                        list_u(Expr::bvar(2).expect("packs")),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        ),
+    );
+    // List.nil.{u} : ∀ (α : Sort (u+1)), List.{u} α
+    env = add_info(
+        &env,
+        ax(
+            nn("List", "nil"),
+            vec![u.clone()],
+            Expr::forall_e(
+                n("a"),
+                sort_u1(),
+                list_u(Expr::bvar(0).expect("packs")),
+                BinderInfo::Default,
+            ),
+        ),
+    );
+    // String: a one-constructor structure over List.{0} Char.
+    env = add_info(
+        &env,
+        ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: n("String"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![n("String")],
+            ctors: vec![nn("String", "mk")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: nn("String", "mk"),
+                level_params: vec![],
+                type_: Expr::forall_e(n("data"), list0_char(), string_c(), BinderInfo::Default),
+            },
+            induct: n("String"),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        }),
+    );
+    // String.ofList : List.{0} Char → String := fun data => String.mk data
+    env = add_info(
+        &env,
+        ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: nn("String", "ofList"),
+                level_params: vec![],
+                type_: Expr::forall_e(n("data"), list0_char(), string_c(), BinderInfo::Default),
+            },
+            value: Expr::lam(
+                n("data"),
+                list0_char(),
+                Expr::app(
+                    Expr::const_(nn("String", "mk"), vec![]),
+                    Expr::bvar(0).expect("packs"),
+                ),
+                BinderInfo::Default,
+            ),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![nn("String", "ofList")],
+        }),
+    );
+    // String.rec.{u} : ∀ motive, (∀ data, motive (String.mk data)) → ∀ t, motive t
+    let motive_ty = Expr::forall_e(
+        n("_t"),
+        string_c(),
+        Expr::sort(Level::param(u.clone())),
+        BinderInfo::Default,
+    );
+    let minor_ty = |motive_bvar: u32| {
+        Expr::forall_e(
+            n("data"),
+            list0_char(),
+            Expr::app(
+                Expr::bvar(motive_bvar + 1).expect("packs"),
+                Expr::app(
+                    Expr::const_(nn("String", "mk"), vec![]),
+                    Expr::bvar(0).expect("packs"),
+                ),
+            ),
+            BinderInfo::Default,
+        )
+    };
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("m"),
+            minor_ty(0),
+            Expr::forall_e(
+                n("t"),
+                string_c(),
+                Expr::app(Expr::bvar(2).expect("packs"), Expr::bvar(0).expect("packs")),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // mk-rule rhs: fun motive m data => m data
+    let rhs = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(
+            n("m"),
+            minor_ty(0),
+            Expr::lam(
+                n("data"),
+                list0_char(),
+                Expr::app(Expr::bvar(1).expect("packs"), Expr::bvar(0).expect("packs")),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: ConstantVal {
+                name: nn("String", "rec"),
+                level_params: vec![u],
+                type_: rec_ty,
+            },
+            all: vec![n("String")],
+            num_params: 0,
+            num_indices: 0,
+            num_motives: 1,
+            num_minors: 1,
+            rules: vec![RecursorRule {
+                ctor: nn("String", "mk"),
+                nfields: 1,
+                rhs,
+            }],
+            k: false,
+            is_unsafe: false,
+        }),
+    )
+}
+
+/// The `List.cons.{0} Char (Char.ofNat cᵢ) …` spine for the given code points,
+/// hand-rolled here as an independent oracle for the kernel's generator.
+fn char_list_spine(codes: &[u64]) -> Expr {
+    let char_c = Expr::const_(n("Char"), vec![]);
+    let cons = Expr::app(
+        Expr::const_(nn("List", "cons"), vec![Level::zero()]),
+        char_c.clone(),
+    );
+    let nil = Expr::app(Expr::const_(nn("List", "nil"), vec![Level::zero()]), char_c);
+    let of_nat = Expr::const_(nn("Char", "ofNat"), vec![]);
+    let mut spine = nil;
+    for code in codes.iter().rev() {
+        spine = Expr::app(
+            Expr::app(cons.clone(), Expr::app(of_nat.clone(), lit(*code))),
+            spine,
+        );
+    }
+    spine
+}
+
+fn of_list_app(spine: Expr) -> Expr {
+    Expr::app(Expr::const_(nn("String", "ofList"), vec![]), spine)
+}
+
+#[test]
+fn kr314_string_literal_defeq_its_oflist_spine() {
+    // The defeq half of KR-314 (pin try_string_lit_expansion + reduce_proj_core
+    // string expansion): a String literal equals its `String.ofList` code-point
+    // spine — in both orientations — and mismatched or reordered code points
+    // are decisively rejected, killing wrong-value and unreversed-fold mutants
+    // in the expansion generator.
+    let env = add_string_fixture(&add_nat_literal_axioms(&Environment::new()));
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &str_lit("ab"),
+            &of_list_app(char_list_spine(&[97, 98])),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "\"ab\" ≟ String.ofList ['a','b']"
+    );
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &of_list_app(char_list_spine(&[97, 98])),
+            &str_lit("ab"),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "the expansion works in the symmetric orientation"
+    );
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &str_lit(""),
+            &of_list_app(char_list_spine(&[])),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "the empty string is the nil spine"
+    );
+    // Unicode: 'λ' is code point 955 — one char, one cons cell.
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &str_lit("λ"),
+            &of_list_app(char_list_spine(&[955])),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "expansion decodes code points, not bytes"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &str_lit("ab"),
+            &of_list_app(char_list_spine(&[97, 99])),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "a wrong code point is decisively unequal"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &str_lit("ab"),
+            &of_list_app(char_list_spine(&[98, 97])),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "reversed code points are decisively unequal (kills an unreversed-fold mutant)"
+    );
+}
+
+#[test]
+fn kr314_projection_expands_string_literal_scrutinees() {
+    // The reduce_proj half (pin reduce_proj_core, :358): projecting field 0
+    // out of a String LITERAL expands the literal, whnfs `String.ofList` down
+    // to the constructor, and extracts the spine.
+    let env = add_string_fixture(&add_nat_literal_axioms(&Environment::new()));
+    let proj = Expr::proj(n("String"), 0, str_lit("ab"));
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &proj,
+            &char_list_spine(&[97, 98]),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "(\"ab\").data reduces to the ['a','b'] spine"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &proj,
+            &char_list_spine(&[98, 97]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "the projected spine is order-exact"
+    );
+}
+
+#[test]
+fn kr314_string_recursor_fires_on_a_literal_major() {
+    // The iota half (pin inductive.h:95): a String-literal major expands and
+    // whnfs to the constructor, the mk-rule fires, and the minor receives the
+    // spine. A mutant that skips the whnf after expansion leaves the major
+    // `String.ofList`-headed — no rule matches and this stays stuck.
+    let env = add_string_fixture(&add_nat_literal_axioms(&Environment::new()));
+    // motive SM : String → Sort 1 and minor sm : ∀ data, SM (String.mk data).
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("SM"),
+                level_params: vec![],
+                type_: Expr::forall_e(
+                    n("_t"),
+                    Expr::const_(n("String"), vec![]),
+                    sort1(),
+                    BinderInfo::Default,
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let list0_char = Expr::app(
+        Expr::const_(n("List"), vec![Level::zero()]),
+        Expr::const_(n("Char"), vec![]),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("sm"),
+                level_params: vec![],
+                type_: Expr::forall_e(
+                    n("data"),
+                    list0_char,
+                    Expr::app(
+                        Expr::const_(n("SM"), vec![]),
+                        Expr::app(
+                            Expr::const_(nn("String", "mk"), vec![]),
+                            Expr::bvar(0).expect("packs"),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let mut rec_app = Expr::const_(nn("String", "rec"), vec![Level::one()]);
+    for arg in [
+        Expr::const_(n("SM"), vec![]),
+        Expr::const_(n("sm"), vec![]),
+        str_lit("a"),
+    ] {
+        rec_app = Expr::app(rec_app, arg);
+    }
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &rec_app,
+            &Expr::app(Expr::const_(n("sm"), vec![]), char_list_spine(&[97])),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "String.rec on \"a\" reduces to `sm ['a']`"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &rec_app,
+            &Expr::app(Expr::const_(n("sm"), vec![]), char_list_spine(&[98])),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "the recursor delivers the literal's actual code points"
+    );
+}
+
+#[test]
+fn kr310_projection_congruence_on_stuck_scrutinees() {
+    // KR-310's projection half (pin is_def_eq_core:1101): same-index
+    // projections close on defeq scrutinees. The scrutinees here are recursor
+    // applications STUCK on an opaque major — whnf cannot reduce the
+    // projection away, and one side hides a metadata wrapper inside the spine,
+    // so only scrutinee-level defeq (which strips it) can close the pair.
+    // This is byte-for-byte the shape of the final Init.Prelude residual
+    // (List.get.match_1: `PProd.0 (List.rec … x)` against the same term with
+    // mdata around `x`).
+    let env = add_nat_with_rec(&Environment::new());
+    let env = add_structure(&env, "PP", "PP.mk", sort1(), &[sort1()]);
+    let nat_c = Expr::const_(n("Nat"), vec![]);
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("nx"),
+                level_params: vec![],
+                type_: nat_c.clone(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("ny"),
+                level_params: vec![],
+                type_: nat_c,
+            },
+            is_unsafe: false,
+        }),
+    );
+    let (env, _) = nat_rec_app(&env, Expr::const_(n("nx"), vec![]));
+    let rec_on = |major: Expr| {
+        let mut app = Expr::const_(nn("Nat", "rec"), vec![Level::one()]);
+        for arg in [
+            Expr::const_(n("NM"), vec![]),
+            Expr::const_(n("nmz"), vec![]),
+            Expr::const_(n("nms"), vec![]),
+            major,
+        ] {
+            app = Expr::app(app, arg);
+        }
+        app
+    };
+    let plain = rec_on(Expr::const_(n("nx"), vec![]));
+    let wrapped = rec_on(Expr::mdata(KVMap::default(), Expr::const_(n("nx"), vec![])));
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &Expr::proj(n("PP"), 0, plain.clone()),
+            &Expr::proj(n("PP"), 0, wrapped.clone()),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "same-index projections of defeq stuck scrutinees are defeq"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::proj(n("PP"), 0, plain.clone()),
+            &Expr::proj(n("PP"), 1, wrapped),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "DIFFERENT indices do not close (kills a dropped-index-guard mutant)"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::proj(n("PP"), 0, plain),
+            &Expr::proj(n("PP"), 0, rec_on(Expr::const_(n("ny"), vec![]))),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "projections of NON-defeq scrutinees stay apart"
+    );
+}
