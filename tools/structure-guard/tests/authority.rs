@@ -495,7 +495,7 @@ fn a_concurrent_governed_root_change_is_typed_inconclusive() {
     assert!(
         out.findings
             .iter()
-            .any(|finding| finding.code == SOURCE_CHANGED),
+            .any(|finding| finding.code.eq(SOURCE_CHANGED)),
         "source change was not typed: {:?}",
         out.findings
     );
@@ -516,11 +516,12 @@ fn a_mismatched_effective_compiler_is_typed_inconclusive() {
     assert_eq!(out.verdict(), "inconclusive");
     assert_eq!(out.exit_code(), 3);
     assert!(out.compiler_identity.contract_declared);
+    assert!(out.compiler_identity.configuration_match);
     assert!(!out.compiler_identity.contract_match);
     assert!(
         out.findings
             .iter()
-            .any(|finding| finding.code == COMPILER_IDENTITY),
+            .any(|finding| finding.code.eq(COMPILER_IDENTITY)),
         "compiler mismatch was not typed: {:?}",
         out.findings
     );

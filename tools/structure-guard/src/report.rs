@@ -83,7 +83,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
     let compiler = &outcome.compiler_identity;
     let environment = &outcome.admitted_environment;
     lines.push(format!(
-        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":\"{}\",\"graph_digest\":\"fnv1a64:{:016x}\",\"crates\":{},\"edges\":{},\"authority_inventory\":{{\"package_class\":\"workspace-graph-exact\",\"packages\":{},\"target_class\":\"cargo-auto-discovery-closed\",\"targets\":{},\"feature_class\":\"manifest-enumerated\",\"features\":{},\"target_triple_class\":\"suite-lock-declared\",\"target_triples\":{}}},\"effective_compiler_identity\":{{\"source\":\"{}\",\"channel\":{},\"release\":{},\"commit\":{},\"host\":{},\"contract_declared\":{},\"contract_match\":{}}},\"admitted_environment\":{{\"policy\":\"{}\",\"admitted_names\":{},\"compiler_override_names\":{}}}}}",
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":\"{}\",\"graph_digest\":\"fnv1a64:{:016x}\",\"crates\":{},\"edges\":{},\"authority_inventory\":{{\"package_class\":\"workspace-graph-exact\",\"packages\":{},\"target_class\":\"cargo-auto-discovery-closed\",\"targets\":{},\"feature_class\":\"manifest-enumerated\",\"features\":{},\"target_triple_class\":\"suite-lock-declared\",\"target_triples\":{}}},\"effective_compiler_identity\":{{\"source\":\"{}\",\"channel\":{},\"release\":{},\"commit\":{},\"host\":{},\"contract_declared\":{},\"configuration_match\":{},\"contract_match\":{}}},\"admitted_environment\":{{\"policy\":\"{}\",\"admitted_names\":{},\"compiler_override_names\":{}}}}}",
         json_escape(root_display),
         json_escape(&outcome.root_identity),
         outcome.graph_digest,
@@ -99,6 +99,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
         optional_json_string(compiler.commit.as_deref()),
         optional_json_string(compiler.host.as_deref()),
         compiler.contract_declared,
+        compiler.configuration_match,
         compiler.contract_match,
         json_escape(environment.policy),
         json_string_array(&environment.admitted_names),

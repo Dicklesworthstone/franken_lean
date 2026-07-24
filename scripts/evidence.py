@@ -3185,8 +3185,14 @@ def require_guard_keys(
 
 
 def require_guard_nat(path: Path, value: Any, *, label: str) -> int:
-    if type(value) is not int or value < 0:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise EvidenceError(f"{path}: {label} must be a nonnegative integer")
+    return value
+
+
+def require_guard_bool(path: Path, value: Any, *, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise EvidenceError(f"{path}: {label} must be a boolean")
     return value
 
 
@@ -3345,6 +3351,7 @@ def validate_guard(
                 "commit",
                 "host",
                 "contract_declared",
+                "configuration_match",
                 "contract_match",
             },
             label="effective_compiler_identity",
@@ -3362,14 +3369,26 @@ def validate_guard(
             or not isinstance(compiler.get("release"), str)
             or re.fullmatch(r"[0-9a-f]{40}", str(compiler.get("commit"))) is None
             or not isinstance(compiler.get("host"), str)
-            or type(compiler.get("contract_declared")) is not bool
-            or type(compiler.get("contract_match")) is not bool
         ):
             raise EvidenceError(f"{path}: effective compiler identity is malformed")
+        compiler_contract_declared = require_guard_bool(
+            path,
+            compiler.get("contract_declared"),
+            label="compiler contract_declared",
+        )
+        compiler_configuration_match = require_guard_bool(
+            path,
+            compiler.get("configuration_match"),
+            label="compiler configuration_match",
+        )
+        compiler_contract_match = require_guard_bool(
+            path, compiler.get("contract_match"), label="compiler contract_match"
+        )
         if expected_verdict == "pass" and (
             compiler.get("channel") is None
-            or compiler["contract_declared"] is not True
-            or compiler["contract_match"] is not True
+            or not compiler_contract_declared
+            or not compiler_configuration_match
+            or not compiler_contract_match
         ):
             raise EvidenceError(f"{path}: passing compiler authority is not established")
 
@@ -3421,10 +3440,15 @@ def validate_guard(
         )
         if scanned + skipped != discovered:
             raise EvidenceError(f"{path}: authority count conservation failed")
+        authority_count_rule_holds = require_guard_bool(
+            path,
+            terminal.get("authority_count_rule_holds"),
+            label="authority_count_rule_holds",
+        )
         if (
             terminal.get("authority_count_rule")
             != "files_scanned+files_skipped_unreadable=files_discovered"
-            or terminal.get("authority_count_rule_holds") is not True
+            or not authority_count_rule_holds
         ):
             raise EvidenceError(f"{path}: authority count rule is not established")
         root_before = require_guard_fnv(
@@ -3433,26 +3457,27 @@ def validate_guard(
         root_after = require_guard_fnv(
             path, terminal.get("governed_root_after"), label="governed_root_after"
         )
-        governed_unchanged = terminal.get("governed_root_unchanged")
-        if (
-            type(governed_unchanged) is not bool
-            or governed_unchanged != (root_before == root_after)
-        ):
+        governed_unchanged = require_guard_bool(
+            path,
+            terminal.get("governed_root_unchanged"),
+            label="governed_root_unchanged",
+        )
+        if governed_unchanged != (root_before == root_after):
             raise EvidenceError(f"{path}: governed-root equality fact disagrees")
         expected_authority = (
             "incomplete" if expected_verdict == "inconclusive" else "complete"
         )
-        if terminal.get("authority") != expected_authority:
+        if terminal.get("authority") != expected_authority:  # ubs:ignore — public verdict enum
             raise EvidenceError(
                 f"{path}: authority {terminal.get('authority')!r}, "
                 f"expected {expected_authority!r}"
             )
-        if expected_authority == "complete" and (
+        if expected_authority == "complete" and (  # ubs:ignore — public verdict enum
             (
-                compiler.get("contract_declared") is True
-                and compiler.get("contract_match") is not True
+                compiler_contract_declared
+                and (not compiler_configuration_match or not compiler_contract_match)
             )
-            or terminal.get("governed_root_unchanged") is not True
+            or not governed_unchanged
         ):
             raise EvidenceError(f"{path}: complete authority lacks identity closure")
     elif records[0].get("graph_digest") is not None:
@@ -3473,10 +3498,18 @@ def validate_guard(
         if (
             terminal.get("authority") != "not_established"
             or terminal.get("traversal") is not None
-            or terminal.get("authority_count_rule_holds") is not False
             or terminal.get("governed_root_before") is not None
             or terminal.get("governed_root_after") is not None
-            or terminal.get("governed_root_unchanged") is not False
+        ):
+            raise EvidenceError(f"{path}: setup failure claims established authority")
+        if require_guard_bool(
+            path,
+            terminal.get("authority_count_rule_holds"),
+            label="setup authority_count_rule_holds",
+        ) or require_guard_bool(
+            path,
+            terminal.get("governed_root_unchanged"),
+            label="setup governed_root_unchanged",
         ):
             raise EvidenceError(f"{path}: setup failure claims established authority")
     actual_findings = []
@@ -9080,6 +9113,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "commit": "77cf889bc178ddb44d6a1c78e5a820b5abb31d8d",
             "host": "x86_64-unknown-linux-gnu",
             "contract_declared": True,
+            "configuration_match": True,
             "contract_match": True,
         },
         "admitted_environment": {
@@ -9141,7 +9175,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         records[1]["governed_root_after"] = "fnv1a64:1111111111111111"
 
     def unbound_guard_compiler(records: list[dict[str, Any]]) -> None:
-        records[0]["effective_compiler_identity"]["contract_match"] = False
+        records[0]["effective_compiler_identity"]["configuration_match"] = False
 
     def leaked_guard_environment_value(records: list[dict[str, Any]]) -> None:
         records[0]["admitted_environment"]["admitted_names"] = ["/secret/path"]

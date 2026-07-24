@@ -71,12 +71,37 @@ fn robot_real_workspace_binds_complete_authority_evidence() {
     assert!(stdout.contains("\"authority_inventory\":{"));
     assert!(stdout.contains("\"effective_compiler_identity\":{"));
     assert!(stdout.contains("\"contract_declared\":true"));
+    assert!(stdout.contains("\"configuration_match\":true"));
     assert!(stdout.contains("\"contract_match\":true"));
     assert!(stdout.contains("\"admitted_environment\":{"));
     assert!(stdout.contains("\"authority\":\"complete\""));
     assert!(stdout.contains("\"authority_count_rule_holds\":true"));
     assert!(stdout.contains("\"governed_root_unchanged\":true"));
     assert!(stdout.contains("\"verdict\":\"pass\""));
+}
+
+#[test]
+fn robot_rejects_an_unbound_rustc_override_without_executing_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let output = Command::new(env!("CARGO_BIN_EXE_structure-guard"))
+        .args([
+            "--root",
+            root.to_str().expect("workspace root is UTF-8"),
+            "--robot",
+        ])
+        .env("RUSTC", "/definitely/not/an/admitted/compiler")
+        .output()
+        .expect("run CLI with a deliberately unbound RUSTC");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty(), "robot stderr must be empty");
+    let stdout = String::from_utf8(output.stdout).expect("robot stdout is UTF-8");
+    assert!(stdout.contains("\"configuration_match\":false"));
+    assert!(stdout.contains("\"code\":\"FLN-STRUCT-029\""));
+    assert!(stdout.contains("\"authority\":\"incomplete\""));
+    assert!(stdout.contains("\"verdict\":\"inconclusive\""));
 }
 
 #[test]

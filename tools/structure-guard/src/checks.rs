@@ -39,7 +39,7 @@
 //!   `SUITE.lock` compiler contract, so compiler authority is inconclusive.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -138,6 +138,7 @@ pub struct CompilerIdentity {
     pub commit: Option<String>,
     pub host: Option<String>,
     pub contract_declared: bool,
+    pub configuration_match: bool,
     pub contract_match: bool,
 }
 
@@ -366,16 +367,17 @@ fn effective_rustc_probe() -> RustcProbe {
     static PROBE: OnceLock<RustcProbe> = OnceLock::new();
     PROBE
         .get_or_init(|| {
-            let (program, source): (OsString, &'static str) = match std::env::var_os("RUSTC") {
-                Some(program) if !program.is_empty() => (program, "RUSTC"),
-                _ => (OsString::from("rustc"), "PATH"),
-            };
-            match Command::new(program).arg("-Vv").output() {
+            // Never execute the program named by ambient RUSTC. The evidence runner's
+            // sealed lane supplies an exact RUSTC path, but a direct invocation may not:
+            // treating that string as an executable would turn identity validation into
+            // arbitrary command execution. Probe the fixed PATH name and compare an
+            // override by canonical file identity below.
+            match Command::new("rustc").arg("-Vv").output() {
                 Ok(output) if output.status.success() => {
-                    parse_rustc_verbose(&output.stdout, source)
+                    parse_rustc_verbose(&output.stdout, "PATH")
                 }
                 _ => RustcProbe {
-                    source,
+                    source: "PATH",
                     release: None,
                     commit: None,
                     host: None,
@@ -385,7 +387,35 @@ fn effective_rustc_probe() -> RustcProbe {
         .clone()
 }
 
-fn compiler_identity(root: &Path) -> CompilerIdentity {
+fn resolve_path_executable(program: &OsStr) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return fs::canonicalize(path)
+            .ok()
+            .filter(|candidate| candidate.is_file());
+    }
+    std::env::var_os("PATH").and_then(|search| {
+        std::env::split_paths(&search).find_map(|directory| {
+            fs::canonicalize(directory.join(path))
+                .ok()
+                .filter(|candidate| candidate.is_file())
+        })
+    })
+}
+
+fn rustc_override_matches_path() -> bool {
+    let Some(override_program) = std::env::var_os("RUSTC") else {
+        return true;
+    };
+    if override_program.is_empty() {
+        return false;
+    }
+    resolve_path_executable(OsStr::new("rustc"))
+        .zip(resolve_path_executable(&override_program))
+        .is_some_and(|(from_path, from_override)| from_path == from_override)
+}
+
+fn compiler_identity(root: &Path, admitted_environment: &AdmittedEnvironment) -> CompilerIdentity {
     let expected = fs::read_to_string(root.join(SUITE_LOCK_FILE))
         .ok()
         .and_then(|text| crate::lockfile::parse_suite_lock(&text).ok());
@@ -410,12 +440,19 @@ fn compiler_identity(root: &Path) -> CompilerIdentity {
             .as_ref()
             .is_some_and(|host| lock.targets.contains(host))
     });
+    // The guard invokes the PATH compiler directly for the identity probe and
+    // strips Cargo/rustc tuning variables from expansion subprocesses. Those
+    // ambient names are still disclosed in the robot envelope, but cannot
+    // change the governed computation. RUSTC is the one identity-bearing
+    // alias: require it to resolve to the same file as PATH's rustc.
+    let configuration_match = rustc_override_matches_path();
     let contract_match = expected_release
         .zip(expected_commit)
         .is_some_and(|(release, commit)| {
             probe.release.as_deref() == Some(release)
                 && probe.commit.as_deref() == Some(commit)
                 && host_is_declared
+                && configuration_match
         });
     CompilerIdentity {
         source: probe.source,
@@ -424,6 +461,7 @@ fn compiler_identity(root: &Path) -> CompilerIdentity {
         commit: probe.commit,
         host: probe.host,
         contract_declared,
+        configuration_match,
         contract_match,
     }
 }
@@ -443,7 +481,7 @@ fn admitted_environment() -> AdmittedEnvironment {
         "USER",
         "RUSTUP_HOME",
     ];
-    const COMPILER_EXACT: [&str; 15] = [
+    const COMPILER_EXACT: [&str; 14] = [
         "RUSTFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_BUILD_RUSTFLAGS",
@@ -458,7 +496,6 @@ fn admitted_environment() -> AdmittedEnvironment {
         "RUSTDOC",
         "RUSTDOCFLAGS",
         "RUSTUP_TOOLCHAIN",
-        "CARGO",
     ];
     const COMPILER_PREFIXES: [&str; 5] = [
         "CARGO_TARGET_",
@@ -1064,8 +1101,8 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         .map(|identity| identity.replace('\\', "/"))
         .ok_or_else(|| "authoritative workspace root is not UTF-8".to_string())?;
     let governed_before = governed_snapshot(&root);
-    let compiler_identity = compiler_identity(&root);
     let admitted_environment = admitted_environment();
+    let compiler_identity = compiler_identity(root, &admitted_environment);
     let mut findings: Vec<Finding> = Vec::new();
 
     // Reject links before any recursive scanner runs. Git can store symlinks, and
@@ -1836,11 +1873,12 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             code: "FLN-STRUCT-029",
             path: SUITE_LOCK_FILE.to_string(),
             detail: format!(
-                "effective compiler identity source={} release={} commit={} host={} does not match the complete SUITE.lock compiler contract; compiler authority is inconclusive",
+                "effective compiler identity source={} release={} commit={} host={} configuration-match={} does not match the complete SUITE.lock compiler contract; compiler authority is inconclusive",
                 compiler_identity.source,
                 compiler_identity.release.as_deref().unwrap_or("unavailable"),
                 compiler_identity.commit.as_deref().unwrap_or("unavailable"),
                 compiler_identity.host.as_deref().unwrap_or("unavailable"),
+                compiler_identity.configuration_match,
             ),
         });
     }
@@ -2265,6 +2303,37 @@ fn c_export_covenant(
 /// builds never contend on the workspace's primary target directory.
 fn run_expansion(root: &Path, package: &str, test_cfg: bool) -> Result<String, String> {
     let mut command = std::process::Command::new("cargo");
+    for name in std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()) {
+        if matches!(
+            name.as_str(),
+            "RUSTFLAGS"
+                | "CARGO_ENCODED_RUSTFLAGS"
+                | "CARGO_BUILD_RUSTFLAGS"
+                | "CARGO_BUILD_RUSTC"
+                | "CARGO_BUILD_RUSTC_WRAPPER"
+                | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+                | "CARGO_BUILD_RUSTDOC"
+                | "CARGO_BUILD_TARGET"
+                | "RUSTC"
+                | "RUSTC_WRAPPER"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "RUSTDOC"
+                | "RUSTDOCFLAGS"
+                | "RUSTUP_TOOLCHAIN"
+        ) || (name != "CARGO_TARGET_DIR"
+            && [
+                "CARGO_TARGET_",
+                "CARGO_ALIAS_",
+                "CARGO_UNSTABLE_",
+                "CARGO_REGISTRIES_",
+                "CARGO_PROFILE_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)))
+        {
+            command.env_remove(name);
+        }
+    }
     command
         .current_dir(root)
         .arg("rustc")
