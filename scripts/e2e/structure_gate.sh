@@ -1199,36 +1199,32 @@ guard_step seeded_nested_cargo_config "$NESTED_CARGO_CONFIG" 1 fail \
   FLN-STRUCT-016@crates/fln-kernel/.cargo/config.toml
 
 # rustup prefers rust-toolchain.toml when both spellings exist, so an unreviewed
-# legacy file can sit beside the reviewed pin undetected.
+# legacy file can sit beside the reviewed pin undetected. The plant is a byte copy
+# of the reviewed pin, so it selects the SAME compiler: that isolates the finding
+# to the structural law (this filename may not exist) instead of entangling it with
+# whatever a redirected toolchain would do to the rest of the run.
 LEGACY_TOOLCHAIN="$SCRATCH_ROOT/legacy-toolchain"
 copy_fixture copy_legacy_toolchain "$LEGACY_TOOLCHAIN"
-printf '[toolchain]\nchannel = "stable"\n' > "$LEGACY_TOOLCHAIN/rust-toolchain"
+cp -- "$LEGACY_TOOLCHAIN/rust-toolchain.toml" "$LEGACY_TOOLCHAIN/rust-toolchain"
 guard_step seeded_legacy_toolchain "$LEGACY_TOOLCHAIN" 1 fail \
   FLN-STRUCT-016@rust-toolchain
 
-# The three ambiguous shapes of the reviewed pin itself: a decoy section carrying
-# the expected channel while [toolchain] selects something else, a path-based
-# toolchain, and a duplicate key whose last value wins. Each must fail the parse
-# rather than resolve to some channel.
+# An ambiguous shape of the reviewed pin itself: a decoy section carrying a channel
+# while [toolchain] is what actually selects. The [toolchain] table keeps the real
+# pin for the same reason as above, so the guard's own compiler is untouched and the
+# parse refusal is the only observable. The path-based and duplicate-key shapes are
+# deliberately NOT run here: both make rustup unable to resolve a toolchain at all,
+# so the observable becomes the expansion covenant (bead fln-lld) failing under a
+# broken compiler rather than this bead's structural law. They are covered exactly
+# where they belong, in lockfile::tests::parses_toolchain_channel.
 DECOY_TOOLCHAIN="$SCRATCH_ROOT/decoy-toolchain"
 copy_fixture copy_decoy_toolchain "$DECOY_TOOLCHAIN"
-printf '[metadata]\nchannel = "nightly-2026-07-13"\n[toolchain]\nchannel = "nightly-2026-07-13"\n' \
-  > "$DECOY_TOOLCHAIN/rust-toolchain.toml"
+{
+  printf '[metadata]\nchannel = "decoy-not-the-pin"\n'
+  cat -- "$DECOY_TOOLCHAIN/rust-toolchain.toml"
+} > "$DECOY_TOOLCHAIN/rust-toolchain.decoy"
+mv -- "$DECOY_TOOLCHAIN/rust-toolchain.decoy" "$DECOY_TOOLCHAIN/rust-toolchain.toml"
 guard_step seeded_decoy_toolchain "$DECOY_TOOLCHAIN" 1 fail \
-  FLN-STRUCT-016@rust-toolchain.toml
-
-PATH_TOOLCHAIN="$SCRATCH_ROOT/path-toolchain"
-copy_fixture copy_path_toolchain "$PATH_TOOLCHAIN"
-printf '[toolchain]\nchannel = "nightly-2026-07-13"\npath = "/tmp/toolchain"\n' \
-  > "$PATH_TOOLCHAIN/rust-toolchain.toml"
-guard_step seeded_path_toolchain "$PATH_TOOLCHAIN" 1 fail \
-  FLN-STRUCT-016@rust-toolchain.toml
-
-DUPLICATE_TOOLCHAIN="$SCRATCH_ROOT/duplicate-toolchain"
-copy_fixture copy_duplicate_toolchain "$DUPLICATE_TOOLCHAIN"
-printf '[toolchain]\nchannel = "nightly-2026-07-13"\nchannel = "nightly-2026-07-13"\n' \
-  > "$DUPLICATE_TOOLCHAIN/rust-toolchain.toml"
-guard_step seeded_duplicate_toolchain "$DUPLICATE_TOOLCHAIN" 1 fail \
   FLN-STRUCT-016@rust-toolchain.toml
 
 # Recovery: an untouched copy still passes, proving the depth-walk did not start
