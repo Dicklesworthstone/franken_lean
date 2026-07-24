@@ -41,15 +41,19 @@ use crate::modules::{
 ///    [`ExtensionEntryId`] content identities — the source ordinal is the position in
 ///    that sequence and the target position is `start + ordinal`, so no rebasable
 ///    journal coordinate is stored per entry;
-/// 4. decode completeness, extension knowledge, and the canonical missing-target set.
+/// 4. the capture-status and payload-transparency axes, and the canonical
+///    missing-target set. The authority axis is derived from that tuple and is
+///    deliberately absent from the bytes, so no record can assert a capability it has
+///    not earned.
 ///
 /// Enum tags are frozen below by paired exhaustive `*_tag`/`read_*` functions:
 /// producer `Reference=0, FrankenLean=1`; grade
 /// `Provisional=0, Verified=1, OracleFixture=2`; merge
 /// `AppendOrdered=0, SetUnion=1, ConflictsRequireReview=2`; checkpoint
 /// `JournalSuffix=0, FullJournal=1`; payload provenance
-/// `Understood=0, Opaque=1`; decode `Complete=0, Partial=1`; extension knowledge
-/// `AllUnderstood=0, ContainsOpaque=1`. Unknown tags and future schema versions are
+/// `Understood=0, Opaque=1`; capture status `Complete=0, Partial=1, Missing=2`;
+/// payload transparency
+/// `Understood=0, Mixed=1, Opaque=2`. Unknown tags and future schema versions are
 /// typed refusals. Any incompatible layout change registers version 2 rather than
 /// reinterpreting version-1 bytes.
 ///
@@ -63,60 +67,145 @@ pub const MODULE_PROVENANCE_SCHEMA: SchemaId = SchemaId {
     version: 1,
 };
 
-/// Whether the decoder produced every contribution-bearing section it understood.
+/// **Capture axis** — how much of this module's contribution the decoder obtained.
+///
+/// This says nothing about whether the captured bytes are understood; that is the
+/// independent [`PayloadTransparency`] axis. `Missing` is not "empty": a module that
+/// genuinely contributes nothing is `Complete` with zero contributions, whereas
+/// `Missing` records that the contributions could not be captured at all. The two
+/// encode the same empty content and make opposite claims about it, which is precisely
+/// why the axis is explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DecodeCompleteness {
+pub enum CaptureStatus {
     Complete,
     Partial,
+    Missing,
 }
 
-/// Whether every retained extension contribution is semantically understood.
+/// **Transparency axis** — whether the captured extension payloads are semantically
+/// understood.
+///
+/// Orthogonal to [`CaptureStatus`]: an opaque payload can be byte-complete, and an
+/// understood one can be partially captured. `Mixed` is a real state, not a rounding
+/// of `Opaque` — it is what keeps an opaque boundary *localized* and addressable
+/// instead of condemning the whole module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ExtensionKnowledge {
-    AllUnderstood,
-    ContainsOpaque,
+pub enum PayloadTransparency {
+    Understood,
+    Mixed,
+    Opaque,
 }
 
-/// Orthogonal completeness dimensions. Missing dependencies are a canonical set;
-/// declaration and extension arrays elsewhere remain ordered sequences.
+/// **Authority axis** — one capability a consumer may exercise over a record.
+///
+/// Authority is *derived*, never stored: it is a pure function of the capture and
+/// transparency axes plus the missing-dependency set (see
+/// [`ProvenanceCompleteness::authority`]). Because the manifest carries no authority
+/// field, a record cannot assert a capability it has not earned — unjustified
+/// authority is unrepresentable rather than merely rejected on decode, and every
+/// decode recomputes it by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProvenanceAuthority {
+    /// Read what was recorded. Requires only that something was captured.
+    Inspection,
+    /// Replay this module's exact ordered extension entries. Opacity is irrelevant —
+    /// opaque bytes replay verbatim — so this needs capture alone.
+    ExactReplay,
+    /// Enumerate every declaration and contribution the module owns.
+    CompleteInventory,
+    /// Serve as an authoritative cache identity. Opacity is tolerable because entry
+    /// identity is byte-exact, but an unresolved import means the recorded closure is
+    /// not the real one.
+    AuthoritativeCache,
+    /// Compute a precise invalidation cone. The strictest capability: it is the only
+    /// one that needs semantic attribution, so an opaque or mixed payload withholds it.
+    FineInvalidation,
+}
+
+impl ProvenanceAuthority {
+    /// Every capability, in strengthening order. Iterating this rather than a
+    /// hand-written list is what makes "omit an axis" detectable in the tests.
+    pub const ALL: [ProvenanceAuthority; 5] = [
+        ProvenanceAuthority::Inspection,
+        ProvenanceAuthority::ExactReplay,
+        ProvenanceAuthority::CompleteInventory,
+        ProvenanceAuthority::AuthoritativeCache,
+        ProvenanceAuthority::FineInvalidation,
+    ];
+}
+
+/// The three independent completeness axes.
+///
+/// They are deliberately *not* reducible to one another and there is no boolean
+/// "complete" accessor: a single flag would have to pick an axis to privilege, and
+/// every caller that asked it would silently inherit that choice. Ask the axis you
+/// actually mean — [`capture`](Self::capture), [`transparency`](Self::transparency),
+/// [`missing_dependencies`](Self::missing_dependencies) — or ask what you are allowed
+/// to do, via [`authority`](Self::authority).
+///
+/// Missing dependencies are a canonical set; declaration and extension arrays
+/// elsewhere remain ordered sequences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenanceCompleteness {
-    decode: DecodeCompleteness,
-    extension_knowledge: ExtensionKnowledge,
+    capture: CaptureStatus,
+    transparency: PayloadTransparency,
     missing_dependencies: Arc<[ModuleId]>,
 }
 
 impl ProvenanceCompleteness {
     pub fn new(
-        decode: DecodeCompleteness,
-        extension_knowledge: ExtensionKnowledge,
+        capture: CaptureStatus,
+        transparency: PayloadTransparency,
         mut missing_dependencies: Vec<ModuleId>,
     ) -> Self {
         missing_dependencies.sort();
         missing_dependencies.dedup();
         Self {
-            decode,
-            extension_knowledge,
+            capture,
+            transparency,
             missing_dependencies: missing_dependencies.into(),
         }
     }
 
-    pub fn decode(&self) -> DecodeCompleteness {
-        self.decode
+    pub fn capture(&self) -> CaptureStatus {
+        self.capture
     }
 
-    pub fn extension_knowledge(&self) -> ExtensionKnowledge {
-        self.extension_knowledge
+    pub fn transparency(&self) -> PayloadTransparency {
+        self.transparency
     }
 
     pub fn missing_dependencies(&self) -> &[ModuleId] {
         &self.missing_dependencies
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.decode == DecodeCompleteness::Complete
-            && self.extension_knowledge == ExtensionKnowledge::AllUnderstood
-            && self.missing_dependencies.is_empty()
+    /// Whether the full axis tuple justifies one capability.
+    ///
+    /// Each arm names the axes it consults and ignores the rest. `Complete + Opaque`
+    /// and `Partial + Understood` are both legal here and both yield a *reduced* set
+    /// rather than nothing — that is the whole point of keeping the axes apart.
+    pub fn grants(&self, authority: ProvenanceAuthority) -> bool {
+        let captured_everything = self.capture == CaptureStatus::Complete;
+        let closure_is_known = self.missing_dependencies.is_empty();
+        let semantics_are_attributable = self.transparency == PayloadTransparency::Understood;
+        match authority {
+            ProvenanceAuthority::Inspection => self.capture != CaptureStatus::Missing,
+            ProvenanceAuthority::ExactReplay | ProvenanceAuthority::CompleteInventory => {
+                captured_everything
+            }
+            ProvenanceAuthority::AuthoritativeCache => captured_everything && closure_is_known,
+            ProvenanceAuthority::FineInvalidation => {
+                captured_everything && closure_is_known && semantics_are_attributable
+            }
+        }
+    }
+
+    /// The complete derived capability set, in strengthening order.
+    pub fn authority(&self) -> Vec<ProvenanceAuthority> {
+        ProvenanceAuthority::ALL
+            .into_iter()
+            .filter(|candidate| self.grants(*candidate))
+            .collect()
     }
 }
 
@@ -463,10 +552,19 @@ pub enum ModuleProvenanceError {
         module: ModuleId,
         contribution_index: usize,
     },
-    ExtensionKnowledgeMismatch {
+    PayloadTransparencyMismatch {
         module: ModuleId,
-        expected: ExtensionKnowledge,
-        actual: ExtensionKnowledge,
+        expected: PayloadTransparency,
+        actual: PayloadTransparency,
+    },
+    /// A record claims its contributions were not captured while carrying some. The
+    /// axes are independent, but each still has to describe the same record.
+    CaptureStatusContradicted {
+        module: ModuleId,
+        capture: CaptureStatus,
+        declarations: usize,
+        extra_declarations: usize,
+        extension_contributions: usize,
     },
     MissingDependenciesMismatch {
         module: ModuleId,
@@ -555,13 +653,24 @@ impl std::fmt::Display for ModuleProvenanceError {
                 "module `{}` extension contribution {contribution_index} range overflows u64",
                 module.name().to_display_string()
             ),
-            Self::ExtensionKnowledgeMismatch {
+            Self::CaptureStatusContradicted {
+                module,
+                capture,
+                declarations,
+                extra_declarations,
+                extension_contributions,
+            } => write!(
+                formatter,
+                "module `{}` claims capture {capture:?} while carrying {declarations} declaration(s), {extra_declarations} extra declaration(s), and {extension_contributions} extension contribution(s)",
+                module.name().to_display_string()
+            ),
+            Self::PayloadTransparencyMismatch {
                 module,
                 expected,
                 actual,
             } => write!(
                 formatter,
-                "module `{}` extension knowledge mismatch: expected {expected:?}, actual {actual:?}",
+                "module `{}` payload transparency mismatch: expected {expected:?}, actual {actual:?}",
                 module.name().to_display_string()
             ),
             Self::MissingDependenciesMismatch {
@@ -812,20 +921,46 @@ fn validate_contribution_record(
         facts.missing_dependencies as u128,
     )?;
 
-    let expected_knowledge = if record
+    // The transparency axis is recomputed from the descriptors rather than trusted, and
+    // it resolves to three states, not two: a module with both understood and opaque
+    // contributions is `Mixed`, which keeps the opaque boundary localized instead of
+    // condemning the module wholesale.
+    let opaque = record
         .extension_contributions
         .iter()
-        .any(|contribution| contribution.descriptor.provenance == PayloadProvenance::Opaque)
-    {
-        ExtensionKnowledge::ContainsOpaque
+        .filter(|contribution| contribution.descriptor.provenance == PayloadProvenance::Opaque)
+        .count();
+    let expected_transparency = if opaque == 0 {
+        PayloadTransparency::Understood
+    } else if opaque == record.extension_contributions.len() {
+        PayloadTransparency::Opaque
     } else {
-        ExtensionKnowledge::AllUnderstood
+        PayloadTransparency::Mixed
     };
-    if expected_knowledge != record.completeness.extension_knowledge {
-        return Err(ModuleProvenanceError::ExtensionKnowledgeMismatch {
+    if expected_transparency != record.completeness.transparency {
+        return Err(ModuleProvenanceError::PayloadTransparencyMismatch {
             module: module.clone(),
-            expected: expected_knowledge,
-            actual: record.completeness.extension_knowledge,
+            expected: expected_transparency,
+            actual: record.completeness.transparency,
+        });
+    }
+
+    // Capture cannot be recomputed — whether the decoder obtained everything it should
+    // have is knowledge from outside the record. Exactly one cross-check is available
+    // and is therefore mandatory: a record cannot claim it captured nothing while
+    // carrying contributions. This is the only coupling between the axes, and it is a
+    // consistency obligation, not a collapse: it never lets one axis *derive* another.
+    if record.completeness.capture == CaptureStatus::Missing
+        && !(record.declarations.is_empty()
+            && record.extra_declarations.is_empty()
+            && record.extension_contributions.is_empty())
+    {
+        return Err(ModuleProvenanceError::CaptureStatusContradicted {
+            module: module.clone(),
+            capture: record.completeness.capture,
+            declarations: record.declarations.len(),
+            extra_declarations: record.extra_declarations.len(),
+            extension_contributions: record.extension_contributions.len(),
         });
     }
 
@@ -1015,10 +1150,8 @@ fn write_contribution_record(record: &ModuleContributionRecord, writer: &mut Can
             writer.bytes(&entry.digest().0);
         }
     }
-    writer.u8(decode_completeness_tag(record.completeness.decode));
-    writer.u8(extension_knowledge_tag(
-        record.completeness.extension_knowledge,
-    ));
+    writer.u8(capture_status_tag(record.completeness.capture));
+    writer.u8(payload_transparency_tag(record.completeness.transparency));
     writer.u64(record.completeness.missing_dependencies.len() as u64);
     for module in record.completeness.missing_dependencies.iter() {
         module.name().write_body(writer);
@@ -1237,8 +1370,8 @@ fn read_contribution_record(
         ));
     }
 
-    let decode = read_decode_completeness(reader.u8()?)?;
-    let extension_knowledge = read_extension_knowledge(reader.u8()?)?;
+    let capture = read_capture_status(reader.u8()?)?;
+    let transparency = read_payload_transparency(reader.u8()?)?;
     let missing_count = read_count(
         reader,
         ModuleProvenanceResource::MissingDependencies,
@@ -1258,7 +1391,7 @@ fn read_contribution_record(
         declarations,
         extra_declarations,
         contributions,
-        ProvenanceCompleteness::new(decode, extension_knowledge, missing),
+        ProvenanceCompleteness::new(capture, transparency, missing),
     ))
 }
 
@@ -1325,17 +1458,19 @@ fn payload_provenance_tag(value: PayloadProvenance) -> u8 {
     }
 }
 
-fn decode_completeness_tag(value: DecodeCompleteness) -> u8 {
+fn capture_status_tag(value: CaptureStatus) -> u8 {
     match value {
-        DecodeCompleteness::Complete => 0,
-        DecodeCompleteness::Partial => 1,
+        CaptureStatus::Complete => 0,
+        CaptureStatus::Partial => 1,
+        CaptureStatus::Missing => 2,
     }
 }
 
-fn extension_knowledge_tag(value: ExtensionKnowledge) -> u8 {
+fn payload_transparency_tag(value: PayloadTransparency) -> u8 {
     match value {
-        ExtensionKnowledge::AllUnderstood => 0,
-        ExtensionKnowledge::ContainsOpaque => 1,
+        PayloadTransparency::Understood => 0,
+        PayloadTransparency::Mixed => 1,
+        PayloadTransparency::Opaque => 2,
     }
 }
 
@@ -1391,22 +1526,24 @@ fn read_payload_provenance(tag: u8) -> Result<PayloadProvenance, ModuleProvenanc
     }
 }
 
-fn read_decode_completeness(tag: u8) -> Result<DecodeCompleteness, ModuleProvenanceError> {
+fn read_capture_status(tag: u8) -> Result<CaptureStatus, ModuleProvenanceError> {
     match tag {
-        0 => Ok(DecodeCompleteness::Complete),
-        1 => Ok(DecodeCompleteness::Partial),
+        0 => Ok(CaptureStatus::Complete),
+        1 => Ok(CaptureStatus::Partial),
+        2 => Ok(CaptureStatus::Missing),
         _ => Err(ModuleProvenanceError::MalformedEncoding {
-            what: "unknown decode completeness tag",
+            what: "unknown capture status tag",
         }),
     }
 }
 
-fn read_extension_knowledge(tag: u8) -> Result<ExtensionKnowledge, ModuleProvenanceError> {
+fn read_payload_transparency(tag: u8) -> Result<PayloadTransparency, ModuleProvenanceError> {
     match tag {
-        0 => Ok(ExtensionKnowledge::AllUnderstood),
-        1 => Ok(ExtensionKnowledge::ContainsOpaque),
+        0 => Ok(PayloadTransparency::Understood),
+        1 => Ok(PayloadTransparency::Mixed),
+        2 => Ok(PayloadTransparency::Opaque),
         _ => Err(ModuleProvenanceError::MalformedEncoding {
-            what: "unknown extension knowledge tag",
+            what: "unknown payload transparency tag",
         }),
     }
 }
@@ -1500,8 +1637,8 @@ mod tests {
             vec![name("A.generated")],
             vec![contribution],
             ProvenanceCompleteness::new(
-                DecodeCompleteness::Complete,
-                ExtensionKnowledge::AllUnderstood,
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
                 vec![id("Ghost")],
             ),
         );
@@ -1511,8 +1648,8 @@ mod tests {
             vec![],
             vec![],
             ProvenanceCompleteness::new(
-                DecodeCompleteness::Complete,
-                ExtensionKnowledge::AllUnderstood,
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
                 vec![],
             ),
         );
@@ -1592,18 +1729,23 @@ mod tests {
                 Ok(value)
             );
         }
-        for value in [DecodeCompleteness::Complete, DecodeCompleteness::Partial] {
-            assert_eq!(
-                read_decode_completeness(decode_completeness_tag(value)),
-                Ok(value)
-            );
+        // Every variant of both axes round-trips, including the two states added when
+        // the axes were separated: an axis whose new variant had no tag would be an
+        // "omit a completeness axis" mutant that only shows up on real data.
+        for value in [
+            CaptureStatus::Complete,
+            CaptureStatus::Partial,
+            CaptureStatus::Missing,
+        ] {
+            assert_eq!(read_capture_status(capture_status_tag(value)), Ok(value));
         }
         for value in [
-            ExtensionKnowledge::AllUnderstood,
-            ExtensionKnowledge::ContainsOpaque,
+            PayloadTransparency::Understood,
+            PayloadTransparency::Mixed,
+            PayloadTransparency::Opaque,
         ] {
             assert_eq!(
-                read_extension_knowledge(extension_knowledge_tag(value)),
+                read_payload_transparency(payload_transparency_tag(value)),
                 Ok(value)
             );
         }
@@ -1614,8 +1756,8 @@ mod tests {
             read_merge_semantics(u8::MAX).expect_err("unknown merge policy is refused"),
             read_checkpoint_semantics(u8::MAX).expect_err("unknown checkpoint policy is refused"),
             read_payload_provenance(u8::MAX).expect_err("unknown provenance is refused"),
-            read_decode_completeness(u8::MAX).expect_err("unknown completeness is refused"),
-            read_extension_knowledge(u8::MAX).expect_err("unknown knowledge grade is refused"),
+            read_capture_status(u8::MAX).expect_err("unknown completeness is refused"),
+            read_payload_transparency(u8::MAX).expect_err("unknown knowledge grade is refused"),
         ] {
             assert!(matches!(
                 error,
@@ -1740,8 +1882,8 @@ mod tests {
         );
 
         let canonical_missing = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Lost"), id("Ghost"), id("Lost")],
         );
         assert_eq!(
@@ -1764,8 +1906,8 @@ mod tests {
             vec![],
             vec![],
             ProvenanceCompleteness::new(
-                DecodeCompleteness::Complete,
-                ExtensionKnowledge::AllUnderstood,
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
                 vec![id("B")],
             ),
         );
@@ -1799,8 +1941,8 @@ mod tests {
         let mut drop_extension = sample_records();
         drop_extension[0].extension_contributions = Arc::from([]);
         drop_extension[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
         let drop_extension = ModuleProvenanceManifest::new(epoch(), drop_extension, TEST_LIMITS)
@@ -1809,8 +1951,8 @@ mod tests {
 
         let mut drop_completeness = sample_records();
         drop_completeness[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Partial,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
         let drop_completeness =
@@ -1940,8 +2082,8 @@ mod tests {
             evidence(0xA1),
         );
         records[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Phantom")],
         );
         observe("direct_import.module+missing_dependency", epoch(), records);
@@ -2045,11 +2187,11 @@ mod tests {
         )]
         .into();
         records[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::ContainsOpaque,
+            CaptureStatus::Complete,
+            PayloadTransparency::Opaque,
             vec![id("Ghost")],
         );
-        observe("extension.provenance+extension_knowledge", epoch(), records);
+        observe("extension.provenance+transparency", epoch(), records);
 
         let mut records = sample_records();
         let original = records[0].extension_contributions[0].clone();
@@ -2099,8 +2241,8 @@ mod tests {
 
         let mut records = sample_records();
         records[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Partial,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
         observe("completeness.decode", epoch(), records);
@@ -2117,8 +2259,8 @@ mod tests {
             evidence(0xA1),
         );
         records[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Lost"), id("Ghost")],
         );
         observe("completeness.missing_dependency_set", epoch(), records);
@@ -2147,8 +2289,8 @@ mod tests {
             evidence(0xA1),
         );
         topology_changed[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
         let topology_changed =
@@ -2318,8 +2460,8 @@ mod tests {
 
         let mut wrong_missing = baseline_records.clone();
         wrong_missing[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![],
         );
         assert!(matches!(
@@ -2329,13 +2471,13 @@ mod tests {
 
         let mut wrong_knowledge = baseline_records.clone();
         wrong_knowledge[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::ContainsOpaque,
+            CaptureStatus::Complete,
+            PayloadTransparency::Opaque,
             vec![id("Ghost")],
         );
         assert!(matches!(
             ModuleProvenanceManifest::new(epoch(), wrong_knowledge, TEST_LIMITS),
-            Err(ModuleProvenanceError::ExtensionKnowledgeMismatch { .. })
+            Err(ModuleProvenanceError::PayloadTransparencyMismatch { .. })
         ));
 
         let mut empty_contribution = baseline_records.clone();
@@ -2486,22 +2628,24 @@ mod tests {
             vec![],
             vec![contribution],
             ProvenanceCompleteness::new(
-                DecodeCompleteness::Partial,
-                ExtensionKnowledge::ContainsOpaque,
+                CaptureStatus::Partial,
+                PayloadTransparency::Opaque,
                 vec![],
             ),
         );
         let manifest = ModuleProvenanceManifest::new(epoch(), vec![record], TEST_LIMITS)
             .expect("opaque partial manifest is retained honestly");
+        let completeness = manifest.records()[0].completeness();
+        assert_eq!(completeness.capture(), CaptureStatus::Partial);
+        assert_eq!(completeness.transparency(), PayloadTransparency::Opaque);
+        // Partial + Opaque is a legal state that keeps inspection and nothing else.
+        // There is deliberately no `is_complete()` to ask instead: that accessor ANDed
+        // the two axes together, so a byte-complete opaque module reported "incomplete"
+        // and the caller could not tell which axis had said so.
         assert_eq!(
-            manifest.records()[0].completeness().decode(),
-            DecodeCompleteness::Partial
+            completeness.authority(),
+            vec![ProvenanceAuthority::Inspection]
         );
-        assert_eq!(
-            manifest.records()[0].completeness().extension_knowledge(),
-            ExtensionKnowledge::ContainsOpaque
-        );
-        assert!(!manifest.records()[0].completeness().is_complete());
         // An opaque payload still gets a full content identity: opacity is about
         // understanding the bytes, not about being unable to name them.
         assert_eq!(
@@ -2513,6 +2657,317 @@ mod tests {
             std::mem::size_of::<ExtensionEntryId>(),
             std::mem::size_of::<Digest>()
         );
+    }
+
+    /// The authority table, written out independently of the implementation so it can
+    /// serve as an oracle rather than a restatement. Consulted by both axis tests.
+    fn expected_authority(
+        capture: CaptureStatus,
+        transparency: PayloadTransparency,
+        has_missing: bool,
+    ) -> Vec<ProvenanceAuthority> {
+        use ProvenanceAuthority::*;
+        match capture {
+            // Nothing was captured, so there is nothing to inspect, replay, or trust.
+            CaptureStatus::Missing => vec![],
+            // Something was captured but not all of it: it can be read and nothing more.
+            CaptureStatus::Partial => vec![Inspection],
+            CaptureStatus::Complete => {
+                if has_missing {
+                    // The module's own content is whole, but its import closure is not,
+                    // so it cannot anchor a cache key or an invalidation cone.
+                    vec![Inspection, ExactReplay, CompleteInventory]
+                } else if transparency == PayloadTransparency::Understood {
+                    vec![
+                        Inspection,
+                        ExactReplay,
+                        CompleteInventory,
+                        AuthoritativeCache,
+                        FineInvalidation,
+                    ]
+                } else {
+                    // Byte-complete but not semantically attributable: everything except
+                    // the one capability that needs to know what the payloads *mean*.
+                    vec![
+                        Inspection,
+                        ExactReplay,
+                        CompleteInventory,
+                        AuthoritativeCache,
+                    ]
+                }
+            }
+        }
+    }
+
+    /// The named mutant this kills: *collapse capture with transparency*.
+    ///
+    /// The rejected design exposed one `is_complete()` boolean that ANDed the capture
+    /// axis, the transparency axis, and the missing-dependency set together. That is
+    /// not merely imprecise, it is lossy: it maps genuinely different states onto the
+    /// same answer, so no caller could recover which axis objected. This test executes
+    /// that collapsed predicate and shows exactly what it destroys.
+    #[test]
+    fn the_axes_are_independent_and_capture_is_not_collapsed_with_transparency() {
+        let completeness = |capture, transparency, missing: Vec<ModuleId>| {
+            ProvenanceCompleteness::new(capture, transparency, missing)
+        };
+
+        // The two states the design names as "both valid with limited authority".
+        let complete_opaque =
+            completeness(CaptureStatus::Complete, PayloadTransparency::Opaque, vec![]);
+        let partial_understood = completeness(
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
+            vec![],
+        );
+
+        // The collapsed predicate the axes replaced, executed rather than described.
+        let collapsed = |c: &ProvenanceCompleteness| {
+            c.capture() == CaptureStatus::Complete
+                && c.transparency() == PayloadTransparency::Understood
+                && c.missing_dependencies().is_empty()
+        };
+        assert!(!collapsed(&complete_opaque));
+        assert!(!collapsed(&partial_understood));
+        assert_eq!(
+            collapsed(&complete_opaque),
+            collapsed(&partial_understood),
+            "the collapsed predicate is expected to conflate these two states — that is the defect"
+        );
+
+        // The axes keep them apart, and so does the authority derived from them: one is
+        // byte-complete and cacheable, the other can only be looked at.
+        assert_ne!(complete_opaque.capture(), partial_understood.capture());
+        assert_ne!(
+            complete_opaque.transparency(),
+            partial_understood.transparency()
+        );
+        assert_ne!(
+            complete_opaque.authority(),
+            partial_understood.authority(),
+            "the collapse mutant survives if authority cannot tell these apart"
+        );
+        assert!(complete_opaque.grants(ProvenanceAuthority::AuthoritativeCache));
+        assert!(!complete_opaque.grants(ProvenanceAuthority::FineInvalidation));
+        assert_eq!(
+            partial_understood.authority(),
+            vec![ProvenanceAuthority::Inspection]
+        );
+
+        // Neither axis may be inferred from the other anywhere in the cross-product: for
+        // each fixed capture there exist transparencies that differ, and vice versa.
+        for capture in [
+            CaptureStatus::Complete,
+            CaptureStatus::Partial,
+            CaptureStatus::Missing,
+        ] {
+            for transparency in [
+                PayloadTransparency::Understood,
+                PayloadTransparency::Mixed,
+                PayloadTransparency::Opaque,
+            ] {
+                let value = completeness(capture, transparency, vec![]);
+                assert_eq!(value.capture(), capture, "capture was rewritten");
+                assert_eq!(
+                    value.transparency(),
+                    transparency,
+                    "transparency was rewritten"
+                );
+            }
+        }
+    }
+
+    /// The named mutant this kills: *grant authority*.
+    ///
+    /// Authority is derived, never stored, so a record cannot assert a capability in
+    /// its bytes. What remains possible is a derivation that hands out too much, which
+    /// this pins against an independently written table over the whole cross-product.
+    #[test]
+    fn every_authority_capability_is_earned_from_the_full_axis_tuple() {
+        let mut observed = BTreeSet::new();
+        for capture in [
+            CaptureStatus::Complete,
+            CaptureStatus::Partial,
+            CaptureStatus::Missing,
+        ] {
+            for transparency in [
+                PayloadTransparency::Understood,
+                PayloadTransparency::Mixed,
+                PayloadTransparency::Opaque,
+            ] {
+                for missing in [Vec::new(), vec![id("Ghost")]] {
+                    let has_missing = !missing.is_empty();
+                    let value = ProvenanceCompleteness::new(capture, transparency, missing);
+                    let expected = expected_authority(capture, transparency, has_missing);
+                    assert_eq!(
+                        value.authority(),
+                        expected,
+                        "authority for {capture:?}/{transparency:?}/missing={has_missing} \
+                         disagrees with the reviewed table"
+                    );
+                    // `grants` and `authority` must agree capability by capability, or
+                    // one of the two surfaces could quietly widen.
+                    for candidate in ProvenanceAuthority::ALL {
+                        assert_eq!(
+                            value.grants(candidate),
+                            expected.contains(&candidate),
+                            "{candidate:?} disagrees for {capture:?}/{transparency:?}"
+                        );
+                    }
+                    observed.insert(value.authority());
+                }
+            }
+        }
+        // The tuple must produce genuinely different capability sets: exactly four
+        // distinct ones (none, inspection-only, complete-with-unknown-closure,
+        // complete-but-opaque, and fully authoritative is five). A derivation that
+        // ignored an axis would collapse this count.
+        assert_eq!(observed.len(), 5, "an axis stopped affecting authority");
+    }
+
+    /// Capture is knowledge from outside the record, so it cannot be recomputed — but
+    /// the one available cross-check is mandatory: claiming nothing was captured while
+    /// carrying contributions is a contradiction, not a permitted axis combination.
+    #[test]
+    fn a_record_cannot_claim_missing_capture_while_carrying_contributions() {
+        for (tag, declarations, extra, contributions) in [
+            ("declaration", vec![name("A.one")], vec![], vec![]),
+            ("extra", vec![], vec![name("A.generated")], vec![]),
+            (
+                "contribution",
+                vec![],
+                vec![],
+                vec![ExtensionContribution::new(
+                    extension_descriptor("simpExt", PayloadProvenance::Understood),
+                    0,
+                    Digest([0x31; 32]),
+                    vec![entry(0x41)],
+                )],
+            ),
+        ] {
+            let record = ModuleContributionRecord::new(
+                ModuleRecord::new(id("A"), true, vec![], evidence(0xA1)),
+                declarations,
+                extra,
+                contributions,
+                ProvenanceCompleteness::new(
+                    CaptureStatus::Missing,
+                    PayloadTransparency::Understood,
+                    vec![],
+                ),
+            );
+            assert!(
+                matches!(
+                    ModuleProvenanceManifest::new(epoch(), vec![record], TEST_LIMITS),
+                    Err(ModuleProvenanceError::CaptureStatusContradicted { .. })
+                ),
+                "a Missing record carrying a {tag} was accepted"
+            );
+        }
+
+        // The refusal is not blanket: Missing over genuinely empty content is the whole
+        // point of the variant, and it is distinguishable from an empty Complete record.
+        let empty = |capture| {
+            ModuleContributionRecord::new(
+                ModuleRecord::new(id("A"), true, vec![], evidence(0xA1)),
+                vec![],
+                vec![],
+                vec![],
+                ProvenanceCompleteness::new(capture, PayloadTransparency::Understood, vec![]),
+            )
+        };
+        let missing = ModuleProvenanceManifest::new(
+            epoch(),
+            vec![empty(CaptureStatus::Missing)],
+            TEST_LIMITS,
+        )
+        .expect("Missing over empty content is legal");
+        let complete = ModuleProvenanceManifest::new(
+            epoch(),
+            vec![empty(CaptureStatus::Complete)],
+            TEST_LIMITS,
+        )
+        .expect("Complete over empty content is legal");
+        assert_ne!(
+            missing.root(),
+            complete.root(),
+            "the two opposite claims about the same empty content must not share a root"
+        );
+        assert_eq!(missing.records()[0].completeness().authority(), vec![]);
+    }
+
+    /// Transparency is recomputed from the descriptors and resolves to three states.
+    /// `Mixed` is what keeps an opaque boundary localized; folding it into `Opaque`
+    /// would condemn every understood contribution beside it.
+    #[test]
+    fn mixed_transparency_is_derived_and_localizes_the_opaque_boundary() {
+        let understood = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let opaque = extension_descriptor("opaqueExt", PayloadProvenance::Opaque);
+        let contribution = |descriptor: &ExtensionDescriptor, seed: u8| {
+            ExtensionContribution::new(
+                descriptor.clone(),
+                0,
+                Digest([0x31; 32]),
+                vec![entry_for(descriptor, &[seed])],
+            )
+        };
+
+        for (contributions, expected) in [
+            (
+                vec![contribution(&understood, 1)],
+                PayloadTransparency::Understood,
+            ),
+            (vec![contribution(&opaque, 2)], PayloadTransparency::Opaque),
+            (
+                vec![contribution(&understood, 1), contribution(&opaque, 2)],
+                PayloadTransparency::Mixed,
+            ),
+            // A module with no extension contributions is vacuously understood.
+            (vec![], PayloadTransparency::Understood),
+        ] {
+            let record = ModuleContributionRecord::new(
+                ModuleRecord::new(id("A"), true, vec![], evidence(0xA1)),
+                vec![name("A.one")],
+                vec![],
+                contributions,
+                ProvenanceCompleteness::new(CaptureStatus::Complete, expected, vec![]),
+            );
+            let manifest = ModuleProvenanceManifest::new(epoch(), vec![record], TEST_LIMITS)
+                .expect("the claimed transparency matches the descriptors");
+            assert_eq!(
+                manifest.records()[0].completeness().transparency(),
+                expected
+            );
+
+            // Mixed is byte-complete, so it keeps every capability except the semantic
+            // one — the localization claim, stated as authority rather than prose.
+            if expected == PayloadTransparency::Mixed {
+                let completeness = manifest.records()[0].completeness();
+                assert!(completeness.grants(ProvenanceAuthority::AuthoritativeCache));
+                assert!(!completeness.grants(ProvenanceAuthority::FineInvalidation));
+            }
+        }
+
+        // A record that rounds Mixed off to Opaque is refused by the recomputation.
+        let record = ModuleContributionRecord::new(
+            ModuleRecord::new(id("A"), true, vec![], evidence(0xA1)),
+            vec![name("A.one")],
+            vec![],
+            vec![contribution(&understood, 1), contribution(&opaque, 2)],
+            ProvenanceCompleteness::new(
+                CaptureStatus::Complete,
+                PayloadTransparency::Opaque,
+                vec![],
+            ),
+        );
+        assert!(matches!(
+            ModuleProvenanceManifest::new(epoch(), vec![record], TEST_LIMITS),
+            Err(ModuleProvenanceError::PayloadTransparencyMismatch {
+                expected: PayloadTransparency::Mixed,
+                actual: PayloadTransparency::Opaque,
+                ..
+            })
+        ));
     }
 
     /// The named mutant this kills: *alias `ExtensionEntryId` to the mutable journal
@@ -2739,8 +3194,8 @@ mod tests {
                     },
                     vec![],
                     ProvenanceCompleteness::new(
-                        DecodeCompleteness::Complete,
-                        ExtensionKnowledge::AllUnderstood,
+                        CaptureStatus::Complete,
+                        PayloadTransparency::Understood,
                         vec![],
                     ),
                 )
