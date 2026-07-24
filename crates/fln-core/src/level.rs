@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use crate::debug_walk::FlatDebug;
 use crate::lean_hash::mix_hash;
 use crate::name::Name;
 
@@ -122,11 +123,73 @@ pub struct Level {
 }
 
 impl std::fmt::Debug for Level {
+    /// Byte-identical to the derived rendering, walked on an explicit task stack:
+    /// `debug_struct` would descend one frame per level and overflow on deep input
+    /// (bead franken_lean-canon-stack-safe-drop-6gy).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Level")
-            .field("node", self.node())
-            .field("data", &self.data)
-            .finish()
+        enum Task<'a> {
+            Level(&'a Level),
+            Node(&'a Node),
+            Field(&'static str),
+            Entry,
+            Leaf(&'a dyn std::fmt::Debug),
+            Close,
+        }
+
+        let mut out = FlatDebug::new(f);
+        let mut tasks = vec![Task::Level(self)];
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Level(level) => {
+                    out.open_struct("Level")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Leaf(&level.data));
+                    tasks.push(Task::Field("data"));
+                    tasks.push(Task::Node(level.node()));
+                    tasks.push(Task::Field("node"));
+                }
+                Task::Node(Node::Zero) => out.unit("Zero")?,
+                Task::Node(Node::Succ(inner)) => {
+                    out.open_tuple("Succ")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Level(inner));
+                    out.entry()?;
+                }
+                Task::Node(Node::Max(left, right)) => {
+                    out.open_tuple("Max")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Level(right));
+                    tasks.push(Task::Entry);
+                    tasks.push(Task::Level(left));
+                    out.entry()?;
+                }
+                Task::Node(Node::IMax(left, right)) => {
+                    out.open_tuple("IMax")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Level(right));
+                    tasks.push(Task::Entry);
+                    tasks.push(Task::Level(left));
+                    out.entry()?;
+                }
+                Task::Node(Node::Param(name)) => {
+                    out.open_tuple("Param")?;
+                    out.entry()?;
+                    out.leaf(name)?;
+                    out.close()?;
+                }
+                Task::Node(Node::MVar(id)) => {
+                    out.open_tuple("MVar")?;
+                    out.entry()?;
+                    out.leaf(id)?;
+                    out.close()?;
+                }
+                Task::Field(name) => out.field(name)?,
+                Task::Entry => out.entry()?,
+                Task::Leaf(value) => out.leaf(value)?,
+                Task::Close => out.close()?,
+            }
+        }
+        Ok(())
     }
 }
 

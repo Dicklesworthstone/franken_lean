@@ -21,6 +21,8 @@
 
 #![forbid(unsafe_code)]
 
+mod debug_walk;
+
 pub mod diag;
 pub mod expr;
 pub mod ids;
