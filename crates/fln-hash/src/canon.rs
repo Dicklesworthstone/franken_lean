@@ -1365,6 +1365,130 @@ mod tests {
         right_thread.join().expect("right dropper completes");
     }
 
+    /// The recursive descent that [`read_level_iter`] replaced (bead
+    /// franken_lean-fnj). Test-only, and it exists for exactly one reason: a
+    /// bounded-stack decode test that passes proves nothing unless the same test
+    /// is known to FAIL against a recursive reader. The byte grammar is identical,
+    /// so the only difference under test is where the control stack lives.
+    fn recursive_level_decoder_mutant(r: &mut CanonReader<'_>) -> Result<Level, CanonError> {
+        match r.u8()? {
+            LEVEL_ZERO => Ok(Level::zero()),
+            LEVEL_SUCC => {
+                let u = recursive_level_decoder_mutant(r)?;
+                u.succ()
+                    .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))
+            }
+            LEVEL_MAX => {
+                let a = recursive_level_decoder_mutant(r)?;
+                let b = recursive_level_decoder_mutant(r)?;
+                Level::max(a, b)
+                    .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))
+            }
+            LEVEL_IMAX => {
+                let a = recursive_level_decoder_mutant(r)?;
+                let b = recursive_level_decoder_mutant(r)?;
+                Level::imax(a, b)
+                    .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))
+            }
+            LEVEL_PARAM => Ok(Level::param(Name::read_body(r)?)),
+            LEVEL_MVAR => Ok(Level::mvar(LMVarId(Name::read_body(r)?))),
+            _ => Err(r.err_public("unknown level tag")),
+        }
+    }
+
+    /// The recursive descent that [`read_expr_iter`] replaced (bead
+    /// franken_lean-fnj); see [`recursive_level_decoder_mutant`].
+    fn recursive_expr_decoder_mutant(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
+        match r.u8()? {
+            EXPR_BVAR => Expr::bvar(r.u32()?)
+                .map_err(|_| r.err_public("bvar exceeds the 20-bit range covenant")),
+            EXPR_FVAR => Ok(Expr::fvar(FVarId(Name::read_body(r)?))),
+            EXPR_MVAR => Ok(Expr::mvar(MVarId(Name::read_body(r)?))),
+            EXPR_SORT => Ok(Expr::sort(recursive_level_decoder_mutant(r)?)),
+            EXPR_CONST => {
+                let name = Name::read_body(r)?;
+                let count = r.u64()?;
+                let mut levels = Vec::new();
+                for _ in 0..count {
+                    levels.push(recursive_level_decoder_mutant(r)?);
+                }
+                Ok(Expr::const_(name, levels))
+            }
+            EXPR_APP => {
+                let f = recursive_expr_decoder_mutant(r)?;
+                let a = recursive_expr_decoder_mutant(r)?;
+                Ok(Expr::app(f, a))
+            }
+            EXPR_LAM => {
+                let binder_name = Name::read_body(r)?;
+                let binder_type = recursive_expr_decoder_mutant(r)?;
+                let body = recursive_expr_decoder_mutant(r)?;
+                let bi = binder_info_from_tag(r.u8()?)
+                    .ok_or_else(|| r.err_public("unknown binder-info tag"))?;
+                Ok(Expr::lam(binder_name, binder_type, body, bi))
+            }
+            EXPR_FORALL => {
+                let binder_name = Name::read_body(r)?;
+                let binder_type = recursive_expr_decoder_mutant(r)?;
+                let body = recursive_expr_decoder_mutant(r)?;
+                let bi = binder_info_from_tag(r.u8()?)
+                    .ok_or_else(|| r.err_public("unknown binder-info tag"))?;
+                Ok(Expr::forall_e(binder_name, binder_type, body, bi))
+            }
+            EXPR_LET => {
+                let decl_name = Name::read_body(r)?;
+                let type_ = recursive_expr_decoder_mutant(r)?;
+                let value = recursive_expr_decoder_mutant(r)?;
+                let body = recursive_expr_decoder_mutant(r)?;
+                let non_dep = r.bool()?;
+                Ok(Expr::let_e(decl_name, type_, value, body, non_dep))
+            }
+            EXPR_LIT_NAT => {
+                let count = r.u64()?;
+                let mut limbs = Vec::new();
+                for _ in 0..count {
+                    limbs.push(r.u64()?);
+                }
+                let lit = NatLit::from_limbs_le(limbs.clone());
+                if lit.limbs_le() != limbs.as_slice() {
+                    return Err(r.err_public("non-normalized nat literal limbs"));
+                }
+                Ok(Expr::lit(Literal::Nat(lit)))
+            }
+            EXPR_LIT_STR => Ok(Expr::lit(Literal::Str(r.str()?.to_string()))),
+            EXPR_MDATA => {
+                let data = KVMap::read_body(r)?;
+                let expr = recursive_expr_decoder_mutant(r)?;
+                Ok(Expr::mdata(data, expr))
+            }
+            EXPR_PROJ => {
+                let struct_name = Name::read_body(r)?;
+                let idx = r.u64()?;
+                let expr = recursive_expr_decoder_mutant(r)?;
+                Ok(Expr::proj(struct_name, idx, expr))
+            }
+            _ => Err(r.err_public("unknown expr tag")),
+        }
+    }
+
+    /// Decode a schema-headed artifact with one of the recursive mutants, mirroring
+    /// [`Canonical::from_canonical_bytes`] exactly apart from the reader it calls.
+    fn decode_with_mutant_level(bytes: &[u8]) -> Result<Level, CanonError> {
+        let mut r = CanonReader::new(bytes);
+        r.expect_schema(SCHEMA_LEVEL)?;
+        let value = recursive_level_decoder_mutant(&mut r)?;
+        r.finish()?;
+        Ok(value)
+    }
+
+    fn decode_with_mutant_expr(bytes: &[u8]) -> Result<Expr, CanonError> {
+        let mut r = CanonReader::new(bytes);
+        r.expect_schema(SCHEMA_EXPR)?;
+        let value = recursive_expr_decoder_mutant(&mut r)?;
+        r.finish()?;
+        Ok(value)
+    }
+
     /// Deterministic value generator (LCG — no external randomness, D1).
     struct Gen(u64);
 
@@ -1807,6 +1931,10 @@ mod tests {
                         panic!("recursive Level encoder mutation unexpectedly survived");
                     }
                     let level_bytes = level.to_canonical_bytes();
+                    if mutant.as_deref() == Some("recursive-level-decoder") {
+                        let _ = decode_with_mutant_level(&level_bytes);
+                        panic!("recursive Level decoder mutation unexpectedly survived");
+                    }
                     let decoded_level = Level::from_canonical_bytes(&level_bytes)
                         .expect("deep valid level decodes");
                     assert_eq!(decoded_level.to_canonical_bytes(), level_bytes);
@@ -1824,6 +1952,10 @@ mod tests {
                         panic!("recursive Expr encoder mutation unexpectedly survived");
                     }
                     let expr_bytes = expr.to_canonical_bytes();
+                    if mutant.as_deref() == Some("recursive-expr-decoder") {
+                        let _ = decode_with_mutant_expr(&expr_bytes);
+                        panic!("recursive Expr decoder mutation unexpectedly survived");
+                    }
                     let decoded_expr = Expr::from_canonical_bytes(&expr_bytes)
                         .expect("deep valid expression decodes");
                     assert_eq!(decoded_expr.to_canonical_bytes(), expr_bytes);
@@ -1938,6 +2070,147 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr),
             );
             print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+    }
+
+    /// Mutation kill for the DECODE side (bead franken_lean-fnj).
+    ///
+    /// `deeply_nested_input_is_a_typed_error_not_a_stack_overflow` and the deep
+    /// valid-lifecycle probe both pass today, but a passing test proves nothing
+    /// about a hazard unless it is known to fail when the hazard returns. These
+    /// children run the byte-identical RECURSIVE readers over the same deep valid
+    /// artifacts; each must die of a stack overflow in its own process. A control
+    /// child with no mutation must succeed on identical input, so a failure here
+    /// cannot be blamed on the harness.
+    ///
+    /// The encoder mutants (`recursive-{level,expr}-encoder`) are killed by
+    /// `scripts/e2e/canon_lifecycle.sh`; these decoder mutants are killed here as
+    /// well so the guard is part of the `cargo test` gate rather than only the lane.
+    #[test]
+    fn recursive_decoder_mutants_die_where_the_iterative_readers_survive() {
+        // Deep enough that a recursive reader cannot fit in the probe's 1 MiB
+        // worker stack, small enough to keep three child processes quick.
+        const DEPTH: &str = "50000";
+        let executable = std::env::current_exe().expect("locate current test binary");
+        let run = |mutant: Option<&str>| {
+            let mut command = std::process::Command::new(&executable);
+            command
+                .arg("--exact")
+                .arg("canon::tests::deep_valid_lifecycle_is_stack_safe_in_subprocess")
+                .arg("--nocapture")
+                .env("FLN_CANON_LIFECYCLE_CHILD", "1")
+                .env("FLN_CANON_LIFECYCLE_DEPTH", DEPTH)
+                .env("FLN_CANON_LIFECYCLE_NAME_DEPTH", "1024");
+            if let Some(mutant) = mutant {
+                command.env("FLN_CANON_LIFECYCLE_MUTANT", mutant);
+            }
+            command
+                .output()
+                .expect("launch sacrificial decoder process")
+        };
+
+        let control = run(None);
+        assert!(
+            control.status.success(),
+            "control child failed on unmutated input: status={:?}\nstderr={}",
+            control.status,
+            String::from_utf8_lossy(&control.stderr),
+        );
+
+        for mutant in ["recursive-level-decoder", "recursive-expr-decoder"] {
+            let killed = run(Some(mutant));
+            assert!(
+                !killed.status.success(),
+                "{mutant} survived: a recursive decoder must not decode a deep artifact"
+            );
+            // The kill must be the intended one. A panic from the "unexpectedly
+            // survived" guard, an unrelated assertion, or an early exit would also
+            // be non-success, and none of those prove stack exhaustion.
+            let stderr = String::from_utf8_lossy(&killed.stderr);
+            assert!(
+                stderr.contains("stack overflow"),
+                "{mutant} died for the wrong reason: status={:?}\nstderr={stderr}",
+                killed.status,
+            );
+        }
+    }
+
+    /// Every prefix of a valid artifact is malformed input, and malformed input is
+    /// a typed error — never a panic, an abort, or a silent success (D8, FL-INV-07,
+    /// bead franken_lean-fnj). A panic anywhere in the sweep fails this test by
+    /// propagating, so "does not panic" needs no separate assertion.
+    #[test]
+    fn every_truncation_of_a_valid_artifact_is_a_typed_error() {
+        let mut generator = Gen(0x5eed_1234);
+        let mut checked = 0usize;
+        for _ in 0..24 {
+            let name = generator.name(4);
+            let level = generator.level(3);
+            let expr = generator.expr(3);
+
+            for (label, bytes, decode_artifact) in [
+                (
+                    "name",
+                    name.to_canonical_bytes(),
+                    (|b: &[u8]| Name::from_canonical_bytes(b).map(|_| ()))
+                        as fn(&[u8]) -> Result<(), CanonError>,
+                ),
+                (
+                    "level",
+                    level.to_canonical_bytes(),
+                    (|b: &[u8]| Level::from_canonical_bytes(b).map(|_| ()))
+                        as fn(&[u8]) -> Result<(), CanonError>,
+                ),
+                (
+                    "expr",
+                    expr.to_canonical_bytes(),
+                    (|b: &[u8]| Expr::from_canonical_bytes(b).map(|_| ()))
+                        as fn(&[u8]) -> Result<(), CanonError>,
+                ),
+            ] {
+                assert!(
+                    decode_artifact(&bytes).is_ok(),
+                    "{label} fixture must decode intact"
+                );
+                for cut in 0..bytes.len() {
+                    let error = decode_artifact(&bytes[..cut])
+                        .expect_err("a truncated artifact must never decode as a value");
+                    assert!(
+                        !error.what.is_empty(),
+                        "{label} truncated at {cut} produced an unlabelled error"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1_000, "the sweep must cover every field boundary");
+    }
+
+    /// Arbitrary bytes are not a crash: corrupting a valid artifact may decode to
+    /// some other value, or fail with a typed error, and nothing else. Seeded, so a
+    /// failure replays exactly.
+    #[test]
+    fn corrupted_artifacts_never_panic_and_always_type_their_errors() {
+        let mut generator = Gen(0xc0ff_ee01);
+        for _ in 0..400 {
+            let expr = generator.expr(3);
+            let mut bytes = expr.to_canonical_bytes();
+            if bytes.is_empty() {
+                continue;
+            }
+            let flips = 1 + generator.range(3) as usize;
+            for _ in 0..flips {
+                let index = generator.range(bytes.len() as u64) as usize;
+                bytes[index] = generator.range(256) as u8;
+            }
+            // Either outcome is legal; the point is that neither aborts, and that a
+            // refusal is always a labelled, public error rather than a bare panic.
+            if let Err(error) = Expr::from_canonical_bytes(&bytes) {
+                assert!(
+                    !error.what.is_empty(),
+                    "corruption produced an empty reason"
+                );
+            }
         }
     }
 }
