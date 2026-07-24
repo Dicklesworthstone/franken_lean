@@ -653,7 +653,11 @@ launch_supervisor() {
   ACTIVE_STEP="$step"
   ACTIVE_READINESS="$LAST_READY"
   SPAWNING=1
-  setsid -- python3 "$EVIDENCE" run --cwd "$ROOT" --metadata "$LAST_META" \
+  # Supervised commands normally run from the workspace root. STEP_CWD lets a step run
+  # the guard from a member directory instead, which is how the acceptance requires the
+  # invocation-directory independence of the verdict to be demonstrated. It is reset by
+  # the caller after each such step so no later step inherits it.
+  setsid -- python3 "$EVIDENCE" run --cwd "${STEP_CWD:-$ROOT}" --metadata "$LAST_META" \
     --stdout "$LAST_OUT" --stderr "$LAST_ERR" --readiness "$LAST_READY" \
     --launch-ready "$launch_ready" --launch-release "$launch_release" \
     --artifact-root "$ART_DIR" --capture-bytes "$capture_bytes" \
@@ -1232,6 +1236,18 @@ guard_step seeded_decoy_toolchain "$DECOY_TOOLCHAIN" 1 fail \
 CONFIG_RECOVERY="$SCRATCH_ROOT/config-recovery"
 copy_fixture copy_config_recovery "$CONFIG_RECOVERY"
 guard_step config_recovery "$CONFIG_RECOVERY" 0 pass
+
+# Invocation-directory independence. The whole reason the configuration-discovery walk
+# above exists is that a supported command can run from a member directory, where cargo
+# and rustup resolve configuration differently than at the root. So the gate itself must
+# be demonstrated from those directories and not only from the root: a verdict that
+# depends on the caller's working directory would mean the evidence names a scan nobody
+# can reproduce. Same frozen binary, same explicit --root, same expected pass.
+STEP_CWD="$ROOT/crates/fln-kernel"
+guard_step crate_dir_invocation "$ROOT" 0 pass
+STEP_CWD="$ROOT/tools/structure-guard"
+guard_step tool_dir_invocation "$ROOT" 0 pass
+unset STEP_CWD
 
 # A real guard invocation that exceeds a deliberately tiny output budget is typed
 # inconclusive. The same frozen binary immediately recovers under the normal budget.

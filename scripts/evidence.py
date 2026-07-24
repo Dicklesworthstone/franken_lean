@@ -142,6 +142,8 @@ E2E_STEP_ORDERS = {
         "seeded_decoy_toolchain",
         "copy_config_recovery",
         "config_recovery",
+        "crate_dir_invocation",
+        "tool_dir_invocation",
         "resource_exhaustion",
         "resource_recovery",
         "cancellation",
