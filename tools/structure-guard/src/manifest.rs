@@ -26,6 +26,13 @@ pub struct Manifest {
     pub name: String,
     pub edition: String,
     pub deps: Vec<Dep>,
+    /// Explicit feature names from the one reviewed `[features]` table.
+    ///
+    /// Feature values are validated while parsing, but the structural authority
+    /// inventory also needs the exact axis cardinality. Keeping the names here
+    /// prevents robot evidence from claiming a closed feature class without
+    /// deriving it from the same manifest parse that drives the dependency audit.
+    pub features: Vec<String>,
 }
 
 const DEP_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
@@ -367,6 +374,7 @@ pub fn parse(text: &str, display_path: &str) -> Result<Manifest, String> {
         name: name.ok_or_else(|| format!("{display_path}: missing package.name"))?,
         edition: edition.ok_or_else(|| format!("{display_path}: missing package.edition"))?,
         deps,
+        features: feature_keys.into_iter().collect(),
     })
 }
 
@@ -382,6 +390,7 @@ mod tests {
         assert_eq!(m.name, "fln-core");
         assert_eq!(m.edition, "2024");
         assert!(m.deps.is_empty());
+        assert!(m.features.is_empty());
     }
 
     #[test]
@@ -409,6 +418,7 @@ mod tests {
         let text = format!("{OK}\n[features]\niron = []\nfrontier = [\"iron\", \"dep:fln-jit\"]\n");
         let m = parse(&text, "t").expect("parses");
         assert!(m.deps.is_empty());
+        assert_eq!(m.features, ["frontier", "iron"]);
 
         let malformed = format!("{OK}\n[features]\niron = [\"ok\",, \"bad\"]\n");
         assert!(parse(&malformed, "t").is_err());

@@ -21,7 +21,14 @@
 
 mod common;
 
+use std::fs;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
 use common::*;
+use structure_guard::checks::Authority;
 
 // Finding codes as named constants: a matrix suite reads better when the code under test
 // is named once, and it keeps `f.code == "FLN-..."` string-literal comparisons out of the
@@ -30,6 +37,8 @@ const SHAPE: &str = "FLN-STRUCT-016";
 const COVENANT: &str = "FLN-STRUCT-015";
 const DEP_PATH: &str = "FLN-STRUCT-023";
 const INCONCLUSIVE: &str = "FLN-STRUCT-027";
+const SOURCE_CHANGED: &str = "FLN-STRUCT-028";
+const COMPILER_IDENTITY: &str = "FLN-STRUCT-029";
 const LAYERING: &str = "FLN-STRUCT-007";
 const PRIMARY_LIB: &str = "crates/fln-hash/src/lib.rs";
 
@@ -42,6 +51,32 @@ fn the_baseline_authority_fixture_is_clean() {
     let out = ws.run();
     assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
     assert_eq!(out.crate_count, FIXTURE_CRATES.len());
+    assert_eq!(out.authority, Authority::Complete);
+    assert!(out.traversal.count_rule_holds());
+}
+
+/// Target inventory counts Cargo roots, while the authority scan still covers every
+/// contributing Rust module. A nested support module must not be reported as a second
+/// integration-test target.
+#[test]
+fn target_inventory_does_not_count_nested_modules_as_cargo_targets() {
+    let ws = TempWs::new("authority-target-cardinality");
+    base(&ws);
+    ws.write(
+        "crates/fln-core/tests/integration.rs",
+        "#![forbid(unsafe_code)]\nmod support;\n",
+    );
+    ws.write(
+        "crates/fln-core/tests/support/mod.rs",
+        "#![forbid(unsafe_code)]\npub fn fixture() {}\n",
+    );
+    let out = ws.run();
+    assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
+    assert_eq!(
+        out.authority_inventory.targets,
+        FIXTURE_CRATES.len() + 1,
+        "one integration-test root plus its module was not classified exactly"
+    );
 }
 
 // ---------------------------------------------------------------- hidden workspace/target
@@ -374,6 +409,16 @@ fn an_unreadable_governed_input_is_inconclusive_and_masks_nothing() {
         base(&ws);
         ws.write_bytes(rel, &GARBAGE);
         let out = ws.run();
+        assert_eq!(
+            out.authority,
+            Authority::Incomplete,
+            "{rel} must not produce an authoritative verdict"
+        );
+        assert!(
+            out.traversal.count_rule_holds(),
+            "{rel} broke traversal conservation: {:?}",
+            out.traversal
+        );
         assert!(
             out.findings
                 .iter()
@@ -410,5 +455,73 @@ fn an_unscannable_root_is_a_setup_failure_not_an_empty_pass() {
     assert!(
         structure_guard::checks::run(&root).is_err(),
         "an empty root must not report a clean structural verdict"
+    );
+}
+
+/// A run over two different source states has no authoritative subject. The changing
+/// file is deliberately irrelevant to every semantic check but inside the governed
+/// closure, proving that pre/post root binding catches concurrent edits independently of
+/// whether they happen to alter a finding.
+#[test]
+fn a_concurrent_governed_root_change_is_typed_inconclusive() {
+    let ws = TempWs::new("authority-concurrent-root-change");
+    base(&ws);
+    ws.write("ci/concurrent-root-change.txt", "sequence=0\n");
+    let root = ws.materialize().expect("materialize retained fixture");
+    let changing = root.join("ci/concurrent-root-change.txt");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let writer = thread::spawn(move || {
+        let mut sequence = 1_u64;
+        while !writer_stop.load(Ordering::Acquire) {
+            fs::write(&changing, format!("sequence={sequence}\n"))
+                .expect("rewrite retained churn fixture");
+            sequence = sequence.checked_add(1).expect("test sequence fits u64");
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    // Give the writer one turn before the first snapshot. It then keeps writing unique
+    // values throughout the scan, so the two retained roots cannot agree by parity.
+    thread::sleep(Duration::from_millis(5));
+    let out = structure_guard::checks::run(&root).expect("guard reports source drift");
+    stop.store(true, Ordering::Release);
+    writer.join().expect("churn writer exits");
+
+    assert_eq!(out.authority, Authority::Incomplete);
+    assert_eq!(out.verdict(), "inconclusive");
+    assert_eq!(out.exit_code(), 3);
+    assert_ne!(out.governed_root_before, out.governed_root_after);
+    assert!(
+        out.findings
+            .iter()
+            .any(|finding| finding.code == SOURCE_CHANGED),
+        "source change was not typed: {:?}",
+        out.findings
+    );
+}
+
+/// The source contract can be complete while the process executes a different compiler.
+/// That disagreement is evidence failure, not a structural rejection of the source.
+#[test]
+fn a_mismatched_effective_compiler_is_typed_inconclusive() {
+    let ws = TempWs::new("authority-compiler-mismatch");
+    base(&ws);
+    ws.write(
+        "SUITE.lock",
+        &SUITE_LOCK_FIXTURE.replace("rust-release 1.99.0-nightly", "rust-release 1.98.0-nightly"),
+    );
+    let out = ws.run();
+    assert_eq!(out.authority, Authority::Incomplete);
+    assert_eq!(out.verdict(), "inconclusive");
+    assert_eq!(out.exit_code(), 3);
+    assert!(out.compiler_identity.contract_declared);
+    assert!(!out.compiler_identity.contract_match);
+    assert!(
+        out.findings
+            .iter()
+            .any(|finding| finding.code == COMPILER_IDENTITY),
+        "compiler mismatch was not typed: {:?}",
+        out.findings
     );
 }

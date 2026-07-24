@@ -14,8 +14,8 @@ use structure_guard::{checks, report};
 
 const USAGE: &str = "usage: structure-guard [--root <path>] [--robot]\n\
   --root <path>  workspace root to check (default: current directory)\n\
-  --robot        NDJSON output (schema structure-guard/2) on stdout\n\
-exit codes: 0 clean, 1 findings, 2 setup failure";
+  --robot        NDJSON output (schema structure-guard/3) on stdout\n\
+exit codes: 0 clean, 1 findings, 2 setup failure, 3 inconclusive authority";
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliAction {
@@ -132,7 +132,7 @@ fn main() -> ExitCode {
     let root_display = root.display().to_string();
     match checks::run(&root) {
         Ok(outcome) => {
-            let clean = outcome.findings.is_empty();
+            let exit_code = outcome.exit_code();
             if robot {
                 print!(
                     "{}",
@@ -141,11 +141,7 @@ fn main() -> ExitCode {
             } else {
                 print!("{}", report::render_human(&root_display, &outcome));
             }
-            if clean {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+            ExitCode::from(exit_code)
         }
         Err(e) => {
             if robot {

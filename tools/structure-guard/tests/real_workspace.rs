@@ -25,7 +25,7 @@ fn assert_versioned_robot_lines(stdout: &str, expected_lines: usize) {
     assert!(
         lines
             .iter()
-            .all(|line| line.contains("\"schema\":\"structure-guard/2\"")),
+            .all(|line| line.contains("\"schema\":\"structure-guard/3\"")),
         "robot output used the wrong schema: {stdout}"
     );
 }
@@ -46,6 +46,37 @@ fn real_workspace_is_structurally_clean() {
         outcome.crate_count > 0,
         "workspace discovery found no crates"
     );
+}
+
+#[test]
+fn robot_real_workspace_binds_complete_authority_evidence() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let output = run_cli(&[
+        "--root",
+        root.to_str().expect("workspace root is UTF-8"),
+        "--robot",
+    ]);
+    assert!(
+        output.status.success(),
+        "robot guard failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty(), "robot stderr must be empty");
+    let stdout = String::from_utf8(output.stdout).expect("robot stdout is UTF-8");
+    assert_versioned_robot_lines(&stdout, 2);
+    assert!(stdout.contains("\"root_identity\":\"/"));
+    assert!(stdout.contains("\"authority_inventory\":{"));
+    assert!(stdout.contains("\"effective_compiler_identity\":{"));
+    assert!(stdout.contains("\"contract_declared\":true"));
+    assert!(stdout.contains("\"contract_match\":true"));
+    assert!(stdout.contains("\"admitted_environment\":{"));
+    assert!(stdout.contains("\"authority\":\"complete\""));
+    assert!(stdout.contains("\"authority_count_rule_holds\":true"));
+    assert!(stdout.contains("\"governed_root_unchanged\":true"));
+    assert!(stdout.contains("\"verdict\":\"pass\""));
 }
 
 #[test]

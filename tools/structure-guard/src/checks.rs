@@ -33,10 +33,17 @@
 //!   that one unreadable input cannot mask every other finding in the run, and it is
 //!   still a finding — never a pass — because the covenant, lint posture, or ledger
 //!   evidence that file carries was not established (FL-INV-07).
+//! * `FLN-STRUCT-028` governed inputs changed during the scan, so the verdict is
+//!   inconclusive rather than being attached to a hybrid source root.
+//! * `FLN-STRUCT-029` the effective compiler identity disagrees with the complete
+//!   `SUITE.lock` compiler contract, so compiler authority is inconclusive.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::boundary_api;
 use crate::export_status;
@@ -62,6 +69,428 @@ pub struct RunOutcome {
     pub crate_count: usize,
     pub edge_count: usize,
     pub graph_digest: u64,
+    pub root_identity: String,
+    pub governed_root_before: u64,
+    pub governed_root_after: u64,
+    pub traversal: TraversalFacts,
+    pub authority: Authority,
+    pub authority_inventory: AuthorityInventory,
+    pub compiler_identity: CompilerIdentity,
+    pub admitted_environment: AdmittedEnvironment,
+}
+
+/// Whether the run established authority over its complete governed input closure.
+///
+/// A structural violation over a complete closure is an authoritative failure. An
+/// unreadable input, compiler-identity ambiguity, or a root that changed during the
+/// scan is different: it is inconclusive under FL-INV-07 and must never be rendered
+/// as either a clean pass or an authoritative rejection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Authority {
+    Complete,
+    Incomplete,
+}
+
+impl Authority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Conservation facts for the dependency-free governed-input traversal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraversalFacts {
+    pub directories_visited: usize,
+    pub files_discovered: usize,
+    pub files_scanned: usize,
+    pub files_skipped_unreadable: usize,
+}
+
+impl TraversalFacts {
+    pub fn count_rule_holds(&self) -> bool {
+        self.files_scanned
+            .checked_add(self.files_skipped_unreadable)
+            .is_some_and(|total| total == self.files_discovered)
+    }
+}
+
+/// Exact cardinalities behind the package/target/feature/target-triple authority axes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityInventory {
+    pub packages: usize,
+    pub targets: usize,
+    pub features: usize,
+    pub target_triples: usize,
+}
+
+/// Runtime compiler facts, compared against the mechanically parsed `SUITE.lock` rows.
+///
+/// Paths are deliberately not emitted: the public evidence needs identity, not a home
+/// directory or other host-specific path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilerIdentity {
+    pub source: &'static str,
+    pub channel: Option<String>,
+    pub release: Option<String>,
+    pub commit: Option<String>,
+    pub host: Option<String>,
+    pub contract_declared: bool,
+    pub contract_match: bool,
+}
+
+/// Names-only environment evidence. Values are never retained or rendered because
+/// compiler-related environment variables can contain credentials or host paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedEnvironment {
+    pub policy: &'static str,
+    pub admitted_names: Vec<String>,
+    pub compiler_override_names: Vec<String>,
+}
+
+impl RunOutcome {
+    pub fn verdict(&self) -> &'static str {
+        if self.authority == Authority::Incomplete {
+            "inconclusive"
+        } else if self.findings.is_empty() {
+            "pass"
+        } else {
+            "fail"
+        }
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        match self.verdict() {
+            "pass" => 0,
+            "fail" => 1,
+            "inconclusive" => 3,
+            _ => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GovernedSnapshot {
+    digest: u64,
+    directories_visited: usize,
+    files_discovered: usize,
+    files_scanned: usize,
+    unreadable: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct RustcProbe {
+    source: &'static str,
+    release: Option<String>,
+    commit: Option<String>,
+    host: Option<String>,
+}
+
+const GOVERNED_ROOT_FILES: [&str; 4] = ["Cargo.toml", LOCK_FILE, SUITE_LOCK_FILE, TOOLCHAIN_FILE];
+const GOVERNED_ROOT_DIRS: [&str; 3] = ["ci", "crates", "tools"];
+pub const AUTHORITY_COUNT_RULE: &str = "files_scanned+files_skipped_unreadable=files_discovered";
+
+fn fnv_update(mut state: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        state ^= u64::from(*byte);
+        state = state.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    state
+}
+
+fn bind_field(state: &mut u64, bytes: &[u8]) {
+    *state = fnv_update(*state, &(bytes.len() as u64).to_le_bytes());
+    *state = fnv_update(*state, bytes);
+}
+
+fn normalized_relative(root: &Path, path: &Path) -> Result<String, String> {
+    path.strip_prefix(root)
+        .map_err(|_| {
+            format!(
+                "{} escaped canonical root {}",
+                path.display(),
+                root.display()
+            )
+        })?
+        .to_str()
+        .map(|relative| relative.replace('\\', "/"))
+        .ok_or_else(|| format!("governed path is not UTF-8: {}", path.display()))
+}
+
+fn collect_governed_entries(
+    root: &Path,
+    start: &Path,
+    entries: &mut Vec<(String, u8, Vec<u8>)>,
+    snapshot: &mut GovernedSnapshot,
+) {
+    let rel = match normalized_relative(root, start) {
+        Ok(rel) => rel,
+        Err(detail) => {
+            snapshot
+                .unreadable
+                .push((start.display().to_string(), detail));
+            return;
+        }
+    };
+    let metadata = match fs::symlink_metadata(start) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            entries.push((rel, b'm', Vec::new()));
+            return;
+        }
+        Err(error) => {
+            snapshot.unreadable.push((
+                rel.clone(),
+                format!("cannot inspect governed input: {error}"),
+            ));
+            entries.push((rel, b'u', Vec::new()));
+            return;
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let target = match fs::read_link(start) {
+            Ok(target) => target.to_string_lossy().as_bytes().to_vec(),
+            Err(error) => {
+                snapshot.unreadable.push((
+                    rel.clone(),
+                    format!("cannot read governed symlink: {error}"),
+                ));
+                Vec::new()
+            }
+        };
+        entries.push((rel, b'l', target));
+        return;
+    }
+    if file_type.is_file() {
+        snapshot.files_discovered += 1;
+        match fs::read(start) {
+            Ok(bytes) => {
+                snapshot.files_scanned += 1;
+                entries.push((rel, b'f', bytes));
+            }
+            Err(error) => {
+                snapshot
+                    .unreadable
+                    .push((rel.clone(), format!("cannot read governed input: {error}")));
+                entries.push((rel, b'u', Vec::new()));
+            }
+        }
+        return;
+    }
+    if !file_type.is_dir() {
+        entries.push((rel, b'o', Vec::new()));
+        return;
+    }
+
+    snapshot.directories_visited += 1;
+    entries.push((rel.clone(), b'd', Vec::new()));
+    let mut children = match fs::read_dir(start) {
+        Ok(children) => match children.collect::<Result<Vec<_>, _>>() {
+            Ok(children) => children,
+            Err(error) => {
+                snapshot.unreadable.push((
+                    rel,
+                    format!("cannot enumerate governed directory completely: {error}"),
+                ));
+                return;
+            }
+        },
+        Err(error) => {
+            snapshot
+                .unreadable
+                .push((rel, format!("cannot read governed directory: {error}")));
+            return;
+        }
+    };
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        collect_governed_entries(root, &child.path(), entries, snapshot);
+    }
+}
+
+fn governed_snapshot(root: &Path) -> GovernedSnapshot {
+    let mut snapshot = GovernedSnapshot {
+        digest: 0,
+        directories_visited: 0,
+        files_discovered: 0,
+        files_scanned: 0,
+        unreadable: Vec::new(),
+    };
+    let mut entries = Vec::new();
+    for rel in GOVERNED_ROOT_FILES {
+        collect_governed_entries(root, &root.join(rel), &mut entries, &mut snapshot);
+    }
+    for rel in GOVERNED_ROOT_DIRS {
+        collect_governed_entries(root, &root.join(rel), &mut entries, &mut snapshot);
+    }
+    entries.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+    let mut digest = fnv1a64(b"fln.structure-guard.governed-root/1\0");
+    for (path, kind, bytes) in entries {
+        bind_field(&mut digest, path.as_bytes());
+        bind_field(&mut digest, &[kind]);
+        bind_field(&mut digest, &bytes);
+    }
+    snapshot.digest = digest;
+    snapshot
+}
+
+fn parse_rustc_verbose(stdout: &[u8], source: &'static str) -> RustcProbe {
+    let text = String::from_utf8_lossy(stdout);
+    let mut release = None;
+    let mut commit = None;
+    let mut host = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "release" if !value.is_empty() => release = Some(value.to_string()),
+            "commit-hash" if !value.is_empty() => commit = Some(value.to_ascii_lowercase()),
+            "host" if !value.is_empty() => host = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    RustcProbe {
+        source,
+        release,
+        commit,
+        host,
+    }
+}
+
+fn effective_rustc_probe() -> RustcProbe {
+    static PROBE: OnceLock<RustcProbe> = OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            let (program, source): (OsString, &'static str) = match std::env::var_os("RUSTC") {
+                Some(program) if !program.is_empty() => (program, "RUSTC"),
+                _ => (OsString::from("rustc"), "PATH"),
+            };
+            match Command::new(program).arg("-Vv").output() {
+                Ok(output) if output.status.success() => {
+                    parse_rustc_verbose(&output.stdout, source)
+                }
+                _ => RustcProbe {
+                    source,
+                    release: None,
+                    commit: None,
+                    host: None,
+                },
+            }
+        })
+        .clone()
+}
+
+fn compiler_identity(root: &Path) -> CompilerIdentity {
+    let expected = fs::read_to_string(root.join(SUITE_LOCK_FILE))
+        .ok()
+        .and_then(|text| crate::lockfile::parse_suite_lock(&text).ok());
+    let probe = effective_rustc_probe();
+    let channel = expected.as_ref().map(|lock| lock.rust_nightly.clone());
+    let expected_release = expected
+        .as_ref()
+        .map(|lock| lock.rust_release.as_str())
+        .filter(|release| !release.is_empty());
+    let expected_commit = expected
+        .as_ref()
+        .map(|lock| lock.rust_commit.as_str())
+        .filter(|commit| !commit.is_empty());
+    let contract_declared = expected_release.is_some()
+        && expected_commit.is_some()
+        && expected
+            .as_ref()
+            .is_some_and(|lock| !lock.targets.is_empty());
+    let host_is_declared = expected.as_ref().is_some_and(|lock| {
+        probe
+            .host
+            .as_ref()
+            .is_some_and(|host| lock.targets.contains(host))
+    });
+    let contract_match = expected_release
+        .zip(expected_commit)
+        .is_some_and(|(release, commit)| {
+            probe.release.as_deref() == Some(release)
+                && probe.commit.as_deref() == Some(commit)
+                && host_is_declared
+        });
+    CompilerIdentity {
+        source: probe.source,
+        channel,
+        release: probe.release,
+        commit: probe.commit,
+        host: probe.host,
+        contract_declared,
+        contract_match,
+    }
+}
+
+fn admitted_environment() -> AdmittedEnvironment {
+    const ADMITTED_EXACT: [&str; 12] = [
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "PATH",
+        "SHELL",
+        "TERM",
+        "TMPDIR",
+        "TZ",
+        "USER",
+        "RUSTUP_HOME",
+    ];
+    const COMPILER_EXACT: [&str; 15] = [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_TARGET",
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTDOC",
+        "RUSTDOCFLAGS",
+        "RUSTUP_TOOLCHAIN",
+        "CARGO",
+    ];
+    const COMPILER_PREFIXES: [&str; 5] = [
+        "CARGO_TARGET_",
+        "CARGO_ALIAS_",
+        "CARGO_UNSTABLE_",
+        "CARGO_REGISTRIES_",
+        "CARGO_PROFILE_",
+    ];
+
+    let mut admitted_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| ADMITTED_EXACT.contains(&name.as_str()) || name.starts_with("LC_"))
+        .collect();
+    let mut compiler_override_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            COMPILER_EXACT.contains(&name.as_str())
+                || (name != "CARGO_TARGET_DIR"
+                    && COMPILER_PREFIXES
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix)))
+        })
+        .collect();
+    admitted_names.sort();
+    admitted_names.dedup();
+    compiler_override_names.sort();
+    compiler_override_names.dedup();
+    AdmittedEnvironment {
+        policy: "names-only-no-values/1",
+        admitted_names,
+        compiler_override_names,
+    }
 }
 
 struct DiscoveredCrate {
@@ -408,6 +837,55 @@ fn crate_roots(c: &DiscoveredCrate) -> Result<Vec<PathBuf>, String> {
     Ok(roots)
 }
 
+/// Cargo's implicit target roots, distinct from every Rust source that contributes to
+/// those targets. A nested `tests/support/mod.rs` is authority-bearing source and is
+/// scanned by `crate_roots`, but it is not a second integration-test target. Robot
+/// inventory must not inflate target cardinality by conflating those two classes.
+fn cargo_target_roots(c: &DiscoveredCrate) -> Result<Vec<PathBuf>, String> {
+    let mut roots: Vec<PathBuf> = ["lib.rs", "main.rs"]
+        .iter()
+        .map(|file| c.dir.join("src").join(file))
+        .filter(|path| is_regular_file(path))
+        .collect();
+    let build_script = c.dir.join("build.rs");
+    if is_regular_file(&build_script) {
+        roots.push(build_script);
+    }
+    for target_dir in ["src/bin", "tests", "examples", "benches"] {
+        let dir = c.dir.join(target_dir);
+        let metadata = match fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let mut entries: Vec<_> = fs::read_dir(&dir)
+            .map_err(|error| format!("cannot read {}: {error}", dir.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if file_type.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+                roots.push(path);
+            } else if file_type.is_dir() {
+                let main = path.join("main.rs");
+                if is_regular_file(&main) {
+                    roots.push(main);
+                }
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) {
     let plan_ranks = [
         ("fln-core", 0),
@@ -572,13 +1050,29 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
 }
 
 pub fn run(root: &Path) -> Result<RunOutcome, String> {
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| format!("cannot resolve authoritative workspace root: {error}"))?;
+    if !canonical_root.is_dir() {
+        return Err(format!(
+            "authoritative workspace root is not a directory: {}",
+            canonical_root.display()
+        ));
+    }
+    let root = canonical_root.as_path();
+    let root_identity = root
+        .to_str()
+        .map(|identity| identity.replace('\\', "/"))
+        .ok_or_else(|| "authoritative workspace root is not UTF-8".to_string())?;
+    let governed_before = governed_snapshot(&root);
+    let compiler_identity = compiler_identity(&root);
+    let admitted_environment = admitted_environment();
     let mut findings: Vec<Finding> = Vec::new();
 
     // Reject links before any recursive scanner runs. Git can store symlinks, and
     // following one here could omit authoritative code from a covenant, authorize a
     // boundary site under the wrong path, escape the workspace, or recurse forever.
-    audit_governed_symlinks(root, &mut findings)?;
-    audit_repository_cargo_config(root, &mut findings)?;
+    audit_governed_symlinks(&root, &mut findings)?;
+    audit_repository_cargo_config(&root, &mut findings)?;
 
     // ---- load the reviewed files -------------------------------------------------------
     let graph_path = root.join(GRAPH_FILE);
@@ -619,8 +1113,8 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
 
     // ---- discover the actual workspace -------------------------------------------------
     let mut discovered: Vec<DiscoveredCrate> = Vec::new();
-    discover(root, "crates", &mut discovered)?;
-    discover(root, "tools", &mut discovered)?;
+    discover(&root, "crates", &mut discovered)?;
+    discover(&root, "tools", &mut discovered)?;
 
     for c in &mut discovered {
         let manifest_rel = format!("{}/Cargo.toml", c.rel);
@@ -637,6 +1131,21 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             }),
         }
     }
+    let feature_count = discovered
+        .iter()
+        .filter_map(|crate_| crate_.manifest.as_ref())
+        .map(|manifest| manifest.features.len())
+        .sum();
+    let mut target_count = 0usize;
+    for crate_ in &discovered {
+        target_count = target_count
+            .checked_add(cargo_target_roots(crate_)?.len())
+            .ok_or_else(|| "authority target count overflow".to_string())?;
+    }
+    let target_triple_count = fs::read_to_string(root.join(SUITE_LOCK_FILE))
+        .ok()
+        .and_then(|text| crate::lockfile::parse_suite_lock(&text).ok())
+        .map_or(0, |lock| lock.targets.len());
 
     // ---- snapshot law: crates on disk <-> crates declared ------------------------------
     let on_disk: BTreeMap<&str, &DiscoveredCrate> =
@@ -1320,14 +1829,120 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // ---- dependency-closure audit (D1; bead franken_lean-xwf) --------------------------
     // Cargo.lock ⇄ ci/CLOSURE_ALLOWLIST.txt ⇄ SUITE.lock ⇄ rust-toolchain.toml. Missing
     // or malformed governance files degrade to findings, never to a silent skip.
-    findings.extend(crate::lockfile::audit(root, &g));
+    findings.extend(crate::lockfile::audit(&root, &g));
 
+    if compiler_identity.contract_declared && !compiler_identity.contract_match {
+        findings.push(Finding {
+            code: "FLN-STRUCT-029",
+            path: SUITE_LOCK_FILE.to_string(),
+            detail: format!(
+                "effective compiler identity source={} release={} commit={} host={} does not match the complete SUITE.lock compiler contract; compiler authority is inconclusive",
+                compiler_identity.source,
+                compiler_identity.release.as_deref().unwrap_or("unavailable"),
+                compiler_identity.commit.as_deref().unwrap_or("unavailable"),
+                compiler_identity.host.as_deref().unwrap_or("unavailable"),
+            ),
+        });
+    }
+
+    let governed_after = governed_snapshot(&root);
+    for (path, detail) in governed_before
+        .unreadable
+        .iter()
+        .chain(governed_after.unreadable.iter())
+    {
+        if !findings
+            .iter()
+            .any(|finding| finding.code == "FLN-STRUCT-027" && finding.path == *path)
+        {
+            findings.push(Finding {
+                code: "FLN-STRUCT-027",
+                path: path.clone(),
+                detail: format!(
+                    "{detail}; structural authority is inconclusive and the traversal is incomplete"
+                ),
+            });
+        }
+    }
+    if governed_before.digest != governed_after.digest {
+        findings.push(Finding {
+            code: "FLN-STRUCT-028",
+            path: root_identity.clone(),
+            detail: format!(
+                "governed source root changed during the scan (fnv1a64:{:016x} -> fnv1a64:{:016x}); the run is bound to no single input closure",
+                governed_before.digest, governed_after.digest
+            ),
+        });
+    }
+
+    let inconclusive_paths: BTreeSet<&str> = findings
+        .iter()
+        .filter(|finding| finding.code == "FLN-STRUCT-027")
+        .map(|finding| finding.path.as_str())
+        .collect();
+    let snapshot_unreadable_paths: BTreeSet<&str> = governed_after
+        .unreadable
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let decoded_files_skipped = inconclusive_paths
+        .difference(&snapshot_unreadable_paths)
+        .count();
+    let files_skipped_unreadable = governed_after
+        .files_discovered
+        .saturating_sub(governed_after.files_scanned)
+        .saturating_add(decoded_files_skipped);
+    let files_scanned = governed_after
+        .files_scanned
+        .saturating_sub(decoded_files_skipped);
+    let traversal = TraversalFacts {
+        directories_visited: governed_after.directories_visited,
+        files_discovered: governed_after.files_discovered,
+        files_scanned,
+        files_skipped_unreadable,
+    };
+    if !traversal.count_rule_holds() {
+        findings.push(Finding {
+            code: "FLN-STRUCT-028",
+            path: root_identity.clone(),
+            detail: format!(
+                "authority-count rule `{AUTHORITY_COUNT_RULE}` failed: scanned={} skipped={} discovered={}",
+                traversal.files_scanned,
+                traversal.files_skipped_unreadable,
+                traversal.files_discovered
+            ),
+        });
+    }
+
+    let authority = if findings.iter().any(|finding| {
+        matches!(
+            finding.code,
+            "FLN-STRUCT-027" | "FLN-STRUCT-028" | "FLN-STRUCT-029"
+        )
+    }) {
+        Authority::Incomplete
+    } else {
+        Authority::Complete
+    };
     findings.sort_by(|a, b| (a.code, &a.path, &a.detail).cmp(&(b.code, &b.path, &b.detail)));
     Ok(RunOutcome {
         findings,
         crate_count: discovered.len(),
         edge_count: actual_edges.len(),
         graph_digest,
+        root_identity,
+        governed_root_before: governed_before.digest,
+        governed_root_after: governed_after.digest,
+        traversal,
+        authority,
+        authority_inventory: AuthorityInventory {
+            packages: discovered.len(),
+            targets: target_count,
+            features: feature_count,
+            target_triples: target_triple_count,
+        },
+        compiler_identity,
+        admitted_environment,
     })
 }
 

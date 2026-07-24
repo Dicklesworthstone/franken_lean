@@ -154,6 +154,8 @@ pub const TOOLCHAIN_PIN: &str = "[toolchain]\nchannel = \"nightly-2026-07-13\"\n
 pub const SUITE_LOCK_FIXTURE: &str = "\
 schema fln-suite-lock/1
 rust-nightly nightly-2026-07-13
+rust-release 1.99.0-nightly
+rust-commit 77cf889bc178ddb44d6a1c78e5a820b5abb31d8d
 target x86_64-unknown-linux-gnu
 suite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync
 crate asupersync repo=asupersync

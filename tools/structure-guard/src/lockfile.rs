@@ -230,6 +230,9 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<AllowRow>, String> {
 #[derive(Debug, Default)]
 pub struct SuiteLock {
     pub rust_nightly: String,
+    pub rust_release: String,
+    pub rust_commit: String,
+    pub targets: BTreeSet<String>,
     /// repo -> pinned commit
     pub suites: BTreeMap<String, String>,
     /// allowed suite package -> repo
@@ -285,7 +288,29 @@ pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
                 }
                 lock.rust_nightly = tokens[1].to_string();
             }
-            "rust-release" | "rust-commit" | "target" if tokens.len() == 2 => {}
+            "rust-release" if tokens.len() == 2 => {
+                if !lock.rust_release.is_empty() {
+                    return Err(err("duplicate rust-release row"));
+                }
+                if tokens[1].is_empty() {
+                    return Err(err("rust-release must be non-empty"));
+                }
+                lock.rust_release = tokens[1].to_string();
+            }
+            "rust-commit" if tokens.len() == 2 => {
+                if !lock.rust_commit.is_empty() {
+                    return Err(err("duplicate rust-commit row"));
+                }
+                if !is_hex40(tokens[1]) {
+                    return Err(err("rust-commit must be 40 hexadecimal digits"));
+                }
+                lock.rust_commit = tokens[1].to_ascii_lowercase();
+            }
+            "target" if tokens.len() == 2 => {
+                if tokens[1].is_empty() || !lock.targets.insert(tokens[1].to_string()) {
+                    return Err(err("target rows must be non-empty and unique"));
+                }
+            }
             "suite" if tokens.len() == 4 => {
                 let commit = tokens[2]
                     .strip_prefix("commit=")
@@ -359,6 +384,15 @@ pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
     }
     if lock.rust_nightly.is_empty() {
         return Err("SUITE.lock: missing rust-nightly row".to_string());
+    }
+    if lock.rust_release.is_empty() {
+        return Err("SUITE.lock: missing rust-release row".to_string());
+    }
+    if lock.rust_commit.is_empty() {
+        return Err("SUITE.lock: missing rust-commit row".to_string());
+    }
+    if lock.targets.is_empty() {
+        return Err("SUITE.lock: at least one target row is required".to_string());
     }
     if lock.reference.is_none() || lock.reference_tree.is_none() || lock.corpus.is_none() {
         return Err(
@@ -704,12 +738,18 @@ mod tests {
         assert!(parse_allowlist(&dup).is_err());
     }
 
-    const SUITE_OK: &str = "schema fln-suite-lock/1\nrust-nightly nightly-2026-07-13\ntarget x86_64-unknown-linux-gnu\nsuite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync\ncrate asupersync repo=asupersync\nreference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91\ncorpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997\n";
+    const SUITE_OK: &str = "schema fln-suite-lock/1\nrust-nightly nightly-2026-07-13\nrust-release 1.99.0-nightly\nrust-commit 77cf889bc178ddb44d6a1c78e5a820b5abb31d8d\ntarget x86_64-unknown-linux-gnu\nsuite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync\ncrate asupersync repo=asupersync\nreference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91\ncorpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997\n";
 
     #[test]
     fn parses_suite_lock_and_enforces_required_rows() {
         let lock = parse_suite_lock(SUITE_OK).expect("parses");
         assert_eq!(lock.rust_nightly, "nightly-2026-07-13");
+        assert_eq!(lock.rust_release, "1.99.0-nightly");
+        assert_eq!(lock.rust_commit, "77cf889bc178ddb44d6a1c78e5a820b5abb31d8d");
+        assert_eq!(
+            lock.targets,
+            BTreeSet::from(["x86_64-unknown-linux-gnu".to_string()])
+        );
         assert_eq!(lock.crates["asupersync"], "asupersync");
         assert!(lock.reference.is_some());
         assert_eq!(
@@ -734,6 +774,24 @@ mod tests {
         assert!(parse_suite_lock(&duplicate_nightly).is_err());
         let undated_nightly = SUITE_OK.replace("nightly-2026-07-13", "nightly");
         assert!(parse_suite_lock(&undated_nightly).is_err());
+        for required_row in [
+            "rust-release 1.99.0-nightly\n",
+            "rust-commit 77cf889bc178ddb44d6a1c78e5a820b5abb31d8d\n",
+            "target x86_64-unknown-linux-gnu\n",
+        ] {
+            assert!(
+                parse_suite_lock(&SUITE_OK.replace(required_row, "")).is_err(),
+                "accepted missing required row: {required_row}"
+            );
+        }
+        let duplicate_target = SUITE_OK.replace(
+            "target x86_64-unknown-linux-gnu",
+            "target x86_64-unknown-linux-gnu\ntarget x86_64-unknown-linux-gnu",
+        );
+        assert!(parse_suite_lock(&duplicate_target).is_err());
+        let malformed_commit =
+            SUITE_OK.replace("77cf889bc178ddb44d6a1c78e5a820b5abb31d8d", "not-a-commit");
+        assert!(parse_suite_lock(&malformed_commit).is_err());
     }
 
     #[test]

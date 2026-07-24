@@ -868,11 +868,11 @@ guard_step() {
     --expected-exit "$expected_exit" --expected-verdict "$expected_verdict" \
     --expected-root "$fixture_root" --observed-exit "$LAST_CHILD_EXIT" \
     --artifact-root "$ART_DIR" "${validate_args[@]}" --output "$validation"; then
-    record_contract_failure "$step" structure-guard/2_exact_contract_mismatch \
+    record_contract_failure "$step" structure-guard/3_exact_contract_mismatch \
       "$SUBJECT_BEFORE" "$SUBJECT_AFTER" "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
   fi
   record_step "$step" pass \
-    "structure-guard/2:$expected_verdict/wrapper=$expected_wrapper/child=$expected_exit" \
+    "structure-guard/3:$expected_verdict/wrapper=$expected_wrapper/child=$expected_exit" \
     "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
     "${validation#"$ART_DIR"/}" "$expected_classification" "$expected_wrapper" \
     "$expected_exit" "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \

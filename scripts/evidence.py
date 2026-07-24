@@ -3173,6 +3173,43 @@ def load_ndjson(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def require_guard_keys(
+    path: Path, record: Mapping[str, Any], expected: set[str], *, label: str
+) -> None:
+    actual = set(record)
+    if actual != expected:
+        raise EvidenceError(
+            f"{path}: {label} keys differ: "
+            f"missing={sorted(expected - actual)!r} extra={sorted(actual - expected)!r}"
+        )
+
+
+def require_guard_nat(path: Path, value: Any, *, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise EvidenceError(f"{path}: {label} must be a nonnegative integer")
+    return value
+
+
+def require_guard_fnv(path: Path, value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"fnv1a64:[0-9a-f]{16}", value) is None:
+        raise EvidenceError(f"{path}: {label} is not a canonical FNV-1a root")
+    return value
+
+
+def require_guard_name_list(path: Path, value: Any, *, label: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or any(
+            not isinstance(name, str)
+            or re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) is None
+            for name in value
+        )
+        or value != sorted(set(value))
+    ):
+        raise EvidenceError(f"{path}: {label} must be a sorted unique environment-name list")
+    return value
+
+
 def validate_guard(
     path: Path,
     expected_exit: int,
@@ -3184,13 +3221,31 @@ def validate_guard(
     path = lexical_absolute(path)
     records, digest = load_ndjson_snapshot(path)
     for index, record in enumerate(records):
-        if record.get("schema") != "structure-guard/2":
+        if record.get("schema") != "structure-guard/3":
             raise EvidenceError(f"{path}:{index + 1}: wrong schema")
     if records[0].get("event") != "run_start":
         raise EvidenceError(f"{path}: first record is not run_start")
+    start = records[0]
+    require_guard_keys(
+        path,
+        start,
+        {
+            "schema",
+            "event",
+            "root",
+            "root_identity",
+            "graph_digest",
+            "crates",
+            "edges",
+            "authority_inventory",
+            "effective_compiler_identity",
+            "admitted_environment",
+        },
+        label="run_start",
+    )
     if records[0].get("root") != expected_root:
         raise EvidenceError(f"{path}: guard root does not match the invoked fixture")
-    if expected_verdict not in {"pass", "fail", "setup_error"}:
+    if expected_verdict not in {"pass", "fail", "inconclusive", "setup_error"}:
         raise EvidenceError(f"{path}: unsupported expected guard verdict")
     if observed_exit != expected_exit:
         raise EvidenceError(
@@ -3200,6 +3255,24 @@ def validate_guard(
     if len(terminals) != 1 or records[-1] is not terminals[0]:
         raise EvidenceError(f"{path}: expected exactly one final run_end")
     terminal = terminals[0]
+    terminal_keys = {
+        "schema",
+        "event",
+        "verdict",
+        "exit_code",
+        "findings",
+        "authority",
+        "traversal",
+        "authority_count_rule",
+        "authority_count_rule_holds",
+        "governed_root_before",
+        "governed_root_after",
+        "governed_root_unchanged",
+        "duration_ms",
+    }
+    if expected_verdict == "setup_error":
+        terminal_keys.update({"reason_code", "detail"})
+    require_guard_keys(path, terminal, terminal_keys, label="run_end")
     if terminal.get("verdict") != expected_verdict:
         raise EvidenceError(
             f"{path}: verdict {terminal.get('verdict')!r}, expected {expected_verdict!r}"
@@ -3208,19 +3281,213 @@ def validate_guard(
         raise EvidenceError(
             f"{path}: terminal exit {terminal.get('exit_code')!r}, expected {expected_exit}"
         )
-    if expected_verdict in {"pass", "fail"}:
-        graph_digest = records[0].get("graph_digest")
-        if not isinstance(graph_digest, str) or not graph_digest.startswith("fnv1a64:"):
-            raise EvidenceError(f"{path}: guard graph digest is missing")
-        if not isinstance(records[0].get("crates"), int) or not isinstance(
-            records[0].get("edges"), int
+    require_guard_nat(path, terminal.get("duration_ms"), label="duration_ms")
+    if expected_verdict in {"pass", "fail", "inconclusive"}:
+        require_guard_fnv(path, start.get("graph_digest"), label="graph_digest")
+        crate_count = require_guard_nat(path, start.get("crates"), label="crates")
+        require_guard_nat(path, start.get("edges"), label="edges")
+        expected_identity = str(Path(expected_root).resolve(strict=True))
+        if start.get("root_identity") != expected_identity:
+            raise EvidenceError(
+                f"{path}: canonical root identity {start.get('root_identity')!r} "
+                f"does not match {expected_identity!r}"
+            )
+
+        inventory = start.get("authority_inventory")
+        if not isinstance(inventory, dict):
+            raise EvidenceError(f"{path}: authority inventory is missing")
+        require_guard_keys(
+            path,
+            inventory,
+            {
+                "package_class",
+                "packages",
+                "target_class",
+                "targets",
+                "feature_class",
+                "features",
+                "target_triple_class",
+                "target_triples",
+            },
+            label="authority_inventory",
+        )
+        expected_classes = {
+            "package_class": "workspace-graph-exact",
+            "target_class": "cargo-auto-discovery-closed",
+            "feature_class": "manifest-enumerated",
+            "target_triple_class": "suite-lock-declared",
+        }
+        for key, expected_class in expected_classes.items():
+            if inventory.get(key) != expected_class:
+                raise EvidenceError(f"{path}: {key} is not {expected_class!r}")
+        if require_guard_nat(path, inventory.get("packages"), label="packages") != crate_count:
+            raise EvidenceError(f"{path}: package inventory disagrees with crate count")
+        target_count = require_guard_nat(path, inventory.get("targets"), label="targets")
+        require_guard_nat(path, inventory.get("features"), label="features")
+        target_triples = require_guard_nat(
+            path, inventory.get("target_triples"), label="target_triples"
+        )
+        if expected_verdict == "pass" and (
+            target_count < crate_count or target_triples == 0
         ):
-            raise EvidenceError(f"{path}: guard graph counts are malformed")
+            raise EvidenceError(f"{path}: passing authority inventory is not closed")
+
+        compiler = start.get("effective_compiler_identity")
+        if not isinstance(compiler, dict):
+            raise EvidenceError(f"{path}: effective compiler identity is missing")
+        require_guard_keys(
+            path,
+            compiler,
+            {
+                "source",
+                "channel",
+                "release",
+                "commit",
+                "host",
+                "contract_declared",
+                "contract_match",
+            },
+            label="effective_compiler_identity",
+        )
+        if compiler.get("source") not in {"PATH", "RUSTC"}:
+            raise EvidenceError(f"{path}: compiler identity source is unsupported")
+        if (
+            (
+                compiler.get("channel") is not None
+                and (
+                    not isinstance(compiler.get("channel"), str)
+                    or not compiler["channel"].startswith("nightly-")
+                )
+            )
+            or not isinstance(compiler.get("release"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", str(compiler.get("commit"))) is None
+            or not isinstance(compiler.get("host"), str)
+            or type(compiler.get("contract_declared")) is not bool
+            or type(compiler.get("contract_match")) is not bool
+        ):
+            raise EvidenceError(f"{path}: effective compiler identity is malformed")
+        if expected_verdict == "pass" and (
+            compiler.get("channel") is None
+            or compiler["contract_declared"] is not True
+            or compiler["contract_match"] is not True
+        ):
+            raise EvidenceError(f"{path}: passing compiler authority is not established")
+
+        environment = start.get("admitted_environment")
+        if not isinstance(environment, dict):
+            raise EvidenceError(f"{path}: admitted environment is missing")
+        require_guard_keys(
+            path,
+            environment,
+            {"policy", "admitted_names", "compiler_override_names"},
+            label="admitted_environment",
+        )
+        if environment.get("policy") != "names-only-no-values/1":
+            raise EvidenceError(f"{path}: admitted environment policy is unsupported")
+        require_guard_name_list(
+            path, environment.get("admitted_names"), label="admitted_names"
+        )
+        require_guard_name_list(
+            path,
+            environment.get("compiler_override_names"),
+            label="compiler_override_names",
+        )
+
+        traversal = terminal.get("traversal")
+        if not isinstance(traversal, dict):
+            raise EvidenceError(f"{path}: traversal facts are missing")
+        require_guard_keys(
+            path,
+            traversal,
+            {
+                "directories_visited",
+                "files_discovered",
+                "files_scanned",
+                "files_skipped_unreadable",
+            },
+            label="traversal",
+        )
+        require_guard_nat(
+            path, traversal.get("directories_visited"), label="directories_visited"
+        )
+        discovered = require_guard_nat(
+            path, traversal.get("files_discovered"), label="files_discovered"
+        )
+        scanned = require_guard_nat(path, traversal.get("files_scanned"), label="files_scanned")
+        skipped = require_guard_nat(
+            path,
+            traversal.get("files_skipped_unreadable"),
+            label="files_skipped_unreadable",
+        )
+        if scanned + skipped != discovered:
+            raise EvidenceError(f"{path}: authority count conservation failed")
+        if (
+            terminal.get("authority_count_rule")
+            != "files_scanned+files_skipped_unreadable=files_discovered"
+            or terminal.get("authority_count_rule_holds") is not True
+        ):
+            raise EvidenceError(f"{path}: authority count rule is not established")
+        root_before = require_guard_fnv(
+            path, terminal.get("governed_root_before"), label="governed_root_before"
+        )
+        root_after = require_guard_fnv(
+            path, terminal.get("governed_root_after"), label="governed_root_after"
+        )
+        governed_unchanged = terminal.get("governed_root_unchanged")
+        if (
+            type(governed_unchanged) is not bool
+            or governed_unchanged != (root_before == root_after)
+        ):
+            raise EvidenceError(f"{path}: governed-root equality fact disagrees")
+        expected_authority = (
+            "incomplete" if expected_verdict == "inconclusive" else "complete"
+        )
+        if terminal.get("authority") != expected_authority:
+            raise EvidenceError(
+                f"{path}: authority {terminal.get('authority')!r}, "
+                f"expected {expected_authority!r}"
+            )
+        if expected_authority == "complete" and (
+            (
+                compiler.get("contract_declared") is True
+                and compiler.get("contract_match") is not True
+            )
+            or terminal.get("governed_root_unchanged") is not True
+        ):
+            raise EvidenceError(f"{path}: complete authority lacks identity closure")
     elif records[0].get("graph_digest") is not None:
         raise EvidenceError(f"{path}: setup failure claims a graph digest")
+    else:
+        if any(
+            start.get(key) is not None
+            for key in (
+                "root_identity",
+                "crates",
+                "edges",
+                "authority_inventory",
+                "effective_compiler_identity",
+                "admitted_environment",
+            )
+        ):
+            raise EvidenceError(f"{path}: setup failure claims structural authority")
+        if (
+            terminal.get("authority") != "not_established"
+            or terminal.get("traversal") is not None
+            or terminal.get("authority_count_rule_holds") is not False
+            or terminal.get("governed_root_before") is not None
+            or terminal.get("governed_root_after") is not None
+            or terminal.get("governed_root_unchanged") is not False
+        ):
+            raise EvidenceError(f"{path}: setup failure claims established authority")
     actual_findings = []
     finding_records = records[1:-1]
     for index, record in enumerate(finding_records, 2):
+        require_guard_keys(
+            path,
+            record,
+            {"schema", "event", "code", "severity", "path", "detail"},
+            label=f"finding line {index}",
+        )
         if record.get("event") != "finding":
             raise EvidenceError(f"{path}:{index}: non-finding inside guard run")
         if record.get("severity") != "error":
@@ -8782,6 +9049,127 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         path = art_dir / name
         path.mkdir()
         return path
+
+    # The structure guard's robot stream is a versioned evidence contract, not a
+    # best-effort JSON bag. Exercise one complete /3 stream and discriminating
+    # mutations here so the validator cannot silently stop checking newly authoritative
+    # fields while the E2E lanes continue to look green.
+    guard_root = case_dir("structure-guard-contract")
+    guard_start = {
+        "schema": "structure-guard/3",
+        "event": "run_start",
+        "root": str(guard_root),
+        "root_identity": str(guard_root.resolve(strict=True)),
+        "graph_digest": "fnv1a64:0123456789abcdef",
+        "crates": 1,
+        "edges": 0,
+        "authority_inventory": {
+            "package_class": "workspace-graph-exact",
+            "packages": 1,
+            "target_class": "cargo-auto-discovery-closed",
+            "targets": 1,
+            "feature_class": "manifest-enumerated",
+            "features": 0,
+            "target_triple_class": "suite-lock-declared",
+            "target_triples": 1,
+        },
+        "effective_compiler_identity": {
+            "source": "PATH",
+            "channel": "nightly-2026-07-13",
+            "release": "1.99.0-nightly",
+            "commit": "77cf889bc178ddb44d6a1c78e5a820b5abb31d8d",
+            "host": "x86_64-unknown-linux-gnu",
+            "contract_declared": True,
+            "contract_match": True,
+        },
+        "admitted_environment": {
+            "policy": "names-only-no-values/1",
+            "admitted_names": ["HOME", "PATH"],
+            "compiler_override_names": [],
+        },
+    }
+    guard_end = {
+        "schema": "structure-guard/3",
+        "event": "run_end",
+        "verdict": "pass",
+        "exit_code": 0,
+        "findings": 0,
+        "authority": "complete",
+        "traversal": {
+            "directories_visited": 3,
+            "files_discovered": 4,
+            "files_scanned": 4,
+            "files_skipped_unreadable": 0,
+        },
+        "authority_count_rule": (
+            "files_scanned+files_skipped_unreadable=files_discovered"
+        ),
+        "authority_count_rule_holds": True,
+        "governed_root_before": "fnv1a64:fedcba9876543210",
+        "governed_root_after": "fnv1a64:fedcba9876543210",
+        "governed_root_unchanged": True,
+        "duration_ms": 1,
+    }
+
+    def write_guard_stream(
+        name: str, mutate: Callable[[list[dict[str, Any]]], None] | None = None
+    ) -> Path:
+        records = json.loads(json.dumps([guard_start, guard_end]))
+        if mutate is not None:
+            mutate(records)
+        stream = guard_root / f"{name}.ndjson"
+        write_new(stream, b"".join(canonical_json(record) for record in records))
+        return stream
+
+    guard_valid = write_guard_stream("valid")
+    validate_guard(guard_valid, PASS, "pass", [], str(guard_root), PASS)
+
+    def old_guard_schema(records: list[dict[str, Any]]) -> None:
+        for record in records:
+            record["schema"] = "structure-guard/2"
+
+    def missing_guard_field(records: list[dict[str, Any]]) -> None:
+        records[0].pop("root_identity")
+
+    def extra_guard_field(records: list[dict[str, Any]]) -> None:
+        records[1]["unversioned_claim"] = True
+
+    def broken_guard_conservation(records: list[dict[str, Any]]) -> None:
+        records[1]["traversal"]["files_scanned"] = 3
+
+    def false_guard_root_equality(records: list[dict[str, Any]]) -> None:
+        records[1]["governed_root_after"] = "fnv1a64:1111111111111111"
+
+    def unbound_guard_compiler(records: list[dict[str, Any]]) -> None:
+        records[0]["effective_compiler_identity"]["contract_match"] = False
+
+    def leaked_guard_environment_value(records: list[dict[str, Any]]) -> None:
+        records[0]["admitted_environment"]["admitted_names"] = ["/secret/path"]
+
+    guard_mutants = [
+        ("old-schema", old_guard_schema),
+        ("missing-field", missing_guard_field),
+        ("extra-field", extra_guard_field),
+        ("broken-conservation", broken_guard_conservation),
+        ("false-root-equality", false_guard_root_equality),
+        ("unbound-compiler", unbound_guard_compiler),
+        ("environment-value", leaked_guard_environment_value),
+    ]
+    for mutant_name, mutate in guard_mutants:
+        mutant = write_guard_stream(mutant_name, mutate)
+        try:
+            validate_guard(mutant, PASS, "pass", [], str(guard_root), PASS)
+        except EvidenceError:
+            pass
+        else:
+            raise EvidenceError(f"structure-guard validator survived mutant {mutant_name}")
+    cases.append(
+        {
+            "case": "structure_guard_v3_contract",
+            "ok": True,
+            "mutants_killed": [name for name, _mutate in guard_mutants],
+        }
+    )
 
     def run_case(
         name: str,
