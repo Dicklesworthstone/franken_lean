@@ -478,8 +478,23 @@ impl Canonical for KVMap {
     fn read_body(r: &mut CanonReader<'_>) -> Result<KVMap, CanonError> {
         let count = r.u64()?;
         let mut map = KVMap::new();
+        // `KVMap::insert` replaces an existing key in place, so a stream carrying the
+        // same key twice would fold two encoded entries into one value — and that
+        // value re-encodes shorter than the bytes it came from. One value would then
+        // have two encodings, which is exactly what this crate's canonicality law
+        // forbids and what every decl hash, logical root, and cache key rests on;
+        // worse, the vanished entry is a smuggling channel, since the bytes that were
+        // hashed are not the value that was used.
+        //
+        // No legitimate encoder can emit this: `KVMap` cannot hold a duplicate key,
+        // so rejecting it refuses no artifact any writer could have produced.
+        // Found by the seeded campaign in tests/canon_fuzz.rs (bead fln-1f8v).
+        let mut seen: std::collections::HashSet<Name> = std::collections::HashSet::new();
         for _ in 0..count {
             let key = Name::read_body(r)?;
+            if !seen.insert(key.clone()) {
+                return Err(r.err_public("duplicate KVMap key"));
+            }
             let value = match r.u8()? {
                 DV_STRING => DataValue::OfString(r.str()?.to_string()),
                 DV_BOOL => DataValue::OfBool(r.bool()?),
@@ -2184,6 +2199,70 @@ mod tests {
             }
         }
         assert!(checked > 1_000, "the sweep must cover every field boundary");
+    }
+
+    /// Regression for the first finding of the seeded codec campaign (bead
+    /// fln-1f8v, found at `flip/KVMap/seed=452821e638d01377/iter=6669`,
+    /// minimized to the two-entry shape below).
+    ///
+    /// A bit flip made one key equal to an earlier key. `KVMap::insert` replaced in
+    /// place, so a 2-entry stream decoded to a 1-entry map that re-encoded 27 bytes
+    /// shorter: one value, two encodings. Decoding must refuse it.
+    #[test]
+    fn duplicate_kvmap_keys_are_refused_not_folded() {
+        let key = Name::str(Name::anonymous(), "a");
+
+        let mut honest = CanonWriter::new();
+        honest.schema(SCHEMA_KVMAP);
+        honest.u64(2);
+        key.write_body(&mut honest);
+        honest.u8(DV_NAT);
+        honest.u64(1);
+        Name::str(Name::anonymous(), "b").write_body(&mut honest);
+        honest.u8(DV_NAT);
+        honest.u64(2);
+        let honest = honest.into_bytes();
+        let decoded = KVMap::from_canonical_bytes(&honest).expect("distinct keys decode");
+        assert_eq!(decoded.entries().len(), 2);
+        assert_eq!(decoded.to_canonical_bytes(), honest, "canonical round trip");
+
+        let mut duplicate = CanonWriter::new();
+        duplicate.schema(SCHEMA_KVMAP);
+        duplicate.u64(2);
+        key.write_body(&mut duplicate);
+        duplicate.u8(DV_NAT);
+        duplicate.u64(1);
+        key.write_body(&mut duplicate);
+        duplicate.u8(DV_NAT);
+        duplicate.u64(2);
+        let duplicate = duplicate.into_bytes();
+        assert_eq!(
+            KVMap::from_canonical_bytes(&duplicate)
+                .expect_err("a duplicate key is malformed input")
+                .what,
+            "duplicate KVMap key"
+        );
+
+        // MData embeds a KVMap, so the same stream must be refused inside an Expr —
+        // that is the path a decl hash would have travelled.
+        let mut mdata = CanonWriter::new();
+        mdata.schema(SCHEMA_EXPR);
+        mdata.u8(EXPR_MDATA);
+        mdata.u64(2);
+        key.write_body(&mut mdata);
+        mdata.u8(DV_NAT);
+        mdata.u64(1);
+        key.write_body(&mut mdata);
+        mdata.u8(DV_NAT);
+        mdata.u64(2);
+        mdata.u8(EXPR_BVAR);
+        mdata.u32(0);
+        assert_eq!(
+            Expr::from_canonical_bytes(&mdata.into_bytes())
+                .expect_err("a duplicate key inside MData is malformed input")
+                .what,
+            "duplicate KVMap key"
+        );
     }
 
     /// Arbitrary bytes are not a crash: corrupting a valid artifact may decode to

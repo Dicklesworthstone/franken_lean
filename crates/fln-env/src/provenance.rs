@@ -496,6 +496,76 @@ pub struct ModuleProvenanceFacts {
     pub encoded_bytes: u128,
 }
 
+/// How an untrusted candidate that claims an identity relates to one already held.
+///
+/// The whole point of this type is that [`IdentityVerdict::Collision`] is a *reported
+/// outcome*, never a resolution. Nothing here picks a winner, merges, or falls back to
+/// the digest: an equal root over unequal canonical values is handed upward as a
+/// candidate for atomic application to adjudicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityVerdict {
+    /// Same root, same canonical bytes. Safe to treat as the same object, which is what
+    /// makes cache hits and re-imports idempotent.
+    Idempotent,
+    /// Different roots. Unrelated objects; the digest's inequality is conclusive because
+    /// a hash never reports different for equal inputs.
+    Distinct,
+    /// Same root, **different** canonical bytes.
+    Collision(IdentityCollision),
+}
+
+/// Evidence for an equal-digest/unequal-value pair, carrying enough to diagnose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityCollision {
+    pub root: ModuleProvenanceRoot,
+    pub held_len: usize,
+    pub candidate_len: usize,
+    /// Byte offset of the first disagreement, or the shorter length when one canonical
+    /// value is a strict prefix of the other.
+    pub first_divergence: usize,
+}
+
+/// Classify a candidate against a held object by claimed root, then by exact canonical
+/// value.
+///
+/// This is the schema's **bounded-model collision seam**. It takes roots and bytes as
+/// separate inputs rather than reading them off two manifests, precisely so a test can
+/// *inject* the digest equality that a real collision would produce. Injecting that
+/// equality is a bounded model: it assumes, counterfactually and only inside the model,
+/// that two distinct canonical values digest alike. **No cryptographic collision is
+/// claimed, searched for, or found**, and this seam must never be cited as evidence
+/// that one exists.
+///
+/// What the seam does establish is the property that matters if collision resistance
+/// ever fails: equal digest plus unequal canonical identity stays *distinguishable*,
+/// because equality is decided by the exact bytes and the digest is only ever a fast
+/// inequality check. Collision resistance is a HYPOTHESIS of the selected digest
+/// (claim type `bounded_model`), never an injectivity proof.
+pub fn classify_identity(
+    held: (ModuleProvenanceRoot, &[u8]),
+    candidate: (ModuleProvenanceRoot, &[u8]),
+) -> IdentityVerdict {
+    let (held_root, held_bytes) = held;
+    let (candidate_root, candidate_bytes) = candidate;
+    if held_root != candidate_root {
+        return IdentityVerdict::Distinct;
+    }
+    if held_bytes == candidate_bytes {
+        return IdentityVerdict::Idempotent;
+    }
+    let first_divergence = held_bytes
+        .iter()
+        .zip(candidate_bytes.iter())
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| held_bytes.len().min(candidate_bytes.len()));
+    IdentityVerdict::Collision(IdentityCollision {
+        root: held_root,
+        held_len: held_bytes.len(),
+        candidate_len: candidate_bytes.len(),
+        first_divergence,
+    })
+}
+
 /// Dedicated identity type prevents accidental substitution for a logical or
 /// operational root even though all three contain a `Digest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -582,6 +652,15 @@ pub enum ModuleProvenanceError {
         what: &'static str,
     },
     NonCanonicalEncoding,
+    /// An inconsistency inside already-validated state. This is an invariant failure,
+    /// never a verdict about a module and never a diagnostic a user caused: the same
+    /// shape arriving from outside is an [`IdentityVerdict::Collision`] instead
+    /// (FL-INV-07 — inconclusive and faulted outcomes are not rejections).
+    InternalFault {
+        what: &'static str,
+        held: ModuleProvenanceRoot,
+        recomputed: ModuleProvenanceRoot,
+    },
 }
 
 impl std::fmt::Display for ModuleProvenanceError {
@@ -699,6 +778,14 @@ impl std::fmt::Display for ModuleProvenanceError {
             Self::MalformedEncoding { what } => {
                 write!(formatter, "malformed module-provenance encoding: {what}")
             }
+            Self::InternalFault {
+                what,
+                held,
+                recomputed,
+            } => write!(
+                formatter,
+                "module-provenance internal fault: {what} (held {held}, recomputed {recomputed})"
+            ),
             Self::NonCanonicalEncoding => {
                 formatter.write_str("module-provenance bytes are not canonical")
             }
@@ -833,6 +920,46 @@ impl ModuleProvenanceManifest {
 
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         encode_manifest(&self.epoch, &self.records)
+    }
+
+    /// Classify an **untrusted** candidate against this manifest.
+    ///
+    /// Equality is decided by the exact canonical value; the root is only the fast
+    /// inequality check that lets the common case skip the comparison. A candidate that
+    /// shares this manifest's root but not its bytes yields
+    /// [`IdentityVerdict::Collision`] — reported for atomic application to adjudicate,
+    /// never silently resolved in either direction.
+    ///
+    /// Both arguments here are validated manifests, so the collision arm is unreachable
+    /// in practice; [`classify_identity`] is the seam where a bounded model can exercise
+    /// it without claiming a real collision.
+    pub fn classify_candidate(&self, candidate: &ModuleProvenanceManifest) -> IdentityVerdict {
+        classify_identity(
+            (self.root, &self.to_canonical_bytes()),
+            (candidate.root(), &candidate.to_canonical_bytes()),
+        )
+    }
+
+    /// Re-derive this manifest's root from its own records and confirm it still matches.
+    ///
+    /// The same equal-digest/unequal-value inconsistency means two different things
+    /// depending on where it is found. Arriving from outside it is an
+    /// [`IdentityVerdict::Collision`] — untrusted input, a normal thing to receive and
+    /// refuse. Found *inside* validated state it is an invariant failure: this manifest
+    /// was checked at construction, so a disagreement now means the value or the
+    /// derivation was corrupted, and the typed answer is `InternalFault`, never a
+    /// verdict about the module (FL-INV-07).
+    pub fn verify_self_consistency(&self) -> Result<(), ModuleProvenanceError> {
+        let recomputed =
+            ModuleProvenanceRoot(hash(Domain::ModuleProvenance, &self.to_canonical_bytes()));
+        if recomputed == self.root {
+            return Ok(());
+        }
+        Err(ModuleProvenanceError::InternalFault {
+            what: "validated manifest root disagrees with its canonical value",
+            held: self.root,
+            recomputed,
+        })
     }
 
     pub fn from_canonical_bytes(
@@ -2775,6 +2902,40 @@ mod tests {
                 );
             }
         }
+
+        // The sharp form of "not collapsed", and the reason this test carries the
+        // mutant's name: transparency is permitted to move EXACTLY ONE capability, the
+        // one that needs semantic attribution. Every collapse — the original
+        // `is_complete()` shape, or a later one that lets transparency gate replay or
+        // inventory — widens this set, so it is caught here rather than only by the
+        // cross-product table. Found by injecting exactly that mutant and observing
+        // that the earlier version of this test still passed.
+        for capture in [
+            CaptureStatus::Complete,
+            CaptureStatus::Partial,
+            CaptureStatus::Missing,
+        ] {
+            for missing in [Vec::new(), vec![id("Ghost")]] {
+                let understood =
+                    completeness(capture, PayloadTransparency::Understood, missing.clone());
+                for other in [PayloadTransparency::Mixed, PayloadTransparency::Opaque] {
+                    let shifted = completeness(capture, other, missing.clone());
+                    let moved: Vec<_> = ProvenanceAuthority::ALL
+                        .into_iter()
+                        .filter(|candidate| {
+                            understood.grants(*candidate) != shifted.grants(*candidate)
+                        })
+                        .collect();
+                    assert!(
+                        moved
+                            .iter()
+                            .all(|candidate| *candidate == ProvenanceAuthority::FineInvalidation),
+                        "transparency moved {moved:?} for {capture:?}; only FineInvalidation \
+                         may depend on it, so an axis has been collapsed"
+                    );
+                }
+            }
+        }
     }
 
     /// The named mutant this kills: *grant authority*.
@@ -2968,6 +3129,167 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Destructure a verdict that must be a collision, with the offending verdict in the
+    /// failure message. One helper rather than a destructure-or-panic at each site.
+    fn expect_collision(verdict: IdentityVerdict, context: &str) -> IdentityCollision {
+        match verdict {
+            IdentityVerdict::Collision(collision) => collision,
+            other => panic!("{context}: expected a collision verdict, got {other:?}"),
+        }
+    }
+
+    /// A manifest that differs from `sample_manifest` in one authoritative field, used
+    /// as the second canonical value in the collision model.
+    fn other_manifest() -> ModuleProvenanceManifest {
+        let mut records = sample_records();
+        records[0].declarations = vec![name("A.one"), name("A.different")].into();
+        ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+            .expect("the variant manifest validates")
+    }
+
+    /// Identity is decided by the exact canonical value. The root is a *locator* and a
+    /// fast inequality check, never the equality test itself.
+    #[test]
+    fn identity_equality_is_exact_canonical_value_and_the_root_is_only_a_locator() {
+        let held = sample_manifest();
+        let same = sample_manifest();
+        let other = other_manifest();
+
+        assert_eq!(held.classify_candidate(&same), IdentityVerdict::Idempotent);
+        assert_eq!(held.classify_candidate(&other), IdentityVerdict::Distinct);
+        assert_ne!(held.root(), other.root());
+
+        // A decoded candidate recomputes its own root at construction, so it cannot
+        // arrive claiming an identity its bytes do not have. That is the precondition
+        // `classify_identity` relies on, asserted rather than assumed.
+        let decoded = ModuleProvenanceManifest::from_canonical_bytes(
+            &other.to_canonical_bytes(),
+            TEST_LIMITS,
+        )
+        .expect("the variant round-trips");
+        assert_eq!(decoded.root(), other.root());
+        assert_eq!(decoded.verify_self_consistency(), Ok(()));
+        assert_eq!(held.verify_self_consistency(), Ok(()));
+    }
+
+    /// **Bounded-model collision seam.**
+    ///
+    /// This test does NOT find a digest collision and must never be cited as evidence
+    /// that one exists. It *injects* the equality a collision would produce — by
+    /// handing `classify_identity` two genuinely different canonical values under one
+    /// root — and asks the only question that matters if collision resistance ever
+    /// failed: does the schema still tell the two values apart? Claim type is
+    /// `bounded_model`; collision resistance itself remains a HYPOTHESIS of the digest,
+    /// never an injectivity proof.
+    ///
+    /// This is also why `classify_identity` takes roots and bytes separately instead of
+    /// re-deriving the digest: re-deriving would make the injection impossible and the
+    /// property untestable.
+    #[test]
+    fn a_bounded_model_collision_stays_distinguishable_and_is_reported_not_resolved() {
+        let held = sample_manifest();
+        let other = other_manifest();
+        let held_bytes = held.to_canonical_bytes();
+        let other_bytes = other.to_canonical_bytes();
+        assert_ne!(
+            held_bytes, other_bytes,
+            "the model needs two genuinely different canonical values"
+        );
+
+        // The counterfactual: assume these two values digest alike. Only `other`'s root
+        // is replaced; its bytes are untouched.
+        let injected = classify_identity(
+            (held.root(), &held_bytes),
+            (held.root(), &other_bytes), // <- `other`'s value under `held`'s root
+        );
+        let collision = expect_collision(injected, "an injected equal-digest/unequal-value pair");
+        assert_eq!(collision.root, held.root());
+        assert_eq!(collision.held_len, held_bytes.len());
+        assert_eq!(collision.candidate_len, other_bytes.len());
+        // First-divergence data must actually locate the disagreement, so the outcome is
+        // diagnosable from the artifact alone.
+        assert!(collision.first_divergence < held_bytes.len().max(other_bytes.len()));
+        assert_eq!(
+            held_bytes[..collision.first_divergence],
+            other_bytes[..collision.first_divergence],
+            "everything before the reported divergence must actually agree"
+        );
+
+        // Reported, never resolved: the seam picks no winner. Swapping the two sides
+        // yields a collision again with the lengths exchanged and the same offset — if
+        // either side were being preferred, the swap would disagree.
+        let swapped = classify_identity((held.root(), &other_bytes), (held.root(), &held_bytes));
+        let swapped = expect_collision(swapped, "the verdict must not depend on argument order");
+        assert_eq!(swapped.first_divergence, collision.first_divergence);
+        assert_eq!(swapped.held_len, collision.candidate_len);
+        assert_eq!(swapped.candidate_len, collision.held_len);
+
+        // The digest's *inequality* remains conclusive — that direction never depends on
+        // collision resistance, because a hash cannot report different for equal inputs.
+        assert_eq!(
+            classify_identity((held.root(), &held_bytes), (other.root(), &other_bytes)),
+            IdentityVerdict::Distinct
+        );
+        // And equal value under one root is still idempotent, so the collision arm has
+        // not swallowed the common case.
+        assert_eq!(
+            classify_identity((held.root(), &held_bytes), (held.root(), &held_bytes)),
+            IdentityVerdict::Idempotent
+        );
+    }
+
+    /// A strict-prefix pair is the boundary case for first-divergence reporting: there
+    /// is no disagreeing byte, so the offset must be the shorter length rather than a
+    /// panic or a silent zero.
+    #[test]
+    fn a_prefix_collision_reports_the_shorter_length_as_its_divergence() {
+        let held = sample_manifest();
+        let bytes = held.to_canonical_bytes();
+        let truncated = &bytes[..bytes.len() - 1];
+        let collision = expect_collision(
+            classify_identity((held.root(), &bytes), (held.root(), truncated)),
+            "a strict prefix is a different canonical value",
+        );
+        assert_eq!(collision.first_divergence, truncated.len());
+        assert_eq!(collision.held_len, bytes.len());
+        assert_eq!(collision.candidate_len, truncated.len());
+    }
+
+    /// The same shape means two different things depending on where it is found.
+    /// Arriving from outside it is untrusted input and a normal thing to refuse; found
+    /// inside validated state it is an invariant failure, and FL-INV-07 forbids
+    /// rendering that as a verdict about the module.
+    #[test]
+    fn the_same_inconsistency_inside_validated_state_is_an_internal_fault() {
+        let healthy = sample_manifest();
+        assert_eq!(healthy.verify_self_consistency(), Ok(()));
+
+        // Only reachable from inside the module: the constructor recomputes the root, so
+        // no external caller can build this state. That is exactly why finding it later
+        // is a fault rather than a rejection.
+        let mut corrupted = sample_manifest();
+        corrupted.root = ModuleProvenanceRoot(Digest([0x00; 32]));
+        let error = corrupted
+            .verify_self_consistency()
+            .expect_err("a corrupted validated manifest must fault");
+        assert!(matches!(
+            error,
+            ModuleProvenanceError::InternalFault { held, recomputed, .. }
+                if held == ModuleProvenanceRoot(Digest([0x00; 32]))
+                    && recomputed == healthy.root()
+        ));
+        // It is a fault, not any of the refusals a malformed input earns.
+        assert!(!matches!(
+            error,
+            ModuleProvenanceError::MalformedEncoding { .. }
+                | ModuleProvenanceError::NonCanonicalEncoding
+        ));
+        assert!(
+            error.to_string().contains("internal fault"),
+            "the fault must be self-identifying in diagnostics: {error}"
+        );
     }
 
     /// The named mutant this kills: *alias `ExtensionEntryId` to the mutable journal
