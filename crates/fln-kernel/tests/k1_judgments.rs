@@ -5168,3 +5168,449 @@ fn kr608_nested_translation_exhaustion_is_typed() {
     );
     assert!(!verdict.is_accepted() && !verdict.is_rejected());
 }
+
+// ---------------------------------------------------------------------------
+// KR-608, second channel: TRANSITIVE (worklist) discovery, deduplication, and
+// auxiliary accounting — the pin's cascade (bead franken_lean-8ce PIN-PROBE
+// CORRECTION). At the pin, `Lean.Syntax.node` nests `Array Syntax` directly;
+// copying `Array` at `Syntax` exposes `Array.mk : List Syntax → Array Syntax`,
+// whose field is itself nested, so `List` is copied too and `num_nested = 2`.
+// The second occurrence exists in NO declared row — only in a minted one — so
+// it is reachable only by iterating the worklist over the auxiliaries.
+//
+// `MyArr` below plays `Array`, `MyList` plays `List`, `MyTree` plays `Syntax`.
+// ---------------------------------------------------------------------------
+
+/// [`mylist_env`] extended with `MyArr α`, whose ONLY constructor carries a
+/// `MyList α` field. Nothing here is nested by itself: the cascade appears
+/// only once `MyArr` is copied at `MyTree`.
+fn myarr_env() -> Environment {
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let myarr = InductiveVal {
+        base: cval(
+            n("MyArr"),
+            vec![],
+            Expr::forall_e(n("α"), sort1(), sort1(), BinderInfo::Default),
+        ),
+        num_params: 1,
+        num_indices: 0,
+        all: vec![n("MyArr")],
+        ctors: vec![nn("MyArr", "mk")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mk = ConstructorVal {
+        base: cval(
+            nn("MyArr", "mk"),
+            vec![],
+            Expr::forall_e(
+                n("α"),
+                sort1(),
+                Expr::forall_e(
+                    n("data"),
+                    Expr::app(Expr::const_(n("MyList"), vec![]), bv(0)),
+                    Expr::app(Expr::const_(n("MyArr"), vec![]), bv(1)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("MyArr"),
+        cidx: 0,
+        num_params: 1,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+    mylist_env()
+        .add_decl(ConstantInfo::Induct(myarr))
+        .expect("env")
+        .add_decl(ConstantInfo::Ctor(mk))
+        .expect("env")
+}
+
+/// Decoded rows for the cascading block: `MyTree.node : MyArr MyTree → MyTree`
+/// (`with_direct_list` adds a second field `MyList MyTree`, which the `MyArr`
+/// copy ALSO reaches — the duplicate-reachability case). `num_nested` is a
+/// parameter because it is the observable each cascade case pins.
+fn cascaded_mytree_rows(
+    num_nested: u32,
+    with_direct_list: bool,
+) -> (Vec<InductiveVal>, Vec<ConstructorVal>) {
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let arr_tree = Expr::app(Expr::const_(n("MyArr"), vec![]), tree());
+    let list_tree = Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let node_ty = if with_direct_list {
+        Expr::forall_e(
+            n("a"),
+            arr_tree,
+            Expr::forall_e(n("l"), list_tree, tree(), BinderInfo::Default),
+            BinderInfo::Default,
+        )
+    } else {
+        Expr::forall_e(n("a"), arr_tree, tree(), BinderInfo::Default)
+    };
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(nn("MyTree", "node"), vec![], node_ty),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: if with_direct_list { 2 } else { 1 },
+        is_unsafe: false,
+    };
+    (vec![ind], vec![node])
+}
+
+/// The cascading block in full restored form: the decoded rows the pin would
+/// serialize for `MyTree.node : MyArr MyTree → MyTree`, including all THREE
+/// recursors. Auxiliary creation order is observable here and nowhere else:
+/// `MyTree.rec_1` eliminates the first auxiliary (`MyArr MyTree`, minted from
+/// the declared field) and `MyTree.rec_2` the second (`MyList MyTree`, minted
+/// from inside the first auxiliary's constructor).
+fn cascaded_mytree_block() -> (Vec<InductiveVal>, Vec<ConstructorVal>, Vec<RecursorVal>) {
+    let (types, ctors) = cascaded_mytree_rows(2, false);
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let arr = || Expr::app(Expr::const_(n("MyArr"), vec![]), tree());
+    let list = || Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let u = Level::param(n("u"));
+    let motive_ty =
+        |major: Expr| Expr::forall_e(n("t"), major, Expr::sort(u.clone()), BinderInfo::Default);
+    let motive_1_ty = motive_ty(tree());
+    let motive_2_ty = motive_ty(arr());
+    let motive_3_ty = motive_ty(list());
+    // node : Π (a : MyArr MyTree), motive_2 a → motive_1 (MyTree.node a)
+    let node_minor_ty = Expr::forall_e(
+        n("a"),
+        arr(),
+        Expr::forall_e(
+            n("a_ih"),
+            Expr::app(bv(2), bv(0)),
+            Expr::app(
+                bv(4),
+                Expr::app(Expr::const_(nn("MyTree", "node"), vec![]), bv(1)),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // mk : Π (data : MyList MyTree), motive_3 data → motive_2 (MyArr.mk MyTree data)
+    let mk_minor_ty = Expr::forall_e(
+        n("data"),
+        list(),
+        Expr::forall_e(
+            n("data_ih"),
+            Expr::app(bv(2), bv(0)),
+            Expr::app(
+                bv(4),
+                Expr::app(
+                    Expr::app(Expr::const_(nn("MyArr", "mk"), vec![]), tree()),
+                    bv(1),
+                ),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // nil : motive_3 (MyList.nil MyTree)
+    let nil_minor_ty = Expr::app(
+        bv(2),
+        Expr::app(Expr::const_(nn("MyList", "nil"), vec![]), tree()),
+    );
+    // cons : Π (head : MyTree) (tail : MyList MyTree), motive_1 head →
+    //   motive_3 tail → motive_3 (MyList.cons MyTree head tail)
+    let cons_minor_ty = Expr::forall_e(
+        n("head"),
+        tree(),
+        Expr::forall_e(
+            n("tail"),
+            list(),
+            Expr::forall_e(
+                n("head_ih"),
+                Expr::app(bv(7), bv(1)),
+                Expr::forall_e(
+                    n("tail_ih"),
+                    Expr::app(bv(6), bv(1)),
+                    Expr::app(
+                        bv(7),
+                        Expr::app(
+                            Expr::app(
+                                Expr::app(Expr::const_(nn("MyList", "cons"), vec![]), tree()),
+                                bv(3),
+                            ),
+                            bv(2),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let minors = [
+        (n("node"), node_minor_ty.clone()),
+        (n("mk"), mk_minor_ty.clone()),
+        (n("nil"), nil_minor_ty.clone()),
+        (n("cons"), cons_minor_ty.clone()),
+    ];
+    let telescope = |major_ty: Expr, result_motive_at: u32| {
+        let mut body = Expr::forall_e(
+            n("t"),
+            major_ty,
+            Expr::app(bv(result_motive_at), bv(0)),
+            BinderInfo::Default,
+        );
+        for (name, ty) in minors.iter().rev() {
+            body = Expr::forall_e(name.clone(), ty.clone(), body, BinderInfo::Default);
+        }
+        for (name, ty) in [
+            (n("motive_3"), motive_3_ty.clone()),
+            (n("motive_2"), motive_2_ty.clone()),
+            (n("motive_1"), motive_1_ty.clone()),
+        ] {
+            body = Expr::forall_e(name, ty, body, BinderInfo::Implicit);
+        }
+        body
+    };
+    // λ motive_1 motive_2 motive_3 node mk nil cons, λ fields…, body
+    let lam7 = |body: Expr, field_lams: &[(Name, Expr)]| {
+        let mut inner = body;
+        for (name, ty) in field_lams.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        for (name, ty) in minors.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        for (name, ty) in [
+            (n("motive_3"), motive_3_ty.clone()),
+            (n("motive_2"), motive_2_ty.clone()),
+            (n("motive_1"), motive_1_ty.clone()),
+        ] {
+            inner = Expr::lam(name, ty, inner, BinderInfo::Default);
+        }
+        inner
+    };
+    let rec_call = |rec: &str, args: &[u32]| {
+        let mut app = Expr::const_(nn("MyTree", rec), vec![u.clone()]);
+        for a in args {
+            app = Expr::app(app, bv(*a));
+        }
+        app
+    };
+    // node rule: … (a) => node a (MyTree.rec_1 … a)
+    let node_rhs = lam7(
+        Expr::app(
+            Expr::app(bv(4), bv(0)),
+            rec_call("rec_1", &[7, 6, 5, 4, 3, 2, 1, 0]),
+        ),
+        &[(n("a"), arr())],
+    );
+    // mk rule: … (data) => mk data (MyTree.rec_2 … data)
+    let mk_rhs = lam7(
+        Expr::app(
+            Expr::app(bv(3), bv(0)),
+            rec_call("rec_2", &[7, 6, 5, 4, 3, 2, 1, 0]),
+        ),
+        &[(n("data"), list())],
+    );
+    // nil rule: … => nil
+    let nil_rhs = lam7(bv(1), &[]);
+    // cons rule: … (head) (tail) => cons head tail (MyTree.rec … head)
+    //   (MyTree.rec_2 … tail)
+    let cons_rhs = lam7(
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
+                rec_call("rec", &[8, 7, 6, 5, 4, 3, 2, 1]),
+            ),
+            rec_call("rec_2", &[8, 7, 6, 5, 4, 3, 2, 0]),
+        ),
+        &[(n("head"), tree()), (n("tail"), list())],
+    );
+    let mk_rec = |name: Name, ty: Expr, rules: Vec<RecursorRule>| RecursorVal {
+        base: cval(name, vec![n("u")], ty),
+        all: vec![n("MyTree")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 3,
+        num_minors: 4,
+        rules,
+        k: false,
+        is_unsafe: false,
+    };
+    let recursors = vec![
+        mk_rec(
+            nn("MyTree", "rec"),
+            telescope(tree(), 7),
+            vec![RecursorRule {
+                ctor: nn("MyTree", "node"),
+                nfields: 1,
+                rhs: node_rhs,
+            }],
+        ),
+        mk_rec(
+            nn("MyTree", "rec_1"),
+            telescope(arr(), 6),
+            vec![RecursorRule {
+                ctor: nn("MyArr", "mk"),
+                nfields: 1,
+                rhs: mk_rhs,
+            }],
+        ),
+        mk_rec(
+            nn("MyTree", "rec_2"),
+            telescope(list(), 5),
+            vec![
+                RecursorRule {
+                    ctor: nn("MyList", "nil"),
+                    nfields: 0,
+                    rhs: nil_rhs,
+                },
+                RecursorRule {
+                    ctor: nn("MyList", "cons"),
+                    nfields: 2,
+                    rhs: cons_rhs,
+                },
+            ],
+        ),
+    ];
+    (types, ctors, recursors)
+}
+
+#[test]
+fn kr608_cascaded_block_admits_with_byte_exact_translated_regeneration() {
+    // The cascade end to end: two auxiliaries (one of them discovered only
+    // inside the other), the full ordinary ruleset on the synthesized
+    // three-type block, three regenerated recursors, restored names and
+    // occurrences — byte-equal to these hand-built restored rows.
+    let (types, ctors, recursors) = cascaded_mytree_block();
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "the cascaded MyTree block must admit under the FULL ruleset; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr608_auxiliary_recursor_numbering_follows_creation_order() {
+    // MUTANT ("reordered auxiliaries"): swap the two auxiliary recursors'
+    // majors. `rec_1` must eliminate the FIRST-minted auxiliary (`MyArr`) and
+    // `rec_2` the one minted from inside it (`MyList`); a translation that
+    // numbered auxiliaries by any other order — environment order, name
+    // order, discovery-set iteration order — admits this swap.
+    let (types, ctors, mut recursors) = cascaded_mytree_block();
+    let rec_1_ty = recursors[1].base.type_.clone();
+    recursors[1].base.type_ = recursors[2].base.type_.clone();
+    recursors[2].base.type_ = rec_1_ty;
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("diverges from regeneration"),
+        "auxiliary recursor numbering must follow creation order: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_cascade_discovers_the_transitive_auxiliary() {
+    // MUTANT ("stops after the direct edge"): `MyList MyTree` occurs in no
+    // declared constructor — only inside the MINTED copy of `MyArr`. A
+    // translation that replaced occurrences in the declared block and stopped
+    // would mint ONE auxiliary and happily accept this `num_nested = 1` row.
+    // The pin's worklist keeps translating the auxiliaries it mints, so the
+    // block has two, and the decoded count is wrong.
+    let (types, ctors) = cascaded_mytree_rows(1, false);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("vs 2 translated auxiliaries"),
+        "the worklist must cascade into the auxiliary it just minted: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_cascade_regenerates_one_recursor_per_translated_type() {
+    // With the auxiliary count agreed, the run reaches the recursor
+    // cross-check. The expected count is the translated block's type count —
+    // main + both auxiliaries — so this pins that the cascade built a
+    // THREE-motive block (`MyTree.rec`, `.rec_1`, `.rec_2`) rather than the
+    // two-motive block a direct-only translation would produce. Reaching this
+    // check at all means the synthesized block already passed the full
+    // ordinary ruleset (positivity, universes, regeneration) after the
+    // cascade.
+    let (types, ctors) = cascaded_mytree_rows(2, false);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("block declares 0 recursors, expected 3"),
+        "one recursor per translated type, auxiliaries included: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_duplicate_reachability_mints_one_auxiliary() {
+    // `MyList MyTree` is now reachable TWICE: directly, as `node`'s second
+    // field, and transitively through the `MyArr` copy. The pin dedups by the
+    // parameter-normalized occurrence key, so the block still carries exactly
+    // two auxiliaries — a translation that minted per reachability path would
+    // report three.
+    let (types, ctors) = cascaded_mytree_rows(3, true);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("vs 2 translated auxiliaries"),
+        "the same occurrence reached twice is ONE auxiliary: {}",
+        reject_message(&verdict)
+    );
+
+    // …and the deduplicated block is still the three-type block, so the
+    // duplicate path did not silently drop the cascade either.
+    let (types, ctors) = cascaded_mytree_rows(2, true);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("block declares 0 recursors, expected 3"),
+        "deduplication must not lose the cascaded auxiliary: {}",
+        reject_message(&verdict)
+    );
+}
