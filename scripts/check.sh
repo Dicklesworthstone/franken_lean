@@ -101,6 +101,7 @@ FINAL_VERDICT="internal_fault"
 FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
+HUMAN_LOG_SEALED=0
 FINALIZING=0
 RUN_STARTED=0
 EARLY_STEP=preflight
@@ -177,6 +178,10 @@ emit_event() {
 }
 
 note() {
+  if [ "$HUMAN_LOG_SEALED" -eq 1 ]; then
+    printf '[check] %s\n' "$*" >&2
+    return 0
+  fi
   printf '[check] %s\n' "$*" | tee -a "$HUMAN" >&2
 }
 
@@ -669,6 +674,16 @@ on_exit() {
     run_finalizer_command python3 "$EVIDENCE" validate-run \
       --file "$NDJSON" --schema "$SCHEMA" --expected-verdict "$FINAL_VERDICT" \
       --artifact-root "$ART_DIR" --output "$ART_DIR/run.validation.json" || publish_rc=2
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
+    # human.log is a manifested artifact. Append its terminal semantic record,
+    # then permanently seal it before the manifest inventories any artifact.
+    # Later publisher diagnostics remain visible on stderr but cannot invalidate
+    # an already-generated manifest.
+    note "terminal verdict=$FINAL_VERDICT reason=$FINAL_REASON process_exit=$FINAL_EXIT" \
+      || publish_rc=2
+    HUMAN_LOG_SEALED=1
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
