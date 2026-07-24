@@ -1635,10 +1635,12 @@ mod tests {
         assert_eq!(decoded.root(), manifest.root());
         assert_eq!(
             manifest.root().to_string(),
-            "8c0a18d29e8d4401615c33de39a516612aabe400cb9888088013c02ef8134b48",
+            "9af861837929fcff05062054d8a328377d5bfd2bf55a23ab7b3009dc5067146f",
             "schema/domain changes require an explicit golden update"
         );
-        assert_eq!(bytes.len(), 685, "canonical layout size is frozen");
+        // Re-pinned when per-entry journal ordinals left the encoding: each occurrence
+        // is now a bare content id, so the two sample entries shed one `u64` each.
+        assert_eq!(bytes.len(), 669, "canonical layout size is frozen");
         assert_eq!(
             manifest.facts(),
             ModuleProvenanceFacts {
@@ -2564,6 +2566,34 @@ mod tests {
         assert_eq!(contribution.source_ordinal(2), None);
         assert_eq!(contribution.target_position(2), None);
         assert_eq!(contribution.end(), Some(9));
+
+        // The mutant, executed rather than merely described: derive the id the way the
+        // rejected design would have, by folding the target position in. If that mutant
+        // were also offset-invariant the assertions above would be vacuous, so this
+        // proves the property discriminates instead of holding for free.
+        let mutant = |start: u64| {
+            let mut writer = CanonWriter::new();
+            writer.schema(EXTENSION_ENTRY_ID_SCHEMA);
+            writer.str(epoch().tag());
+            writer.str(epoch().commit());
+            descriptor.name.write_body(&mut writer);
+            writer.u8(merge_semantics_tag(descriptor.merge));
+            writer.u8(checkpoint_semantics_tag(descriptor.checkpoint));
+            writer.u8(payload_provenance_tag(descriptor.provenance));
+            writer.bytes(&[0x41]);
+            writer.u64(start); // the defect: a rebasable journal coordinate
+            hash(Domain::ModuleProvenance, &writer.into_bytes())
+        };
+        assert_ne!(
+            mutant(7),
+            mutant(0),
+            "the position-folding mutant must be offset-sensitive, or this test proves nothing"
+        );
+        assert_ne!(
+            ExtensionEntryId::from_digest(mutant(7)),
+            entry(0x41),
+            "the shipped derivation must not be the position-folding mutant"
+        );
     }
 
     /// The identity's input set is exactly epoch + descriptor + payload. Every one of
@@ -2598,7 +2628,11 @@ mod tests {
         ] {
             moved.insert(ExtensionEntryId::derive(&epoch(), &altered, &[0x41]));
         }
-        assert_eq!(moved.len(), 8, "an authoritative input failed to move the id");
+        assert_eq!(
+            moved.len(),
+            8,
+            "an authoritative input failed to move the id"
+        );
 
         // The excluded facts do not move it: the same payload contributed by a
         // different module, at a different source ordinal, in a different range, is the
@@ -2633,7 +2667,11 @@ mod tests {
             .expect("repeated occurrences are ordered replay data, not a duplicate error");
 
         let contribution = &manifest.records()[0].extension_contributions()[0];
-        assert_eq!(contribution.entries().len(), 3, "an occurrence was collapsed");
+        assert_eq!(
+            contribution.entries().len(),
+            3,
+            "an occurrence was collapsed"
+        );
         assert_eq!(contribution.entries()[0], contribution.entries()[1]);
         assert_ne!(contribution.entries()[0], contribution.entries()[2]);
 
