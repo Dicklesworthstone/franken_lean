@@ -38,7 +38,7 @@ jobs:
             exit 2
           fi
           mkdir -p "$evidence_root/check" "$evidence_root/e2e"
-          python3 - "$evidence_root/attempt-start.json" <<'PY'
+          python3 -I - "$evidence_root/attempt-start.json" <<'PY'
           import json
           import os
           import sys
@@ -86,7 +86,7 @@ jobs:
             exit 2
           fi
           printf 'UBS source commit: %s\n' "$actual_commit"
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import hashlib
           from pathlib import Path
 
@@ -102,14 +102,86 @@ jobs:
           chmod +x target/ci-tools/ubs/ubs
           echo "$GITHUB_WORKSPACE/target/ci-tools/ubs" >> "$GITHUB_PATH"
 
+      # The trusted bootstrap parses SUITE.lock and rust-toolchain.toml to decide which
+      # compiler to install, before structure-guard or any other repository check runs.
+      # Prove — against a real hostile module, not a comment — that the interpreter it
+      # uses cannot be redirected by module shadowing, and that the probe itself is
+      # meaningful because the non-isolated interpreter IS redirected. The shadow lives
+      # in a scratch directory; the repository tree is never mutated.
+      - name: bootstrap interpreter isolation probe
+        shell: bash
+        run: |
+          shadow="$(mktemp -d)"
+          cat > "$shadow/tomllib.py" <<'SHADOW'
+          def loads(*_args, **_kwargs):
+              return {"toolchain": {"channel": "attacker-chosen-toolchain"}}
+          SHADOW
+          probe=$'import pathlib, sys, sysconfig, tomllib\n'
+          probe+=$'stdlib = pathlib.Path(sysconfig.get_paths()["stdlib"]).resolve()\n'
+          probe+=$'shadowed = not pathlib.Path(tomllib.__file__).resolve().is_relative_to(stdlib)\n'
+          probe+=$'print("shadowed" if shadowed else "stdlib")\n'
+
+          # Vector 1: a module beside the script / in the cwd of a stdin script.
+          vulnerable="$(cd "$shadow" && printf '%s' "$probe" | python3 -)"
+          isolated="$(cd "$shadow" && printf '%s' "$probe" | python3 -I -)"
+          # Vector 2: an ambient PYTHONPATH.
+          vulnerable_env="$(PYTHONPATH="$shadow" python3 -c "$probe")"
+          isolated_env="$(PYTHONPATH="$shadow" python3 -I -c "$probe")"
+
+          rc=0
+          if [[ "$vulnerable" != "shadowed" ]]; then
+            echo "probe is not meaningful: cwd shadowing did not take effect" >&2
+            rc=2
+          fi
+          if [[ "$vulnerable_env" != "shadowed" ]]; then
+            echo "probe is not meaningful: PYTHONPATH shadowing did not take effect" >&2
+            rc=2
+          fi
+          if [[ "$isolated" != "stdlib" ]]; then
+            echo "isolated interpreter was shadowed via the script directory" >&2
+            rc=2
+          fi
+          if [[ "$isolated_env" != "stdlib" ]]; then
+            echo "isolated interpreter was shadowed via PYTHONPATH" >&2
+            rc=2
+          fi
+          # Every trusted bootstrap snippet in this workflow must request isolation.
+          if grep -nE '^\s*(channel="\$\()?([A-Z_]+="[^"]*" )*python3 - ' .github/workflows/ci.yml; then
+            echo "a bootstrap snippet invokes python3 without -I (see matches above)" >&2
+            rc=2
+          fi
+          if [[ $rc -eq 0 ]]; then
+            echo "bootstrap interpreter isolation: both shadowing vectors reproduced and both refused"
+          fi
+          exit "$rc"
+
       # rust-toolchain.toml pins the exact nightly; rustup honors it automatically.
       - name: install pinned toolchain
         shell: bash
         run: |
-          channel="$(python3 - <<'PY'
+          channel="$(python3 -I - <<'PY'
           import pathlib
           import re
+          import sys
+          import sysconfig
           import tomllib
+
+          # This snippet decides which compiler the whole job installs, and it runs
+          # before any repository-controlled check. Python resolves imports from the
+          # script's directory (or the cwd, for a stdin script) and from PYTHONPATH, so
+          # a checked-in `tomllib.py` or an ambient PYTHONPATH would otherwise choose
+          # the toolchain for us. `-I` closes both channels; assert it rather than
+          # trusting that a future edit keeps the flag.
+          if not sys.flags.isolated:
+              raise SystemExit(
+                  "bootstrap parser must run under `python3 -I`: without isolation a "
+                  "repository-local or PYTHONPATH module can shadow the stdlib parser "
+                  "that selects the toolchain"
+              )
+          stdlib = pathlib.Path(sysconfig.get_paths()["stdlib"]).resolve()
+          resolved = pathlib.Path(tomllib.__file__).resolve()
+          if not resolved.is_relative_to(stdlib):
+              raise SystemExit(f"tomllib resolved outside the stdlib: {resolved}")
 
           def parse_suite_channel(source):
               rows = []
@@ -246,7 +318,7 @@ jobs:
           )"
           rustup toolchain install "$channel" --profile minimal \
             --component rustfmt --component clippy
-          PINNED_RUST_CHANNEL="$channel" python3 - <<'PY'
+          PINNED_RUST_CHANNEL="$channel" python3 -I - <<'PY'
           import os
           import pathlib
           import subprocess
@@ -527,7 +599,7 @@ jobs:
           VELLUM_NAMING_ARTIFACT: ${{ steps.vellum_naming.outputs.artifact_path }}
           VELLUM_NAMING_EXIT: ${{ steps.vellum_naming.outputs.command_exit }}
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import hashlib
           import json
           import os
@@ -661,6 +733,7 @@ jobs:
               subprocess.run(
                   [
                       "python3",
+                      "-I",
                       "scripts/evidence.py",
                       "validate-bundle",
                       "--art-dir",
