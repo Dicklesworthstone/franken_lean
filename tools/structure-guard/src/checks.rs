@@ -415,7 +415,7 @@ fn rustc_override_matches_path() -> bool {
         .is_some_and(|(from_path, from_override)| from_path == from_override)
 }
 
-fn compiler_identity(root: &Path, admitted_environment: &AdmittedEnvironment) -> CompilerIdentity {
+fn compiler_identity(root: &Path) -> CompilerIdentity {
     let expected = fs::read_to_string(root.join(SUITE_LOCK_FILE))
         .ok()
         .and_then(|text| crate::lockfile::parse_suite_lock(&text).ok());
@@ -1102,7 +1102,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         .ok_or_else(|| "authoritative workspace root is not UTF-8".to_string())?;
     let governed_before = governed_snapshot(&root);
     let admitted_environment = admitted_environment();
-    let compiler_identity = compiler_identity(root, &admitted_environment);
+    let compiler_identity = compiler_identity(root);
     let mut findings: Vec<Finding> = Vec::new();
 
     // Reject links before any recursive scanner runs. Git can store symlinks, and
@@ -2319,7 +2319,6 @@ fn run_expansion(root: &Path, package: &str, test_cfg: bool) -> Result<String, S
                 | "RUSTC_WORKSPACE_WRAPPER"
                 | "RUSTDOC"
                 | "RUSTDOCFLAGS"
-                | "RUSTUP_TOOLCHAIN"
         ) || (name != "CARGO_TARGET_DIR"
             && [
                 "CARGO_TARGET_",
