@@ -269,7 +269,11 @@ impl std::fmt::Display for TooManyBoundVars {
 }
 
 /// The constructor inventory (plan §1.1). Field order follows the pin.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// Deliberately **not** `PartialEq`/`Eq`: a derived node comparison descends one
+/// stack frame per child and overflows on deep input.  Structural equality is a
+/// property of [`Expr`], whose `PartialEq` walks a heap worklist instead.
+#[derive(Debug)]
 pub enum ExprNode {
     /// de Bruijn bound variable.
     BVar {
@@ -347,8 +351,165 @@ impl std::fmt::Debug for Expr {
 
 impl PartialEq for Expr {
     fn eq(&self, other: &Expr) -> bool {
-        self.data == other.data
-            && (Arc::ptr_eq(self.node_arc(), other.node_arc()) || self.node() == other.node())
+        // Data word first (hash and packed flags reject fast), then structure.
+        //
+        // The structural arm walks an explicit heap worklist instead of recursing
+        // through one `Expr::eq` frame per constructor: two independently built
+        // deep-but-equal terms agree on every data word, so the fast rejections
+        // never fire and a recursive comparison would consume the stack in
+        // proportion to input depth (the term-plane analogue of the `Name` fix in
+        // bead franken_lean-p8a.1).  Equality is a pure predicate, so the order in
+        // which pending pairs are visited does not change the verdict.
+        let mut pending: Vec<(&Expr, &Expr)> = vec![(self, other)];
+        while let Some((left, right)) = pending.pop() {
+            if left.data != right.data {
+                return false;
+            }
+            if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                continue;
+            }
+            match (left.node(), right.node()) {
+                (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                // `Level`, `Name`, `Literal` and `KVMap` payloads all compare without
+                // recursion over *this* term's depth: the first two are iterative in
+                // their own right and the last two are flat.
+                (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (
+                    ExprNode::Const {
+                        name: a,
+                        levels: a_levels,
+                    },
+                    ExprNode::Const {
+                        name: b,
+                        levels: b_levels,
+                    },
+                ) => {
+                    if a != b || a_levels != b_levels {
+                        return false;
+                    }
+                }
+                (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                    pending.push((aa, ba));
+                    pending.push((af, bf));
+                }
+                // `Lam` and `ForallE` share a shape but are distinct constructors, so
+                // each needs its own arm: an or-pattern here would equate them.
+                (
+                    ExprNode::Lam {
+                        binder_name: a_name,
+                        binder_type: a_type,
+                        body: a_body,
+                        binder_info: a_info,
+                    },
+                    ExprNode::Lam {
+                        binder_name: b_name,
+                        binder_type: b_type,
+                        body: b_body,
+                        binder_info: b_info,
+                    },
+                )
+                | (
+                    ExprNode::ForallE {
+                        binder_name: a_name,
+                        binder_type: a_type,
+                        body: a_body,
+                        binder_info: a_info,
+                    },
+                    ExprNode::ForallE {
+                        binder_name: b_name,
+                        binder_type: b_type,
+                        body: b_body,
+                        binder_info: b_info,
+                    },
+                ) => {
+                    if a_name != b_name || a_info != b_info {
+                        return false;
+                    }
+                    pending.push((a_body, b_body));
+                    pending.push((a_type, b_type));
+                }
+                (
+                    ExprNode::LetE {
+                        decl_name: a_name,
+                        type_: a_type,
+                        value: a_value,
+                        body: a_body,
+                        non_dep: a_non_dep,
+                    },
+                    ExprNode::LetE {
+                        decl_name: b_name,
+                        type_: b_type,
+                        value: b_value,
+                        body: b_body,
+                        non_dep: b_non_dep,
+                    },
+                ) => {
+                    if a_name != b_name || a_non_dep != b_non_dep {
+                        return false;
+                    }
+                    pending.push((a_body, b_body));
+                    pending.push((a_value, b_value));
+                    pending.push((a_type, b_type));
+                }
+                (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (
+                    ExprNode::MData {
+                        data: a_data,
+                        expr: a_expr,
+                    },
+                    ExprNode::MData {
+                        data: b_data,
+                        expr: b_expr,
+                    },
+                ) => {
+                    if a_data != b_data {
+                        return false;
+                    }
+                    pending.push((a_expr, b_expr));
+                }
+                (
+                    ExprNode::Proj {
+                        struct_name: a_name,
+                        idx: a_idx,
+                        expr: a_expr,
+                    },
+                    ExprNode::Proj {
+                        struct_name: b_name,
+                        idx: b_idx,
+                        expr: b_expr,
+                    },
+                ) => {
+                    if a_name != b_name || a_idx != b_idx {
+                        return false;
+                    }
+                    pending.push((a_expr, b_expr));
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 }
 impl Eq for Expr {}
@@ -1036,6 +1197,259 @@ mod tests {
             Arc::strong_count(leaf.node_arc()),
             1,
             "no shared internal node may retain either leaf edge"
+        );
+    }
+
+    /// The recursive comparison this type deliberately no longer derives. Kept as a
+    /// test-only oracle: on shallow terms recursion is safe, so it pins the exact
+    /// verdict the iterative predicate must reproduce.
+    fn recursive_expr_eq(left: &Expr, right: &Expr) -> bool {
+        if left.data != right.data {
+            return false;
+        }
+        if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+            return true;
+        }
+        match (left.node(), right.node()) {
+            (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) => a == b,
+            (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => a == b,
+            (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) => a == b,
+            (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => a == b,
+            (
+                ExprNode::Const {
+                    name: a,
+                    levels: a_levels,
+                },
+                ExprNode::Const {
+                    name: b,
+                    levels: b_levels,
+                },
+            ) => a == b && a_levels == b_levels,
+            (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                recursive_expr_eq(af, bf) && recursive_expr_eq(aa, ba)
+            }
+            (
+                ExprNode::Lam {
+                    binder_name: a_name,
+                    binder_type: a_type,
+                    body: a_body,
+                    binder_info: a_info,
+                },
+                ExprNode::Lam {
+                    binder_name: b_name,
+                    binder_type: b_type,
+                    body: b_body,
+                    binder_info: b_info,
+                },
+            )
+            | (
+                ExprNode::ForallE {
+                    binder_name: a_name,
+                    binder_type: a_type,
+                    body: a_body,
+                    binder_info: a_info,
+                },
+                ExprNode::ForallE {
+                    binder_name: b_name,
+                    binder_type: b_type,
+                    body: b_body,
+                    binder_info: b_info,
+                },
+            ) => {
+                a_name == b_name
+                    && a_info == b_info
+                    && recursive_expr_eq(a_type, b_type)
+                    && recursive_expr_eq(a_body, b_body)
+            }
+            (
+                ExprNode::LetE {
+                    decl_name: a_name,
+                    type_: a_type,
+                    value: a_value,
+                    body: a_body,
+                    non_dep: a_non_dep,
+                },
+                ExprNode::LetE {
+                    decl_name: b_name,
+                    type_: b_type,
+                    value: b_value,
+                    body: b_body,
+                    non_dep: b_non_dep,
+                },
+            ) => {
+                a_name == b_name
+                    && a_non_dep == b_non_dep
+                    && recursive_expr_eq(a_type, b_type)
+                    && recursive_expr_eq(a_value, b_value)
+                    && recursive_expr_eq(a_body, b_body)
+            }
+            (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) => a == b,
+            (
+                ExprNode::MData {
+                    data: a_data,
+                    expr: a_expr,
+                },
+                ExprNode::MData {
+                    data: b_data,
+                    expr: b_expr,
+                },
+            ) => a_data == b_data && recursive_expr_eq(a_expr, b_expr),
+            (
+                ExprNode::Proj {
+                    struct_name: a_name,
+                    idx: a_idx,
+                    expr: a_expr,
+                },
+                ExprNode::Proj {
+                    struct_name: b_name,
+                    idx: b_idx,
+                    expr: b_expr,
+                },
+            ) => a_name == b_name && a_idx == b_idx && recursive_expr_eq(a_expr, b_expr),
+            _ => false,
+        }
+    }
+
+    /// One value per constructor, plus the pairs that must NOT collapse: same shape
+    /// under a different constructor (`Lam` vs `ForallE`), differing binder metadata,
+    /// differing literals, and a shared node reached two ways.
+    fn shallow_equality_matrix() -> Vec<Expr> {
+        let x = Name::str(Name::anonymous(), "x");
+        let y = Name::str(Name::anonymous(), "y");
+        let bvar = Expr::bvar(0).expect("small");
+        let sort = Expr::sort(Level::zero());
+        let shared = Expr::app(bvar.clone(), sort.clone());
+        vec![
+            bvar.clone(),
+            Expr::bvar(1).expect("small"),
+            Expr::fvar(FVarId(x.clone())),
+            Expr::fvar(FVarId(y.clone())),
+            Expr::mvar(MVarId(x.clone())),
+            sort.clone(),
+            Expr::sort(Level::zero().add_offset(1).expect("small")),
+            Expr::const_(x.clone(), Vec::new()),
+            Expr::const_(x.clone(), vec![Level::zero()]),
+            Expr::const_(y.clone(), Vec::new()),
+            Expr::app(bvar.clone(), sort.clone()),
+            Expr::app(sort.clone(), bvar.clone()),
+            shared.clone(),
+            shared,
+            Expr::lam(x.clone(), sort.clone(), bvar.clone(), BinderInfo::Default),
+            Expr::lam(x.clone(), sort.clone(), bvar.clone(), BinderInfo::Implicit),
+            Expr::lam(y.clone(), sort.clone(), bvar.clone(), BinderInfo::Default),
+            Expr::forall_e(x.clone(), sort.clone(), bvar.clone(), BinderInfo::Default),
+            Expr::let_e(x.clone(), sort.clone(), bvar.clone(), bvar.clone(), false),
+            Expr::let_e(x.clone(), sort.clone(), bvar.clone(), bvar.clone(), true),
+            Expr::lit(Literal::Nat(NatLit::from_u64(0))),
+            Expr::lit(Literal::Nat(NatLit::from_u64(1))),
+            Expr::lit(Literal::Str("s".to_string())),
+            Expr::mdata(KVMap::default(), bvar.clone()),
+            Expr::proj(x.clone(), 0, bvar.clone()),
+            Expr::proj(x, 1, bvar.clone()),
+            Expr::proj(y, 0, bvar),
+        ]
+    }
+
+    #[test]
+    fn iterative_equality_matches_the_recursive_oracle_on_every_constructor() {
+        let values = shallow_equality_matrix();
+        for (left_index, left) in values.iter().enumerate() {
+            for (right_index, right) in values.iter().enumerate() {
+                assert_eq!(
+                    left == right,
+                    recursive_expr_eq(left, right),
+                    "verdict changed at ({left_index}, {right_index})"
+                );
+                assert_eq!(
+                    left == right,
+                    right == left,
+                    "equality is symmetric at ({left_index}, {right_index})"
+                );
+            }
+            assert!(left == left, "equality is reflexive at {left_index}");
+            assert!(
+                *left == left.clone(),
+                "a clone shares its node and stays equal at {left_index}"
+            );
+        }
+    }
+
+    /// A `Lam` and a `ForallE` with identical payloads are distinct terms. The data
+    /// word already separates them, but the structural arms must not merge either.
+    #[test]
+    fn binder_constructors_never_compare_equal() {
+        let name = Name::str(Name::anonymous(), "x");
+        let body = Expr::bvar(0).expect("small");
+        let type_ = Expr::sort(Level::zero());
+        let lam = Expr::lam(
+            name.clone(),
+            type_.clone(),
+            body.clone(),
+            BinderInfo::Default,
+        );
+        let forall = Expr::forall_e(name, type_, body, BinderInfo::Default);
+        assert!(lam != forall);
+        assert!(!recursive_expr_eq(&lam, &forall));
+    }
+
+    /// Independently built deep-but-equal terms agree on every data word, so the
+    /// structural arm is reached at every node — the exact shape that overflowed
+    /// while the comparison recursed. A 1 MiB worker is far below what one frame
+    /// per node would need at this depth.
+    #[test]
+    fn deep_structural_equality_is_stack_bounded() {
+        const DEPTH: usize = 100_000;
+
+        fn deep_app_spine(leaf: Expr, depth: usize) -> Expr {
+            let mut expr = leaf;
+            for _ in 0..depth {
+                expr = Expr::app(expr, Expr::bvar(0).expect("small"));
+            }
+            expr
+        }
+
+        fn deep_binder_spine(leaf: Expr, depth: usize) -> Expr {
+            let name = Name::str(Name::anonymous(), "x");
+            let type_ = Expr::sort(Level::zero());
+            let mut expr = leaf;
+            for index in 0..depth {
+                expr = if index.is_multiple_of(2) {
+                    Expr::lam(name.clone(), type_.clone(), expr, BinderInfo::Default)
+                } else {
+                    Expr::forall_e(name.clone(), type_.clone(), expr, BinderInfo::Default)
+                };
+            }
+            expr
+        }
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let leaf = || Expr::sort(Level::zero());
+                let left = deep_app_spine(leaf(), DEPTH);
+                let right = deep_app_spine(leaf(), DEPTH);
+                assert!(
+                    left == right,
+                    "independently built deep terms must compare equal"
+                );
+
+                // A mismatch buried under the whole spine: the walk must reach it
+                // rather than stop at the roots' data words.
+                let other = deep_app_spine(Expr::bvar(0).expect("small"), DEPTH);
+                assert!(left != other, "a deep leaf mismatch must be observed");
+
+                let left_binders = deep_binder_spine(leaf(), DEPTH);
+                let right_binders = deep_binder_spine(leaf(), DEPTH);
+                assert!(
+                    left_binders == right_binders,
+                    "deep alternating binder spines must agree"
+                );
+            })
+            .expect("spawn bounded-stack Expr comparison worker")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "deep Expr equality exhausted the bounded worker stack"
         );
     }
 }

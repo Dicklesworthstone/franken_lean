@@ -97,7 +97,11 @@ impl std::fmt::Display for LevelTooDeep {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+/// Deliberately **not** `PartialEq`/`Eq`/`Hash`: each derived traversal descends
+/// one stack frame per child and overflows on deep input.  Equality and hashing
+/// are properties of [`Level`] — the former walks a heap worklist, the latter is
+/// the O(1) data word.
+#[derive(Debug)]
 enum Node {
     Zero,
     Succ(Level),
@@ -130,8 +134,46 @@ impl PartialEq for Level {
     fn eq(&self, other: &Level) -> bool {
         // Data word first (hash/depth/flags reject fast), then structure — the same
         // discipline as lean_level_eq (kernel/level.cpp:125-150).
-        self.data == other.data
-            && (Arc::ptr_eq(self.node_arc(), other.node_arc()) || self.node() == other.node())
+        //
+        // The comparison walks an explicit heap worklist rather than descending
+        // through one `Level::eq` frame per input level: two independently built
+        // deep-but-equal levels agree on every data word, so the structural arm is
+        // reached at every node and a recursive comparison would consume the stack
+        // in proportion to input depth.  Equality is a pure predicate, so visiting
+        // the pending pairs in any order yields the same verdict.
+        let mut pending: Vec<(&Level, &Level)> = vec![(self, other)];
+        while let Some((left, right)) = pending.pop() {
+            if left.data != right.data {
+                return false;
+            }
+            if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                continue;
+            }
+            match (left.node(), right.node()) {
+                (Node::Zero, Node::Zero) => {}
+                (Node::Succ(a), Node::Succ(b)) => pending.push((a, b)),
+                // Distinct constructors never compare equal, so `Max`/`IMax` may not
+                // share an arm with each other.
+                (Node::Max(a1, a2), Node::Max(b1, b2))
+                | (Node::IMax(a1, a2), Node::IMax(b1, b2)) => {
+                    pending.push((a2, b2));
+                    pending.push((a1, b1));
+                }
+                (Node::Param(a), Node::Param(b)) => {
+                    // `Name` compares iteratively (bead franken_lean-p8a.1).
+                    if a != b {
+                        return false;
+                    }
+                }
+                (Node::MVar(a), Node::MVar(b)) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 }
 impl Eq for Level {}
@@ -1015,6 +1057,132 @@ mod tests {
             Arc::strong_count(leaf.node_arc()),
             1,
             "no shared internal node may retain either leaf edge"
+        );
+    }
+
+    /// The recursive comparison this type deliberately no longer derives. Kept as a
+    /// test-only oracle: on shallow values recursion is safe, so it pins the exact
+    /// verdict the iterative predicate must reproduce.
+    fn recursive_level_eq(left: &Level, right: &Level) -> bool {
+        if left.data != right.data {
+            return false;
+        }
+        if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+            return true;
+        }
+        match (left.node(), right.node()) {
+            (Node::Zero, Node::Zero) => true,
+            (Node::Succ(a), Node::Succ(b)) => recursive_level_eq(a, b),
+            (Node::Max(a1, a2), Node::Max(b1, b2)) | (Node::IMax(a1, a2), Node::IMax(b1, b2)) => {
+                recursive_level_eq(a1, b1) && recursive_level_eq(a2, b2)
+            }
+            (Node::Param(a), Node::Param(b)) => a == b,
+            (Node::MVar(a), Node::MVar(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Every constructor, against every other, in both directions: the iterative
+    /// predicate agrees with the recursive oracle on shallow values.
+    fn shallow_equality_matrix() -> Vec<Level> {
+        let mvar = Level::mvar(LMVarId(Name::str(Name::anonymous(), "m")));
+        let other_mvar = Level::mvar(LMVarId(Name::str(Name::anonymous(), "n")));
+        let shared = Level::max(p("a"), nat(1)).expect("shallow");
+        vec![
+            Level::zero(),
+            nat(1),
+            nat(2),
+            p("a"),
+            p("b"),
+            mvar,
+            other_mvar,
+            Level::succ(p("a")).expect("shallow"),
+            Level::max(p("a"), p("b")).expect("shallow"),
+            Level::max(p("b"), p("a")).expect("shallow"),
+            Level::imax(p("a"), p("b")).expect("shallow"),
+            Level::imax(p("b"), p("a")).expect("shallow"),
+            Level::max(p("a"), nat(1)).expect("shallow"),
+            shared.clone(),
+            shared,
+            Level::max(Level::max(p("a"), p("b")).expect("shallow"), nat(3)).expect("shallow"),
+        ]
+    }
+
+    #[test]
+    fn iterative_equality_matches_the_recursive_oracle_on_every_constructor() {
+        let values = shallow_equality_matrix();
+        for (left_index, left) in values.iter().enumerate() {
+            for (right_index, right) in values.iter().enumerate() {
+                assert_eq!(
+                    left == right,
+                    recursive_level_eq(left, right),
+                    "verdict changed at ({left_index}, {right_index})"
+                );
+                assert_eq!(
+                    left == right,
+                    right == left,
+                    "equality is symmetric at ({left_index}, {right_index})"
+                );
+            }
+            assert!(left == left, "equality is reflexive at {left_index}");
+            assert!(
+                *left == left.clone(),
+                "a clone shares its node and stays equal at {left_index}"
+            );
+        }
+    }
+
+    /// Independently built deep-but-equal levels agree on every data word, so the
+    /// structural arm is reached at every node — the exact shape that overflowed
+    /// while the comparison recursed. A 1 MiB worker is far below what one frame
+    /// per level would need at this depth.
+    #[test]
+    fn deep_structural_equality_is_stack_bounded() {
+        const DEPTH: usize = 100_000;
+
+        fn deep_succ_over(base: Level, depth: usize) -> Level {
+            let mut level = base;
+            for _ in 0..depth {
+                level = Level::succ(level).expect("depth is inside the 24-bit packing");
+            }
+            level
+        }
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let left = deep_succ_over(p("a"), DEPTH);
+                let right = deep_succ_over(p("a"), DEPTH);
+                assert!(
+                    left == right,
+                    "independently built deep levels must compare equal"
+                );
+
+                // A mismatch buried under the whole chain: the walk must reach it
+                // rather than stop at the roots' data words.
+                let deep_other = deep_succ_over(p("b"), DEPTH);
+                assert!(left != deep_other, "a deep leaf mismatch must be observed");
+
+                // Alternating Max/IMax spines exercise the two-child arms.
+                let mut left_spine = Level::zero();
+                let mut right_spine = Level::zero();
+                for index in 0..DEPTH {
+                    let (l, r) = (left_spine.clone(), right_spine.clone());
+                    if index.is_multiple_of(2) {
+                        left_spine = Level::max(l, p("a")).expect("shallow width");
+                        right_spine = Level::max(r, p("a")).expect("shallow width");
+                    } else {
+                        left_spine = Level::imax(l, p("a")).expect("shallow width");
+                        right_spine = Level::imax(r, p("a")).expect("shallow width");
+                    }
+                }
+                assert!(left_spine == right_spine, "deep max/imax spines must agree");
+            })
+            .expect("spawn bounded-stack Level comparison worker")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "deep Level equality exhausted the bounded worker stack"
         );
     }
 }
