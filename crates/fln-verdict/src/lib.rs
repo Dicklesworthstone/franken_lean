@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 const WIRE_MAGIC: [u8; 8] = *b"FLNVRDCT";
+#[cfg(test)]
 const WIRE_HEADER_BYTES: usize = 13;
 pub const VERDICT_SCHEMA_VERSION: u16 = 1;
 
@@ -198,6 +199,10 @@ pub enum SchemaError {
         step_index: usize,
         clause: ClauseId,
     },
+    DuplicateDeletionTarget {
+        step_index: usize,
+        clause: ClauseId,
+    },
     EmptyDependencyChain {
         step: ClauseId,
     },
@@ -316,6 +321,11 @@ impl fmt::Display for SchemaError {
             Self::DeletingMissingClause { step_index, clause } => write!(
                 formatter,
                 "proof step {step_index} deletes unavailable clause {}",
+                clause.get()
+            ),
+            Self::DuplicateDeletionTarget { step_index, clause } => write!(
+                formatter,
+                "proof step {step_index} repeats deletion target {}",
                 clause.get()
             ),
             Self::EmptyDependencyChain { step } => write!(
@@ -462,15 +472,15 @@ impl Clause {
         literals.sort_unstable();
         let mut normalized: Vec<Literal> = Vec::with_capacity(literals.len());
         for literal in literals {
-            if let Some(previous) = normalized.last().copied() {
-                if previous.variable() == literal.variable() {
-                    if previous.polarity() != literal.polarity() {
-                        return Err(SchemaError::TautologicalClause {
-                            variable: literal.variable(),
-                        });
-                    }
-                    continue;
+            if let Some(previous) = normalized.last().copied()
+                && previous.variable() == literal.variable()
+            {
+                if previous.polarity() != literal.polarity() {
+                    return Err(SchemaError::TautologicalClause {
+                        variable: literal.variable(),
+                    });
                 }
+                continue;
             }
             normalized.push(literal);
         }
@@ -608,7 +618,8 @@ impl Cnf {
             u64::from(variable_count),
         )?;
         let count = reader.count(ResourceKind::Clauses, limits.max_clauses)?;
-        let mut clauses = Vec::with_capacity(count);
+        reader.require_minimum_rows(count, 16, "CNF clauses exceed remaining bytes")?;
+        let mut clauses = Vec::new();
         for _ in 0..count {
             let id = ClauseId::new(reader.u64()?)?;
             let clause = read_clause(&mut reader, limits.max_literals)?;
@@ -755,7 +766,8 @@ impl SatModel {
             u64::from(variable_count),
         )?;
         let count = reader.count(ResourceKind::Assignments, limits.max_assignments)?;
-        let mut assignments = Vec::with_capacity(count);
+        reader.require_minimum_rows(count, 5, "SAT assignments exceed remaining bytes")?;
+        let mut assignments = Vec::new();
         for _ in 0..count {
             assignments.push(Assignment::new(
                 VariableId::new(reader.u32()?)?,
@@ -791,13 +803,6 @@ impl ProofRule {
     pub fn rup(antecedents: Vec<ClauseId>) -> Self {
         Self::Rup {
             antecedents: antecedents.into_boxed_slice(),
-        }
-    }
-
-    pub fn dependencies(&self) -> &[ClauseId] {
-        match self {
-            Self::Resolution { .. } => &[],
-            Self::Rup { antecedents } => antecedents,
         }
     }
 }
@@ -921,7 +926,8 @@ impl UnsatProof {
         let mut reader = Reader::new(bytes);
         reader.header(SchemaKind::UnsatProof)?;
         let count = reader.count(ResourceKind::ProofSteps, limits.max_proof_steps)?;
-        let mut steps = Vec::with_capacity(count);
+        reader.require_minimum_rows(count, 9, "proof steps exceed remaining bytes")?;
+        let mut steps = Vec::new();
         for _ in 0..count {
             let opcode_at = reader.position();
             let opcode = reader.u8()?;
@@ -1060,7 +1066,7 @@ fn normalize_proof_steps(steps: &mut [ProofStep]) -> Result<(), SchemaError> {
                 canonical.sort_unstable();
                 for pair in canonical.windows(2) {
                     if pair[0] == pair[1] {
-                        return Err(SchemaError::DeletingMissingClause {
+                        return Err(SchemaError::DuplicateDeletionTarget {
                             step_index,
                             clause: pair[0],
                         });
@@ -1410,6 +1416,26 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn require_minimum_rows(
+        &self,
+        count: usize,
+        minimum_row_bytes: usize,
+        what: &'static str,
+    ) -> Result<(), SchemaError> {
+        let required =
+            count
+                .checked_mul(minimum_row_bytes)
+                .ok_or(SchemaError::MalformedEncoding {
+                    at: self.at,
+                    what: "collection byte requirement overflows address space",
+                })?;
+        if required > self.bytes.len().saturating_sub(self.at) {
+            Err(SchemaError::MalformedEncoding { at: self.at, what })
+        } else {
+            Ok(())
+        }
+    }
+
     fn finish(self) -> Result<(), SchemaError> {
         if self.at == self.bytes.len() {
             Ok(())
@@ -1432,7 +1458,8 @@ fn write_clause(writer: &mut Writer, clause: &Clause) {
 
 fn read_clause(reader: &mut Reader<'_>, max_literals: u64) -> Result<Clause, SchemaError> {
     let count = reader.count(ResourceKind::Literals, max_literals)?;
-    let mut literals = Vec::with_capacity(count);
+    reader.require_minimum_rows(count, 5, "clause literals exceed remaining bytes")?;
+    let mut literals = Vec::new();
     for _ in 0..count {
         let variable = VariableId::new(reader.u32()?)?;
         let polarity_at = reader.position();
@@ -1457,7 +1484,8 @@ fn read_clause_ids(
     limit: u64,
 ) -> Result<Vec<ClauseId>, SchemaError> {
     let count = reader.count(resource, limit)?;
-    let mut ids = Vec::with_capacity(count);
+    reader.require_minimum_rows(count, 8, "clause ids exceed remaining bytes")?;
+    let mut ids = Vec::new();
     for _ in 0..count {
         ids.push(ClauseId::new(reader.u64()?)?);
     }
@@ -1691,6 +1719,49 @@ mod verdict_schema_totality {
             Some(PublishableArtifact::Sat(_))
         ));
     }
+
+    #[test]
+    fn forged_collection_counts_fail_before_allocation_and_decoder_recovers() {
+        let limits = SchemaLimits::default();
+
+        let mut cnf_writer = Writer::new();
+        cnf_writer.header(SchemaKind::Cnf);
+        cnf_writer.u32(0);
+        cnf_writer.u64(limits.max_clauses);
+        assert!(matches!(
+            Cnf::from_canonical_bytes(&cnf_writer.finish(), limits),
+            Err(SchemaError::MalformedEncoding {
+                what: "CNF clauses exceed remaining bytes",
+                ..
+            })
+        ));
+
+        let mut model_writer = Writer::new();
+        model_writer.header(SchemaKind::SatModel);
+        model_writer.u32(0);
+        model_writer.u64(limits.max_assignments);
+        assert!(matches!(
+            SatModel::from_canonical_bytes(&model_writer.finish(), limits),
+            Err(SchemaError::MalformedEncoding {
+                what: "SAT assignments exceed remaining bytes",
+                ..
+            })
+        ));
+
+        let mut proof_writer = Writer::new();
+        proof_writer.header(SchemaKind::UnsatProof);
+        proof_writer.u64(limits.max_proof_steps);
+        assert!(matches!(
+            UnsatProof::from_canonical_bytes(&proof_writer.finish(), &unsat_formula(), limits),
+            Err(SchemaError::MalformedEncoding {
+                what: "proof steps exceed remaining bytes",
+                ..
+            })
+        ));
+
+        let valid = sat_formula().to_canonical_bytes();
+        assert!(Cnf::from_canonical_bytes(&valid, limits).is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -1756,7 +1827,7 @@ mod cnf_canonical_property {
     }
 
     #[test]
-    fn noncanonical_clause_and_id_order_is_rejected_on_decode() {
+    fn noncanonical_clause_and_id_order_is_rejected_during_wire_read() {
         let mut writer = Writer::new();
         writer.header(SchemaKind::Cnf);
         writer.u32(2);
@@ -1957,6 +2028,22 @@ mod proof_dependency_model {
             Err(SchemaError::DuplicateDependency {
                 step: clause_id(3),
                 dependency: clause_id(1)
+            })
+        );
+        assert_eq!(
+            UnsatProof::new(
+                &cnf,
+                vec![
+                    ProofStep::delete(vec![clause_id(1), clause_id(1)]),
+                    ProofStep::Conclude {
+                        empty_clause: clause_id(2)
+                    }
+                ],
+                SchemaLimits::default()
+            ),
+            Err(SchemaError::DuplicateDeletionTarget {
+                step_index: 0,
+                clause: clause_id(1)
             })
         );
     }
