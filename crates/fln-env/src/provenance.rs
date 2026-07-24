@@ -36,8 +36,11 @@ use crate::modules::{
 ///    direct-import rows (target, `import_all`, `is_exported`, `is_meta`), then
 ///    artifact digest/producer/grade;
 /// 3. ordered declarations, ordered extra declarations, and ordered extension
-///    contributions; each contribution carries its descriptor, start ordinal,
-///    base-history digest, and contiguous `(ordinal, payload_digest)` identities;
+///    contributions; each contribution carries its descriptor, target-journal start,
+///    base-history digest, and its module-local source sequence of
+///    [`ExtensionEntryId`] content identities — the source ordinal is the position in
+///    that sequence and the target position is `start + ordinal`, so no rebasable
+///    journal coordinate is stored per entry;
 /// 4. decode completeness, extension knowledge, and the canonical missing-target set.
 ///
 /// Enum tags are frozen below by paired exhaustive `*_tag`/`read_*` functions:
@@ -117,38 +120,85 @@ impl ProvenanceCompleteness {
     }
 }
 
-/// Stable identity of one extension journal entry. The payload is not copied into
-/// provenance: the ordinal binds replay position and the digest binds exact bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExtensionEntryIdentity {
-    index: u64,
-    payload_digest: Digest,
+/// Dedicated versioned derivation for extension-entry content identity.
+///
+/// It shares [`Domain::ModuleProvenance`] with the manifest root but is separated from
+/// it by this canonical schema prefix, so an entry-id preimage can never coincide with
+/// a manifest preimage.
+pub const EXTENSION_ENTRY_ID_SCHEMA: SchemaId = SchemaId {
+    name: "fln.env.module-provenance.entry-id",
+    version: 1,
+};
+
+/// Stable content identity of one extension journal entry.
+///
+/// Derived from the versioned entry schema, the module epoch, the exact extension
+/// descriptor identity, and the exact raw payload bytes — and from nothing else. The
+/// contributing module, the module-local source ordinal, the target journal position,
+/// the applied range, the journal branch, and every allocation or `Arc` fact are
+/// deliberately excluded, so the identity survives journal rebasing, replay, restore,
+/// and merge. Two occurrences carrying the same descriptor and payload therefore share
+/// this id by construction; they remain distinguishable *as occurrences* by the
+/// contributing [`ModuleId`] plus the module-local source ordinal
+/// ([`ExtensionContribution::source_ordinal`]).
+///
+/// The id is a locator and a fast inequality check. Digest collision resistance is a
+/// HYPOTHESIS of the selected digest, never an injectivity proof: wherever equality or
+/// ownership is load-bearing, the exact canonical fields decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtensionEntryId(Digest);
+
+impl ExtensionEntryId {
+    /// Derive the identity from the only inputs it is permitted to depend on. The
+    /// payload is hashed, never retained: provenance stores identity, and the bytes
+    /// themselves stay `Arc`-backed in the extension journal.
+    pub fn derive(epoch: &ModuleEpoch, descriptor: &ExtensionDescriptor, payload: &[u8]) -> Self {
+        let mut writer = CanonWriter::new();
+        writer.schema(EXTENSION_ENTRY_ID_SCHEMA);
+        writer.str(epoch.tag());
+        writer.str(epoch.commit());
+        descriptor.name.write_body(&mut writer);
+        writer.u8(merge_semantics_tag(descriptor.merge));
+        writer.u8(checkpoint_semantics_tag(descriptor.checkpoint));
+        writer.u8(payload_provenance_tag(descriptor.provenance));
+        writer.bytes(payload);
+        Self(hash(Domain::ModuleProvenance, &writer.into_bytes()))
+    }
+
+    /// Reconstruct from canonical bytes. Crate-internal on purpose: an external caller
+    /// must [`derive`](Self::derive) the id from the payload rather than assert one,
+    /// so no fabricated identity can enter a manifest.
+    pub(crate) const fn from_digest(digest: Digest) -> Self {
+        Self(digest)
+    }
+
+    pub fn digest(&self) -> Digest {
+        self.0
+    }
 }
 
-impl ExtensionEntryIdentity {
-    pub const fn new(index: u64, payload_digest: Digest) -> Self {
-        Self {
-            index,
-            payload_digest,
-        }
-    }
-
-    pub fn index(&self) -> u64 {
-        self.index
-    }
-
-    pub fn payload_digest(&self) -> Digest {
-        self.payload_digest
+impl std::fmt::Display for ExtensionEntryId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
 /// One exact ordered range contributed to a registered extension.
+///
+/// `entries` is the module-local source sequence: the array index *is* the entry's
+/// `ExtensionSourceOrdinal` (zero-based), and empty or repeated occurrences are
+/// retained rather than deduplicated, because this is ordered replay data.
+///
+/// `start` is the target journal position the range was applied at. It is scoped to
+/// one committed provenance root and one extension, may change after replay, restore,
+/// or merge, and is never an input to any [`ExtensionEntryId`]. Source ordinal and
+/// target position are therefore two different coordinates and never aliases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionContribution {
     descriptor: ExtensionDescriptor,
     start: u64,
     base_history_digest: Digest,
-    entries: Arc<[ExtensionEntryIdentity]>,
+    entries: Arc<[ExtensionEntryId]>,
 }
 
 impl ExtensionContribution {
@@ -156,7 +206,7 @@ impl ExtensionContribution {
         descriptor: ExtensionDescriptor,
         start: u64,
         base_history_digest: Digest,
-        entries: Vec<ExtensionEntryIdentity>,
+        entries: Vec<ExtensionEntryId>,
     ) -> Self {
         Self {
             descriptor,
@@ -170,6 +220,7 @@ impl ExtensionContribution {
         &self.descriptor
     }
 
+    /// Target-journal start of the applied range. Not stable content identity.
     pub fn start(&self) -> u64 {
         self.start
     }
@@ -178,8 +229,23 @@ impl ExtensionContribution {
         self.base_history_digest
     }
 
-    pub fn entries(&self) -> &[ExtensionEntryIdentity] {
+    pub fn entries(&self) -> &[ExtensionEntryId] {
         &self.entries
+    }
+
+    /// Module-local source ordinal of the occurrence at `index` — the coordinate that,
+    /// with the contributing module and the entry id, identifies an occurrence.
+    pub fn source_ordinal(&self, index: usize) -> Option<u64> {
+        if index >= self.entries.len() {
+            return None;
+        }
+        u64::try_from(index).ok()
+    }
+
+    /// Current target-journal position of the occurrence at `index`. Scoped to one
+    /// committed root and extension; it may differ after replay, restore, or merge.
+    pub fn target_position(&self, index: usize) -> Option<u64> {
+        self.start.checked_add(self.source_ordinal(index)?)
     }
 
     pub fn end(&self) -> Option<u64> {
@@ -393,13 +459,6 @@ pub enum ModuleProvenanceError {
         module: ModuleId,
         contribution_index: usize,
     },
-    EntryIndexMismatch {
-        module: ModuleId,
-        contribution_index: usize,
-        entry_index: usize,
-        expected: u64,
-        actual: u64,
-    },
     EntryRangeOverflow {
         module: ModuleId,
         contribution_index: usize,
@@ -486,17 +545,6 @@ impl std::fmt::Display for ModuleProvenanceError {
             } => write!(
                 formatter,
                 "module `{}` extension contribution {contribution_index} is empty",
-                module.name().to_display_string()
-            ),
-            Self::EntryIndexMismatch {
-                module,
-                contribution_index,
-                entry_index,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "module `{}` extension contribution {contribution_index} entry {entry_index} has index {actual}, expected {expected}",
                 module.name().to_display_string()
             ),
             Self::EntryRangeOverflow {
@@ -850,30 +898,11 @@ fn validate_contribution_record(
                 contribution_index,
             });
         }
-        for (entry_index, entry) in contribution.entries.iter().enumerate() {
-            let entry_offset = u64::try_from(entry_index).map_err(|_| {
-                ModuleProvenanceError::EntryRangeOverflow {
-                    module: module.clone(),
-                    contribution_index,
-                }
-            })?;
-            let expected = contribution
-                .start
-                .checked_add(entry_offset)
-                .ok_or_else(|| ModuleProvenanceError::EntryRangeOverflow {
-                    module: module.clone(),
-                    contribution_index,
-                })?;
-            if entry.index != expected {
-                return Err(ModuleProvenanceError::EntryIndexMismatch {
-                    module: module.clone(),
-                    contribution_index,
-                    entry_index,
-                    expected,
-                    actual: entry.index,
-                });
-            }
-        }
+        // Source ordinal and target position are both derived from the array index and
+        // `start`, so neither can disagree with the range by construction — the
+        // `EntryIndexMismatch` this loop used to raise is unrepresentable now that no
+        // entry carries a journal coordinate of its own. `end()` above already proved
+        // the whole range fits, which is the only remaining arithmetic obligation.
         facts.extension_entries = facts
             .extension_entries
             .saturating_add(contribution.entries.len());
@@ -980,8 +1009,10 @@ fn write_contribution_record(record: &ModuleContributionRecord, writer: &mut Can
         writer.bytes(&contribution.base_history_digest.0);
         writer.u64(contribution.entries.len() as u64);
         for entry in contribution.entries.iter() {
-            writer.u64(entry.index);
-            writer.bytes(&entry.payload_digest.0);
+            // The occurrence's source ordinal is its position in this sequence and its
+            // target position is `start + ordinal`; writing either again would put a
+            // rebasable journal coordinate inside the entry identity.
+            writer.bytes(&entry.digest().0);
         }
     }
     writer.u8(decode_completeness_tag(record.completeness.decode));
@@ -1196,10 +1227,7 @@ fn read_contribution_record(
         )?;
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            entries.push(ExtensionEntryIdentity::new(
-                reader.u64()?,
-                read_digest(reader)?,
-            ));
+            entries.push(ExtensionEntryId::from_digest(read_digest(reader)?));
         }
         contributions.push(ExtensionContribution::new(
             descriptor,
@@ -1434,8 +1462,20 @@ mod tests {
         }
     }
 
-    fn entry(index: u64, seed: u8) -> ExtensionEntryIdentity {
-        ExtensionEntryIdentity::new(index, hash(Domain::Fixture, &[seed]))
+    /// Fixture entries are derived exactly as production entries are — from the epoch,
+    /// the descriptor, and raw payload bytes. No test may assert an id it fabricated,
+    /// or the derivation law would be tested against itself.
+    fn entry_for(descriptor: &ExtensionDescriptor, payload: &[u8]) -> ExtensionEntryId {
+        ExtensionEntryId::derive(&epoch(), descriptor, payload)
+    }
+
+    /// The common case: an entry under the `simpExt`/Understood descriptor that
+    /// `sample_records` uses.
+    fn entry(seed: u8) -> ExtensionEntryId {
+        entry_for(
+            &extension_descriptor("simpExt", PayloadProvenance::Understood),
+            &[seed],
+        )
     }
 
     fn sample_records() -> Vec<ModuleContributionRecord> {
@@ -1452,7 +1492,7 @@ mod tests {
             extension_descriptor("simpExt", PayloadProvenance::Understood),
             7,
             Digest([0x31; 32]),
-            vec![entry(7, 0x41), entry(8, 0x42)],
+            vec![entry(0x41), entry(0x42)],
         );
         let a = ModuleContributionRecord::new(
             module_a,
@@ -1657,10 +1697,9 @@ mod tests {
         let mut contribution_reordered = sample_records();
         let contribution = &contribution_reordered[0].extension_contributions[0];
         let mut entries = contribution.entries().to_vec();
+        // Source order is the array order, so a swap is the whole mutation: no journal
+        // coordinate has to be rewritten to keep the applied range valid.
         entries.swap(0, 1);
-        // Preserve a valid contiguous range while reversing payload identities.
-        entries[0] = ExtensionEntryIdentity::new(7, entries[0].payload_digest());
-        entries[1] = ExtensionEntryIdentity::new(8, entries[1].payload_digest());
         contribution_reordered[0].extension_contributions = vec![ExtensionContribution::new(
             contribution.descriptor().clone(),
             contribution.start(),
@@ -1678,7 +1717,10 @@ mod tests {
             extension_descriptor("traceExt", PayloadProvenance::Understood),
             0,
             Digest([0x52; 32]),
-            vec![entry(0, 0x53)],
+            vec![entry_for(
+                &extension_descriptor("traceExt", PayloadProvenance::Understood),
+                &[0x53],
+            )],
         );
         let first = two_contributions[0].extension_contributions[0].clone();
         two_contributions[0].extension_contributions = vec![first.clone(), second.clone()].into();
@@ -1803,7 +1845,7 @@ mod tests {
         let mut entry_payload = sample_records();
         let contribution = &entry_payload[0].extension_contributions[0];
         let mut entries = contribution.entries().to_vec();
-        entries[1] = entry(8, 0x99);
+        entries[1] = entry(0x99);
         entry_payload[0].extension_contributions = vec![ExtensionContribution::new(
             contribution.descriptor().clone(),
             contribution.start(),
@@ -2013,10 +2055,12 @@ mod tests {
             original.descriptor().clone(),
             9,
             original.base_history_digest(),
-            vec![entry(9, 0x41), entry(10, 0x42)],
+            vec![entry(0x41), entry(0x42)],
         )]
         .into();
-        observe("extension.range_start+entry_ordinals", epoch(), records);
+        // Only the applied range start moves here: entry ordinals are positions in the
+        // source sequence now, not stored fields, so they cannot vary independently.
+        observe("extension.range_start", epoch(), records);
 
         let mut records = sample_records();
         let original = records[0].extension_contributions[0].clone();
@@ -2035,10 +2079,10 @@ mod tests {
             original.descriptor().clone(),
             original.start(),
             original.base_history_digest(),
-            vec![entry(7, 0x41), entry(8, 0x99)],
+            vec![entry(0x41), entry(0x99)],
         )]
         .into();
-        observe("extension.entry_payload_digest", epoch(), records);
+        observe("extension.entry_id", epoch(), records);
 
         let mut records = sample_records();
         let original = records[0].extension_contributions[0].clone();
@@ -2046,7 +2090,7 @@ mod tests {
             original.descriptor().clone(),
             original.start(),
             original.base_history_digest(),
-            vec![entry(7, 0x41), entry(8, 0x42), entry(9, 0x43)],
+            vec![entry(0x41), entry(0x42), entry(0x43)],
         )]
         .into();
         observe("extension.entry_count", epoch(), records);
@@ -2306,19 +2350,11 @@ mod tests {
             Err(ModuleProvenanceError::EmptyExtensionContribution { .. })
         ));
 
-        let mut wrong_entry = baseline_records.clone();
-        let original = &wrong_entry[0].extension_contributions[0];
-        wrong_entry[0].extension_contributions = vec![ExtensionContribution::new(
-            original.descriptor().clone(),
-            original.start(),
-            original.base_history_digest(),
-            vec![entry(7, 1), entry(99, 2)],
-        )]
-        .into();
-        assert!(matches!(
-            ModuleProvenanceManifest::new(epoch(), wrong_entry, TEST_LIMITS),
-            Err(ModuleProvenanceError::EntryIndexMismatch { .. })
-        ));
+        // There is deliberately no "entry index disagrees with the range" row here any
+        // more: an occurrence carries no journal coordinate of its own, so that class of
+        // malformed input is unrepresentable rather than merely rejected. The property
+        // that replaced it is proved by
+        // `entry_identity_is_content_derived_and_survives_journal_rebasing`.
 
         let mut overflow = baseline_records.clone();
         let original = &overflow[0].extension_contributions[0];
@@ -2326,7 +2362,7 @@ mod tests {
             original.descriptor().clone(),
             u64::MAX,
             original.base_history_digest(),
-            vec![entry(u64::MAX, 1)],
+            vec![entry(1)],
         )]
         .into();
         assert!(matches!(
@@ -2439,8 +2475,9 @@ mod tests {
     #[test]
     fn opaque_and_partial_grades_are_explicit_and_payloads_are_not_copied() {
         let descriptor = extension_descriptor("opaqueExt", PayloadProvenance::Opaque);
+        let opaque_entry = entry_for(&descriptor, &[9]);
         let contribution =
-            ExtensionContribution::new(descriptor, 0, Digest([0; 32]), vec![entry(0, 9)]);
+            ExtensionContribution::new(descriptor.clone(), 0, Digest([0; 32]), vec![opaque_entry]);
         let record = ModuleContributionRecord::new(
             ModuleRecord::new(id("Opaque"), true, vec![], evidence(9)),
             vec![name("Opaque.one")],
@@ -2463,14 +2500,161 @@ mod tests {
             ExtensionKnowledge::ContainsOpaque
         );
         assert!(!manifest.records()[0].completeness().is_complete());
+        // An opaque payload still gets a full content identity: opacity is about
+        // understanding the bytes, not about being unable to name them.
         assert_eq!(
-            manifest.records()[0].extension_contributions()[0].entries()[0].payload_digest(),
-            hash(Domain::Fixture, &[9])
+            manifest.records()[0].extension_contributions()[0].entries()[0],
+            ExtensionEntryId::derive(&epoch(), &descriptor, &[9])
         );
         // The schema contains only a fixed-size digest, not the source payload Arc.
         assert_eq!(
-            std::mem::size_of::<ExtensionEntryIdentity>(),
-            std::mem::size_of::<u64>() + std::mem::size_of::<Digest>()
+            std::mem::size_of::<ExtensionEntryId>(),
+            std::mem::size_of::<Digest>()
+        );
+    }
+
+    /// The named mutant this kills: *alias `ExtensionEntryId` to the mutable journal
+    /// ordinal*. If the target position were folded into the identity, replaying the
+    /// same module's contribution at a different journal offset would silently rename
+    /// every entry, and no downstream consumer could recognise an entry across a
+    /// rebase, restore, or merge.
+    #[test]
+    fn entry_identity_is_content_derived_and_survives_journal_rebasing() {
+        let descriptor = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let entries = vec![entry(0x41), entry(0x42)];
+
+        let rebase = |start: u64| {
+            let mut records = sample_records();
+            records[0].extension_contributions = vec![ExtensionContribution::new(
+                descriptor.clone(),
+                start,
+                Digest([0x31; 32]),
+                entries.clone(),
+            )]
+            .into();
+            ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+                .expect("a rebased range is still a valid manifest")
+        };
+
+        let at_seven = rebase(7);
+        let at_zero = rebase(0);
+        let far = rebase(1_000_000);
+
+        // Rebasing invariance: the ids are byte-identical at every applied offset.
+        for rebased in [&at_zero, &far] {
+            assert_eq!(
+                at_seven.records()[0].extension_contributions()[0].entries(),
+                rebased.records()[0].extension_contributions()[0].entries(),
+                "a journal offset must not rename an entry"
+            );
+        }
+
+        // The applied range is still authoritative committed state, so moving it does
+        // change the aggregate root. Identity-stability must not be bought by dropping
+        // the range from the canonical bytes.
+        assert_ne!(at_seven.root(), at_zero.root());
+        assert_ne!(at_seven.root(), far.root());
+
+        // Source ordinal and target position are two coordinates, not aliases.
+        let contribution = &at_seven.records()[0].extension_contributions()[0];
+        assert_eq!(contribution.source_ordinal(0), Some(0));
+        assert_eq!(contribution.source_ordinal(1), Some(1));
+        assert_eq!(contribution.target_position(0), Some(7));
+        assert_eq!(contribution.target_position(1), Some(8));
+        assert_eq!(contribution.source_ordinal(2), None);
+        assert_eq!(contribution.target_position(2), None);
+        assert_eq!(contribution.end(), Some(9));
+    }
+
+    /// The identity's input set is exactly epoch + descriptor + payload. Every one of
+    /// those must move it, and the excluded facts must not — that pair of claims is
+    /// what makes the id a *content* id rather than a position or a contributor tag.
+    #[test]
+    fn entry_identity_binds_epoch_descriptor_and_payload_and_nothing_else() {
+        let descriptor = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let baseline = ExtensionEntryId::derive(&epoch(), &descriptor, &[0x41]);
+
+        // Each authoritative input moves the identity.
+        let mut moved = BTreeSet::new();
+        moved.insert(baseline);
+        moved.insert(ExtensionEntryId::derive(
+            &ModuleEpoch::new("v4.33.0", PIN_COMMIT),
+            &descriptor,
+            &[0x41],
+        ));
+        moved.insert(ExtensionEntryId::derive(&epoch(), &descriptor, &[0x42]));
+        moved.insert(ExtensionEntryId::derive(&epoch(), &descriptor, &[]));
+        for altered in [
+            extension_descriptor("otherExt", PayloadProvenance::Understood),
+            extension_descriptor("simpExt", PayloadProvenance::Opaque),
+            ExtensionDescriptor {
+                merge: MergeSemantics::SetUnion,
+                ..descriptor.clone()
+            },
+            ExtensionDescriptor {
+                checkpoint: CheckpointSemantics::FullJournal,
+                ..descriptor.clone()
+            },
+        ] {
+            moved.insert(ExtensionEntryId::derive(&epoch(), &altered, &[0x41]));
+        }
+        assert_eq!(moved.len(), 8, "an authoritative input failed to move the id");
+
+        // The excluded facts do not move it: the same payload contributed by a
+        // different module, at a different source ordinal, in a different range, is the
+        // same entry.
+        let elsewhere = ExtensionContribution::new(
+            descriptor.clone(),
+            4_096,
+            Digest([0xAB; 32]),
+            vec![entry(0x99), entry(0x41)],
+        );
+        assert_eq!(elsewhere.entries()[1], baseline);
+        assert_eq!(elsewhere.source_ordinal(1), Some(1));
+        assert_eq!(elsewhere.target_position(1), Some(4_097));
+    }
+
+    /// Equal descriptor and payload share one content id by construction; occurrences
+    /// stay distinct through `(ModuleId, source ordinal, entry id)`. This is what lets
+    /// duplicate replay data be retained without collapsing it.
+    #[test]
+    fn equal_payloads_share_one_content_id_while_occurrences_stay_distinct() {
+        let descriptor = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let repeated = entry(0x41);
+        let mut records = sample_records();
+        records[0].extension_contributions = vec![ExtensionContribution::new(
+            descriptor,
+            7,
+            Digest([0x31; 32]),
+            vec![repeated, repeated, entry(0x42)],
+        )]
+        .into();
+        let manifest = ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+            .expect("repeated occurrences are ordered replay data, not a duplicate error");
+
+        let contribution = &manifest.records()[0].extension_contributions()[0];
+        assert_eq!(contribution.entries().len(), 3, "an occurrence was collapsed");
+        assert_eq!(contribution.entries()[0], contribution.entries()[1]);
+        assert_ne!(contribution.entries()[0], contribution.entries()[2]);
+
+        // The two identical entries are the same *entry* at two different occurrences.
+        assert_ne!(
+            contribution.source_ordinal(0),
+            contribution.source_ordinal(1)
+        );
+        assert_ne!(
+            contribution.target_position(0),
+            contribution.target_position(1)
+        );
+
+        // Retention is observable in the canonical bytes, not just in memory.
+        let bytes = manifest.to_canonical_bytes().to_vec();
+        let decoded = ModuleProvenanceManifest::from_canonical_bytes(&bytes, TEST_LIMITS)
+            .expect("repeated occurrences round-trip");
+        assert_eq!(decoded.root(), manifest.root());
+        assert_eq!(
+            decoded.records()[0].extension_contributions()[0].entries(),
+            contribution.entries()
         );
     }
 
