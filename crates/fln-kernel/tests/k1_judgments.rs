@@ -4717,6 +4717,19 @@ fn kr310_projection_congruence_on_stuck_scrutinees() {
 /// The environment rows the translation copies: a plain parameterized
 /// `MyList` (α : Type) with nil/cons, monomorphic for fixture clarity.
 fn mylist_env() -> Environment {
+    let (mylist, ctors) = mylist_rows();
+    let mut env = Environment::new()
+        .add_decl(ConstantInfo::Induct(mylist))
+        .expect("env");
+    for ctor in ctors {
+        env = env.add_decl(ConstantInfo::Ctor(ctor)).expect("env");
+    }
+    env
+}
+
+/// `MyList`'s rows on their own, so an environment can declare the families in
+/// either order (the declaration-order permutation).
+fn mylist_rows() -> (InductiveVal, Vec<ConstructorVal>) {
     let mylist = InductiveVal {
         base: cval(
             n("MyList"),
@@ -4777,13 +4790,7 @@ fn mylist_env() -> Environment {
         num_fields: 2,
         is_unsafe: false,
     };
-    Environment::new()
-        .add_decl(ConstantInfo::Induct(mylist))
-        .expect("env")
-        .add_decl(ConstantInfo::Ctor(nil))
-        .expect("env")
-        .add_decl(ConstantInfo::Ctor(cons))
-        .expect("env")
+    (mylist, vec![nil, cons])
 }
 
 /// The decoded (restored-form) nested block: `MyTree.node : MyList MyTree →
@@ -5185,6 +5192,29 @@ fn kr608_nested_translation_exhaustion_is_typed() {
 /// `MyList α` field. Nothing here is nested by itself: the cascade appears
 /// only once `MyArr` is copied at `MyTree`.
 fn myarr_env() -> Environment {
+    cascade_env(false)
+}
+
+/// Both families, with `arr_first` choosing which is DECLARED first. The
+/// translation resolves nested heads by name out of the environment, so this
+/// order must not be observable anywhere in the result.
+fn cascade_env(arr_first: bool) -> Environment {
+    let (mylist, list_ctors) = mylist_rows();
+    let (myarr, arr_ctor) = myarr_rows();
+    let list: Vec<ConstantInfo> = std::iter::once(ConstantInfo::Induct(mylist))
+        .chain(list_ctors.into_iter().map(ConstantInfo::Ctor))
+        .collect();
+    let arr = vec![ConstantInfo::Induct(myarr), ConstantInfo::Ctor(arr_ctor)];
+    let (first, second) = if arr_first { (arr, list) } else { (list, arr) };
+    let mut env = Environment::new();
+    for info in first.into_iter().chain(second) {
+        env = env.add_decl(info).expect("env");
+    }
+    env
+}
+
+/// `MyArr`'s rows: the family whose copy exposes the cascade.
+fn myarr_rows() -> (InductiveVal, ConstructorVal) {
     let bv = |i: u32| Expr::bvar(i).expect("packs");
     let myarr = InductiveVal {
         base: cval(
@@ -5223,11 +5253,7 @@ fn myarr_env() -> Environment {
         num_fields: 1,
         is_unsafe: false,
     };
-    mylist_env()
-        .add_decl(ConstantInfo::Induct(myarr))
-        .expect("env")
-        .add_decl(ConstantInfo::Ctor(mk))
-        .expect("env")
+    (myarr, mk)
 }
 
 /// Decoded rows for the cascading block: `MyTree.node : MyArr MyTree → MyTree`
@@ -5531,6 +5557,461 @@ fn kr608_auxiliary_recursor_numbering_follows_creation_order() {
         "auxiliary recursor numbering must follow creation order: {}",
         reject_message(&verdict)
     );
+}
+
+// ---------------------------------------------------------------------------
+// KR-608 permutations (bead franken_lean-8ce). Auxiliaries are minted in
+// OCCURRENCE order, so permuting the constructor's fields permutes the
+// translated block's types — and with them the motive positions, the minor
+// order, and which auxiliary `rec_1` eliminates. Permuting the ENVIRONMENT's
+// declaration order must change nothing at all: nested heads are resolved by
+// name. Both blocks below nest `MyArr MyTree` and `MyList MyTree` directly and
+// differ only in which field comes first.
+// ---------------------------------------------------------------------------
+
+/// One minor binder — name and type — in telescope order.
+type Minor = (Name, Expr);
+/// An auxiliary recursor: its restored name suffix and its rules, each a
+/// constructor with that constructor's field count.
+type AuxRecursorSpec = (&'static str, Vec<(Name, u32)>);
+
+/// The two-field cascading block. `arr_first` puts `MyArr MyTree` before
+/// `MyList MyTree` in `MyTree.node`'s telescope.
+fn permuted_rows(arr_first: bool) -> (Vec<InductiveVal>, Vec<ConstructorVal>) {
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let arr = || Expr::app(Expr::const_(n("MyArr"), vec![]), tree());
+    let list = || Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let ((first, first_ty), (second, second_ty)) = if arr_first {
+        ((n("a"), arr()), (n("l"), list()))
+    } else {
+        ((n("l"), list()), (n("a"), arr()))
+    };
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested: 2,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(
+            nn("MyTree", "node"),
+            vec![],
+            Expr::forall_e(
+                first,
+                first_ty,
+                Expr::forall_e(second, second_ty, tree(), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 2,
+        is_unsafe: false,
+    };
+    (vec![ind], vec![node])
+}
+
+/// The same block in full restored form, with the three recursors the pin
+/// would serialize for THAT field order. The two orders are genuinely
+/// different decoded rows, not a relabelling: `motive_2`/`motive_3` swap
+/// meaning, the minors reorder (`node mk nil cons` versus `node nil cons mk`),
+/// and every rule right-hand side shifts with them.
+fn permuted_block(arr_first: bool) -> (Vec<InductiveVal>, Vec<ConstructorVal>, Vec<RecursorVal>) {
+    let (types, ctors) = permuted_rows(arr_first);
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let arr = || Expr::app(Expr::const_(n("MyArr"), vec![]), tree());
+    let list = || Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let u = Level::param(n("u"));
+    let motive_ty =
+        |major: Expr| Expr::forall_e(n("t"), major, Expr::sort(u.clone()), BinderInfo::Default);
+    // Motive order IS translated-type order: main, then auxiliaries in
+    // creation order — which is the field order.
+    let (aux_1, aux_2) = if arr_first {
+        (arr(), list())
+    } else {
+        (list(), arr())
+    };
+    let motive_1_ty = motive_ty(tree());
+    let motive_2_ty = motive_ty(aux_1.clone());
+    let motive_3_ty = motive_ty(aux_2.clone());
+    // The `node` minor is index-identical under both orders: whichever field
+    // comes first is the first-minted auxiliary and therefore `motive_2`.
+    let (f1, f1_ty, f2, f2_ty) = if arr_first {
+        (n("a"), arr(), n("l"), list())
+    } else {
+        (n("l"), list(), n("a"), arr())
+    };
+    let node_minor_ty = Expr::forall_e(
+        f1.clone(),
+        f1_ty,
+        Expr::forall_e(
+            f2.clone(),
+            f2_ty,
+            Expr::forall_e(
+                Name::str(Name::anonymous(), format!("{}_ih", f1.to_display_string())),
+                Expr::app(bv(3), bv(1)),
+                Expr::forall_e(
+                    Name::str(Name::anonymous(), format!("{}_ih", f2.to_display_string())),
+                    Expr::app(bv(3), bv(1)),
+                    Expr::app(
+                        bv(6),
+                        Expr::app(
+                            Expr::app(Expr::const_(nn("MyTree", "node"), vec![]), bv(3)),
+                            bv(2),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let mk_app = |data: Expr| {
+        Expr::app(
+            Expr::app(Expr::const_(nn("MyArr", "mk"), vec![]), tree()),
+            data,
+        )
+    };
+    let nil_app = || Expr::app(Expr::const_(nn("MyList", "nil"), vec![]), tree());
+    let cons_app = |head: Expr, tail: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::const_(nn("MyList", "cons"), vec![]), tree()),
+                head,
+            ),
+            tail,
+        )
+    };
+    // Minor types depend on each minor's POSITION in the telescope, so the two
+    // orders carry different de Bruijn indices for the same judgment.
+    let (minors, aux_rules): (Vec<Minor>, [AuxRecursorSpec; 2]) = if arr_first {
+        // …node mk nil cons: mk is the 2nd minor, nil/cons the 3rd and 4th.
+        let mk_minor_ty = Expr::forall_e(
+            n("data"),
+            list(),
+            Expr::forall_e(
+                n("data_ih"),
+                Expr::app(bv(2), bv(0)),
+                Expr::app(bv(4), mk_app(bv(1))),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let nil_minor_ty = Expr::app(bv(2), nil_app());
+        let cons_minor_ty = Expr::forall_e(
+            n("head"),
+            tree(),
+            Expr::forall_e(
+                n("tail"),
+                list(),
+                Expr::forall_e(
+                    n("head_ih"),
+                    Expr::app(bv(7), bv(1)),
+                    Expr::forall_e(
+                        n("tail_ih"),
+                        Expr::app(bv(6), bv(1)),
+                        Expr::app(bv(7), cons_app(bv(3), bv(2))),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        (
+            vec![
+                (n("node"), node_minor_ty.clone()),
+                (n("mk"), mk_minor_ty),
+                (n("nil"), nil_minor_ty),
+                (n("cons"), cons_minor_ty),
+            ],
+            [
+                ("rec_1", vec![(nn("MyArr", "mk"), 1)]),
+                (
+                    "rec_2",
+                    vec![(nn("MyList", "nil"), 0), (nn("MyList", "cons"), 2)],
+                ),
+            ],
+        )
+    } else {
+        // …node nil cons mk: nil/cons are the 2nd and 3rd minors, mk the 4th.
+        let nil_minor_ty = Expr::app(bv(2), nil_app());
+        let cons_minor_ty = Expr::forall_e(
+            n("head"),
+            tree(),
+            Expr::forall_e(
+                n("tail"),
+                list(),
+                Expr::forall_e(
+                    n("head_ih"),
+                    Expr::app(bv(6), bv(1)),
+                    Expr::forall_e(
+                        n("tail_ih"),
+                        Expr::app(bv(6), bv(1)),
+                        Expr::app(bv(7), cons_app(bv(3), bv(2))),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let mk_minor_ty = Expr::forall_e(
+            n("data"),
+            list(),
+            Expr::forall_e(
+                n("data_ih"),
+                Expr::app(bv(5), bv(0)),
+                Expr::app(bv(5), mk_app(bv(1))),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        (
+            vec![
+                (n("node"), node_minor_ty.clone()),
+                (n("nil"), nil_minor_ty),
+                (n("cons"), cons_minor_ty),
+                (n("mk"), mk_minor_ty),
+            ],
+            [
+                (
+                    "rec_1",
+                    vec![(nn("MyList", "nil"), 0), (nn("MyList", "cons"), 2)],
+                ),
+                ("rec_2", vec![(nn("MyArr", "mk"), 1)]),
+            ],
+        )
+    };
+    let motive_binders = [
+        (n("motive_3"), motive_3_ty.clone()),
+        (n("motive_2"), motive_2_ty.clone()),
+        (n("motive_1"), motive_1_ty.clone()),
+    ];
+    let telescope = |major_ty: Expr, result_motive_at: u32| {
+        let mut body = Expr::forall_e(
+            n("t"),
+            major_ty,
+            Expr::app(bv(result_motive_at), bv(0)),
+            BinderInfo::Default,
+        );
+        for (name, ty) in minors.iter().rev() {
+            body = Expr::forall_e(name.clone(), ty.clone(), body, BinderInfo::Default);
+        }
+        for (name, ty) in &motive_binders {
+            body = Expr::forall_e(name.clone(), ty.clone(), body, BinderInfo::Implicit);
+        }
+        body
+    };
+    let lam = |body: Expr, field_lams: &[(Name, Expr)]| {
+        let mut inner = body;
+        for (name, ty) in field_lams.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        for (name, ty) in minors.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        for (name, ty) in &motive_binders {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        inner
+    };
+    let rec_call = |rec: &str, args: &[u32]| {
+        let mut app = Expr::const_(nn("MyTree", rec), vec![u.clone()]);
+        for a in args {
+            app = Expr::app(app, bv(*a));
+        }
+        app
+    };
+    // node: … (f1) (f2) => node f1 f2 (rec_1 … f1) (rec_2 … f2). The minor
+    // sits at index 5 under both orders (two fields plus three later minors).
+    let node_rhs = lam(
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::app(bv(5), bv(1)), bv(0)),
+                rec_call("rec_1", &[8, 7, 6, 5, 4, 3, 2, 1]),
+            ),
+            rec_call("rec_2", &[8, 7, 6, 5, 4, 3, 2, 0]),
+        ),
+        &[(f1, aux_1.clone()), (f2, aux_2.clone())],
+    );
+    // The `MyList` copy's own recursor: `rec_2` when the list is minted second,
+    // `rec_1` when it is minted first.
+    let list_rec = if arr_first { "rec_2" } else { "rec_1" };
+    let (mk_minor_at, nil_minor_at, cons_minor_at) = if arr_first { (3, 1, 2) } else { (1, 2, 3) };
+    let mk_rhs = lam(
+        Expr::app(
+            Expr::app(bv(mk_minor_at), bv(0)),
+            rec_call(list_rec, &[7, 6, 5, 4, 3, 2, 1, 0]),
+        ),
+        &[(n("data"), list())],
+    );
+    let nil_rhs = lam(bv(nil_minor_at), &[]);
+    let cons_rhs = lam(
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::app(bv(cons_minor_at), bv(1)), bv(0)),
+                rec_call("rec", &[8, 7, 6, 5, 4, 3, 2, 1]),
+            ),
+            rec_call(list_rec, &[8, 7, 6, 5, 4, 3, 2, 0]),
+        ),
+        &[(n("head"), tree()), (n("tail"), list())],
+    );
+    let rhs_for = |ctor: &Name| -> Expr {
+        if ctor == &nn("MyArr", "mk") {
+            mk_rhs.clone()
+        } else if ctor == &nn("MyList", "nil") {
+            nil_rhs.clone()
+        } else {
+            cons_rhs.clone()
+        }
+    };
+    let mk_rec = |name: Name, ty: Expr, rules: Vec<RecursorRule>| RecursorVal {
+        base: cval(name, vec![n("u")], ty),
+        all: vec![n("MyTree")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 3,
+        num_minors: 4,
+        rules,
+        k: false,
+        is_unsafe: false,
+    };
+    let mut recursors = vec![mk_rec(
+        nn("MyTree", "rec"),
+        telescope(tree(), 7),
+        vec![RecursorRule {
+            ctor: nn("MyTree", "node"),
+            nfields: 2,
+            rhs: node_rhs,
+        }],
+    )];
+    for (index, (rec_name, rules)) in aux_rules.iter().enumerate() {
+        let major = if index == 0 {
+            aux_1.clone()
+        } else {
+            aux_2.clone()
+        };
+        recursors.push(mk_rec(
+            nn("MyTree", rec_name),
+            telescope(major, 6 - index as u32),
+            rules
+                .iter()
+                .map(|(ctor, nfields)| RecursorRule {
+                    ctor: ctor.clone(),
+                    nfields: *nfields,
+                    rhs: rhs_for(ctor),
+                })
+                .collect(),
+        ));
+    }
+    (types, ctors, recursors)
+}
+
+#[test]
+fn kr608_permutation_arr_first_admits_byte_exact() {
+    // Fields (MyArr MyTree, MyList MyTree): auxiliaries are minted
+    // [MyArr, MyList], so `rec_1` eliminates the array copy and the minors run
+    // node/mk/nil/cons.
+    let (types, ctors, recursors) = permuted_block(true);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "arr-first permutation must admit with its own recursors; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr608_permutation_list_first_admits_byte_exact() {
+    // The mirrored order (MyList MyTree, MyArr MyTree): auxiliaries are minted
+    // [MyList, MyArr], `rec_1` eliminates the list copy, and the minors run
+    // node/nil/cons/mk. Same judgment, different serialized block.
+    let (types, ctors, recursors) = permuted_block(false);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "list-first permutation must admit with its own recursors; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr608_permutation_arr_first_recursors_reject_the_list_first_block() {
+    // Insertion order is OBSERVABLE, and each order gets its own recursors: a
+    // translation that fixed the auxiliary order (by name, by environment
+    // position, by set iteration) would admit this cross-feed.
+    let (types, ctors) = permuted_rows(false);
+    let (_, _, arr_first_recursors) = permuted_block(true);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, arr_first_recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("diverges from regeneration"),
+        "arr-first recursors must not satisfy the list-first block: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_permutation_list_first_recursors_reject_the_arr_first_block() {
+    // The mirror of the previous test, so neither direction passes by accident.
+    let (types, ctors) = permuted_rows(true);
+    let (_, _, list_first_recursors) = permuted_block(false);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, list_first_recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("diverges from regeneration"),
+        "list-first recursors must not satisfy the arr-first block: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_permutation_environment_declaration_order_is_not_observable() {
+    // The other permutation axis: declaring `MyArr` before `MyList` or after
+    // must change nothing, because nested heads are resolved by name out of
+    // the environment. Both field orders are checked against both environment
+    // orders — four runs, one verdict.
+    for arr_first_block in [true, false] {
+        for arr_first_env in [true, false] {
+            let (types, ctors, recursors) = permuted_block(arr_first_block);
+            let verdict = check(
+                &cascade_env(arr_first_env),
+                &block_decl(types, ctors, recursors),
+                Budget::DEFAULT,
+            );
+            assert!(
+                verdict.is_accepted(),
+                "declaration order must not be observable \
+                 (block arr_first={arr_first_block}, env arr_first={arr_first_env}); got {verdict:?}"
+            );
+        }
+    }
 }
 
 #[test]
