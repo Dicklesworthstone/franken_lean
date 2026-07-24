@@ -1184,6 +1184,59 @@ printf '\npub(crate) fn seeded_crate_local_api() {}\n' \
   >> "$RESTRICTED/crates/fln-unsafe-abi/src/lib.rs"
 guard_step export_recovery "$RESTRICTED" 0 pass
 
+# The configuration-discovery family. Cargo merges .cargo/config(.toml) from the
+# invocation directory upward and rustup resolves the toolchain the same way, so
+# every one of these plants is live for a supported command yet appears in no
+# reviewed manifest. The nested plant is the one the root-only audit could not
+# see: `cd crates/fln-kernel && cargo build` would compile the kernel with
+# `--cap-lints allow`, which silently defeats the D3 forbid(unsafe_code) posture.
+NESTED_CARGO_CONFIG="$SCRATCH_ROOT/nested-cargo-config"
+copy_fixture copy_nested_cargo_config "$NESTED_CARGO_CONFIG"
+mkdir "$NESTED_CARGO_CONFIG/crates/fln-kernel/.cargo"
+printf '[build]\nrustflags = ["--cap-lints", "allow"]\n' \
+  > "$NESTED_CARGO_CONFIG/crates/fln-kernel/.cargo/config.toml"
+guard_step seeded_nested_cargo_config "$NESTED_CARGO_CONFIG" 1 fail \
+  FLN-STRUCT-016@crates/fln-kernel/.cargo/config.toml
+
+# rustup prefers rust-toolchain.toml when both spellings exist, so an unreviewed
+# legacy file can sit beside the reviewed pin undetected.
+LEGACY_TOOLCHAIN="$SCRATCH_ROOT/legacy-toolchain"
+copy_fixture copy_legacy_toolchain "$LEGACY_TOOLCHAIN"
+printf '[toolchain]\nchannel = "stable"\n' > "$LEGACY_TOOLCHAIN/rust-toolchain"
+guard_step seeded_legacy_toolchain "$LEGACY_TOOLCHAIN" 1 fail \
+  FLN-STRUCT-016@rust-toolchain
+
+# The three ambiguous shapes of the reviewed pin itself: a decoy section carrying
+# the expected channel while [toolchain] selects something else, a path-based
+# toolchain, and a duplicate key whose last value wins. Each must fail the parse
+# rather than resolve to some channel.
+DECOY_TOOLCHAIN="$SCRATCH_ROOT/decoy-toolchain"
+copy_fixture copy_decoy_toolchain "$DECOY_TOOLCHAIN"
+printf '[metadata]\nchannel = "nightly-2026-07-13"\n[toolchain]\nchannel = "nightly-2026-07-13"\n' \
+  > "$DECOY_TOOLCHAIN/rust-toolchain.toml"
+guard_step seeded_decoy_toolchain "$DECOY_TOOLCHAIN" 1 fail \
+  FLN-STRUCT-016@rust-toolchain.toml
+
+PATH_TOOLCHAIN="$SCRATCH_ROOT/path-toolchain"
+copy_fixture copy_path_toolchain "$PATH_TOOLCHAIN"
+printf '[toolchain]\nchannel = "nightly-2026-07-13"\npath = "/tmp/toolchain"\n' \
+  > "$PATH_TOOLCHAIN/rust-toolchain.toml"
+guard_step seeded_path_toolchain "$PATH_TOOLCHAIN" 1 fail \
+  FLN-STRUCT-016@rust-toolchain.toml
+
+DUPLICATE_TOOLCHAIN="$SCRATCH_ROOT/duplicate-toolchain"
+copy_fixture copy_duplicate_toolchain "$DUPLICATE_TOOLCHAIN"
+printf '[toolchain]\nchannel = "nightly-2026-07-13"\nchannel = "nightly-2026-07-13"\n' \
+  > "$DUPLICATE_TOOLCHAIN/rust-toolchain.toml"
+guard_step seeded_duplicate_toolchain "$DUPLICATE_TOOLCHAIN" 1 fail \
+  FLN-STRUCT-016@rust-toolchain.toml
+
+# Recovery: an untouched copy still passes, proving the depth-walk did not start
+# rejecting the one legal member of the family (the reviewed root pin).
+CONFIG_RECOVERY="$SCRATCH_ROOT/config-recovery"
+copy_fixture copy_config_recovery "$CONFIG_RECOVERY"
+guard_step config_recovery "$CONFIG_RECOVERY" 0 pass
+
 # A real guard invocation that exceeds a deliberately tiny output budget is typed
 # inconclusive. The same frozen binary immediately recovers under the normal budget.
 resource_exhaustion_step resource_exhaustion "$ROOT"
