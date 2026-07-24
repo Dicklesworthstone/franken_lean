@@ -1248,4 +1248,307 @@ mod tests {
             "deep Level equality exhausted the bounded worker stack"
         );
     }
+    /// Byte-for-byte `Debug` vectors captured from the recursive implementation
+    /// this walk replaces (bead franken_lean-canon-stack-safe-drop-6gy). Rendering
+    /// is a compatibility surface: consumers, goldens, and diagnostics read it, so
+    /// the stack-safety fix must be invisible in both `{:?}` and `{:#?}`.
+    #[test]
+    fn debug_rendering_is_byte_identical_to_the_recursive_goldens() {
+        let x = || Name::str(Name::anonymous(), "x");
+        let values: Vec<(&str, Level)> = vec![
+            ("zero", Level::zero()),
+            ("succ", Level::zero().succ().expect("small")),
+            ("param", Level::param(x())),
+            (
+                "mvar",
+                Level::mvar(LMVarId(Name::num(Name::anonymous(), 4))),
+            ),
+            (
+                "max",
+                Level::max(Level::zero(), Level::param(x())).expect("small"),
+            ),
+            (
+                "imax",
+                Level::imax(Level::param(x()), Level::zero()).expect("small"),
+            ),
+            (
+                "nested",
+                Level::max(
+                    Level::zero().succ().expect("small"),
+                    Level::imax(Level::param(x()), Level::zero()).expect("small"),
+                )
+                .expect("small"),
+            ),
+        ];
+        const GOLDENS: [(&str, &str, &str); 7] = [
+            (
+                "zero",
+                "Level { node: Zero, data: LevelData(2221) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Zero,\n",
+                    "    data: LevelData(\n",
+                    "        2221,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "succ",
+                "Level { node: Succ(Level { node: Zero, data: LevelData(2221) }), data: LevelData(1101033050548) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Succ(\n",
+                    "        Level {\n",
+                    "            node: Zero,\n",
+                    "            data: LevelData(\n",
+                    "                2221,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        1101033050548,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "param",
+                "Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Param(\n",
+                    "        Name(\n",
+                    "            Str(\n",
+                    "                StrNode {\n",
+                    "                    pre: Name(\n",
+                    "                        Anonymous,\n",
+                    "                    ),\n",
+                    "                    component: \"x\",\n",
+                    "                    hash: 13655884332201764339,\n",
+                    "                },\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        10400061217,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "mvar",
+                "Level { node: MVar(LMVarId(Name(Num(NumNode { pre: Name(Anonymous), component: 4, overflowed: false, hash: 5025098885263514187 })))), data: LevelData(6529228386) }",
+                concat!(
+                    "Level {\n",
+                    "    node: MVar(\n",
+                    "        LMVarId(\n",
+                    "            Name(\n",
+                    "                Num(\n",
+                    "                    NumNode {\n",
+                    "                        pre: Name(\n",
+                    "                            Anonymous,\n",
+                    "                        ),\n",
+                    "                        component: 4,\n",
+                    "                        overflowed: false,\n",
+                    "                        hash: 5025098885263514187,\n",
+                    "                    },\n",
+                    "                ),\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        6529228386,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "max",
+                "Level { node: Max(Level { node: Zero, data: LevelData(2221) }, Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }), data: LevelData(1111868905434) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Max(\n",
+                    "        Level {\n",
+                    "            node: Zero,\n",
+                    "            data: LevelData(\n",
+                    "                2221,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        Level {\n",
+                    "            node: Param(\n",
+                    "                Name(\n",
+                    "                    Str(\n",
+                    "                        StrNode {\n",
+                    "                            pre: Name(\n",
+                    "                                Anonymous,\n",
+                    "                            ),\n",
+                    "                            component: \"x\",\n",
+                    "                            hash: 13655884332201764339,\n",
+                    "                        },\n",
+                    "                    ),\n",
+                    "                ),\n",
+                    "            ),\n",
+                    "            data: LevelData(\n",
+                    "                10400061217,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        1111868905434,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "imax",
+                "Level { node: IMax(Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }, Level { node: Zero, data: LevelData(2221) }), data: LevelData(1111737256431) }",
+                concat!(
+                    "Level {\n",
+                    "    node: IMax(\n",
+                    "        Level {\n",
+                    "            node: Param(\n",
+                    "                Name(\n",
+                    "                    Str(\n",
+                    "                        StrNode {\n",
+                    "                            pre: Name(\n",
+                    "                                Anonymous,\n",
+                    "                            ),\n",
+                    "                            component: \"x\",\n",
+                    "                            hash: 13655884332201764339,\n",
+                    "                        },\n",
+                    "                    ),\n",
+                    "                ),\n",
+                    "            ),\n",
+                    "            data: LevelData(\n",
+                    "                10400061217,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        Level {\n",
+                    "            node: Zero,\n",
+                    "            data: LevelData(\n",
+                    "                2221,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        1111737256431,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "nested",
+                "Level { node: Max(Level { node: Succ(Level { node: Zero, data: LevelData(2221) }), data: LevelData(1101033050548) }, Level { node: IMax(Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }, Level { node: Zero, data: LevelData(2221) }), data: LevelData(1111737256431) }), data: LevelData(2211360343728) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Max(\n",
+                    "        Level {\n",
+                    "            node: Succ(\n",
+                    "                Level {\n",
+                    "                    node: Zero,\n",
+                    "                    data: LevelData(\n",
+                    "                        2221,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            ),\n",
+                    "            data: LevelData(\n",
+                    "                1101033050548,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        Level {\n",
+                    "            node: IMax(\n",
+                    "                Level {\n",
+                    "                    node: Param(\n",
+                    "                        Name(\n",
+                    "                            Str(\n",
+                    "                                StrNode {\n",
+                    "                                    pre: Name(\n",
+                    "                                        Anonymous,\n",
+                    "                                    ),\n",
+                    "                                    component: \"x\",\n",
+                    "                                    hash: 13655884332201764339,\n",
+                    "                                },\n",
+                    "                            ),\n",
+                    "                        ),\n",
+                    "                    ),\n",
+                    "                    data: LevelData(\n",
+                    "                        10400061217,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "                Level {\n",
+                    "                    node: Zero,\n",
+                    "                    data: LevelData(\n",
+                    "                        2221,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            ),\n",
+                    "            data: LevelData(\n",
+                    "                1111737256431,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        2211360343728,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+        ];
+        assert_eq!(values.len(), GOLDENS.len());
+        for ((label, value), (golden_label, plain, alternate)) in values.iter().zip(GOLDENS) {
+            assert_eq!(*label, golden_label, "vector order drifted");
+            assert_eq!(
+                format!("{value:?}"),
+                plain,
+                "plain Debug changed for `{label}`"
+            );
+            assert_eq!(
+                format!("{value:#?}"),
+                alternate,
+                "pretty Debug changed for `{label}`"
+            );
+        }
+    }
+
+    /// Formatting is the other structural traversal: it must be depth-independent
+    /// in both modes, and every level must still appear in the output.
+    ///
+    /// The two modes run at different depths on purpose. Plain rendering is linear
+    /// in the input, so it runs deep. Pretty rendering indents each nesting level
+    /// by four spaces, which makes its *output* quadratic in depth — a property of
+    /// `{:#?}` itself, unchanged by this walk — so it runs at a depth whose output
+    /// stays a few megabytes. Both are far past the recursion threshold: the
+    /// recursive renderer this replaces aborted at depth 2000 on this stack.
+    #[test]
+    fn deep_debug_rendering_is_stack_bounded() {
+        const PLAIN_DEPTH: usize = 100_000;
+        const PRETTY_DEPTH: usize = 2_000;
+
+        fn succ_chain(depth: usize) -> Level {
+            let mut level = Level::zero();
+            for _ in 0..depth {
+                level = level.succ().expect("depth is inside the 24-bit packing");
+            }
+            level
+        }
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let deep = succ_chain(PLAIN_DEPTH);
+                let plain = format!("{deep:?}");
+                assert_eq!(plain.matches("Succ(").count(), PLAIN_DEPTH);
+
+                let shallower = succ_chain(PRETTY_DEPTH);
+                let pretty = format!("{shallower:#?}");
+                assert_eq!(pretty.matches("Succ(").count(), PRETTY_DEPTH);
+            })
+            .expect("spawn bounded-stack Level formatter")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "deep Level formatting exhausted the bounded worker stack"
+        );
+    }
 }

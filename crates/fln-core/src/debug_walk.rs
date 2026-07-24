@@ -72,9 +72,10 @@ impl<'a, 'b> FlatDebug<'a, 'b> {
         let tuple = frame.tuple;
         frame.filled = true;
         if self.alternate {
-            if first {
-                self.formatter.write_char('\n')?;
-            }
+            // Every pretty-mode entry is terminated by a comma and a newline: the
+            // last one gets it from `close`, the others from the entry that
+            // follows them.
+            self.formatter.write_str(if first { "\n" } else { ",\n" })?;
             self.indent()
         } else if first {
             if tuple {
