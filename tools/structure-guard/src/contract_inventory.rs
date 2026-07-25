@@ -23,6 +23,7 @@ use crate::{
     CONTRACT_INVENTORY_SCHEMA_FILE, SUITE_LOCK_FILE,
 };
 
+pub const DEFINITION_SCHEMA: &str = "fln-contract-inventory-definition/1";
 pub const INVENTORY_SCHEMA: &str = "fln-contract-inventory/1";
 pub const POLICY_SCHEMA: &str = "fln-contract-inventory-policy/1";
 pub const EXTRACTOR_ID: &str = "suite-lock";
@@ -42,6 +43,7 @@ source-authority SUITE.lock
 extractor suite-lock version=1
 hash fnv1a64-noncryptographic domain=required fields=u64le-length-prefixed
 row-fields key,kind,extractor,extractor-version,source,target-class,abi-class,raw-evidence-hash,identity,authority,support
+root-fields schema,suite-lock,raw,policy,reference,canonical
 row-order canonical-key-byte-order
 pin-values forbidden-outside-source-authority
 policy-join exact-bijection
@@ -117,8 +119,15 @@ pub struct InventorySnapshot {
     pub inventory_root: String,
     pub schema_root: String,
     pub suite_lock_root: String,
+    pub raw_root: String,
     pub policy_root: String,
+    pub reference_root: String,
     pub row_count: usize,
+    pub target_row_count: usize,
+    pub abi_row_count: usize,
+    pub unresolved_row_count: usize,
+    pub source_bytes: usize,
+    pub canonical_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -647,6 +656,58 @@ fn canonical_inventory(
         "fln.contract-inventory.policy-root/1",
         policy_text.as_bytes(),
     );
+    let mut raw_projection = String::new();
+    for (key, row) in &raw {
+        raw_projection.push_str(&format!(
+            "row {key} kind={} source={} raw-evidence-hash={}\n",
+            row.kind,
+            row.source,
+            labeled_hash(row.evidence_hash),
+        ));
+    }
+    let raw_root = hash_one(
+        "fln.contract-inventory.raw-root/1",
+        raw_projection.as_bytes(),
+    );
+    let reference = raw.get("reference").ok_or_else(|| {
+        InventoryError::new(
+            ErrorClass::InternalFault,
+            "reference_raw_row_missing",
+            SUITE_LOCK_FILE,
+            "raw inventory lost the mandatory Reference row",
+        )
+    })?;
+    let reference_evidence = labeled_hash(reference.evidence_hash);
+    let reference_root = hash_fields(
+        "fln.contract-inventory.reference-root/1",
+        &[
+            reference.key.as_bytes(),
+            reference.kind.as_bytes(),
+            reference.source.as_bytes(),
+            reference_evidence.as_bytes(),
+        ],
+    );
+    let target_row_count = raw
+        .values()
+        .filter(|row| matches!(row.kind, "target"))
+        .count();
+    let abi_row_count = policy
+        .values()
+        .filter(|row| !matches!(row.abi_class.as_str(), "none"))
+        .count();
+    let unresolved_row_count = 0;
+    let source_bytes = suite_lock_text
+        .len()
+        .checked_add(schema_text.len())
+        .and_then(|total| total.checked_add(policy_text.len()))
+        .ok_or_else(|| {
+            InventoryError::new(
+                ErrorClass::InternalFault,
+                "resource_accounting_overflow",
+                CONTRACT_INVENTORY_FILE,
+                "source byte accounting overflowed usize",
+            )
+        })?;
     let mut output = String::new();
     output.push_str(&format!("schema {INVENTORY_SCHEMA}\n"));
     output.push_str(&format!("schema-root {}\n", labeled_hash(schema_root)));
@@ -654,11 +715,19 @@ fn canonical_inventory(
         "suite-lock-root {}\n",
         labeled_hash(suite_lock_root)
     ));
+    output.push_str(&format!("raw-root {}\n", labeled_hash(raw_root)));
     output.push_str(&format!("policy-root {}\n", labeled_hash(policy_root)));
+    output.push_str(&format!(
+        "reference-root {}\n",
+        labeled_hash(reference_root)
+    ));
     output.push_str(&format!(
         "extractor {EXTRACTOR_ID} version={EXTRACTOR_VERSION}\n"
     ));
     output.push_str(&format!("row-count {}\n", raw.len()));
+    output.push_str(&format!("target-row-count {target_row_count}\n"));
+    output.push_str(&format!("abi-row-count {abi_row_count}\n"));
+    output.push_str(&format!("unresolved-row-count {unresolved_row_count}\n"));
 
     for (key, raw_row) in &raw {
         let policy_row = policy.get(key).ok_or_else(|| {
@@ -720,14 +789,22 @@ fn canonical_inventory(
         ErrorClass::InternalFault,
         "canonical_renderer_invalid",
     )?;
+    let canonical_bytes = output.len();
     Ok(CanonicalInventory {
         bytes: output.into_bytes(),
         snapshot: InventorySnapshot {
             inventory_root: labeled_hash(inventory_root),
             schema_root: labeled_hash(schema_root),
             suite_lock_root: labeled_hash(suite_lock_root),
+            raw_root: labeled_hash(raw_root),
             policy_root: labeled_hash(policy_root),
+            reference_root: labeled_hash(reference_root),
             row_count: raw.len(),
+            target_row_count,
+            abi_row_count,
+            unresolved_row_count,
+            source_bytes,
+            canonical_bytes,
         },
     })
 }
@@ -1260,6 +1337,7 @@ fn publish_with_hook(
         ErrorClass::InternalFault,
         "published_inventory_invalid_after_rename",
     )?;
+    ensure_no_candidate(&root)?;
     Ok(PublicationReceipt {
         action: PublicationAction::Published,
         snapshot: expected.snapshot,
@@ -1347,6 +1425,7 @@ pub fn recover(root: &Path) -> Result<PublicationReceipt, InventoryError> {
         ErrorClass::InternalFault,
         "published_inventory_invalid_after_recovery",
     )?;
+    ensure_no_candidate(&root)?;
     Ok(PublicationReceipt {
         action: PublicationAction::Recovered,
         snapshot: expected.snapshot,
@@ -1489,6 +1568,19 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
         let second =
             canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, REQUIRED_POLICY).unwrap();
         assert_eq!(first, second);
+        for required_header in [
+            "raw-root fnv1a64:",
+            "reference-root fnv1a64:",
+            "row-count 5\n",
+            "target-row-count 1\n",
+            "abi-row-count 0\n",
+            "unresolved-row-count 0\n",
+        ] {
+            assert!(
+                first.contains(required_header),
+                "canonical inventory lost `{required_header}`"
+            );
+        }
         for forbidden_pin in [
             "nightly-2026-07-13",
             "x86_64-unknown-linux-gnu",
@@ -1501,6 +1593,21 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
                 "derived inventory copied authoritative pin `{forbidden_pin}`"
             );
         }
+        let changed_reference = TEST_SUITE_LOCK.replace(
+            "8c9756b28d64dab099da31a4c09229a9e6a2ef35",
+            "9c9756b28d64dab099da31a4c09229a9e6a2ef35",
+        );
+        let changed =
+            canonical_inventory_text(&changed_reference, SCHEMA_DEFINITION, REQUIRED_POLICY)
+                .expect("another well-shaped Reference pin remains derivable");
+        assert_ne!(
+            first, changed,
+            "Reference pin drift must change the opaque Reference and canonical roots"
+        );
+        assert!(
+            !changed.contains("9c9756b28d64dab099da31a4c09229a9e6a2ef35"),
+            "Reference drift binding must remain opaque rather than becoming a second pin authority"
+        );
 
         let missing = REQUIRED_POLICY.replace(
             "row target:0001 kind=target support=required target-class=certified abi-class=none\n",
@@ -1515,6 +1622,14 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
         let error = canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, &stale)
             .expect_err("stale policy row must fail the bijection");
         assert_eq!(error.reason, "policy_join_not_bijective");
+
+        let duplicate = REQUIRED_POLICY.replace(
+            "row reference kind=reference support=required target-class=none abi-class=none\n",
+            "row reference kind=reference support=required target-class=none abi-class=none\nrow reference kind=reference support=required target-class=none abi-class=none\n",
+        );
+        let error = canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, &duplicate)
+            .expect_err("duplicate policy row must fail before the join");
+        assert_eq!(error.reason, "policy_not_canonical");
     }
 
     #[test]

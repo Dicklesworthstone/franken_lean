@@ -5,6 +5,7 @@ source-authority SUITE.lock
 extractor suite-lock version=1
 hash fnv1a64-noncryptographic domain=required fields=u64le-length-prefixed
 row-fields key,kind,extractor,extractor-version,source,target-class,abi-class,raw-evidence-hash,identity,authority,support
+root-fields schema,suite-lock,raw,policy,reference,canonical
 row-order canonical-key-byte-order
 pin-values forbidden-outside-source-authority
 policy-join exact-bijection

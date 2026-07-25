@@ -12,8 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use structure_guard::contract_inventory::{self, InventoryError, PublicationReceipt};
+use structure_guard::contract_inventory::{
+    self, DEFINITION_SCHEMA, EXTRACTOR_ID, EXTRACTOR_VERSION, INVENTORY_SCHEMA, InventoryError,
+    MAX_LINE_BYTES, MAX_ROWS, MAX_SOURCE_BYTES, POLICY_SCHEMA, PublicationReceipt,
+};
 use structure_guard::{checks, report};
+
+const PUBLICATION_SCENARIO_ID: &str = "fln-k5rr.contract-inventory-atomic-publication";
 
 const USAGE: &str = "usage: structure-guard [--root <path>] [--robot]\n\
        structure-guard --publish-contract-inventory [--root <path>] [--robot]\n\
@@ -131,16 +136,56 @@ fn parse_cli(args: &[OsString]) -> Result<CliAction, CliError> {
     }
 }
 
+fn success_step_id(action: &str) -> &'static str {
+    match action {
+        "published" => "publish.atomic-commit",
+        "recovered" => "recover.atomic-commit",
+        _ => "unknown.atomic-commit",
+    }
+}
+
+fn success_stage(action: &str) -> &'static str {
+    match action {
+        "published" => "candidate-validated-renamed-and-directory-synced",
+        "recovered" => "candidate-revalidated-renamed-and-directory-synced",
+        _ => "unknown-commit-stage",
+    }
+}
+
+fn requested_step_id(action: &str) -> &'static str {
+    match action {
+        "publish" => "publish.refused",
+        "recover" => "recover.refused",
+        _ => "unknown.refused",
+    }
+}
+
 fn render_publication_success(receipt: &PublicationReceipt, duration_ms: u128) -> String {
     let snapshot = &receipt.snapshot;
+    let action = receipt.action.as_str();
+    let run_id = format!(
+        "{PUBLICATION_SCENARIO_ID}:{action}:{}",
+        snapshot.inventory_root
+    );
     format!(
-        "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_inventory_publication\",\"action\":\"{}\",\"verdict\":\"pass\",\"exit_code\":0,\"inventory_root\":\"{}\",\"schema_root\":\"{}\",\"suite_lock_root\":\"{}\",\"policy_root\":\"{}\",\"rows\":{},\"duration_ms\":{duration_ms}}}\n",
-        receipt.action.as_str(),
-        report::json_escape(&snapshot.inventory_root),
-        report::json_escape(&snapshot.schema_root),
+        "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_inventory_publication\",\"run_id\":\"{}\",\"scenario_id\":\"{PUBLICATION_SCENARIO_ID}\",\"step_id\":\"{}\",\"action\":\"{action}\",\"verdict\":\"pass\",\"exit_code\":0,\"inventory_schema\":\"{INVENTORY_SCHEMA}\",\"definition_schema\":\"{DEFINITION_SCHEMA}\",\"policy_schema\":\"{POLICY_SCHEMA}\",\"extractor_id\":\"{EXTRACTOR_ID}\",\"extractor_version\":\"{EXTRACTOR_VERSION}\",\"reference_root\":\"{}\",\"suite_lock_root\":\"{}\",\"schema_root\":\"{}\",\"target_facts\":{{\"rows\":{},\"certified_rows\":{},\"abi_rows\":{}}},\"raw_root\":\"{}\",\"canonical_root\":\"{}\",\"policy_root\":\"{}\",\"rows_total\":{},\"unresolved_rows\":{},\"resource_facts\":{{\"source_bytes\":{},\"canonical_bytes\":{},\"max_source_bytes\":{MAX_SOURCE_BYTES},\"max_rows\":{MAX_ROWS},\"max_line_bytes\":{MAX_LINE_BYTES}}},\"publication_stage\":\"{}\",\"authority\":\"complete\",\"cleanup\":\"candidate_absent\",\"final_published_root\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+        report::json_escape(&run_id),
+        success_step_id(action),
+        report::json_escape(&snapshot.reference_root),
         report::json_escape(&snapshot.suite_lock_root),
+        report::json_escape(&snapshot.schema_root),
+        snapshot.target_row_count,
+        snapshot.target_row_count,
+        snapshot.abi_row_count,
+        report::json_escape(&snapshot.raw_root),
+        report::json_escape(&snapshot.inventory_root),
         report::json_escape(&snapshot.policy_root),
         snapshot.row_count,
+        snapshot.unresolved_row_count,
+        snapshot.source_bytes,
+        snapshot.canonical_bytes,
+        success_stage(action),
+        report::json_escape(&snapshot.inventory_root),
     )
 }
 
@@ -149,14 +194,70 @@ fn render_publication_failure(
     error: &InventoryError,
     duration_ms: u128,
 ) -> String {
+    let run_id = format!(
+        "{PUBLICATION_SCENARIO_ID}:{requested_action}:{}",
+        error.reason
+    );
     format!(
-        "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_inventory_publication\",\"action\":\"{}\",\"verdict\":\"{}\",\"exit_code\":{},\"reason\":\"{}\",\"path\":\"{}\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+        "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_inventory_publication\",\"run_id\":\"{}\",\"scenario_id\":\"{PUBLICATION_SCENARIO_ID}\",\"step_id\":\"{}\",\"action\":\"{}\",\"verdict\":\"{}\",\"exit_code\":{},\"inventory_schema\":\"{INVENTORY_SCHEMA}\",\"definition_schema\":\"{DEFINITION_SCHEMA}\",\"policy_schema\":\"{POLICY_SCHEMA}\",\"extractor_id\":\"{EXTRACTOR_ID}\",\"extractor_version\":\"{EXTRACTOR_VERSION}\",\"reference_root\":null,\"suite_lock_root\":null,\"schema_root\":null,\"target_facts\":null,\"raw_root\":null,\"canonical_root\":null,\"policy_root\":null,\"rows_total\":null,\"unresolved_rows\":null,\"resource_facts\":{{\"source_bytes\":null,\"canonical_bytes\":null,\"max_source_bytes\":{MAX_SOURCE_BYTES},\"max_rows\":{MAX_ROWS},\"max_line_bytes\":{MAX_LINE_BYTES}}},\"publication_stage\":\"refused-or-failed-before-clean-terminal-receipt\",\"authority\":\"{}\",\"cleanup\":\"not_established\",\"final_published_root\":null,\"reason\":\"{}\",\"path\":\"{}\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+        report::json_escape(&run_id),
+        requested_step_id(requested_action),
         requested_action,
         error.class.as_str(),
         error.class.exit_code(),
+        error.class.as_str(),
         report::json_escape(error.reason),
         report::json_escape(&error.path),
         report::json_escape(&error.detail),
+    )
+}
+
+fn render_publication_success_human(receipt: &PublicationReceipt, duration_ms: u128) -> String {
+    let snapshot = &receipt.snapshot;
+    let action = receipt.action.as_str();
+    let run_id = format!(
+        "{PUBLICATION_SCENARIO_ID}:{action}:{}",
+        snapshot.inventory_root
+    );
+    format!(
+        "structure-guard: contract_inventory_publication run_id={run_id} scenario_id={PUBLICATION_SCENARIO_ID} step_id={} action={action} verdict=pass exit_code=0 inventory_schema={INVENTORY_SCHEMA} definition_schema={DEFINITION_SCHEMA} policy_schema={POLICY_SCHEMA} extractor_id={EXTRACTOR_ID} extractor_version={EXTRACTOR_VERSION} reference_root={} suite_lock_root={} schema_root={} target_rows={} target_certified_rows={} abi_rows={} raw_root={} canonical_root={} policy_root={} rows_total={} unresolved_rows={} source_bytes={} canonical_bytes={} max_source_bytes={MAX_SOURCE_BYTES} max_rows={MAX_ROWS} max_line_bytes={MAX_LINE_BYTES} publication_stage={} authority=complete cleanup=candidate_absent final_published_root={} duration_ms={duration_ms}\n",
+        success_step_id(action),
+        snapshot.reference_root,
+        snapshot.suite_lock_root,
+        snapshot.schema_root,
+        snapshot.target_row_count,
+        snapshot.target_row_count,
+        snapshot.abi_row_count,
+        snapshot.raw_root,
+        snapshot.inventory_root,
+        snapshot.policy_root,
+        snapshot.row_count,
+        snapshot.unresolved_row_count,
+        snapshot.source_bytes,
+        snapshot.canonical_bytes,
+        success_stage(action),
+        snapshot.inventory_root,
+    )
+}
+
+fn render_publication_failure_human(
+    requested_action: &str,
+    error: &InventoryError,
+    duration_ms: u128,
+) -> String {
+    let run_id = format!(
+        "{PUBLICATION_SCENARIO_ID}:{requested_action}:{}",
+        error.reason
+    );
+    format!(
+        "structure-guard: contract_inventory_publication run_id={run_id} scenario_id={PUBLICATION_SCENARIO_ID} step_id={} action={requested_action} verdict={} exit_code={} inventory_schema={INVENTORY_SCHEMA} definition_schema={DEFINITION_SCHEMA} policy_schema={POLICY_SCHEMA} extractor_id={EXTRACTOR_ID} extractor_version={EXTRACTOR_VERSION} reference_root=unavailable suite_lock_root=unavailable schema_root=unavailable target_facts=unavailable raw_root=unavailable canonical_root=unavailable policy_root=unavailable rows_total=unavailable unresolved_rows=unavailable source_bytes=unavailable canonical_bytes=unavailable max_source_bytes={MAX_SOURCE_BYTES} max_rows={MAX_ROWS} max_line_bytes={MAX_LINE_BYTES} publication_stage=refused-or-failed-before-clean-terminal-receipt authority={} cleanup=not_established final_published_root=unavailable reason={} path={} detail={} duration_ms={duration_ms}\n",
+        requested_step_id(requested_action),
+        error.class.as_str(),
+        error.class.exit_code(),
+        error.class.as_str(),
+        error.reason,
+        error.path,
+        error.detail.replace('\n', "\\n"),
     )
 }
 
@@ -179,11 +280,9 @@ fn execute_publication(
                     render_publication_success(&receipt, started.elapsed().as_millis())
                 );
             } else {
-                println!(
-                    "structure-guard: contract inventory {} root={} rows={}",
-                    receipt.action.as_str(),
-                    receipt.snapshot.inventory_root,
-                    receipt.snapshot.row_count
+                print!(
+                    "{}",
+                    render_publication_success_human(&receipt, started.elapsed().as_millis())
                 );
             }
             ExitCode::SUCCESS
@@ -199,7 +298,14 @@ fn execute_publication(
                     )
                 );
             } else {
-                eprintln!("structure-guard: contract inventory {error}");
+                eprint!(
+                    "{}",
+                    render_publication_failure_human(
+                        requested_action,
+                        &error,
+                        started.elapsed().as_millis()
+                    )
+                );
             }
             ExitCode::from(error.class.exit_code())
         }
@@ -387,14 +493,48 @@ mod tests {
                 inventory_root: "fnv1a64:0000000000000001".to_string(),
                 schema_root: "fnv1a64:0000000000000002".to_string(),
                 suite_lock_root: "fnv1a64:0000000000000003".to_string(),
-                policy_root: "fnv1a64:0000000000000004".to_string(),
+                raw_root: "fnv1a64:0000000000000004".to_string(),
+                policy_root: "fnv1a64:0000000000000005".to_string(),
+                reference_root: "fnv1a64:0000000000000006".to_string(),
                 row_count: 5,
+                target_row_count: 1,
+                abi_row_count: 0,
+                unresolved_row_count: 0,
+                source_bytes: 300,
+                canonical_bytes: 700,
             },
         };
         let success = render_publication_success(&receipt, 7);
         assert_eq!(success.lines().count(), 1);
         assert!(success.contains("\"verdict\":\"pass\""));
         assert!(success.contains("\"exit_code\":0"));
+        for field in [
+            "\"run_id\":",
+            "\"scenario_id\":",
+            "\"step_id\":",
+            "\"inventory_schema\":",
+            "\"definition_schema\":",
+            "\"extractor_version\":",
+            "\"reference_root\":",
+            "\"suite_lock_root\":",
+            "\"target_facts\":",
+            "\"raw_root\":",
+            "\"canonical_root\":",
+            "\"policy_root\":",
+            "\"rows_total\":",
+            "\"unresolved_rows\":",
+            "\"resource_facts\":",
+            "\"publication_stage\":",
+            "\"authority\":\"complete\"",
+            "\"cleanup\":\"candidate_absent\"",
+            "\"final_published_root\":",
+        ] {
+            assert!(success.contains(field), "success record lost {field}");
+        }
+        let human = render_publication_success_human(&receipt, 8);
+        assert_eq!(human.lines().count(), 1);
+        assert!(human.contains("cleanup=candidate_absent"));
+        assert!(human.contains("final_published_root=fnv1a64:0000000000000001"));
 
         let failure = render_publication_failure(
             "recover",
@@ -411,5 +551,22 @@ mod tests {
         assert!(failure.contains("\"exit_code\":3"));
         assert!(failure.contains("a\\\"b"));
         assert!(failure.contains("first\\nsecond"));
+        assert!(failure.contains("\"reference_root\":null"));
+        assert!(failure.contains("\"cleanup\":\"not_established\""));
+        assert!(failure.contains("\"final_published_root\":null"));
+
+        let human_failure = render_publication_failure_human(
+            "recover",
+            &InventoryError {
+                class: ErrorClass::Inconclusive,
+                reason: "stale_candidate",
+                path: "contracts/a".to_string(),
+                detail: "first\nsecond".to_string(),
+            },
+            10,
+        );
+        assert_eq!(human_failure.lines().count(), 1);
+        assert!(human_failure.contains("authority=inconclusive"));
+        assert!(human_failure.contains("cleanup=not_established"));
     }
 }
