@@ -5,6 +5,8 @@
 //! and evaluated against the exact CNF, while UNSAT proof bytes are replayed by
 //! the independent streaming checker.
 
+#![forbid(unsafe_code)]
+
 use fln_verdict::{
     Assignment, Clause, ClauseId, Cnf, InputClause, Literal, Polarity, ProofCheckLimits,
     ProofCheckOutcome, SatModel, SchemaLimits, SolverLimits, SolverOutcome, VariableId,
