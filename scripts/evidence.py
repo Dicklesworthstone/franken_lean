@@ -245,6 +245,15 @@ E2E_STEP_ORDERS = {
         "resource_mutant",
         "resource_recovery",
     ],
+    "declaration_tag_matrix": [
+        "declaration_tag_matrix",
+    ],
+    "declaration_membership": [
+        "declaration_membership",
+    ],
+    "extension_descriptor_matrix": [
+        "extension_descriptor_matrix",
+    ],
     "verdict_schema": [
         "positive",
         "failure",
@@ -385,6 +394,73 @@ ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY = 1_000
 ENVIRONMENT_RESOURCE_COLLISION_TEST = (
     "pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence"
 )
+DECLARATION_TAG_MATRIX_SCHEMA = "fln.e2e.declaration-tag-matrix"
+DECLARATION_TAG_MATRIX_TEST = (
+    "environment::tests::"
+    "declaration_tag_matrix_e2e_emits_detailed_real_path_evidence"
+)
+DECLARATION_MEMBERSHIP_SCHEMA = "fln.e2e.declaration-membership"
+DECLARATION_MEMBERSHIP_TEST = (
+    "environment::tests::"
+    "declaration_membership_matrix_e2e_emits_detailed_real_path_evidence"
+)
+EXTENSION_DESCRIPTOR_MATRIX_SCHEMA = "fln.e2e.extension-descriptor-matrix"
+EXTENSION_DESCRIPTOR_MATRIX_TEST = (
+    "extensions::tests::"
+    "extension_descriptor_matrix_e2e_emits_detailed_real_path_evidence"
+)
+ENVIRONMENT_IDENTITY_VERSION = 1
+DECLARATION_TAG_GOLDENS = {
+    ("definition_safety", "unsafe"): (
+        "definition",
+        0,
+        286,
+        "157d1d61733828db775de4ee898c84ab608f57ca609965b7d8aba3ef9e3a1a5e",
+        "e6e48d3267b42c87425ac704373120f0c4624c591f6c3218412cdfd5464443ab",
+    ),
+    ("definition_safety", "safe"): (
+        "definition",
+        1,
+        286,
+        "e3a242872a3ffd8c515331f5821c1b42f81780060413feb33f2d63ca8aeb697d",
+        "5995ca5cc9f678192cb1700abb6bc18a87af673a6f3285cc9d55caa9b20bb6b0",
+    ),
+    ("definition_safety", "partial"): (
+        "definition",
+        2,
+        286,
+        "00a37c5b26ce2df45b79a0e5ddc0b32fe7ba3fd16e2267a8b199a3a2a5421f52",
+        "5a313316b29da1dab36b88cd02d1d52b96b025a3cb6b9682d0ba10eb59ae76d1",
+    ),
+    ("quot_kind", "type"): (
+        "quotient",
+        0,
+        157,
+        "d85f3e7116bf264784bad45e2d9a9acc9ad69ca15c2387f73d390b51c1a52674",
+        "64a010c5b799b51b464f4394db8f06a4d7f0c8f98a89bc634cddf3936f3a431f",
+    ),
+    ("quot_kind", "ctor"): (
+        "quotient",
+        1,
+        157,
+        "7a209bee80a459d0eddd0e82ced0b96345895dfdf11cb420729783eff42fe0a0",
+        "d8fc3394629ba859ee37b56dd6d937d787aa86b607b02941091a8699983e0589",
+    ),
+    ("quot_kind", "lift"): (
+        "quotient",
+        2,
+        157,
+        "706326aa022cfa4b76f80ea32c04ad0aef70d796da8762b86771b3b4d42937ad",
+        "804e0ddc5baea6f095d63662b95d303a11c7f33cc92c8d5c77efeb96df021706",
+    ),
+    ("quot_kind", "ind"): (
+        "quotient",
+        3,
+        157,
+        "32cecea0df45330f5ea249486eb8c0dd4ff236dc27ca90e79122de9f7e3d365a",
+        "7e0d5346e053845bda23a4fb2f3edf80f7daa3f86898a129d66d0531e0e22066",
+    ),
+}
 ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT = (
     "fln-fixture:fe1a2f87707d8edea65e8d4d61db5a1882c838b3e1975ec55b136af78f154dfe"
 )
@@ -6041,6 +6117,1006 @@ def validate_environment_resource_collision(
     }
 
 
+def read_environment_identity_stream(
+    path: Path, artifact_root: Path, *, label: str
+) -> tuple[Path, bytes, str, str, str]:
+    root = lexical_absolute(artifact_root)
+    absolute = require_within(path, root, label=f"environment-identity {label}")
+    data, _size, digest = stable_file_facts(absolute, max_bytes=MAX_LOG_BYTES)
+    if data and not data.endswith(b"\n"):
+        raise EvidenceError(f"environment-identity {label} is unterminated: {absolute}")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"environment-identity {label} is not UTF-8: {absolute}"
+        ) from error
+    for number, raw_line in enumerate(data.splitlines(), 1):
+        if len(raw_line) > MAX_RECORD_BYTES:
+            raise EvidenceError(
+                f"{absolute}:{number}: environment-identity {label} line is too large"
+            )
+    return absolute, data, text, digest, absolute.relative_to(root).as_posix()
+
+
+def environment_identity_failure_material(text: str, test_name: str) -> bool:
+    failed_forms = {
+        f"{test_name} --- FAILED",
+        f"test {test_name} ... FAILED",
+    }
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (
+            stripped in failed_forms
+            or stripped.startswith("test result: FAILED.")
+            or stripped.startswith("thread '")
+            and " panicked at " in stripped
+            or re.fullmatch(r"assertion .* failed(?:: .*)?", stripped) is not None
+            or stripped.startswith("error: test failed")
+            or stripped.startswith("error: could not compile")
+        ):
+            return True
+    return False
+
+
+def prepare_environment_identity_validation(
+    stdout_path: Path,
+    stderr_path: Path,
+    *,
+    artifact_root: Path,
+    schema: str,
+    test_name: str,
+    expected_run_id: str,
+    observed_exit: int,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+    expected_records: int,
+) -> tuple[list[dict[str, Any]], str, str, str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", expected_run_id):
+        raise EvidenceError("environment-identity run id is malformed")
+    if (
+        not isinstance(observed_exit, int)
+        or isinstance(observed_exit, bool)
+        or observed_exit != 0
+    ):
+        raise EvidenceError(
+            f"environment-identity observed exit {observed_exit!r}, expected 0"
+        )
+    root = lexical_absolute(artifact_root)
+    stdout_path, stdout_data, stdout_text, stdout_digest, stdout_relative = (
+        read_environment_identity_stream(stdout_path, root, label="stdout")
+    )
+    stderr_path, stderr_data, stderr_text, stderr_digest, stderr_relative = (
+        read_environment_identity_stream(stderr_path, root, label="stderr")
+    )
+    if stdout_path == stderr_path:
+        raise EvidenceError("environment-identity stdout and stderr are not distinct")
+    for label, expected, actual in (
+        ("stdout", expected_stdout_artifact, stdout_relative),
+        ("stderr", expected_stderr_artifact, stderr_relative),
+    ):
+        if not isinstance(expected, str) or not expected:
+            raise EvidenceError(f"environment-identity expected {label} is missing")
+        if expected != actual:
+            raise EvidenceError(
+                f"environment-identity {label} path {actual!r}, expected {expected!r}"
+            )
+    if environment_identity_failure_material(stdout_text, test_name):
+        raise EvidenceError("environment-identity stdout contains failure material")
+    if environment_identity_failure_material(stderr_text, test_name):
+        raise EvidenceError("environment-identity stderr contains failure material")
+
+    marker = f'"schema":"{schema}"'.encode()
+    prefix = b'{"schema":"' + schema.encode() + b'"'
+    records: list[dict[str, Any]] = []
+    for stream_label, data in (("stdout", stdout_data), ("stderr", stderr_data)):
+        for number, raw_line in enumerate(data.splitlines(), 1):
+            if marker not in raw_line:
+                continue
+            if not raw_line.startswith(prefix):
+                raise EvidenceError(
+                    f"environment-identity {stream_label}:{number} "
+                    "record is not canonically positioned"
+                )
+            try:
+                record = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise EvidenceError(
+                    f"environment-identity {stream_label}:{number} "
+                    "record is malformed"
+                ) from error
+            if not isinstance(record, dict):
+                raise EvidenceError(
+                    f"environment-identity {stream_label}:{number} "
+                    "record is not an object"
+                )
+            if stream_label != "stdout":
+                raise EvidenceError(
+                    "environment-identity detail rows leaked into stderr"
+                )
+            records.append(record)
+    if len(records) != expected_records:
+        raise EvidenceError(
+            f"environment-identity emitted {len(records)} records, "
+            f"expected {expected_records}"
+        )
+    return (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    )
+
+
+def require_environment_identity_fields(
+    record: dict[str, Any],
+    expected_fields: set[str],
+    *,
+    schema: str,
+    expected_run_id: str,
+    expected_beads: list[str],
+    label: str,
+) -> None:
+    if set(record) != expected_fields:
+        missing = sorted(expected_fields - set(record))
+        extra = sorted(set(record) - expected_fields)
+        raise EvidenceError(
+            f"{label} field mismatch: missing={missing!r} extra={extra!r}"
+        )
+    if (
+        record.get("schema") != schema
+        or record.get("version") != ENVIRONMENT_IDENTITY_VERSION
+        or record.get("run_id") != expected_run_id
+        or record.get("beads") != expected_beads
+        or record.get("status") != "pass"
+        or record.get("final_state") != "verified"
+    ):
+        raise EvidenceError(f"{label} shared identity fields differ")
+
+
+def require_environment_identity_hex(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise EvidenceError(f"{label} is not canonical lowercase hex")
+    return value
+
+
+def require_environment_identity_count(value: Any, *, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise EvidenceError(f"{label} is not a nonnegative integer")
+    return value
+
+
+def validate_declaration_tag_matrix(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=DECLARATION_TAG_MATRIX_SCHEMA,
+        test_name=DECLARATION_TAG_MATRIX_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=11,
+    )
+    common = {
+        "schema",
+        "version",
+        "run_id",
+        "beads",
+        "scenario",
+        "status",
+        "final_state",
+    }
+    case_fields = common | {
+        "case",
+        "family",
+        "variant",
+        "kind",
+        "canonical_tag",
+        "production_tag",
+        "tag_source",
+        "stream_bytes",
+        "golden_stream_bytes",
+        "stream_hash",
+        "golden_stream_hash",
+        "expected_digest",
+        "actual_digest",
+        "golden_digest",
+        "repeated_digest",
+        "digest_relation",
+        "repeat_relation",
+        "expected_root",
+        "actual_root",
+        "root_relation",
+        "model",
+        "elapsed_us",
+    }
+    thread_fields = common | {
+        "worker_count",
+        "distinct_root_count",
+        "expected_root",
+        "actual_root",
+        "root_relation",
+        "order_independence",
+        "elapsed_us",
+    }
+    summary_fields = common | {
+        "case_count",
+        "unique_digest_count",
+        "pairwise_comparisons",
+        "expected_pairwise_comparisons",
+        "thread_matrix",
+        "thread_matrix_roots_distinct",
+        "canonical_root",
+        "source_order_defect_root",
+        "source_order_defect_relation",
+        "omitted_declaration_root",
+        "omitted_declaration_relation",
+        "named_defects_discriminated",
+        "claim_type",
+        "elapsed_us",
+    }
+    case_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    thread_rows: dict[int, dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    for number, record in enumerate(records, 1):
+        scenario = record.get("scenario")
+        label = f"declaration-tag record {number}"
+        if scenario == "declaration-tag-matrix":
+            require_environment_identity_fields(
+                record,
+                case_fields,
+                schema=DECLARATION_TAG_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.12", "fln-amv.14"],
+                label=label,
+            )
+            key = (record.get("family"), record.get("variant"))
+            if key not in DECLARATION_TAG_GOLDENS or key in case_rows:
+                raise EvidenceError(f"{label} has an unknown or duplicate case")
+            kind, tag, stream_bytes, stream_hash, digest = (
+                DECLARATION_TAG_GOLDENS[key]
+            )
+            if (
+                record.get("case") != f"{key[0]}/{key[1]}"
+                or record.get("kind") != kind
+                or record.get("canonical_tag") != tag
+                or record.get("production_tag") != tag
+                or record.get("tag_source") != "explicit_exhaustive_match"
+                or record.get("stream_bytes") != stream_bytes
+                or record.get("golden_stream_bytes") != stream_bytes
+                or record.get("stream_hash") != stream_hash
+                or record.get("golden_stream_hash") != stream_hash
+                or record.get("expected_digest") != digest
+                or record.get("actual_digest") != digest
+                or record.get("golden_digest") != digest
+                or record.get("repeated_digest") != digest
+                or record.get("digest_relation") != "equal"
+                or record.get("repeat_relation") != "equal"
+                or record.get("root_relation") != "equal"
+                or record.get("model") != "independent-complete-stream-v1"
+            ):
+                raise EvidenceError(f"{label} differs from the frozen case contract")
+            expected_root = require_environment_identity_hex(
+                record.get("expected_root"), label=f"{label} expected root"
+            )
+            actual_root = require_environment_identity_hex(
+                record.get("actual_root"), label=f"{label} actual root"
+            )
+            if expected_root != actual_root:
+                raise EvidenceError(f"{label} root relation is false")
+            require_environment_identity_count(
+                record.get("elapsed_us"), label=f"{label} elapsed_us"
+            )
+            case_rows[key] = record
+        elif scenario == "declaration-tag-thread-matrix":
+            require_environment_identity_fields(
+                record,
+                thread_fields,
+                schema=DECLARATION_TAG_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.12", "fln-amv.14"],
+                label=label,
+            )
+            workers = record.get("worker_count")
+            if workers not in {1, 8, 32} or workers in thread_rows:
+                raise EvidenceError(f"{label} has an unknown or duplicate worker count")
+            expected_root = require_environment_identity_hex(
+                record.get("expected_root"), label=f"{label} expected root"
+            )
+            actual_root = require_environment_identity_hex(
+                record.get("actual_root"), label=f"{label} actual root"
+            )
+            if (
+                record.get("distinct_root_count") != 1
+                or expected_root != actual_root
+                or record.get("root_relation") != "equal"
+                or record.get("order_independence") != "proven"
+            ):
+                raise EvidenceError(f"{label} thread relation differs")
+            require_environment_identity_count(
+                record.get("elapsed_us"), label=f"{label} elapsed_us"
+            )
+            thread_rows[workers] = record
+        elif scenario == "declaration-tag-summary":
+            require_environment_identity_fields(
+                record,
+                summary_fields,
+                schema=DECLARATION_TAG_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.12", "fln-amv.14"],
+                label=label,
+            )
+            summaries.append(record)
+        else:
+            raise EvidenceError(f"{label} has an unknown scenario")
+    if set(case_rows) != set(DECLARATION_TAG_GOLDENS):
+        raise EvidenceError("declaration-tag case matrix is incomplete")
+    if set(thread_rows) != {1, 8, 32}:
+        raise EvidenceError("declaration-tag thread matrix is incomplete")
+    if len(summaries) != 1:
+        raise EvidenceError("declaration-tag summary is missing or duplicated")
+    if len({row["actual_digest"] for row in case_rows.values()}) != 7:
+        raise EvidenceError("declaration-tag case digests are not pairwise distinct")
+    thread_roots = {row["actual_root"] for row in thread_rows.values()}
+    if len(thread_roots) != 1:
+        raise EvidenceError("declaration-tag thread roots differ")
+    summary = summaries[0]
+    canonical_root = require_environment_identity_hex(
+        summary.get("canonical_root"), label="declaration-tag canonical root"
+    )
+    source_order_root = require_environment_identity_hex(
+        summary.get("source_order_defect_root"),
+        label="declaration-tag source-order defect root",
+    )
+    omitted_root = require_environment_identity_hex(
+        summary.get("omitted_declaration_root"),
+        label="declaration-tag omitted-declaration root",
+    )
+    if (
+        summary.get("case_count") != 7
+        or summary.get("unique_digest_count") != 7
+        or summary.get("pairwise_comparisons") != 21
+        or summary.get("expected_pairwise_comparisons") != 21
+        or summary.get("thread_matrix") != [1, 8, 32]
+        or summary.get("thread_matrix_roots_distinct") != 1
+        or thread_roots != {canonical_root}
+        or source_order_root == canonical_root
+        or omitted_root == canonical_root
+        or summary.get("source_order_defect_relation") != "differs"
+        or summary.get("omitted_declaration_relation") != "differs"
+        or summary.get("named_defects_discriminated")
+        != ["cast_after_source_reorder", "omitted_declaration"]
+        or summary.get("claim_type") != "bounded_model"
+    ):
+        raise EvidenceError("declaration-tag summary differs from the strict contract")
+    require_environment_identity_count(
+        summary.get("elapsed_us"), label="declaration-tag summary elapsed_us"
+    )
+    return {
+        "schema": "fln.validation/1",
+        "validator": "declaration-tag-matrix/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "case_count": len(case_rows),
+        "thread_matrix": [1, 8, 32],
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def validate_declaration_membership(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=DECLARATION_MEMBERSHIP_SCHEMA,
+        test_name=DECLARATION_MEMBERSHIP_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=41,
+    )
+    common = {
+        "schema",
+        "version",
+        "run_id",
+        "beads",
+        "scenario",
+        "status",
+        "final_state",
+    }
+    matrix_fields = common | {
+        "kind",
+        "membership_case",
+        "member_count",
+        "expected_digest",
+        "actual_digest",
+        "repeated_digest",
+        "digest_relation",
+        "repeat_relation",
+        "expected_root",
+        "actual_root",
+        "root_relation",
+        "root_propagation",
+        "model",
+        "elapsed_us",
+    }
+    defect_fields = common | {
+        "kind",
+        "canonical_digest",
+        "dropped_list_digest",
+        "dropped_list_relation",
+        "omitted_count_digest",
+        "omitted_count_relation",
+        "sorted_members_digest",
+        "sorted_members_relation",
+        "sorted_members_order_collapse",
+        "wrong_domain_digest",
+        "wrong_domain_relation",
+        "real_root",
+        "stale_digest_root",
+        "root_propagation_relation",
+        "named_defects_discriminated",
+        "boundary_distinctions",
+    }
+    summary_fields = common | {
+        "kind_count",
+        "membership_case_count",
+        "matrix_rows",
+        "large_member_count",
+        "opaque_solo_digest",
+        "opaque_grouped_digest",
+        "opaque_regression_relation",
+        "root_propagation",
+        "claim_type",
+        "elapsed_us",
+    }
+    kinds = {"definition", "theorem", "opaque", "inductive", "recursor"}
+    member_counts = {
+        "empty": 0,
+        "singleton": 1,
+        "repeated": 2,
+        "ordered": 2,
+        "reordered": 2,
+        "renamed": 2,
+        "declared_large": 4096,
+    }
+    matrix: dict[tuple[str, str], dict[str, Any]] = {}
+    defects: dict[str, dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    for number, record in enumerate(records, 1):
+        scenario = record.get("scenario")
+        label = f"declaration-membership record {number}"
+        if scenario == "declaration-membership-matrix":
+            require_environment_identity_fields(
+                record,
+                matrix_fields,
+                schema=DECLARATION_MEMBERSHIP_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.1", "fln-amv.14"],
+                label=label,
+            )
+            key = (record.get("kind"), record.get("membership_case"))
+            if (
+                key[0] not in kinds
+                or key[1] not in member_counts
+                or key in matrix
+            ):
+                raise EvidenceError(f"{label} has an unknown or duplicate case")
+            expected_digest = require_environment_identity_hex(
+                record.get("expected_digest"), label=f"{label} expected digest"
+            )
+            actual_digest = require_environment_identity_hex(
+                record.get("actual_digest"), label=f"{label} actual digest"
+            )
+            repeated_digest = require_environment_identity_hex(
+                record.get("repeated_digest"), label=f"{label} repeated digest"
+            )
+            expected_root = require_environment_identity_hex(
+                record.get("expected_root"), label=f"{label} expected root"
+            )
+            actual_root = require_environment_identity_hex(
+                record.get("actual_root"), label=f"{label} actual root"
+            )
+            if (
+                record.get("member_count") != member_counts[key[1]]
+                or expected_digest != actual_digest
+                or repeated_digest != actual_digest
+                or record.get("digest_relation") != "equal"
+                or record.get("repeat_relation") != "equal"
+                or expected_root != actual_root
+                or record.get("root_relation") != "equal"
+                or record.get("root_propagation") != "exact"
+                or record.get("model") != "independent-canonical-membership-v1"
+            ):
+                raise EvidenceError(f"{label} relation differs")
+            require_environment_identity_count(
+                record.get("elapsed_us"), label=f"{label} elapsed_us"
+            )
+            matrix[key] = record
+        elif scenario == "declaration-membership-defects":
+            require_environment_identity_fields(
+                record,
+                defect_fields,
+                schema=DECLARATION_MEMBERSHIP_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.1", "fln-amv.14"],
+                label=label,
+            )
+            kind = record.get("kind")
+            if kind not in kinds or kind in defects:
+                raise EvidenceError(f"{label} has an unknown or duplicate kind")
+            defects[kind] = record
+        elif scenario == "declaration-membership-summary":
+            require_environment_identity_fields(
+                record,
+                summary_fields,
+                schema=DECLARATION_MEMBERSHIP_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.1", "fln-amv.14"],
+                label=label,
+            )
+            summaries.append(record)
+        else:
+            raise EvidenceError(f"{label} has an unknown scenario")
+    expected_matrix = {
+        (kind, membership_case)
+        for kind in kinds
+        for membership_case in member_counts
+    }
+    if set(matrix) != expected_matrix:
+        raise EvidenceError("declaration-membership matrix is incomplete")
+    if set(defects) != kinds or len(summaries) != 1:
+        raise EvidenceError("declaration-membership defect or summary rows are incomplete")
+    for kind in kinds:
+        rows = {
+            membership_case: matrix[(kind, membership_case)]
+            for membership_case in member_counts
+        }
+        if len({row["actual_digest"] for row in rows.values()}) != 7:
+            raise EvidenceError(
+                f"declaration-membership {kind} boundary digests alias"
+            )
+        defect = defects[kind]
+        digests = {
+            field: require_environment_identity_hex(
+                defect.get(field), label=f"declaration-membership {kind} {field}"
+            )
+            for field in (
+                "canonical_digest",
+                "dropped_list_digest",
+                "omitted_count_digest",
+                "sorted_members_digest",
+                "wrong_domain_digest",
+            )
+        }
+        real_root = require_environment_identity_hex(
+            defect.get("real_root"), label=f"declaration-membership {kind} real root"
+        )
+        stale_root = require_environment_identity_hex(
+            defect.get("stale_digest_root"),
+            label=f"declaration-membership {kind} stale root",
+        )
+        canonical = rows["ordered"]["actual_digest"]
+        reordered = rows["reordered"]["actual_digest"]
+        if (
+            digests["canonical_digest"] != canonical
+            or digests["dropped_list_digest"] == canonical
+            or digests["omitted_count_digest"] == canonical
+            or digests["wrong_domain_digest"] == canonical
+            or digests["sorted_members_digest"] != canonical
+            or digests["sorted_members_digest"] == reordered
+            or real_root != rows["ordered"]["actual_root"]
+            or stale_root == real_root
+            or defect.get("dropped_list_relation") != "differs"
+            or defect.get("omitted_count_relation") != "differs"
+            or defect.get("sorted_members_relation") != "differs"
+            or defect.get("sorted_members_order_collapse") is not True
+            or defect.get("wrong_domain_relation") != "differs"
+            or defect.get("root_propagation_relation") != "differs"
+            or defect.get("named_defects_discriminated")
+            != [
+                "dropped_list",
+                "omitted_count",
+                "reordered_membership",
+                "wrong_domain",
+                "failed_root_propagation",
+            ]
+            or defect.get("boundary_distinctions") != 7
+        ):
+            raise EvidenceError(
+                f"declaration-membership {kind} defect contract differs"
+            )
+    summary = summaries[0]
+    opaque_solo = require_environment_identity_hex(
+        summary.get("opaque_solo_digest"),
+        label="declaration-membership opaque solo digest",
+    )
+    opaque_grouped = require_environment_identity_hex(
+        summary.get("opaque_grouped_digest"),
+        label="declaration-membership opaque grouped digest",
+    )
+    if (
+        summary.get("kind_count") != 5
+        or summary.get("membership_case_count") != 7
+        or summary.get("matrix_rows") != 40
+        or summary.get("large_member_count") != 4096
+        or opaque_solo != matrix[("opaque", "singleton")]["actual_digest"]
+        or opaque_grouped != matrix[("opaque", "ordered")]["actual_digest"]
+        or opaque_solo == opaque_grouped
+        or summary.get("opaque_regression_relation") != "differs"
+        or summary.get("root_propagation") != "exact"
+        or summary.get("claim_type") != "bounded_model"
+    ):
+        raise EvidenceError(
+            "declaration-membership summary differs from the strict contract"
+        )
+    require_environment_identity_count(
+        summary.get("elapsed_us"),
+        label="declaration-membership summary elapsed_us",
+    )
+    return {
+        "schema": "fln.validation/1",
+        "validator": "declaration-membership/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "matrix_rows": len(matrix),
+        "defect_rows": len(defects),
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def validate_extension_descriptor_matrix(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+        test_name=EXTENSION_DESCRIPTOR_MATRIX_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=25,
+    )
+    common = {
+        "schema",
+        "version",
+        "run_id",
+        "beads",
+        "scenario",
+        "status",
+        "final_state",
+    }
+    matrix_fields = common | {
+        "merge",
+        "merge_tag",
+        "checkpoint",
+        "checkpoint_tag",
+        "provenance",
+        "provenance_tag",
+        "descriptor_position",
+        "journal_entries",
+        "expected_digest",
+        "actual_digest",
+        "repeated_digest",
+        "digest_relation",
+        "repeat_relation",
+        "expected_root",
+        "actual_root",
+        "root_relation",
+        "root_propagation",
+        "model",
+        "elapsed_us",
+    }
+    defect_fields = common | {
+        "merge",
+        "checkpoint",
+        "provenance",
+        "canonical_digest",
+        "omit_merge_digest",
+        "omit_merge_relation",
+        "omit_checkpoint_digest",
+        "omit_checkpoint_relation",
+        "omit_provenance_digest",
+        "omit_provenance_relation",
+        "swapped_tag_digest",
+        "swapped_tag_relation",
+        "swapped_tag_discriminating",
+        "swapped_field_digest",
+        "swapped_field_relation",
+        "swapped_field_discriminating",
+        "debug_text_digest",
+        "debug_text_relation",
+        "after_journal_digest",
+        "after_journal_relation",
+        "named_defects_discriminated",
+    }
+    summary_fields = common | {
+        "combination_count",
+        "merge_variants",
+        "checkpoint_variants",
+        "provenance_variants",
+        "distinct_delta_digests",
+        "distinct_logical_roots",
+        "descriptor_position",
+        "matrix_rows",
+        "root_propagation",
+        "claim_type",
+        "elapsed_us",
+    }
+    merge_tags = {
+        "append_ordered": 0,
+        "set_union": 1,
+        "conflicts_require_review": 2,
+    }
+    checkpoint_tags = {"journal_suffix": 0, "full_journal": 1}
+    provenance_tags = {"understood": 0, "opaque": 1}
+    matrix: dict[tuple[str, str, str], dict[str, Any]] = {}
+    defects: dict[tuple[str, str, str], dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    for number, record in enumerate(records, 1):
+        scenario = record.get("scenario")
+        label = f"extension-descriptor record {number}"
+        if scenario == "extension-descriptor-matrix":
+            require_environment_identity_fields(
+                record,
+                matrix_fields,
+                schema=EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.2", "fln-amv.14"],
+                label=label,
+            )
+            key = (
+                record.get("merge"),
+                record.get("checkpoint"),
+                record.get("provenance"),
+            )
+            if (
+                key[0] not in merge_tags
+                or key[1] not in checkpoint_tags
+                or key[2] not in provenance_tags
+                or key in matrix
+            ):
+                raise EvidenceError(f"{label} has an unknown or duplicate case")
+            expected_digest = require_environment_identity_hex(
+                record.get("expected_digest"), label=f"{label} expected digest"
+            )
+            actual_digest = require_environment_identity_hex(
+                record.get("actual_digest"), label=f"{label} actual digest"
+            )
+            repeated_digest = require_environment_identity_hex(
+                record.get("repeated_digest"), label=f"{label} repeated digest"
+            )
+            expected_root = require_environment_identity_hex(
+                record.get("expected_root"), label=f"{label} expected root"
+            )
+            actual_root = require_environment_identity_hex(
+                record.get("actual_root"), label=f"{label} actual root"
+            )
+            if (
+                record.get("merge_tag") != merge_tags[key[0]]
+                or record.get("checkpoint_tag") != checkpoint_tags[key[1]]
+                or record.get("provenance_tag") != provenance_tags[key[2]]
+                or record.get("descriptor_position") != "before_journal"
+                or record.get("journal_entries") != 2
+                or expected_digest != actual_digest
+                or repeated_digest != actual_digest
+                or record.get("digest_relation") != "equal"
+                or record.get("repeat_relation") != "equal"
+                or expected_root != actual_root
+                or record.get("root_relation") != "equal"
+                or record.get("root_propagation") != "exact"
+                or record.get("model") != "independent-descriptor-layout-v1"
+            ):
+                raise EvidenceError(f"{label} relation differs")
+            require_environment_identity_count(
+                record.get("elapsed_us"), label=f"{label} elapsed_us"
+            )
+            matrix[key] = record
+        elif scenario == "extension-descriptor-defects":
+            require_environment_identity_fields(
+                record,
+                defect_fields,
+                schema=EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.2", "fln-amv.14"],
+                label=label,
+            )
+            key = (
+                record.get("merge"),
+                record.get("checkpoint"),
+                record.get("provenance"),
+            )
+            if (
+                key[0] not in merge_tags
+                or key[1] not in checkpoint_tags
+                or key[2] not in provenance_tags
+                or key in defects
+            ):
+                raise EvidenceError(f"{label} has an unknown or duplicate case")
+            defects[key] = record
+        elif scenario == "extension-descriptor-summary":
+            require_environment_identity_fields(
+                record,
+                summary_fields,
+                schema=EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.2", "fln-amv.14"],
+                label=label,
+            )
+            summaries.append(record)
+        else:
+            raise EvidenceError(f"{label} has an unknown scenario")
+    expected_matrix = {
+        (merge, checkpoint, provenance)
+        for merge in merge_tags
+        for checkpoint in checkpoint_tags
+        for provenance in provenance_tags
+    }
+    if set(matrix) != expected_matrix or set(defects) != expected_matrix:
+        raise EvidenceError("extension-descriptor matrix is incomplete")
+    if len(summaries) != 1:
+        raise EvidenceError("extension-descriptor summary is missing or duplicated")
+    if len({row["actual_digest"] for row in matrix.values()}) != 12:
+        raise EvidenceError("extension-descriptor delta digests alias")
+    if len({row["actual_root"] for row in matrix.values()}) != 12:
+        raise EvidenceError("extension-descriptor logical roots alias")
+    for key, row in matrix.items():
+        defect = defects[key]
+        canonical = row["actual_digest"]
+        digest_fields = (
+            "canonical_digest",
+            "omit_merge_digest",
+            "omit_checkpoint_digest",
+            "omit_provenance_digest",
+            "swapped_tag_digest",
+            "swapped_field_digest",
+            "debug_text_digest",
+            "after_journal_digest",
+        )
+        digests = {
+            field: require_environment_identity_hex(
+                defect.get(field),
+                label=f"extension-descriptor {'/'.join(key)} {field}",
+            )
+            for field in digest_fields
+        }
+        tag_discriminating = key[0] != "conflicts_require_review"
+        field_discriminating = merge_tags[key[0]] != checkpoint_tags[key[1]]
+        expected_tag_relation = (
+            "differs" if tag_discriminating else "equal_by_construction"
+        )
+        expected_field_relation = (
+            "differs" if field_discriminating else "equal_by_construction"
+        )
+        if (
+            digests["canonical_digest"] != canonical
+            or any(
+                digests[field] == canonical
+                for field in (
+                    "omit_merge_digest",
+                    "omit_checkpoint_digest",
+                    "omit_provenance_digest",
+                    "debug_text_digest",
+                    "after_journal_digest",
+                )
+            )
+            or (digests["swapped_tag_digest"] != canonical) != tag_discriminating
+            or (digests["swapped_field_digest"] != canonical)
+            != field_discriminating
+            or defect.get("omit_merge_relation") != "differs"
+            or defect.get("omit_checkpoint_relation") != "differs"
+            or defect.get("omit_provenance_relation") != "differs"
+            or defect.get("swapped_tag_relation") != expected_tag_relation
+            or defect.get("swapped_tag_discriminating") is not tag_discriminating
+            or defect.get("swapped_field_relation") != expected_field_relation
+            or defect.get("swapped_field_discriminating")
+            is not field_discriminating
+            or defect.get("debug_text_relation") != "differs"
+            or defect.get("after_journal_relation") != "differs"
+            or defect.get("named_defects_discriminated")
+            != ["omitted_dimension", "swapped_tag", "debug_text", "after_journal"]
+        ):
+            raise EvidenceError(
+                f"extension-descriptor {'/'.join(key)} defect contract differs"
+            )
+    summary = summaries[0]
+    if (
+        summary.get("combination_count") != 12
+        or summary.get("merge_variants") != 3
+        or summary.get("checkpoint_variants") != 2
+        or summary.get("provenance_variants") != 2
+        or summary.get("distinct_delta_digests") != 12
+        or summary.get("distinct_logical_roots") != 12
+        or summary.get("descriptor_position") != "before_journal"
+        or summary.get("matrix_rows") != 24
+        or summary.get("root_propagation") != "exact"
+        or summary.get("claim_type") != "bounded_model"
+    ):
+        raise EvidenceError(
+            "extension-descriptor summary differs from the strict contract"
+        )
+    require_environment_identity_count(
+        summary.get("elapsed_us"), label="extension-descriptor summary elapsed_us"
+    )
+    return {
+        "schema": "fln.validation/1",
+        "validator": "extension-descriptor-matrix/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "combination_count": len(matrix),
+        "defect_rows": len(defects),
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
 def read_kernel_admission_stream(
     path: Path, artifact_root: Path, *, label: str
 ) -> tuple[Path, bytes, str, str, str]:
@@ -10807,6 +11883,62 @@ def cmd_validate_environment_resource_collision(args: argparse.Namespace) -> int
     return PASS
 
 
+def cmd_validate_environment_identity(
+    args: argparse.Namespace,
+    validator: Callable[..., dict[str, Any]],
+    *,
+    label: str,
+) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    stdout_path = require_within(
+        Path(args.file), artifact_root, label=f"{label} stdout"
+    )
+    stderr_path = require_within(
+        Path(args.stderr_file), artifact_root, label=f"{label} stderr"
+    )
+    report = validator(
+        stdout_path,
+        stderr_path,
+        args.expected_run_id,
+        args.observed_exit,
+        artifact_root=artifact_root,
+        expected_stdout_artifact=args.expected_stdout_artifact,
+        expected_stderr_artifact=args.expected_stderr_artifact,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output), artifact_root, label=f"{label} validation"
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_declaration_tag_matrix(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_declaration_tag_matrix,
+        label="declaration-tag-matrix",
+    )
+
+
+def cmd_validate_declaration_membership(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_declaration_membership,
+        label="declaration-membership",
+    )
+
+
+def cmd_validate_extension_descriptor_matrix(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_extension_descriptor_matrix,
+        label="extension-descriptor-matrix",
+    )
+
+
 def cmd_validate_kernel_admission(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
     stdout_path = require_within(
@@ -14285,6 +15417,486 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         {"case": "strict_ndjson_validator", "ok": True, "mutants_killed": 2}
     )
 
+    identity_validation_root = case_dir("environment_identity_matrix_validation")
+    identity_run_id = "environment-identity-self-test"
+
+    def identity_hex(index: int) -> str:
+        return f"{index:064x}"
+
+    def identity_log(records: Sequence[dict[str, Any]]) -> bytes:
+        return (
+            b"running 1 test\n"
+            + b"".join(
+                (
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode()
+                for record in records
+            )
+            + b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
+        )
+
+    def write_identity_fixture(
+        label: str,
+        records: Sequence[dict[str, Any]],
+        *,
+        stderr: bytes = b"",
+    ) -> tuple[Path, Path]:
+        stdout_path = identity_validation_root / f"{label}.out"
+        stderr_path = identity_validation_root / f"{label}.err"
+        write_new(stdout_path, identity_log(records))
+        write_new(stderr_path, stderr)
+        return stdout_path, stderr_path
+
+    def identity_validator_call(
+        validator: Callable[..., dict[str, Any]],
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> dict[str, Any]:
+        return validator(
+            stdout_path,
+            stderr_path,
+            identity_run_id,
+            0,
+            artifact_root=identity_validation_root,
+            expected_stdout_artifact=stdout_path.name,
+            expected_stderr_artifact=stderr_path.name,
+        )
+
+    def expect_identity_rejection(
+        label: str,
+        validator: Callable[..., dict[str, Any]],
+        records: Sequence[dict[str, Any]],
+        *,
+        stderr: bytes = b"",
+    ) -> None:
+        stdout_path, stderr_path = write_identity_fixture(
+            label, records, stderr=stderr
+        )
+        try:
+            identity_validator_call(validator, stdout_path, stderr_path)
+        except EvidenceError:
+            return
+        raise EvidenceError(f"{label} environment-identity mutant was accepted")
+
+    tag_records: list[dict[str, Any]] = []
+    for index, ((family, variant), golden) in enumerate(
+        DECLARATION_TAG_GOLDENS.items(), 1
+    ):
+        kind, tag, stream_bytes, stream_hash, digest = golden
+        root = identity_hex(100 + index)
+        tag_records.append(
+            {
+                "schema": DECLARATION_TAG_MATRIX_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.12", "fln-amv.14"],
+                "scenario": "declaration-tag-matrix",
+                "case": f"{family}/{variant}",
+                "family": family,
+                "variant": variant,
+                "kind": kind,
+                "canonical_tag": tag,
+                "production_tag": tag,
+                "tag_source": "explicit_exhaustive_match",
+                "stream_bytes": stream_bytes,
+                "golden_stream_bytes": stream_bytes,
+                "stream_hash": stream_hash,
+                "golden_stream_hash": stream_hash,
+                "expected_digest": digest,
+                "actual_digest": digest,
+                "golden_digest": digest,
+                "repeated_digest": digest,
+                "digest_relation": "equal",
+                "repeat_relation": "equal",
+                "expected_root": root,
+                "actual_root": root,
+                "root_relation": "equal",
+                "model": "independent-complete-stream-v1",
+                "status": "pass",
+                "elapsed_us": index,
+                "final_state": "verified",
+            }
+        )
+    aggregate_root = identity_hex(500)
+    for index, workers in enumerate((1, 8, 32), 1):
+        tag_records.append(
+            {
+                "schema": DECLARATION_TAG_MATRIX_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.12", "fln-amv.14"],
+                "scenario": "declaration-tag-thread-matrix",
+                "worker_count": workers,
+                "distinct_root_count": 1,
+                "expected_root": aggregate_root,
+                "actual_root": aggregate_root,
+                "root_relation": "equal",
+                "order_independence": "proven",
+                "status": "pass",
+                "elapsed_us": index,
+                "final_state": "verified",
+            }
+        )
+    tag_records.append(
+        {
+            "schema": DECLARATION_TAG_MATRIX_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.12", "fln-amv.14"],
+            "scenario": "declaration-tag-summary",
+            "case_count": 7,
+            "unique_digest_count": 7,
+            "pairwise_comparisons": 21,
+            "expected_pairwise_comparisons": 21,
+            "thread_matrix": [1, 8, 32],
+            "thread_matrix_roots_distinct": 1,
+            "canonical_root": aggregate_root,
+            "source_order_defect_root": identity_hex(501),
+            "source_order_defect_relation": "differs",
+            "omitted_declaration_root": identity_hex(502),
+            "omitted_declaration_relation": "differs",
+            "named_defects_discriminated": [
+                "cast_after_source_reorder",
+                "omitted_declaration",
+            ],
+            "claim_type": "bounded_model",
+            "status": "pass",
+            "elapsed_us": 10,
+            "final_state": "verified",
+        }
+    )
+    tag_stdout, tag_stderr = write_identity_fixture("tag_valid", tag_records)
+    require(
+        identity_validator_call(
+            validate_declaration_tag_matrix, tag_stdout, tag_stderr
+        )["records"]
+        == 11,
+        "valid declaration-tag matrix was not accepted",
+    )
+    tag_missing_field = json.loads(json.dumps(tag_records))
+    del tag_missing_field[0]["production_tag"]
+    expect_identity_rejection(
+        "tag_missing_field",
+        validate_declaration_tag_matrix,
+        tag_missing_field,
+    )
+    tag_wrong_pin = json.loads(json.dumps(tag_records))
+    tag_wrong_pin[0]["golden_digest"] = identity_hex(900)
+    expect_identity_rejection(
+        "tag_wrong_pin",
+        validate_declaration_tag_matrix,
+        tag_wrong_pin,
+    )
+
+    membership_kinds = (
+        "definition",
+        "theorem",
+        "opaque",
+        "inductive",
+        "recursor",
+    )
+    membership_cases = {
+        "empty": 0,
+        "singleton": 1,
+        "repeated": 2,
+        "ordered": 2,
+        "reordered": 2,
+        "renamed": 2,
+        "declared_large": 4096,
+    }
+    membership_records: list[dict[str, Any]] = []
+    membership_matrix: dict[tuple[str, str], dict[str, Any]] = {}
+    identity_index = 1_000
+    for kind in membership_kinds:
+        for membership_case, member_count in membership_cases.items():
+            digest = identity_hex(identity_index)
+            root = identity_hex(identity_index + 500)
+            identity_index += 1
+            row = {
+                "schema": DECLARATION_MEMBERSHIP_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.1", "fln-amv.14"],
+                "scenario": "declaration-membership-matrix",
+                "kind": kind,
+                "membership_case": membership_case,
+                "member_count": member_count,
+                "expected_digest": digest,
+                "actual_digest": digest,
+                "repeated_digest": digest,
+                "digest_relation": "equal",
+                "repeat_relation": "equal",
+                "expected_root": root,
+                "actual_root": root,
+                "root_relation": "equal",
+                "root_propagation": "exact",
+                "model": "independent-canonical-membership-v1",
+                "status": "pass",
+                "elapsed_us": identity_index,
+                "final_state": "verified",
+            }
+            membership_records.append(row)
+            membership_matrix[(kind, membership_case)] = row
+    for kind_index, kind in enumerate(membership_kinds, 1):
+        ordered = membership_matrix[(kind, "ordered")]
+        membership_records.append(
+            {
+                "schema": DECLARATION_MEMBERSHIP_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.1", "fln-amv.14"],
+                "scenario": "declaration-membership-defects",
+                "kind": kind,
+                "canonical_digest": ordered["actual_digest"],
+                "dropped_list_digest": identity_hex(2_000 + kind_index),
+                "dropped_list_relation": "differs",
+                "omitted_count_digest": identity_hex(2_100 + kind_index),
+                "omitted_count_relation": "differs",
+                "sorted_members_digest": ordered["actual_digest"],
+                "sorted_members_relation": "differs",
+                "sorted_members_order_collapse": True,
+                "wrong_domain_digest": identity_hex(2_200 + kind_index),
+                "wrong_domain_relation": "differs",
+                "real_root": ordered["actual_root"],
+                "stale_digest_root": identity_hex(2_300 + kind_index),
+                "root_propagation_relation": "differs",
+                "named_defects_discriminated": [
+                    "dropped_list",
+                    "omitted_count",
+                    "reordered_membership",
+                    "wrong_domain",
+                    "failed_root_propagation",
+                ],
+                "boundary_distinctions": 7,
+                "status": "pass",
+                "final_state": "verified",
+            }
+        )
+    membership_records.append(
+        {
+            "schema": DECLARATION_MEMBERSHIP_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.1", "fln-amv.14"],
+            "scenario": "declaration-membership-summary",
+            "kind_count": 5,
+            "membership_case_count": 7,
+            "matrix_rows": 40,
+            "large_member_count": 4096,
+            "opaque_solo_digest": membership_matrix[
+                ("opaque", "singleton")
+            ]["actual_digest"],
+            "opaque_grouped_digest": membership_matrix[
+                ("opaque", "ordered")
+            ]["actual_digest"],
+            "opaque_regression_relation": "differs",
+            "root_propagation": "exact",
+            "claim_type": "bounded_model",
+            "status": "pass",
+            "elapsed_us": 1,
+            "final_state": "verified",
+        }
+    )
+    membership_stdout, membership_stderr = write_identity_fixture(
+        "membership_valid", membership_records
+    )
+    require(
+        identity_validator_call(
+            validate_declaration_membership,
+            membership_stdout,
+            membership_stderr,
+        )["records"]
+        == 41,
+        "valid declaration-membership matrix was not accepted",
+    )
+    membership_false_collapse = json.loads(json.dumps(membership_records))
+    opaque_defect = next(
+        row
+        for row in membership_false_collapse
+        if row.get("scenario") == "declaration-membership-defects"
+        and row.get("kind") == "opaque"
+    )
+    opaque_defect["sorted_members_digest"] = membership_matrix[
+        ("opaque", "reordered")
+    ]["actual_digest"]
+    expect_identity_rejection(
+        "membership_false_collapse",
+        validate_declaration_membership,
+        membership_false_collapse,
+    )
+
+    merge_tags = {
+        "append_ordered": 0,
+        "set_union": 1,
+        "conflicts_require_review": 2,
+    }
+    checkpoint_tags = {"journal_suffix": 0, "full_journal": 1}
+    provenance_tags = {"understood": 0, "opaque": 1}
+    descriptor_records: list[dict[str, Any]] = []
+    descriptor_matrix: dict[tuple[str, str, str], dict[str, Any]] = {}
+    descriptor_index = 3_000
+    for merge, merge_tag in merge_tags.items():
+        for checkpoint, checkpoint_tag in checkpoint_tags.items():
+            for provenance, provenance_tag in provenance_tags.items():
+                digest = identity_hex(descriptor_index)
+                root = identity_hex(descriptor_index + 500)
+                descriptor_index += 1
+                key = (merge, checkpoint, provenance)
+                row = {
+                    "schema": EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                    "version": ENVIRONMENT_IDENTITY_VERSION,
+                    "run_id": identity_run_id,
+                    "beads": ["fln-amv.2", "fln-amv.14"],
+                    "scenario": "extension-descriptor-matrix",
+                    "merge": merge,
+                    "merge_tag": merge_tag,
+                    "checkpoint": checkpoint,
+                    "checkpoint_tag": checkpoint_tag,
+                    "provenance": provenance,
+                    "provenance_tag": provenance_tag,
+                    "descriptor_position": "before_journal",
+                    "journal_entries": 2,
+                    "expected_digest": digest,
+                    "actual_digest": digest,
+                    "repeated_digest": digest,
+                    "digest_relation": "equal",
+                    "repeat_relation": "equal",
+                    "expected_root": root,
+                    "actual_root": root,
+                    "root_relation": "equal",
+                    "root_propagation": "exact",
+                    "model": "independent-descriptor-layout-v1",
+                    "status": "pass",
+                    "elapsed_us": descriptor_index,
+                    "final_state": "verified",
+                }
+                descriptor_records.append(row)
+                descriptor_matrix[key] = row
+    for defect_index, (key, row) in enumerate(descriptor_matrix.items(), 1):
+        merge, checkpoint, provenance = key
+        canonical = row["actual_digest"]
+        tag_discriminating = merge != "conflicts_require_review"
+        field_discriminating = merge_tags[merge] != checkpoint_tags[checkpoint]
+        descriptor_records.append(
+            {
+                "schema": EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.2", "fln-amv.14"],
+                "scenario": "extension-descriptor-defects",
+                "merge": merge,
+                "checkpoint": checkpoint,
+                "provenance": provenance,
+                "canonical_digest": canonical,
+                "omit_merge_digest": identity_hex(4_000 + defect_index),
+                "omit_merge_relation": "differs",
+                "omit_checkpoint_digest": identity_hex(4_100 + defect_index),
+                "omit_checkpoint_relation": "differs",
+                "omit_provenance_digest": identity_hex(4_200 + defect_index),
+                "omit_provenance_relation": "differs",
+                "swapped_tag_digest": (
+                    identity_hex(4_300 + defect_index)
+                    if tag_discriminating
+                    else canonical
+                ),
+                "swapped_tag_relation": (
+                    "differs"
+                    if tag_discriminating
+                    else "equal_by_construction"
+                ),
+                "swapped_tag_discriminating": tag_discriminating,
+                "swapped_field_digest": (
+                    identity_hex(4_400 + defect_index)
+                    if field_discriminating
+                    else canonical
+                ),
+                "swapped_field_relation": (
+                    "differs"
+                    if field_discriminating
+                    else "equal_by_construction"
+                ),
+                "swapped_field_discriminating": field_discriminating,
+                "debug_text_digest": identity_hex(4_500 + defect_index),
+                "debug_text_relation": "differs",
+                "after_journal_digest": identity_hex(4_600 + defect_index),
+                "after_journal_relation": "differs",
+                "named_defects_discriminated": [
+                    "omitted_dimension",
+                    "swapped_tag",
+                    "debug_text",
+                    "after_journal",
+                ],
+                "status": "pass",
+                "final_state": "verified",
+            }
+        )
+    descriptor_records.append(
+        {
+            "schema": EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.2", "fln-amv.14"],
+            "scenario": "extension-descriptor-summary",
+            "combination_count": 12,
+            "merge_variants": 3,
+            "checkpoint_variants": 2,
+            "provenance_variants": 2,
+            "distinct_delta_digests": 12,
+            "distinct_logical_roots": 12,
+            "descriptor_position": "before_journal",
+            "matrix_rows": 24,
+            "root_propagation": "exact",
+            "claim_type": "bounded_model",
+            "status": "pass",
+            "elapsed_us": 1,
+            "final_state": "verified",
+        }
+    )
+    descriptor_stdout, descriptor_stderr = write_identity_fixture(
+        "descriptor_valid", descriptor_records
+    )
+    require(
+        identity_validator_call(
+            validate_extension_descriptor_matrix,
+            descriptor_stdout,
+            descriptor_stderr,
+        )["records"]
+        == 25,
+        "valid extension-descriptor matrix was not accepted",
+    )
+    descriptor_false_conditional = json.loads(json.dumps(descriptor_records))
+    nondiscriminating = next(
+        row
+        for row in descriptor_false_conditional
+        if row.get("scenario") == "extension-descriptor-defects"
+        and row.get("merge") == "conflicts_require_review"
+    )
+    nondiscriminating["swapped_tag_digest"] = identity_hex(9_000)
+    expect_identity_rejection(
+        "descriptor_false_conditional",
+        validate_extension_descriptor_matrix,
+        descriptor_false_conditional,
+    )
+    expect_identity_rejection(
+        "tag_stderr_leak",
+        validate_declaration_tag_matrix,
+        tag_records,
+        stderr=canonical_json(tag_records[0]),
+    )
+    cases.append(
+        {
+            "case": "environment_identity_matrix_validation",
+            "ok": True,
+            "validators": 3,
+            "mutants_killed": 5,
+        }
+    )
+
     collision_validation_root = case_dir("environment_collision_validation")
     collision_run_id = "collision-self-test"
     collision_cwd = str(art_dir)
@@ -17151,6 +18763,34 @@ def build_parser() -> argparse.ArgumentParser:
     resource_collision_parser.set_defaults(
         func=cmd_validate_environment_resource_collision
     )
+
+    for command, help_text, command_func in (
+        (
+            "validate-declaration-tag-matrix",
+            "strictly validate the fln-amv.12 declaration-tag matrix",
+            cmd_validate_declaration_tag_matrix,
+        ),
+        (
+            "validate-declaration-membership",
+            "strictly validate the fln-amv.1 declaration-membership matrix",
+            cmd_validate_declaration_membership,
+        ),
+        (
+            "validate-extension-descriptor-matrix",
+            "strictly validate the fln-amv.2 extension-descriptor matrix",
+            cmd_validate_extension_descriptor_matrix,
+        ),
+    ):
+        identity_parser = subparsers.add_parser(command, help=help_text)
+        identity_parser.add_argument("--file", required=True)
+        identity_parser.add_argument("--stderr-file", required=True)
+        identity_parser.add_argument("--expected-run-id", required=True)
+        identity_parser.add_argument("--observed-exit", type=int, required=True)
+        identity_parser.add_argument("--expected-stdout-artifact", required=True)
+        identity_parser.add_argument("--expected-stderr-artifact", required=True)
+        identity_parser.add_argument("--artifact-root", required=True)
+        identity_parser.add_argument("--output")
+        identity_parser.set_defaults(func=command_func)
 
     verdict_parser = subparsers.add_parser(
         "validate-verdict-schema",
