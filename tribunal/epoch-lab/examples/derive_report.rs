@@ -17,8 +17,10 @@
 #![forbid(unsafe_code)]
 
 use fln_epoch_lab::derive::{
-    derive_g0_roster, derive_module_scan, derive_workspace_inventory, render_module_artifact,
+    classify, derive_epoch_tree, derive_g0_roster, derive_module_scan, derive_oracle_edges,
+    derive_targets, derive_workspace_inventory, render_epoch_tree, render_module_artifact,
 };
+use fln_epoch_lab::poison::Shippability;
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
@@ -29,6 +31,13 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("report") => report(),
+        Some("emit-tree") => match (args.get(1), args.get(2)) {
+            (Some(epoch), Some(head)) => emit_tree(epoch, head),
+            _ => {
+                eprintln!("usage: derive_report emit-tree <epoch-tag> <head-root>");
+                std::process::ExitCode::from(2)
+            }
+        },
         Some("emit-modules") => match (args.get(1), args.get(2)) {
             (Some(toolchain), Some(pin)) => emit_modules(toolchain, pin),
             _ => {
@@ -82,6 +91,46 @@ fn report() -> std::process::ExitCode {
         }
     }
 
+    match derive_targets(&root) {
+        Ok(d) => {
+            let p = d.provenance();
+            println!(
+                "derive: rule={} verdict=pass targets={} digest={}",
+                p.rule, p.item_count, p.source_digest
+            );
+            // No policy file yet: every crate is unclassified, which is the
+            // honest starting state and blocks rather than defaulting.
+            let (_, gaps) = classify(d.value(), &[]);
+            println!("derive: shippability unclassified_crates={}", gaps.len());
+            match derive_oracle_edges(&root, d.value()) {
+                Ok(e) => {
+                    println!(
+                        "derive: rule={} verdict=pass edges={} digest={}",
+                        e.provenance().rule,
+                        e.provenance().item_count,
+                        e.provenance().source_digest
+                    );
+                    for edge in e.value() {
+                        println!(
+                            "derive: oracle-edge target={} capability={}",
+                            edge.target,
+                            edge.capability.as_str()
+                        );
+                    }
+                }
+                Err(err) => {
+                    println!("derive: rule=oracle-edges verdict=fail reason={err}");
+                    failed = true;
+                }
+            }
+            let _ = Shippability::Shippable;
+        }
+        Err(e) => {
+            println!("derive: rule=cargo-targets verdict=fail reason={e}");
+            failed = true;
+        }
+    }
+
     if failed {
         std::process::ExitCode::FAILURE
     } else {
@@ -103,6 +152,26 @@ fn emit_modules(toolchain: &str, pin: &str) -> std::process::ExitCode {
         }
         Err(e) => {
             eprintln!("derive: rule=module-scan verdict=fail reason={e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn emit_tree(epoch: &str, head_root: &str) -> std::process::ExitCode {
+    let dir = repo_root().join("tribunal/epochs").join(epoch);
+    match derive_epoch_tree(&dir, epoch, head_root) {
+        Ok(d) => {
+            eprintln!(
+                "derive: rule={} verdict=pass files={} digest={}",
+                d.provenance().rule,
+                d.provenance().item_count,
+                d.provenance().source_digest
+            );
+            print!("{}", render_epoch_tree(&d));
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("derive: rule=epoch-tree verdict=fail reason={e}");
             std::process::ExitCode::FAILURE
         }
     }

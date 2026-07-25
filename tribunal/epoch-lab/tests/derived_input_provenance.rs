@@ -538,3 +538,302 @@ fn derivations_are_deterministic_across_repeated_runs() {
         assert_eq!(c.provenance().source_digest, e.provenance().source_digest);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 5. The published epoch can no longer move
+// ---------------------------------------------------------------------------
+
+fn epoch_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../epochs/v4.32.0")
+}
+
+fn committed_epoch_tree() -> String {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../derived/v4.32.0/EPOCH_TREE.txt");
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("epoch tree missing at {p:?}: {e}"))
+}
+
+const HEAD_ROOT: &str = "7e554b20907d81a272d10718c26da2c25e2e6d70b2e962dc87516bb24dc18a75";
+
+#[test]
+fn the_published_epoch_matches_its_committed_tree() {
+    let drifts =
+        fln_epoch_lab::derive::verify_epoch_tree(&committed_epoch_tree(), &epoch_dir(), HEAD_ROOT)
+            .expect("the tree artifact parses");
+    assert!(
+        drifts.is_empty(),
+        "the published epoch has moved: {drifts:?}"
+    );
+}
+
+#[test]
+fn the_tree_binds_every_file_not_just_the_manifest() {
+    // THE MUTABLE-LAB HAZARD. The revision chain binds MANIFEST.txt and nothing
+    // else, so before this a transcript could be edited, a fixture added or a
+    // sibling deleted with nothing detecting it — a published lab that can
+    // still move is the same defect class as an input accepted on trust,
+    // because in both cases a downstream check measures something unpinned.
+    let tree =
+        fln_epoch_lab::derive::parse_epoch_tree(&committed_epoch_tree()).expect("the tree parses");
+    assert!(
+        tree.files.iter().any(|f| f.path == "MANIFEST.txt"),
+        "the manifest is not bound"
+    );
+    let transcripts = tree
+        .files
+        .iter()
+        .filter(|f| f.path.starts_with("transcripts/"))
+        .count();
+    assert!(
+        transcripts > 10,
+        "only {transcripts} transcripts bound; the walk is not recursing"
+    );
+    // The chain file is excluded, because it cannot contain its own digest.
+    assert!(
+        !tree.files.iter().any(|f| f.path == "REVISIONS.txt"),
+        "the chain file must not be bound by the tree it publishes"
+    );
+    assert!(
+        tree.files.len() >= 40,
+        "only {} files bound",
+        tree.files.len()
+    );
+}
+
+#[test]
+fn an_edited_added_or_removed_epoch_file_is_detected() {
+    let text = committed_epoch_tree();
+
+    // Edited: same path, different digest.
+    let edited = text.replacen(
+        "file MANIFEST.txt ",
+        "file MANIFEST.txt 0000000000000000000000000000000000000000000000000000000000000000 ",
+        1,
+    );
+    // That produced a malformed row; build the realistic case instead by
+    // rewriting the digest in place.
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    for l in lines.iter_mut() {
+        if l.starts_with("file MANIFEST.txt ") {
+            *l = "file MANIFEST.txt ".to_string() + &"0".repeat(64);
+        }
+    }
+    let tampered = lines.join("\n") + "\n";
+    // The artifact's own digest no longer covers its rows, so it is refused
+    // before any comparison with the disk — which is the stronger failure.
+    assert!(
+        fln_epoch_lab::derive::verify_epoch_tree(&tampered, &epoch_dir(), HEAD_ROOT).is_err(),
+        "a tampered tree artifact was accepted"
+    );
+    let _ = edited;
+
+    // Removed / added, expressed against a directory that legitimately differs:
+    // point a valid tree at the derived/ directory instead of the epoch.
+    let drifts = fln_epoch_lab::derive::verify_epoch_tree(
+        &committed_epoch_tree(),
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../derived/v4.32.0"),
+        HEAD_ROOT,
+    )
+    .expect("parses");
+    assert!(
+        !drifts.is_empty(),
+        "a different directory produced no drift"
+    );
+    assert!(
+        drifts.iter().any(|d| d.reason() == "file-removed"),
+        "expected removals: {drifts:?}"
+    );
+    assert!(
+        drifts.iter().any(|d| d.reason() == "file-added"),
+        "expected additions: {drifts:?}"
+    );
+}
+
+#[test]
+fn a_tree_bound_to_a_different_head_is_refused() {
+    // A tree describes one revision. Reading it against another would let a
+    // stale binding vouch for a lab that has since been republished.
+    let drifts = fln_epoch_lab::derive::verify_epoch_tree(
+        &committed_epoch_tree(),
+        &epoch_dir(),
+        &"f".repeat(64),
+    )
+    .expect("parses");
+    assert!(
+        drifts.iter().any(|d| d.reason() == "head-moved"),
+        "a tree bound to a different head was accepted: {drifts:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Targets, shippability, and the real reachability scan
+// ---------------------------------------------------------------------------
+
+fn policy() -> Vec<(String, fln_epoch_lab::poison::Shippability)> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../derived/SHIPPABILITY_POLICY.txt");
+    fln_epoch_lab::derive::read_shippability_policy(&p).expect("the policy file is readable")
+}
+
+#[test]
+fn the_target_set_is_derived_from_the_tree() {
+    let d = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    let targets = d.value();
+    assert!(targets.len() > 50, "only {} targets found", targets.len());
+    // Targets that certainly exist, one of each interesting kind.
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.crate_name == "fln-kernel" && t.kind_str == "lib"),
+        "fln-kernel's lib target is missing"
+    );
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.name == "reference_differential" && t.kind_str == "test"),
+        "the kernel differential test target is missing"
+    );
+}
+
+#[test]
+fn the_policy_covers_every_derived_crate() {
+    // The classification must be COMPLETE with respect to the derived set. An
+    // unclassified crate blocks; it does not default. This is the C1 discipline
+    // applied to shippability.
+    let d = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    let (_, gaps) = fln_epoch_lab::derive::classify(d.value(), &policy());
+    assert!(
+        gaps.is_empty(),
+        "the shippability policy does not cover the workspace: {gaps:?}"
+    );
+}
+
+#[test]
+fn an_uncovered_crate_blocks_rather_than_defaulting() {
+    let d = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    let (_, gaps) = fln_epoch_lab::derive::classify(d.value(), &[]);
+    assert!(!gaps.is_empty(), "an empty policy produced no gaps");
+    assert!(gaps.iter().all(|g| g.reason() == "unclassified-crate"));
+
+    // And a policy naming a crate that does not exist is equally a defect: it
+    // is describing a tree that has moved.
+    let stale = vec![(
+        "fln-does-not-exist".to_string(),
+        fln_epoch_lab::poison::Shippability::Shippable,
+    )];
+    let (_, gaps) = fln_epoch_lab::derive::classify(d.value(), &stale);
+    assert!(gaps.iter().any(|g| g.reason() == "unknown-crate"));
+}
+
+#[test]
+fn no_policy_can_make_a_test_target_shippable() {
+    // The mechanical floor. Cargo does not put a test, bench or example into a
+    // release artifact, so this is a fact rather than a judgement and no policy
+    // row may override it.
+    use fln_epoch_lab::poison::{Shippability, TargetKind};
+    let d = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    // Claim EVERY crate ships, which is the most permissive policy expressible.
+    let permissive: Vec<(String, Shippability)> = d
+        .value()
+        .iter()
+        .map(|t| (t.crate_name.clone(), Shippability::Shippable))
+        .collect();
+    let (classified, _) = fln_epoch_lab::derive::classify(d.value(), &permissive);
+    for t in &classified {
+        if matches!(
+            t.kind,
+            TargetKind::Test | TargetKind::Bench | TargetKind::Example
+        ) {
+            assert_eq!(
+                t.shippability,
+                Shippability::DevelopmentOnly,
+                "{}::{} was made shippable by policy",
+                t.crate_name,
+                t.name
+            );
+        }
+    }
+}
+
+#[test]
+fn the_real_workspace_has_no_oracle_path_from_a_shippable_target() {
+    // THE POINT OF THE WHOLE BEAD. Derived targets, the declared policy, and
+    // oracle edges discovered from real source — fed to the real reachability
+    // scan. Until now `fln-rzyk` was proven correct over a supplied inventory
+    // and said nothing about this workspace. This says something about this
+    // workspace.
+    use fln_epoch_lab::poison::{Inventory, Profile, ScanOutcome, scan};
+    let targets = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    let (classified, gaps) = fln_epoch_lab::derive::classify(targets.value(), &policy());
+    assert!(gaps.is_empty(), "classification is incomplete: {gaps:?}");
+    let edges = fln_epoch_lab::derive::derive_oracle_edges(&repo_root(), targets.value())
+        .expect("readable");
+    let features = fln_epoch_lab::derive::derive_workspace_inventory(&repo_root())
+        .expect("readable")
+        .value()
+        .feature_universe();
+
+    let inv = Inventory {
+        targets: classified,
+        profiles: vec![Profile::Dev, Profile::Release, Profile::ReproducibleRelease],
+        features,
+        edges: edges.value().clone(),
+        products: vec![],
+    };
+    let outcome = scan(&inv);
+    match &outcome {
+        ScanOutcome::Clean {
+            combinations_checked,
+            shippable_targets,
+        } => {
+            assert!(*shippable_targets > 0, "nothing was classified shippable");
+            assert!(*combinations_checked > 0);
+        }
+        other => panic!(
+            "a shippable target in this workspace can reach the oracle: {other:?}\n{}",
+            fln_epoch_lab::poison::report(&outcome)
+        ),
+    }
+}
+
+#[test]
+fn the_discovered_oracle_edges_are_real_and_all_development_only() {
+    // The edges are not hypothetical: four real paths exist in this tree. Every
+    // one must sit on a development-only target, which is D8 satisfied rather
+    // than D8 asserted.
+    use fln_epoch_lab::poison::Shippability;
+    let targets = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    let (classified, _) = fln_epoch_lab::derive::classify(targets.value(), &policy());
+    let edges = fln_epoch_lab::derive::derive_oracle_edges(&repo_root(), targets.value())
+        .expect("readable");
+    assert!(
+        !edges.value().is_empty(),
+        "no oracle edges discovered; the marker scan has stopped working"
+    );
+    // Per-CAPABILITY coverage, not merely a non-empty set. A mutant that broke
+    // the ORACLE_FALLBACK marker survived an emptiness check, because the two
+    // toolchain-path markers kept the set populated — so each capability the
+    // tree really does exercise is pinned individually.
+    use fln_epoch_lab::poison::OracleCapability;
+    for want in [
+        OracleCapability::OracleFallback,
+        OracleCapability::SpawnReferenceBinary,
+    ] {
+        assert!(
+            edges.value().iter().any(|e| e.capability == want),
+            "no edge discovered for {} — that marker has stopped matching",
+            want.as_str()
+        );
+    }
+    for e in edges.value() {
+        let t = classified
+            .iter()
+            .find(|t| t.name == e.target)
+            .unwrap_or_else(|| panic!("edge names unknown target {}", e.target));
+        assert_eq!(
+            t.shippability,
+            Shippability::DevelopmentOnly,
+            "{} reaches {} and is not development-only",
+            e.target,
+            e.capability.as_str()
+        );
+    }
+}

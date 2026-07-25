@@ -58,6 +58,9 @@ pub mod rules {
     pub const WORKSPACE_INVENTORY: &str = "fln.derive.workspace-inventory/1";
     pub const G0_ROSTER: &str = "fln.derive.g0-roster/1";
     pub const MODULE_SCAN: &str = "fln.derive.module-scan/1";
+    pub const EPOCH_TREE: &str = "fln.derive.epoch-tree/1";
+    pub const TARGETS: &str = "fln.derive.cargo-targets/1";
+    pub const ORACLE_EDGES: &str = "fln.derive.oracle-edges/1";
 }
 
 /// What was scanned, at which pin, under which rule.
@@ -745,4 +748,608 @@ mod structural {
         let e: Vec<String> = vec!["x".to_string(), "y".to_string()];
         assert_ne!(set_digest("r", &d), set_digest("r", &e));
     }
+}
+
+// ---------------------------------------------------------------------------
+// 5. The epoch tree — binding a published lab so it cannot move
+// ---------------------------------------------------------------------------
+
+/// Schema line of the committed epoch-tree artifact.
+pub const EPOCH_TREE_SCHEMA: &str = "fln-epoch-tree/1";
+
+/// One file in a published epoch, with its content digest.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EpochFile {
+    pub path: String,
+    pub digest: String,
+}
+
+/// Every file a published epoch contains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochTree {
+    pub epoch: String,
+    /// The chain head this tree corresponds to, so a tree cannot be read as
+    /// describing a revision it does not.
+    pub head_root: String,
+    pub files: Vec<EpochFile>,
+}
+
+/// A way a published epoch has moved since it was bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeDrift {
+    /// A file exists that was not in the published tree.
+    Added { path: String },
+    /// A published file is gone.
+    Removed { path: String },
+    /// A published file's bytes changed.
+    Edited {
+        path: String,
+        stated: String,
+        computed: String,
+    },
+    /// The tree describes a different chain head than the one presented.
+    HeadMoved { stated: String, actual: String },
+}
+
+impl TreeDrift {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            TreeDrift::Added { .. } => "file-added",
+            TreeDrift::Removed { .. } => "file-removed",
+            TreeDrift::Edited { .. } => "file-edited",
+            TreeDrift::HeadMoved { .. } => "head-moved",
+        }
+    }
+}
+
+/// Files the tree deliberately does not bind.
+///
+/// The chain file cannot contain its own digest, and a leftover candidate is
+/// already a typed inconclusive in [`crate::verify_epoch`]. Everything else in
+/// the directory IS bound — including subdirectories, which is where the C1
+/// transcripts live and where the hazard actually was.
+fn tree_excluded(rel: &str) -> bool {
+    rel == crate::CHAIN_FILE || rel == crate::CANDIDATE_FILE
+}
+
+fn walk_files(base: &Path, dir: &Path, out: &mut Vec<EpochFile>) -> Result<(), DeriveError> {
+    let entries = std::fs::read_dir(dir).map_err(|e| DeriveError::SourceUnavailable {
+        path: dir.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        if p.is_dir() {
+            walk_files(base, &p, out)?;
+        } else {
+            let rel = p.strip_prefix(base).unwrap_or(&p).display().to_string();
+            if tree_excluded(&rel) {
+                continue;
+            }
+            let bytes = std::fs::read(&p).map_err(|e| DeriveError::SourceUnavailable {
+                path: p.display().to_string(),
+                detail: e.to_string(),
+            })?;
+            out.push(EpochFile {
+                path: rel,
+                digest: source_digest(&bytes),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Bind every file in a published epoch.
+///
+/// The revision chain binds `MANIFEST.txt` and nothing else, so before this a
+/// published lab could still move: a transcript edited, a fixture added, a
+/// sibling deleted — none of it detectable. That is the same defect class as an
+/// input accepted on trust, because in both cases a downstream check is
+/// measuring something that is not pinned.
+pub fn derive_epoch_tree(
+    epoch_dir: &Path,
+    epoch: &str,
+    head_root: &str,
+) -> Result<Derived<EpochTree>, DeriveError> {
+    let mut files = Vec::new();
+    walk_files(epoch_dir, epoch_dir, &mut files)?;
+    files.sort();
+    if files.is_empty() {
+        return Err(DeriveError::EmptyScan {
+            path: epoch_dir.display().to_string(),
+            rule: rules::EPOCH_TREE,
+        });
+    }
+    let keys: Vec<String> = files
+        .iter()
+        .map(|f| format!("{}\u{1}{}", f.path, f.digest))
+        .collect();
+    let digest = set_digest(rules::EPOCH_TREE, &keys);
+    let count = files.len();
+    Ok(Derived::new(
+        EpochTree {
+            epoch: epoch.to_string(),
+            head_root: head_root.to_string(),
+            files,
+        },
+        Provenance {
+            source: format!("epochs/{epoch}"),
+            pin: epoch.to_string(),
+            rule: rules::EPOCH_TREE,
+            source_digest: digest,
+            item_count: count,
+        },
+    ))
+}
+
+/// Render a committed epoch-tree artifact.
+pub fn render_epoch_tree(tree: &Derived<EpochTree>) -> String {
+    let t = tree.value();
+    let p = tree.provenance();
+    let mut out = format!(
+        "{EPOCH_TREE_SCHEMA}\nepoch {}\nhead_root {}\nrule {}\ncount {}\ndigest {}\n",
+        t.epoch, t.head_root, p.rule, p.item_count, p.source_digest
+    );
+    for f in &t.files {
+        out.push_str(&format!("file {} {}\n", f.path, f.digest));
+    }
+    out
+}
+
+/// Parse a committed epoch-tree artifact, recomputing its own digest.
+pub fn parse_epoch_tree(text: &str) -> Result<EpochTree, DeriveError> {
+    let mut epoch = None;
+    let mut head_root = None;
+    let mut rule = None;
+    let mut count = None;
+    let mut digest = None;
+    let mut files: Vec<EpochFile> = Vec::new();
+
+    let mut lines = text.lines().enumerate();
+    match lines.next() {
+        Some((_, l)) if l.trim() == EPOCH_TREE_SCHEMA => {}
+        _ => {
+            return Err(DeriveError::ArtifactInconsistent {
+                detail: "unrecognised epoch-tree schema".to_string(),
+            });
+        }
+    }
+    for (idx, line) in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(' ') else {
+            return Err(DeriveError::Unparseable {
+                path: "<epoch-tree>".to_string(),
+                line: idx + 1,
+                detail: format!("not a key/value line: {line:?}"),
+            });
+        };
+        match k {
+            "epoch" => epoch = Some(v.to_string()),
+            "head_root" => head_root = Some(v.to_string()),
+            "rule" => rule = Some(v.to_string()),
+            "count" => count = v.parse::<usize>().ok(),
+            "digest" => digest = Some(v.to_string()),
+            "file" => {
+                let Some((path, d)) = v.rsplit_once(' ') else {
+                    return Err(DeriveError::Unparseable {
+                        path: "<epoch-tree>".to_string(),
+                        line: idx + 1,
+                        detail: "file row has no digest".to_string(),
+                    });
+                };
+                files.push(EpochFile {
+                    path: path.to_string(),
+                    digest: d.to_string(),
+                });
+            }
+            other => {
+                return Err(DeriveError::Unparseable {
+                    path: "<epoch-tree>".to_string(),
+                    line: idx + 1,
+                    detail: format!("unknown key {other:?}"),
+                });
+            }
+        }
+    }
+    let (Some(epoch), Some(head_root), Some(rule), Some(count), Some(digest)) =
+        (epoch, head_root, rule, count, digest)
+    else {
+        return Err(DeriveError::ArtifactInconsistent {
+            detail: "epoch-tree header is incomplete".to_string(),
+        });
+    };
+    if rule != rules::EPOCH_TREE {
+        return Err(DeriveError::ArtifactInconsistent {
+            detail: format!("epoch tree was produced under rule {rule}"),
+        });
+    }
+    if count != files.len() {
+        return Err(DeriveError::ArtifactInconsistent {
+            detail: format!(
+                "header says {count} files, artifact carries {}",
+                files.len()
+            ),
+        });
+    }
+    let keys: Vec<String> = files
+        .iter()
+        .map(|f| format!("{}\u{1}{}", f.path, f.digest))
+        .collect();
+    let recomputed = set_digest(rules::EPOCH_TREE, &keys);
+    if recomputed != digest {
+        return Err(DeriveError::DigestMismatch {
+            path: "<epoch-tree>".to_string(),
+            stated: digest,
+            computed: recomputed,
+        });
+    }
+    Ok(EpochTree {
+        epoch,
+        head_root,
+        files,
+    })
+}
+
+/// Check a published epoch against its committed tree.
+///
+/// Returns every drift found, not the first: an epoch with three edited
+/// transcripts should report three. An empty result means the lab on disk is
+/// exactly the lab that was published.
+pub fn verify_epoch_tree(
+    artifact: &str,
+    epoch_dir: &Path,
+    head_root: &str,
+) -> Result<Vec<TreeDrift>, DeriveError> {
+    let published = parse_epoch_tree(artifact)?;
+    let mut drifts = Vec::new();
+    if published.head_root != head_root {
+        drifts.push(TreeDrift::HeadMoved {
+            stated: published.head_root.clone(),
+            actual: head_root.to_string(),
+        });
+    }
+    let mut on_disk = Vec::new();
+    walk_files(epoch_dir, epoch_dir, &mut on_disk)?;
+    on_disk.sort();
+
+    for want in &published.files {
+        match on_disk.iter().find(|f| f.path == want.path) {
+            None => drifts.push(TreeDrift::Removed {
+                path: want.path.clone(),
+            }),
+            Some(got) if got.digest != want.digest => drifts.push(TreeDrift::Edited {
+                path: want.path.clone(),
+                stated: want.digest.clone(),
+                computed: got.digest.clone(),
+            }),
+            Some(_) => {}
+        }
+    }
+    for got in &on_disk {
+        if !published.files.iter().any(|f| f.path == got.path) {
+            drifts.push(TreeDrift::Added {
+                path: got.path.clone(),
+            });
+        }
+    }
+    Ok(drifts)
+}
+
+// ---------------------------------------------------------------------------
+// 6. Cargo targets and shippability
+// ---------------------------------------------------------------------------
+
+use crate::poison::{OracleCapability, OracleEdge, Shippability, Target, TargetKind};
+
+/// One build target as found on disk.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TargetScan {
+    pub crate_name: String,
+    pub name: String,
+    pub kind_str: &'static str,
+    pub path: String,
+}
+
+fn kind_of(s: &str) -> TargetKind {
+    match s {
+        "lib" => TargetKind::Lib,
+        "bin" => TargetKind::Bin,
+        "test" => TargetKind::Test,
+        "bench" => TargetKind::Bench,
+        "example" => TargetKind::Example,
+        _ => TargetKind::BuildScript,
+    }
+}
+
+fn rs_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "rs"))
+        .filter_map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| (s.to_string(), p.clone()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Enumerate every Cargo target in the workspace from the tree's conventions.
+///
+/// The reachability scan's target dimension was supplied; this derives it. Note
+/// what is mechanical here and what is not: the target SET and each target's
+/// KIND are facts about the tree, but shippability is a policy decision and is
+/// handled separately by [`classify`] — deriving a judgement would be inventing
+/// one.
+pub fn derive_targets(root: &Path) -> Result<Derived<Vec<TargetScan>>, DeriveError> {
+    let members = derive_workspace_inventory(root)?;
+    let mut targets = Vec::new();
+    for m in &members.value().members {
+        let dir = root.join(&m.dir);
+        let push = |targets: &mut Vec<TargetScan>, name: String, kind: &'static str, p: PathBuf| {
+            targets.push(TargetScan {
+                crate_name: m.name.clone(),
+                name,
+                kind_str: kind,
+                path: p.strip_prefix(root).unwrap_or(&p).display().to_string(),
+            });
+        };
+        if dir.join("src/lib.rs").is_file() {
+            push(&mut targets, m.name.clone(), "lib", dir.join("src/lib.rs"));
+        }
+        if dir.join("src/main.rs").is_file() {
+            push(&mut targets, m.name.clone(), "bin", dir.join("src/main.rs"));
+        }
+        for (name, p) in rs_files(&dir.join("src/bin")) {
+            push(&mut targets, name, "bin", p);
+        }
+        for (name, p) in rs_files(&dir.join("tests")) {
+            push(&mut targets, name, "test", p);
+        }
+        for (name, p) in rs_files(&dir.join("benches")) {
+            push(&mut targets, name, "bench", p);
+        }
+        for (name, p) in rs_files(&dir.join("examples")) {
+            push(&mut targets, name, "example", p);
+        }
+    }
+    targets.sort();
+    if targets.is_empty() {
+        return Err(DeriveError::EmptyScan {
+            path: root.display().to_string(),
+            rule: rules::TARGETS,
+        });
+    }
+    let keys: Vec<String> = targets
+        .iter()
+        .map(|t| format!("{}\u{1}{}\u{1}{}", t.crate_name, t.name, t.kind_str))
+        .collect();
+    let digest = set_digest(rules::TARGETS, &keys);
+    let count = targets.len();
+    Ok(Derived::new(
+        targets,
+        Provenance {
+            source: root.display().to_string(),
+            pin: "-".to_string(),
+            rule: rules::TARGETS,
+            source_digest: digest,
+            item_count: count,
+        },
+    ))
+}
+
+/// A crate the shippability policy has not classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyGap {
+    /// A crate exists in the workspace and the policy says nothing about it.
+    /// A hard block: an unclassified crate defaults to nothing, because a
+    /// shippable target misfiled as development-only is invisible to the very
+    /// gate built to catch it.
+    UnclassifiedCrate { name: String },
+    /// The policy classifies a crate that is not in the workspace — stale, and
+    /// a sign the policy is describing a tree that has moved.
+    UnknownCrate { name: String },
+}
+
+impl PolicyGap {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            PolicyGap::UnclassifiedCrate { .. } => "unclassified-crate",
+            PolicyGap::UnknownCrate { .. } => "unknown-crate",
+        }
+    }
+}
+
+/// Apply a shippability policy to derived targets.
+///
+/// Two layers, deliberately. **Mechanical:** a `test`, `bench` or `example`
+/// target is never shipped — cargo does not put them in a release artifact, and
+/// no policy may say otherwise. **Policy:** whether a crate's `lib`/`bin`
+/// targets ship is a judgement, so it must be declared per crate, and every
+/// crate in the derived set must be covered or the classification blocks.
+pub fn classify(
+    targets: &[TargetScan],
+    policy: &[(String, Shippability)],
+) -> (Vec<Target>, Vec<PolicyGap>) {
+    let mut gaps = Vec::new();
+    let mut out = Vec::new();
+    let crates: BTreeSet<&str> = targets.iter().map(|t| t.crate_name.as_str()).collect();
+
+    for c in &crates {
+        if !policy.iter().any(|(n, _)| n == c) {
+            gaps.push(PolicyGap::UnclassifiedCrate {
+                name: (*c).to_string(),
+            });
+        }
+    }
+    for (n, _) in policy {
+        if !crates.contains(n.as_str()) {
+            gaps.push(PolicyGap::UnknownCrate { name: n.clone() });
+        }
+    }
+
+    for t in targets {
+        let kind = kind_of(t.kind_str);
+        // The mechanical floor. Never overridable by policy.
+        let never_ships = matches!(
+            kind,
+            TargetKind::Test | TargetKind::Bench | TargetKind::Example | TargetKind::BuildScript
+        );
+        let declared = policy
+            .iter()
+            .find(|(n, _)| *n == t.crate_name)
+            .map(|(_, s)| *s);
+        let shippability = if never_ships {
+            Shippability::DevelopmentOnly
+        } else {
+            // An unclassified crate's lib/bin targets are NOT defaulted to
+            // anything — the gap above blocks, and the conservative reading is
+            // recorded so a caller that ignores the gaps still does not get a
+            // free pass.
+            declared.unwrap_or(Shippability::Shippable)
+        };
+        out.push(Target {
+            crate_name: t.crate_name.clone(),
+            name: t.name.clone(),
+            kind,
+            shippability,
+        });
+    }
+    (out, gaps)
+}
+
+// ---------------------------------------------------------------------------
+// 7. Oracle edges — discovered from source, not declared
+// ---------------------------------------------------------------------------
+
+/// Source markers that indicate a path to an oracle capability.
+///
+/// Deliberately conservative and deliberately visible: a marker that fires on
+/// harmless text produces a false positive, which is the failure mode
+/// `oracle_only_reachability` treats as seriously as a miss. Each marker is a
+/// string that has no innocent reason to appear in shippable source.
+pub const ORACLE_MARKERS: &[(&str, OracleCapability)] = &[
+    ("ORACLE_FALLBACK", OracleCapability::OracleFallback),
+    ("libleanshared", OracleCapability::LinkReferenceSymbol),
+    (".elan/toolchains", OracleCapability::SpawnReferenceBinary),
+    ("leanprover--lean4", OracleCapability::SpawnReferenceBinary),
+];
+
+/// Scan derived targets' source for oracle markers.
+///
+/// The edge set was supplied, which meant a real oracle path nobody declared
+/// was invisible to the scan. This finds them. It reads only this repository.
+pub fn derive_oracle_edges(
+    root: &Path,
+    targets: &[TargetScan],
+) -> Result<Derived<Vec<OracleEdge>>, DeriveError> {
+    let mut edges: Vec<OracleEdge> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    for t in targets {
+        let p = root.join(&t.path);
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        for (marker, capability) in ORACLE_MARKERS {
+            // One edge per (target, capability): two markers for the same
+            // capability in one file is one path, not two, and duplicate rows
+            // would inflate every count a reader uses to judge severity.
+            if text.contains(marker)
+                && !edges
+                    .iter()
+                    .any(|e| e.target == t.name && e.capability == *capability)
+            {
+                keys.push(format!("{}\u{1}{}\u{1}{}", t.crate_name, t.name, marker));
+                edges.push(OracleEdge {
+                    target: t.name.clone(),
+                    capability: *capability,
+                    // Feature gating cannot be read from a text scan; an
+                    // ungated edge is the conservative reading, because it is
+                    // reachable in every combination rather than some.
+                    requires: BTreeSet::new(),
+                });
+            }
+        }
+    }
+    let digest = set_digest(rules::ORACLE_EDGES, &keys);
+    let count = edges.len();
+    Ok(Derived::new(
+        edges,
+        Provenance {
+            source: root.display().to_string(),
+            pin: "-".to_string(),
+            rule: rules::ORACLE_EDGES,
+            source_digest: digest,
+            item_count: count,
+        },
+    ))
+}
+
+/// Schema line of the shippability policy file.
+pub const POLICY_SCHEMA: &str = "fln-shippability-policy/1";
+
+/// Read the declared shippability policy.
+///
+/// Deliberately a separate input from the derived target set: the set is a fact
+/// about the tree and the classification is a judgement about the product. What
+/// [`classify`] enforces is that the judgement COVERS the fact.
+pub fn read_shippability_policy(path: &Path) -> Result<Vec<(String, Shippability)>, DeriveError> {
+    let text = read(path)?;
+    let mut lines = text.lines().enumerate();
+    match lines.next() {
+        Some((_, l)) if l.trim() == POLICY_SCHEMA => {}
+        _ => {
+            return Err(DeriveError::ArtifactInconsistent {
+                detail: "unrecognised shippability-policy schema".to_string(),
+            });
+        }
+    }
+    let mut out = Vec::new();
+    for (idx, line) in lines {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = l.strip_prefix("crate ") else {
+            return Err(DeriveError::Unparseable {
+                path: path.display().to_string(),
+                line: idx + 1,
+                detail: format!("not a crate row: {l:?}"),
+            });
+        };
+        let Some((name, s)) = rest.split_once(' ') else {
+            return Err(DeriveError::Unparseable {
+                path: path.display().to_string(),
+                line: idx + 1,
+                detail: "crate row has no classification".to_string(),
+            });
+        };
+        let shippability = match s.trim() {
+            "shippable" => Shippability::Shippable,
+            "development-only" => Shippability::DevelopmentOnly,
+            other => {
+                return Err(DeriveError::Unparseable {
+                    path: path.display().to_string(),
+                    line: idx + 1,
+                    detail: format!("unknown classification {other:?}"),
+                });
+            }
+        };
+        out.push((name.trim().to_string(), shippability));
+    }
+    if out.is_empty() {
+        return Err(DeriveError::EmptyScan {
+            path: path.display().to_string(),
+            rule: rules::TARGETS,
+        });
+    }
+    Ok(out)
 }
