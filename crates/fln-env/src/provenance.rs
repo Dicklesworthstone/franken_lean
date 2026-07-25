@@ -2532,7 +2532,13 @@ impl ModuleProvenanceIndexes {
     ///
     /// Deterministic and total: every input row lands in both directions, so a
     /// rebuild from the same records is byte-for-byte the same projection.
-    pub fn derive(manifest: &ModuleProvenanceManifest) -> Self {
+    ///
+    /// Fallible on purpose. A projection that quietly drops a row it could not
+    /// place would still re-derive *identically* — both sides would skip the same
+    /// row — so silence here is unfalsifiable. Every refusal is a
+    /// [`GraphAdmissionFault`](ModuleProvenanceError::GraphAdmissionFault) about
+    /// validated state disagreeing with itself, never a verdict about a module.
+    pub fn derive(manifest: &ModuleProvenanceManifest) -> Result<Self, ModuleProvenanceError> {
         let mut owners = BTreeMap::new();
         let mut declarations_by_module = BTreeMap::new();
         let mut entry_occurrences: BTreeMap<ExtensionEntryId, Vec<EntryOccurrence>> =
@@ -2559,9 +2565,14 @@ impl ModuleProvenanceIndexes {
                 record.extension_contributions().iter().enumerate()
             {
                 for (offset, entry) in contribution.entries().iter().enumerate() {
-                    let Some(source_ordinal) = contribution.source_ordinal(offset) else {
-                        continue;
-                    };
+                    // In range by construction, so `None` here means the committed
+                    // record cannot address a row it committed. Skipping it would
+                    // hide the hole from re-derivation; refusing surfaces it.
+                    let source_ordinal = contribution.source_ordinal(offset).ok_or(
+                        ModuleProvenanceError::GraphAdmissionFault {
+                            what: "validated contribution cannot supply a source ordinal for a row it committed",
+                        },
+                    )?;
                     entry_occurrences
                         .entry(*entry)
                         .or_default()
@@ -2576,12 +2587,70 @@ impl ModuleProvenanceIndexes {
         for occurrences in entry_occurrences.values_mut() {
             occurrences.sort();
         }
-        Self {
+        let indexes = Self {
             owners,
             declarations_by_module,
             entry_occurrences,
             derived_from: manifest.root(),
+        };
+        indexes.check_coverage(&manifest.facts())?;
+        Ok(indexes)
+    }
+
+    /// Count conservation against the facts the manifest computed when it validated.
+    ///
+    /// This is the half that re-derivation cannot supply. Comparing a projection to a
+    /// rebuild of itself proves only that the same code twice agrees with itself; a
+    /// systematic hole — a row class the loop never visits, a name silently
+    /// overwritten by a later one — survives that comparison intact. `facts` is
+    /// counted by the validator over the same records without consulting this loop,
+    /// so joining against it is an independent statement.
+    ///
+    /// Every equality below is exact, in the shape of the project's other
+    /// conservation law (`checked + artifact_incomplete == decls_total`): a validated
+    /// manifest admits no duplicate module id and no duplicate declaration name, in a
+    /// module or across modules, so each committed row must appear exactly once.
+    fn check_coverage(&self, facts: &ModuleProvenanceFacts) -> Result<(), ModuleProvenanceError> {
+        if self.declarations_by_module.len() != facts.modules {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward index does not carry exactly the manifest's modules",
+            });
         }
+        let expected_declarations = facts
+            .declarations
+            .checked_add(facts.extra_declarations)
+            .ok_or(ModuleProvenanceError::GraphAdmissionFault {
+                what: "manifest declaration counts overflow their own total",
+            })?;
+        let indexed: usize = self
+            .declarations_by_module
+            .values()
+            .map(|names| names.len())
+            .sum();
+        if indexed != expected_declarations {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward index does not cover exactly the manifest's declarations",
+            });
+        }
+        // Distinct from the forward count: `owners` is keyed by name, so a duplicate
+        // that slipped past validation would be absorbed by last-writer-wins here and
+        // nowhere else. Equality is what makes that absorption impossible.
+        if self.owners.len() != expected_declarations {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "reverse index does not cover exactly the manifest's declarations",
+            });
+        }
+        let occurrences: usize = self
+            .entry_occurrences
+            .values()
+            .map(|occurrences| occurrences.len())
+            .sum();
+        if occurrences != facts.extension_entries {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "entry-occurrence index does not cover exactly the manifest's entries",
+            });
+        }
+        Ok(())
     }
 
     /// The aggregate root these projections were derived from. This is a *back
@@ -2625,7 +2694,11 @@ impl ModuleProvenanceIndexes {
                 recomputed: manifest.root(),
             });
         }
-        let rebuilt = Self::derive(manifest);
+        // Coverage first, on `self`: it is the check that does not depend on the
+        // rebuild agreeing, so it stays meaningful even if `derive` is the thing at
+        // fault.
+        self.check_coverage(&manifest.facts())?;
+        let rebuilt = Self::derive(manifest)?;
         if rebuilt.owners != self.owners {
             return Err(ModuleProvenanceError::GraphAdmissionFault {
                 what: "declaration-owner projection disagrees with the committed records",
@@ -3673,11 +3746,14 @@ mod tests {
     fn index_projections_are_derivable_bidirectional_and_never_authoritative() {
         let manifest = sample_manifest();
         let root_before = manifest.root();
-        let indexes = ModuleProvenanceIndexes::derive(&manifest);
+        let indexes = ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
 
         // Derivable: a rebuild from the same records is the same projection, and it
         // verifies against the manifest it came from.
-        assert_eq!(indexes, ModuleProvenanceIndexes::derive(&manifest));
+        assert_eq!(
+            indexes,
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest")
+        );
         assert_eq!(indexes.verify(&manifest), Ok(()));
         assert_eq!(indexes.derived_from(), root_before);
 
@@ -3687,7 +3763,7 @@ mod tests {
         // keeps it there.
         let bytes_before = manifest.to_canonical_bytes();
         let _clone = indexes.clone();
-        drop(ModuleProvenanceIndexes::derive(&manifest));
+        drop(ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest"));
         assert_eq!(
             manifest.root(),
             root_before,
@@ -3765,7 +3841,7 @@ mod tests {
 
         // Carried across to a different committed root: caught by the back reference
         // before any row is compared.
-        let stale = ModuleProvenanceIndexes::derive(&manifest);
+        let stale = ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
         assert!(matches!(
             stale.verify(&other),
             Err(ModuleProvenanceError::InternalFault {
@@ -3776,7 +3852,8 @@ mod tests {
 
         // Tampered rows, with the root reference left intact so the row comparison is
         // what has to catch it. Each is a distinct way a cache can rot.
-        let mut dropped_owner = ModuleProvenanceIndexes::derive(&manifest);
+        let mut dropped_owner =
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
         let victim = manifest.records()[0].declarations()[0].clone();
         dropped_owner.owners.remove(&victim);
         assert!(matches!(
@@ -3784,7 +3861,8 @@ mod tests {
             Err(ModuleProvenanceError::GraphAdmissionFault { .. })
         ));
 
-        let mut wrong_owner = ModuleProvenanceIndexes::derive(&manifest);
+        let mut wrong_owner =
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
         wrong_owner
             .owners
             .insert(victim.clone(), (id("B"), DeclarationClass::Declaration));
@@ -3793,7 +3871,8 @@ mod tests {
             Err(ModuleProvenanceError::GraphAdmissionFault { .. })
         ));
 
-        let mut flattened_class = ModuleProvenanceIndexes::derive(&manifest);
+        let mut flattened_class =
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
         let extra = manifest.records()[0].extra_declarations()[0].clone();
         flattened_class
             .owners
@@ -3806,7 +3885,8 @@ mod tests {
             "collapsing the ordinary/extra class distinction must fault"
         );
 
-        let mut lost_occurrence = ModuleProvenanceIndexes::derive(&manifest);
+        let mut lost_occurrence =
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
         let entry = manifest.records()[0].extension_contributions()[0].entries()[0];
         lost_occurrence.entry_occurrences.remove(&entry);
         assert!(matches!(
@@ -3817,9 +3897,103 @@ mod tests {
         // And the healthy projection still verifies, so none of the above is a
         // blanket refusal.
         assert_eq!(
-            ModuleProvenanceIndexes::derive(&manifest).verify(&manifest),
+            ModuleProvenanceIndexes::derive(&manifest)
+                .expect("validated manifest")
+                .verify(&manifest),
             Ok(())
         );
+    }
+
+    /// Count conservation is the half that re-derivation cannot supply.
+    ///
+    /// Diffing a projection against a rebuild of itself proves only that the same
+    /// loop twice agrees with itself: a systematic hole — a row class never visited,
+    /// a name absorbed by last-writer-wins — survives that comparison untouched.
+    /// `facts` is counted by the validator over the same records without consulting
+    /// this loop, so each equality below is an independent statement, and each hole
+    /// is pinned to the specific equality that must catch it.
+    #[test]
+    fn index_coverage_is_conserved_against_independently_counted_facts() {
+        let manifest = sample_manifest();
+        let facts = manifest.facts();
+        let healthy = ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
+        assert_eq!(healthy.check_coverage(&facts), Ok(()));
+
+        // Exact equality, not "at least": a validated manifest admits no duplicate
+        // module id and no duplicate declaration name, in a module or across modules,
+        // so every committed row appears exactly once in each direction.
+        let declarations = facts.declarations + facts.extra_declarations;
+        assert_eq!(healthy.owners.len(), declarations);
+        assert_eq!(healthy.declarations_by_module.len(), facts.modules);
+        assert_eq!(
+            healthy
+                .entry_occurrences
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            facts.extension_entries
+        );
+
+        let victim_module = manifest.records()[0].module().id.clone();
+        let victim_name = manifest.records()[0].declarations()[0].clone();
+
+        // A whole module missing from the forward index.
+        let mut lost_module = healthy.clone();
+        lost_module.declarations_by_module.remove(&victim_module);
+        assert!(matches!(
+            lost_module.check_coverage(&facts),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward index does not carry exactly the manifest's modules",
+            })
+        ));
+
+        // A declaration dropped from a module that is itself still present, so the
+        // module count stays right and only the declaration total can catch it.
+        let mut short_module = healthy.clone();
+        short_module
+            .declarations_by_module
+            .get_mut(&victim_module)
+            .expect("the victim module is indexed")
+            .pop()
+            .expect("the victim module owns declarations");
+        assert!(matches!(
+            short_module.check_coverage(&facts),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward index does not cover exactly the manifest's declarations",
+            })
+        ));
+
+        // The same row lost from the reverse direction only. This is the shape a
+        // duplicate name would take if one ever slipped past validation: absorbed
+        // silently by the name-keyed map and visible nowhere else.
+        let mut lost_owner = healthy.clone();
+        lost_owner.owners.remove(&victim_name);
+        assert!(matches!(
+            lost_owner.check_coverage(&facts),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "reverse index does not cover exactly the manifest's declarations",
+            })
+        ));
+
+        // An entry occurrence dropped.
+        let mut lost_occurrence = healthy.clone();
+        let entry = manifest.records()[0].extension_contributions()[0].entries()[0];
+        lost_occurrence.entry_occurrences.remove(&entry);
+        assert!(matches!(
+            lost_occurrence.check_coverage(&facts),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "entry-occurrence index does not cover exactly the manifest's entries",
+            })
+        ));
+
+        // Ordering: verify() reaches coverage before the row diff, so a hole is
+        // reported as a hole rather than as generic disagreement.
+        assert!(matches!(
+            lost_owner.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "reverse index does not cover exactly the manifest's declarations",
+            })
+        ));
     }
 
     #[test]
