@@ -247,3 +247,61 @@ fn real_olean_recompaction_fixpoint() {
     let ours2 = compact(&again, BASE_B).expect("recompact");
     assert_eq!(ours1, ours2, "fixpoint holds on a real module graph");
 }
+
+/// Extreme mpz header fields must be a TYPED fault, not a panic and not a
+/// misfiled one (FL-INV-07; the module contract is "malformed input yields a
+/// typed RegionFault, never a panic").
+///
+/// `_mp_size` and `_mp_alloc` are four attacker-controlled bytes each, and the
+/// coherence law `_mp_alloc >= |_mp_size|` used to be checked with
+/// `mp_size.abs()`. On `i32::MIN` that negation overflows: it PANICKED in a
+/// debug build, and in release it silently stayed negative, so the comparison
+/// was false, the object passed its integrity check, and the fault surfaced
+/// later and wrongly as `Truncated` (from the absurd 17 GB size) instead of
+/// `MpzIntegrity`. Checking in the unsigned domain fixes both.
+///
+/// `audit` is the entry the olean codec runs over shared/sealed mappings, so
+/// the input here is exactly a corrupt `.olean` byte range.
+#[test]
+fn mpz_header_extremes_are_typed_faults_not_panics() {
+    // A region is [root word][objects…]; the root is a scalar (odd) word so
+    // the walk reaches the object at offset 8.
+    let region_with = |alloc: i32, mp_size: i32| {
+        let mut buf = vec![0u8; 32];
+        buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+        buf[15] = fln_rt::abi::TAG_MPZ;
+        buf[16..20].copy_from_slice(&alloc.to_le_bytes());
+        buf[20..24].copy_from_slice(&mp_size.to_le_bytes());
+        buf
+    };
+
+    for (alloc, mp_size, what) in [
+        (0, i32::MIN, "the negation that overflowed"),
+        (i32::MIN, i32::MIN, "both fields extreme"),
+        (i32::MIN, 1, "negative _mp_alloc"),
+        (-1, 1, "_mp_alloc below |_mp_size|"),
+        (4, 0, "zero limb count"),
+    ] {
+        let buf = region_with(alloc, mp_size);
+        assert_eq!(
+            fln_rt::region::audit(&buf, 0),
+            Err(RegionFault::MpzIntegrity { offset: 8 }),
+            "{what}: must be MpzIntegrity at the offending object"
+        );
+    }
+
+    // And the coherent shape still walks: 2 limbs, alloc >= |size|, limb
+    // pointer inside this object's own inline block.
+    // Object at 8 spans MPZ_FIXED(24) + 2 limbs * 8 = 40 bytes, so the region
+    // is 8 + 40 = 48 and the inline limb block is [32, 48).
+    let mut ok = vec![0u8; 48];
+    ok[0..8].copy_from_slice(&1u64.to_le_bytes());
+    ok[15] = fln_rt::abi::TAG_MPZ;
+    ok[16..20].copy_from_slice(&2i32.to_le_bytes());
+    ok[20..24].copy_from_slice(&(-2i32).to_le_bytes()); // negative size = sign, |size| = 2
+    ok[24..32].copy_from_slice(&32u64.to_le_bytes()); // limb ptr -> the block start
+    assert!(
+        fln_rt::region::audit(&ok, 0).is_ok(),
+        "a coherent mpz must still audit clean"
+    );
+}

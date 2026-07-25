@@ -393,8 +393,15 @@ fn walk_step(buf: &[u8], offset: usize) -> RResult<WalkStep> {
         need(buf, offset, MPZ_FIXED)?;
         let mp_size = read_i32(buf, offset + 12);
         let limbs = usize::try_from(mp_size.unsigned_abs()).expect("u32 fits usize");
-        let alloc = read_i32(buf, offset + 8);
-        if limbs == 0 || alloc < mp_size.abs() {
+        // Both fields are attacker-controlled bytes, so the `_mp_alloc >=
+        // |_mp_size|` law is checked in the UNSIGNED domain: `i32::MIN.abs()`
+        // panics on overflow (debug) or stays negative (release), and a
+        // negative `_mp_alloc` is itself incoherent rather than a comparison
+        // operand.
+        let Ok(alloc) = u32::try_from(read_i32(buf, offset + 8)) else {
+            return Err(RegionFault::MpzIntegrity { offset });
+        };
+        if limbs == 0 || alloc < mp_size.unsigned_abs() {
             return Err(RegionFault::MpzIntegrity { offset });
         }
         let size = MPZ_FIXED
