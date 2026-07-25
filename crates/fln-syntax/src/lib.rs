@@ -9,3 +9,4 @@
 
 pub mod rope;
 pub mod source;
+pub mod view;
