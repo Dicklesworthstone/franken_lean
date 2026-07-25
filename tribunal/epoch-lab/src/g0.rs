@@ -1,0 +1,714 @@
+//! `G0SpikeDecisionV1` — one row per G0 spike, and no way to talk past the gate
+//! (bead `franken_lean-869w`, carved out of `fln-euo`; plan §22.1).
+//!
+//! # What this schema is for
+//!
+//! G0 exists so that no W2–W12 workstream freezes an interface on top of an
+//! unpriced bet. **A gate whose decisions can be paraphrased, aggregated, or
+//! quietly amended is not a gate.** Each of the ten §22.1 spikes emits exactly
+//! one [`Decision`], and every way a decision could be softened is a typed
+//! refusal rather than a judgement call.
+//!
+//! # Absence versus deferral — the boundary, and why it is drawn twice
+//!
+//! A spike may resolve to [`Resolution::Blocked`]: a schema that cannot say "we
+//! have not answered this yet" forces the honest answer to be indistinguishable
+//! from silence.
+//!
+//! But absence of a row is a hard [`Block::MissingDecision`], because tolerating
+//! it would just move the silence up one level — a spike nobody ever thought
+//! about would look exactly like one deliberately deferred. **Not answering is
+//! a disposition you record, never one you achieve by staying quiet.** That is
+//! the same law [`crate::corpus`] applies to the C1 inventory, stated twice
+//! because it is the same failure twice.
+//!
+//! [`Resolution::Blocked`] is deliberately **not** a fourth [`Outcome`].
+//! `Outcome` stays exactly Ratified / Amended / NoGo; folding Blocked into it
+//! would conflate "a decision was reached" with "no decision was reached".
+//!
+//! # The two laundering rules
+//!
+//! **Amended is expensive or it is not an amendment.** [`Amendment`] requires
+//! the exact §25 wording, a rationale, the blast radius, owners, dependency
+//! updates, and *green* acceptance tests. Every field is checked non-empty and
+//! the tests are checked actually green.
+//!
+//! **Non-evidence never becomes evidence.** [`WitnessRoot`] is typed Recorded /
+//! Absent / Failed / Unresolved, and a Ratified or Amended outcome requires
+//! every root to be `Recorded`. The refusal is on the root's *type*, not on
+//! anybody's characterisation of it, so failed or absent evidence cannot be
+//! narrated into an amendment.
+//!
+//! # No aggregate green
+//!
+//! [`verify`] computes over the **roster**, never over the rows that happen to
+//! be present. There is no aggregate that can be green while a decision is
+//! absent.
+
+use crate::corpus::CorpusFamily;
+use crate::oracle::{ClaimType, ComparisonClass, EvidenceState, Mode, OracleKind, Platform};
+use std::collections::BTreeMap;
+
+/// Schema line for a G0 decision ledger.
+pub const G0_SCHEMA: &str = "fln-g0-spike-decision/1";
+
+/// One roster entry: a spike id and the exact §22.1 question it must answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterSpike {
+    pub id: &'static str,
+    pub question: &'static str,
+}
+
+/// The ten G0 spikes of §22.1.
+///
+/// **Provenance caveat.** These are transcribed from the plan, not extracted
+/// from it, so this table is exactly the kind of hand-listed artifact the rest
+/// of this crate refuses. It is a constant rather than a derivation because
+/// reading the plan file is the extraction slice's job; until then, a drift
+/// between this table and §22.1 is undetectable here, and that is recorded on
+/// the bead rather than hidden.
+pub const G0_ROSTER: [RosterSpike; 10] = [
+    RosterSpike {
+        id: "G0-1",
+        question: "ABI resurrection: parse a real mathlib .olean at the pin, walk every constant and extension entry, validate object-graph integrity against the extracted contract tables",
+    },
+    RosterSpike {
+        id: "G0-2",
+        question: "Independent check: prototype Crucible checks a nontrivial upstream module from its olean, verdicts diffed against lean4checker",
+    },
+    RosterSpike {
+        id: "G0-3",
+        question: "Golem execution: execute real user-class compiled Lean code through the prototype intrinsic table on ABI values, end to end",
+    },
+    RosterSpike {
+        id: "G0-4",
+        question: "Hygiene and syntax fidelity: compare Syntax trees, positions and hygiene observables against the Reference on macro-heavy Corpus files",
+    },
+    RosterSpike {
+        id: "G0-5",
+        question: "Byte-identical re-emit: read, rebuild and byte-diff Reference oleans; enumerate every serialization freedom and pin each with a policy",
+    },
+    RosterSpike {
+        id: "G0-6",
+        question: "Fuel parity: calibrate the heartbeat-counting law until faithful timeout behavior matches tick for tick; document any irreducible divergence class",
+    },
+    RosterSpike {
+        id: "G0-7",
+        question: "Defeq tail: the twenty nastiest Corpus defeq/whnf problems timed on the memoization design; decide cache keying and lazy-delta strategy",
+    },
+    RosterSpike {
+        id: "G0-8",
+        question: "Mirror-facade viability: census and facade stubs for a metaprogram-heavy slice; enumerate every API whose semantics resist native backing and assign each an honest L-level",
+    },
+    RosterSpike {
+        id: "G0-9",
+        question: "Instrumented oracle: dump unifier/instance/macro decision traces on a pilot corpus; prove the trace schema, volume and replay-rig design",
+    },
+    RosterSpike {
+        id: "G0-10",
+        question: "Dependency-closure audit: full transitive closure generated and allowlisted, SUITE.lock committed, extraction scripts stood up in CI",
+    },
+];
+
+/// A witness root, with its status in the type rather than in a comment.
+///
+/// Closed: there is no `Other`, and no `Partial`. The three non-Recorded arms
+/// are exactly the words the epic uses — failed, absent, unresolved — because
+/// those are the three ways a missing result gets narrated into a present one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitnessRoot {
+    /// A real digest of a real artifact.
+    Recorded(String),
+    /// Never run.
+    Absent,
+    /// Ran and failed.
+    Failed,
+    /// Ran, and the outcome was never classified.
+    Unresolved,
+}
+
+impl WitnessRoot {
+    pub fn is_recorded(&self) -> bool {
+        matches!(self, WitnessRoot::Recorded(_))
+    }
+    pub fn status(&self) -> &'static str {
+        match self {
+            WitnessRoot::Recorded(_) => "recorded",
+            WitnessRoot::Absent => "absent",
+            WitnessRoot::Failed => "failed",
+            WitnessRoot::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// The evidence a spike produced.
+///
+/// `evidence_state` is the WITNESS's state and is deliberately a separate field
+/// from [`Decision::claim`], which is the D7 type of what the row asserts.
+/// Neither is derived from the other — that separation is the same one the
+/// Parity Ledger enforces, and it is here for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Witness {
+    pub evidence_state: EvidenceState,
+    pub fixture_root: WitnessRoot,
+    pub generated_contract_root: WitnessRoot,
+    pub implementation_root: WitnessRoot,
+    pub mutation_root: WitnessRoot,
+    /// The REAL no-mock end-to-end root. A mock may support a unit test and may
+    /// not close a gate.
+    pub no_mock_e2e_root: WitnessRoot,
+    pub oracle: OracleKind,
+    pub comparison: ComparisonClass,
+}
+
+impl Witness {
+    /// Every root paired with its field name, for reporting which one failed.
+    pub fn roots(&self) -> [(&'static str, &WitnessRoot); 5] {
+        [
+            ("fixture", &self.fixture_root),
+            ("generated_contract", &self.generated_contract_root),
+            ("implementation", &self.implementation_root),
+            ("mutation", &self.mutation_root),
+            ("no_mock_e2e", &self.no_mock_e2e_root),
+        ]
+    }
+}
+
+/// The exact scope a decision is valid within. A decision outside its scope is
+/// not a weaker decision; it is a different question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    pub epoch: String,
+    pub corpus: CorpusFamily,
+    pub platform: Platform,
+    pub mode: Mode,
+}
+
+/// A resource contract and what was actually used against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resources {
+    pub contract_wall_ms: u64,
+    pub contract_rss_bytes: u64,
+    pub used_wall_ms: u64,
+    pub used_rss_bytes: u64,
+}
+
+impl Resources {
+    /// Whether usage stayed inside the contract it declared.
+    ///
+    /// A spike that blew its budget did not prove the thing could be done
+    /// inside the budget, and the budget is usually the whole question.
+    pub fn within_contract(&self) -> bool {
+        self.used_wall_ms <= self.contract_wall_ms && self.used_rss_bytes <= self.contract_rss_bytes
+    }
+}
+
+/// Everything an amendment must carry. All of it, or it is not an amendment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Amendment {
+    /// The exact §25 wording the amendment installs. Not a summary of it.
+    pub section_25_wording: String,
+    pub rationale: String,
+    /// Every downstream interface the amendment moves.
+    pub blast_radius: Vec<String>,
+    pub owners: Vec<String>,
+    pub dependency_updates: Vec<String>,
+    /// The amended acceptance tests, which must be green.
+    pub acceptance_suite: String,
+    pub acceptance_green: bool,
+    pub acceptance_root: WitnessRoot,
+}
+
+/// Why a spike says no.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoGo {
+    pub rationale: String,
+    /// What must change instead. A NoGo with no consequence is a shrug.
+    pub affected_interfaces: Vec<String>,
+}
+
+/// The three decisions a spike can reach. Exactly three — Blocked is not one of
+/// them, because "no decision" is not a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Ratified,
+    Amended(Amendment),
+    NoGo(NoGo),
+}
+
+impl Outcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Outcome::Ratified => "ratified",
+            Outcome::Amended(_) => "amended",
+            Outcome::NoGo(_) => "no-go",
+        }
+    }
+}
+
+/// Why a spike has not been decided. Closed; no `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedReason {
+    /// Waiting on a prerequisite spike or workstream.
+    AwaitingDependency,
+    /// The apparatus to answer it does not exist yet.
+    ApparatusMissing,
+    /// Needs a platform this lab has not run on.
+    PlatformUnavailable,
+    /// Deliberately deferred with an owner.
+    DeferredByOwner,
+}
+
+impl BlockedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockedReason::AwaitingDependency => "awaiting-dependency",
+            BlockedReason::ApparatusMissing => "apparatus-missing",
+            BlockedReason::PlatformUnavailable => "platform-unavailable",
+            BlockedReason::DeferredByOwner => "deferred-by-owner",
+        }
+    }
+}
+
+/// Decided, or explicitly not yet. "Neither" is not representable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    Decided(Outcome),
+    /// We have not answered this. Written down, with an owner, so that it is
+    /// visible rather than silent.
+    Blocked {
+        reason: BlockedReason,
+        owner: String,
+        note: String,
+    },
+}
+
+/// One G0 spike decision row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    pub spike: String,
+    /// The exact §22.1 question. Checked against the roster verbatim: a row
+    /// that paraphrases the question is answering a different one, which is
+    /// precisely how a gate gets talked past.
+    pub question: String,
+    pub resolution: Resolution,
+    /// D7 claim type of what this row asserts. Separate from
+    /// `witness.evidence_state`, always.
+    pub claim: ClaimType,
+    pub witness: Witness,
+    pub scope: Scope,
+    pub resources: Resources,
+    /// Known limitations. Required and non-empty; a row with none must say so.
+    pub limitations: String,
+    /// Downstream interfaces this decision affects.
+    pub affected_interfaces: Vec<String>,
+}
+
+/// A way a G0 ledger fails. Every variant blocks; there is no warning level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Block {
+    /// A roster spike with no row at all. The hard failure half of the boundary.
+    MissingDecision { spike: String },
+    /// More than one row for a spike. "Exactly one row" means exactly one.
+    DuplicateDecision { spike: String },
+    /// A row for a spike that is not on the §22.1 roster.
+    UnknownSpike { spike: String },
+    /// The row's question is not the roster's question, verbatim.
+    QuestionMismatch { spike: String },
+    /// A Ratified or Amended outcome resting on a root that is not Recorded.
+    /// Failed, absent and unresolved evidence cannot become evidence.
+    LaunderedNonEvidence {
+        spike: String,
+        root: &'static str,
+        status: &'static str,
+    },
+    /// An amendment missing one of its mandatory parts.
+    IncompleteAmendment {
+        spike: String,
+        missing: &'static str,
+    },
+    /// An amendment whose acceptance tests are not green.
+    AmendmentNotGreen { spike: String },
+    /// A NoGo with no rationale or no consequence.
+    HollowNoGo {
+        spike: String,
+        missing: &'static str,
+    },
+    /// A Blocked row with no owner or no note.
+    UnownedBlock {
+        spike: String,
+        missing: &'static str,
+    },
+    /// Usage exceeded the contract it declared.
+    ResourceContractExceeded { spike: String },
+    /// A row with no stated limitations.
+    NoLimitationsStated { spike: String },
+}
+
+impl Block {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Block::MissingDecision { .. } => "missing-decision",
+            Block::DuplicateDecision { .. } => "duplicate-decision",
+            Block::UnknownSpike { .. } => "unknown-spike",
+            Block::QuestionMismatch { .. } => "question-mismatch",
+            Block::LaunderedNonEvidence { .. } => "laundered-non-evidence",
+            Block::IncompleteAmendment { .. } => "incomplete-amendment",
+            Block::AmendmentNotGreen { .. } => "amendment-not-green",
+            Block::HollowNoGo { .. } => "hollow-no-go",
+            Block::UnownedBlock { .. } => "unowned-block",
+            Block::ResourceContractExceeded { .. } => "resource-contract-exceeded",
+            Block::NoLimitationsStated { .. } => "no-limitations-stated",
+        }
+    }
+}
+
+/// What a G0 ledger amounts to.
+///
+/// Three states, and `clears_g0` is the only one that lets a workstream freeze
+/// an interface. Note there is no score, no percentage, and no "9 of 10" —
+/// [`Gate::blocked`] and [`Gate::no_go`] name the spikes, because an aggregate
+/// is exactly what this schema exists to refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gate {
+    pub roster_size: usize,
+    pub ratified: Vec<String>,
+    pub amended: Vec<String>,
+    pub no_go: Vec<String>,
+    pub blocked: Vec<String>,
+    pub blocks: Vec<Block>,
+}
+
+impl Gate {
+    /// Does this ledger clear G0?
+    ///
+    /// Every roster spike must be Decided, every decision must be well-formed,
+    /// and no spike may be NoGo or Blocked. A NoGo is a real decision — the bet
+    /// was priced and the answer was no — but it does not license the dependent
+    /// workstream to freeze the interface it was going to freeze.
+    pub fn clears(&self) -> bool {
+        // Stated ONCE, positively. Every roster spike lands in exactly one of
+        // the four buckets, so `ratified + amended == roster_size` already
+        // means no spike is NoGo, Blocked or missing — adding
+        // `no_go.is_empty() && blocked.is_empty()` would restate the same
+        // predicate over the same data in the same function.
+        //
+        // That redundancy was here and a mutation campaign proved it dead:
+        // deleting `blocked.is_empty()` changed no observable behaviour and the
+        // mutant SURVIVED. It is the `poison::scan` lesson in a second
+        // disguise — indistinguishable redundancy is not defence in depth, it
+        // is dead code that no campaign can see. Unlike the scan's second
+        // budget guard, which buys termination, these clauses bought nothing,
+        // so the fix is deletion rather than differentiation.
+        self.blocks.is_empty() && self.ratified.len() + self.amended.len() == self.roster_size
+    }
+}
+
+fn check_amendment(spike: &str, a: &Amendment, blocks: &mut Vec<Block>) {
+    for (missing, empty) in [
+        ("section_25_wording", a.section_25_wording.trim().is_empty()),
+        ("rationale", a.rationale.trim().is_empty()),
+        ("blast_radius", a.blast_radius.is_empty()),
+        ("owners", a.owners.is_empty()),
+        ("dependency_updates", a.dependency_updates.is_empty()),
+        ("acceptance_suite", a.acceptance_suite.trim().is_empty()),
+        ("acceptance_root", !a.acceptance_root.is_recorded()),
+    ] {
+        if empty {
+            blocks.push(Block::IncompleteAmendment {
+                spike: spike.to_string(),
+                missing,
+            });
+        }
+    }
+    if !a.acceptance_green {
+        blocks.push(Block::AmendmentNotGreen {
+            spike: spike.to_string(),
+        });
+    }
+}
+
+/// Verify a set of decisions against the roster.
+///
+/// Iterates the ROSTER, not the rows. That is what makes an absent decision
+/// visible: a verifier that walked the rows would report nothing at all for a
+/// spike nobody filed, and the aggregate would look green.
+pub fn verify(decisions: &[Decision], roster: &[RosterSpike]) -> Gate {
+    let mut blocks = Vec::new();
+    let mut by_spike: BTreeMap<&str, Vec<&Decision>> = BTreeMap::new();
+    for d in decisions {
+        by_spike.entry(d.spike.as_str()).or_default().push(d);
+    }
+
+    // UNKNOWN. A row for a spike not on the roster is answering a question G0
+    // did not ask.
+    for spike in by_spike.keys() {
+        if !roster.iter().any(|r| r.id == *spike) {
+            blocks.push(Block::UnknownSpike {
+                spike: (*spike).to_string(),
+            });
+        }
+    }
+
+    let mut ratified = Vec::new();
+    let mut amended = Vec::new();
+    let mut no_go = Vec::new();
+    let mut blocked = Vec::new();
+
+    for r in roster {
+        let rows = by_spike.get(r.id).map(Vec::as_slice).unwrap_or(&[]);
+        // MISSING. The hard-failure half of the boundary: you must WRITE the
+        // Blocked row, you cannot achieve deferral by staying quiet.
+        if rows.is_empty() {
+            blocks.push(Block::MissingDecision {
+                spike: r.id.to_string(),
+            });
+            continue;
+        }
+        if rows.len() > 1 {
+            blocks.push(Block::DuplicateDecision {
+                spike: r.id.to_string(),
+            });
+        }
+        let d = rows[0];
+
+        // The exact question, verbatim. A paraphrase is a different question.
+        if d.question != r.question {
+            blocks.push(Block::QuestionMismatch {
+                spike: r.id.to_string(),
+            });
+        }
+
+        if d.limitations.trim().is_empty() {
+            blocks.push(Block::NoLimitationsStated {
+                spike: r.id.to_string(),
+            });
+        }
+        if !d.resources.within_contract() {
+            blocks.push(Block::ResourceContractExceeded {
+                spike: r.id.to_string(),
+            });
+        }
+
+        match &d.resolution {
+            Resolution::Decided(outcome) => {
+                match outcome {
+                    Outcome::Ratified => ratified.push(r.id.to_string()),
+                    Outcome::Amended(a) => {
+                        amended.push(r.id.to_string());
+                        check_amendment(r.id, a, &mut blocks);
+                    }
+                    Outcome::NoGo(n) => {
+                        no_go.push(r.id.to_string());
+                        if n.rationale.trim().is_empty() {
+                            blocks.push(Block::HollowNoGo {
+                                spike: r.id.to_string(),
+                                missing: "rationale",
+                            });
+                        }
+                        if n.affected_interfaces.is_empty() {
+                            blocks.push(Block::HollowNoGo {
+                                spike: r.id.to_string(),
+                                missing: "affected_interfaces",
+                            });
+                        }
+                    }
+                }
+
+                // THE LAUNDERING RULE. A positive decision rests on recorded
+                // evidence or it does not rest on anything. The check is on the
+                // root's TYPE, so no amount of narration converts a Failed root
+                // into support for an amendment.
+                if matches!(outcome, Outcome::Ratified | Outcome::Amended(_)) {
+                    for (name, root) in d.witness.roots() {
+                        if !root.is_recorded() {
+                            blocks.push(Block::LaunderedNonEvidence {
+                                spike: r.id.to_string(),
+                                root: name,
+                                status: root.status(),
+                            });
+                        }
+                    }
+                }
+            }
+            Resolution::Blocked { owner, note, .. } => {
+                blocked.push(r.id.to_string());
+                if owner.trim().is_empty() {
+                    blocks.push(Block::UnownedBlock {
+                        spike: r.id.to_string(),
+                        missing: "owner",
+                    });
+                }
+                if note.trim().is_empty() {
+                    blocks.push(Block::UnownedBlock {
+                        spike: r.id.to_string(),
+                        missing: "note",
+                    });
+                }
+            }
+        }
+    }
+
+    Gate {
+        roster_size: roster.len(),
+        ratified,
+        amended,
+        no_go,
+        blocked,
+        blocks,
+    }
+}
+
+/// Line-oriented report. Names every spike in every non-clearing state.
+///
+/// Emits no score and no ratio. "9 of 10 ratified" is the aggregate this schema
+/// exists to refuse: it reads as almost-done and hides which bet is unpriced.
+pub fn report(g: &Gate) -> String {
+    let mut out = String::new();
+    for b in &g.blocks {
+        out.push_str(&format!("g0: block reason={} {b:?}\n", b.reason()));
+    }
+    for s in &g.no_go {
+        out.push_str(&format!("g0: no-go spike={s}\n"));
+    }
+    for s in &g.blocked {
+        out.push_str(&format!("g0: blocked spike={s}\n"));
+    }
+    out.push_str(&format!(
+        "g0: verdict={} roster={} ratified={} amended={} no_go={} blocked={} blocks={}\n",
+        if g.clears() { "clear" } else { "not-clear" },
+        g.roster_size,
+        g.ratified.len(),
+        g.amended.len(),
+        g.no_go.len(),
+        g.blocked.len(),
+        g.blocks.len()
+    ));
+    out
+}
+
+#[cfg(test)]
+mod structural {
+    use super::*;
+
+    #[test]
+    fn the_roster_is_the_plans_ten_spikes_with_distinct_ids_and_questions() {
+        assert_eq!(G0_ROSTER.len(), 10);
+        let mut ids: Vec<&str> = G0_ROSTER.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 10, "two roster spikes share an id");
+        let mut qs: Vec<&str> = G0_ROSTER.iter().map(|r| r.question).collect();
+        qs.sort_unstable();
+        qs.dedup();
+        assert_eq!(qs.len(), 10, "two roster spikes share a question");
+        for r in &G0_ROSTER {
+            assert!(r.id.starts_with("G0-"), "{} is not a G0 spike id", r.id);
+            assert!(
+                r.question.len() > 40,
+                "{} carries a question too short to be the section 22.1 one",
+                r.id
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_is_not_an_outcome() {
+        // The vocabulary check that keeps "no decision" out of the decision
+        // vocabulary. Outcome has exactly three constructors; a fourth called
+        // Blocked would let a Blocked row be counted among the decided.
+        let tokens = [
+            Outcome::Ratified.as_str(),
+            Outcome::Amended(Amendment {
+                section_25_wording: String::new(),
+                rationale: String::new(),
+                blast_radius: vec![],
+                owners: vec![],
+                dependency_updates: vec![],
+                acceptance_suite: String::new(),
+                acceptance_green: false,
+                acceptance_root: WitnessRoot::Absent,
+            })
+            .as_str(),
+            Outcome::NoGo(NoGo {
+                rationale: String::new(),
+                affected_interfaces: vec![],
+            })
+            .as_str(),
+        ];
+        assert_eq!(tokens.len(), 3);
+        for t in tokens {
+            assert!(t != "blocked", "Blocked leaked into the Outcome vocabulary");
+        }
+    }
+
+    #[test]
+    fn every_block_variant_has_its_own_reason_token() {
+        let all = [
+            Block::MissingDecision {
+                spike: String::new(),
+            },
+            Block::DuplicateDecision {
+                spike: String::new(),
+            },
+            Block::UnknownSpike {
+                spike: String::new(),
+            },
+            Block::QuestionMismatch {
+                spike: String::new(),
+            },
+            Block::LaunderedNonEvidence {
+                spike: String::new(),
+                root: "fixture",
+                status: "absent",
+            },
+            Block::IncompleteAmendment {
+                spike: String::new(),
+                missing: "owners",
+            },
+            Block::AmendmentNotGreen {
+                spike: String::new(),
+            },
+            Block::HollowNoGo {
+                spike: String::new(),
+                missing: "rationale",
+            },
+            Block::UnownedBlock {
+                spike: String::new(),
+                missing: "owner",
+            },
+            Block::ResourceContractExceeded {
+                spike: String::new(),
+            },
+            Block::NoLimitationsStated {
+                spike: String::new(),
+            },
+        ];
+        let mut t: Vec<&str> = all.iter().map(Block::reason).collect();
+        let before = t.len();
+        t.sort_unstable();
+        t.dedup();
+        assert_eq!(before, t.len(), "two Block variants share a reason token");
+    }
+
+    #[test]
+    fn the_report_names_spikes_and_emits_no_score() {
+        let g = Gate {
+            roster_size: 10,
+            ratified: (1..=9).map(|i| format!("G0-{i}")).collect(),
+            amended: vec![],
+            no_go: vec![],
+            blocked: vec!["G0-10".to_string()],
+            blocks: vec![],
+        };
+        let text = report(&g);
+        assert!(!text.contains('%'));
+        for w in ["score", "9/10", "9 of 10", "percent"] {
+            assert!(!text.contains(w), "the report emitted {w:?}");
+        }
+        // The blocked spike is NAMED, because "9 ratified" reads as almost-done
+        // and hides which bet is still unpriced.
+        assert!(text.contains("blocked spike=G0-10"));
+        assert!(text.contains("verdict=not-clear"));
+    }
+}
