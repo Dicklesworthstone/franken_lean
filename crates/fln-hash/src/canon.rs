@@ -2596,6 +2596,131 @@ mod tests {
         }
     }
 
+    /// The last criterion of franken_lean-fnj, discharged against the budget surface
+    /// built under fln-4zk8: **resource exhaustion on deep untrusted input surfaces
+    /// only through the typed inconclusive path.**
+    ///
+    /// This could not be tested when fnj was written, because there was nothing to
+    /// exhaust — every refusal the decoders could produce was a well-formedness
+    /// rejection. All four prohibitions are checked, not just the happy one:
+    ///
+    /// * never a SIGABRT — the whole thing runs on a 1 MiB worker, and `.join()`
+    ///   returning `Ok` is what proves no abort happened;
+    /// * never a panic — a panic inside the worker fails the join;
+    /// * never a rejection — the outcome is `Inconclusive`, and the SAME bytes under
+    ///   an unlimited budget produce `Malformed` instead, so the two are genuinely
+    ///   different answers rather than one relabelled;
+    /// * never cacheable — an inconclusive outcome yields no value to cache, and
+    ///   there is no conversion that could turn it into a verdict.
+    ///
+    /// And the constraint fnj sets: **no hard nesting cap**. A budget is a resource
+    /// contract, not a depth limit, so a legitimately deep artifact still decodes
+    /// when the caller is willing to pay for it — asserted here at depth 100_000,
+    /// which a cap would have refused.
+    #[test]
+    fn deep_hostile_input_over_budget_is_inconclusive_never_a_verdict() {
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                // The hostile shape: a compact stream of nesting tags with no
+                // operands. 1e6 tags is far past any recursive decoder's stack and
+                // far past a small budget.
+                let mut hostile = CanonWriter::new();
+                hostile.schema(SCHEMA_EXPR);
+                let mut hostile = hostile.into_bytes();
+                hostile.extend(std::iter::repeat_n(EXPR_APP, 1_000_000));
+
+                // Under a tight budget the caller's limit is reached first.
+                let stopped = Expr::from_canonical_bytes_budgeted(
+                    &hostile,
+                    DecodeBudget::new(u64::MAX, 1_000),
+                );
+                match stopped {
+                    Decoded::Inconclusive(exhausted) => {
+                        assert_eq!(exhausted.limit, BudgetLimit::ProducedNodes);
+                        assert_eq!(exhausted.allowed, 1_000);
+                        assert!(
+                            exhausted.observed > exhausted.allowed,
+                            "a stop reports what it cost"
+                        );
+                    }
+                    Decoded::Malformed(error) => panic!(
+                        "budget exhaustion was reported as a claim about the bytes: {error:?}"
+                    ),
+                    Decoded::Value(_) => panic!("the budget was not honoured"),
+                }
+
+                // Nothing to cache: an inconclusive outcome carries no value, so a
+                // caller cannot store it as either verdict.
+                let stopped = Expr::from_canonical_bytes_budgeted(
+                    &hostile,
+                    DecodeBudget::new(u64::MAX, 1_000),
+                );
+                assert!(stopped.is_inconclusive());
+                assert!(
+                    stopped.value().is_none(),
+                    "an inconclusive decode must not yield a value"
+                );
+
+                // The SAME bytes with room to work are a rejection — a real verdict
+                // about the input, and a different answer from the stop above.
+                match Expr::from_canonical_bytes_budgeted(&hostile, DecodeBudget::unlimited()) {
+                    Decoded::Malformed(error) => assert_eq!(
+                        error.what, "input truncated",
+                        "the operands never arrive, and that is a well-formedness fact"
+                    ),
+                    other => panic!("expected a typed rejection, got {other:?}"),
+                }
+
+                // The byte limit is the other half of the contract, on the same input.
+                match Expr::from_canonical_bytes_budgeted(
+                    &hostile,
+                    DecodeBudget::new(512, u64::MAX),
+                ) {
+                    Decoded::Inconclusive(exhausted) => {
+                        assert_eq!(exhausted.limit, BudgetLimit::InputBytes);
+                        assert!((exhausted.at as u64) <= 512);
+                    }
+                    other => panic!("expected a byte-budget stop, got {other:?}"),
+                }
+
+                // NO NESTING CAP: a legitimately deep VALID artifact still decodes
+                // when the caller pays for it. A depth limit would refuse this, and
+                // refusing valid deep mathlib terms is what fnj rules out.
+                let leaf = Expr::bvar(0).expect("small");
+                let mut deep = leaf.clone();
+                for _ in 0..100_000 {
+                    deep = Expr::app(deep, leaf.clone());
+                }
+                let deep_bytes = deep.to_canonical_bytes();
+                let decoded = Expr::from_canonical_bytes_budgeted(
+                    &deep_bytes,
+                    DecodeBudget::new(u64::MAX, u64::MAX),
+                )
+                .value()
+                .expect("a valid deep artifact decodes when the budget allows it");
+                assert_eq!(decoded.to_canonical_bytes(), deep_bytes);
+
+                // And the same artifact under a budget it does not fit is a stop, not
+                // a rejection: the artifact is fine, the caller was not willing to pay.
+                assert!(
+                    Expr::from_canonical_bytes_budgeted(
+                        &deep_bytes,
+                        DecodeBudget::new(u64::MAX, 64)
+                    )
+                    .is_inconclusive(),
+                    "a valid artifact over budget is inconclusive, never rejected"
+                );
+            })
+            .expect("spawn bounded-stack budget worker")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "decoding deep hostile input under a budget aborted or panicked instead of \
+             producing a typed outcome"
+        );
+    }
+
     /// Regression for the first finding of the seeded codec campaign (bead
     /// fln-1f8v, found at `flip/KVMap/seed=452821e638d01377/iter=6669`,
     /// minimized to the two-entry shape below).
