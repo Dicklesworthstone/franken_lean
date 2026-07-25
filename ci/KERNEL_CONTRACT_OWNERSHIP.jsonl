@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":314,"projection_hash":"c7627b71330c8dffc5d1ff94da81b1b4f0b9b7c430424fd62bfc4f8d32948613"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":315,"projection_hash":"d16f302dfd4fddf829996b0731b60e780dc5e6f3363a80ff95363fca046dbea3"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -75,6 +75,7 @@
 {"id":"fln-evidence-runner-bootstrap-btk"}
 {"id":"fln-extension-history-checkpoint-identity-41s"}
 {"id":"fln-extension-merge-validation-proof-debt-dt5"}
+{"id":"fln-fei1"}
 {"id":"fln-ffam"}
 {"id":"fln-fur"}
 {"id":"fln-g6d1"}
