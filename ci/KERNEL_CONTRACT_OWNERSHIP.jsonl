@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":249,"projection_hash":"2f7184042ba5cc45c68a9d1ca0f8688b8029726bb4aad6292e7b6600afc8a05a"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":250,"projection_hash":"06cc43314df198bd60c4525761f94607e69462e6337c30703f2b5c72a71789aa"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1f8v"}
@@ -229,6 +229,7 @@
 {"id":"franken_lean-uv6"}
 {"id":"franken_lean-v2p"}
 {"id":"franken_lean-v2z"}
+{"id":"franken_lean-vugo"}
 {"id":"franken_lean-vv0r"}
 {"id":"franken_lean-w75y"}
 {"id":"franken_lean-wasm-judge-packaging-contract-xte"}
