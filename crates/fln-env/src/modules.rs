@@ -2170,6 +2170,283 @@ mod tests {
         );
     }
 
+    /// Two module names whose `key_hash` is IDENTICAL, constructed rather than searched.
+    ///
+    /// `Name::num(pre, k)` hashes as `mix_hash(pre.hash(), k)`, and Lean's `mix_hash` is
+    /// `(h ^ f(k)) * M` where `f(k) = ((k*M) ^ ((k*M) >> 47)) ^ M`. Every step of `f` is a
+    /// bijection on `u64` — multiply by an odd constant, a right-xorshift by 47 (self
+    /// inverse, since 47*2 >= 64), and an xor — and the final multiply by `M` is a
+    /// bijection too. So `f` is invertible, and for any two prefixes with hashes `h1` and
+    /// `h2` a colliding pair follows directly: pick `k1`, then
+    /// `k2 = f_inverse(f(k1) ^ h1 ^ h2)`.
+    ///
+    /// That matters beyond this test. It means an ADVERSARY can force full-hash collisions
+    /// on module identities analytically, with no search — which is exactly why
+    /// `fln-amv.13`'s collision budget exists, and why an all-collision shape is a real
+    /// case rather than a theoretical one. A random shape generator would never produce it.
+    fn colliding_module_ids(count: usize) -> Vec<ModuleId> {
+        const M: u64 = 0xc6a4_a793_5bd1_e995;
+
+        const fn inverse_of_m() -> u64 {
+            let mut inverse = 1u64;
+            let mut round = 0;
+            while round < 6 {
+                inverse = inverse.wrapping_mul(2u64.wrapping_sub(M.wrapping_mul(inverse)));
+                round += 1;
+            }
+            inverse
+        }
+        // Self-inverse: shifting right by 47 twice moves every bit past the end.
+        const fn unxorshift47(value: u64) -> u64 {
+            value ^ (value >> 47)
+        }
+        const fn forward(k: u64) -> u64 {
+            let scaled = k.wrapping_mul(M);
+            (scaled ^ (scaled >> 47)) ^ M
+        }
+        const fn backward(y: u64) -> u64 {
+            unxorshift47(y ^ M).wrapping_mul(inverse_of_m())
+        }
+        assert_eq!(M.wrapping_mul(inverse_of_m()), 1, "M must be invertible");
+        assert_eq!(backward(forward(12_345)), 12_345, "f must round-trip");
+
+        // One prefix per key, so the names are genuinely distinct, and one component per
+        // prefix chosen to land every hash on the first prefix's value.
+        let anchor_prefix = Name::str(Name::anonymous(), "coll0");
+        let anchor = Name::num(anchor_prefix.clone(), 0);
+        let target = anchor.hash();
+        let mut ids = vec![ModuleId::new(anchor)];
+        for index in 1..count {
+            let prefix = Name::str(Name::anonymous(), format!("coll{index}"));
+            // Solve mix_hash(prefix.hash(), k) == target for k.
+            let component = backward(forward(0) ^ prefix.hash() ^ anchor_prefix.hash());
+            let name = Name::num(prefix, component);
+            assert_eq!(
+                name.hash(),
+                target,
+                "constructed name {index} failed to collide"
+            );
+            ids.push(ModuleId::new(name));
+        }
+        // Distinct identities, one hash.
+        let distinct: HashSet<&ModuleId> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "the ids must be distinct");
+        assert_eq!(
+            ids.iter()
+                .map(PKey::key_hash)
+                .collect::<HashSet<u64>>()
+                .len(),
+            1,
+            "every id must share one key hash"
+        );
+        ids
+    }
+
+    /// Item 6: graph SHAPES — sparse, dense, and all-collision.
+    ///
+    /// The all-collision case is the one that earns its keep. A hash-keyed structure can
+    /// be correct under sparse and dense input and wrong only when everything collides,
+    /// because that is the single shape where the trie degenerates into one bucket and
+    /// lookup falls back on structural equality. Sparse and dense are the easy cases; this
+    /// asserts all three give the same semantic answers.
+    #[test]
+    fn admission_is_correct_under_sparse_dense_and_all_collision_shapes() {
+        let shapes: [(&str, Vec<ModuleId>); 3] = [
+            // Sparse: unrelated names, well spread.
+            (
+                "sparse",
+                (0..24)
+                    .map(|index| id(&format!("sparse{index}.mod")))
+                    .collect(),
+            ),
+            // Dense: one deep shared prefix, so names differ only in the last component.
+            (
+                "dense",
+                (0..24)
+                    .map(|index| id(&format!("a.b.c.d.e.f.leaf{index}")))
+                    .collect(),
+            ),
+            // All-collision: every identity distinct, every key hash identical.
+            ("all_collision", colliding_module_ids(24)),
+        ];
+
+        for (label, ids) in &shapes {
+            let mut graph = graph();
+            for module in ids {
+                let candidate = ModuleRecord::new(module.clone(), true, vec![], evidence(0x11));
+                let prepared = match graph.prepare_registration(candidate.clone(), None) {
+                    ModuleGraphOutcome::Complete(prepared) => prepared,
+                    other => unreachable!("{label}: preparation must complete, got {other:?}"),
+                };
+                match prepared.commit(&graph, None) {
+                    ModuleGraphOutcome::Complete(registration) => {
+                        assert_eq!(
+                            registration.disposition,
+                            RegistrationDisposition::Inserted,
+                            "{label}: a fresh module must insert"
+                        );
+                        graph = registration.graph;
+                    }
+                    other => unreachable!("{label}: commit must publish, got {other:?}"),
+                }
+            }
+
+            // Every identity is retrievable and distinct — the property total collision
+            // would break if lookup relied on the hash rather than on structural equality.
+            assert_eq!(graph.binding().facts.modules, ids.len(), "{label}: count");
+            for module in ids {
+                let found = graph
+                    .record(module)
+                    .unwrap_or_else(|| unreachable!("{label}: {module:?} must be retrievable"));
+                assert_eq!(&found.id, module, "{label}: lookup returned another module");
+            }
+            // And re-registering each is IDEMPOTENT, not a conflict: under total collision
+            // an equality-by-hash implementation would report every module as a conflict
+            // with the first one.
+            for module in ids {
+                let same = ModuleRecord::new(module.clone(), true, vec![], evidence(0x11));
+                match graph.register(same) {
+                    ModuleGraphOutcome::Complete(registration) => assert_eq!(
+                        registration.disposition,
+                        RegistrationDisposition::Idempotent,
+                        "{label}: an identical re-registration must be idempotent"
+                    ),
+                    other => unreachable!("{label}: re-registration completes, got {other:?}"),
+                }
+            }
+            // A non-identical re-registration is still a conflict, so idempotence above is
+            // not simply accepting everything.
+            let first = &ids[0];
+            let divergent = ModuleRecord::new(first.clone(), true, vec![], evidence(0x99));
+            match graph.register(divergent) {
+                ModuleGraphOutcome::Rejected(_) => {}
+                other => {
+                    unreachable!("{label}: a divergent record must be rejected, got {other:?}")
+                }
+            }
+
+            eprintln!(
+                "{{\"schema\":\"fln.unit.module-graph-shape\",\"version\":1,\
+                 \"bead\":\"franken_lean-6sf3\",\"claim_type\":\"bounded_model\",\
+                 \"scenario\":\"sparse-dense-all-collision\",\"shape\":\"{label}\",\
+                 \"modules\":{},\"all_retrievable\":true,\"identical_is_idempotent\":true,\
+                 \"divergent_is_rejected\":true,\
+                 \"collision_construction\":\"analytic_via_invertible_mix_hash\",\
+                 \"status\":\"pass\"}}",
+                ids.len()
+            );
+        }
+    }
+
+    /// Item 6: per-dimension boundaries — zero, one-under, exact, one-over, large.
+    #[test]
+    fn every_resource_dimension_is_swept_at_its_boundaries() {
+        // Modules: a limit of N admits the Nth and refuses the N+1th.
+        for limit in [1usize, 2, 8] {
+            let limits = ModuleGraphLimits::new(limit, 100_000, 256, u128::MAX);
+            let mut graph = ModuleGraph::new(epoch(), limits).expect_complete("graph constructs");
+            assert_eq!(graph.binding().facts.modules, 0, "zero is a valid state");
+            for index in 0..limit {
+                // one-under and exact
+                graph = match graph.register(record(&format!("M{index}"), vec![], 0x1)) {
+                    ModuleGraphOutcome::Complete(registration) => registration.graph,
+                    other => unreachable!("module {index} of {limit} must admit, got {other:?}"),
+                };
+            }
+            assert_eq!(
+                graph.binding().facts.modules,
+                limit,
+                "exact fills the limit"
+            );
+            // one-over
+            match graph.register(record("Over", vec![], 0x1)) {
+                ModuleGraphOutcome::Inconclusive(
+                    ModuleGraphInconclusive::ResourceLimitExceeded {
+                        resource,
+                        limit: reported,
+                        actual,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(resource, ModuleGraphResource::Modules);
+                    assert_eq!(reported, u128::try_from(limit).unwrap_or(u128::MAX));
+                    assert!(actual > reported, "a stop must report past its allowance");
+                }
+                other => unreachable!("one over the module limit must stop, got {other:?}"),
+            }
+        }
+
+        // Edges: same sweep on direct import rows.
+        for limit in [1usize, 3] {
+            let limits = ModuleGraphLimits::new(10_000, limit, 256, u128::MAX);
+            let base = ModuleGraph::new(epoch(), limits)
+                .expect_complete("graph constructs")
+                .register(record("Target", vec![], 0x1))
+                .expect_complete("target inserts")
+                .graph;
+            let exact: Vec<DirectImport> = (0..limit).map(|_| direct("Target", 0b001)).collect();
+            assert!(
+                matches!(
+                    base.register(record("Exact", exact, 0x2)),
+                    ModuleGraphOutcome::Complete(_)
+                ),
+                "exactly {limit} rows must admit"
+            );
+            let over: Vec<DirectImport> = (0..limit + 1).map(|_| direct("Target", 0b001)).collect();
+            match base.register(record("Over", over, 0x3)) {
+                ModuleGraphOutcome::Inconclusive(
+                    ModuleGraphInconclusive::ResourceLimitExceeded { resource, .. },
+                ) => assert_eq!(resource, ModuleGraphResource::DirectImportRows),
+                other => unreachable!("one over the edge limit must stop, got {other:?}"),
+            }
+        }
+
+        // Name depth: exact admits, one over stops.
+        for depth in [1usize, 4] {
+            let limits = ModuleGraphLimits::new(10_000, 100_000, depth, u128::MAX);
+            let base = ModuleGraph::new(epoch(), limits).expect_complete("graph constructs");
+            let exact = ModuleId::new(Name::from_components(std::iter::repeat_n("d", depth)));
+            assert!(
+                matches!(
+                    base.register(ModuleRecord::new(exact, true, vec![], evidence(0x1))),
+                    ModuleGraphOutcome::Complete(_)
+                ),
+                "a name of exactly depth {depth} must admit"
+            );
+            let over = ModuleId::new(Name::from_components(std::iter::repeat_n("d", depth + 1)));
+            match base.register(ModuleRecord::new(over, true, vec![], evidence(0x1))) {
+                ModuleGraphOutcome::Inconclusive(
+                    ModuleGraphInconclusive::ResourceLimitExceeded { resource, .. },
+                ) => assert_eq!(resource, ModuleGraphResource::NameDepth),
+                other => unreachable!("one over the depth limit must stop, got {other:?}"),
+            }
+        }
+
+        // Large: well inside a generous limit, to show the sweep is not only about edges.
+        let generous = ModuleGraph::new(epoch(), TEST_LIMITS).expect_complete("graph constructs");
+        let mut large = generous;
+        for index in 0..256usize {
+            large = large
+                .register(record(&format!("L{index}"), vec![], 0x1))
+                .expect_complete("large fixture inserts")
+                .graph;
+        }
+        assert_eq!(large.binding().facts.modules, 256);
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.module-dimension-boundaries\",\"version\":1,\
+             \"bead\":\"franken_lean-6sf3\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"zero-one-under-exact-one-over-large\",\
+             \"dimensions\":[\"modules\",\"direct_import_rows\",\"name_depth\"],\
+             \"zero_state_valid\":true,\"exact_admits\":true,\"one_over_stops\":true,\
+             \"stop_reports_past_allowance\":true,\"large_fixture_modules\":256,\
+             \"payload_bytes_swept\":false,\
+             \"payload_bytes_reason\":\"no fixture in this suite carries artifact payload \
+             bytes, so a limit on them cannot be reached without a new fixture kind\",\
+             \"status\":\"pass\"}}"
+        );
+    }
+
     /// Item 8: one strict schema-versioned SEMANTIC row per admission outcome, with
     /// telemetry excluded by construction rather than by discipline.
     ///
