@@ -34,11 +34,14 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
@@ -349,6 +352,8 @@ fn json_string(s: &str) -> String {
 /// thread matrix then witnesses.
 struct WorkItem {
     lead: Name,
+    member_names: Vec<Name>,
+    member_indices: Vec<usize>,
     kind: &'static str,
     members: u64,
     env: Environment,
@@ -359,6 +364,11 @@ struct WorkItem {
 struct PreparedReplay {
     items: Vec<WorkItem>,
     unchecked: BTreeMap<&'static str, u64>,
+    /// Decoded rows that cannot be submitted as fresh declarations in the
+    /// supplied fixture environment (most commonly duplicate theorem rows
+    /// collapsed by the Reference replay's `HashMap`). They are never counted
+    /// as compared: the Reference did not issue a second kernel verdict.
+    context_unscorable: Vec<(usize, Name, &'static str)>,
     /// Blocks with nested auxiliaries — all admitted under the FULL ruleset
     /// (the partial path was retired by franken_lean-8ce).
     nested_full: u64,
@@ -392,6 +402,18 @@ impl PreparedReplay {
 /// (Kahn) order, snapshotting each unit's checking environment and admitting
 /// every declaration — the deterministic phase every matrix width shares.
 fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
+    prepare_replay_from(Environment::new(), infos, true)
+}
+
+/// Corpus-scale variant of [`prepare_replay`]. The supplied environment is a
+/// decoded Reference import environment used only as Tribunal fixture context:
+/// declarations under test still go through `fln_kernel::check`, and no result
+/// from this harness is an authority to admit a declaration in production.
+fn prepare_replay_from(
+    mut env: Environment,
+    infos: &[ConstantInfo],
+    emit_order_summary: bool,
+) -> PreparedReplay {
     let index_by_name: HashMap<Name, usize> = infos
         .iter()
         .enumerate()
@@ -467,18 +489,20 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
         .iter()
         .map(|&u| infos[units[u].members[0]].name().to_display_string())
         .collect();
-    eprintln!(
-        "kernel_replay order: {} units over {} declarations \
-         ({} topologically sorted, {} in dependency cycles replayed last)",
-        units.len(),
-        infos.len(),
-        order.len(),
-        cyclic.len()
-    );
+    if emit_order_summary {
+        eprintln!(
+            "kernel_replay order: {} units over {} declarations \
+             ({} topologically sorted, {} in dependency cycles replayed last)",
+            units.len(),
+            infos.len(),
+            order.len(),
+            cyclic.len()
+        );
+    }
 
-    let mut env = Environment::new();
     let mut items: Vec<WorkItem> = Vec::new();
     let mut unchecked: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut context_unscorable = Vec::new();
     let mut nested_full: u64 = 0;
     let mut artifact_incomplete: Vec<MissingConstantFinding> = Vec::new();
     let units_total = units.len();
@@ -522,6 +546,23 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
                 ("quot", Some(Declaration::Quotient(decls)))
             }
         };
+        let has_existing_member = unit
+            .members
+            .iter()
+            .any(|member| env.find(infos[*member].name()).is_some());
+        if has_existing_member {
+            for &member in &unit.members {
+                let reason = match env.find(infos[member].name()) {
+                    Some(existing) if reference_replay_duplicate(existing, &infos[member]) => {
+                        "reference_replay_duplicate_theorem"
+                    }
+                    Some(_) => "decoded_name_collision_in_fixture_context",
+                    None => "admission_unit_contains_context_collision",
+                };
+                context_unscorable.push((member, infos[member].name().clone(), reason));
+            }
+            continue;
+        }
         let Some(decl) = decl else {
             // No admission rule for this kind yet (opaques): typed limitation,
             // counted per kind — never a silent pass.
@@ -575,6 +616,12 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
         }
         items.push(WorkItem {
             lead: info.name().clone(),
+            member_names: unit
+                .members
+                .iter()
+                .map(|member| infos[*member].name().clone())
+                .collect(),
+            member_indices: unit.members.clone(),
             kind: kind_str,
             members: n_members,
             env: env.clone(),
@@ -593,6 +640,7 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
     PreparedReplay {
         items,
         unchecked,
+        context_unscorable,
         nested_full,
         artifact_incomplete,
         final_env: env,
@@ -978,6 +1026,1393 @@ fn decode_prelude() -> Option<(Vec<u8>, Vec<ConstantInfo>)> {
         .decode_module_constants()
         .expect("decode Prelude constants");
     Some((bytes, infos))
+}
+
+// ---------------------------------------------------------------------------
+// Present-olean Reference-kernel corpus (beads fln-lst4 / fln-7odd).
+// ---------------------------------------------------------------------------
+
+/// Floors are deliberately inequalities, not golden equality pins: adding a
+/// module at the same Reference epoch may increase coverage, while silently
+/// enumerating or decoding less than the measured pin must fail.
+const PINNED_PRESENT_OLEAN_FLOOR: u64 = 2_433;
+const PINNED_DECODED_DECL_FLOOR: u64 = 158_608;
+const PINNED_ORACLE_APPLICABLE_FLOOR: u64 = 157_183;
+const MAX_PINNED_OLEAN_BYTES: u64 = 512 * 1024 * 1024;
+const LEANCHECKER_TIMEOUT: Duration = Duration::from_secs(300);
+const ORACLE_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+
+#[derive(Clone)]
+struct CorpusModule {
+    name: String,
+    path: PathBuf,
+    olean_hash: String,
+    imports: BTreeSet<String>,
+    decoded: u64,
+    oracle_skipped: u64,
+}
+
+struct CorpusInventory {
+    modules: BTreeMap<String, CorpusModule>,
+    decoded: u64,
+    oracle_skipped: u64,
+    missing_imports: Vec<(String, String)>,
+    fixture_hash: String,
+}
+
+/// This mirrors the exact filter in the pinned `Lean.Replay.replay`, rather
+/// than inferring oracle authority from a successful process exit. The
+/// Reference deliberately does not submit unsafe or partial constants to its
+/// kernel; those rows therefore have no oracle verdict and are unscorable.
+fn reference_replay_skips(info: &ConstantInfo) -> bool {
+    match info {
+        ConstantInfo::Axiom(value) => value.is_unsafe,
+        ConstantInfo::Defn(value) => value.safety != DefinitionSafety::Safe,
+        ConstantInfo::Thm(_) | ConstantInfo::Quot(_) => false,
+        ConstantInfo::Opaque(value) => value.is_unsafe,
+        ConstantInfo::Induct(value) => value.is_unsafe,
+        ConstantInfo::Ctor(value) => value.is_unsafe,
+        ConstantInfo::Rec(value) => value.is_unsafe,
+    }
+}
+
+fn collect_present_oleans(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|error| format!("read corpus directory {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("enumerate corpus directory {}: {error}", dir.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("stat corpus entry {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "present-olean corpus refuses symlink entry {}",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            collect_present_oleans(&path, paths)?;
+        } else if file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("olean")
+        {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn module_name_from_path(root: &Path, path: &Path) -> Result<String, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|error| format!("{} is outside {}: {error}", path.display(), root.display()))?
+        .with_extension("");
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!(
+                "non-normal module path component in {}",
+                relative.display()
+            ));
+        };
+        let part = part
+            .to_str()
+            .ok_or_else(|| format!("non-UTF-8 module path {}", relative.display()))?;
+        if part.is_empty() {
+            return Err(format!(
+                "empty module path component in {}",
+                relative.display()
+            ));
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return Err(format!("empty module name for {}", path.display()));
+    }
+    Ok(parts.join("."))
+}
+
+fn tagged_fixture_hash(tag: &[u8], fields: &[&[u8]]) -> String {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(tag);
+    preimage.push(0);
+    for field in fields {
+        preimage.extend_from_slice(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes());
+        preimage.extend_from_slice(field);
+    }
+    hash(Domain::Fixture, &preimage).to_hex()
+}
+
+fn decode_corpus_module(path: &Path) -> Result<(Vec<u8>, Vec<ConstantInfo>), String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
+    if metadata.len() > MAX_PINNED_OLEAN_BYTES {
+        return Err(format!(
+            "{} is {} bytes, over the {}-byte corpus cap",
+            path.display(),
+            metadata.len(),
+            MAX_PINNED_OLEAN_BYTES
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let view =
+        OleanView::parse(&bytes).map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let infos = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .map_err(|error| format!("decode {}: {error}", path.display()))?;
+    Ok((bytes, infos))
+}
+
+fn inventory_present_oleans(root: &Path) -> Result<CorpusInventory, String> {
+    let mut paths = Vec::new();
+    collect_present_oleans(root, &mut paths)?;
+    paths.sort();
+    let mut modules = BTreeMap::new();
+    let mut decoded = 0_u64;
+    let mut oracle_skipped = 0_u64;
+    let mut aggregate = Vec::new();
+    aggregate.extend_from_slice(b"fln.kernel-reference-corpus.inventory/1\0");
+    for path in paths {
+        let name = module_name_from_path(root, &path)?;
+        let metadata =
+            fs::metadata(&path).map_err(|error| format!("stat {}: {error}", path.display()))?;
+        if metadata.len() > MAX_PINNED_OLEAN_BYTES {
+            return Err(format!(
+                "{} is {} bytes, over the {}-byte corpus cap",
+                path.display(),
+                metadata.len(),
+                MAX_PINNED_OLEAN_BYTES
+            ));
+        }
+        let bytes = fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+        let view = OleanView::parse(&bytes)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+        let module_data = view
+            .module_data(WalkBudget::default())
+            .map_err(|error| format!("module data {}: {error}", path.display()))?;
+        let infos = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .map_err(|error| format!("decode {}: {error}", path.display()))?;
+        let decoded_here = u64::try_from(infos.len())
+            .map_err(|_| format!("declaration count overflow in {}", path.display()))?;
+        let skipped_here = infos
+            .iter()
+            .filter(|info| reference_replay_skips(info))
+            .count() as u64;
+        let olean_hash = tagged_fixture_hash(
+            b"fln.kernel-reference-corpus.olean/1",
+            &[name.as_bytes(), &bytes],
+        );
+        let imports = module_data
+            .imports
+            .iter()
+            .map(|import| import.module.to_display_string())
+            .collect::<BTreeSet<_>>();
+        let module = CorpusModule {
+            name: name.clone(),
+            path,
+            olean_hash: olean_hash.clone(),
+            imports,
+            decoded: decoded_here,
+            oracle_skipped: skipped_here,
+        };
+        if modules.insert(name.clone(), module).is_some() {
+            return Err(format!("duplicate present olean module {name}"));
+        }
+        decoded = decoded
+            .checked_add(decoded_here)
+            .ok_or_else(|| "decoded declaration census overflow".to_string())?;
+        oracle_skipped = oracle_skipped
+            .checked_add(skipped_here)
+            .ok_or_else(|| "oracle-skipped declaration census overflow".to_string())?;
+        aggregate.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        aggregate.extend_from_slice(name.as_bytes());
+        aggregate.extend_from_slice(&(olean_hash.len() as u64).to_le_bytes());
+        aggregate.extend_from_slice(olean_hash.as_bytes());
+    }
+    let present = modules.keys().cloned().collect::<BTreeSet<_>>();
+    let mut missing_imports = Vec::new();
+    for module in modules.values() {
+        for import in module.imports.difference(&present) {
+            missing_imports.push((module.name.clone(), import.clone()));
+        }
+    }
+    Ok(CorpusInventory {
+        modules,
+        decoded,
+        oracle_skipped,
+        missing_imports,
+        fixture_hash: hash(Domain::Fixture, &aggregate).to_hex(),
+    })
+}
+
+fn corpus_module_order(inventory: &CorpusInventory) -> Result<Vec<String>, String> {
+    let present = inventory
+        .modules
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<String>>();
+    let mut indegree = BTreeMap::<String, usize>::new();
+    let mut dependents = BTreeMap::<String, BTreeSet<String>>::new();
+    for module in inventory.modules.values() {
+        let imports = module
+            .imports
+            .intersection(&present)
+            .filter(|import| *import != &module.name)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        indegree.insert(module.name.clone(), imports.len());
+        for import in imports {
+            dependents
+                .entry(import)
+                .or_default()
+                .insert(module.name.clone());
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(name, degree)| (*degree == 0).then_some(name.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut order = Vec::with_capacity(inventory.modules.len());
+    while let Some(name) = ready.iter().next().cloned() {
+        ready.remove(&name);
+        order.push(name.clone());
+        if let Some(next) = dependents.get(&name) {
+            for dependent in next {
+                let degree = indegree
+                    .get_mut(dependent)
+                    .expect("dependent module has an indegree row");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.insert(dependent.clone());
+                }
+            }
+        }
+    }
+    if order.len() != inventory.modules.len() {
+        let cyclic = indegree
+            .into_iter()
+            .filter_map(|(name, degree)| (degree != 0).then_some(name))
+            .take(20)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "present-olean import graph contains a cycle or unresolved edge: {cyclic:?}"
+        ));
+    }
+    Ok(order)
+}
+
+#[derive(Debug)]
+enum ReferenceCorpusVerdict {
+    Accepted {
+        duration: Duration,
+        stdout: String,
+        stderr: String,
+    },
+    Rejected {
+        status: ExitStatus,
+        duration: Duration,
+        stdout: String,
+        stderr: String,
+    },
+    NoAnswer {
+        reason: String,
+        duration: Duration,
+        stdout: String,
+        stderr: String,
+    },
+}
+
+fn read_capped(mut input: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let read = input.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        let room = limit.saturating_sub(kept.len());
+        let take = room.min(read);
+        kept.extend_from_slice(&chunk[..take]);
+        truncated |= take != read;
+    }
+    Ok((kept, truncated))
+}
+
+fn bounded_text(bytes: Vec<u8>, truncated: bool) -> String {
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("\n[output truncated by fln-lst4 bound]\n");
+    }
+    text
+}
+
+fn leanchecker_path(reference_lib: &Path) -> Result<PathBuf, String> {
+    let toolchain = reference_lib
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            format!(
+                "Reference library {} has no toolchain root",
+                reference_lib.display()
+            )
+        })?;
+    let path = toolchain.join("bin/leanchecker");
+    path.is_file()
+        .then_some(path.clone())
+        .ok_or_else(|| format!("pinned leanchecker not found at {}", path.display()))
+}
+
+fn component_prefix(prefix: &str, module: &str) -> bool {
+    let prefix = prefix.split('.').collect::<Vec<_>>();
+    let module = module.split('.').collect::<Vec<_>>();
+    prefix.len() <= module.len() && prefix.iter().zip(module.iter()).all(|(a, b)| a == b)
+}
+
+/// Compact target set for leanchecker's prefix-matching CLI. A top-level
+/// zero-declaration umbrella is replaced by its immediate children; this
+/// avoids the pin's packaging-only root failures without expanding the CLI to
+/// one target per leaf (leanchecker rescans every olean for every target).
+fn leanchecker_targets(inventory: &CorpusInventory) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    for module in inventory
+        .modules
+        .values()
+        .filter(|module| module.decoded != 0)
+    {
+        let components = module.name.split('.').collect::<Vec<_>>();
+        let top = components[0];
+        let width = match inventory.modules.get(top) {
+            Some(exact) if exact.decoded == 0 && components.len() > 1 => 2,
+            _ => 1,
+        };
+        candidates.insert(components[..width].join("."));
+    }
+    let mut selected = Vec::<String>::new();
+    for candidate in candidates {
+        if !selected
+            .iter()
+            .any(|prefix| component_prefix(prefix, &candidate))
+        {
+            selected.push(candidate);
+        }
+    }
+    selected
+}
+
+fn run_leanchecker(
+    reference_lib: &Path,
+    targets: &[String],
+) -> Result<ReferenceCorpusVerdict, String> {
+    let binary = leanchecker_path(reference_lib)?;
+    let pinned_bin = binary
+        .parent()
+        .ok_or_else(|| format!("leanchecker {} has no bin directory", binary.display()))?;
+    let mut command = Command::new(&binary);
+    command
+        .env_clear()
+        // `Lean.findSysroot` invokes the sibling `lean --print-prefix` by
+        // basename. Give it only the pinned bin directory, never ambient PATH.
+        .env("PATH", pinned_bin)
+        .env("LEAN_PATH", reference_lib)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
+        .arg("-v")
+        .args(targets)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn {}: {error}", binary.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "leanchecker stdout pipe missing".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "leanchecker stderr pipe missing".to_string())?;
+    let stdout_reader = std::thread::spawn(move || read_capped(stdout, ORACLE_OUTPUT_LIMIT));
+    let stderr_reader = std::thread::spawn(move || read_capped(stderr, ORACLE_OUTPUT_LIMIT));
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll leanchecker: {error}"))?
+        {
+            break status;
+        }
+        if started.elapsed() >= LEANCHECKER_TIMEOUT {
+            timed_out = true;
+            child
+                .kill()
+                .map_err(|error| format!("kill timed-out leanchecker: {error}"))?;
+            break child
+                .wait()
+                .map_err(|error| format!("reap timed-out leanchecker: {error}"))?;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout_bytes, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| "leanchecker stdout reader panicked".to_string())?
+        .map_err(|error| format!("read leanchecker stdout: {error}"))?;
+    let (stderr_bytes, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| "leanchecker stderr reader panicked".to_string())?
+        .map_err(|error| format!("read leanchecker stderr: {error}"))?;
+    let stdout = bounded_text(stdout_bytes, stdout_truncated);
+    let stderr = bounded_text(stderr_bytes, stderr_truncated);
+    let duration = started.elapsed();
+    if timed_out {
+        return Ok(ReferenceCorpusVerdict::NoAnswer {
+            reason: format!(
+                "leanchecker exceeded {} seconds",
+                LEANCHECKER_TIMEOUT.as_secs()
+            ),
+            duration,
+            stdout,
+            stderr,
+        });
+    }
+    if status.success() {
+        return Ok(ReferenceCorpusVerdict::Accepted {
+            duration,
+            stdout,
+            stderr,
+        });
+    }
+    if status.code().is_none() {
+        return Ok(ReferenceCorpusVerdict::NoAnswer {
+            reason: format!("leanchecker terminated by signal: {status}"),
+            duration,
+            stdout,
+            stderr,
+        });
+    }
+    let packaging_or_setup = [
+        "does not exist",
+        "failed to read module data",
+        "incompatible header",
+        "Could not find any oleans",
+        "Could not resolve module",
+        "could not execute external process 'lean'",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle));
+    if packaging_or_setup {
+        Ok(ReferenceCorpusVerdict::NoAnswer {
+            reason: format!("leanchecker setup/artifact failure: {status}"),
+            duration,
+            stdout,
+            stderr,
+        })
+    } else {
+        Ok(ReferenceCorpusVerdict::Rejected {
+            status,
+            duration,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+fn oracle_binary_hash(reference_lib: &Path) -> Result<String, String> {
+    let path = leanchecker_path(reference_lib)?;
+    let checker_bytes =
+        fs::read(&path).map_err(|error| format!("read oracle {}: {error}", path.display()))?;
+    let lean_path = path
+        .parent()
+        .ok_or_else(|| format!("leanchecker {} has no bin directory", path.display()))?
+        .join("lean");
+    let lean_bytes = fs::read(&lean_path)
+        .map_err(|error| format!("read oracle helper {}: {error}", lean_path.display()))?;
+    Ok(tagged_fixture_hash(
+        b"fln.kernel-reference-corpus.oracle/1",
+        &[&checker_bytes, &lean_bytes],
+    ))
+}
+
+fn checkpoint_content(module: &CorpusModule, oracle_hash: &str) -> String {
+    format!(
+        "schema=fln.kernel-reference-corpus.checkpoint/1\n\
+         module={}\n\
+         olean_hash={}\n\
+         oracle_hash={oracle_hash}\n\
+         verdict=accepted\n\
+         complete=true\n",
+        module.name, module.olean_hash
+    )
+}
+
+fn checkpoint_path(dir: &Path, module: &CorpusModule, oracle_hash: &str) -> PathBuf {
+    let key = tagged_fixture_hash(
+        b"fln.kernel-reference-corpus.checkpoint-key/1",
+        &[
+            module.name.as_bytes(),
+            module.olean_hash.as_bytes(),
+            oracle_hash.as_bytes(),
+        ],
+    );
+    dir.join(format!("{key}.record"))
+}
+
+fn checkpoint_is_complete(
+    dir: &Path,
+    module: &CorpusModule,
+    oracle_hash: &str,
+) -> Result<bool, String> {
+    let path = checkpoint_path(dir, module, oracle_hash);
+    match fs::read_to_string(&path) {
+        Ok(actual) => {
+            let expected = checkpoint_content(module, oracle_hash);
+            if actual != expected {
+                return Err(format!(
+                    "checkpoint {} exists but is not the exact complete record for {}",
+                    path.display(),
+                    module.name
+                ));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("read checkpoint {}: {error}", path.display())),
+    }
+}
+
+fn persist_checkpoint(dir: &Path, module: &CorpusModule, oracle_hash: &str) -> Result<(), String> {
+    if let Ok(metadata) = fs::symlink_metadata(dir)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "checkpoint directory {} must not be a symlink",
+            dir.display()
+        ));
+    }
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("create checkpoint directory {}: {error}", dir.display()))?;
+    let path = checkpoint_path(dir, module, oracle_hash);
+    let expected = checkpoint_content(module, oracle_hash);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(expected.as_bytes())
+                .map_err(|error| format!("write checkpoint {}: {error}", path.display()))?;
+            file.sync_all()
+                .map_err(|error| format!("sync checkpoint {}: {error}", path.display()))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            checkpoint_is_complete(dir, module, oracle_hash).and_then(|complete| {
+                complete.then_some(()).ok_or_else(|| {
+                    format!(
+                        "concurrent checkpoint publication did not complete {}",
+                        path.display()
+                    )
+                })
+            })
+        }
+        Err(error) => Err(format!("create checkpoint {}: {error}", path.display())),
+    }
+}
+
+fn reference_verdict_with_resume(
+    reference_lib: &Path,
+    inventory: &CorpusInventory,
+) -> Result<(ReferenceCorpusVerdict, &'static str), String> {
+    let oracle_hash = oracle_binary_hash(reference_lib)?;
+    let checkpoint_dir = std::env::var_os("FLN_CORPUS_CHECKPOINT_DIR").map(PathBuf::from);
+    if let Some(dir) = &checkpoint_dir {
+        let mut complete = 0_u64;
+        let mut expected = 0_u64;
+        for module in inventory
+            .modules
+            .values()
+            .filter(|module| module.decoded != 0)
+        {
+            expected += 1;
+            complete += u64::from(checkpoint_is_complete(dir, module, &oracle_hash)?);
+        }
+        if expected != 0 && complete == expected {
+            return Ok((
+                ReferenceCorpusVerdict::Accepted {
+                    duration: Duration::ZERO,
+                    stdout: format!(
+                        "resumed {complete} immutable per-module oracle records from {}",
+                        dir.display()
+                    ),
+                    stderr: String::new(),
+                },
+                "checkpoint",
+            ));
+        }
+    }
+    let targets = leanchecker_targets(inventory);
+    if targets.is_empty() {
+        return Err("present-olean corpus produced no declaration-bearing targets".to_string());
+    }
+    let verdict = run_leanchecker(reference_lib, &targets)?;
+    if matches!(verdict, ReferenceCorpusVerdict::Accepted { .. })
+        && let Some(dir) = &checkpoint_dir
+    {
+        for module in inventory
+            .modules
+            .values()
+            .filter(|module| module.decoded != 0)
+        {
+            persist_checkpoint(dir, module, &oracle_hash)?;
+        }
+    }
+    Ok((verdict, "live"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CorpusAxisVerdict {
+    Accepted,
+    Rejected(String),
+    NoAnswer(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CorpusDivergence {
+    Agree,
+    UnsoundlyPermissive { oracle: String },
+    Restrictive { ours: String },
+    NoAnswer { detail: String },
+}
+
+fn classify_corpus_verdict(
+    oracle: &CorpusAxisVerdict,
+    ours: &CorpusAxisVerdict,
+) -> CorpusDivergence {
+    match (oracle, ours) {
+        (CorpusAxisVerdict::NoAnswer(detail), _) => CorpusDivergence::NoAnswer {
+            detail: format!("oracle: {detail}"),
+        },
+        (_, CorpusAxisVerdict::NoAnswer(detail)) => CorpusDivergence::NoAnswer {
+            detail: format!("subject: {detail}"),
+        },
+        (CorpusAxisVerdict::Accepted, CorpusAxisVerdict::Accepted)
+        | (CorpusAxisVerdict::Rejected(_), CorpusAxisVerdict::Rejected(_)) => {
+            CorpusDivergence::Agree
+        }
+        (CorpusAxisVerdict::Rejected(oracle), CorpusAxisVerdict::Accepted) => {
+            CorpusDivergence::UnsoundlyPermissive {
+                oracle: oracle.clone(),
+            }
+        }
+        (CorpusAxisVerdict::Accepted, CorpusAxisVerdict::Rejected(ours)) => {
+            CorpusDivergence::Restrictive { ours: ours.clone() }
+        }
+    }
+}
+
+struct CorpusCarveOut {
+    declaration: &'static str,
+    justification: &'static str,
+}
+
+/// D23 applies only to the restrictive direction. This registry is
+/// intentionally empty: every future row is a public Behavior Note, not a
+/// suppression, and must name one decoded declaration plus its justification.
+const CORPUS_CARVE_OUTS: &[CorpusCarveOut] = &[];
+
+fn corpus_carve_out(name: &str) -> Option<&'static CorpusCarveOut> {
+    CORPUS_CARVE_OUTS.iter().find(|row| row.declaration == name)
+}
+
+fn subject_axis(outcome: &UnitOutcome) -> CorpusAxisVerdict {
+    if outcome.outcome == "accepted" {
+        CorpusAxisVerdict::Accepted
+    } else if outcome.outcome.starts_with("rejected:") {
+        CorpusAxisVerdict::Rejected(format!("{}: {}", outcome.outcome, outcome.message))
+    } else {
+        CorpusAxisVerdict::NoAnswer(format!("{}: {}", outcome.outcome, outcome.message))
+    }
+}
+
+#[derive(Debug, Default)]
+struct CorpusCounts {
+    decoded: u64,
+    compared: u64,
+    agree: u64,
+    unsoundly_permissive: u64,
+    restrictive_with_carve_out: u64,
+    restrictive_without_carve_out: u64,
+    unscorable: u64,
+    oracle_skipped: u64,
+    subject_no_answer: u64,
+}
+
+impl CorpusCounts {
+    fn disagreements(&self) -> u64 {
+        self.unsoundly_permissive
+            + self.restrictive_with_carve_out
+            + self.restrictive_without_carve_out
+    }
+
+    fn add(&mut self, other: &CorpusCounts) {
+        self.decoded += other.decoded;
+        self.compared += other.compared;
+        self.agree += other.agree;
+        self.unsoundly_permissive += other.unsoundly_permissive;
+        self.restrictive_with_carve_out += other.restrictive_with_carve_out;
+        self.restrictive_without_carve_out += other.restrictive_without_carve_out;
+        self.unscorable += other.unscorable;
+        self.oracle_skipped += other.oracle_skipped;
+        self.subject_no_answer += other.subject_no_answer;
+    }
+
+    fn assert_conservation(&self, scope: &str) {
+        assert_eq!(
+            self.decoded,
+            self.compared + self.unscorable,
+            "{scope}: decoded must equal compared + unscorable"
+        );
+        assert_eq!(
+            self.compared,
+            self.agree
+                + self.unsoundly_permissive
+                + self.restrictive_with_carve_out
+                + self.restrictive_without_carve_out,
+            "{scope}: compared rows must conserve the D23 direction buckets"
+        );
+    }
+}
+
+fn extend_reference_fixture_environment(
+    mut env: Environment,
+    infos: &[ConstantInfo],
+    module: &str,
+) -> Result<(Environment, Vec<String>), String> {
+    let mut collisions = Vec::new();
+    for info in infos {
+        if let Some(existing) = env.find(info.name()) {
+            if existing != info && !reference_replay_duplicate(existing, info) {
+                collisions.push(info.name().to_display_string());
+            }
+            continue;
+        }
+        env = env.add_decl(info.clone()).map_err(|error| {
+            format!(
+                "publish decoded fixture declaration {} from {module}: {error:?}",
+                info.name().to_display_string()
+            )
+        })?;
+    }
+    Ok((env, collisions))
+}
+
+/// Lean.Replay's exact duplicate-theorem exception: proof values may differ,
+/// but name, statement, universe parameters, and mutual-block membership must
+/// agree. Such a second row is not submitted to the Reference kernel.
+fn reference_replay_duplicate(existing: &ConstantInfo, candidate: &ConstantInfo) -> bool {
+    let (ConstantInfo::Thm(existing), ConstantInfo::Thm(candidate)) = (existing, candidate) else {
+        return false;
+    };
+    existing.base.name == candidate.base.name
+        && existing.base.type_ == candidate.base.type_
+        && existing.base.level_params == candidate.base.level_params
+        && existing.all == candidate.all
+}
+
+/// Leanchecker first folds the serialized `(constNames, constants)` arrays
+/// into a `HashMap`, so a repeated name contributes exactly its last row.
+/// Earlier serialized rows are decoded-corpus rows but receive no oracle
+/// verdict; preserve their original indices so the census cannot lose them.
+fn reference_active_rows(
+    infos: &[ConstantInfo],
+) -> (Vec<ConstantInfo>, Vec<usize>, HashSet<usize>) {
+    let mut last = HashMap::<Name, usize>::new();
+    for (index, info) in infos.iter().enumerate() {
+        last.insert(info.name().clone(), index);
+    }
+    let mut active = Vec::new();
+    let mut active_to_decoded = Vec::new();
+    let mut shadowed = HashSet::new();
+    for (index, info) in infos.iter().enumerate() {
+        if last[info.name()] == index {
+            active.push(info.clone());
+            active_to_decoded.push(index);
+        } else {
+            shadowed.insert(index);
+        }
+    }
+    (active, active_to_decoded, shadowed)
+}
+
+fn score_accepted_reference_module(
+    module: &CorpusModule,
+    decoded_infos: &[ConstantInfo],
+    active_infos: &[ConstantInfo],
+    active_to_decoded: &[usize],
+    shadowed: &HashSet<usize>,
+    prep: &PreparedReplay,
+    run: &MatrixRun,
+) -> CorpusCounts {
+    assert_eq!(
+        prep.items.len(),
+        run.outcomes.len(),
+        "{}: every prepared unit has an outcome",
+        module.name
+    );
+    let context_unscorable = prep
+        .context_unscorable
+        .iter()
+        .map(|(index, _, reason)| (active_to_decoded[*index], *reason))
+        .collect::<HashMap<_, _>>();
+    let mut represented = HashSet::new();
+    let mut counts = CorpusCounts {
+        decoded: module.decoded,
+        oracle_skipped: module.oracle_skipped,
+        unscorable: module.oracle_skipped,
+        ..CorpusCounts::default()
+    };
+    for (item, outcome) in prep.items.iter().zip(&run.outcomes) {
+        let mut applicable_members = Vec::new();
+        for (member_index, name) in item.member_indices.iter().zip(&item.member_names) {
+            let decoded_index = active_to_decoded[*member_index];
+            assert!(
+                represented.insert(decoded_index),
+                "{}: declaration row {} ({}) appears in two admission units",
+                module.name,
+                decoded_index,
+                name.to_display_string()
+            );
+            let info = &active_infos[*member_index];
+            if !reference_replay_skips(info) {
+                applicable_members.push(name);
+            }
+        }
+        if applicable_members.is_empty() {
+            continue;
+        }
+        let ours = subject_axis(outcome);
+        let divergence = classify_corpus_verdict(&CorpusAxisVerdict::Accepted, &ours);
+        match divergence {
+            CorpusDivergence::Agree => {
+                counts.agree += applicable_members.len() as u64;
+                counts.compared += applicable_members.len() as u64;
+            }
+            CorpusDivergence::UnsoundlyPermissive { .. } => {
+                unreachable!("Reference accepted this module")
+            }
+            CorpusDivergence::Restrictive { ours } => {
+                for name in applicable_members {
+                    let rendered = name.to_display_string();
+                    counts.compared += 1;
+                    if let Some(row) = corpus_carve_out(&rendered) {
+                        assert!(
+                            !row.justification.trim().is_empty(),
+                            "carve-out {rendered} has no justification"
+                        );
+                        counts.restrictive_with_carve_out += 1;
+                        eprintln!(
+                            "kernel_reference_corpus finding: module={} declaration={} \
+                             direction=restrictive carve_out=true ours={} justification={}",
+                            module.name, rendered, ours, row.justification
+                        );
+                    } else {
+                        counts.restrictive_without_carve_out += 1;
+                        eprintln!(
+                            "kernel_reference_corpus finding: module={} declaration={} \
+                             direction=restrictive carve_out=false ours={}",
+                            module.name, rendered, ours
+                        );
+                    }
+                }
+            }
+            CorpusDivergence::NoAnswer { detail } => {
+                let affected = applicable_members.len() as u64;
+                counts.unscorable += affected;
+                counts.subject_no_answer += affected;
+                eprintln!(
+                    "kernel_reference_corpus finding: module={} declaration={} \
+                     direction=unscorable affected={} detail={}",
+                    module.name,
+                    item.lead.to_display_string(),
+                    affected,
+                    detail
+                );
+            }
+        }
+    }
+    let mut oracle_omitted = Vec::new();
+    let mut subject_omitted = Vec::new();
+    for (index, info) in decoded_infos.iter().enumerate() {
+        if !reference_replay_skips(info) && !represented.contains(&index) {
+            let rendered = info.name().to_display_string();
+            if shadowed.contains(&index) {
+                oracle_omitted.push((rendered, "reference_hash_map_shadowed_row"));
+            } else if let Some(reason) = context_unscorable.get(&index) {
+                if *reason == "reference_replay_duplicate_theorem" {
+                    oracle_omitted.push((rendered, *reason));
+                } else {
+                    subject_omitted.push(rendered);
+                }
+            } else {
+                subject_omitted.push(rendered);
+            }
+        }
+    }
+    if !oracle_omitted.is_empty() {
+        counts.unscorable += oracle_omitted.len() as u64;
+        counts.oracle_skipped += oracle_omitted.len() as u64;
+        eprintln!(
+            "kernel_reference_corpus finding: module={} direction=unscorable \
+             reason=reference_context_skip affected={} first={:?}",
+            module.name,
+            oracle_omitted.len(),
+            oracle_omitted.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+    if !subject_omitted.is_empty() {
+        counts.unscorable += subject_omitted.len() as u64;
+        counts.subject_no_answer += subject_omitted.len() as u64;
+        eprintln!(
+            "kernel_reference_corpus finding: module={} direction=unscorable \
+             reason=subject_has_no_declaration_envelope affected={} first={:?}",
+            module.name,
+            subject_omitted.len(),
+            subject_omitted.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+    counts.assert_conservation(&module.name);
+    counts
+}
+
+#[test]
+fn corpus_comparator_preserves_d23_asymmetry_and_no_answer() {
+    use CorpusAxisVerdict::{Accepted, NoAnswer, Rejected};
+
+    assert_eq!(
+        classify_corpus_verdict(&Accepted, &Accepted),
+        CorpusDivergence::Agree
+    );
+    assert_eq!(
+        classify_corpus_verdict(&Rejected("reference".into()), &Rejected("ours".into())),
+        CorpusDivergence::Agree
+    );
+    assert!(matches!(
+        classify_corpus_verdict(&Rejected("reference".into()), &Accepted),
+        CorpusDivergence::UnsoundlyPermissive { .. }
+    ));
+    assert!(matches!(
+        classify_corpus_verdict(&Accepted, &Rejected("ours".into())),
+        CorpusDivergence::Restrictive { .. }
+    ));
+    assert!(matches!(
+        classify_corpus_verdict(&NoAnswer("oracle crash".into()), &Accepted),
+        CorpusDivergence::NoAnswer { .. }
+    ));
+    assert!(matches!(
+        classify_corpus_verdict(&Accepted, &NoAnswer("subject exhausted".into())),
+        CorpusDivergence::NoAnswer { .. }
+    ));
+    assert!(
+        CORPUS_CARVE_OUTS
+            .iter()
+            .all(|row| !row.justification.trim().is_empty()),
+        "every D23 carve-out is explicit and justified"
+    );
+}
+
+#[test]
+fn present_olean_corpus_inventory_is_closed_and_honest() {
+    let Some(reference_lib) = reference_lib() else {
+        eprintln!(
+            "SKIP present_olean_corpus_inventory: pinned Reference stdlib not found; \
+             pin-dependent test must run locally"
+        );
+        return;
+    };
+    let inventory =
+        inventory_present_oleans(&reference_lib).expect("inventory every present pinned olean");
+    let order = corpus_module_order(&inventory).expect("present imports have canonical order");
+    let oracle_targets = leanchecker_targets(&inventory);
+    let oracle_applicable = inventory.decoded - inventory.oracle_skipped;
+    eprintln!(
+        "kernel_reference_corpus inventory: modules={} decoded={} \
+         oracle_applicable={} oracle_skipped={} missing_imports={} oracle_targets={} \
+         fixture_hash={}",
+        inventory.modules.len(),
+        inventory.decoded,
+        oracle_applicable,
+        inventory.oracle_skipped,
+        inventory.missing_imports.len(),
+        oracle_targets.len(),
+        inventory.fixture_hash
+    );
+    assert!(
+        inventory.modules.len() as u64 >= PINNED_PRESENT_OLEAN_FLOOR,
+        "present-olean corpus silently shrank: {} < {} modules",
+        inventory.modules.len(),
+        PINNED_PRESENT_OLEAN_FLOOR
+    );
+    assert!(
+        inventory.decoded >= PINNED_DECODED_DECL_FLOOR,
+        "decoded corpus silently shrank: {} < {} declarations",
+        inventory.decoded,
+        PINNED_DECODED_DECL_FLOOR
+    );
+    assert!(
+        oracle_applicable >= PINNED_ORACLE_APPLICABLE_FLOOR,
+        "leanchecker-applicable corpus silently shrank: {oracle_applicable} < \
+         {PINNED_ORACLE_APPLICABLE_FLOOR}"
+    );
+    assert_eq!(
+        inventory.oracle_skipped, 1_425,
+        "Lean.Replay applicability census moved; never count skipped rows as accepted"
+    );
+    assert_eq!(
+        order.len(),
+        inventory.modules.len(),
+        "canonical module order must conserve the present inventory"
+    );
+    assert!(
+        oracle_targets.len() <= 160,
+        "leanchecker target cover regressed to an unbounded leaf list: {}",
+        oracle_targets.len()
+    );
+    for module in inventory
+        .modules
+        .values()
+        .filter(|module| module.decoded != 0)
+    {
+        assert!(
+            oracle_targets
+                .iter()
+                .any(|target| component_prefix(target, &module.name)),
+            "leanchecker target cover omitted declaration-bearing module {}",
+            module.name
+        );
+    }
+}
+
+/// The executable corpus obligation. It remains ignored while fln-7odd is
+/// open because the selected oracle itself supplies no verdict for 1,425
+/// decoded rows; enabling a gate that is known to fail before that contract is
+/// decided would make every ordinary `cargo test` unusable. Run explicitly:
+///
+/// `cargo test -p fln-conformance --test kernel_replay \
+///  pinned_present_olean_kernel_differential -- --ignored --exact --nocapture`
+#[test]
+#[ignore = "blocked by fln-7odd: leanchecker skips unsafe and partial declarations"]
+fn pinned_present_olean_kernel_differential() {
+    let reference_lib =
+        reference_lib().expect("pinned Reference stdlib required for the live corpus differential");
+    let inventory =
+        inventory_present_oleans(&reference_lib).expect("inventory every present pinned olean");
+    let order = corpus_module_order(&inventory).expect("canonical present-module order");
+    assert!(
+        inventory.modules.len() as u64 >= PINNED_PRESENT_OLEAN_FLOOR,
+        "present-module coverage floor"
+    );
+    assert!(
+        inventory.decoded >= PINNED_DECODED_DECL_FLOOR,
+        "decoded-declaration coverage floor"
+    );
+    let (oracle, oracle_source) =
+        reference_verdict_with_resume(&reference_lib, &inventory).expect("run pinned leanchecker");
+    match oracle {
+        ReferenceCorpusVerdict::Accepted {
+            duration,
+            stdout,
+            stderr,
+        } => {
+            eprintln!(
+                "kernel_reference_corpus oracle: verdict=accepted source={} \
+                 duration_ms={} stdout_bytes={} stderr_bytes={}",
+                oracle_source,
+                duration.as_millis(),
+                stdout.len(),
+                stderr.len()
+            );
+        }
+        ReferenceCorpusVerdict::Rejected {
+            status,
+            duration,
+            stdout,
+            stderr,
+        } => {
+            eprintln!(
+                "kernel_reference_corpus oracle: verdict=rejected status={} \
+                 duration_ms={} stdout={} stderr={}",
+                status,
+                duration.as_millis(),
+                stdout.lines().take(20).collect::<Vec<_>>().join(" | "),
+                stderr.lines().take(20).collect::<Vec<_>>().join(" | ")
+            );
+            eprintln!(
+                "kernel_reference_corpus SUMMARY: 0 of {} decoded declarations compared, \
+                 0 disagreements, split by direction: unsoundly_permissive=0 \
+                 restrictive_with_carve_out=0 restrictive_without_carve_out=0; \
+                 unscorable={}",
+                inventory.decoded, inventory.decoded
+            );
+            panic!(
+                "module-level oracle rejection cannot be assigned to individual decoded declarations"
+            );
+        }
+        ReferenceCorpusVerdict::NoAnswer {
+            reason,
+            duration,
+            stdout,
+            stderr,
+        } => {
+            eprintln!(
+                "kernel_reference_corpus oracle: verdict=no_answer reason={} \
+                 duration_ms={} stdout={} stderr={}",
+                reason,
+                duration.as_millis(),
+                stdout.lines().take(20).collect::<Vec<_>>().join(" | "),
+                stderr.lines().take(20).collect::<Vec<_>>().join(" | ")
+            );
+            eprintln!(
+                "kernel_reference_corpus SUMMARY: 0 of {} decoded declarations compared, \
+                 0 disagreements, split by direction: unsoundly_permissive=0 \
+                 restrictive_with_carve_out=0 restrictive_without_carve_out=0; \
+                 unscorable={}",
+                inventory.decoded, inventory.decoded
+            );
+            panic!("a Reference non-answer agrees with nothing");
+        }
+    }
+
+    struct FixtureState {
+        closure: BTreeSet<String>,
+        final_env: Environment,
+        active_infos: Vec<ConstantInfo>,
+        faithful: bool,
+    }
+
+    let order_index = order
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut states = BTreeMap::<String, FixtureState>::new();
+    let mut total = CorpusCounts::default();
+    for (index, module_name) in order.iter().enumerate() {
+        let module = &inventory.modules[module_name];
+        let (bytes, infos) =
+            decode_corpus_module(&module.path).expect("decode governed corpus module");
+        let current_hash = tagged_fixture_hash(
+            b"fln.kernel-reference-corpus.olean/1",
+            &[module.name.as_bytes(), &bytes],
+        );
+        assert_eq!(
+            current_hash, module.olean_hash,
+            "{} changed between inventory and replay",
+            module.name
+        );
+        assert_eq!(
+            infos.len() as u64,
+            module.decoded,
+            "{} declaration census changed between passes",
+            module.name
+        );
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| reference_replay_skips(info))
+                .count() as u64,
+            module.oracle_skipped,
+            "{} oracle-applicability census changed between passes",
+            module.name
+        );
+        let (active_infos, active_to_decoded, shadowed) = reference_active_rows(&infos);
+
+        // Reconstruct exactly the union of PRESENT direct-import closures.
+        // Starting from the largest direct import preserves structural sharing;
+        // only contributions absent from that base are inserted.
+        let direct_imports = module
+            .imports
+            .iter()
+            .filter(|import| {
+                inventory.modules.contains_key(*import) && import.as_str() != module.name
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut closure = BTreeSet::new();
+        let mut context_faithful = true;
+        for import in &direct_imports {
+            let state = states
+                .get(import)
+                .unwrap_or_else(|| panic!("{} imported before {import}", module.name));
+            closure.insert(import.clone());
+            closure.extend(state.closure.iter().cloned());
+            context_faithful &= state.faithful;
+        }
+        let base = direct_imports
+            .iter()
+            .max_by_key(|import| states[*import].closure.len());
+        let (mut imported_env, mut included) = match base {
+            Some(base) => {
+                let state = &states[base];
+                let mut included = state.closure.clone();
+                included.insert(base.clone());
+                (state.final_env.clone(), included)
+            }
+            None => (Environment::new(), BTreeSet::new()),
+        };
+        let mut missing = closure.difference(&included).cloned().collect::<Vec<_>>();
+        missing.sort_by_key(|name| order_index[name]);
+        for dependency in missing {
+            let state = &states[&dependency];
+            let (next, collisions) = extend_reference_fixture_environment(
+                imported_env,
+                &state.active_infos,
+                &dependency,
+            )
+            .expect("merge a decoded import contribution");
+            imported_env = next;
+            included.insert(dependency.clone());
+            if !collisions.is_empty() {
+                context_faithful = false;
+                eprintln!(
+                    "kernel_reference_corpus finding: module={} direction=unscorable \
+                     reason=import_context_collision dependency={} affected={} first={:?}",
+                    module.name,
+                    dependency,
+                    collisions.len(),
+                    collisions.iter().take(5).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        let (counts, stream_digest) = if context_faithful {
+            let prep = prepare_replay_from(imported_env.clone(), &active_infos, false);
+            let threads = if prep.items.len() < 64 { 1 } else { 8 };
+            let run = check_matrix_run(&prep, threads, Budget::DEFAULT);
+            (
+                score_accepted_reference_module(
+                    module,
+                    &infos,
+                    &active_infos,
+                    &active_to_decoded,
+                    &shadowed,
+                    &prep,
+                    &run,
+                ),
+                run.stream_digest,
+            )
+        } else {
+            let dynamic_oracle_skips = shadowed
+                .iter()
+                .filter(|row| !reference_replay_skips(&infos[**row]))
+                .count() as u64;
+            let oracle_skipped = module.oracle_skipped + dynamic_oracle_skips;
+            let counts = CorpusCounts {
+                decoded: module.decoded,
+                unscorable: module.decoded,
+                oracle_skipped,
+                subject_no_answer: module.decoded - oracle_skipped,
+                ..CorpusCounts::default()
+            };
+            counts.assert_conservation(&module.name);
+            eprintln!(
+                "kernel_reference_corpus finding: module={} direction=unscorable \
+                 reason=import_context_not_faithfully_representable affected={}",
+                module.name, module.decoded
+            );
+            (
+                counts,
+                tagged_fixture_hash(
+                    b"fln.kernel-reference-corpus.context-unavailable/1",
+                    &[module.name.as_bytes()],
+                ),
+            )
+        };
+        println!(
+            "kernel_reference_corpus module={} index={} decoded={} compared={} \
+             disagreements={} unsoundly_permissive={} restrictive_with_carve_out={} \
+             restrictive_without_carve_out={} unscorable={} oracle_skipped={} \
+             subject_no_answer={} stream_digest={}",
+            module.name,
+            index,
+            counts.decoded,
+            counts.compared,
+            counts.disagreements(),
+            counts.unsoundly_permissive,
+            counts.restrictive_with_carve_out,
+            counts.restrictive_without_carve_out,
+            counts.unscorable,
+            counts.oracle_skipped,
+            counts.subject_no_answer,
+            stream_digest
+        );
+        total.add(&counts);
+        let (final_env, current_collisions) =
+            extend_reference_fixture_environment(imported_env, &active_infos, &module.name)
+                .expect("publish decoded module into non-authoritative Reference fixture context");
+        if !current_collisions.is_empty() {
+            context_faithful = false;
+            eprintln!(
+                "kernel_reference_corpus finding: module={} direction=unscorable \
+                 reason=current_module_context_collision affected={} first={:?}",
+                module.name,
+                current_collisions.len(),
+                current_collisions.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+        states.insert(
+            module.name.clone(),
+            FixtureState {
+                closure,
+                final_env,
+                active_infos,
+                faithful: context_faithful,
+            },
+        );
+    }
+    total.assert_conservation("full present-olean corpus");
+    println!(
+        "kernel_reference_corpus SUMMARY: {} of {} decoded declarations compared, \
+         {} disagreements, split by direction: unsoundly_permissive={} \
+         restrictive_with_carve_out={} restrictive_without_carve_out={}; \
+         unscorable={} oracle_skipped={} subject_no_answer={} modules={} \
+         missing_imports={} fixture_hash={}",
+        total.compared,
+        total.decoded,
+        total.disagreements(),
+        total.unsoundly_permissive,
+        total.restrictive_with_carve_out,
+        total.restrictive_without_carve_out,
+        total.unscorable,
+        total.oracle_skipped,
+        total.subject_no_answer,
+        inventory.modules.len(),
+        inventory.missing_imports.len(),
+        inventory.fixture_hash
+    );
+    assert!(
+        total.compared >= PINNED_ORACLE_APPLICABLE_FLOOR,
+        "kernel differential coverage silently stopped: {} < {} scoreable declarations",
+        total.compared,
+        PINNED_ORACLE_APPLICABLE_FLOOR
+    );
+    assert_eq!(
+        total.unsoundly_permissive, 0,
+        "accepting what the Reference rejects is release-blocking; no carve-out exists"
+    );
+    assert_eq!(
+        total.restrictive_without_carve_out, 0,
+        "restrictive disagreements require repair or an explicit justified D23 row"
+    );
+    assert_eq!(
+        total.unscorable, 0,
+        "a non-answer from either side agrees with nothing"
+    );
 }
 
 #[test]
