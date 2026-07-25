@@ -34,6 +34,7 @@
 
 pub mod normalize;
 pub mod oracle;
+pub mod parity;
 
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 use std::path::{Path, PathBuf};
