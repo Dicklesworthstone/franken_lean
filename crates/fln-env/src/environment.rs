@@ -23,7 +23,7 @@ use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
 use crate::constants::{ConstantInfo, DefinitionSafety, QuotKind, ReducibilityHints};
 use crate::extensions::{
     CheckpointError, CheckpointLimits, CheckpointSemantics, ExtensionCheckpoint,
-    ExtensionDescriptor, ExtensionState,
+    ExtensionDescriptor, ExtensionState, ProofBudget,
 };
 #[cfg(test)]
 use crate::extensions::{MergeSemantics, PayloadProvenance};
@@ -1017,6 +1017,7 @@ impl Environment {
         extension: &Name,
         base: Option<&Environment>,
         limits: CheckpointLimits,
+        proof: ProofBudget,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Outcome<Result<ExtensionCheckpoint, EnvError>> {
         let Some(state) = self.extension(extension) else {
@@ -1036,7 +1037,7 @@ impl Environment {
             None => None,
         };
         state
-            .try_checkpoint(base_state, limits, cancellation)
+            .try_checkpoint(base_state, limits, proof, cancellation)
             .map_complete(|captured| captured.map_err(EnvError::Checkpoint))
     }
 
@@ -1050,6 +1051,7 @@ impl Environment {
         &self,
         checkpoint: &ExtensionCheckpoint,
         limits: CheckpointLimits,
+        proof: ProofBudget,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Outcome<Result<Environment, EnvError>> {
         let name = &checkpoint.descriptor().name;
@@ -1076,7 +1078,7 @@ impl Environment {
             CheckpointSemantics::JournalSuffix => Some(registered),
             CheckpointSemantics::FullJournal => None,
         };
-        ExtensionState::try_restore(base, checkpoint, limits, cancellation).map_complete(
+        ExtensionState::try_restore(base, checkpoint, limits, proof, cancellation).map_complete(
             |restored| {
                 restored
                     .map(|state| Environment {
@@ -1958,11 +1960,21 @@ mod tests {
             .push_extension_entry(&n("simpExt"), &b"suffix-a"[..])
             .and_then(|env| env.push_extension_entry(&n("simpExt"), &b"suffix-b"[..]))
             .expect("target environment builds");
-        let checkpoint =
-            completed(target.checkpoint_extension(&n("simpExt"), Some(&base), limits, None))
-                .expect("environment suffix captures");
-        let restored = completed(base.apply_extension_checkpoint(&checkpoint, limits, None))
-            .expect("environment suffix applies");
+        let checkpoint = completed(target.checkpoint_extension(
+            &n("simpExt"),
+            Some(&base),
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("environment suffix captures");
+        let restored = completed(base.apply_extension_checkpoint(
+            &checkpoint,
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("environment suffix applies");
 
         assert_eq!(restored, target);
         assert_eq!(
@@ -1983,7 +1995,12 @@ mod tests {
             .and_then(|env| env.push_extension_entry(&n("otherExt"), &b"other"[..]))
             .expect("same-length divergent branch builds");
         assert!(matches!(
-            completed(divergent.apply_extension_checkpoint(&checkpoint, limits, None)),
+            completed(divergent.apply_extension_checkpoint(
+                &checkpoint,
+                limits,
+                ProofBudget::UNBOUNDED,
+                None
+            )),
             Err(EnvError::Checkpoint(
                 CheckpointError::BaseHistoryMismatch { .. }
             ))
@@ -2016,17 +2033,34 @@ mod tests {
             .push_extension_entry(&n("fullExt"), &b"one"[..])
             .and_then(|env| env.push_extension_entry(&n("fullExt"), &b"two"[..]))
             .expect("source builds");
-        let checkpoint = completed(source.checkpoint_extension(&n("fullExt"), None, limits, None))
-            .expect("full environment checkpoint captures");
-        let restored = completed(destination.apply_extension_checkpoint(&checkpoint, limits, None))
-            .expect("full checkpoint applies without a semantic base");
+        let checkpoint = completed(source.checkpoint_extension(
+            &n("fullExt"),
+            None,
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("full environment checkpoint captures");
+        let restored = completed(destination.apply_extension_checkpoint(
+            &checkpoint,
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("full checkpoint applies without a semantic base");
         assert_eq!(restored, source);
         assert_eq!(
             restored.logical_root(&KVMap::new()),
             source.logical_root(&KVMap::new())
         );
         assert!(matches!(
-            completed(source.checkpoint_extension(&n("ghost"), None, limits, None)),
+            completed(source.checkpoint_extension(
+                &n("ghost"),
+                None,
+                limits,
+                ProofBudget::UNBOUNDED,
+                None
+            )),
             Err(EnvError::UnknownExtension { .. })
         ));
     }

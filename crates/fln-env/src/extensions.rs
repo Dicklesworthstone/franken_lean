@@ -15,8 +15,9 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
-use fln_core::outcome::{Inconclusive, Outcome};
+use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, hash};
 
@@ -597,25 +598,144 @@ pub enum ExtensionMergeOutcome {
 /// an `Outcome` rather than a `Result`, because a `CheckpointError` is a rejection type
 /// and reporting "we ran out of comparison budget" as a rejection would be the exact
 /// collapse this bead exists to prevent. That signature change is the next slice.
+/// Fixture-only unbounded form. `#[cfg(test)]` because with the production path bounded
+/// there is no reason for an uncharged comparison to be reachable.
+#[cfg(test)]
 fn first_entry_divergence(left: &ExtensionState, right: &ExtensionState) -> Option<usize> {
-    let mut index = 0;
+    bounded_entry_divergence(left, right, ProofBudget::UNBOUNDED)
+        .expect("an unbounded budget cannot bind")
+}
+
+/// [`first_entry_divergence`], charged against a budget.
+///
+/// Charges before comparing, so the entry that would exceed the budget is never
+/// examined: a budget that is only checked after the work is a budget that permits one
+/// unbounded step. Both dimensions are charged per entry, and payload bytes are charged
+/// from the *left* side, which is the retained base — the side whose size the caller can
+/// actually bound.
+fn bounded_entry_divergence(
+    left: &ExtensionState,
+    right: &ExtensionState,
+    budget: ProofBudget,
+) -> BoundedComparison {
+    let mut index = 0usize;
+    let mut compared_bytes = 0u128;
     let mut left_entries = left.entries();
     let mut right_entries = right.entries();
     loop {
         match (left_entries.next(), right_entries.next()) {
             (Some(mine), Some(theirs)) => {
+                if index >= budget.max_compared_entries {
+                    return Err((
+                        ProofDimension::ComparedEntries,
+                        u128::try_from(budget.max_compared_entries).unwrap_or(u128::MAX),
+                        u128::try_from(index).unwrap_or(u128::MAX).saturating_add(1),
+                    ));
+                }
+                let next_bytes =
+                    compared_bytes.saturating_add(u128::try_from(mine.payload.len()).unwrap_or(0));
+                if next_bytes > budget.max_compared_payload_bytes {
+                    return Err((
+                        ProofDimension::ComparedPayloadBytes,
+                        budget.max_compared_payload_bytes,
+                        next_bytes,
+                    ));
+                }
+                compared_bytes = next_bytes;
                 if mine != theirs {
-                    return Some(index);
+                    return Ok(Some(index));
                 }
                 index += 1;
             }
-            (None, None) => return None,
+            (None, None) => return Ok(None),
             // One ran out first: they diverge at that length. The digest fast path
             // already rejects a length mismatch, so reaching this means a genuinely
             // inconsistent input rather than an ordinary short base.
-            (None, Some(_)) | (Some(_), None) => return Some(index),
+            (None, Some(_)) | (Some(_), None) => return Ok(Some(index)),
         }
     }
+}
+
+/// What a caller allows one base-identity proof to cost.
+///
+/// Separate from [`CheckpointLimits`], which bounds the entries a checkpoint *carries*.
+/// This bounds the entries a proof *compares*, which is a different quantity over a
+/// different input: a one-entry suffix over a million-entry base carries one entry and
+/// may compare a million. Conflating them would let a tight carry limit imply a bound
+/// it does not provide.
+///
+/// `UNBOUNDED` and the `Default` mirror [`CheckpointLimits`]' neighbours in this crate,
+/// so an unset budget behaves exactly as the pre-budget code did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofBudget {
+    /// Entries the exact comparison may examine.
+    pub max_compared_entries: usize,
+    /// Canonical payload bytes the exact comparison may examine.
+    pub max_compared_payload_bytes: u128,
+}
+
+impl ProofBudget {
+    pub const UNBOUNDED: ProofBudget = ProofBudget {
+        max_compared_entries: usize::MAX,
+        max_compared_payload_bytes: u128::MAX,
+    };
+
+    pub const fn new(max_compared_entries: usize, max_compared_payload_bytes: u128) -> Self {
+        ProofBudget {
+            max_compared_entries,
+            max_compared_payload_bytes,
+        }
+    }
+}
+
+impl Default for ProofBudget {
+    fn default() -> Self {
+        Self::UNBOUNDED
+    }
+}
+
+/// Which quantity a [`ProofBudget`] bound.
+///
+/// A fact on the report, not a new [`StructuralUnit`]: both are `ProducedNodes` under
+/// the closed D8 taxonomy, whose bar for a new unit is that a caller must react
+/// differently, and the reaction to both is the same — raise the budget or accept that
+/// this base cannot be proved here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofDimension {
+    ComparedEntries,
+    ComparedPayloadBytes,
+}
+
+impl ProofDimension {
+    const fn as_str(self) -> &'static str {
+        match self {
+            ProofDimension::ComparedEntries => "compared_entries",
+            ProofDimension::ComparedPayloadBytes => "compared_payload_bytes",
+        }
+    }
+}
+
+/// A bounded exact comparison: either it finished, or it ran out.
+///
+/// `Ok(None)` means the histories are exactly equal over the compared range, `Ok(Some)`
+/// names the first divergence, and `Err` means the budget bound before either could be
+/// established — which is a non-answer, never a divergence. Returning "diverged" for a
+/// comparison that never finished is the precise defect this bead exists to prevent.
+type BoundedComparison = Result<Option<usize>, (ProofDimension, u128, u128)>;
+
+fn proof_stop(dimension: ProofDimension, allowed: u128, observed: u128) -> Inconclusive {
+    Inconclusive::resource(ResourceUsage {
+        reason: ResourceReason::StructuralBudget {
+            unit: StructuralUnit::ProducedNodes,
+        },
+        allowed: u64::try_from(allowed).unwrap_or(u64::MAX),
+        // A stop must report spending past its allowance or it is not a stop, and
+        // `is_genuine_exhaustion` depends on it.
+        observed: u64::try_from(observed)
+            .unwrap_or(u64::MAX)
+            .max(u64::try_from(allowed).unwrap_or(u64::MAX).saturating_add(1)),
+    })
+    .with_progress(dimension.as_str())
 }
 
 /// Frozen cancellation observation points for the checkpoint identity proofs.
@@ -649,15 +769,46 @@ impl std::fmt::Display for CheckpointProofCheckpoint {
 /// stored cumulative prefix digest cannot supply. `base` shorter than `target` is the
 /// normal case; a base that runs longer than the target is a divergence at the target's
 /// length, which the caller's own length arithmetic would otherwise underflow on.
+/// Fixture-only unbounded form — see [`first_entry_divergence`].
+#[cfg(test)]
 fn prefix_divergence(target: &ExtensionState, base: &ExtensionState) -> Option<usize> {
+    bounded_prefix_divergence(target, base, ProofBudget::UNBOUNDED)
+        .expect("an unbounded budget cannot bind")
+}
+
+/// [`prefix_divergence`], charged against a budget, with the same charge-before-compare
+/// rule as [`bounded_entry_divergence`].
+fn bounded_prefix_divergence(
+    target: &ExtensionState,
+    base: &ExtensionState,
+    budget: ProofBudget,
+) -> BoundedComparison {
     let mut target_entries = target.entries();
+    let mut compared_bytes = 0u128;
     for (index, base_entry) in base.entries().enumerate() {
+        if index >= budget.max_compared_entries {
+            return Err((
+                ProofDimension::ComparedEntries,
+                u128::try_from(budget.max_compared_entries).unwrap_or(u128::MAX),
+                u128::try_from(index).unwrap_or(u128::MAX).saturating_add(1),
+            ));
+        }
+        let next_bytes =
+            compared_bytes.saturating_add(u128::try_from(base_entry.payload.len()).unwrap_or(0));
+        if next_bytes > budget.max_compared_payload_bytes {
+            return Err((
+                ProofDimension::ComparedPayloadBytes,
+                budget.max_compared_payload_bytes,
+                next_bytes,
+            ));
+        }
+        compared_bytes = next_bytes;
         match target_entries.next() {
             Some(target_entry) if target_entry == base_entry => {}
-            _ => return Some(index),
+            _ => return Ok(Some(index)),
         }
     }
-    None
+    Ok(None)
 }
 
 /// The logical footprint a checkpoint retains beyond the entries it carries.
@@ -1164,6 +1315,7 @@ impl ExtensionState {
         &self,
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
+        proof: ProofBudget,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Outcome<Result<ExtensionCheckpoint, CheckpointError>> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -1171,7 +1323,10 @@ impl ExtensionState {
                 CheckpointProofCheckpoint::BeforeBaseProof.to_string(),
             ));
         }
-        let captured = self.checkpoint_unbounded(base, limits);
+        let captured = match self.checkpoint_bounded(base, limits, proof) {
+            Ok(captured) => captured,
+            Err(stop) => return Outcome::Inconclusive(stop),
+        };
         if captured.is_ok() && cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Outcome::Inconclusive(Inconclusive::cancelled(
                 CheckpointProofCheckpoint::BeforePublication.to_string(),
@@ -1189,42 +1344,55 @@ impl ExtensionState {
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
     ) -> Result<ExtensionCheckpoint, CheckpointError> {
-        self.checkpoint_unbounded(base, limits)
+        self.checkpoint_bounded(base, limits, ProofBudget::UNBOUNDED)
+            .expect("an unbounded proof budget cannot bind")
     }
 
-    fn checkpoint_unbounded(
+    /// The proof-bounded capture body. Outer `Err` is a budget stop, inner is a verdict.
+    fn checkpoint_bounded(
         &self,
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
-    ) -> Result<ExtensionCheckpoint, CheckpointError> {
-        self.checkpoint_with_work(base, limits)
+        proof: ProofBudget,
+    ) -> Result<Result<ExtensionCheckpoint, CheckpointError>, Inconclusive> {
+        Ok(self
+            .checkpoint_with_work(base, limits, proof)?
             .map(|(checkpoint, work)| {
                 debug_assert_eq!(work.captured_entries, checkpoint.captured_entries);
                 debug_assert!(work.prefix_lookup_steps <= self.journal.depth as usize + 1);
                 checkpoint
-            })
+            }))
     }
 
+    /// Outer `Err` is a budget stop, inner is a verdict — see
+    /// [`ExtensionState::restore_bounded`] for why the two live at different depths.
     fn checkpoint_with_work(
         &self,
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
-    ) -> Result<(ExtensionCheckpoint, CheckpointWork), CheckpointError> {
+        proof: ProofBudget,
+    ) -> Result<Result<(ExtensionCheckpoint, CheckpointWork), CheckpointError>, Inconclusive> {
         match self.descriptor.checkpoint {
             CheckpointSemantics::JournalSuffix => {
-                let base = base.ok_or_else(|| CheckpointError::MissingBase {
-                    extension: self.descriptor.name.clone(),
-                })?;
-                validate_checkpoint_descriptor(&self.descriptor, &base.descriptor)?;
+                let Some(base) = base else {
+                    return Ok(Err(CheckpointError::MissingBase {
+                        extension: self.descriptor.name.clone(),
+                    }));
+                };
+                if let Err(refusal) =
+                    validate_checkpoint_descriptor(&self.descriptor, &base.descriptor)
+                {
+                    return Ok(Err(refusal));
+                }
                 let Some((prefix_digest, prefix_payload_bytes, lookup_steps)) =
                     self.journal.prefix_facts(base.len())
                 else {
-                    return Err(history_mismatch(base, self));
+                    return Ok(Err(history_mismatch(base, self)));
                 };
                 if prefix_digest != base.journal.digest
                     || prefix_payload_bytes != base.journal.payload_bytes
                 {
-                    return Err(history_mismatch(base, self));
+                    return Ok(Err(history_mismatch(base, self)));
                 }
 
                 // The check above is a REJECTION ACCELERATOR, exactly as on the restore
@@ -1239,23 +1407,32 @@ impl ExtensionState {
                 // the base's entries, in order, exactly. `records()` yields this
                 // journal's entries from the start, so taking `base.len()` of them IS
                 // the claimed prefix.
-                if let Some(divergence) = prefix_divergence(self, base) {
-                    return Err(CheckpointError::BaseNotExact {
-                        extension: self.descriptor.name.clone(),
-                        base_len: base.len(),
-                        first_divergence: divergence,
-                    });
+                // Charged, and a stop here is a non-answer rather than a divergence.
+                match bounded_prefix_divergence(self, base, proof) {
+                    Ok(Some(divergence)) => {
+                        return Ok(Err(CheckpointError::BaseNotExact {
+                            extension: self.descriptor.name.clone(),
+                            base_len: base.len(),
+                            first_divergence: divergence,
+                        }));
+                    }
+                    Ok(None) => {}
+                    Err((dimension, allowed, observed)) => {
+                        return Err(proof_stop(dimension, allowed, observed));
+                    }
                 }
 
                 let captured_entries = self.len() - base.len();
                 let captured_payload_bytes =
                     self.journal.payload_bytes - base.journal.payload_bytes;
-                enforce_checkpoint_limits(
+                if let Err(refusal) = enforce_checkpoint_limits(
                     &self.descriptor.name,
                     captured_entries,
                     captured_payload_bytes,
                     limits,
-                )?;
+                ) {
+                    return Ok(Err(refusal));
+                }
 
                 let journal = ExtensionJournal::from_entries(
                     self.journal
@@ -1277,26 +1454,28 @@ impl ExtensionState {
                         journal,
                     },
                 };
-                Ok((
+                Ok(Ok((
                     checkpoint,
                     CheckpointWork {
                         prefix_lookup_steps: lookup_steps,
                         captured_entries,
                     },
-                ))
+                )))
             }
             CheckpointSemantics::FullJournal => {
                 if base.is_some() {
-                    return Err(CheckpointError::UnexpectedBase {
+                    return Ok(Err(CheckpointError::UnexpectedBase {
                         extension: self.descriptor.name.clone(),
-                    });
+                    }));
                 }
-                enforce_checkpoint_limits(
+                if let Err(refusal) = enforce_checkpoint_limits(
                     &self.descriptor.name,
                     self.len(),
                     self.journal.payload_bytes,
                     limits,
-                )?;
+                ) {
+                    return Ok(Err(refusal));
+                }
                 let journal = ExtensionJournal::from_entries(
                     self.journal.records().map(|record| record.entry.clone()),
                 );
@@ -1307,13 +1486,13 @@ impl ExtensionState {
                     captured_payload_bytes: self.journal.payload_bytes,
                     payload: CheckpointPayload::FullJournal { journal },
                 };
-                Ok((
+                Ok(Ok((
                     checkpoint,
                     CheckpointWork {
                         prefix_lookup_steps: 0,
                         captured_entries: self.len(),
                     },
-                ))
+                )))
             }
         }
     }
@@ -1339,13 +1518,13 @@ impl ExtensionState {
     /// reporting a refusal is a verdict (decision `fln-um4a`). Only cancellation and,
     /// once bounded, comparison exhaustion are non-answers.
     ///
-    /// Cancellation is sampled at fixed [`CheckpointProofCheckpoint`]s and is never
-    /// cacheable. The comparison budget arrives in the next slice; this signature is
-    /// what makes it expressible.
+    /// Cancellation is sampled at fixed [`CheckpointProofCheckpoint`]s, exhaustion is
+    /// charged against `proof` before each compared entry, and neither is cacheable.
     pub fn try_restore(
         base: Option<&ExtensionState>,
         checkpoint: &ExtensionCheckpoint,
         limits: CheckpointLimits,
+        proof: ProofBudget,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Outcome<Result<ExtensionState, CheckpointError>> {
         // Sampled before any input-sized proof work: a caller who has given up must not
@@ -1355,7 +1534,10 @@ impl ExtensionState {
                 CheckpointProofCheckpoint::BeforeBaseProof.to_string(),
             ));
         }
-        let restored = ExtensionState::restore_unbounded(base, checkpoint, limits);
+        let restored = match ExtensionState::restore_bounded(base, checkpoint, limits, proof) {
+            Ok(restored) => restored,
+            Err(stop) => return Outcome::Inconclusive(stop),
+        };
         if restored.is_ok() && cancellation.is_some_and(CancellationProbe::is_cancelled) {
             // Proved, but the caller withdrew before publication. Discarding the result
             // is correct: a restored state nobody asked for any more is not a verdict.
@@ -1379,48 +1561,59 @@ impl ExtensionState {
         checkpoint: &ExtensionCheckpoint,
         limits: CheckpointLimits,
     ) -> Result<ExtensionState, CheckpointError> {
-        ExtensionState::restore_unbounded(base, checkpoint, limits)
+        ExtensionState::restore_bounded(base, checkpoint, limits, ProofBudget::UNBOUNDED)
+            .expect("an unbounded proof budget cannot bind")
     }
 
-    fn restore_unbounded(
+    /// The proof-bounded body. The OUTER `Err` is a budget stop and never a verdict; the
+    /// verdict lives in the inner `Result`. Keeping them at different depths is what
+    /// makes "ran out" and "refused" impossible to confuse at a call site.
+    fn restore_bounded(
         base: Option<&ExtensionState>,
         checkpoint: &ExtensionCheckpoint,
         limits: CheckpointLimits,
-    ) -> Result<ExtensionState, CheckpointError> {
+        proof: ProofBudget,
+    ) -> Result<Result<ExtensionState, CheckpointError>, Inconclusive> {
+        // Every `Ok(Err(..))` below is a completed VERDICT about this checkpoint. The
+        // only `Err(..)` at the outer depth is a budget stop, and it appears exactly
+        // once, at the bounded comparison. The extra `Ok(` is deliberate noise: it makes
+        // each site say which kind of answer it is giving.
         if checkpoint.schema_version != EXTENSION_CHECKPOINT_SCHEMA_VERSION {
-            return Err(CheckpointError::UnsupportedVersion {
+            return Ok(Err(CheckpointError::UnsupportedVersion {
                 found: checkpoint.schema_version,
                 supported: EXTENSION_CHECKPOINT_SCHEMA_VERSION,
-            });
+            }));
         }
         let payload_mode = checkpoint.mode();
         if checkpoint.descriptor.checkpoint != payload_mode {
-            return Err(CheckpointError::ModeMismatch {
+            return Ok(Err(CheckpointError::ModeMismatch {
                 descriptor_mode: checkpoint.descriptor.checkpoint,
                 payload_mode,
-            });
+            }));
         }
         let journal = checkpoint.journal();
-        journal
-            .integrity()
-            .map_err(|reason| CheckpointError::MalformedCheckpoint {
+        if let Err(reason) = journal.integrity() {
+            return Ok(Err(CheckpointError::MalformedCheckpoint {
                 extension: checkpoint.descriptor.name.clone(),
                 reason,
-            })?;
+            }));
+        }
         if journal.len != checkpoint.captured_entries
             || journal.payload_bytes != checkpoint.captured_payload_bytes
         {
-            return Err(CheckpointError::MalformedCheckpoint {
+            return Ok(Err(CheckpointError::MalformedCheckpoint {
                 extension: checkpoint.descriptor.name.clone(),
                 reason: "declared checkpoint measurements do not match its journal",
-            });
+            }));
         }
-        enforce_checkpoint_limits(
+        if let Err(refusal) = enforce_checkpoint_limits(
             &checkpoint.descriptor.name,
             journal.len,
             journal.payload_bytes,
             limits,
-        )?;
+        ) {
+            return Ok(Err(refusal));
+        }
 
         match &checkpoint.payload {
             CheckpointPayload::JournalSuffix {
@@ -1430,31 +1623,37 @@ impl ExtensionState {
                 base: retained_base,
                 journal,
             } => {
-                let base = base.ok_or_else(|| CheckpointError::MissingBase {
-                    extension: checkpoint.descriptor.name.clone(),
-                })?;
-                validate_checkpoint_descriptor(&checkpoint.descriptor, &base.descriptor)?;
+                let Some(base) = base else {
+                    return Ok(Err(CheckpointError::MissingBase {
+                        extension: checkpoint.descriptor.name.clone(),
+                    }));
+                };
+                if let Err(refusal) =
+                    validate_checkpoint_descriptor(&checkpoint.descriptor, &base.descriptor)
+                {
+                    return Ok(Err(refusal));
+                }
                 if base.len() != *base_len {
-                    return Err(CheckpointError::BaseLengthMismatch {
+                    return Ok(Err(CheckpointError::BaseLengthMismatch {
                         extension: checkpoint.descriptor.name.clone(),
                         expected: *base_len,
                         actual: base.len(),
-                    });
+                    }));
                 }
                 if base.journal.digest != *base_history_digest {
-                    return Err(CheckpointError::BaseHistoryMismatch {
+                    return Ok(Err(CheckpointError::BaseHistoryMismatch {
                         extension: checkpoint.descriptor.name.clone(),
                         expected: *base_history_digest,
                         actual: base.journal.digest,
-                    });
+                    }));
                 }
                 let actual_state_digest = base.content_digest();
                 if actual_state_digest != *base_state_digest {
-                    return Err(CheckpointError::BaseDigestMismatch {
+                    return Ok(Err(CheckpointError::BaseDigestMismatch {
                         extension: checkpoint.descriptor.name.clone(),
                         expected: *base_state_digest,
                         actual: actual_state_digest,
-                    });
+                    }));
                 }
 
                 // Everything above is a REJECTION ACCELERATOR. Length and both digests
@@ -1471,31 +1670,43 @@ impl ExtensionState {
                 //     retained handle, which is what lets an independently rebuilt or
                 //     sibling base with identical content SUCCEED rather than being
                 //     refused for having a different allocation lineage.
-                if !base.journal.is_same_structure(&retained_base.journal)
-                    && let Some(divergence) = first_entry_divergence(retained_base, base)
-                {
-                    return Err(CheckpointError::BaseNotExact {
-                        extension: checkpoint.descriptor.name.clone(),
-                        base_len: *base_len,
-                        first_divergence: divergence,
-                    });
+                //
+                // The comparison is CHARGED, and this is the one place in this function
+                // that can produce a non-answer. A stop is not a divergence: reporting
+                // "diverged" for a comparison that never finished would manufacture a
+                // verdict out of running out of room, which is the defect this whole
+                // bead is about.
+                if !base.journal.is_same_structure(&retained_base.journal) {
+                    match bounded_entry_divergence(retained_base, base, proof) {
+                        Ok(Some(divergence)) => {
+                            return Ok(Err(CheckpointError::BaseNotExact {
+                                extension: checkpoint.descriptor.name.clone(),
+                                base_len: *base_len,
+                                first_divergence: divergence,
+                            }));
+                        }
+                        Ok(None) => {}
+                        Err((dimension, allowed, observed)) => {
+                            return Err(proof_stop(dimension, allowed, observed));
+                        }
+                    }
                 }
                 let mut restored = base.clone();
                 for record in journal.records() {
                     restored = restored.push_entry(Arc::clone(&record.entry.payload));
                 }
-                Ok(restored)
+                Ok(Ok(restored))
             }
             CheckpointPayload::FullJournal { journal } => {
                 if base.is_some() {
-                    return Err(CheckpointError::UnexpectedBase {
+                    return Ok(Err(CheckpointError::UnexpectedBase {
                         extension: checkpoint.descriptor.name.clone(),
-                    });
+                    }));
                 }
-                Ok(ExtensionState {
+                Ok(Ok(ExtensionState {
                     descriptor: checkpoint.descriptor.clone(),
                     journal: journal.clone(),
-                })
+                }))
             }
         }
     }
@@ -4752,8 +4963,13 @@ mod tests {
             (1, CheckpointProofCheckpoint::BeforePublication),
         ] {
             let probe = TripAt::new(sample);
-            let cancelled =
-                ExtensionState::try_restore(Some(&base), &checkpoint, TEST_LIMITS, Some(&probe));
+            let cancelled = ExtensionState::try_restore(
+                Some(&base),
+                &checkpoint,
+                TEST_LIMITS,
+                ProofBudget::UNBOUNDED,
+                Some(&probe),
+            );
             let Outcome::Inconclusive(inconclusive) = &cancelled else {
                 unreachable!("a tripped probe must stop restore, got {cancelled:?}")
             };
@@ -4779,8 +4995,12 @@ mod tests {
 
         // Capture side, same contract.
         let capture_probe = TripAt::new(0);
-        let cancelled_capture =
-            target.try_checkpoint(Some(&base), TEST_LIMITS, Some(&capture_probe));
+        let cancelled_capture = target.try_checkpoint(
+            Some(&base),
+            TEST_LIMITS,
+            ProofBudget::UNBOUNDED,
+            Some(&capture_probe),
+        );
         assert_eq!(
             cancelled_capture.authority(),
             Authority::NonAuthoritative,
@@ -4789,11 +5009,16 @@ mod tests {
 
         // An untripped probe must not change the answer, on either side.
         let quiet = TripAt::new(u32::MAX);
-        let restored =
-            ExtensionState::try_restore(Some(&base), &checkpoint, TEST_LIMITS, Some(&quiet))
-                .into_complete()
-                .expect("an untripped probe restores")
-                .expect("and the restore itself succeeds");
+        let restored = ExtensionState::try_restore(
+            Some(&base),
+            &checkpoint,
+            TEST_LIMITS,
+            ProofBudget::UNBOUNDED,
+            Some(&quiet),
+        )
+        .into_complete()
+        .expect("an untripped probe restores")
+        .expect("and the restore itself succeeds");
         assert_eq!(
             restored.content_digest(),
             ExtensionState::restore(Some(&base), &checkpoint, TEST_LIMITS)
@@ -4803,7 +5028,12 @@ mod tests {
         let quiet_capture = TripAt::new(u32::MAX);
         assert_eq!(
             target
-                .try_checkpoint(Some(&base), TEST_LIMITS, Some(&quiet_capture))
+                .try_checkpoint(
+                    Some(&base),
+                    TEST_LIMITS,
+                    ProofBudget::UNBOUNDED,
+                    Some(&quiet_capture)
+                )
                 .into_complete()
                 .expect("an untripped probe captures")
                 .expect("and the capture itself succeeds"),
@@ -4813,7 +5043,13 @@ mod tests {
         // A completed refusal stays a refusal: widening the type must not have turned a
         // verdict into a non-answer.
         let wrong = state_with_checkpoint(2, CheckpointSemantics::JournalSuffix);
-        let refused = ExtensionState::try_restore(Some(&wrong), &checkpoint, TEST_LIMITS, None);
+        let refused = ExtensionState::try_restore(
+            Some(&wrong),
+            &checkpoint,
+            TEST_LIMITS,
+            ProofBudget::UNBOUNDED,
+            None,
+        );
         assert_eq!(
             refused.authority(),
             Authority::Authoritative,
@@ -4822,6 +5058,143 @@ mod tests {
         assert!(
             refused.into_complete().expect("completed").is_err(),
             "and that determination is a refusal"
+        );
+    }
+
+    /// The proof budget binds, and a stop is a non-answer — never a divergence.
+    ///
+    /// This is the payoff of widening the type first. The comparison can now run out,
+    /// and when it does the outcome says "no verdict was reached", not "these histories
+    /// differ". Manufacturing a divergence out of running short of room would be a
+    /// refusal invented from a resource limit, which is this bead's defect in its purest
+    /// form.
+    #[test]
+    fn the_proof_budget_binds_and_a_stop_is_not_a_divergence() {
+        let captured_base = state_with_checkpoint(6, CheckpointSemantics::JournalSuffix);
+        let target = captured_base.push_entry(bytes(b"suffix"));
+        let checkpoint = target
+            .checkpoint(Some(&captured_base), TEST_LIMITS)
+            .expect("checkpoint captures");
+        // An independently rebuilt base, so the O(1) structural proof cannot apply and
+        // the comparison is genuinely reached.
+        let rebuilt = state_with_checkpoint(6, CheckpointSemantics::JournalSuffix);
+        assert!(!rebuilt.journal.is_same_structure(&captured_base.journal));
+
+        // Exactly enough entries admits.
+        let exact = ProofBudget::new(6, u128::MAX);
+        assert!(
+            ExtensionState::try_restore(Some(&rebuilt), &checkpoint, TEST_LIMITS, exact, None)
+                .into_complete()
+                .expect("an exact budget must not stop")
+                .is_ok(),
+            "an exact budget must admit"
+        );
+
+        // One short stops, and the stop is INCONCLUSIVE rather than a BaseNotExact.
+        let one_short = ProofBudget::new(5, u128::MAX);
+        let stopped =
+            ExtensionState::try_restore(Some(&rebuilt), &checkpoint, TEST_LIMITS, one_short, None);
+        let Outcome::Inconclusive(inconclusive) = &stopped else {
+            unreachable!("one entry short must stop, got {stopped:?}")
+        };
+        let InconclusiveCause::ResourceExhausted { usage } = &inconclusive.cause else {
+            unreachable!("a budget stop must be ResourceExhausted")
+        };
+        assert_eq!(usage.allowed, 5);
+        assert!(
+            usage.observed > usage.allowed,
+            "a stop must report spending past its allowance"
+        );
+        assert!(usage.is_genuine_exhaustion());
+        assert_eq!(
+            inconclusive
+                .progress
+                .as_ref()
+                .map(|progress| progress.text()),
+            Some(ProofDimension::ComparedEntries.as_str())
+        );
+        assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            stopped.cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
+        );
+
+        // The payload-byte dimension binds independently of the entry count.
+        let byte_bound = ProofBudget::new(usize::MAX, 4);
+        let byte_stopped =
+            ExtensionState::try_restore(Some(&rebuilt), &checkpoint, TEST_LIMITS, byte_bound, None);
+        let (_, byte_progress) = match &byte_stopped {
+            Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+                InconclusiveCause::ResourceExhausted { usage } => (
+                    usage,
+                    inconclusive
+                        .progress
+                        .as_ref()
+                        .map(|progress| progress.text()),
+                ),
+                _ => unreachable!("a budget stop must be ResourceExhausted"),
+            },
+            _ => unreachable!("a tight byte budget must stop, got {byte_stopped:?}"),
+        };
+        assert_eq!(
+            byte_progress,
+            Some(ProofDimension::ComparedPayloadBytes.as_str())
+        );
+
+        // AN ADEQUATE-BUDGET RETRY SUCCEEDS AND IS IDENTICAL. A stop must be recoverable,
+        // or it is a rejection by another name.
+        let retried =
+            ExtensionState::try_restore(Some(&rebuilt), &checkpoint, TEST_LIMITS, exact, None)
+                .into_complete()
+                .expect("the retry completes")
+                .expect("and restores");
+        assert_eq!(
+            retried.content_digest(),
+            ExtensionState::restore(Some(&captured_base), &checkpoint, TEST_LIMITS)
+                .expect("the fixture path agrees")
+                .content_digest(),
+            "an adequate-budget retry must reproduce the unlimited result exactly"
+        );
+
+        // A stop must never be reported as a divergence, at either depth. Under a
+        // budget that binds, the bounded comparison returns Err rather than Ok(Some).
+        assert!(
+            matches!(
+                bounded_entry_divergence(&captured_base, &rebuilt, one_short),
+                Err((ProofDimension::ComparedEntries, 5, _))
+            ),
+            "a bound comparison must report a stop, not a divergence"
+        );
+        // And where it does finish, it agrees with the unbounded helper.
+        assert_eq!(
+            bounded_entry_divergence(&captured_base, &rebuilt, exact),
+            Ok(None)
+        );
+        assert_eq!(first_entry_divergence(&captured_base, &rebuilt), None);
+
+        // Capture side, same contract.
+        let capture_stop = target.try_checkpoint(Some(&rebuilt), TEST_LIMITS, one_short, None);
+        assert_eq!(
+            capture_stop.authority(),
+            Authority::NonAuthoritative,
+            "a bound capture proof reached no verdict either"
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-proof-budget\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"scenario\":\"bounded-exact-comparison\",\
+             \"compared_entries_exact\":\"admits\",\
+             \"compared_entries_one_short\":\"inconclusive_resource_exhausted\",\
+             \"compared_payload_bytes_tight\":\"inconclusive_resource_exhausted\",\
+             \"stop_reported_as_divergence\":false,\
+             \"adequate_budget_retry\":\"identical_to_unlimited\",\
+             \"authority_on_stop\":\"non_authoritative\",\
+             \"cacheable_on_stop\":false,\
+             \"charge_order\":\"before_each_compared_entry\",\"status\":\"pass\"}}"
         );
     }
 
@@ -5346,7 +5719,8 @@ mod tests {
                 target = target.push_entry(bytes(&(10_000u64 + index as u64).to_le_bytes()));
             }
             let (checkpoint, work) = target
-                .checkpoint_with_work(Some(&suffix_base), TEST_LIMITS)
+                .checkpoint_with_work(Some(&suffix_base), TEST_LIMITS, ProofBudget::UNBOUNDED)
+                .expect("an unbounded proof budget cannot bind")
                 .expect("suffix capture succeeds");
             assert_eq!(checkpoint.captured_entries(), suffix_len);
             assert_eq!(checkpoint.entries().count(), suffix_len);
@@ -5361,7 +5735,8 @@ mod tests {
 
         let full = state_with_checkpoint(4_096, CheckpointSemantics::FullJournal);
         let (checkpoint, work) = full
-            .checkpoint_with_work(None, TEST_LIMITS)
+            .checkpoint_with_work(None, TEST_LIMITS, ProofBudget::UNBOUNDED)
+            .expect("an unbounded proof budget cannot bind")
             .expect("full capture succeeds");
         assert_eq!(work.prefix_lookup_steps, 0);
         assert_eq!(work.captured_entries, full.len());
@@ -5483,15 +5858,26 @@ mod tests {
         );
 
         let suffix_started = Instant::now();
-        let checkpoint =
-            completed(target.checkpoint_extension(&extension_name, Some(&base), limits, None))
-                .expect("capture through the real environment registry");
+        let checkpoint = completed(target.checkpoint_extension(
+            &extension_name,
+            Some(&base),
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("capture through the real environment registry");
         let (instrumented_checkpoint, suffix_work) = target_state
-            .checkpoint_with_work(Some(base_state), limits)
+            .checkpoint_with_work(Some(base_state), limits, ProofBudget::UNBOUNDED)
+            .expect("an unbounded proof budget cannot bind")
             .expect("measure the same real suffix capture");
         assert_eq!(checkpoint, instrumented_checkpoint);
-        let restored = completed(base.apply_extension_checkpoint(&checkpoint, limits, None))
-            .expect("apply through the real environment registry");
+        let restored = completed(base.apply_extension_checkpoint(
+            &checkpoint,
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("apply through the real environment registry");
         assert_eq!(restored, target);
         let checkpoint_id = checkpoint_evidence_id(&checkpoint);
         let restored_state = restored
@@ -5535,15 +5921,26 @@ mod tests {
                 .push_extension_entry(&full_name, index.to_le_bytes().as_slice())
                 .expect("append full-journal entry");
         }
-        let full_checkpoint =
-            completed(full_target.checkpoint_extension(&full_name, None, limits, None))
-                .expect("capture real full journal");
+        let full_checkpoint = completed(full_target.checkpoint_extension(
+            &full_name,
+            None,
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("capture real full journal");
         let (_, full_work) = full_target
             .extension(&full_name)
             .expect("full target extension exists")
-            .checkpoint_with_work(None, limits)
+            .checkpoint_with_work(None, limits, ProofBudget::UNBOUNDED)
+            .expect("an unbounded proof budget cannot bind")
             .expect("measure the same real full capture");
-        let full_restored = full_base.apply_extension_checkpoint(&full_checkpoint, limits, None);
+        let full_restored = full_base.apply_extension_checkpoint(
+            &full_checkpoint,
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        );
         let full_restored = completed(full_restored).expect("apply real full journal");
         assert_eq!(full_restored, full_target);
         println!(
@@ -5584,8 +5981,13 @@ mod tests {
                 .expect("append divergent base entry");
         }
         let divergent_root_before = divergent.logical_root(&KVMap::new());
-        let refusal = completed(divergent.apply_extension_checkpoint(&checkpoint, limits, None))
-            .expect_err("divergent base must receive a typed refusal");
+        let refusal = completed(divergent.apply_extension_checkpoint(
+            &checkpoint,
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect_err("divergent base must receive a typed refusal");
         assert!(matches!(
             refusal,
             crate::environment::EnvError::Checkpoint(CheckpointError::BaseHistoryMismatch { .. })
@@ -5596,8 +5998,13 @@ mod tests {
             divergent_root_before,
             "failed apply is atomic"
         );
-        let recovered = completed(base.apply_extension_checkpoint(&checkpoint, limits, None))
-            .expect("clean recovery after typed refusal");
+        let recovered = completed(base.apply_extension_checkpoint(
+            &checkpoint,
+            limits,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("clean recovery after typed refusal");
         assert_eq!(recovered, target);
         println!(
             "{{\"schema\":\"fln.e2e.environment-state\",\"version\":1,\"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.7\"],\"scenario\":\"checkpoint-negative-recovery\",\"mode\":\"journal_suffix\",\"status\":\"pass\",\"base_id\":\"{}\",\"checkpoint_id\":\"{checkpoint_id}\",\"restored_id\":\"{}\",\"base_root_before\":\"{divergent_root_before}\",\"base_root_after\":\"{}\",\"expected_root\":\"{}\",\"actual_root\":\"{}\",\"base_entries\":{},\"checkpoint_entries\":{},\"restored_entries\":{},\"entry_limit\":{},\"payload_byte_limit\":{},\"expected_outcome\":\"base_history_mismatch\",\"actual_outcome\":\"{actual_outcome}\",\"recovery_outcome\":\"restored\",\"elapsed_us\":{},\"final_state\":\"clean_recovery\"}}",
