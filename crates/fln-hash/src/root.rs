@@ -85,23 +85,45 @@ impl LogicalRootBuilder {
     /// canonical bytes and the options-bearing root, on the ground that upstream `KVMap`
     /// is an ordered association list and therefore an ordering IS part of the value.
     ///
-    /// **Know what that costs you**, because it is not obvious and the module doc used to
-    /// claim the opposite. With the unique keys `KVMap` guarantees, insertion order is
-    /// unobservable through lookup: two differently-ordered maps carrying the same pairs
-    /// agree on every `find`, `contains`, and `get_*`. Two hosts that set the same
-    /// options in a different order therefore produce *different* logical roots while
-    /// behaving identically — a spurious cache miss, and two identities for what a reader
-    /// would call one environment. A caller that wants set identity must canonicalize
-    /// first; [`kvmap_canonical_set_bytes`](crate::canon::kvmap_canonical_set_bytes) is
-    /// that projection, and it is a separate schema precisely so the choice is explicit
-    /// at the call site rather than smuggled into this digest.
+    /// **Know what it costs**, because the module doc used to claim the opposite. Order is
+    /// unobservable through *our* lookups: with the unique keys `KVMap` guarantees, two
+    /// differently-ordered maps carrying the same pairs agree on every `find`, `contains`,
+    /// and `get_*`. So two hosts that set the same options in a different order get
+    /// different roots while behaving identically here — a spurious cache miss. A caller
+    /// that wants set identity canonicalizes first;
+    /// [`kvmap_canonical_set_bytes`](crate::canon::kvmap_canonical_set_bytes) is that
+    /// projection, under its own schema so the choice is explicit at the call site rather
+    /// than smuggled into this digest.
     ///
-    /// Whether requirement (d)'s "two hosts producing the same trusted environment share
-    /// a logical root" is satisfied by this reading is a live question recorded on bead
-    /// franken_lean-rps: it turns on whether option order is part of the environment.
-    /// Both directions are pinned meanwhile, so neither answer can drift in silently —
-    /// see `options_are_identified_as_an_ordered_list_not_a_set` and
-    /// `option_identity_does_not_collapse_distinct_option_sets`.
+    /// **This is settled, not pending** (decided 2026-07-25 on bead franken_lean-rps).
+    /// Requirement (d)'s "two hosts producing the same trusted environment share a logical
+    /// root" is read with option order *inside* the environment, on two grounds:
+    ///
+    /// * **The Reference distinguishes them, so they are not one environment.** `Options`
+    ///   is a `KVMap` — an ordered association list — so order is observable upstream.
+    ///   Under the Oracle-Only Law our encoding mirrors what the pin actually
+    ///   distinguishes; we do not get to decide the semantics are cleaner than they are,
+    ///   and faithful mode requires bug-for-bug observational parity. "We normalized away
+    ///   a distinction upstream preserves" is revert-class drift. Note the phrasing above
+    ///   carefully: the cost is a redundant distinction *by our lookups*, not two
+    ///   identities for one environment.
+    /// * **False identity is the strictly more dangerous error.** A redundant distinction
+    ///   costs a cache miss. A collision means a cached or replayed result can be
+    ///   attributed to the wrong closure, silently, with nothing detecting it — and this
+    ///   digest is what the Ledger, receipts, and the transparency log key on. That is the
+    ///   defect class of bead franken_lean-f6br, where `witness_digest` bound a lossy
+    ///   display projection of `Name` and distinct finding sets shared a witness. Not to
+    ///   be reintroduced one layer up.
+    ///
+    /// So the behaviour above is correct and **is not a bug to fix**. Changing it fails
+    /// `options_are_identified_as_an_ordered_list_not_a_set` here and the Tribunal's
+    /// exclusive MR in fln-conformance; `option_identity_does_not_collapse_distinct_option_sets`
+    /// pins the other direction, so it cannot quietly become a digest that varies with
+    /// everything either.
+    ///
+    /// **What would reopen it:** Tribunal evidence that the Reference cannot observe
+    /// option order or duplicate keys in any surface we mirror. Absent that evidence the
+    /// fork is closed — reopen it on the bead, not here.
     pub fn set_options(&mut self, options: &KVMap) -> &mut LogicalRootBuilder {
         self.options = Some(hash(Domain::OptionsSet, &options.to_canonical_bytes()));
         self
