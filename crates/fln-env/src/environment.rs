@@ -769,75 +769,66 @@ impl std::fmt::Display for EnvError {
     }
 }
 
-/// The typed outcome of a resource-bounded declaration admission (bead `fln-amv.13`).
+/// What a resource-bounded declaration admission **decided** (bead `fln-amv.13`).
 ///
-/// Three-way by construction, so FL-INV-07's law is a type error to violate rather
-/// than a convention to remember: a caller cannot read exhaustion as acceptance or as
-/// rejection, because there is no `Result` whose `Err` means both. The distinction is
-/// load-bearing — a rejection says *this declaration is not admissible*, while an
-/// inconclusive says *we did not find out*, and only the first may ever be cached,
-/// counted, or reported as a verdict.
-/// # Migrated onto the shared taxonomy
-/// (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`)
+/// # Both arms are answers
+/// (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`, per decision `fln-um4a`)
 ///
-/// The `Inconclusive` arm used to carry a bespoke `CollisionExhausted`, which was a
-/// `std::error::Error` — so a non-answer could be `?`-propagated into an ordinary error
-/// path and reported as a failure. It now carries the shared [`Inconclusive`], the same
-/// value every other bounded path in this crate reports, so folding several bounded
-/// operations no longer needs a special case for this one. Special cases are where an
-/// inconclusive gets read as a rejection.
+/// This used to be a four-arm enum with `Inconclusive` and `InternalFault` sitting
+/// beside `Rejected`. That shape was the FL-INV-07 hazard spelled out: the arms *looked*
+/// symmetric and were not — a rejection says *this declaration is not admissible*, an
+/// inconclusive says *we did not find out* — and a caller folding several bounded
+/// operations had to remember which was which. Now the non-answers are
+/// [`Outcome`]'s own arms, carrying no domain payload, and this type holds only what the
+/// environment actually concluded. A caller that wants the verdict must go through
+/// [`Outcome::as_complete`] or [`Outcome::into_complete`], so "we did not know" cannot be
+/// spelled as a verdict at all.
+///
+/// This is the same fold [`ClosureVerdict`](crate::effective_imports::ClosureVerdict),
+/// [`DeclarationPlan`] and [`DeclarationCommitted`] already use, deliberately rather than
+/// coincidentally: one shape in the crate, so a reader who has understood one has
+/// understood all of them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeclAdmission {
     /// The declaration entered the returned environment.
     Admitted(Environment),
     /// A complete, resource-independent determination that the declaration is not
-    /// admissible — today, the kernel's one-name-one-constant law.
+    /// admissible — today, the kernel's one-name-one-constant law. A completed
+    /// determination, not a non-answer: the bounded lookup finished and the answer is no.
     Rejected(EnvError),
-    /// The adversarial-collision budget bound before any mutation. Not accepted, not
-    /// rejected, not checked, not cacheable; the receiving environment is unchanged.
-    /// A hash collision alone never produces this — only a collision large or heavy
-    /// enough to exceed the reviewed envelope does.
-    Inconclusive(Inconclusive),
-    /// A broken internal invariant. Not a verdict about the declaration and not a
-    /// resource stop — a fourth arm rather than a reuse of either, because reusing one
-    /// would make a fault indistinguishable from the thing it was folded into.
-    InternalFault(InternalFault),
 }
 
 impl DeclAdmission {
-    /// Stable evidence label, matching the vocabulary
-    /// [`DeclClosureStatus`](crate::decl_closure::DeclClosureStatus) already uses.
-    pub fn outcome_label(&self) -> &'static str {
-        match self {
-            DeclAdmission::Admitted(_) => "admitted",
-            DeclAdmission::Rejected(_) => "rejected",
-            DeclAdmission::Inconclusive(_) => "inconclusive-collision-budget",
-            DeclAdmission::InternalFault(_) => "internal-fault",
+    /// Stable evidence label for a whole budgeted-admission outcome, sharing the
+    /// vocabulary [`DeclClosureStatus`](crate::decl_closure::DeclClosureStatus) and
+    /// [`ModuleGraphOutcome`](crate::modules::ModuleGraphOutcome) use.
+    ///
+    /// It takes the [`Outcome`] rather than `&self` because two of the four states it
+    /// names are not verdicts about the declaration at all — which is precisely the fact
+    /// the fold made structural. The signature is the documentation.
+    pub fn outcome_label(outcome: &Outcome<DeclAdmission>) -> &'static str {
+        match outcome {
+            Outcome::Complete(DeclAdmission::Admitted(_)) => "admitted",
+            Outcome::Complete(DeclAdmission::Rejected(_)) => "rejected",
+            // The bounded insert's only inconclusive source is the collision envelope.
+            Outcome::Inconclusive(_) => "inconclusive-collision-budget",
+            Outcome::InternalFault(_) => "internal-fault",
         }
     }
 
-    /// Only an admitted declaration may feed a cache. Inconclusive outcomes are not
-    /// publication-grade, and re-admitting one later must redo the work rather than
-    /// replay a stored refusal.
-    pub fn is_cacheable(&self) -> bool {
-        matches!(self, DeclAdmission::Admitted(_))
-    }
-
-    /// The environment to carry forward, if any. `None` for both non-admitted arms —
-    /// the caller keeps the environment it already held, unchanged.
-    pub fn environment(&self) -> Option<&Environment> {
+    /// The environment to carry forward, if any. `None` for a rejection — the caller
+    /// keeps the environment it already held, unchanged.
+    ///
+    /// Note what this no longer answers: whether the result may be *cached*. That is
+    /// [`Outcome::cache_admission`]'s question and it is about authority, which the
+    /// non-answer arms lack and a rejection has. Merging the two into one `is_cacheable`
+    /// was how "there is no environment here" and "nothing may be concluded here" came to
+    /// share a bit; they are different claims and now have different accessors.
+    pub const fn environment(&self) -> Option<&Environment> {
         match self {
             DeclAdmission::Admitted(environment) => Some(environment),
-            DeclAdmission::Rejected(_)
-            | DeclAdmission::Inconclusive(_)
-            | DeclAdmission::InternalFault(_) => None,
+            DeclAdmission::Rejected(_) => None,
         }
-    }
-
-    /// Whether this outcome is in the inconclusive family. Kept explicit so evidence
-    /// rows never have to pattern-match a shape that may gain arms later.
-    pub fn is_inconclusive(&self) -> bool {
-        matches!(self, DeclAdmission::Inconclusive(_))
     }
 }
 
@@ -918,9 +909,9 @@ impl Environment {
     /// Exhaustion is atomic and **inconclusive**, never a rejection: `self` is
     /// unchanged, nothing is published, and the caller learns that no verdict was
     /// reached about this declaration (FL-INV-07). Refusing the *insertion* is not
-    /// the same as refusing the *declaration*, and the three-way
-    /// [`DeclAdmission`] makes conflating them a type error rather than a
-    /// convention.
+    /// the same as refusing the *declaration*, and returning
+    /// [`Outcome<DeclAdmission>`](Outcome) makes conflating them a type error rather than
+    /// a convention: the verdict is reachable only through the authoritative arm.
     ///
     /// `expanded_weight` is supplied by the caller because a generic map cannot
     /// infer the semantic weight of an opaque declaration; the decoder or
@@ -934,39 +925,37 @@ impl Environment {
     /// declaration's weight and this method charges what it was told, so a caller that
     /// understates it buys unbounded insertion work with a small integer. It also
     /// reports no identity work — nothing about canonical bytes, expression nodes, rows,
-    /// or depth — and its refusal is a `CollisionExhausted` error rather than a typed
-    /// [`Outcome::Inconclusive`], so it composes with `?` into ordinary error paths
-    /// where a non-answer can be read as a failure.
+    /// or depth.
     ///
-    /// [`Environment::plan_add_decl`] measures the weight instead of trusting it and
-    /// folds the refusal through the shared authority vocabulary.
-    /// `franken_lean-pmap-refusal-outcome-taxonomy-i1z9` owns migrating this signature.
+    /// [`Environment::plan_add_decl`] measures the weight instead of trusting it. The
+    /// refusal shape is no longer a difference between the two: both report through
+    /// [`Outcome`] as of `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`.
     pub fn try_add_decl_with_budget(
         &self,
         info: ConstantInfo,
         expanded_weight: u64,
         budget: CollisionBudget,
-    ) -> DeclAdmission {
+    ) -> Outcome<DeclAdmission> {
         let name = info.name().clone();
         if self.constants.contains_key(&name) {
-            return DeclAdmission::Rejected(EnvError::DuplicateDeclaration { name });
+            // A completed determination, so it travels inside the authoritative arm.
+            return Outcome::complete(DeclAdmission::Rejected(EnvError::DuplicateDeclaration {
+                name,
+            }));
         }
-        match self
-            .constants
+        // A pure fold now: the bounded insert already speaks this vocabulary, so the
+        // inconclusive and fault arms pass through untouched rather than being translated
+        // into local ones. There is no arm here that could launder a fault into "this
+        // declaration is inadmissible" or report it as a budget stop, because there is no
+        // longer anywhere local for either to go.
+        self.constants
             .try_insert_with_budget(name, Arc::new(info), expanded_weight, budget)
-        {
-            Outcome::Complete(constants) => DeclAdmission::Admitted(Environment {
-                constants,
-                extensions: self.extensions.clone(),
-            }),
-            Outcome::Inconclusive(stop) => DeclAdmission::Inconclusive(stop),
-            // A fault is neither a verdict nor an exhaustion, so it gets its own arm. The
-            // bounded insert has no fault path today and this is unreachable — but mapping
-            // it onto `Rejected` would launder a broken invariant into "this declaration is
-            // inadmissible", and onto `Inconclusive` would report it as a budget stop.
-            // Both are the conflation this bead exists to remove.
-            Outcome::InternalFault(fault) => DeclAdmission::InternalFault(fault),
-        }
+            .map_complete(|constants| {
+                DeclAdmission::Admitted(Environment {
+                    constants,
+                    extensions: self.extensions.clone(),
+                })
+            })
     }
 
     /// Preflight one declaration's identity and admission as a single decision
@@ -3812,18 +3801,30 @@ mod tests {
         let outcome = base.try_add_decl_with_budget(axiom("Fresh"), 1, zero);
 
         assert!(
-            outcome.is_inconclusive(),
+            matches!(outcome, Outcome::Inconclusive(_)),
             "expected inconclusive: {outcome:?}"
         );
-        assert_eq!(outcome.outcome_label(), "inconclusive-collision-budget");
+        assert_eq!(
+            DeclAdmission::outcome_label(&outcome),
+            "inconclusive-collision-budget"
+        );
         // FL-INV-07: never acceptance, never rejection, never cacheable.
-        assert!(!outcome.is_cacheable());
-        assert_eq!(outcome.environment(), None);
+        assert_eq!(
+            outcome.cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
+        );
+        assert_eq!(outcome.as_complete(), None);
+        // Since the fold, "not a rejection" is not something a stop has to be CHECKED for
+        // — a `DeclAdmission` is only reachable through `Outcome::Complete`, so an
+        // inconclusive cannot name one. The assertion is kept because it is the bead's
+        // whole claim, and it now reads as the tautology it should be.
         assert!(
-            !matches!(outcome, DeclAdmission::Rejected(_)),
+            !matches!(outcome, Outcome::Complete(DeclAdmission::Rejected(_))),
             "resource exhaustion must never be reported as a rejection"
         );
-        let DeclAdmission::Inconclusive(exhausted) = &outcome else {
+        let Outcome::Inconclusive(exhausted) = &outcome else {
             unreachable!("asserted inconclusive above")
         };
         // The refusal's finer facts moved from typed fields onto the shared outcome when
@@ -3850,10 +3851,11 @@ mod tests {
         // Recovery proves the refusal was about the envelope, not the declaration:
         // the very same declaration admits once the budget allows it.
         let admitted = base.try_add_decl_with_budget(axiom("Fresh"), 1, CollisionBudget::UNBOUNDED);
-        assert_eq!(admitted.outcome_label(), "admitted");
-        assert!(admitted.is_cacheable());
+        assert_eq!(DeclAdmission::outcome_label(&admitted), "admitted");
+        assert_eq!(admitted.cache_admission(), CacheAdmission::Admissible);
         let grown = admitted
-            .environment()
+            .as_complete()
+            .and_then(DeclAdmission::environment)
             .expect("an admitted outcome carries the environment");
         assert!(grown.contains(&n("Fresh")));
         assert_ne!(grown.logical_root(&KVMap::new()), before_root);
@@ -3864,13 +3866,25 @@ mod tests {
         // one-name-one-constant law, in either direction.
         for budget in [CollisionBudget::UNBOUNDED, zero] {
             let duplicate = base.try_add_decl_with_budget(axiom("Held"), 1, budget);
-            assert_eq!(duplicate.outcome_label(), "rejected");
-            assert!(!duplicate.is_inconclusive());
-            assert!(!duplicate.is_cacheable());
-            assert_eq!(duplicate.environment(), None);
+            assert_eq!(DeclAdmission::outcome_label(&duplicate), "rejected");
+            assert!(!matches!(duplicate, Outcome::Inconclusive(_)));
+            // A DELIBERATE MEANING CHANGE, recorded here rather than discovered later. The
+            // retired `is_cacheable` answered `false` here; `cache_admission` answers
+            // `Admissible`, and that is correct — a duplicate-name rejection is an ANSWER,
+            // a deterministic function of this environment, so it is authoritative and a
+            // ledger may store it. What it is not is an ADMISSION, and that question is
+            // `environment()`'s, one line down. The old single bit merged the two, which is
+            // exactly the merge this bead removed one level up.
+            assert_eq!(duplicate.cache_admission(), CacheAdmission::Admissible);
+            assert_eq!(
+                duplicate.as_complete().and_then(DeclAdmission::environment),
+                None
+            );
             assert!(matches!(
                 duplicate,
-                DeclAdmission::Rejected(EnvError::DuplicateDeclaration { .. })
+                Outcome::Complete(DeclAdmission::Rejected(
+                    EnvError::DuplicateDeclaration { .. }
+                ))
             ));
         }
 
