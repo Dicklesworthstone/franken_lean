@@ -31,6 +31,32 @@
 //! configurations over the *same* inputs, so the test has to run both and compare. And the
 //! corpus needs passing inputs as well as failing ones, because a recovery implementation
 //! that rejected everything would satisfy a failing-inputs-only corpus vacuously.
+//!
+//! ## Why this still steps one byte between trivia runs
+//!
+//! [`crate::token::lex_token`] now exists, so the obvious next move is to call it here
+//! instead of stepping a byte. That would be wrong, and the reason is a fact about Lean
+//! rather than a gap in this crate: **Lean's lexing is parser-driven in places, so there is
+//! no total "next token" function to loop.** `Lean/Parser/Term.lean:91`:
+//!
+//! ```text
+//! def docComment := leading_parser
+//!   ppDedent $ "/--" >> ppSpace >> ... commentBody ... >> ppLine
+//! ```
+//!
+//! `/--` is an ordinary table token, but the comment *body* is consumed by `commentBody`, a
+//! dedicated parser the token table knows nothing about. String interpolation is the same
+//! shape. So a `while let Ok(tok) = lex_token(..)` loop would refuse the body of every doc
+//! comment in the language, and wiring it in here would trade a stated limitation for a
+//! wrong answer that the acceptance differential would then dutifully certify — both
+//! configurations would reject the same files, and the law would pass while the tokenizer
+//! was broken. A law can only protect the property it states.
+//!
+//! The obligation therefore moves rather than closes: whatever drives token consumption —
+//! the category parser, bead `fln-ffam` — must re-run this differential over itself
+//! unchanged. The law is about acceptance, so it does not weaken when the thing between
+//! boundaries gets smarter; if it starts failing there, that layer has taken acceptance
+//! authority it is not allowed to have.
 
 use crate::source::{BytePos, ByteSpan, SourceText};
 use crate::trivia::{TriviaError, scan_trivia};
@@ -76,8 +102,7 @@ pub fn lex(text: &SourceText) -> Lexed {
             Ok(end) => {
                 boundaries.push(end);
                 // Past the trivia is a non-trivia byte; step over it so the scan advances.
-                // A real tokenizer consumes a token here — slice B — and until it exists
-                // one byte is the honest minimum rather than a pretend token.
+                // See the module docs on why this is still one byte and not a token.
                 at = BytePos(next_boundary(text, end));
             }
             Err(error) => {
