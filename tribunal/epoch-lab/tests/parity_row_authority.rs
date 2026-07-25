@@ -669,3 +669,89 @@ fn a_row_naming_a_fixture_that_does_not_exist_is_refused() {
     });
     assert!(found, "a nonexistent fixture was accepted: {blocks:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Dogfooding: can this schema carry the corpus result it was built for?
+// (bead franken_lean-9pnc meets franken_lean-d17i / kxbj / fln-7odd)
+// ---------------------------------------------------------------------------
+
+/// The four things the corpus run actually produced, attempted as rows.
+///
+/// This is the honest test of the schema: not whether it accepts a
+/// well-formed row, but whether the project's strongest real result can be
+/// expressed in it without bending anything. Three of the four cannot be, and
+/// the tests below record exactly how — a schema defect stated is worth more
+/// than a result rounded off to fit.
+#[test]
+fn an_agreeing_symbol_is_expressible() {
+    // The 15,722 compared declarations that agreed. This is the case the
+    // schema was designed around and it works.
+    let l = parsed(HEAD, &[Row::valid("Nat.succ_le_of_lt")]);
+    assert!(verify(&l, &["Nat.succ_le_of_lt"], HEAD).is_empty());
+}
+
+#[test]
+fn a_restrictive_divergence_is_not_expressible() {
+    // DEFECT 1. A restrictive divergence — we reject, the Reference accepts —
+    // is the single most load-bearing row type a Parity Ledger can carry, and
+    // this schema refuses it. The two roots necessarily differ, so under
+    // byte-identical the row is blocked as a root mismatch, and there is no
+    // comparison class that means "compared, and they disagreed".
+    let mut r = Row::valid("Lean.Arrow");
+    r.oracle_root = ROOT_B.to_string(); // ours != theirs: that IS the finding
+    let blocks = verify(&parsed(HEAD, &[r]), &["Lean.Arrow"], HEAD);
+    assert!(
+        reasons(&blocks).contains(&"root-mismatch"),
+        "expected the schema to refuse a divergence row: {blocks:?}"
+    );
+    // The refusal is correct FOR AN AGREEMENT LEDGER and wrong for a parity
+    // ledger: D7 says the ledger is row-per-symbol, and a symbol we diverge on
+    // is exactly the row a reader most needs. The 5 unclassified divergences of
+    // franken_lean-d17i therefore have NO representation here.
+}
+
+#[test]
+fn an_oracle_silent_symbol_is_not_expressible() {
+    // DEFECT 2. fln-7odd's 1,425 declarations are ones leanchecker legitimately
+    // cannot judge — unsafe or partial constants its own replay never submits.
+    // That is a real bound on the oracle and belongs in the report as a stated
+    // limit. Every ComparisonClass presupposes a comparison happened:
+    // ByteIdentical, NormalizedIdentical, AcceptanceOnly and
+    // DiagnosticEquivalent all assert an act of comparing. There is no
+    // OracleSilent arm.
+    //
+    // The nearest expressible thing is acceptance-only with both roots absent,
+    // which parses — but it says "we compared acceptance and agreed", which is
+    // FALSE. The oracle said nothing.
+    let mut r = Row::valid("Nat.unsafeCast");
+    r.comparison = "acceptance-only".to_string();
+    r.ours_root = "-".to_string();
+    r.oracle_root = "-".to_string();
+    let blocks = verify(&parsed(HEAD, &[r]), &["Nat.unsafeCast"], HEAD);
+    assert!(
+        blocks.is_empty(),
+        "the nearest encoding passes, which is the defect: {blocks:?}"
+    );
+    // It passing is the problem. A schema that can only express a claim it
+    // cannot support is worse here than one that refuses.
+}
+
+#[test]
+fn an_unassessed_symbol_is_not_expressible_either() {
+    // DEFECT 3, and the largest by volume. 142,886 of 158,608 decoded
+    // declarations were never compared — 141,461 because OUR side gave no
+    // answer, including kxbj's 65 behind a depth bound. A Parity Ledger over
+    // this corpus is 90% not-assessed, and the schema has no row for it: a
+    // symbol either has a row asserting comparison, or has no row at all and
+    // is then reported as Block::MissingSymbol.
+    let scan = ["A", "B"];
+    let l = parsed(HEAD, &[Row::valid("A")]);
+    let blocks = verify(&l, &scan, HEAD);
+    assert!(
+        reasons(&blocks).contains(&"missing"),
+        "an unassessed symbol can only be a MissingSymbol block: {blocks:?}"
+    );
+    // "Missing" and "assessed, no verdict available" are different facts and
+    // the schema conflates them. That is precisely the conflation this epic
+    // spent six slices refusing everywhere else.
+}
