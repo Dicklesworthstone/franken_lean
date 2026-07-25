@@ -504,6 +504,39 @@ mod tests {
         })
     }
 
+    /// Successor chains over every enum whose variants reach `Domain::DeclContent`.
+    ///
+    /// `definition_safety_tag` and `quot_kind_tag` already force a new variant to be
+    /// *tagged*, because their matches are exhaustive. Nothing forced a new variant
+    /// into the *test matrix* while `DeclarationTagCase::ALL` was a hand-written
+    /// array: the author would satisfy the tag matches, ship, and the variant would
+    /// carry no golden, no pairwise-distinction row, no named mutant and no E2E
+    /// record — silently untested identity, which is this bead's own failure mode one
+    /// level up. Rust has no enum reflection, so the forcing function has to be an
+    /// exhaustive match that *generates* the matrix rather than one that merely
+    /// validates it. Adding a variant fails to compile here until it is placed in a
+    /// chain, and the chains are what build `ALL`, so tagging a variant and covering
+    /// it become the same edit.
+    const fn succ_definition_safety(safety: DefinitionSafety) -> Option<DefinitionSafety> {
+        match safety {
+            DefinitionSafety::Unsafe => Some(DefinitionSafety::Safe),
+            DefinitionSafety::Safe => Some(DefinitionSafety::Partial),
+            DefinitionSafety::Partial => None,
+        }
+    }
+
+    const fn succ_quot_kind(kind: QuotKind) -> Option<QuotKind> {
+        match kind {
+            QuotKind::Type => Some(QuotKind::Ctor),
+            QuotKind::Ctor => Some(QuotKind::Lift),
+            QuotKind::Lift => Some(QuotKind::Ind),
+            QuotKind::Ind => None,
+        }
+    }
+
+    const FIRST_DEFINITION_SAFETY: DefinitionSafety = DefinitionSafety::Unsafe;
+    const FIRST_QUOT_KIND: QuotKind = QuotKind::Type;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum DeclarationTagCase {
         Definition(DefinitionSafety),
@@ -511,15 +544,61 @@ mod tests {
     }
 
     impl DeclarationTagCase {
-        const ALL: [DeclarationTagCase; 7] = [
-            DeclarationTagCase::Definition(DefinitionSafety::Unsafe),
-            DeclarationTagCase::Definition(DefinitionSafety::Safe),
-            DeclarationTagCase::Definition(DefinitionSafety::Partial),
-            DeclarationTagCase::Quotient(QuotKind::Type),
-            DeclarationTagCase::Quotient(QuotKind::Ctor),
-            DeclarationTagCase::Quotient(QuotKind::Lift),
-            DeclarationTagCase::Quotient(QuotKind::Ind),
-        ];
+        /// Frozen number of declaration-tag cases, and the count
+        /// `scripts/evidence.py`'s strict `declaration-tag-matrix` validator pins;
+        /// the two move together.
+        ///
+        /// Lengthening a successor chain without bumping this fails const evaluation
+        /// of `derive_all`. Shortening one fails it too — that is the single way to
+        /// satisfy an exhaustive match while orphaning a variant (write
+        /// `New => None` and drop the arm that reached `Partial`), so the count is
+        /// asserted in both directions rather than as an upper bound.
+        const COUNT: usize = 7;
+
+        const FIRST: DeclarationTagCase = DeclarationTagCase::Definition(FIRST_DEFINITION_SAFETY);
+
+        /// Derived from the successor chains, never hand-written. Every golden, every
+        /// pairwise-distinction check, every named mutant and the E2E producer iterate
+        /// this, so generating it is what makes coverage total rather than customary.
+        const ALL: [DeclarationTagCase; Self::COUNT] = Self::derive_all();
+
+        const fn succ(self) -> Option<DeclarationTagCase> {
+            match self {
+                DeclarationTagCase::Definition(safety) => match succ_definition_safety(safety) {
+                    Some(next) => Some(DeclarationTagCase::Definition(next)),
+                    // The families are chained end to end so that one walk enumerates
+                    // the whole matrix: the definition chain running out enters the
+                    // quotient chain.
+                    None => Some(DeclarationTagCase::Quotient(FIRST_QUOT_KIND)),
+                },
+                DeclarationTagCase::Quotient(kind) => match succ_quot_kind(kind) {
+                    Some(next) => Some(DeclarationTagCase::Quotient(next)),
+                    None => None,
+                },
+            }
+        }
+
+        const fn derive_all() -> [DeclarationTagCase; Self::COUNT] {
+            let mut cases = [Self::FIRST; Self::COUNT];
+            let mut cursor = Self::FIRST;
+            let mut filled = 1;
+            while let Some(next) = cursor.succ() {
+                // A chain that is too long, or one that cycles, is caught here rather
+                // than by writing past the end of the array.
+                assert!(
+                    filled < Self::COUNT,
+                    "declaration-tag successor chains yield more cases than DeclarationTagCase::COUNT"
+                );
+                cases[filled] = next;
+                cursor = next;
+                filled += 1;
+            }
+            assert!(
+                filled == Self::COUNT,
+                "declaration-tag successor chains yield fewer cases than DeclarationTagCase::COUNT: a variant is orphaned"
+            );
+            cases
+        }
 
         const fn family(self) -> &'static str {
             match self {
@@ -1359,6 +1438,42 @@ mod tests {
         ];
         assert_eq!(DEFINITION_TAGS, [0, 1, 2]);
         assert_eq!(QUOTIENT_TAGS, [0, 1, 2, 3]);
+
+        // The exact seven-row tag table, asserted against the *derived* case list
+        // rather than against a hand-written one. A new variant cannot reach a digest
+        // without joining a successor chain, joining one grows `ALL`, and growing
+        // `ALL` changes this array's length — so the row must be written here before
+        // the crate compiles again.
+        const EXPECTED_TAG_TABLE: [(&str, &str, u8); DeclarationTagCase::COUNT] = [
+            ("definition_safety", "unsafe", 0),
+            ("definition_safety", "safe", 1),
+            ("definition_safety", "partial", 2),
+            ("quot_kind", "type", 0),
+            ("quot_kind", "ctor", 1),
+            ("quot_kind", "lift", 2),
+            ("quot_kind", "ind", 3),
+        ];
+        let observed_tag_table: Vec<(&str, &str, u8)> = DeclarationTagCase::ALL
+            .iter()
+            .map(|case| (case.family(), case.variant(), case.production_tag()))
+            .collect();
+        assert_eq!(
+            observed_tag_table.as_slice(),
+            EXPECTED_TAG_TABLE.as_slice(),
+            "the derived declaration-tag table drifted from its frozen seven rows"
+        );
+
+        let definition_variant_count = DeclarationTagCase::ALL
+            .iter()
+            .filter(|case| matches!(case, DeclarationTagCase::Definition(_)))
+            .count();
+        let quotient_variant_count = DeclarationTagCase::ALL
+            .iter()
+            .filter(|case| matches!(case, DeclarationTagCase::Quotient(_)))
+            .count();
+        assert_eq!(definition_variant_count, DEFINITION_TAGS.len());
+        assert_eq!(quotient_variant_count, QUOTIENT_TAGS.len());
+
         for case in DeclarationTagCase::ALL {
             assert_eq!(
                 case.production_tag(),
@@ -1374,7 +1489,9 @@ mod tests {
              \"scenario\":\"closed-tag-projection-policy\",\
              \"claim_scope\":\"closed_enum_tag_projection_only\",\
              \"evidence\":\"const_exhaustive_match_plus_forbid_as_conversions\",\
-             \"definition_variant_count\":3,\"quotient_variant_count\":4,\
+             \"matrix_source\":\"generated_from_exhaustive_succ_chains\",\
+             \"definition_variant_count\":{definition_variant_count},\
+             \"quotient_variant_count\":{quotient_variant_count},\
              \"tag_helper_output_bytes\":1,\
              \"tag_helper_input_dependent_iterations\":0,\
              \"tag_helper_owned_allocations\":0,\
@@ -1384,6 +1501,163 @@ mod tests {
              \"enclosing_decl_content_budget_api\":\"absent\",\
              \"resource_followup\":\"franken_lean-j8h\",\
              \"status\":\"pass\"}}"
+        );
+    }
+
+    /// The coverage half of the `fln-amv.12` guard.
+    ///
+    /// The tag matches force a new variant to be *tagged*; the successor chains force
+    /// it to be *covered*, and this proves the chains actually generate the matrix the
+    /// goldens, mutants and E2E producer iterate. The three-way expectation for every
+    /// enum that reaches declaration identity: a source-order **reorder** must change
+    /// nothing, because the tags bind variant names rather than positions and a test
+    /// that went red on a reorder would be asserting the bug; an **added** variant must
+    /// fail to compile; a **changed tag value** must fail a frozen golden.
+    #[test]
+    fn declaration_identity_tag_matrix_is_generated_by_exhaustive_succ_chains() {
+        // Walk each family's chain independently of `ALL`, so the generated matrix is
+        // checked against the chains rather than against itself.
+        let mut definition_chain: Vec<DefinitionSafety> = Vec::new();
+        let mut safety = Some(FIRST_DEFINITION_SAFETY);
+        while let Some(current) = safety {
+            assert!(
+                !definition_chain.contains(&current),
+                "the DefinitionSafety successor chain revisits {current:?}, which would \
+                 silently drop every variant after the cycle"
+            );
+            definition_chain.push(current);
+            safety = succ_definition_safety(current);
+        }
+        let mut quotient_chain: Vec<QuotKind> = Vec::new();
+        let mut kind = Some(FIRST_QUOT_KIND);
+        while let Some(current) = kind {
+            assert!(
+                !quotient_chain.contains(&current),
+                "the QuotKind successor chain revisits {current:?}, which would silently \
+                 drop every variant after the cycle"
+            );
+            quotient_chain.push(current);
+            kind = succ_quot_kind(current);
+        }
+        assert_eq!(
+            definition_chain.as_slice(),
+            [
+                DefinitionSafety::Unsafe,
+                DefinitionSafety::Safe,
+                DefinitionSafety::Partial,
+            ]
+            .as_slice(),
+            "the DefinitionSafety chain no longer enumerates every variant"
+        );
+        assert_eq!(
+            quotient_chain.as_slice(),
+            [
+                QuotKind::Type,
+                QuotKind::Ctor,
+                QuotKind::Lift,
+                QuotKind::Ind,
+            ]
+            .as_slice(),
+            "the QuotKind chain no longer enumerates every variant"
+        );
+
+        // Exact equality, which is the both-directions assertion: every chain member
+        // reaches the matrix, and the matrix contains nothing that is not a chain
+        // member. Either direction alone would accept a matrix that quietly dropped a
+        // variant or invented one.
+        let expected: Vec<DeclarationTagCase> = definition_chain
+            .iter()
+            .copied()
+            .map(DeclarationTagCase::Definition)
+            .chain(
+                quotient_chain
+                    .iter()
+                    .copied()
+                    .map(DeclarationTagCase::Quotient),
+            )
+            .collect();
+        assert_eq!(
+            DeclarationTagCase::ALL.as_slice(),
+            expected.as_slice(),
+            "the generated declaration-tag matrix diverged from the successor chains"
+        );
+
+        for (index, lhs) in DeclarationTagCase::ALL.iter().enumerate() {
+            for rhs in &DeclarationTagCase::ALL[index + 1..] {
+                assert_ne!(
+                    lhs, rhs,
+                    "the generated matrix repeats a case, so one variant carries two \
+                     rows and another carries none"
+                );
+            }
+        }
+
+        // Tags must be pairwise distinct within a family, and deliberately *not*
+        // dense: retiring a variant should retire its tag forever rather than force a
+        // renumbering, and renumbering is precisely the silent identity rewrite this
+        // bead exists to prevent.
+        for family in [
+            DeclarationTagCase::ALL
+                .iter()
+                .filter(|case| matches!(case, DeclarationTagCase::Definition(_)))
+                .collect::<Vec<_>>(),
+            DeclarationTagCase::ALL
+                .iter()
+                .filter(|case| matches!(case, DeclarationTagCase::Quotient(_)))
+                .collect::<Vec<_>>(),
+        ] {
+            for (index, lhs) in family.iter().enumerate() {
+                for rhs in &family[index + 1..] {
+                    assert_ne!(
+                        lhs.production_tag(),
+                        rhs.production_tag(),
+                        "{}/{} and {}/{} share a tag, so two declarations that differ \
+                         collide on one identity",
+                        lhs.family(),
+                        lhs.variant(),
+                        rhs.family(),
+                        rhs.variant()
+                    );
+                }
+            }
+        }
+
+        // Every frozen count in this file's declaration-tag coverage is pinned to
+        // `COUNT`, so growing the matrix cannot leave a stale expectation quietly
+        // passing on a subset. `scripts/evidence.py`'s strict validator pins the same
+        // 7 for the `fln.e2e.declaration-tag-matrix` bundle.
+        assert_eq!(DeclarationTagCase::COUNT, 7);
+        assert_eq!(
+            DeclarationTagCase::COUNT * (DeclarationTagCase::COUNT - 1) / 2,
+            21,
+            "the frozen 21 pairwise comparisons no longer match the matrix size"
+        );
+        assert_eq!(
+            DeclarationTagCase::COUNT * 5,
+            35,
+            "the frozen 35 mutant discriminations no longer match the matrix size"
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.declaration-tag-coverage\",\"version\":1,\
+             \"bead\":\"fln-amv.12\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"generated-tag-case-matrix\",\
+             \"claim_scope\":\"declaration_tag_case_coverage_only\",\
+             \"matrix_source\":\"generated_from_exhaustive_succ_chains\",\
+             \"guard_kind\":\"compile_time_and_const_eval\",\
+             \"added_variant_outcome\":\"compile_error\",\
+             \"source_reorder_outcome\":\"no_digest_change\",\
+             \"retagged_variant_outcome\":\"frozen_golden_failure\",\
+             \"shortened_chain_outcome\":\"const_eval_assert\",\
+             \"definition_chain_length\":{},\"quotient_chain_length\":{},\
+             \"generated_case_count\":{},\"frozen_case_count\":{},\
+             \"tag_density_asserted\":false,\
+             \"tag_pairwise_distinct_within_family\":true,\
+             \"status\":\"pass\"}}",
+            definition_chain.len(),
+            quotient_chain.len(),
+            DeclarationTagCase::ALL.len(),
+            DeclarationTagCase::COUNT
         );
     }
 
@@ -1513,11 +1787,13 @@ mod tests {
             }
         }
         assert_eq!(pairwise_comparisons, 21);
+        let case_count = DeclarationTagCase::COUNT;
+        let unique_digest_count = unique_digests.len();
         eprintln!(
             "{{\"schema\":\"fln.unit.declaration-tag-identity-summary\",\"version\":1,\
              \"bead\":\"fln-amv.12\",\"claim_type\":\"bounded_model\",\
              \"scenario\":\"rich-same-name-seven-row-matrix\",\
-             \"case_count\":7,\"unique_digest_count\":7,\
+             \"case_count\":{case_count},\"unique_digest_count\":{unique_digest_count},\
              \"pairwise_comparisons\":{pairwise_comparisons},\
              \"expected_pairwise_comparisons\":21,\
              \"model\":\"independent-complete-definition-quotient-stream-v1\",\
@@ -1672,11 +1948,12 @@ mod tests {
             root_propagation_discriminations, 35,
             "all five digest mutants must propagate to distinct roots for all seven cases"
         );
+        let case_count = DeclarationTagCase::COUNT;
         eprintln!(
             "{{\"schema\":\"fln.unit.declaration-tag-mutants-summary\",\"version\":1,\
              \"bead\":\"fln-amv.12\",\"claim_type\":\"bounded_model\",\
              \"scenario\":\"named-tag-identity-mutants\",\
-             \"case_count\":7,\"digest_mutation_classes\":5,\
+             \"case_count\":{case_count},\"digest_mutation_classes\":5,\
              \"root_mutation_class\":\"failed_root_propagation\",\
              \"root_propagation_input_classes\":5,\
              \"digest_discriminations\":{digest_discriminations},\
@@ -1823,6 +2100,7 @@ mod tests {
                     );
                 }
                 worker_roots.push(*actual_root);
+                let case_count = DeclarationTagCase::COUNT;
                 eprintln!(
                     "{{\"schema\":\"fln.unit.declaration-tag-concurrent-build\",\
                      \"version\":1,\"bead\":\"fln-amv.12\",\
@@ -1836,7 +2114,7 @@ mod tests {
                      \"input_order_id\":\"{order_id}\",\
                      \"raw_input_order_case_count\":{},\
                      \"raw_input_order_labels\":\"{raw_input_order_labels}\",\
-                     \"declaration_cases\":7,\"actual_root\":\"{actual_root}\",\
+                     \"declaration_cases\":{case_count},\"actual_root\":\"{actual_root}\",\
                      \"expected_root\":\"{expected_root}\",\
                      \"full_environment_equal\":true,\
                      \"per_name_digest_equal\":true,\"status\":\"pass\"}}",
@@ -1864,6 +2142,7 @@ mod tests {
                 root_set_writer.bytes(&root.0.0);
             }
             let worker_roots_hash = hash(Domain::Fixture, &root_set_writer.into_bytes());
+            let case_count = DeclarationTagCase::COUNT;
             eprintln!(
                 "{{\"schema\":\"fln.unit.declaration-tag-concurrent-build-summary\",\
                  \"version\":1,\"bead\":\"fln-amv.12\",\
@@ -1874,7 +2153,7 @@ mod tests {
                  \"permutation_scheme\":\"affine-modulo-seven-v1\",\
                  \"concurrent_worker_count\":{worker_count},\
                  \"productive_workers\":{},\"distinct_full_permutations\":{},\
-                 \"declaration_cases_per_worker\":7,\
+                 \"declaration_cases_per_worker\":{case_count},\
                  \"order_set_hash\":\"{order_set_hash}\",\
                  \"worker_roots_hash\":\"{worker_roots_hash}\",\
                  \"expected_root\":\"{expected_root}\",\
