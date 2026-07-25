@@ -11,6 +11,11 @@
 //!   `fln_hash::canon::SCHEMA_REGISTRY` (bead franken_lean-dgxa, Appendix B): one
 //!   specification feeds both the codecs and the corpus, joined in both directions,
 //!   and a coverage claim carries the exercise that demonstrates it;
+//! * [`witness`] — the claim matrix and its documentation gate (bead
+//!   franken_lean-claim-matrix-doc-ci-mhew, Bet B8): every governed claim is a row carrying
+//!   its D7 type, its B8 evidence state, and the evidence itself, checked in both directions
+//!   so repaired wording cannot regress and a standing overclaim cannot be quietly fixed
+//!   without the matrix noticing;
 //! * [`naming`] — the suite-wide subsystem-name registry (`ci/SUBSYSTEM_REGISTRY.txt`)
 //!   and the current-vocabulary scanner (bead fln-7gr6): reserved codenames cannot
 //!   silently re-enter governed prose, contracts, schemas, or mutable bead fields;
@@ -37,3 +42,4 @@ pub mod ownership;
 #[cfg(feature = "oracle-fallback-dev")]
 pub mod poison;
 pub mod precedence;
+pub mod witness;
