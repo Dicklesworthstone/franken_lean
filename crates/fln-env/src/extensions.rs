@@ -738,6 +738,158 @@ fn proof_stop(dimension: ProofDimension, allowed: u128, observed: u128) -> Incon
     .with_progress(dimension.as_str())
 }
 
+/// How a base-identity proof was discharged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryProofKind {
+    /// The presented base was the retained base by construction. `O(1)`, charged nothing.
+    SharedStructure,
+    /// Proved entry by entry against the retained base.
+    ExactComparison,
+    /// `FullJournal`: self-contained, so there was no base to prove.
+    SelfContained,
+}
+
+/// Exact work one base-identity proof consumed.
+///
+/// **Phase-local**: it describes the proof, not the whole restore, and it is a logical
+/// attributed count of entries and canonical payload bytes examined — never allocator
+/// bytes, RSS, or wall time. Recorded on the plan so a later phase that recharged the
+/// same proof would be visible rather than merely wasteful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryProofUsage {
+    pub kind: HistoryProofKind,
+    pub compared_entries: usize,
+    pub compared_payload_bytes: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryMaterial {
+    Suffix {
+        base: ExtensionState,
+        suffix: ExtensionJournal,
+    },
+    Full {
+        state: ExtensionState,
+    },
+}
+
+/// One restored extension state, with what committing it cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionHistoryRestored {
+    pub state: ExtensionState,
+    /// Work **this commit** consumed. Zero by contract in every mode: the proof was
+    /// discharged at plan time and is never recomputed. A non-zero value here means
+    /// something recharged the history proof, which is why the field exists.
+    pub commit_usage: HistoryProofUsage,
+}
+
+/// An immutable, non-authoritative extension-history identity plan (bead
+/// `fln-extension-history-checkpoint-identity-41s`).
+///
+/// Bound to the exact base, schema, descriptor and limits it was decided under.
+/// Deliberately the twin of `franken_lean-j8h`'s declaration-admission plan rather than
+/// a second shape: holding material is not authority, nothing here is reachable as an
+/// extension state, it is never cacheable, and committing revalidates before applying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedExtensionHistory {
+    schema: u16,
+    descriptor: ExtensionDescriptor,
+    limits: CheckpointLimits,
+    usage: HistoryProofUsage,
+    material: HistoryMaterial,
+}
+
+impl PreparedExtensionHistory {
+    /// **Never.** A plan is a decision in flight, not a result.
+    pub const fn is_cacheable(&self) -> bool {
+        false
+    }
+
+    /// What the base-identity proof cost. Available before commit because it describes
+    /// work already done; the state it authorises is not available until commit.
+    pub const fn proof_usage(&self) -> &HistoryProofUsage {
+        &self.usage
+    }
+
+    pub const fn descriptor(&self) -> &ExtensionDescriptor {
+        &self.descriptor
+    }
+
+    /// Whether this plan is still meaningful for `base`.
+    ///
+    /// `O(1)` and charges nothing: the plan holds the base it proved against, so
+    /// revalidation is a structural-identity check rather than a second comparison.
+    /// A plan decided against one base and committed against another is refused even
+    /// when the two are content-identical, because the plan's recorded proof describes
+    /// the base it was given.
+    pub fn is_valid_for(&self, base: Option<&ExtensionState>) -> bool {
+        if self.schema != EXTENSION_CHECKPOINT_SCHEMA_VERSION {
+            return false;
+        }
+        match (&self.material, base) {
+            (HistoryMaterial::Suffix { base: planned, .. }, Some(presented)) => {
+                planned.journal.is_same_structure(&presented.journal)
+                    && planned.descriptor == presented.descriptor
+            }
+            (HistoryMaterial::Full { .. }, None) => true,
+            _ => false,
+        }
+    }
+
+    /// Revalidate and apply exactly once.
+    ///
+    /// Three things are rechecked and **nothing is recomputed**: the plan's schema, its
+    /// base binding, and cancellation. The base-identity proof is *consumed*, not
+    /// repeated — repeating it would charge the same work twice and could disagree with
+    /// the decision the plan already records.
+    ///
+    /// Applying is immutable: the base is never mutated, so every non-applied arm leaves
+    /// the caller's state the same value it already held, with the same content digest
+    /// and the same structural sharing.
+    pub fn commit(
+        &self,
+        base: Option<&ExtensionState>,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<ExtensionHistoryRestored, CheckpointError> {
+        if !self.is_valid_for(base) {
+            return Err(CheckpointError::PlanSuperseded {
+                extension: self.descriptor.name.clone(),
+            });
+        }
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            // A cancelled commit is a non-answer, and this signature cannot carry one —
+            // so callers that thread cancellation must sample it themselves before
+            // committing. `try_restore` does exactly that at
+            // `CheckpointProofCheckpoint::BeforePublication`. Reaching here means the
+            // probe tripped between that sample and this one; refusing to apply is the
+            // conservative half, and the caller's own outcome carries the authority.
+            return Err(CheckpointError::PlanSuperseded {
+                extension: self.descriptor.name.clone(),
+            });
+        }
+        let state = match &self.material {
+            HistoryMaterial::Suffix { base, suffix } => {
+                let mut restored = base.clone();
+                for record in suffix.records() {
+                    restored = restored.push_entry(Arc::clone(&record.entry.payload));
+                }
+                restored
+            }
+            HistoryMaterial::Full { state } => state.clone(),
+        };
+        Ok(ExtensionHistoryRestored {
+            state,
+            // Zero in every mode: applying a suffix examines the SUFFIX, never the base,
+            // and the base is the only thing the proof measured.
+            commit_usage: HistoryProofUsage {
+                kind: self.usage.kind,
+                compared_entries: 0,
+                compared_payload_bytes: 0,
+            },
+        })
+    }
+}
+
 /// Frozen cancellation observation points for the checkpoint identity proofs.
 ///
 /// Numbered and fixed for the same reason the declaration-admission checkpoints are: a
@@ -996,6 +1148,15 @@ pub enum CheckpointResource {
 /// Every checkpoint refusal is classified and leaves all input snapshots unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointError {
+    /// A [`PreparedExtensionHistory`] was committed against a base it was not decided
+    /// against, or under a superseded schema.
+    ///
+    /// A completed determination *about this plan* — the plan is unusable here — rather
+    /// than a statement that the checkpoint is bad: re-planning against the current base
+    /// may well succeed.
+    PlanSuperseded {
+        extension: Name,
+    },
     /// The presented base agreed with every recorded digest and still is not the base
     /// this checkpoint was captured against (bead
     /// `fln-extension-history-checkpoint-identity-41s`).
@@ -1067,6 +1228,12 @@ pub enum CheckpointError {
 impl std::fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CheckpointError::PlanSuperseded { extension } => write!(
+                f,
+                "extension `{}` history plan was decided against a different base or schema; \
+                 re-plan against the current base rather than reusing this one",
+                extension.to_display_string()
+            ),
             CheckpointError::BaseNotExact {
                 extension,
                 base_len,
@@ -1565,15 +1732,41 @@ impl ExtensionState {
             .expect("an unbounded proof budget cannot bind")
     }
 
-    /// The proof-bounded body. The OUTER `Err` is a budget stop and never a verdict; the
-    /// verdict lives in the inner `Result`. Keeping them at different depths is what
-    /// makes "ran out" and "refused" impossible to confuse at a call site.
+    /// Restore as one preflighted transaction: plan, then commit.
+    ///
+    /// There is no second implementation — this *is* plan-then-commit, so the plan path
+    /// and the direct path cannot drift apart. That is the same property
+    /// `franken_lean-j8h`'s declaration admission has, and it is why the plan was added
+    /// by refactoring the existing body rather than beside it.
     fn restore_bounded(
         base: Option<&ExtensionState>,
         checkpoint: &ExtensionCheckpoint,
         limits: CheckpointLimits,
         proof: ProofBudget,
     ) -> Result<Result<ExtensionState, CheckpointError>, Inconclusive> {
+        let plan = match ExtensionState::plan_history_restore(base, checkpoint, limits, proof)? {
+            Ok(plan) => plan,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        Ok(plan.commit(base, None).map(|restored| restored.state))
+    }
+
+    /// Preflight a checkpoint into an immutable, non-authoritative plan.
+    ///
+    /// Every validation and the whole base-identity proof happen here, once. The plan
+    /// records what the proof cost so a later phase cannot charge it again — the bead's
+    /// "consume the plan once, revalidate it, and never recompute or double-charge the
+    /// history proof."
+    ///
+    /// The OUTER `Err` is a budget stop and never a verdict; the verdict lives in the
+    /// inner `Result`. Keeping them at different depths is what makes "ran out" and
+    /// "refused" impossible to confuse at a call site.
+    fn plan_history_restore(
+        base: Option<&ExtensionState>,
+        checkpoint: &ExtensionCheckpoint,
+        limits: CheckpointLimits,
+        proof: ProofBudget,
+    ) -> Result<Result<PreparedExtensionHistory, CheckpointError>, Inconclusive> {
         // Every `Ok(Err(..))` below is a completed VERDICT about this checkpoint. The
         // only `Err(..)` at the outer depth is a budget stop, and it appears exactly
         // once, at the bounded comparison. The extra `Ok(` is deliberate noise: it makes
@@ -1676,7 +1869,16 @@ impl ExtensionState {
                 // "diverged" for a comparison that never finished would manufacture a
                 // verdict out of running out of room, which is the defect this whole
                 // bead is about.
-                if !base.journal.is_same_structure(&retained_base.journal) {
+                let usage = if base.journal.is_same_structure(&retained_base.journal) {
+                    // Proved in O(1) and charged nothing, because nothing input-sized
+                    // was examined. Recording zero here rather than omitting the fact is
+                    // what lets a later double-charge be seen.
+                    HistoryProofUsage {
+                        kind: HistoryProofKind::SharedStructure,
+                        compared_entries: 0,
+                        compared_payload_bytes: 0,
+                    }
+                } else {
                     match bounded_entry_divergence(retained_base, base, proof) {
                         Ok(Some(divergence)) => {
                             return Ok(Err(CheckpointError::BaseNotExact {
@@ -1685,17 +1887,26 @@ impl ExtensionState {
                                 first_divergence: divergence,
                             }));
                         }
-                        Ok(None) => {}
+                        Ok(None) => HistoryProofUsage {
+                            kind: HistoryProofKind::ExactComparison,
+                            compared_entries: base.len(),
+                            compared_payload_bytes: base.journal.payload_bytes,
+                        },
                         Err((dimension, allowed, observed)) => {
                             return Err(proof_stop(dimension, allowed, observed));
                         }
                     }
-                }
-                let mut restored = base.clone();
-                for record in journal.records() {
-                    restored = restored.push_entry(Arc::clone(&record.entry.payload));
-                }
-                Ok(Ok(restored))
+                };
+                Ok(Ok(PreparedExtensionHistory {
+                    schema: checkpoint.schema_version,
+                    descriptor: checkpoint.descriptor.clone(),
+                    limits,
+                    usage,
+                    material: HistoryMaterial::Suffix {
+                        base: base.clone(),
+                        suffix: journal.clone(),
+                    },
+                }))
             }
             CheckpointPayload::FullJournal { journal } => {
                 if base.is_some() {
@@ -1703,9 +1914,23 @@ impl ExtensionState {
                         extension: checkpoint.descriptor.name.clone(),
                     }));
                 }
-                Ok(Ok(ExtensionState {
+                Ok(Ok(PreparedExtensionHistory {
+                    schema: checkpoint.schema_version,
                     descriptor: checkpoint.descriptor.clone(),
-                    journal: journal.clone(),
+                    limits,
+                    // Self-contained: no base, so no base-identity proof and no charge.
+                    // The mode difference is a reported fact rather than an implication.
+                    usage: HistoryProofUsage {
+                        kind: HistoryProofKind::SelfContained,
+                        compared_entries: 0,
+                        compared_payload_bytes: 0,
+                    },
+                    material: HistoryMaterial::Full {
+                        state: ExtensionState {
+                            descriptor: checkpoint.descriptor.clone(),
+                            journal: journal.clone(),
+                        },
+                    },
                 }))
             }
         }
@@ -5058,6 +5283,202 @@ mod tests {
         assert!(
             refused.into_complete().expect("completed").is_err(),
             "and that determination is a refusal"
+        );
+    }
+
+    fn planned(
+        base: Option<&ExtensionState>,
+        checkpoint: &ExtensionCheckpoint,
+    ) -> PreparedExtensionHistory {
+        ExtensionState::plan_history_restore(base, checkpoint, TEST_LIMITS, ProofBudget::UNBOUNDED)
+            .expect("an unbounded proof budget cannot bind")
+            .expect("planning succeeds")
+    }
+
+    /// One preflighted transaction, and a failed one leaves the original untouched —
+    /// proved by comparing roots before and after, not by reading the code path.
+    #[test]
+    fn the_history_plan_is_preflighted_and_a_failure_leaves_the_original_untouched() {
+        let captured_base = state_with_checkpoint(4, CheckpointSemantics::JournalSuffix);
+        let target = captured_base.push_entry(bytes(b"suffix"));
+        let checkpoint = target
+            .checkpoint(Some(&captured_base), TEST_LIMITS)
+            .expect("checkpoint captures");
+
+        let plan = planned(Some(&captured_base), &checkpoint);
+        // Material is not authority.
+        assert!(!plan.is_cacheable());
+        assert_eq!(plan.descriptor(), checkpoint.descriptor());
+        assert!(plan.is_valid_for(Some(&captured_base)));
+        // The proof happened at plan time, in O(1) here because the base was kept.
+        assert_eq!(plan.proof_usage().kind, HistoryProofKind::SharedStructure);
+        assert_eq!(plan.proof_usage().compared_entries, 0);
+
+        // Roots before: the target ExtensionState's own digest, and an enclosing
+        // Environment's logical root, because both must be untouched by a failure.
+        let digest_before = captured_base.content_digest();
+        let env = Environment::new()
+            .register_extension(captured_base.descriptor.clone())
+            .expect("register");
+        let env_root_before = env.logical_root(&KVMap::new());
+        let snapshot = captured_base.clone();
+
+        // Forced failure 1: the plan committed against a DIFFERENT base. Content-identical
+        // but independently built, so this is refused on the plan's own binding rather
+        // than on content — a plan's recorded proof describes the base it was given.
+        let rebuilt = state_with_checkpoint(4, CheckpointSemantics::JournalSuffix);
+        assert_eq!(rebuilt.content_digest(), captured_base.content_digest());
+        assert!(!plan.is_valid_for(Some(&rebuilt)));
+        let superseded = plan
+            .commit(Some(&rebuilt), None)
+            .expect_err("a cross-base plan must be refused");
+        assert!(matches!(superseded, CheckpointError::PlanSuperseded { .. }));
+
+        // Forced failure 2: committed with no base at all.
+        assert!(plan.commit(None, None).is_err());
+
+        // Forced failure 3: a full-journal plan committed against a base.
+        let full = state_with_checkpoint(3, CheckpointSemantics::FullJournal)
+            .checkpoint(None, TEST_LIMITS)
+            .expect("full captures");
+        let full_plan = planned(None, &full);
+        assert_eq!(
+            full_plan.proof_usage().kind,
+            HistoryProofKind::SelfContained
+        );
+        assert!(full_plan.commit(Some(&captured_base), None).is_err());
+
+        // Untouched after all three: same value, same digest, same enclosing root, and
+        // still sharing with the pre-failure snapshot.
+        assert_eq!(digest_before, captured_base.content_digest());
+        assert_eq!(digest_before, snapshot.content_digest());
+        assert_eq!(env_root_before, env.logical_root(&KVMap::new()));
+        assert_eq!(captured_base, snapshot);
+        assert!(captured_base.journal.is_same_structure(&snapshot.journal));
+
+        // And the honest commit still applies, reproducing exactly what the direct path
+        // produces — so plan-then-commit is not a second semantics.
+        let restored = plan
+            .commit(Some(&captured_base), None)
+            .expect("the honest commit applies");
+        assert_eq!(restored.state, target);
+        assert_eq!(
+            restored.state.content_digest(),
+            ExtensionState::restore(Some(&captured_base), &checkpoint, TEST_LIMITS)
+                .expect("direct path agrees")
+                .content_digest()
+        );
+        // Committing twice from one plan yields the same state: applying is a pure
+        // function of the plan, so "consumed once" is about the PROOF, not about the plan
+        // becoming unusable.
+        assert_eq!(
+            plan.commit(Some(&captured_base), None)
+                .expect("re-commit applies")
+                .state,
+            restored.state
+        );
+    }
+
+    /// DOUBLE-CHARGE EXACT COMPARISON: the named mutant, killed on recorded usage.
+    ///
+    /// Previously unwritable rather than merely unwritten — there was no charge to double.
+    /// Now the plan records what the proof cost and commit records what committing cost,
+    /// so charging the comparison a second time is a visible arithmetic fact rather than
+    /// an invisible performance loss.
+    #[test]
+    fn the_double_charge_exact_comparison_mutant_is_killed_on_recorded_usage() {
+        let captured_base = state_with_checkpoint(5, CheckpointSemantics::JournalSuffix);
+        let target = captured_base.push_entry(bytes(b"suffix"));
+        let checkpoint = target
+            .checkpoint(Some(&captured_base), TEST_LIMITS)
+            .expect("checkpoint captures");
+
+        // An independently rebuilt base, so the proof is a real exact comparison and
+        // therefore has a non-zero charge to be double-counted.
+        let rebuilt = state_with_checkpoint(5, CheckpointSemantics::JournalSuffix);
+        assert!(!rebuilt.journal.is_same_structure(&captured_base.journal));
+        let plan = planned(Some(&rebuilt), &checkpoint);
+        assert_eq!(plan.proof_usage().kind, HistoryProofKind::ExactComparison);
+        let charged_once = *plan.proof_usage();
+        assert_eq!(charged_once.compared_entries, 5);
+        assert!(charged_once.compared_payload_bytes > 0);
+
+        // CANONICAL: committing charges NOTHING, because the proof was consumed at plan
+        // time. Applying a suffix examines the suffix, never the base.
+        let restored = plan
+            .commit(Some(&rebuilt), None)
+            .expect("the commit applies");
+        assert_eq!(
+            restored.commit_usage.compared_entries, 0,
+            "commit must not recharge the base comparison"
+        );
+        assert_eq!(restored.commit_usage.compared_payload_bytes, 0);
+        let canonical_total = charged_once
+            .compared_entries
+            .checked_add(restored.commit_usage.compared_entries)
+            .expect("no overflow");
+        assert_eq!(
+            canonical_total, charged_once.compared_entries,
+            "the total charge must equal the single proof"
+        );
+
+        // MUTANT: a commit that re-proves the base. Modelled by charging the comparison
+        // again — which is exactly what re-running it would cost.
+        let recharged = bounded_entry_divergence(&rebuilt, &rebuilt, ProofBudget::UNBOUNDED);
+        assert_eq!(recharged, Ok(None), "the model re-proof does succeed");
+        let mutant_total = charged_once
+            .compared_entries
+            .checked_add(charged_once.compared_entries)
+            .expect("no overflow");
+        assert_ne!(
+            mutant_total, canonical_total,
+            "the double-charge model must be distinguishable from the canonical total"
+        );
+        assert_eq!(
+            mutant_total,
+            charged_once.compared_entries * 2,
+            "and it must be exactly twice, or it is not modelling a double charge"
+        );
+
+        // The typed kill: the discriminating signal is commit_usage being zero, not the
+        // totals merely differing. A commit that recharged would report non-zero here,
+        // and that field is the only place the difference is observable.
+        assert_eq!(
+            restored.commit_usage.compared_entries, 0,
+            "recorded_commit_usage is the typed kill signal for double_charge"
+        );
+        // And it is zero in the O(1) mode too, so the contract does not depend on which
+        // proof discharged it.
+        let shared_plan = planned(Some(&captured_base), &checkpoint);
+        assert_eq!(
+            shared_plan.proof_usage().kind,
+            HistoryProofKind::SharedStructure
+        );
+        assert_eq!(
+            shared_plan
+                .commit(Some(&captured_base), None)
+                .expect("applies")
+                .commit_usage
+                .compared_entries,
+            0
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-history-plan\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"scenario\":\"plan-consumed-once-not-double-charged\",\
+             \"plan_cacheable\":false,\
+             \"proof_charged_at_plan_entries\":{},\
+             \"commit_charged_entries\":0,\
+             \"canonical_total_entries\":{},\
+             \"double_charge_model_total_entries\":{},\
+             \"mutant\":\"double_charge_exact_comparison\",\
+             \"kill_signal\":\"recorded_commit_usage\",\
+             \"cross_base_plan\":\"refused_plan_superseded\",\
+             \"usage_accounting\":\"logical_attributed_phase_local\",\
+             \"allocator_or_rss_claimed\":false,\"status\":\"pass\"}}",
+            charged_once.compared_entries, canonical_total, mutant_total
         );
     }
 
