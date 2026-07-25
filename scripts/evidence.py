@@ -3888,9 +3888,12 @@ def validate_verification_manifest(
                     f"{manifest_path}: coverage {bead_id!r} names unregistered "
                     f"scenario {scenario!r}"
                 )
+            # Scenario ownership names the bead responsible for maintaining the
+            # lane and its artifact contract. It is not an exclusive-consumer
+            # lock: several coverage rows may honestly rely on one active CI
+            # scenario without duplicating the same execution artifact.
             if (
-                registered["owner"] != bead_id
-                or registered["activation"] != "active"
+                registered["activation"] != "active"
                 or registered["ci_required"] is not True
             ):
                 raise EvidenceError(
@@ -11294,6 +11297,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     verification_beads = [
         {"id": "baseline-closed", "status": "closed"},
         {"id": "rur", "status": "in_progress"},
+        {"id": "rur-consumer", "status": "in_progress"},
     ]
     verification_ids = sorted(record["id"] for record in verification_beads)
     verification_header = {
@@ -11309,7 +11313,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "record_count": len(verification_ids),
         "projection_hash": verification_adoption_hash(verification_ids),
         "adoption_ids": verification_ids,
-        "adoption_open_ids": ["rur"],
+        "adoption_open_ids": ["rur", "rur-consumer"],
     }
     verification_authority_hash = verification_adoption_authority_hash(
         verification_header["adoption_ids"],
@@ -11347,6 +11351,13 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "negative_recovery": ["quality_gate:failure-recovery"],
         "artifacts": ["human.log", "run.ndjson"],
     }
+    verification_shared_coverage = dict(verification_coverage)
+    verification_shared_coverage.update(
+        bead="rur-consumer",
+        owner="consumer-fixture",
+        requirement_ids=["REQ-SHARED-QUALITY-GATE"],
+        claim_ids=["CLAIM-SHARED-QUALITY-GATE"],
+    )
     verification_scenario = {
         "schema": VERIFICATION_MANIFEST_SCHEMA,
         "kind": "scenario",
@@ -11364,6 +11375,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     verification_records = [
         verification_header,
         verification_coverage,
+        verification_shared_coverage,
         verification_scenario,
     ]
 
@@ -11403,9 +11415,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         expected_adoption_authority_hash=verification_authority_hash,
     )
     require(
-        positive_report["coverage_rows"] == 1
+        positive_report["coverage_rows"] == 2
+        and positive_report["scenario_rows"] == 1
         and positive_report["ci_scenarios"] == ["quality_gate"],
-        "verification manifest positive report lost its authority rows",
+        "verification manifest shared scenario lost its authority rows",
     )
     verification_mutants = 0
 
@@ -11453,15 +11466,15 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
     reject_verification_case(
         "planned-counted-passed",
-        lambda records, _beads: records[2].update(activation="planned"),
+        lambda records, _beads: records[-1].update(activation="planned"),
     )
     reject_verification_case(
         "mock-scenario-closes-invariant",
-        lambda records, _beads: records[2].update(evidence_kind="mock"),
+        lambda records, _beads: records[-1].update(evidence_kind="mock"),
     )
     reject_verification_case(
         "active-scenario-not-ci-enforced",
-        lambda records, _beads: records[2].update(
+        lambda records, _beads: records[-1].update(
             ci_required=False,
             ci_root="-",
             artifact_kind="none",
@@ -11470,7 +11483,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
     reject_verification_case(
         "orphan-scenario",
-        lambda records, _beads: records[2].update(owner="missing-owner"),
+        lambda records, _beads: records[-1].update(owner="missing-owner"),
     )
     reject_verification_case(
         "extra-field",
