@@ -402,7 +402,7 @@ impl PreparedReplay {
 /// (Kahn) order, snapshotting each unit's checking environment and admitting
 /// every declaration — the deterministic phase every matrix width shares.
 fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
-    prepare_replay_from(Environment::new(), infos, true)
+    prepare_replay_from(Environment::new(), None, infos, true)
 }
 
 /// Corpus-scale variant of [`prepare_replay`]. The supplied environment is a
@@ -411,6 +411,7 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
 /// from this harness is an authority to admit a declaration in production.
 fn prepare_replay_from(
     mut env: Environment,
+    reference_context: Option<&ReferenceFixtureContext>,
     infos: &[ConstantInfo],
     emit_order_summary: bool,
 ) -> PreparedReplay {
@@ -553,7 +554,14 @@ fn prepare_replay_from(
         if has_existing_member {
             for &member in &unit.members {
                 let reason = match env.find(infos[member].name()) {
-                    Some(existing) if reference_replay_duplicate(existing, &infos[member]) => {
+                    Some(existing)
+                        if reference_replay_duplicate(
+                            reference_context
+                                .and_then(|context| context.representative(infos[member].name()))
+                                .unwrap_or(existing),
+                            &infos[member],
+                        ) =>
+                    {
                         "reference_replay_duplicate_theorem"
                     }
                     Some(_) => "decoded_name_collision_in_fixture_context",
@@ -1789,27 +1797,147 @@ impl CorpusCounts {
     }
 }
 
+/// Tribunal-only adapter for the Reference's `finalizeImport` duplicate law.
+///
+/// FrankenLean's authoritative [`Environment`] remains a one-name map and is
+/// never overwritten. The shadow map records only the richer Reference
+/// representative chosen by `subsumesInfo`; every such replacement has the
+/// same name, type, level parameters, and kernel safety, so the original
+/// declaration in `environment` is observationally equivalent for kernel
+/// checking. Keeping the representative separately is still necessary:
+/// subsequent duplicate decisions inspect whether the Reference retained a
+/// theorem or an axiom.
+#[derive(Clone, Default)]
+struct ReferenceFixtureContext {
+    environment: Environment,
+    representative_overrides: BTreeMap<Name, ConstantInfo>,
+}
+
+impl ReferenceFixtureContext {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn representative(&self, name: &Name) -> Option<&ConstantInfo> {
+        self.representative_overrides
+            .get(name)
+            .or_else(|| self.environment.find(name))
+    }
+
+    fn set_representative(&mut self, info: &ConstantInfo) {
+        let name = info.name();
+        if self.environment.find(name) == Some(info) {
+            self.representative_overrides.remove(name);
+        } else {
+            self.representative_overrides
+                .insert(name.clone(), info.clone());
+        }
+    }
+}
+
+/// The pin's deliberately cheap proposition recognizer used only by
+/// `finalizeImport.subsumesInfo` for axiom/axiom extended duplicates.
+fn reference_import_is_prop_cheap(context: &ReferenceFixtureContext, type_: &Expr) -> bool {
+    let mut result = type_.clone();
+    while let ExprNode::ForallE { body, .. } = result.node() {
+        result = body.clone();
+    }
+
+    let mut head = result;
+    let mut argument_count = 0_usize;
+    while let ExprNode::App { f, .. } = head.node() {
+        let Some(next_count) = argument_count.checked_add(1) else {
+            return false;
+        };
+        argument_count = next_count;
+        head = f.clone();
+    }
+    let ExprNode::Const { name, .. } = head.node() else {
+        return false;
+    };
+    let Some(predicate) = context.representative(name) else {
+        return false;
+    };
+    let mut predicate_type = predicate.constant_val().type_.clone();
+    for _ in 0..argument_count {
+        let ExprNode::ForallE { body, .. } = predicate_type.node() else {
+            return false;
+        };
+        predicate_type = body.clone();
+    }
+    matches!(
+        predicate_type.node(),
+        ExprNode::Sort { level } if level.is_zero()
+    )
+}
+
+/// Exact port of the three `subsumesInfo` arms in the pinned
+/// `Lean.Environment.finalizeImport`.
+fn reference_import_subsumes(
+    context: &ReferenceFixtureContext,
+    richer: &ConstantInfo,
+    weaker: &ConstantInfo,
+) -> bool {
+    let richer_base = richer.constant_val();
+    let weaker_base = weaker.constant_val();
+    if richer_base.name != weaker_base.name
+        || richer_base.type_ != weaker_base.type_
+        || richer_base.level_params != weaker_base.level_params
+    {
+        return false;
+    }
+    match (richer, weaker) {
+        (ConstantInfo::Thm(richer), ConstantInfo::Thm(weaker)) => richer.all == weaker.all,
+        (ConstantInfo::Thm(richer), ConstantInfo::Axiom(weaker)) => {
+            richer.all.as_slice() == std::slice::from_ref(&weaker.base.name) && !weaker.is_unsafe
+        }
+        (ConstantInfo::Axiom(richer), ConstantInfo::Axiom(weaker)) => {
+            richer.is_unsafe == weaker.is_unsafe
+                && reference_import_is_prop_cheap(context, &richer.base.type_)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReferenceFixtureMerge {
+    collisions: Vec<String>,
+    extended_duplicates: u64,
+    extended_only_duplicates: u64,
+}
+
 fn extend_reference_fixture_environment(
-    mut env: Environment,
+    mut context: ReferenceFixtureContext,
     infos: &[ConstantInfo],
     module: &str,
-) -> Result<(Environment, Vec<String>), String> {
-    let mut collisions = Vec::new();
+) -> Result<(ReferenceFixtureContext, ReferenceFixtureMerge), String> {
+    let mut report = ReferenceFixtureMerge::default();
     for info in infos {
-        if let Some(existing) = env.find(info.name()) {
-            if existing != info && !reference_replay_duplicate(existing, info) {
-                collisions.push(info.name().to_display_string());
+        if let Some(existing) = context.representative(info.name()).cloned() {
+            let legacy_duplicate = reference_replay_duplicate(&existing, info);
+            if reference_import_subsumes(&context, info, &existing) {
+                context.set_representative(info);
+                report.extended_duplicates += 1;
+                report.extended_only_duplicates += u64::from(!legacy_duplicate);
+            } else if reference_import_subsumes(&context, &existing, info) {
+                report.extended_duplicates += 1;
+                report.extended_only_duplicates += u64::from(!legacy_duplicate);
+            } else {
+                report.collisions.push(info.name().to_display_string());
             }
             continue;
         }
-        env = env.add_decl(info.clone()).map_err(|error| {
-            format!(
-                "publish decoded fixture declaration {} from {module}: {error:?}",
-                info.name().to_display_string()
-            )
-        })?;
+        context.environment = context
+            .environment
+            .add_decl(info.clone())
+            .map_err(|error| {
+                format!(
+                    "publish decoded fixture declaration {} from {module}: {error:?}",
+                    info.name().to_display_string()
+                )
+            })?;
     }
-    Ok((env, collisions))
+    Ok((context, report))
 }
 
 /// Lean.Replay's exact duplicate-theorem exception: proof values may differ,
@@ -2027,6 +2155,215 @@ fn corpus_comparator_preserves_d23_asymmetry_and_no_answer() {
 }
 
 #[test]
+fn reference_import_adapter_preserves_one_name_authority_and_rejects_conflicts() {
+    use fln_env::constants::{AxiomVal, ConstantVal, TheoremVal};
+
+    let name = Name::str(Name::anonymous(), "extendedDuplicate");
+    let proposition = Expr::sort(fln_core::level::Level::zero());
+    let base = ConstantVal {
+        name: name.clone(),
+        level_params: Vec::new(),
+        type_: proposition.clone(),
+    };
+    let exported_axiom = ConstantInfo::Axiom(AxiomVal {
+        base: base.clone(),
+        is_unsafe: false,
+    });
+    let private_theorem = ConstantInfo::Thm(TheoremVal {
+        base: base.clone(),
+        value: proposition,
+        all: vec![name.clone()],
+    });
+
+    let (context, seed) = extend_reference_fixture_environment(
+        ReferenceFixtureContext::new(),
+        std::slice::from_ref(&exported_axiom),
+        "Exported",
+    )
+    .expect("seed fixture context");
+    assert!(seed.collisions.is_empty());
+    assert_eq!(seed.extended_duplicates, 0);
+    assert_eq!(seed.extended_only_duplicates, 0);
+    assert_eq!(context.environment.len(), 1);
+
+    // The authoritative environment still refuses the duplicate. Only the
+    // Tribunal adapter applies the Reference import law.
+    assert!(
+        context
+            .environment
+            .add_decl(private_theorem.clone())
+            .is_err(),
+        "extended duplicate handling must not weaken Environment::add_decl"
+    );
+
+    let (context, richer) = extend_reference_fixture_environment(
+        context,
+        std::slice::from_ref(&private_theorem),
+        "Private",
+    )
+    .expect("merge richer theorem representation");
+    assert!(richer.collisions.is_empty());
+    assert_eq!(richer.extended_duplicates, 1);
+    assert_eq!(richer.extended_only_duplicates, 1);
+    assert_eq!(context.environment.len(), 1);
+    assert!(matches!(
+        context.environment.find(&name),
+        Some(ConstantInfo::Axiom(_))
+    ));
+    assert!(matches!(
+        context.representative(&name),
+        Some(ConstantInfo::Thm(_))
+    ));
+
+    let replay = prepare_replay_from(
+        context.environment.clone(),
+        Some(&context),
+        std::slice::from_ref(&private_theorem),
+        false,
+    );
+    assert!(replay.items.is_empty());
+    assert_eq!(
+        replay.context_unscorable,
+        vec![(0, name.clone(), "reference_replay_duplicate_theorem")],
+        "the shadow representative must recover the Reference replay skip"
+    );
+
+    // The shadow representative is load-bearing: a later exported axiom is
+    // subsumed by the retained theorem even though the one-name environment
+    // itself still contains the first axiom.
+    let (context, later) = extend_reference_fixture_environment(
+        context,
+        std::slice::from_ref(&exported_axiom),
+        "LaterExport",
+    )
+    .expect("merge later weakened representation");
+    assert!(later.collisions.is_empty());
+    assert_eq!(later.extended_duplicates, 1);
+    assert_eq!(later.extended_only_duplicates, 1);
+    assert!(matches!(
+        context.representative(&name),
+        Some(ConstantInfo::Thm(_))
+    ));
+
+    let conflicting = ConstantInfo::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: Vec::new(),
+            type_: Expr::const_(Name::str(Name::anonymous(), "Different"), Vec::new()),
+        },
+        is_unsafe: false,
+    });
+    let (context, conflict) = extend_reference_fixture_environment(
+        context,
+        std::slice::from_ref(&conflicting),
+        "Conflict",
+    )
+    .expect("classify conflicting duplicate");
+    assert_eq!(
+        conflict.collisions,
+        vec![name.to_display_string()],
+        "a type mismatch is a real collision, never an extended duplicate"
+    );
+    assert_eq!(conflict.extended_duplicates, 0);
+    assert_eq!(conflict.extended_only_duplicates, 0);
+    assert_eq!(context.environment.len(), 1);
+    assert!(matches!(
+        context.representative(&name),
+        Some(ConstantInfo::Thm(_))
+    ));
+
+    let predicate_name = Name::str(Name::anonymous(), "Predicate");
+    let predicate = ConstantInfo::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: predicate_name.clone(),
+            level_params: Vec::new(),
+            type_: Expr::forall_e(
+                Name::anonymous(),
+                Expr::sort(fln_core::level::Level::zero()),
+                Expr::sort(fln_core::level::Level::zero()),
+                BinderInfo::Default,
+            ),
+        },
+        is_unsafe: false,
+    });
+    let proposition_axiom_name = Name::str(Name::anonymous(), "propositionAxiom");
+    let proposition_axiom = ConstantInfo::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: proposition_axiom_name.clone(),
+            level_params: Vec::new(),
+            type_: Expr::app(
+                Expr::const_(predicate_name, Vec::new()),
+                Expr::sort(fln_core::level::Level::zero()),
+            ),
+        },
+        is_unsafe: false,
+    });
+    let (axiom_context, _) = extend_reference_fixture_environment(
+        ReferenceFixtureContext::new(),
+        &[predicate, proposition_axiom.clone()],
+        "AxiomSeed",
+    )
+    .expect("seed proposition-shaped axiom context");
+    let (_, axiom_duplicate) = extend_reference_fixture_environment(
+        axiom_context,
+        std::slice::from_ref(&proposition_axiom),
+        "AxiomDuplicate",
+    )
+    .expect("classify proposition-shaped axiom duplicate");
+    assert!(axiom_duplicate.collisions.is_empty());
+    assert_eq!(axiom_duplicate.extended_only_duplicates, 1);
+
+    let type_predicate_name = Name::str(Name::anonymous(), "TypePredicate");
+    let type_predicate = ConstantInfo::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: type_predicate_name.clone(),
+            level_params: Vec::new(),
+            type_: Expr::forall_e(
+                Name::anonymous(),
+                Expr::sort(fln_core::level::Level::zero()),
+                Expr::sort(
+                    fln_core::level::Level::zero()
+                        .succ()
+                        .expect("the first successor level is representable"),
+                ),
+                BinderInfo::Default,
+            ),
+        },
+        is_unsafe: false,
+    });
+    let type_axiom_name = Name::str(Name::anonymous(), "typeAxiom");
+    let type_axiom = ConstantInfo::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: type_axiom_name.clone(),
+            level_params: Vec::new(),
+            type_: Expr::app(
+                Expr::const_(type_predicate_name, Vec::new()),
+                Expr::sort(fln_core::level::Level::zero()),
+            ),
+        },
+        is_unsafe: false,
+    });
+    let (type_context, _) = extend_reference_fixture_environment(
+        ReferenceFixtureContext::new(),
+        &[type_predicate, type_axiom.clone()],
+        "TypeAxiomSeed",
+    )
+    .expect("seed non-proposition axiom context");
+    let (_, type_duplicate) = extend_reference_fixture_environment(
+        type_context,
+        std::slice::from_ref(&type_axiom),
+        "TypeAxiomDuplicate",
+    )
+    .expect("classify non-proposition axiom duplicate");
+    assert_eq!(
+        type_duplicate.collisions,
+        vec![type_axiom_name.to_display_string()],
+        "even an identical axiom duplicate is a conflict when isPropCheap is false"
+    );
+    assert_eq!(type_duplicate.extended_only_duplicates, 0);
+}
+
+#[test]
 fn present_olean_corpus_inventory_is_closed_and_honest() {
     let Some(reference_lib) = reference_lib() else {
         eprintln!(
@@ -2096,6 +2433,152 @@ fn present_olean_corpus_inventory_is_closed_and_honest() {
             module.name
         );
     }
+}
+
+#[test]
+fn present_olean_import_contexts_accept_reference_extended_duplicates() {
+    let Some(reference_lib) = reference_lib() else {
+        eprintln!(
+            "SKIP present_olean_import_contexts: pinned Reference stdlib not found; \
+             pin-dependent test must run locally"
+        );
+        return;
+    };
+    let inventory =
+        inventory_present_oleans(&reference_lib).expect("inventory every present pinned olean");
+    let order = corpus_module_order(&inventory).expect("present imports have canonical order");
+    let order_index = order
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    struct ContextState {
+        closure: BTreeSet<String>,
+        context: ReferenceFixtureContext,
+        active_infos: Vec<ConstantInfo>,
+    }
+
+    let mut states = BTreeMap::<String, ContextState>::new();
+    let mut extended_duplicates = 0_u64;
+    let mut extended_only_duplicates = 0_u64;
+    let mut collision_count = 0_u64;
+    let mut first_collisions = Vec::new();
+    for module_name in &order {
+        let module = &inventory.modules[module_name];
+        let (_, infos) = decode_corpus_module(&module.path).expect("decode governed corpus module");
+        let (active_infos, _, _) = reference_active_rows(&infos);
+        let direct_imports = module
+            .imports
+            .iter()
+            .filter(|import| {
+                inventory.modules.contains_key(*import) && import.as_str() != module.name
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut closure = BTreeSet::new();
+        for import in &direct_imports {
+            let state = states
+                .get(import)
+                .expect("canonical module order places every present import first");
+            closure.insert(import.clone());
+            closure.extend(state.closure.iter().cloned());
+        }
+        let base = direct_imports
+            .iter()
+            .max_by_key(|import| states[*import].closure.len());
+        let (mut context, mut included) = match base {
+            Some(base) => {
+                let state = &states[base];
+                let mut included = state.closure.clone();
+                included.insert(base.clone());
+                (state.context.clone(), included)
+            }
+            None => (ReferenceFixtureContext::new(), BTreeSet::new()),
+        };
+        let mut missing = closure.difference(&included).cloned().collect::<Vec<_>>();
+        missing.sort_by_key(|name| order_index[name]);
+        for dependency in missing {
+            let state = &states[&dependency];
+            let (next, report) =
+                extend_reference_fixture_environment(context, &state.active_infos, &dependency)
+                    .expect("merge a decoded import contribution");
+            context = next;
+            included.insert(dependency.clone());
+            extended_duplicates = extended_duplicates
+                .checked_add(report.extended_duplicates)
+                .expect("extended-duplicate census overflow");
+            extended_only_duplicates = extended_only_duplicates
+                .checked_add(report.extended_only_duplicates)
+                .expect("extended-only duplicate census overflow");
+            collision_count = collision_count
+                .checked_add(
+                    u64::try_from(report.collisions.len())
+                        .expect("collision count must fit the evidence schema"),
+                )
+                .expect("collision census overflow");
+            for name in report.collisions {
+                if first_collisions.len() < 20 {
+                    first_collisions.push(format!("{} <- {dependency}: {name}", module.name));
+                }
+            }
+        }
+        assert_eq!(
+            included, closure,
+            "{} import-context reconstruction omitted a present dependency",
+            module.name
+        );
+        let (context, report) =
+            extend_reference_fixture_environment(context, &active_infos, &module.name)
+                .expect("publish decoded module into fixture context");
+        extended_duplicates = extended_duplicates
+            .checked_add(report.extended_duplicates)
+            .expect("extended-duplicate census overflow");
+        extended_only_duplicates = extended_only_duplicates
+            .checked_add(report.extended_only_duplicates)
+            .expect("extended-only duplicate census overflow");
+        collision_count = collision_count
+            .checked_add(
+                u64::try_from(report.collisions.len())
+                    .expect("collision count must fit the evidence schema"),
+            )
+            .expect("collision census overflow");
+        for name in report.collisions {
+            if first_collisions.len() < 20 {
+                first_collisions.push(format!("{} <- self: {name}", module.name));
+            }
+        }
+        states.insert(
+            module.name.clone(),
+            ContextState {
+                closure,
+                context,
+                active_infos,
+            },
+        );
+    }
+
+    eprintln!(
+        "kernel_reference_corpus context_adapter: modules={} \
+         extended_duplicates={} extended_only_duplicates={} collisions={}",
+        states.len(),
+        extended_duplicates,
+        extended_only_duplicates,
+        collision_count
+    );
+    assert_eq!(
+        states.len(),
+        inventory.modules.len(),
+        "context adapter must cover every present module"
+    );
+    assert!(
+        extended_only_duplicates > 0,
+        "the pin must exercise duplicate cases beyond the legacy replay exception"
+    );
+    assert_eq!(
+        collision_count, 0,
+        "valid pinned import closures must all be representable; first={first_collisions:?}"
+    );
 }
 
 /// The executable corpus obligation. It remains ignored while fln-7odd is
@@ -2190,7 +2673,7 @@ fn pinned_present_olean_kernel_differential() {
 
     struct FixtureState {
         closure: BTreeSet<String>,
-        final_env: Environment,
+        context: ReferenceFixtureContext,
         active_infos: Vec<ConstantInfo>,
         faithful: bool,
     }
@@ -2256,42 +2739,47 @@ fn pinned_present_olean_kernel_differential() {
         let base = direct_imports
             .iter()
             .max_by_key(|import| states[*import].closure.len());
-        let (mut imported_env, mut included) = match base {
+        let (mut imported_context, mut included) = match base {
             Some(base) => {
                 let state = &states[base];
                 let mut included = state.closure.clone();
                 included.insert(base.clone());
-                (state.final_env.clone(), included)
+                (state.context.clone(), included)
             }
-            None => (Environment::new(), BTreeSet::new()),
+            None => (ReferenceFixtureContext::new(), BTreeSet::new()),
         };
         let mut missing = closure.difference(&included).cloned().collect::<Vec<_>>();
         missing.sort_by_key(|name| order_index[name]);
         for dependency in missing {
             let state = &states[&dependency];
-            let (next, collisions) = extend_reference_fixture_environment(
-                imported_env,
+            let (next, merge) = extend_reference_fixture_environment(
+                imported_context,
                 &state.active_infos,
                 &dependency,
             )
             .expect("merge a decoded import contribution");
-            imported_env = next;
+            imported_context = next;
             included.insert(dependency.clone());
-            if !collisions.is_empty() {
+            if !merge.collisions.is_empty() {
                 context_faithful = false;
                 eprintln!(
                     "kernel_reference_corpus finding: module={} direction=unscorable \
                      reason=import_context_collision dependency={} affected={} first={:?}",
                     module.name,
                     dependency,
-                    collisions.len(),
-                    collisions.iter().take(5).collect::<Vec<_>>()
+                    merge.collisions.len(),
+                    merge.collisions.iter().take(5).collect::<Vec<_>>()
                 );
             }
         }
 
         let (counts, stream_digest) = if context_faithful {
-            let prep = prepare_replay_from(imported_env.clone(), &active_infos, false);
+            let prep = prepare_replay_from(
+                imported_context.environment.clone(),
+                Some(&imported_context),
+                &active_infos,
+                false,
+            );
             let threads = if prep.items.len() < 64 { 1 } else { 8 };
             let run = check_matrix_run(&prep, threads, Budget::DEFAULT);
             (
@@ -2352,24 +2840,24 @@ fn pinned_present_olean_kernel_differential() {
             stream_digest
         );
         total.add(&counts);
-        let (final_env, current_collisions) =
-            extend_reference_fixture_environment(imported_env, &active_infos, &module.name)
+        let (context, current_merge) =
+            extend_reference_fixture_environment(imported_context, &active_infos, &module.name)
                 .expect("publish decoded module into non-authoritative Reference fixture context");
-        if !current_collisions.is_empty() {
+        if !current_merge.collisions.is_empty() {
             context_faithful = false;
             eprintln!(
                 "kernel_reference_corpus finding: module={} direction=unscorable \
                  reason=current_module_context_collision affected={} first={:?}",
                 module.name,
-                current_collisions.len(),
-                current_collisions.iter().take(5).collect::<Vec<_>>()
+                current_merge.collisions.len(),
+                current_merge.collisions.iter().take(5).collect::<Vec<_>>()
             );
         }
         states.insert(
             module.name.clone(),
             FixtureState {
                 closure,
-                final_env,
+                context,
                 active_infos,
                 faithful: context_faithful,
             },
