@@ -518,6 +518,28 @@ pub enum ModuleGraphInconclusive {
     /// base moving says nothing about whether this module is admissible. Re-deciding
     /// against the current base may well admit it. Caching this as a refusal would
     /// record "the graph was busy" as "this module is invalid".
+    ///
+    /// # When this folds onto `fln_core::outcome` (bead `fln-um4a`), it maps to
+    /// [`InconclusiveCause::AuthorityIncomplete`](fln_core::outcome::InconclusiveCause)
+    ///
+    /// Recorded here rather than only on the bead, because this is the one arm `fln-um4a`
+    /// expected NOT to fit: a plan consumed against a moved base is neither a budget stop
+    /// nor a cancellation, and the bead instructed that if no core cause fitted honestly
+    /// it should go to `fln-171x` as evidence for a new one rather than becoming a local
+    /// invention.
+    ///
+    /// It fits, and the precedent is in this crate. [`crate::environment::PreparedDeclarationAdmission::commit`]
+    /// reaches the identical situation — a plan decided against a base that has since
+    /// moved — and answers it with
+    /// `Inconclusive::authority_incomplete("declaration admission plan decided against a
+    /// superseded environment")`. The argument there is word-for-word the argument in the
+    /// paragraph above: the base moving is a statement about the PLAN, not about the
+    /// subject, so authority was never established and nothing was decided.
+    ///
+    /// So no new core cause is needed and `fln-171x` should not be opened for this. The
+    /// folded form carries the module id and both revisions in the inconclusive's
+    /// `progress` text, since `Inconclusive` is payload-free by the `fln-171x` decision
+    /// and those three numbers are diagnostic rather than authority-bearing.
     PlanSuperseded {
         module: ModuleId,
         expected_revision: u64,
