@@ -1155,7 +1155,24 @@ impl<'a> Engine<'a> {
                     let s = tc.infer(&l.type_.clone(), 0)?;
                     tc.whnf_public(&s, 0)
                 })?;
-                if !matches!(field_sort.node(), ExprNode::Sort { level } if level.is_zero()) {
+                // NORMALISE THE LEVEL BEFORE ASKING WHETHER IT IS ZERO.
+                // `Level::is_zero` is purely structural, and `whnf` reduces the
+                // EXPRESSION without normalising the level inside a `Sort`. A
+                // field of sort `Sort (imax u 0)` is semantically a Prop but is
+                // not `Node::Zero`, so it was treated as data, pushed to
+                // `to_check`, found absent from the result's arguments, and the
+                // whole inductive was restricted to Prop-only elimination.
+                //
+                // That cost 228 corpus rows across 76 subsingleton types (bead
+                // `franken_lean-d17i`): the regenerated recursor carried no
+                // motive universe and its level-parameter list came out one
+                // shorter than the pin's, rejecting every declaration in the
+                // block. Restrictive, so never unsound — but wrong.
+                let is_prop = matches!(
+                    field_sort.node(),
+                    ExprNode::Sort { level } if level.normalize_fixpoint().is_zero()
+                );
+                if !is_prop {
                     to_check.push(l.clone());
                 }
                 l
