@@ -4,3 +4,5 @@
 //! the crate map and layering are governed by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 
 #![forbid(unsafe_code)]
+
+pub mod state;
