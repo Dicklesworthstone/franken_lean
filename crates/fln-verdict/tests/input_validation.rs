@@ -753,33 +753,115 @@ fn pigeonhole(pigeons: u32, holes: u32) -> Cnf {
     .expect("pigeonhole fixture is a valid CNF")
 }
 
+fn complete_assignment_cube(variable_count: u32) -> Cnf {
+    let assignment_count = 1_u64
+        .checked_shl(variable_count)
+        .expect("cost corpus variable count fits the assignment mask");
+    let clauses = (0..assignment_count)
+        .map(|assignment| {
+            let literals = (0..variable_count)
+                .map(|variable| {
+                    let polarity = if assignment & (1_u64 << variable) == 0 {
+                        Polarity::Positive
+                    } else {
+                        Polarity::Negative
+                    };
+                    (variable + 1, polarity)
+                })
+                .collect::<Vec<_>>();
+            clause(&literals)
+        })
+        .enumerate()
+        .map(|(index, clause)| InputClause::new(clause_id(index as u64 + 1), clause))
+        .collect();
+    Cnf::new(variable_count, clauses, SchemaLimits::default())
+        .expect("complete assignment cube is a valid UNSAT CNF")
+}
+
 #[test]
-#[ignore = "franken_lean-r4m8: checker cost exceeds solver recomputation"]
-fn checker_work_is_below_decision_heavy_recomputation_work() {
-    let cnf = pigeonhole(4, 3);
-    let SolverOutcome::Unsat {
-        artifact,
-        statistics,
-    } = solve(&cnf, SolverLimits::default())
-    else {
-        panic!("pigeonhole(4, 3) must produce a checked UNSAT artifact");
-    };
-    let replay = check_unsat_streams(
-        artifact.cnf_bytes(),
-        artifact.proof_bytes(),
-        ProofCheckLimits::default(),
-    );
-    let receipt = replay
-        .receipt()
-        .expect("solver-produced proof must replay independently");
-    assert_eq!(receipt, artifact.receipt());
-    println!(
-        "verdict-cost-evidence checker_work={} solver_work={}",
-        receipt.work_units, statistics.work_units
-    );
+fn checker_work_is_strictly_below_recomputation_on_unsat_corpus() {
+    let corpus = [
+        ("pigeonhole", 3, pigeonhole(3, 2)),
+        ("pigeonhole", 4, pigeonhole(4, 3)),
+        ("pigeonhole", 5, pigeonhole(5, 4)),
+        ("assignment-cube", 3, complete_assignment_cube(3)),
+        ("assignment-cube", 4, complete_assignment_cube(4)),
+        ("assignment-cube", 5, complete_assignment_cube(5)),
+    ];
+    let mut violations = Vec::new();
+    for (family, size, cnf) in corpus {
+        let outcome = solve(&cnf, SolverLimits::default());
+        let SolverOutcome::Unsat {
+            artifact,
+            statistics,
+        } = outcome
+        else {
+            panic!("{family}({size}) must produce a checked UNSAT artifact: {outcome:?}");
+        };
+        let replay = check_unsat_streams(
+            artifact.cnf_bytes(),
+            artifact.proof_bytes(),
+            ProofCheckLimits::default(),
+        );
+        let receipt = replay
+            .receipt()
+            .expect("solver-produced proof must replay independently");
+        assert_eq!(receipt, artifact.receipt());
+        let mut derived_literals = 0_u64;
+        let mut rup_assumptions = 0_u64;
+        let mut rup_dependencies = 0_u64;
+        let mut rup_steps = 0_u64;
+        let mut resolution_work = 0_u64;
+        let mut resolution_steps = 0_u64;
+        for step in artifact.proof().steps() {
+            if let ProofStep::Derive { clause, rule, .. } = step {
+                let literals = clause.literals().len() as u64;
+                derived_literals += literals;
+                match rule {
+                    ProofRule::Rup { antecedents } => {
+                        rup_steps += 1;
+                        rup_assumptions += literals;
+                        rup_dependencies += antecedents.len() as u64;
+                    }
+                    ProofRule::Resolution { .. } => {
+                        resolution_steps += 1;
+                        resolution_work += literals;
+                    }
+                }
+            }
+        }
+        let structural_work = cnf.facts().clauses
+            + cnf.facts().literals
+            + receipt.proof_steps
+            + derived_literals
+            + rup_dependencies
+            + rup_assumptions
+            + resolution_work;
+        let rup_scan_work = receipt
+            .work_units
+            .checked_sub(structural_work)
+            .expect("checker work accounting must conserve registered units");
+        println!(
+            "verdict-cost-evidence family={family} size={size} variables={} clauses={} \
+             proof_steps={} resolution_steps={resolution_steps} rup_steps={rup_steps} \
+             dependencies={} structural_work={} rup_scan_work={} \
+             checker_work={} solver_work={}",
+            cnf.variable_count(),
+            cnf.facts().clauses,
+            receipt.proof_steps,
+            receipt.dependencies,
+            structural_work,
+            rup_scan_work,
+            receipt.work_units,
+            statistics.work_units
+        );
+        if receipt.work_units >= statistics.work_units {
+            violations.push((family, size, receipt.work_units, statistics.work_units));
+        }
+    }
     assert!(
-        receipt.work_units < statistics.work_units,
-        "decision-heavy proof checking must be cheaper than recomputation"
+        violations.is_empty(),
+        "proof checking must be strictly cheaper than recomputation: {violations:?}"
     );
 }
 

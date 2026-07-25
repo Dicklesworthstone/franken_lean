@@ -25,12 +25,12 @@ pub struct CdclDeterminismPolicy {
 }
 
 pub const DETERMINISTIC_CDCL_POLICY: CdclDeterminismPolicy = CdclDeterminismPolicy {
-    policy_id: "fln.verdict.cdcl.determinism/1",
+    policy_id: "fln.verdict.cdcl.determinism/2",
     variable_order: "highest-integer-activity-then-smallest-variable",
     initial_phase: "negative-then-saved-phase",
-    conflict_analysis: "first-uip-canonical-backjump",
+    conflict_analysis: "first-uip-root-context-preserving-backjump",
     restart_schedule: "luby-base-conflicts",
-    proof_order: "monotone-clause-id-full-live-rup",
+    proof_order: "reverse-trail-resolution-relevant-rup-fallback",
 };
 
 /// A solver-owned resource.  These are operation facts, not SAT verdicts.
@@ -490,6 +490,19 @@ enum SearchResult {
     Unsat(usize),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolutionLink {
+    pivot: usize,
+    reason: usize,
+}
+
+#[derive(Debug)]
+struct ConflictAnalysis {
+    learned: Vec<SolverLiteral>,
+    backtrack_level: u32,
+    resolution_links: Vec<ResolutionLink>,
+}
+
 #[derive(Debug)]
 enum Stop {
     Inconclusive(SolverInconclusive),
@@ -548,6 +561,16 @@ impl<'a> Engine<'a> {
             limits.max_literals,
             cnf.facts().literals,
         )?;
+        let initial_work = cnf
+            .facts()
+            .clauses
+            .checked_add(cnf.facts().literals)
+            .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+        enforce_initial(
+            SolverResource::WorkUnits,
+            limits.max_work_units,
+            initial_work,
+        )?;
 
         let variable_count = usize::try_from(cnf.variable_count()).map_err(|_| {
             Stop::Inconclusive(SolverInconclusive::AllocationRefused {
@@ -595,7 +618,10 @@ impl<'a> Engine<'a> {
             total_literals: cnf.facts().literals,
             conflicts_since_restart: 0,
             restart_index: 1,
-            statistics: SolverStatistics::default(),
+            statistics: SolverStatistics {
+                work_units: initial_work,
+                ..SolverStatistics::default()
+            },
         };
 
         for row in cnf.clauses() {
@@ -664,13 +690,19 @@ impl<'a> Engine<'a> {
                 if self.decision_level() == 0 {
                     return Ok(SearchResult::Unsat(conflict));
                 }
-                let (learned, backtrack_level) = self.analyze(conflict)?;
-                self.backtrack(backtrack_level)?;
-                let asserting = learned
+                let analysis = self.analyze(conflict)?;
+                self.backtrack(analysis.backtrack_level)?;
+                let asserting = analysis
+                    .learned
                     .first()
                     .copied()
                     .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
-                let learned_index = self.log_learned_clause(learned)?;
+                let learned_index = self.log_learned_clause(
+                    conflict,
+                    analysis.learned,
+                    &analysis.resolution_links,
+                    cancelled,
+                )?;
                 if !self.enqueue(asserting, Some(learned_index), true)? {
                     return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
                 }
@@ -865,7 +897,7 @@ impl<'a> Engine<'a> {
         Ok(true)
     }
 
-    fn analyze(&mut self, conflict: usize) -> EngineResult<(Vec<SolverLiteral>, u32)> {
+    fn analyze(&mut self, conflict: usize) -> EngineResult<ConflictAnalysis> {
         let current_level = self.decision_level();
         if current_level == 0 {
             return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
@@ -885,23 +917,37 @@ impl<'a> Engine<'a> {
         let mut trail_index = self.trail.len();
         let mut clause_index = conflict;
         let mut skip_variable = None;
+        let mut resolution_links = Vec::new();
 
         loop {
-            let literals = self
+            let literal_count = self
                 .clauses
                 .get(clause_index)
                 .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?
                 .literals
-                .clone();
-            for literal in literals {
+                .len();
+            for literal_index in 0..literal_count {
                 self.spend_work(1)?;
-                if skip_variable == Some(literal.variable)
-                    || self.seen[literal.variable]
-                    || self.levels[literal.variable] == 0
-                {
+                let literal = self
+                    .clauses
+                    .get(clause_index)
+                    .and_then(|clause| clause.literals.get(literal_index))
+                    .copied()
+                    .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+                if skip_variable == Some(literal.variable) || self.seen[literal.variable] {
                     continue;
                 }
                 self.seen[literal.variable] = true;
+                if self.levels[literal.variable] == 0 {
+                    learned.try_reserve(1).map_err(|_| {
+                        Stop::Inconclusive(SolverInconclusive::AllocationRefused {
+                            resource: SolverResource::AddressSpace,
+                            requested: learned.len().saturating_add(1) as u64,
+                        })
+                    })?;
+                    learned.push(literal);
+                    continue;
+                }
                 self.bump_activity(literal.variable);
                 if self.levels[literal.variable] == current_level {
                     unresolved = unresolved
@@ -935,8 +981,19 @@ impl<'a> Engine<'a> {
                 learned[0] = pivot.negated();
                 break;
             }
-            clause_index = self.reasons[pivot.variable]
+            let reason = self.reasons[pivot.variable]
                 .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+            resolution_links.try_reserve(1).map_err(|_| {
+                Stop::Inconclusive(SolverInconclusive::AllocationRefused {
+                    resource: SolverResource::ProofDependencies,
+                    requested: resolution_links.len().saturating_add(1) as u64,
+                })
+            })?;
+            resolution_links.push(ResolutionLink {
+                pivot: pivot.variable,
+                reason,
+            });
+            clause_index = reason;
             skip_variable = Some(pivot.variable);
         }
 
@@ -960,10 +1017,23 @@ impl<'a> Engine<'a> {
             .map(|literal| self.levels[literal.variable])
             .max()
             .unwrap_or(0);
-        Ok((learned, backtrack))
+        Ok(ConflictAnalysis {
+            learned,
+            backtrack_level: backtrack,
+            resolution_links,
+        })
     }
 
-    fn log_learned_clause(&mut self, learned: Vec<SolverLiteral>) -> EngineResult<usize> {
+    fn log_learned_clause<F>(
+        &mut self,
+        conflict: usize,
+        learned: Vec<SolverLiteral>,
+        resolution_links: &[ResolutionLink],
+        cancelled: &mut F,
+    ) -> EngineResult<usize>
+    where
+        F: FnMut() -> bool,
+    {
         self.charge_counter(
             self.statistics.learned_clauses,
             self.limits.max_learned_clauses,
@@ -980,15 +1050,155 @@ impl<'a> Engine<'a> {
             .checked_add(learned_literals)
             .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
         enforce_initial(SolverResource::Literals, self.limits.max_literals, total)?;
-        let id = self.allocate_clause_id()?;
-        let public = self.public_clause(&learned)?;
-        let antecedents: Vec<ClauseId> = self.active_ids.iter().copied().collect();
-        self.record_rup(id, public, antecedents)?;
+        let id = if let Some(id) =
+            self.record_learned_resolution_chain(conflict, &learned, resolution_links, cancelled)?
+        {
+            id
+        } else {
+            let id = self.allocate_clause_id()?;
+            let public = self.public_clause(&learned)?;
+            let antecedents = self.relevant_rup_antecedents(&learned, cancelled)?;
+            self.record_rup(id, public, antecedents)?;
+            id
+        };
         let index = self.install_clause(id, learned)?;
         self.active_ids.insert(id);
         self.total_literals = total;
         self.statistics.learned_clauses += 1;
         Ok(index)
+    }
+
+    fn record_learned_resolution_chain<F>(
+        &mut self,
+        conflict: usize,
+        learned: &[SolverLiteral],
+        links: &[ResolutionLink],
+        cancelled: &mut F,
+    ) -> EngineResult<Option<ClauseId>>
+    where
+        F: FnMut() -> bool,
+    {
+        let conflict_clause = self
+            .clauses
+            .get(conflict)
+            .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+        let mut current = canonical_solver_literals(&conflict_clause.literals)?;
+        let mut current_id = conflict_clause.id;
+        let target = canonical_solver_literals(learned)?;
+        let mut derived_any = false;
+        for link in links {
+            self.observe_cancel(cancelled)?;
+            let reason = self
+                .clauses
+                .get(link.reason)
+                .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+            let (resolvent, positive_parent, negative_parent) =
+                resolve_solver_literals(&current, current_id, reason, link.pivot)?;
+            let id = self.allocate_clause_id()?;
+            let public = self.public_clause(&resolvent)?;
+            let pivot = u32::try_from(link.pivot)
+                .ok()
+                .and_then(|raw| VariableId::new(raw).ok())
+                .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+            self.record_resolution(id, public, pivot, positive_parent, negative_parent)?;
+            current = resolvent;
+            current_id = id;
+            derived_any = true;
+        }
+
+        if current == target {
+            Ok(derived_any.then_some(current_id))
+        } else {
+            Err(Stop::InternalFault(SolverInternalFault::StateInvariant))
+        }
+    }
+
+    fn relevant_rup_antecedents<F>(
+        &self,
+        derived: &[SolverLiteral],
+        cancelled: &mut F,
+    ) -> EngineResult<Vec<ClauseId>>
+    where
+        F: FnMut() -> bool,
+    {
+        let mut previous_id = None;
+        let mut active_clause_count = 0_usize;
+        for clause in &self.clauses {
+            if !self.active_ids.contains(&clause.id) {
+                continue;
+            }
+            if previous_id.is_some_and(|previous| previous >= clause.id) {
+                return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+            }
+            previous_id = Some(clause.id);
+            active_clause_count = active_clause_count
+                .checked_add(1)
+                .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+        }
+        if active_clause_count != self.active_ids.len() {
+            return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+        }
+
+        let mut assignments = fallible_filled_vec(self.assignments.len(), None)?;
+        for literal in derived {
+            let Some(slot) = assignments.get_mut(literal.variable) else {
+                return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+            };
+            if slot.replace(!literal.positive).is_some() {
+                return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+            }
+        }
+        let mut antecedents =
+            fallible_vec(self.assignments.len(), SolverResource::ProofDependencies)?;
+
+        loop {
+            self.observe_cancel(cancelled)?;
+            let mut progressed = false;
+            for clause in &self.clauses {
+                if !self.active_ids.contains(&clause.id) {
+                    continue;
+                }
+                let mut satisfied = false;
+                let mut unit = None;
+                let mut multiple_unassigned = false;
+                for literal in &clause.literals {
+                    match assignments.get(literal.variable).copied().flatten() {
+                        Some(value) if value == literal.positive => {
+                            satisfied = true;
+                            break;
+                        }
+                        Some(_) => {}
+                        None if unit.is_none() => unit = Some(*literal),
+                        None => multiple_unassigned = true,
+                    }
+                }
+                if satisfied {
+                    continue;
+                }
+                if unit.is_none() {
+                    antecedents.push(clause.id);
+                    antecedents.sort_unstable();
+                    return Ok(antecedents);
+                }
+                if multiple_unassigned {
+                    continue;
+                }
+                let Some(unit) = unit else {
+                    return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+                };
+                let Some(slot) = assignments.get_mut(unit.variable) else {
+                    return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+                };
+                if slot.replace(unit.positive).is_some() {
+                    return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+                }
+                antecedents.push(clause.id);
+                progressed = true;
+            }
+            if !progressed {
+                return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+            }
+        }
     }
 
     fn record_rup(
@@ -1037,25 +1247,124 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    fn record_resolution(
+        &mut self,
+        id: ClauseId,
+        clause: Clause,
+        pivot: VariableId,
+        positive_parent: ClauseId,
+        negative_parent: ClauseId,
+    ) -> EngineResult<()> {
+        if positive_parent == negative_parent {
+            return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+        }
+        let dependency_total = self
+            .statistics
+            .proof_dependencies
+            .checked_add(2)
+            .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+        enforce_initial(
+            SolverResource::ProofDependencies,
+            self.limits.max_proof_dependencies,
+            dependency_total,
+        )?;
+        let step_total = self
+            .statistics
+            .proof_steps
+            .checked_add(1)
+            .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+        enforce_initial(
+            SolverResource::ProofSteps,
+            self.limits.max_proof_steps,
+            step_total,
+        )?;
+        self.proof_steps.try_reserve(1).map_err(|_| {
+            Stop::Inconclusive(SolverInconclusive::AllocationRefused {
+                resource: SolverResource::AddressSpace,
+                requested: step_total,
+            })
+        })?;
+        self.proof_steps.push(ProofStep::Derive {
+            id,
+            clause,
+            rule: ProofRule::Resolution {
+                pivot,
+                positive_parent,
+                negative_parent,
+            },
+        });
+        self.statistics.proof_steps = step_total;
+        self.statistics.proof_dependencies = dependency_total;
+        Ok(())
+    }
+
+    fn record_empty_resolution_chain<F>(
+        &mut self,
+        conflict: usize,
+        cancelled: &mut F,
+    ) -> EngineResult<ClauseId>
+    where
+        F: FnMut() -> bool,
+    {
+        let conflict_clause = self
+            .clauses
+            .get(conflict)
+            .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+        let mut current = canonical_solver_literals(&conflict_clause.literals)?;
+        let mut current_id = conflict_clause.id;
+        let mut steps = 0_usize;
+        while !current.is_empty() {
+            self.observe_cancel(cancelled)?;
+            steps = steps
+                .checked_add(1)
+                .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+            if steps > self.assignments.len() {
+                return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+            }
+            if current
+                .iter()
+                .any(|literal| self.literal_value(*literal) != Some(false))
+            {
+                return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+            }
+            let pivot = self
+                .trail
+                .iter()
+                .rev()
+                .find(|assigned| {
+                    current
+                        .iter()
+                        .any(|literal| literal.variable == assigned.variable)
+                })
+                .copied()
+                .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+            let reason_index = self.reasons[pivot.variable]
+                .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+            let reason = self
+                .clauses
+                .get(reason_index)
+                .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+            let (resolvent, positive_parent, negative_parent) =
+                resolve_solver_literals(&current, current_id, reason, pivot.variable)?;
+            let id = self.allocate_clause_id()?;
+            let public = self.public_clause(&resolvent)?;
+            let pivot = u32::try_from(pivot.variable)
+                .ok()
+                .and_then(|raw| VariableId::new(raw).ok())
+                .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+            self.record_resolution(id, public, pivot, positive_parent, negative_parent)?;
+            current = resolvent;
+            current_id = id;
+        }
+        Ok(current_id)
+    }
+
     fn finish_unsat<F>(&mut self, conflict: usize, cancelled: &mut F) -> EngineResult<SolverOutcome>
     where
         F: FnMut() -> bool,
     {
         self.observe_cancel(cancelled)?;
-        let conflict_clause = self
-            .clauses
-            .get(conflict)
-            .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
-        let empty_id = if conflict_clause.literals.is_empty() {
-            conflict_clause.id
-        } else {
-            let id = self.allocate_clause_id()?;
-            let antecedents: Vec<ClauseId> = self.active_ids.iter().copied().collect();
-            let empty = Clause::new(Vec::new())
-                .map_err(|error| Stop::InternalFault(SolverInternalFault::Schema(error)))?;
-            self.record_rup(id, empty, antecedents)?;
-            id
-        };
+        let empty_id = self.record_empty_resolution_chain(conflict, cancelled)?;
 
         let final_steps = self
             .statistics
@@ -1363,6 +1672,78 @@ impl<'a> Engine<'a> {
     }
 }
 
+fn clone_solver_literals(literals: &[SolverLiteral]) -> EngineResult<Vec<SolverLiteral>> {
+    let mut cloned = fallible_vec(literals.len(), SolverResource::AddressSpace)?;
+    cloned.extend_from_slice(literals);
+    Ok(cloned)
+}
+
+fn canonical_solver_literals(literals: &[SolverLiteral]) -> EngineResult<Vec<SolverLiteral>> {
+    canonicalize_solver_literals(clone_solver_literals(literals)?)
+}
+
+fn canonicalize_solver_literals(
+    mut literals: Vec<SolverLiteral>,
+) -> EngineResult<Vec<SolverLiteral>> {
+    literals.sort_unstable();
+    literals.dedup();
+    if literals.iter().any(|literal| literal.variable == 0)
+        || literals
+            .windows(2)
+            .any(|pair| pair[0].variable == pair[1].variable)
+    {
+        return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+    }
+    Ok(literals)
+}
+
+fn resolve_solver_literals(
+    current: &[SolverLiteral],
+    current_id: ClauseId,
+    reason: &SolverClause,
+    pivot: usize,
+) -> EngineResult<(Vec<SolverLiteral>, ClauseId, ClauseId)> {
+    let mut current_polarity = None;
+    for literal in current {
+        if literal.variable == pivot && current_polarity.replace(literal.positive).is_some() {
+            return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+        }
+    }
+    let mut reason_polarity = None;
+    for literal in &reason.literals {
+        if literal.variable == pivot && reason_polarity.replace(literal.positive).is_some() {
+            return Err(Stop::InternalFault(SolverInternalFault::StateInvariant));
+        }
+    }
+    let current_polarity =
+        current_polarity.ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+    let reason_polarity =
+        reason_polarity.ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+    let (positive_parent, negative_parent) = match (current_polarity, reason_polarity) {
+        (true, false) => (current_id, reason.id),
+        (false, true) => (reason.id, current_id),
+        _ => return Err(Stop::InternalFault(SolverInternalFault::StateInvariant)),
+    };
+
+    let capacity = current
+        .len()
+        .checked_add(reason.literals.len())
+        .ok_or(Stop::InternalFault(SolverInternalFault::StateInvariant))?;
+    let mut resolvent = fallible_vec(capacity, SolverResource::AddressSpace)?;
+    resolvent.extend(
+        current
+            .iter()
+            .chain(&reason.literals)
+            .copied()
+            .filter(|literal| literal.variable != pivot),
+    );
+    Ok((
+        canonicalize_solver_literals(resolvent)?,
+        positive_parent,
+        negative_parent,
+    ))
+}
+
 fn enforce_initial(resource: SolverResource, limit: u64, actual: u64) -> EngineResult<()> {
     if actual <= limit {
         Ok(())
@@ -1569,12 +1950,12 @@ mod cdcl_state_model {
         assert_eq!(
             DETERMINISTIC_CDCL_POLICY,
             CdclDeterminismPolicy {
-                policy_id: "fln.verdict.cdcl.determinism/1",
+                policy_id: "fln.verdict.cdcl.determinism/2",
                 variable_order: "highest-integer-activity-then-smallest-variable",
                 initial_phase: "negative-then-saved-phase",
-                conflict_analysis: "first-uip-canonical-backjump",
+                conflict_analysis: "first-uip-root-context-preserving-backjump",
                 restart_schedule: "luby-base-conflicts",
-                proof_order: "monotone-clause-id-full-live-rup",
+                proof_order: "reverse-trail-resolution-relevant-rup-fallback",
             }
         );
         assert_eq!(
