@@ -1620,6 +1620,12 @@ impl ModuleProvenanceManifest {
                         ModuleGraphInconclusive::Cancelled { .. } => {
                             "module-graph construction reported cancellation without a request"
                         }
+                        // Construction decides and publishes in one step; there is no
+                        // plan to supersede. Reaching this is an invariant failure of
+                        // the layer below, not a verdict about the manifest.
+                        ModuleGraphInconclusive::PlanSuperseded { .. } => {
+                            "module-graph construction reported a superseded plan it never prepared"
+                        }
                     },
                 });
             }
@@ -1669,6 +1675,15 @@ impl ModuleProvenanceManifest {
                     // module, and never a user-facing diagnostic.
                     return Err(ModuleProvenanceError::GraphAdmissionFault {
                         what: "module-graph registration reported cancellation without a request",
+                    });
+                }
+                ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::PlanSuperseded {
+                    ..
+                }) => {
+                    // Same class: this path registers directly against a graph it
+                    // holds exclusively, so nothing can supersede a plan under it.
+                    return Err(ModuleProvenanceError::GraphAdmissionFault {
+                        what: "module-graph registration reported a superseded plan under exclusive ownership",
                     });
                 }
             };

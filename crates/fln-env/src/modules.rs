@@ -466,6 +466,18 @@ pub enum ModuleGraphInconclusive {
         module: ModuleId,
         checkpoint: RegistrationCheckpoint,
     },
+    /// A prepared admission was committed against a base that had moved since it
+    /// was decided (bead `franken_lean-6sf3`).
+    ///
+    /// Inconclusive rather than rejected, and the distinction is the usual one: the
+    /// base moving says nothing about whether this module is admissible. Re-deciding
+    /// against the current base may well admit it. Caching this as a refusal would
+    /// record "the graph was busy" as "this module is invalid".
+    PlanSuperseded {
+        module: ModuleId,
+        expected_revision: u64,
+        actual_revision: u64,
+    },
 }
 
 /// The typed outcome of one module-graph registration (bead
@@ -840,6 +852,9 @@ impl<T> ModuleGraphOutcome<T> {
             ModuleGraphOutcome::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
                 ..
             }) => "inconclusive-resource",
+            ModuleGraphOutcome::Inconclusive(ModuleGraphInconclusive::PlanSuperseded {
+                ..
+            }) => "inconclusive-plan-superseded",
         }
     }
 
@@ -956,6 +971,96 @@ struct ModuleGraphState {
     /// makes a plan computed against an earlier state detectably stale; see
     /// [`ModuleGraphBinding`] for what it does and does not prove.
     revision: u64,
+}
+
+/// The material a prepared admission holds until it is committed.
+#[derive(Debug)]
+enum PreparedMaterial {
+    Publish {
+        records: PMap<ModuleId, Arc<ModuleRecord>>,
+        facts: ModuleGraphFacts,
+        work: RegistrationWork,
+    },
+    Idempotent {
+        work: RegistrationWork,
+    },
+}
+
+/// A decided admission that has not been published.
+///
+/// It carries the candidate state so committing publishes without re-deriving
+/// anything, and it is consumed **exactly once** — [`commit`](Self::commit) takes
+/// `self` by value, so a second publication from the same decision is not something
+/// a caller can express rather than something they are asked not to do.
+///
+/// Holding material is not authority. Nothing here is reachable as the graph, it is
+/// never cacheable, and committing revalidates the base and cancellation first.
+#[derive(Debug)]
+pub struct PreparedAdmission {
+    plan: ModuleGraphAdmissionPlan,
+    material: PreparedMaterial,
+}
+
+impl PreparedAdmission {
+    /// The descriptive plan for this decision — the same value
+    /// [`ModuleGraph::plan_registration`] would produce for the same input.
+    pub fn plan(&self) -> &ModuleGraphAdmissionPlan {
+        &self.plan
+    }
+
+    /// Whether committing would publish a new graph state.
+    pub fn publishes(&self) -> bool {
+        matches!(self.material, PreparedMaterial::Publish { .. })
+    }
+
+    /// **Never.** A prepared admission is a decision in flight, not a result.
+    pub const fn is_cacheable(&self) -> bool {
+        false
+    }
+
+    /// Revalidate against `graph` and publish exactly once.
+    ///
+    /// Two things are rechecked immediately before publication and nothing else is
+    /// recomputed: the base binding, because a plan decided against one base is
+    /// meaningless against another, and cancellation, because a caller who gave up
+    /// between deciding and publishing must not have a module published on their
+    /// behalf. Both refusals are FL-INV-07 inconclusive — no verdict was reached
+    /// about the module — and neither is cacheable.
+    pub fn commit(
+        self,
+        graph: &ModuleGraph,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> ModuleGraphAdmission {
+        if !self.plan.is_valid_for(graph) {
+            return ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::PlanSuperseded {
+                module: self.plan.request().clone(),
+                expected_revision: self.plan.base().revision,
+                actual_revision: graph.binding().revision,
+            });
+        }
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::Cancelled {
+                module: self.plan.request().clone(),
+                checkpoint: RegistrationCheckpoint::BeforePublication,
+            });
+        }
+        match self.material {
+            PreparedMaterial::Idempotent { work } => ModuleGraphAdmission::Complete(Registration {
+                graph: graph.clone(),
+                disposition: RegistrationDisposition::Idempotent,
+                work,
+            }),
+            PreparedMaterial::Publish {
+                records,
+                facts,
+                work,
+            } => ModuleGraphAdmission::Complete(Registration {
+                graph: graph.published(records, facts),
+                disposition: RegistrationDisposition::Inserted,
+                work,
+            }),
+        }
+    }
 }
 
 /// The outcome shape of the shared decision procedure, before publication.
@@ -1125,35 +1230,103 @@ impl ModuleGraph {
         // One decision procedure, then publication. Admission does not re-derive
         // anything the decision already established, so a plan of the same input
         // cannot disagree with it.
-        let decision = self.decide(&record, cancellation);
-        match decision.outcome {
-            DecisionOutcome::Rejected(error) => ModuleGraphAdmission::Rejected(error),
-            DecisionOutcome::Inconclusive(reason) => ModuleGraphAdmission::Inconclusive(reason),
-            DecisionOutcome::Idempotent { work } => ModuleGraphAdmission::Complete(Registration {
-                graph: self.clone(),
-                disposition: RegistrationDisposition::Idempotent,
-                work,
+        // Prepare, then commit. Direct registration is not a second path to
+        // publication: it is the plan protocol with both steps taken together, so
+        // anything true of a committed plan is true of it. The base cannot move
+        // between the halves here, so the commit-time base revalidation is
+        // trivially satisfied rather than skipped. Cancellation is passed as `None`
+        // because `decide` has already sampled it at `BeforePublication` — sampling
+        // again would be a second sample of the caller's probe within one
+        // registration, which would change what a probe observes rather than
+        // strengthen the check.
+        match self.prepare_registration(record, cancellation) {
+            ModuleGraphOutcome::Complete(prepared) => prepared.commit(self, None),
+            ModuleGraphOutcome::Rejected(error) => ModuleGraphAdmission::Rejected(error),
+            ModuleGraphOutcome::Inconclusive(reason) => ModuleGraphAdmission::Inconclusive(reason),
+        }
+    }
+
+    /// Publish a candidate state, moving the lineage exactly one step. The single
+    /// place a new graph state comes into existence.
+    fn published(
+        &self,
+        records: PMap<ModuleId, Arc<ModuleRecord>>,
+        facts: ModuleGraphFacts,
+    ) -> Self {
+        Self {
+            epoch: self.epoch.clone(),
+            limits: self.limits,
+            state: Arc::new(ModuleGraphState {
+                records,
+                facts,
+                revision: self.state.revision.saturating_add(1),
             }),
+        }
+    }
+
+    /// Decide a registration and hold the result, **without publishing it**.
+    ///
+    /// This is the consumable half of the plan protocol (bead `franken_lean-6sf3`).
+    /// [`plan_registration`](Self::plan_registration) answers "what would happen"
+    /// and keeps no material; this answers the same question and *keeps* the
+    /// candidate state so that [`PreparedAdmission::commit`] can publish it without
+    /// redoing the lookup, the canonicalization, or the accounting. That is the
+    /// property atomic application needs: the work is done once and handed over.
+    ///
+    /// Preparing publishes nothing. A refused or inconclusive decision returns that
+    /// outcome directly and yields no `PreparedAdmission` at all, so an exhaustion
+    /// reached while preparing has nothing to commit and nothing to memoize.
+    pub fn prepare_registration(
+        &self,
+        record: ModuleRecord,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> ModuleGraphOutcome<PreparedAdmission> {
+        let decision = self.decide(&record, cancellation);
+        let plan = self.plan_from(&record, &decision);
+        match decision.outcome {
+            DecisionOutcome::Rejected(error) => ModuleGraphOutcome::Rejected(error),
+            DecisionOutcome::Inconclusive(reason) => ModuleGraphOutcome::Inconclusive(reason),
+            DecisionOutcome::Idempotent { work } => {
+                ModuleGraphOutcome::Complete(PreparedAdmission {
+                    plan,
+                    material: PreparedMaterial::Idempotent { work },
+                })
+            }
             DecisionOutcome::Admit {
                 records,
                 facts,
                 work,
-            } => ModuleGraphAdmission::Complete(Registration {
-                graph: Self {
-                    epoch: self.epoch.clone(),
-                    limits: self.limits,
-                    state: Arc::new(ModuleGraphState {
-                        records,
-                        facts,
-                        // The lineage moves exactly once per publication, which is
-                        // what makes a plan computed against the old state
-                        // detectably stale.
-                        revision: self.state.revision.saturating_add(1),
-                    }),
+            } => ModuleGraphOutcome::Complete(PreparedAdmission {
+                plan,
+                material: PreparedMaterial::Publish {
+                    records,
+                    facts,
+                    work,
                 },
-                disposition: RegistrationDisposition::Inserted,
-                work,
             }),
+        }
+    }
+
+    /// Build the descriptive plan for a decision. Shared by planning and preparing so
+    /// both describe the decision identically.
+    fn plan_from(
+        &self,
+        record: &ModuleRecord,
+        decision: &AdmissionDecision,
+    ) -> ModuleGraphAdmissionPlan {
+        ModuleGraphAdmissionPlan {
+            version: ModuleGraphAdmissionPlan::VERSION,
+            usage_version: UsageUnit::VERSION,
+            base: self.binding(),
+            request: record.id.clone(),
+            precedence: decision.precedence,
+            checkpoint: decision.precedence.checkpoint(),
+            usage: decision.usage,
+            exactness: decision.exactness,
+            predicted_facts: match &decision.outcome {
+                DecisionOutcome::Admit { facts, .. } => Some(*facts),
+                _ => None,
+            },
         }
     }
 
@@ -2096,6 +2269,168 @@ mod tests {
                 other => panic!("expected a resource refusal, got {other:?}"),
             }
         }
+    }
+
+    /// Preparing decides but does not publish; committing publishes exactly once.
+    ///
+    /// "Exactly once" is structural rather than asserted: `commit` takes `self` by
+    /// value, so a second publication from one decision is not something a caller can
+    /// express. What is asserted here is the half a type cannot enforce — that
+    /// preparing changes nothing observable, and that committing then moves the
+    /// lineage by exactly one step.
+    #[test]
+    fn preparing_publishes_nothing_and_committing_publishes_once() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let environment = crate::environment::Environment::new();
+        let options = fln_core::options::KVMap::new();
+        let root_before = environment.logical_root(&options);
+        let binding_before = base.binding();
+        let base_before = base.clone();
+
+        let prepared = base
+            .prepare_registration(record("B", vec![direct("A", 0b011)], 0xB1), None)
+            .expect_complete("preparing a valid record decides");
+        assert!(prepared.publishes());
+        assert!(
+            !prepared.is_cacheable(),
+            "a prepared admission is not a result"
+        );
+        assert!(!prepared.plan().is_cacheable());
+
+        // Nothing published: the base is untouched by value, facts, lineage and
+        // storage, the module is still absent, and no logical root moved.
+        assert_eq!(base, base_before, "preparing mutated the graph");
+        assert_eq!(base.binding(), binding_before);
+        assert!(base.shares_storage_with(&base_before));
+        assert!(base.record(&id("B")).is_none());
+        assert_eq!(environment.logical_root(&options), root_before);
+
+        // Committing publishes once, and only then is the module reachable.
+        let registration = prepared
+            .commit(&base, None)
+            .expect_complete("committing a valid prepared admission publishes");
+        assert_eq!(registration.disposition, RegistrationDisposition::Inserted);
+        assert!(registration.graph.record(&id("B")).is_some());
+        assert_eq!(
+            registration.graph.binding().revision,
+            binding_before.revision + 1,
+            "publication must move the lineage exactly one step"
+        );
+        // The base the plan was decided against is still untouched.
+        assert_eq!(base, base_before);
+        assert!(base.record(&id("B")).is_none());
+        assert_eq!(environment.logical_root(&options), root_before);
+    }
+
+    /// Committing against a base that moved is inconclusive, never a rejection: the
+    /// graph moving says nothing about whether the module is admissible.
+    #[test]
+    fn committing_against_a_moved_base_is_inconclusive_and_publishes_nothing() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let prepared = base
+            .prepare_registration(record("B", vec![], 0xB1), None)
+            .expect_complete("prepare decides");
+
+        // Someone else publishes first.
+        let moved = insert(&base, record("C", vec![], 0xC1));
+        let moved_before = moved.clone();
+
+        let outcome = prepared.commit(&moved, None);
+        match &outcome {
+            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::PlanSuperseded {
+                module,
+                expected_revision,
+                actual_revision,
+            }) => {
+                assert_eq!(module, &id("B"));
+                assert_eq!(*expected_revision, base.binding().revision);
+                assert_eq!(*actual_revision, moved.binding().revision);
+                assert_ne!(expected_revision, actual_revision);
+            }
+            other => panic!("expected a superseded plan, got {other:?}"),
+        }
+        assert!(
+            !outcome.is_cacheable(),
+            "a superseded plan must never be cacheable"
+        );
+        assert_eq!(outcome.outcome_label(), "inconclusive-plan-superseded");
+        // Nothing was published on either graph.
+        assert_eq!(moved, moved_before);
+        assert!(moved.record(&id("B")).is_none());
+        assert!(base.record(&id("B")).is_none());
+    }
+
+    /// Cancellation is revalidated immediately before publication, so a caller who
+    /// gives up between deciding and publishing gets no module published for them.
+    #[test]
+    fn commit_revalidates_cancellation_immediately_before_publication() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let prepared = base
+            .prepare_registration(record("B", vec![], 0xB1), None)
+            .expect_complete("prepare decides with no cancellation");
+
+        let cancelled = TripAt::new(1);
+        let outcome = prepared.commit(&base, Some(&cancelled));
+        match &outcome {
+            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::Cancelled {
+                module,
+                checkpoint,
+            }) => {
+                assert_eq!(module, &id("B"));
+                assert_eq!(*checkpoint, RegistrationCheckpoint::BeforePublication);
+            }
+            other => panic!("expected cancellation, got {other:?}"),
+        }
+        assert!(!outcome.is_cacheable());
+        assert!(
+            base.record(&id("B")).is_none(),
+            "cancelled commit published"
+        );
+    }
+
+    /// An exhaustion reached while preparing yields no prepared admission at all, so
+    /// there is nothing to commit and nothing to memoize. The plan protocol must not
+    /// become a back door that caches an FL-INV-07 inconclusive.
+    #[test]
+    fn an_exhaustion_while_preparing_leaves_nothing_to_commit_or_cache() {
+        let environment = crate::environment::Environment::new();
+        let options = fln_core::options::KVMap::new();
+        let root_before = environment.logical_root(&options);
+        let tight = ModuleGraph::new(
+            epoch(),
+            ModuleGraphLimits::new(0, 64, 64, graph().facts().payload_bytes),
+        )
+        .expect_complete("tight graph constructs");
+        let tight_before = tight.clone();
+        let breaching = record("A", vec![], 0xA1);
+
+        let prepared = tight.prepare_registration(breaching.clone(), None);
+        assert!(
+            matches!(
+                prepared,
+                ModuleGraphOutcome::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
+                    resource: ModuleGraphResource::Modules,
+                    ..
+                })
+            ),
+            "expected a modules exhaustion, got {prepared:?}"
+        );
+        assert!(!prepared.is_cacheable(), "exhaustion must not be cacheable");
+        assert!(
+            prepared.complete().is_none(),
+            "an exhausted preparation must yield no committable material"
+        );
+
+        // The descriptive plan agrees and is likewise never cacheable.
+        let plan = tight.plan_registration(&breaching);
+        assert_eq!(plan.precedence(), AdmissionPrecedence::ResourceModules);
+        assert!(!plan.publishes());
+        assert!(!plan.is_cacheable());
+        assert_eq!(plan.exactness(), UsageExactness::LowerBound);
+
+        // And nothing moved.
+        assert_eq!(tight, tight_before);
+        assert_eq!(environment.logical_root(&options), root_before);
     }
 
     /// A plan is bound to the base it was computed against, so it cannot be replayed
