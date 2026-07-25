@@ -23,7 +23,7 @@ row meta-api | mixHash | function | native | L2 | faithful | pinned-source | exa
 
 # ---- meta-api: inventoried, shape pending (recognized only — precise unsupported) -----
 row meta-api | Lean.Expr.mkData | function | native | L0 | faithful | pinned-source | exact | , | D0 | TARGETED | inventory-v4.32.0
-row meta-api | Lean.FileMap.toPosition | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/pos.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.FileMap.toPosition | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 
 # ---- kernel: judgment rules (symbols are KERNEL_CONTRACT.md rule ids; the linkage
 # ---- is CI-checked by fln-conformance tests/kernel_contract.rs) -----------------------
@@ -48,11 +48,19 @@ row cli | lean --run | flag | pending | L0 | faithful | pinned-binary | exact | 
 #       Reference-produced value is compared. Real evidence, development-grade: the
 #       tests can only prove we match our own reading of upstream.
 #
-# What would raise every L1 row below to L2 is the same single step, so it is stated
-# once: add the symbol's cases to scripts/extract/gen_core_fixtures.lean, regenerate
-# crates/fln-conformance/fixtures/core_observables.txt against the pin, and extend
-# tests/core_observables.rs to compare the new records. Nothing about the Rust side
-# needs to change — the gap is oracle coverage, not implementation.
+# Most of the rows that were L1 here are now L2: bead fln-it70 added
+# crates/fln-core/fixtures/gen_core_ext.lean, ran it under the pinned binary, and
+# crates/fln-core/tests/pin_ext_observables.rs compares 533 Reference-produced records
+# on every run. That immediately paid for itself — it caught a real divergence in
+# Level.geq (fixed in the same change).
+#
+# FOUR rows are deliberately still L1, because the new fixture does not reach them:
+#   Lean.Name.quickCmpAux   — the fixture pins quickCmp/quickLt, not the aux step
+#   Lean.KVMap.insertCore   — exercised only through the maps the fixture builds
+#   Lean.KVMap.getSyntax    — no syntax handles in the corpus
+#   Lean.FileMap.getLine    — our line_of_index is private, so the test cannot call it
+# Each rises by adding its cases to gen_core_ext.lean and regenerating against the pin
+# (and, for getLine, by deciding whether that accessor should be public API at all).
 # ======================================================================================
 
 # ---- meta-api L2: Expr computed observables, compared field-by-field against the pin.
@@ -98,41 +106,41 @@ row meta-api | Lean.Expr.proj | constructor | native | L2 | faithful | pinned-bi
 # ---- meta-api L1: Name ordering and rendering. Implemented against Name.lean with
 # ---- in-repo vectors, deep-input regressions, and old-versus-new comparisons; no
 # ---- Reference-produced ordering is compared, so these are NOT L2.
-row meta-api | Lean.Name.quickCmp | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/name.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.Name.quickCmp | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 row meta-api | Lean.Name.quickCmpAux | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/name.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Name.quickLt | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/name.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Name.toString | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/name.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.Name.quickLt | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Name.toString | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 
 # ---- meta-api L1: Level operations beyond the pinned data word. normalize and isEquiv
 # ---- are L2 above because the oracle emits their results; these are not in the fixture.
-row meta-api | Lean.Level.addOffset | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/level.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Level.toNat | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/level.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Level.isAlwaysZero | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/level.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Level.occurs | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/level.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Level.dec | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/level.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Level.geq | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/level.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | mkLevelMax' | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/level.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | mkLevelIMax' | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/level.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.Level.addOffset | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Level.toNat | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Level.isAlwaysZero | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Level.occurs | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Level.dec | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Level.geq | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | mkLevelMax' | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | mkLevelIMax' | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 
 # ---- meta-api L1: KVMap. Ordered-assoc-list semantics (insertion order IS the value),
 # ---- implemented against KVMap.lean with in-repo tests.
-row meta-api | Lean.KVMap.findCore | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.KVMap.findCore | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 row meta-api | Lean.KVMap.insertCore | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.KVMap.erase | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.KVMap.getString | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.KVMap.getNat | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.KVMap.getInt | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.KVMap.getBool | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.KVMap.getName | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.KVMap.erase | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.KVMap.getString | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.KVMap.getNat | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.KVMap.getInt | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.KVMap.getBool | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.KVMap.getName | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 row meta-api | Lean.KVMap.getSyntax | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.DataValue.sameCtor | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/options.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.DataValue.sameCtor | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 
 # ---- meta-api L1: FileMap. Position mapping drives every diagnostic span, so its
 # ---- exactness is load-bearing for the LSP surface later.
-row meta-api | Lean.FileMap.ofString | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/pos.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.FileMap.ofPosition | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/pos.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.FileMap.lineStart | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/pos.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.FileMap.getLastLine | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/pos.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.FileMap.ofString | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.FileMap.ofPosition | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.FileMap.lineStart | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.FileMap.getLastLine | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 row meta-api | Lean.FileMap.getLine | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/pos.rs | D0 | OBSERVED | unit-suite-v4.32.0
 
 # ---- hash: NOT a Reference surface. fln-hash owns BLAKE3 outright (D1: no external
@@ -150,10 +158,10 @@ row hash | BLAKE3.finalize_xof | function | native | L2 | faithful | spec-vector
 # ---- against the Prelude grammar `<name>._@.(<module>.<scopes>)*.<mainModule>._hyg.<scopes>`
 # ---- with in-repo tests, including deep-chain bounded-stack coverage. Not oracled: the
 # ---- fixture generator emits no hygienic names yet.
-row meta-api | Lean.Name.appendCore | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/name.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Name.hasMacroScopes | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/name.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Name.eraseMacroScopes | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/name.rs | D0 | OBSERVED | unit-suite-v4.32.0
-row meta-api | Lean.Name.simpMacroScopes | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/name.rs | D0 | OBSERVED | unit-suite-v4.32.0
+row meta-api | Lean.Name.appendCore | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Name.hasMacroScopes | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Name.eraseMacroScopes | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
+row meta-api | Lean.Name.simpMacroScopes | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 
 # ---- meta-api: the constructor inventory and the resource limits are now MECHANICALLY
 # ---- checked against the pinned sources on every run (D5/D9) rather than transcribed:

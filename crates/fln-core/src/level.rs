@@ -772,45 +772,46 @@ impl Level {
     /// normalized forms exactly as the pin does. Used by KR-604 (constructor
     /// field universes) and KR-602/700 machinery.
     pub fn is_geq(&self, other: &Level) -> bool {
-        fn to_offset(l: &Level) -> (Level, u32) {
-            let mut base = l.clone();
-            let mut k = 0u32;
-            while let LevelView::Succ(inner) = base.view() {
-                let inner = inner.clone();
-                base = inner;
-                k += 1;
-            }
-            (base, k)
-        }
-        fn core(l1: &Level, l2: &Level) -> bool {
-            if l1 == l2 || l2.is_zero() {
+        /// `Level.geq.go` (Level.lean:620-638), transcribed arm for arm.
+        ///
+        /// Two things here are load-bearing and were wrong in the previous
+        /// re-derivation, which disagreed with the pinned binary on 5 of 196
+        /// generated pairs (all of them `succ^k(imax _ (succ _))`, caught by
+        /// crates/fln-core/tests/pin_ext_observables.rs):
+        ///
+        /// * the recursion is on `go`, **not** back through `is_geq`. Re-entering
+        ///   `is_geq` normalizes again at every step, and `normalize` is not
+        ///   idempotent (bead fln-0uvk), so the operands drifted mid-comparison.
+        /// * the arm ORDER decides the answer. `imax` on the LEFT is consumed by
+        ///   its own arm before `k` ever runs, and `k` is what handles `imax` on
+        ///   the right. Testing the right-hand `imax` first — as the old code did —
+        ///   answers a different question.
+        fn go(u: &Level, v: &Level) -> bool {
+            if u == v {
                 return true;
             }
-            if let LevelView::Max(a, b) = l2.view() {
-                return l1.is_geq(a) && l1.is_geq(b);
+            // `k` in the pin: the offset comparison, with the right-hand `imax`
+            // decomposed here rather than in the match.
+            let k = |u: &Level, v: &Level| -> bool {
+                match v.view() {
+                    LevelView::IMax(v1, v2) => go(u, v1) && go(u, v2),
+                    _ => {
+                        let v_base = v.get_level_offset();
+                        (u.get_level_offset() == v_base || v_base.is_zero())
+                            && u.get_offset() >= v.get_offset()
+                    }
+                }
+            };
+            match (u.view(), v.view()) {
+                (_, LevelView::Zero) => true,
+                (_, LevelView::Max(v1, v2)) => go(u, v1) && go(u, v2),
+                (LevelView::Max(u1, u2), _) => go(u1, v) || go(u2, v) || k(u, v),
+                (LevelView::IMax(_, u2), _) => go(u2, v),
+                (LevelView::Succ(u1), LevelView::Succ(v1)) => go(u1, v1),
+                _ => k(u, v),
             }
-            if let LevelView::Max(a, b) = l1.view()
-                && (a.is_geq(l2) || b.is_geq(l2))
-            {
-                return true;
-            }
-            if let LevelView::IMax(a, b) = l2.view() {
-                return l1.is_geq(a) && l1.is_geq(b);
-            }
-            if let LevelView::IMax(_, b) = l1.view() {
-                return b.is_geq(l2);
-            }
-            let (base1, k1) = to_offset(l1);
-            let (base2, k2) = to_offset(l2);
-            if base1 == base2 || base2.is_zero() {
-                return k1 >= k2;
-            }
-            if k1 == k2 && k1 > 0 {
-                return base1.is_geq(&base2);
-            }
-            false
         }
-        core(&self.normalize(), &other.normalize())
+        go(&self.normalize(), &other.normalize())
     }
 
     // ---- cheap smart constructors ------------------------------------------------------
