@@ -136,16 +136,16 @@ fn check_nonsafe_definition(
     if let Err(stop) = header_outcome {
         return stop_to_outcome(stop, total, budget);
     }
-    let scratch = match env.add_decl(ConstantInfo::Defn(v.clone())) {
-        Ok(scratch) => scratch,
-        Err(_) => {
-            return Outcome::complete(Verdict::Rejected {
-                class: RejectClass::AlreadyDeclared,
-                message: format!("`{}` is already declared", v.base.name.to_display_string()),
-                consumption: total,
-            });
-        }
-    };
+    // Bounded admission path (`fln-kernel-bounded-decl-admission-ukzx`). The
+    // unbounded `add_decl` is gone from every production site in this crate;
+    // see `admit::scratch_admit` for why the budget here is explicitly
+    // UNBOUNDED rather than absent, and why a non-answer never becomes a
+    // rejection.
+    let scratch =
+        match crate::admit::scratch_admit(env, ConstantInfo::Defn(v.clone()), &v.base.name) {
+            Ok(scratch) => scratch,
+            Err(stop) => return stop_to_outcome(stop, total, budget),
+        };
     let remaining = Budget {
         steps: budget.steps.saturating_sub(total.steps_used),
         depth: budget.depth,
@@ -195,6 +195,12 @@ fn stop_to_outcome(
             consumption,
         }),
         Stop::Exhausted(reason) => exhaustion_outcome(reason, consumption, budget),
+        // Never a Verdict. An internal fault is our accounting failing, and
+        // FL-INV-07 forbids rendering it as acceptance OR rejection.
+        Stop::Fault(what) => Outcome::InternalFault(fln_core::outcome::InternalFault::new(
+            "kernel scratch admission",
+            what,
+        )),
     }
 }
 
@@ -367,6 +373,10 @@ pub fn check_def_eq(
             message,
             consumption,
         }),
+        Err(Stop::Fault(what)) => Outcome::InternalFault(fln_core::outcome::InternalFault::new(
+            "kernel scratch admission",
+            what,
+        )),
         Err(Stop::Exhausted(reason)) => exhaustion_outcome(reason, consumption, budget),
     }
 }

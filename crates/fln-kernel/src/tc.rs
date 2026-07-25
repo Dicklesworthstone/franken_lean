@@ -41,6 +41,14 @@ use crate::verdict::{Budget, Consumption, ExhaustionReason, RejectClass};
 pub(crate) enum Stop {
     Reject(RejectClass, String),
     Exhausted(ExhaustionReason),
+    /// OUR accounting contradicted itself — not a statement about the
+    /// declaration. Added for the bounded admission migration
+    /// (`fln-kernel-bounded-decl-admission-ukzx`): the bounded environment path
+    /// can return an InternalFault, and the two existing arms could only have
+    /// reported it as a rejection (an FL-INV-07 collapse — "we broke" recorded
+    /// as "your declaration is invalid") or as resource exhaustion (a
+    /// misreport, since ExhaustionReason is Steps|Depth and neither happened).
+    Fault(String),
 }
 
 type KResult<T> = Result<T, Stop>;

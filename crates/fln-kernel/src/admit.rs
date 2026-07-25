@@ -25,10 +25,12 @@
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
 use fln_core::level::Level;
 use fln_core::name::{LeafView, Name};
+use fln_core::outcome::Outcome;
 use fln_env::constants::{
     ConstantInfo, ConstructorVal, InductiveVal, QuotKind, QuotVal, RecursorRule, RecursorVal,
 };
-use fln_env::environment::Environment;
+use fln_env::environment::{DeclarationBudget, DeclarationCommitted, DeclarationPlan, Environment};
+use fln_env::pmap::CollisionBudget;
 
 use crate::tc::{Stop, TypeChecker};
 use crate::verdict::{Budget, Consumption, ExhaustionReason, RejectClass};
@@ -1594,33 +1596,11 @@ impl<'a> Engine<'a> {
         // Declare the types (pin declare_inductive_types), then check ctors
         // against the extended scratch env.
         for ind in &self.block.types {
-            self.env = self
-                .env
-                .add_decl(ConstantInfo::Induct(ind.clone()))
-                .map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::AlreadyDeclared,
-                        format!(
-                            "`{}` is already declared",
-                            ind.base.name.to_display_string()
-                        ),
-                    )
-                })?;
+            self.env = scratch_admit(&self.env, ConstantInfo::Induct(ind.clone()), &ind.base.name)?;
         }
         self.check_constructors(!nested)?;
         for ctor in &self.block.ctors {
-            self.env = self
-                .env
-                .add_decl(ConstantInfo::Ctor(ctor.clone()))
-                .map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::AlreadyDeclared,
-                        format!(
-                            "`{}` is already declared",
-                            ctor.base.name.to_display_string()
-                        ),
-                    )
-                })?;
+            self.env = scratch_admit(&self.env, ConstantInfo::Ctor(ctor.clone()), &ctor.base.name)?;
         }
         if nested {
             return self.check_nested_full();
@@ -1640,33 +1620,11 @@ impl<'a> Engine<'a> {
         let is_rec = self.compute_is_rec()?;
         let is_reflexive = self.compute_is_reflexive()?;
         for ind in &self.block.types {
-            self.env = self
-                .env
-                .add_decl(ConstantInfo::Induct(ind.clone()))
-                .map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::AlreadyDeclared,
-                        format!(
-                            "`{}` is already declared",
-                            ind.base.name.to_display_string()
-                        ),
-                    )
-                })?;
+            self.env = scratch_admit(&self.env, ConstantInfo::Induct(ind.clone()), &ind.base.name)?;
         }
         self.check_constructors(true)?;
         for ctor in &self.block.ctors {
-            self.env = self
-                .env
-                .add_decl(ConstantInfo::Ctor(ctor.clone()))
-                .map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::AlreadyDeclared,
-                        format!(
-                            "`{}` is already declared",
-                            ctor.base.name.to_display_string()
-                        ),
-                    )
-                })?;
+            self.env = scratch_admit(&self.env, ConstantInfo::Ctor(ctor.clone()), &ctor.base.name)?;
         }
         self.init_elim_level()?;
         self.init_k_target();
@@ -3040,4 +2998,76 @@ fn check_quotient_inner(env: &Environment, decls: &[QuotVal]) -> KResult<()> {
         }
     }
     Ok(())
+}
+
+/// Insert one already-checked constant into a SCRATCH environment through the
+/// bounded admission path (`fln-kernel-bounded-decl-admission-ukzx`).
+///
+/// The five production callers all build temporary environments out of
+/// declarations the kernel is itself checking, so three decisions are recorded
+/// here once rather than repeated five times:
+///
+/// **The budget is explicitly UNBOUNDED, not absent.** These sites insert
+/// material the kernel has ALREADY traversed under its own [`Budget`] during
+/// header inference and constructor checking. `DeclarationBudget` bounds the
+/// same row families that traversal just walked, so re-bounding here would
+/// double-charge the same declaration and could refuse one the kernel had
+/// already found structurally sound. The untrusted-input boundary is upstream,
+/// at `check`; this is downstream of it.
+///
+/// **A duplicate name stays a rejection.** It is a completed determination
+/// about the declaration — the name is taken — and it was a rejection before
+/// this migration too.
+///
+/// **A non-answer never becomes one.** `Inconclusive` and `InternalFault` from
+/// the environment are propagated as the kernel's own non-answers. Collapsing
+/// either into `AlreadyDeclared` would be the FL-INV-07 failure this migration
+/// exists to avoid: recording "we ran out of room" or "we broke" as "this
+/// declaration is invalid" caches a wrong verdict about someone else's code.
+pub(crate) fn scratch_admit(
+    env: &Environment,
+    info: ConstantInfo,
+    name: &Name,
+) -> Result<Environment, Stop> {
+    let plan = match env.plan_add_decl(
+        info,
+        DeclarationBudget::UNBOUNDED,
+        CollisionBudget::UNBOUNDED,
+        None,
+    ) {
+        Outcome::Complete(DeclarationPlan::Prepared(plan)) => plan,
+        Outcome::Complete(DeclarationPlan::DuplicateName { name }) => {
+            return Err(Stop::Reject(
+                RejectClass::AlreadyDeclared,
+                format!("`{}` is already declared", name.to_display_string()),
+            ));
+        }
+        Outcome::Inconclusive(reason) => {
+            return Err(Stop::Fault(format!(
+                "scratch admission of `{}` was inconclusive: {reason:?}",
+                name.to_display_string()
+            )));
+        }
+        Outcome::InternalFault(fault) => {
+            return Err(Stop::Fault(format!(
+                "scratch admission of `{}` faulted: {fault:?}",
+                name.to_display_string()
+            )));
+        }
+    };
+    match plan.commit(env, None) {
+        Outcome::Complete(DeclarationCommitted::Published(published)) => Ok(published.environment),
+        Outcome::Complete(DeclarationCommitted::DuplicateName { name }) => Err(Stop::Reject(
+            RejectClass::AlreadyDeclared,
+            format!("`{}` is already declared", name.to_display_string()),
+        )),
+        Outcome::Inconclusive(reason) => Err(Stop::Fault(format!(
+            "scratch publication of `{}` was inconclusive: {reason:?}",
+            name.to_display_string()
+        ))),
+        Outcome::InternalFault(fault) => Err(Stop::Fault(format!(
+            "scratch publication of `{}` faulted: {fault:?}",
+            name.to_display_string()
+        ))),
+    }
 }
