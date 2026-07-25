@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":337,"projection_hash":"e2a607fdf95882348e6edff42c624491e3a50b58d087da17d6349097cb675b79"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":338,"projection_hash":"f6f21f4769f27da4df9d0e69a76a1e4bb2787918e009758e59834a54bb61fc26"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -217,6 +217,7 @@
 {"id":"franken_lean-convergence-wip-governance-149"}
 {"id":"franken_lean-d17i"}
 {"id":"franken_lean-d2h5"}
+{"id":"franken_lean-d3-safety-note-unenforced-cdbg"}
 {"id":"franken_lean-dgxa"}
 {"id":"franken_lean-e5k7"}
 {"id":"franken_lean-e7q5"}
