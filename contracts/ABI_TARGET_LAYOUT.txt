@@ -1,0 +1,93 @@
+schema fln-abi-target-layout/1
+extractor lean-h-clang-layout version=1
+source path=include/lean/lean.h authority=SUITE.lock:reference sha256=22eed50aa703c4403010fabc12a7231ffa34dc979bd59ca1bfbac13c29a1dad2
+target-count 1
+target target:0001 abi-class=lp64-le data-model=lp64 endianness=little pointer-bits=64 size-t-bits=64 char-bits=8 int-bits=32 unsigned-bits=32 long-bits=64 long-long-bits=64 max-align-bytes=16
+define target:0001 name=LEAN_CLOSURE_MAX_ARGS value=16 source-line=31
+define target:0001 name=LEAN_OBJECT_SIZE_DELTA value=8 source-line=32
+define target:0001 name=LEAN_MAX_SMALL_OBJECT_SIZE value=4096 source-line=33
+define target:0001 name=LEAN_MAX_CTOR_FIELDS value=256 source-line=106
+define target:0001 name=LEAN_MAX_CTOR_SCALARS_SIZE value=1024 source-line=107
+define target:0001 name=LEAN_TASK_STATE_WAITING value=0 source-line=1341
+define target:0001 name=LEAN_TASK_STATE_RUNNING value=1 source-line=1342
+define target:0001 name=LEAN_TASK_STATE_FINISHED value=2 source-line=1343
+define target:0001 name=LEAN_MAX_SMALL_NAT value=9223372036854775807 source-line=1380
+define target:0001 name=LEAN_MAX_SMALL_INT value=2147483647 source-line=1588
+define target:0001 name=LEAN_MIN_SMALL_INT value=-2147483648 source-line=1589
+tag target:0001 name=LeanMaxCtorTag value=243 source-line=92
+tag target:0001 name=LeanPromise value=244 source-line=93
+tag target:0001 name=LeanClosure value=245 source-line=94
+tag target:0001 name=LeanArray value=246 source-line=95
+tag target:0001 name=LeanStructArray value=247 source-line=96
+tag target:0001 name=LeanScalarArray value=248 source-line=97
+tag target:0001 name=LeanString value=249 source-line=98
+tag target:0001 name=LeanMPZ value=250 source-line=99
+tag target:0001 name=LeanThunk value=251 source-line=100
+tag target:0001 name=LeanTask value=252 source-line=101
+tag target:0001 name=LeanRef value=253 source-line=102
+tag target:0001 name=LeanExternal value=254 source-line=103
+tag target:0001 name=LeanReserved value=255 source-line=104
+struct target:0001 name=lean_object size-bytes=8 align-bytes=4 source-lines=143-148
+field target:0001 struct=lean_object name=m_rc offset-bits=0 width-bits=32 storage=scalar element-width-bits=0 source-line=144
+field target:0001 struct=lean_object name=m_cs_sz offset-bits=32 width-bits=16 storage=bitfield element-width-bits=0 source-line=145
+field target:0001 struct=lean_object name=m_other offset-bits=48 width-bits=8 storage=bitfield element-width-bits=0 source-line=146
+field target:0001 struct=lean_object name=m_tag offset-bits=56 width-bits=8 storage=bitfield element-width-bits=0 source-line=147
+struct target:0001 name=lean_ctor_object size-bytes=8 align-bytes=8 source-lines=182-185
+field target:0001 struct=lean_ctor_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=183
+field target:0001 struct=lean_ctor_object name=m_objs offset-bits=64 width-bits=0 storage=flexible-array element-width-bits=64 source-line=184
+struct target:0001 name=lean_array_object size-bytes=24 align-bytes=8 source-lines=188-193
+field target:0001 struct=lean_array_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=189
+field target:0001 struct=lean_array_object name=m_size offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=190
+field target:0001 struct=lean_array_object name=m_capacity offset-bits=128 width-bits=64 storage=scalar element-width-bits=0 source-line=191
+field target:0001 struct=lean_array_object name=m_data offset-bits=192 width-bits=0 storage=flexible-array element-width-bits=64 source-line=192
+struct target:0001 name=lean_sarray_object size-bytes=24 align-bytes=8 source-lines=196-201
+field target:0001 struct=lean_sarray_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=197
+field target:0001 struct=lean_sarray_object name=m_size offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=198
+field target:0001 struct=lean_sarray_object name=m_capacity offset-bits=128 width-bits=64 storage=scalar element-width-bits=0 source-line=199
+field target:0001 struct=lean_sarray_object name=m_data offset-bits=192 width-bits=0 storage=flexible-array element-width-bits=8 source-line=200
+struct target:0001 name=lean_string_object size-bytes=32 align-bytes=8 source-lines=203-209
+field target:0001 struct=lean_string_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=204
+field target:0001 struct=lean_string_object name=m_size offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=205
+field target:0001 struct=lean_string_object name=m_capacity offset-bits=128 width-bits=64 storage=scalar element-width-bits=0 source-line=206
+field target:0001 struct=lean_string_object name=m_length offset-bits=192 width-bits=64 storage=scalar element-width-bits=0 source-line=207
+field target:0001 struct=lean_string_object name=m_data offset-bits=256 width-bits=0 storage=flexible-array element-width-bits=8 source-line=208
+struct target:0001 name=lean_closure_object size-bytes=24 align-bytes=8 source-lines=211-217
+field target:0001 struct=lean_closure_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=212
+field target:0001 struct=lean_closure_object name=m_fun offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=213
+field target:0001 struct=lean_closure_object name=m_arity offset-bits=128 width-bits=16 storage=scalar element-width-bits=0 source-line=214
+field target:0001 struct=lean_closure_object name=m_num_fixed offset-bits=144 width-bits=16 storage=scalar element-width-bits=0 source-line=215
+field target:0001 struct=lean_closure_object name=m_objs offset-bits=192 width-bits=0 storage=flexible-array element-width-bits=64 source-line=216
+struct target:0001 name=lean_ref_object size-bytes=16 align-bytes=8 source-lines=219-222
+field target:0001 struct=lean_ref_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=220
+field target:0001 struct=lean_ref_object name=m_value offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=221
+struct target:0001 name=lean_thunk_object size-bytes=24 align-bytes=8 source-lines=224-228
+field target:0001 struct=lean_thunk_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=225
+field target:0001 struct=lean_thunk_object name=m_value offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=226
+field target:0001 struct=lean_thunk_object name=m_closure offset-bits=128 width-bits=64 storage=scalar element-width-bits=0 source-line=227
+struct target:0001 name=lean_task_imp size-bytes=32 align-bytes=8 source-lines=234-243
+field target:0001 struct=lean_task_imp name=m_closure offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=235
+field target:0001 struct=lean_task_imp name=m_head_dep offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=236
+field target:0001 struct=lean_task_imp name=m_next_dep offset-bits=128 width-bits=64 storage=scalar element-width-bits=0 source-line=237
+field target:0001 struct=lean_task_imp name=m_prio offset-bits=192 width-bits=32 storage=scalar element-width-bits=0 source-line=238
+field target:0001 struct=lean_task_imp name=m_canceled offset-bits=224 width-bits=8 storage=scalar element-width-bits=0 source-line=239
+field target:0001 struct=lean_task_imp name=m_keep_alive offset-bits=232 width-bits=8 storage=scalar element-width-bits=0 source-line=241
+field target:0001 struct=lean_task_imp name=m_deleted offset-bits=240 width-bits=8 storage=scalar element-width-bits=0 source-line=242
+struct target:0001 name=lean_task_object size-bytes=24 align-bytes=8 source-lines=296-300
+field target:0001 struct=lean_task_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=297
+field target:0001 struct=lean_task_object name=m_value offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=298
+field target:0001 struct=lean_task_object name=m_imp offset-bits=128 width-bits=64 storage=scalar element-width-bits=0 source-line=299
+struct target:0001 name=lean_promise_object size-bytes=16 align-bytes=8 source-lines=302-305
+field target:0001 struct=lean_promise_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=303
+field target:0001 struct=lean_promise_object name=m_result offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=304
+struct target:0001 name=lean_external_class size-bytes=16 align-bytes=8 source-lines=310-313
+field target:0001 struct=lean_external_class name=m_finalize offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=311
+field target:0001 struct=lean_external_class name=m_foreach offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=312
+struct target:0001 name=lean_external_object size-bytes=24 align-bytes=8 source-lines=318-322
+field target:0001 struct=lean_external_object name=m_header offset-bits=0 width-bits=64 storage=scalar element-width-bits=0 source-line=319
+field target:0001 struct=lean_external_object name=m_class offset-bits=64 width-bits=64 storage=scalar element-width-bits=0 source-line=320
+field target:0001 struct=lean_external_object name=m_data offset-bits=128 width-bits=64 storage=scalar element-width-bits=0 source-line=321
+struct target:0001 name=lean_once_cell_t size-bytes=8 align-bytes=4 source-lines=3269-3272
+field target:0001 struct=lean_once_cell_t name=state offset-bits=0 width-bits=32 storage=scalar element-width-bits=0 source-line=3270
+field target:0001 struct=lean_once_cell_t name=lock offset-bits=32 width-bits=32 storage=scalar element-width-bits=0 source-line=3271
+target-root target:0001 fnv1a64:e901915ef1b928e7
+inventory-root fnv1a64:45bbfc4ed77033d7

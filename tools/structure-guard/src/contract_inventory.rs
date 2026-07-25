@@ -1,9 +1,11 @@
 //! Canonical pin/target inventory and failure-atomic publication (bead `fln-k5rr`).
 //!
 //! `SUITE.lock` remains the only authority for exact toolchain, target, suite,
-//! Reference, and Corpus values. The published inventory contains opaque evidence
-//! roots and source locators, never a second copy of those values. A reviewed policy
-//! classifies the derived raw rows, and the join must be bijective.
+//! Reference, and Corpus values. Target-indexed ABI observations come from the
+//! mechanically extracted `contracts/ABI_TARGET_LAYOUT.txt`; it carries opaque target
+//! keys that join by position to `SUITE.lock`, never copied target or pin values. The
+//! published inventory contains opaque evidence roots and source locators. A reviewed
+//! policy classifies the derived raw rows, and the join must be bijective.
 //!
 //! Publication is candidate-first: create a sibling without overwrite, write and sync
 //! the complete canonical generation, validate it, re-read its governed sources, then
@@ -19,8 +21,9 @@ use std::path::{Component, Path, PathBuf};
 use crate::checks::Finding;
 use crate::lockfile::{SuiteLock, parse_suite_lock};
 use crate::{
-    CONTRACT_INVENTORY_CANDIDATE_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
-    CONTRACT_INVENTORY_SCHEMA_FILE, SUITE_LOCK_FILE,
+    ABI_TARGET_LAYOUT_CANDIDATE_FILE, ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_CANDIDATE_FILE,
+    CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE, CONTRACT_INVENTORY_SCHEMA_FILE,
+    SUITE_LOCK_FILE,
 };
 
 pub const DEFINITION_SCHEMA: &str = "fln-contract-inventory-definition/1";
@@ -28,6 +31,9 @@ pub const INVENTORY_SCHEMA: &str = "fln-contract-inventory/1";
 pub const POLICY_SCHEMA: &str = "fln-contract-inventory-policy/1";
 pub const EXTRACTOR_ID: &str = "suite-lock";
 pub const EXTRACTOR_VERSION: &str = "1";
+pub const ABI_EXTRACTOR_ID: &str = "lean-h-clang-layout";
+pub const ABI_EXTRACTOR_VERSION: &str = "1";
+pub const ABI_TARGET_LAYOUT_SCHEMA: &str = "fln-abi-target-layout/1";
 pub const MAX_SOURCE_BYTES: usize = 1_048_576;
 pub const MAX_ROWS: usize = 4_096;
 pub const MAX_LINE_BYTES: usize = 8_192;
@@ -39,16 +45,18 @@ pub const SCHEMA_DEFINITION: &str = "\
 schema fln-contract-inventory-definition/1
 inventory-schema fln-contract-inventory/1
 policy-schema fln-contract-inventory-policy/1
-source-authority SUITE.lock
+source-authority SUITE.lock,contracts/ABI_TARGET_LAYOUT.txt
 extractor suite-lock version=1
+extractor lean-h-clang-layout version=1
 hash fnv1a64-noncryptographic domain=required fields=u64le-length-prefixed
 row-fields key,kind,extractor,extractor-version,source,target-class,abi-class,raw-evidence-hash,identity,authority,support
-root-fields schema,suite-lock,raw,policy,reference,canonical
+root-fields schema,suite-lock,abi-target-layout,raw,policy,reference,canonical
 row-order canonical-key-byte-order
 pin-values forbidden-outside-source-authority
 policy-join exact-bijection
 authority-states observed
 publication candidate=contracts/PIN_TARGET_INVENTORY.txt.candidate commit=atomic-rename recovery=explicit-promotion
+source-publication contracts/ABI_TARGET_LAYOUT.txt candidate=contracts/ABI_TARGET_LAYOUT.txt.candidate commit=atomic-rename
 limits source-bytes=1048576 rows=4096 line-bytes=8192
 ";
 
@@ -119,6 +127,7 @@ pub struct InventorySnapshot {
     pub inventory_root: String,
     pub schema_root: String,
     pub suite_lock_root: String,
+    pub abi_target_layout_root: String,
     pub raw_root: String,
     pub policy_root: String,
     pub reference_root: String,
@@ -163,8 +172,19 @@ struct PolicyRow {
 struct RawRow {
     key: String,
     kind: &'static str,
+    extractor: &'static str,
+    extractor_version: &'static str,
     source: String,
+    observed_abi_class: Option<String>,
     evidence_hash: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AbiLayoutRow {
+    key: String,
+    abi_class: String,
+    target_root: u64,
+    source_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +192,7 @@ struct SourceSet {
     schema: Vec<u8>,
     suite_lock: Vec<u8>,
     policy: Vec<u8>,
+    abi_target_layout: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,7 +413,7 @@ fn parse_policy(text: &str) -> Result<BTreeMap<String, PolicyRow>, InventoryErro
         )?;
         if !matches!(
             kind,
-            "toolchain" | "target" | "suite" | "reference" | "corpus"
+            "abi-layout" | "toolchain" | "target" | "suite" | "reference" | "corpus"
         ) {
             return Err(InventoryError::new(
                 ErrorClass::Violation,
@@ -409,7 +430,12 @@ fn parse_policy(text: &str) -> Result<BTreeMap<String, PolicyRow>, InventoryErro
                 format!("line {line_number} has unsupported support `{support}`"),
             ));
         }
-        if !matches!(target_class, "none" | "certified") || !matches!(abi_class, "none") {
+        if !matches!(target_class, "none" | "certified")
+            || !matches!(
+                abi_class,
+                "none" | "lp64-le" | "lp64-be" | "llp64-le" | "llp64-be" | "ilp32-le" | "ilp32-be"
+            )
+        {
             return Err(InventoryError::new(
                 ErrorClass::Violation,
                 "policy_invalid",
@@ -428,12 +454,34 @@ fn parse_policy(text: &str) -> Result<BTreeMap<String, PolicyRow>, InventoryErro
                     format!("line {line_number} target rows must be required and certified"),
                 ));
             }
-        } else if !matches!(target_class, "none") {
+            if !matches!(abi_class, "none") {
+                return Err(InventoryError::new(
+                    ErrorClass::Violation,
+                    "policy_invalid",
+                    CONTRACT_INVENTORY_POLICY_FILE,
+                    format!("line {line_number} target rows cannot duplicate ABI class"),
+                ));
+            }
+        } else if matches!(kind, "abi-layout") {
+            if !matches!(support, "required")
+                || !matches!(target_class, "certified")
+                || matches!(abi_class, "none")
+            {
+                return Err(InventoryError::new(
+                    ErrorClass::Inconclusive,
+                    "abi_class_ambiguous",
+                    CONTRACT_INVENTORY_POLICY_FILE,
+                    format!(
+                        "line {line_number} ABI layout rows must be required, certified, and carry one observed ABI class"
+                    ),
+                ));
+            }
+        } else if !matches!(target_class, "none") || !matches!(abi_class, "none") {
             return Err(InventoryError::new(
                 ErrorClass::Inconclusive,
                 "target_class_ambiguous",
                 CONTRACT_INVENTORY_POLICY_FILE,
-                format!("line {line_number} non-target row claims a target class"),
+                format!("line {line_number} non-target/non-ABI row claims a target or ABI class"),
             ));
         }
         if matches!(support, "optional") && !matches!(kind, "suite") {
@@ -467,6 +515,568 @@ fn parse_policy(text: &str) -> Result<BTreeMap<String, PolicyRow>, InventoryErro
     Ok(rows)
 }
 
+fn abi_layout_error(line: usize, detail: impl Into<String>) -> InventoryError {
+    InventoryError::new(
+        ErrorClass::Violation,
+        "abi_target_layout_invalid",
+        ABI_TARGET_LAYOUT_FILE,
+        format!("line {line}: {}", detail.into()),
+    )
+}
+
+fn abi_field<'a>(token: &'a str, prefix: &str, line: usize) -> Result<&'a str, InventoryError> {
+    token
+        .strip_prefix(prefix)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            abi_layout_error(
+                line,
+                format!("expected `{prefix}<value>` in canonical field order"),
+            )
+        })
+}
+
+fn abi_u64(token: &str, prefix: &str, line: usize) -> Result<u64, InventoryError> {
+    abi_field(token, prefix, line)?
+        .parse()
+        .map_err(|_| abi_layout_error(line, format!("`{token}` is not a canonical u64 field")))
+}
+
+fn abi_i128(token: &str, prefix: &str, line: usize) -> Result<i128, InventoryError> {
+    abi_field(token, prefix, line)?
+        .parse()
+        .map_err(|_| abi_layout_error(line, format!("`{token}` is not a canonical integer field")))
+}
+
+fn abi_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn lower_hex(value: &str, digits: usize) -> bool {
+    value.len().eq(&digits)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn parse_abi_target_layout(
+    text: &str,
+    expected_target_count: usize,
+) -> Result<BTreeMap<String, AbiLayoutRow>, InventoryError> {
+    validate_text_shape(
+        ABI_TARGET_LAYOUT_FILE,
+        text,
+        ErrorClass::Violation,
+        "abi_target_layout_invalid",
+    )?;
+    let lines: Vec<_> = text.lines().collect();
+    if lines.len() < 6 {
+        return Err(abi_layout_error(1, "target-layout table is truncated"));
+    }
+    if !matches!(lines[0], "schema fln-abi-target-layout/1") {
+        return Err(abi_layout_error(
+            1,
+            format!("expected `schema {ABI_TARGET_LAYOUT_SCHEMA}`"),
+        ));
+    }
+    if !matches!(lines[1], "extractor lean-h-clang-layout version=1") {
+        return Err(abi_layout_error(
+            2,
+            format!("expected `extractor {ABI_EXTRACTOR_ID} version={ABI_EXTRACTOR_VERSION}`"),
+        ));
+    }
+    let source_tokens: Vec<_> = lines[2].split_whitespace().collect();
+    let [source, path, authority, sha_token] = source_tokens.as_slice() else {
+        return Err(abi_layout_error(
+            3,
+            "source row must be `source path=include/lean/lean.h authority=SUITE.lock:reference sha256=<64-lower-hex>`",
+        ));
+    };
+    if !matches!(*source, "source")
+        || !matches!(*path, "path=include/lean/lean.h")
+        || !matches!(*authority, "authority=SUITE.lock:reference")
+    {
+        return Err(abi_layout_error(
+            3,
+            "source locator must point opaquely to the Reference row in SUITE.lock",
+        ));
+    }
+    let source_sha256 = abi_field(sha_token, "sha256=", 3)?;
+    if !lower_hex(source_sha256, 64) {
+        return Err(abi_layout_error(
+            3,
+            "source SHA-256 must be exactly 64 lowercase hexadecimal digits",
+        ));
+    }
+    let count_tokens: Vec<_> = lines[3].split_whitespace().collect();
+    let [count_directive, count_value] = count_tokens.as_slice() else {
+        return Err(abi_layout_error(
+            4,
+            "target count must be `target-count <decimal>`",
+        ));
+    };
+    let target_count = count_value
+        .parse::<usize>()
+        .map_err(|_| abi_layout_error(4, "target count is not a canonical usize"))?;
+    if !matches!(*count_directive, "target-count") || target_count != expected_target_count {
+        return Err(InventoryError::new(
+            ErrorClass::Violation,
+            "abi_target_matrix_mismatch",
+            ABI_TARGET_LAYOUT_FILE,
+            format!(
+                "target-count={target_count} but SUITE.lock has {expected_target_count} certified targets"
+            ),
+        ));
+    }
+    if target_count == 0 || target_count > MAX_ROWS {
+        return Err(InventoryError::new(
+            ErrorClass::Inconclusive,
+            "resource_exhausted",
+            ABI_TARGET_LAYOUT_FILE,
+            format!("target-count must be within 1..={MAX_ROWS}, got {target_count}"),
+        ));
+    }
+
+    let mut rows = BTreeMap::new();
+    let mut index = 4;
+    for target_index in 1..=target_count {
+        let line_number = index + 1;
+        let target_tokens: Vec<_> = lines
+            .get(index)
+            .ok_or_else(|| abi_layout_error(line_number, "missing target row"))?
+            .split_whitespace()
+            .collect();
+        let [
+            directive,
+            key_token,
+            abi_token,
+            model_token,
+            endian_token,
+            pointer_token,
+            size_t_token,
+            char_token,
+            int_token,
+            unsigned_token,
+            long_token,
+            long_long_token,
+            max_align_token,
+        ] = target_tokens.as_slice()
+        else {
+            return Err(abi_layout_error(
+                line_number,
+                "target row fields are missing, extra, or not canonically ordered",
+            ));
+        };
+        let target_key = format!("target:{target_index:04}");
+        if !matches!(*directive, "target") || key_token.ne(&target_key) {
+            return Err(InventoryError::new(
+                ErrorClass::Violation,
+                "abi_target_matrix_mismatch",
+                ABI_TARGET_LAYOUT_FILE,
+                format!(
+                    "line {line_number}: expected opaque key `{target_key}`, got `{key_token}`"
+                ),
+            ));
+        }
+        let abi_class = abi_field(abi_token, "abi-class=", line_number)?;
+        let data_model = abi_field(model_token, "data-model=", line_number)?;
+        let endianness = abi_field(endian_token, "endianness=", line_number)?;
+        let endian_class = match endianness {
+            "little" => "le",
+            "big" => "be",
+            _ => {
+                return Err(abi_layout_error(
+                    line_number,
+                    format!("unsupported endianness `{endianness}`"),
+                ));
+            }
+        };
+        if !matches!(data_model, "lp64" | "llp64" | "ilp32")
+            || abi_class.ne(&format!("{data_model}-{endian_class}"))
+        {
+            return Err(abi_layout_error(
+                line_number,
+                format!(
+                    "ABI class `{abi_class}` does not canonically encode data model `{data_model}` and endianness `{endianness}`"
+                ),
+            ));
+        }
+        let pointer_bits = abi_u64(pointer_token, "pointer-bits=", line_number)?;
+        let size_t_bits = abi_u64(size_t_token, "size-t-bits=", line_number)?;
+        let char_bits = abi_u64(char_token, "char-bits=", line_number)?;
+        let int_bits = abi_u64(int_token, "int-bits=", line_number)?;
+        let unsigned_bits = abi_u64(unsigned_token, "unsigned-bits=", line_number)?;
+        let long_bits = abi_u64(long_token, "long-bits=", line_number)?;
+        let long_long_bits = abi_u64(long_long_token, "long-long-bits=", line_number)?;
+        let max_align_bytes = abi_u64(max_align_token, "max-align-bytes=", line_number)?;
+        let expected_shape = match data_model {
+            "lp64" => (64, 64, 32, 32, 64, 64),
+            "llp64" => (64, 64, 32, 32, 32, 64),
+            "ilp32" => (32, 32, 32, 32, 32, 64),
+            _ => unreachable!("data model checked above"),
+        };
+        if (
+            pointer_bits,
+            size_t_bits,
+            int_bits,
+            unsigned_bits,
+            long_bits,
+            long_long_bits,
+        ) != expected_shape
+            || char_bits != 8
+            || max_align_bytes == 0
+            || !max_align_bytes.is_power_of_two()
+        {
+            return Err(abi_layout_error(
+                line_number,
+                "primitive widths or maximum alignment contradict the declared ABI class",
+            ));
+        }
+
+        let block_start = index;
+        index += 1;
+        let mut phase = 0_u8;
+        let mut define_names = BTreeSet::new();
+        let mut tag_names = BTreeSet::new();
+        let mut struct_names = BTreeSet::new();
+        let mut field_names = BTreeSet::new();
+        let mut current_struct: Option<(String, u64, usize)> = None;
+        let mut detail_rows = 0_usize;
+        loop {
+            let detail_line_number = index + 1;
+            let line = lines
+                .get(index)
+                .ok_or_else(|| abi_layout_error(detail_line_number, "missing target-root row"))?;
+            if line.starts_with("target-root ") {
+                if let Some((name, _, fields)) = &current_struct
+                    && fields.eq(&0)
+                {
+                    return Err(abi_layout_error(
+                        detail_line_number,
+                        format!("struct `{name}` has no field observations"),
+                    ));
+                }
+                break;
+            }
+            if detail_rows >= MAX_ROWS {
+                return Err(InventoryError::new(
+                    ErrorClass::Inconclusive,
+                    "resource_exhausted",
+                    ABI_TARGET_LAYOUT_FILE,
+                    format!("target `{target_key}` exceeds {MAX_ROWS} bounded detail rows"),
+                ));
+            }
+            detail_rows += 1;
+            let tokens: Vec<_> = line.split_whitespace().collect();
+            let Some(kind) = tokens.first().copied() else {
+                return Err(abi_layout_error(detail_line_number, "blank detail row"));
+            };
+            match kind {
+                "define" | "tag" => {
+                    let [_, detail_key, name_token, value_token, source_line_token] =
+                        tokens.as_slice()
+                    else {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            format!("`{kind}` row fields are not canonical"),
+                        ));
+                    };
+                    if detail_key.ne(&target_key) {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            format!("`{kind}` row does not belong to `{target_key}`"),
+                        ));
+                    }
+                    let name = abi_field(name_token, "name=", detail_line_number)?;
+                    if !abi_name(name) {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            format!("`{name}` is not a canonical C identifier"),
+                        ));
+                    }
+                    let _value = abi_i128(value_token, "value=", detail_line_number)?;
+                    let source_line =
+                        abi_u64(source_line_token, "source-line=", detail_line_number)?;
+                    if source_line == 0 {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            "source-line must be positive",
+                        ));
+                    }
+                    if matches!(kind, "define") {
+                        if phase != 0 || !define_names.insert(name.to_string()) {
+                            return Err(abi_layout_error(
+                                detail_line_number,
+                                "define rows must be unique and precede tag/struct rows",
+                            ));
+                        }
+                    } else {
+                        if phase > 1 {
+                            return Err(abi_layout_error(
+                                detail_line_number,
+                                "tag rows must precede struct rows",
+                            ));
+                        }
+                        phase = 1;
+                        let value = abi_i128(value_token, "value=", detail_line_number)?;
+                        if !(0..=255).contains(&value) || !tag_names.insert(name.to_string()) {
+                            return Err(abi_layout_error(
+                                detail_line_number,
+                                "tag rows must be unique u8 observations",
+                            ));
+                        }
+                    }
+                }
+                "struct" => {
+                    if let Some((name, _, fields)) = &current_struct
+                        && fields.eq(&0)
+                    {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            format!("struct `{name}` has no field observations"),
+                        ));
+                    }
+                    phase = 2;
+                    let [
+                        _,
+                        detail_key,
+                        name_token,
+                        size_token,
+                        align_token,
+                        source_lines_token,
+                    ] = tokens.as_slice()
+                    else {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            "struct row fields are not canonical",
+                        ));
+                    };
+                    if detail_key.ne(&target_key) {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            format!("struct row does not belong to `{target_key}`"),
+                        ));
+                    }
+                    let name = abi_field(name_token, "name=", detail_line_number)?;
+                    if !abi_name(name) || !struct_names.insert(name.to_string()) {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            format!("struct name `{name}` is invalid or duplicated"),
+                        ));
+                    }
+                    let size_bytes = abi_u64(size_token, "size-bytes=", detail_line_number)?;
+                    let align_bytes = abi_u64(align_token, "align-bytes=", detail_line_number)?;
+                    let source_lines =
+                        abi_field(source_lines_token, "source-lines=", detail_line_number)?;
+                    let Some((start, end)) = source_lines.split_once('-') else {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            "source-lines must be `<positive>-<positive>`",
+                        ));
+                    };
+                    let start = start.parse::<u64>().map_err(|_| {
+                        abi_layout_error(detail_line_number, "invalid source-lines start")
+                    })?;
+                    let end = end.parse::<u64>().map_err(|_| {
+                        abi_layout_error(detail_line_number, "invalid source-lines end")
+                    })?;
+                    if size_bytes == 0
+                        || align_bytes == 0
+                        || !align_bytes.is_power_of_two()
+                        || size_bytes % align_bytes != 0
+                        || start == 0
+                        || end < start
+                    {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            "struct size/alignment/source range is impossible",
+                        ));
+                    }
+                    let size_bits = size_bytes.checked_mul(char_bits).ok_or_else(|| {
+                        abi_layout_error(detail_line_number, "struct size in bits overflowed u64")
+                    })?;
+                    current_struct = Some((name.to_string(), size_bits, 0));
+                    field_names.clear();
+                }
+                "field" => {
+                    if phase != 2 {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            "field row must follow its struct row",
+                        ));
+                    }
+                    let [
+                        _,
+                        detail_key,
+                        struct_token,
+                        name_token,
+                        offset_token,
+                        width_token,
+                        storage_token,
+                        element_token,
+                        source_line_token,
+                    ] = tokens.as_slice()
+                    else {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            "field row fields are not canonical",
+                        ));
+                    };
+                    if detail_key.ne(&target_key) {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            format!("field row does not belong to `{target_key}`"),
+                        ));
+                    }
+                    let struct_name = abi_field(struct_token, "struct=", detail_line_number)?;
+                    let name = abi_field(name_token, "name=", detail_line_number)?;
+                    let (current_name, struct_bits, field_count) =
+                        current_struct.as_mut().ok_or_else(|| {
+                            abi_layout_error(detail_line_number, "field row has no current struct")
+                        })?;
+                    if struct_name.ne(current_name)
+                        || !abi_name(name)
+                        || !field_names.insert(name.to_string())
+                    {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            "field struct/name is invalid, duplicated, or not current",
+                        ));
+                    }
+                    let offset_bits = abi_u64(offset_token, "offset-bits=", detail_line_number)?;
+                    let width_bits = abi_u64(width_token, "width-bits=", detail_line_number)?;
+                    let storage = abi_field(storage_token, "storage=", detail_line_number)?;
+                    let element_width_bits =
+                        abi_u64(element_token, "element-width-bits=", detail_line_number)?;
+                    let source_line =
+                        abi_u64(source_line_token, "source-line=", detail_line_number)?;
+                    let end_bits = offset_bits.checked_add(width_bits).ok_or_else(|| {
+                        abi_layout_error(detail_line_number, "field bit range overflowed u64")
+                    })?;
+                    let storage_valid = match storage {
+                        "scalar" | "bitfield" => {
+                            width_bits > 0 && element_width_bits == 0 && end_bits <= *struct_bits
+                        }
+                        "flexible-array" => {
+                            width_bits == 0 && element_width_bits > 0 && offset_bits <= *struct_bits
+                        }
+                        _ => false,
+                    };
+                    if !storage_valid || source_line == 0 {
+                        return Err(abi_layout_error(
+                            detail_line_number,
+                            "field range/storage/source observation is impossible",
+                        ));
+                    }
+                    *field_count += 1;
+                }
+                _ => {
+                    return Err(abi_layout_error(
+                        detail_line_number,
+                        format!("unsupported target detail row `{kind}`"),
+                    ));
+                }
+            }
+            index += 1;
+        }
+        if define_names.is_empty()
+            || tag_names.is_empty()
+            || struct_names.is_empty()
+            || detail_rows == 0
+        {
+            return Err(abi_layout_error(
+                index + 1,
+                "each target requires define, tag, struct, and field observations",
+            ));
+        }
+        let root_line_number = index + 1;
+        let root_tokens: Vec<_> = lines[index].split_whitespace().collect();
+        let [root_directive, root_key, root_token] = root_tokens.as_slice() else {
+            return Err(abi_layout_error(
+                root_line_number,
+                "target-root row is not canonical",
+            ));
+        };
+        if !matches!(*root_directive, "target-root") || root_key.ne(&target_key) {
+            return Err(abi_layout_error(
+                root_line_number,
+                format!("expected `target-root {target_key} <root>`"),
+            ));
+        }
+        let claimed_root = parse_labeled_hash(root_token).ok_or_else(|| {
+            abi_layout_error(
+                root_line_number,
+                "target root must be `fnv1a64:<16-lower-hex>`",
+            )
+        })?;
+        let block = format!("{}\n", lines[block_start..index].join("\n"));
+        let computed_root = hash_fields("fln.abi-target-layout.target-root/1", &[block.as_bytes()]);
+        if claimed_root != computed_root {
+            return Err(abi_layout_error(
+                root_line_number,
+                format!(
+                    "target root mismatch: claimed={} computed={}",
+                    labeled_hash(claimed_root),
+                    labeled_hash(computed_root)
+                ),
+            ));
+        }
+        let row_key = format!("abi-layout:{target_key}");
+        rows.insert(
+            row_key.clone(),
+            AbiLayoutRow {
+                key: row_key,
+                abi_class: abi_class.to_string(),
+                target_root: claimed_root,
+                source_sha256: source_sha256.to_string(),
+            },
+        );
+        index += 1;
+    }
+
+    if index + 1 != lines.len() {
+        return Err(abi_layout_error(
+            index + 1,
+            "inventory-root must be the single terminal row",
+        ));
+    }
+    let root_tokens: Vec<_> = lines[index].split_whitespace().collect();
+    let [directive, root_token] = root_tokens.as_slice() else {
+        return Err(abi_layout_error(
+            index + 1,
+            "inventory-root row is not canonical",
+        ));
+    };
+    if !matches!(*directive, "inventory-root") {
+        return Err(abi_layout_error(
+            index + 1,
+            "inventory-root must be the single terminal row",
+        ));
+    }
+    let claimed_root = parse_labeled_hash(root_token).ok_or_else(|| {
+        abi_layout_error(index + 1, "inventory root must be `fnv1a64:<16-lower-hex>`")
+    })?;
+    let prefix = format!("{}\n", lines[..index].join("\n"));
+    let computed_root = hash_fields(
+        "fln.abi-target-layout.inventory-root/1",
+        &[prefix.as_bytes()],
+    );
+    if claimed_root != computed_root {
+        return Err(abi_layout_error(
+            index + 1,
+            format!(
+                "inventory root mismatch: claimed={} computed={}",
+                labeled_hash(claimed_root),
+                labeled_hash(computed_root)
+            ),
+        ));
+    }
+    Ok(rows)
+}
+
 fn evidence_hash(kind: &str, source: &str, facts: &[&str]) -> u64 {
     let mut fields: Vec<&[u8]> = Vec::with_capacity(facts.len() + 2);
     fields.push(kind.as_bytes());
@@ -475,7 +1085,10 @@ fn evidence_hash(kind: &str, source: &str, facts: &[&str]) -> u64 {
     hash_fields("fln.contract-inventory.raw-evidence/1", &fields)
 }
 
-fn raw_rows(lock: &SuiteLock) -> Result<BTreeMap<String, RawRow>, InventoryError> {
+fn raw_rows(
+    lock: &SuiteLock,
+    abi_layout_text: &str,
+) -> Result<BTreeMap<String, RawRow>, InventoryError> {
     let mut rows = BTreeMap::new();
     let mut insert = |row: RawRow| -> Result<(), InventoryError> {
         if rows.insert(row.key.clone(), row).is_some() {
@@ -493,7 +1106,10 @@ fn raw_rows(lock: &SuiteLock) -> Result<BTreeMap<String, RawRow>, InventoryError
     insert(RawRow {
         key: "toolchain".to_string(),
         kind: "toolchain",
+        extractor: EXTRACTOR_ID,
+        extractor_version: EXTRACTOR_VERSION,
         source: toolchain_source.to_string(),
+        observed_abi_class: None,
         evidence_hash: evidence_hash(
             "toolchain",
             toolchain_source,
@@ -507,8 +1123,11 @@ fn raw_rows(lock: &SuiteLock) -> Result<BTreeMap<String, RawRow>, InventoryError
         insert(RawRow {
             key,
             kind: "target",
+            extractor: EXTRACTOR_ID,
+            extractor_version: EXTRACTOR_VERSION,
             evidence_hash: evidence_hash("target", &source, &[target]),
             source,
+            observed_abi_class: None,
         })?;
     }
 
@@ -525,8 +1144,11 @@ fn raw_rows(lock: &SuiteLock) -> Result<BTreeMap<String, RawRow>, InventoryError
         insert(RawRow {
             key: format!("suite:{repo}"),
             kind: "suite",
+            extractor: EXTRACTOR_ID,
+            extractor_version: EXTRACTOR_VERSION,
             evidence_hash: evidence_hash("suite", &source, &[repo, &pin.commit, path]),
             source,
+            observed_abi_class: None,
         })?;
     }
 
@@ -551,7 +1173,10 @@ fn raw_rows(lock: &SuiteLock) -> Result<BTreeMap<String, RawRow>, InventoryError
     insert(RawRow {
         key: "reference".to_string(),
         kind: "reference",
+        extractor: EXTRACTOR_ID,
+        extractor_version: EXTRACTOR_VERSION,
         source: reference_source.to_string(),
+        observed_abi_class: None,
         evidence_hash: evidence_hash(
             "reference",
             reference_source,
@@ -576,13 +1201,46 @@ fn raw_rows(lock: &SuiteLock) -> Result<BTreeMap<String, RawRow>, InventoryError
     insert(RawRow {
         key: "corpus".to_string(),
         kind: "corpus",
+        extractor: EXTRACTOR_ID,
+        extractor_version: EXTRACTOR_VERSION,
         source: corpus_source.to_string(),
+        observed_abi_class: None,
         evidence_hash: evidence_hash(
             "corpus",
             corpus_source,
             &[corpus_repo, corpus_tag, corpus_commit],
         ),
     })?;
+
+    for layout in parse_abi_target_layout(abi_layout_text, lock.targets.len())?.into_values() {
+        let target_key = layout
+            .key
+            .strip_prefix("abi-layout:")
+            .ok_or_else(|| {
+                InventoryError::new(
+                    ErrorClass::InternalFault,
+                    "abi_layout_identity_invalid",
+                    ABI_TARGET_LAYOUT_FILE,
+                    format!("validated ABI layout key lost its prefix: `{}`", layout.key),
+                )
+            })?
+            .to_string();
+        let source = format!("{ABI_TARGET_LAYOUT_FILE}:{target_key}");
+        let target_root = labeled_hash(layout.target_root);
+        insert(RawRow {
+            key: layout.key,
+            kind: "abi-layout",
+            extractor: ABI_EXTRACTOR_ID,
+            extractor_version: ABI_EXTRACTOR_VERSION,
+            observed_abi_class: Some(layout.abi_class.clone()),
+            evidence_hash: evidence_hash(
+                "abi-layout",
+                &source,
+                &[&layout.abi_class, &target_root, &layout.source_sha256],
+            ),
+            source,
+        })?;
+    }
 
     Ok(rows)
 }
@@ -591,6 +1249,7 @@ fn canonical_inventory(
     suite_lock_text: &str,
     schema_text: &str,
     policy_text: &str,
+    abi_target_layout_text: &str,
 ) -> Result<CanonicalInventory, InventoryError> {
     validate_text_shape(
         SUITE_LOCK_FILE,
@@ -620,7 +1279,7 @@ fn canonical_inventory(
             detail,
         )
     })?;
-    let raw = raw_rows(&lock)?;
+    let raw = raw_rows(&lock, abi_target_layout_text)?;
     let policy = parse_policy(policy_text)?;
     if raw.len() > MAX_ROWS {
         return Err(InventoryError::new(
@@ -652,15 +1311,22 @@ fn canonical_inventory(
         "fln.contract-inventory.suite-lock-root/1",
         suite_lock_text.as_bytes(),
     );
+    let abi_target_layout_root = hash_one(
+        "fln.contract-inventory.abi-target-layout-root/1",
+        abi_target_layout_text.as_bytes(),
+    );
     let policy_root = hash_one(
         "fln.contract-inventory.policy-root/1",
         policy_text.as_bytes(),
     );
     let mut raw_projection = String::new();
     for (key, row) in &raw {
+        let observed_abi_class = row.observed_abi_class.as_deref().unwrap_or("none");
         raw_projection.push_str(&format!(
-            "row {key} kind={} source={} raw-evidence-hash={}\n",
+            "row {key} kind={} extractor={} extractor-version={} source={} observed-abi-class={observed_abi_class} raw-evidence-hash={}\n",
             row.kind,
+            row.extractor,
+            row.extractor_version,
             row.source,
             labeled_hash(row.evidence_hash),
         ));
@@ -700,6 +1366,7 @@ fn canonical_inventory(
         .len()
         .checked_add(schema_text.len())
         .and_then(|total| total.checked_add(policy_text.len()))
+        .and_then(|total| total.checked_add(abi_target_layout_text.len()))
         .ok_or_else(|| {
             InventoryError::new(
                 ErrorClass::InternalFault,
@@ -715,6 +1382,10 @@ fn canonical_inventory(
         "suite-lock-root {}\n",
         labeled_hash(suite_lock_root)
     ));
+    output.push_str(&format!(
+        "abi-target-layout-root {}\n",
+        labeled_hash(abi_target_layout_root)
+    ));
     output.push_str(&format!("raw-root {}\n", labeled_hash(raw_root)));
     output.push_str(&format!("policy-root {}\n", labeled_hash(policy_root)));
     output.push_str(&format!(
@@ -723,6 +1394,9 @@ fn canonical_inventory(
     ));
     output.push_str(&format!(
         "extractor {EXTRACTOR_ID} version={EXTRACTOR_VERSION}\n"
+    ));
+    output.push_str(&format!(
+        "extractor {ABI_EXTRACTOR_ID} version={ABI_EXTRACTOR_VERSION}\n"
     ));
     output.push_str(&format!("row-count {}\n", raw.len()));
     output.push_str(&format!("target-row-count {target_row_count}\n"));
@@ -749,6 +1423,19 @@ fn canonical_inventory(
                 ),
             ));
         }
+        if let Some(observed_abi_class) = &raw_row.observed_abi_class
+            && policy_row.abi_class.ne(observed_abi_class)
+        {
+            return Err(InventoryError::new(
+                ErrorClass::Violation,
+                "abi_policy_mismatch",
+                CONTRACT_INVENTORY_POLICY_FILE,
+                format!(
+                    "row `{key}` classifies ABI `{}` but mechanical extraction observes `{observed_abi_class}`",
+                    policy_row.abi_class
+                ),
+            ));
+        }
         let evidence = labeled_hash(raw_row.evidence_hash);
         let suite_lock_root_label = labeled_hash(suite_lock_root);
         let identity = hash_fields(
@@ -757,8 +1444,8 @@ fn canonical_inventory(
                 suite_lock_root_label.as_bytes(),
                 key.as_bytes(),
                 raw_row.kind.as_bytes(),
-                EXTRACTOR_ID.as_bytes(),
-                EXTRACTOR_VERSION.as_bytes(),
+                raw_row.extractor.as_bytes(),
+                raw_row.extractor_version.as_bytes(),
                 raw_row.source.as_bytes(),
                 policy_row.target_class.as_bytes(),
                 policy_row.abi_class.as_bytes(),
@@ -768,8 +1455,10 @@ fn canonical_inventory(
             ],
         );
         output.push_str(&format!(
-            "row {key} kind={} extractor={EXTRACTOR_ID} extractor-version={EXTRACTOR_VERSION} source={} target-class={} abi-class={} raw-evidence-hash={evidence} identity={} authority=observed support={}\n",
+            "row {key} kind={} extractor={} extractor-version={} source={} target-class={} abi-class={} raw-evidence-hash={evidence} identity={} authority=observed support={}\n",
             raw_row.kind,
+            raw_row.extractor,
+            raw_row.extractor_version,
             raw_row.source,
             policy_row.target_class,
             policy_row.abi_class,
@@ -796,6 +1485,7 @@ fn canonical_inventory(
             inventory_root: labeled_hash(inventory_root),
             schema_root: labeled_hash(schema_root),
             suite_lock_root: labeled_hash(suite_lock_root),
+            abi_target_layout_root: labeled_hash(abi_target_layout_root),
             raw_root: labeled_hash(raw_root),
             policy_root: labeled_hash(policy_root),
             reference_root: labeled_hash(reference_root),
@@ -815,8 +1505,14 @@ pub fn canonical_inventory_text(
     suite_lock_text: &str,
     schema_text: &str,
     policy_text: &str,
+    abi_target_layout_text: &str,
 ) -> Result<String, InventoryError> {
-    let inventory = canonical_inventory(suite_lock_text, schema_text, policy_text)?;
+    let inventory = canonical_inventory(
+        suite_lock_text,
+        schema_text,
+        policy_text,
+        abi_target_layout_text,
+    )?;
     String::from_utf8(inventory.bytes).map_err(|error| {
         InventoryError::new(
             ErrorClass::InternalFault,
@@ -996,6 +1692,12 @@ fn read_sources(root: &Path) -> Result<SourceSet, InventoryError> {
             ErrorClass::Inconclusive,
             "source_unavailable",
         )?,
+        abi_target_layout: read_bounded(
+            root,
+            ABI_TARGET_LAYOUT_FILE,
+            ErrorClass::Inconclusive,
+            "source_unavailable",
+        )?,
     })
 }
 
@@ -1019,6 +1721,12 @@ fn canonical_from_sources(sources: &SourceSet) -> Result<CanonicalInventory, Inv
             ErrorClass::Violation,
             "policy_invalid",
         )?,
+        utf8(
+            ABI_TARGET_LAYOUT_FILE,
+            &sources.abi_target_layout,
+            ErrorClass::Violation,
+            "abi_target_layout_invalid",
+        )?,
     )
 }
 
@@ -1036,7 +1744,34 @@ fn candidate_exists(root: &Path) -> Result<bool, InventoryError> {
     }
 }
 
+fn abi_source_candidate_exists(root: &Path) -> Result<bool, InventoryError> {
+    validate_parent_chain(root, ABI_TARGET_LAYOUT_CANDIDATE_FILE)?;
+    match fs::symlink_metadata(root.join(ABI_TARGET_LAYOUT_CANDIDATE_FILE)) {
+        Ok(_) => Ok(true),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(error) => Err(InventoryError::new(
+            ErrorClass::Inconclusive,
+            "source_unavailable",
+            ABI_TARGET_LAYOUT_CANDIDATE_FILE,
+            format!("cannot inspect ABI target-layout publication candidate: {error}"),
+        )),
+    }
+}
+
+fn ensure_no_abi_source_candidate(root: &Path) -> Result<(), InventoryError> {
+    if abi_source_candidate_exists(root)? {
+        return Err(InventoryError::new(
+            ErrorClass::Inconclusive,
+            "stale_source_candidate",
+            ABI_TARGET_LAYOUT_CANDIDATE_FILE,
+            "interrupted ABI target-layout publication candidate exists; refuse both the raw table and its derived canonical inventory",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_no_candidate(root: &Path) -> Result<(), InventoryError> {
+    ensure_no_abi_source_candidate(root)?;
     if candidate_exists(root)? {
         return Err(InventoryError::new(
             ErrorClass::Inconclusive,
@@ -1353,6 +2088,7 @@ pub fn publish(root: &Path) -> Result<PublicationReceipt, InventoryError> {
 /// An invalid/stale candidate is retained and the previous publication is untouched.
 pub fn recover(root: &Path) -> Result<PublicationReceipt, InventoryError> {
     let root = checked_root(root)?;
+    ensure_no_abi_source_candidate(&root)?;
     if !candidate_exists(&root)? {
         return Err(InventoryError::new(
             ErrorClass::Violation,
@@ -1485,8 +2221,11 @@ reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6
 corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997
 ";
 
+    const TEST_ABI_TARGET_LAYOUT: &str = include_str!("../../../contracts/ABI_TARGET_LAYOUT.txt");
+
     const REQUIRED_POLICY: &str = "\
 schema fln-contract-inventory-policy/1
+row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=required target-class=none abi-class=none
@@ -1496,6 +2235,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
 
     const OPTIONAL_POLICY: &str = "\
 schema fln-contract-inventory-policy/1
+row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=optional target-class=none abi-class=none
@@ -1558,22 +2298,36 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             &root.join(CONTRACT_INVENTORY_POLICY_FILE),
             policy.as_bytes(),
         );
+        write_new(
+            &root.join(ABI_TARGET_LAYOUT_FILE),
+            TEST_ABI_TARGET_LAYOUT.as_bytes(),
+        );
         root
     }
 
     #[test]
-    fn canonical_generation_is_deterministic_bijective_and_not_a_second_pin_authority() {
-        let first =
-            canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, REQUIRED_POLICY).unwrap();
-        let second =
-            canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, REQUIRED_POLICY).unwrap();
+    fn abi_contract_inventory_model_is_deterministic_bijective_and_not_a_second_pin_authority() {
+        let first = canonical_inventory_text(
+            TEST_SUITE_LOCK,
+            SCHEMA_DEFINITION,
+            REQUIRED_POLICY,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .unwrap();
+        let second = canonical_inventory_text(
+            TEST_SUITE_LOCK,
+            SCHEMA_DEFINITION,
+            REQUIRED_POLICY,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .unwrap();
         assert_eq!(first, second);
         for required_header in [
             "raw-root fnv1a64:",
             "reference-root fnv1a64:",
-            "row-count 5\n",
+            "row-count 6\n",
             "target-row-count 1\n",
-            "abi-row-count 0\n",
+            "abi-row-count 1\n",
             "unresolved-row-count 0\n",
         ] {
             assert!(
@@ -1597,9 +2351,13 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             "8c9756b28d64dab099da31a4c09229a9e6a2ef35",
             "9c9756b28d64dab099da31a4c09229a9e6a2ef35",
         );
-        let changed =
-            canonical_inventory_text(&changed_reference, SCHEMA_DEFINITION, REQUIRED_POLICY)
-                .expect("another well-shaped Reference pin remains derivable");
+        let changed = canonical_inventory_text(
+            &changed_reference,
+            SCHEMA_DEFINITION,
+            REQUIRED_POLICY,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .expect("another well-shaped Reference pin remains derivable");
         assert_ne!(
             first, changed,
             "Reference pin drift must change the opaque Reference and canonical roots"
@@ -1613,23 +2371,71 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             "row target:0001 kind=target support=required target-class=certified abi-class=none\n",
             "",
         );
-        let error = canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, &missing)
-            .expect_err("missing policy row must fail the bijection");
+        let error = canonical_inventory_text(
+            TEST_SUITE_LOCK,
+            SCHEMA_DEFINITION,
+            &missing,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .expect_err("missing policy row must fail the bijection");
         assert_eq!(error.reason, "policy_join_not_bijective");
 
         let stale = REQUIRED_POLICY.to_string()
             + "row zzzz:stale kind=suite support=required target-class=none abi-class=none\n";
-        let error = canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, &stale)
-            .expect_err("stale policy row must fail the bijection");
+        let error = canonical_inventory_text(
+            TEST_SUITE_LOCK,
+            SCHEMA_DEFINITION,
+            &stale,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .expect_err("stale policy row must fail the bijection");
         assert_eq!(error.reason, "policy_join_not_bijective");
 
         let duplicate = REQUIRED_POLICY.replace(
             "row reference kind=reference support=required target-class=none abi-class=none\n",
             "row reference kind=reference support=required target-class=none abi-class=none\nrow reference kind=reference support=required target-class=none abi-class=none\n",
         );
-        let error = canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, &duplicate)
-            .expect_err("duplicate policy row must fail before the join");
+        let error = canonical_inventory_text(
+            TEST_SUITE_LOCK,
+            SCHEMA_DEFINITION,
+            &duplicate,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .expect_err("duplicate policy row must fail before the join");
         assert_eq!(error.reason, "policy_not_canonical");
+    }
+
+    #[test]
+    fn abi_target_matrix_rejects_torn_or_misindexed_observations() {
+        let parsed = parse_abi_target_layout(TEST_ABI_TARGET_LAYOUT, 1)
+            .expect("checked-in fixture is a complete one-target observation");
+        let row = parsed
+            .get("abi-layout:target:0001")
+            .expect("opaque first target is present");
+        assert_eq!(row.abi_class, "lp64-le");
+
+        let mismatch = parse_abi_target_layout(TEST_ABI_TARGET_LAYOUT, 2)
+            .expect_err("one layout cannot silently stand in for two certified targets");
+        assert_eq!(mismatch.reason, "abi_target_matrix_mismatch");
+
+        let torn = &TEST_ABI_TARGET_LAYOUT[..TEST_ABI_TARGET_LAYOUT.len() / 2];
+        let torn_error =
+            parse_abi_target_layout(torn, 1).expect_err("a torn table has no authority");
+        assert_eq!(torn_error.reason, "abi_target_layout_invalid");
+    }
+
+    #[test]
+    fn abi_policy_bijection_rejects_a_class_not_observed_by_the_extractor() {
+        let wrong_class = REQUIRED_POLICY.replace("abi-class=lp64-le", "abi-class=llp64-le");
+        let error = canonical_inventory_text(
+            TEST_SUITE_LOCK,
+            SCHEMA_DEFINITION,
+            &wrong_class,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .expect_err("review policy cannot relabel the mechanically observed ABI");
+        assert_eq!(error.class, ErrorClass::Violation);
+        assert_eq!(error.reason, "abi_policy_mismatch");
     }
 
     #[test]
@@ -1664,8 +2470,13 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
     #[test]
     fn resource_exhaustion_is_typed_inconclusive() {
         let oversized = "x".repeat(MAX_SOURCE_BYTES + 1);
-        let error = canonical_inventory_text(&oversized, SCHEMA_DEFINITION, REQUIRED_POLICY)
-            .expect_err("bounded input must refuse exhaustion");
+        let error = canonical_inventory_text(
+            &oversized,
+            SCHEMA_DEFINITION,
+            REQUIRED_POLICY,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .expect_err("bounded input must refuse exhaustion");
         assert_eq!(error.class, ErrorClass::Inconclusive);
         assert_eq!(error.reason, "resource_exhausted");
     }
@@ -1677,8 +2488,13 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
         assert_eq!(missing.class, ErrorClass::Violation);
         assert_eq!(missing.reason, "published_inventory_missing");
 
-        let canonical =
-            canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, REQUIRED_POLICY).unwrap();
+        let canonical = canonical_inventory_text(
+            TEST_SUITE_LOCK,
+            SCHEMA_DEFINITION,
+            REQUIRED_POLICY,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .unwrap();
         write_new(
             &root.join(CONTRACT_INVENTORY_CANDIDATE_FILE),
             canonical.as_bytes(),
@@ -1706,6 +2522,25 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
     }
 
     #[test]
+    fn abi_source_candidate_is_typed_and_cannot_be_hidden_by_a_stable_inventory() {
+        let root = fixture_root("abi-source-candidate", REQUIRED_POLICY);
+        publish(&root).expect("baseline canonical inventory publishes");
+        let stable = fs::read(root.join(CONTRACT_INVENTORY_FILE)).expect("read stable publication");
+        write_new(
+            &root.join(ABI_TARGET_LAYOUT_CANDIDATE_FILE),
+            &TEST_ABI_TARGET_LAYOUT.as_bytes()[..TEST_ABI_TARGET_LAYOUT.len() / 2],
+        );
+        let error = consume(&root)
+            .expect_err("leftover raw-table candidate must mask the older stable projection");
+        assert_eq!(error.class, ErrorClass::Inconclusive);
+        assert_eq!(error.reason, "stale_source_candidate");
+        assert_eq!(
+            fs::read(root.join(CONTRACT_INVENTORY_FILE)).expect("old projection remains intact"),
+            stable
+        );
+    }
+
+    #[test]
     fn non_authoritative_source_outcomes_are_typed_and_preserve_publication() {
         let unavailable = retained_root("source-unavailable");
         write_new(
@@ -1720,10 +2555,17 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
         assert_eq!(error.class, ErrorClass::Inconclusive);
         assert_eq!(error.reason, "source_unavailable");
 
-        let ambiguous_policy =
-            REQUIRED_POLICY.replace("target-class=certified", "target-class=none");
-        let error = canonical_inventory_text(TEST_SUITE_LOCK, SCHEMA_DEFINITION, &ambiguous_policy)
-            .expect_err("ambiguous target classification is not authoritative");
+        let ambiguous_policy = REQUIRED_POLICY.replace(
+            "row target:0001 kind=target support=required target-class=certified abi-class=none",
+            "row target:0001 kind=target support=required target-class=none abi-class=none",
+        );
+        let error = canonical_inventory_text(
+            TEST_SUITE_LOCK,
+            SCHEMA_DEFINITION,
+            &ambiguous_policy,
+            TEST_ABI_TARGET_LAYOUT,
+        )
+        .expect_err("ambiguous target classification is not authoritative");
         assert_eq!(error.class, ErrorClass::Inconclusive);
         assert_eq!(error.reason, "target_class_ambiguous");
 

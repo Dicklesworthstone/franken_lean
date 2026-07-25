@@ -1,4 +1,5 @@
 schema fln-contract-inventory-policy/1
+row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=required target-class=none abi-class=none

@@ -23,8 +23,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use structure_guard::checks::{self, RunOutcome};
 use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
 use structure_guard::{
-    CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE, CONTRACT_INVENTORY_SCHEMA_FILE,
-    SUITE_LOCK_FILE,
+    ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
+    CONTRACT_INVENTORY_SCHEMA_FILE, SUITE_LOCK_FILE,
 };
 
 /// An immutable workspace recipe. Every execution materializes a fresh, uniquely named
@@ -82,17 +82,20 @@ impl TempWs {
 
         let mut files = self.files.borrow().clone();
         if !files.contains_key(CONTRACT_INVENTORY_FILE)
-            && let (Some(suite_lock), Some(schema), Some(policy)) = (
+            && let (Some(suite_lock), Some(schema), Some(policy), Some(abi_target_layout)) = (
                 files.get(SUITE_LOCK_FILE),
                 files.get(CONTRACT_INVENTORY_SCHEMA_FILE),
                 files.get(CONTRACT_INVENTORY_POLICY_FILE),
+                files.get(ABI_TARGET_LAYOUT_FILE),
             )
-            && let (Ok(suite_lock), Ok(schema), Ok(policy)) = (
+            && let (Ok(suite_lock), Ok(schema), Ok(policy), Ok(abi_target_layout)) = (
                 std::str::from_utf8(suite_lock),
                 std::str::from_utf8(schema),
                 std::str::from_utf8(policy),
+                std::str::from_utf8(abi_target_layout),
             )
-            && let Ok(inventory) = canonical_inventory_text(suite_lock, schema, policy)
+            && let Ok(inventory) =
+                canonical_inventory_text(suite_lock, schema, policy, abi_target_layout)
         {
             files.insert(CONTRACT_INVENTORY_FILE.to_string(), inventory.into_bytes());
         }
@@ -187,12 +190,66 @@ corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665
 
 pub const CONTRACT_INVENTORY_POLICY_FIXTURE: &str = "\
 schema fln-contract-inventory-policy/1
+row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=required target-class=none abi-class=none
 row target:0001 kind=target support=required target-class=certified abi-class=none
 row toolchain kind=toolchain support=required target-class=none abi-class=none
 ";
+
+pub const ABI_TARGET_LAYOUT_FIXTURE: &str =
+    include_str!("../../../../contracts/ABI_TARGET_LAYOUT.txt");
+
+fn fixture_hash_fields(domain: &str, fields: &[&[u8]]) -> u64 {
+    let mut state = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in domain.as_bytes().iter().copied().chain(std::iter::once(0)) {
+        state ^= u64::from(byte);
+        state = state.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for field in fields {
+        for byte in (field.len() as u64)
+            .to_le_bytes()
+            .iter()
+            .copied()
+            .chain(field.iter().copied())
+        {
+            state ^= u64::from(byte);
+            state = state.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    state
+}
+
+/// Test-only mechanical expansion of the checked-in one-target ABI observation. Both
+/// fixture targets use the same LP64 little-endian layout; target identities remain
+/// opaque and are bound positionally by the production parser.
+pub fn abi_target_layout_fixture(target_count: usize) -> String {
+    assert!(target_count > 0, "fixture needs at least one target");
+    let lines: Vec<_> = ABI_TARGET_LAYOUT_FIXTURE.lines().collect();
+    let root_index = lines
+        .iter()
+        .position(|line| line.starts_with("target-root target:0001 "))
+        .expect("fixture target root");
+    let block_template = lines[4..root_index].join("\n") + "\n";
+    let mut output = format!(
+        "{}\n{}\n{}\ntarget-count {target_count}\n",
+        lines[0], lines[1], lines[2]
+    );
+    for index in 1..=target_count {
+        let key = format!("target:{index:04}");
+        let block = block_template.replace("target:0001", &key);
+        output.push_str(&block);
+        let root = fixture_hash_fields("fln.abi-target-layout.target-root/1", &[block.as_bytes()]);
+        output.push_str(&format!("target-root {key} fnv1a64:{root:016x}\n"));
+    }
+    let root = fixture_hash_fields(
+        "fln.abi-target-layout.inventory-root/1",
+        &[output.as_bytes()],
+    );
+    output.push_str(&format!("inventory-root fnv1a64:{root:016x}\n"));
+    output
+}
 
 /// The crates every base fixture materializes (name, is-boundary) — must stay in
 /// lockstep with BASE_GRAPH and base().
@@ -300,6 +357,7 @@ pub fn base(ws: &TempWs) {
         CONTRACT_INVENTORY_POLICY_FILE,
         CONTRACT_INVENTORY_POLICY_FIXTURE,
     );
+    ws.write(ABI_TARGET_LAYOUT_FILE, ABI_TARGET_LAYOUT_FIXTURE);
     ws.write("Cargo.lock", &fixture_cargo_lock());
     ws.write("ci/CLOSURE_ALLOWLIST.txt", &fixture_allowlist());
     ws.write("ci/WORKSPACE_GRAPH.txt", BASE_GRAPH);

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """gen_abi_contract.py — D5/D9 contract extraction: the ABI contract from the pinned lean.h.
 
-The law (plan Appendix B, bead franken_lean-53v): layout constants are DERIVED,
-never remembered. This checked-in script parses the PINNED Reference header
-(vendor/lean4-src/src/include/lean/lean.h) and renders three artifacts from ONE
-canonical inventory, so they cannot disagree by construction:
+The law (plan Appendix B, beads franken_lean-53v and franken_lean-b7n8): layout
+constants are DERIVED, never remembered. This checked-in script parses the PINNED
+Reference header and renders five artifacts from ONE canonical extraction, so they
+cannot disagree by construction:
 
   contracts/abi_inventory.json   — the canonical intermediate (schema fln-abi-contract/1)
+  contracts/ABI_TARGET_LAYOUT.txt
+                                 — target-indexed sizes, alignments, offsets, widths,
+                                   tag values, and resolved layout constants
   ABI_CONTRACT.md                — the human contract, per-field provenance
   crates/fln-rt/src/abi.rs       — the Rust constants module Marrow compiles against
   crates/fln-unsafe-abi/src/contract.rs
@@ -18,14 +21,17 @@ canonical inventory, so they cannot disagree by construction:
                                    same provenance, drift-checked together
 
 The upstream header is parsed as DATA (Oracle-Only Law D8: fixture/census mine);
-nothing from it executes. Extraction is offline, read-only over vendor/lean4-src,
-and deterministic: no timestamps, no locale dependence, source order preserved.
+nothing from it executes. Target layouts are observed by the clang shipped in the
+pinned Reference toolchain, using compile-only LLVM constants and AST record-layout
+dumps for every certified SUITE.lock target. No target binary executes and no host
+layout is projected onto another target. Extraction is offline and deterministic:
+no timestamps, no ambient include paths, fixed locale/timezone, source order preserved.
 
 Usage:
-  scripts/extract/gen_abi_contract.py           # (re)generate all three artifacts
+  scripts/extract/gen_abi_contract.py           # (re)generate all five artifacts
   scripts/extract/gen_abi_contract.py --check   # regenerate in memory, byte-compare
                                                 # against the checked-in artifacts;
-                                                # exit 2 with first divergence on drift
+                                                # exit 1 with first divergence on drift
 
 Any parse anomaly (anchor drift in the pin, unexpected declaration shape) is a
 loud failure with the offending line — never a silently narrower contract.
@@ -33,7 +39,9 @@ loud failure with the offending line — never a silently narrower contract.
 
 import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
 from bisect import bisect_right
 from pathlib import Path
@@ -42,12 +50,19 @@ ROOT = Path(__file__).resolve().parents[2]
 LEAN_H = ROOT / "vendor" / "lean4-src" / "src" / "include" / "lean" / "lean.h"
 SUITE_LOCK = ROOT / "SUITE.lock"
 INVENTORY_PATH = ROOT / "contracts" / "abi_inventory.json"
+TARGET_LAYOUT_PATH = ROOT / "contracts" / "ABI_TARGET_LAYOUT.txt"
 CONTRACT_PATH = ROOT / "ABI_CONTRACT.md"
 RUST_PATH = ROOT / "crates" / "fln-rt" / "src" / "abi.rs"
 BOUNDARY_RUST_PATH = ROOT / "crates" / "fln-unsafe-abi" / "src" / "contract.rs"
 
 SCHEMA = "fln-abi-contract/1"
+TARGET_LAYOUT_SCHEMA = "fln-abi-target-layout/1"
+TARGET_LAYOUT_EXTRACTOR = "lean-h-clang-layout"
+TARGET_LAYOUT_EXTRACTOR_VERSION = "1"
 SRC_REL = "vendor/lean4-src/src/include/lean/lean.h"
+TOOLCHAIN_HEADER_REL = "include/lean/lean.h"
+CLANG_TIMEOUT_SECONDS = 30
+MAX_CLANG_OUTPUT_BYTES = 4 * 1024 * 1024
 
 # Object structs whose field layouts are contract (plan §6.2). Auxiliary structs
 # (task_imp, external_class) are included: their fields are reachable from object
@@ -114,6 +129,25 @@ def read_pin() -> dict:
                 "tree": fields.get("tree", ""),
             }
     die("SUITE.lock has no reference row")
+
+
+def read_targets() -> list[str]:
+    targets = []
+    for line in SUITE_LOCK.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line.startswith("target "):
+            tokens = line.split()
+            if len(tokens) != 2:
+                die(f"SUITE.lock target row is not canonical: {line!r}")
+            target = tokens[1]
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", target):
+                die(f"SUITE.lock target is not a safe target triple: {target!r}")
+            if target in targets:
+                die(f"SUITE.lock repeats target {target!r}")
+            targets.append(target)
+    if not targets:
+        die("SUITE.lock has no certified target rows")
+    return targets
 
 
 def strip_comments(text: str) -> str:
@@ -198,11 +232,13 @@ def parse_layout_defines(lines: list[str]) -> list[dict]:
 
 
 FIELD_RX = re.compile(
-    r"^\s*(.+?)\s*\b(m_\w+)\s*(\[\s*\d*\s*\])?\s*(?::\s*(\d+))?\s*;\s*$"
+    r"^\s*(.+?)\s*\b([A-Za-z_]\w*)\s*(\[\s*\d*\s*\])?\s*(?::\s*(\d+))?\s*;\s*$"
 )
 
 
-def parse_structs(stripped: str, lmap: LineMap) -> list[dict]:
+def parse_structs(
+    stripped: str, lmap: LineMap, selected_names: list[str] | None
+) -> list[dict]:
     structs = []
     by_name = {}
     # Anonymous form: typedef struct { ... } name;  Named form: typedef struct tag { ... } name;
@@ -220,7 +256,7 @@ def parse_structs(stripped: str, lmap: LineMap) -> list[dict]:
         if not tail:
             continue
         name = tail.group(1)
-        if name not in TARGET_STRUCTS:
+        if selected_names is not None and name not in selected_names:
             continue
         body = stripped[m.end():j - 1]
         body_line0 = lmap.line(m.end())
@@ -251,12 +287,19 @@ def parse_structs(stripped: str, lmap: LineMap) -> list[dict]:
             "fields": fields,
         }
         structs.append(entry)
+        if name in by_name:
+            die(f"duplicate public struct typedef in lean.h: {name}")
         by_name[name] = entry
-    missing = [s for s in TARGET_STRUCTS if s not in by_name]
-    if missing:
-        die(f"object structs not found in lean.h: {missing}")
-    # preserve TARGET_STRUCTS order (stable regardless of source shuffling)
-    return [by_name[n] for n in TARGET_STRUCTS]
+    if selected_names is not None:
+        missing = [name for name in selected_names if name not in by_name]
+        if missing:
+            die(f"selected ABI structs not found in lean.h: {missing}")
+        # Preserve the reviewed object-model order for the pre-existing v1 inventory.
+        return [by_name[name] for name in selected_names]
+    if not structs:
+        die("lean.h contains no public struct typedefs")
+    # Full target-layout extraction is source-ordered and mechanically exhaustive.
+    return structs
 
 
 def parse_ownership(lines: list[str], raw_lines: list[str]) -> list[dict]:
@@ -399,9 +442,506 @@ def build_inventory() -> dict:
         "tags": parse_tags(stripped_lines),
         "layout": parse_layout_defines(stripped_lines),
         "ownership": parse_ownership(stripped_lines, raw_lines),
-        "structs": parse_structs(stripped, lmap),
+        "structs": parse_structs(stripped, lmap, TARGET_STRUCTS),
         "functions": parse_functions(stripped, lmap),
     }
+
+
+def fnv1a64_fields(domain: str, fields: list[bytes]) -> int:
+    state = 0xCBF29CE484222325
+
+    def update(payload: bytes) -> None:
+        nonlocal state
+        for byte in payload:
+            state ^= byte
+            state = (state * 0x00000100000001B3) & 0xFFFFFFFFFFFFFFFF
+
+    update(domain.encode("ascii"))
+    update(b"\0")
+    for field in fields:
+        update(len(field).to_bytes(8, "little"))
+        update(field)
+    return state
+
+
+def labeled_fnv(value: int) -> str:
+    return f"fnv1a64:{value:016x}"
+
+
+def reference_toolchain(pin: dict) -> Path:
+    tag = pin["tag"]
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-.A-Za-z0-9]*)?", tag):
+        die(f"Reference tag cannot map to an elan toolchain safely: {tag!r}")
+    toolchain = (
+        Path.home()
+        / ".elan"
+        / "toolchains"
+        / f"leanprover--lean4---{tag}"
+    )
+    required = [
+        toolchain / "bin" / "clang",
+        toolchain / TOOLCHAIN_HEADER_REL,
+        toolchain / "include" / "clang" / "stddef.h",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        die(
+            "pinned Reference toolchain is incomplete; local extraction requires "
+            f"{toolchain}: missing {missing}"
+        )
+    return toolchain
+
+
+def clang_base(toolchain: Path, target: str) -> list[str]:
+    return [
+        str(toolchain / "bin" / "clang"),
+        f"--target={target}",
+        "--sysroot",
+        str(toolchain),
+        "-nostdinc",
+        "-isystem",
+        str(toolchain / "include" / "clang"),
+        "-I",
+        str(toolchain / "include"),
+        "-x",
+        "c",
+        "-std=c11",
+        "-fno-color-diagnostics",
+        "-Werror",
+    ]
+
+
+def run_clang(
+    toolchain: Path,
+    target: str,
+    source: str,
+    extra_args: list[str],
+    purpose: str,
+) -> tuple[str, str]:
+    command = clang_base(toolchain, target) + extra_args + ["-"]
+    environment = {
+        "HOME": str(Path.home()),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TZ": "UTC",
+    }
+    try:
+        completed = subprocess.run(
+            command,
+            input=source,
+            text=True,
+            capture_output=True,
+            timeout=CLANG_TIMEOUT_SECONDS,
+            check=False,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired:
+        die(
+            f"pinned clang {purpose} timed out after "
+            f"{CLANG_TIMEOUT_SECONDS}s for target {target}"
+        )
+    output_bytes = len(completed.stdout.encode()) + len(completed.stderr.encode())
+    if output_bytes > MAX_CLANG_OUTPUT_BYTES:
+        die(
+            f"pinned clang {purpose} emitted {output_bytes} bytes for target "
+            f"{target}; bounded maximum is {MAX_CLANG_OUTPUT_BYTES}"
+        )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        die(
+            f"pinned clang {purpose} failed for target {target} "
+            f"(exit {completed.returncode}): {detail}"
+        )
+    return completed.stdout, completed.stderr
+
+
+def probe_name(*parts: str) -> str:
+    name = "__".join(parts)
+    if not re.fullmatch(r"[A-Za-z0-9_]+", name):
+        die(f"internal probe identifier is not C-safe: {name!r}")
+    return name
+
+
+def build_probe_source(inv: dict) -> tuple[str, set[str]]:
+    lines = [
+        "#include <lean/lean.h>",
+        "#include <limits.h>",
+        "#define FLN_PROBE(name, expr) "
+        "const long long fln_probe_##name = (long long)(expr)",
+        "FLN_PROBE(pointer_bits, sizeof(void *) * CHAR_BIT);",
+        "FLN_PROBE(size_t_bits, sizeof(size_t) * CHAR_BIT);",
+        "FLN_PROBE(char_bits, CHAR_BIT);",
+        "FLN_PROBE(int_bits, sizeof(int) * CHAR_BIT);",
+        "FLN_PROBE(unsigned_bits, sizeof(unsigned) * CHAR_BIT);",
+        "FLN_PROBE(long_bits, sizeof(long) * CHAR_BIT);",
+        "FLN_PROBE(long_long_bits, sizeof(long long) * CHAR_BIT);",
+        "FLN_PROBE(max_align_bytes, _Alignof(max_align_t));",
+        "#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__",
+        "FLN_PROBE(endianness, 0);",
+        "#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__",
+        "FLN_PROBE(endianness, 1);",
+        "#else",
+        "#error unsupported target byte order",
+        "#endif",
+    ]
+    names = {
+        "pointer_bits",
+        "size_t_bits",
+        "char_bits",
+        "int_bits",
+        "unsigned_bits",
+        "long_bits",
+        "long_long_bits",
+        "max_align_bytes",
+        "endianness",
+    }
+
+    for define in inv["layout"]:
+        name = probe_name("define", define["name"])
+        names.add(name)
+        lines.append(f"FLN_PROBE({name}, {define['name']});")
+
+    for struct in inv["structs"]:
+        struct_name = struct["name"]
+        size_name = probe_name("struct", struct_name, "size")
+        align_name = probe_name("struct", struct_name, "align")
+        names.update((size_name, align_name))
+        lines.append(f"FLN_PROBE({size_name}, sizeof({struct_name}));")
+        lines.append(f"FLN_PROBE({align_name}, _Alignof({struct_name}));")
+        for field in struct["fields"]:
+            if field["bits"] is not None:
+                continue
+            field_name = field["name"]
+            offset_name = probe_name("field", struct_name, field_name, "offset")
+            names.add(offset_name)
+            lines.append(
+                f"FLN_PROBE({offset_name}, "
+                f"__builtin_offsetof({struct_name}, {field_name}));"
+            )
+            if field["flexible_array"]:
+                element_name = probe_name(
+                    "field", struct_name, field_name, "element_size"
+                )
+                names.add(element_name)
+                lines.append(
+                    f"FLN_PROBE({element_name}, "
+                    f"sizeof(*((({struct_name} *)0)->{field_name})));"
+                )
+            else:
+                width_name = probe_name("field", struct_name, field_name, "size")
+                names.add(width_name)
+                lines.append(
+                    f"FLN_PROBE({width_name}, "
+                    f"sizeof((({struct_name} *)0)->{field_name}));"
+                )
+
+    # A complete object forces clang's bitfield record-layout dump without executing
+    # any target code. Other offsets and widths come from compile-time LLVM constants.
+    lines.append("lean_object fln_probe_record_layout_lean_object;")
+    return "\n".join(lines) + "\n", names
+
+
+IR_VALUE_RX = re.compile(
+    r"^@fln_probe_([A-Za-z0-9_]+)\s*=.*\bconstant\s+i[0-9]+\s+(-?[0-9]+),",
+    re.M,
+)
+
+
+def parse_ir_values(ir: str, expected: set[str], target: str) -> dict[str, int]:
+    values = {}
+    for match in IR_VALUE_RX.finditer(ir):
+        name = match.group(1)
+        if name in values:
+            die(f"pinned clang repeated LLVM probe constant {name!r} for {target}")
+        values[name] = int(match.group(2))
+    missing = sorted(expected - values.keys())
+    extra = sorted(values.keys() - expected)
+    if missing or extra:
+        die(
+            f"pinned clang LLVM probe set differs for {target}: "
+            f"missing={missing} extra={extra}"
+        )
+    triple = re.search(r'^target triple = "([^"]+)"$', ir, re.M)
+    if triple is None or triple.group(1) != target:
+        die(
+            f"pinned clang normalized target unexpectedly: requested={target!r} "
+            f"emitted={triple.group(1) if triple else None!r}"
+        )
+    return values
+
+
+def parse_lean_object_bitfields(
+    layout_output: str, inv: dict, target: str
+) -> dict[str, tuple[int, int]]:
+    blocks = layout_output.split("*** Dumping AST Record Layout")
+    block = next(
+        (
+            candidate
+            for candidate in blocks
+            if re.search(r"^\s*0\s+\|\s+lean_object\s*$", candidate, re.M)
+        ),
+        None,
+    )
+    if block is None:
+        die(f"pinned clang did not emit lean_object record layout for {target}")
+    size_align = re.search(r"\[sizeof=([0-9]+), align=([0-9]+)\]", block)
+    if size_align is None:
+        die(f"lean_object record layout lacks size/alignment for {target}")
+
+    expected = {
+        field["name"]: field["bits"]
+        for struct in inv["structs"]
+        if struct["name"] == "lean_object"
+        for field in struct["fields"]
+        if field["bits"] is not None
+    }
+    observed = {}
+    bitfield_rx = re.compile(
+        r"^\s*([0-9]+):([0-9]+)-([0-9]+)\s+\|\s+"
+        r"unsigned(?:\s+int)?\s+(m_[A-Za-z0-9_]+)\s*$",
+        re.M,
+    )
+    for match in bitfield_rx.finditer(block):
+        byte_offset = int(match.group(1))
+        first_bit = int(match.group(2))
+        last_bit = int(match.group(3))
+        name = match.group(4)
+        if name not in expected:
+            continue
+        width = last_bit - first_bit + 1
+        if width != expected[name]:
+            die(
+                f"lean_object bitfield {name} width drift for {target}: "
+                f"header={expected[name]} clang={width}"
+            )
+        observed[name] = (byte_offset * 8 + first_bit, width)
+    missing = sorted(expected.keys() - observed.keys())
+    if missing:
+        die(f"pinned clang omitted lean_object bitfields for {target}: {missing}")
+    return observed
+
+
+def classify_data_model(values: dict[str, int], target: str) -> str:
+    shape = (
+        values["int_bits"],
+        values["long_bits"],
+        values["pointer_bits"],
+        values["size_t_bits"],
+    )
+    models = {
+        (32, 64, 64, 64): "lp64",
+        (32, 32, 64, 64): "llp64",
+        (32, 32, 32, 32): "ilp32",
+    }
+    model = models.get(shape)
+    if model is None:
+        die(
+            f"target {target} has an unclassified C data model "
+            f"(int,long,pointer,size_t)={shape}; publication is inconclusive"
+        )
+    return model
+
+
+def extract_target_layout(inv: dict, toolchain: Path, target: str) -> dict:
+    source, expected = build_probe_source(inv)
+    ir, ir_stderr = run_clang(
+        toolchain,
+        target,
+        source,
+        ["-S", "-emit-llvm", "-o", "-"],
+        "LLVM constant extraction",
+    )
+    if ir_stderr.strip():
+        die(
+            f"pinned clang LLVM constant extraction emitted unexpected stderr "
+            f"for {target}: {ir_stderr.strip()}"
+        )
+    values = parse_ir_values(ir, expected, target)
+    layout_stdout, layout_stderr = run_clang(
+        toolchain,
+        target,
+        source,
+        ["-Xclang", "-fdump-record-layouts", "-fsyntax-only"],
+        "record-layout extraction",
+    )
+    bitfields = parse_lean_object_bitfields(
+        layout_stdout + "\n" + layout_stderr, inv, target
+    )
+    endianness = {0: "little", 1: "big"}.get(values["endianness"])
+    if endianness is None:
+        die(f"target {target} emitted unknown endianness code {values['endianness']}")
+    data_model = classify_data_model(values, target)
+
+    structs = []
+    for struct in inv["structs"]:
+        struct_name = struct["name"]
+        fields = []
+        for field in struct["fields"]:
+            field_name = field["name"]
+            if field["bits"] is not None:
+                offset_bits, width_bits = bitfields[field_name]
+                storage = "bitfield"
+                element_width_bits = 0
+            else:
+                offset = values[
+                    probe_name("field", struct_name, field_name, "offset")
+                ]
+                offset_bits = offset * values["char_bits"]
+                if field["flexible_array"]:
+                    width_bits = 0
+                    element_width_bits = (
+                        values[
+                            probe_name(
+                                "field",
+                                struct_name,
+                                field_name,
+                                "element_size",
+                            )
+                        ]
+                        * values["char_bits"]
+                    )
+                    storage = "flexible-array"
+                else:
+                    width_bits = (
+                        values[probe_name("field", struct_name, field_name, "size")]
+                        * values["char_bits"]
+                    )
+                    element_width_bits = 0
+                    storage = "scalar"
+            fields.append(
+                {
+                    "name": field_name,
+                    "offset_bits": offset_bits,
+                    "width_bits": width_bits,
+                    "element_width_bits": element_width_bits,
+                    "storage": storage,
+                    "source_line": field["line"],
+                }
+            )
+        structs.append(
+            {
+                "name": struct_name,
+                "size_bytes": values[probe_name("struct", struct_name, "size")],
+                "align_bytes": values[probe_name("struct", struct_name, "align")],
+                "source_line_start": struct["line_start"],
+                "source_line_end": struct["line_end"],
+                "fields": fields,
+            }
+        )
+
+    endian_class = {"little": "le", "big": "be"}[endianness]
+    return {
+        "data_model": data_model,
+        "abi_class": f"{data_model}-{endian_class}",
+        "endianness": endianness,
+        "pointer_bits": values["pointer_bits"],
+        "size_t_bits": values["size_t_bits"],
+        "char_bits": values["char_bits"],
+        "int_bits": values["int_bits"],
+        "unsigned_bits": values["unsigned_bits"],
+        "long_bits": values["long_bits"],
+        "long_long_bits": values["long_long_bits"],
+        "max_align_bytes": values["max_align_bytes"],
+        "layout": [
+            {
+                "name": define["name"],
+                "value": values[probe_name("define", define["name"])],
+                "source_line": define["line"],
+            }
+            for define in inv["layout"]
+        ],
+        "tags": [
+            {
+                "name": tag["name"],
+                "value": tag["value"],
+                "source_line": tag["line"],
+            }
+            for tag in inv["tags"]
+        ],
+        "structs": structs,
+    }
+
+
+def render_target_layout(inv: dict) -> str:
+    pin = inv["pin"]
+    toolchain = reference_toolchain(pin)
+    toolchain_header = toolchain / TOOLCHAIN_HEADER_REL
+    toolchain_bytes = toolchain_header.read_bytes()
+    vendor_bytes = LEAN_H.read_bytes()
+    if toolchain_bytes != vendor_bytes:
+        die(
+            "pinned toolchain lean.h differs from the vendored Reference source: "
+            f"toolchain_sha256={hashlib.sha256(toolchain_bytes).hexdigest()} "
+            f"vendor_sha256={hashlib.sha256(vendor_bytes).hexdigest()}"
+        )
+    header_sha = hashlib.sha256(toolchain_bytes).hexdigest()
+    targets = read_targets()
+    vendor_text = vendor_bytes.decode("utf-8")
+    layout_inventory = dict(inv)
+    layout_inventory["structs"] = parse_structs(
+        strip_comments(vendor_text), LineMap(vendor_text), None
+    )
+
+    output = [
+        f"schema {TARGET_LAYOUT_SCHEMA}",
+        f"extractor {TARGET_LAYOUT_EXTRACTOR} "
+        f"version={TARGET_LAYOUT_EXTRACTOR_VERSION}",
+        "source path=include/lean/lean.h authority=SUITE.lock:reference "
+        f"sha256={header_sha}",
+        f"target-count {len(targets)}",
+    ]
+    for index, target in enumerate(targets, start=1):
+        key = f"target:{index:04}"
+        layout = extract_target_layout(layout_inventory, toolchain, target)
+        block = [
+            f"target {key} abi-class={layout['abi_class']} "
+            f"data-model={layout['data_model']} endianness={layout['endianness']} "
+            f"pointer-bits={layout['pointer_bits']} "
+            f"size-t-bits={layout['size_t_bits']} char-bits={layout['char_bits']} "
+            f"int-bits={layout['int_bits']} unsigned-bits={layout['unsigned_bits']} "
+            f"long-bits={layout['long_bits']} "
+            f"long-long-bits={layout['long_long_bits']} "
+            f"max-align-bytes={layout['max_align_bytes']}"
+        ]
+        for define in layout["layout"]:
+            block.append(
+                f"define {key} name={define['name']} value={define['value']} "
+                f"source-line={define['source_line']}"
+            )
+        for tag in layout["tags"]:
+            block.append(
+                f"tag {key} name={tag['name']} value={tag['value']} "
+                f"source-line={tag['source_line']}"
+            )
+        for struct in layout["structs"]:
+            block.append(
+                f"struct {key} name={struct['name']} "
+                f"size-bytes={struct['size_bytes']} align-bytes={struct['align_bytes']} "
+                f"source-lines={struct['source_line_start']}-{struct['source_line_end']}"
+            )
+            for field in struct["fields"]:
+                block.append(
+                    f"field {key} struct={struct['name']} name={field['name']} "
+                    f"offset-bits={field['offset_bits']} "
+                    f"width-bits={field['width_bits']} storage={field['storage']} "
+                    f"element-width-bits={field['element_width_bits']} "
+                    f"source-line={field['source_line']}"
+                )
+        block_bytes = ("\n".join(block) + "\n").encode("utf-8")
+        output.extend(block)
+        output.append(
+            f"target-root {key} "
+            f"{labeled_fnv(fnv1a64_fields('fln.abi-target-layout.target-root/1', [block_bytes]))}"
+        )
+
+    prefix = "\n".join(output) + "\n"
+    root = labeled_fnv(
+        fnv1a64_fields(
+            "fln.abi-target-layout.inventory-root/1", [prefix.encode("utf-8")]
+        )
+    )
+    return prefix + f"inventory-root {root}\n"
 
 
 # ---------------------------------------------------------------- rendering
@@ -760,22 +1300,72 @@ def render_markdown(inv: dict, digest: str) -> str:
     return "\n".join(w) + "\n"
 
 
+def atomic_publish(path: Path, text: str) -> str:
+    payload = text.encode("utf-8")
+    if path.exists() and path.read_bytes() == payload:
+        return "unchanged"
+    candidate = path.with_name(path.name + ".candidate")
+    try:
+        with candidate.open("xb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError:
+        die(
+            f"interrupted publication candidate exists: "
+            f"{candidate.relative_to(ROOT)}"
+        )
+    except OSError as error:
+        die(
+            f"cannot write publication candidate "
+            f"{candidate.relative_to(ROOT)}: {error}"
+        )
+    try:
+        os.replace(candidate, path)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as error:
+        die(
+            f"atomic publication failed for {path.relative_to(ROOT)}; "
+            f"candidate state is retained when available: {error}"
+        )
+    return "published"
+
+
 def main() -> int:
-    check = "--check" in sys.argv[1:]
+    arguments = sys.argv[1:]
+    unknown = [argument for argument in arguments if argument != "--check"]
+    if unknown:
+        die(f"unknown arguments: {unknown}; supported usage is optional --check")
+    check = "--check" in arguments
     inv = build_inventory()
     inventory_text = render_inventory(inv)
+    target_layout_text = render_target_layout(inv)
     digest = hashlib.sha256(inventory_text.encode("utf-8")).hexdigest()
     outputs = [
         (INVENTORY_PATH, inventory_text),
+        (TARGET_LAYOUT_PATH, target_layout_text),
         (CONTRACT_PATH, render_markdown(inv, digest)),
         (RUST_PATH, render_rust(inv, digest)),
         (BOUNDARY_RUST_PATH, render_rust_boundary(inv, digest)),
     ]
     if check:
         for path, want in outputs:
+            candidate = path.with_name(path.name + ".candidate")
+            if candidate.exists():
+                print(
+                    f"gen_abi_contract: DRIFT: "
+                    f"{candidate.relative_to(ROOT)} exists",
+                    file=sys.stderr,
+                )
+                return 1
             if not path.exists():
                 print(f"gen_abi_contract: DRIFT: {path.relative_to(ROOT)} missing", file=sys.stderr)
-                return 2
+                return 1
             have = path.read_text(encoding="utf-8")
             if have != want:
                 for i, (hl, wl) in enumerate(
@@ -794,16 +1384,22 @@ def main() -> int:
                         f"({len(have)} vs {len(want)} bytes)",
                         file=sys.stderr,
                     )
-                return 2
+                return 1
         print(f"gen_abi_contract: check OK ({len(outputs)} artifacts, "
-              f"{len(inv['functions'])} census rows, inventory digest {digest[:16]}…)")
+              f"{len(inv['functions'])} census rows, "
+              f"{len(read_targets())} target layout rows, "
+              f"inventory digest {digest[:16]}…)")
         return 0
     INVENTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     for path, text in outputs:
-        path.write_text(text, encoding="utf-8")
-        print(f"gen_abi_contract: wrote {path.relative_to(ROOT)} ({len(text)} bytes)")
+        action = atomic_publish(path, text)
+        print(
+            f"gen_abi_contract: {action} {path.relative_to(ROOT)} "
+            f"({len(text)} bytes)"
+        )
     print(f"gen_abi_contract: {len(inv['functions'])} census rows "
           f"({sum(1 for f in inv['functions'] if f['linkage'] == 'export')} export), "
+          f"{len(read_targets())} target layout rows, "
           f"inventory digest {digest}")
     return 0
 

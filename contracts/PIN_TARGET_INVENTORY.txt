@@ -1,14 +1,17 @@
 schema fln-contract-inventory/1
-schema-root fnv1a64:a963feb8a3e62e4f
+schema-root fnv1a64:89e7d38884d04589
 suite-lock-root fnv1a64:54c4ae5afb0b3bbb
-raw-root fnv1a64:891a41b38a8a0ea9
-policy-root fnv1a64:f4eb1c5e8c58ac9b
+abi-target-layout-root fnv1a64:ca9297f838ac6c63
+raw-root fnv1a64:1536254e59c75b41
+policy-root fnv1a64:6dce6996aa011318
 reference-root fnv1a64:bd39284374050f56
 extractor suite-lock version=1
-row-count 13
+extractor lean-h-clang-layout version=1
+row-count 14
 target-row-count 1
-abi-row-count 0
+abi-row-count 1
 unresolved-row-count 0
+row abi-layout:target:0001 kind=abi-layout extractor=lean-h-clang-layout extractor-version=1 source=contracts/ABI_TARGET_LAYOUT.txt:target:0001 target-class=certified abi-class=lp64-le raw-evidence-hash=fnv1a64:d0438549619fdcba identity=fnv1a64:faa3989d5745de52 authority=observed support=required
 row corpus kind=corpus extractor=suite-lock extractor-version=1 source=SUITE.lock:corpus target-class=none abi-class=none raw-evidence-hash=fnv1a64:6d1b83338ddaa18f identity=fnv1a64:9761289027c71188 authority=observed support=required
 row reference kind=reference extractor=suite-lock extractor-version=1 source=SUITE.lock:reference target-class=none abi-class=none raw-evidence-hash=fnv1a64:1da56b93f1791c9c identity=fnv1a64:1dfb74213b9ed04f authority=observed support=required
 row suite:asupersync kind=suite extractor=suite-lock extractor-version=1 source=SUITE.lock:suite:asupersync target-class=none abi-class=none raw-evidence-hash=fnv1a64:b1f35099f3a70926 identity=fnv1a64:60a47678d58e823b authority=observed support=required
@@ -22,4 +25,4 @@ row suite:frankentorch kind=suite extractor=suite-lock extractor-version=1 sourc
 row suite:frankentui kind=suite extractor=suite-lock extractor-version=1 source=SUITE.lock:suite:frankentui target-class=none abi-class=none raw-evidence-hash=fnv1a64:bc21aef797d001e6 identity=fnv1a64:a6cdd25a6df0eb45 authority=observed support=required
 row target:0001 kind=target extractor=suite-lock extractor-version=1 source=SUITE.lock:target:0001 target-class=certified abi-class=none raw-evidence-hash=fnv1a64:b6a4c7c3dac6fc5e identity=fnv1a64:485a819efd484124 authority=observed support=required
 row toolchain kind=toolchain extractor=suite-lock extractor-version=1 source=SUITE.lock:rust-toolchain target-class=none abi-class=none raw-evidence-hash=fnv1a64:c475f44ee5684dc2 identity=fnv1a64:13e0c972f2d2fbaa authority=observed support=required
-inventory-root fnv1a64:6ca8ff2cbd03f86e
+inventory-root fnv1a64:e56e25c9722fd3df

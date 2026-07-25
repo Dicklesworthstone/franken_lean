@@ -57,6 +57,10 @@ pub const TOOLCHAIN_FILE: &str = "rust-toolchain.toml";
 pub const CONTRACT_INVENTORY_SCHEMA_FILE: &str = "contracts/CONTRACT_INVENTORY_V1.txt";
 /// Workspace-relative path of the reviewed policy joined bijectively to raw pin rows.
 pub const CONTRACT_INVENTORY_POLICY_FILE: &str = "ci/PIN_TARGET_POLICY.txt";
+/// Target-indexed ABI layouts mechanically extracted from the pinned Reference header.
+pub const ABI_TARGET_LAYOUT_FILE: &str = "contracts/ABI_TARGET_LAYOUT.txt";
+/// Interrupted ABI-layout publication. Its presence makes layout authority inconclusive.
+pub const ABI_TARGET_LAYOUT_CANDIDATE_FILE: &str = "contracts/ABI_TARGET_LAYOUT.txt.candidate";
 /// Workspace-relative path of the atomically published derived pin/target inventory.
 pub const CONTRACT_INVENTORY_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt";
 /// Interrupted-publication sibling. Its presence makes inventory authority inconclusive.

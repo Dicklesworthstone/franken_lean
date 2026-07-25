@@ -28,8 +28,8 @@ use std::thread;
 use std::time::Duration;
 
 use common::*;
-use structure_guard::CONTRACT_INVENTORY_POLICY_FILE;
 use structure_guard::checks::Authority;
+use structure_guard::{ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_POLICY_FILE};
 
 // Finding codes as named constants: a matrix suite reads better when the code under test
 // is named once, and it keeps `f.code == "FLN-..."` string-literal comparisons out of the
@@ -433,11 +433,17 @@ fn feature_profile_and_host_target_axes_are_closed() {
     );
     targets.write(
         CONTRACT_INVENTORY_POLICY_FILE,
-        &CONTRACT_INVENTORY_POLICY_FIXTURE.replace(
-            "row toolchain",
-            "row target:0002 kind=target support=required target-class=certified abi-class=none\nrow toolchain",
-        ),
+        &CONTRACT_INVENTORY_POLICY_FIXTURE
+            .replace(
+                "row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le",
+                "row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le\nrow abi-layout:target:0002 kind=abi-layout support=required target-class=certified abi-class=lp64-le",
+            )
+            .replace(
+                "row toolchain",
+                "row target:0002 kind=target support=required target-class=certified abi-class=none\nrow toolchain",
+            ),
     );
+    targets.write(ABI_TARGET_LAYOUT_FILE, &abi_target_layout_fixture(2));
     let targets_out = targets.run();
     assert!(
         targets_out.findings.is_empty(),
