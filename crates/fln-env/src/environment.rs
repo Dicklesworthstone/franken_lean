@@ -3835,10 +3835,9 @@ mod tests {
         };
         assert_eq!(usage.allowed, 0);
         assert!(
-            exhausted
-                .progress
-                .as_ref()
-                .is_some_and(|p| p.text().contains("collision_entries")),
+            exhausted.progress.as_ref().is_some_and(|p| p
+                .text()
+                .contains(CollisionResource::Entries.as_str_for_test())),
             "the refused resource must remain identifiable: {:?}",
             exhausted.progress
         );

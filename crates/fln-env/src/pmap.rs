@@ -46,9 +46,13 @@ pub trait PKey: Clone + Eq + Ord {
 /// boundary because a generic map cannot infer the expanded semantic weight of
 /// an opaque key/value pair. `max_fresh_nodes` is checked against a
 /// schedule-independent upper bound, not the history-dependent number of AVL
-/// rotations an individual insertion happened to need. Total weight is `u128`,
-/// so the unbounded envelope exactly represents the sum of `u64` entry weights
-/// across every family cardinality possible on the certified 64-bit platforms.
+/// rotations an individual insertion happened to need.
+///
+/// The measured family total is `u128` while the limit is `u64`: the candidate total is
+/// aggregated without wrapping so a refusal is REACHED, and the limit is widened for the
+/// comparison so a refusal's numbers fit the shared authority type without conversion.
+/// [`CollisionBudget::UNBOUNDED`] is therefore the widest REPRESENTABLE envelope, not the
+/// absence of a bound — a family heavier than `u64::MAX` is refused under it, typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollisionBudget {
     pub max_collision_entries: usize,
@@ -2353,9 +2357,34 @@ mod tests {
             "the degenerate number pair must not weaken the refusal itself"
         );
         assert_eq!(wide_base.len(), 1);
-        let wide = wide_base
-            .try_insert_with_budget(CollKey(1), 1, u64::MAX, CollisionBudget::UNBOUNDED)
-            .expect_admitted("the unbounded envelope admits every representable family weight");
+
+        // THE WRAP THAT THE `u128` TOTAL PREVENTS, which is a different hazard from the
+        // saturation wart just above and is why both are asserted. A second maximum-weight
+        // entry makes the family total `2 * u64::MAX`. Accumulated in `u64` that sum WRAPS
+        // to `u64::MAX - 1` — strictly BELOW the limit — so a narrower accumulator would
+        // ADMIT it; a saturating one would report exactly `u64::MAX`, which is not greater
+        // than the limit either, so it would admit it too. Only the `u128` measurement
+        // refuses. That is the asymmetry the narrowing decision deliberately kept: the
+        // LIMIT is `u64` so a stop's numbers fit the shared authority type, while the
+        // MEASURED total stays `u128` so a stop is reached at all.
+        let wide_overflow =
+            wide_base.try_insert_with_budget(CollKey(1), 1, u64::MAX, CollisionBudget::UNBOUNDED);
+        let (unit, allowed, observed, progress) = stop_facts(
+            &wide_overflow,
+            "a family total past the representable ceiling must refuse, not wrap into admission",
+        );
+        assert_eq!(unit, StructuralUnit::ExpandedWeight);
+        assert_eq!(allowed, u64::MAX);
+        assert_eq!(observed, u64::MAX);
+        assert!(progress.contains(CollisionResource::ExpandedWeight.as_str_for_test()));
+        assert_eq!(wide_base.len(), 1, "a refused insertion is atomic");
+
+        // ABOVE the widest admissible envelope the MEASUREMENT is still exact, which is
+        // what makes the refusal above correct rather than lucky. Reached through the
+        // unbudgeted profiled path because, by construction since `max_expanded_weight`
+        // became a `u64`, NO budget can admit a family this heavy — `CollisionBudget` is
+        // the widest representable envelope, not the absence of one.
+        let wide = wide_base.insert_profiled(CollKey(1), 1, u64::MAX).0;
         assert_eq!(wide.len(), 2);
         let mut wide_preflight = MutationFacts::default();
         let (_, wide_weight, _) = wide
@@ -2369,9 +2398,10 @@ mod tests {
         assert_eq!(wide_weight, 2 * u128::from(u64::MAX));
         let mut wide_tree = PMap::new();
         for key in 0..=INLINE_COLLISION_MAX as u64 {
-            wide_tree = wide_tree
-                .try_insert_with_budget(CollKey(key), key, u64::MAX, CollisionBudget::UNBOUNDED)
-                .expect_admitted("tree-tier weight aggregation remains exact above u64");
+            // Unbudgeted for the same reason: tree-tier aggregation must stay exact above
+            // `u64` even though no envelope admits the result, because the candidate total
+            // a refusal is computed FROM is aggregated by this same arithmetic.
+            wide_tree = wide_tree.insert_profiled(CollKey(key), key, u64::MAX).0;
         }
         let wide_tree_weight = collision_bucket_for(&wide_tree, &CollKey(0))
             .and_then(|bucket| match bucket {
