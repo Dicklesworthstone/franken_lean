@@ -49,6 +49,39 @@ fn real_workspace_is_structurally_clean() {
 }
 
 #[test]
+fn real_verification_manifest_covers_the_live_tracker() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let output = Command::new("python3")
+        .args(["-I", "-S"])
+        .arg(root.join("scripts/evidence.py"))
+        .arg("validate-verification-manifest")
+        .arg("--manifest")
+        .arg(root.join("ci/VERIFICATION_MANIFEST.jsonl"))
+        .arg("--beads")
+        .arg(root.join(".beads/issues.jsonl"))
+        .output()
+        .expect("run the authoritative verification-manifest validator");
+    assert!(
+        output.status.success(),
+        "verification coverage drifted from the live tracker:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "successful validator wrote stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("validator stdout is UTF-8");
+    assert!(stdout.contains("\"schema\":\"fln.validation/1\""));
+    assert!(stdout.contains("\"validator\":\"fln.verification-manifest/1\""));
+    assert!(stdout.contains("\"valid\":true"));
+}
+
+#[test]
 fn robot_real_workspace_binds_complete_authority_evidence() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

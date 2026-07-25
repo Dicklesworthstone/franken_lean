@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Pre-commit guard: ci/KERNEL_CONTRACT_OWNERSHIP.jsonl may never lag
-# .beads/issues.jsonl in a commit (bead franken_lean-projection-republish-mechanical-voz4).
+# Pre-commit governance guard:
+#
+#   * ci/KERNEL_CONTRACT_OWNERSHIP.jsonl may never lag .beads/issues.jsonl
+#     (bead franken_lean-projection-republish-mechanical-voz4).
+#   * ci/VERIFICATION_MANIFEST.jsonl must describe the prospective bead states
+#     whenever the tracker, manifest, or its validator changes
+#     (bead franken_lean-e5k7).
 #
 # WHY THIS EXISTS. The projection is a canonical hash over the sorted id set of
 # .beads/issues.jsonl. A commit that carries the JSONL without a matching
@@ -39,6 +44,15 @@
 #     structure-guard already treats that state as typed inconclusive, so
 #     committing across it hands the next agent an unexplained gate failure.
 #
+# The verification-coverage half uses the same prospective-tree rule and the
+# same single-authority rule. It extracts the prospective tracker, manifest, and
+# scripts/evidence.py from Git's index and executes that exact validator. It does
+# not reimplement the adoption boundary, state mapping, or evidence taxonomy in
+# shell. A comment-only tracker commit therefore passes, while a new bead or a
+# status transition without its matching coverage row refuses at the commit
+# which creates the debt. A manifest-only or validator-only corruption refuses
+# too, instead of waiting for scripts/check.sh stage 2.
+#
 # Bypassable with `git commit --no-verify`, which is a deliberate limit: this is
 # a guard that closes the feedback loop at the moment of the mistake, not a
 # proof. Making the failure impossible is Option A on the bead (have whatever
@@ -52,11 +66,14 @@ set -euo pipefail
 SOURCE_RELATIVE='.beads/issues.jsonl'
 MANIFEST_RELATIVE='ci/KERNEL_CONTRACT_OWNERSHIP.jsonl'
 CANDIDATE_RELATIVE='ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate'
+VERIFICATION_MANIFEST_RELATIVE='ci/VERIFICATION_MANIFEST.jsonl'
+VERIFICATION_VALIDATOR_RELATIVE='scripts/evidence.py'
 PUBLISHER_DIR='tools/structure-guard/kernel-ownership-publisher'
 PUBLISHER_BIN_NAME='kernel-ownership-publisher'
 WAIT_MS=30000
 
 say() { printf 'projection-guard: %s\n' "$1" >&2; }
+coverage_say() { printf 'verification-coverage-guard: %s\n' "$1" >&2; }
 
 # This hook is reached through core.hooksPath, which makes git ignore
 # .git/hooks/ entirely. Anything installed there — MCP Agent Mail's file
@@ -93,19 +110,56 @@ undecided() {
     exit 2
 }
 
+coverage_refuse() {
+    coverage_say "REFUSED — $1"
+    coverage_say ''
+    coverage_say 'The prospective tracker and verification manifest must validate'
+    coverage_say 'together. New beads need planned rows; claims need active rows;'
+    coverage_say 'closures need complete evidence rows in the same commit.'
+    coverage_say ''
+    coverage_say 'Check the exact prospective-tree obligation with:'
+    coverage_say "  python3 -I -S ${VERIFICATION_VALIDATOR_RELATIVE} validate-verification-manifest \\"
+    coverage_say "    --manifest ${VERIFICATION_MANIFEST_RELATIVE} --beads ${SOURCE_RELATIVE}"
+    exit 1
+}
+
+path_changes_in_prospective_tree() {
+    local path=$1
+    if git rev-parse --verify --quiet HEAD >/dev/null; then
+        if git diff --cached --quiet HEAD -- "$path"; then
+            return 1
+        fi
+        return 0
+    else
+        git ls-files --cached --error-unmatch -- "$path" >/dev/null 2>&1
+    fi
+}
+
 repo_root=$(git rev-parse --show-toplevel) || undecided 'not inside a git work tree'
 cd "$repo_root" || undecided "cannot enter $repo_root"
 
-# An initial commit has no HEAD to diff against; treat every path as changed.
-if git rev-parse --verify --quiet HEAD >/dev/null; then
-    if git diff --cached --quiet HEAD -- "$SOURCE_RELATIVE"; then
-        pass "$@"
-    fi
-elif ! git ls-files --cached --error-unmatch -- "$SOURCE_RELATIVE" >/dev/null 2>&1; then
+source_changed=false
+verification_manifest_changed=false
+verification_validator_changed=false
+if path_changes_in_prospective_tree "$SOURCE_RELATIVE"; then
+    source_changed=true
+fi
+if path_changes_in_prospective_tree "$VERIFICATION_MANIFEST_RELATIVE"; then
+    verification_manifest_changed=true
+fi
+if path_changes_in_prospective_tree "$VERIFICATION_VALIDATOR_RELATIVE"; then
+    verification_validator_changed=true
+fi
+
+if [ "$source_changed" = false ] &&
+    [ "$verification_manifest_changed" = false ] &&
+    [ "$verification_validator_changed" = false ]; then
     pass "$@"
 fi
 
-# From here the commit changes the tracker export and owes a projection.
+# A tracker change owes its id-set projection. Manifest-only and validator-only
+# commits skip this half and proceed directly to verification coverage.
+if [ "$source_changed" = true ]; then
 
 if ! git cat-file -e ":$SOURCE_RELATIVE" 2>/dev/null; then
     refuse "the commit removes $SOURCE_RELATIVE; a projection cannot be derived from an absent source"
@@ -186,9 +240,67 @@ esac
 if cmp -s -- "$scratch/$MANIFEST_RELATIVE" "$scratch/expected-manifest"; then
     cleanup
     trap - EXIT
-    pass "$@"
+else
+    staged_count=$(head -n 1 -- "$scratch/expected-manifest" | grep -o '"record_count":[0-9]*' || true)
+    fresh_count=$(head -n 1 -- "$scratch/$MANIFEST_RELATIVE" | grep -o '"record_count":[0-9]*' || true)
+    refuse "the committed projection is not a projection of the committed ${SOURCE_RELATIVE} (committed ${staged_count:-record_count:?}, derived ${fresh_count:-record_count:?})"
+fi
 fi
 
-staged_count=$(head -n 1 -- "$scratch/expected-manifest" | grep -o '"record_count":[0-9]*' || true)
-fresh_count=$(head -n 1 -- "$scratch/$MANIFEST_RELATIVE" | grep -o '"record_count":[0-9]*' || true)
-refuse "the committed projection is not a projection of the committed ${SOURCE_RELATIVE} (committed ${staged_count:-record_count:?}, derived ${fresh_count:-record_count:?})"
+# Any prospective change to the tracker, coverage manifest, or validator is
+# judged by the exact prospective validator. The scratch tree contains no
+# working-tree bytes and therefore stays correct under `git commit --only`.
+if ! git cat-file -e ":$SOURCE_RELATIVE" 2>/dev/null; then
+    coverage_refuse "the commit has no ${SOURCE_RELATIVE}"
+fi
+if ! git cat-file -e ":$VERIFICATION_MANIFEST_RELATIVE" 2>/dev/null; then
+    coverage_refuse "the commit has no ${VERIFICATION_MANIFEST_RELATIVE}"
+fi
+if ! git cat-file -e ":$VERIFICATION_VALIDATOR_RELATIVE" 2>/dev/null; then
+    coverage_refuse "the commit has no ${VERIFICATION_VALIDATOR_RELATIVE}"
+fi
+
+coverage_scratch=$(mktemp -d "${TMPDIR:-/tmp}/fln-verification-coverage-guard.XXXXXXXX") \
+    || undecided 'cannot create a verification-coverage scratch directory'
+
+coverage_cleanup() {
+    rm -f -- \
+        "$coverage_scratch/$SOURCE_RELATIVE" \
+        "$coverage_scratch/$VERIFICATION_MANIFEST_RELATIVE" \
+        "$coverage_scratch/$VERIFICATION_VALIDATOR_RELATIVE" >/dev/null 2>&1 || true
+    rmdir -- \
+        "$coverage_scratch/.beads" \
+        "$coverage_scratch/ci" \
+        "$coverage_scratch/scripts" \
+        "$coverage_scratch" >/dev/null 2>&1 || true
+}
+trap coverage_cleanup EXIT
+
+mkdir -p -- \
+    "$coverage_scratch/.beads" \
+    "$coverage_scratch/ci" \
+    "$coverage_scratch/scripts" \
+    || undecided 'cannot lay out the verification-coverage scratch tree'
+git cat-file blob ":$SOURCE_RELATIVE" > "$coverage_scratch/$SOURCE_RELATIVE" \
+    || undecided "cannot read the prospective $SOURCE_RELATIVE"
+git cat-file blob ":$VERIFICATION_MANIFEST_RELATIVE" \
+    > "$coverage_scratch/$VERIFICATION_MANIFEST_RELATIVE" \
+    || undecided "cannot read the prospective $VERIFICATION_MANIFEST_RELATIVE"
+git cat-file blob ":$VERIFICATION_VALIDATOR_RELATIVE" \
+    > "$coverage_scratch/$VERIFICATION_VALIDATOR_RELATIVE" \
+    || undecided "cannot read the prospective $VERIFICATION_VALIDATOR_RELATIVE"
+
+coverage_status=0
+coverage_output=$(
+    python3 -I -S "$coverage_scratch/$VERIFICATION_VALIDATOR_RELATIVE" \
+        validate-verification-manifest \
+        --manifest "$coverage_scratch/$VERIFICATION_MANIFEST_RELATIVE" \
+        --beads "$coverage_scratch/$SOURCE_RELATIVE" 2>&1
+) || coverage_status=$?
+if [ "$coverage_status" -ne 0 ]; then
+    coverage_refuse "prospective verification coverage is invalid (exit ${coverage_status}): ${coverage_output}"
+fi
+
+coverage_cleanup
+trap - EXIT
+pass "$@"

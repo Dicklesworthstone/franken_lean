@@ -5,14 +5,28 @@
 # here rather than look correct.
 set -uo pipefail
 
+[ "$#" -eq 5 ] || {
+    printf 'usage: %s HOOK PUBLISHER VALIDATOR VERIFICATION_MANIFEST LIVE_TRACKER\n' "$0" >&2
+    exit 2
+}
+
 # Resolved before the first `cd`: the harness runs inside a throwaway repo, so a
 # relative path handed in from the caller's directory would silently miss and
 # every guard case would "fail" for want of a hook rather than for a reason.
 abspath() { (cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd)" "$(basename "$1")"); }
 HOOK=$(abspath "$1")
 PUBLISHER=$(abspath "$2")
+VALIDATOR=$(abspath "$3")
+VERIFICATION_MANIFEST=$(abspath "$4")
+LIVE_TRACKER=$(abspath "$5")
 [ -x "$HOOK" ] || { printf 'harness: %s is not an executable hook\n' "$HOOK" >&2; exit 2; }
 [ -x "$PUBLISHER" ] || { printf 'harness: %s is not an executable publisher\n' "$PUBLISHER" >&2; exit 2; }
+[ -f "$VALIDATOR" ] || { printf 'harness: %s is not a validator file\n' "$VALIDATOR" >&2; exit 2; }
+[ -f "$VERIFICATION_MANIFEST" ] || {
+    printf 'harness: %s is not a verification manifest\n' "$VERIFICATION_MANIFEST" >&2
+    exit 2
+}
+[ -f "$LIVE_TRACKER" ] || { printf 'harness: %s is not a tracker export\n' "$LIVE_TRACKER" >&2; exit 2; }
 LAB=$(mktemp -d "${TMPDIR:-/tmp}/fln-guard-lab.XXXXXXXX")
 PASSES=0
 FAILS=0
@@ -37,7 +51,11 @@ check() {
 }
 
 # --- a repo shaped like franken_lean -----------------------------------------
-mkdir -p "$LAB/repo/.beads" "$LAB/repo/ci" "$LAB/repo/tools/structure-guard/kernel-ownership-publisher"
+mkdir -p \
+    "$LAB/repo/.beads" \
+    "$LAB/repo/ci" \
+    "$LAB/repo/scripts" \
+    "$LAB/repo/tools/structure-guard/kernel-ownership-publisher"
 cd "$LAB/repo" || exit 2
 git init --quiet -b main .
 git config user.email guard@test
@@ -54,6 +72,17 @@ export CARGO_TARGET_DIR="$LAB/target"
 
 write_source() { printf '%s\n' "$@" > .beads/issues.jsonl; }
 republish() { "$LAB/target/debug/kernel-ownership-publisher" --root . --wait-ms 30000 --robot >/dev/null; }
+
+# This first lab isolates the projection law. Its prospective verification
+# validator is deliberately a total pass fixture; the second lab below uses the
+# real scripts/evidence.py and live adoption authority to exercise coverage.
+printf '%s\n' \
+    'import sys' \
+    'if len(sys.argv) < 2 or sys.argv[1] != "validate-verification-manifest":' \
+    '    raise SystemExit(2)' \
+    'print("{\"schema\":\"fln.validation/1\",\"valid\":true}")' \
+    > scripts/evidence.py
+printf '%s\n' '{"fixture":"projection-only"}' > ci/VERIFICATION_MANIFEST.jsonl
 
 run_commit() {
     local out code
@@ -202,6 +231,164 @@ else
     PASSES=$((PASSES + 1))
 fi
 rm -f .git/hooks/pre-commit
+
+# --- verification coverage: real validator over the prospective tree ---------
+# This second lab starts from the repository's real frozen adoption authority.
+# Unlike the projection-only fixture above, every refusal here comes from the
+# checked-in validator that scripts/check.sh and cargo test also execute.
+mkdir -p \
+    "$LAB/coverage-repo/.beads" \
+    "$LAB/coverage-repo/ci" \
+    "$LAB/coverage-repo/scripts" \
+    "$LAB/coverage-hooks" \
+    "$LAB/coverage-target/debug"
+cd "$LAB/coverage-repo" || exit 2
+git init --quiet -b main .
+git config user.email guard@test
+git config user.name guard
+git config core.hooksPath "$LAB/coverage-hooks"
+cp "$HOOK" "$LAB/coverage-hooks/pre-commit"
+chmod +x "$LAB/coverage-hooks/pre-commit"
+cp "$PUBLISHER" "$LAB/coverage-target/debug/kernel-ownership-publisher"
+cp "$VALIDATOR" scripts/evidence.py
+cp "$VERIFICATION_MANIFEST" ci/VERIFICATION_MANIFEST.jsonl
+cp "$LIVE_TRACKER" .beads/issues.jsonl
+export CARGO_TARGET_DIR="$LAB/coverage-target"
+
+coverage_republish() {
+    "$LAB/coverage-target/debug/kernel-ownership-publisher" \
+        --root . --wait-ms 30000 --robot >/dev/null
+}
+
+rewrite_tracker() {
+    local bead_id=$1 bead_state=$2
+    jq -c --arg bead "$bead_id" --arg state "$bead_state" \
+        'if .id == $bead then .status = $state else . end' \
+        .beads/issues.jsonl > .beads/issues.jsonl.next
+    mv .beads/issues.jsonl.next .beads/issues.jsonl
+}
+
+canonicalize_manifest_with() {
+    local extra_row=$1
+    {
+        jq -c . ci/VERIFICATION_MANIFEST.jsonl
+        printf '%s\n' "$extra_row"
+    } |
+        jq -sSc '
+            map(with_entries(
+                if (.value | type) == "array" then .value |= sort else . end
+            )) |
+            sort_by(
+                if .kind == "adoption" then [0, ""]
+                elif .kind == "coverage" then [1, .bead]
+                else [2, .scenario]
+                end
+            )[]
+        ' > ci/VERIFICATION_MANIFEST.jsonl.next
+    mv ci/VERIFICATION_MANIFEST.jsonl.next ci/VERIFICATION_MANIFEST.jsonl
+}
+
+# A real, currently valid tracker/manifest pair is the baseline.
+coverage_republish
+printf '%s\n' 'verification coverage prospective-tree harness' > README.md
+git add \
+    .beads/issues.jsonl \
+    ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
+    ci/VERIFICATION_MANIFEST.jsonl \
+    scripts/evidence.py \
+    README.md
+out=$(run_commit -q -m 'coverage baseline' 2>&1); code=$?
+check 'real verification coverage baseline is accepted' 0 '' "$code" "$out"
+
+# A comment edits the tracker bytes but does not create a state obligation.
+jq -c '
+    if .id == "franken_lean-e5k7" then
+        .comments = ((.comments // []) + [{
+            "id": 999999999,
+            "author": "guard-test",
+            "text": "comment-only prospective-tree plant"
+        }])
+    else .
+    end
+' .beads/issues.jsonl > .beads/issues.jsonl.next
+mv .beads/issues.jsonl.next .beads/issues.jsonl
+out=$(run_commit -q -o .beads/issues.jsonl -m 'comment only' 2>&1); code=$?
+check 'a comment-only tracker commit remains valid' 0 '' "$code" "$out"
+
+# A new id with a fresh ownership projection but no verification row is the
+# historical e5k7 failure: internally consistent projection, silently missing
+# coverage. It must refuse for the coverage reason rather than the id-set reason.
+printf '%s\n' '{"id":"franken_lean-hook-coverage-plant","status":"open"}' \
+    >> .beads/issues.jsonl
+coverage_republish
+out=$(run_commit -q -o \
+    .beads/issues.jsonl \
+    ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
+    -m 'new bead without coverage' 2>&1); code=$?
+check 'a new bead without coverage is refused' 1 \
+    'crossed the adoption boundary' "$code" "$out"
+if printf '%s' "$out" | grep -qF 'projection-guard: REFUSED'; then
+    printf 'FAIL new-bead coverage: projection guard masked the coverage reason\n%s\n' "$out"
+    FAILS=$((FAILS + 1))
+else
+    printf 'ok   matching id projection reached the coverage authority\n'
+    PASSES=$((PASSES + 1))
+fi
+
+planned_row='{"artifacts":[],"bead":"franken_lean-hook-coverage-plant","behavior_notes":["prospective-tree test fixture"],"boundary":[],"cancellation":[],"claim_ids":[],"claim_type":"bounded_model","error":[],"evidence_kind":"unit","failure_atomicity":[],"fault":[],"fuzz":[],"gate_ids":["W1"],"invariant_ids":[],"kind":"coverage","metamorphic":[],"mock_only":false,"mutation":[],"negative_recovery":[],"owner":"guard-test","parity_rows":[],"property":[],"requirement_ids":[],"resource":[],"scenarios":[],"schema":"fln.verification-manifest/1","skip":"none","state":"planned","unit":[],"workstream":"W1"}'
+canonicalize_manifest_with "$planned_row"
+out=$(run_commit -q -o \
+    .beads/issues.jsonl \
+    ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
+    ci/VERIFICATION_MANIFEST.jsonl \
+    -m 'new bead with planned coverage' 2>&1); code=$?
+check 'a new bead with matching planned coverage is accepted' 0 '' "$code" "$out"
+
+# Claiming the bead changes the required manifest state. The id-set projection
+# remains byte-identical, so only the verification validator can catch this.
+rewrite_tracker franken_lean-hook-coverage-plant in_progress
+coverage_republish
+out=$(run_commit -q -o \
+    .beads/issues.jsonl \
+    ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
+    -m 'claim with stale planned coverage' 2>&1); code=$?
+check 'a claim with stale planned coverage is refused' 1 \
+    "coverage state for 'franken_lean-hook-coverage-plant'" "$code" "$out"
+
+jq -c '
+    if .kind == "coverage" and .bead == "franken_lean-hook-coverage-plant" then
+        .artifacts = ["prospective-tree-active-fixture"] |
+        .boundary = ["prospective-tree-active-boundary"] |
+        .cancellation = ["prospective-tree-active-cancellation"] |
+        .claim_ids = ["HOOK-COVERAGE-ACTIVE"] |
+        .error = ["prospective-tree-active-error"] |
+        .failure_atomicity = ["prospective-tree-active-failure-atomicity"] |
+        .gate_ids = ["W1"] |
+        .negative_recovery = ["prospective-tree-active-negative-recovery"] |
+        .requirement_ids = ["HOOK-COVERAGE-ACTIVE"] |
+        .resource = ["prospective-tree-active-resource"] |
+        .scenarios = ["quality_gate"] |
+        .state = "active" |
+        .unit = ["prospective-tree-active-unit"]
+    else .
+    end
+' ci/VERIFICATION_MANIFEST.jsonl > ci/VERIFICATION_MANIFEST.jsonl.next
+mv ci/VERIFICATION_MANIFEST.jsonl.next ci/VERIFICATION_MANIFEST.jsonl
+out=$(run_commit -q -o \
+    .beads/issues.jsonl \
+    ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
+    ci/VERIFICATION_MANIFEST.jsonl \
+    -m 'claim with active coverage' 2>&1); code=$?
+check 'a claim with matching active coverage is accepted' 0 '' "$code" "$out"
+
+# If the prospective validator itself cannot run, fail closed. The invalid
+# script is never committed; restoring the fixture makes the worktree clean.
+cp scripts/evidence.py "$LAB/coverage-validator.saved"
+printf '%s\n' 'raise SystemExit("planted validator failure")' > scripts/evidence.py
+out=$(run_commit -q -o scripts/evidence.py -m 'invalid validator' 2>&1); code=$?
+check 'an invalid prospective validator refuses rather than passes' 1 \
+    'planted validator failure' "$code" "$out"
+mv "$LAB/coverage-validator.saved" scripts/evidence.py
 
 printf '\n%s passed, %s failed\n' "$PASSES" "$FAILS"
 [ "$FAILS" -eq 0 ]
