@@ -1123,6 +1123,62 @@ mod tests {
         );
     }
 
+    /// `Level.geq` had no test anywhere in the workspace — found while auditing what
+    /// ci/PARITY_LEDGER.txt could honestly claim. It decides "≥ under every parameter
+    /// assignment" for KR-604 constructor-field universes, so it is load-bearing for
+    /// the kernel even though nothing calls it yet.
+    ///
+    /// The properties below are stated from the relation's meaning, not read off the
+    /// implementation: `u ≥ 0` for every `u`, reflexivity, `succ u ≥ u` strictly one
+    /// way, `max` above both arms, and the two cases where a parameter cannot be
+    /// ordered against another parameter at all.
+    #[test]
+    fn geq_orders_universes_by_meaning_not_by_syntax() {
+        let zero = Level::zero();
+        let u = p("u");
+        let v = p("v");
+
+        for level in [
+            zero.clone(),
+            u.clone(),
+            nat(3),
+            Level::max(u.clone(), v.clone()).expect("shallow"),
+        ] {
+            assert!(level.is_geq(&zero), "every universe is at least zero");
+            assert!(level.is_geq(&level), "geq is reflexive");
+        }
+
+        let succ_u = u.clone().succ().expect("shallow");
+        assert!(succ_u.is_geq(&u), "succ u ≥ u");
+        assert!(!u.is_geq(&succ_u), "u is not ≥ succ u");
+        assert!(!zero.is_geq(&u), "zero is not ≥ a parameter");
+
+        // Distinct parameters are incomparable in both directions: neither dominates
+        // under every assignment.
+        assert!(!u.is_geq(&v));
+        assert!(!v.is_geq(&u));
+
+        // max is above both arms, and dominates a parameter only through an arm.
+        let max_uv = Level::max(u.clone(), v.clone()).expect("shallow");
+        assert!(max_uv.is_geq(&u));
+        assert!(max_uv.is_geq(&v));
+        assert!(!u.is_geq(&max_uv));
+
+        // Offsets compose with the base: u+2 ≥ u+1, and not the reverse.
+        let u1 = u.clone().add_offset(1).expect("shallow");
+        let u2 = u.clone().add_offset(2).expect("shallow");
+        assert!(u2.is_geq(&u1));
+        assert!(!u1.is_geq(&u2));
+
+        // Explicit levels compare by value, and syntax that normalizes to the same
+        // level compares equal in both directions.
+        assert!(nat(5).is_geq(&nat(5)));
+        assert!(nat(5).is_geq(&nat(4)));
+        assert!(!nat(4).is_geq(&nat(5)));
+        let max_u_u = Level::max(u.clone(), u.clone()).expect("shallow");
+        assert!(max_u_u.is_geq(&u) && u.is_geq(&max_u_u), "max u u ≡ u");
+    }
+
     /// The recursive comparison this type deliberately no longer derives. Kept as a
     /// test-only oracle: on shallow values recursion is safe, so it pins the exact
     /// verdict the iterative predicate must reproduce.

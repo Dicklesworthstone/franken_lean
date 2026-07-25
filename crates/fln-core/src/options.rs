@@ -229,4 +229,24 @@ mod tests {
         assert_eq!(limits::MAX_SYNTH_PENDING_DEPTH_DEFAULT, 1);
         assert_eq!(limits::MAX_UNIVERSE_OFFSET_DEFAULT, 32);
     }
+
+    /// `KVMap.findCore` is only reached transitively through the typed getters in the
+    /// other tests; the Parity Ledger rows it as its own symbol, so it gets its own
+    /// direct evidence: first match wins, absence is `None`, and a re-insert replaces
+    /// in place rather than shadowing.
+    #[test]
+    fn find_core_returns_the_first_match_and_none_for_absent_keys() {
+        let key = Name::str(Name::anonymous(), "k");
+        let other = Name::str(Name::anonymous(), "absent");
+        let mut map = KVMap::new();
+        assert_eq!(map.find(&key), None);
+
+        map.insert(key.clone(), DataValue::OfNat(1));
+        assert_eq!(map.find(&key), Some(&DataValue::OfNat(1)));
+        assert_eq!(map.find(&other), None);
+
+        map.insert(key.clone(), DataValue::OfNat(2));
+        assert_eq!(map.find(&key), Some(&DataValue::OfNat(2)));
+        assert_eq!(map.len(), 1, "a re-insert replaces rather than shadows");
+    }
 }

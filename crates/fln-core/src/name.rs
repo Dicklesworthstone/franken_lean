@@ -790,6 +790,41 @@ mod tests {
         }
     }
 
+    /// `Name.quickLt` had no caller and no test anywhere in the workspace — found
+    /// while auditing what ci/PARITY_LEDGER.txt could honestly claim. It is the
+    /// `NameSet`/`NameMap` ordering predicate, so it must agree with `quickCmp`
+    /// exactly, on every pair, in both directions.
+    #[test]
+    fn quick_lt_agrees_with_quick_cmp_on_every_pair() {
+        let names = [
+            Name::anonymous(),
+            Name::str(Name::anonymous(), "a"),
+            Name::str(Name::anonymous(), "b"),
+            Name::num(Name::anonymous(), 0),
+            Name::num(Name::anonymous(), 1),
+            Name::str(Name::str(Name::anonymous(), "a"), "b"),
+            Name::num(Name::str(Name::anonymous(), "a"), 7),
+            mixed_name(8),
+        ];
+        for (left_index, left) in names.iter().enumerate() {
+            for (right_index, right) in names.iter().enumerate() {
+                assert_eq!(
+                    left.quick_lt(right),
+                    left.quick_cmp(right) == std::cmp::Ordering::Less,
+                    "quickLt disagrees with quickCmp at ({left_index}, {right_index})"
+                );
+                assert!(
+                    !(left.quick_lt(right) && right.quick_lt(left)),
+                    "quickLt is antisymmetric at ({left_index}, {right_index})"
+                );
+            }
+            assert!(
+                !left.quick_lt(left),
+                "quickLt is irreflexive at {left_index}"
+            );
+        }
+    }
+
     #[test]
     fn deep_name_operations_and_randomized_clone_drops_are_stack_bounded() {
         let outcome = std::thread::Builder::new()
