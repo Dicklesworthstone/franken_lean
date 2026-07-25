@@ -42,6 +42,12 @@ pub const SCHEMA_KVMAP: SchemaId = SchemaId {
     name: "fln.canon.kvmap",
     version: 1,
 };
+/// The order-independent projection of a `KVMap` — a *set* view, distinct from the
+/// ordered encoding above. See [`kvmap_canonical_set_bytes`].
+pub const SCHEMA_KVMAP_SET: SchemaId = SchemaId {
+    name: "fln.canon.kvmap-set",
+    version: 1,
+};
 
 /// The crate that defines a durable format's codec.
 ///
@@ -112,7 +118,7 @@ pub struct SchemaRow {
 ///
 /// Adding a durable format means adding a row here. That is the point: the registry is
 /// the reviewed inventory the conformance corpus is meant to be a projection of.
-pub const SCHEMA_REGISTRY: [SchemaRow; 10] = [
+pub const SCHEMA_REGISTRY: [SchemaRow; 11] = [
     SchemaRow {
         id: SCHEMA_NAME,
         owner: SchemaOwner::Hash,
@@ -131,7 +137,12 @@ pub const SCHEMA_REGISTRY: [SchemaRow; 10] = [
     SchemaRow {
         id: SCHEMA_KVMAP,
         owner: SchemaOwner::Hash,
-        covers: "an options / key-value map",
+        covers: "an options / key-value map, insertion order significant",
+    },
+    SchemaRow {
+        id: SCHEMA_KVMAP_SET,
+        owner: SchemaOwner::Hash,
+        covers: "the same map as an order-independent set (logical-root input)",
     },
     SchemaRow {
         id: SCHEMA_DIAG,
@@ -797,40 +808,88 @@ const DV_NAT: u8 = 3;
 const DV_INT: u8 = 4;
 const DV_SYNTAX: u8 = 5;
 
+/// The one `DataValue` byte grammar, shared by the ordered encoding and the
+/// order-independent projection so the two can never disagree about a value.
+fn write_data_value(value: &DataValue, w: &mut CanonWriter) {
+    match value {
+        DataValue::OfString(v) => {
+            w.u8(DV_STRING);
+            w.str(v);
+        }
+        DataValue::OfBool(v) => {
+            w.u8(DV_BOOL);
+            w.bool(*v);
+        }
+        DataValue::OfName(v) => {
+            w.u8(DV_NAME);
+            v.write_body(w);
+        }
+        DataValue::OfNat(v) => {
+            w.u8(DV_NAT);
+            w.u64(*v);
+        }
+        DataValue::OfInt(v) => {
+            w.u8(DV_INT);
+            w.i64(*v);
+        }
+        DataValue::OfSyntax(v) => {
+            w.u8(DV_SYNTAX);
+            w.u64(v.0);
+        }
+    }
+}
+
+/// The **order-independent** view of a `KVMap`: entries sorted by canonical key bytes.
+///
+/// Two encodings of one map exist on purpose, and conflating them was a real defect.
+/// The [`Canonical`] impl is order-*sensitive*, correctly: upstream `KVMap` is an
+/// ordered assoc list, so insertion order is part of the value and the encoding must be
+/// injective on it. But a *set* consumer — the logical root of plan §7.1 — needs the
+/// opposite property. `KVMap::insert` replaces a key in place and `find` returns the
+/// first match, so with the unique keys the type guarantees, insertion order is not
+/// observable through any lookup: two differently-ordered maps with the same pairs agree
+/// on every `find`, `contains`, and `get_*`. Digesting the ordered bytes therefore gave
+/// one environment two logical roots depending on the order options happened to be set
+/// in — spurious cache misses, and two identities for one environment in receipts and
+/// the transparency log.
+///
+/// Sorting by canonical key bytes rather than by `Name`'s `Ord` keeps the order fixed by
+/// the wire format instead of by a trait impl that could be changed, and matches how
+/// [`LogicalRootBuilder`](crate::root::LogicalRootBuilder) already keys declarations.
+///
+/// This is a distinct schema, so its preimages can never be confused with the ordered
+/// encoding's — order-independence is a property of the projection, never something the
+/// canonical encoding quietly acquired.
+pub fn kvmap_canonical_set_bytes(map: &KVMap) -> Vec<u8> {
+    let mut sorted: Vec<(Vec<u8>, &DataValue)> = map
+        .entries()
+        .iter()
+        .map(|(key, value)| (key.to_canonical_bytes(), value))
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut w = CanonWriter::new();
+    w.schema(SCHEMA_KVMAP_SET);
+    w.u64(sorted.len() as u64);
+    for (key_bytes, value) in sorted {
+        // Length-prefixed, so a key's bytes can never run into the next field.
+        w.bytes(&key_bytes);
+        write_data_value(value, &mut w);
+    }
+    w.into_bytes()
+}
+
 impl Canonical for KVMap {
     const SCHEMA: SchemaId = SCHEMA_KVMAP;
 
     fn write_body(&self, w: &mut CanonWriter) {
-        // Insertion order IS the value (upstream KVMap is an ordered assoc list).
+        // Insertion order IS the value (upstream KVMap is an ordered assoc list), so
+        // this encoding is deliberately order-SENSITIVE and a test asserts that
+        // permuting entries changes the bytes. The order-independent view a *set*
+        // consumer needs is a separate projection — see [`kvmap_canonical_set_bytes`].
         w.u64(self.entries().len() as u64);
         for (key, value) in self.entries() {
             key.write_body(w);
-            match value {
-                DataValue::OfString(v) => {
-                    w.u8(DV_STRING);
-                    w.str(v);
-                }
-                DataValue::OfBool(v) => {
-                    w.u8(DV_BOOL);
-                    w.bool(*v);
-                }
-                DataValue::OfName(v) => {
-                    w.u8(DV_NAME);
-                    v.write_body(w);
-                }
-                DataValue::OfNat(v) => {
-                    w.u8(DV_NAT);
-                    w.u64(*v);
-                }
-                DataValue::OfInt(v) => {
-                    w.u8(DV_INT);
-                    w.i64(*v);
-                }
-                DataValue::OfSyntax(v) => {
-                    w.u8(DV_SYNTAX);
-                    w.u64(v.0);
-                }
-            }
+            write_data_value(value, w);
         }
     }
 
@@ -1511,6 +1570,7 @@ mod tests {
             (SCHEMA_LEVEL, "fln.canon.level"),
             (SCHEMA_EXPR, "fln.canon.expr"),
             (SCHEMA_KVMAP, "fln.canon.kvmap"),
+            (SCHEMA_KVMAP_SET, "fln.canon.kvmap-set"),
             (SCHEMA_DIAG, "fln.canon.diag"),
         ] {
             assert_eq!(constant.name, expected);
@@ -1529,7 +1589,7 @@ mod tests {
             .filter(|row| row.owner == SchemaOwner::Hash)
             .count();
         assert_eq!(
-            hash_rows, 5,
+            hash_rows, 6,
             "fln-hash owns a schema the constant join above does not cover"
         );
     }
@@ -2286,7 +2346,98 @@ mod tests {
         let bytes = map.to_canonical_bytes();
         let back = KVMap::from_canonical_bytes(&bytes).expect("round-trip");
         assert_eq!(back, map);
-        assert_eq!(back.entries()[0].0, map.entries()[0].0);
+        // Exact order, every position — not just the first entry.
+        assert_eq!(
+            back.entries()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>(),
+            map.entries()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// The two KVMap views, asserted in **both** directions. Checking only the
+    /// permissive side of an ordering claim proves nothing: a codec that sorted its
+    /// entries would still round-trip, and a "set" digest that ignored content would
+    /// still be order-independent.
+    #[test]
+    fn the_ordered_encoding_is_order_sensitive_and_the_set_projection_is_not() {
+        let pairs = [
+            (Name::str(Name::anonymous(), "b"), DataValue::OfNat(2)),
+            (Name::str(Name::anonymous(), "a"), DataValue::OfBool(true)),
+            (
+                Name::str(Name::anonymous(), "s"),
+                DataValue::OfSyntax(SyntaxHandle(7)),
+            ),
+        ];
+        let build = |order: [usize; 3]| {
+            let mut map = KVMap::new();
+            for i in order {
+                map.insert(pairs[i].0.clone(), pairs[i].1.clone());
+            }
+            map
+        };
+        let forward = build([0, 1, 2]);
+        let permutations = [[0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+
+        for order in permutations {
+            let other = build(order);
+            // Same options by every observable lookup — this is what makes the two
+            // requirements below a genuine tension rather than a distinction on paper.
+            for (key, _) in &pairs {
+                assert_eq!(
+                    forward.find(key),
+                    other.find(key),
+                    "{order:?} changed a lookup"
+                );
+            }
+
+            // SEQUENCE DIRECTION: insertion order IS the value for an ordered assoc
+            // list, so the canonical encoding must separate permutations. If this ever
+            // passes by accident, someone has "canonicalized" the codec by sorting and
+            // silently merged two distinct upstream KVMap values into one encoding.
+            assert_ne!(
+                forward.to_canonical_bytes(),
+                other.to_canonical_bytes(),
+                "the ordered encoding lost order under {order:?}"
+            );
+
+            // SET DIRECTION: the projection must NOT separate them.
+            assert_eq!(
+                kvmap_canonical_set_bytes(&forward),
+                kvmap_canonical_set_bytes(&other),
+                "the set projection kept order under {order:?}"
+            );
+        }
+
+        // The projection still separates genuinely different sets — order-independence
+        // must not be bought by dropping content.
+        let mut different_value = KVMap::new();
+        different_value.insert(pairs[0].0.clone(), DataValue::OfNat(3));
+        different_value.insert(pairs[1].0.clone(), pairs[1].1.clone());
+        different_value.insert(pairs[2].0.clone(), pairs[2].1.clone());
+        assert_ne!(
+            kvmap_canonical_set_bytes(&forward),
+            kvmap_canonical_set_bytes(&different_value)
+        );
+
+        // And the two views are never the same bytes, so a preimage under one can never
+        // be replayed as a preimage under the other.
+        assert_ne!(
+            forward.to_canonical_bytes(),
+            kvmap_canonical_set_bytes(&forward)
+        );
+        assert!(
+            kvmap_canonical_set_bytes(&forward).starts_with(&{
+                let mut w = CanonWriter::new();
+                w.schema(SCHEMA_KVMAP_SET);
+                w.into_bytes()
+            }),
+            "the projection must carry its own schema header"
+        );
     }
 
     #[test]
