@@ -17,12 +17,14 @@ set -Eeuo pipefail
 
 FINALIZER_PROBE=0
 EARLY_FAULT_PROBE=0
+TRIBUNAL_MANIFEST_INVENTORY_ONLY=0
 case "${1:-}" in
   --help|-h)
     sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   --self-test|"") ;;
+  --tribunal-manifest-inventory) TRIBUNAL_MANIFEST_INVENTORY_ONLY=1 ;;
   --finalizer-probe) FINALIZER_PROBE=1 ;;
   --early-fault-probe) FINALIZER_PROBE=1; EARLY_FAULT_PROBE=1 ;;
   *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
@@ -59,6 +61,7 @@ VERIFICATION_MANIFEST_REL="ci/VERIFICATION_MANIFEST.jsonl"
 VERIFICATION_MANIFEST="$REPO/$VERIFICATION_MANIFEST_REL"
 CHECK_STAGE_ORDER=(
   evidence-self-test verification-manifest shellcheck fmt check clippy test
+  tribunal-manifest-inventory epoch-lab-test epoch-lab-live-verify
   structure-guard vendor-tree ubs
 )
 RUN_ID="check-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -165,6 +168,48 @@ INPUT_PATHS=(
   tribunal
   .github/workflows/ci.yml
 )
+# Every Cargo manifest below tribunal/ is outside the root workspace by
+# construction. Keep the registry exact so adding another nested Tribunal suite
+# without adding its gate invocation cannot silently reduce coverage.
+TRIBUNAL_NESTED_MANIFESTS=(
+  tribunal/epoch-lab/Cargo.toml
+)
+verify_tribunal_manifest_inventory() {
+  local -a expected=("$@") actual=()
+  local manifest index mismatch=0
+  mapfile -d "" -t actual < <(
+    find tribunal -path "*/target" -prune -o -name Cargo.toml -print0 |
+      LC_ALL=C sort -z
+  )
+  if ((${#actual[@]} != ${#expected[@]})); then
+    mismatch=1
+  else
+    for index in "${!expected[@]}"; do
+      if [[ "${actual[index]}" != "${expected[index]}" ]]; then
+        mismatch=1
+        break
+      fi
+    done
+  fi
+  for manifest in "${actual[@]}"; do
+    if [[ -L "$REPO/$manifest" || ! -f "$REPO/$manifest" ]]; then
+      printf "tribunal_manifest_inventory: non_regular_manifest=%s\n" \
+        "$manifest" >&2
+      return 1
+    fi
+  done
+  if ((mismatch)); then
+    printf "tribunal_manifest_inventory: unregistered_nested_suite\n" >&2
+    printf "expected=%s\n" "$(IFS=,; printf "%s" "${expected[*]}")" >&2
+    printf "actual=%s\n" "$(IFS=,; printf "%s" "${actual[*]}")" >&2
+    return 1
+  fi
+  printf "tribunal_manifest_inventory: pass count=%d\n" "${#actual[@]}"
+}
+if ((TRIBUNAL_MANIFEST_INVENTORY_ONLY)); then
+  verify_tribunal_manifest_inventory "${TRIBUNAL_NESTED_MANIFESTS[@]}"
+  exit $?
+fi
 HASH_ARGS=()
 GOVERNED_ARGS=()
 for input_path in "${INPUT_PATHS[@]}"; do
@@ -1017,10 +1062,11 @@ run_stage() {
     semantic_args=()
   else
     case "$name" in
-      verification-manifest|shellcheck|fmt|structure-guard|vendor-tree|ubs)
+      verification-manifest|shellcheck|fmt|tribunal-manifest-inventory|\
+        epoch-lab-live-verify|structure-guard|vendor-tree|ubs)
         semantic_args=(--semantic-failure-exit 1)
         ;;
-      check|clippy|test)
+      check|clippy|test|epoch-lab-test)
         semantic_args=(--semantic-failure-exit 101)
         ;;
     esac
@@ -1030,7 +1076,7 @@ run_stage() {
   # identity is verified, and build state is isolated per attempt.
   local -a sealed_args=()
   case "$name" in
-    fmt|check|clippy|test|structure-guard)
+    fmt|check|clippy|test|epoch-lab-test|epoch-lab-live-verify|structure-guard)
       sealed_args=(--sealed-cargo --suite-lock "$REPO/SUITE.lock"
         --sealed-build-root "$SEALED_BUILD_ROOT")
       ;;
@@ -1499,6 +1545,15 @@ run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets
 run_stage clippy cargo clippy --locked --all-targets -- -D warnings
 run_stage test cargo test --locked
+run_stage tribunal-manifest-inventory \
+  bash scripts/check.sh --tribunal-manifest-inventory
+run_stage epoch-lab-test cargo test --locked \
+  --manifest-path tribunal/epoch-lab/Cargo.toml
+# The live verifier reserves exit 1 for a semantic chain mismatch. Its exit 2
+# is a typed absent-epoch non-answer and intentionally remains non-semantic here,
+# so the enclosing gate cannot misreport an inconclusive oracle as rejection.
+run_stage epoch-lab-live-verify cargo run --locked \
+  --manifest-path tribunal/epoch-lab/Cargo.toml -- verify v4.32.0
 run_stage structure-guard cargo run -q --locked -p structure-guard -- --root "$REPO" --robot
 run_stage vendor-tree bash scripts/verify_vendor_tree.sh
 

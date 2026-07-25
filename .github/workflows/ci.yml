@@ -426,6 +426,15 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           exit "$command_rc"
 
+      - name: tribunal epoch-lab nested workspace
+        id: epoch_lab
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          ./scripts/check.sh --tribunal-manifest-inventory
+          cargo test --locked --manifest-path tribunal/epoch-lab/Cargo.toml
+          cargo run --locked --manifest-path tribunal/epoch-lab/Cargo.toml -- verify v4.32.0
+
       - name: gate self-test (planted failures must be caught and named)
         id: gate_self_test
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
