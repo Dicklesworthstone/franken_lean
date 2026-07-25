@@ -2493,6 +2493,185 @@ fn read_payload_transparency(tag: u8) -> Result<PayloadTransparency, ModuleProve
     }
 }
 
+/// Where one extension entry occurrence lives: the contributing module, its
+/// contribution index, and the module-local source ordinal within that contribution.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EntryOccurrence {
+    pub module: ModuleId,
+    pub contribution_index: usize,
+    pub source_ordinal: u64,
+}
+
+/// Derived forward and reverse indexes over a validated manifest.
+///
+/// **These are projections, not truth.** The manifest's records are the committed
+/// state and [`ModuleProvenanceRoot`] is the sole authoritative aggregate identity.
+/// An index is a rebuildable cache: it carries the root it was derived from so it can
+/// be checked against the records, and it never contributes to that root. Persisting
+/// one and later disagreeing with the records is an invariant failure, not a second
+/// opinion — [`verify`](Self::verify) reports that as `InternalFault`.
+///
+/// Index layout, ordering, and sharing are deliberately outside the canonical bytes:
+/// building, dropping, or rebuilding indexes cannot move the aggregate root, and a
+/// test asserts exactly that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleProvenanceIndexes {
+    /// Reverse: declaration name -> its owning module and contribution class.
+    owners: BTreeMap<Name, (ModuleId, DeclarationClass)>,
+    /// Forward: module -> the declaration names it owns, in canonical order.
+    declarations_by_module: BTreeMap<ModuleId, Vec<Name>>,
+    /// Reverse: entry identity -> every occurrence of it, canonically ordered.
+    entry_occurrences: BTreeMap<ExtensionEntryId, Vec<EntryOccurrence>>,
+    /// The aggregate root these projections were derived from. Carried for checking,
+    /// never as an identity of its own.
+    derived_from: ModuleProvenanceRoot,
+}
+
+impl ModuleProvenanceIndexes {
+    /// Derive both indexes from the manifest's primary records.
+    ///
+    /// Deterministic and total: every input row lands in both directions, so a
+    /// rebuild from the same records is byte-for-byte the same projection.
+    pub fn derive(manifest: &ModuleProvenanceManifest) -> Self {
+        let mut owners = BTreeMap::new();
+        let mut declarations_by_module = BTreeMap::new();
+        let mut entry_occurrences: BTreeMap<ExtensionEntryId, Vec<EntryOccurrence>> =
+            BTreeMap::new();
+        for record in manifest.records() {
+            let module = record.module().id.clone();
+            let mut owned =
+                Vec::with_capacity(record.declarations().len() + record.extra_declarations().len());
+            for (class, names) in [
+                (DeclarationClass::Declaration, record.declarations()),
+                (
+                    DeclarationClass::ExtraDeclaration,
+                    record.extra_declarations(),
+                ),
+            ] {
+                for name in names {
+                    owners.insert(name.clone(), (module.clone(), class));
+                    owned.push(name.clone());
+                }
+            }
+            owned.sort();
+            declarations_by_module.insert(module.clone(), owned);
+            for (contribution_index, contribution) in
+                record.extension_contributions().iter().enumerate()
+            {
+                for (offset, entry) in contribution.entries().iter().enumerate() {
+                    let Some(source_ordinal) = contribution.source_ordinal(offset) else {
+                        continue;
+                    };
+                    entry_occurrences
+                        .entry(*entry)
+                        .or_default()
+                        .push(EntryOccurrence {
+                            module: module.clone(),
+                            contribution_index,
+                            source_ordinal,
+                        });
+                }
+            }
+        }
+        for occurrences in entry_occurrences.values_mut() {
+            occurrences.sort();
+        }
+        Self {
+            owners,
+            declarations_by_module,
+            entry_occurrences,
+            derived_from: manifest.root(),
+        }
+    }
+
+    /// The aggregate root these projections were derived from. This is a *back
+    /// reference*, not an identity: two different index layouts over the same records
+    /// report the same value because the records decide it.
+    pub fn derived_from(&self) -> ModuleProvenanceRoot {
+        self.derived_from
+    }
+
+    /// Reverse query: which module owns this declaration, and in which class.
+    pub fn owner_of(&self, name: &Name) -> Option<&(ModuleId, DeclarationClass)> {
+        self.owners.get(name)
+    }
+
+    /// Forward query: the declarations this module owns, canonically ordered.
+    pub fn declarations_of(&self, module: &ModuleId) -> Option<&[Name]> {
+        self.declarations_by_module
+            .get(module)
+            .map(|names| names.as_slice())
+    }
+
+    /// Reverse query: every occurrence of one entry identity.
+    pub fn occurrences_of(&self, entry: &ExtensionEntryId) -> Option<&[EntryOccurrence]> {
+        self.entry_occurrences
+            .get(entry)
+            .map(|occurrences| occurrences.as_slice())
+    }
+
+    /// Re-derive from `manifest` and confirm this projection still agrees with it.
+    ///
+    /// Any disagreement — a stale root, a missing row, an extra row, or a
+    /// contradictory one — is an [`InternalFault`](ModuleProvenanceError::InternalFault)
+    /// or a [`GraphAdmissionFault`](ModuleProvenanceError::GraphAdmissionFault),
+    /// never a verdict about a module. Validated state that disagrees with itself is
+    /// an invariant failure by definition (FL-INV-07).
+    pub fn verify(&self, manifest: &ModuleProvenanceManifest) -> Result<(), ModuleProvenanceError> {
+        if self.derived_from != manifest.root() {
+            return Err(ModuleProvenanceError::InternalFault {
+                what: "index projection was derived from a different committed root",
+                held: self.derived_from,
+                recomputed: manifest.root(),
+            });
+        }
+        let rebuilt = Self::derive(manifest);
+        if rebuilt.owners != self.owners {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "declaration-owner projection disagrees with the committed records",
+            });
+        }
+        if rebuilt.declarations_by_module != self.declarations_by_module {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward declaration projection disagrees with the committed records",
+            });
+        }
+        if rebuilt.entry_occurrences != self.entry_occurrences {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "entry-occurrence projection disagrees with the committed records",
+            });
+        }
+        // Bidirectional coverage: the forward and reverse declaration indexes must be
+        // exact inverses. A one-way index is how a projection quietly becomes a second
+        // source of truth.
+        for (name, (module, _)) in &self.owners {
+            let owned =
+                self.declarations_of(module)
+                    .ok_or(ModuleProvenanceError::GraphAdmissionFault {
+                        what: "reverse index names a module the forward index does not carry",
+                    })?;
+            if !owned.contains(name) {
+                return Err(ModuleProvenanceError::GraphAdmissionFault {
+                    what: "reverse index maps a declaration to a module that does not own it",
+                });
+            }
+        }
+        for (module, names) in &self.declarations_by_module {
+            for name in names {
+                match self.owner_of(name) {
+                    Some((owner, _)) if owner == module => {}
+                    _ => {
+                        return Err(ModuleProvenanceError::GraphAdmissionFault {
+                            what: "forward index owns a declaration the reverse index does not",
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3485,6 +3664,162 @@ mod tests {
                 row.tag
             );
         }
+    }
+
+    /// Projections are rebuildable caches, never truth. The properties that make
+    /// that claim real: they are exactly derivable from the primary records, they
+    /// cover both directions, and their existence cannot move the aggregate root.
+    #[test]
+    fn index_projections_are_derivable_bidirectional_and_never_authoritative() {
+        let manifest = sample_manifest();
+        let root_before = manifest.root();
+        let indexes = ModuleProvenanceIndexes::derive(&manifest);
+
+        // Derivable: a rebuild from the same records is the same projection, and it
+        // verifies against the manifest it came from.
+        assert_eq!(indexes, ModuleProvenanceIndexes::derive(&manifest));
+        assert_eq!(indexes.verify(&manifest), Ok(()));
+        assert_eq!(indexes.derived_from(), root_before);
+
+        // NEVER AUTHORITATIVE: deriving, holding, cloning, and dropping projections
+        // leaves the aggregate root and the canonical bytes untouched. Index layout
+        // is outside the identity by construction, and this is the assertion that
+        // keeps it there.
+        let bytes_before = manifest.to_canonical_bytes();
+        let _clone = indexes.clone();
+        drop(ModuleProvenanceIndexes::derive(&manifest));
+        assert_eq!(
+            manifest.root(),
+            root_before,
+            "an index moved the aggregate root"
+        );
+        assert_eq!(manifest.to_canonical_bytes(), bytes_before);
+
+        // Bidirectional coverage over real data: every owned declaration resolves
+        // back to its owner, and every owner's list is exactly its declarations.
+        let mut seen = 0usize;
+        for record in manifest.records() {
+            let module = &record.module().id;
+            let owned = indexes
+                .declarations_of(module)
+                .expect("every module is in the forward index");
+            let mut expected: Vec<Name> = record
+                .declarations()
+                .iter()
+                .chain(record.extra_declarations().iter())
+                .cloned()
+                .collect();
+            expected.sort();
+            assert_eq!(owned, expected.as_slice(), "forward index disagrees");
+            for name in &expected {
+                let (owner, class) = indexes
+                    .owner_of(name)
+                    .expect("every declaration is in the reverse index");
+                assert_eq!(owner, module);
+                // The class distinction survives the projection: an ordinary and an
+                // extra generated declaration are not interchangeable.
+                let expected_class = if record.declarations().contains(name) {
+                    DeclarationClass::Declaration
+                } else {
+                    DeclarationClass::ExtraDeclaration
+                };
+                assert_eq!(*class, expected_class, "declaration class was flattened");
+                seen += 1;
+            }
+        }
+        assert_eq!(
+            seen,
+            manifest.facts().declarations + manifest.facts().extra_declarations,
+            "bidirectional walk did not cover every declaration"
+        );
+
+        // Reverse entry index: occurrences resolve to real coordinates.
+        for record in manifest.records() {
+            for (contribution_index, contribution) in
+                record.extension_contributions().iter().enumerate()
+            {
+                for (offset, entry) in contribution.entries().iter().enumerate() {
+                    let occurrences = indexes
+                        .occurrences_of(entry)
+                        .expect("every entry occurrence is indexed");
+                    assert!(
+                        occurrences.contains(&EntryOccurrence {
+                            module: record.module().id.clone(),
+                            contribution_index,
+                            source_ordinal: contribution
+                                .source_ordinal(offset)
+                                .expect("offset is in range"),
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    /// The named mutants: a projection that disagrees with the committed records, or
+    /// one carried across to a different manifest, must fault rather than answer.
+    #[test]
+    fn a_disagreeing_index_projection_is_a_fault_not_a_second_opinion() {
+        let manifest = sample_manifest();
+        let other = other_manifest();
+
+        // Carried across to a different committed root: caught by the back reference
+        // before any row is compared.
+        let stale = ModuleProvenanceIndexes::derive(&manifest);
+        assert!(matches!(
+            stale.verify(&other),
+            Err(ModuleProvenanceError::InternalFault {
+                what: "index projection was derived from a different committed root",
+                ..
+            })
+        ));
+
+        // Tampered rows, with the root reference left intact so the row comparison is
+        // what has to catch it. Each is a distinct way a cache can rot.
+        let mut dropped_owner = ModuleProvenanceIndexes::derive(&manifest);
+        let victim = manifest.records()[0].declarations()[0].clone();
+        dropped_owner.owners.remove(&victim);
+        assert!(matches!(
+            dropped_owner.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault { .. })
+        ));
+
+        let mut wrong_owner = ModuleProvenanceIndexes::derive(&manifest);
+        wrong_owner
+            .owners
+            .insert(victim.clone(), (id("B"), DeclarationClass::Declaration));
+        assert!(matches!(
+            wrong_owner.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault { .. })
+        ));
+
+        let mut flattened_class = ModuleProvenanceIndexes::derive(&manifest);
+        let extra = manifest.records()[0].extra_declarations()[0].clone();
+        flattened_class
+            .owners
+            .insert(extra, (id("A"), DeclarationClass::Declaration));
+        assert!(
+            matches!(
+                flattened_class.verify(&manifest),
+                Err(ModuleProvenanceError::GraphAdmissionFault { .. })
+            ),
+            "collapsing the ordinary/extra class distinction must fault"
+        );
+
+        let mut lost_occurrence = ModuleProvenanceIndexes::derive(&manifest);
+        let entry = manifest.records()[0].extension_contributions()[0].entries()[0];
+        lost_occurrence.entry_occurrences.remove(&entry);
+        assert!(matches!(
+            lost_occurrence.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault { .. })
+        ));
+
+        // And the healthy projection still verifies, so none of the above is a
+        // blanket refusal.
+        assert_eq!(
+            ModuleProvenanceIndexes::derive(&manifest).verify(&manifest),
+            Ok(())
+        );
     }
 
     #[test]
