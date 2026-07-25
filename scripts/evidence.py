@@ -30,6 +30,7 @@ import signal
 import stat
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 from functools import partial
@@ -143,8 +144,25 @@ HOSTILE_COMPILER_ENV_PREFIXES = (
     "CARGO_REGISTRIES_",
     "CARGO_PROFILE_",
 )
+# Python's isolated mode ignores every interpreter configuration channel in
+# this family. Record the names that were present so isolation never becomes
+# silent environment scrubbing.
+PYTHON_CONFIGURATION_ENV_EXACT = frozenset(
+    {
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONEXECUTABLE",
+        "PYTHONUSERBASE",
+        "PYTHONNOUSERSITE",
+        "PYTHONSAFEPATH",
+    }
+)
+PYTHON_CONFIGURATION_ENV_PREFIXES = ("PYTHON",)
 # Scrubbed-and-overridden by the lane itself, never treated as hostile.
-SEALED_ENV_OVERRIDDEN = frozenset({"CARGO_HOME", "CARGO_TARGET_DIR"})
+SEALED_ENV_OVERRIDDEN = frozenset(
+    {"CARGO_HOME", "CARGO_TARGET_DIR", *PYTHON_CONFIGURATION_ENV_EXACT}
+)
 # Ambient variables admitted into the sealed child environment as-is. PATH is
 # REBUILT (pinned toolchain bin first), never inherited.
 SEALED_ENV_ALLOWLIST = frozenset(
@@ -746,6 +764,47 @@ class SealedCompilerRejection(EvidenceError):
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def overridden_python_environment(environ: Mapping[str, str]) -> list[str]:
+    """Return ambient Python configuration names neutralized by ``-I``.
+
+    Values are deliberately never copied into evidence: names prove that the
+    channel was classified, while values may contain paths or other host data.
+    """
+
+    return sorted(
+        name
+        for name in environ
+        if name in PYTHON_CONFIGURATION_ENV_EXACT
+        or any(
+            name.startswith(prefix)
+            for prefix in PYTHON_CONFIGURATION_ENV_PREFIXES
+        )
+    )
+
+
+def effective_interpreter_identity(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Bind the Python authority that computes hashes and verdicts."""
+
+    source_environment = os.environ if environ is None else environ
+    stdlib_prefix = Path(sysconfig.get_path("stdlib")).resolve()
+    return {
+        "executable": str(Path(sys.executable).resolve()),
+        "version": platform.python_version(),
+        "stdlib_prefix": str(stdlib_prefix),
+        "base_prefix": str(Path(sys.base_prefix).resolve()),
+        "exec_prefix": str(Path(sys.exec_prefix).resolve()),
+        "flags": {
+            "isolated": bool(sys.flags.isolated),
+            "ignore_environment": bool(sys.flags.ignore_environment),
+            "no_user_site": bool(sys.flags.no_user_site),
+            "safe_path": bool(sys.flags.safe_path),
+        },
+        "overridden_env": overridden_python_environment(source_environment),
+    }
 
 
 def canonical_json(value: Any) -> bytes:
@@ -3276,6 +3335,14 @@ def prepare_sealed_cargo(
         "cargo_home": str(cargo_home),
         "target_dir": str(target_dir),
         "admitted_env": sorted(sealed_env),
+        "overridden_env": sorted(
+            {
+                name
+                for name in environ
+                if name in SEALED_ENV_OVERRIDDEN
+            }
+            | set(overridden_python_environment(environ))
+        ),
         "rejected_env": [],
         "original_argv0": original_argv0,
         "effective_argv0": argv[0] if argv else "",
@@ -7313,14 +7380,24 @@ def validate_supervisor_object(
                 raise EvidenceError(
                     f"{path}:{record_number}: sealed-compiler commit is malformed"
                 )
-            admitted = sealed.get("admitted_env")
-            if "admitted_env" in sealed and (
-                not isinstance(admitted, list)
-                or not all(isinstance(item, str) for item in admitted)
+            for environment_field in (
+                "admitted_env",
+                "overridden_env",
+                "rejected_env",
             ):
-                raise EvidenceError(
-                    f"{path}:{record_number}: sealed-compiler admitted env is malformed"
-                )
+                environment_names = sealed.get(environment_field)
+                if environment_field in sealed and (
+                    not isinstance(environment_names, list)
+                    or not all(
+                        isinstance(item, str) and item
+                        for item in environment_names
+                    )
+                    or environment_names != sorted(set(environment_names))
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: sealed-compiler "
+                        f"{environment_field} is malformed"
+                    )
     if not isinstance(value["argv"], list) or not value["argv"] or not all(
         isinstance(item, str) for item in value["argv"]
     ):
