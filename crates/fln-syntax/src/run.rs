@@ -37,6 +37,8 @@
 use crate::source::{BytePos, ByteSpan, SourceText};
 use crate::token::{LexedToken, TokenError, TokenTable, lex_token};
 use crate::trivia::scan_trivia;
+use fln_core::diag::{ResourceReason, StructuralUnit};
+use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 
 /// One event in a lexical run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +170,23 @@ pub fn lex_run_from(text: &SourceText, table: &TokenTable, from: BytePos) -> Lex
 /// exactly one definition of what a run is — two drivers would be two things to drift, which
 /// is the same argument that keeps recovery from having its own lexer.
 fn lex_from(text: &SourceText, table: &TokenTable, from: BytePos) -> Vec<Event> {
+    lex_from_bounded(text, table, from, None).0
+}
+
+/// The one driver, with an optional event bound. Returns the events and whether the bound
+/// stopped it.
+///
+/// The bound is threaded through the single driver rather than layered on top of it by stepping:
+/// a stepping wrapper that re-lexed the tail to decide each step would be quadratic, and — worse
+/// — would be a second definition of what one iteration is. There is exactly one loop here, and
+/// the bound is a condition inside it.
+fn lex_from_bounded(
+    text: &SourceText,
+    table: &TokenTable,
+    from: BytePos,
+    max_events: Option<u64>,
+) -> (Vec<Event>, bool) {
+    let over = |events: &Vec<Event>| max_events.is_some_and(|limit| events.len() as u64 > limit);
     let mut events = Vec::new();
     let mut at = from;
     let end = text.len_bytes();
@@ -175,6 +194,9 @@ fn lex_from(text: &SourceText, table: &TokenTable, from: BytePos) -> Vec<Event> 
         match scan_trivia(text, at) {
             Ok(stop) => {
                 events.push(Event::Trivia(span(at, stop)));
+                if over(&events) {
+                    return (events, true);
+                }
                 if stop.0 >= end {
                     break;
                 }
@@ -193,6 +215,9 @@ fn lex_from(text: &SourceText, table: &TokenTable, from: BytePos) -> Vec<Event> 
                             continue;
                         }
                         events.push(Event::Token(token));
+                        if over(&events) {
+                            return (events, true);
+                        }
                         at = next;
                     }
                     Err(error) => {
@@ -201,6 +226,9 @@ fn lex_from(text: &SourceText, table: &TokenTable, from: BytePos) -> Vec<Event> 
                             error: RunError::Token(error),
                             skipped: span(stop, resume),
                         });
+                        if over(&events) {
+                            return (events, true);
+                        }
                         at = resume;
                     }
                 }
@@ -218,6 +246,9 @@ fn lex_from(text: &SourceText, table: &TokenTable, from: BytePos) -> Vec<Event> 
                     // is how the incremental property found this.
                     skipped: span(at, resume),
                 });
+                if over(&events) {
+                    return (events, true);
+                }
                 if resume.0 <= at.0 {
                     break;
                 }
@@ -225,7 +256,7 @@ fn lex_from(text: &SourceText, table: &TokenTable, from: BytePos) -> Vec<Event> 
             }
         }
     }
-    events
+    (events, false)
 }
 
 /// Skip one scalar past a token refusal, so the driver always advances.
@@ -525,6 +556,86 @@ fn shift_event(event: &Event, delta: isize) -> Event {
 
 fn span(start: BytePos, end: BytePos) -> ByteSpan {
     ByteSpan::new(start, end).unwrap_or(ByteSpan::empty_at(start))
+}
+
+/// A bound on how much work a lexical run may do.
+///
+/// ## Why the lexer needs one at all
+///
+/// A run is linear in the input, so this is not about pathological blowup — it is about the
+/// front end refusing to be handed a gigabyte and quietly trying. `InputBytes` and
+/// `ProducedNodes` are bounded separately because they answer different questions: the first is
+/// "is this file too big to consider", the second is "did lexing it materialize more structure
+/// than I allowed", and a caller raising one is making a different decision than a caller
+/// raising the other. That distinction is why [`StructuralUnit`] has both variants
+/// (bead franken_lean-vui8), and this is the first consumer that uses them for their intended
+/// purpose rather than as labels.
+///
+/// ## What exceeding it is, and is not
+///
+/// Exceeding a budget is **inconclusive, never rejected** (FL-INV-07, doctrine §8). The file is
+/// not malformed and we are not saying it is; we are saying we declined to finish. So the result
+/// is `Outcome::Inconclusive` with a [`ResourceUsage`], and it must never be rendered as a
+/// diagnostic, cached, or counted as either acceptance or rejection. A budget refusal that
+/// leaked into the diagnostic stream would tell a user their correct file has an error in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LexBudget {
+    /// Maximum input size, in bytes.
+    pub max_input_bytes: u64,
+    /// Maximum number of events the run may produce.
+    pub max_events: u64,
+}
+
+impl LexBudget {
+    /// A budget large enough for any real source file, for callers that want the typed
+    /// signature without imposing a limit they have not thought about.
+    pub const fn generous() -> LexBudget {
+        LexBudget {
+            max_input_bytes: 64 * 1024 * 1024,
+            max_events: 16 * 1024 * 1024,
+        }
+    }
+}
+
+fn exhausted(unit: StructuralUnit, allowed: u64, observed: u64) -> Outcome<LexRun> {
+    Outcome::Inconclusive(Inconclusive::resource(ResourceUsage {
+        reason: ResourceReason::StructuralBudget { unit },
+        allowed,
+        observed,
+    }))
+}
+
+/// Lex a whole text under a budget.
+///
+/// Returns `Outcome::Complete(run)` when the run finished inside the budget, and
+/// `Outcome::Inconclusive` when it did not. **A budget that is not exceeded cannot change the
+/// answer**: the run is byte-for-byte the one [`lex_run`] produces, because the budget is a
+/// stopping condition and not a lexing rule. The suite asserts that in both directions — that a
+/// generous budget is invisible, and that a tight one actually stops.
+pub fn lex_run_bounded(
+    text: &SourceText,
+    table: &TokenTable,
+    budget: LexBudget,
+) -> Outcome<LexRun> {
+    // Input size is checked BEFORE any work: the point of an input bound is to decline without
+    // reading the file, so charging for the read first would defeat it.
+    let len = text.len_bytes() as u64;
+    if len > budget.max_input_bytes {
+        return exhausted(StructuralUnit::InputBytes, budget.max_input_bytes, len);
+    }
+
+    let (events, stopped) = lex_from_bounded(text, table, BytePos(0), Some(budget.max_events));
+    if stopped {
+        // `observed` must exceed `allowed` for `is_genuine_exhaustion` to hold, so the report is
+        // the count that broke the limit rather than the limit itself. A usage whose numbers are
+        // equal claims a stop that never happened, and fln-core refuses it.
+        return exhausted(
+            StructuralUnit::ProducedNodes,
+            budget.max_events,
+            events.len() as u64,
+        );
+    }
+    Outcome::Complete(LexRun { events })
 }
 
 #[cfg(test)]
