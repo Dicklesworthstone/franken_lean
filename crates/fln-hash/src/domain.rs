@@ -187,4 +187,226 @@ mod tests {
         assert!(d.to_hex().chars().all(|c| c == 'a' || c == 'b'));
         assert_eq!(format!("{d}"), d.to_hex());
     }
+
+    /// The display name a fixture row uses for a domain. Written out rather than
+    /// derived from `Debug` so the fixture's first column is a stable contract and not
+    /// hostage to a formatting change.
+    fn row_name(domain: Domain) -> &'static str {
+        match domain {
+            Domain::DeclContent => "DeclContent",
+            Domain::LogicalRoot => "LogicalRoot",
+            Domain::ExtensionDelta => "ExtensionDelta",
+            Domain::OptionsSet => "OptionsSet",
+            Domain::Receipt => "Receipt",
+            Domain::TransparencyLeaf => "TransparencyLeaf",
+            Domain::TransparencyNode => "TransparencyNode",
+            Domain::CacheKey => "CacheKey",
+            Domain::OperationalMeta => "OperationalMeta",
+            Domain::CanonicalSchema => "CanonicalSchema",
+            Domain::ModuleProvenance => "ModuleProvenance",
+            Domain::Fixture => "Fixture",
+        }
+    }
+
+    /// The four fixture inputs, in column order. See the fixture header for why these:
+    /// empty, a short input, exactly one BLAKE3 chunk, and a multi-chunk input that
+    /// forces the parent/tree path.
+    fn fixture_inputs() -> [Vec<u8>; 4] {
+        [
+            Vec::new(),
+            b"abc".to_vec(),
+            vec![0u8; 1024],
+            (0..2049).map(|i| (i % 251) as u8).collect(),
+        ]
+    }
+
+    /// **The whole fixture contract, in one function.**
+    ///
+    /// Both the suite and every plant below call exactly this, because a mutation
+    /// harness that drives a subset of the production contract can report a false green
+    /// — the lesson from this bead's BLAKE3 fixture round, where a dropped-row plant
+    /// survived because the row count lived in the test body instead of the parser.
+    ///
+    /// Returns the number of rows checked, or the first violation.
+    fn check_domain_vector_contract(text: &str) -> Result<usize, String> {
+        let mut saw_schema = false;
+        let mut rows: std::collections::BTreeMap<&str, (&str, Vec<&str>)> =
+            std::collections::BTreeMap::new();
+        for line in text.lines() {
+            if line == "# schema fln-domain-vectors/1" {
+                saw_schema = true;
+                continue;
+            }
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('|').collect();
+            // domain + tag + one digest per input. A short row and a trailing field are
+            // both rejected: the BLAKE3 fixture silently accepted trailing fields until
+            // a plant found it.
+            if fields.len() != 2 + fixture_inputs().len() {
+                return Err(format!(
+                    "row has {} fields, expected {}: {line}",
+                    fields.len(),
+                    2 + fixture_inputs().len()
+                ));
+            }
+            for digest in &fields[2..] {
+                if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("field is not a 64-char hex digest: {digest}"));
+                }
+                if digest.bytes().any(|b| b.is_ascii_uppercase()) {
+                    return Err(format!("digest must be lowercase hex: {digest}"));
+                }
+            }
+            if rows
+                .insert(fields[0], (fields[1], fields[2..].to_vec()))
+                .is_some()
+            {
+                return Err(format!("duplicate row for domain {}", fields[0]));
+            }
+        }
+        if !saw_schema {
+            return Err("fixture missing its schema line".to_string());
+        }
+
+        // The join, both directions. A registered domain with no row means the fixture
+        // is stale (a new domain shipped unfrozen); a row naming no registered domain
+        // means the fixture describes something that no longer exists.
+        let inputs = fixture_inputs();
+        for domain in Domain::ALL {
+            let name = row_name(domain);
+            let Some((tag, digests)) = rows.remove(name) else {
+                return Err(format!(
+                    "no fixture row for registered domain {name}; every domain's tag must \
+                     be frozen, or a new domain can change nothing visibly and everything \
+                     underneath"
+                ));
+            };
+            if tag != domain.tag() {
+                return Err(format!(
+                    "{name}: tag drifted from the frozen value.\n  fixture: {tag}\n  code:    {}\n\
+                     A tag change re-digests every artifact under this domain — it is an \
+                     epoch-class event, not a refactor.",
+                    domain.tag()
+                ));
+            }
+            for (input, expected) in inputs.iter().zip(&digests) {
+                let actual = hash(domain, input).to_hex();
+                if actual != *expected {
+                    return Err(format!(
+                        "{name}: digest drifted for the {}-byte input.\n  expected: {expected}\n\
+                         \n  actual:   {actual}",
+                        input.len()
+                    ));
+                }
+            }
+        }
+        if let Some((extra, _)) = rows.iter().next() {
+            return Err(format!(
+                "fixture row {extra} names no registered domain — the registry shrank, or \
+                 the row is a typo that was silently checking nothing"
+            ));
+        }
+        Ok(Domain::ALL.len())
+    }
+
+    const DOMAIN_VECTORS: &str = include_str!("../fixtures/domain_vectors.txt");
+
+    #[test]
+    fn every_domain_tag_and_digest_matches_the_frozen_fixture() {
+        match check_domain_vector_contract(DOMAIN_VECTORS) {
+            Ok(rows) => assert_eq!(rows, Domain::ALL.len()),
+            Err(violation) => panic!("{violation}"),
+        }
+    }
+
+    #[test]
+    fn the_fixture_contract_kills_tag_digest_and_structural_damage() {
+        // Every plant runs the full contract over damaged text, exactly as the suite
+        // runs it over the real fixture. The checked-in fixture is never mutated.
+        let plant = |from: &str, to: &str| DOMAIN_VECTORS.replacen(from, to, 1);
+
+        // A TAG EDIT — the drift this fixture exists for. Before it, this change
+        // re-digested every artifact in the program and no test failed.
+        let retagged = plant(
+            "fln 2026 domain decl-content/1",
+            "fln 2026 domain decl-content/2",
+        );
+        let error = check_domain_vector_contract(&retagged).expect_err("a tag edit must fail");
+        assert!(error.contains("tag drifted"), "{error}");
+
+        // A ONE-BIT DIGEST FLIP, on a mid-fixture row rather than the first, and on the
+        // multi-chunk column rather than the empty one — so the check is known to reach
+        // every row and every input, not just the cheap first cell.
+        let victim = &DOMAIN_VECTORS
+            .lines()
+            .find(|line| line.starts_with("CacheKey|"))
+            .expect("the CacheKey row exists");
+        let last = victim.rsplit('|').next().expect("a last column");
+        let mut flipped_hex = last.to_string();
+        let first = flipped_hex.remove(0);
+        let value = first.to_digit(16).expect("hex");
+        flipped_hex.insert(0, std::char::from_digit(value ^ 1, 16).expect("still hex"));
+        let flipped = plant(last, &flipped_hex);
+        let error = check_domain_vector_contract(&flipped).expect_err("a digest flip must fail");
+        assert!(error.contains("digest drifted"), "{error}");
+        assert!(
+            error.contains("2049"),
+            "the flip must be reported against the multi-chunk input: {error}"
+        );
+
+        // STRUCTURAL DAMAGE. Each is a distinct way a fixture stops checking what it
+        // claims to check.
+        let dropped = DOMAIN_VECTORS.replacen(
+            &format!("{}\n", DOMAIN_VECTORS.lines().last().expect("a last row")),
+            "",
+            1,
+        );
+        let error = check_domain_vector_contract(&dropped).expect_err("a dropped row must fail");
+        assert!(
+            error.contains("no fixture row for registered domain"),
+            "{error}"
+        );
+
+        let duplicated = format!(
+            "{DOMAIN_VECTORS}{}\n",
+            DOMAIN_VECTORS.lines().last().unwrap()
+        );
+        assert!(
+            check_domain_vector_contract(&duplicated)
+                .expect_err("a duplicated row must fail")
+                .contains("duplicate row"),
+        );
+
+        let unknown = format!(
+            "{DOMAIN_VECTORS}NotADomain|fln 2026 domain nope/1|{}\n",
+            std::iter::repeat_n("00".repeat(32), 4)
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        assert!(
+            check_domain_vector_contract(&unknown)
+                .expect_err("a row for no registered domain must fail")
+                .contains("names no registered domain"),
+        );
+
+        let short = plant("CacheKey|", "CacheKey|extra|");
+        assert!(
+            check_domain_vector_contract(&short)
+                .expect_err("a wrong-width row must fail")
+                .contains("fields, expected"),
+        );
+
+        let no_schema = plant("# schema fln-domain-vectors/1", "# schema wrong/1");
+        assert!(
+            check_domain_vector_contract(&no_schema)
+                .expect_err("a damaged schema line must fail")
+                .contains("missing its schema line"),
+        );
+
+        // And the undamaged fixture still passes, so none of the above is a blanket
+        // refusal that would also reject a healthy fixture.
+        assert!(check_domain_vector_contract(DOMAIN_VECTORS).is_ok());
+    }
 }
