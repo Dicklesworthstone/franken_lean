@@ -22,11 +22,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 mod checker;
+mod solver;
 
 pub use checker::{
     ProofCheckInconclusive, ProofCheckInternalFault, ProofCheckLimits, ProofCheckOutcome,
     ProofCheckReceipt, ProofCheckResource, ProofOpcodeClass, ProofRefusal, ProofStream,
     check_unsat_streams, check_unsat_streams_with_cancel,
+};
+pub use solver::{
+    CdclDeterminismPolicy, CheckedSat, CheckedSolverArtifact, CheckedUnsat,
+    DETERMINISTIC_CDCL_POLICY, IncrementalError, IncrementalSolver, PreparedSolve,
+    SolverInconclusive, SolverInternalFault, SolverLimits, SolverOutcome, SolverResource,
+    SolverStatistics, solve, solve_with_cancel,
 };
 
 const WIRE_MAGIC: [u8; 8] = *b"FLNVRDCT";
