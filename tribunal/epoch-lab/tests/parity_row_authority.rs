@@ -77,7 +77,7 @@ use fln_epoch_lab::oracle::{
     score_verdicts,
 };
 use fln_epoch_lab::parity::{
-    Assessment, Block, LEDGER_SCHEMA, Ledger, ROW_FIELDS, census, is_aggregate_symbol, parse,
+    Assessment, Block, Ledger, OUTCOME_SCHEMA, ROW_FIELDS, census, is_aggregate_symbol, parse,
     report, verify, verify_with_fixtures,
 };
 use std::path::PathBuf;
@@ -208,7 +208,7 @@ impl Row {
 }
 
 fn ledger_text(revision: &str, rows: &[Row]) -> String {
-    let mut s = format!("{LEDGER_SCHEMA}\nepoch v4.32.0\nrevision {revision}\n");
+    let mut s = format!("{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {revision}\n");
     for r in rows {
         s.push_str(&r.render());
         s.push('\n');
@@ -261,7 +261,7 @@ fn a_row_missing_any_required_field_does_not_parse() {
         let rest = &full[at + 1..];
         let end = rest.find(' ').map_or(full.len(), |e| at + 1 + e);
         let mutilated = format!("{}{}", &full[..at], &full[end..]);
-        let text = format!("{LEDGER_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n{mutilated}\n");
+        let text = format!("{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n{mutilated}\n");
         assert!(
             parse(&text).is_err(),
             "a row without {field:?} parsed anyway"
@@ -289,7 +289,7 @@ fn a_reordered_or_repeated_field_does_not_parse() {
     // Fixed field order keeps the file diffable and makes a reordered row a
     // refusal rather than a silent acceptance.
     let reordered = format!(
-        "{LEDGER_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n\
+        "{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n\
          row Nat.foo fixture_digest={FIXTURE_DIGEST} fixture=fixtures/nat.lean \
          ours_root={ROOT_A} oracle_root={ROOT_A} oracle=reference-binary \
          comparison=byte-identical normalizer=- claim=bounded_model \
@@ -316,14 +316,14 @@ fn hostile_input_is_refused_and_never_panics() {
     for text in [
         "",
         "not-a-schema",
-        LEDGER_SCHEMA,
-        &format!("{LEDGER_SCHEMA}\n"),
-        &format!("{LEDGER_SCHEMA}\nepoch v4.32.0\n"),
-        &format!("{LEDGER_SCHEMA}\nrevision {HEAD}\n"),
-        &format!("{LEDGER_SCHEMA}\nepoch v\nrevision r\nrow\n"),
-        &format!("{LEDGER_SCHEMA}\nepoch v\nrevision r\nrow x limits=\n"),
-        &format!("{LEDGER_SCHEMA}\nepoch v\nrevision r\nnonsense verb here\n"),
-        &format!("{LEDGER_SCHEMA}\nepoch v\nrevision r\nrow x y z limits=q\n"),
+        OUTCOME_SCHEMA,
+        &format!("{OUTCOME_SCHEMA}\n"),
+        &format!("{OUTCOME_SCHEMA}\nepoch v4.32.0\n"),
+        &format!("{OUTCOME_SCHEMA}\nrevision {HEAD}\n"),
+        &format!("{OUTCOME_SCHEMA}\nepoch v\nrevision r\nrow\n"),
+        &format!("{OUTCOME_SCHEMA}\nepoch v\nrevision r\nrow x limits=\n"),
+        &format!("{OUTCOME_SCHEMA}\nepoch v\nrevision r\nnonsense verb here\n"),
+        &format!("{OUTCOME_SCHEMA}\nepoch v\nrevision r\nrow x y z limits=q\n"),
     ] {
         assert!(parse(text).is_err(), "hostile input parsed: {text:?}");
     }
@@ -731,7 +731,7 @@ fn a_row_whose_fixture_verifies_is_accepted() {
         .into_parts()
         .0;
     let text = format!(
-        "{LEDGER_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n\
+        "{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n\
          row Nat.a fixture={fixture} fixture_digest={digest} \
          ours_root={ROOT_A} oracle_root={ROOT_A} ours_verdict=accepted \
          oracle_verdict=accepted assessment=agree disposition=- \

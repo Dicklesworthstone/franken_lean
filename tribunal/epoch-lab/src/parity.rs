@@ -122,21 +122,34 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// Schema line. Versioned: a change to what a row must name registers a NEW
 /// schema rather than reinterpreting rows already recorded under the old one.
 ///
-/// Version 2 is the per-side-outcome row of `fln-fei1`. The bump is not
-/// optional bookkeeping: a version-1 row cannot state what either side said, so
-/// a version-1 file read under these rules would have its silence mistaken for
-/// agreement — which is the exact defect the version exists to close.
+/// **The outcome record's own schema id — a distinct lineage, not a successor**
+/// (bead `franken_lean-otwd`, deciding the question `fln-fei1` surfaced).
 ///
-/// The bump also settles a collision. Two mutually unparseable grammars were
-/// both declaring `fln-parity-ledger/1`: this one, and the twelve-field
-/// pipe-separated inventory in `crates/fln-conformance/src/ledger.rs` that
-/// backs `ci/PARITY_LEDGER.txt`. One version string naming two file formats is
-/// how a reader ends up applying the wrong rules to a real artifact.
-/// [`refuses_the_inventory_grammar_that_shared_its_version_string`] pins the
-/// separation so it cannot silently return.
+/// This file answers *what happened when we compared a symbol against the
+/// oracle*: keyed `(symbol, platform, mode)`, carrying roots, oracle kind,
+/// comparison class, per-side verdicts, an assessment and a disposition.
+///
+/// It is **not** a version of the twelve-field pipe-separated **inventory** in
+/// `crates/fln-conformance/src/ledger.rs` that backs `ci/PARITY_LEDGER.txt` and
+/// keeps `fln-parity-ledger/1`. That record answers a different question —
+/// *which surface rows do we claim, and at what evidence level* — and is keyed
+/// `(surface, symbol, mode)`. Different question, different key, different
+/// grammar; neither parser accepts the other's file.
+///
+/// `fln-fei1` moved this record to `fln-parity-ledger/2`, which removed the live
+/// collision but left a worse reading in place: `/2` looks like the successor of
+/// `/1`, so a reader would reasonably assume the inventory is superseded and
+/// that rows migrate between them. They do not. Naming the lineages apart is the
+/// only version string that cannot be misread that way, and doing it **now** is
+/// nearly free precisely because this record has no published artifact yet —
+/// the same rename after publication would be a migration.
+///
+/// The version therefore restarts at 1: this is version 1 of the outcome record,
+/// not version 3 of anything. [`refuses_the_inventory_grammar_that_shared_its_version_string`]
+/// pins the separation so it cannot silently return.
 ///
 /// [`refuses_the_inventory_grammar_that_shared_its_version_string`]: self::structural::refuses_the_inventory_grammar_that_shared_its_version_string
-pub const LEDGER_SCHEMA: &str = "fln-parity-ledger/2";
+pub const OUTCOME_SCHEMA: &str = "fln-parity-outcome/1";
 
 /// What actually backed a run. Its own closed vocabulary — see the module note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -717,7 +730,7 @@ pub fn parse(text: &str) -> Result<Ledger, Vec<Block>> {
 
     let schema = lines.next();
     match schema {
-        Some((_, l)) if l.trim() == LEDGER_SCHEMA => {}
+        Some((_, l)) if l.trim() == OUTCOME_SCHEMA => {}
         Some((_, l)) => {
             return Err(vec![Block::BadSchema {
                 found: l.trim().to_string(),
@@ -1385,12 +1398,23 @@ mod structural {
         // this one takes line 1 verbatim — so the shared id was never a shared
         // format, only a shared name for two of them.
         //
-        // Version 2 separates them. This pins the separation: the id must have
-        // moved, and a file in the inventory grammar must be refused as what it
-        // is rather than parsed under rules written for something else.
-        assert_ne!(
-            LEDGER_SCHEMA, "fln-parity-ledger/1",
-            "the outcome ledger is back on the inventory record's version string"
+        // `fln-fei1` moved this record to `fln-parity-ledger/2`, which removed the
+        // collision but left `/2` reading as the successor of `/1`. Bead
+        // `franken_lean-otwd` decided the lineages are named apart instead, so the
+        // check is stronger than "the version moved": this record must not be in
+        // the inventory's NAME FAMILY AT ALL. A future `fln-parity-ledger/3` would
+        // otherwise reintroduce exactly the misreading, and a version-only
+        // assertion would not notice.
+        assert!(
+            !OUTCOME_SCHEMA.starts_with("fln-parity-ledger/"),
+            "the outcome record is back inside the inventory's name family \
+             ({OUTCOME_SCHEMA}); they are different lineages over different \
+             questions, not versions of each other"
+        );
+        assert_eq!(
+            OUTCOME_SCHEMA, "fln-parity-outcome/1",
+            "the outcome record's id is a governed decision (franken_lean-otwd), \
+             not an implementation detail"
         );
 
         let inventory = "schema fln-parity-ledger/1\n\
