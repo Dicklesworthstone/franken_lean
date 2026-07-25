@@ -299,6 +299,10 @@ pub enum WitnessComponent {
     ImportAll,
     Exported,
     IrTransitive,
+    /// The route witness that records how a module was first reached. Its own
+    /// component, because a missing first-discovery path is a different failure from
+    /// a missing data or import-all witness and must not be reported as one.
+    FirstDiscovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -881,7 +885,17 @@ fn propagate_candidate(
             .cloned()
             .unwrap_or_else(|| route_witness.clone())
     });
-    let first_path = route_witness.paths.first().cloned().unwrap_or_default();
+    // A discovered module always has at least one route path: `ComponentWitness::root`
+    // seeds one and `append` only extends. If that invariant ever breaks, the honest
+    // answer is a typed fault — substituting `ImportWitnessPath::default()` would
+    // publish an empty path as this module's first discovery, a plausible-looking
+    // value asserting it was reached by no import at all. Under FL-INV-07 an
+    // invariant failure is an InternalFault, never a fabricated result.
+    let first_path = route_witness
+        .paths
+        .first()
+        .cloned()
+        .ok_or_else(|| fault(WitnessComponent::FirstDiscovery))?;
 
     Ok(Some(Candidate {
         state: EffectiveImportState {
@@ -1739,6 +1753,87 @@ mod tests {
                     direct_row_index: 0,
                 }
             }
+        );
+    }
+
+    /// A discovered module always has at least one route path, so this state is
+    /// unreachable today — which is exactly why it must fault rather than default.
+    /// The rejected code substituted `ImportWitnessPath::default()`, publishing an
+    /// empty path as the module's first discovery: a plausible-looking value
+    /// asserting it was reached by no import at all. That is the same
+    /// substitute-a-plausible-default class as the witness collision in
+    /// franken_lean-f6br, and it is worse than a loud failure because nothing
+    /// downstream can tell the difference.
+    #[test]
+    fn a_missing_first_discovery_path_faults_instead_of_defaulting_to_empty() {
+        // Reaches the route-witness step with every component witness absent, so the
+        // route is `parent.route_witness.append(..)` — and `append` maps over `paths`,
+        // so an empty parent route stays empty.
+        let empty_route = PropagationContext {
+            import_all: false,
+            is_exported: false,
+            needs_data: false,
+            needs_ir_transitive: false,
+            import_all_witness: None,
+            exported_witness: None,
+            data_witness: None,
+            ir_transitive_witness: None,
+            route_witness: ComponentWitness {
+                paths: Vec::new().into(),
+            },
+        };
+        let mut facts = ClosureFacts::default();
+        // `Server` requests IR globally, so the candidate is not short-circuited as
+        // uninteresting before the route witness is built.
+        let outcome = propagate_candidate(
+            GlobalOLeanLevel::Server,
+            ImportSource::Root,
+            0,
+            &direct("A", 0),
+            &empty_route,
+            &mut facts,
+        );
+        assert_eq!(
+            outcome.expect_err("an absent first-discovery path is an invariant failure"),
+            ClosureInternalFault::MissingComponentWitness {
+                component: WitnessComponent::FirstDiscovery,
+                source: ImportSource::Root,
+                direct_row_index: 0,
+                target: id("A"),
+            },
+            "the fault must name the first-discovery component, not borrow another's"
+        );
+
+        // Not a blanket refusal: the identical request with a well-formed route
+        // witness still produces a candidate, so the fault is about the missing
+        // evidence and not about the request.
+        let healthy = PropagationContext {
+            route_witness: ComponentWitness::root(),
+            ..empty_route
+        };
+        let mut facts = ClosureFacts::default();
+        let candidate = propagate_candidate(
+            GlobalOLeanLevel::Server,
+            ImportSource::Root,
+            0,
+            &direct("A", 0),
+            &healthy,
+            &mut facts,
+        )
+        .expect("a seeded route witness is not a fault")
+        .expect("the candidate is produced");
+        // `ComponentWitness::root` seeds one empty path and this propagation appends
+        // exactly one step, so a real first-discovery witness has exactly one step —
+        // and is therefore distinguishable from the empty default the fix removed.
+        assert_eq!(
+            candidate.state.witnesses.first_discovery.steps.len(),
+            1,
+            "the healthy path must yield a first-discovery witness with a real step"
+        );
+        assert_ne!(
+            candidate.state.witnesses.first_discovery,
+            ImportWitnessPath::default(),
+            "a real witness must be distinguishable from the substituted default"
         );
     }
 
