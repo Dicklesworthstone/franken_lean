@@ -40,6 +40,8 @@
 //! completion order — collecting in completion order would produce a permutation and prove
 //! nothing about the lexer.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{BASES, FRAGMENTS, Rng, table, text_of};

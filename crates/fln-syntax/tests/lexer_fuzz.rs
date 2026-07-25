@@ -30,6 +30,8 @@
 //! (D1) — and because a fuzz failure nobody can reproduce is a rumour. Every assertion prints
 //! the seed and the input.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{FRAGMENTS, Rng, table};

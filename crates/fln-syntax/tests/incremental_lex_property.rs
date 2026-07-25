@@ -27,6 +27,8 @@
 //! `relex_incremental` therefore backs up by the lexer's real lookahead bound, and the
 //! targeted cases below are what make that bound falsifiable rather than asserted.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{BASES, Rng, random_insert, random_span, table, text_of};

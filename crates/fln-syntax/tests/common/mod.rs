@@ -5,6 +5,7 @@
 //! splitmix64 and every failure is replayable from the seed printed in the assertion. That is
 //! not a limitation to work around: a fuzz failure nobody can reproduce is a rumour.
 
+#![forbid(unsafe_code)]
 #![allow(dead_code)] // each suite uses a different subset
 
 use fln_syntax::source::{BytePos, ByteSpan, SourceText};
