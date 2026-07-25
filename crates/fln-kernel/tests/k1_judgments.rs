@@ -4478,6 +4478,112 @@ fn kr700_a_restricted_block_admits_with_prop_elimination() {
 }
 
 #[test]
+fn kr701_a_single_constructor_prop_carrying_data_is_elimination_restricted() {
+    // KR-701's subsingleton rule: a ONE-constructor `Prop` may eliminate large
+    // only if every non-parameter field is itself a Prop, or is pinned by the
+    // result's arguments. `S : Prop` with a single field `d : D`, `D : Sort 1`,
+    // satisfies neither — `D` is data, and `S` has no indices for `d` to occur
+    // in — so `S` eliminates ONLY into Prop, and the Prop-restricted recursor
+    // below is the one the kernel must regenerate.
+    //
+    // SOUNDNESS STAKE: large elimination here would let a proof of `S` be
+    // destructed into `Sort 1`, carrying the `D` witness out of Prop. That is
+    // proof-irrelevance broken at the recursor, not at a projection.
+    //
+    // WHY THIS TEST EXISTS: a mutation campaign inverted each half of the
+    // KR-701 test independently — the field-sort check and the
+    // occurs-in-result-args check — and BOTH mutants survived all 93 kernel
+    // tests. Every pre-existing KR-700/701 case used nullary constructors, so
+    // the field loop this rule lives in was never entered. The two-constructor
+    // rule above it was guarded; the single-constructor rule was not.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let s = || Expr::const_(n("S"), vec![]);
+    let d = || Expr::const_(n("D"), vec![]);
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+
+    let ind = InductiveVal {
+        base: cval(n("S"), vec![], prop()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("S")],
+        ctors: vec![nn("S", "mk")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let ctor = ConstructorVal {
+        base: cval(
+            nn("S", "mk"),
+            vec![],
+            Expr::forall_e(n("d"), d(), s(), BinderInfo::Default),
+        ),
+        induct: n("S"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+
+    // {motive : S -> Prop} -> (mk : (d : D) -> motive (S.mk d)) -> (t : S) -> motive t
+    let motive_ty = Expr::forall_e(n("t"), s(), prop(), BinderInfo::Default);
+    let minor_ty = Expr::forall_e(
+        n("d"),
+        d(),
+        Expr::app(bv(1), Expr::app(Expr::const_(nn("S", "mk"), vec![]), bv(0))),
+        BinderInfo::Default,
+    );
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("mk"),
+            minor_ty.clone(),
+            Expr::forall_e(n("t"), s(), Expr::app(bv(2), bv(0)), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    // fun motive mk d => mk d
+    let rhs = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(
+            n("mk"),
+            minor_ty,
+            Expr::lam(n("d"), d(), Expr::app(bv(1), bv(0)), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rec = RecursorVal {
+        base: cval(nn("S", "rec"), vec![], rec_ty),
+        all: vec![n("S")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 1,
+        rules: vec![RecursorRule {
+            ctor: nn("S", "mk"),
+            nfields: 1,
+            rhs,
+        }],
+        k: false,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &env,
+        &block_decl(vec![ind], vec![ctor], vec![rec]),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "a 1-ctor Prop with a data field must admit with Prop-RESTRICTED \
+         elimination; got {verdict:?}"
+    );
+}
+
+#[test]
 fn kr607_decoded_flags_are_cross_checked() {
     // The decoded is_rec flag is UNTRUSTED: MyNat decoded as non-recursive
     // must reject (a flags-comparison-drop mutant dies here).

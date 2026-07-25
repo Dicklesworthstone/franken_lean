@@ -2464,3 +2464,74 @@ fn collect_undeclared_param(level: &Level, declared: &[Name], found: &mut Option
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KR-202's substitution primitive: when `instantiate` consumes binder `k`,
+    /// every loose bvar ABOVE `k` must shift down by one, because the binder it
+    /// used to count past is gone.
+    ///
+    /// This is tested here, against the primitive, rather than through `check`,
+    /// because the branch is unreachable from the public surface: KR-100 rejects
+    /// terms with loose bvars, so in a closed term every bvar reached at depth
+    /// `k` has index at most `k`. A mutation campaign confirmed that directly —
+    /// dropping the `- 1` left all 93 kernel tests passing, and a panic planted
+    /// in the branch was never once reached by the suite.
+    ///
+    /// That makes the arm defensive code inside the TCB whose correctness rested
+    /// on an unstated precondition. It is one `pub(crate)` caller away from
+    /// being live, and a wrong shift there silently rebinds a variable to the
+    /// wrong binder — a term that still typechecks and means something else.
+    #[test]
+    fn instantiate_shifts_loose_bvars_down_past_the_consumed_binder() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let bv = |i: u32| Expr::bvar(i).expect("packs");
+        let subst = Expr::sort(Level::zero());
+
+        // `#0 #1` with binder 0 consumed: #0 becomes the substitute, and #1 —
+        // which pointed one binder further out — must become #0.
+        let open = Expr::app(bv(0), bv(1));
+        // `assert!` rather than `assert_eq!`: FLN-STRUCT-030 admits exactly
+        // {assert, format, matches, unreachable, vec} inside the kernel, so
+        // that every expansion maps to a reviewed, LOC-counted callsite.
+        assert!(
+            tc.instantiate(&open, 0, &subst, 0).expect("instantiates")
+                == Expr::app(subst.clone(), bv(0)),
+            "a free bvar above the consumed binder must shift down by one"
+        );
+
+        // The same law one binder deeper, where `k` has advanced to 1: #0 is
+        // the inner binder and is untouched, #2 shifts to #1.
+        let under_binder = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            subst.clone(),
+            Expr::app(bv(0), bv(2)),
+            fln_core::expr::BinderInfo::Default,
+        );
+        let expected = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            subst.clone(),
+            Expr::app(bv(0), bv(1)),
+            fln_core::expr::BinderInfo::Default,
+        );
+        assert!(
+            tc.instantiate(&under_binder, 0, &subst, 0)
+                .expect("instantiates")
+                == expected,
+            "the shift must apply under binders with k advanced, and must not \
+             disturb bvars bound inside the term"
+        );
+
+        // Bvars strictly below `k` are bound inside and must not move at all.
+        let inner_bound = Expr::app(bv(0), bv(0));
+        assert!(
+            tc.instantiate(&inner_bound, 1, &subst, 0)
+                .expect("instantiates")
+                == inner_bound,
+            "bvars below the consumed binder are untouched"
+        );
+    }
+}
