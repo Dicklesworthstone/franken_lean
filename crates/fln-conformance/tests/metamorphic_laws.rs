@@ -620,8 +620,7 @@ fn repeated_pinned_olean_decode_is_bit_identical() {
             "first decode failed for {fixture_name}: {}",
             first
                 .as_ref()
-                .err()
-                .expect("failed decode must include a typed error")
+                .expect_err("failed decode must include a typed error")
         );
         let first = first.expect("first decode was checked above");
         let second = decode_transcript(&bytes);
@@ -630,8 +629,7 @@ fn repeated_pinned_olean_decode_is_bit_identical() {
             "second decode failed for {fixture_name}: {}",
             second
                 .as_ref()
-                .err()
-                .expect("failed decode must include a typed error")
+                .expect_err("failed decode must include a typed error")
         );
         let second = second.expect("second decode was checked above");
         assert_eq!(
