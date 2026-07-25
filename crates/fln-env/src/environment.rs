@@ -12,9 +12,10 @@
 use std::sync::Arc;
 
 use fln_core::diag::{ResourceReason, StructuralUnit};
+use fln_core::expr::Expr;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
-use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
@@ -26,7 +27,9 @@ use crate::extensions::{
 };
 #[cfg(test)]
 use crate::extensions::{MergeSemantics, PayloadProvenance};
+use crate::modules::CancellationProbe;
 use crate::pmap::{CollisionBudget, CollisionExhausted, PKey, PMap};
+use crate::terms::WeightBudget;
 
 /// Stable `Domain::DeclContent` tags. These are schema values, not Rust enum
 /// discriminants: changing them requires an explicit identity/epoch decision.
@@ -76,6 +79,34 @@ pub enum DeclarationDimension {
     MutualRows,
     ConstructorRows,
     RecursorRules,
+}
+
+/// Frozen cancellation observation points for declaration preflight.
+///
+/// Numbered and fixed, because "cancellation is checked somewhere in here" is not a
+/// contract a caller can rely on: a probe that trips must produce the *same*
+/// checkpoint every run, or the outcome is schedule-dependent.
+///
+/// The row families are not a checkpoint. There is nothing to abandon there — every
+/// count is a `len()` on a materialized vector — and claiming a checkpoint that
+/// cannot fire would be an untruthful contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclarationCheckpoint {
+    /// Before measuring the expression at this frozen index. See
+    /// [`declaration_expressions`] for the order.
+    BeforeExpression(usize),
+}
+
+impl std::fmt::Display for DeclarationCheckpoint {
+    /// The wire form a cancellation carries in its `at` field. Stable, because a test
+    /// pins it and a caller distinguishing checkpoints reads it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeclarationCheckpoint::BeforeExpression(index) => {
+                write!(f, "before-expression/{index}")
+            }
+        }
+    }
 }
 
 impl DeclarationDimension {
@@ -140,6 +171,16 @@ pub struct DeclarationUsage {
     pub constructor_rows: u64,
     /// Recursor rule rows.
     pub recursor_rules: u64,
+    /// Expressions measured: the signature type, a body if the variant has one, and
+    /// one per recursor rule.
+    pub expressions: u64,
+    /// Distinct expression nodes stored across every expression, summed with checked
+    /// arithmetic.
+    pub expr_nodes: u64,
+    /// Total denoted (fully expanded) tree size across every expression, computed
+    /// without expanding it. `u128` because a shared graph denotes a tree that can
+    /// exceed `u64` while the graph itself stays small.
+    pub expanded_weight: u128,
 }
 
 impl DeclarationUsage {
@@ -164,6 +205,10 @@ pub struct DeclarationBudget {
     pub max_mutual_rows: u64,
     pub max_constructor_rows: u64,
     pub max_recursor_rules: u64,
+    /// Distinct expression nodes across **the whole declaration**, not per expression.
+    pub max_expr_nodes: u64,
+    /// Denoted tree size across the whole declaration.
+    pub max_expanded_weight: u64,
 }
 
 impl DeclarationBudget {
@@ -172,6 +217,8 @@ impl DeclarationBudget {
         max_mutual_rows: u64::MAX,
         max_constructor_rows: u64::MAX,
         max_recursor_rules: u64::MAX,
+        max_expr_nodes: u64::MAX,
+        max_expanded_weight: u64::MAX,
     };
 
     const fn get(&self, dimension: DeclarationDimension) -> u64 {
@@ -229,6 +276,9 @@ pub fn preflight_declaration_rows(
             ConstantInfo::Rec(v) => usize_to_u64(v.rules.len()),
             _ => 0,
         },
+        expressions: 0,
+        expr_nodes: 0,
+        expanded_weight: 0,
     };
 
     for dimension in DeclarationDimension::ORDER {
@@ -252,6 +302,147 @@ pub fn preflight_declaration_rows(
         }
     }
     Outcome::complete(usage)
+}
+
+/// Preflight one declaration's identity work in full: rows, then expressions.
+///
+/// Cheap dimensions first, and the order is the point rather than an optimisation.
+/// The row families are constant work per family, so refusing there costs nothing and
+/// prevents entering an input-sized traversal at all; only a declaration whose rows
+/// already fit pays for its expressions to be measured.
+///
+/// # Authority
+///
+/// One [`Outcome`]. Exhaustion and cancellation are both
+/// [`Outcome::Inconclusive`] — never a rejection, never an acceptance — and neither is
+/// cacheable. Exact totals exist only inside [`Outcome::Complete`]; on any non-answer
+/// the partial facts are deliberately not returned, because a partial usage total is a
+/// number that understates the work while looking like a measurement.
+///
+/// Nothing is hashed, published, or cached here on any path. In particular no
+/// provisional digest exists to be returned, logged, or cached, because preflight
+/// completes before hashing begins.
+///
+/// # What is still missing, and it is named rather than approximated
+///
+/// Canonical output bytes remain unreported: [`CanonWriter`] exposes no length and
+/// [`Canonical::write_body`] takes it concretely, so this crate cannot bound or even
+/// observe the encoded size without buffering the whole thing first — which is the
+/// defect, not the fix. Maximum logical depth is likewise unreported;
+/// [`crate::terms::WeightReport`] does not carry it today, and the iterative traversal
+/// already discharges depth's *safety* role even though the fact is unavailable.
+pub fn preflight_declaration(
+    info: &ConstantInfo,
+    budget: DeclarationBudget,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<DeclarationUsage> {
+    let mut usage = match preflight_declaration_rows(info, budget).non_answer_for() {
+        Ok(non_answer) => return non_answer,
+        Err(usage) => usage,
+    };
+    if let Some(non_answer) =
+        preflight_declaration_expressions(info, budget, cancellation, &mut usage)
+    {
+        return non_answer;
+    }
+    Outcome::complete(usage)
+}
+
+/// Every expression one declaration carries, in a frozen order.
+///
+/// The order is part of the contract, not an implementation detail: it is the order
+/// cancellation checkpoints are numbered in and the order a shared budget is spent
+/// in, so two runs over the same declaration abandon at the same expression and
+/// report the same primary stop. Signature type first, then the body a
+/// value-bearing variant has, then recursor rule right-hand sides in rule order.
+fn declaration_expressions(info: &ConstantInfo) -> Vec<&Expr> {
+    let mut expressions = vec![&info.constant_val().type_];
+    match info {
+        ConstantInfo::Defn(v) => expressions.push(&v.value),
+        ConstantInfo::Thm(v) => expressions.push(&v.value),
+        ConstantInfo::Opaque(v) => expressions.push(&v.value),
+        ConstantInfo::Rec(v) => expressions.extend(v.rules.iter().map(|rule| &rule.rhs)),
+        ConstantInfo::Axiom(_)
+        | ConstantInfo::Quot(_)
+        | ConstantInfo::Induct(_)
+        | ConstantInfo::Ctor(_) => {}
+    }
+    expressions
+}
+
+/// Measure every expression `info` carries, spending one shared budget across them.
+///
+/// # The budget is shared, not per-expression
+///
+/// A per-expression limit would be no limit at all for a recursor: a thousand rules
+/// each just under the cap costs a thousand times the cap. So each expression is
+/// measured against what is *left*, which is also why the expression order is frozen.
+///
+/// # Cancellation
+///
+/// Sampled once before each expression, at a fixed, numbered checkpoint. Cancellation
+/// is [`InconclusiveCause::Cancelled`], never a resource stop and never a rejection:
+/// `is_genuine_exhaustion` refuses a cancellation precisely so the two cannot be
+/// conflated, and the probe is an abstraction rather than a bare flag so a test can
+/// trip a chosen sample instead of always the first.
+///
+/// # Folding someone else's refusal
+///
+/// A stop inside [`crate::terms::expanded_weight`] is propagated **unchanged**, via
+/// [`Outcome::non_answer_for`]. Its `ResourceUsage` already carries the exact unit and
+/// numbers and its `progress` already names the unit that bound, so restating it in
+/// this layer's vocabulary would paraphrase a measurement this function did not make.
+/// The consequence is deliberate and worth knowing: on that path the reported stop
+/// speaks in the term-measurement vocabulary, and the partial declaration-level facts
+/// consumed so far are *not* claimed, because they are partial.
+fn preflight_declaration_expressions(
+    info: &ConstantInfo,
+    budget: DeclarationBudget,
+    cancellation: Option<&dyn CancellationProbe>,
+    usage: &mut DeclarationUsage,
+) -> Option<Outcome<DeclarationUsage>> {
+    for (index, expr) in declaration_expressions(info).into_iter().enumerate() {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Some(Outcome::Inconclusive(Inconclusive::cancelled(
+                DeclarationCheckpoint::BeforeExpression(index).to_string(),
+            )));
+        }
+
+        // What is left, so the limit is over the declaration rather than over each
+        // expression independently.
+        let remaining_nodes = budget.max_expr_nodes.saturating_sub(usage.expr_nodes);
+        let remaining_weight = u64::try_from(
+            u128::from(budget.max_expanded_weight).saturating_sub(usage.expanded_weight),
+        )
+        .unwrap_or(u64::MAX);
+        let measured = crate::terms::expanded_weight(
+            expr,
+            &WeightBudget::new(remaining_weight, remaining_nodes),
+        );
+        let report = match measured.non_answer_for::<DeclarationUsage>() {
+            Ok(non_answer) => return Some(non_answer),
+            Err(report) => report,
+        };
+
+        usage.expressions += 1;
+        // Checked, not saturating: a wrapped or clamped total is a usage fact that
+        // silently understates the work, which is worse than refusing to report one.
+        let Some(nodes) = usage.expr_nodes.checked_add(report.distinct_nodes) else {
+            return Some(Outcome::InternalFault(InternalFault::new(
+                "fln-env.declaration-usage.node-total-overflow",
+                "declaration expression node total overflowed u64",
+            )));
+        };
+        let Some(weight) = usage.expanded_weight.checked_add(report.expanded_weight) else {
+            return Some(Outcome::InternalFault(InternalFault::new(
+                "fln-env.declaration-usage.weight-total-overflow",
+                "declaration expanded-weight total overflowed u128",
+            )));
+        };
+        usage.expr_nodes = nodes;
+        usage.expanded_weight = weight;
+    }
+    None
 }
 
 /// The mutual-block members of `info`, or an empty slice for a variant that has none.
@@ -3525,6 +3716,266 @@ mod tests {
             );
             assert_eq!(again, refused);
         }
+    }
+
+    /// A probe that trips at a chosen sample rather than always the first, so a test
+    /// can pin the exact checkpoint instead of only proving that cancellation happens.
+    struct TripAt {
+        trip_on: std::cell::Cell<u32>,
+    }
+
+    impl TripAt {
+        fn new(sample: u32) -> TripAt {
+            TripAt {
+                trip_on: std::cell::Cell::new(sample),
+            }
+        }
+    }
+
+    impl CancellationProbe for TripAt {
+        fn is_cancelled(&self) -> bool {
+            let remaining = self.trip_on.get();
+            if remaining == 0 {
+                return true;
+            }
+            self.trip_on.set(remaining - 1);
+            false
+        }
+    }
+
+    /// Expression facts are exact, and the expression set is the frozen one.
+    #[test]
+    fn declaration_expression_usage_is_exact_and_covers_every_carried_expression() {
+        // Signature type only.
+        let axiom_usage = preflight_declaration(&axiom("A"), DeclarationBudget::UNBOUNDED, None)
+            .into_complete()
+            .expect("unbounded admits");
+        assert_eq!(axiom_usage.expressions, 1);
+        assert!(axiom_usage.expr_nodes >= 1);
+
+        // Signature plus a body.
+        let defn = all_bearing_decl(AllBearingKind::Definition, vec![n("a")]);
+        let defn_usage = preflight_declaration(&defn, DeclarationBudget::UNBOUNDED, None)
+            .into_complete()
+            .expect("unbounded admits");
+        assert_eq!(defn_usage.expressions, 2);
+
+        // Signature plus one right-hand side per recursor rule: the fixture has two.
+        let rec = all_bearing_decl(AllBearingKind::Recursor, vec![n("a")]);
+        let rec_usage = preflight_declaration(&rec, DeclarationBudget::UNBOUNDED, None)
+            .into_complete()
+            .expect("unbounded admits");
+        assert_eq!(rec_usage.expressions, 3);
+        assert_eq!(
+            rec_usage.expressions,
+            usize_to_u64(declaration_expressions(&rec).len()),
+            "the measured expression count must equal the frozen expression set"
+        );
+
+        // Repeatable: the same declaration measured twice reports identical facts, so
+        // the facts are a property of the value rather than of the run.
+        assert_eq!(
+            rec_usage,
+            preflight_declaration(&rec, DeclarationBudget::UNBOUNDED, None)
+                .into_complete()
+                .expect("unbounded admits")
+        );
+    }
+
+    /// A recursor whose signature and every rule right-hand side is genuinely
+    /// multi-node. The shared `all_bearing_decl` fixture uses single-node bodies, which
+    /// cannot distinguish a shared budget from a per-expression one — with one node per
+    /// expression the two agree.
+    fn multi_node_recursor() -> ConstantInfo {
+        let multi = |head: &str| {
+            Expr::app(
+                Expr::const_(n(head), vec![Level::param(n("u"))]),
+                Expr::sort(Level::param(n("u"))),
+            )
+        };
+        ConstantInfo::Rec(RecursorVal {
+            base: ConstantVal {
+                name: n("d"),
+                level_params: vec![n("u")],
+                type_: multi("carrier"),
+            },
+            all: vec![n("d")],
+            num_params: 2,
+            num_indices: 1,
+            num_motives: 1,
+            num_minors: 2,
+            rules: vec![
+                RecursorRule {
+                    ctor: n("mk"),
+                    nfields: 3,
+                    rhs: multi("body"),
+                },
+                RecursorRule {
+                    ctor: n("mkAlt"),
+                    nfields: 4,
+                    rhs: multi("bodyAlt"),
+                },
+            ],
+            k: true,
+            is_unsafe: true,
+        })
+    }
+
+    /// The node budget is shared across the declaration, not granted per expression.
+    #[test]
+    fn declaration_expression_budget_is_shared_across_expressions() {
+        let rec = multi_node_recursor();
+        let total = preflight_declaration(&rec, DeclarationBudget::UNBOUNDED, None)
+            .into_complete()
+            .expect("unbounded admits");
+        assert!(
+            total.expressions > 1 && total.expr_nodes > total.expressions,
+            "the fixture must carry several multi-node expressions for this to mean anything"
+        );
+
+        // Exactly enough for the whole declaration admits.
+        assert!(
+            matches!(
+                preflight_declaration(
+                    &rec,
+                    DeclarationBudget {
+                        max_expr_nodes: total.expr_nodes,
+                        ..DeclarationBudget::UNBOUNDED
+                    },
+                    None,
+                ),
+                Outcome::Complete(_)
+            ),
+            "a budget equal to the exact total must admit"
+        );
+
+        // One short refuses, and it refuses as a non-answer rather than a rejection.
+        let refused = preflight_declaration(
+            &rec,
+            DeclarationBudget {
+                max_expr_nodes: total.expr_nodes - 1,
+                ..DeclarationBudget::UNBOUNDED
+            },
+            None,
+        );
+        assert_eq!(refused.authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            refused.cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
+        );
+        let (usage, _) = resource_stop(&refused).expect("one short must be a resource stop");
+        assert!(usage.is_genuine_exhaustion());
+
+        // The shared-budget claim, stated as the thing a per-expression limit would
+        // get wrong: the largest single expression fits well inside the total, so a
+        // per-expression cap of that size would have admitted a declaration whose
+        // aggregate exceeds it.
+        let largest = declaration_expressions(&rec)
+            .into_iter()
+            .map(|expr| {
+                crate::terms::expanded_weight(expr, &WeightBudget::new(u64::MAX, u64::MAX))
+                    .into_complete()
+                    .expect("unbounded admits")
+                    .distinct_nodes
+            })
+            .max()
+            .expect("the fixture carries expressions");
+        assert!(
+            largest < total.expr_nodes,
+            "a per-expression budget would not have bound this declaration"
+        );
+    }
+
+    /// Cancellation is a distinct non-answer at a frozen, numbered checkpoint.
+    #[test]
+    fn declaration_preflight_cancellation_is_typed_at_a_frozen_checkpoint() {
+        let rec = all_bearing_decl(AllBearingKind::Recursor, vec![n("a")]);
+        for sample in 0..3u32 {
+            let probe = TripAt::new(sample);
+            let cancelled = preflight_declaration(&rec, DeclarationBudget::UNBOUNDED, Some(&probe));
+            let Outcome::Inconclusive(inconclusive) = &cancelled else {
+                unreachable!("a tripped probe must stop preflight")
+            };
+            let InconclusiveCause::Cancelled { at } = &inconclusive.cause else {
+                unreachable!("cancellation must not be reported as exhaustion")
+            };
+            assert_eq!(
+                at.text(),
+                DeclarationCheckpoint::BeforeExpression(sample as usize).to_string(),
+                "the probe must stop at the checkpoint it was set for"
+            );
+            // Cancellation is not exhaustion, and the taxonomy enforces that rather
+            // than leaving it to convention.
+            assert!(resource_stop(&cancelled).is_none());
+            assert_eq!(cancelled.authority(), Authority::NonAuthoritative);
+        }
+
+        // An untripped probe must not change the answer.
+        let probe = TripAt::new(u32::MAX);
+        assert_eq!(
+            preflight_declaration(&rec, DeclarationBudget::UNBOUNDED, Some(&probe))
+                .into_complete()
+                .expect("an untripped probe admits"),
+            preflight_declaration(&rec, DeclarationBudget::UNBOUNDED, None)
+                .into_complete()
+                .expect("no probe admits")
+        );
+    }
+
+    /// A refused preflight leaves the environment value-, root- and sharing-identical,
+    /// and an adequate-budget retry produces the same digest and root.
+    #[test]
+    fn refused_declaration_preflight_publishes_nothing_and_retries_identically() {
+        let options = KVMap::new();
+        let base = Environment::new()
+            .add_decl(axiom("Existing"))
+            .expect("base builds");
+        let base_root = base.logical_root(&options);
+        let info = all_bearing_decl(AllBearingKind::Recursor, vec![n("a"), n("b")]);
+
+        let refused = preflight_declaration(
+            &info,
+            DeclarationBudget {
+                max_expr_nodes: 1,
+                ..DeclarationBudget::UNBOUNDED
+            },
+            None,
+        );
+        assert!(refused.into_complete().is_err(), "the budget must bind");
+
+        // Untouched: same value, same logical root, and still sharing with the
+        // snapshot taken before the refusal.
+        let after = base.clone();
+        assert_eq!(base_root, base.logical_root(&options));
+        assert_eq!(base_root, after.logical_root(&options));
+        assert!(base.find(&n("Existing")).is_some());
+        assert!(
+            base.find(info.name()).is_none(),
+            "a refused declaration must not be reachable"
+        );
+
+        // The retry is identical, which is the claim that makes a refusal safe to
+        // recover from rather than merely safe to observe.
+        let admitted = preflight_declaration(&info, DeclarationBudget::UNBOUNDED, None)
+            .into_complete()
+            .expect("adequate budget admits");
+        assert_eq!(admitted.expressions, 3);
+        let published = base.add_decl(info.clone()).expect("admission succeeds");
+        let published_again = base
+            .add_decl(info.clone())
+            .expect("admission succeeds again");
+        assert_eq!(
+            Environment::decl_content_digest(&info),
+            Environment::decl_content_digest(&info)
+        );
+        assert_eq!(
+            published.logical_root(&options),
+            published_again.logical_root(&options),
+            "an adequate-budget retry must reproduce the same logical root"
+        );
+        assert_ne!(base_root, published.logical_root(&options));
     }
 
     /// An unset budget behaves exactly as the pre-budget code did, and preflight
