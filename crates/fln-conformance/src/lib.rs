@@ -7,6 +7,10 @@
 //! Bootstrap layout:
 //! * [`ledger`] — the row-per-symbol Parity Ledger schema (§18.1): parse, validate,
 //!   aggregate; headline percentages are never accepted as evidence (D6);
+//! * [`corpus`] — the corpus's durable-format descriptors as a projection of
+//!   `fln_hash::canon::SCHEMA_REGISTRY` (bead franken_lean-dgxa, Appendix B): one
+//!   specification feeds both the codecs and the corpus, joined in both directions,
+//!   and a coverage claim carries the exercise that demonstrates it;
 //! * [`naming`] — the suite-wide subsystem-name registry (`ci/SUBSYSTEM_REGISTRY.txt`)
 //!   and the current-vocabulary scanner (bead fln-7gr6): reserved codenames cannot
 //!   silently re-enter governed prose, contracts, schemas, or mutable bead fields;
@@ -25,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod corpus;
 pub mod ledger;
 pub mod naming;
 pub mod normalize;

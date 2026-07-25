@@ -45,6 +45,7 @@ dependencies = [
  "fln-hash",
  "fln-kernel",
  "fln-olean",
+ "fln-verdict",
 ]
 
 [[package]]
