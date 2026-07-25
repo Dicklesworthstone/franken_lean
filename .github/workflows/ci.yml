@@ -587,7 +587,7 @@ jobs:
           fi
           exit "$command_rc"
 
-      - name: e2e smoke — environment collision determinism and resource bounds
+      - name: e2e smoke — environment snapshots and collision children
         id: environment_collision
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
         shell: bash
@@ -603,14 +603,22 @@ jobs:
           mapfile -d '' -t parent_bundles < <(
             find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
           )
+          parent_artifact=""
           artifact=""
           resource_artifact=""
           capture_rc=0
           if (( ${#parent_bundles[@]} != 1 )); then
-            echo "environment collision lane published ${#parent_bundles[@]} parent bundles; expected exactly one" >&2
+            echo "environment snapshots lane published ${#parent_bundles[@]} parent bundles; expected exactly one" >&2
             capture_rc=2
           else
-            candidate="${parent_bundles[0]}/collision-fln-amv.10"
+            parent_candidate="${parent_bundles[0]}"
+            if [[ -L "$parent_candidate" || ! -d "$parent_candidate" ]]; then
+              echo "environment snapshots parent bundle is missing or not a real directory: $parent_candidate" >&2
+              capture_rc=2
+            else
+              parent_artifact="$parent_candidate"
+            fi
+            candidate="$parent_candidate/collision-fln-amv.10"
             if [[ -L "$candidate" || ! -d "$candidate" ]]; then
               echo "environment collision child bundle is missing or not a real directory: $candidate" >&2
               capture_rc=2
@@ -626,6 +634,7 @@ jobs:
             fi
           fi
           {
+            printf 'parent_artifact_path=%s\n' "$parent_artifact"
             printf 'artifact_path=%s\n' "$artifact"
             printf 'resource_artifact_path=%s\n' "$resource_artifact"
             printf 'command_exit=%s\n' "$command_rc"
@@ -715,6 +724,7 @@ jobs:
           CLOSURE_EXIT: ${{ steps.closure_audit.outputs.command_exit }}
           CONTRACT_HANDOFF_ARTIFACT: ${{ steps.contract_handoff.outputs.artifact_path }}
           CONTRACT_HANDOFF_EXIT: ${{ steps.contract_handoff.outputs.command_exit }}
+          ENV_SNAPSHOTS_ARTIFACT: ${{ steps.environment_collision.outputs.parent_artifact_path }}
           ENVIRONMENT_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.artifact_path }}
           ENVIRONMENT_RESOURCE_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.resource_artifact_path }}
           ENVIRONMENT_COLLISION_EXIT: ${{ steps.environment_collision.outputs.command_exit }}
@@ -750,6 +760,8 @@ jobs:
                   "structure-gate",
                   "closure-audit",
                   "contract-handoff",
+                  # env_snapshots is the sole parent bundle at this shared root;
+                  # the two collision scenarios are its named children.
                   "environment-collision",
                   "vellum-naming",
                   "verdict-schema",
@@ -797,6 +809,13 @@ jobs:
                   os.environ.get("CONTRACT_HANDOFF_ARTIFACT", ""),
                   os.environ.get("CONTRACT_HANDOFF_EXIT", ""),
                   e2e_root / "contract-handoff",
+                  True,
+              ),
+              (
+                  "env_snapshots",
+                  os.environ.get("ENV_SNAPSHOTS_ARTIFACT", ""),
+                  os.environ.get("ENVIRONMENT_COLLISION_EXIT", ""),
+                  e2e_root / "environment-collision",
                   True,
               ),
               (

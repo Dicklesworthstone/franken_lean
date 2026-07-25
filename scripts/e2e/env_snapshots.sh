@@ -43,6 +43,13 @@ OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-67108864}"
 TIMEOUT_MS="${FLN_E2E_TIMEOUT_MS:-1200000}"
 GRACE_MS="${FLN_E2E_KILL_GRACE_MS:-2000}"
 READY_WAIT_MS="${FLN_E2E_READY_WAIT_MS:-30000}"
+if ! [[ "$READY_WAIT_MS" =~ ^[0-9]+$ ]]; then
+  echo "[env_snapshots] setup failure: FLN_E2E_READY_WAIT_MS must be an integer" >&2
+  exit 2
+fi
+if ((READY_WAIT_MS > 30000)); then
+  READY_WAIT_MS=30000
+fi
 CACHE_STATE="${FLN_E2E_CACHE_STATE:-uncontrolled}"
 START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 SEQ=0
@@ -1084,6 +1091,74 @@ mutations = {
     w.u8(payload_provenance_tag(descriptor.provenance));
 }""",
     ),
+    "declaration_budget_check_omission": (
+        b"""    const ORDER: [DeclarationDimension; 5] = [
+        DeclarationDimension::LevelParams,
+        DeclarationDimension::MutualRows,""",
+        b"""    const ORDER: [DeclarationDimension; 5] = [
+        DeclarationDimension::LevelParams,
+        DeclarationDimension::LevelParams,""",
+    ),
+    "declaration_cancellation_as_resource": (
+        b"""        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Some(Outcome::Inconclusive(Inconclusive::cancelled(
+                DeclarationCheckpoint::BeforeExpression(index).to_string(),
+            )));
+        }""",
+        b"""        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Some(Outcome::Inconclusive(
+                Inconclusive::resource(ResourceUsage {
+                    reason: ResourceReason::StructuralBudget {
+                        unit: StructuralUnit::ProducedNodes,
+                    },
+                    allowed: 0,
+                    observed: 1,
+                })
+                .with_progress(DeclarationCheckpoint::BeforeExpression(index).to_string()),
+            ));
+        }""",
+    ),
+    "declaration_plan_base_binding_omission": (
+        b"""        if !self.is_valid_for(env) {
+            return Outcome::Inconclusive(Inconclusive::authority_incomplete(
+                "declaration admission plan decided against a superseded environment",
+            ));
+        }
+""",
+        b"",
+    ),
+    "declaration_bytes_unit_hardcoded": (
+        b"""                    reason: ResourceReason::StructuralBudget {
+                        unit: dimension.unit(),
+                    },""",
+        b"""                    reason: ResourceReason::StructuralBudget {
+                        unit: StructuralUnit::ProducedNodes,
+                    },""",
+    ),
+    "checkpoint_base_digest_collision": (
+        b"""                let usage = if base.journal.is_same_structure(&retained_base.journal) {""",
+        b"""                let usage = if true {""",
+    ),
+    "checkpoint_prefix_digest_collision": (
+        b"""                match bounded_prefix_divergence(self, base, proof) {""",
+        b"""                match Ok::<Option<usize>, (ProofDimension, u128, u128)>(None) {""",
+    ),
+    "checkpoint_schema_omission": (
+        b"""        if checkpoint.schema_version != EXTENSION_CHECKPOINT_SCHEMA_VERSION {""",
+        b"""        if false && checkpoint.schema_version != EXTENSION_CHECKPOINT_SCHEMA_VERSION {""",
+    ),
+    "checkpoint_cumulative_facts_omission": (
+        b"""        if journal.len != checkpoint.captured_entries
+            || journal.payload_bytes != checkpoint.captured_payload_bytes""",
+        b"""        if false && journal.len != checkpoint.captured_entries
+            || journal.payload_bytes != checkpoint.captured_payload_bytes""",
+    ),
+    "checkpoint_entry_identity_omission": (
+        b"""        if derive_entry_ids(&checkpoint.epoch, &checkpoint.descriptor, journal)
+            != checkpoint.entry_ids""",
+        b"""        if false && derive_entry_ids(&checkpoint.epoch, &checkpoint.descriptor, journal)
+            != checkpoint.entry_ids""",
+    ),
 }
 try:
     anchor, replacement = mutations[seed]
@@ -1167,6 +1242,51 @@ run_identity_path_mutant_recovery extension_descriptor \
   extensions::tests::descriptor_identity_matrix_matches_model_and_logical_roots \
   'extensions::tests::descriptor_identity_matrix_matches_model_and_logical_roots --- FAILED' \
   'descriptor identity diverged from the independent layout model'
+run_identity_path_mutant_recovery declaration_budget_check_omission \
+  fln-env/src/environment.rs declaration_budget_check_omission \
+  environment::tests::declaration_row_preflight_admits_at_exact_and_refuses_one_over \
+  'environment::tests::declaration_row_preflight_admits_at_exact_and_refuses_one_over --- FAILED' \
+  'one over budget must refuse with a resource stop'
+run_identity_path_mutant_recovery declaration_cancellation_as_resource \
+  fln-env/src/environment.rs declaration_cancellation_as_resource \
+  environment::tests::declaration_preflight_cancellation_is_typed_at_a_frozen_checkpoint \
+  'environment::tests::declaration_preflight_cancellation_is_typed_at_a_frozen_checkpoint --- FAILED' \
+  'cancellation must not be reported as exhaustion'
+run_identity_path_mutant_recovery declaration_plan_base_binding_omission \
+  fln-env/src/environment.rs declaration_plan_base_binding_omission \
+  environment::tests::a_failed_declaration_admission_leaves_the_base_untouched \
+  'environment::tests::a_failed_declaration_admission_leaves_the_base_untouched --- FAILED' \
+  'a superseded plan must not publish'
+run_identity_path_mutant_recovery declaration_bytes_unit_hardcoded \
+  fln-env/src/environment.rs declaration_bytes_unit_hardcoded \
+  environment::tests::declaration_row_preflight_admits_at_exact_and_refuses_one_over \
+  'environment::tests::declaration_row_preflight_admits_at_exact_and_refuses_one_over --- FAILED' \
+  'StructuralBudget'
+run_identity_path_mutant_recovery checkpoint_base_digest_collision \
+  fln-env/src/extensions.rs checkpoint_base_digest_collision \
+  extensions::tests::equal_length_and_equal_digest_unequal_histories_are_refused \
+  'extensions::tests::equal_length_and_equal_digest_unequal_histories_are_refused --- FAILED' \
+  'an equal-digest different history must still be refused'
+run_identity_path_mutant_recovery checkpoint_prefix_digest_collision \
+  fln-env/src/extensions.rs checkpoint_prefix_digest_collision \
+  extensions::tests::capture_refuses_a_base_that_only_matches_the_prefix_digest \
+  'extensions::tests::capture_refuses_a_base_that_only_matches_the_prefix_digest --- FAILED' \
+  'an equal-digest non-prefix base must still be refused at capture'
+run_identity_path_mutant_recovery checkpoint_schema_omission \
+  fln-env/src/extensions.rs checkpoint_schema_omission \
+  extensions::tests::full_journal_binding_omissions_each_die_for_their_own_typed_reason \
+  'extensions::tests::full_journal_binding_omissions_each_die_for_their_own_typed_reason --- FAILED' \
+  'assertion failed: matches!(schema_refused, CheckpointError::UnsupportedVersion'
+run_identity_path_mutant_recovery checkpoint_cumulative_facts_omission \
+  fln-env/src/extensions.rs checkpoint_cumulative_facts_omission \
+  extensions::tests::full_journal_binding_omissions_each_die_for_their_own_typed_reason \
+  'extensions::tests::full_journal_binding_omissions_each_die_for_their_own_typed_reason --- FAILED' \
+  'declared facts that disagree with the journal must be refused'
+run_identity_path_mutant_recovery checkpoint_entry_identity_omission \
+  fln-env/src/extensions.rs checkpoint_entry_identity_omission \
+  extensions::tests::capture_binds_the_epoch_and_ordered_entry_ids \
+  'extensions::tests::capture_binds_the_epoch_and_ordered_entry_ids --- FAILED' \
+  'ids that do not re-derive must be refused'
 
 identity_emit_event() {
   local sequence="$IDENTITY_SEQ"
