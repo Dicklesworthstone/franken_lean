@@ -98,6 +98,68 @@ impl std::fmt::Display for EditError {
     }
 }
 
+/// Update a line index in place for one replacement, **without reading the text**
+/// (bead franken_lean-0sv9).
+///
+/// The signature is the cost proof. This function has no access to the rope's bytes, so
+/// its work cannot be proportional to the file: it reads the existing index and the
+/// inserted text and nothing else. A measured benchmark would show the same thing more
+/// weakly — timings drift and a regression can hide inside noise — whereas a function that
+/// *cannot* touch the file is proportional to the edit by construction.
+///
+/// The rule follows entirely from the index's definition ([`scan_line_starts`]): a start
+/// `s` exists exactly when byte `s - 1` is `\n`. So for a replacement of `span` by
+/// `insert`:
+///
+/// * starts at or before `span.start` are untouched — their producing `\n` is before the
+///   edit. This is also why an edit at byte 0 cannot disturb line 0's start, BOM or not.
+/// * starts in `[span.start + 1, span.end]` are dropped — their producing `\n` lay inside
+///   the replaced range.
+/// * every `\n` in `insert` contributes a new start.
+/// * starts after `span.end` shift by `insert.len() - span.len()`.
+///
+/// The line-ending traps need no special cases *because* of that definition, which is the
+/// argument for defining it that way. Splitting a CRLF by inserting between the `\r` and
+/// the `\n` does not change which bytes are `\n`, so the start merely shifts; deleting the
+/// `\n` of a CRLF removes exactly that start and leaves the `\r` as ordinary content; a
+/// lone `\r` never had a start to lose. Nothing normalizes, and no terminator is invented.
+///
+/// Cost is O(inserted bytes + starts after the edit). Not O(1): a shift touches every
+/// later start, so an edit at the top of a large file is proportional to its line count.
+/// That is a real improvement on the O(file bytes) recompute it replaces — typically by
+/// the average line length — but it is not the O(edit + lines touched) that a
+/// tree-structured index would give, and the difference is recorded rather than glossed.
+fn splice_line_starts(starts: &mut Vec<BytePos>, span: ByteSpan, insert: &str) {
+    let removed = span.len_bytes();
+    let inserted = insert.len();
+    let keep_through = span.start().0;
+    let drop_through = span.end().0;
+
+    // Everything strictly after the replaced range shifts; everything inside it goes.
+    let mut rebuilt: Vec<BytePos> = Vec::with_capacity(starts.len() + 1);
+    let mut tail: Vec<BytePos> = Vec::new();
+    for start in starts.iter().copied() {
+        if start.0 <= keep_through {
+            rebuilt.push(start);
+        } else if start.0 > drop_through {
+            // Signed arithmetic avoided: the shift is applied as two unsigned steps so a
+            // deletion larger than the offset cannot underflow. It never can — a start
+            // after the range is at least span.end, and removed <= span.end — but relying
+            // on that silently is how an underflow ships in a release build.
+            tail.push(BytePos(start.0 + inserted - removed));
+        }
+    }
+
+    // New starts from the insertion, at their absolute offsets.
+    for (offset, byte) in insert.bytes().enumerate() {
+        if byte == b'\n' {
+            rebuilt.push(BytePos(keep_through + offset + 1));
+        }
+    }
+    rebuilt.extend(tail);
+    *starts = rebuilt;
+}
+
 /// An editable source text that shares its original bytes.
 #[derive(Debug, Clone)]
 pub struct Rope {
@@ -105,8 +167,14 @@ pub struct Rope {
     added: String,
     pieces: Vec<Piece>,
     len_bytes: usize,
-    /// Derived view of the current bytes, dropped by every edit. `None` means "not
-    /// computed since the last change", never "empty".
+    /// The line index, maintained INCREMENTALLY by every edit (bead franken_lean-0sv9).
+    /// Always current, so line queries never trigger a scan and there is no "stale index"
+    /// state to represent.
+    line_starts: Vec<BytePos>,
+    /// The full text as a [`SourceText`], for callers that want one. Dropped by every edit
+    /// and rebuilt on demand; `None` means "not materialized since the last change", never
+    /// "empty". Materializing is O(bytes), which is why line queries below do NOT go
+    /// through it.
     materialized: Option<SourceText>,
 }
 
@@ -130,6 +198,7 @@ impl Rope {
             added: String::new(),
             pieces,
             len_bytes,
+            line_starts: text.line_starts().to_vec(),
             materialized: Some(text),
         })
     }
@@ -175,12 +244,30 @@ impl Rope {
             let text = self.to_string_lossless();
             // Infallible: every piece came from validated UTF-8 and pieces are only ever
             // split on char boundaries, which `edit` enforces before splicing.
-            self.materialized = Some(
-                SourceText::from_utf8(text.as_bytes())
-                    .expect("pieces are only split on char boundaries"),
-            );
+            // Built from the maintained index rather than rescanning, so the two can
+            // never disagree by construction. `from_parts` debug-asserts equality with a
+            // full scan, which turns any splice bug into a loud failure in test builds.
+            self.materialized = Some(SourceText::from_parts(text, self.line_starts.clone()));
         }
         self.materialized.as_ref().expect("just computed")
+    }
+
+    /// Number of lines, from the maintained index. No text materialization.
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+
+    /// Byte offset of the start of `line`, from the maintained index.
+    pub fn line_start(&self, line: usize) -> Option<BytePos> {
+        self.line_starts.get(line).copied()
+    }
+
+    /// The line containing `at`, from the maintained index.
+    pub fn line_of(&self, at: BytePos) -> usize {
+        match self.line_starts.binary_search(&at) {
+            Ok(exact) => exact,
+            Err(insert) => insert.saturating_sub(1),
+        }
     }
 
     /// Project a byte offset, as [`SourceText::position_of`] does over the current bytes.
@@ -300,8 +387,11 @@ impl Rope {
 
         self.pieces = rebuilt;
         self.len_bytes = self.len_bytes - span.len_bytes() + insert.len();
-        // The derived index is dropped, not patched. See the module note: this is what
-        // makes a stale index unrepresentable rather than merely tested against.
+        // The line index is UPDATED, not dropped — that is this bead's whole point, and
+        // the update cannot read the text, so it is proportional to the edit.
+        splice_line_starts(&mut self.line_starts, span, insert);
+        // The full materialization is still dropped: rebuilding it is O(bytes), and only
+        // callers that explicitly want a SourceText pay for it.
         self.materialized = None;
         Ok(())
     }
@@ -320,6 +410,7 @@ impl Rope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::scan_line_starts;
 
     /// A tiny deterministic generator. Seeded so any failure replays exactly, and
     /// hand-rolled because the dependency universe is closed (D1).
@@ -351,6 +442,178 @@ mod tests {
             at -= 1;
         }
         at
+    }
+
+    /// **The differential for the incremental index** (bead franken_lean-0sv9): after every
+    /// edit, the maintained index must equal a full rescan of the resulting bytes.
+    ///
+    /// This is the only honest proof for an incremental structure. Incremental bugs hide
+    /// until a particular edit ORDER triggers them, so a handful of hand-written cases
+    /// cannot establish the property — the same reason the rope itself is differentiated
+    /// against a flat buffer. The insertion alphabet is weighted towards line terminators
+    /// and the bytes around them, because that is where a splice rule goes wrong.
+    #[test]
+    fn the_incremental_line_index_equals_a_full_rescan_after_every_edit() {
+        for seed in [
+            0x494E_4445_5800_0001u64,
+            0x494E_4445_5800_0002,
+            0x494E_4445_5800_0003,
+            0x494E_4445_5800_0004,
+            0x494E_4445_5800_0005,
+        ] {
+            let mut rng = Seeded(seed);
+            let start: Vec<u8> = [
+                crate::source::BOM,
+                "a\r\nb\nc\rd\ne".as_bytes(),
+                "π\r\n漢\n".as_bytes(),
+            ]
+            .concat();
+            let mut rope = Rope::from_utf8(&start).expect("valid");
+            let mut flat = String::from_utf8(start).expect("valid");
+
+            for step in 0..60 {
+                // Terminators and their neighbours dominate on purpose.
+                let inserts = [
+                    "", "\n", "\r", "\r\n", "\n\r", "\n\n", "x", "π", "\u{FEFF}", "a\nb\nc",
+                ];
+                let insert = inserts[rng.below(inserts.len())];
+                let a = floor_boundary(&flat, rng.below(flat.len() + 1));
+                let b = floor_boundary(&flat, rng.below(flat.len() + 1));
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                let span = ByteSpan::new(BytePos(lo), BytePos(hi)).expect("forward");
+
+                rope.replace(span, insert).unwrap_or_else(|error| {
+                    panic!("seed {seed:#x} step {step}: refused a valid edit: {error}")
+                });
+                flat.replace_range(lo..hi, insert);
+
+                // THE ASSERTION: the maintained index is exactly what a scan would produce.
+                let expected = scan_line_starts(&flat);
+                assert_eq!(
+                    rope.line_starts, expected,
+                    "seed {seed:#x} step {step}: incremental index diverged from a rescan \
+                     (edit {lo}..{hi} -> {insert:?})"
+                );
+
+                // And the queries built on it agree, including the byte length, so an index
+                // that is right cannot sit beside a length that is not.
+                assert_eq!(rope.len_bytes(), flat.len());
+                assert_eq!(rope.line_count(), expected.len());
+                for line in 0..=expected.len() {
+                    assert_eq!(rope.line_start(line), expected.get(line).copied());
+                }
+                // One probed offset per step: line_of over every byte every step would be
+                // quadratic, and the index equality above already covers the whole file.
+                if let Some((offset, _)) = flat.char_indices().nth(rng.below(flat.len().max(1))) {
+                    let fresh = SourceText::from_utf8(flat.as_bytes()).expect("valid");
+                    assert_eq!(
+                        rope.line_of(BytePos(offset)),
+                        fresh.line_of(BytePos(offset)),
+                        "seed {seed:#x} step {step}: line_of disagreed at byte {offset}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The splice rule stated directly, case by case — the cases a naive newline scan gets
+    /// wrong, each named so a failure says which rule broke.
+    ///
+    /// Note what this test does NOT pass in: the text. `splice_line_starts` cannot read it,
+    /// which is the cost claim made structural — a function without access to the file
+    /// cannot be proportional to it. A benchmark would say the same thing more weakly.
+    #[test]
+    fn the_splice_rule_handles_every_line_boundary_case() {
+        let starts = |offsets: &[usize]| offsets.iter().map(|o| BytePos(*o)).collect::<Vec<_>>();
+        let span = |a: usize, b: usize| ByteSpan::new(BytePos(a), BytePos(b)).expect("forward");
+
+        // An edit wholly inside one line touches no other start.
+        let mut index = starts(&[0, 4, 9]);
+        splice_line_starts(&mut index, span(5, 6), "XY");
+        assert_eq!(index, starts(&[0, 4, 10]), "only later starts shift");
+
+        // Inserting a newline adds exactly one start, at the right absolute offset.
+        let mut index = starts(&[0, 4]);
+        splice_line_starts(&mut index, span(6, 6), "\n");
+        assert_eq!(index, starts(&[0, 4, 7]));
+
+        // Deleting a newline JOINS two lines: its start disappears.
+        let mut index = starts(&[0, 4, 9]);
+        splice_line_starts(&mut index, span(3, 4), "");
+        assert_eq!(
+            index,
+            starts(&[0, 8]),
+            "the start produced by the deleted \\n is gone"
+        );
+
+        // A deletion spanning SEVERAL newlines removes all of their starts.
+        let mut index = starts(&[0, 3, 6, 9, 12]);
+        splice_line_starts(&mut index, span(2, 10), "");
+        assert_eq!(index, starts(&[0, 4]));
+
+        // SPLITTING A CRLF: inserting between the \r and the \n does not change which bytes
+        // are \n, so the start merely shifts. This is the case the bead calls out.
+        let mut index = starts(&[0, 3]); // "a\r\nb" -> \n at 2, start at 3
+        splice_line_starts(&mut index, span(2, 2), "X");
+        assert_eq!(
+            index,
+            starts(&[0, 4]),
+            "the \\n still starts a line, one byte later"
+        );
+
+        // Deleting the \n of a CRLF removes the start and leaves the \r as content.
+        let mut index = starts(&[0, 3]);
+        splice_line_starts(&mut index, span(2, 3), "");
+        assert_eq!(index, starts(&[0]));
+
+        // An edit at byte 0 never disturbs line 0's start — BOM or not.
+        let mut index = starts(&[0, 5]);
+        splice_line_starts(&mut index, span(0, 0), "\u{FEFF}");
+        assert_eq!(index, starts(&[0, 8]), "line 0 still starts at 0");
+
+        // Replacing the whole text with text containing terminators rebuilds from scratch.
+        let mut index = starts(&[0, 3, 7]);
+        splice_line_starts(&mut index, span(0, 9), "p\nq\n");
+        assert_eq!(index, starts(&[0, 2, 4]));
+
+        // An empty replacement of an empty span is a no-op.
+        let mut index = starts(&[0, 4]);
+        let before = index.clone();
+        splice_line_starts(&mut index, span(2, 2), "");
+        assert_eq!(index, before);
+    }
+
+    /// Trailing-terminator behaviour, which is where "line count" definitions usually rot.
+    #[test]
+    fn a_missing_or_added_final_terminator_is_described_not_normalized() {
+        // No final newline: two lines, and nothing invents a third.
+        let mut rope = Rope::from_utf8(b"a\nb").expect("valid");
+        assert_eq!(rope.line_count(), 2);
+
+        // Adding one at the very end adds exactly one start, and does NOT add a further
+        // empty line beyond it.
+        rope.insert(BytePos(3), "\n").expect("at end");
+        assert_eq!(rope.line_count(), 3);
+        assert_eq!(rope.line_start(2), Some(BytePos(4)));
+        assert_eq!(rope.to_string_lossless(), "a\nb\n");
+        assert_eq!(rope.line_starts, scan_line_starts("a\nb\n"));
+
+        // Removing it again returns to two lines — no terminator is retained or invented.
+        let span = ByteSpan::new(BytePos(3), BytePos(4)).expect("forward");
+        rope.delete(span).expect("valid");
+        assert_eq!(rope.line_count(), 2);
+        assert_eq!(rope.to_string_lossless(), "a\nb");
+
+        // A lone CR starts nothing, before or after an edit.
+        let mut cr = Rope::from_utf8(b"a\rb").expect("valid");
+        assert_eq!(cr.line_count(), 1);
+        cr.insert(BytePos(3), "\rc").expect("at end");
+        assert_eq!(
+            cr.line_count(),
+            1,
+            "carriage returns are content, not terminators"
+        );
+        assert_eq!(cr.line_starts, scan_line_starts("a\rb\rc"));
     }
 
     #[test]
@@ -578,16 +841,31 @@ mod tests {
         );
     }
 
+    /// The two derived things an edit touches, and they are touched DIFFERENTLY — which is
+    /// the change bead franken_lean-0sv9 made, so the test says which is which rather than
+    /// lumping them together as "the derived index".
     #[test]
-    fn the_derived_index_is_dropped_by_an_edit_rather_than_patched() {
+    fn an_edit_patches_the_line_index_and_drops_the_full_materialization() {
         let mut rope = Rope::from_utf8(b"a\nb").expect("valid");
-        // Force the cache to exist.
+        // Force the full materialization to exist.
         assert_eq!(rope.source_text().line_count(), 2);
         assert!(rope.materialized.is_some());
         rope.insert(BytePos(3), "\nc").expect("end");
         assert!(
             rope.materialized.is_none(),
-            "an edit must drop the derived index, not update it in place"
+            "the FULL materialization is O(bytes), so an edit must drop it rather than \
+             rebuild it eagerly"
+        );
+        // The line index, by contrast, is maintained: current immediately, no scan.
+        assert_eq!(
+            rope.line_starts,
+            scan_line_starts("a\nb\nc"),
+            "the line index must be patched by the edit, not left stale or dropped"
+        );
+        assert_eq!(rope.line_count(), 3, "answered without materializing");
+        assert!(
+            rope.materialized.is_none(),
+            "a line query must not have forced a materialization"
         );
         // And the recomputation is correct rather than merely present.
         assert_eq!(rope.source_text().line_count(), 3);

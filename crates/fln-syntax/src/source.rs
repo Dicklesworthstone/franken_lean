@@ -145,13 +145,30 @@ impl SourceText {
     }
 
     fn from_string(text: String) -> SourceText {
-        let mut line_starts = vec![BytePos(0)];
-        for (offset, byte) in text.bytes().enumerate() {
-            if byte == b'\n' {
-                line_starts.push(BytePos(offset + 1));
-            }
-        }
+        let line_starts = scan_line_starts(&text);
         SourceText { text, line_starts }
+    }
+
+    /// Build from a text and a line index computed elsewhere.
+    ///
+    /// Exists so the rope can maintain its index incrementally (bead franken_lean-0sv9)
+    /// without this module having to expose the field. Crate-private and debug-checked
+    /// against a full scan, because a caller-supplied index is an invariant this type
+    /// otherwise establishes for itself, and the whole value of the incremental path is
+    /// that it agrees with the scan.
+    pub(crate) fn from_parts(text: String, line_starts: Vec<BytePos>) -> SourceText {
+        debug_assert_eq!(
+            line_starts,
+            scan_line_starts(&text),
+            "a supplied line index must equal what a full scan produces"
+        );
+        SourceText { text, line_starts }
+    }
+
+    /// The line index this type would compute for itself — the reference an incremental
+    /// index is differentiated against.
+    pub(crate) fn line_starts(&self) -> &[BytePos] {
+        &self.line_starts
     }
 
     /// **Exactly the bytes handed in.** The losslessness law rests on this.
@@ -267,6 +284,24 @@ impl SourceText {
         }
         (consumed == target).then_some(BytePos(at))
     }
+}
+
+/// The authoritative definition of the line index: the offset just past every `\n`.
+///
+/// Deliberately keyed on `\n` alone, which is what makes the line-ending cases fall out
+/// rather than needing special handling. A CRLF's `\n` starts a line and its `\r` is
+/// ordinary content of the previous line; a lone `\r` starts nothing; a BOM is content of
+/// line 0, which always starts at 0; and a file with no final terminator still ends a line
+/// without gaining a start for a line that is not there. Nothing here rewrites a byte, so
+/// the index describes the bytes that are present rather than a tidied version of them.
+pub(crate) fn scan_line_starts(text: &str) -> Vec<BytePos> {
+    let mut line_starts = vec![BytePos(0)];
+    for (offset, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(BytePos(offset + 1));
+        }
+    }
+    line_starts
 }
 
 /// A byte offset projected into the three units of [`SourceText::position_of`].
