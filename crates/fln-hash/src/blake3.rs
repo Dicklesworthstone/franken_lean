@@ -19,6 +19,9 @@ const CHUNK_START: u32 = 1 << 0;
 const CHUNK_END: u32 = 1 << 1;
 const PARENT: u32 = 1 << 2;
 const ROOT: u32 = 1 << 3;
+/// Reached only through `Hasher::new_keyed`; see the note there for why the mode is
+/// retained even though the program's own hashing never selects it.
+#[cfg_attr(not(test), allow(dead_code))]
 const KEYED_HASH: u32 = 1 << 4;
 const DERIVE_KEY_CONTEXT: u32 = 1 << 5;
 const DERIVE_KEY_MATERIAL: u32 = 1 << 6;
@@ -322,6 +325,15 @@ impl Hasher {
 
     /// Keyed hash mode: the 32-byte key supplies the key words, KEYED_HASH
     /// flag on every compression (spec §2.5).
+    ///
+    /// The registry never selects this mode — domain separation goes through
+    /// `derive_key` — so nothing outside `mod tests` calls it. It is retained
+    /// deliberately: the official vector suite checks all three modes on every row,
+    /// and `ci/PARITY_LEDGER.txt` carries an L2 `BLAKE3.keyed_hash` row that those
+    /// vectors are the evidence for. Dropping it would retire a ledger row, which is
+    /// not a refactor. The allow is scoped to non-test builds so that if the vector
+    /// suite ever stops exercising it, the warning comes back.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_keyed(key: &[u8; KEY_LEN]) -> Hasher {
         Hasher::new_internal(words_from_le_key(key), KEYED_HASH)
     }
@@ -414,6 +426,14 @@ impl Default for Hasher {
 }
 
 /// One-shot regular BLAKE3 hash of `input` (spec §2.4).
+///
+/// Unkeyed hashing is not something the program does — every digest names a domain —
+/// so this has no caller outside `mod tests`. Retained for the same reason as
+/// [`Hasher::new_keyed`]: the official vectors check the one-shot result against the
+/// incremental one on every row (a digest that agreed with itself under one path only
+/// would hide a chunk-boundary bug), and `ci/PARITY_LEDGER.txt` has an L2
+/// `BLAKE3.hash` row resting on that.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn hash(input: &[u8]) -> [u8; OUT_LEN] {
     Hasher::new().update(input).finalize()
 }
