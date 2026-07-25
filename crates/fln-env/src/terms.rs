@@ -44,7 +44,9 @@
 
 use std::collections::HashMap;
 
+use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
+use fln_core::outcome::{BoundedText, Inconclusive, InconclusiveCause, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 
@@ -214,12 +216,175 @@ pub fn alpha_canonical_digest(root: &Expr) -> Digest {
         .unwrap_or(Digest([0; 32]))
 }
 
+/// What a caller allows one term to cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeightBudget {
+    /// Maximum size of the tree the DAG denotes.
+    pub max_expanded_weight: u64,
+    /// Maximum number of distinct nodes visited. Bounds the traversal itself, so a
+    /// term that is merely enormous (rather than merely deep) also stops.
+    pub max_distinct_nodes: u64,
+}
+
+impl WeightBudget {
+    pub const fn new(max_expanded_weight: u64, max_distinct_nodes: u64) -> Self {
+        Self {
+            max_expanded_weight,
+            max_distinct_nodes,
+        }
+    }
+}
+
+/// Exact cost facts for one term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeightReport {
+    /// Size of the tree the DAG denotes.
+    pub expanded_weight: u128,
+    /// Distinct nodes actually stored.
+    pub distinct_nodes: u64,
+    /// Child edges traversed.
+    pub edges: u64,
+}
+
+impl WeightReport {
+    /// How much smaller the stored DAG is than the tree it denotes. `1` means no
+    /// sharing at all; larger means the term is shared.
+    pub fn sharing_factor(&self) -> u128 {
+        let distinct = u128::from(self.distinct_nodes).max(1);
+        self.expanded_weight / distinct
+    }
+}
+
+/// A budget stop, in the structural-budget axis `franken_lean-vui8` added.
+///
+/// The unit matters and is not decoration: `ExpandedWeight` says the DENOTED tree
+/// was too large, `ProducedNodes` says the STORED graph was. A caller that cannot
+/// tell them apart cannot react — shrinking the input helps the second and may not
+/// help the first at all. Neither is a statement that the term is malformed, which is
+/// the distinction the taxonomy now lets this seam make rather than collapse.
+fn exhausted(unit: StructuralUnit, allowed: u64, observed: u64) -> Inconclusive {
+    Inconclusive {
+        cause: InconclusiveCause::ResourceExhausted {
+            usage: ResourceUsage {
+                reason: ResourceReason::StructuralBudget { unit },
+                allowed,
+                // A stop must report spending past its allowance or it is not a stop;
+                // `is_genuine_exhaustion` depends on it.
+                observed: observed.max(allowed.saturating_add(1)),
+            },
+        },
+        diagnostic: None,
+        // Where the traversal had got to. Diagnostic only: `allowed`/`observed` size
+        // a retry, this says which measurement bound so a caller can tell a denoted
+        // -size stop from a stored-graph one at a glance.
+        progress: Some(Box::new(BoundedText::new(unit.as_str()))),
+    }
+}
+
+/// Measure what `root` expands to, refusing before the budget is exceeded.
+///
+/// **Charges for what the term DENOTES, not what it looks like.** A term's wire size
+/// and its stored node count are both blind to sharing: `f x x` over a chain of
+/// shared nodes is small on disk, small in memory, and astronomical expanded, because
+/// each level that references the level below it twice doubles the tree it denotes.
+/// A size check that counts bytes or distinct nodes waves that through, and the work
+/// it triggers later dies far from the input that caused it — usually as an
+/// allocation abort rather than a diagnosis. This is the same shape as the fln-olean
+/// defect fixed in `c26b8ed`: a length that escapes the budget before the storage it
+/// implies is charged.
+///
+/// Returns [`Outcome::Complete`] with exact facts, or [`Outcome::Inconclusive`] when a
+/// budget binds. It never rejects — a term over budget is not a term judged
+/// ill-formed — and the outcome's own `cache_admission` refuses to memoize it.
+pub fn expanded_weight(root: &Expr, budget: &WeightBudget) -> Outcome<WeightReport> {
+    // Phase 1: collect distinct nodes in post-order, iteratively. An explicit stack is
+    // what makes a deep term a measurement rather than a stack overflow.
+    let mut order: Vec<*const ExprNode> = Vec::new();
+    let mut seen: HashMap<*const ExprNode, ()> = HashMap::new();
+    let mut nodes: Vec<&Expr> = Vec::new();
+    let mut edges: u64 = 0;
+
+    enum Step<'a> {
+        Enter(&'a Expr),
+        Exit(&'a Expr),
+    }
+    let mut stack = vec![Step::Enter(root)];
+    let mut kids: Vec<&Expr> = Vec::new();
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Enter(expr) => {
+                let key = node_key(expr);
+                if seen.insert(key, ()).is_some() {
+                    continue;
+                }
+                if u64::try_from(seen.len()).unwrap_or(u64::MAX) > budget.max_distinct_nodes {
+                    return Outcome::Inconclusive(exhausted(
+                        StructuralUnit::ProducedNodes,
+                        budget.max_distinct_nodes,
+                        u64::try_from(seen.len()).unwrap_or(u64::MAX),
+                    ));
+                }
+                stack.push(Step::Exit(expr));
+                kids.clear();
+                children(expr.node(), &mut kids);
+                for child in kids.iter().rev() {
+                    stack.push(Step::Enter(child));
+                }
+            }
+            Step::Exit(expr) => {
+                order.push(node_key(expr));
+                nodes.push(expr);
+            }
+        }
+    }
+
+    // Phase 2: fold weights in post-order, so every child is already resolved.
+    // Checked u128 throughout: a bomb must stop AT THE BUDGET, never wrap into a
+    // small number that then passes.
+    let allowed = u128::from(budget.max_expanded_weight);
+    let mut weights: HashMap<*const ExprNode, u128> = HashMap::with_capacity(order.len());
+    for expr in &nodes {
+        kids.clear();
+        children(expr.node(), &mut kids);
+        let mut weight: u128 = 1;
+        for child in &kids {
+            edges = edges.saturating_add(1);
+            let child_weight = weights.get(&node_key(child)).copied().unwrap_or(1);
+            match weight.checked_add(child_weight) {
+                Some(next) => weight = next,
+                None => {
+                    return Outcome::Inconclusive(exhausted(
+                        StructuralUnit::ExpandedWeight,
+                        budget.max_expanded_weight,
+                        u64::MAX,
+                    ));
+                }
+            }
+        }
+        if weight > allowed {
+            return Outcome::Inconclusive(exhausted(
+                StructuralUnit::ExpandedWeight,
+                budget.max_expanded_weight,
+                u64::try_from(weight).unwrap_or(u64::MAX),
+            ));
+        }
+        weights.insert(node_key(expr), weight);
+    }
+
+    Outcome::Complete(WeightReport {
+        expanded_weight: weights.get(&node_key(root)).copied().unwrap_or(1),
+        distinct_nodes: u64::try_from(order.len()).unwrap_or(u64::MAX),
+        edges,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fln_core::level::Level;
     use fln_core::name::Name;
     use fln_core::options::{DataValue, KVMap};
+    use fln_core::outcome::CacheAdmission;
 
     fn n(value: &str) -> Name {
         Name::str(Name::anonymous(), value)
@@ -430,6 +595,122 @@ mod tests {
             alpha_canonical_digest(&shared),
             "repeated computation must agree"
         );
+    }
+
+    const GENEROUS: WeightBudget = WeightBudget::new(u64::MAX, u64::MAX);
+
+    fn weight_of(expr: &Expr) -> WeightReport {
+        match expanded_weight(expr, &GENEROUS) {
+            Outcome::Complete(report) => report,
+            other => panic!("expected a complete measurement, got {other:?}"),
+        }
+    }
+
+    /// On a tree, expanded weight is just the node count — the case where a naive
+    /// size check happens to be right, pinned so the model is anchored somewhere
+    /// obvious.
+    #[test]
+    fn expanded_weight_of_an_unshared_term_is_its_node_count() {
+        assert_eq!(weight_of(&c("a")).expanded_weight, 1);
+        let report = weight_of(&Expr::app(c("f"), c("a")));
+        assert_eq!(report.expanded_weight, 3, "f, a, and the application");
+        assert_eq!(report.distinct_nodes, 3);
+        assert_eq!(report.edges, 2);
+        assert_eq!(
+            report.sharing_factor(),
+            1,
+            "an unshared term shares nothing"
+        );
+    }
+
+    /// Sharing is measured, not assumed: the same subterm used twice is stored once
+    /// and counted twice.
+    #[test]
+    fn sharing_is_measured_exactly() {
+        let shared = Expr::app(c("f"), c("a"));
+        let report = weight_of(&Expr::app(shared.clone(), shared));
+        assert_eq!(report.distinct_nodes, 4, "outer app, inner app, f, a");
+        assert_eq!(report.expanded_weight, 7, "1 + 3 + 3");
+    }
+
+    /// THE ADVERSARIAL CASE. Each level references the level below it twice, so the
+    /// stored DAG grows by one node while the tree it denotes doubles. This is the
+    /// term a byte or node count waves through and a later traversal dies on — the
+    /// same shape as the fln-olean length that escaped its budget in c26b8ed.
+    #[test]
+    fn a_dag_bomb_is_typed_inconclusive_rather_than_an_abort() {
+        let mut bomb = c("leaf");
+        for _ in 0..40 {
+            bomb = Expr::app(bomb.clone(), bomb);
+        }
+
+        // Wire-small by every naive measure, astronomical by the one that counts.
+        let report = weight_of(&bomb);
+        assert_eq!(report.distinct_nodes, 41, "the stored DAG really is tiny");
+        assert!(
+            report.expanded_weight > 1_000_000_000_000,
+            "the tree it denotes really is astronomical: {}",
+            report.expanded_weight
+        );
+        assert!(report.sharing_factor() > 1_000_000_000);
+
+        // Under a realistic budget it stops, as an FL-INV-07 inconclusive: not a
+        // rejection of the term, and never cacheable.
+        let outcome = expanded_weight(&bomb, &WeightBudget::new(100_000, u64::MAX));
+        match &outcome {
+            Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+                InconclusiveCause::ResourceExhausted { usage } => {
+                    assert_eq!(usage.allowed, 100_000);
+                    assert!(
+                        usage.is_genuine_exhaustion(),
+                        "a stop must report spending past its allowance"
+                    );
+                    // The unit is the point: DENOTED size, not stored size, and not
+                    // a claim that the term is malformed.
+                    assert_eq!(
+                        usage.reason,
+                        ResourceReason::StructuralBudget {
+                            unit: StructuralUnit::ExpandedWeight
+                        }
+                    );
+                }
+                other => panic!("expected resource exhaustion, got {other:?}"),
+            },
+            other => panic!("expected inconclusive, got {other:?}"),
+        }
+        assert!(
+            matches!(outcome.cache_admission(), CacheAdmission::Refused { .. }),
+            "an exhausted measurement must never be cacheable"
+        );
+    }
+
+    /// The distinct-node budget bounds the traversal itself, and reports a DIFFERENT
+    /// unit — a caller shrinking its input can act on that, and could not if both
+    /// stops collapsed into one reason.
+    #[test]
+    fn the_distinct_node_budget_stops_under_its_own_unit() {
+        let mut wide = c("leaf");
+        for _ in 0..2_000u32 {
+            wide = Expr::app(wide, Expr::const_(n("f"), vec![Level::param(n("u"))]));
+        }
+        let outcome = expanded_weight(&wide, &WeightBudget::new(u64::MAX, 100));
+        match &outcome {
+            Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+                InconclusiveCause::ResourceExhausted { usage } => assert_eq!(
+                    usage.reason,
+                    ResourceReason::StructuralBudget {
+                        unit: StructuralUnit::ProducedNodes
+                    },
+                    "a stored-graph stop must not be reported as a denoted-size stop"
+                ),
+                other => panic!("expected resource exhaustion, got {other:?}"),
+            },
+            other => panic!("expected inconclusive, got {other:?}"),
+        }
+        assert!(matches!(
+            outcome.cache_admission(),
+            CacheAdmission::Refused { .. }
+        ));
     }
 
     /// Totality on the degenerate shape: deep terms are digested on the heap, not the
