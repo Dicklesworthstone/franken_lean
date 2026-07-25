@@ -27,7 +27,7 @@ use crate::extensions::{
 };
 #[cfg(test)]
 use crate::extensions::{MergeSemantics, PayloadProvenance};
-use crate::modules::CancellationProbe;
+use crate::modules::{CancellationProbe, ModuleEpoch};
 use crate::pmap::{CollisionBudget, CollisionExhausted, PKey, PMap};
 use crate::terms::WeightBudget;
 
@@ -1018,6 +1018,7 @@ impl Environment {
         base: Option<&Environment>,
         limits: CheckpointLimits,
         proof: ProofBudget,
+        epoch: &ModuleEpoch,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Outcome<Result<ExtensionCheckpoint, EnvError>> {
         let Some(state) = self.extension(extension) else {
@@ -1037,7 +1038,7 @@ impl Environment {
             None => None,
         };
         state
-            .try_checkpoint(base_state, limits, proof, cancellation)
+            .try_checkpoint(base_state, limits, proof, epoch, cancellation)
             .map_complete(|captured| captured.map_err(EnvError::Checkpoint))
     }
 
@@ -1965,6 +1966,7 @@ mod tests {
             Some(&base),
             limits,
             ProofBudget::UNBOUNDED,
+            &crate::extensions::fixture_epoch(),
             None,
         ))
         .expect("environment suffix captures");
@@ -2038,6 +2040,7 @@ mod tests {
             None,
             limits,
             ProofBudget::UNBOUNDED,
+            &crate::extensions::fixture_epoch(),
             None,
         ))
         .expect("full environment checkpoint captures");
@@ -2059,6 +2062,7 @@ mod tests {
                 None,
                 limits,
                 ProofBudget::UNBOUNDED,
+                &crate::extensions::fixture_epoch(),
                 None
             )),
             Err(EnvError::UnknownExtension { .. })

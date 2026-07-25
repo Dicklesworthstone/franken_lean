@@ -21,7 +21,15 @@ use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, hash};
 
-use crate::modules::CancellationProbe;
+use crate::modules::{CancellationProbe, ModuleEpoch};
+use crate::provenance::ExtensionEntryId;
+
+/// The epoch fixtures capture under, so the ~35 existing `checkpoint` call sites keep
+/// their shape. Test-only: production capture takes its epoch from the caller.
+#[cfg(test)]
+pub(crate) fn fixture_epoch() -> ModuleEpoch {
+    ModuleEpoch::new("v4.32.0", "0000000000000000000000000000000000000000")
+}
 
 /// Declared merge semantics for one extension — the contract branch/merge consults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -963,6 +971,23 @@ fn bounded_prefix_divergence(
     Ok(None)
 }
 
+/// Content identities for the entries a checkpoint carries, in journal order.
+///
+/// Uses the crate's existing [`ExtensionEntryId::derive`], which binds epoch tag, epoch
+/// commit, descriptor name and all three descriptor semantic tags, then the payload. So one
+/// mechanism binds epoch, descriptor and value together, and the payload is hashed rather
+/// than retained.
+fn derive_entry_ids(
+    epoch: &ModuleEpoch,
+    descriptor: &ExtensionDescriptor,
+    journal: &ExtensionJournal,
+) -> Arc<[ExtensionEntryId]> {
+    journal
+        .records()
+        .map(|record| ExtensionEntryId::derive(epoch, descriptor, &record.entry.payload))
+        .collect()
+}
+
 /// The logical footprint a checkpoint retains beyond the entries it carries.
 ///
 /// **Logical attributed accounting, not allocator ownership.** These are counts of
@@ -1033,6 +1058,20 @@ enum CheckpointPayload {
 pub struct ExtensionCheckpoint {
     schema_version: u16,
     descriptor: ExtensionDescriptor,
+    /// The epoch this checkpoint was captured under (bead
+    /// `fln-extension-history-checkpoint-identity-41s`).
+    ///
+    /// Bound at CAPTURE time, not supplied at restore, because a self-contained checkpoint
+    /// that cannot state its own epoch is not self-contained. It is also an input to every
+    /// [`ExtensionEntryId`] below, so the binding is by DERIVATION rather than comparison:
+    /// the same payloads under a different epoch produce different ids.
+    epoch: ModuleEpoch,
+    /// Content identities of the carried entries, in journal order.
+    ///
+    /// Derived from epoch, descriptor and payload through the crate's existing
+    /// [`ExtensionEntryId`] mechanism, not a new one. Identity is stored; the bytes stay
+    /// `Arc`-backed in the journal, so payload identity is bound without copying payload.
+    entry_ids: Arc<[ExtensionEntryId]>,
     captured_entries: usize,
     captured_payload_bytes: u128,
     payload: CheckpointPayload,
@@ -1060,6 +1099,31 @@ impl ExtensionCheckpoint {
 
     pub fn captured_payload_bytes(&self) -> u128 {
         self.captured_payload_bytes
+    }
+
+    /// The epoch this checkpoint was captured under.
+    ///
+    /// A caller that requires a checkpoint from its own epoch compares this and refuses;
+    /// that policy is the caller's. Restore validates the entry ids against THIS epoch,
+    /// which catches tampering but deliberately does not decide whose epoch is correct.
+    pub fn epoch(&self) -> &ModuleEpoch {
+        &self.epoch
+    }
+
+    /// Content identities of the carried entries, in journal order.
+    pub fn entry_ids(&self) -> &[ExtensionEntryId] {
+        &self.entry_ids
+    }
+
+    /// Bounded test seam: forge the recorded entry ids so they no longer re-derive.
+    ///
+    /// Needed because capture always derives ids consistently, so nothing in normal
+    /// operation can make the restore-side check fire — and a check nothing can make fire
+    /// is unfalsifiable.
+    #[cfg(test)]
+    fn forge_entry_ids(mut self, entry_ids: Arc<[ExtensionEntryId]>) -> Self {
+        self.entry_ids = entry_ids;
+        self
     }
 
     /// Bounded test seam: forge the declared schema version.
@@ -1163,6 +1227,16 @@ pub enum CheckpointResource {
 /// Every checkpoint refusal is classified and leaves all input snapshots unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointError {
+    /// The carried entries' re-derived identities do not match the recorded ones.
+    ///
+    /// A completed determination. Epoch, descriptor and every payload value are inputs to
+    /// [`ExtensionEntryId::derive`], so this fires when any of them has moved since
+    /// capture — including ids carried over from a different epoch.
+    EntryIdentityMismatch {
+        extension: Name,
+        epoch_tag: String,
+        entries: usize,
+    },
     /// A [`PreparedExtensionHistory`] was committed against a base it was not decided
     /// against, or under a superseded schema.
     ///
@@ -1243,6 +1317,17 @@ pub enum CheckpointError {
 impl std::fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CheckpointError::EntryIdentityMismatch {
+                extension,
+                epoch_tag,
+                entries,
+            } => write!(
+                f,
+                "extension `{}` checkpoint carries {entries} entries whose identities do not \
+                 re-derive under its own epoch `{epoch_tag}`: a payload, the descriptor, or \
+                 the epoch has moved since capture",
+                extension.to_display_string()
+            ),
             CheckpointError::PlanSuperseded { extension } => write!(
                 f,
                 "extension `{}` history plan was decided against a different base or schema; \
@@ -1498,6 +1583,7 @@ impl ExtensionState {
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
         proof: ProofBudget,
+        epoch: &ModuleEpoch,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Outcome<Result<ExtensionCheckpoint, CheckpointError>> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -1505,7 +1591,7 @@ impl ExtensionState {
                 CheckpointProofCheckpoint::BeforeBaseProof.to_string(),
             ));
         }
-        let captured = match self.checkpoint_bounded(base, limits, proof) {
+        let captured = match self.checkpoint_bounded(base, limits, proof, epoch) {
             Ok(captured) => captured,
             Err(stop) => return Outcome::Inconclusive(stop),
         };
@@ -1526,7 +1612,7 @@ impl ExtensionState {
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
     ) -> Result<ExtensionCheckpoint, CheckpointError> {
-        self.checkpoint_bounded(base, limits, ProofBudget::UNBOUNDED)
+        self.checkpoint_bounded(base, limits, ProofBudget::UNBOUNDED, &fixture_epoch())
             .expect("an unbounded proof budget cannot bind")
     }
 
@@ -1536,9 +1622,10 @@ impl ExtensionState {
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
         proof: ProofBudget,
+        epoch: &ModuleEpoch,
     ) -> Result<Result<ExtensionCheckpoint, CheckpointError>, Inconclusive> {
         Ok(self
-            .checkpoint_with_work(base, limits, proof)?
+            .checkpoint_with_work(base, limits, proof, epoch)?
             .map(|(checkpoint, work)| {
                 debug_assert_eq!(work.captured_entries, checkpoint.captured_entries);
                 debug_assert!(work.prefix_lookup_steps <= self.journal.depth as usize + 1);
@@ -1553,6 +1640,7 @@ impl ExtensionState {
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
         proof: ProofBudget,
+        epoch: &ModuleEpoch,
     ) -> Result<Result<(ExtensionCheckpoint, CheckpointWork), CheckpointError>, Inconclusive> {
         match self.descriptor.checkpoint {
             CheckpointSemantics::JournalSuffix => {
@@ -1624,6 +1712,8 @@ impl ExtensionState {
                 let checkpoint = ExtensionCheckpoint {
                     schema_version: EXTENSION_CHECKPOINT_SCHEMA_VERSION,
                     descriptor: self.descriptor.clone(),
+                    epoch: epoch.clone(),
+                    entry_ids: derive_entry_ids(epoch, &self.descriptor, &journal),
                     captured_entries,
                     captured_payload_bytes,
                     payload: CheckpointPayload::JournalSuffix {
@@ -1664,6 +1754,8 @@ impl ExtensionState {
                 let checkpoint = ExtensionCheckpoint {
                     schema_version: EXTENSION_CHECKPOINT_SCHEMA_VERSION,
                     descriptor: self.descriptor.clone(),
+                    epoch: epoch.clone(),
+                    entry_ids: derive_entry_ids(epoch, &self.descriptor, &journal),
                     captured_entries: self.len(),
                     captured_payload_bytes: self.journal.payload_bytes,
                     payload: CheckpointPayload::FullJournal { journal },
@@ -1812,6 +1904,21 @@ impl ExtensionState {
             return Ok(Err(CheckpointError::MalformedCheckpoint {
                 extension: checkpoint.descriptor.name.clone(),
                 reason: "declared checkpoint measurements do not match its journal",
+            }));
+        }
+        // Re-derive the carried entries' identities from the checkpoint's OWN epoch and
+        // descriptor and compare against the recorded ids. Because the epoch is an input to
+        // the derivation, one check binds epoch, descriptor and every payload value: a
+        // tampered payload, a swapped descriptor, or ids carried over from another epoch all
+        // fail here. It is not a substitute for a caller comparing `checkpoint.epoch()` to
+        // its own — that is the caller's policy, and the accessor exists for it.
+        if derive_entry_ids(&checkpoint.epoch, &checkpoint.descriptor, journal)
+            != checkpoint.entry_ids
+        {
+            return Ok(Err(CheckpointError::EntryIdentityMismatch {
+                extension: checkpoint.descriptor.name.clone(),
+                epoch_tag: checkpoint.epoch.tag().to_owned(),
+                entries: journal.len,
             }));
         }
         if let Err(refusal) = enforce_checkpoint_limits(
@@ -5158,6 +5265,142 @@ mod tests {
         );
     }
 
+    /// Epoch and ordered entry ids are bound at CAPTURE time, and the binding
+    /// discriminates.
+    ///
+    /// The decision this implements, recorded on the bead before the code was written:
+    /// capture-time binding, rejecting restore-time derivation from a caller-supplied
+    /// epoch. The reason for rejecting it is that a checkpoint which cannot state its own
+    /// epoch is not self-contained, and a wrong-epoch restore would then surface as a
+    /// wrong-VALUE mismatch rather than a wrong-EPOCH one — a worse diagnostic for the same
+    /// defect, and the diagnostic collapse this bead keeps objecting to.
+    ///
+    /// The binding is by DERIVATION, not comparison: epoch is an input to every
+    /// [`ExtensionEntryId`], so the same payloads under a different epoch produce different
+    /// ids. That makes reading a checkpoint from one epoch as one from another impossible
+    /// rather than merely inadvisable.
+    #[test]
+    fn capture_binds_the_epoch_and_ordered_entry_ids() {
+        let state = state_with_checkpoint(4, CheckpointSemantics::FullJournal);
+        let here = fixture_epoch();
+        let elsewhere = ModuleEpoch::new("v4.33.0", "1111111111111111111111111111111111111111");
+        assert_ne!(here, elsewhere);
+
+        let capture = |epoch: &ModuleEpoch, from: &ExtensionState| {
+            from.try_checkpoint(None, TEST_LIMITS, ProofBudget::UNBOUNDED, epoch, None)
+                .into_complete()
+                .expect("capture completes")
+                .expect("capture succeeds")
+        };
+        let mine = capture(&here, &state);
+        let theirs = capture(&elsewhere, &state);
+
+        // The checkpoint states its own epoch — the point of capture-time binding.
+        assert_eq!(mine.epoch(), &here);
+        assert_eq!(theirs.epoch(), &elsewhere);
+        assert_eq!(mine.entry_ids().len(), state.len());
+
+        // SAME payloads, DIFFERENT epoch, DIFFERENT ids — pairwise, so a reordering could
+        // not pass either.
+        for (ours, others) in mine.entry_ids().iter().zip(theirs.entry_ids()) {
+            assert_ne!(
+                ours, others,
+                "an entry id must depend on the epoch, or the epoch is not bound"
+            );
+        }
+        assert_ne!(mine, theirs, "the checkpoints must differ by epoch alone");
+
+        // Order is bound: reversing the entries changes the id SEQUENCE while leaving the
+        // id SET identical, so only order distinguishes them.
+        let payloads: Vec<Arc<[u8]>> = state
+            .entries()
+            .map(|entry| Arc::clone(&entry.payload))
+            .collect();
+        let mut reversed = ExtensionState::new(state.descriptor.clone());
+        for payload in payloads.iter().rev() {
+            reversed = reversed.push_entry(Arc::clone(payload));
+        }
+        let reversed_point = capture(&here, &reversed);
+        assert_ne!(
+            mine.entry_ids(),
+            reversed_point.entry_ids(),
+            "the id sequence must be order-sensitive"
+        );
+        let ours: HashSet<&ExtensionEntryId> = mine.entry_ids().iter().collect();
+        let permuted: HashSet<&ExtensionEntryId> = reversed_point.entry_ids().iter().collect();
+        assert_eq!(
+            ours, permuted,
+            "the same entries must yield the same id set"
+        );
+
+        // Each restores under its own epoch, because restore re-derives with the
+        // checkpoint's own epoch rather than an ambient one.
+        for point in [&mine, &theirs, &reversed_point] {
+            assert!(
+                ExtensionState::restore(None, point, TEST_LIMITS).is_ok(),
+                "a checkpoint must restore under the epoch it was captured with"
+            );
+        }
+
+        // A changed payload changes its id, which is what makes the recorded ids a check
+        // rather than a decoration.
+        let mut tampered = ExtensionState::new(state.descriptor.clone());
+        for (index, payload) in payloads.iter().enumerate() {
+            tampered = if index == 2 {
+                tampered.push_entry(bytes(b"tampered"))
+            } else {
+                tampered.push_entry(Arc::clone(payload))
+            };
+        }
+        let tampered_point = capture(&here, &tampered);
+        assert_ne!(
+            mine.entry_ids()[2],
+            tampered_point.entry_ids()[2],
+            "a changed payload must change its id"
+        );
+
+        // THE CHECK FIRES. Capture always derives consistently, so the restore-side
+        // comparison can only be exercised through a seam — and a check nothing can make
+        // fire is unfalsifiable, which is the standard this bead applies everywhere else.
+        let forged = mine
+            .clone()
+            .forge_entry_ids(theirs.entry_ids().to_vec().into());
+        let caught = ExtensionState::restore(None, &forged, TEST_LIMITS)
+            .expect_err("ids that do not re-derive must be refused");
+        let CheckpointError::EntryIdentityMismatch {
+            epoch_tag, entries, ..
+        } = &caught
+        else {
+            unreachable!("expected an entry-identity mismatch, got {caught:?}")
+        };
+        assert_eq!(
+            epoch_tag,
+            here.tag(),
+            "the refusal names the epoch it derived under"
+        );
+        assert_eq!(*entries, state.len());
+        // And the unforged checkpoint still restores, so the seam is discriminating rather
+        // than breaking everything.
+        assert!(ExtensionState::restore(None, &mine, TEST_LIMITS).is_ok());
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-epoch-entry-binding\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"scenario\":\"capture-time-epoch-and-ordered-entry-ids\",\
+             \"decision\":\"capture_time_binding\",\
+             \"option_rejected\":\"restore_time_derivation_from_caller_supplied_epoch\",\
+             \"binding_mechanism\":\"derivation_not_comparison\",\
+             \"entry_ids\":{},\"epoch_changes_every_id\":true,\
+             \"order_sensitive\":true,\"same_id_set_under_permutation\":true,\
+             \"tampered_payload_changes_its_id\":true,\
+             \"forged_ids_refused\":\"entry_identity_mismatch\",\
+             \"unforged_still_restores\":true,\
+             \"payload_retained\":false,\"status\":\"pass\"}}",
+            mine.entry_ids().len()
+        );
+    }
+
     /// A probe that trips at a chosen sample, so a test can pin the exact checkpoint
     /// rather than only prove that cancellation happens.
     struct TripAt {
@@ -5239,6 +5482,7 @@ mod tests {
             Some(&base),
             TEST_LIMITS,
             ProofBudget::UNBOUNDED,
+            &fixture_epoch(),
             Some(&capture_probe),
         );
         assert_eq!(
@@ -5272,6 +5516,7 @@ mod tests {
                     Some(&base),
                     TEST_LIMITS,
                     ProofBudget::UNBOUNDED,
+                    &fixture_epoch(),
                     Some(&quiet_capture)
                 )
                 .into_complete()
@@ -6013,7 +6258,13 @@ mod tests {
         assert_eq!(first_entry_divergence(&captured_base, &rebuilt), None);
 
         // Capture side, same contract.
-        let capture_stop = target.try_checkpoint(Some(&rebuilt), TEST_LIMITS, one_short, None);
+        let capture_stop = target.try_checkpoint(
+            Some(&rebuilt),
+            TEST_LIMITS,
+            one_short,
+            &fixture_epoch(),
+            None,
+        );
         assert_eq!(
             capture_stop.authority(),
             Authority::NonAuthoritative,
@@ -6557,7 +6808,12 @@ mod tests {
                 target = target.push_entry(bytes(&(10_000u64 + index as u64).to_le_bytes()));
             }
             let (checkpoint, work) = target
-                .checkpoint_with_work(Some(&suffix_base), TEST_LIMITS, ProofBudget::UNBOUNDED)
+                .checkpoint_with_work(
+                    Some(&suffix_base),
+                    TEST_LIMITS,
+                    ProofBudget::UNBOUNDED,
+                    &fixture_epoch(),
+                )
                 .expect("an unbounded proof budget cannot bind")
                 .expect("suffix capture succeeds");
             assert_eq!(checkpoint.captured_entries(), suffix_len);
@@ -6573,7 +6829,7 @@ mod tests {
 
         let full = state_with_checkpoint(4_096, CheckpointSemantics::FullJournal);
         let (checkpoint, work) = full
-            .checkpoint_with_work(None, TEST_LIMITS, ProofBudget::UNBOUNDED)
+            .checkpoint_with_work(None, TEST_LIMITS, ProofBudget::UNBOUNDED, &fixture_epoch())
             .expect("an unbounded proof budget cannot bind")
             .expect("full capture succeeds");
         assert_eq!(work.prefix_lookup_steps, 0);
@@ -6701,11 +6957,17 @@ mod tests {
             Some(&base),
             limits,
             ProofBudget::UNBOUNDED,
+            &fixture_epoch(),
             None,
         ))
         .expect("capture through the real environment registry");
         let (instrumented_checkpoint, suffix_work) = target_state
-            .checkpoint_with_work(Some(base_state), limits, ProofBudget::UNBOUNDED)
+            .checkpoint_with_work(
+                Some(base_state),
+                limits,
+                ProofBudget::UNBOUNDED,
+                &fixture_epoch(),
+            )
             .expect("an unbounded proof budget cannot bind")
             .expect("measure the same real suffix capture");
         assert_eq!(checkpoint, instrumented_checkpoint);
@@ -6764,13 +7026,14 @@ mod tests {
             None,
             limits,
             ProofBudget::UNBOUNDED,
+            &fixture_epoch(),
             None,
         ))
         .expect("capture real full journal");
         let (_, full_work) = full_target
             .extension(&full_name)
             .expect("full target extension exists")
-            .checkpoint_with_work(None, limits, ProofBudget::UNBOUNDED)
+            .checkpoint_with_work(None, limits, ProofBudget::UNBOUNDED, &fixture_epoch())
             .expect("an unbounded proof budget cannot bind")
             .expect("measure the same real full capture");
         let full_restored = full_base.apply_extension_checkpoint(
