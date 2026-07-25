@@ -182,7 +182,11 @@ fn source_read_at_l1_and_value_produced_above_it_are_both_permitted() {
              pinned-binary | exact | {OK_FIXTURE} | D0 | OBSERVED | core-observables-v4.32.0"
         ),
         &format!(
-            "row hash | blake3.vector | function | native | L2 | faithful | spec-vectors | \
+            // Deliberately NOT the real hasher's name: fln-hash's domain-enforcement
+            // guard refuses that identifier anywhere outside fln-hash, and it cannot
+            // tell fixture prose from a call site. Naming it here made the workspace
+            // red from d5cc084b until this line was fixed.
+            "row hash | spec.vector | function | native | L2 | faithful | spec-vectors | \
              exact | {OK_FIXTURE} | D0 | OBSERVED | rfc-vectors"
         ),
         "row cli | lean --version | flag | pending | L0 | faithful | pinned-source | exact \

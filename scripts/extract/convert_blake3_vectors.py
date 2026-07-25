@@ -7,8 +7,13 @@ Output: crates/fln-hash/fixtures/blake3_vectors.txt with one line per case:
         input_len|hash_hex|keyed_hash_hex|derive_key_hex
 
 The upstream JSON defines the input bytes for each case as the repeating
-pattern 0,1,2,...,249,0,1,... of length input_len; the fixture stores only
-lengths and expected hex, and the Rust tests regenerate the pattern.
+pattern 0,1,2,...,250,0,1,... of length input_len -- modulus 251, which is
+prime so the pattern never aligns with a block boundary. The fixture stores
+only lengths and expected hex, and the Rust tests regenerate the pattern.
+
+The emitted header below is the ONLY statement of that convention a future
+reader gets, and fln-hash pins its own `test_input` against it, so the two
+strings are one fact in two files: change either and change both.
 
 Usage: python3 scripts/extract/convert_blake3_vectors.py <test_vectors.json> <out.txt>
 """
@@ -48,8 +53,8 @@ def main(argv: list[str]) -> None:
         f"# provenance: converted from {SOURCE_URL}",
         f"# provenance: keyed_hash key = {json.dumps(key)} (ASCII, 32 bytes)",
         f"# provenance: derive_key context = {json.dumps(context)}",
-        "# input bytes for each case: repeating pattern 0,1,...,249,0,1,... "
-        "of length input_len",
+        "# input bytes for each case: repeating pattern 0,1,...,250,0,1,... "
+        "of length input_len (modulus 251)",
         f"# schema {SCHEMA}",
         "# format: input_len|hash_hex|keyed_hash_hex|derive_key_hex",
     ]

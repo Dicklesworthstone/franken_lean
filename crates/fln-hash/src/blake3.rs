@@ -462,7 +462,8 @@ mod tests {
         s
     }
 
-    /// The official vectors' input: the repeating byte pattern 0,1,...,249.
+    /// The official vectors' input: the repeating byte pattern 0,1,...,250,
+    /// modulus 251 (prime, so it never aligns with a block boundary).
     fn test_input(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
@@ -604,9 +605,13 @@ mod tests {
     /// They had already drifted: the header read `0,1,...,249` while the code uses
     /// modulus 251, i.e. `0,1,...,250`. The code is right — all 35 vectors match, and
     /// the official BLAKE3 set is defined over a repeating sequence of 251 bytes — so
-    /// the header was corrected. The same wrong text is still in
-    /// scripts/extract/convert_blake3_vectors.py, which regenerates this header, so
-    /// this test is what stops a regeneration from quietly putting it back.
+    /// the header was corrected. The generator that emits that header,
+    /// `scripts/extract/convert_blake3_vectors.py`, carried the same wrong text until
+    /// bead `franken_lean-vv0r`; regenerating the fixture would have put it back, and
+    /// this test would have caught it while pointing at the wrong file. The generator
+    /// is now checked directly by
+    /// [`the_generator_emits_the_header_this_test_pins`], so the artifact and the
+    /// thing that produces it are both guarded.
     #[test]
     fn the_input_pattern_matches_the_fixtures_own_header() {
         let header = FIXTURE
@@ -630,6 +635,51 @@ mod tests {
         );
         assert_eq!(input[modulus], 0, "and wraps immediately after it");
         assert_eq!(input[modulus + 1], 1);
+    }
+
+    /// The GENERATOR must emit the header the test above pins, not merely the
+    /// checked-in artifact.
+    ///
+    /// `the_input_pattern_matches_the_fixtures_own_header` guards the fixture. That is
+    /// one join; the other is the script that writes the fixture, and it was wrong for
+    /// as long as the fixture was — the artifact got repaired and the thing that
+    /// produces it did not (bead `franken_lean-vv0r`). A regeneration would have
+    /// silently restored the drift, the artifact-side test would have gone red, and it
+    /// would have named the fixture rather than the script that broke it.
+    ///
+    /// So this reads the generator's own emitted string. It fails at the source, and it
+    /// fails BEFORE anyone regenerates rather than after.
+    #[test]
+    fn the_generator_emits_the_header_this_test_pins() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root is two levels above the crate manifest");
+        const GENERATOR: &str = "scripts/extract/convert_blake3_vectors.py";
+        let script = std::fs::read_to_string(root.join(GENERATOR))
+            .map_err(|error| format!("cannot read {GENERATOR}: {error}"))
+            .expect("the generator that produces the fixture is readable");
+
+        assert!(
+            script.contains("0,1,...,250,0,1,..."),
+            "{GENERATOR} does not emit the input pattern the fixture header states and \
+             this module's test_input implements. Regenerating the fixture would put \
+             the wrong convention back into the artifact every other check trusts."
+        );
+        assert!(
+            !script.contains("0,1,...,249"),
+            "{GENERATOR} still carries the pre-vv0r pattern text somewhere; the \
+             convention is one fact and every statement of it must agree"
+        );
+
+        // Negative control: a `contains` that matches anything proves nothing, and this
+        // whole module exists because a check can look like verification without being
+        // one.
+        assert!(
+            !script.contains("0,1,...,we-never-wrote-this"),
+            "the containment check matches text that was never written, so it cannot \
+             distinguish a correct generator from any other file"
+        );
     }
 
     /// Prove the goldens are load-bearing rather than decorative.
