@@ -195,6 +195,25 @@ impl ExtensionJournal {
         }
     }
 
+    /// Whether these are the same journal **by construction** — the same root node,
+    /// not merely equal contents.
+    ///
+    /// `O(1)`, and it is a *proof*, not an accelerator: sharing a root node means the
+    /// two values were built from one another, which digest equality can never
+    /// establish. Deliberately conservative in one direction — an independently
+    /// rebuilt journal with identical contents answers `false` and must then be proved
+    /// by exact comparison, which is the slow path rather than a refusal.
+    ///
+    /// The pointer is **compared, never recorded**: no address enters a digest, a
+    /// canonical encoding, or any evidence record.
+    fn is_same_structure(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (None, None) => true,
+            (Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs) && self.len == other.len,
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
     fn records(&self) -> JournalIter<'_> {
         let mut stack = Vec::with_capacity(self.depth as usize + 1);
         if let Some(root) = &self.root {
@@ -562,6 +581,56 @@ pub enum ExtensionMergeOutcome {
     },
 }
 
+/// The first entry index at which two extension states' journals differ, or `None`
+/// when they are exactly equal over the shorter of the two.
+///
+/// Deterministic exact comparison: it compares *values*, in order, and stops at the
+/// first divergence. This is the proof that digest equality cannot supply, and it is
+/// the reason a content-identical base rebuilt from scratch is accepted while a
+/// same-length or same-digest different history is not.
+///
+/// Cost is linear in the compared prefix and is not yet bounded by an explicit budget.
+/// Making exhaustion here a typed FL-INV-07 inconclusive requires `restore` to return
+/// an `Outcome` rather than a `Result`, because a `CheckpointError` is a rejection type
+/// and reporting "we ran out of comparison budget" as a rejection would be the exact
+/// collapse this bead exists to prevent. That signature change is the next slice.
+fn first_entry_divergence(left: &ExtensionState, right: &ExtensionState) -> Option<usize> {
+    let mut index = 0;
+    let mut left_entries = left.entries();
+    let mut right_entries = right.entries();
+    loop {
+        match (left_entries.next(), right_entries.next()) {
+            (Some(mine), Some(theirs)) => {
+                if mine != theirs {
+                    return Some(index);
+                }
+                index += 1;
+            }
+            (None, None) => return None,
+            // One ran out first: they diverge at that length. The digest fast path
+            // already rejects a length mismatch, so reaching this means a genuinely
+            // inconsistent input rather than an ordinary short base.
+            (None, Some(_)) | (Some(_), None) => return Some(index),
+        }
+    }
+}
+
+/// The logical footprint a checkpoint retains beyond the entries it carries.
+///
+/// **Logical attributed accounting, not allocator ownership.** These are counts of
+/// entries and canonical payload bytes the retained base denotes. They are not RSS,
+/// not allocator-resident bytes, and not a claim that those bytes belong exclusively to
+/// this checkpoint — the base is *shared*, which is the whole point of retaining a
+/// handle instead of copying. No address or allocation identity appears here or in any
+/// evidence derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedBaseFacts {
+    /// Entries in the retained base.
+    pub entries: usize,
+    /// Canonical payload bytes the retained base denotes.
+    pub payload_bytes: u128,
+}
+
 /// The only checkpoint schema version this build accepts. Unknown versions are a
 /// typed refusal; they are never guessed compatible.
 pub const EXTENSION_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -590,6 +659,18 @@ enum CheckpointPayload {
         base_len: usize,
         base_history_digest: Digest,
         base_state_digest: Digest,
+        /// The retained base, held as an `Arc` so the journal nodes are **shared, not
+        /// copied** (bead `fln-extension-history-checkpoint-identity-41s`).
+        ///
+        /// This exists because the recorded digests above cannot establish that a
+        /// presented base *is* this base — they can only reject one that plainly is
+        /// not. Restore proves base equality against this handle, by shared structural
+        /// identity when the presented base was built from it and by deterministic
+        /// exact comparison otherwise. Retaining it is what makes that proof possible,
+        /// and it is reported through
+        /// [`ExtensionCheckpoint::retained_base_facts`] because a checkpoint that
+        /// silently keeps its base alive has a footprint a caller must be able to see.
+        base: Arc<ExtensionState>,
         journal: ExtensionJournal,
     },
     FullJournal {
@@ -631,6 +712,50 @@ impl ExtensionCheckpoint {
 
     pub fn captured_payload_bytes(&self) -> u128 {
         self.captured_payload_bytes
+    }
+
+    /// Bounded test seam: forge the recorded base digests so a *wrong* base passes
+    /// every fast-path check.
+    ///
+    /// A digest collision cannot be produced on demand, so the only way to test that
+    /// equality is treated as an accelerator rather than a proof is to simulate the
+    /// collision. This overwrites just the two recorded digests, leaving the retained
+    /// base handle and every other field alone — so restore's fast paths accept, and
+    /// only the exact comparison can catch it. Test-only, and it constructs no state a
+    /// production path can reach.
+    #[cfg(test)]
+    fn forge_recorded_base_digests(mut self, history: Digest, state: Digest) -> Self {
+        if let CheckpointPayload::JournalSuffix {
+            base_history_digest,
+            base_state_digest,
+            ..
+        } = &mut self.payload
+        {
+            *base_history_digest = history;
+            *base_state_digest = state;
+        }
+        self
+    }
+
+    /// What this checkpoint retains beyond the entries it carries.
+    ///
+    /// `Some` for suffix mode, which holds a shared handle to its base so restore can
+    /// *prove* base equality rather than infer it from a digest. `None` for
+    /// `FullJournal`, which is self-contained and retains nothing — so the difference
+    /// in footprint between the two modes is visible rather than implied.
+    ///
+    /// Reporting this is a requirement, not a convenience: a checkpoint that keeps its
+    /// base alive changes what a caller can drop, and a footprint that is invisible is
+    /// a footprint nobody budgets for. See [`RetainedBaseFacts`] for what the numbers
+    /// do and do not claim.
+    pub fn retained_base_facts(&self) -> Option<RetainedBaseFacts> {
+        match &self.payload {
+            CheckpointPayload::JournalSuffix { base, .. } => Some(RetainedBaseFacts {
+                entries: base.len(),
+                payload_bytes: base.journal.payload_bytes,
+            }),
+            CheckpointPayload::FullJournal { .. } => None,
+        }
     }
 
     pub fn base_len(&self) -> Option<usize> {
@@ -675,6 +800,19 @@ pub enum CheckpointResource {
 /// Every checkpoint refusal is classified and leaves all input snapshots unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointError {
+    /// The presented base agreed with every recorded digest and still is not the base
+    /// this checkpoint was captured against (bead
+    /// `fln-extension-history-checkpoint-identity-41s`).
+    ///
+    /// A *completed determination*, so a rejection rather than an inconclusive: the
+    /// exact comparison finished and the histories differ. `first_divergence` is the
+    /// entry index where they parted, which is what a caller needs to act; it is
+    /// diagnostic, and no address or allocation identity appears in it.
+    BaseNotExact {
+        extension: Name,
+        base_len: usize,
+        first_divergence: usize,
+    },
     UnsupportedVersion {
         found: u16,
         supported: u16,
@@ -733,6 +871,17 @@ pub enum CheckpointError {
 impl std::fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CheckpointError::BaseNotExact {
+                extension,
+                base_len,
+                first_divergence,
+            } => write!(
+                f,
+                "extension `{}` presented a base that matched every recorded digest but \
+                 diverges from the captured base at entry {first_divergence} of {base_len}: \
+                 digest equality is a rejection accelerator, not a proof of base identity",
+                extension.to_display_string()
+            ),
             CheckpointError::UnsupportedVersion { found, supported } => write!(
                 f,
                 "unsupported extension checkpoint schema version {found}; supported version is {supported}"
@@ -1003,6 +1152,9 @@ impl ExtensionState {
                         base_len: base.len(),
                         base_history_digest: base.journal.digest,
                         base_state_digest: base.content_digest(),
+                        // `clone` is O(1) structural sharing: the journal's root `Arc`
+                        // is shared, so this retains the base rather than copying it.
+                        base: Arc::new(base.clone()),
                         journal,
                     },
                 };
@@ -1094,6 +1246,7 @@ impl ExtensionState {
                 base_len,
                 base_history_digest,
                 base_state_digest,
+                base: retained_base,
                 journal,
             } => {
                 let base = base.ok_or_else(|| CheckpointError::MissingBase {
@@ -1120,6 +1273,30 @@ impl ExtensionState {
                         extension: checkpoint.descriptor.name.clone(),
                         expected: *base_state_digest,
                         actual: actual_state_digest,
+                    });
+                }
+
+                // Everything above is a REJECTION ACCELERATOR. Length and both digests
+                // can only rule a base out cheaply; passing them establishes nothing,
+                // because two unequal histories may agree on any digest and equal
+                // digests are not equal values. Base equality is proved here or not at
+                // all.
+                //
+                // Two proofs, in cost order:
+                //   * shared structural identity — the presented base and the retained
+                //     one are the same journal by construction, which is O(1) and is
+                //     the case whenever the caller kept the base it captured from;
+                //   * deterministic exact comparison — entry by entry against the
+                //     retained handle, which is what lets an independently rebuilt or
+                //     sibling base with identical content SUCCEED rather than being
+                //     refused for having a different allocation lineage.
+                if !base.journal.is_same_structure(&retained_base.journal)
+                    && let Some(divergence) = first_entry_divergence(retained_base, base)
+                {
+                    return Err(CheckpointError::BaseNotExact {
+                        extension: checkpoint.descriptor.name.clone(),
+                        base_len: *base_len,
+                        first_divergence: divergence,
                     });
                 }
                 let mut restored = base.clone();
@@ -4122,6 +4299,237 @@ mod tests {
             }
         );
         assert_eq!((target, divergent), before, "refusal mutates no snapshot");
+    }
+
+    /// An independently rebuilt, content-identical base SUCCEEDS.
+    ///
+    /// This is the first of the two discriminating tests. Allocation lineage is not
+    /// semantic identity: a base rebuilt from scratch shares no journal node with the
+    /// one the checkpoint was captured against, so the O(1) structural proof fails and
+    /// the exact comparison has to carry it. If restore only accepted the original
+    /// handle it would be enforcing allocation identity, which is the defect in the
+    /// other direction.
+    #[test]
+    fn a_content_identical_independently_rebuilt_base_restores() {
+        let captured_base = state_with_checkpoint(3, CheckpointSemantics::JournalSuffix);
+        let target = captured_base.push_entry(bytes(b"suffix"));
+        let checkpoint = target
+            .checkpoint(Some(&captured_base), TEST_LIMITS)
+            .expect("checkpoint captures");
+
+        // Rebuilt from scratch: same descriptor, same entries, no shared nodes.
+        let rebuilt = state_with_checkpoint(3, CheckpointSemantics::JournalSuffix);
+        assert_eq!(rebuilt.content_digest(), captured_base.content_digest());
+        assert!(
+            !rebuilt.journal.is_same_structure(&captured_base.journal),
+            "the rebuilt base must not share structure, or this proves nothing"
+        );
+
+        let restored = ExtensionState::restore(Some(&rebuilt), &checkpoint, TEST_LIMITS)
+            .expect("a content-identical rebuilt base must restore");
+        let expected = ExtensionState::restore(Some(&captured_base), &checkpoint, TEST_LIMITS)
+            .expect("the original base restores");
+        assert_eq!(restored.content_digest(), expected.content_digest());
+        assert_eq!(restored, expected);
+
+        // A sibling base — reached by a different path but content-identical — is the
+        // same requirement stated the way a caller meets it in practice.
+        let sibling = state_with_checkpoint(2, CheckpointSemantics::JournalSuffix)
+            .push_entry(bytes(&2u64.to_le_bytes()));
+        assert_eq!(sibling.content_digest(), captured_base.content_digest());
+        assert_eq!(
+            ExtensionState::restore(Some(&sibling), &checkpoint, TEST_LIMITS)
+                .expect("a sibling base must restore")
+                .content_digest(),
+            expected.content_digest()
+        );
+    }
+
+    /// Equal-length and equal-digest UNEQUAL histories FAIL.
+    ///
+    /// The second discriminating test, and the one that makes the whole bead's claim
+    /// load-bearing: a recorded digest can only reject, so a base that satisfies every
+    /// recorded digest must still be refused when its history differs.
+    #[test]
+    fn equal_length_and_equal_digest_unequal_histories_are_refused() {
+        let captured_base = state_with_checkpoint(3, CheckpointSemantics::JournalSuffix);
+        let target = captured_base.push_entry(bytes(b"suffix"));
+        let checkpoint = target
+            .checkpoint(Some(&captured_base), TEST_LIMITS)
+            .expect("checkpoint captures");
+
+        // Same length, different contents: the digest fast path is enough here, and the
+        // point of asserting it is that the cheap rejection still happens.
+        let mut equal_length = ExtensionState::new(descriptor_with_checkpoint(
+            CheckpointSemantics::JournalSuffix,
+        ));
+        for index in 0..3u64 {
+            equal_length = equal_length.push_entry(bytes(&(index + 100).to_le_bytes()));
+        }
+        assert_eq!(equal_length.len(), captured_base.len());
+        assert_ne!(
+            equal_length.content_digest(),
+            captured_base.content_digest()
+        );
+        let refused = ExtensionState::restore(Some(&equal_length), &checkpoint, TEST_LIMITS)
+            .expect_err("an equal-length different history must be refused");
+        assert!(
+            matches!(
+                refused,
+                CheckpointError::BaseHistoryMismatch { .. }
+                    | CheckpointError::BaseDigestMismatch { .. }
+            ),
+            "expected a digest-level rejection, got {refused:?}"
+        );
+
+        // Now the case the digests CANNOT catch, simulated through the bounded seam:
+        // the recorded digests are forged to match this wrong base exactly, so every
+        // fast path accepts and only the exact comparison can refuse.
+        let colliding = checkpoint.clone().forge_recorded_base_digests(
+            equal_length.journal.digest,
+            equal_length.content_digest(),
+        );
+        let caught = ExtensionState::restore(Some(&equal_length), &colliding, TEST_LIMITS)
+            .expect_err("an equal-digest different history must still be refused");
+        let CheckpointError::BaseNotExact {
+            base_len,
+            first_divergence,
+            ..
+        } = &caught
+        else {
+            unreachable!("expected the exact comparison to refuse, got {caught:?}")
+        };
+        assert_eq!(*base_len, 3);
+        assert_eq!(
+            *first_divergence, 0,
+            "the divergence index must name where the histories actually parted"
+        );
+
+        // And the same forged checkpoint against the RIGHT base still succeeds, so the
+        // refusal above is discriminating rather than the seam breaking everything.
+        assert!(
+            ExtensionState::restore(Some(&captured_base), &colliding, TEST_LIMITS).is_err(),
+            "forged digests do not match the real base, so its fast path rejects"
+        );
+        let honest = ExtensionState::restore(Some(&captured_base), &checkpoint, TEST_LIMITS);
+        assert!(honest.is_ok(), "the unforged checkpoint restores normally");
+    }
+
+    /// A digest match is an accelerator: passing it must not be the last word, and a
+    /// shared-structure base takes the O(1) proof rather than the comparison.
+    #[test]
+    fn base_equality_is_proved_by_structure_or_by_exact_comparison() {
+        let captured_base = state_with_checkpoint(4, CheckpointSemantics::JournalSuffix);
+        let target = captured_base.push_entry(bytes(b"suffix"));
+        let checkpoint = target
+            .checkpoint(Some(&captured_base), TEST_LIMITS)
+            .expect("checkpoint captures");
+
+        // The retained handle and the presented base are the same journal by
+        // construction, so the O(1) proof applies.
+        let CheckpointPayload::JournalSuffix { base: retained, .. } = &checkpoint.payload else {
+            unreachable!("suffix mode")
+        };
+        assert!(retained.journal.is_same_structure(&captured_base.journal));
+        assert_eq!(first_entry_divergence(retained, &captured_base), None);
+
+        // Exact comparison agrees with structural identity wherever both apply, and
+        // reports a divergence index wherever they differ.
+        let diverging = state_with_checkpoint(2, CheckpointSemantics::JournalSuffix)
+            .push_entry(bytes(b"different"))
+            .push_entry(bytes(b"also-different"));
+        assert_eq!(diverging.len(), captured_base.len());
+        assert_eq!(first_entry_divergence(retained, &diverging), Some(2));
+    }
+
+    /// An unrelated Environment edit does not invalidate a valid checkpoint.
+    ///
+    /// Base root means the TARGET `ExtensionState` root, not the encompassing
+    /// Environment logical root. Conflating them is how a checkpoint that is still
+    /// perfectly valid starts failing because some other extension or declaration
+    /// changed.
+    #[test]
+    fn an_unrelated_environment_edit_does_not_invalidate_a_checkpoint() {
+        let descriptor = descriptor_with_checkpoint(CheckpointSemantics::JournalSuffix);
+        let target_name = descriptor.name.clone();
+        let base_state = state_with_checkpoint(3, CheckpointSemantics::JournalSuffix);
+        let target = base_state.push_entry(bytes(b"suffix"));
+        let checkpoint = target
+            .checkpoint(Some(&base_state), TEST_LIMITS)
+            .expect("checkpoint captures");
+
+        let expected = ExtensionState::restore(Some(&base_state), &checkpoint, TEST_LIMITS)
+            .expect("restores against its own base")
+            .content_digest();
+
+        // A second, unrelated extension whose journal grows. The Environment's logical
+        // root moves; the target ExtensionState's does not.
+        let other = ExtensionDescriptor {
+            name: Name::str(Name::anonymous(), "other.extension"),
+            checkpoint: CheckpointSemantics::FullJournal,
+            ..descriptor_with_checkpoint(CheckpointSemantics::FullJournal)
+        };
+        let unrelated_before = ExtensionState::new(other);
+        let unrelated_after = unrelated_before.push_entry(bytes(b"unrelated"));
+        assert_ne!(
+            unrelated_before.content_digest(),
+            unrelated_after.content_digest(),
+            "the unrelated extension must actually change, or this proves nothing"
+        );
+
+        // The target base is untouched by that edit, so the checkpoint still restores
+        // to exactly the same state.
+        assert_eq!(
+            ExtensionState::restore(Some(&base_state), &checkpoint, TEST_LIMITS)
+                .expect("an unrelated edit must not invalidate this checkpoint")
+                .content_digest(),
+            expected
+        );
+        assert_eq!(checkpoint.descriptor().name, target_name);
+    }
+
+    /// Suffix mode reports the memory it retains; full-journal mode retains none.
+    #[test]
+    fn suffix_checkpoints_report_their_retained_base_footprint() {
+        let base_state = state_with_checkpoint(5, CheckpointSemantics::JournalSuffix);
+        let target = base_state.push_entry(bytes(b"suffix"));
+        let suffix = target
+            .checkpoint(Some(&base_state), TEST_LIMITS)
+            .expect("suffix checkpoint captures");
+
+        let retained = suffix
+            .retained_base_facts()
+            .expect("suffix mode retains its base for exact proof");
+        assert_eq!(retained.entries, base_state.len());
+        assert_eq!(retained.payload_bytes, base_state.journal.payload_bytes);
+        // The retained footprint is the BASE's, and it is separate from what the
+        // checkpoint carries — the suffix itself is one entry.
+        assert_eq!(suffix.captured_entries(), 1);
+        assert!(retained.entries > suffix.captured_entries());
+
+        let full = state_with_checkpoint(5, CheckpointSemantics::FullJournal)
+            .checkpoint(None, TEST_LIMITS)
+            .expect("full-journal checkpoint captures");
+        assert_eq!(
+            full.retained_base_facts(),
+            None,
+            "full-journal mode is self-contained and must retain nothing"
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-retained-footprint\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"scenario\":\"retained-base-handle-accounting\",\
+             \"mode\":\"journal_suffix\",\"retained_entries\":{},\
+             \"retained_payload_bytes\":{},\"carried_entries\":{},\
+             \"accounting\":\"logical_attributed_footprint\",\
+             \"allocator_or_rss_claimed\":false,\"address_identity_used\":false,\
+             \"full_journal_retains\":\"none\",\"status\":\"pass\"}}",
+            retained.entries,
+            retained.payload_bytes,
+            suffix.captured_entries()
+        );
     }
 
     #[test]
