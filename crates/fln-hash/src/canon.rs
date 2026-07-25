@@ -2946,6 +2946,97 @@ mod tests {
     /// The budget reaches the payloads decoded by their own readers, not just the
     /// top-level term walk — otherwise a hostile `Name` chain or `KVMap` inside an
     /// otherwise small artifact would be unmetered.
+    /// **The adoption blocker on bead fln-8gz3, held as a trigger rather than a note.**
+    ///
+    /// fln-8gz3 folds [`Decoded`] into `fln_core::outcome::Outcome<Result<T, CanonError>>`.
+    /// Two of the three arms map cleanly — `Value` to `Complete(Ok(..))` and `Malformed`
+    /// to `Complete(Err(..))`, since malformed bytes are a real domain verdict and belong
+    /// inside the authoritative arm. The third does not, and the bead's own plan for it
+    /// ("BudgetLimit becoming the ResourceReason") was written without checking that the
+    /// vocabulary existed. It does not.
+    ///
+    /// `InconclusiveCause::ResourceExhausted` requires a `ResourceUsage`, which requires a
+    /// `ResourceReason` — the D8 taxonomy's *diagnostic* vocabulary, declared closed at
+    /// version 1. Its four entries are `maxHeartbeats`, `maxRecDepth`, cancellation, and a
+    /// declared memory budget. A canonical decode stops on neither: its limits are input
+    /// bytes consumed and values produced. Nothing in the taxonomy names either.
+    ///
+    /// So the fold cannot be completed honestly today, and the dishonest routes are worth
+    /// naming so nobody takes one by accident:
+    ///
+    /// * `Memory { limit_bytes }` for [`BudgetLimit::InputBytes`] would make a renderer
+    ///   print "memory budget exhausted" for a decode that stopped on an input-byte cap.
+    ///   The diagnostic would be false, and D8 diagnostics are a compatibility surface.
+    /// * `RecursionDepth` for [`BudgetLimit::ProducedNodes`] is worse: the produced-node
+    ///   meter exists *precisely because* a depth cap would refuse legitimately deep terms,
+    ///   which bead franken_lean-fnj forbids. Reporting it as a depth limit reintroduces
+    ///   the claim that bead exists to deny.
+    /// * Widening `ResourceReason` here would be a D8 taxonomy revision — a reviewed,
+    ///   spec-level act that breaks every exhaustive match in the workspace — smuggled in
+    ///   under a P3 in one crate.
+    ///
+    /// This test is the trigger. Both enums are matched exhaustively, so **adding a variant
+    /// to either fails to compile right here**, with this comment as the explanation: if the
+    /// new `ResourceReason` names a byte or work budget, the blocker is cleared and fln-8gz3
+    /// can be done; if it does not, record that fln-8gz3 is still blocked and move on.
+    #[test]
+    fn the_outcome_adoption_blocker_is_a_missing_resource_vocabulary() {
+        // Exhaustive on purpose. A new arm here is the signal described above.
+        fn faithfully_names(reason: &ResourceReason, limit: BudgetLimit) -> bool {
+            match (reason, limit) {
+                (ResourceReason::Heartbeats { .. }, _)
+                | (ResourceReason::RecursionDepth { .. }, _)
+                | (ResourceReason::Cancelled, _)
+                | (ResourceReason::Memory { .. }, _) => false,
+            }
+        }
+
+        // Every limit a budgeted decode can stop on, exhaustively.
+        fn every_limit() -> Vec<BudgetLimit> {
+            let all = vec![BudgetLimit::InputBytes, BudgetLimit::ProducedNodes];
+            for limit in &all {
+                match limit {
+                    BudgetLimit::InputBytes | BudgetLimit::ProducedNodes => {}
+                }
+            }
+            all
+        }
+
+        let vocabulary = [
+            ResourceReason::Heartbeats {
+                consumed: 1,
+                limit: 0,
+            },
+            ResourceReason::RecursionDepth { limit: 0 },
+            ResourceReason::Cancelled,
+            ResourceReason::Memory { limit_bytes: 0 },
+        ];
+        for limit in every_limit() {
+            for reason in &vocabulary {
+                assert!(
+                    !faithfully_names(reason, limit),
+                    "ResourceReason::{reason:?} now claims to name {limit:?} — if that is \
+                     true, the fln-8gz3 blocker is CLEARED and Decoded should be folded \
+                     into fln_core::outcome::Outcome<Result<T, CanonError>>; if it is not, \
+                     fix the mapping rather than this assertion"
+                );
+            }
+        }
+
+        // The half that already maps needs no taxonomy change, and is asserted so the
+        // blocker is scoped to the inconclusive arm and not read as "the fold is
+        // impossible": a malformed decode is an authoritative domain rejection.
+        let malformed: Decoded<Level> = Level::from_canonical_bytes_budgeted(
+            b"not a canonical level",
+            DecodeBudget::unlimited(),
+        );
+        assert!(
+            matches!(malformed, Decoded::Malformed(_)),
+            "the Complete(Err(..)) half of the fold rests on this arm existing"
+        );
+        assert!(!malformed.is_inconclusive());
+    }
+
     #[test]
     fn the_budget_is_honoured_inside_nested_name_and_kvmap_payloads() {
         let mut deep_name = Name::anonymous();
