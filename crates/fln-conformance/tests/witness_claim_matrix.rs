@@ -192,6 +192,32 @@ fn evidence_that_has_gone_stale_is_caught_even_though_the_anchors_still_match() 
     );
 }
 
+/// The ratchet: no row may be added without a tripwire.
+///
+/// **This is a floor, not coverage**, and the distinction is the whole finding. It guarantees
+/// every row has *a* checkable fact; it does not make the row current. A citation catches only
+/// rot someone anticipated well enough to cite, and both rows that rotted on 2026-07-25 rotted
+/// in ways nobody anticipated — found by re-reading prose, not by any check. Reading a green
+/// run here as "the evidence is current" is exactly the over-reading this matrix exists to
+/// refuse.
+#[test]
+fn every_row_cites_at_least_one_checkable_fact() {
+    for row in &CLAIM_MATRIX {
+        let cited = EVIDENCE_CITATIONS.iter().any(|(id, _)| *id == row.id);
+        assert!(
+            cited,
+            "{} has no citation: its evidence is prose that nothing checks, so it can go \
+             factually false while every anchor still matches — which is precisely how \
+             B3-INDEPENDENT-CHECKER and B3-CONSENSUS-HALTS rotted. Add a Citation naming one \
+             load-bearing fact the evidence asserts.",
+            row.id
+        );
+    }
+}
+
+/// A citation whose fact is *already* false at authoring time would be a tripwire that fires
+/// on day one and gets deleted rather than heeded, so the live table must be clean — which the
+/// clean-tree scan asserts — and every row must be reachable, which this asserts.
 #[test]
 fn a_citation_naming_no_row_is_refused() {
     let citation = EVIDENCE_CITATIONS

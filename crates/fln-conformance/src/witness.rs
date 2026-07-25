@@ -256,11 +256,16 @@ COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, seeded from a measured rea
 (bead franken_lean-claim-matrix-doc-ci-mhew). NOT covered: the overwhelming majority of \
 README.md (~41 KB) and the plan (~195 KB), every claim in every other crate header, and all \
 generated contracts. Only three concepts have a conservation census; every other repeated \
-claim in these documents is unwatched. Six evidence citations over five rows are checked \
-against the tree; every other row's evidence prose is UNCHECKED and can rot exactly as two \
-rows did on 2026-07-25 while this gate stayed green. A passing scan means no row, no census \
-and no citation is violated. It does not mean the documentation is accurate, and it does not \
-mean the evidence is current.";
+claim in these documents is unwatched. Every row now cites at least one checkable fact \
+(sixteen citations over fifteen rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
+only rot someone anticipated well enough to cite, and it protects one clause of a \
+multi-clause evidence paragraph. B3-CONSENSUS-HALTS has nine factual clauses and one is \
+cited, and it is not the clause its state depends on. Both rows that actually rotted on \
+2026-07-25 rotted in ways nobody anticipated and were found by re-reading prose, not by any \
+check; catching UNANTICIPATED rot needs a freshness predicate, which franken_lean-1gf \
+specifies and this does not implement. A passing scan means no row, no census and no citation \
+is violated. It does not mean the documentation is accurate, and it does not mean the \
+evidence is current.";
 
 const fn site(document: &'static str, text: &'static str) -> ClaimSite {
     ClaimSite { document, text }
@@ -575,7 +580,16 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 ///
 /// This is a seed, not coverage: six citations over five rows. Most evidence prose here is
 /// still unchecked, and [`GOVERNED_SCOPE`] says so.
-pub const EVIDENCE_CITATIONS: [(&str, Citation); 6] = [
+/// Every row must carry at least one citation ([`every_row_cites_a_checkable_fact`] in the
+/// suite). That is a **ratchet, not coverage**: it guarantees each row has *a* tripwire, which
+/// is emphatically not the same as the row being current. A citation only catches rot someone
+/// anticipated well enough to cite, and both rows that actually rotted on 2026-07-25 rotted in
+/// ways nobody anticipated — they were found by re-reading prose, not by a check. The general
+/// property needs a freshness predicate (`franken_lean-1gf` specifies one); this is the cheap
+/// floor under it.
+///
+/// [`every_row_cites_a_checkable_fact`]: ../../tests/witness_claim_matrix.rs
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 16] = [
     // Corrected 2026-07-25 after this row asserted a stub that had grown to 149 lines.
     (
         "B3-INDEPENDENT-CHECKER",
@@ -619,6 +633,98 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 6] = [
         Citation::FileAtMostLines {
             path: "crates/fln-cli/src/lib.rs",
             max_lines: 10,
+        },
+    ),
+    // ---- the ratchet: one citation for every previously-uncited row ------------------
+    (
+        "B3-KERNEL-LOC-COVENANT",
+        Citation::OccursExactly {
+            path: "ci/WORKSPACE_GRAPH.txt",
+            needle: "covenant fln-kernel max-loc=12000",
+            count: 1,
+        },
+    ),
+    // Count zero is a citation too, and the sharpest kind: it fires the moment the thing
+    // this row says does not exist starts to.
+    (
+        "B3-DUAL-ENGINE",
+        Citation::OccursExactly {
+            path: "crates/fln-kernel/src/lib.rs",
+            needle: "pub mod nbe",
+            count: 0,
+        },
+    ),
+    (
+        "B3-K2-ENGINE-NAMED-AS-LIVE",
+        Citation::OccursExactly {
+            path: "crates/fln-kernel/src/lib.rs",
+            needle: "pub mod nbe",
+            count: 0,
+        },
+    ),
+    (
+        "B3-RECEIPTS-BY-DEFAULT",
+        Citation::OccursExactly {
+            path: "crates/fln-kernel/src/verdict.rs",
+            needle: "receipts and the full typestate envelope",
+            count: 1,
+        },
+    ),
+    // This row's evidence says the matrix governs fifteen rows, so the citation tracks the
+    // row count — but it must live in a DIFFERENT file than the needle describes. Citing
+    // `witness.rs` for a literal inside `witness.rs` counts the citation itself: the first
+    // attempt used `pub const CLAIM_MATRIX: [ClaimRow; 15]` and found it twice, once as the
+    // declaration and once as its own needle. The mechanism caught that on its first run,
+    // which is a small proof it discriminates. The suite's expectation moves whenever the
+    // matrix does, so anchoring there tracks the same fact without self-reference.
+    (
+        "B8-DOCS-CI-ENFORCES-WORDING",
+        Citation::OccursExactly {
+            path: "crates/fln-conformance/tests/witness_claim_matrix.rs",
+            needle: "report.acknowledged, 12",
+            count: 1,
+        },
+    ),
+    (
+        "INSTALL-ONELINER-RUNNABLE",
+        Citation::OccursExactly {
+            path: "README.md",
+            needle: "Install script — *not yet available*",
+            count: 1,
+        },
+    ),
+    (
+        "OLEAN-WRITE-README",
+        Citation::OccursExactly {
+            path: "crates/fln-olean/src/lib.rs",
+            needle: "Today this crate reads",
+            count: 1,
+        },
+    ),
+    (
+        "OLEAN-WRITE-CRATE-HEADER",
+        Citation::OccursExactly {
+            path: "crates/fln-olean/src/decl.rs",
+            needle: "pub fn decode_expr",
+            count: 1,
+        },
+    ),
+    // The strongest citation in the table: D1's prohibition is that the lock carries no
+    // external package. One dependency edge and this fires.
+    (
+        "SUITE-INTEGRATION",
+        Citation::OccursExactly {
+            path: "Cargo.lock",
+            needle: "source = ",
+            count: 0,
+        },
+    ),
+    (
+        "DETERMINISM-THREAD-MATRIX",
+        Citation::OccursExactly {
+            path: "crates/fln-syntax/tests/lexer_thread_matrix.rs",
+            needle: "const THREAD_COUNTS: [usize; 3] = [1, 8, 32];",
+            count: 1,
         },
     ),
 ];
