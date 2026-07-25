@@ -2318,6 +2318,137 @@ mod tests {
         (map, total)
     }
 
+    /// The adversarial case this bead exists for: an attacker who can choose keys
+    /// crafts a family that all hashes to one 64-bit value, then keeps pushing.
+    ///
+    /// `CollKey` is not a mock — its keys genuinely share a `key_hash`, and the code
+    /// under test is the production bucket, preflight, and budget. It models an
+    /// attacker who has *found* collisions; finding them is assumed, not performed.
+    ///
+    /// Two properties have to hold together, and only the pair defends the boundary:
+    /// the budget must actually bind (a refusal happens), and the refusal must be
+    /// CHEAP. A bound that costs O(n) per refused attempt is not a defence — an
+    /// attacker sending n requests still extracts O(n^2) work while being told "no"
+    /// every time.
+    #[test]
+    fn an_adversarial_collision_family_binds_the_budget_with_bounded_refusal_work() {
+        const ADMITTED: usize = 512;
+
+        let mut map = PMap::new();
+        for key in 0..ADMITTED as u64 {
+            map = map
+                .try_insert_with_budget(CollKey(key), key, 1, CollisionBudget::UNBOUNDED)
+                .expect("the unbounded envelope admits the whole family");
+        }
+        assert_eq!(map.len(), ADMITTED);
+
+        // Every entry shares one hash, so this is a single full-hash family in the
+        // tree tier — the shape the attacker is trying to weaponize.
+        let (_, len) = collision_bucket_for(&map, &CollKey(0))
+            .and_then(|bucket| match bucket {
+                CollisionBucket::Tree { root, len, .. } => Some((root, len)),
+                CollisionBucket::Inline(_) => None,
+            })
+            .expect("an adversarial family must be in the tree tier");
+        assert_eq!(*len, ADMITTED);
+
+        // Exact boundary: a budget of exactly the resulting cardinality admits, and
+        // one less refuses. `entries` counts the family AFTER the insertion, so
+        // admitting the (ADMITTED+1)-th needs a budget of ADMITTED + 1.
+        let at_limit = CollisionBudget {
+            max_collision_entries: ADMITTED + 1,
+            ..CollisionBudget::UNBOUNDED
+        };
+        let one_under = CollisionBudget {
+            max_collision_entries: ADMITTED,
+            ..CollisionBudget::UNBOUNDED
+        };
+        let grown = map
+            .try_insert_with_budget(CollKey(ADMITTED as u64), 0, 1, at_limit)
+            .expect("the exact budget admits");
+        assert_eq!(grown.len(), ADMITTED + 1);
+
+        let exhausted = map
+            .try_insert_with_budget(CollKey(ADMITTED as u64), 0, 1, one_under)
+            .expect_err("one under the exact budget must refuse");
+        assert_eq!(exhausted.resource, CollisionResource::Entries);
+        assert_eq!(exhausted.limit, ADMITTED as u128);
+        assert_eq!(exhausted.attempted, ADMITTED as u128 + 1);
+        assert_eq!(exhausted.collision_hash, CollKey(0).key_hash());
+
+        // Atomic: a refused attempt leaves the receiver untouched. Not "mostly
+        // unchanged" — the same length, and every prior key still resolves.
+        assert_eq!(map.len(), ADMITTED);
+        assert_eq!(map.get(&CollKey(ADMITTED as u64)), None);
+        for probe in [0u64, (ADMITTED / 2) as u64, ADMITTED as u64 - 1] {
+            assert_eq!(map.get(&CollKey(probe)), Some(&probe));
+        }
+
+        // The anti-DoS property: refusal cost is logarithmic in family size, not
+        // linear. Measured as the comparisons the preflight actually charged.
+        let log = ceil_log2(ADMITTED + 1);
+        let refusal_bound = 2 * log + 2;
+        let mut refusal_facts = MutationFacts::default();
+        let hash = CollKey(0).key_hash();
+        let bucket = collision_bucket_for(&map, &CollKey(0)).expect("family is present");
+        let shape = bucket.insertion_shape(&CollKey(ADMITTED as u64), 1, &mut refusal_facts);
+        assert!(shape.is_ok(), "the preflight itself must not fail");
+        assert!(
+            refusal_facts.comparisons <= refusal_bound,
+            "refusing one adversarial insert cost {} comparisons, bound {refusal_bound} \
+             for cardinality {ADMITTED}; a linear refusal path is an amplification vector",
+            refusal_facts.comparisons
+        );
+        assert!(
+            refusal_facts.comparisons < ADMITTED,
+            "refusal work must be sublinear in the family the attacker built"
+        );
+
+        // Each dimension binds independently, so a budget cannot be evaded by
+        // trading one resource against another.
+        let weight_bound = map
+            .try_insert_with_budget(
+                CollKey(ADMITTED as u64),
+                0,
+                1,
+                CollisionBudget {
+                    max_expanded_weight: ADMITTED as u128,
+                    ..CollisionBudget::UNBOUNDED
+                },
+            )
+            .expect_err("expanded weight must bind on its own");
+        assert_eq!(weight_bound.resource, CollisionResource::ExpandedWeight);
+        assert_eq!(weight_bound.collision_hash, hash);
+
+        let node_bound = map
+            .try_insert_with_budget(
+                CollKey(ADMITTED as u64),
+                0,
+                1,
+                CollisionBudget {
+                    max_fresh_nodes: 0,
+                    ..CollisionBudget::UNBOUNDED
+                },
+            )
+            .expect_err("fresh nodes must bind on its own");
+        assert_eq!(node_bound.resource, CollisionResource::FreshNodes);
+
+        // Recovery: the refusal is about the envelope, never about the key. Raising
+        // the budget admits the very entry that was just refused, which is what makes
+        // this inconclusive rather than a rejection.
+        let recovered = map
+            .try_insert_with_budget(CollKey(ADMITTED as u64), 0, 1, CollisionBudget::UNBOUNDED)
+            .expect("a valid key is never rejected merely for colliding");
+        assert_eq!(recovered.len(), ADMITTED + 1);
+        assert_eq!(recovered.get(&CollKey(ADMITTED as u64)), Some(&0));
+
+        println!(
+            "adversarial collision evidence: cardinality={ADMITTED} \
+             refusal_comparisons={} refusal_bound={refusal_bound} hash={hash:016x}",
+            refusal_facts.comparisons
+        );
+    }
+
     #[test]
     fn collision_families_at_1k_and_10k_have_non_quadratic_exact_counters() {
         for cardinality in [1_000usize, 10_000] {

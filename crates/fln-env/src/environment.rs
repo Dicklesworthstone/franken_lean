@@ -24,7 +24,7 @@ use crate::extensions::{
 };
 #[cfg(test)]
 use crate::extensions::{MergeSemantics, PayloadProvenance};
-use crate::pmap::{PKey, PMap};
+use crate::pmap::{CollisionBudget, CollisionExhausted, PKey, PMap};
 
 /// Stable `Domain::DeclContent` tags. These are schema values, not Rust enum
 /// discriminants: changing them requires an explicit identity/epoch decision.
@@ -120,6 +120,62 @@ impl std::fmt::Display for EnvError {
     }
 }
 
+/// The typed outcome of a resource-bounded declaration admission (bead `fln-amv.13`).
+///
+/// Three-way by construction, so FL-INV-07's law is a type error to violate rather
+/// than a convention to remember: a caller cannot read exhaustion as acceptance or as
+/// rejection, because there is no `Result` whose `Err` means both. The distinction is
+/// load-bearing — a rejection says *this declaration is not admissible*, while an
+/// inconclusive says *we did not find out*, and only the first may ever be cached,
+/// counted, or reported as a verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeclAdmission {
+    /// The declaration entered the returned environment.
+    Admitted(Environment),
+    /// A complete, resource-independent determination that the declaration is not
+    /// admissible — today, the kernel's one-name-one-constant law.
+    Rejected(EnvError),
+    /// The adversarial-collision budget bound before any mutation. Not accepted, not
+    /// rejected, not checked, not cacheable; the receiving environment is unchanged.
+    /// A hash collision alone never produces this — only a collision large or heavy
+    /// enough to exceed the reviewed envelope does.
+    Inconclusive(CollisionExhausted),
+}
+
+impl DeclAdmission {
+    /// Stable evidence label, matching the vocabulary
+    /// [`DeclClosureStatus`](crate::decl_closure::DeclClosureStatus) already uses.
+    pub fn outcome_label(&self) -> &'static str {
+        match self {
+            DeclAdmission::Admitted(_) => "admitted",
+            DeclAdmission::Rejected(_) => "rejected",
+            DeclAdmission::Inconclusive(_) => "inconclusive-collision-budget",
+        }
+    }
+
+    /// Only an admitted declaration may feed a cache. Inconclusive outcomes are not
+    /// publication-grade, and re-admitting one later must redo the work rather than
+    /// replay a stored refusal.
+    pub fn is_cacheable(&self) -> bool {
+        matches!(self, DeclAdmission::Admitted(_))
+    }
+
+    /// The environment to carry forward, if any. `None` for both non-admitted arms —
+    /// the caller keeps the environment it already held, unchanged.
+    pub fn environment(&self) -> Option<&Environment> {
+        match self {
+            DeclAdmission::Admitted(environment) => Some(environment),
+            DeclAdmission::Rejected(_) | DeclAdmission::Inconclusive(_) => None,
+        }
+    }
+
+    /// Whether this outcome is in the inconclusive family. Kept explicit so evidence
+    /// rows never have to pattern-match a shape that may gain arms later.
+    pub fn is_inconclusive(&self) -> bool {
+        matches!(self, DeclAdmission::Inconclusive(_))
+    }
+}
+
 /// The environment. `Clone` IS `snapshot`: O(1), fully isolated.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
@@ -151,6 +207,12 @@ impl Environment {
 
     /// Add a constant. One name, one constant — a duplicate is a typed refusal
     /// (the kernel's admission law; nothing here can overwrite a declaration).
+    ///
+    /// This is the unbounded *semantic* operation: it never refuses a valid
+    /// declaration merely because its 64-bit hash collides with another's. An
+    /// admission boundary exposed to untrusted input must instead call
+    /// [`Environment::try_add_decl_with_budget`], which bounds the adversarial
+    /// full-hash-collision work without ever turning a collision into a rejection.
     pub fn add_decl(&self, info: ConstantInfo) -> Result<Environment, EnvError> {
         let name = info.name().clone();
         if self.constants.contains_key(&name) {
@@ -160,6 +222,45 @@ impl Environment {
             constants: self.constants.insert(name, Arc::new(info)),
             extensions: self.extensions.clone(),
         })
+    }
+
+    /// Resource-bounded declaration admission (bead `fln-amv.13`).
+    ///
+    /// `add_decl`'s duplicate law still applies and is evaluated first, because it
+    /// is a complete determination that costs a single bounded lookup. Only then is
+    /// the insertion preflighted against `budget`, so a crafted family of names
+    /// sharing one `key_hash` cannot drive unbounded work through this boundary.
+    ///
+    /// Exhaustion is atomic and **inconclusive**, never a rejection: `self` is
+    /// unchanged, nothing is published, and the caller learns that no verdict was
+    /// reached about this declaration (FL-INV-07). Refusing the *insertion* is not
+    /// the same as refusing the *declaration*, and the three-way
+    /// [`DeclAdmission`] makes conflating them a type error rather than a
+    /// convention.
+    ///
+    /// `expanded_weight` is supplied by the caller because a generic map cannot
+    /// infer the semantic weight of an opaque declaration; the decoder or
+    /// admission boundary that parsed it can.
+    pub fn try_add_decl_with_budget(
+        &self,
+        info: ConstantInfo,
+        expanded_weight: u64,
+        budget: CollisionBudget,
+    ) -> DeclAdmission {
+        let name = info.name().clone();
+        if self.constants.contains_key(&name) {
+            return DeclAdmission::Rejected(EnvError::DuplicateDeclaration { name });
+        }
+        match self
+            .constants
+            .try_insert_with_budget(name, Arc::new(info), expanded_weight, budget)
+        {
+            Ok(constants) => DeclAdmission::Admitted(Environment {
+                constants,
+                extensions: self.extensions.clone(),
+            }),
+            Err(exhausted) => DeclAdmission::Inconclusive(exhausted),
+        }
     }
 
     /// Register an extension with its declared contracts.
@@ -382,6 +483,7 @@ mod tests {
         AxiomVal, ConstantVal, DefinitionVal, InductiveVal, OpaqueVal, QuotVal, RecursorRule,
         RecursorVal, TheoremVal,
     };
+    use crate::pmap::CollisionResource;
     use fln_core::expr::Expr;
     use fln_core::level::Level;
     use fln_core::options::DataValue;
@@ -2140,5 +2242,84 @@ mod tests {
             });
             assert_eq!(root, sequential, "{threads}-thread interleaving diverged");
         }
+    }
+
+    /// The boundary an attacker actually reaches (bead `fln-amv.13`). The budget
+    /// machinery living in `pmap` proves nothing if no admission path calls it, so
+    /// this pins the wiring and the FL-INV-07 typing at `Environment`.
+    ///
+    /// A zero-entry budget is used to drive the refusal: real `Name` keys do not
+    /// collide on demand — engineering one would be a hash collision — so the
+    /// adversarial *family* is modelled in `pmap::tests` with keys that genuinely
+    /// share a hash, while the boundary test drives the same refusal through the
+    /// budget's zero case. Both exercise the identical production path.
+    #[test]
+    fn budgeted_admission_is_inconclusive_not_a_rejection_and_leaves_the_environment_intact() {
+        let base = Environment::new()
+            .add_decl(axiom("Held"))
+            .expect("the baseline declaration admits");
+        let before_root = base.logical_root(&KVMap::new());
+
+        // Zero entries: no insertion can fit, so the envelope binds immediately.
+        let zero = CollisionBudget {
+            max_collision_entries: 0,
+            ..CollisionBudget::UNBOUNDED
+        };
+        let outcome = base.try_add_decl_with_budget(axiom("Fresh"), 1, zero);
+
+        assert!(
+            outcome.is_inconclusive(),
+            "expected inconclusive: {outcome:?}"
+        );
+        assert_eq!(outcome.outcome_label(), "inconclusive-collision-budget");
+        // FL-INV-07: never acceptance, never rejection, never cacheable.
+        assert!(!outcome.is_cacheable());
+        assert_eq!(outcome.environment(), None);
+        assert!(
+            !matches!(outcome, DeclAdmission::Rejected(_)),
+            "resource exhaustion must never be reported as a rejection"
+        );
+        let DeclAdmission::Inconclusive(exhausted) = &outcome else {
+            unreachable!("asserted inconclusive above")
+        };
+        assert_eq!(exhausted.resource, CollisionResource::Entries);
+        assert_eq!(exhausted.limit, 0);
+
+        // Atomic: the receiver is untouched, down to its logical root.
+        assert!(!base.contains(&n("Fresh")));
+        assert!(base.contains(&n("Held")));
+        assert_eq!(base.logical_root(&KVMap::new()), before_root);
+
+        // Recovery proves the refusal was about the envelope, not the declaration:
+        // the very same declaration admits once the budget allows it.
+        let admitted = base.try_add_decl_with_budget(axiom("Fresh"), 1, CollisionBudget::UNBOUNDED);
+        assert_eq!(admitted.outcome_label(), "admitted");
+        assert!(admitted.is_cacheable());
+        let grown = admitted
+            .environment()
+            .expect("an admitted outcome carries the environment");
+        assert!(grown.contains(&n("Fresh")));
+        assert_ne!(grown.logical_root(&KVMap::new()), before_root);
+
+        // A duplicate is a *rejection* — a complete determination that costs one
+        // bounded lookup — and stays a rejection under a budget that would otherwise
+        // bind. Exhaustion must not be able to mask or masquerade as the kernel's
+        // one-name-one-constant law, in either direction.
+        for budget in [CollisionBudget::UNBOUNDED, zero] {
+            let duplicate = base.try_add_decl_with_budget(axiom("Held"), 1, budget);
+            assert_eq!(duplicate.outcome_label(), "rejected");
+            assert!(!duplicate.is_inconclusive());
+            assert!(!duplicate.is_cacheable());
+            assert_eq!(duplicate.environment(), None);
+            assert!(matches!(
+                duplicate,
+                DeclAdmission::Rejected(EnvError::DuplicateDeclaration { .. })
+            ));
+        }
+
+        // The unbudgeted semantic operation is unchanged: it never refuses for
+        // resource reasons, which is why the budgeted path had to be a sibling
+        // rather than a replacement.
+        assert!(base.add_decl(axiom("Fresh")).is_ok());
     }
 }
