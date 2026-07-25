@@ -16,6 +16,8 @@
 //!   (including the `imax u 0 = 0` collapse Prop impredicativity depends on);
 //! * [`expr`] — the kernel expression inventory with per-constructor cached data;
 //! * [`options`] — `KVMap`/`DataValue` and the canonical resource limits;
+//! * [`outcome`] — the FL-INV-07 operation-outcome algebra: complete / inconclusive /
+//!   internal-fault, kept orthogonal to the [`diag`] cause vocabulary;
 //! * [`pos`] — byte positions and the `FileMap` line/column model;
 //! * [`ids`] — the distinct semantic-kind newtypes of §8.2b.
 
@@ -30,4 +32,5 @@ pub mod lean_hash;
 pub mod level;
 pub mod name;
 pub mod options;
+pub mod outcome;
 pub mod pos;
