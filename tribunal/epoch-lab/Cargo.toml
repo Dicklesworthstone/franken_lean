@@ -1,0 +1,18 @@
+[package]
+name = "fln-epoch-lab"
+version = "0.0.0"
+edition = "2024"
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+publish = false
+
+[dependencies]
+fln-hash = { path = "../../crates/fln-hash" }
+
+# Deliberately a nested workspace, following tools/structure-guard/
+# kernel-ownership-publisher. The epoch lab is Tribunal apparatus, not a product
+# crate: it must not add a tooling-only edge to the product workspace (members =
+# crates/* plus tools/*) nor force unrelated agents to rewrite the root
+# Cargo.lock. structure-guard discovers crates under crates/ and tools/ only, so
+# this adds no governance rows either.
+[workspace]
+resolver = "3"
