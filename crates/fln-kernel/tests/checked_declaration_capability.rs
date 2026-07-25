@@ -209,10 +209,7 @@ fn an_exhausted_budget_yields_no_capability() {
     // exhaustion is never promoted to acceptance, and here it additionally
     // cannot be promoted to a publication right.
     let env = Environment::new();
-    let starved = Budget {
-        steps: 0,
-        ..Budget::DEFAULT
-    };
+    let starved = Budget::DEFAULT.narrowed(0, Budget::DEFAULT.depth);
     if let Outcome::Complete(Admitted::Accepted(_)) =
         admit(&env, axiom("Starved", sort1()), starved)
     {

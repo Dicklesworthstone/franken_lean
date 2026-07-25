@@ -4008,10 +4008,11 @@ fn admission_fault_matrix_is_typed_and_atomic() {
     // Exact-limit acceptance: budget == consumption is enough.
     {
         let start_us = emit.started.elapsed().as_micros();
-        let exact = Budget {
-            steps: s,
-            depth: budget.depth,
-        };
+        // MECHANICAL ONLY (cc_2, bead franken_lean-4o3n): a `Budget` now carries
+        // the calibration its depth ceiling was derived from, so there is no
+        // struct-literal form. `narrowed` lowers the allowances and keeps that
+        // derivation; the steps and depth asked for here are unchanged.
+        let exact = budget.narrowed(s, budget.depth);
         let v = fln_kernel::check(&subject.env, &subject.decl, exact);
         let (actual, class, _msg, steps_used, max_depth) = verdict_facts(&v);
         let ok = actual == "accepted" && steps_used == s;
@@ -4043,10 +4044,7 @@ fn admission_fault_matrix_is_typed_and_atomic() {
     // One-under: typed Inconclusive{Steps}, never a verdict about the term.
     {
         let start_us = emit.started.elapsed().as_micros();
-        let under = Budget {
-            steps: s - 1,
-            depth: budget.depth,
-        };
+        let under = budget.narrowed(s - 1, budget.depth);
         let v = fln_kernel::check(&subject.env, &subject.decl, under);
         let (actual, class, _msg, steps_used, max_depth) = verdict_facts(&v);
         let ok = matches!(
@@ -4089,10 +4087,7 @@ fn admission_fault_matrix_is_typed_and_atomic() {
     // Depth exhaustion: a shallow depth budget is typed Inconclusive{Depth}.
     {
         let start_us = emit.started.elapsed().as_micros();
-        let shallow = Budget {
-            steps: budget.steps,
-            depth: 2,
-        };
+        let shallow = budget.narrowed(budget.steps, 2);
         let v = fln_kernel::check(&subject.env, &subject.decl, shallow);
         let (actual, class, _msg, steps_used, max_depth) = verdict_facts(&v);
         let ok = matches!(

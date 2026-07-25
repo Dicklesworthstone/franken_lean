@@ -492,10 +492,7 @@ fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
         ),
         BinderInfo::Default,
     );
-    let tiny = Budget {
-        steps: 5,
-        depth: 4096,
-    };
+    let tiny = Budget::DEFAULT.narrowed(5, 4096);
     let verdict = check(
         &Environment::new(),
         &defn("id", ty.clone(), value.clone()),
@@ -520,10 +517,7 @@ fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
     assert!(verdict.as_complete().is_none());
 
     // Depth exhaustion likewise.
-    let shallow = Budget {
-        steps: 1_000_000,
-        depth: 1,
-    };
+    let shallow = Budget::DEFAULT.narrowed(1_000_000, 1);
     let verdict = check(&Environment::new(), &defn("id", ty, value), shallow);
     let usage = exhausted_usage(&verdict);
     assert_eq!(
@@ -1899,10 +1893,7 @@ fn fl_inv_07_iota_chain_exhaustion_is_inconclusive_never_rejected() {
         &[],
         &lhs,
         &Expr::const_(n("nmz"), vec![]),
-        Budget {
-            steps: 2_000,
-            depth: 64,
-        },
+        Budget::DEFAULT.narrowed(2_000, 64),
     );
     assert!(
         verdict.is_inconclusive(),
@@ -5784,10 +5775,7 @@ fn kr608_nested_translation_exhaustion_is_typed() {
     let verdict = check(
         &mylist_env(),
         &block_decl(types, ctors, recursors),
-        Budget {
-            steps: 5,
-            depth: 4096,
-        },
+        Budget::DEFAULT.narrowed(5, 4096),
     );
     assert!(
         verdict.is_inconclusive(),
@@ -6993,10 +6981,7 @@ fn kr608_deduplication_keeps_the_cascade_cost_bounded() {
     let capped = check(
         &myarr_env(),
         &block_decl(types, ctors, recursors),
-        Budget {
-            steps: CASCADE_STEP_CAP,
-            depth: 4_096,
-        },
+        Budget::DEFAULT.narrowed(CASCADE_STEP_CAP, 4_096),
     );
     assert!(
         capped.is_accepted(),

@@ -788,7 +788,10 @@ mod tests {
     fn kernel_admission_boundary_never_promotes_kernel_exhaustion() {
         let environment = Environment::new();
         let limits = ReflectedTheoremLimits {
-            kernel: KernelBudget { steps: 0, depth: 1 },
+            // Narrowed rather than built from a literal: a kernel budget now
+            // carries the calibration its depth ceiling was derived from
+            // (bead franken_lean-4o3n), and lowering an allowance keeps it.
+            kernel: KernelBudget::DEFAULT.narrowed(0, 1),
             ..ReflectedTheoremLimits::default()
         };
         let outcome = publish_reflected_theorem(

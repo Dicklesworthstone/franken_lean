@@ -625,10 +625,13 @@ impl<'a> Engine<'a> {
     }
 
     fn remaining(&self) -> Budget {
-        Budget {
-            steps: self.budget.steps.saturating_sub(self.used.steps_used),
-            depth: self.budget.depth,
-        }
+        // `narrowed` rather than a fresh literal: the remaining allowance is
+        // the SAME derivation with less of it left, and rebuilding a budget
+        // beside the calibration is how a ceiling loses its provenance.
+        self.budget.narrowed(
+            self.budget.steps.saturating_sub(self.used.steps_used),
+            self.budget.depth,
+        )
     }
 
     fn charge(&mut self, c: Consumption) -> KResult<()> {

@@ -288,10 +288,11 @@ fn probe_child() {
             // Deeper than the ceiling, so the ceiling — not the term — ends
             // the descent, and `max_depth` is pinned to `depth` exactly.
             let probe = build_probe(shape, depth.saturating_add(16));
-            let budget = Budget {
-                steps: u64::MAX,
-                depth,
-            };
+            // Stated, not derived: this IS the instrument that decides what a
+            // derivation may claim, so it must be able to ask for a depth the
+            // current constants call unsafe. `stack` is the claim the
+            // experiment is about to test (bead `franken_lean-4o3n`).
+            let budget = Budget::stated_for_measurement(u64::MAX, depth, stack);
             classify(&probe.run(budget))
         })
         .expect("probe worker spawns");

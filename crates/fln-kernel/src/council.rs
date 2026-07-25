@@ -1,4 +1,4 @@
-//! The consensus seat (bead `fln-uc44`; plan §8.3c, B3).
+//! The consensus seat (beads `fln-uc44` and `franken_lean-4o3n`; plan §8.3c, B3).
 //!
 //! # What this is
 //!
@@ -46,6 +46,39 @@
 //! to the council: a missing opinion is a missing opinion, and silently reading
 //! it as assent is how a witness lane decays into a rubber stamp.
 //!
+//! # Ran out is not disagreed — and may not even be comparable
+//!
+//! The pressure this seat will actually face is not a forged agreement. It is
+//! *noise*. A second engine running under a bound asymmetric to the kernel's
+//! turns every declaration it cannot finish into a halt — correctly on the
+//! seat's own terms, and constantly, on artifacts rather than on
+//! disagreements. Someone competent then proposes, on performance grounds,
+//! treating the second engine's inconclusive as agreement. That is the
+//! FL-INV-07 promotion this module forbids, it will be argued well, and it will
+//! sound reasonable because the halts really are noise.
+//!
+//! The defence is not a stronger prohibition; it is making the noise legible
+//! before there is any of it (bead `franken_lean-4o3n`):
+//!
+//! * [`SeatVerdict::Exhausted`] is a **distinct arm** from `Disagrees` and from
+//!   `NoAnswer`, carrying which [`Bound`] was hit. "Ran out" and "disagreed"
+//!   stop being the same event in the record.
+//! * Every seat states the bound it answered under ([`SeatBounds`]), so a
+//!   resource stop can be read against the kernel's own bound instead of
+//!   against a guess.
+//! * When two bounds cannot be established comparable
+//!   ([`Comparability`](crate::verdict::Comparability)), the seat says
+//!   so as a **typed refusal** — [`ObjectionKind::ExhaustionNotComparable`] —
+//!   rather than quietly reading the stop as a disagreement or as noise. Two
+//!   engines can report identical fuel while neither measured it in the
+//!   configuration it runs in, and agreement between those two numbers
+//!   certifies nothing.
+//! * [`Halt::is_purely_resource`] gives the honest half of the concession —
+//!   "nothing here is evidence the declaration is bad" — **without** the
+//!   unsound half. It still halts. All three objection kinds halt; the typing
+//!   exists so a reader can tell them apart, never so that one of them can be
+//!   waived.
+//!
 //! # Zero I/O, deliberately
 //!
 //! `fln-kernel` is zero-I/O by covenant (§8.1), so this module cannot read a
@@ -66,10 +99,16 @@
 //! of that, and nothing more.
 
 use crate::capability::{Admitted, CheckedDecl};
-use crate::verdict::{Consumption, RejectClass};
+use crate::verdict::{Bound, Budget, Comparability, ComparabilityDefect, Consumption, RejectClass};
 
 /// Who is speaking. An identity for the record, never a trust level — nothing
 /// in this module treats one seat as weightier than another.
+///
+/// Distinct from [`crate::verdict::EngineId`]: this names a *participant*, and
+/// two seats can be two runs of one engine or a lane with no engine behind it
+/// at all. The engine identity that matters for comparability travels on the
+/// seat's [`SeatBounds`], where it is a claim about measured code rather than a
+/// label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeatId(String);
 
@@ -80,6 +119,41 @@ impl SeatId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// The resource contract a seat answered under.
+///
+/// Required of every seat, including the ones that have nothing to declare —
+/// which is why the second arm exists and is spelled out rather than left as an
+/// `Option`. A subprocess witness with only a wall clock genuinely has no
+/// bound this process derived, and saying so is a statement about **what we
+/// know**, not an accusation about the witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeatBounds {
+    /// Derived in this process from a stated [`crate::verdict::StackMeasurement`]
+    /// of this seat's own engine. The only form that can be established
+    /// comparable with the kernel's.
+    Derived(Budget),
+    /// No bound was established here: a foreign process, a lane with no
+    /// resource contract, or a number stated without a measurement behind it.
+    /// Perfectly fine for a seat that completes — a completed check is a
+    /// completed check under any bound, because a budget can stop a check but
+    /// cannot make one finish falsely. It is only a seat's *resource stop* that
+    /// this leaves unreadable.
+    NotEstablished { note: String },
+}
+
+impl SeatBounds {
+    pub fn not_established(note: impl Into<String>) -> SeatBounds {
+        SeatBounds::NotEstablished { note: note.into() }
+    }
+
+    pub fn budget(&self) -> Option<&Budget> {
+        match self {
+            SeatBounds::Derived(budget) => Some(budget),
+            SeatBounds::NotEstablished { .. } => None,
+        }
     }
 }
 
@@ -97,6 +171,16 @@ pub enum SeatVerdict {
     /// cannot be investigated, and an uninvestigable disagreement is the one
     /// most likely to be dismissed.
     Disagrees { detail: String },
+    /// The seat hit its own resource bound: it neither agreed nor disagreed,
+    /// and it did not merely fall silent — it *stopped*, on a named limit.
+    ///
+    /// Separated from [`SeatVerdict::NoAnswer`] because the two decay
+    /// differently. Silence is an operational problem someone fixes. A resource
+    /// stop is a *systematic* one that recurs on the same declarations every
+    /// run, and its volume is the argument that will be used to reclassify it
+    /// as agreement. Naming it is what lets that volume be reported honestly
+    /// instead of being laundered.
+    Exhausted { bound: Bound },
     /// The seat could not answer: absent, errored, cancelled, timed out, or
     /// never run. **Not agreement** (FL-INV-07).
     NoAnswer { reason: String },
@@ -106,15 +190,74 @@ pub enum SeatVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seat {
     pub id: SeatId,
+    /// What the seat answered under. See [`SeatBounds`].
+    pub bounds: SeatBounds,
     pub verdict: SeatVerdict,
 }
 
 impl Seat {
-    pub fn new(id: impl Into<String>, verdict: SeatVerdict) -> Seat {
+    pub fn new(id: impl Into<String>, bounds: SeatBounds, verdict: SeatVerdict) -> Seat {
         Seat {
             id: SeatId::new(id),
+            bounds,
             verdict,
         }
+    }
+}
+
+/// Why a seat's resource stop could not be read against the kernel's bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Incomparability {
+    /// The seat declared no derived bound at all.
+    NoBoundEstablished { note: String },
+    /// It declared one, and the two could not be established comparable.
+    Defect(ComparabilityDefect),
+}
+
+impl Incomparability {
+    pub fn describe(&self) -> String {
+        match self {
+            Incomparability::NoBoundEstablished { note } => {
+                format!("no bound was established for this seat ({note})")
+            }
+            Incomparability::Defect(defect) => defect.describe(),
+        }
+    }
+}
+
+/// What kind of objection a seat raised — the three-way distinction bead
+/// `franken_lean-4o3n` requires, with exhaustion split by whether it can be
+/// read at all.
+///
+/// Every kind halts. The distinction is for the reader of the record, and its
+/// purpose is to make the *second* and *third* kinds impossible to confuse with
+/// the first when someone argues that the halts are noise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectionKind {
+    /// A real negative judgment about the term. The only kind that is evidence
+    /// the declaration might be bad.
+    Disagreement,
+    /// A resource stop under a bound established comparable with the kernel's.
+    /// A genuine fact about two comparable engines: this one ran out where the
+    /// kernel did not. Still a non-answer, and still a halt.
+    Exhaustion { bound: Bound },
+    /// A resource stop under a bound that could NOT be established comparable.
+    ///
+    /// Nothing may be concluded from it — not that the engines disagree, and
+    /// not that the stop is a spurious artifact of asymmetric bounds. Both
+    /// readings are claims about a comparison that did not happen. This is the
+    /// typed refusal, and it is deliberately not collapsible into the arm
+    /// above: the whole failure mode is that an unreadable stop gets read.
+    ExhaustionNotComparable { bound: Bound, why: Incomparability },
+    /// The seat said nothing.
+    Silence,
+}
+
+impl ObjectionKind {
+    /// Whether this objection is evidence about the *declaration* rather than
+    /// about the run.
+    pub fn is_about_the_declaration(&self) -> bool {
+        matches!(self, ObjectionKind::Disagreement)
     }
 }
 
@@ -166,13 +309,74 @@ pub struct Halt {
     /// What the kernel concluded, retained so a halt cannot be misread as the
     /// kernel having rejected.
     pub kernel_accepted: bool,
-    /// Every seat that did not agree, with its reason.
+    /// The bound the kernel's own check ran under, with its calibration. Kept
+    /// on the halt because every judgement about a seat's resource stop is a
+    /// judgement *relative to this*, and a record that omits it cannot be
+    /// re-read later.
+    pub kernel_budget: Budget,
+    /// Every seat that did not agree, with its reason and its bounds.
     pub objections: Vec<Seat>,
 }
 
 impl Halt {
-    /// A one-line summary for logs. The structured `objections` remain the
-    /// authoritative record; this never replaces them.
+    /// Classify every objection against the kernel's own bound.
+    ///
+    /// Order is the supplied order (FL-INV-01). The classification is computed
+    /// rather than stored so it cannot drift from the seats it describes.
+    pub fn classify(&self) -> Vec<(SeatId, ObjectionKind)> {
+        self.objections
+            .iter()
+            .map(|seat| (seat.id.clone(), self.classify_seat(seat)))
+            .collect()
+    }
+
+    fn classify_seat(&self, seat: &Seat) -> ObjectionKind {
+        match &seat.verdict {
+            // Not an objection; `objections` never contains one, and a total
+            // match here is better than an unreachable arm.
+            SeatVerdict::Agrees => ObjectionKind::Silence,
+            SeatVerdict::Disagrees { .. } => ObjectionKind::Disagreement,
+            SeatVerdict::NoAnswer { .. } => ObjectionKind::Silence,
+            SeatVerdict::Exhausted { bound } => match &seat.bounds {
+                SeatBounds::NotEstablished { note } => ObjectionKind::ExhaustionNotComparable {
+                    bound: bound.clone(),
+                    why: Incomparability::NoBoundEstablished { note: note.clone() },
+                },
+                SeatBounds::Derived(budget) => {
+                    match Comparability::establish(&self.kernel_budget, budget) {
+                        Comparability::Established => ObjectionKind::Exhaustion {
+                            bound: bound.clone(),
+                        },
+                        Comparability::NotEstablished(defect) => {
+                            ObjectionKind::ExhaustionNotComparable {
+                                bound: bound.clone(),
+                                why: Incomparability::Defect(defect),
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// True when **no** objection is evidence about the declaration — every one
+    /// is a resource stop or a silence.
+    ///
+    /// This is the honest half of the concession the noise argument asks for,
+    /// and it is deliberately all of it. A caller may report "these halts say
+    /// nothing bad about this declaration" and be exactly right. What no caller
+    /// may do is turn that into publication: the capability is already gone,
+    /// and this predicate cannot bring it back. Legible is not waivable.
+    pub fn is_purely_resource(&self) -> bool {
+        !self
+            .objections
+            .iter()
+            .any(|seat| matches!(seat.verdict, SeatVerdict::Disagrees { .. }))
+    }
+
+    /// A one-line summary for logs. The structured `objections` and
+    /// [`Halt::classify`] remain the authoritative record; this never replaces
+    /// them.
     pub fn summary(&self) -> String {
         let mut parts = Vec::with_capacity(self.objections.len());
         for seat in &self.objections {
@@ -180,6 +384,14 @@ impl Halt {
                 SeatVerdict::Agrees => "agrees".to_string(),
                 SeatVerdict::Disagrees { detail } => format!("disagrees: {detail}"),
                 SeatVerdict::NoAnswer { reason } => format!("no answer: {reason}"),
+                SeatVerdict::Exhausted { bound } => match self.classify_seat(seat) {
+                    ObjectionKind::ExhaustionNotComparable { why, .. } => format!(
+                        "ran out of {} under a bound not comparable to the kernel's: {}",
+                        bound.describe(),
+                        why.describe()
+                    ),
+                    _ => format!("ran out of {}", bound.describe()),
+                },
             };
             parts.push(format!("{}={what}", seat.id.as_str()));
         }
@@ -234,11 +446,16 @@ pub fn convene<'env>(council: &Council, admitted: Admitted<'env>) -> CouncilOutc
             if objections.is_empty() {
                 CouncilOutcome::Agreed(checked)
             } else {
+                // Read the kernel's bound BEFORE the drop: the halt has to
+                // record what the seats were being compared against, and after
+                // this line the capability — and everything it knows — is gone.
+                let kernel_budget = checked.budget();
                 // `checked` is not returned and not stored: dropping it here is
                 // the halt. Nothing downstream can reconstruct it.
                 drop(checked);
                 CouncilOutcome::Halted(Halt {
                     kernel_accepted: true,
+                    kernel_budget,
                     objections,
                 })
             }

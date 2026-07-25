@@ -73,11 +73,24 @@ pub struct CheckedDecl<'env> {
     /// never a caller-supplied one, so "check A, publish B" has no expression.
     decl: Declaration,
     consumption: Consumption,
+    /// The bound the accepting check ran under, with its calibration attached
+    /// (bead `franken_lean-4o3n`). Retained because a council cannot classify a
+    /// seat's resource stop — or refuse to, when the two bounds are not
+    /// comparable — without knowing what the kernel's own bound was.
+    budget: crate::Budget,
     _seal: Seal,
 }
 
 /// What [`admit`] concluded. The accepted arm is the only inhabitant of the
 /// capability type.
+///
+/// The arms are lopsided since [`CheckedDecl`] began carrying the calibrated
+/// [`crate::Budget`] it was checked under (bead `franken_lean-4o3n`), and that
+/// is accepted rather than boxed. Boxing would buy back stack width at the cost
+/// of one heap allocation per *accepted declaration* — 158,608 of them in a
+/// single Corpus replay — to shrink a value that is returned, matched, and
+/// consumed immediately and is never stored in a collection.
+#[allow(clippy::large_enum_variant)]
 pub enum Admitted<'env> {
     Accepted(CheckedDecl<'env>),
     Rejected {
@@ -117,6 +130,7 @@ pub fn admit<'env>(
                 base,
                 decl,
                 consumption,
+                budget,
                 _seal: Seal,
             }))
         }
@@ -143,6 +157,11 @@ impl<'env> CheckedDecl<'env> {
     /// What the accepting check cost.
     pub fn consumption(&self) -> Consumption {
         self.consumption
+    }
+
+    /// The bound the accepting check ran under, carrying its calibration.
+    pub fn budget(&self) -> crate::Budget {
+        self.budget
     }
 
     /// The name this capability authorises, for reporting only.

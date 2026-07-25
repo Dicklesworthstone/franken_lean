@@ -1,5 +1,6 @@
 //! Domain verdicts and the resource algebra slice (plan §8.2b/§8.2c; beads
-//! franken_lean-zht and franken_lean-1fxz).
+//! franken_lean-zht, franken_lean-1fxz, franken_lean-kxbj and
+//! franken_lean-4o3n).
 //!
 //! The kernel's one authority speaks in [`fln_core::outcome::Outcome<Verdict>`].
 //! [`Verdict`] contains only completed domain answers: acceptance or a real
@@ -76,9 +77,617 @@ impl RejectClass {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Calibration — what a bound is DERIVED from (bead `franken_lean-4o3n`)
+// ---------------------------------------------------------------------------
+//
+// The one sentence this section exists for, and it is cc_3's:
+//
+//     Two engines can report identical fuel while neither measured it in the
+//     configuration it actually executes in, and the agreement then certifies
+//     nothing.
+//
+// The measurement on record makes that concrete rather than theoretical. Bead
+// `franken_lean-kxbj` measured this kernel's marginal native stack cost at
+// 5,935 bytes per unit of depth in the `dev` profile and 640 in `release` — the
+// same code, the same target, the same `depth = 4096`, a 9.3x gap in what that
+// number COSTS. So "both engines ran at depth 4096" is agreement about a
+// LABEL. It says nothing about a resource, and a seat that reads it as
+// agreement about a resource has certified nothing while appearing to certify
+// parity.
+//
+// Everything below exists so that a bound cannot be stated without the
+// configuration it was measured in, and so that two bounds cannot be compared
+// until that configuration has been established comparable. Parity here is
+// parity of the *derivation*, never parity of the number.
+
+/// Compile-time string equality, so configurations can be compared in `const`
+/// contexts as well as at run time.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The smallest power of two at or above `n`. Written out rather than taken
+/// from `usize::next_power_of_two` so the derivation of
+/// [`Budget::MIN_STACK_BYTES`] is visible in the same file that justifies it.
+const fn round_up_to_power_of_two(n: usize) -> usize {
+    let mut p: usize = 1;
+    while p < n {
+        p *= 2;
+    }
+    p
+}
+
+/// Which engine's frames a measurement is of — and therefore which engine a
+/// bound derived from it is a claim about.
+///
+/// Deliberately not [`crate::council::SeatId`]. A seat id names *who is
+/// speaking*: two seats can be two runs of one engine, and a seat can be a
+/// subprocess with no measurement at all. This names the **code that was
+/// measured**, which is the only thing a depth ceiling is a statement about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineId(&'static str);
+
+impl EngineId {
+    /// The certified small-step engine in this crate — the only engine that
+    /// exists today (`fln-checker` is an independence boundary and a schema,
+    /// not an implementation that decides verdicts).
+    pub const K1: EngineId = EngineId("fln-kernel/k1");
+
+    /// Name another engine. Public because a second engine has to be able to
+    /// state its own identity, and stating one grants nothing — exactly as
+    /// stating a [`crate::council::SeatVerdict`] grants nothing.
+    pub const fn named(name: &'static str) -> EngineId {
+        EngineId(name)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    pub const fn is(self, other: EngineId) -> bool {
+        str_eq(self.0, other.0)
+    }
+}
+
+/// Optimisation posture of the build a measurement was taken in, or that a
+/// budget is derived for.
+///
+/// `debug_assertions` is a **proxy** for "unoptimised", and it is named as one
+/// rather than presented as a fact about `opt-level`: a crate cannot see its own
+/// optimisation level, and a profile that turns debug assertions off while
+/// leaving optimisation off would be classified `Release` here and would get a
+/// ceiling too generous for its frames. It is the right proxy for the measured
+/// 9.3x gap — that gap is exactly `cargo test` versus `cargo test --release` —
+/// and it is honest about being one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Dev,
+    Release,
+}
+
+impl Profile {
+    /// The profile THIS build was compiled under.
+    pub const fn current() -> Profile {
+        if cfg!(debug_assertions) {
+            Profile::Dev
+        } else {
+            Profile::Release
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Profile::Dev => "dev",
+            Profile::Release => "release",
+        }
+    }
+}
+
+/// The execution configuration a measurement was taken in — and therefore the
+/// only configuration a bound derived from it describes.
+///
+/// Three axes, each of which moved the measured number in practice or can be
+/// shown to: the optimisation posture (measured, 9.3x), and the target's
+/// architecture and OS (frame layout and ABI). A budget that travels without
+/// these is a number, and the whole defect class this type exists for is
+/// numbers that look like bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecConfig {
+    pub profile: Profile,
+    pub arch: &'static str,
+    pub os: &'static str,
+}
+
+impl ExecConfig {
+    /// The configuration THIS build runs in, resolved entirely at compile time.
+    /// No I/O: `std::env::consts` are constants baked in by rustc, not a
+    /// lookup, so this respects the kernel's zero-I/O covenant (§8.1).
+    pub const fn current() -> ExecConfig {
+        ExecConfig {
+            profile: Profile::current(),
+            arch: std::env::consts::ARCH,
+            os: std::env::consts::OS,
+        }
+    }
+
+    pub const fn of(profile: Profile, arch: &'static str, os: &'static str) -> ExecConfig {
+        ExecConfig { profile, arch, os }
+    }
+
+    /// Configuration equality, usable in `const` contexts.
+    pub const fn is(self, other: ExecConfig) -> bool {
+        matches!(
+            (self.profile, other.profile),
+            (Profile::Dev, Profile::Dev) | (Profile::Release, Profile::Release)
+        ) && str_eq(self.arch, other.arch)
+            && str_eq(self.os, other.os)
+    }
+
+    /// A stable one-line rendering for halts, refusals and logs.
+    pub fn describe(self) -> String {
+        format!("{}/{}/{}", self.profile.as_str(), self.arch, self.os)
+    }
+}
+
+/// A **measured** native-stack cost for one engine, taken in one stated
+/// configuration.
+///
+/// A unit of depth is not a stack frame. In this kernel `whnf` calls
+/// `whnf_core` at the *same* depth, `infer` calls `infer_core` at the same
+/// depth, and `is_def_eq` calls `quick_def_eq_rules` at the same depth, so one
+/// level of the ceiling buys several native frames of unknown width. The
+/// quantity is therefore measured end to end rather than modelled from frame
+/// layouts — see `crates/fln-kernel/tests/depth_stack_calibration.rs`, which
+/// bisects the deepest surviving descent at two known stack sizes for each of
+/// the four depth-threading descents and takes the slope of the worst.
+///
+/// A second engine does **not** inherit these numbers. It is different code
+/// with different frames, and handing it this kernel's ceiling because that is
+/// the constant in this file is precisely the copied-number defect: either
+/// unsafe for it or artificially shallow, and artificially shallow manufactures
+/// the non-answers that erode a consensus seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackMeasurement {
+    engine: EngineId,
+    taken_in: ExecConfig,
+    bytes_per_depth: usize,
+    entry_reserve_bytes: usize,
+    safety_factor: usize,
+}
+
+impl StackMeasurement {
+    /// Record a measurement. Every field is required: an engine that cannot say
+    /// what it measured, where, cannot be established comparable with anything.
+    pub const fn measured(
+        engine: EngineId,
+        taken_in: ExecConfig,
+        bytes_per_depth: usize,
+        entry_reserve_bytes: usize,
+        safety_factor: usize,
+    ) -> StackMeasurement {
+        StackMeasurement {
+            engine,
+            taken_in,
+            // A zero slope would make every ceiling infinite; refuse it here
+            // rather than let it become an unbounded descent downstream.
+            bytes_per_depth: if bytes_per_depth == 0 {
+                1
+            } else {
+                bytes_per_depth
+            },
+            entry_reserve_bytes,
+            safety_factor: if safety_factor == 0 { 1 } else { safety_factor },
+        }
+    }
+
+    /// Stack consumed before the metered descent begins — the caller's own
+    /// frames, the `check` entry path, `TypeChecker` construction. Measured as
+    /// the intercept of the two-point fit (21.8 KiB worst case) and rounded up.
+    /// Subtracted first so the per-level slope is never asked to absorb a fixed
+    /// cost.
+    pub const K1_ENTRY_RESERVE_BYTES: usize = 64 * 1024;
+
+    /// Multiplier applied to a measurement before deriving a stack requirement
+    /// or a ceiling.
+    ///
+    /// The calibration is empirical over four planted descents on one target at
+    /// one optimisation level; it is not a proof that no Corpus term is worse.
+    /// This factor is what makes the derivation robust to a shape we did not
+    /// plant and to a future rustc that widens a frame. It is explicitly NOT
+    /// what carries a measurement to a *different configuration*: that is what
+    /// [`Grade::Extrapolated`] records, and an extrapolated bound is never
+    /// established comparable.
+    pub const K1_SAFETY_FACTOR: usize = 2;
+
+    /// K1 measured in the `dev` profile on `x86_64-unknown-linux-gnu` at the
+    /// pinned nightly, 2026-07-25 (bead `franken_lean-kxbj`).
+    ///
+    /// | shape                        | bytes/depth |
+    /// |------------------------------|-------------|
+    /// | `forall` inference (worst)   | 5_935       |
+    ///
+    /// The three inference descents land on the same slope because the
+    /// dominating cost is a single `infer_core` frame per level; defeq binder
+    /// congruence is cheaper per level despite using two frames.
+    ///
+    /// Rerun `cargo test -p fln-kernel --test depth_stack_calibration --
+    /// --ignored --nocapture calibrate_stack_bytes_per_depth` after any change
+    /// to the descent, and move this number if it moved. `benchmark` class (D7)
+    /// on this target and toolchain.
+    pub const K1_DEV: StackMeasurement = StackMeasurement::measured(
+        EngineId::K1,
+        ExecConfig::of(Profile::Dev, "x86_64", "linux"),
+        5_935,
+        StackMeasurement::K1_ENTRY_RESERVE_BYTES,
+        StackMeasurement::K1_SAFETY_FACTOR,
+    );
+
+    /// K1 measured in the `release` profile on the same target and day — 640
+    /// bytes per depth, 9.3x cheaper than [`StackMeasurement::K1_DEV`] for the
+    /// identical depth number. This pair IS the bead: same label, different
+    /// resource.
+    pub const K1_RELEASE: StackMeasurement = StackMeasurement::measured(
+        EngineId::K1,
+        ExecConfig::of(Profile::Release, "x86_64", "linux"),
+        640,
+        StackMeasurement::K1_ENTRY_RESERVE_BYTES,
+        StackMeasurement::K1_SAFETY_FACTOR,
+    );
+
+    /// The K1 measurement for the profile this build was compiled under.
+    ///
+    /// Selected rather than fixed. Shipping the `dev` figure unconditionally
+    /// would be *safe* — it is the worse of the two — but it would make the
+    /// provenance lie in a release build, claiming a cost that was measured
+    /// somewhere else. A bound whose provenance is wrong in the safe direction
+    /// is still a bound nobody can compare.
+    pub const fn k1_here() -> StackMeasurement {
+        match Profile::current() {
+            Profile::Dev => StackMeasurement::K1_DEV,
+            Profile::Release => StackMeasurement::K1_RELEASE,
+        }
+    }
+
+    pub const fn engine(self) -> EngineId {
+        self.engine
+    }
+
+    pub const fn taken_in(self) -> ExecConfig {
+        self.taken_in
+    }
+
+    pub const fn bytes_per_depth(self) -> usize {
+        self.bytes_per_depth
+    }
+
+    pub const fn entry_reserve_bytes(self) -> usize {
+        self.entry_reserve_bytes
+    }
+
+    pub const fn safety_factor(self) -> usize {
+        self.safety_factor
+    }
+
+    /// The native stack a descent to `depth` requires under this measurement,
+    /// safety factor included. The inverse of
+    /// [`StackMeasurement::depth_for_stack_bytes`].
+    pub const fn stack_bytes_for_depth(self, depth: u32) -> usize {
+        let per_level = self.bytes_per_depth * self.safety_factor;
+        (depth as usize) * per_level + self.entry_reserve_bytes
+    }
+
+    /// The largest depth ceiling that fits in `stack_bytes` under this
+    /// measurement.
+    ///
+    /// Monotone in `stack_bytes` and never zero: a caller with a tiny stack
+    /// gets a ceiling of 1, which yields a typed depth non-answer on the first
+    /// descent rather than an abort.
+    pub const fn depth_for_stack_bytes(self, stack_bytes: usize) -> u32 {
+        let usable = stack_bytes.saturating_sub(self.entry_reserve_bytes);
+        let per_level = self.bytes_per_depth * self.safety_factor;
+        let depth = usable / per_level;
+        if depth == 0 {
+            1
+        } else if depth > u32::MAX as usize {
+            u32::MAX
+        } else {
+            depth as u32
+        }
+    }
+}
+
+/// How much a bound's number is worth where it is being used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grade {
+    /// The measurement was taken in the configuration this bound runs in. The
+    /// number is a measured resource.
+    Measured,
+    /// The measurement was taken somewhere else and carried here by the safety
+    /// factor. Safe to *run* under — that is what the factor is for — and never
+    /// comparable, because "safe by a factor we chose" and "measured" are not
+    /// the same claim and only one of them supports certifying parity.
+    Extrapolated,
+}
+
+/// The provenance a budget carries: which engine's measurement it came from,
+/// where that measurement was taken, and which configuration and stack it was
+/// derived FOR.
+///
+/// A budget without this is the same defect class as a `ProofCheckReceipt`
+/// binding counts and no content (bead `fln-46mw`): a number that looks like
+/// evidence and is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Calibration {
+    measurement: StackMeasurement,
+    running_in: ExecConfig,
+    stack_bytes: usize,
+}
+
+impl Calibration {
+    /// The engine this bound is a claim about.
+    pub const fn engine(self) -> EngineId {
+        self.measurement.engine()
+    }
+
+    pub const fn measurement(self) -> StackMeasurement {
+        self.measurement
+    }
+
+    /// The configuration the bound was derived for — i.e. where the run it
+    /// governs is expected to happen.
+    pub const fn running_in(self) -> ExecConfig {
+        self.running_in
+    }
+
+    /// The native stack the derivation assumed. A *requirement on the caller*,
+    /// stated so it can be met rather than discovered by aborting.
+    pub const fn stack_bytes(self) -> usize {
+        self.stack_bytes
+    }
+
+    pub const fn grade(self) -> Grade {
+        if self.measurement.taken_in().is(self.running_in) {
+            Grade::Measured
+        } else {
+            Grade::Extrapolated
+        }
+    }
+
+    pub fn describe(self) -> String {
+        format!(
+            "engine={} measured_in={} running_in={} bytes_per_depth={} safety_factor={} \
+             assumed_stack_bytes={}",
+            self.engine().as_str(),
+            self.measurement.taken_in().describe(),
+            self.running_in.describe(),
+            self.measurement.bytes_per_depth(),
+            self.measurement.safety_factor(),
+            self.stack_bytes,
+        )
+    }
+}
+
+/// Which bound a run stopped on. Public vocabulary, because a seat has to be
+/// able to say *which* limit it hit — "disagreed" and "ran out" are different
+/// facts, and "ran out of steps" and "ran out of depth" are different facts
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bound {
+    /// The counted-work bound.
+    ///
+    /// Engine-local by nature: a step in a small-step checker is not a step in
+    /// an NbE evaluator, so two step *numbers* are never comparable even when
+    /// both engines are honest. Only the outcome — this engine ran out — is a
+    /// fact about the world.
+    Steps,
+    /// The traversal-depth bound: the one calibrated against native stack, and
+    /// the one whose cost is measured by [`StackMeasurement`].
+    Depth,
+    /// A bound this vocabulary does not name, stated by whoever hit it — a wall
+    /// clock, a heap ceiling, a foreign checker's own limit. Open on purpose: a
+    /// closed enum would force a foreign engine to misreport.
+    Other(String),
+}
+
+impl Bound {
+    pub fn describe(&self) -> String {
+        match self {
+            Bound::Steps => "steps".to_string(),
+            Bound::Depth => "depth".to_string(),
+            Bound::Other(what) => what.clone(),
+        }
+    }
+}
+
+/// Why a budget may not govern a particular run.
+///
+/// Both arms are refusals to *start*, not diagnoses after the fact. The depth
+/// ceiling is the only thing standing between a legitimately deep term and a
+/// native stack overflow, and a stack overflow is the one exhaustion FL-INV-07
+/// cannot convert into a typed answer, because it aborts the process
+/// uncatchably. So a ceiling whose derivation does not apply here must be
+/// refused before the first descent, never audited afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetObjection {
+    /// The bound was derived from a measurement of a different engine. Its
+    /// number says nothing about this engine's frames.
+    CalibratedForAnotherEngine {
+        calibrated_for: EngineId,
+        running: EngineId,
+    },
+    /// The bound was derived for a different configuration than the one it is
+    /// about to run in. This is the 9.3x case: a `release`-derived depth in a
+    /// `dev` build is a ceiling nine times above the floor.
+    CalibratedForAnotherConfiguration {
+        calibrated_for: ExecConfig,
+        running: ExecConfig,
+    },
+}
+
+impl BudgetObjection {
+    pub fn describe(&self) -> String {
+        match self {
+            BudgetObjection::CalibratedForAnotherEngine {
+                calibrated_for,
+                running,
+            } => format!(
+                "budget is calibrated for engine `{}` but would govern `{}`: a depth ceiling \
+                 derived from another engine's frames is a number, not a bound",
+                calibrated_for.as_str(),
+                running.as_str()
+            ),
+            BudgetObjection::CalibratedForAnotherConfiguration {
+                calibrated_for,
+                running,
+            } => format!(
+                "budget is calibrated for configuration {} but would run in {}: the same depth \
+                 costs a different amount of native stack in each, so the ceiling is not known \
+                 to be below the floor",
+                calibrated_for.describe(),
+                running.describe()
+            ),
+        }
+    }
+}
+
+/// Whether two bounds may have their OUTCOMES compared.
+///
+/// Never their numbers. Establishing comparability licenses reading "engine A
+/// ran out where engine B did not" as a fact about the two engines; it never
+/// licenses reading "A allowed 4096 and B allowed 4096" as agreement, because
+/// that is the vacuity this whole section exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparability {
+    /// Each bound was derived from a measurement of its own engine, taken in
+    /// the configuration that engine actually runs in, and both run in the same
+    /// configuration.
+    Established,
+    /// Not established. **Nothing** may be concluded from a difference between
+    /// the two outcomes — not that the engines disagree, and not that a stop
+    /// is a spurious artifact of asymmetric bounds. Both readings are claims
+    /// about a comparison that did not happen.
+    NotEstablished(ComparabilityDefect),
+}
+
+/// Why two bounds could not be established comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparabilityDefect {
+    /// Both bounds are calibrated for the same engine. An engine cannot
+    /// corroborate itself, and two copies of one measurement agreeing is
+    /// agreement with itself.
+    SameEngine { engine: EngineId },
+    /// One side's measurement was not taken where that side runs, so its number
+    /// is carried by a safety factor rather than measured. Honest, safe to run
+    /// under, and not comparable.
+    NotMeasuredWhereItRuns {
+        engine: EngineId,
+        taken_in: ExecConfig,
+        running_in: ExecConfig,
+    },
+    /// The two sides run in different configurations. The bead's headline case:
+    /// identical depth numbers, incomparable resources.
+    RunsInDifferentConfigurations { a: ExecConfig, b: ExecConfig },
+}
+
+impl ComparabilityDefect {
+    pub fn describe(&self) -> String {
+        match self {
+            ComparabilityDefect::SameEngine { engine } => format!(
+                "both bounds are calibrated for engine `{}`; an engine cannot corroborate itself",
+                engine.as_str()
+            ),
+            ComparabilityDefect::NotMeasuredWhereItRuns {
+                engine,
+                taken_in,
+                running_in,
+            } => format!(
+                "engine `{}` runs in {} but its measurement was taken in {}: the bound is \
+                 extrapolated by a safety factor, not measured where it runs",
+                engine.as_str(),
+                running_in.describe(),
+                taken_in.describe()
+            ),
+            ComparabilityDefect::RunsInDifferentConfigurations { a, b } => format!(
+                "the two bounds run in different configurations ({} vs {}): the same depth \
+                 number costs a different resource in each",
+                a.describe(),
+                b.describe()
+            ),
+        }
+    }
+}
+
+impl Comparability {
+    /// Establish — or refuse to establish — that two bounds may have their
+    /// outcomes compared.
+    ///
+    /// The checks run in a fixed order so the reported defect is deterministic
+    /// (FL-INV-01) when a pair has more than one: self-comparison first,
+    /// because it invalidates the exercise entirely; then each side's own
+    /// grade, in argument order; then the cross-configuration check, which is
+    /// the only one that is a property of the pair rather than of a side.
+    pub fn establish(a: &Budget, b: &Budget) -> Comparability {
+        let (ca, cb) = (a.calibration(), b.calibration());
+        if ca.engine().is(cb.engine()) {
+            return Comparability::NotEstablished(ComparabilityDefect::SameEngine {
+                engine: ca.engine(),
+            });
+        }
+        for c in [ca, cb] {
+            if c.grade() == Grade::Extrapolated {
+                return Comparability::NotEstablished(
+                    ComparabilityDefect::NotMeasuredWhereItRuns {
+                        engine: c.engine(),
+                        taken_in: c.measurement().taken_in(),
+                        running_in: c.running_in(),
+                    },
+                );
+            }
+        }
+        if !ca.running_in().is(cb.running_in()) {
+            return Comparability::NotEstablished(
+                ComparabilityDefect::RunsInDifferentConfigurations {
+                    a: ca.running_in(),
+                    b: cb.running_in(),
+                },
+            );
+        }
+        Comparability::Established
+    }
+
+    pub const fn is_established(&self) -> bool {
+        matches!(self, Comparability::Established)
+    }
+
+    pub const fn defect(&self) -> Option<ComparabilityDefect> {
+        match self {
+            Comparability::Established => None,
+            Comparability::NotEstablished(defect) => Some(*defect),
+        }
+    }
+}
+
 /// The typed budget the caller hands the kernel (§8.2c slice: reduction/inference
 /// steps and traversal depth). Exhaustion is an outcome about the run (KR-403),
 /// never a [`Verdict`].
+///
+/// The allowances are public and readable; the [`Calibration`] is private and
+/// travels with them. That asymmetry is the point: there is no struct-literal
+/// expression for a `Budget` outside this crate, so no engine can hand itself a
+/// ceiling it did not derive from a stated measurement. `depth` can still be
+/// *read* by anyone — a bound nobody can inspect would be its own problem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     /// Counted work steps (inference nodes + reduction steps + defeq queries).
@@ -91,131 +700,197 @@ pub struct Budget {
     /// being provably below the floor, never from recovery — see
     /// [`Budget::depth_for_stack_bytes`].
     pub depth: u32,
+    /// Where the ceiling came from. Private so it cannot be detached from the
+    /// number it justifies.
+    calibration: Calibration,
 }
 
 impl Budget {
     /// Steps are a work bound, not a stack bound; they are independent of the
-    /// stack calibration below and unchanged by it.
+    /// stack calibration and unchanged by it. They are also **engine-local**:
+    /// see [`Bound::Steps`] for why a step count is never comparable across
+    /// engines even when both engines are honest.
     pub const DEFAULT_STEPS: u64 = 10_000_000;
 
     /// The traversal depth [`Budget::DEFAULT`] offers.
     ///
     /// This one number is a **policy** choice — how much checking power the
     /// default hands a caller — and it is the only free parameter here.
-    /// Everything else on this impl is measured or derived from it. Its cost
-    /// is [`Budget::MIN_STACK_BYTES`], which is what a caller must actually
+    /// Everything else is measured or derived from it. Its cost is
+    /// [`Budget::MIN_STACK_BYTES`], which is what a caller must actually
     /// provide; the pairing is asserted at compile time below.
     pub const DEFAULT_DEPTH: u32 = 4_096;
 
-    /// **Measured** worst-case marginal native stack, in bytes, consumed per
-    /// unit of [`Budget::depth`] (bead `franken_lean-kxbj`).
-    ///
-    /// A unit of depth is not a stack frame. `whnf` calls `whnf_core` at the
-    /// *same* depth, `infer` calls `infer_core` at the same depth, and
-    /// `is_def_eq` calls `quick_def_eq_rules` at the same depth, so one level
-    /// of the ceiling buys several native frames of unknown width. This
-    /// constant is therefore measured end-to-end rather than modelled from
-    /// frame layouts: `crates/fln-kernel/tests/depth_stack_calibration.rs`
-    /// bisects the deepest surviving descent at two known stack sizes for each
-    /// of the four depth-threading descents (`forall` inference, `lam`
-    /// inference, application-spine inference, defeq binder congruence) and
-    /// takes the slope of the worst.
-    ///
-    /// Measured 2026-07-25 on `x86_64-unknown-linux-gnu` at the pinned
-    /// nightly. The three inference descents all land on the same slope
-    /// because the dominating cost is a single `infer_core` frame per level;
-    /// defeq binder congruence is cheaper per level despite using two frames.
-    ///
-    /// | profile | worst shape    | bytes/depth |
-    /// |---------|----------------|-------------|
-    /// | `dev`   | `forall_infer` | 5_935       |
-    /// | `release` | `forall_infer` | 640       |
-    ///
-    /// **The `dev` figure is the one shipped here**, deliberately: `cargo test`
-    /// is the profile the Tribunal and every kernel replay actually run under,
-    /// and it is 9.3x worse than `release`. Calibrating against the optimised
-    /// build would leave the tested configuration unbounded.
-    ///
-    /// Rerun `cargo test -p fln-kernel --test depth_stack_calibration -- \
-    /// --ignored --nocapture calibrate_stack_bytes_per_depth` after any change
-    /// to the descent, and move this number if it moved. It is a `benchmark`
-    /// class measurement (D7) on this target and toolchain; the safety factor
-    /// below is what carries it to the ones we have not measured.
-    pub const MEASURED_STACK_BYTES_PER_DEPTH: usize = 5_935;
+    /// The measured marginal native stack per unit of depth for THIS engine in
+    /// THIS build's profile. See [`StackMeasurement::k1_here`].
+    pub const MEASURED_STACK_BYTES_PER_DEPTH: usize = StackMeasurement::k1_here().bytes_per_depth();
 
-    /// Stack consumed before the metered descent begins (the caller's own
-    /// frames, the `check` entry path, `TypeChecker` construction). Measured
-    /// as the intercept of the same two-point fit — 21.8 KiB worst case —
-    /// and rounded up. Subtracted first so the per-level slope is never asked
-    /// to absorb a fixed cost.
-    pub const STACK_ENTRY_RESERVE_BYTES: usize = 64 * 1024;
+    /// See [`StackMeasurement::K1_ENTRY_RESERVE_BYTES`].
+    pub const STACK_ENTRY_RESERVE_BYTES: usize = StackMeasurement::K1_ENTRY_RESERVE_BYTES;
 
-    /// Multiplier applied to the measurement before deriving a stack
-    /// requirement or a ceiling.
-    ///
-    /// The calibration is empirical over four planted descents on one target
-    /// at one optimisation level; it is not a proof that no Corpus term is
-    /// worse. This factor is what makes the derivation robust to a shape we
-    /// did not plant, to a future rustc that widens a frame, and to a target
-    /// whose ABI is fatter than this one.
-    pub const STACK_SAFETY_FACTOR: usize = 2;
+    /// See [`StackMeasurement::K1_SAFETY_FACTOR`].
+    pub const STACK_SAFETY_FACTOR: usize = StackMeasurement::K1_SAFETY_FACTOR;
 
     /// The minimum usable native stack, in bytes, that [`Budget::DEFAULT`]
     /// requires of its caller's thread.
     ///
-    /// This is a **requirement on the caller**, stated so it can be met rather
-    /// than discovered by aborting. It is far above Rust's default spawned
-    /// thread (2 MiB) and above a typical main thread (8 MiB), because
-    /// `DEFAULT_DEPTH` at the measured `dev`-profile cost genuinely needs
-    /// `4096 * 5935 * 2 + 64 KiB` = 46.4 MiB; 64 MiB is the next round,
-    /// allocatable figure above it. Thread stacks are lazily committed, so
-    /// this is address space, not resident memory.
+    /// A **requirement on the caller**, stated so it can be met rather than
+    /// discovered by aborting. Derived, not chosen: it is exactly the stack
+    /// `DEFAULT_DEPTH` needs under the current profile's measurement, rounded
+    /// up to the next power of two. In the `dev` profile that is
+    /// `4096 * 5935 * 2 + 64 KiB` = 46.4 MiB, rounded to **64 MiB** — far above
+    /// Rust's default spawned thread (2 MiB) and above a typical main thread
+    /// (8 MiB). Thread stacks are lazily committed, so this is address space,
+    /// not resident memory.
     ///
     /// A caller who cannot provide it must not use `DEFAULT`. They call
     /// [`Budget::for_stack_bytes`] with the stack they actually have and get a
     /// correspondingly shallower — and safe — ceiling.
-    pub const MIN_STACK_BYTES: usize = 64 * 1024 * 1024;
+    pub const MIN_STACK_BYTES: usize = round_up_to_power_of_two(
+        StackMeasurement::k1_here().stack_bytes_for_depth(Budget::DEFAULT_DEPTH),
+    );
 
-    /// The native stack a descent to `depth` requires, safety factor included.
-    /// The inverse of [`Budget::depth_for_stack_bytes`].
+    /// The native stack a K1 descent to `depth` requires in this build, safety
+    /// factor included.
     pub const fn stack_bytes_for_depth(depth: u32) -> usize {
-        let per_level = Budget::MEASURED_STACK_BYTES_PER_DEPTH * Budget::STACK_SAFETY_FACTOR;
-        (depth as usize) * per_level + Budget::STACK_ENTRY_RESERVE_BYTES
+        StackMeasurement::k1_here().stack_bytes_for_depth(depth)
     }
 
-    /// The largest depth ceiling that fits in `stack_bytes` of native stack,
-    /// under the measured per-level cost and the safety factor.
-    ///
-    /// Monotone in `stack_bytes` and never zero: a caller with a tiny stack
-    /// gets a ceiling of 1, which yields a typed depth non-answer on the first
-    /// descent rather than an abort.
+    /// The largest K1 depth ceiling that fits in `stack_bytes` in this build.
     pub const fn depth_for_stack_bytes(stack_bytes: usize) -> u32 {
-        let usable = stack_bytes.saturating_sub(Budget::STACK_ENTRY_RESERVE_BYTES);
-        let per_level = Budget::MEASURED_STACK_BYTES_PER_DEPTH * Budget::STACK_SAFETY_FACTOR;
-        let depth = usable / per_level;
-        if depth == 0 {
-            1
-        } else if depth > u32::MAX as usize {
-            u32::MAX
-        } else {
-            depth as u32
+        StackMeasurement::k1_here().depth_for_stack_bytes(stack_bytes)
+    }
+
+    /// Derive a budget from a measurement — the only way to make one.
+    ///
+    /// `running_in` is stated rather than assumed to be [`ExecConfig::current`]
+    /// so that a budget for a run happening somewhere else (a subprocess
+    /// witness, a worker built differently) is *representable and marked*
+    /// rather than quietly mislabelled. The kernel refuses to run under a
+    /// budget whose `running_in` is not this process — see
+    /// [`Budget::objection_to_governing`] — so representing one costs nothing
+    /// and lets a comparison say precisely what is wrong with it.
+    pub const fn derive(
+        measurement: StackMeasurement,
+        running_in: ExecConfig,
+        stack_bytes: usize,
+        steps: u64,
+    ) -> Budget {
+        Budget {
+            steps,
+            depth: measurement.depth_for_stack_bytes(stack_bytes),
+            calibration: Calibration {
+                measurement,
+                running_in,
+                stack_bytes,
+            },
         }
     }
 
-    /// The budget for a caller with a **known** native stack.
+    /// The budget for a caller with a **known** native stack, running this
+    /// kernel in this process.
     ///
     /// This is the constructor any caller running the kernel off a thread it
     /// created should use. `std::thread` defaults to 2 MiB — a quarter of the
     /// main thread and a small fraction of what `DEFAULT` needs — so a worker
     /// pool that inherits the default and passes `DEFAULT` is precisely the
     /// pairing that aborts. That pairing is the defect of bead
-    /// `franken_lean-kxbj`, and this function is how a caller avoids it
-    /// without having to know any of the constants above.
+    /// `franken_lean-kxbj`, and this function is how a caller avoids it without
+    /// having to know any of the constants above.
     pub const fn for_stack_bytes(stack_bytes: usize) -> Budget {
+        Budget::derive(
+            StackMeasurement::k1_here(),
+            ExecConfig::current(),
+            stack_bytes,
+            Budget::DEFAULT_STEPS,
+        )
+    }
+
+    /// A budget for the CALIBRATION INSTRUMENT: a ceiling that is *stated*
+    /// rather than derived, together with the stack the instrument claims to be
+    /// running on.
+    ///
+    /// The one place in the program where a depth does not come out of a
+    /// measurement, and it has to be one. An instrument that could only ask for
+    /// depths the current constants already call safe could never discover that
+    /// they are not — it would confirm the number it was given. So the
+    /// instrument states a claim ("this depth is survivable on this stack") and
+    /// the experiment finds out; see
+    /// `crates/fln-kernel/tests/depth_stack_calibration.rs`, which runs exactly
+    /// this in a subprocess and reads the exit status.
+    ///
+    /// It is still calibrated in the two senses [`Budget::objection_to_governing`]
+    /// checks — K1's own engine, this process's configuration — so the kernel
+    /// runs under it. What it is not is *derived*, and its name says so.
+    pub const fn stated_for_measurement(steps: u64, depth: u32, stack_bytes: usize) -> Budget {
         Budget {
-            steps: Budget::DEFAULT_STEPS,
-            depth: Budget::depth_for_stack_bytes(stack_bytes),
+            steps,
+            depth,
+            calibration: Calibration {
+                measurement: StackMeasurement::k1_here(),
+                running_in: ExecConfig::current(),
+                stack_bytes,
+            },
         }
+    }
+
+    /// The provenance travelling with this bound.
+    pub const fn calibration(&self) -> Calibration {
+        self.calibration
+    }
+
+    /// The engine this bound is a claim about.
+    pub const fn engine(&self) -> EngineId {
+        self.calibration.engine()
+    }
+
+    /// Lower the allowances, keeping the derivation.
+    ///
+    /// Lowering is always safe: a shallower ceiling needs less stack than the
+    /// calibration already promised. Raising is not, so both arguments are
+    /// clamped rather than trusted — this is how the kernel's own internal
+    /// re-budgeting (remaining steps after a header check) stays inside the
+    /// derivation instead of quietly reconstructing a budget beside it.
+    pub const fn narrowed(self, steps: u64, depth: u32) -> Budget {
+        Budget {
+            steps: if steps < self.steps {
+                steps
+            } else {
+                self.steps
+            },
+            depth: if depth < self.depth {
+                depth
+            } else {
+                self.depth
+            },
+            calibration: self.calibration,
+        }
+    }
+
+    /// Why this budget may not govern a run of `engine` in this process, if it
+    /// may not.
+    ///
+    /// Two refusals, both structural rather than advisory — see
+    /// [`BudgetObjection`]. Note what is deliberately NOT refused: an
+    /// [`Grade::Extrapolated`] bound, whose measurement was taken on another
+    /// target. Refusing that would make the kernel unusable on every target we
+    /// have not yet measured, and the safety factor exists precisely to carry
+    /// it there. It cannot be established comparable, which is the honest
+    /// consequence and is recorded by [`Comparability`] rather than here.
+    pub fn objection_to_governing(&self, engine: EngineId) -> Option<BudgetObjection> {
+        if !self.calibration.engine().is(engine) {
+            return Some(BudgetObjection::CalibratedForAnotherEngine {
+                calibrated_for: self.calibration.engine(),
+                running: engine,
+            });
+        }
+        if !self.calibration.running_in().is(ExecConfig::current()) {
+            return Some(BudgetObjection::CalibratedForAnotherConfiguration {
+                calibrated_for: self.calibration.running_in(),
+                running: ExecConfig::current(),
+            });
+        }
+        None
     }
 
     /// A generous default for interactive checking; callers with real budgets
@@ -227,6 +902,11 @@ impl Budget {
     pub const DEFAULT: Budget = Budget {
         steps: Budget::DEFAULT_STEPS,
         depth: Budget::DEFAULT_DEPTH,
+        calibration: Calibration {
+            measurement: StackMeasurement::k1_here(),
+            running_in: ExecConfig::current(),
+            stack_bytes: Budget::MIN_STACK_BYTES,
+        },
     };
 }
 
@@ -248,6 +928,18 @@ const _: () = assert!(
 const _: () = assert!(
     Budget::depth_for_stack_bytes(Budget::MIN_STACK_BYTES) >= Budget::DEFAULT_DEPTH,
     "the stack floor must admit at least the default depth"
+);
+
+/// The default must be calibrated for the engine that runs it. If this ever
+/// fails, `DEFAULT` was built from another engine's measurement — the exact
+/// copied-number defect bead `franken_lean-4o3n` exists to make impossible.
+const _: () = assert!(
+    Budget::DEFAULT
+        .calibration
+        .measurement
+        .engine
+        .is(EngineId::K1),
+    "Budget::DEFAULT must be derived from a measurement of K1's own frames"
 );
 
 /// What a completed run consumed — attached to every domain verdict (§8.2c).
@@ -331,5 +1023,62 @@ mod tests {
         ] {
             assert!(seen.insert(class.as_str()), "duplicate class string");
         }
+    }
+
+    /// The two K1 measurements are the bead's evidence, and they must keep
+    /// disagreeing about what one depth costs. If they ever converge, either
+    /// somebody normalised them by hand or the profiles stopped differing —
+    /// both worth noticing, because the whole argument rests on this gap.
+    #[test]
+    fn the_two_profiles_do_not_agree_about_what_one_depth_costs() {
+        let dev = StackMeasurement::K1_DEV;
+        let release = StackMeasurement::K1_RELEASE;
+        assert_eq!(dev.engine(), release.engine());
+        assert_ne!(dev.taken_in(), release.taken_in());
+        assert!(
+            dev.bytes_per_depth() > release.bytes_per_depth() * 5,
+            "the measured dev/release gap is the evidence that a depth number is not a \
+             resource: dev={} release={}",
+            dev.bytes_per_depth(),
+            release.bytes_per_depth()
+        );
+        assert_ne!(
+            dev.stack_bytes_for_depth(Budget::DEFAULT_DEPTH),
+            release.stack_bytes_for_depth(Budget::DEFAULT_DEPTH),
+            "identical depth, identical cost would mean the profile does not matter"
+        );
+    }
+
+    /// Narrowing keeps the derivation and cannot be used to widen it.
+    #[test]
+    fn narrowing_lowers_and_never_raises() {
+        let base = Budget::DEFAULT;
+        let narrowed = base.narrowed(10, 7);
+        assert_eq!((narrowed.steps, narrowed.depth), (10, 7));
+        assert_eq!(narrowed.calibration(), base.calibration());
+
+        let widened = base.narrowed(u64::MAX, u32::MAX);
+        assert_eq!(
+            (widened.steps, widened.depth),
+            (base.steps, base.depth),
+            "narrowed() must clamp rather than trust its arguments"
+        );
+    }
+
+    /// A zero slope would make every ceiling infinite. The constructor refuses
+    /// it at the point of statement rather than letting it become an unbounded
+    /// descent later.
+    #[test]
+    fn a_degenerate_measurement_cannot_produce_an_infinite_ceiling() {
+        let degenerate = StackMeasurement::measured(
+            EngineId::named("degenerate"),
+            ExecConfig::current(),
+            0,
+            0,
+            0,
+        );
+        assert!(degenerate.bytes_per_depth() >= 1);
+        assert!(degenerate.safety_factor() >= 1);
+        assert_eq!(degenerate.depth_for_stack_bytes(usize::MAX), u32::MAX);
     }
 }

@@ -82,6 +82,9 @@ impl Declaration {
 /// environment under the given budget. Nothing else in the program can admit a
 /// constant (FL-INV-02); callers extend the environment only on `Accepted`.
 pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Outcome<Verdict> {
+    if let Some(refusal) = refuse_uncalibrated_budget(budget) {
+        return refusal;
+    }
     // Block declarations own their freshness/level laws and their scratch
     // environments; they meter consumption themselves.
     match decl {
@@ -147,10 +150,7 @@ fn check_nonsafe_definition(
             Ok(scratch) => scratch,
             Err(stop) => return stop_to_outcome(stop, total, budget),
         };
-    let remaining = Budget {
-        steps: budget.steps.saturating_sub(total.steps_used),
-        depth: budget.depth,
-    };
+    let remaining = budget.narrowed(budget.steps.saturating_sub(total.steps_used), budget.depth);
     let mut body =
         TypeChecker::new_with_safety(&scratch, &v.base.level_params, remaining, v.safety);
     let outcome = (|| -> Result<(), Stop> {
@@ -171,6 +171,29 @@ fn check_nonsafe_definition(
     total.steps_used += c.steps_used;
     total.max_depth = total.max_depth.max(c.max_depth);
     check_result_to_outcome(outcome, total, budget)
+}
+
+/// Refuse, before the first descent, a budget whose derivation does not apply
+/// to this engine in this process (bead `franken_lean-4o3n`).
+///
+/// This is a **precondition**, not a diagnosis. `Budget::depth` is the only
+/// thing standing between a legitimately deep term and a native stack overflow,
+/// and a stack overflow is the one exhaustion FL-INV-07 cannot convert into a
+/// typed answer — it aborts the process uncatchably. So a ceiling derived from
+/// another engine's frames, or for another build's frame sizes (the measured
+/// dev/release gap is 9.3x for the identical depth number), has to be refused
+/// before the descent starts. There is no "after the fact" in which to type it.
+///
+/// The refusal is an [`Outcome::Inconclusive`] with an
+/// [`fln_core::outcome::InconclusiveCause::AuthorityIncomplete`] cause, which is
+/// the precise thing that happened: the kernel could not establish authority
+/// over one of its own inputs. FL-INV-07 then applies unchanged — it is never
+/// an acceptance and never a rejection, and it mints no capability.
+fn refuse_uncalibrated_budget(budget: Budget) -> Option<Outcome<Verdict>> {
+    let objection = budget.objection_to_governing(verdict::EngineId::K1)?;
+    Some(Outcome::Inconclusive(Inconclusive::authority_incomplete(
+        objection.describe(),
+    )))
 }
 
 fn check_result_to_outcome(
@@ -359,6 +382,9 @@ pub fn check_def_eq(
     s: &fln_core::expr::Expr,
     budget: Budget,
 ) -> Outcome<Verdict> {
+    if let Some(refusal) = refuse_uncalibrated_budget(budget) {
+        return refusal;
+    }
     let mut checker = TypeChecker::new(env, lparams, budget);
     let outcome = checker.def_eq_public(t, s, 0);
     let consumption = checker.consumption();

@@ -1,4 +1,5 @@
-//! The consensus seat, exercised with ZERO in-repo engines (bead `fln-uc44`).
+//! The consensus seat, exercised with ZERO in-repo engines (beads `fln-uc44`
+//! and `franken_lean-4o3n`).
 //!
 //! There is no second engine and no NbE in this workspace, and this file does
 //! not pretend otherwise. It does not need one: every property the seat must
@@ -11,6 +12,12 @@
 //! the specific failure this file exists to catch is a seat that turns out to
 //! be theatre: one whose disagreement is recorded and then ignored, or whose
 //! agreement can be forged into a publication right.
+//!
+//! The second half of the file is the budget-parity boundary. Its planted
+//! violations are the ones that matter *before* a second engine exists, because
+//! the pressure on this seat will not arrive as a forged agreement — it will
+//! arrive as a flood of resource halts and a competent argument that they are
+//! noise. See `tests/budget_parity.rs` for the bound-level half.
 
 #![forbid(unsafe_code)]
 
@@ -23,8 +30,12 @@ use fln_env::environment::{DeclarationBudget, Environment};
 use fln_env::pmap::CollisionBudget;
 use fln_kernel::Declaration;
 use fln_kernel::capability::{Admitted, Published, admit};
-use fln_kernel::council::{Council, CouncilOutcome, Seat, SeatVerdict, convene};
-use fln_kernel::verdict::Budget;
+use fln_kernel::council::{
+    Council, CouncilOutcome, Incomparability, ObjectionKind, Seat, SeatBounds, SeatVerdict, convene,
+};
+use fln_kernel::verdict::{
+    Bound, Budget, ComparabilityDefect, EngineId, ExecConfig, Profile, StackMeasurement,
+};
 
 fn n(s: &str) -> Name {
     Name::str(Name::anonymous(), s)
@@ -81,6 +92,59 @@ fn publish(checked: fln_kernel::capability::CheckedDecl<'_>) -> Published {
 }
 
 // ---------------------------------------------------------------------------
+// Seat bound fixtures
+// ---------------------------------------------------------------------------
+
+/// A second engine that has done the work bead `franken_lean-4o3n` requires: it
+/// measured its OWN frames in the configuration it actually runs in. This is
+/// what a seat's bounds look like when they can be compared with the kernel's.
+fn measured_here(engine: &'static str) -> SeatBounds {
+    SeatBounds::Derived(Budget::derive(
+        StackMeasurement::measured(
+            EngineId::named(engine),
+            ExecConfig::current(),
+            1_500,
+            StackMeasurement::K1_ENTRY_RESERVE_BYTES,
+            StackMeasurement::K1_SAFETY_FACTOR,
+        ),
+        ExecConfig::current(),
+        16 * 1024 * 1024,
+        Budget::DEFAULT_STEPS,
+    ))
+}
+
+/// A second engine whose ceiling was derived in the profile this build is NOT.
+/// Its `depth` is a number of the same kind as the kernel's and a resource of a
+/// different kind — the 9.3x gap measured in `franken_lean-kxbj`.
+fn measured_in_the_other_profile(engine: &'static str) -> SeatBounds {
+    let elsewhere = ExecConfig::of(
+        match Profile::current() {
+            Profile::Dev => Profile::Release,
+            Profile::Release => Profile::Dev,
+        },
+        ExecConfig::current().arch,
+        ExecConfig::current().os,
+    );
+    SeatBounds::Derived(Budget::derive(
+        StackMeasurement::measured(
+            EngineId::named(engine),
+            elsewhere,
+            1_500,
+            StackMeasurement::K1_ENTRY_RESERVE_BYTES,
+            StackMeasurement::K1_SAFETY_FACTOR,
+        ),
+        elsewhere,
+        16 * 1024 * 1024,
+        Budget::DEFAULT_STEPS,
+    ))
+}
+
+/// The real foreign witness: a subprocess with no bound this process derived.
+fn foreign_witness() -> SeatBounds {
+    SeatBounds::not_established("subprocess witness; wall clock only")
+}
+
+// ---------------------------------------------------------------------------
 // The negative half — the tests that decide whether the seat is real
 // ---------------------------------------------------------------------------
 
@@ -105,8 +169,8 @@ fn publish(checked: fln_kernel::capability::CheckedDecl<'_>) -> Published {
 fn a_forged_seat_agreeing_about_a_rejected_declaration_publishes_nothing() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new("forged-a", SeatVerdict::Agrees),
-        Seat::new("forged-b", SeatVerdict::Agrees),
+        Seat::new("forged-a", foreign_witness(), SeatVerdict::Agrees),
+        Seat::new("forged-b", foreign_witness(), SeatVerdict::Agrees),
     ]);
 
     match convene(&council, admitted(&env, bad_axiom("Forged"))) {
@@ -135,11 +199,12 @@ fn a_forged_seat_agreeing_about_a_rejected_declaration_publishes_nothing() {
 fn one_dissenting_seat_halts_publication_and_is_never_outvoted() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new("engine-k1", SeatVerdict::Agrees),
-        Seat::new("engine-k2", SeatVerdict::Agrees),
-        Seat::new("fln-checker", SeatVerdict::Agrees),
+        Seat::new("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
+        Seat::new("engine-k3", measured_here("test/k3"), SeatVerdict::Agrees),
+        Seat::new("fln-checker", foreign_witness(), SeatVerdict::Agrees),
         Seat::new(
             "leanchecker",
+            foreign_witness(),
             SeatVerdict::Disagrees {
                 detail: "foreign witness rejects at KR-303".into(),
             },
@@ -167,6 +232,10 @@ fn one_dissenting_seat_halts_publication_and_is_never_outvoted() {
         halt.summary()
     );
     assert!(
+        !halt.is_purely_resource(),
+        "a disagreement is evidence about the declaration and must never be classed as noise"
+    );
+    assert!(
         env.find(&n("Contested")).is_none(),
         "a halted declaration must not reach the environment"
     );
@@ -188,9 +257,10 @@ fn an_absent_or_errored_seat_halts_rather_than_abstaining_into_a_pass() {
         "lane skipped",
     ] {
         let council = Council::of(vec![
-            Seat::new("engine-k1", SeatVerdict::Agrees),
+            Seat::new("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
             Seat::new(
                 "leanchecker",
+                foreign_witness(),
                 SeatVerdict::NoAnswer {
                     reason: reason.into(),
                 },
@@ -200,6 +270,7 @@ fn an_absent_or_errored_seat_halts_rather_than_abstaining_into_a_pass() {
             CouncilOutcome::Halted(halt) => {
                 assert_eq!(halt.objections.len(), 1, "reason={reason}");
                 assert!(halt.summary().contains(reason), "{}", halt.summary());
+                assert_eq!(halt.classify()[0].1, ObjectionKind::Silence);
             }
             CouncilOutcome::Agreed(_) => {
                 panic!("a seat that did not answer was read as agreement (reason={reason})")
@@ -224,13 +295,15 @@ fn every_objection_is_retained_in_order_with_its_reason() {
     let council = Council::of(vec![
         Seat::new(
             "first-objector",
+            foreign_witness(),
             SeatVerdict::Disagrees {
                 detail: "rejects at KR-303".into(),
             },
         ),
-        Seat::new("agreeing-seat", SeatVerdict::Agrees),
+        Seat::new("agreeing-seat", foreign_witness(), SeatVerdict::Agrees),
         Seat::new(
             "second-objector",
+            foreign_witness(),
             SeatVerdict::NoAnswer {
                 reason: "timed out".into(),
             },
@@ -257,22 +330,256 @@ fn every_objection_is_retained_in_order_with_its_reason() {
 }
 
 // ---------------------------------------------------------------------------
+// Budget parity — the planted violations that need no second engine
+// ---------------------------------------------------------------------------
+
+/// A BUDGET-INDUCED STOP IS NEVER SILENTLY EQUATED WITH AGREEMENT.
+///
+/// The failure this prevents, stated plainly: a second engine under a bound
+/// asymmetric to the kernel's cannot finish some declarations, every one of
+/// those becomes a halt, and someone proposes reading the engine's inconclusive
+/// as assent because the halts are noise. The halt below stays a halt, publishes
+/// nothing, and — this is the part that survives the argument — is *typed* as a
+/// resource stop rather than as a disagreement, so the noise can be reported
+/// honestly instead of laundered.
+#[test]
+fn a_budget_induced_stop_halts_and_is_typed_as_exhaustion_not_agreement() {
+    let env = Environment::new();
+    for bound in [
+        Bound::Depth,
+        Bound::Steps,
+        Bound::Other("wall clock".into()),
+    ] {
+        let council = Council::of(vec![
+            Seat::new("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
+            Seat::new(
+                "engine-k3",
+                measured_here("test/k3"),
+                SeatVerdict::Exhausted {
+                    bound: bound.clone(),
+                },
+            ),
+        ]);
+
+        let halt = match convene(&council, admitted(&env, good_axiom("Starved"))) {
+            CouncilOutcome::Halted(halt) => halt,
+            CouncilOutcome::Agreed(_) => {
+                panic!("a seat that ran out of {bound:?} was read as agreement")
+            }
+            CouncilOutcome::KernelRejected { .. } => panic!("the kernel accepts this declaration"),
+        };
+
+        let classified = halt.classify();
+        assert_eq!(classified.len(), 1);
+        assert_eq!(
+            classified[0].1,
+            ObjectionKind::Exhaustion {
+                bound: bound.clone()
+            },
+            "a comparable resource stop must be typed as exhaustion, and never as a \
+             disagreement: {}",
+            halt.summary()
+        );
+        assert!(
+            halt.is_purely_resource(),
+            "nothing here is evidence about the declaration, and saying so is the honest \
+             half of the concession"
+        );
+        assert!(
+            env.find(&n("Starved")).is_none(),
+            "being purely a resource stop is legible, not waivable: it still halts"
+        );
+    }
+}
+
+/// A STOP UNDER AN INCOMPARABLE BOUND IS A TYPED REFUSAL, NOT A DISAGREEMENT
+/// AND NOT NOISE.
+///
+/// The seat below ran out under a ceiling derived in a configuration this build
+/// is not. Its `depth` number is of exactly the same kind as the kernel's and
+/// its resource is not — the measured 9.3x gap. Nothing may be concluded from
+/// the difference: not that the engines disagree, and not that the stop is a
+/// spurious artifact. Both readings are claims about a comparison that did not
+/// happen, and the second is the one that will be argued for.
+#[test]
+fn a_stop_under_an_incomparable_bound_is_refused_rather_than_read() {
+    let env = Environment::new();
+    let council = Council::of(vec![Seat::new(
+        "engine-k2",
+        measured_in_the_other_profile("test/k2"),
+        SeatVerdict::Exhausted {
+            bound: Bound::Depth,
+        },
+    )]);
+
+    let halt = match convene(&council, admitted(&env, good_axiom("Incomparable"))) {
+        CouncilOutcome::Halted(halt) => halt,
+        CouncilOutcome::Agreed(_) => panic!("an incomparable stop was read as agreement"),
+        CouncilOutcome::KernelRejected { .. } => panic!("the kernel accepts this declaration"),
+    };
+
+    match &halt.classify()[0].1 {
+        ObjectionKind::ExhaustionNotComparable { bound, why } => {
+            assert_eq!(*bound, Bound::Depth);
+            assert!(
+                matches!(
+                    why,
+                    Incomparability::Defect(
+                        ComparabilityDefect::RunsInDifferentConfigurations { .. }
+                    ) | Incomparability::Defect(ComparabilityDefect::NotMeasuredWhereItRuns { .. })
+                ),
+                "the refusal must name the configuration mismatch: {}",
+                why.describe()
+            );
+        }
+        other => panic!(
+            "a stop under an incomparable bound was classified as {other:?}; the whole \
+             failure mode is that an unreadable stop gets read"
+        ),
+    }
+    assert!(
+        halt.summary().contains("not comparable"),
+        "the record must say the comparison did not happen: {}",
+        halt.summary()
+    );
+    assert!(env.find(&n("Incomparable")).is_none());
+}
+
+/// A SEAT WITH NO ESTABLISHED BOUND CANNOT HAVE ITS STOP READ EITHER — and the
+/// distinction is honest about *us*, not about the witness.
+///
+/// A subprocess witness with only a wall clock has no bound this process
+/// derived. That is a statement about what we know. It costs the witness
+/// nothing when it completes (see the positive tests: such a seat agrees and
+/// publishes); it costs only the ability to read its resource stop against the
+/// kernel's.
+#[test]
+fn a_seat_that_declared_no_bound_cannot_have_its_stop_compared() {
+    let env = Environment::new();
+    let council = Council::of(vec![Seat::new(
+        "leanchecker",
+        foreign_witness(),
+        SeatVerdict::Exhausted {
+            bound: Bound::Other("30s wall clock".into()),
+        },
+    )]);
+
+    let halt = match convene(&council, admitted(&env, good_axiom("Unbounded"))) {
+        CouncilOutcome::Halted(halt) => halt,
+        CouncilOutcome::Agreed(_) => panic!("an unreadable stop was read as agreement"),
+        CouncilOutcome::KernelRejected { .. } => panic!("the kernel accepts this declaration"),
+    };
+    assert!(matches!(
+        &halt.classify()[0].1,
+        ObjectionKind::ExhaustionNotComparable {
+            why: Incomparability::NoBoundEstablished { .. },
+            ..
+        }
+    ));
+    assert!(env.find(&n("Unbounded")).is_none());
+}
+
+/// A SEAT CALIBRATED FOR THE KERNEL'S OWN ENGINE CANNOT CORROBORATE IT.
+///
+/// Two bounds calibrated for one engine agree with themselves. A seat holding
+/// K1's own budget is K1 nodding at K1, and its stop says nothing about a second
+/// opinion — so the classification refuses rather than certifying the pair as
+/// comparable.
+#[test]
+fn a_seat_holding_the_kernels_own_bound_is_not_an_independent_witness() {
+    let env = Environment::new();
+    let council = Council::of(vec![Seat::new(
+        "k1-again",
+        SeatBounds::Derived(Budget::DEFAULT),
+        SeatVerdict::Exhausted {
+            bound: Bound::Depth,
+        },
+    )]);
+
+    let halt = match convene(&council, admitted(&env, good_axiom("SelfWitness"))) {
+        CouncilOutcome::Halted(halt) => halt,
+        CouncilOutcome::Agreed(_) => panic!("self-corroboration was read as agreement"),
+        CouncilOutcome::KernelRejected { .. } => panic!("the kernel accepts this declaration"),
+    };
+    assert!(matches!(
+        &halt.classify()[0].1,
+        ObjectionKind::ExhaustionNotComparable {
+            why: Incomparability::Defect(ComparabilityDefect::SameEngine { .. }),
+            ..
+        }
+    ));
+}
+
+/// The halt records what the seats were compared AGAINST. A record that omits
+/// the kernel's own bound cannot be re-read later, and every judgement about a
+/// seat's stop is a judgement relative to it.
+#[test]
+fn the_halt_records_the_kernels_own_bound() {
+    let env = Environment::new();
+    let council = Council::of(vec![Seat::new(
+        "engine-k2",
+        measured_here("test/k2"),
+        SeatVerdict::Exhausted {
+            bound: Bound::Steps,
+        },
+    )]);
+    let halt = match convene(&council, admitted(&env, good_axiom("Recorded"))) {
+        CouncilOutcome::Halted(halt) => halt,
+        other => panic!(
+            "expected a halt, got {}",
+            match other {
+                CouncilOutcome::Agreed(_) => "Agreed",
+                CouncilOutcome::KernelRejected { .. } => "KernelRejected",
+                CouncilOutcome::Halted(_) => unreachable!(),
+            }
+        ),
+    };
+    assert_eq!(halt.kernel_budget, Budget::DEFAULT);
+    assert_eq!(halt.kernel_budget.engine(), EngineId::K1);
+}
+
+// ---------------------------------------------------------------------------
 // The positive half — the mechanism must still let correct work through
 // ---------------------------------------------------------------------------
 
 /// Unanimous agreement publishes. A veto that blocks everything is as useless
 /// as one that blocks nothing.
+///
+/// Note the seats: one with a derived bound, one a foreign witness with none.
+/// A completed check is a completed check under any bound — a budget can stop a
+/// check but cannot make one finish falsely — so requiring comparability in
+/// order to *agree* would have locked out the only real witnesses we have.
 #[test]
 fn a_unanimous_council_publishes() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new("engine-k1", SeatVerdict::Agrees),
-        Seat::new("leanchecker", SeatVerdict::Agrees),
+        Seat::new("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
+        Seat::new("leanchecker", foreign_witness(), SeatVerdict::Agrees),
     ]);
 
     let checked = match convene(&council, admitted(&env, good_axiom("Agreed"))) {
         CouncilOutcome::Agreed(checked) => checked,
         CouncilOutcome::Halted(halt) => panic!("unanimous council halted: {}", halt.summary()),
+        CouncilOutcome::KernelRejected { .. } => panic!("the kernel accepts this declaration"),
+    };
+    assert!(matches!(publish(checked), Published::Committed(_)));
+}
+
+/// Even a seat whose bound is incomparable with the kernel's may AGREE, and
+/// that agreement publishes. Comparability is required to read a resource stop,
+/// not to accept a completed answer — conflating the two would turn an honest
+/// boundary into a wall.
+#[test]
+fn an_incomparable_bound_does_not_prevent_a_completed_agreement() {
+    let env = Environment::new();
+    let council = Council::of(vec![Seat::new(
+        "engine-k2",
+        measured_in_the_other_profile("test/k2"),
+        SeatVerdict::Agrees,
+    )]);
+    let checked = match convene(&council, admitted(&env, good_axiom("StillPublishes"))) {
+        CouncilOutcome::Agreed(checked) => checked,
+        CouncilOutcome::Halted(halt) => panic!("a completed agreement halted: {}", halt.summary()),
         CouncilOutcome::KernelRejected { .. } => panic!("the kernel accepts this declaration"),
     };
     assert!(matches!(publish(checked), Published::Committed(_)));
@@ -302,9 +609,9 @@ fn an_empty_council_is_named_rather_than_defaulted() {
 fn seats_cannot_overturn_a_kernel_rejection() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new("a", SeatVerdict::Agrees),
-        Seat::new("b", SeatVerdict::Agrees),
-        Seat::new("c", SeatVerdict::Agrees),
+        Seat::new("a", foreign_witness(), SeatVerdict::Agrees),
+        Seat::new("b", foreign_witness(), SeatVerdict::Agrees),
+        Seat::new("c", foreign_witness(), SeatVerdict::Agrees),
     ]);
     match convene(&council, admitted(&env, bad_axiom("Overruled"))) {
         CouncilOutcome::KernelRejected { .. } => {}
