@@ -47,8 +47,10 @@
 use crate::decl_closure::canonical_name_bytes;
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{Expr, ExprNode};
+use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
+use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 use std::collections::HashMap;
 
@@ -551,6 +553,44 @@ fn update_name(hasher: &mut DomainHasher, name: &Name) {
     hasher.update(&encoded);
 }
 
+/// Feed a [`Level`] into a digest by its **canonical** encoding, length-prefixed.
+///
+/// # Finishing `bf9ef450` in its own function
+///
+/// That commit replaced `Name::to_display_string` with the structural encoding above, and left
+/// three sibling call sites in [`identity_digest`] feeding `format!("{:?}")` — `Sort`'s level,
+/// `Const`'s level list, and the `FVar`/`MVar` ids. The correct encoder was already reachable and
+/// already used one line away. Keying an identity on a RENDERER is the defect `franken_lean-f6br`
+/// and `bf9ef450` were both filed over; it was fixed here for names and not for levels.
+///
+/// # This one was latent, not active, and the difference is the whole point
+///
+/// `Level`'s `Debug` is a hand-written stack-safe copy of the DERIVED rendering, so it is
+/// structural and tagged, and `Name`'s `Debug` is structural too. No two distinct levels collide
+/// today — unlike `to_display_string`, where the collision was real and demonstrable. So nothing
+/// was broken and no digest was wrong.
+///
+/// What was wrong is that the correctness rested on an ACCIDENT nothing pinned, inside a function
+/// whose entire subject is identity:
+///
+/// * `Level`'s own doc says its `Debug` is "byte-identical to the derived rendering". A field
+///   added, renamed or reordered in `Level` or its `Node` silently moves every digest preimage.
+///   Nothing would catch it: a digest here is a bucket hint confirmed by full [`Expr`] equality, so
+///   every test stays green while `bucket_misses` quietly changes meaning.
+/// * The rendering includes `Level`'s packed `data` word — a CACHED hash seed, depth and flags —
+///   so the identity preimage depended on a cache rather than on the level's structure alone.
+///
+/// [`Canonical`](fln_hash::canon::Canonical) for `Level` already existed in `fln-hash`, tagged per
+/// variant and iterative for stack safety. Using it makes the encoding a contract rather than a
+/// coincidence, and drops a per-node `String` allocation on the way.
+fn update_level(hasher: &mut DomainHasher, level: &Level) {
+    let mut writer = CanonWriter::new();
+    level.write_body(&mut writer);
+    let encoded = writer.into_bytes();
+    hasher.update(&(encoded.len() as u64).to_le_bytes());
+    hasher.update(&encoded);
+}
+
 fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Digest {
     let mut hasher = DomainHasher::new(Domain::DeclContent);
     hasher.update(INTERN_TAG);
@@ -578,25 +618,29 @@ fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Dige
             hasher.update(&[1]);
             hasher.update(&idx.to_le_bytes());
         }
+        // `FVarId`, `MVarId` and `LMVarId` are all newtypes over `Name`, so their identity IS a
+        // name's and goes through the same structural encoding rather than through the derived
+        // `Debug` of the wrapper.
         ExprNode::FVar { id } => {
             hasher.update(&[2]);
-            hasher.update(format!("{id:?}").as_bytes());
+            update_name(&mut hasher, &id.0);
         }
         ExprNode::MVar { id } => {
             hasher.update(&[3]);
-            hasher.update(format!("{id:?}").as_bytes());
+            update_name(&mut hasher, &id.0);
         }
         ExprNode::Sort { level } => {
             hasher.update(&[4]);
-            hasher.update(format!("{level:?}").as_bytes());
+            update_level(&mut hasher, level);
         }
         ExprNode::Const { name, levels } => {
             hasher.update(&[5]);
             update_name(&mut hasher, name);
             hasher.update(&(levels.len() as u64).to_le_bytes());
             for level in levels {
-                hasher.update(format!("{level:?}").as_bytes());
-                hasher.update(&[0]);
+                // No NUL separator: `update_level` length-prefixes, so the stream is
+                // self-delimiting and a separator would be a second, weaker mechanism.
+                update_level(&mut hasher, level);
             }
         }
         ExprNode::App { f, a } => {
@@ -1227,6 +1271,53 @@ mod tests {
     /// digest is a bucket hint and full `Expr` equality would still separate the two terms. That is
     /// why this was not a soundness bug — and also why only a digest-level assertion can catch it.
     /// A store-level test here would be the test that passes while the property is false.
+    /// The level plane is keyed on the CANONICAL encoding, not on `Debug`.
+    ///
+    /// This test is written against the ENCODER rather than against discrimination, and that is
+    /// deliberate: `Level`'s `Debug` is structural, so distinct levels do not actually collide
+    /// under it and a discrimination-only test would pass equally well before and after the fix.
+    /// It would prove nothing and would quietly certify the defect.
+    ///
+    /// So the assertion recomputes the preimage independently — `Domain::DeclContent`, the intern
+    /// tag, the `Sort` discriminant, then the length-prefixed `Canonical` bytes — and requires
+    /// `identity_digest` to agree. Reverting either level site to `format!("{:?}")` fails it.
+    ///
+    /// The defect being pinned was LATENT, not active (see `update_level`): nothing was wrong,
+    /// but the correctness rested on `Debug` happening to be structural, which no test asserted
+    /// and which `Level`'s own doc invites a refactor to change.
+    #[test]
+    fn the_identity_digest_keys_levels_on_the_canonical_encoding_not_on_debug() {
+        let done = HashMap::new();
+        let level = Level::param(Name::str(Name::anonymous(), "u"))
+            .succ()
+            .expect("one successor is within the depth bound");
+        let sort = Expr::sort(level.clone());
+
+        let mut writer = CanonWriter::new();
+        level.write_body(&mut writer);
+        let canonical = writer.into_bytes();
+
+        let mut expected = DomainHasher::new(Domain::DeclContent);
+        expected.update(INTERN_TAG);
+        expected.update(&[0]);
+        expected.update(&[4]);
+        expected.update(&(canonical.len() as u64).to_le_bytes());
+        expected.update(&canonical);
+
+        assert_eq!(
+            identity_digest(&sort, &done),
+            expected.finalize(),
+            "a Sort's identity preimage must be the canonical level bytes, length-prefixed"
+        );
+
+        // And the encoding is not the rendering: if these were equal the fix would be vacuous.
+        assert_ne!(
+            canonical.as_slice(),
+            format!("{level:?}").as_bytes(),
+            "premise: the canonical encoding must differ from the Debug rendering"
+        );
+    }
+
     #[test]
     fn the_identity_digest_separates_names_the_display_form_collides() {
         let done = HashMap::new();
