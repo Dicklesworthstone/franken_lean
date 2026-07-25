@@ -979,6 +979,25 @@ impl Environment {
     /// measurement. A total that exceeds `u64` saturates to `u64::MAX`, which charges
     /// the most rather than the least: the conservative direction refuses, and a charge
     /// that silently understated the work would be the untruthful fact.
+    ///
+    /// # KERNEL-ONLY BY D6 (bead `franken_lean-oof9`)
+    ///
+    /// Bounded is not the same as authorised. This path measures and refuses truthfully,
+    /// but it does not require that anything CHECKED the declaration — so under D6
+    /// ("nothing but the kernel may admit a constant") the only legitimate production
+    /// callers are in `fln-kernel`, and today there are exactly two:
+    /// `fln-kernel/src/admit.rs` and `fln-kernel/src/capability.rs`.
+    ///
+    /// That restriction cannot be expressed in this signature. `fln-env` is rank 4 and
+    /// `fln-kernel` sits above it, so a kernel-bound capability type can never appear
+    /// here without inverting a layering edge. A sealed trait does not help either: sealing
+    /// means only `fln-env` may implement, which excludes the one crate that should. So the
+    /// property is enforced by a structure-guard allowlist rather than by the type system,
+    /// and this comment exists so the next reader knows that is a deliberate limit rather
+    /// than an oversight.
+    ///
+    /// [`Environment::add_decl`] is the *unbounded* sibling and has no legitimate
+    /// production caller anywhere.
     pub fn plan_add_decl(
         &self,
         info: ConstantInfo,
