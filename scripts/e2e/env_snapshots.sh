@@ -882,7 +882,7 @@ run_structured_positive_step set_union \
   extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
   '{"schema":"fln.e2e.set-union","version":1' 4
 
-# Retained overlay for the two named mutation kills and the historical collision
+# Retained overlay for the named mutation kills and the historical collision
 # children. Every mutation is restored byte-for-byte before the next phase.
 OVERLAY="$ART_DIR/overlay"
 mkdir "$OVERLAY"
@@ -1027,6 +1027,146 @@ record_step set_union_recovery pass pass/wrapper=0/child=0 \
   "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
   not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
   "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+
+run_identity_path_mutant_recovery() {
+  local stem="$1" source_rel="$2" seed="$3" test_name="$4"
+  local stdout_signature="$5" stderr_signature="$6"
+  local overlay_source="$OVERLAY/$source_rel"
+  local pristine_source="$ART_DIR/$stem.pristine.rs"
+  local mutant_step="${stem}_mutant"
+  local recovery_step="${stem}_recovery"
+
+  cp -- "$overlay_source" "$pristine_source"
+  if ! "${PYTHON[@]}" - "$overlay_source" "$seed" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+seed = sys.argv[2]
+mutations = {
+    "opaque_membership_omission": (
+        b"""            ConstantInfo::Opaque(v) => {
+                v.value.write_body(&mut w);
+                w.bool(v.is_unsafe);
+                write_mutual_membership(&mut w, &v.all);
+            }""",
+        b"""            ConstantInfo::Opaque(v) => {
+                v.value.write_body(&mut w);
+                w.bool(v.is_unsafe);
+            }""",
+    ),
+    "definition_safe_retag": (
+        b"""const fn definition_safety_tag(safety: DefinitionSafety) -> u8 {
+    match safety {
+        DefinitionSafety::Unsafe => 0,
+        DefinitionSafety::Safe => 1,
+        DefinitionSafety::Partial => 2,
+    }
+}""",
+        b"""const fn definition_safety_tag(safety: DefinitionSafety) -> u8 {
+    match safety {
+        DefinitionSafety::Unsafe => 0,
+        DefinitionSafety::Safe => 5,
+        DefinitionSafety::Partial => 2,
+    }
+}""",
+    ),
+    "descriptor_merge_omission": (
+        b"""fn write_descriptor_identity(w: &mut CanonWriter, descriptor: &ExtensionDescriptor) {
+    descriptor.name.write_body(w);
+    w.u8(merge_semantics_tag(descriptor.merge));
+    w.u8(checkpoint_semantics_tag(descriptor.checkpoint));
+    w.u8(payload_provenance_tag(descriptor.provenance));
+}""",
+        b"""fn write_descriptor_identity(w: &mut CanonWriter, descriptor: &ExtensionDescriptor) {
+    descriptor.name.write_body(w);
+    w.u8(checkpoint_semantics_tag(descriptor.checkpoint));
+    w.u8(payload_provenance_tag(descriptor.provenance));
+}""",
+    ),
+}
+try:
+    anchor, replacement = mutations[seed]
+except KeyError as error:
+    raise SystemExit(f"unknown identity mutation seed: {seed}") from error
+source = path.read_bytes()
+anchor_count = source.count(anchor)
+if anchor_count != 1:
+    raise SystemExit(
+        f"identity mutation anchor count is not exactly one: "
+        f"seed={seed} count={anchor_count}"
+    )
+path.write_bytes(source.replace(anchor, replacement, 1))
+PY
+  then
+    set_final internal_fault "$mutant_step:mutation_anchor_mismatch" 2
+    exit 2
+  fi
+  if cmp -s "$overlay_source" "$pristine_source"; then
+    set_final internal_fault "$mutant_step:mutation_seed_noop" 2
+    exit 2
+  fi
+
+  snapshot_before "$OVERLAY" "$source_rel" "$mutant_step"
+  note "running identity-path mutant step=$mutant_step seed=$seed"
+  supervise_in "$ART_DIR" "$mutant_step" "$OVERLAY" \
+    --semantic-failure-exit 101 --planted \
+    env CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
+    "$test_name" -- --exact --nocapture
+  inspect_supervisor "$mutant_step"
+  snapshot_after "$OVERLAY" "$source_rel" "$mutant_step"
+  require_unchanged "$mutant_step"
+  if [ "$LAST_CLASSIFICATION" != fail ] || [ "$LAST_RC" -ne 1 ] || \
+     [ "$LAST_CHILD_EXIT" != 101 ]; then
+    record_contract_failure "$mutant_step" mutant_survived_or_wrong_exit
+  fi
+  if ! grep -Fq "$stdout_signature" "$LAST_OUT" || \
+     ! grep -Fq "$stderr_signature" "$LAST_ERR"; then
+    record_contract_failure "$mutant_step" intended_failure_signature_missing
+  fi
+  record_step "$mutant_step" pass mutation-killed/fail/wrapper=1/child=101 \
+    "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+    not_applicable fail 1 101 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+    "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+
+  cp -- "$pristine_source" "$overlay_source"
+  if ! cmp -s "$overlay_source" "$pristine_source"; then
+    set_final internal_fault "$recovery_step:recovery_not_byte_exact" 2
+    exit 2
+  fi
+  snapshot_before "$OVERLAY" "$source_rel" "$recovery_step"
+  note "running identity-path recovery step=$recovery_step seed=$seed"
+  supervise_in "$ART_DIR" "$recovery_step" "$OVERLAY" \
+    env CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
+    "$test_name" -- --exact --nocapture
+  inspect_supervisor "$recovery_step"
+  snapshot_after "$OVERLAY" "$source_rel" "$recovery_step"
+  require_unchanged "$recovery_step"
+  if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] || \
+     [ "$LAST_CHILD_EXIT" != 0 ]; then
+    record_contract_failure "$recovery_step" recovery_failed
+  fi
+  record_step "$recovery_step" pass pass/wrapper=0/child=0 \
+    "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+    not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+    "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+}
+
+run_identity_path_mutant_recovery declaration_membership \
+  fln-env/src/environment.rs opaque_membership_omission \
+  environment::tests::mutual_block_membership_changes_the_content_digest \
+  'environment::tests::mutual_block_membership_changes_the_content_digest --- FAILED' \
+  'opaque empty membership diverged from the independent canonical model'
+run_identity_path_mutant_recovery declaration_tag \
+  fln-env/src/environment.rs definition_safe_retag \
+  environment::tests::declaration_identity_tag_policy_is_const_exhaustive_and_cast_free \
+  'environment::tests::declaration_identity_tag_policy_is_const_exhaustive_and_cast_free --- FAILED' \
+  'left: [0, 5, 2]'
+run_identity_path_mutant_recovery extension_descriptor \
+  fln-env/src/extensions.rs descriptor_merge_omission \
+  extensions::tests::descriptor_identity_matrix_matches_model_and_logical_roots \
+  'extensions::tests::descriptor_identity_matrix_matches_model_and_logical_roots --- FAILED' \
+  'descriptor identity diverged from the independent layout model'
 
 identity_emit_event() {
   local sequence="$IDENTITY_SEQ"
