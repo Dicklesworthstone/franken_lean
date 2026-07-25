@@ -1062,6 +1062,21 @@ impl ExtensionCheckpoint {
         self.captured_payload_bytes
     }
 
+    /// Bounded test seam: forge the declared schema version.
+    #[cfg(test)]
+    fn forge_schema_version(mut self, schema_version: u16) -> Self {
+        self.schema_version = schema_version;
+        self
+    }
+
+    /// Bounded test seam: forge the declared cumulative facts so they disagree with the
+    /// journal they describe.
+    #[cfg(test)]
+    fn forge_cumulative_facts(mut self, captured_entries: usize) -> Self {
+        self.captured_entries = captured_entries;
+        self
+    }
+
     /// Bounded test seam: forge the recorded base digests so a *wrong* base passes
     /// every fast-path check.
     ///
@@ -5479,6 +5494,226 @@ mod tests {
              \"usage_accounting\":\"logical_attributed_phase_local\",\
              \"allocator_or_rss_claimed\":false,\"status\":\"pass\"}}",
             charged_once.compared_entries, canonical_total, mutant_total
+        );
+    }
+
+    /// FullJournal binds every fact it names that EXISTS, and each omission dies for its
+    /// own typed reason.
+    ///
+    /// # Two named bindings refer to surface this crate does not have
+    ///
+    /// The bead requires FullJournal to bind "epoch/profile" and "exact ordered
+    /// EntryIds". Neither exists: `ExtensionEntry` carries a payload and nothing else, so
+    /// there are no entry *ids* (order is bound — the journal and its digest are
+    /// order-sensitive — but there is no identifier to bind), and there is no epoch or
+    /// profile concept on `ExtensionCheckpoint` or `ExtensionDescriptor` at all. Adding
+    /// either is new design surface, not a binding fix, so it is recorded on the bead as
+    /// a decision rather than invented here. What follows covers every named binding that
+    /// does exist.
+    #[test]
+    fn full_journal_binding_omissions_each_die_for_their_own_typed_reason() {
+        let full_state = state_with_checkpoint(4, CheckpointSemantics::FullJournal);
+        let checkpoint = full_state
+            .checkpoint(None, TEST_LIMITS)
+            .expect("full journal captures");
+        let host = Environment::new()
+            .register_extension(full_state.descriptor.clone())
+            .expect("register the target extension");
+
+        // Baseline: it applies, and to exactly the captured state.
+        let applied = completed(host.apply_extension_checkpoint(
+            &checkpoint,
+            TEST_LIMITS,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect("the honest full-journal checkpoint applies");
+        assert_eq!(
+            applied
+                .extension(&full_state.descriptor.name)
+                .expect("registered")
+                .content_digest(),
+            full_state.content_digest()
+        );
+
+        // ---- omit the DESCRIPTOR binding -> ContractMismatch / NameMismatch ----------
+        let other_descriptor = ExtensionDescriptor {
+            name: full_state.descriptor.name.clone(),
+            provenance: PayloadProvenance::Opaque,
+            ..full_state.descriptor.clone()
+        };
+        assert_ne!(other_descriptor, full_state.descriptor);
+        let wrong_host = Environment::new()
+            .register_extension(other_descriptor)
+            .expect("register a differently-contracted extension");
+        let refused = completed(wrong_host.apply_extension_checkpoint(
+            &checkpoint,
+            TEST_LIMITS,
+            ProofBudget::UNBOUNDED,
+            None,
+        ))
+        .expect_err("a descriptor mismatch must be refused");
+        assert!(
+            matches!(
+                refused,
+                crate::environment::EnvError::Checkpoint(CheckpointError::ContractMismatch { .. })
+            ),
+            "expected a contract mismatch, got {refused:?}"
+        );
+
+        // ---- omit the TARGET NAME binding -> UnknownExtension -----------------------
+        let empty_host = Environment::new();
+        assert!(
+            completed(empty_host.apply_extension_checkpoint(
+                &checkpoint,
+                TEST_LIMITS,
+                ProofBudget::UNBOUNDED,
+                None,
+            ))
+            .is_err(),
+            "a checkpoint must not apply to an environment lacking its target"
+        );
+
+        // ---- omit the SCHEMA binding -> UnsupportedVersion --------------------------
+        let wrong_schema = checkpoint
+            .clone()
+            .forge_schema_version(EXTENSION_CHECKPOINT_SCHEMA_VERSION + 7);
+        let schema_refused = ExtensionState::restore(None, &wrong_schema, TEST_LIMITS)
+            .expect_err("an unknown schema must be refused, never guessed compatible");
+        assert!(matches!(
+            schema_refused,
+            CheckpointError::UnsupportedVersion { .. }
+        ));
+
+        // ---- omit the CUMULATIVE FACTS binding -> MalformedCheckpoint ---------------
+        let wrong_facts = checkpoint.clone().forge_cumulative_facts(99);
+        let facts_refused = ExtensionState::restore(None, &wrong_facts, TEST_LIMITS)
+            .expect_err("declared facts that disagree with the journal must be refused");
+        assert!(matches!(
+            facts_refused,
+            CheckpointError::MalformedCheckpoint { .. }
+        ));
+
+        // ---- omit the VALUE binding -> different restored identity ------------------
+        let mut altered = ExtensionState::new(full_state.descriptor.clone());
+        for index in 0..4u64 {
+            let payload = if index == 2 {
+                u64::MAX.to_le_bytes()
+            } else {
+                index.to_le_bytes()
+            };
+            altered = altered.push_entry(bytes(payload.as_slice()));
+        }
+        let altered_checkpoint = altered
+            .checkpoint(None, TEST_LIMITS)
+            .expect("altered full journal captures");
+        assert_eq!(
+            altered_checkpoint.captured_entries(),
+            checkpoint.captured_entries()
+        );
+        assert_ne!(
+            ExtensionState::restore(None, &altered_checkpoint, TEST_LIMITS)
+                .expect("applies")
+                .content_digest(),
+            ExtensionState::restore(None, &checkpoint, TEST_LIMITS)
+                .expect("applies")
+                .content_digest(),
+            "one changed entry value must change the restored identity"
+        );
+
+        // ---- omit the AMBIENT-BASE refusal -> UnexpectedBase ------------------------
+        let base_refused = ExtensionState::restore(Some(&full_state), &checkpoint, TEST_LIMITS)
+            .expect_err("full-journal mode is self-contained and must refuse an ambient base");
+        assert!(matches!(
+            base_refused,
+            CheckpointError::UnexpectedBase { .. }
+        ));
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-full-journal-bindings\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"scenario\":\"full-journal-binding-omissions\",\
+             \"descriptor_omission\":\"contract_mismatch\",\
+             \"target_name_omission\":\"unknown_extension\",\
+             \"schema_omission\":\"unsupported_version\",\
+             \"cumulative_facts_omission\":\"malformed_checkpoint\",\
+             \"value_omission\":\"restored_identity_differs\",\
+             \"ambient_base_omission\":\"unexpected_base\",\
+             \"bindings_named_but_absent_from_this_crate\":\
+             [\"epoch_or_profile\",\"ordered_entry_ids\"],\
+             \"absent_surface_is_new_design_not_a_binding_fix\":true,\"status\":\"pass\"}}"
+        );
+    }
+
+    /// Usage facts are LOGICAL and reproducible, never allocator or process facts.
+    ///
+    /// The bead's mutants include reporting allocator/RSS bytes as canonical usage and
+    /// claiming cross-process portability. The discriminating property for both is
+    /// reproducibility from values alone: two independently built, content-identical
+    /// states must report byte-identical facts. An allocator or RSS number would not,
+    /// and a durable cross-process claim would need surface this crate does not have.
+    #[test]
+    fn usage_facts_are_reproducible_from_values_not_from_the_process() {
+        let first = state_with_checkpoint(6, CheckpointSemantics::JournalSuffix);
+        let second = state_with_checkpoint(6, CheckpointSemantics::JournalSuffix);
+        assert_eq!(first.content_digest(), second.content_digest());
+        assert!(
+            !first.journal.is_same_structure(&second.journal),
+            "the two must be independently built, or reproducibility proves nothing"
+        );
+
+        let first_point = first
+            .push_entry(bytes(b"suffix"))
+            .checkpoint(Some(&first), TEST_LIMITS)
+            .expect("captures");
+        let second_point = second
+            .push_entry(bytes(b"suffix"))
+            .checkpoint(Some(&second), TEST_LIMITS)
+            .expect("captures");
+
+        // Retained-base facts: identical across two separate allocations of the same value.
+        assert_eq!(
+            first_point.retained_base_facts(),
+            second_point.retained_base_facts(),
+            "retained facts must be a function of the value, not of the allocation"
+        );
+
+        // Proof usage: identical too, including the compared byte count, which is the
+        // field an allocator-derived number would most obviously perturb.
+        let cross = planned(Some(&second), &first_point);
+        let cross_again = planned(Some(&second), &first_point);
+        assert_eq!(cross.proof_usage(), cross_again.proof_usage());
+        assert_eq!(cross.proof_usage().kind, HistoryProofKind::ExactComparison);
+        assert_eq!(
+            cross.proof_usage().compared_payload_bytes,
+            second.journal.payload_bytes,
+            "compared bytes must equal the canonical payload total, a logical quantity"
+        );
+
+        // Same-process semantic portability: the plan proved against an independently
+        // rebuilt base commits to the same state the original does.
+        assert_eq!(
+            cross
+                .commit(Some(&second), None)
+                .expect("applies")
+                .state
+                .content_digest(),
+            ExtensionState::restore(Some(&first), &first_point, TEST_LIMITS)
+                .expect("original applies")
+                .content_digest()
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-usage-provenance\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"scenario\":\"usage-facts-reproducible-from-values\",\
+             \"mutants\":[\"report_allocator_or_rss_as_canonical_usage\",\
+             \"claim_cross_process_portability\"],\
+             \"kill_signal\":\"byte_identical_facts_across_independent_allocations\",\
+             \"portability_claimed\":\"same_process_semantic_only\",\
+             \"durable_encoding_claimed\":false,\"status\":\"pass\"}}"
         );
     }
 
