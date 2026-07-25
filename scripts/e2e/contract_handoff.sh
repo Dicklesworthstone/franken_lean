@@ -272,7 +272,16 @@ finalize() {
       "$ART_DIR" >&2
     exit 2
   fi
-  note "$FINAL_VERDICT reason=$FINAL_REASON evidence=$ART_DIR scratch=$SCRATCH_BASE"
+  printf '[contract_handoff] %s reason=%s evidence=%s scratch=%s\n' \
+    "$FINAL_VERDICT" "$FINAL_REASON" "$ART_DIR" "$SCRATCH_BASE" >&2
+  if ! "${PYTHON[@]}" "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+      --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
+      --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
+      >/dev/null; then
+    printf '[contract_handoff] INTERNAL FAULT: terminal bundle mutated after commit: %s\n' \
+      "$ART_DIR" >&2
+    exit 2
+  fi
   exit "$FINAL_EXIT"
 }
 
