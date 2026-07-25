@@ -213,6 +213,31 @@ A mail-like layer for agents to coordinate via MCP tools/resources: identities, 
 
 ---
 
+## The Build Gate — what "governed write" actually means
+
+Long-running e2e lanes re-hash their `INPUT_PATHS` around every supervised step and flip `inconclusive: governed_inputs_changed` if any of them moved. A write during someone else's lane does not corrupt anything — it *voids their run*, and they start over.
+
+One command decides it, always:
+
+```bash
+flock -n /data/tmp/fln-gate.lockfile -c true    # exit 0 = free, exit 1 = HELD
+```
+
+**A failed probe is an answer, not an obstacle.** If you wrote `flock -n … && git commit …` and the chain exits 1 with no commit, the plumbing worked: the gate said *held*. Do not re-run the command without the guard. This is written from a real one — on 2026-07-25 cc_3 diagnosed the short-circuit correctly, read it as shell friction, committed directly 16 seconds into cod_2's `env_snapshots` lane, and cost a rerun.
+
+**THE HALF THAT IS EASY TO MISS: `.beads/issues.jsonl` is `INPUT_PATHS` line 150.** Everyone correctly pictures `crates/`, `ci/` and `scripts/` and then files a bead. So, while the lock is held:
+
+- **No `br create`, `br close`, `br update`, `br dep add`, `br sync`.** Filing a bead is a governed write. So is closing one.
+- **No `br` command at all without `--no-auto-flush`** — `br` auto-flushes the JSONL on ordinary *reads*, so even `br show` writes.
+- No committing `.beads/` or `ci/KERNEL_CONTRACT_OWNERSHIP.jsonl`.
+- Draft the bead text into a scratch file and file it the moment the lane releases.
+
+**Where to go instead**, so a held gate is not an idle one — none of these are in `INPUT_PATHS`: `AGENTS.md`, `README.md`, `COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md`, and anything under `/data/tmp`. Reading is always safe. If unsure about a path, check it against the `INPUT_PATHS` array in `scripts/check.sh` (~line 149) rather than guessing — the list is explicit and short.
+
+**Do not use `pgrep -f` to decide whether a lane is running.** It matches its own command line and will report a lane that is your own grep. Use `ps -eo pid,ppid,args` and exclude your own process tree, or just trust the lock.
+
+---
+
 ## Beads (br) — Dependency-Aware Issue Tracking
 
 This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`). Issues live in `.beads/` and are tracked in git. **`br` is non-invasive — it NEVER runs git.** After `br sync --flush-only`, manually `git add .beads/ && git commit`.
