@@ -8605,6 +8605,8 @@ def run_git(
         "core.ignoreStat=false",
         "-c",
         "core.filemode=true",
+        "-c",
+        "maintenance.auto=false",
         *args,
     ]
     completed = subprocess.run(
@@ -11290,6 +11292,100 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         path.mkdir()
         return path
 
+    # A supervisor may begin only when it owns no other child lifetime. Recreate
+    # the Git 2.54 auto-maintenance topology directly: a launcher forks a
+    # detached worker, the launcher exits, and this subreaper adopts the exited
+    # worker. The guard must reject that unreaped child instead of silently
+    # broadening its authority; only the fixture then reaps the exact child.
+    detached_root = case_dir("preexisting_detached_child_refusal")
+    detached_program = (
+        "import os,sys\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os.setsid()\n"
+        "    os._exit(0)\n"
+        "sys.stdout.write(str(child))\n"
+        "sys.stdout.flush()\n"
+    )
+    try:
+        detached_launcher = subprocess.run(
+            [sys.executable, "-c", detached_program],
+            cwd=art_dir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise EvidenceError("detached-child launcher timed out") from error
+    require(
+        detached_launcher.returncode == 0,
+        "detached-child launcher failed: "
+        f"{detached_launcher.stderr[-300:]!r}",
+    )
+    try:
+        detached_pid = int(detached_launcher.stdout.decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise EvidenceError(
+            "detached-child launcher returned a malformed PID"
+        ) from error
+    detached_deadline = time.monotonic() + 1.0
+    detached_facts: tuple[str, int, int] | None = None
+    detached_children: set[int] = set()
+    while time.monotonic() < detached_deadline:
+        detached_children = proc_children(os.getpid())
+        if detached_pid in detached_children:
+            detached_facts = proc_stat_facts(detached_pid)
+            if detached_facts is not None and detached_facts[0] == "Z":
+                break
+        time.sleep(0.005)
+    require(
+        detached_facts is not None
+        and detached_facts[0] == "Z"
+        and detached_children == {detached_pid},
+        "detached-child topology did not produce an adopted zombie",
+    )
+    try:
+        run_supervised(
+            argv=[sys.executable, "-c", "raise SystemExit('guard bypassed')"],
+            cwd=art_dir,
+            metadata_path=detached_root / "stage.meta.json",
+            stdout_path=detached_root / "stage.out",
+            stderr_path=detached_root / "stage.err",
+            readiness_path=detached_root / "stage.ready.json",
+            artifact_root=art_dir,
+            capture_bytes=4096,
+            output_budget_bytes=262_144,
+            timeout_ms=1000,
+            grace_ms=500,
+            stage_id="preexisting_detached_child_refusal",
+            planted=True,
+            setup_timeout_ms=1000,
+        )
+    except EvidenceError as error:
+        require(
+            "supervisor process already owns unrelated child lifetimes" in str(error)
+            and str(detached_pid) in str(error),
+            f"detached-child topology failed for the wrong reason: {error}",
+        )
+    else:
+        raise EvidenceError("supervisor accepted an unrelated adopted child")
+    finally:
+        reap_adopted_children()
+    require(
+        proc_stat_facts(detached_pid) is None,
+        "detached-child refusal fixture did not reap its adopted zombie",
+    )
+    cases.append(
+        {
+            "case": "preexisting_detached_child_refusal",
+            "ok": True,
+            "observed_state": "adopted_zombie",
+            "guard": "typed_refusal",
+        }
+    )
+
     # The verification registry is a closed schema with a frozen adoption
     # boundary. Exercise both the real transition law and discriminating
     # authority mutants before any repository stage can rely on it.
@@ -11624,6 +11720,19 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         git_init.returncode == 0,
         f"UBS scope fixture git init failed: {git_init.stderr[-300:]!r}",
     )
+    maintenance_auto = run_git(
+        ubs_scope_repo,
+        ["config", "--bool", "--get", "maintenance.auto"],
+        subject="UBS scope fixture sealed maintenance policy",
+    ).decode("ascii").strip()
+    require(
+        maintenance_auto == "false",
+        "evidence Git invocation did not disable automatic maintenance",
+    )
+    require(
+        not proc_children(os.getpid()),
+        "sealed Git policy query left an adopted maintenance child",
+    )
     tracked_input = ubs_scope_repo / "tracked.py"
     stable_input = ubs_scope_repo / "stable.py"
     write_new(tracked_input, b"value = 1\n")
@@ -11646,6 +11755,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "initial",
         ],
         subject="UBS scope fixture initial commit",
+    )
+    require(
+        not proc_children(os.getpid()),
+        "sealed Git initial commit left an adopted maintenance child",
     )
     with tracked_input.open("ab") as handle:
         handle.write(b"# captured change\n")
@@ -11686,6 +11799,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "scope transition",
         ],
         subject="UBS scope fixture transition commit",
+    )
+    require(
+        not proc_children(os.getpid()),
+        "sealed Git transition commit left an adopted maintenance child",
     )
     try:
         validate_ubs_inventory(
@@ -11741,6 +11858,14 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "case": "ubs_inventory_scope_snapshot",
             "ok": True,
             "mutants_killed": 2,
+        }
+    )
+    cases.append(
+        {
+            "case": "git_maintenance_subreaper_boundary",
+            "ok": True,
+            "maintenance_auto": maintenance_auto,
+            "owned_children_after_commits": [],
         }
     )
 
