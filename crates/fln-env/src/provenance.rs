@@ -4341,6 +4341,61 @@ mod tests {
         ));
     }
 
+    /// The last two named mutants from the parent bead: admitting allocation identity
+    /// into the aggregate root, and letting insertion order decide canonical order.
+    ///
+    /// Both are invisible on a fixture built once and used once, which is exactly why
+    /// they are worth a test that builds the same value twice, differently.
+    #[test]
+    fn identity_is_by_value_never_by_allocation_or_input_order() {
+        let first = sample_manifest();
+        // A second, independently allocated construction of the same value. The
+        // storage assertion is what stops this from being a vacuous comparison of one
+        // object with itself.
+        let second = sample_manifest();
+        assert!(
+            !first.shares_storage_with(&second),
+            "the two fixtures share storage, so this proves nothing about allocation"
+        );
+        assert_eq!(first.root(), second.root(), "allocation reached the root");
+        assert_eq!(first.to_canonical_bytes(), second.to_canonical_bytes());
+
+        // The projections inherit the same law: they are functions of the records, so
+        // two allocations of one value project identically.
+        assert_eq!(
+            ModuleProvenanceSubdigests::derive(&first),
+            ModuleProvenanceSubdigests::derive(&second)
+        );
+        assert_eq!(
+            ModuleProvenanceIndexes::derive(&first).expect("validated manifest"),
+            ModuleProvenanceIndexes::derive(&second).expect("validated manifest")
+        );
+
+        // Sharing does not change identity in the other direction either: a clone that
+        // *does* share every allocation still reports the same root.
+        let shared = first.clone();
+        assert!(first.shares_storage_with(&shared));
+        assert_eq!(first.root(), shared.root());
+
+        // Canonical order is decided by canonicalization, not by the order records
+        // arrived in. Reversing the input must be undetectable in the identity.
+        let mut reversed = sample_records();
+        reversed.reverse();
+        let reordered = ModuleProvenanceManifest::new(epoch(), reversed, TEST_LIMITS)
+            .expect("reordered records validate");
+        assert_eq!(
+            reordered.root(),
+            first.root(),
+            "input order reached the root"
+        );
+        assert_eq!(reordered.to_canonical_bytes(), first.to_canonical_bytes());
+        assert_eq!(
+            reordered.records()[0].module.id,
+            id("A"),
+            "records are not in canonical order"
+        );
+    }
+
     /// Count conservation is the half that re-derivation cannot supply.
     ///
     /// Diffing a projection against a rebuild of itself proves only that the same
