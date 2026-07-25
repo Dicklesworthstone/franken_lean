@@ -166,6 +166,8 @@ INPUT_PATHS=(
   scripts/tribunal/leanchecker_witness.sh
   contracts ABI_CONTRACT.md OLEAN_CONTRACT.md rustfmt.toml
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
+  scripts/git-hooks/pre-commit scripts/git-hooks/install.sh
+  scripts/git-hooks/test_projection_guard.sh
   tribunal
   .github/workflows/ci.yml
 )
@@ -1542,7 +1544,9 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh \
   scripts/e2e/verdict_schema.sh \
   scripts/tribunal/leanchecker_witness.sh \
-  scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
+  scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh \
+  scripts/git-hooks/pre-commit scripts/git-hooks/install.sh \
+  scripts/git-hooks/test_projection_guard.sh
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets
 run_stage clippy cargo clippy --locked --all-targets -- -D warnings
