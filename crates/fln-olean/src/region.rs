@@ -748,7 +748,26 @@ impl<'a> OleanView<'a> {
                 reason: what,
             });
         }
-        Ok((off, self.read_u64(off + 8)?))
+        let len = self.read_u64(off + 8)?;
+        // The length is attacker-controlled and must be proven to fit BEFORE it
+        // reaches a caller, because callers size allocations from it. Without this,
+        // a 24-byte array object claiming 2^40 elements makes the decoder allocate
+        // terabytes and abort — a process death rather than the typed RegionError
+        // this module promises for every malformed input. Charging the storage here
+        // means the length is bounded by the file, so an allocation derived from it
+        // is bounded too.
+        let elements = len.checked_mul(8).ok_or(RegionError::DecodeShape {
+            offset: off,
+            reason: "array length overflows its element storage",
+        })?;
+        self.read_bytes(
+            off.checked_add(24).ok_or(RegionError::Truncated {
+                wanted_end: u64::MAX,
+                len: self.bytes.len() as u64,
+            })?,
+            elements,
+        )?;
+        Ok((off, len))
     }
 
     fn decode_array_view(
