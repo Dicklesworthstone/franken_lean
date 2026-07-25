@@ -85,6 +85,25 @@ pub enum NonAuthoritative {
     /// Our own accounting contradicted itself — an invariant failure, not a
     /// statement about the subject or the oracle.
     InternalFault { what: String },
+    /// The oracle ran, our accounting is sound, and there is still no judgment
+    /// about THIS subject: the oracle does not judge it, or it was never
+    /// submitted at this scope.
+    ///
+    /// A fact about the subject's COVERAGE, which is why it is neither of the
+    /// two above — the run completed, so it is not `Inconclusive`, and nothing
+    /// contradicted itself, so it is not `InternalFault`. The gap was found by
+    /// `fln-7odd`: 1,425 declarations the pinned checker legitimately declines
+    /// to submit, plus the far larger set never submitted at a given scope.
+    /// Before this arm the nearest encoding of either was a completed run with
+    /// exit 0, which reads as [`OracleVerdict::Accepted`] — an answer the
+    /// oracle never gave.
+    ///
+    /// Never reachable from [`Observation::verdict`], and deliberately so: an
+    /// observation is a record of a PROCESS, and no process outcome can tell
+    /// you whether a subject was in scope. Only a caller that knows the subject
+    /// can say this, which is why it is constructed by
+    /// [`NonAuthoritative::not_judged`] and never inferred.
+    NotJudged { what: String },
 }
 
 impl ProcessOutcome {
@@ -126,6 +145,13 @@ impl ProcessOutcome {
 impl NonAuthoritative {
     pub fn internal_fault(what: impl Into<String>) -> NonAuthoritative {
         NonAuthoritative::InternalFault { what: what.into() }
+    }
+
+    /// The oracle produced no judgment about this subject. See
+    /// [`NonAuthoritative::NotJudged`] for why this is constructed and never
+    /// inferred from a process outcome.
+    pub fn not_judged(what: impl Into<String>) -> NonAuthoritative {
+        NonAuthoritative::NotJudged { what: what.into() }
     }
 }
 
@@ -251,9 +277,21 @@ impl Scored {
 /// Note the order: the oracle's non-answer is checked BEFORE our verdict is
 /// consulted at all, so there is no path where a crash is paired with anything.
 pub fn score(ours: &OurVerdict, oracle: &Observation) -> Scored {
-    let oracle_verdict = match oracle.verdict() {
-        OracleVerdict::NoAnswer(reason) => return Scored::Unscorable(reason),
-        answered => answered,
+    score_verdicts(ours, &oracle.verdict())
+}
+
+/// Score two verdicts that have already been established.
+///
+/// The same rule as [`score`], applied one step later in the pipe. It exists
+/// because a recorded row (the Parity Ledger) holds verdicts rather than a live
+/// [`Observation`], and a ledger that re-implemented the scoring rule could
+/// drift from it silently — the one place the two sides are allowed to meet has
+/// to stay one place. [`score`] is defined in terms of this, so there is no
+/// second copy to keep in step.
+pub fn score_verdicts(ours: &OurVerdict, oracle: &OracleVerdict) -> Scored {
+    let oracle_verdict = match oracle {
+        OracleVerdict::NoAnswer(reason) => return Scored::Unscorable(reason.clone()),
+        answered => answered.clone(),
     };
     match (ours, oracle_verdict) {
         (OurVerdict::Inconclusive { what }, _) => {

@@ -39,6 +39,28 @@
 //! | claim/level conflation | the level rule also requires a strong claim type | `the_level_rule_does_not_read_the_claim_type`, `an_unearned_level_blocks` |
 //! | aggregate admitted | `is_aggregate_symbol` returns `false` | `an_aggregate_row_blocks` |
 //!
+//! Schema 2 (`fln-fei1`) added five rules, each planted and measured the same
+//! way:
+//!
+//! | mutant | edit | killed by |
+//! |---|---|---|
+//! | misscored not blocked | the `derived != stated` push is skipped | `a_row_whose_assessment_its_own_sides_do_not_support_is_refused`, `a_non_answer_from_either_side_is_never_a_divergence_in_a_row`, `an_oracle_silent_symbol_is_expressible_and_the_old_lie_is_refused` |
+//! | disposition not blocked | the `(divergence, NotADivergence)` arm is dropped | `a_divergence_must_say_whether_it_was_called` **only** |
+//! | uncompared not blocked | both arms guarded `if false` | `a_comparison_class_is_named_exactly_when_something_was_compared`, `an_oracle_silent_symbol_is_expressible_and_the_old_lie_is_refused` |
+//! | identical roots under a divergence admitted | the `a == b` check inside the divergence arm is dropped | `a_divergence_whose_roots_are_identical_is_refused` **only** |
+//! | silent oracle's root admitted | the uncompared arm stops reading `oracle_root` | `a_silent_oracle_cannot_have_its_root_cited` **only** |
+//! | level closed without a comparison | the rule requires `level_rank > 4` | `an_unassessed_symbol_cannot_carry_a_compatibility_level` **only** |
+//! | scoring rule copied instead of shared | the verifier re-implements the table, mapping every non-answer to `Agree` | `an_oracle_silent_symbol_is_expressible_and_the_old_lie_is_refused`, `an_unassessed_symbol_is_expressible_and_is_not_a_missing_symbol`, `an_unassessed_symbol_cannot_carry_a_compatibility_level`, `a_silent_oracle_cannot_have_its_root_cited`, `the_report_verdicts_on_the_schema_and_says_so` |
+//!
+//! **The copied-scoring-rule row is the one worth reading here.**
+//! `the_scoring_rule_the_ledger_uses_is_the_one_the_rigs_use` did NOT kill it —
+//! that test asserts on `score_verdicts` itself, so a private copy inside the
+//! verifier leaves it green. What actually catches the copy is the set of rows
+//! where a side did not answer: every one of them scores `Agree` under the
+//! mutant and the ledger starts agreeing with itself. So the anti-drift
+//! property is carried by the non-answer rows, not by the function test, and
+//! deleting them to "reduce duplication" would silently restore the hole.
+//!
 //! **The stale row is the one worth reading.** `a_stale_revision_blocks` did
 //! NOT kill the `starts_with` mutant — it uses a revision that is not a prefix
 //! of the head, so a prefix-accepting comparison still refuses it and the test
@@ -50,10 +72,13 @@
 
 #![forbid(unsafe_code)]
 
-use fln_epoch_lab::oracle::{ClaimType, EvidenceState, LLevel, Mode, Platform};
+use fln_epoch_lab::oracle::{
+    ClaimType, EvidenceState, LLevel, Mode, NonAuthoritative, OracleVerdict, OurVerdict, Platform,
+    score_verdicts,
+};
 use fln_epoch_lab::parity::{
-    Block, LEDGER_SCHEMA, Ledger, ROW_FIELDS, is_aggregate_symbol, parse, report, verify,
-    verify_with_fixtures,
+    Assessment, Block, LEDGER_SCHEMA, Ledger, ROW_FIELDS, census, is_aggregate_symbol, parse,
+    report, verify, verify_with_fixtures,
 };
 use std::path::PathBuf;
 
@@ -64,10 +89,15 @@ const FIXTURE_DIGEST: &str = "33333333333333333333333333333333333333333333333333
 
 /// A row builder that starts from a fully valid row, so every test changes
 /// exactly one thing and the reason a ledger was refused is unambiguous.
+#[derive(Clone)]
 struct Row {
     symbol: String,
     ours_root: String,
     oracle_root: String,
+    ours_verdict: String,
+    oracle_verdict: String,
+    assessment: String,
+    disposition: String,
     comparison: String,
     normalizer: String,
     claim: String,
@@ -85,6 +115,10 @@ impl Row {
             symbol: symbol.to_string(),
             ours_root: ROOT_A.to_string(),
             oracle_root: ROOT_A.to_string(),
+            ours_verdict: "accepted".to_string(),
+            oracle_verdict: "accepted".to_string(),
+            assessment: "agree".to_string(),
+            disposition: "-".to_string(),
             comparison: "byte-identical".to_string(),
             normalizer: "-".to_string(),
             claim: "bounded_model".to_string(),
@@ -97,15 +131,69 @@ impl Row {
         }
     }
 
+    /// The row a restrictive divergence produces: we rejected, the oracle
+    /// accepted, the two artifacts necessarily differ, and the cause has not
+    /// been called. Under schema 1 this row could not be written at all.
+    fn restrictive_uncalled(symbol: &str) -> Row {
+        Row {
+            oracle_root: ROOT_B.to_string(),
+            ours_verdict: "rejected".to_string(),
+            oracle_verdict: "accepted".to_string(),
+            assessment: "restrictive".to_string(),
+            disposition: "uncalled".to_string(),
+            // A divergence closes no compatibility level for its symbol.
+            level: "L0".to_string(),
+            limits: "root-cause deliberately unclassified".to_string(),
+            ..Row::valid(symbol)
+        }
+    }
+
+    /// The row a symbol the oracle does not judge produces: our answer stands,
+    /// the oracle never spoke, nothing was compared.
+    fn oracle_silent(symbol: &str) -> Row {
+        Row {
+            oracle_root: "-".to_string(),
+            ours_verdict: "accepted".to_string(),
+            oracle_verdict: "no-answer:out-of-scope".to_string(),
+            assessment: "unscorable".to_string(),
+            disposition: "-".to_string(),
+            comparison: "-".to_string(),
+            level: "L0".to_string(),
+            limits: "the pinned checker does not submit this constant".to_string(),
+            ..Row::valid(symbol)
+        }
+    }
+
+    /// The row an unassessed symbol produces: nobody asked either side.
+    fn unassessed(symbol: &str) -> Row {
+        Row {
+            ours_root: "-".to_string(),
+            oracle_root: "-".to_string(),
+            ours_verdict: "inconclusive:not-assessed-at-this-scope".to_string(),
+            oracle_verdict: "no-answer:not-assessed".to_string(),
+            assessment: "unscorable".to_string(),
+            disposition: "-".to_string(),
+            comparison: "-".to_string(),
+            level: "L0".to_string(),
+            limits: "outside the scope of this run".to_string(),
+            ..Row::valid(symbol)
+        }
+    }
+
     fn render(&self) -> String {
         format!(
             "row {} fixture=fixtures/nat.lean fixture_digest={FIXTURE_DIGEST} \
-             ours_root={} oracle_root={} oracle=reference-binary comparison={} \
+             ours_root={} oracle_root={} ours_verdict={} oracle_verdict={} \
+             assessment={} disposition={} oracle=reference-binary comparison={} \
              normalizer={} claim={} evidence=differential state={} level={} \
              mode={} platform={} backing={} freshness=current limits={}",
             self.symbol,
             self.ours_root,
             self.oracle_root,
+            self.ours_verdict,
+            self.oracle_verdict,
+            self.assessment,
+            self.disposition,
             self.comparison,
             self.normalizer,
             self.claim,
@@ -645,7 +733,9 @@ fn a_row_whose_fixture_verifies_is_accepted() {
     let text = format!(
         "{LEDGER_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n\
          row Nat.a fixture={fixture} fixture_digest={digest} \
-         ours_root={ROOT_A} oracle_root={ROOT_A} oracle=reference-binary \
+         ours_root={ROOT_A} oracle_root={ROOT_A} ours_verdict=accepted \
+         oracle_verdict=accepted assessment=agree disposition=- \
+         oracle=reference-binary \
          comparison=byte-identical normalizer=- claim=bounded_model \
          evidence=differential state=observed level=L2 mode=sound \
          platform=linux-x86_64 backing=real-reference freshness=current \
@@ -672,86 +762,363 @@ fn a_row_naming_a_fixture_that_does_not_exist_is_refused() {
 
 // ---------------------------------------------------------------------------
 // Dogfooding: can this schema carry the corpus result it was built for?
-// (bead franken_lean-9pnc meets franken_lean-d17i / kxbj / fln-7odd)
+// (bead franken_lean-9pnc meets franken_lean-d17i / kxbj / fln-7odd, settled by
+// fln-fei1)
 // ---------------------------------------------------------------------------
+//
+// The four things a real corpus run produces, attempted as rows. This is the
+// honest test of a schema: not whether it accepts a well-formed row, but
+// whether the project's strongest real result can be written down in it without
+// bending anything.
+//
+// Under schema 1 exactly one of the four could be. The three that could not are
+// re-derived below against schema 2, and each one now asserts the SAME fact
+// from the other side: that the honest encoding is accepted, and that the
+// dishonest encoding version 1 forced on it is refused. Both halves matter. A
+// schema that merely admits the new row while still admitting the old lie has
+// not fixed anything.
 
-/// The four things the corpus run actually produced, attempted as rows.
-///
-/// This is the honest test of the schema: not whether it accepts a
-/// well-formed row, but whether the project's strongest real result can be
-/// expressed in it without bending anything. Three of the four cannot be, and
-/// the tests below record exactly how — a schema defect stated is worth more
-/// than a result rounded off to fit.
 #[test]
 fn an_agreeing_symbol_is_expressible() {
-    // The 15,722 compared declarations that agreed. This is the case the
-    // schema was designed around and it works.
+    // The compared declarations that agreed. This is the case schema 1 was
+    // designed around and it still works unchanged — the extension is additive
+    // for the row kind that already fit.
     let l = parsed(HEAD, &[Row::valid("Nat.succ_le_of_lt")]);
     assert!(verify(&l, &["Nat.succ_le_of_lt"], HEAD).is_empty());
 }
 
 #[test]
-fn a_restrictive_divergence_is_not_expressible() {
-    // DEFECT 1. A restrictive divergence — we reject, the Reference accepts —
-    // is the single most load-bearing row type a Parity Ledger can carry, and
-    // this schema refuses it. The two roots necessarily differ, so under
-    // byte-identical the row is blocked as a root mismatch, and there is no
-    // comparison class that means "compared, and they disagreed".
-    let mut r = Row::valid("Lean.Arrow");
-    r.oracle_root = ROOT_B.to_string(); // ours != theirs: that IS the finding
-    let blocks = verify(&parsed(HEAD, &[r]), &["Lean.Arrow"], HEAD);
-    assert!(
-        reasons(&blocks).contains(&"root-mismatch"),
-        "expected the schema to refuse a divergence row: {blocks:?}"
-    );
-    // The refusal is correct FOR AN AGREEMENT LEDGER and wrong for a parity
-    // ledger: D7 says the ledger is row-per-symbol, and a symbol we diverge on
-    // is exactly the row a reader most needs. The 5 unclassified divergences of
-    // franken_lean-d17i therefore have NO representation here.
-}
-
-#[test]
-fn an_oracle_silent_symbol_is_not_expressible() {
-    // DEFECT 2. fln-7odd's 1,425 declarations are ones leanchecker legitimately
-    // cannot judge — unsafe or partial constants its own replay never submits.
-    // That is a real bound on the oracle and belongs in the report as a stated
-    // limit. Every ComparisonClass presupposes a comparison happened:
-    // ByteIdentical, NormalizedIdentical, AcceptanceOnly and
-    // DiagnosticEquivalent all assert an act of comparing. There is no
-    // OracleSilent arm.
-    //
-    // The nearest expressible thing is acceptance-only with both roots absent,
-    // which parses — but it says "we compared acceptance and agreed", which is
-    // FALSE. The oracle said nothing.
-    let mut r = Row::valid("Nat.unsafeCast");
-    r.comparison = "acceptance-only".to_string();
-    r.ours_root = "-".to_string();
-    r.oracle_root = "-".to_string();
-    let blocks = verify(&parsed(HEAD, &[r]), &["Nat.unsafeCast"], HEAD);
+fn a_restrictive_divergence_is_expressible_and_reads_as_uncalled() {
+    // DEFECT 1, CLOSED. A restrictive divergence — we reject, the Reference
+    // accepts — is the single most load-bearing row a Parity Ledger can carry,
+    // and schema 1 refused it: the two roots necessarily differ, so
+    // byte-identical blocked it as a root mismatch, and no ComparisonClass
+    // meant "compared, and they disagreed".
+    let l = parsed(HEAD, &[Row::restrictive_uncalled("Lean.Arrow")]);
+    let blocks = verify(&l, &["Lean.Arrow"], HEAD);
     assert!(
         blocks.is_empty(),
-        "the nearest encoding passes, which is the defect: {blocks:?}"
+        "a restrictive divergence was refused: {blocks:?}"
     );
-    // It passing is the problem. A schema that can only express a claim it
-    // cannot support is worse here than one that refuses.
+
+    // And it reads as neither a pass nor a finding. The census gives it its own
+    // class; nothing folds it into either.
+    let text = census(&l);
+    assert!(
+        text.contains("assessment=restrictive disposition=uncalled n=1"),
+        "an uncalled divergence lost its own class: {text}"
+    );
+    assert!(
+        !text.contains("assessment=agree"),
+        "counted as a pass: {text}"
+    );
 }
 
 #[test]
-fn an_unassessed_symbol_is_not_expressible_either() {
-    // DEFECT 3, and the largest by volume. 142,886 of 158,608 decoded
-    // declarations were never compared — 141,461 because OUR side gave no
-    // answer, including kxbj's 65 behind a depth bound. A Parity Ledger over
-    // this corpus is 90% not-assessed, and the schema has no row for it: a
-    // symbol either has a row asserting comparison, or has no row at all and
-    // is then reported as Block::MissingSymbol.
+fn an_uncalled_divergence_is_not_the_same_row_as_a_called_one() {
+    // The disposition is a real axis, not decoration: the same measurement with
+    // its cause called reads differently, and both are legal rows. If these two
+    // collapsed to one, "we measured a difference" and "we know why" would be
+    // the same claim again.
+    let mut called = Row::restrictive_uncalled("Lean.Arrow");
+    called.disposition = "harness".to_string();
+    called.limits = "our decoder truncates extended imports at this scope".to_string();
+    let l = parsed(HEAD, &[called]);
+    assert!(verify(&l, &["Lean.Arrow"], HEAD).is_empty());
+    assert!(census(&l).contains("assessment=restrictive disposition=harness n=1"));
+}
+
+#[test]
+fn an_oracle_silent_symbol_is_expressible_and_the_old_lie_is_refused() {
+    // DEFECT 2, CLOSED. fln-7odd's 1,425 declarations are ones the pinned
+    // checker legitimately cannot judge — unsafe or partial constants its own
+    // replay never submits. That is a real bound on the oracle and belongs in
+    // the report as a stated limit on a row, not as an absence from the file.
+    let l = parsed(HEAD, &[Row::oracle_silent("Nat.unsafeCast")]);
+    let blocks = verify(&l, &["Nat.unsafeCast"], HEAD);
+    assert!(
+        blocks.is_empty(),
+        "an oracle-silent row was refused: {blocks:?}"
+    );
+    assert!(census(&l).contains("assessment=unscorable"));
+
+    // The other half, and the half that matters more. Schema 1's nearest
+    // encoding — acceptance-only with both roots absent — PARSED AND PASSED
+    // while asserting "we compared acceptance and agreed", which is false: the
+    // oracle never spoke. That encoding must now be refused, and for its own
+    // reason, not incidentally.
+    // Written out literally — an oracle that said nothing, under a row that
+    // claims the two sides agreed — it is refused as misscored: the stated
+    // conclusion is not what the row's own sides produce.
+    let mut lie = Row::valid("Nat.unsafeCast");
+    lie.comparison = "acceptance-only".to_string();
+    lie.ours_root = "-".to_string();
+    lie.oracle_root = "-".to_string();
+    lie.oracle_verdict = "no-answer:out-of-scope".to_string();
+    let blocks = verify(&parsed(HEAD, &[lie.clone()]), &["Nat.unsafeCast"], HEAD);
+    assert!(
+        reasons(&blocks).contains(&"misscored"),
+        "the version-1 encoding of an oracle-silent symbol still passes: {blocks:?}"
+    );
+
+    // And once the conclusion is corrected, the borrowed comparison class is
+    // still refused on its own — for its own reason. Two separate defects in
+    // that one old row, and each has to fail by itself or a mutant that revives
+    // either is covered by the other.
+    let mut honest_score = lie;
+    honest_score.assessment = "unscorable".to_string();
+    honest_score.level = "L0".to_string(); // isolate: an uncompared row closes no level either
+    let blocks = verify(&parsed(HEAD, &[honest_score]), &["Nat.unsafeCast"], HEAD);
+    assert_eq!(reasons(&blocks), vec!["uncompared"]);
+}
+
+#[test]
+fn an_unassessed_symbol_is_expressible_and_is_not_a_missing_symbol() {
+    // DEFECT 3, CLOSED, and the largest by volume: most of a decoded corpus is
+    // never compared. Schema 1 offered a row asserting comparison, or no row at
+    // all and then Block::MissingSymbol — and "we have no row for this symbol"
+    // and "we have a row saying nobody looked" are different facts.
     let scan = ["A", "B"];
-    let l = parsed(HEAD, &[Row::valid("A")]);
+    let l = parsed(HEAD, &[Row::valid("A"), Row::unassessed("B")]);
     let blocks = verify(&l, &scan, HEAD);
     assert!(
-        reasons(&blocks).contains(&"missing"),
-        "an unassessed symbol can only be a MissingSymbol block: {blocks:?}"
+        blocks.is_empty(),
+        "an unassessed row was refused: {blocks:?}"
     );
-    // "Missing" and "assessed, no verdict available" are different facts and
-    // the schema conflates them. That is precisely the conflation this epic
-    // spent six slices refusing everywhere else.
+    assert!(
+        !reasons(&blocks).contains(&"missing"),
+        "an assessed-nobody-looked row was still reported as missing: {blocks:?}"
+    );
+
+    // MissingSymbol survives, and is now a sharper refusal than it was: it means
+    // the ledger does not mention the symbol AT ALL, which after schema 2 is a
+    // publication defect rather than the only way to say "not assessed".
+    let thin = parsed(HEAD, &[Row::valid("A")]);
+    assert!(reasons(&verify(&thin, &scan, HEAD)).contains(&"missing"));
+}
+
+#[test]
+fn an_unassessed_symbol_cannot_carry_a_compatibility_level() {
+    // The trap the level rule alone does not catch. "We observed that nobody
+    // assessed this" is an honest thing to say, and state=observed carries an L4
+    // ceiling — so without a rule that reads the assessment, a symbol nobody
+    // checked could be published as attested by a row that lies about nothing.
+    let mut r = Row::unassessed("B");
+    r.level = "L3".to_string();
+    let blocks = verify(&parsed(HEAD, &[r]), &["B"], HEAD);
+    assert_eq!(reasons(&blocks), vec!["level-without-comparison"]);
+}
+
+// ---------------------------------------------------------------------------
+// The refusals schema 2 adds. Each fires for its own reason.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_row_whose_assessment_its_own_sides_do_not_support_is_refused() {
+    // The most dangerous row this file can contain, and one schema 1 could not
+    // even express: a stated conclusion that the two recorded verdicts do not
+    // produce. The verifier re-derives it with the live scoring function rather
+    // than trusting the field.
+    let mut lying = Row::valid("Nat.a");
+    lying.ours_verdict = "rejected".to_string();
+    lying.oracle_verdict = "accepted".to_string();
+    // ...but the row still claims they agreed.
+    let blocks = verify(&parsed(HEAD, &[lying]), &["Nat.a"], HEAD);
+    assert!(
+        reasons(&blocks).contains(&"misscored"),
+        "a misscored row was not refused: {blocks:?}"
+    );
+    let found = blocks.iter().any(|b| {
+        matches!(
+            b,
+            Block::Misscored {
+                stated: Assessment::Agree,
+                derived: Assessment::Restrictive,
+                ..
+            }
+        )
+    });
+    assert!(found, "the refusal did not name both readings: {blocks:?}");
+}
+
+#[test]
+fn the_scoring_rule_the_ledger_uses_is_the_one_the_rigs_use() {
+    // The anti-drift device. If the ledger scored with its own copy of the rule,
+    // the copy could diverge from `oracle::score` and every row would still
+    // verify — a ledger agreeing with itself. It must be the same function, so
+    // this asserts on the function rather than on a transcribed table.
+    for (ours, oracle, want) in [
+        (
+            OurVerdict::Accepted,
+            OracleVerdict::Accepted,
+            Assessment::Agree,
+        ),
+        (
+            OurVerdict::Rejected {
+                diagnostic: String::new(),
+            },
+            OracleVerdict::Accepted,
+            Assessment::Restrictive,
+        ),
+        (
+            OurVerdict::Accepted,
+            OracleVerdict::Rejected {
+                diagnostic: String::new(),
+            },
+            Assessment::UnsoundlyPermissive,
+        ),
+        (
+            OurVerdict::Accepted,
+            OracleVerdict::NoAnswer(NonAuthoritative::not_judged("out-of-scope")),
+            Assessment::Unscorable,
+        ),
+        (
+            OurVerdict::Inconclusive {
+                what: "depth-bound".to_string(),
+            },
+            OracleVerdict::Accepted,
+            Assessment::Unscorable,
+        ),
+    ] {
+        let got = Assessment::of(&score_verdicts(&ours, &oracle));
+        assert_eq!(got, want, "{ours:?} vs {oracle:?}");
+    }
+}
+
+#[test]
+fn a_non_answer_from_either_side_is_never_a_divergence_in_a_row() {
+    // FL-INV-07 at the ledger layer. A row where either side did not answer
+    // cannot be recorded as a finding, however it is spelled: the assessment is
+    // re-derived, so `restrictive` over a non-answer is refused as misscored
+    // rather than published as a divergence.
+    for mut r in [Row::oracle_silent("Nat.a"), Row::unassessed("Nat.a")] {
+        r.assessment = "restrictive".to_string();
+        r.disposition = "semantic".to_string();
+        let blocks = verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD);
+        assert!(
+            reasons(&blocks).contains(&"misscored"),
+            "a non-answer was published as a divergence: {blocks:?}"
+        );
+    }
+}
+
+#[test]
+fn a_divergence_must_say_whether_it_was_called() {
+    // A divergence with nothing said about its cause is not a legal row: the
+    // schema will take `uncalled` and will not take silence, because silence is
+    // what let an unclassified divergence be filed as a clean pass.
+    let mut silent = Row::restrictive_uncalled("Lean.Arrow");
+    silent.disposition = "-".to_string();
+    let blocks = verify(&parsed(HEAD, &[silent]), &["Lean.Arrow"], HEAD);
+    assert_eq!(reasons(&blocks), vec!["incoherent-disposition"]);
+
+    // And the converse: a row with nothing to call must not name a cause.
+    let mut spurious = Row::valid("Nat.a");
+    spurious.disposition = "semantic".to_string();
+    let blocks = verify(&parsed(HEAD, &[spurious]), &["Nat.a"], HEAD);
+    assert_eq!(reasons(&blocks), vec!["incoherent-disposition"]);
+}
+
+#[test]
+fn a_divergence_whose_roots_are_identical_is_refused() {
+    // The sharper half of the re-derived root rule, and a row schema 1 could
+    // not express at all. Under version 1 the rule read the comparison class
+    // alone and any two differing roots were the defect; now the roots have to
+    // agree with the ASSESSMENT, so a declared divergence whose two artifacts
+    // are the same bytes is a row contradicting its own evidence.
+    let mut r = Row::restrictive_uncalled("Lean.Arrow");
+    r.oracle_root = ROOT_A.to_string(); // same as ours: nothing actually differs
+    let blocks = verify(&parsed(HEAD, &[r]), &["Lean.Arrow"], HEAD);
+    assert_eq!(reasons(&blocks), vec!["root-mismatch"]);
+}
+
+#[test]
+fn a_silent_oracle_cannot_have_its_root_cited() {
+    // An oracle that gave no answer produced nothing to cite. A digest there is
+    // a fabrication, and it is the shape a copy-pasted row takes.
+    let mut r = Row::oracle_silent("Nat.unsafeCast");
+    r.oracle_root = ROOT_B.to_string();
+    let blocks = verify(&parsed(HEAD, &[r]), &["Nat.unsafeCast"], HEAD);
+    assert_eq!(reasons(&blocks), vec!["root-mismatch"]);
+}
+
+#[test]
+fn a_comparison_class_is_named_exactly_when_something_was_compared() {
+    // Both directions, because either alone leaves a lie expressible.
+    let mut classed = Row::oracle_silent("Nat.a");
+    classed.comparison = "acceptance-only".to_string();
+    classed.ours_root = "-".to_string();
+    assert!(reasons(&verify(&parsed(HEAD, &[classed]), &["Nat.a"], HEAD)).contains(&"uncompared"));
+
+    let mut classless = Row::valid("Nat.a");
+    classless.comparison = "-".to_string();
+    assert!(
+        reasons(&verify(&parsed(HEAD, &[classless]), &["Nat.a"], HEAD)).contains(&"uncompared")
+    );
+}
+
+#[test]
+fn an_inconclusive_must_name_what_was_inconclusive() {
+    // FL-INV-07 says a non-answer is typed, not silent. A bare `inconclusive`
+    // does not parse: the row has to say what it could not conclude, which is
+    // how kxbj's depth bound stays distinguishable from a scope decision.
+    let mut bare = Row::unassessed("B");
+    bare.ours_verdict = "inconclusive:".to_string();
+    let err = parse(&ledger_text(HEAD, &[bare])).expect_err("a bare inconclusive parsed");
+    assert!(reasons(&err).contains(&"malformed"), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The report says what it verdicts on.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_report_verdicts_on_the_schema_and_says_so() {
+    // `verdict=pass` over a ledger of unassessed rows is exactly the sentence
+    // that gets quoted as "we match the Reference". What `report` decides is
+    // whether the FILE is admissible, and after schema 2 — where a well-formed
+    // ledger can be 90% not-assessed — the word has to carry its own scope.
+    let l = parsed(HEAD, &[Row::unassessed("A")]);
+    let blocks = verify(&l, &["A"], HEAD);
+    assert!(blocks.is_empty(), "the fixture ledger is admissible");
+    let text = report(&blocks);
+    assert!(text.contains("schema-verdict=pass"), "{text}");
+    assert!(
+        !text.contains("parity=") && !text.contains('%'),
+        "the report implied a parity result: {text}"
+    );
+}
+
+#[test]
+fn the_census_disaggregates_and_never_totals() {
+    // The census is the opposite of a headline number: one line per class, no
+    // grand total and no percentage to quote. D7 forbids the aggregate, not the
+    // disaggregation — and a report that printed only blocks would satisfy the
+    // "no aggregates" rule by saying nothing about the corpus at all.
+    let l = parsed(
+        HEAD,
+        &[
+            Row::valid("A"),
+            Row::restrictive_uncalled("B"),
+            Row::oracle_silent("C"),
+            Row::unassessed("D"),
+        ],
+    );
+    let text = census(&l);
+    for want in [
+        "assessment=agree disposition=- n=1",
+        "assessment=restrictive disposition=uncalled n=1",
+        "assessment=unscorable disposition=- n=2",
+    ] {
+        assert!(text.contains(want), "census lost {want:?}: {text}");
+    }
+    for forbidden in ["total", "percent", "%", "score=", "rate="] {
+        assert!(
+            !text.contains(forbidden),
+            "the census emitted {forbidden:?}: {text}"
+        );
+    }
+    // Four rows, three classes: the classes are what is reported, and the count
+    // of rows is never printed as one number.
+    assert_eq!(text.lines().count(), 3, "{text}");
 }

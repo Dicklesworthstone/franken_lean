@@ -10,8 +10,12 @@
 //! fixture, exact roots, the oracle that produced the observation, the class of
 //! comparison performed, its D7 claim type, its evidence state, its L-level,
 //! mode and platform, its stated limitations, and its freshness. Absence is a
-//! refusal, not a default — there is no `Option` in [`ParityRow`] and no
-//! `Default` impl, so a row that omits a field does not parse.
+//! refusal, not a default — every field is required and there is no `Default`
+//! impl, so a row that omits a field does not parse. The two fields that are
+//! `Option` ([`ParityRow::normalizer`], [`ParityRow::comparison`]) are not
+//! optional in the file: they are spelled `-`, which is a *declared* absence
+//! somebody asserted, and the verifier holds it to the same coherence rules as
+//! any other value.
 //!
 //! # This is the first consumer of the closed vocabularies
 //!
@@ -41,6 +45,15 @@
 //! | mock-only | [`Block::MockOnlyClosure`] |
 //! | overclaimed | [`Block::OverclaimedLevel`], [`Block::OverclaimedClaim`] |
 //!
+//! Schema 2 adds four, on the same law — one condition, one variant, one token:
+//!
+//! | condition | variant |
+//! |---|---|
+//! | the stated conclusion is not what the row's own sides produce | [`Block::Misscored`] |
+//! | a divergence with nothing said about its cause, or a cause named where there is no divergence | [`Block::IncoherentDisposition`] |
+//! | a comparison class named where nothing was compared, or omitted where something was | [`Block::UncomparedRow`] |
+//! | a compatibility level closed by a row that compared nothing | [`Block::LevelWithoutComparison`] |
+//!
 //! [`verify`] returns every block it finds rather than the first, because a
 //! ledger with four problems should report four, and it BLOCKS on any non-empty
 //! result. There is no warning level: the epic's acceptance criteria are the
@@ -61,17 +74,69 @@
 //! real Reference is a property of the RUN, not of the kind of evidence — and
 //! folding it into `EvidenceKind` is exactly the conflation this epic keeps
 //! warning about.
+//!
+//! # Schema 2: what version 1 could not say (bead `fln-fei1`)
+//!
+//! Version 1 was an **agreement** ledger wearing a parity ledger's name. Four
+//! row kinds come out of a real corpus run and it could express one of them:
+//! an agreeing symbol. A restrictive divergence was refused as a root mismatch,
+//! because every [`ComparisonClass`] asserts an act of comparing that concluded
+//! in agreement and differing roots could only mean the row was wrong. An
+//! oracle-silent symbol had no encoding at all, and its NEAREST encoding —
+//! `acceptance-only` with both roots absent — passed while asserting a
+//! comparison that never happened. An unassessed symbol could only be absent,
+//! which reports as [`Block::MissingSymbol`]: "we have no row" and "we have a
+//! row that says nobody looked" are different facts.
+//!
+//! Version 2 adds the axis that was missing: **what each side actually said**.
+//! [`ParityRow::ours_verdict`] and [`ParityRow::oracle_verdict`] are recorded
+//! per side, [`ParityRow::assessment`] records what that pair scores to, and
+//! the verifier re-derives the score with [`crate::oracle::score_verdicts`] —
+//! the same function the live rigs use, so a row cannot state a conclusion its
+//! own two sides do not support.
+//!
+//! Two consequences worth stating, because they change what old refusals mean:
+//!
+//! **A divergence is now a representable row, so [`Block::RootMismatch`] had to
+//! be re-derived.** Under version 1 it fired on any two differing roots. Under
+//! version 2 it fires when the roots contradict the ASSESSMENT: agreement with
+//! differing roots is still a defect, and a divergence with *identical* roots is
+//! now a defect too — that one was unrepresentable before and is the sharper of
+//! the pair.
+//!
+//! **A divergence must say whether it was called.** [`Disposition`] is a
+//! separate axis from [`Assessment`] on purpose: "the two implementations
+//! differ" and "we have classified why" are different questions, and a schema
+//! that answered only the first would force every measured-but-unclassified
+//! divergence to be recorded as either a finding or nothing. `uncalled` is a
+//! first-class value, and the census below reports it as its own class — never
+//! folded into a pass and never into a finding.
 
 use crate::normalize::{NormalizerId, NormalizerVersion};
 use crate::oracle::{
-    ClaimType, ComparisonClass, EvidenceKind, EvidenceState, Freshness, LLevel, Mode, OracleKind,
-    Platform,
+    ClaimType, ComparisonClass, EvidenceKind, EvidenceState, Freshness, LLevel, Mode,
+    NonAuthoritative, OracleKind, OracleVerdict, OurVerdict, Platform, Scored, score_verdicts,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Schema line. Versioned: a change to what a row must name registers a NEW
 /// schema rather than reinterpreting rows already recorded under the old one.
-pub const LEDGER_SCHEMA: &str = "fln-parity-ledger/1";
+///
+/// Version 2 is the per-side-outcome row of `fln-fei1`. The bump is not
+/// optional bookkeeping: a version-1 row cannot state what either side said, so
+/// a version-1 file read under these rules would have its silence mistaken for
+/// agreement — which is the exact defect the version exists to close.
+///
+/// The bump also settles a collision. Two mutually unparseable grammars were
+/// both declaring `fln-parity-ledger/1`: this one, and the twelve-field
+/// pipe-separated inventory in `crates/fln-conformance/src/ledger.rs` that
+/// backs `ci/PARITY_LEDGER.txt`. One version string naming two file formats is
+/// how a reader ends up applying the wrong rules to a real artifact.
+/// [`refuses_the_inventory_grammar_that_shared_its_version_string`] pins the
+/// separation so it cannot silently return.
+///
+/// [`refuses_the_inventory_grammar_that_shared_its_version_string`]: self::structural::refuses_the_inventory_grammar_that_shared_its_version_string
+pub const LEDGER_SCHEMA: &str = "fln-parity-ledger/2";
 
 /// What actually backed a run. Its own closed vocabulary — see the module note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,6 +181,117 @@ pub enum Root {
     Absent,
 }
 
+/// What a row concluded from its two sides.
+///
+/// The arms are [`Scored`]'s arms without the payload: a row records the class
+/// of the conclusion, and the reason a non-answer happened is already carried by
+/// the side that gave it. Kept as its own type rather than storing a `Scored`
+/// because [`Scored::Unscorable`] carries a [`NonAuthoritative`] that would then
+/// have to be reconstructed from text, inviting a fabricated payload — and a
+/// fabricated reason is worse than a named class.
+///
+/// Recorded in the file AND re-derived by the verifier. The redundancy is the
+/// point: a reader sees `restrictive` without doing the derivation in their
+/// head, and [`Block::Misscored`] proves the file is not lying about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Assessment {
+    /// Both sides answered and agreed.
+    Agree,
+    /// We rejected, the oracle accepted. A finding, and the D23 carve-out
+    /// direction — restrictive, not unsound.
+    Restrictive,
+    /// We accepted, the oracle rejected. Unsound, never carve-out-able.
+    UnsoundlyPermissive,
+    /// At least one side did not answer, so there is nothing to score. **Not**
+    /// a divergence in either direction.
+    Unscorable,
+}
+
+impl Assessment {
+    /// The class of a [`Scored`]. Total, so a new `Scored` arm cannot be
+    /// silently dropped into an existing class.
+    pub fn of(scored: &Scored) -> Assessment {
+        match scored {
+            Scored::Agree => Assessment::Agree,
+            Scored::Restrictive => Assessment::Restrictive,
+            Scored::UnsoundlyPermissive => Assessment::UnsoundlyPermissive,
+            Scored::Unscorable(_) => Assessment::Unscorable,
+        }
+    }
+
+    /// Whether the two implementations differ. Mirrors
+    /// [`Scored::is_divergence`], and for the same reason: an unscorable row
+    /// counted as a divergence is a manufactured finding.
+    pub fn is_divergence(self) -> bool {
+        matches!(
+            self,
+            Assessment::Restrictive | Assessment::UnsoundlyPermissive
+        )
+    }
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Assessment::Agree => "agree",
+            Assessment::Restrictive => "restrictive",
+            Assessment::UnsoundlyPermissive => "unsoundly-permissive",
+            Assessment::Unscorable => "unscorable",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Assessment> {
+        match s {
+            "agree" => Some(Assessment::Agree),
+            "restrictive" => Some(Assessment::Restrictive),
+            "unsoundly-permissive" => Some(Assessment::UnsoundlyPermissive),
+            "unscorable" => Some(Assessment::Unscorable),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a divergence's root cause has been classified, and as what.
+///
+/// A **separate axis** from [`Assessment`], not a refinement of it. "The two
+/// implementations differ" is a measurement; "we know why" is a conclusion; and
+/// collapsing them forces every divergence whose cause is still open to be
+/// filed as either a finding or nothing at all. [`Disposition::Uncalled`] is
+/// what a real corpus run produces most of, and the census reports it as its
+/// own class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Disposition {
+    /// There is no divergence to call. Spelled `-`: a declared absence, like
+    /// every other `-` in this schema, never a default.
+    NotADivergence,
+    /// Measured, and deliberately not classified. Neither a pass nor a finding.
+    Uncalled,
+    /// Called: the cause is in our comparison apparatus — decoder, scope,
+    /// fixture — and not in either implementation.
+    Harness,
+    /// Called: the cause is a real difference between the two implementations.
+    Semantic,
+}
+
+impl Disposition {
+    pub fn token(self) -> &'static str {
+        match self {
+            Disposition::NotADivergence => "-",
+            Disposition::Uncalled => "uncalled",
+            Disposition::Harness => "harness",
+            Disposition::Semantic => "semantic",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Disposition> {
+        match s {
+            "-" => Some(Disposition::NotADivergence),
+            "uncalled" => Some(Disposition::Uncalled),
+            "harness" => Some(Disposition::Harness),
+            "semantic" => Some(Disposition::Semantic),
+            _ => None,
+        }
+    }
+}
+
 /// One row. One symbol. Every field required.
 ///
 /// No `Option`, no `Default`, and no constructor that derives one field from
@@ -134,8 +310,26 @@ pub struct ParityRow {
     pub ours_root: Root,
     /// The oracle's artifact root.
     pub oracle_root: Root,
+    /// What WE said about this symbol.
+    pub ours_verdict: OurVerdict,
+    /// What the ORACLE said about this symbol. Its `NoAnswer` arm is how a
+    /// symbol the oracle does not judge gets a row instead of an absence.
+    pub oracle_verdict: OracleVerdict,
+    /// What those two score to. Re-derived by the verifier; see
+    /// [`Block::Misscored`].
+    pub assessment: Assessment,
+    /// Whether a divergence's cause has been called. Its own axis; see
+    /// [`Disposition`].
+    pub disposition: Disposition,
     pub oracle: OracleKind,
-    pub comparison: ComparisonClass,
+    /// How the two artifacts were compared, or a declared `-` for "no
+    /// comparison was performed".
+    ///
+    /// `Option` here is the same declared-absence device as [`Root::Absent`] and
+    /// the normalizer's `-`, and it is what version 1 lacked: every
+    /// [`ComparisonClass`] asserts that a comparison happened, so a symbol
+    /// nobody compared could only be described by a class that lied about it.
+    pub comparison: Option<ComparisonClass>,
     pub normalizer: Option<NormalizerRef>,
     /// D7 claim type. Never derived from `state` or `level`.
     pub claim: ClaimType,
@@ -220,6 +414,37 @@ pub enum Block {
     /// not one that INVENTED one: `fixture_digest` was checked for shape and
     /// never for truth. This is that refusal.
     FixtureUnverified { symbol: String, detail: String },
+    /// The stated assessment is not what the row's own two sides score to.
+    ///
+    /// Checked with [`crate::oracle::score_verdicts`], the same function the
+    /// live rigs score with. A row that says `agree` over a rejection and an
+    /// acceptance is the single most dangerous thing this file can contain, and
+    /// before schema 2 it could not even be written down, let alone refused.
+    Misscored {
+        symbol: String,
+        stated: Assessment,
+        derived: Assessment,
+    },
+    /// The disposition and the assessment disagree about whether there is a
+    /// divergence to call.
+    IncoherentDisposition {
+        symbol: String,
+        assessment: Assessment,
+        disposition: Disposition,
+    },
+    /// A comparison class was declared for a row nothing was compared in, or
+    /// omitted from one that was compared.
+    UncomparedRow { symbol: String, detail: String },
+    /// A row that compared nothing claims an L-level above L0.
+    ///
+    /// Separate from [`Block::OverclaimedLevel`], which reads the evidence
+    /// state: this one fires however impeccable the state is, because a level is
+    /// a claim about a symbol's compatibility and an uncompared symbol has no
+    /// compatibility evidence at all. Without it, `state=observed` — an honest
+    /// thing to say about having observed that the oracle is silent — would
+    /// carry an L4 ceiling and let a symbol nobody checked be published as
+    /// attested.
+    LevelWithoutComparison { symbol: String, level: LLevel },
 }
 
 impl Block {
@@ -240,6 +465,10 @@ impl Block {
             Block::AggregateRow { .. } => "aggregate",
             Block::IncoherentComparison { .. } => "incoherent-comparison",
             Block::FixtureUnverified { .. } => "fixture-unverified",
+            Block::Misscored { .. } => "misscored",
+            Block::IncoherentDisposition { .. } => "incoherent-disposition",
+            Block::UncomparedRow { .. } => "uncompared",
+            Block::LevelWithoutComparison { .. } => "level-without-comparison",
         }
     }
 }
@@ -254,6 +483,10 @@ pub const ROW_FIELDS: &[&str] = &[
     "fixture_digest",
     "ours_root",
     "oracle_root",
+    "ours_verdict",
+    "oracle_verdict",
+    "assessment",
+    "disposition",
     "oracle",
     "comparison",
     "normalizer",
@@ -286,12 +519,67 @@ fn parse_oracle(s: &str) -> Option<OracleKind> {
     }
 }
 
-fn parse_comparison(s: &str) -> Option<ComparisonClass> {
+fn parse_comparison(s: &str) -> Option<Option<ComparisonClass>> {
     match s {
-        "byte-identical" => Some(ComparisonClass::ByteIdentical),
-        "normalized-identical" => Some(ComparisonClass::NormalizedIdentical),
-        "acceptance-only" => Some(ComparisonClass::AcceptanceOnly),
-        "diagnostic-equivalent" => Some(ComparisonClass::DiagnosticEquivalent),
+        // A declared absence, exactly like the normalizer's `-`: no comparison
+        // was performed. Not a class, and not a missing field.
+        "-" => Some(None),
+        "byte-identical" => Some(Some(ComparisonClass::ByteIdentical)),
+        "normalized-identical" => Some(Some(ComparisonClass::NormalizedIdentical)),
+        "acceptance-only" => Some(Some(ComparisonClass::AcceptanceOnly)),
+        "diagnostic-equivalent" => Some(Some(ComparisonClass::DiagnosticEquivalent)),
+        _ => None,
+    }
+}
+
+/// Our side's verdict, as a row records it.
+///
+/// `rejected` carries no diagnostic text here on purpose. The ledger is not a
+/// diagnostic archive: comparing diagnostics is what the `diagnostic-equivalent`
+/// comparison class and its normalizer are for, and a row quoting an error
+/// string invites text-matching in a place where a versioned normalizer already
+/// governs the question. `inconclusive` must name what was inconclusive,
+/// because FL-INV-07's whole point is that a non-answer is typed rather than
+/// silent.
+fn parse_our_verdict(s: &str) -> Option<OurVerdict> {
+    match s {
+        "accepted" => Some(OurVerdict::Accepted),
+        "rejected" => Some(OurVerdict::Rejected {
+            diagnostic: String::new(),
+        }),
+        _ => {
+            let what = s.strip_prefix("inconclusive:")?;
+            (!what.is_empty()).then(|| OurVerdict::Inconclusive {
+                what: what.to_string(),
+            })
+        }
+    }
+}
+
+/// The oracle's verdict, as a row records it.
+///
+/// The non-answer reasons are a closed set, not free text: an oracle's reasons
+/// for not answering are exactly the vocabulary business of [`crate::oracle`],
+/// and a free string here would let anyone mint a new one. `out-of-scope` and
+/// `not-assessed` are both [`NonAuthoritative::NotJudged`] — the run was fine
+/// and there is still no judgment about this subject — and they are spelled
+/// apart because "the oracle does not judge this kind of symbol" and "nobody
+/// submitted it at this scope" are different facts about coverage.
+fn parse_oracle_verdict(s: &str) -> Option<OracleVerdict> {
+    match s {
+        "accepted" => Some(OracleVerdict::Accepted),
+        "rejected" => Some(OracleVerdict::Rejected {
+            diagnostic: String::new(),
+        }),
+        "no-answer:out-of-scope" => Some(OracleVerdict::NoAnswer(NonAuthoritative::not_judged(
+            "out-of-scope",
+        ))),
+        "no-answer:not-assessed" => Some(OracleVerdict::NoAnswer(NonAuthoritative::not_judged(
+            "not-assessed",
+        ))),
+        "no-answer:internal-fault" => Some(OracleVerdict::NoAnswer(
+            NonAuthoritative::internal_fault("recorded ledger row"),
+        )),
         _ => None,
     }
 }
@@ -544,6 +832,14 @@ fn parse_row(rest: &str, line: usize) -> Result<ParityRow, Block> {
             .ok_or_else(|| bad("ours_root", get("ours_root")))?,
         oracle_root: parse_root(get("oracle_root"))
             .ok_or_else(|| bad("oracle_root", get("oracle_root")))?,
+        ours_verdict: parse_our_verdict(get("ours_verdict"))
+            .ok_or_else(|| bad("ours_verdict", get("ours_verdict")))?,
+        oracle_verdict: parse_oracle_verdict(get("oracle_verdict"))
+            .ok_or_else(|| bad("oracle_verdict", get("oracle_verdict")))?,
+        assessment: Assessment::parse(get("assessment"))
+            .ok_or_else(|| bad("assessment", get("assessment")))?,
+        disposition: Disposition::parse(get("disposition"))
+            .ok_or_else(|| bad("disposition", get("disposition")))?,
         oracle: parse_oracle(get("oracle")).ok_or_else(|| bad("oracle", get("oracle")))?,
         comparison: parse_comparison(get("comparison"))
             .ok_or_else(|| bad("comparison", get("comparison")))?,
@@ -663,20 +959,86 @@ pub fn verify(ledger: &Ledger, expected: &[&str], chain_head: &str) -> Vec<Block
             blocks.push(Block::DuplicateRow { key });
         }
 
-        // ROOT MISMATCH. The comparison class decides what the roots must say.
+        // MISSCORED. First of the outcome rules, because every rule after it
+        // reads the assessment and a lying assessment would poison all of them.
+        // Derived with the live scoring function, never re-implemented here.
+        let derived = Assessment::of(&score_verdicts(&row.ours_verdict, &row.oracle_verdict));
+        if derived != row.assessment {
+            blocks.push(Block::Misscored {
+                symbol: row.symbol.clone(),
+                stated: row.assessment,
+                derived,
+            });
+        }
+
+        // INCOHERENT DISPOSITION. A divergence must be called or explicitly
+        // uncalled; a row with nothing to call must not name a cause.
+        match (row.assessment.is_divergence(), row.disposition) {
+            (true, Disposition::NotADivergence)
+            | (false, Disposition::Uncalled)
+            | (false, Disposition::Harness)
+            | (false, Disposition::Semantic) => {
+                blocks.push(Block::IncoherentDisposition {
+                    symbol: row.symbol.clone(),
+                    assessment: row.assessment,
+                    disposition: row.disposition,
+                });
+            }
+            _ => {}
+        }
+
+        // UNCOMPARED. Whether a comparison class is named must match whether
+        // there was anything to compare. This is the rule that stops the
+        // version-1 lie: an oracle-silent symbol can no longer borrow
+        // `acceptance-only` to look like a comparison that agreed.
+        match (row.comparison, row.assessment) {
+            (Some(_), Assessment::Unscorable) => blocks.push(Block::UncomparedRow {
+                symbol: row.symbol.clone(),
+                detail: "a comparison class is named but one side did not answer".to_string(),
+            }),
+            (None, a) if a != Assessment::Unscorable => blocks.push(Block::UncomparedRow {
+                symbol: row.symbol.clone(),
+                detail: "both sides answered but no comparison class is named".to_string(),
+            }),
+            _ => {}
+        }
+
+        // ROOT MISMATCH. The comparison class decides what the roots must say —
+        // and, since schema 2, so does the assessment. Under version 1 this rule
+        // read the class alone, which made every divergence a defect.
         match row.comparison {
-            ComparisonClass::ByteIdentical => match (&row.ours_root, &row.oracle_root) {
-                (Root::Digest(a), Root::Digest(b)) if a == b => {}
-                (Root::Digest(_), Root::Digest(_)) => blocks.push(Block::RootMismatch {
-                    symbol: row.symbol.clone(),
-                    detail: "byte-identical declared but the two roots differ".to_string(),
-                }),
-                _ => blocks.push(Block::RootMismatch {
-                    symbol: row.symbol.clone(),
-                    detail: "byte-identical declared without both roots".to_string(),
-                }),
-            },
-            ComparisonClass::AcceptanceOnly => {
+            Some(ComparisonClass::ByteIdentical) => {
+                match (&row.ours_root, &row.oracle_root, row.assessment) {
+                    // Agreement: two roots, and they must be the same bytes.
+                    (Root::Digest(a), Root::Digest(b), Assessment::Agree) if a == b => {}
+                    (Root::Digest(_), Root::Digest(_), Assessment::Agree) => {
+                        blocks.push(Block::RootMismatch {
+                            symbol: row.symbol.clone(),
+                            detail: "byte-identical agreement declared but the two roots differ"
+                                .to_string(),
+                        });
+                    }
+                    // Divergence: two roots, and they must NOT be the same
+                    // bytes. Identical roots under a divergence was
+                    // unrepresentable before schema 2 and is the sharper half of
+                    // this pair — it is a row claiming a finding its own
+                    // evidence contradicts.
+                    (Root::Digest(a), Root::Digest(b), d) if d.is_divergence() => {
+                        if a == b {
+                            blocks.push(Block::RootMismatch {
+                                symbol: row.symbol.clone(),
+                                detail: "a divergence is declared but the two roots are identical"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    _ => blocks.push(Block::RootMismatch {
+                        symbol: row.symbol.clone(),
+                        detail: "byte-identical declared without both roots".to_string(),
+                    }),
+                }
+            }
+            Some(ComparisonClass::AcceptanceOnly) => {
                 // No artifact was compared, so citing roots claims a comparison
                 // that did not happen.
                 if row.ours_root != Root::Absent || row.oracle_root != Root::Absent {
@@ -686,11 +1048,25 @@ pub fn verify(ledger: &Ledger, expected: &[&str], chain_head: &str) -> Vec<Block
                     });
                 }
             }
-            ComparisonClass::NormalizedIdentical | ComparisonClass::DiagnosticEquivalent => {
+            Some(ComparisonClass::NormalizedIdentical)
+            | Some(ComparisonClass::DiagnosticEquivalent) => {
                 if row.ours_root == Root::Absent || row.oracle_root == Root::Absent {
                     blocks.push(Block::RootMismatch {
                         symbol: row.symbol.clone(),
                         detail: "a normalized comparison must cite both roots".to_string(),
+                    });
+                }
+            }
+            // Nothing was compared. Our own root may still exist — we may have
+            // produced an artifact for a symbol the oracle never judged, and
+            // recording it is a limitation ON the row rather than an absence
+            // from it. The oracle's root may not: an oracle that gave no answer
+            // produced nothing to cite, so a digest there is a fabrication.
+            None => {
+                if row.oracle_root != Root::Absent {
+                    blocks.push(Block::RootMismatch {
+                        symbol: row.symbol.clone(),
+                        detail: "the oracle gave no answer but its root is cited".to_string(),
                     });
                 }
             }
@@ -699,21 +1075,32 @@ pub fn verify(ledger: &Ledger, expected: &[&str], chain_head: &str) -> Vec<Block
         // INCOHERENT COMPARISON. A normalizer named where nothing was
         // normalized, or normalization claimed with no normalizer named.
         match (row.comparison, row.normalizer) {
-            (ComparisonClass::NormalizedIdentical, None)
-            | (ComparisonClass::DiagnosticEquivalent, None) => {
+            (Some(ComparisonClass::NormalizedIdentical), None)
+            | (Some(ComparisonClass::DiagnosticEquivalent), None) => {
                 blocks.push(Block::IncoherentComparison {
                     symbol: row.symbol.clone(),
                     detail: "a normalized comparison must name its normalizer".to_string(),
                 });
             }
-            (ComparisonClass::ByteIdentical, Some(_))
-            | (ComparisonClass::AcceptanceOnly, Some(_)) => {
+            (Some(ComparisonClass::ByteIdentical), Some(_))
+            | (Some(ComparisonClass::AcceptanceOnly), Some(_))
+            | (None, Some(_)) => {
                 blocks.push(Block::IncoherentComparison {
                     symbol: row.symbol.clone(),
                     detail: "a normalizer is named but nothing was normalized".to_string(),
                 });
             }
             _ => {}
+        }
+
+        // LEVEL WITHOUT COMPARISON. An uncompared symbol has no compatibility
+        // evidence, whatever its evidence state says. Reads `assessment` and
+        // `level` only — the state rule below is separate and still applies.
+        if row.assessment == Assessment::Unscorable && level_rank(row.level) > 0 {
+            blocks.push(Block::LevelWithoutComparison {
+                symbol: row.symbol.clone(),
+                level: row.level,
+            });
         }
 
         // MOCK ONLY. A mock may support a unit test and may not close a public
@@ -804,11 +1191,66 @@ pub fn report(blocks: &[Block]) -> String {
             b.reason()
         ));
     }
+    // `schema-verdict`, not `verdict`. What this function decides is whether the
+    // FILE is admissible, and a bare `verdict=pass` on a ledger of unassessed
+    // rows is exactly the sentence someone quotes as "we match the Reference".
+    // The parity content is in [`census`], where it cannot be read as one word.
     out.push_str(&format!(
-        "parity-ledger: verdict={} blocks={}\n",
+        "parity-ledger: schema-verdict={} blocks={}\n",
         if blocks.is_empty() { "pass" } else { "fail" },
         blocks.len()
     ));
+    out
+}
+
+/// What the ledger's rows actually say, one line per class.
+///
+/// This is not an aggregate in the D7 sense and it is the opposite of a headline
+/// number: it is the disaggregation, and there is deliberately no grand total
+/// and no percentage to quote. Each line names an assessment and, for
+/// divergences, a disposition — so a measured-but-uncalled divergence appears as
+/// its own class and is never folded into a pass or into a finding. That is the
+/// requirement `fln-fei1` names first, and a report that only printed blocks
+/// would satisfy it by saying nothing at all.
+///
+/// Ordered by the vocabularies rather than by count, so the output is stable and
+/// diffable and a class that dropped to zero is visibly absent rather than
+/// resorted.
+pub fn census(ledger: &Ledger) -> String {
+    const ASSESSMENTS: [Assessment; 4] = [
+        Assessment::Agree,
+        Assessment::Restrictive,
+        Assessment::UnsoundlyPermissive,
+        Assessment::Unscorable,
+    ];
+    const DISPOSITIONS: [Disposition; 4] = [
+        Disposition::NotADivergence,
+        Disposition::Uncalled,
+        Disposition::Harness,
+        Disposition::Semantic,
+    ];
+
+    let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for row in &ledger.rows {
+        *counts
+            .entry((row.assessment.token(), row.disposition.token()))
+            .or_insert(0) += 1;
+    }
+
+    let mut out = String::new();
+    for a in ASSESSMENTS {
+        for d in DISPOSITIONS {
+            let n = counts.get(&(a.token(), d.token())).copied().unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            out.push_str(&format!(
+                "parity-ledger: rows assessment={} disposition={} n={n}\n",
+                a.token(),
+                d.token()
+            ));
+        }
+    }
     out
 }
 
@@ -903,6 +1345,24 @@ mod structural {
                 symbol: String::new(),
                 detail: String::new(),
             },
+            Block::Misscored {
+                symbol: String::new(),
+                stated: Assessment::Agree,
+                derived: Assessment::Unscorable,
+            },
+            Block::IncoherentDisposition {
+                symbol: String::new(),
+                assessment: Assessment::Agree,
+                disposition: Disposition::Uncalled,
+            },
+            Block::UncomparedRow {
+                symbol: String::new(),
+                detail: String::new(),
+            },
+            Block::LevelWithoutComparison {
+                symbol: String::new(),
+                level: LLevel::L1,
+            },
         ];
         let mut tokens: Vec<&str> = all.iter().map(Block::reason).collect();
         let before = tokens.len();
@@ -913,6 +1373,37 @@ mod structural {
             tokens.len(),
             "two Block variants share a reason token"
         );
+    }
+
+    #[test]
+    fn refuses_the_inventory_grammar_that_shared_its_version_string() {
+        // Two mutually unparseable grammars were both declaring
+        // `fln-parity-ledger/1`: this one, and the twelve-field pipe-separated
+        // inventory in `crates/fln-conformance/src/ledger.rs` that backs
+        // `ci/PARITY_LEDGER.txt`. Neither parser accepts the other's file — that
+        // one prefixes its schema line with `schema ` and opens with comments,
+        // this one takes line 1 verbatim — so the shared id was never a shared
+        // format, only a shared name for two of them.
+        //
+        // Version 2 separates them. This pins the separation: the id must have
+        // moved, and a file in the inventory grammar must be refused as what it
+        // is rather than parsed under rules written for something else.
+        assert_ne!(
+            LEDGER_SCHEMA, "fln-parity-ledger/1",
+            "the outcome ledger is back on the inventory record's version string"
+        );
+
+        let inventory = "schema fln-parity-ledger/1\n\
+            row meta-api | Lean.Name.hash | function | native | L2 | faithful \
+            | pinned-binary | exact | fixtures/x.txt | D0 | OBSERVED | run-1\n";
+        match parse(inventory) {
+            Err(blocks) => assert_eq!(
+                blocks.iter().map(Block::reason).collect::<Vec<_>>(),
+                vec!["bad-schema"],
+                "the inventory grammar was refused for the wrong reason"
+            ),
+            Ok(l) => panic!("a file in the other grammar parsed as this one: {l:?}"),
+        }
     }
 
     #[test]
