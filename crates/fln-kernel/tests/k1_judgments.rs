@@ -4707,6 +4707,122 @@ fn kr95x_quotient_initialization_requires_the_exact_eq_shape() {
 }
 
 #[test]
+fn kr950_quotient_init_checks_the_eq_constructor_not_only_the_eq_type() {
+    // KR-950 validates BOTH halves of the pinned equality: the `Eq` type AND
+    // its `Eq.refl` constructor. A mutation campaign found the constructor
+    // half unguarded — replacing its structural comparison with `if false`
+    // left all 96 tests passing, because the only existing KR-95x case removes
+    // `Eq` from the environment entirely and returns long before the
+    // constructor is ever looked at.
+    //
+    // SOUNDNESS STAKE: `Quot.sound` is stated in terms of this `Eq`. An
+    // `Eq.refl` of the wrong type is a different equality wearing the right
+    // name, and quotient soundness is what rests on it.
+    let u = n("u");
+    let lvl = Level::param(u.clone());
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+
+    // Eq : forall {a : Sort u}, a -> a -> Prop  (exactly the pinned shape)
+    let eq_ty = Expr::forall_e(
+        n("α"),
+        Expr::sort(lvl.clone()),
+        Expr::forall_e(
+            n("a"),
+            bv(0),
+            Expr::forall_e(n("b"), bv(1), prop(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let eq_info = |refl_ty: Expr| {
+        let ind = ConstantInfo::Induct(InductiveVal {
+            base: cval(n("Eq"), vec![u.clone()], eq_ty.clone()),
+            num_params: 1,
+            num_indices: 2,
+            all: vec![n("Eq")],
+            ctors: vec![nn("Eq", "refl")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        });
+        let ctor = ConstantInfo::Ctor(ConstructorVal {
+            base: cval(nn("Eq", "refl"), vec![u.clone()], refl_ty),
+            induct: n("Eq"),
+            cidx: 0,
+            num_params: 1,
+            num_fields: 1,
+            is_unsafe: false,
+        });
+        add_info(&add_info(&Environment::new(), ind), ctor)
+    };
+
+    // A "refl" that is NOT reflexive: forall {a} (x y : a), Eq a x y — it
+    // relates two DIFFERENT values, so it proves everything equal.
+    let bad_refl = Expr::forall_e(
+        n("α"),
+        Expr::sort(lvl.clone()),
+        Expr::forall_e(
+            n("x"),
+            bv(0),
+            Expr::forall_e(
+                n("y"),
+                bv(1),
+                Expr::app(
+                    Expr::app(
+                        Expr::app(Expr::const_(n("Eq"), vec![lvl.clone()]), bv(2)),
+                        bv(1),
+                    ),
+                    bv(0),
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let verdict = check(
+        &eq_info(bad_refl),
+        &Declaration::Quotient(vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("type for 'Eq' type constructor"),
+        "a non-reflexive `Eq.refl` must be refused by name; got: {}",
+        reject_message(&verdict)
+    );
+
+    // CONTROL: with the correct refl the run gets PAST this check — it then
+    // fails on the absent quotient declarations instead. Without this the test
+    // could pass for any reason at all.
+    let good_refl = Expr::forall_e(
+        n("α"),
+        Expr::sort(lvl.clone()),
+        Expr::forall_e(
+            n("a"),
+            bv(0),
+            Expr::app(
+                Expr::app(Expr::app(Expr::const_(n("Eq"), vec![lvl]), bv(1)), bv(0)),
+                bv(0),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let control = check(
+        &eq_info(good_refl),
+        &Declaration::Quotient(vec![]),
+        Budget::DEFAULT,
+    );
+    assert!(
+        !reject_message(&control).contains("type for 'Eq' type constructor"),
+        "the correct refl must clear the constructor check; got: {}",
+        reject_message(&control)
+    );
+}
+
+#[test]
 fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
     // Pin add_definition/add_mutual semantics: a PARTIAL definition may
     // reference itself (header → add → body in the scratch env); a SAFE
