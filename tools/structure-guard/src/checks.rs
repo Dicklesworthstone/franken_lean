@@ -1001,6 +1001,7 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
         ("fln-hash", 1),
         ("fln-bignum", 1),
         ("fln-libm", 1),
+        ("fln-bench", 2),
         ("fln-unsafe-abi", 2),
         ("fln-unsafe-region", 2),
         ("fln-rt", 3),

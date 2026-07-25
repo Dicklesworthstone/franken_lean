@@ -156,6 +156,7 @@ crate fln-core       rank=0  kind=ordinary
 crate fln-hash       rank=1  kind=ordinary
 crate fln-bignum     rank=1  kind=ordinary
 crate fln-libm       rank=1  kind=ordinary
+crate fln-bench      rank=2  kind=ordinary
 crate fln-unsafe-abi rank=2  kind=unsafe-boundary
 crate fln-unsafe-region rank=2 kind=unsafe-boundary
 crate fln-rt         rank=3  kind=ordinary
@@ -332,11 +333,12 @@ pub fn olean_ilean_format_fixture(target_count: usize) -> String {
 
 /// The crates every base fixture materializes (name, is-boundary) — must stay in
 /// lockstep with BASE_GRAPH and base().
-pub const FIXTURE_CRATES: [(&str, bool); 32] = [
+pub const FIXTURE_CRATES: [(&str, bool); 33] = [
     ("fln-core", false),
     ("fln-hash", false),
     ("fln-bignum", false),
     ("fln-libm", false),
+    ("fln-bench", false),
     ("fln-unsafe-abi", true),
     ("fln-unsafe-region", true),
     ("fln-rt", false),

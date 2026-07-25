@@ -107,6 +107,7 @@ const GRAPH: &str = "\
 	crate fln-hash rank=1 kind=ordinary
 	crate fln-bignum rank=1 kind=ordinary
 	crate fln-libm rank=1 kind=ordinary
+	crate fln-bench rank=2 kind=ordinary
 	crate fln-unsafe-abi rank=2 kind=unsafe-boundary
 	crate fln-unsafe-region rank=2 kind=unsafe-boundary
 	crate fln-rt rank=3 kind=ordinary
@@ -192,6 +193,7 @@ fn base_files() -> Vec<(String, String)> {
         ("fln-hash", false),
         ("fln-bignum", false),
         ("fln-libm", false),
+        ("fln-bench", false),
         ("fln-unsafe-abi", true),
         ("fln-unsafe-region", true),
         ("fln-rt", false),

@@ -121,6 +121,52 @@ fn unacknowledged_edge_is_flagged_and_recovers_when_acknowledged() {
 }
 
 #[test]
+fn fln_bench_snapshot_and_edge_laws_are_falsifiable() {
+    let missing = TempWs::new("fln-bench-missing-snapshot");
+    base(&missing);
+    let graph_without_bench =
+        BASE_GRAPH.replacen("crate fln-bench      rank=2  kind=ordinary\n", "", 1);
+    assert_ne!(graph_without_bench, BASE_GRAPH);
+    missing.write("ci/WORKSPACE_GRAPH.txt", &graph_without_bench);
+    let missing_codes = codes(&missing.run());
+    assert!(missing_codes.contains(&"FLN-STRUCT-001"));
+    assert!(missing_codes.contains(&"FLN-STRUCT-024"));
+
+    let undeclared = TempWs::new("fln-bench-undeclared-edge");
+    base(&undeclared);
+    undeclared.write(
+        "crates/fln-bench/Cargo.toml",
+        &manifest("fln-bench", &["fln-hash"]),
+    );
+    undeclared.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-bench", &["fln-hash"])]),
+    );
+    assert_eq!(codes(&undeclared.run()), vec!["FLN-STRUCT-005"]);
+    undeclared.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &graph_with_edges(&["fln-bench -> fln-hash"]),
+    );
+    assert!(undeclared.run().findings.is_empty());
+
+    let upward = TempWs::new("fln-bench-upward-edge");
+    base(&upward);
+    upward.write(
+        "crates/fln-bench/Cargo.toml",
+        &manifest("fln-bench", &["fln-env"]),
+    );
+    upward.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-bench", &["fln-env"])]),
+    );
+    upward.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &graph_with_edges(&["fln-bench -> fln-env"]),
+    );
+    assert_eq!(codes(&upward.run()), vec!["FLN-STRUCT-007"]);
+}
+
+#[test]
 fn stale_acknowledged_edge_is_flagged() {
     let ws = TempWs::new("stale-edge");
     base(&ws);

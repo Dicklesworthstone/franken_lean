@@ -32,6 +32,7 @@ crate fln-core          rank=0  kind=ordinary
 crate fln-hash          rank=1  kind=ordinary
 crate fln-bignum        rank=1  kind=ordinary
 crate fln-libm          rank=1  kind=ordinary
+crate fln-bench         rank=2  kind=ordinary
 crate fln-unsafe-abi    rank=2  kind=unsafe-boundary
 crate fln-unsafe-region rank=2  kind=unsafe-boundary
 crate fln-rt            rank=3  kind=ordinary
@@ -65,6 +66,7 @@ crate structure-guard   kind=tool
 # every future edge lands here in the same change as its Cargo.toml counterpart
 edge fln-conformance -> fln-core   # C0 core-observable fixture diff harness (franken_lean-p8a)
 edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)
+edge fln-bench -> fln-hash         # canonical benchmark evidence records and roots (franken_lean-oy62)
 edge fln-env -> fln-core           # environment holds term-plane constants (fln-amv)
 edge fln-env -> fln-hash           # logical + operational roots over the identity layer (fln-amv)
 edge fln-bignum -> fln-core        # loss-free NatLit interop, shared limb layout (franken_lean-npl)

@@ -11,6 +11,13 @@ name = "fln-anvil"
 version = "0.0.0"
 
 [[package]]
+name = "fln-bench"
+version = "0.0.0"
+dependencies = [
+ "fln-hash",
+]
+
+[[package]]
 name = "fln-bignum"
 version = "0.0.0"
 dependencies = [
@@ -125,6 +132,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-syntax"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-trace"
