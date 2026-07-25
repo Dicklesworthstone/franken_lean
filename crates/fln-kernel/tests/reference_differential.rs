@@ -46,14 +46,28 @@
 //!
 //! # Scope, stated plainly
 //!
-//! The corpus is small and hand-paired: each case is a Lean source text and the
-//! `Declaration` it denotes, written side by side. That pairing is the harness's
-//! weak point and I am not going to dress it up — a transcription error makes a
-//! case vacuous rather than wrong, which is the failure mode this file can least
-//! afford. Two things bound it: every case runs both sides, so a mis-transcribed
-//! subject that no longer denotes its source still has to agree with the pin on
-//! *something*; and `harness_detects_divergence_when_our_side_is_broken` proves
-//! the comparator reports rather than passes.
+//! **This is RULE-SHAPE coverage, not CORPUS coverage.** The generator crosses
+//! sorts, binders and admission kinds, which says nothing about whether the
+//! pinned stdlib agrees with us. That is bead `fln-lst4`: it needs decoded
+//! `.olean` declarations, therefore `fln-olean`, therefore `fln-conformance`,
+//! and it is the harder and more valuable half. Nobody should read a growing
+//! case count here as the Corpus obligation being discharged.
+//!
+//! For the same reason, two numbers that get quoted together are worth keeping
+//! apart. `fln-conformance`'s `kernel_replay` reports `checked=2198`, and those
+//! 2198 declarations are ONE module (`Init.Prelude`) — that is the differential's
+//! real corpus coverage today. The 158,608 constants across 2433 modules it also
+//! reports are a DECODE cross-check: evidence that we can read what the Reference
+//! wrote, not that our kernel and its kernel agree on a verdict.
+//!
+//! Cases are GENERATED rather than hand-paired. Each is described once and both
+//! halves are derived from that description, because the old arrangement — a
+//! Lean text and a `Declaration` written side by side — had a failure mode worse
+//! than being wrong: a transcription slip made a case VACUOUS. The halves stopped
+//! describing the same declaration, both sides still answered, they still agreed,
+//! and the case proved nothing while looking green. [`Ty`] and [`Tm`] can only be
+//! built by constructors that produce the Lean rendering and the `Expr` in one
+//! call, so the two cannot drift.
 //!
 //! Scaling past hand-pairing means decoding real `.olean` declarations, which
 //! needs `fln-olean` — outside fln-kernel's `allow-direct` covenant (fln-core,
@@ -213,17 +227,292 @@ fn thm(name: &str, type_: Expr, value: Expr) -> Declaration {
     })
 }
 
-/// One differential case: a Lean text, and the declaration it denotes.
+/// A TYPE, carrying its Lean rendering and its `Expr` together.
+///
+/// This pairing is the whole point of the generator. Previously each case wrote
+/// the Lean text and the `Expr` separately, and a slip between them did not make
+/// the case wrong — it made it VACUOUS: the halves stopped describing the same
+/// declaration, both sides still answered, they still agreed, and the case
+/// proved nothing while looking green. Here a type can only be built by a
+/// constructor that produces both halves in one call, so they cannot drift.
+#[derive(Clone)]
+struct Ty {
+    lean: String,
+    expr: Expr,
+}
+
+fn t_prop() -> Ty {
+    Ty {
+        lean: "Prop".into(),
+        expr: prop(),
+    }
+}
+fn t_type() -> Ty {
+    Ty {
+        lean: "Type".into(),
+        expr: sort1(),
+    }
+}
+fn t_type1() -> Ty {
+    Ty {
+        lean: "Type 1".into(),
+        expr: Expr::sort(Level::succ(Level::one()).expect("Sort 2 packs")),
+    }
+}
+fn t_named(name: &str) -> Ty {
+    Ty {
+        lean: name.to_string(),
+        expr: cst(name),
+    }
+}
+/// `a -> b`, non-dependent, so the body carries no loose bvar.
+fn t_arrow(a: &Ty, b: &Ty) -> Ty {
+    Ty {
+        lean: format!("{} -> {}", a.lean, b.lean),
+        expr: Expr::forall_e(n("x"), a.expr.clone(), b.expr.clone(), BinderInfo::Default),
+    }
+}
+
+/// A TERM, paired with its Lean rendering for the same reason as [`Ty`].
+#[derive(Clone)]
+struct Tm {
+    lean: String,
+    expr: Expr,
+}
+
+fn m_const(name: &str) -> Tm {
+    Tm {
+        lean: name.to_string(),
+        expr: cst(name),
+    }
+}
+/// `fun (_ : ty) => body`, where `body` is closed — so no de Bruijn arithmetic
+/// is needed and none can be got wrong.
+fn m_lambda(ty: &Ty, body: &Tm) -> Tm {
+    Tm {
+        lean: format!("fun (_ : {}) => {}", ty.lean, body.lean),
+        expr: Expr::lam(
+            n("x"),
+            ty.expr.clone(),
+            body.expr.clone(),
+            BinderInfo::Default,
+        ),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Axiom,
+    Def,
+    Theorem,
+}
+
+/// One differential case, described ONCE. Both the Lean source handed to the
+/// Reference and the `Declaration` handed to our kernel are derived from these
+/// fields, so the two halves are the same statement by construction.
 struct Case {
-    /// Stable id, used in reports and in `CARVE_OUTS`.
-    id: &'static str,
-    /// The kernel rule this case exercises, for the coverage report.
+    id: String,
     rule: &'static str,
-    /// Source given to the Reference. The SUBJECT is the final declaration;
-    /// everything above it is premise and is mirrored by `subject`'s env.
-    source: &'static str,
-    /// Builds the premise environment and the subject declaration.
-    subject: fn() -> (Environment, Declaration),
+    /// Axioms declared before the subject, in order.
+    premises: Vec<(String, Ty)>,
+    kind: Kind,
+    name: String,
+    ty: Ty,
+    /// `None` for an axiom.
+    body: Option<Tm>,
+}
+
+impl Case {
+    /// The Lean text. `def` is emitted `noncomputable` because a body built
+    /// from axioms has no executable content and the code generator would
+    /// otherwise fail the file for a reason that is not a kernel verdict.
+    fn source(&self) -> String {
+        let mut out = String::new();
+        for (name, ty) in &self.premises {
+            out.push_str(&format!("axiom {name} : {}\n", ty.lean));
+        }
+        match (self.kind, &self.body) {
+            (Kind::Axiom, _) => out.push_str(&format!("axiom {} : {}\n", self.name, self.ty.lean)),
+            (Kind::Def, Some(b)) => out.push_str(&format!(
+                "noncomputable def {} : {} := {}\n",
+                self.name, self.ty.lean, b.lean
+            )),
+            (Kind::Theorem, Some(b)) => out.push_str(&format!(
+                "theorem {} : {} := {}\n",
+                self.name, self.ty.lean, b.lean
+            )),
+            (k, None) => {
+                let _ = k;
+                unreachable!("only an axiom may have no body")
+            }
+        }
+        out
+    }
+
+    /// The same statement as a premise environment plus the subject.
+    fn subject(&self) -> (Environment, Declaration) {
+        let mut env = Environment::new();
+        for (name, ty) in &self.premises {
+            env = with_axiom(&env, name, ty.expr.clone());
+        }
+        let decl = match (self.kind, &self.body) {
+            (Kind::Axiom, _) => Declaration::Axiom(AxiomVal {
+                base: cval(&self.name, self.ty.expr.clone()),
+                is_unsafe: false,
+            }),
+            (Kind::Def, Some(b)) => defn(&self.name, self.ty.expr.clone(), b.expr.clone()),
+            (Kind::Theorem, Some(b)) => thm(&self.name, self.ty.expr.clone(), b.expr.clone()),
+            (_, None) => unreachable!("only an axiom may have no body"),
+        };
+        (env, decl)
+    }
+}
+
+/// The generated corpus.
+///
+/// RULE-SHAPE COVERAGE, NOT CORPUS COVERAGE. Generating cases over sorts,
+/// binders and admission kinds says nothing about whether the pinned stdlib
+/// agrees with us — that is bead fln-lst4, it needs decoded oleans, and it is
+/// the harder and more valuable half. This makes the small corpus trustworthy
+/// and cheap to extend; it does not make it big.
+/// One axis of the matrix: a sort, tagged for case ids.
+type SortAxis = (&'static str, fn() -> Ty);
+
+fn corpus() -> Vec<Case> {
+    let mut cases = Vec::new();
+    let sorts: [SortAxis; 3] = [
+        ("prop", t_prop as fn() -> Ty),
+        ("type", t_type),
+        ("type1", t_type1),
+    ];
+
+    // KR-972: a declaration whose type IS a sort admits, at every sort.
+    for (tag, mk) in sorts {
+        cases.push(Case {
+            id: format!("GEN-ACC-sort-{tag}"),
+            rule: "KR-972 a declaration type that is a sort admits",
+            premises: vec![],
+            kind: Kind::Axiom,
+            name: format!("A_{tag}"),
+            ty: mk(),
+            body: None,
+        });
+    }
+
+    // KR-972 negative: a type whose own type is NOT a sort must be refused.
+    // `d : D` with `D : Sort n`, so the type expression `d` infers to `D`,
+    // which is a constant and not a sort.
+    for (tag, mk) in sorts {
+        cases.push(Case {
+            id: format!("GEN-REJ-nonsort-{tag}"),
+            rule: "KR-972 a declaration type that is not a sort is refused",
+            premises: vec![("D".into(), mk()), ("d".into(), t_named("D"))],
+            kind: Kind::Axiom,
+            name: format!("bad_{tag}"),
+            ty: t_named("d"),
+            body: None,
+        });
+    }
+
+    // KR-974: a theorem's type must be a Prop, and its body must match it.
+    // The Prop row accepts; the Type rows are the elimination of the same
+    // shape one universe up and must be refused.
+    for (tag, mk) in sorts {
+        let carrier = mk();
+        let accept = tag == "prop";
+        cases.push(Case {
+            id: format!("GEN-{}-thm-{tag}", if accept { "ACC" } else { "REJ" }),
+            rule: "KR-974 a theorem type must be a proposition",
+            premises: vec![("P".into(), carrier.clone()), ("hp".into(), t_named("P"))],
+            kind: Kind::Theorem,
+            name: format!("t_{tag}"),
+            ty: t_named("P"),
+            body: Some(m_const("hp")),
+        });
+    }
+
+    // KR-974 bodies: a definition body must be defeq to the declared type,
+    // at every sort — matching accepts, crossed rejects.
+    for (tag, mk) in sorts {
+        cases.push(Case {
+            id: format!("GEN-ACC-def-match-{tag}"),
+            rule: "KR-974 a definition body type matching its declared type",
+            premises: vec![("A".into(), mk()), ("a".into(), t_named("A"))],
+            kind: Kind::Def,
+            name: format!("f_{tag}"),
+            ty: t_named("A"),
+            body: Some(m_const("a")),
+        });
+        cases.push(Case {
+            id: format!("GEN-REJ-def-mismatch-{tag}"),
+            rule: "KR-974 a definition body type that is not the declared type",
+            premises: vec![
+                ("A".into(), mk()),
+                ("B".into(), mk()),
+                ("a".into(), t_named("A")),
+            ],
+            kind: Kind::Def,
+            name: format!("g_{tag}"),
+            ty: t_named("B"),
+            body: Some(m_const("a")),
+        });
+    }
+
+    // KR-105: a reference to a constant that is not in the environment.
+    cases.push(Case {
+        id: "GEN-REJ-unknown-const".into(),
+        rule: "KR-105 a reference to a constant not in the environment",
+        premises: vec![("A".into(), t_type())],
+        kind: Kind::Def,
+        name: "h".into(),
+        ty: t_named("A"),
+        body: Some(m_const("nope")),
+    });
+
+    // KR-107: a binder whose domain is a TERM rather than a type.
+    cases.push(Case {
+        id: "GEN-REJ-binder-domain".into(),
+        rule: "KR-107 a binder domain that is not a type",
+        premises: vec![("A".into(), t_type()), ("a".into(), t_named("A"))],
+        kind: Kind::Def,
+        name: "k".into(),
+        ty: t_type(),
+        body: None,
+    });
+    // …expressed as a definition whose declared type is the bad Pi.
+    let last = cases.len() - 1;
+    cases[last].ty = t_arrow(&t_named("a"), &t_named("A"));
+    cases[last].kind = Kind::Axiom;
+
+    // Function types at every sort, and a lambda inhabiting one: the binder
+    // congruence path that carries a real domain on both sides.
+    for (tag, mk) in sorts {
+        let carrier = mk();
+        cases.push(Case {
+            id: format!("GEN-ACC-arrow-{tag}"),
+            rule: "KR-107/KR-974 a function type inhabited by a lambda",
+            premises: vec![("A".into(), carrier.clone()), ("a".into(), t_named("A"))],
+            kind: Kind::Def,
+            name: format!("fn_{tag}"),
+            ty: t_arrow(&t_named("A"), &t_named("A")),
+            body: Some(m_lambda(&t_named("A"), &m_const("a"))),
+        });
+        cases.push(Case {
+            id: format!("GEN-REJ-arrow-domain-{tag}"),
+            rule: "KR-302 a binder whose DOMAIN differs is not defeq",
+            premises: vec![
+                ("A".into(), carrier.clone()),
+                ("B".into(), carrier.clone()),
+                ("a".into(), t_named("A")),
+            ],
+            kind: Kind::Def,
+            name: format!("fx_{tag}"),
+            ty: t_arrow(&t_named("B"), &t_named("A")),
+            body: Some(m_lambda(&t_named("A"), &m_const("a"))),
+        });
+    }
+
+    cases
 }
 
 /// Our verdict, reduced to the axis the Reference also speaks on.
@@ -303,101 +592,13 @@ fn carve_out_for(case_id: &str) -> Option<&'static CarveOut> {
 }
 
 // ---------------------------------------------------------------------------
-// The corpus
-// ---------------------------------------------------------------------------
-
-const CASES: &[Case] = &[
-    Case {
-        id: "REF-ACC-001",
-        rule: "KR-972 a declaration type that is a sort admits",
-        source: "axiom A : Type\n",
-        subject: || {
-            (
-                Environment::new(),
-                Declaration::Axiom(AxiomVal {
-                    base: cval("A", sort1()),
-                    is_unsafe: false,
-                }),
-            )
-        },
-    },
-    Case {
-        id: "REF-ACC-002",
-        rule: "KR-974 a theorem whose type is a Prop and whose body matches",
-        source: "axiom P : Prop\naxiom hp : P\ntheorem t : P := hp\n",
-        subject: || {
-            let env = with_axiom(&Environment::new(), "P", prop());
-            let env = with_axiom(&env, "hp", cst("P"));
-            (env, thm("t", cst("P"), cst("hp")))
-        },
-    },
-    Case {
-        id: "REF-ACC-003",
-        rule: "KR-974 a definition whose body type matches its declared type",
-        source: "axiom A : Type\naxiom a : A\nnoncomputable def f : A := a\n",
-        subject: || {
-            let env = with_axiom(&Environment::new(), "A", sort1());
-            let env = with_axiom(&env, "a", cst("A"));
-            (env, defn("f", cst("A"), cst("a")))
-        },
-    },
-    Case {
-        id: "REF-REJ-001",
-        rule: "KR-974 a theorem whose type is not a proposition",
-        source: "axiom A : Type\naxiom a : A\ntheorem bad : A := a\n",
-        subject: || {
-            let env = with_axiom(&Environment::new(), "A", sort1());
-            let env = with_axiom(&env, "a", cst("A"));
-            (env, thm("bad", cst("A"), cst("a")))
-        },
-    },
-    Case {
-        id: "REF-REJ-002",
-        rule: "KR-974 a definition body whose type is not the declared type",
-        source: "axiom A : Type\naxiom B : Type\naxiom a : A\nnoncomputable def g : B := a\n",
-        subject: || {
-            let env = with_axiom(&Environment::new(), "A", sort1());
-            let env = with_axiom(&env, "B", sort1());
-            let env = with_axiom(&env, "a", cst("A"));
-            (env, defn("g", cst("B"), cst("a")))
-        },
-    },
-    Case {
-        id: "REF-REJ-003",
-        rule: "KR-105 a reference to a constant that is not in the environment",
-        source: "axiom A : Type\nnoncomputable def h : A := nope\n",
-        subject: || {
-            let env = with_axiom(&Environment::new(), "A", sort1());
-            (env, defn("h", cst("A"), cst("nope")))
-        },
-    },
-    Case {
-        id: "REF-REJ-004",
-        rule: "KR-107 a binder whose domain is not a type",
-        source: "axiom A : Type\naxiom a : A\nnoncomputable def k : Type := forall _ : a, A\n",
-        subject: || {
-            let env = with_axiom(&Environment::new(), "A", sort1());
-            let env = with_axiom(&env, "a", cst("A"));
-            (
-                env,
-                defn(
-                    "k",
-                    sort1(),
-                    Expr::forall_e(n("x"), cst("a"), cst("A"), BinderInfo::Default),
-                ),
-            )
-        },
-    },
-];
-
-// ---------------------------------------------------------------------------
 // The runs
 // ---------------------------------------------------------------------------
 
 /// Result of one case, kept so both the differential test and the
 /// divergence-detection test can share the machinery.
 struct Outcome1 {
-    id: &'static str,
+    id: String,
     rule: &'static str,
     oracle: OracleVerdict,
     ours: OurVerdict,
@@ -408,12 +609,12 @@ fn run_corpus(lean: &PathBuf, cases: &[Case]) -> Vec<Outcome1> {
     cases
         .iter()
         .map(|case| {
-            let oracle = ask_reference(lean, case.id, case.source);
-            let (env, decl) = (case.subject)();
+            let oracle = ask_reference(lean, &case.id, &case.source());
+            let (env, decl) = case.subject();
             let ours = ask_ourselves(&env, &decl);
             let divergence = Divergence::classify(&oracle, &ours);
             Outcome1 {
-                id: case.id,
+                id: case.id.clone(),
                 rule: case.rule,
                 oracle,
                 ours,
@@ -434,7 +635,8 @@ fn kernel_verdicts_agree_with_the_pinned_reference() {
         return;
     };
 
-    let results = run_corpus(&lean, CASES);
+    let cases = corpus();
+    let results = run_corpus(&lean, &cases);
     let mut findings: Vec<String> = Vec::new();
 
     for r in &results {
@@ -451,7 +653,7 @@ fn kernel_verdicts_agree_with_the_pinned_reference() {
                  (D23 permits soundness over bug-parity, never the reverse).",
                 r.id
             )),
-            Divergence::Restrictive { ours } => match carve_out_for(r.id) {
+            Divergence::Restrictive { ours } => match carve_out_for(&r.id) {
                 Some(c) => println!(
                     "refdiff id={} CARVE-OUT accepted: {}",
                     r.id, c.justification
@@ -471,6 +673,29 @@ fn kernel_verdicts_agree_with_the_pinned_reference() {
         }
     }
 
+    // THE REPORT IS THE CLAIM. A count, not a boolean: "differential testing
+    // exists" is exactly the unquantified marketing AGENTS.md forbids.
+    let accepts = results
+        .iter()
+        .filter(|r| matches!(r.oracle, OracleVerdict::Accepted))
+        .count();
+    let rejects = results
+        .iter()
+        .filter(|r| matches!(r.oracle, OracleVerdict::Rejected(_)))
+        .count();
+    let rules: std::collections::BTreeSet<&str> = results.iter().map(|r| r.rule).collect();
+    println!(
+        "refdiff SUMMARY: {} descriptions -> {} cases ({} accept-direction, {} \
+         reject-direction), {} divergences, {} distinct rule shapes. \
+         RULE-SHAPE COVERAGE, NOT CORPUS COVERAGE.",
+        cases.len(),
+        results.len(),
+        accepts,
+        rejects,
+        findings.len(),
+        rules.len()
+    );
+
     assert!(
         findings.is_empty(),
         "kernel diverged from the pinned Reference on {} case(s):\n  {}",
@@ -482,7 +707,7 @@ fn kernel_verdicts_agree_with_the_pinned_reference() {
     // otherwise report a clean pass.
     assert_eq!(
         results.len(),
-        CASES.len(),
+        cases.len(),
         "the corpus did not run to completion"
     );
     assert!(
@@ -496,6 +721,19 @@ fn kernel_verdicts_agree_with_the_pinned_reference() {
             .iter()
             .any(|r| matches!(r.oracle, OracleVerdict::Rejected(_))),
         "no case exercised the REJECT direction"
+    );
+    // Floor on the generator itself. A matrix that quietly stopped crossing its
+    // axes would otherwise still report a clean pass, which is the failure this
+    // whole rig is built to make impossible.
+    assert!(
+        results.len() >= 20,
+        "the generated corpus collapsed to {} cases",
+        results.len()
+    );
+    assert!(
+        rules.len() >= 7,
+        "the generated corpus covers only {} rule shapes",
+        rules.len()
     );
 }
 
@@ -517,39 +755,39 @@ fn harness_detects_divergence_when_our_side_is_broken() {
         return;
     };
 
-    const BROKEN: &[Case] = &[Case {
-        id: "REF-REJ-001-BROKEN",
-        rule: "negative control: source the Reference rejects, subject we accept",
-        source: "axiom A : Type\naxiom a : A\ntheorem bad : A := a\n",
-        subject: || {
-            let env = with_axiom(&Environment::new(), "P", prop());
-            let env = with_axiom(&env, "hp", cst("P"));
-            (env, thm("t", cst("P"), cst("hp")))
-        },
-    }];
+    // A mismatched Case can no longer be CONSTRUCTED — source and subject are
+    // both derived from one description, which is the property this generator
+    // exists to provide. So the control composes the two halves by hand at the
+    // call site instead: the Reference is asked about a text it must reject,
+    // and our kernel is asked about a DIFFERENT, well-formed declaration it
+    // must accept. That is the release-blocking direction, assembled
+    // deliberately rather than by a slip.
+    let rejected_source = "axiom A : Type\naxiom a : A\ntheorem bad : A := a\n";
+    let oracle = ask_reference(&lean, "control-broken", rejected_source);
 
-    let results = run_corpus(&lean, BROKEN);
-    let r = &results[0];
+    let env = with_axiom(&Environment::new(), "P", prop());
+    let env = with_axiom(&env, "hp", cst("P"));
+    let ours = ask_ourselves(&env, &thm("t", cst("P"), cst("hp")));
+
+    let divergence = Divergence::classify(&oracle, &ours);
 
     // Matched on the diagnostic text, not the whole line: the line carries an
     // absolute temp path, and pinning that would make the control fail on any
     // other machine for a reason having nothing to do with the kernel.
     assert!(
-        matches!(&r.oracle, OracleVerdict::Rejected(m) if m.contains("is not a proposition")),
+        matches!(&oracle, OracleVerdict::Rejected(m) if m.contains("is not a proposition")),
         "the oracle must actually reject this source, or the control proves \
-         nothing; got {:?}",
-        r.oracle
+         nothing; got {oracle:?}"
     );
-    assert_eq!(r.ours, OurVerdict::Accepted, "our planted side must accept");
+    assert_eq!(ours, OurVerdict::Accepted, "our planted side must accept");
     assert!(
-        matches!(r.divergence, Divergence::UnsoundlyPermissive { .. }),
+        matches!(divergence, Divergence::UnsoundlyPermissive { .. }),
         "the comparator must classify accept-over-reject as RELEASE-BLOCKING, \
-         got {:?}",
-        r.divergence
+         got {divergence:?}"
     );
     // And it must be unexcusable: no carve-out exists, and none could.
     assert!(
-        carve_out_for("REF-REJ-001-BROKEN").is_none(),
+        carve_out_for("control-broken").is_none(),
         "the unsound direction must not be carve-out-able"
     );
 }
