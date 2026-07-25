@@ -40,9 +40,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use fln_core::diag::ResourceReason;
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
+use fln_core::outcome::{InconclusiveCause, Outcome, ResourceUsage};
 use fln_env::constants::{ConstantInfo, DefinitionSafety};
 use fln_env::decl_closure::{
     self, DeclClosureBudget, DeclClosureInput, DeclClosureStatus, MissingConstantFinding,
@@ -50,7 +52,7 @@ use fln_env::decl_closure::{
 use fln_env::environment::Environment;
 use fln_hash::domain::{Domain, hash};
 use fln_kernel::Declaration;
-use fln_kernel::verdict::{Budget, ExhaustionReason, Verdict};
+use fln_kernel::verdict::{Budget, Verdict};
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
 
@@ -649,7 +651,7 @@ struct MatrixRun {
 fn check_matrix_run(prep: &PreparedReplay, threads: usize, budget: Budget) -> MatrixRun {
     let started = Instant::now();
     let n = prep.items.len();
-    let slots: Vec<OnceLock<Verdict>> = (0..n).map(|_| OnceLock::new()).collect();
+    let slots: Vec<OnceLock<Outcome<Verdict>>> = (0..n).map(|_| OnceLock::new()).collect();
     let cursor = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -677,41 +679,36 @@ fn check_matrix_run(prep: &PreparedReplay, threads: usize, budget: Budget) -> Ma
     let mut stream = String::new();
     for (i, item) in prep.items.iter().enumerate() {
         let verdict = slots[i].get().expect("worker pool drained the cursor");
-        let (outcome, message, consumption) = match verdict {
-            Verdict::Accepted { consumption } => {
+        match verdict {
+            Outcome::Complete(Verdict::Accepted { .. }) => {
                 accepted += item.members;
-                ("accepted".to_string(), String::new(), *consumption)
             }
-            Verdict::Rejected {
-                class,
-                message,
-                consumption,
-            } => {
+            Outcome::Complete(Verdict::Rejected { class, .. }) => {
                 *rejected.entry(format!("{class:?}")).or_default() += item.members;
-                (format!("rejected:{class:?}"), message.clone(), *consumption)
             }
-            Verdict::Inconclusive {
-                reason,
-                consumption,
-            } => {
+            Outcome::Inconclusive(_) => {
                 inconclusive += item.members;
-                (
-                    format!("inconclusive:{reason:?}"),
-                    String::new(),
-                    *consumption,
-                )
             }
+            // Internal faults are deliberately absent from all authoritative
+            // census buckets. `verdict_facts` preserves the fault in the unit
+            // stream, and the totality assertion below makes the run fail.
+            Outcome::InternalFault(_) => {}
+        }
+        let (outcome, class, message, steps_used, max_depth) = verdict_facts(verdict);
+        let outcome = match class {
+            Some(class) => format!("{outcome}:{class}"),
+            None => outcome,
         };
-        steps_total = steps_total.saturating_add(consumption.steps_used);
-        depth_max = depth_max.max(consumption.max_depth);
+        steps_total = steps_total.saturating_add(steps_used);
+        depth_max = depth_max.max(max_depth);
         let outcome = UnitOutcome {
             lead: item.lead.to_display_string(),
             kind: item.kind,
             members: item.members,
             outcome,
             message,
-            steps_used: consumption.steps_used,
-            max_depth: consumption.max_depth,
+            steps_used,
+            max_depth,
         };
         stream.push_str(&outcome.canonical_line(i));
         stream.push('\n');
@@ -1563,35 +1560,84 @@ fn quot_item(prep: &PreparedReplay) -> &WorkItem {
         .expect("Init.Prelude has the quotient-initialization unit")
 }
 
-fn verdict_facts(v: &Verdict) -> (String, Option<String>, String, u64, u32) {
+fn resource_usage_facts(usage: &ResourceUsage) -> (String, u64, u32) {
+    match usage.reason {
+        ResourceReason::Heartbeats { .. } => ("inconclusive:Steps".into(), usage.observed, 0),
+        ResourceReason::RecursionDepth { .. } => (
+            "inconclusive:Depth".into(),
+            0,
+            u32::try_from(usage.observed).unwrap_or(u32::MAX),
+        ),
+        ResourceReason::Cancelled => ("inconclusive:Cancelled".into(), 0, 0),
+        ResourceReason::Memory { .. } => ("inconclusive:Memory".into(), usage.observed, 0),
+    }
+}
+
+fn resource_exhaustion(v: &Outcome<Verdict>) -> Option<&ResourceUsage> {
     match v {
-        Verdict::Accepted { consumption } => (
+        Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+            InconclusiveCause::ResourceExhausted { usage } => Some(usage),
+            InconclusiveCause::Cancelled { .. }
+            | InconclusiveCause::DependencyUnavailable { .. }
+            | InconclusiveCause::AuthorityIncomplete { .. } => None,
+        },
+        Outcome::Complete(_) | Outcome::InternalFault(_) => None,
+    }
+}
+
+fn verdict_facts(v: &Outcome<Verdict>) -> (String, Option<String>, String, u64, u32) {
+    match v {
+        Outcome::Complete(Verdict::Accepted { consumption }) => (
             "accepted".into(),
             None,
             String::new(),
             consumption.steps_used,
             consumption.max_depth,
         ),
-        Verdict::Rejected {
+        Outcome::Complete(Verdict::Rejected {
             class,
             message,
             consumption,
-        } => (
+        }) => (
             "rejected".into(),
             Some(format!("{class:?}")),
             message.clone(),
             consumption.steps_used,
             consumption.max_depth,
         ),
-        Verdict::Inconclusive {
-            reason,
-            consumption,
-        } => (
-            format!("inconclusive:{reason:?}"),
+        Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+            InconclusiveCause::ResourceExhausted { usage } => {
+                let (outcome, steps_used, max_depth) = resource_usage_facts(usage);
+                (outcome, None, String::new(), steps_used, max_depth)
+            }
+            InconclusiveCause::Cancelled { at } => (
+                "inconclusive:Cancelled".into(),
+                None,
+                at.text().to_string(),
+                0,
+                0,
+            ),
+            InconclusiveCause::DependencyUnavailable { what } => (
+                "inconclusive:DependencyUnavailable".into(),
+                None,
+                what.text().to_string(),
+                0,
+                0,
+            ),
+            InconclusiveCause::AuthorityIncomplete { what } => (
+                "inconclusive:AuthorityIncomplete".into(),
+                None,
+                what.text().to_string(),
+                0,
+                0,
+            ),
+        },
+        Outcome::InternalFault(fault) => (
+            "internal_fault".into(),
             None,
-            String::new(),
-            consumption.steps_used,
-            consumption.max_depth,
+            format!("{}: {}", fault.invariant, fault.detail.text()),
+            0,
+            0,
         ),
     }
 }
@@ -1889,14 +1935,14 @@ fn admission_fault_matrix_is_typed_and_atomic() {
                 return false;
             }
             let v = fln_kernel::check(&item.env, &item.decl, budget);
-            matches!(&v, Verdict::Accepted { consumption }
+            matches!(&v, Outcome::Complete(Verdict::Accepted { consumption })
                 if consumption.steps_used >= 50 && consumption.max_depth >= 4)
         })
         .expect("a real accepted definition with measurable consumption");
     let baseline = fln_kernel::check(&subject.env, &subject.decl, budget);
-    let Verdict::Accepted {
+    let Outcome::Complete(Verdict::Accepted {
         consumption: base_cost,
-    } = baseline
+    }) = baseline
     else {
         panic!("baseline must accept");
     };
@@ -1954,13 +2000,16 @@ fn admission_fault_matrix_is_typed_and_atomic() {
         let v = fln_kernel::check(&subject.env, &subject.decl, under);
         let (actual, class, _msg, steps_used, max_depth) = verdict_facts(&v);
         let ok = matches!(
-            &v,
-            Verdict::Inconclusive {
-                reason: ExhaustionReason::Steps,
-                ..
-            }
-        ) && !v.is_accepted()
-            && !v.is_rejected();
+            resource_exhaustion(&v),
+            Some(ResourceUsage {
+                reason: ResourceReason::Heartbeats { consumed, limit },
+                allowed,
+                observed,
+            }) if *consumed == *observed
+                && *limit == under.steps
+                && *allowed == under.steps
+                && *observed > *allowed
+        );
         let root_after = subject.env.logical_root(&options).to_string();
         emit.fault_row(
             "resource_exhaustion_steps",
@@ -1997,11 +2046,14 @@ fn admission_fault_matrix_is_typed_and_atomic() {
         let v = fln_kernel::check(&subject.env, &subject.decl, shallow);
         let (actual, class, _msg, steps_used, max_depth) = verdict_facts(&v);
         let ok = matches!(
-            &v,
-            Verdict::Inconclusive {
-                reason: ExhaustionReason::Depth,
-                ..
-            }
+            resource_exhaustion(&v),
+            Some(ResourceUsage {
+                reason: ResourceReason::RecursionDepth { limit },
+                allowed,
+                observed,
+            }) if *limit == u64::from(shallow.depth)
+                && *allowed == u64::from(shallow.depth)
+                && *observed > *allowed
         );
         emit.fault_row(
             "resource_exhaustion_depth",

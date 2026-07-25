@@ -1,9 +1,11 @@
-//! Verdicts and the resource algebra slice (plan §8.2b/§8.2c; bead franken_lean-zht).
+//! Domain verdicts and the resource algebra slice (plan §8.2b/§8.2c; beads
+//! franken_lean-zht and franken_lean-1fxz).
 //!
-//! The kernel's one authority speaks in exactly these values. FL-INV-07 is
-//! structural: [`Verdict::Inconclusive`] is a distinct arm carrying a consumption
-//! profile; nothing converts it to or from [`Verdict::Rejected`], and no caller can
-//! observe exhaustion as a judgment about the term.
+//! The kernel's one authority speaks in [`fln_core::outcome::Outcome<Verdict>`].
+//! [`Verdict`] contains only completed domain answers: acceptance or a real
+//! rejection. Budget exhaustion lives on the orthogonal operation-outcome axis, so
+//! no caller can obtain a `Verdict` at all until it handles FL-INV-07's
+//! non-authoritative cases.
 //!
 //! Bootstrap slice: receipts and the full typestate envelope (§8.2b) are follow-up
 //! slices recorded on the bead; the verdict shape and the budget discipline are
@@ -75,7 +77,8 @@ impl RejectClass {
 }
 
 /// The typed budget the caller hands the kernel (§8.2c slice: reduction/inference
-/// steps and traversal depth). Exhaustion is a verdict about the run (KR-403).
+/// steps and traversal depth). Exhaustion is an outcome about the run (KR-403),
+/// never a [`Verdict`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     /// Counted work steps (inference nodes + reduction steps + defeq queries).
@@ -94,8 +97,9 @@ impl Budget {
     };
 }
 
-/// What a run actually consumed — attached to every verdict, so exhaustion
-/// diagnoses itself (§8.2c).
+/// What a completed run consumed — attached to every domain verdict (§8.2c).
+/// An interrupted run instead reports the exceeded dimension through
+/// [`fln_core::outcome::ResourceUsage`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Consumption {
     pub steps_used: u64,
@@ -104,12 +108,13 @@ pub struct Consumption {
 
 /// Why a run could not finish (FL-INV-07: never a judgment about the term).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExhaustionReason {
+pub(crate) enum ExhaustionReason {
     Steps,
     Depth,
 }
 
-/// The kernel's answer. Exactly one of these; no other channel exists.
+/// The kernel's completed domain answer. Operation non-answers are represented only
+/// by [`fln_core::outcome::Outcome`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// The declaration is admitted. (Receipts: follow-up slice.)
@@ -118,12 +123,6 @@ pub enum Verdict {
     Rejected {
         class: RejectClass,
         message: String,
-        consumption: Consumption,
-    },
-    /// The run exhausted its budget — a verdict about the RUN. Never rendered as,
-    /// cached as, or promoted to acceptance or rejection.
-    Inconclusive {
-        reason: ExhaustionReason,
         consumption: Consumption,
     },
 }
@@ -136,10 +135,6 @@ impl Verdict {
     pub fn is_rejected(&self) -> bool {
         matches!(self, Verdict::Rejected { .. })
     }
-
-    pub fn is_inconclusive(&self) -> bool {
-        matches!(self, Verdict::Inconclusive { .. })
-    }
 }
 
 #[cfg(test)]
@@ -147,7 +142,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_three_arms_are_disjoint_observables() {
+    fn completed_domain_answers_are_disjoint() {
         let consumption = Consumption::default();
         let accepted = Verdict::Accepted { consumption };
         let rejected = Verdict::Rejected {
@@ -155,18 +150,8 @@ mod tests {
             message: "x".into(),
             consumption,
         };
-        let inconclusive = Verdict::Inconclusive {
-            reason: ExhaustionReason::Steps,
-            consumption,
-        };
-        assert!(accepted.is_accepted() && !accepted.is_rejected() && !accepted.is_inconclusive());
-        assert!(rejected.is_rejected() && !rejected.is_accepted() && !rejected.is_inconclusive());
-        assert!(
-            inconclusive.is_inconclusive()
-                && !inconclusive.is_accepted()
-                && !inconclusive.is_rejected(),
-            "FL-INV-07: exhaustion is neither acceptance nor rejection"
-        );
+        assert!(accepted.is_accepted() && !accepted.is_rejected());
+        assert!(rejected.is_rejected() && !rejected.is_accepted());
     }
 
     #[test]

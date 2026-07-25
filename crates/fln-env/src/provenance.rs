@@ -2520,6 +2520,199 @@ fn read_payload_transparency(tag: u8) -> Result<PayloadTransparency, ModuleProve
     }
 }
 
+// ---------------------------------------------------------------------------------
+// The `.9.3` consumer handoff (bead `franken_lean-3ldh`).
+//
+// `franken_lean-module-provenance-atomic-apply-as7` is the consumer. What it needs is
+// not a description of this module but the set of statements it must implement
+// identically or knowingly diverge from — and, just as importantly, the statements
+// this schema does NOT make, so it cannot be relied on for durability it never
+// claimed. Same discipline as the V1 table: this is data joined against the code by
+// tests, not prose that can drift away from it.
+// ---------------------------------------------------------------------------------
+
+/// One handoff obligation: the thing being pinned, and the rule about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoffRule {
+    pub subject: &'static str,
+    pub rule: &'static str,
+}
+
+/// Pinned vectors over the in-crate fixture named by
+/// [`ModuleProvenanceHandoff::vector_fixture`]. A consumer that reproduces these
+/// agrees with this implementation bit for bit; one that does not has found a real
+/// divergence, not a formatting difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoffVectors {
+    pub root: &'static str,
+    pub canonical_bytes: usize,
+    pub topology_subdigest: &'static str,
+    pub artifact_subdigest: &'static str,
+    pub contribution_subdigest: &'static str,
+    pub completeness_subdigest: &'static str,
+}
+
+/// The versioned data contract handed to atomic import application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleProvenanceHandoff {
+    /// Version of *this handoff*, distinct from the schema version: the handoff can
+    /// gain obligations without the canonical layout moving.
+    pub handoff_version: u16,
+    pub schema: SchemaId,
+    pub root_domain_tag: &'static str,
+    pub vector_fixture: &'static str,
+    /// What an [`ExtensionEntryId`] is derived from, in order. Journal coordinates are
+    /// deliberately absent.
+    pub entry_identity_inputs: &'static [&'static str],
+    pub subdigest_tags: [(ProvenanceFamily, &'static str); 4],
+    pub ordinal_rules: &'static [HandoffRule],
+    pub completeness_rules: &'static [HandoffRule],
+    pub collision_outcomes: &'static [HandoffRule],
+    pub index_reconstruction: &'static [HandoffRule],
+    /// The W8 boundary: what this schema explicitly does *not* claim.
+    pub durability: &'static [HandoffRule],
+    pub vectors: HandoffVectors,
+}
+
+/// The published handoff. Every field is joined against the implementation by
+/// `handoff_states_the_contract_the_code_actually_implements`.
+pub const MODULE_PROVENANCE_HANDOFF: ModuleProvenanceHandoff = ModuleProvenanceHandoff {
+    handoff_version: 1,
+    schema: MODULE_PROVENANCE_SCHEMA,
+    root_domain_tag: Domain::ModuleProvenance.tag(),
+    vector_fixture: "fln_env::provenance::tests::sample_manifest",
+    entry_identity_inputs: &["module epoch", "extension descriptor", "payload bytes"],
+    subdigest_tags: [
+        (
+            ProvenanceFamily::Topology,
+            "fln.module-provenance.subdigest.topology/1",
+        ),
+        (
+            ProvenanceFamily::Artifact,
+            "fln.module-provenance.subdigest.artifact/1",
+        ),
+        (
+            ProvenanceFamily::Contribution,
+            "fln.module-provenance.subdigest.contribution/1",
+        ),
+        (
+            ProvenanceFamily::Completeness,
+            "fln.module-provenance.subdigest.completeness/1",
+        ),
+    ],
+    ordinal_rules: &[
+        HandoffRule {
+            subject: "source ordinal",
+            rule: "an occurrence's position within its contribution; module-local, u64, \
+                   never written into the entry identity",
+        },
+        HandoffRule {
+            subject: "target position",
+            rule: "contribution start + source ordinal; scoped to one committed root and \
+                   extension, and may differ after replay, restore, or merge — a \
+                   consumer must not persist it as an identity",
+        },
+        HandoffRule {
+            subject: "ordinal namespaces",
+            rule: "direct import, ordinary declaration, extra declaration, extension \
+                   source, and missing dependency are separate namespaces; an ordinary \
+                   and an extra declaration never share a coordinate",
+        },
+        HandoffRule {
+            subject: "record order",
+            rule: "records are canonicalized by module id at construction, so input \
+                   order never reaches the root; duplicate module ids are refused",
+        },
+    ],
+    completeness_rules: &[
+        HandoffRule {
+            subject: "capture",
+            rule: "knowledge from outside the record and never recomputed; the single \
+                   cross-check is that Missing cannot carry declarations or \
+                   contributions",
+        },
+        HandoffRule {
+            subject: "transparency",
+            rule: "RECOMPUTED from the contributions' descriptors and refused on \
+                   mismatch — a consumer must derive it, not trust it, and must expect \
+                   a descriptor change to move the completeness subdigest too",
+        },
+        HandoffRule {
+            subject: "authority",
+            rule: "derived from the capture and transparency axes on demand, never \
+                   stored and never written into the root",
+        },
+    ],
+    collision_outcomes: &[
+        HandoffRule {
+            subject: "Idempotent",
+            rule: "same root, same canonical bytes: safe to treat as the same object, \
+                   which is what makes re-import and cache hits idempotent",
+        },
+        HandoffRule {
+            subject: "Distinct",
+            rule: "different roots: unrelated objects, and the inequality is conclusive \
+                   because a hash never reports different for equal inputs",
+        },
+        HandoffRule {
+            subject: "Collision",
+            rule: "same root, different canonical bytes: REPORTED, never resolved. \
+                   Nothing here picks a winner, merges, or falls back to the digest; \
+                   atomic application adjudicates",
+        },
+    ],
+    index_reconstruction: &[
+        HandoffRule {
+            subject: "derivation",
+            rule: "indexes and subdigests are functions of the committed records alone; \
+                   deriving, holding, or dropping them cannot move the aggregate root",
+        },
+        HandoffRule {
+            subject: "bidirectional coverage",
+            rule: "the forward and reverse declaration indexes are exact inverses, and \
+                   the declaration class survives the projection",
+        },
+        HandoffRule {
+            subject: "count conservation",
+            rule: "indexed modules, declarations, and entry occurrences equal the \
+                   manifest's own facts exactly — the check re-derivation cannot supply",
+        },
+        HandoffRule {
+            subject: "disagreement",
+            rule: "a projection that disagrees with the records is InternalFault or \
+                   GraphAdmissionFault (FL-INV-07), never a verdict about a module and \
+                   never a second opinion to reconcile",
+        },
+    ],
+    durability: &[
+        HandoffRule {
+            subject: "in-memory only",
+            rule: "this schema claims NO durability: not for the Arc-backed records, \
+                   not for derived indexes, not for snapshots",
+        },
+        HandoffRule {
+            subject: "restart and crash recovery",
+            rule: "no restart, replay, or crash-recovery guarantee is made or implied; \
+                   W8 (Ledger records + CAS) owns durable persistence and is where such \
+                   a claim must be earned",
+        },
+        HandoffRule {
+            subject: "persisted projections",
+            rule: "an index may be persisted only as a rebuildable cache; on reload it \
+                   must verify against the records, and disagreement is a fault rather \
+                   than a recovery input",
+        },
+    ],
+    vectors: HandoffVectors {
+        root: "9af861837929fcff05062054d8a328377d5bfd2bf55a23ab7b3009dc5067146f",
+        canonical_bytes: 669,
+        topology_subdigest: "c2679e114320013741ba040984bdf84a9fad0f9ec522b745b2e27e821d249d51",
+        artifact_subdigest: "59051e7c3b04086c6198b9746bf802bc28bb9cbc6246ae6cd993430ded92d7f0",
+        contribution_subdigest: "0def00f2db2e504fe8cfceb546f6ca2f29e70c6bae46727b1dcf892252054394",
+        completeness_subdigest: "52b394d44ec197612404654f23214fa2a0980af6ae52898b67677e23b07d9e1c",
+    },
+};
+
 /// The four families that partition a record's canonical encoding.
 ///
 /// Order is the order they appear in [`write_contribution_record`], and that is not a
@@ -4339,6 +4532,127 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The handoff is a joined statement, not a description that can drift.
+    ///
+    /// Every field is checked against the thing it claims to describe: the schema
+    /// against the schema, each subdigest tag against the tag the hasher actually
+    /// uses, each vector against a recomputation, and each rule list against the
+    /// requirement that no obligation is blank or duplicated. A handoff that cannot be
+    /// joined is the failure mode the V1 table existed to end, and it would be a worse
+    /// failure here — a consumer reads this one.
+    #[test]
+    fn handoff_states_the_contract_the_code_actually_implements() {
+        let handoff = MODULE_PROVENANCE_HANDOFF;
+        assert_eq!(handoff.schema, MODULE_PROVENANCE_SCHEMA);
+        assert_eq!(handoff.root_domain_tag, Domain::ModuleProvenance.tag());
+        assert_eq!(handoff.handoff_version, 1);
+
+        // Every family appears exactly once, and each declared tag is the tag the
+        // hasher is actually keyed with -- not a copy that can drift from it.
+        let mut declared = BTreeSet::new();
+        for (family, tag) in handoff.subdigest_tags {
+            assert!(declared.insert(family), "{family:?} declared twice");
+            assert_eq!(
+                tag.as_bytes(),
+                family.tag(),
+                "{family:?} handoff tag disagrees with the hasher"
+            );
+        }
+        assert_eq!(
+            declared,
+            ProvenanceFamily::ALL.into_iter().collect::<BTreeSet<_>>(),
+            "the handoff does not cover exactly the families that exist"
+        );
+
+        // Vectors, recomputed rather than restated.
+        let manifest = sample_manifest();
+        let subdigests = ModuleProvenanceSubdigests::derive(&manifest);
+        let vectors = handoff.vectors;
+        assert_eq!(manifest.root().to_string(), vectors.root);
+        assert_eq!(manifest.to_canonical_bytes().len(), vectors.canonical_bytes);
+        for (family, pinned) in [
+            (ProvenanceFamily::Topology, vectors.topology_subdigest),
+            (ProvenanceFamily::Artifact, vectors.artifact_subdigest),
+            (
+                ProvenanceFamily::Contribution,
+                vectors.contribution_subdigest,
+            ),
+            (
+                ProvenanceFamily::Completeness,
+                vectors.completeness_subdigest,
+            ),
+        ] {
+            assert_eq!(
+                subdigests.of(family).to_string(),
+                pinned,
+                "{family:?} vector moved -- a schema or domain change needs an explicit \
+                 handoff update, not a silent re-pin"
+            );
+        }
+
+        // No blank or duplicated obligation: an unclassified row blocks closure here
+        // exactly as it does in the V1 table.
+        let lists: [(&str, &[HandoffRule]); 5] = [
+            ("ordinal", handoff.ordinal_rules),
+            ("completeness", handoff.completeness_rules),
+            ("collision", handoff.collision_outcomes),
+            ("index reconstruction", handoff.index_reconstruction),
+            ("durability", handoff.durability),
+        ];
+        for (list_name, rules) in lists {
+            assert!(!rules.is_empty(), "{list_name} rules are empty");
+            let mut subjects = BTreeSet::new();
+            for rule in rules {
+                assert!(
+                    !rule.subject.is_empty() && !rule.rule.is_empty(),
+                    "{list_name} carries a blank obligation"
+                );
+                assert!(
+                    subjects.insert(rule.subject),
+                    "{list_name} declares `{}` twice",
+                    rule.subject
+                );
+            }
+        }
+
+        // The collision outcomes cover every verdict the code can produce. The match is
+        // exhaustive on purpose: adding a variant fails to compile here rather than
+        // silently leaving the consumer a case the handoff never mentioned.
+        for verdict in [
+            IdentityVerdict::Idempotent,
+            IdentityVerdict::Distinct,
+            IdentityVerdict::Collision(IdentityCollision {
+                root: manifest.root(),
+                held_len: 669,
+                candidate_len: 669,
+                first_divergence: 0,
+            }),
+        ] {
+            let subject = match verdict {
+                IdentityVerdict::Idempotent => "Idempotent",
+                IdentityVerdict::Distinct => "Distinct",
+                IdentityVerdict::Collision(_) => "Collision",
+            };
+            assert!(
+                handoff
+                    .collision_outcomes
+                    .iter()
+                    .any(|rule| rule.subject == subject),
+                "the handoff does not name the {subject} outcome"
+            );
+        }
+
+        // The W8 boundary is a statement about what is NOT claimed, so it has to say
+        // so in the negative or it is not a boundary at all.
+        assert!(
+            handoff
+                .durability
+                .iter()
+                .any(|rule| rule.rule.contains("NO durability")),
+            "the durability boundary does not actually disclaim durability"
+        );
     }
 
     /// The last two named mutants from the parent bead: admitting allocation identity

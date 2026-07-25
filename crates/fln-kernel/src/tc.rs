@@ -603,7 +603,10 @@ impl<'a> TypeChecker<'a> {
                 // Result size is input bits + shift count: charge it up front.
                 let Some(count) = vb.to_u64() else {
                     // A shift count beyond u64 is beyond any feasible memory:
-                    // typed exhaustion, never an attempted allocation.
+                    // charge the smallest representable over-budget forecast so
+                    // the typed exhaustion carries genuine allowed/observed facts,
+                    // never an attempted allocation or a fabricated completion.
+                    self.used.steps_used = self.budget.steps.saturating_add(1);
                     return Err(Stop::Exhausted(ExhaustionReason::Steps));
                 };
                 self.charge_bulk(count / 64 + 1)?;

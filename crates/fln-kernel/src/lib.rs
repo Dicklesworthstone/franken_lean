@@ -2,7 +2,7 @@
 //! franken_lean-zht, K1 bootstrap slice). One authority, nothing else:
 //!
 //! ```text
-//! check : Environment × Declaration × Budget → Verdict
+//! check : Environment × Declaration × Budget → Outcome<Verdict>
 //! ```
 //!
 //! Covenant posture (§8.1): `forbid(unsafe_code)`; dependencies exactly the
@@ -19,9 +19,9 @@
 //! full recursor REGENERATION KR-800..803 (decoded rows are untrusted and
 //! compared against the kernel's own generation), and quotient initialization
 //! KR-950..954. Every
-//! exhaustion is a typed [`verdict::Verdict::Inconclusive`] carrying its
-//! consumption profile (FL-INV-07); an unimplemented reduction can only cause a
-//! rejection, never an acceptance.
+//! exhaustion is a typed [`fln_core::outcome::Outcome::Inconclusive`] carrying
+//! bounded resource facts (FL-INV-07); an unimplemented reduction can only cause
+//! a rejection, never an acceptance.
 
 #![forbid(unsafe_code)]
 
@@ -30,7 +30,9 @@ pub mod verdict;
 mod admit;
 mod tc;
 
+use fln_core::diag::ResourceReason;
 use fln_core::name::Name;
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_env::constants::{
     AxiomVal, ConstantInfo, DefinitionSafety, DefinitionVal, QuotVal, TheoremVal,
 };
@@ -77,39 +79,17 @@ impl Declaration {
 /// The kernel's one authority (§8.2b): checks the declaration against the
 /// environment under the given budget. Nothing else in the program can admit a
 /// constant (FL-INV-02); callers extend the environment only on `Accepted`.
-pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Verdict {
+pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Outcome<Verdict> {
     // Block declarations own their freshness/level laws and their scratch
     // environments; they meter consumption themselves.
     match decl {
         Declaration::Inductive(block) => {
             let (outcome, consumption) = admit::check_inductive_block(env, block, budget);
-            return match outcome {
-                Ok(()) => Verdict::Accepted { consumption },
-                Err(Stop::Reject(class, message)) => Verdict::Rejected {
-                    class,
-                    message,
-                    consumption,
-                },
-                Err(Stop::Exhausted(reason)) => Verdict::Inconclusive {
-                    reason,
-                    consumption,
-                },
-            };
+            return check_result_to_outcome(outcome, consumption, budget);
         }
         Declaration::Quotient(decls) => {
             let (outcome, consumption) = admit::check_quotient_init(env, decls, budget);
-            return match outcome {
-                Ok(()) => Verdict::Accepted { consumption },
-                Err(Stop::Reject(class, message)) => Verdict::Rejected {
-                    class,
-                    message,
-                    consumption,
-                },
-                Err(Stop::Exhausted(reason)) => Verdict::Inconclusive {
-                    reason,
-                    consumption,
-                },
-            };
+            return check_result_to_outcome(outcome, consumption, budget);
         }
         _ => {}
     }
@@ -126,18 +106,7 @@ pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Verdict {
     let mut checker = TypeChecker::new(env, decl.level_params(), budget);
     let outcome = check_inner(env, decl, &mut checker);
     let consumption = checker.consumption();
-    match outcome {
-        Ok(()) => Verdict::Accepted { consumption },
-        Err(Stop::Reject(class, message)) => Verdict::Rejected {
-            class,
-            message,
-            consumption,
-        },
-        Err(Stop::Exhausted(reason)) => Verdict::Inconclusive {
-            reason,
-            consumption,
-        },
-    }
+    check_result_to_outcome(outcome, consumption, budget)
 }
 
 /// Pin environment.cpp:160/225 (`add_definition` unsafe branch, `add_mutual`):
@@ -145,7 +114,11 @@ pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Verdict {
 /// definition's own safety), then the body against a scratch env CONTAINING
 /// the definition, defeq to the declared type. Non-safe definitions can be
 /// recursive — that is exactly why the body checks after the add.
-fn check_nonsafe_definition(env: &Environment, v: &DefinitionVal, budget: Budget) -> Verdict {
+fn check_nonsafe_definition(
+    env: &Environment,
+    v: &DefinitionVal,
+    budget: Budget,
+) -> Outcome<Verdict> {
     let mut total = verdict::Consumption::default();
     let mut header = TypeChecker::new_with_safety(env, &v.base.level_params, budget, v.safety);
     let header_outcome = check_header(
@@ -160,16 +133,16 @@ fn check_nonsafe_definition(env: &Environment, v: &DefinitionVal, budget: Budget
     total.steps_used += c.steps_used;
     total.max_depth = total.max_depth.max(c.max_depth);
     if let Err(stop) = header_outcome {
-        return stop_to_verdict(stop, total);
+        return stop_to_outcome(stop, total, budget);
     }
     let scratch = match env.add_decl(ConstantInfo::Defn(v.clone())) {
         Ok(scratch) => scratch,
         Err(_) => {
-            return Verdict::Rejected {
+            return Outcome::complete(Verdict::Rejected {
                 class: RejectClass::AlreadyDeclared,
                 message: format!("`{}` is already declared", v.base.name.to_display_string()),
                 consumption: total,
-            };
+            });
         }
     };
     let remaining = Budget {
@@ -195,23 +168,68 @@ fn check_nonsafe_definition(env: &Environment, v: &DefinitionVal, budget: Budget
     let c = body.consumption();
     total.steps_used += c.steps_used;
     total.max_depth = total.max_depth.max(c.max_depth);
-    match outcome {
-        Ok(()) => Verdict::Accepted { consumption: total },
-        Err(stop) => stop_to_verdict(stop, total),
+    check_result_to_outcome(outcome, total, budget)
+}
+
+fn check_result_to_outcome(
+    result: Result<(), Stop>,
+    consumption: verdict::Consumption,
+    budget: Budget,
+) -> Outcome<Verdict> {
+    match result {
+        Ok(()) => Outcome::complete(Verdict::Accepted { consumption }),
+        Err(stop) => stop_to_outcome(stop, consumption, budget),
     }
 }
 
-fn stop_to_verdict(stop: Stop, consumption: verdict::Consumption) -> Verdict {
+fn stop_to_outcome(
+    stop: Stop,
+    consumption: verdict::Consumption,
+    budget: Budget,
+) -> Outcome<Verdict> {
     match stop {
-        Stop::Reject(class, message) => Verdict::Rejected {
+        Stop::Reject(class, message) => Outcome::complete(Verdict::Rejected {
             class,
             message,
             consumption,
+        }),
+        Stop::Exhausted(reason) => exhaustion_outcome(reason, consumption, budget),
+    }
+}
+
+fn exhaustion_outcome(
+    reason: verdict::ExhaustionReason,
+    consumption: verdict::Consumption,
+    budget: Budget,
+) -> Outcome<Verdict> {
+    let usage = match reason {
+        verdict::ExhaustionReason::Steps => ResourceUsage {
+            reason: ResourceReason::Heartbeats {
+                consumed: consumption.steps_used,
+                limit: budget.steps,
+            },
+            allowed: budget.steps,
+            observed: consumption.steps_used,
         },
-        Stop::Exhausted(reason) => Verdict::Inconclusive {
-            reason,
-            consumption,
+        verdict::ExhaustionReason::Depth => ResourceUsage {
+            reason: ResourceReason::RecursionDepth {
+                limit: u64::from(budget.depth),
+            },
+            allowed: u64::from(budget.depth),
+            observed: u64::from(consumption.max_depth),
         },
+    };
+    if usage.is_genuine_exhaustion() {
+        Outcome::Inconclusive(Inconclusive::resource(usage))
+    } else {
+        Outcome::InternalFault(InternalFault::new(
+            "FL-INV-07",
+            format!(
+                "kernel reported {reason:?} exhaustion without exceeding its allowance: \
+                 allowed={}, observed={}",
+                usage.allowed, usage.observed
+            ),
+        ))
     }
 }
 
@@ -332,25 +350,22 @@ pub fn check_def_eq(
     t: &fln_core::expr::Expr,
     s: &fln_core::expr::Expr,
     budget: Budget,
-) -> Verdict {
+) -> Outcome<Verdict> {
     let mut checker = TypeChecker::new(env, lparams, budget);
     let outcome = checker.def_eq_public(t, s, 0);
     let consumption = checker.consumption();
     match outcome {
-        Ok(true) => Verdict::Accepted { consumption },
-        Ok(false) => Verdict::Rejected {
+        Ok(true) => Outcome::complete(Verdict::Accepted { consumption }),
+        Ok(false) => Outcome::complete(Verdict::Rejected {
             class: RejectClass::NotDefEq,
             message: "terms are not definitionally equal".to_string(),
             consumption,
-        },
-        Err(Stop::Reject(class, message)) => Verdict::Rejected {
+        }),
+        Err(Stop::Reject(class, message)) => Outcome::complete(Verdict::Rejected {
             class,
             message,
             consumption,
-        },
-        Err(Stop::Exhausted(reason)) => Verdict::Inconclusive {
-            reason,
-            consumption,
-        },
+        }),
+        Err(Stop::Exhausted(reason)) => exhaustion_outcome(reason, consumption, budget),
     }
 }

@@ -6,10 +6,15 @@
 //!
 //! Representation invariant: little-endian `u64` limbs, normalized — no
 //! trailing zero limbs; the empty limb vector is zero. This is deliberately
-//! identical to `fln_core::expr::NatLit`'s representation (interop is wired
-//! elsewhere; this crate does not depend on `fln-core`).
+//! identical to `fln_core::expr::NatLit`'s representation, which is what lets
+//! `interop` move values across the term-plane boundary without reshaping them.
 //!
-//! No code path in this module panics on any input, and no hot path recurses.
+//! No hot path recurses. The two operations whose *result* grows without bound
+//! in their argument — [`BigNat::shl`] and [`BigNat::pow`] — size that result
+//! before allocating it and refuse through [`BigNat::checked_shl`] /
+//! [`BigNat::checked_pow`] when it would exceed [`MAX_LIMBS`]. Refusal is what
+//! FL-INV-07 requires: resource exhaustion is a typed outcome the caller can
+//! see, never an allocator abort that takes the process with it.
 
 use std::cmp::Ordering;
 
@@ -25,6 +30,22 @@ pub struct BigNat {
 const DECIMAL_CHUNK_BASE: u128 = 10_000_000_000_000_000_000;
 /// Digits per decimal chunk (`log10(DECIMAL_CHUNK_BASE)`).
 const DECIMAL_CHUNK_DIGITS: usize = 19;
+
+/// The widest single value this crate will allocate: `2^28` limbs, or 2 GiB.
+///
+/// A *policy* bound, not a mathematical one — `Nat` is unbounded. It exists so
+/// that an absurd growth request is answered rather than attempted: `x << 2^58`
+/// names a number needing two exabytes of limbs, and asking the allocator for
+/// that aborts the process instead of returning a verdict. The bound is far
+/// above anything a kernel-accepted proof reaches (the pinned `pow` exponent cap
+/// is `2^24`, and every kernel growth path charges its result size against a
+/// budget first — see `fln_kernel::tc`), so refusing past it costs no reachable
+/// arithmetic.
+///
+/// It is also what makes the sizing portable: the limb count is computed in
+/// `u128` and compared here, so a 32-bit `usize` cannot truncate a large shift
+/// into a small, silently *wrong* allocation.
+pub const MAX_LIMBS: usize = 1 << 28;
 
 fn normalize(limbs: &mut Vec<u64>) {
     while limbs.last() == Some(&0) {
@@ -289,7 +310,32 @@ impl BigNat {
     /// `self ^ exp` by iterative square-and-multiply; `x ^ 0 = 1` (KR-313
     /// caps the accelerated exponent at `2^24`; the cap is enforced by the
     /// kernel caller, not here).
+    ///
+    /// # Panics
+    /// If the result would exceed [`MAX_LIMBS`] limbs. As with
+    /// [`BigNat::shl`], the kernel charges the result size first; callers that
+    /// cannot use [`BigNat::checked_pow`].
     pub fn pow(&self, exp: u32) -> BigNat {
+        self.checked_pow(exp).unwrap_or_else(|| {
+            panic!(
+                "BigNat::pow: raising a {}-bit value to {exp} exceeds MAX_LIMBS ({MAX_LIMBS}); \
+                 the caller must charge the result size before exponentiating",
+                self.bit_length()
+            )
+        })
+    }
+
+    /// `self ^ exp`, or `None` when the result would exceed [`MAX_LIMBS`].
+    ///
+    /// The bound is decided from `bit_length · exp` before any multiplication
+    /// runs. Square-and-multiply never builds a value wider than the result it
+    /// is heading for — the loop stops squaring once the exponent is exhausted
+    /// — so bounding the result bounds every intermediate too.
+    pub fn checked_pow(&self, exp: u32) -> Option<BigNat> {
+        let result_bits = u128::from(self.bit_length()) * u128::from(exp);
+        if result_bits / 64 + 1 > MAX_LIMBS as u128 {
+            return None;
+        }
         let mut result = BigNat::from_u64(1);
         let mut base = self.clone();
         let mut e = exp;
@@ -302,7 +348,7 @@ impl BigNat {
                 base = base.mul(&base);
             }
         }
-        result
+        Some(result)
     }
 
     /// Greatest common divisor, iterative Euclid via `rem`; `gcd(0, x) = x`
@@ -360,11 +406,44 @@ impl BigNat {
     }
 
     /// `self << bits` (KR-313 `Nat.shiftLeft`).
+    ///
+    /// The caller must already have established that the result fits — as the
+    /// kernel does, by charging `bits / 64` against its budget before reducing a
+    /// `Nat.shiftLeft` application. Violating that is an invariant failure, not
+    /// a user diagnostic, so it panics here; callers that cannot make the
+    /// guarantee use [`BigNat::checked_shl`] and handle the refusal.
+    ///
+    /// # Panics
+    /// If the result would exceed [`MAX_LIMBS`] limbs.
     pub fn shl(&self, bits: u64) -> BigNat {
+        self.checked_shl(bits).unwrap_or_else(|| {
+            panic!(
+                "BigNat::shl: {bits}-bit shift of a {}-limb value exceeds MAX_LIMBS ({MAX_LIMBS}); \
+                 the caller must charge the result size before shifting",
+                self.limbs.len()
+            )
+        })
+    }
+
+    /// `self << bits`, or `None` when the result would exceed [`MAX_LIMBS`].
+    ///
+    /// The refusal is decided from the operand sizes alone, before a single
+    /// limb is allocated, so an unrepresentable request costs nothing and never
+    /// reaches the allocator.
+    pub fn checked_shl(&self, bits: u64) -> Option<BigNat> {
         if self.is_zero() {
-            return BigNat::zero();
+            return Some(BigNat::zero());
         }
-        let limb_shift = (bits / 64) as usize;
+        // Sized in u128: on a 32-bit target `(bits / 64) as usize` truncates,
+        // which would allocate a small buffer and return a wrong value rather
+        // than refusing.
+        let limb_shift = u128::from(bits / 64);
+        let needed = limb_shift + self.limbs.len() as u128 + 1;
+        if needed > MAX_LIMBS as u128 {
+            return None;
+        }
+        // In range by the check above, so this conversion cannot truncate.
+        let limb_shift = limb_shift as usize;
         let bit_shift = (bits % 64) as u32;
         let mut out = vec![0u64; limb_shift];
         out.reserve(self.limbs.len() + 1);
@@ -380,7 +459,7 @@ impl BigNat {
                 out.push(carry);
             }
         }
-        BigNat::from_limbs_le(out)
+        Some(BigNat::from_limbs_le(out))
     }
 
     /// `self >> bits` (KR-313 `Nat.shiftRight`); shifts past the top yield 0.
@@ -723,5 +802,82 @@ mod tests {
         assert_eq!(x.to_u64(), None);
         assert_eq!(BigNat::from_u64(9).to_u64(), Some(9));
         assert_eq!(zero.to_u64(), Some(0));
+    }
+
+    /// FL-INV-07 at the crate boundary: a result too large to represent is
+    /// refused from the operand sizes alone, before the allocator is asked for
+    /// anything. `shl` previously computed `(bits / 64) as usize` and handed it
+    /// straight to `vec![0u64; n]`, so these inputs aborted the process — an
+    /// exhaustion the caller could neither see nor survive.
+    #[test]
+    fn oversized_growth_is_refused_before_allocating() {
+        let one = BigNat::from_u64(1);
+        let wide = BigNat::from_limbs_le(vec![u64::MAX; 4]);
+
+        // 2^58 limbs is two exabytes. Refused, and cheaply — if this test ever
+        // takes measurable time, the refusal moved after the allocation.
+        assert_eq!(one.checked_shl(u64::MAX), None);
+        assert_eq!(one.checked_shl(1 << 40), None);
+        assert_eq!(wide.checked_shl(u64::MAX), None);
+
+        // The 32-bit case, which failed differently and worse: this shift needs
+        // 2^32 limbs, and `as usize` on a 32-bit target truncates that to 0 —
+        // a small buffer and a silently *wrong* answer rather than a crash.
+        // Sizing in u128 refuses it on every target.
+        assert_eq!(one.checked_shl(1 << 38), None);
+
+        // pow is bounded by `bit_length · exp` the same way.
+        assert_eq!(BigNat::from_u64(u64::MAX).checked_pow(u32::MAX), None);
+        assert_eq!(wide.checked_pow(1 << 27), None);
+
+        // Operations that cannot grow stay total, so the bound costs no
+        // reachable arithmetic: 0 << n, 1^n, and x^0 all still answer.
+        assert_eq!(BigNat::zero().checked_shl(u64::MAX), Some(BigNat::zero()));
+        assert_eq!(one.checked_pow(u32::MAX), Some(one.clone()));
+        assert_eq!(wide.checked_pow(0), Some(one.clone()));
+    }
+
+    /// Below the cap the checked spelling is the infallible one — refusal is the
+    /// only behavior that was added, not a change of results.
+    #[test]
+    fn checked_growth_agrees_with_the_infallible_spelling_below_the_cap() {
+        let values = [
+            BigNat::zero(),
+            BigNat::from_u64(1),
+            BigNat::from_u64(u64::MAX),
+            BigNat::from_limbs_le(vec![u64::MAX, 0, 1]),
+        ];
+        for value in &values {
+            for bits in [0u64, 1, 63, 64, 65, 127, 128, 1000] {
+                assert_eq!(
+                    value.checked_shl(bits),
+                    Some(value.shl(bits)),
+                    "checked_shl disagrees at {bits} bits"
+                );
+            }
+            for exp in [0u32, 1, 2, 5, 17] {
+                assert_eq!(
+                    value.checked_pow(exp),
+                    Some(value.pow(exp)),
+                    "checked_pow disagrees at exponent {exp}"
+                );
+            }
+        }
+    }
+
+    /// The infallible spelling is for callers that have already charged the
+    /// result size, as `fln-kernel` does before reducing `Nat.shiftLeft`.
+    /// Breaking that contract is an invariant failure with an attributable
+    /// message, never an allocator abort that takes the process down anonymously.
+    #[test]
+    #[should_panic(expected = "exceeds MAX_LIMBS")]
+    fn shl_past_the_cap_is_an_attributable_invariant_failure() {
+        let _ = BigNat::from_u64(1).shl(u64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_LIMBS")]
+    fn pow_past_the_cap_is_an_attributable_invariant_failure() {
+        let _ = BigNat::from_u64(u64::MAX).pow(u32::MAX);
     }
 }

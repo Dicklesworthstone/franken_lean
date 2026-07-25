@@ -4,17 +4,49 @@
 
 #![forbid(unsafe_code)]
 
+use fln_core::diag::ResourceReason;
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
+use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause, Outcome, ResourceUsage};
 use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
     InductiveVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints, TheoremVal,
 };
 use fln_env::environment::Environment;
-use fln_kernel::verdict::{Budget, ExhaustionReason, RejectClass, Verdict};
+use fln_kernel::verdict::{Budget, RejectClass, Verdict};
 use fln_kernel::{Declaration, check, check_def_eq};
+
+trait KernelOutcomeAssertions {
+    fn is_accepted(&self) -> bool;
+    fn is_rejected(&self) -> bool;
+    fn is_inconclusive(&self) -> bool;
+}
+
+impl KernelOutcomeAssertions for Outcome<Verdict> {
+    fn is_accepted(&self) -> bool {
+        matches!(self, Outcome::Complete(Verdict::Accepted { .. }))
+    }
+
+    fn is_rejected(&self) -> bool {
+        matches!(self, Outcome::Complete(Verdict::Rejected { .. }))
+    }
+
+    fn is_inconclusive(&self) -> bool {
+        matches!(self, Outcome::Inconclusive(_))
+    }
+}
+
+fn exhausted_usage(outcome: &Outcome<Verdict>) -> &ResourceUsage {
+    match outcome {
+        Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+            InconclusiveCause::ResourceExhausted { usage } => usage,
+            other => panic!("expected resource exhaustion, got {other:?}"),
+        },
+        other => panic!("expected an inconclusive kernel outcome, got {other:?}"),
+    }
+}
 
 fn n(s: &str) -> Name {
     Name::str(Name::anonymous(), s)
@@ -71,9 +103,9 @@ fn admit(env: &Environment, decl: &Declaration) -> Environment {
     env.add_decl(info).expect("kernel-accepted decl adds")
 }
 
-fn reject_class(verdict: &Verdict) -> Option<RejectClass> {
+fn reject_class(verdict: &Outcome<Verdict>) -> Option<RejectClass> {
     match verdict {
-        Verdict::Rejected { class, .. } => Some(*class),
+        Outcome::Complete(Verdict::Rejected { class, .. }) => Some(*class),
         _ => None,
     }
 }
@@ -397,8 +429,9 @@ fn distinct_axioms_are_not_defeq() {
 
 #[test]
 fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
-    // The identity-function check under a 5-step budget: must be Inconclusive
-    // with a consumption profile — categorically NOT a rejection.
+    // The identity-function check under a 5-step budget: must be an
+    // outcome-level Inconclusive with bounded usage facts — categorically not
+    // a domain verdict.
     let ty = Expr::forall_e(
         n("alpha"),
         sort1(),
@@ -430,20 +463,23 @@ fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
         &defn("id", ty.clone(), value.clone()),
         tiny,
     );
-    assert!(
-        matches!(
-            &verdict,
-            Verdict::Inconclusive {
-                reason: ExhaustionReason::Steps,
-                ..
-            }
-        ),
-        "FL-INV-07 violated: expected Steps-exhaustion Inconclusive, got {verdict:?}"
+    let usage = exhausted_usage(&verdict);
+    assert!(usage.observed > tiny.steps);
+    assert_eq!(usage.allowed, tiny.steps);
+    assert_eq!(
+        usage.reason,
+        ResourceReason::Heartbeats {
+            consumed: usage.observed,
+            limit: tiny.steps,
+        }
     );
-    if let Verdict::Inconclusive { consumption, .. } = &verdict {
-        assert!(consumption.steps_used >= 5);
-    }
-    assert!(!verdict.is_rejected() && !verdict.is_accepted());
+    assert_eq!(
+        verdict.cache_admission(),
+        CacheAdmission::Refused {
+            authority: Authority::NonAuthoritative,
+        }
+    );
+    assert!(verdict.as_complete().is_none());
 
     // Depth exhaustion likewise.
     let shallow = Budget {
@@ -451,16 +487,15 @@ fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
         depth: 1,
     };
     let verdict = check(&Environment::new(), &defn("id", ty, value), shallow);
-    assert!(
-        matches!(
-            verdict,
-            Verdict::Inconclusive {
-                reason: ExhaustionReason::Depth,
-                ..
-            }
-        ),
-        "{verdict:?}"
+    let usage = exhausted_usage(&verdict);
+    assert_eq!(
+        usage.reason,
+        ResourceReason::RecursionDepth {
+            limit: u64::from(shallow.depth),
+        }
     );
+    assert_eq!(usage.allowed, u64::from(shallow.depth));
+    assert!(usage.observed > usage.allowed);
 }
 
 #[test]
@@ -1832,7 +1867,7 @@ fn fl_inv_07_iota_chain_exhaustion_is_inconclusive_never_rejected() {
         },
     );
     assert!(
-        matches!(verdict, Verdict::Inconclusive { .. }),
+        verdict.is_inconclusive(),
         "budget exhaustion in an iota chain is Inconclusive, got {verdict:?}"
     );
 }
@@ -3331,9 +3366,16 @@ fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
     let env = add_nat_literal_axioms(&Environment::new());
     let huge_count = nat_op_app("shiftLeft", lit(1), lit(1u64 << 40));
     let verdict = check_def_eq(&env, &[], &huge_count, &lit(0), Budget::DEFAULT);
-    assert!(
-        verdict.is_inconclusive() && !verdict.is_rejected() && !verdict.is_accepted(),
-        "an infeasible shift is a verdict about the RUN, got {verdict:?}"
+    let usage = exhausted_usage(&verdict);
+    assert_eq!(usage.allowed, Budget::DEFAULT.steps);
+    assert!(usage.observed > usage.allowed);
+    assert_eq!(
+        usage.reason,
+        ResourceReason::Heartbeats {
+            consumed: usage.observed,
+            limit: usage.allowed,
+        },
+        "an infeasible shift is an outcome about the run"
     );
     // A count beyond u64 entirely (2^64, limbs [0,1]) takes the same typed path.
     let beyond_u64 = nat_op_app(
@@ -3342,9 +3384,11 @@ fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
         Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
     );
     let verdict = check_def_eq(&env, &[], &beyond_u64, &lit(0), Budget::DEFAULT);
-    assert!(
-        verdict.is_inconclusive(),
-        "a beyond-u64 shift count is typed exhaustion, got {verdict:?}"
+    let usage = exhausted_usage(&verdict);
+    assert_eq!(
+        (usage.allowed, usage.observed),
+        (Budget::DEFAULT.steps, Budget::DEFAULT.steps + 1),
+        "a beyond-u64 shift count records the minimal forecasted overrun"
     );
     // shiftRight only shrinks: the same beyond-u64 count simply zeroes.
     let shr_all = nat_op_app(
@@ -4003,9 +4047,9 @@ fn shift(e: &Expr, d: u32) -> Expr {
     go(e, d, 0)
 }
 
-fn reject_message(verdict: &Verdict) -> String {
+fn reject_message(verdict: &Outcome<Verdict>) -> String {
     match verdict {
-        Verdict::Rejected { message, .. } => message.clone(),
+        Outcome::Complete(Verdict::Rejected { message, .. }) => message.clone(),
         other => panic!("expected rejection, got {other:?}"),
     }
 }
@@ -6263,7 +6307,7 @@ fn kr608_random_nested_shapes_agree_with_the_independent_model() {
                             .join(", ")
                     );
                     match &verdict {
-                        Verdict::Rejected { class, message, .. } => {
+                        Outcome::Complete(Verdict::Rejected { class, message, .. }) => {
                             assert_eq!(
                                 *class,
                                 RejectClass::BlockMismatch,
@@ -6390,7 +6434,7 @@ fn kr608_deduplication_keeps_the_cascade_cost_bounded() {
         &block_decl(types, ctors, recursors),
         Budget::DEFAULT,
     ) {
-        Verdict::Accepted { consumption } => consumption.steps_used,
+        Outcome::Complete(Verdict::Accepted { consumption }) => consumption.steps_used,
         other => panic!("the cascading block must admit; got {other:?}"),
     };
     assert!(
