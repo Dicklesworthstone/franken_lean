@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fln_core::name::Name;
+use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 
 use crate::constants::DefinitionSafety;
@@ -37,7 +38,16 @@ use crate::constants::DefinitionSafety;
 /// Domain-separation tag for the artifact-incomplete witness digest (the same
 /// `Domain::Fixture` + tag + NUL + length-prefixed-rows discipline as the
 /// kernel-contract ownership projection).
-const WITNESS_TAG: &[u8] = b"fln.artifact-incomplete-witness/1";
+///
+/// **Version 2** replaced version 1's display projection of [`Name`] with the
+/// canonical structural encoding. Version 1 hashed `to_display_string()`, which
+/// joins components with `.` without escaping and renders numeric and string
+/// components identically — so distinct names collided and the witness stopped
+/// discriminating the finding set it exists to bind. The tag moves with the
+/// encoding on purpose: a consumer that recomputes a witness must be able to tell
+/// "different data" from "different rule", and an encoding that changed silently
+/// under an unchanged version is indistinguishable from corruption.
+const WITNESS_TAG: &[u8] = b"fln.artifact-incomplete-witness/2";
 
 /// One declaration whose artifact cannot supply its dependency closure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,15 +182,30 @@ pub struct DeclClosureInput {
 /// EVERY fact a finding row asserts — declaration, safety class, and the
 /// exact missing set — so no single-field tamper survives it. Deterministic
 /// for a given finding set; input-order independence is the census's job.
+/// Canonical, injective bytes for one [`Name`].
+///
+/// [`Name::write_body`] is the same structural encoding that
+/// `Environment::decl_content_digest` and the provenance manifest already commit
+/// to: it tags each component's kind and length, so an anonymous, string, or
+/// numeric component can never imitate another, and a component containing the
+/// display separator cannot forge a deeper path. Reusing it — rather than writing a
+/// second name encoding here — is deliberate: a private encoding is exactly how the
+/// two would drift apart again.
+fn canonical_name_bytes(name: &Name) -> Vec<u8> {
+    let mut writer = CanonWriter::new();
+    name.write_body(&mut writer);
+    writer.into_bytes()
+}
+
 pub fn witness_digest(findings: &[MissingConstantFinding]) -> Digest {
     let mut hasher = DomainHasher::new(Domain::Fixture);
     hasher.update(WITNESS_TAG);
     hasher.update(&[0]);
     hasher.update(&(findings.len() as u64).to_le_bytes());
     for finding in findings {
-        let declaration = finding.declaration.to_display_string();
+        let declaration = canonical_name_bytes(&finding.declaration);
         hasher.update(&(declaration.len() as u64).to_le_bytes());
-        hasher.update(declaration.as_bytes());
+        hasher.update(&declaration);
         hasher.update(&[match finding.safety {
             DefinitionSafety::Safe => 0,
             DefinitionSafety::Unsafe => 1,
@@ -188,9 +213,9 @@ pub fn witness_digest(findings: &[MissingConstantFinding]) -> Digest {
         }]);
         hasher.update(&(finding.missing.len() as u64).to_le_bytes());
         for name in &finding.missing {
-            let text = name.to_display_string();
-            hasher.update(&(text.len() as u64).to_le_bytes());
-            hasher.update(text.as_bytes());
+            let encoded = canonical_name_bytes(name);
+            hasher.update(&(encoded.len() as u64).to_le_bytes());
+            hasher.update(&encoded);
         }
     }
     hasher.finalize()
@@ -297,6 +322,86 @@ mod tests {
             safety,
             dependencies: deps.iter().map(|d| name(d)).collect(),
         }
+    }
+
+    fn finding(declaration: Name, missing: Vec<Name>) -> MissingConstantFinding {
+        MissingConstantFinding {
+            declaration,
+            safety: DefinitionSafety::Unsafe,
+            missing,
+        }
+    }
+
+    /// The witness has exactly one job: distinguish the finding set it binds. A
+    /// `Name` is a structured path of anonymous, string, and numeric components, and
+    /// flattening it to its display form collapses distinct structures onto one
+    /// string — so the digest stopped being a discriminator.
+    ///
+    /// This is soundness-adjacent rather than cosmetic: a colliding witness lets a
+    /// cached or replayed result be attributed to the wrong closure, silently, with
+    /// no error anywhere. The pairs below are the three distinct ways the display
+    /// projection loses information, and every one of them collided before this was
+    /// fixed.
+    #[test]
+    fn the_witness_binds_name_structure_not_its_display_form() {
+        let dotted_component = Name::str(Name::anonymous(), "a.b");
+        let two_components = Name::str(Name::str(Name::anonymous(), "a"), "b");
+        let numeric = Name::num(Name::anonymous(), 1);
+        let numeric_lookalike = Name::str(Name::anonymous(), "1");
+
+        // Each pair is genuinely two different names that render identically.
+        for (left, right) in [
+            (&dotted_component, &two_components),
+            (&numeric, &numeric_lookalike),
+        ] {
+            assert_ne!(left, right, "the pair must be structurally distinct");
+            assert_eq!(
+                left.to_display_string(),
+                right.to_display_string(),
+                "the pair must be indistinguishable in display form, or it proves nothing"
+            );
+        }
+
+        // (1) ambiguity in the declaration position
+        assert_ne!(
+            witness_digest(&[finding(dotted_component.clone(), vec![])]),
+            witness_digest(&[finding(two_components.clone(), vec![])]),
+            "two distinct declarations share a witness"
+        );
+        // (2) ambiguity inside the missing list
+        let host = Name::str(Name::anonymous(), "D");
+        assert_ne!(
+            witness_digest(&[finding(host.clone(), vec![dotted_component])]),
+            witness_digest(&[finding(host.clone(), vec![two_components])]),
+            "two distinct missing-reference sets share a witness"
+        );
+        // (3) numeric vs string components — the case that occurs in real pin data,
+        // where Lean's private mangling puts a genuine `Num` component inside names
+        // like `_private.Init.Prelude.0.Lean.Name.hash._proof_1`.
+        assert_ne!(
+            witness_digest(&[finding(numeric.clone(), vec![])]),
+            witness_digest(&[finding(numeric_lookalike, vec![])]),
+            "a numeric component and its string lookalike share a witness"
+        );
+
+        // The separator itself must not be forgeable: a component containing the
+        // component separator may not imitate a deeper path.
+        let nested = Name::str(Name::str(Name::str(Name::anonymous(), "x"), "y"), "z");
+        let flat = Name::str(Name::anonymous(), "x.y.z");
+        assert_ne!(
+            witness_digest(&[finding(nested, vec![])]),
+            witness_digest(&[finding(flat, vec![])]),
+            "a dotted component forged a deeper path"
+        );
+
+        // Discrimination must not have been bought with instability: the witness is
+        // still a pure function of the finding set.
+        let stable = finding(numeric, vec![Name::str(Name::anonymous(), "M")]);
+        assert_eq!(
+            witness_digest(std::slice::from_ref(&stable)),
+            witness_digest(std::slice::from_ref(&stable)),
+            "the witness must stay deterministic"
+        );
     }
 
     fn resolver(present: &[&str]) -> impl Fn(&Name) -> bool {

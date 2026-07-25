@@ -333,7 +333,7 @@ for needle in (
     "unchecked={}",
     "artifact_incomplete=6",
     "artifact_incomplete_witness="
-    "d690ccada7f5151a88c1a06062328cf5b13f3f507074ccd489f59c576ebcc96a",
+    "c7fa135fc4f85a21488bfc2393cbe4f7fa81b13205dbf18023ced322b829e015",
     "nested_partial_blocks=0 nested_full_blocks=1",
 ):
     if needle not in line:

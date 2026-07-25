@@ -315,11 +315,13 @@ KERNEL_ADMISSION_CENSUS = {
 # implementation helpers whose private auxiliaries the pin's serializer
 # discarded. Each row is (declaration, safety, missing references) in
 # canonical order; the witness digest binds the exact finding set
-# (fln-env decl_closure, tag fln.artifact-incomplete-witness/1). These rows
+# (fln-env decl_closure, tag fln.artifact-incomplete-witness/2 — version 2
+# binds the structural Name rather than its display form, which was not
+# injective; bead franken_lean-f6br). These rows
 # are inconclusive-family outcomes: never checked, never cacheable, never
 # environment-admissible — and never folded into a success total.
 KERNEL_ADMISSION_ARTIFACT_WITNESS = (
-    "d690ccada7f5151a88c1a06062328cf5b13f3f507074ccd489f59c576ebcc96a"
+    "c7fa135fc4f85a21488bfc2393cbe4f7fa81b13205dbf18023ced322b829e015"
 )
 KERNEL_ADMISSION_ARTIFACT_ROWS = (
     (
