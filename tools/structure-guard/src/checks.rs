@@ -876,7 +876,7 @@ fn count_loc(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<usi
 /// wants that name, while `normalize_fixpoint` is the distinctive `fln-core`
 /// entry point and is refused.
 fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
-    const SEMANTIC: [(&str, &str); 11] = [
+    const SEMANTIC: [(&str, &str); 12] = [
         (
             "is_equiv",
             "universe equivalence is a judgment fln-kernel returns as its verdict (KR-303); \
@@ -919,6 +919,12 @@ fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &
         (
             "from_canonical_bytes",
             "the Canonical reader; fln-checker must bring its own decoder (gii)",
+        ),
+        (
+            "from_canonical_bytes_budgeted",
+            "the Canonical reader canon.rs itself steers callers to for untrusted input, \
+             so a checker author following the documentation would slip past a guard \
+             that named only the unbudgeted entry point",
         ),
         (
             "fln_bignum",

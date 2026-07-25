@@ -1136,7 +1136,7 @@ fn missing_census_fails_closed_when_status_exists() {
 /// passing is an unenforced claim, which is the failure class this suite exists
 /// to prevent — so every entry in the semantic inventory is planted here and
 /// asserted to fire.
-const CHECKER_SEMANTIC_INVENTORY: [&str; 11] = [
+const CHECKER_SEMANTIC_INVENTORY: [&str; 12] = [
     "is_equiv",
     "normalize_fixpoint",
     "loose_bvar_range",
@@ -1147,6 +1147,7 @@ const CHECKER_SEMANTIC_INVENTORY: [&str; 11] = [
     "approx_depth",
     "read_body",
     "from_canonical_bytes",
+    "from_canonical_bytes_budgeted",
     "fln_bignum",
 ];
 
