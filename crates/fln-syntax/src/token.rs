@@ -55,6 +55,7 @@
 //! forbidding its own leading token to stop left recursion), not of the lexer, and modelling
 //! it here would put parser state in the wrong layer.
 
+use crate::literal::{self, LiteralError, LiteralKind};
 use crate::source::{BytePos, ByteSpan, SourceText};
 use fln_core::name::Name;
 use std::collections::BTreeMap;
@@ -158,6 +159,8 @@ pub enum TokenKind {
     Symbol(Token),
     /// An identifier, with the structural `Name` its parts spell.
     Ident(Name),
+    /// A literal. The form is [`crate::literal`]'s business; the table decides nothing here.
+    Literal(LiteralKind),
 }
 
 /// One lexed token: what it is and the bytes it occupies (view coordinates).
@@ -177,10 +180,10 @@ pub enum TokenError {
     NotAToken { at: BytePos },
     /// A `«` with no `»`. Upstream's message, verbatim.
     UnterminatedIdentifierEscape { at: BytePos },
-    /// A literal opener this slice does not lex yet. Typed rather than guessed: reporting
-    /// "not a token" would be a lie about the input, and falling through to the symbol path
-    /// would classify `"abc"` as whatever the table says about `"`.
-    LiteralNotYetLexed { at: BytePos, opener: char },
+    /// A literal opener was found but the literal is malformed. Wrapped rather than
+    /// flattened: a literal's refusals are about the literal's own grammar, and collapsing
+    /// them into "not a token" would throw away the position and the message the user needs.
+    Literal(LiteralError),
 }
 
 impl TokenError {
@@ -190,7 +193,7 @@ impl TokenError {
             TokenError::EndOfInput { .. } => "unexpected end of input",
             TokenError::NotAToken { .. } => "token",
             TokenError::UnterminatedIdentifierEscape { .. } => "unterminated identifier escape",
-            TokenError::LiteralNotYetLexed { .. } => "literal lexing is not implemented yet",
+            TokenError::Literal(error) => error.message(),
         }
     }
 
@@ -198,8 +201,8 @@ impl TokenError {
         match self {
             TokenError::EndOfInput { at }
             | TokenError::NotAToken { at }
-            | TokenError::UnterminatedIdentifierEscape { at }
-            | TokenError::LiteralNotYetLexed { at, .. } => *at,
+            | TokenError::UnterminatedIdentifierEscape { at } => *at,
+            TokenError::Literal(error) => error.at(),
         }
     }
 }
@@ -275,28 +278,15 @@ pub fn lex_token(
     if from.0 >= s.len() {
         return Err(TokenError::EndOfInput { at: from });
     }
-    let first = char_at(s, from.0);
-
-    // Literal openers, in the pin's own order, so that when the literal slice lands it
-    // slots into this dispatch rather than replacing it.
-    if first == '"' || (first == '\'' && char_after(s, from.0) != Some('\'')) {
-        return Err(TokenError::LiteralNotYetLexed {
-            at: from,
-            opener: first,
-        });
-    }
-    if first.is_ascii_digit() {
-        return Err(TokenError::LiteralNotYetLexed {
-            at: from,
-            opener: first,
-        });
-    }
-    if first == '`' && char_after(s, from.0).is_some_and(|c| is_id_first(c) || c == ID_BEGIN_ESCAPE)
-    {
-        return Err(TokenError::LiteralNotYetLexed {
-            at: from,
-            opener: first,
-        });
+    // Literal openers first, in the pin's own order (`tokenFnAux`). The table is not
+    // consulted for them at all: a `"` is a string opener whatever the table says about `"`.
+    if literal::starts_literal(text, from) {
+        return literal::lex_literal(text, from)
+            .map(|lexed| LexedToken {
+                kind: TokenKind::Literal(lexed.kind),
+                extent: lexed.extent,
+            })
+            .map_err(TokenError::Literal);
     }
 
     // Step 1: the trie's longest match, kept aside and NOT acted on yet.
@@ -325,6 +315,14 @@ pub fn lex_token(
         // Neither an identifier nor a table token: upstream `mkErrorAt "token"`.
         (None, None) => Err(TokenError::NotAToken { at: from }),
     }
+}
+
+/// The extent of an identifier starting at `from`, or `Ok(None)` if none does.
+///
+/// Exposed for [`crate::literal`]'s name literals: `` `foo `` has to spell exactly the name
+/// that `foo` would spell as an identifier, and a second scanner is a second thing to drift.
+pub fn scan_ident_extent(s: &str, from: BytePos) -> Result<Option<BytePos>, TokenError> {
+    Ok(scan_ident(s, from)?.map(|id| id.stop))
 }
 
 /// An identifier scan's result: the name its parts spell, and where it stopped.
@@ -462,6 +460,10 @@ mod tests {
                 kind: TokenKind::Symbol(token),
                 ..
             }) => format!("symbol {token}"),
+            Ok(LexedToken {
+                kind: TokenKind::Literal(kind),
+                ..
+            }) => format!("literal {kind:?}"),
             Err(error) => format!("error {error:?}"),
         }
     }
@@ -605,14 +607,17 @@ mod tests {
         );
         // A byte that is neither an identifier start nor in the table.
         assert_eq!(lex("#"), Err(TokenError::NotAToken { at: BytePos(0) }));
-        assert!(matches!(
-            lex("\"abc\""),
-            Err(TokenError::LiteralNotYetLexed { opener: '"', .. })
-        ));
-        assert!(matches!(
-            lex("42"),
-            Err(TokenError::LiteralNotYetLexed { opener: '4', .. })
-        ));
+        // Literals reach the literal grammar rather than the table, and their refusals keep
+        // their own message and position.
+        assert_eq!(classify("\"abc\""), "literal Str");
+        assert_eq!(classify("42"), "literal Nat");
+        assert_eq!(classify("'a'"), "literal Char");
+        assert_eq!(classify("`foo"), "literal Name");
+        assert_eq!(classify("1.5"), "literal Scientific");
+        assert!(
+            matches!(lex("\"abc"), Err(TokenError::Literal(_))),
+            "an unterminated string is a literal refusal, not a token refusal"
+        );
     }
 
     /// An empty table is a real configuration (no imports yet), and every identifier must
