@@ -19,6 +19,9 @@
 //! * [`naming`] — the suite-wide subsystem-name registry (`ci/SUBSYSTEM_REGISTRY.txt`)
 //!   and the current-vocabulary scanner (bead fln-7gr6): reserved codenames cannot
 //!   silently re-enter governed prose, contracts, schemas, or mutable bead fields;
+//! * [`pin`] — locating the pinned Reference from `SUITE.lock`, once: a rig that
+//!   hard-codes a toolchain path can consult a Reference this epoch is not defined
+//!   against, and the run looks exactly as green;
 //! * [`normalize`] — comparison classes as versioned normalizer code: a normalizer
 //!   may strip only declared-nonsemantic fields and can never discard an error body
 //!   to pass;
@@ -39,6 +42,7 @@ pub mod ledger;
 pub mod naming;
 pub mod normalize;
 pub mod ownership;
+pub mod pin;
 #[cfg(feature = "oracle-fallback-dev")]
 pub mod poison;
 pub mod precedence;

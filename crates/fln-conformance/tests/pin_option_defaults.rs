@@ -37,9 +37,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use fln_conformance::pin;
 use fln_core::options::limits;
 
 /// What `fln-core` claims, and the exact ledger row each claim backs.
@@ -84,43 +84,6 @@ run_cmd do
     logInfo m!"OPTION|{name}|{decl.defValue}"
   logInfo m!"TABLE_SIZE|{n}"
 "#;
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .expect("workspace root is two levels above the crate manifest")
-}
-
-/// The Reference tag, read from `SUITE.lock` rather than hard-coded.
-///
-/// A hard-coded toolchain path can silently probe a toolchain the lock does not pin, and
-/// the answer would look exactly as green. The lock is the single pin ceremony (D15), so
-/// it is what this asks.
-fn pinned_tag() -> Option<String> {
-    let lock = std::fs::read_to_string(workspace_root().join("SUITE.lock")).ok()?;
-    lock.lines()
-        .find(|line| line.starts_with("reference leanprover/lean4 "))?
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("tag=").map(str::to_string))
-}
-
-/// Locate the pinned `lean`. `FLN_REFERENCE_BIN` overrides; the elan layout is the default.
-/// Absent toolchain is a typed skip, never a silent pass.
-fn pinned_lean() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("FLN_REFERENCE_BIN") {
-        let p = PathBuf::from(path);
-        return p.is_file().then_some(p);
-    }
-    let home = std::env::var("HOME").ok()?;
-    let tag = pinned_tag()?;
-    let p = PathBuf::from(home)
-        .join(".elan/toolchains")
-        .join(format!("leanprover--lean4---{tag}"))
-        .join("bin/lean");
-    p.is_file().then_some(p)
-}
 
 /// Parse `OPTION|<name>|<default>` out of whatever else the binary prints.
 ///
@@ -172,15 +135,8 @@ fn divergences(claimed: &[(&str, u64)], table: &BTreeMap<String, String>) -> Vec
 
 #[test]
 fn every_option_default_fln_core_claims_is_the_one_the_pinned_binary_reports() {
-    let Some(lean) = pinned_lean() else {
-        eprintln!(
-            "SKIP pin_option_defaults: pinned Reference toolchain not found (tag {:?}). \
-             Install with `elan toolchain install leanprover/lean4:{}` or set \
-             FLN_REFERENCE_BIN. This is a typed skip: nothing about the option defaults is \
-             established by this run.",
-            pinned_tag(),
-            pinned_tag().unwrap_or_else(|| "<unreadable SUITE.lock>".into())
-        );
+    let Some(lean) = pin::pinned_lean() else {
+        eprintln!("{}", pin::skip_notice("pin_option_defaults"));
         return;
     };
 
@@ -324,7 +280,7 @@ fn the_parse_is_anchored_on_the_marker_not_on_the_line_shape() {
 /// nobody pinned would be green against the wrong oracle.
 #[test]
 fn the_probed_toolchain_is_the_one_suite_lock_pins() {
-    let tag = pinned_tag().expect("SUITE.lock names a reference tag");
+    let tag = pin::pinned_tag().expect("SUITE.lock names a reference tag");
     assert!(
         tag.starts_with('v'),
         "the reference tag should look like a version: {tag:?}"
@@ -333,7 +289,7 @@ fn the_probed_toolchain_is_the_one_suite_lock_pins() {
         eprintln!("pin_option_defaults: FLN_REFERENCE_BIN overrides the elan layout ({explicit})");
         return;
     }
-    if let Some(path) = pinned_lean() {
+    if let Some(path) = pin::pinned_lean() {
         let rendered = path.to_string_lossy().into_owned();
         assert!(
             rendered.contains(&tag),
