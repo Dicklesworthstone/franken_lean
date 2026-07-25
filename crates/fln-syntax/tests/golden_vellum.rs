@@ -1,5 +1,10 @@
 //! Byte-exact goldens for Vellum's green trees and token streams (bead pending; plan §9).
 //!
+//! How this suite composes with the other Vellum test mechanisms — and the measured gap
+//! between them — is written up in `crates/fln-syntax/TESTING_COMPOSITION.md`. Read it before
+//! adding a suite here: the two mechanisms do NOT back each other up in the direction one
+//! would assume, and their blind spots overlap.
+//!
 //! ## No update mode, by construction
 //!
 //! These tests **never write** the corpus or its provenance. There is no `UPDATE_GOLDENS`

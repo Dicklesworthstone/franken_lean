@@ -1,5 +1,10 @@
 //! Metamorphic laws for Vellum (plan §18 "Metamorphic laws"; bead pending).
 //!
+//! How this suite composes with the other Vellum test mechanisms — and the measured gap
+//! between them — is written up in `crates/fln-syntax/TESTING_COMPOSITION.md`. Read it before
+//! adding a suite here: the two mechanisms do NOT back each other up in the direction one
+//! would assume, and their blind spots overlap.
+//!
 //! ## What these establish, and what they do not
 //!
 //! **These are self-differentials.** Every law compares my parser to my parser under a
