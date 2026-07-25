@@ -79,6 +79,15 @@ pub enum DeclarationDimension {
     MutualRows,
     ConstructorRows,
     RecursorRules,
+    /// Bytes the canonical `Domain::DeclContent` encoder emits.
+    ///
+    /// Reported through `StructuralUnit::InputBytes` rather than a fourth D8 unit,
+    /// because a caller reacts to a byte bound the same way it reacts to a row bound —
+    /// by shrinking the declaration — and that reaction, not the number, is the
+    /// taxonomy's stated bar for a new unit. Which side of the codec the bytes are on is
+    /// the finer fact, and it lives here, exactly as the four row families' finer facts
+    /// do.
+    CanonicalBytes,
 }
 
 /// Frozen cancellation observation points for declaration preflight.
@@ -328,11 +337,15 @@ impl DeclarationDimension {
     /// Schedule-independent by construction — the scan is a fixed sequence over an
     /// immutable value, so two threads preflighting the same declaration report the
     /// same primary dimension.
-    const ORDER: [DeclarationDimension; 4] = [
+    const ORDER: [DeclarationDimension; 5] = [
         DeclarationDimension::LevelParams,
         DeclarationDimension::MutualRows,
         DeclarationDimension::ConstructorRows,
         DeclarationDimension::RecursorRules,
+        // Last, because it is the only dimension whose exact value is not known until
+        // the encoder has run. The frozen order is still what selects the primary reason,
+        // so a declaration over both rows and bytes reports the cheap dimension.
+        DeclarationDimension::CanonicalBytes,
     ];
 
     const fn as_str(self) -> &'static str {
@@ -341,6 +354,21 @@ impl DeclarationDimension {
             DeclarationDimension::MutualRows => "mutual_rows",
             DeclarationDimension::ConstructorRows => "constructor_rows",
             DeclarationDimension::RecursorRules => "recursor_rules",
+            DeclarationDimension::CanonicalBytes => "canonical_bytes",
+        }
+    }
+
+    /// The D8 unit a refusal on this dimension reports.
+    const fn unit(self) -> StructuralUnit {
+        match self {
+            DeclarationDimension::LevelParams
+            | DeclarationDimension::MutualRows
+            | DeclarationDimension::ConstructorRows
+            | DeclarationDimension::RecursorRules => StructuralUnit::ProducedNodes,
+            // The byte-shaped unit. Its documented wording says "consumed", which is the
+            // one wart; the dimension name in `progress` carries the side, and widening
+            // that wording is fln-core's call and is not needed for this to be truthful.
+            DeclarationDimension::CanonicalBytes => StructuralUnit::InputBytes,
         }
     }
 }
@@ -354,16 +382,9 @@ impl DeclarationDimension {
 ///
 /// # What this deliberately does not yet claim
 ///
-/// `franken_lean-j8h` also names canonical output bytes, expression node counts, and
-/// maximum logical depth. None of the three is reported here, and approximating them
-/// would be worse than omitting them:
+/// `franken_lean-j8h` also names maximum logical depth, which is not reported here.
+/// Approximating it would be worse than omitting it:
 ///
-/// * **Canonical bytes** cannot be bounded from this crate at all. `CanonWriter` is a
-///   bare `Vec<u8>` with no length accessor, and `Canonical::write_body` takes it
-///   concretely, so a budgeted sink cannot be substituted from here — while
-///   `CanonReader` in the same file already has `with_budget`, `charge_node` and
-///   `Exhausted`. Reporting a modeled byte count as if it were measured is exactly
-///   the untruthful work fact this bead exists to remove.
 /// * **Expression nodes and expanded weight** are already measured, bounded and
 ///   cancellable by [`crate::terms::expanded_weight`]; folding them in is the next
 ///   slice, and doing it here would have meant one commit spanning two traversals.
@@ -381,6 +402,9 @@ pub struct DeclarationUsage {
     pub constructor_rows: u64,
     /// Recursor rule rows.
     pub recursor_rules: u64,
+    /// Bytes the canonical encoder emits for this declaration. Exact, because it is the
+    /// length of the one stream the digest is taken over rather than a model of it.
+    pub canonical_bytes: u64,
     /// Expressions measured: the signature type, a body if the variant has one, and
     /// one per recursor rule.
     pub expressions: u64,
@@ -400,6 +424,7 @@ impl DeclarationUsage {
             DeclarationDimension::MutualRows => self.mutual_rows,
             DeclarationDimension::ConstructorRows => self.constructor_rows,
             DeclarationDimension::RecursorRules => self.recursor_rules,
+            DeclarationDimension::CanonicalBytes => self.canonical_bytes,
         }
     }
 }
@@ -415,6 +440,8 @@ pub struct DeclarationBudget {
     pub max_mutual_rows: u64,
     pub max_constructor_rows: u64,
     pub max_recursor_rules: u64,
+    /// Bytes the canonical encoder may emit for this declaration.
+    pub max_canonical_bytes: u64,
     /// Distinct expression nodes across **the whole declaration**, not per expression.
     pub max_expr_nodes: u64,
     /// Denoted tree size across the whole declaration.
@@ -427,6 +454,7 @@ impl DeclarationBudget {
         max_mutual_rows: u64::MAX,
         max_constructor_rows: u64::MAX,
         max_recursor_rules: u64::MAX,
+        max_canonical_bytes: u64::MAX,
         max_expr_nodes: u64::MAX,
         max_expanded_weight: u64::MAX,
     };
@@ -437,6 +465,7 @@ impl DeclarationBudget {
             DeclarationDimension::MutualRows => self.max_mutual_rows,
             DeclarationDimension::ConstructorRows => self.max_constructor_rows,
             DeclarationDimension::RecursorRules => self.max_recursor_rules,
+            DeclarationDimension::CanonicalBytes => self.max_canonical_bytes,
         }
     }
 }
@@ -486,6 +515,12 @@ pub fn preflight_declaration_rows(
             ConstantInfo::Rec(v) => usize_to_u64(v.rules.len()),
             _ => 0,
         },
+        // Exact, and computed here rather than modelled: the encoder is run once and its
+        // stream length taken. It is the length of the SAME bytes the digest is over, so
+        // the fact cannot describe a different encoding. Running it costs one pass over a
+        // declaration whose structure the row families have not yet bounded, which is why
+        // the byte dimension is checked LAST in the frozen order — see `ORDER`.
+        canonical_bytes: usize_to_u64(Environment::decl_content_bytes(info).len()),
         expressions: 0,
         expr_nodes: 0,
         expanded_weight: 0,
@@ -497,8 +532,11 @@ pub fn preflight_declaration_rows(
         if observed > allowed {
             return Outcome::Inconclusive(
                 Inconclusive::resource(ResourceUsage {
+                    // Per dimension, not hardcoded: the row families are ProducedNodes and
+                    // canonical bytes is InputBytes. Hardcoding one unit would have made
+                    // the taxonomy decision true in the docs and false in the refusal.
                     reason: ResourceReason::StructuralBudget {
-                        unit: StructuralUnit::ProducedNodes,
+                        unit: dimension.unit(),
                     },
                     allowed,
                     // A stop must report spending past its allowance or it is not a
@@ -535,12 +573,16 @@ pub fn preflight_declaration_rows(
 ///
 /// # What is still missing, and it is named rather than approximated
 ///
-/// Canonical output bytes remain unreported: [`CanonWriter`] exposes no length and
-/// [`Canonical::write_body`] takes it concretely, so this crate cannot bound or even
-/// observe the encoded size without buffering the whole thing first — which is the
-/// defect, not the fix. Maximum logical depth is likewise unreported;
-/// [`crate::terms::WeightReport`] does not carry it today, and the iterative traversal
-/// already discharges depth's *safety* role even though the fact is unavailable.
+/// Maximum logical depth remains unreported: [`crate::terms::WeightReport`] does not
+/// carry it today, and the iterative traversal already discharges depth's *safety* role
+/// even though the fact is unavailable.
+///
+/// Canonical bytes ARE now reported, and exactly rather than modelled — the encoder runs
+/// once and its stream length is taken, so the fact describes the same bytes the digest is
+/// over. The cost is that the byte dimension is the one whose exact value is not known
+/// until the encoder has run, which is why it sits LAST in
+/// [`DeclarationDimension::ORDER`]: a declaration over both rows and bytes reports the
+/// cheap dimension, and the expensive one is only consulted when the cheap ones passed.
 pub fn preflight_declaration(
     info: &ConstantInfo,
     budget: DeclarationBudget,
@@ -1096,6 +1138,15 @@ impl Environment {
     /// is the codec's business; this digest is FrankenLean's own identity.
     #[forbid(clippy::as_conversions)]
     pub fn decl_content_digest(info: &ConstantInfo) -> Digest {
+        hash(Domain::DeclContent, &Environment::decl_content_bytes(info))
+    }
+
+    /// The canonical `Domain::DeclContent` byte stream for one constant.
+    ///
+    /// One encoder, so the digest and the canonical-byte usage fact cannot diverge — a
+    /// measured byte count taken from a second implementation would be a fact about the
+    /// wrong bytes (bead `franken_lean-j8h`).
+    fn decl_content_bytes(info: &ConstantInfo) -> Vec<u8> {
         let mut w = CanonWriter::new();
         w.str(info.kind_name());
         info.name().write_body(&mut w);
@@ -1171,7 +1222,7 @@ impl Environment {
                 write_mutual_membership(&mut w, &v.all);
             }
         }
-        hash(Domain::DeclContent, &w.into_bytes())
+        w.into_bytes()
     }
 
     /// The logical root of this commit: declarations + extension deltas + options —
@@ -3916,11 +3967,95 @@ mod tests {
         }
     }
 
+    /// The canonical-byte fact is the length of the bytes the DIGEST is over.
+    ///
+    /// One encoder, so the fact and the identity cannot describe different streams. This
+    /// asserts that directly against every all-bearing variant rather than trusting the
+    /// refactor — a byte count taken from a second implementation would be a fact about
+    /// the wrong bytes, which is the failure mode the shared encoder exists to remove.
+    #[test]
+    fn the_canonical_byte_fact_measures_the_stream_the_digest_is_taken_over() {
+        for kind in AllBearingKind::ALL {
+            let info = all_bearing_decl(kind, vec![n("a"), n("b")]);
+            let bytes = Environment::decl_content_bytes(&info);
+            assert_eq!(
+                row_usage(&info).canonical_bytes,
+                usize_to_u64(bytes.len()),
+                "the reported byte count must be the encoder's own length ({})",
+                kind.label()
+            );
+            // And those bytes are the digest's preimage, not a parallel encoding.
+            assert_eq!(
+                hash(Domain::DeclContent, &bytes),
+                Environment::decl_content_digest(&info),
+                "the measured bytes must be the digest's preimage ({})",
+                kind.label()
+            );
+        }
+
+        // A larger declaration reports more bytes: the fact tracks the input rather than
+        // being a constant that happens to match.
+        let small = all_bearing_decl(AllBearingKind::Definition, vec![n("a")]);
+        let large = all_bearing_decl(
+            AllBearingKind::Definition,
+            (0..16).map(|i| n(&format!("m{i}"))).collect(),
+        );
+        assert!(
+            row_usage(&large).canonical_bytes > row_usage(&small).canonical_bytes,
+            "more membership rows must encode to more bytes"
+        );
+
+        // The unit a byte refusal reports, pinned so the decision is visible in a test and
+        // not only in a doc comment.
+        assert_eq!(
+            DeclarationDimension::CanonicalBytes.unit(),
+            StructuralUnit::InputBytes
+        );
+        for dimension in [
+            DeclarationDimension::LevelParams,
+            DeclarationDimension::MutualRows,
+            DeclarationDimension::ConstructorRows,
+            DeclarationDimension::RecursorRules,
+        ] {
+            assert_eq!(
+                dimension.unit(),
+                StructuralUnit::ProducedNodes,
+                "the row families stay on ProducedNodes ({})",
+                dimension.as_str()
+            );
+        }
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.declaration-canonical-bytes\",\"version\":1,\
+             \"bead\":\"franken_lean-j8h\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"canonical-bytes-exact-not-modelled\",\
+             \"measurement\":\"length_of_the_digest_preimage\",\
+             \"modelled\":false,\"shared_encoder\":true,\
+             \"unit\":\"input_bytes\",\"new_structural_unit_added\":false,\
+             \"decision\":\"no_fourth_d8_unit\",\
+             \"decision_reason\":\"a caller reacts to a byte bound the same way it reacts \
+             to a row bound, so the taxonomy's bar for a new unit is not met\",\
+             \"finer_fact_home\":\"declaration_dimension_on_the_report\",\
+             \"order_position\":\"last\",\"status\":\"pass\"}}"
+        );
+    }
+
     /// Exact admits, one-over refuses, per dimension.
     #[test]
     fn declaration_row_preflight_admits_at_exact_and_refuses_one_over() {
         let members = vec![n("d"), n("peer"), n("third")];
-        let cases: [(DeclarationDimension, ConstantInfo, u64); 3] = [
+        // The canonical-bytes case takes its exact value from the encoder itself rather
+        // than a literal, because a hardcoded byte count would pin the encoding here as
+        // well as in the goldens and the two would drift apart independently.
+        let bytes_fixture = all_bearing_decl(AllBearingKind::Theorem, members.clone());
+        let exact_bytes = row_usage(&bytes_fixture).canonical_bytes;
+        assert!(exact_bytes > 0, "the fixture must encode to something");
+        let cases: [(DeclarationDimension, ConstantInfo, u64); 4] = [
+            (
+                DeclarationDimension::CanonicalBytes,
+                bytes_fixture,
+                exact_bytes,
+            ),
             (
                 DeclarationDimension::MutualRows,
                 all_bearing_decl(AllBearingKind::Definition, members.clone()),
@@ -3951,6 +4086,10 @@ mod tests {
                     max_recursor_rules: exact,
                     ..DeclarationBudget::UNBOUNDED
                 },
+                DeclarationDimension::CanonicalBytes => DeclarationBudget {
+                    max_canonical_bytes: exact,
+                    ..DeclarationBudget::UNBOUNDED
+                },
                 DeclarationDimension::LevelParams => unreachable!(),
             };
             assert!(
@@ -3975,6 +4114,10 @@ mod tests {
                     max_recursor_rules: exact - 1,
                     ..DeclarationBudget::UNBOUNDED
                 },
+                DeclarationDimension::CanonicalBytes => DeclarationBudget {
+                    max_canonical_bytes: exact - 1,
+                    ..DeclarationBudget::UNBOUNDED
+                },
                 DeclarationDimension::LevelParams => unreachable!(),
             };
             let refused = preflight_declaration_rows(&info, one_under);
@@ -3990,10 +4133,13 @@ mod tests {
                 "a stop that did not report spending past its allowance is not a stop"
             );
             assert!(usage.is_genuine_exhaustion());
+            // The reported unit is the DIMENSION's unit, so a byte refusal says
+            // InputBytes and a row refusal says ProducedNodes. Asserting the dimension's
+            // own answer rather than a constant is what makes this catch a hardcoded unit.
             assert_eq!(
                 usage.reason,
                 ResourceReason::StructuralBudget {
-                    unit: StructuralUnit::ProducedNodes
+                    unit: dimension.unit()
                 }
             );
             assert_eq!(
@@ -4067,6 +4213,7 @@ mod tests {
                 DeclarationDimension::MutualRows,
                 DeclarationDimension::ConstructorRows,
                 DeclarationDimension::RecursorRules,
+                DeclarationDimension::CanonicalBytes,
             ],
             "the reported-reason order is frozen; changing it changes which reason \
              callers see for the same declaration"
