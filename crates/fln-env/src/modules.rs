@@ -2170,6 +2170,153 @@ mod tests {
         );
     }
 
+    /// Item 8: one strict schema-versioned SEMANTIC row per admission outcome, with
+    /// telemetry excluded by construction rather than by discipline.
+    ///
+    /// The bead requires timing, host and scheduler telemetry to be excluded from
+    /// semantic comparison or emitted in a separate bounded non-authoritative stream
+    /// referenced by digest. This takes the first option, and the test proves the
+    /// exclusion instead of promising it: the row is emitted twice for the same input and
+    /// the two must be byte-identical. A row carrying a duration, a hostname or a thread
+    /// id could not pass that, so the property is enforced by the assertion rather than by
+    /// remembering not to add one.
+    #[test]
+    fn semantic_evidence_rows_are_reproducible_and_carry_no_telemetry() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let cyclic = insert(&base, record("C", vec![direct("D", 0b001)], 0xC1));
+        let deep_name = ModuleId::new(Name::from_components(std::iter::repeat_n(
+            "deep",
+            TEST_LIMITS.max_name_depth + 2,
+        )));
+
+        let cases: Vec<(&str, ModuleGraph, ModuleRecord)> = vec![
+            (
+                "admitted",
+                base.clone(),
+                record("B", vec![direct("A", 0b101)], 0xB1),
+            ),
+            ("idempotent", base.clone(), record("A", vec![], 0xA1)),
+            // A self-import is MALFORMED, and malformed precedes conflict — so this case
+            // exercises the malformed rule, not the conflict rule. Labelled for what it
+            // actually reaches: a case named for a rule it never hits makes the matrix
+            // look more complete than it is.
+            (
+                "self_import_malformed",
+                base.clone(),
+                record("A", vec![direct("A", 0b001)], 0xA2),
+            ),
+            // A genuine conflict: same identity, non-identical artifact, nothing malformed.
+            ("conflict", base.clone(), record("A", vec![], 0xA2)),
+            (
+                "name_depth",
+                base.clone(),
+                ModuleRecord::new(deep_name, true, vec![], evidence(0xD9)),
+            ),
+            ("cycle", cyclic, record("D", vec![direct("C", 0b001)], 0xD1)),
+        ];
+
+        let row = |label: &str, graph: &ModuleGraph, candidate: &ModuleRecord| -> String {
+            let plan = graph.plan_registration(candidate);
+            let usage = plan.usage();
+            let charges = plan.charges();
+            let mut cumulative: Vec<String> = Vec::new();
+            for unit in UsageUnit::ALL {
+                cumulative.push(format!(
+                    "{{\"unit\":\"{}\",\"total\":{},\"exact_at\":\"{:?}\"}}",
+                    unit.label(),
+                    usage.get(unit),
+                    unit.observed_at()
+                ));
+            }
+            let mut flags: Vec<String> = Vec::new();
+            for import in candidate.direct_imports() {
+                // All three flags of every row, in row order — the "exact ordered rows
+                // and flags" the bead names. Collapsing any of the eight triples is one
+                // of its mutants, so the row must carry each flag independently.
+                flags.push(format!(
+                    "{{\"module\":\"{}\",\"import_all\":{},\"exported\":{},\"meta\":{}}}",
+                    import.module.name().to_display_string(),
+                    import.import_all,
+                    import.is_exported,
+                    import.is_meta
+                ));
+            }
+            format!(
+                "{{\"schema\":\"fln.semantic.module-admission\",\"version\":1,\
+                 \"bead\":\"franken_lean-6sf3\",\"case\":\"{label}\",\
+                 \"plan_schema\":{},\"usage_schema\":{},\
+                 \"base_epoch_tag\":\"{}\",\"base_revision\":{},\
+                 \"request\":\"{}\",\
+                 \"precedence\":\"{:?}\",\"precedence_rank\":{},\
+                 \"checkpoint\":\"{:?}\",\"publishes\":{},\
+                 \"authoritative\":{},\"cacheable\":{},\
+                 \"reservation\":\"{}\",\"pmap_charge\":\"{}\",\"decoder_charge\":\"{}\",\
+                 \"direct_rows\":[{}],\"cumulative_usage\":[{}],\
+                 \"telemetry_excluded\":true,\"status\":\"recorded\"}}",
+                plan.version(),
+                plan.usage_version(),
+                graph.binding().epoch.tag(),
+                graph.binding().revision,
+                candidate.id.name().to_display_string(),
+                plan.precedence(),
+                plan.precedence().rank(),
+                plan.checkpoint(),
+                plan.publishes(),
+                plan.precedence() == AdmissionPrecedence::Admitted
+                    || plan.precedence() == AdmissionPrecedence::ExistingRecordIdempotent,
+                plan.publishes(),
+                match plan.reservation() {
+                    ReservationClaim::Unsupported { .. } => "unsupported",
+                    ReservationClaim::NotRequired => "not_required",
+                    ReservationClaim::Reserved { .. } => "reserved",
+                },
+                match charges.pmap_admission {
+                    ChargeOwnership::Uncharged { .. } => "uncharged",
+                    ChargeOwnership::OwnedElsewhere { .. } => "owned_elsewhere",
+                    ChargeOwnership::ChargedOnceAtPlanTime => "charged_once",
+                },
+                match charges.decoder {
+                    ChargeOwnership::OwnedElsewhere { owner } => owner,
+                    ChargeOwnership::Uncharged { .. } => "uncharged",
+                    ChargeOwnership::ChargedOnceAtPlanTime => "charged_once",
+                },
+                flags.join(","),
+                cumulative.join(",")
+            )
+        };
+
+        let mut seen: HashSet<String> = HashSet::new();
+        for (label, graph, candidate) in &cases {
+            let first = row(label, graph, candidate);
+            let second = row(label, graph, candidate);
+            // Reproducible byte for byte. A duration, hostname or thread id could not
+            // survive this, which is how the telemetry exclusion is ENFORCED rather than
+            // promised.
+            assert_eq!(
+                first, second,
+                "the semantic row for {label} is not reproducible, so it carries \
+                 something that is not semantic"
+            );
+            assert!(
+                !first.contains("elapsed")
+                    && !first.contains("duration")
+                    && !first.contains("host")
+                    && !first.contains("thread"),
+                "a semantic row must not name a telemetry field: {first}"
+            );
+            assert!(
+                seen.insert(first.clone()),
+                "two different cases produced the same semantic row ({label})"
+            );
+            println!("{first}");
+        }
+        assert_eq!(
+            seen.len(),
+            cases.len(),
+            "every case must be distinguishable"
+        );
+    }
+
     /// Item 7's remaining named mutants, each killed on its own typed signal.
     ///
     /// The six already killed by earlier work are not repeated. These are the ones this
