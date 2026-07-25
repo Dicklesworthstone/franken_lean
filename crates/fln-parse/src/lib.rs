@@ -5,5 +5,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod category;
 pub mod pratt;
 pub mod state;
