@@ -32,6 +32,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod normalize;
+pub mod oracle;
+
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 use std::path::{Path, PathBuf};
 
