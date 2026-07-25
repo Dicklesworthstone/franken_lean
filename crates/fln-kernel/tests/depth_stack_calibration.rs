@@ -568,8 +568,280 @@ fn undersized_stack_still_aborts_and_the_derived_budget_prevents_it() {
 }
 
 impl Shape {
-    /// The shape used by the reproduction witness: the deepest-per-level
-    /// descent measured by `calibrate_stack_bytes_per_depth`, i.e. the one
-    /// that overflows first.
-    const WITNESS: Shape = Shape::DefEqBinder;
+    /// The shape used by the reproduction witness and by the tripwire's planted
+    /// violations: the WORST per-level descent in
+    /// `calibrate_stack_bytes_per_depth`'s table, i.e. the one that overflows
+    /// first.
+    ///
+    /// Corrected under bead `fln-kx3y`. This named `DefEqBinder` and described
+    /// it as the deepest-per-level descent, which the measurement contradicts:
+    /// defeq binder congruence uses two kernel frames per level and is
+    /// nonetheless the CHEAPEST of the four at 4,507 bytes/depth against 5,935
+    /// for the three inference descents, so it overflows LAST. The witness
+    /// still fired, because `Budget::DEFAULT` on 2 MiB overflows on any shape —
+    /// which is exactly why nobody noticed. A witness that passes for a reason
+    /// other than the one stated beside it is the same defect class this bead
+    /// is about, one level down.
+    const WITNESS: Shape = Shape::ForallInfer;
+}
+
+// ---------------------------------------------------------------------------
+// The tripwire: the shipped calibration cannot go stale silently (bead
+// `fln-kx3y`)
+// ---------------------------------------------------------------------------
+//
+// WHY THE GUARDS ABOVE DO NOT COVER THIS. They prove SURVIVAL AT THE SHIPPED
+// PAIRING — `Budget::DEFAULT` returns a typed non-answer on a 64 MiB thread,
+// `for_stack_bytes(2 MiB)` does the same on 2 MiB. That is a different claim
+// from "the shipped number still describes this descent". They pass unchanged
+// while the true per-level cost drifts upward, because `STACK_SAFETY_FACTOR`
+// is 2 and `MIN_STACK_BYTES` was rounded up on top of that: there is roughly
+// 3x of headroom in which `MEASURED_STACK_BYTES_PER_DEPTH` can be fiction and
+// every test still passes. And when the headroom finally runs out the guard
+// does not fail — it aborts the test binary uncatchably.
+//
+// THE DRIFT IS NOT HYPOTHETICAL. Two observations on 2026-07-25, both recorded
+// on `franken_lean-kxbj`'s judgement row: the same instrument read 5,935.3
+// bytes/depth on the development host and 6,553.6 on an RCH remote worker at
+// the identical (profile, arch, os); and widening `Budget` for
+// `franken_lean-4o3n` cost two of the four shapes one level of ceiling. Neither
+// was caught by anything. Both were caught because a human re-ran an
+// `#[ignore]`d test on a hunch.
+//
+// SO THE SAFETY FACTOR IS TURNED FROM A SILENT ABSORBER OF DRIFT INTO A MARGIN
+// WITH A TRIPWIRE IN IT, which is what a margin is supposed to be. The bands
+// below sit strictly inside the factor, so this fires while the margin is
+// still intact rather than after it has been spent.
+
+/// Stack the tripwire probes against.
+///
+/// Large on purpose. The tripwire predicts a depth from the shipped constants
+/// using [`Budget::STACK_ENTRY_RESERVE_BYTES`] in place of the measured
+/// intercept, and that substitution is only harmless while the fixed cost is a
+/// small part of the total. At 4 MiB the reserve overstates the measured
+/// intercept by about 38 KiB — under 1% of the prediction, an order of
+/// magnitude inside the narrowest band. At 1 MiB the same substitution is a 4%
+/// error and would eat into it.
+const TRIPWIRE_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+/// How far the true per-level cost may exceed the shipped constant before the
+/// tripwire fires.
+///
+/// This is the UNSAFE direction: an understated constant makes
+/// [`Budget::MIN_STACK_BYTES`] promise less stack than the descent needs, which
+/// is bead `franken_lean-kxbj`'s defect returning. 25% is chosen against two
+/// measured facts rather than picked: it is 2.4x the largest host-to-host
+/// spread yet observed (10.4%), so ordinary machine variation cannot redden the
+/// tree, and it is half of [`Budget::STACK_SAFETY_FACTOR`], so it fires with
+/// the whole margin still unspent.
+const TRIPWIRE_TOLERANCE_HIGH: f64 = 0.25;
+
+/// How far the true per-level cost may fall BELOW the shipped constant.
+///
+/// Deliberately looser, because the two directions have different consequences.
+/// An overstated constant is not merely wasteful: it shrinks
+/// [`Budget::depth_for_stack_bytes`] for every caller, so a legitimate deep
+/// term becomes a typed non-answer that nobody can distinguish from a real one
+/// — and under `franken_lean-4o3n` a manufactured non-answer is exactly what
+/// erodes a consensus seat. It is still not a SAFETY failure, so it is given
+/// room that the unsafe direction is not.
+const TRIPWIRE_TOLERANCE_LOW: f64 = 0.33;
+
+/// Depth used by the entry-reserve probe. Small, so the fixed cost dominates
+/// and the probe is a statement about the reserve rather than about the slope.
+const TRIPWIRE_RESERVE_PROBE_DEPTH: u32 = 8;
+
+/// What the two bracket probes and the reserve probe said about one shape.
+#[derive(Debug)]
+struct ShapeObservation {
+    shape: Shape,
+    /// Survived the depth that only fits while this shape's cost is within
+    /// [`TRIPWIRE_TOLERANCE_HIGH`] of the claim.
+    within_high_bound: bool,
+    /// Survived the depth that only fits once this shape's cost has fallen
+    /// [`TRIPWIRE_TOLERANCE_LOW`] below the claim.
+    below_low_bound: bool,
+    /// The claimed entry reserve plus a few levels held a descent of those
+    /// levels.
+    reserve_covers_entry: bool,
+    high_probe_depth: u32,
+    low_probe_depth: u32,
+    reserve_probe_stack: usize,
+}
+
+/// Ask one shape the three questions, against a CLAIMED calibration.
+///
+/// The claim is a parameter, not a constant read, and that is the whole design:
+/// a tripwire that could only ever be handed the shipped numbers could not be
+/// shown to discriminate, and a check that cannot fail is a rubber stamp. The
+/// planted violations below hand it deliberately wrong claims and require it to
+/// refuse each one.
+///
+/// Note what this does NOT do: it never re-derives the constant and compares
+/// the result to itself, which would be the same number twice and would prove
+/// nothing. It brackets — it asks the real descent questions whose answers are
+/// only all correct when the claim is true.
+fn observe_shape(
+    shape: Shape,
+    claimed_bytes_per_depth: usize,
+    claimed_entry_reserve: usize,
+) -> ShapeObservation {
+    let usable = TRIPWIRE_STACK_BYTES.saturating_sub(claimed_entry_reserve);
+    let claimed = claimed_bytes_per_depth.max(1) as f64;
+
+    let depth_at = |cost_per_level: f64| -> u32 {
+        ((usable as f64) / cost_per_level)
+            .floor()
+            .clamp(1.0, f64::from(u32::MAX)) as u32
+    };
+    let high_probe_depth = depth_at(claimed * (1.0 + TRIPWIRE_TOLERANCE_HIGH));
+    let low_probe_depth = depth_at(claimed * (1.0 - TRIPWIRE_TOLERANCE_LOW)).saturating_add(1);
+    let reserve_probe_stack =
+        claimed_entry_reserve + (TRIPWIRE_RESERVE_PROBE_DEPTH as usize) * claimed_bytes_per_depth;
+
+    ShapeObservation {
+        shape,
+        within_high_bound: run_probe(shape, TRIPWIRE_STACK_BYTES, high_probe_depth).fits(),
+        below_low_bound: run_probe(shape, TRIPWIRE_STACK_BYTES, low_probe_depth).fits(),
+        reserve_covers_entry: run_probe(shape, reserve_probe_stack, TRIPWIRE_RESERVE_PROBE_DEPTH)
+            .fits(),
+        high_probe_depth,
+        low_probe_depth,
+        reserve_probe_stack,
+    }
+}
+
+/// Every way a claimed calibration can be refused, over the whole shape set.
+///
+/// THE TWO DIRECTIONS ARE NOT QUANTIFIED THE SAME WAY, and getting that wrong
+/// is how this check would have become a flake generator. The constant is the
+/// MAXIMUM over the four descents, so:
+///
+/// * ABOVE the claim is a property of ANY shape. One descent costing more than
+///   the constant says is enough to make `MIN_STACK_BYTES` promise too little,
+///   whatever the other three do.
+/// * BELOW the claim is a property of ALL shapes AT ONCE. A single cheap
+///   descent is not evidence the constant is overstated — the constant is not
+///   describing that shape. `defeq_binder` measures 4,507 bytes/depth against
+///   the shipped 5,935, which is 24% below it *by design*; quantifying the low
+///   bound per shape would have put a permanent tripwire 9 points away from a
+///   value that is correct, and the first person to see it fire would have
+///   widened the band rather than read it.
+fn calibration_refusals(
+    claimed_bytes_per_depth: usize,
+    claimed_entry_reserve: usize,
+) -> Vec<String> {
+    let observations: Vec<ShapeObservation> = Shape::ALL
+        .into_iter()
+        .map(|shape| observe_shape(shape, claimed_bytes_per_depth, claimed_entry_reserve))
+        .collect();
+    let mut refusals = Vec::new();
+
+    for o in &observations {
+        if !o.within_high_bound {
+            refusals.push(format!(
+                "{:?}: a descent to depth {} did not survive {TRIPWIRE_STACK_BYTES} bytes of \
+                 stack, so this shape's per-level cost is more than {:.0}% ABOVE the claimed \
+                 {claimed_bytes_per_depth} bytes/depth. MIN_STACK_BYTES now promises less \
+                 stack than the descent needs — this is the direction that aborts processes. \
+                 Re-run `calibrate_stack_bytes_per_depth` and move \
+                 Budget::MEASURED_STACK_BYTES_PER_DEPTH up",
+                o.shape,
+                o.high_probe_depth,
+                TRIPWIRE_TOLERANCE_HIGH * 100.0
+            ));
+        }
+        if !o.reserve_covers_entry {
+            refusals.push(format!(
+                "{:?}: a stack of {} bytes — the claimed entry reserve of \
+                 {claimed_entry_reserve} plus {TRIPWIRE_RESERVE_PROBE_DEPTH} levels — could \
+                 not hold {TRIPWIRE_RESERVE_PROBE_DEPTH} levels, so the fixed entry cost has \
+                 outgrown Budget::STACK_ENTRY_RESERVE_BYTES and depth_for_stack_bytes \
+                 over-promises depth to every caller",
+                o.shape, o.reserve_probe_stack
+            ));
+        }
+    }
+
+    if observations.iter().all(|o| o.below_low_bound) {
+        refusals.push(format!(
+            "every shape survived its low-bound probe (depths {:?}), so the WORST per-level \
+             cost is more than {:.0}% BELOW the claimed {claimed_bytes_per_depth} bytes/depth. \
+             Not a safety failure and refused anyway: every caller is being handed a \
+             shallower ceiling than its stack supports, which manufactures typed non-answers \
+             that nobody can tell from real ones. Re-run `calibrate_stack_bytes_per_depth` \
+             and move the constant down",
+            observations
+                .iter()
+                .map(|o| o.low_probe_depth)
+                .collect::<Vec<_>>(),
+            TRIPWIRE_TOLERANCE_LOW * 100.0
+        ));
+    }
+
+    refusals
+}
+
+/// THE TRIPWIRE. The shipped calibration still describes the descent — every
+/// shape, both directions, plus the entry reserve.
+///
+/// Every shape rather than the measured-worst one, because
+/// `MEASURED_STACK_BYTES_PER_DEPTH` is the MAXIMUM over the four descents: a
+/// drift that moved a different shape above the shipped figure would be exactly
+/// as unsafe and would be invisible to a single-shape check. Twelve subprocess
+/// probes, no bisection.
+#[test]
+fn the_shipped_calibration_still_describes_the_descent() {
+    let refusals = calibration_refusals(
+        Budget::MEASURED_STACK_BYTES_PER_DEPTH,
+        Budget::STACK_ENTRY_RESERVE_BYTES,
+    );
+    assert!(
+        refusals.is_empty(),
+        "the shipped stack calibration no longer describes the kernel:\n  {}",
+        refusals.join("\n  ")
+    );
+}
+
+/// PLANTED VIOLATION — an understated constant is refused. The unsafe
+/// direction: half the true cost is what a stale constant looks like after the
+/// descent has grown, and it is the shape of `franken_lean-kxbj`'s original
+/// defect.
+#[test]
+fn a_calibration_that_understates_the_cost_is_refused() {
+    let claim = Budget::MEASURED_STACK_BYTES_PER_DEPTH / 2;
+    let refusals = calibration_refusals(claim, Budget::STACK_ENTRY_RESERVE_BYTES);
+    assert!(
+        refusals.iter().any(|r| r.contains("ABOVE the claimed")),
+        "a constant claiming half the true per-level cost must be refused in the unsafe \
+         direction; a tripwire that accepts it is not watching the direction that aborts \
+         processes. Got: {refusals:?}"
+    );
+}
+
+/// PLANTED VIOLATION — an overstated constant is refused. Not a safety failure,
+/// and refused anyway: it shrinks every derived ceiling and manufactures the
+/// typed non-answers that erode a consensus seat.
+#[test]
+fn a_calibration_that_overstates_the_cost_is_refused() {
+    let claim = Budget::MEASURED_STACK_BYTES_PER_DEPTH * 3;
+    let refusals = calibration_refusals(claim, Budget::STACK_ENTRY_RESERVE_BYTES);
+    assert!(
+        refusals.iter().any(|r| r.contains("BELOW the claimed")),
+        "a constant claiming three times the true cost must be refused; every shape is then \
+         below it, which is what the all-shapes quantifier is for. Got: {refusals:?}"
+    );
+}
+
+/// PLANTED VIOLATION — an entry reserve below the true fixed cost is refused.
+/// The slope and the intercept drift independently, and on 2026-07-25 it was
+/// the intercept that moved while the slope held exactly.
+#[test]
+fn an_entry_reserve_below_the_fixed_cost_is_refused() {
+    let refusals = calibration_refusals(Budget::MEASURED_STACK_BYTES_PER_DEPTH, 8 * 1024);
+    assert!(
+        refusals.iter().any(|r| r.contains("entry reserve")),
+        "an entry reserve of 8 KiB is far below the measured fixed cost and must be refused. \
+         Got: {refusals:?}"
+    );
 }
