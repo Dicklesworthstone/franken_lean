@@ -70,7 +70,7 @@ fn terminal_human_log_is_sealed_before_manifest_generation() {
 #[test]
 fn env_snapshots_parent_is_authoritative_and_preserves_nested_children() {
     let script = env_snapshots_script();
-    let normalized = script.replace("\\\n  ", " ");
+    let normalized = script.replace("\\\n  ", "");
 
     assert!(
         script.contains("SCHEMA=\"fln.e2e/2\""),
