@@ -742,6 +742,46 @@ jobs:
               ),
           )
 
+          manifest_records = [
+              json.loads(line)
+              for line in Path("ci/VERIFICATION_MANIFEST.jsonl")
+              .read_text(encoding="utf-8")
+              .splitlines()
+          ]
+          ci_registry = {
+              record["scenario"]: record
+              for record in manifest_records
+              if record.get("kind") == "scenario"
+              and record.get("activation") == "active"
+              and record.get("ci_required") is True
+          }
+          spec_labels = {label for label, *_rest in specs}
+          if set(ci_registry) != spec_labels:
+              raise SystemExit(
+                  "CI specs and active verification registry differ: "
+                  f"{sorted(spec_labels)} != {sorted(ci_registry)}"
+              )
+          for label, _raw_path, _raw_exit, expected, is_child in specs:
+              registry = ci_registry[label]
+              expected_root = expected.relative_to(attempt_root).as_posix()
+              expected_kind = (
+                  "named-child"
+                  if isinstance(is_child, str)
+                  else "single-bundle"
+                  if is_child
+                  else "direct"
+              )
+              expected_name = is_child if isinstance(is_child, str) else "-"
+              if (
+                  registry.get("ci_root") != expected_root
+                  or registry.get("artifact_kind") != expected_kind
+                  or registry.get("artifact_name") != expected_name
+              ):
+                  raise SystemExit(
+                      f"{label} CI artifact contract differs from "
+                      "ci/VERIFICATION_MANIFEST.jsonl"
+                  )
+
           records = []
           seen = set()
           for label, raw_path, raw_exit, expected, is_child in specs:

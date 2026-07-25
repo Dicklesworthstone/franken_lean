@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # scripts/check.sh — the single FrankenLean quality gate.
 #
-# Stages are append-only obligations: evidence harness self-test, fmt, check, clippy,
-# tests, structural policy, exact Reference tree, and UBS.  Each command runs under a
-# bounded supervisor that drains stdout/stderr to EOF, preserves useful head+tail
-# captures, applies a monotonic timeout and total-output budget, and cancels the whole
-# child process group.  The published fln.check/2 NDJSON has exactly one final terminal
-# record plus a write-once SHA-256 artifact manifest.
+# Stages are append-only obligations: evidence harness self-test, verification registry,
+# shell policy, fmt, check, clippy, tests, structural policy, exact Reference tree, and
+# UBS. Each command runs under a bounded supervisor that drains stdout/stderr to EOF,
+# preserves useful head+tail captures, applies a monotonic timeout and total-output
+# budget, and cancels the whole child process group. The published fln.check/2 NDJSON
+# names every stage in canonical order: after the first failure every later obligation is
+# explicit `not_run`. It has exactly one final terminal record plus a write-once SHA-256
+# artifact manifest.
 #
 # Exit taxonomy: 0 pass; 1 stage failure; 2 setup/evidence/internal fault;
 # 3 resource exhaustion or timeout (inconclusive); 129/130/143 HUP/INT/TERM cancellation.
@@ -41,6 +43,12 @@ EVIDENCE="$REPO/scripts/evidence.py"
 SCHEMA="fln.check/2"
 SCENARIO="quality_gate"
 BEAD="franken_lean-rur"
+VERIFICATION_MANIFEST_REL="ci/VERIFICATION_MANIFEST.jsonl"
+VERIFICATION_MANIFEST="$REPO/$VERIFICATION_MANIFEST_REL"
+CHECK_STAGE_ORDER=(
+  evidence-self-test verification-manifest shellcheck fmt check clippy test
+  structure-guard vendor-tree ubs
+)
 RUN_ID="check-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_CHECK_ART_ROOT:-$REPO/target/check}"
 ART_DIR="${FLN_CHECK_ART_DIR:-$ART_ROOT/$RUN_ID}"
@@ -50,6 +58,7 @@ ART_DIR="${FLN_CHECK_ART_DIR:-$ART_ROOT/$RUN_ID}"
 SEALED_BUILD_ROOT="${FLN_CHECK_SEALED_BUILD_ROOT:-$REPO/target/sealed}/$RUN_ID"
 NDJSON="$ART_DIR/run.ndjson"
 HUMAN="$ART_DIR/human.log"
+HUMAN_SEMANTIC="$ART_DIR/human.semantic.log"
 CAPTURE_BYTES="${FLN_CHECK_CAPTURE_BYTES:-262144}"
 OUTPUT_BUDGET_BYTES="${FLN_CHECK_OUTPUT_BUDGET_BYTES:-67108864}"
 STAGE_TIMEOUT_MS="${FLN_CHECK_STAGE_TIMEOUT_MS:-1200000}"
@@ -122,7 +131,8 @@ FINALIZER_TEST_ACK="$FINALIZER_TEST_CONTROL/signal-ack"
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 EVENT_COMMAND=()
 INPUT_PATHS=(
-  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml .beads/issues.jsonl
+  ci crates tools
   vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
@@ -672,6 +682,12 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
+    run_finalizer_command python3 "$EVIDENCE" render-check-human \
+      --file "$NDJSON" --output "$HUMAN_SEMANTIC" --artifact-root "$ART_DIR" \
+      || publish_rc=2
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
     run_finalizer_command python3 "$EVIDENCE" validate-run \
       --file "$NDJSON" --schema "$SCHEMA" --expected-verdict "$FINAL_VERDICT" \
       --artifact-root "$ART_DIR" --output "$ART_DIR/run.validation.json" || publish_rc=2
@@ -898,6 +914,7 @@ emit_event \
   --string input_root "$INPUT_ROOT" \
   --string ubs_inventory "$UBS_INVENTORY_BINDING" \
   --string vendor_binding "$VENDOR_BINDING_BINDING" \
+  --string verification_manifest "$VERIFICATION_MANIFEST_REL" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"stage_timeout_ms\":$STAGE_TIMEOUT_MS,\"kill_grace_ms\":$KILL_GRACE_MS}" \
   --string rustc "$(rustc --version 2>/dev/null || printf unknown)" \
   --string planted "$PLANT_BINDING" \
@@ -944,6 +961,25 @@ else:
 PY
 }
 
+emit_not_run_after() {
+  local failed_stage="$1" causal_reason="$2" stage seen=0
+  for stage in "${CHECK_STAGE_ORDER[@]}"; do
+    if [ "$seen" -eq 1 ]; then
+      emit_event --string event stage --string stage "$stage" \
+        --string outcome not_run --string reason_code blocked_by_prior_stage \
+        --string expected not_run --string actual not_run \
+        --string causal_stage "$failed_stage" \
+        --string causal_reason "$causal_reason"
+      note "not_run stage=$stage causal_stage=$failed_stage reason=$causal_reason"
+    fi
+    if [ "$stage" = "$failed_stage" ]; then seen=1; fi
+  done
+  if [ "$seen" -ne 1 ]; then
+    set_final internal_fault unknown_failed_stage 2
+    exit 2
+  fi
+}
+
 run_stage() {
   local name="$1"; shift
   local meta="$ART_DIR/$name.meta.json" out="$ART_DIR/$name.out" err="$ART_DIR/$name.err"
@@ -967,7 +1003,7 @@ run_stage() {
     semantic_args=()
   else
     case "$name" in
-      shellcheck|fmt|structure-guard|vendor-tree|ubs)
+      verification-manifest|shellcheck|fmt|structure-guard|vendor-tree|ubs)
         semantic_args=(--semantic-failure-exit 1)
         ;;
       check|clippy|test)
@@ -1095,12 +1131,27 @@ run_stage() {
       --string outcome internal_fault --string reason_code missing_supervisor_metadata \
       --string expected exit_zero --string actual metadata_unavailable \
       --boolean supervisor_available false --integer wrapper_exit "$wrapper_rc"
+    emit_not_run_after "$name" missing_supervisor_metadata
     set_final internal_fault missing_supervisor_metadata 2
     exit 2
   fi
   classification="$(read_meta_field "$meta" classification)"
   reason="$(read_meta_field "$meta" reason_code)"
   recorded_wrapper="$(read_meta_field "$meta" wrapper_exit)"
+  if [ "$recorded_wrapper" != "$wrapper_rc" ]; then
+    emit_event \
+      --string event stage \
+      --string stage "$name" \
+      --string outcome internal_fault \
+      --string reason_code wrapper_exit_mismatch \
+      --string expected supervisor_wrapper_exit \
+      --string actual shell_wrapper_exit_mismatch \
+      --integer wrapper_exit "$wrapper_rc" \
+      --json-file supervisor "$meta"
+    emit_not_run_after "$name" wrapper_exit_mismatch
+    set_final internal_fault "$name:wrapper_exit_mismatch" 2
+    exit 2
+  fi
   emit_event \
     --string event stage \
     --string stage "$name" \
@@ -1110,10 +1161,6 @@ run_stage() {
     --string actual "$classification" \
     --integer wrapper_exit "$wrapper_rc" \
     --json-file supervisor "$meta"
-  if [ "$recorded_wrapper" != "$wrapper_rc" ]; then
-    set_final internal_fault "$name:wrapper_exit_mismatch" 2
-    exit 2
-  fi
   if [ "$wrapper_rc" -eq 0 ] && [ "$classification" = pass ]; then
     note "ok stage=$name"
     return 0
@@ -1121,6 +1168,7 @@ run_stage() {
   note "$classification stage=$name reason=$reason wrapper_exit=$wrapper_rc"
   note "captured stderr tail follows ($name)"
   tail -n 40 "$err" >&2 || true
+  emit_not_run_after "$name" "$reason"
   case "$wrapper_rc" in
     1) set_final fail "$name:$reason" 1; exit 1 ;;
     3) set_final inconclusive "$name:$reason" 3; exit 3 ;;
@@ -1141,7 +1189,7 @@ skip_stage() {
 self_test() {
   local failures=0 stage rc child="$ART_DIR" child_pid wrapper_ready
   local wrapper_launch_ready wrapper_launch_release cancel_meta
-  for stage in evidence-self-test shellcheck fmt check clippy test structure-guard vendor-tree ubs; do
+  for stage in "${CHECK_STAGE_ORDER[@]}"; do
     echo "[check:self-test] planting failure in stage=$stage" >&2
     child="$ART_DIR/selftest-$stage"
     wrapper_ready="$ART_DIR/selftest-$stage.guardian.ready.json"
@@ -1419,6 +1467,9 @@ fi
 # --locked makes Cargo.lock drift a failure instead of silently rewriting it.
 run_stage evidence-self-test python3 scripts/evidence.py self-test \
   --art-dir "$ART_DIR/evidence-self-test"
+run_stage verification-manifest python3 scripts/evidence.py \
+  validate-verification-manifest --manifest "$VERIFICATION_MANIFEST" \
+  --beads "$REPO/.beads/issues.jsonl"
 run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh \
   scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \

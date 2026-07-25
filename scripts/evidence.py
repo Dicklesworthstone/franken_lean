@@ -44,6 +44,72 @@ INCONCLUSIVE = 3
 CANCELLED = 4
 
 RUN_SCHEMAS = {"fln.check/2", "fln.e2e/2"}
+VERIFICATION_MANIFEST_SCHEMA = "fln.verification-manifest/1"
+VERIFICATION_MANIFEST_PATH = "ci/VERIFICATION_MANIFEST.jsonl"
+CHECK_HUMAN_SCHEMA = "fln.check-human/1"
+CHECK_HUMAN_LOG = "human.semantic.log"
+# Frozen with the migration commit. This binds both the complete adopted ID set
+# and which adopted beads were still open at adoption time. Expanding or
+# weakening the grandfathered set therefore requires an explicit validator
+# change, not merely recomputing a self-described manifest hash.
+VERIFICATION_ADOPTION_AUTHORITY_HASH = (
+    "sha256:30b15f035857461b2798c624c2e35f52dba0626af0667c9a2f845c074729cbbc"
+)
+VERIFICATION_CLAIM_TYPES = frozenset(
+    {"invariant", "proof", "bounded_model", "statistical", "slo", "benchmark"}
+)
+VERIFICATION_EVIDENCE_KINDS = frozenset(
+    {
+        "unit",
+        "property",
+        "metamorphic",
+        "fuzz",
+        "mutation",
+        "fault",
+        "mock",
+        "no_mock_e2e",
+        "proof",
+        "benchmark",
+    }
+)
+VERIFICATION_COVERAGE_ARRAY_FIELDS = (
+    "requirement_ids",
+    "claim_ids",
+    "invariant_ids",
+    "parity_rows",
+    "behavior_notes",
+    "gate_ids",
+    "unit",
+    "boundary",
+    "error",
+    "resource",
+    "cancellation",
+    "failure_atomicity",
+    "property",
+    "metamorphic",
+    "fuzz",
+    "mutation",
+    "fault",
+    "scenarios",
+    "negative_recovery",
+    "artifacts",
+)
+VERIFICATION_COVERAGE_REQUIRED_FIELDS = frozenset(
+    {
+        "requirement_ids",
+        "claim_ids",
+        "gate_ids",
+        "unit",
+        "boundary",
+        "error",
+        "resource",
+        "cancellation",
+        "failure_atomicity",
+        "scenarios",
+        "negative_recovery",
+        "artifacts",
+    }
+)
 
 # --- Sealed compiler environment (bead fln-evidence-runner-bootstrap-btk) ----
 # Ambient channels that can alter what the pinned compiler does (cap-lints
@@ -92,6 +158,7 @@ SEALED_HOST_TRIPLES = {
 SEALED_RUSTC_PROBE_TIMEOUT_S = 30
 CHECK_STAGE_ORDER = [
     "evidence-self-test",
+    "verification-manifest",
     "shellcheck",
     "fmt",
     "check",
@@ -3341,6 +3408,513 @@ def load_ndjson(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def render_check_human(records: Sequence[Mapping[str, Any]]) -> bytes:
+    if not records:
+        raise EvidenceError("cannot render an empty check run")
+    if any(record.get("schema") != "fln.check/2" for record in records):
+        raise EvidenceError("human renderer accepts only fln.check/2 records")
+    lines = [f"{CHECK_HUMAN_SCHEMA} records={len(records)}\n"]
+    for record in records:
+        event = record.get("event")
+        if event == "run_start":
+            subject = record.get("scenario")
+            outcome = "started"
+            reason = "none"
+        elif event == "stage":
+            subject = record.get("stage")
+            outcome = record.get("outcome")
+            reason = record.get("reason_code")
+        elif event == "self_test":
+            subject = record.get("stage")
+            outcome = "pass" if record.get("ok") is True else "fail"
+            reason = "self_test_result"
+        elif event == "run_end":
+            subject = record.get("scenario")
+            outcome = record.get("verdict")
+            reason = record.get("reason_code")
+        else:
+            raise EvidenceError(f"human renderer rejects event {event!r}")
+        values = {
+            "event": event,
+            "outcome": outcome,
+            "reason": reason,
+            "subject": subject,
+        }
+        if not all(isinstance(value, str) and value for value in values.values()):
+            raise EvidenceError("human renderer received an incomplete event")
+        record_digest = hashlib.sha256(canonical_json(record)).hexdigest()
+        lines.append(
+            " ".join(
+                (
+                    f"sequence={record.get('sequence')}",
+                    *(
+                        f"{key}={json.dumps(value, ensure_ascii=True)}"
+                        for key, value in values.items()
+                    ),
+                    f"record_sha256={record_digest}",
+                )
+            )
+            + "\n"
+        )
+    return "".join(lines).encode("utf-8")
+
+
+def validate_check_human(run_path: Path, human_path: Path) -> dict[str, Any]:
+    run_path = lexical_absolute(run_path)
+    human_path = lexical_absolute(human_path)
+    records, run_digest = load_ndjson_snapshot(run_path)
+    expected = render_check_human(records)
+    actual, size, digest = stable_file_facts(human_path, max_bytes=MAX_LOG_BYTES)
+    if not hmac.compare_digest(actual, expected):
+        raise EvidenceError(f"{human_path}: human/NDJSON event rendering differs")
+    return {
+        "schema": "fln.validation/1",
+        "validator": CHECK_HUMAN_SCHEMA,
+        "subject": human_path.name,
+        "valid": True,
+        "records": len(records),
+        "bytes": size,
+        "sha256": digest,
+        "run_sha256": run_digest,
+    }
+
+
+def verification_adoption_hash(ids: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-manifest.adoption.ids/1")
+    digest.update(b"\0")
+    for bead_id in ids:
+        encoded = bead_id.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def verification_adoption_authority_hash(
+    ids: Sequence[str], open_ids: Sequence[str]
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-manifest.adoption-authority/1")
+    digest.update(b"\0")
+    for label, values in ((b"ids", ids), (b"open", open_ids)):
+        digest.update(len(label).to_bytes(8, "little"))
+        digest.update(label)
+        digest.update(len(values).to_bytes(8, "little"))
+        for bead_id in values:
+            encoded = bead_id.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "little"))
+            digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def require_manifest_string_array(
+    path: Path,
+    record_number: int,
+    record: Mapping[str, Any],
+    field: str,
+    *,
+    nonempty: bool,
+) -> list[str]:
+    value = record.get(field)
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: {field} must be a string array"
+        )
+    if len(value) != len(set(value)) or value != sorted(value):
+        raise EvidenceError(
+            f"{path}:{record_number}: {field} must be sorted and duplicate-free"
+        )
+    if nonempty and not value:
+        raise EvidenceError(f"{path}:{record_number}: {field} must not be empty")
+    return value
+
+
+def bead_status_projection(path: Path) -> dict[str, str]:
+    records, _digest = load_ndjson_snapshot(path)
+    states: dict[str, str] = {}
+    for number, record in enumerate(records, 1):
+        bead_id = record.get("id")
+        status = record.get("status")
+        if not isinstance(bead_id, str) or not bead_id:
+            raise EvidenceError(f"{path}:{number}: bead id is missing")
+        if status not in {"open", "in_progress", "closed", "tombstone"}:
+            raise EvidenceError(
+                f"{path}:{number}: bead {bead_id!r} has unsupported status {status!r}"
+            )
+        if bead_id in states:
+            raise EvidenceError(f"{path}:{number}: duplicate bead id {bead_id!r}")
+        states[bead_id] = status
+    return states
+
+
+def validate_verification_manifest(
+    manifest_path: Path,
+    beads_path: Path,
+    *,
+    expected_adoption_authority_hash: str = VERIFICATION_ADOPTION_AUTHORITY_HASH,
+) -> dict[str, Any]:
+    manifest_path = lexical_absolute(manifest_path)
+    beads_path = lexical_absolute(beads_path)
+    records, manifest_digest = load_ndjson_snapshot(manifest_path)
+    header = records[0]
+    header_keys = {
+        "schema",
+        "kind",
+        "source",
+        "projection",
+        "hash_algorithm",
+        "hash_preimage",
+        "record_count",
+        "projection_hash",
+        "adoption_ids",
+        "adoption_open_ids",
+    }
+    if set(header) != header_keys:
+        raise EvidenceError(
+            f"{manifest_path}: adoption header shape differs: "
+            f"missing={sorted(header_keys - set(header))!r} "
+            f"extra={sorted(set(header) - header_keys)!r}"
+        )
+    if (
+        header.get("schema") != VERIFICATION_MANIFEST_SCHEMA
+        or header.get("kind") != "adoption"
+        or header.get("source") != ".beads/issues.jsonl"
+        or header.get("projection") != "sorted-canonical-bead-ids-v1"
+        or header.get("hash_algorithm") != "sha256"
+        or header.get("hash_preimage")
+        != "fln.verification-manifest.adoption.ids/1+nul+u64le-length-prefixed-utf8"
+    ):
+        raise EvidenceError(f"{manifest_path}: invalid adoption authority header")
+    adoption_ids = require_manifest_string_array(
+        manifest_path, 1, header, "adoption_ids", nonempty=True
+    )
+    adoption_open_ids = require_manifest_string_array(
+        manifest_path, 1, header, "adoption_open_ids", nonempty=False
+    )
+    if not set(adoption_open_ids).issubset(adoption_ids):
+        raise EvidenceError(
+            f"{manifest_path}: adoption_open_ids is not a subset of adoption_ids"
+        )
+    if (
+        not isinstance(header.get("record_count"), int)
+        or isinstance(header["record_count"], bool)
+        or header["record_count"] != len(adoption_ids)
+    ):
+        raise EvidenceError(f"{manifest_path}: adoption record_count is stale")
+    expected_projection_hash = verification_adoption_hash(adoption_ids)
+    if not hmac.compare_digest(
+        str(header.get("projection_hash")), expected_projection_hash
+    ):
+        raise EvidenceError(f"{manifest_path}: adoption projection hash is stale")
+    actual_adoption_authority_hash = verification_adoption_authority_hash(
+        adoption_ids, adoption_open_ids
+    )
+    if not hmac.compare_digest(
+        actual_adoption_authority_hash, expected_adoption_authority_hash
+    ):
+        raise EvidenceError(
+            f"{manifest_path}: adoption authority differs from the frozen migration"
+        )
+
+    coverage_keys = {
+        "schema",
+        "kind",
+        "bead",
+        "state",
+        "owner",
+        "workstream",
+        "claim_type",
+        "evidence_kind",
+        "mock_only",
+        "skip",
+        *VERIFICATION_COVERAGE_ARRAY_FIELDS,
+    }
+    scenario_keys = {
+        "schema",
+        "kind",
+        "scenario",
+        "owner",
+        "activation",
+        "claim_type",
+        "evidence_kind",
+        "gate_ids",
+        "ci_required",
+        "ci_root",
+        "artifact_kind",
+        "artifact_name",
+    }
+    coverage: dict[str, dict[str, Any]] = {}
+    scenarios: dict[str, dict[str, Any]] = {}
+    order: list[tuple[int, str]] = []
+    for number, record in enumerate(records[1:], 2):
+        if record.get("schema") != VERIFICATION_MANIFEST_SCHEMA:
+            raise EvidenceError(f"{manifest_path}:{number}: wrong manifest schema")
+        kind = record.get("kind")
+        if kind == "coverage":
+            if set(record) != coverage_keys:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: coverage shape differs: "
+                    f"missing={sorted(coverage_keys - set(record))!r} "
+                    f"extra={sorted(set(record) - coverage_keys)!r}"
+                )
+            bead_id = record.get("bead")
+            if not isinstance(bead_id, str) or not bead_id:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: coverage bead is missing"
+                )
+            if bead_id in coverage:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: duplicate coverage row for {bead_id}"
+                )
+            order.append((0, bead_id))
+            coverage[bead_id] = record
+            state = record.get("state")
+            if state not in {"planned", "active", "complete", "blocked"}:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid coverage state {state!r}"
+                )
+            for field in ("owner", "workstream"):
+                if not isinstance(record.get(field), str) or not record[field]:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: coverage {field} is missing"
+                    )
+            if not re.fullmatch(r"W[0-9]+", record["workstream"]):
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid workstream identity"
+                )
+            claim_type = record.get("claim_type")
+            evidence_kind = record.get("evidence_kind")
+            if claim_type not in VERIFICATION_CLAIM_TYPES:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid claim_type {claim_type!r}"
+                )
+            if evidence_kind not in VERIFICATION_EVIDENCE_KINDS:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid evidence_kind {evidence_kind!r}"
+                )
+            if not isinstance(record.get("mock_only"), bool):
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: mock_only must be boolean"
+                )
+            skip = record.get("skip")
+            if skip not in {"none", "typed_limitation", "blocked"}:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: unclassified skip {skip!r}"
+                )
+            if state in {"active", "complete"} and skip != "none":
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: authoritative coverage cannot be skipped"
+                )
+            if state == "blocked" and skip != "blocked":
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: blocked coverage lacks blocked classification"
+                )
+            for field in VERIFICATION_COVERAGE_ARRAY_FIELDS:
+                require_manifest_string_array(
+                    manifest_path,
+                    number,
+                    record,
+                    field,
+                    nonempty=(
+                        state in {"active", "complete"}
+                        and field in VERIFICATION_COVERAGE_REQUIRED_FIELDS
+                    ),
+                )
+            if claim_type in {"invariant", "proof"}:
+                if record["mock_only"] or evidence_kind not in {
+                    "no_mock_e2e",
+                    "proof",
+                }:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: {claim_type} claim has "
+                        f"insufficient {evidence_kind} evidence"
+                    )
+                if not record["invariant_ids"]:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: authoritative claim lacks invariant ids"
+                    )
+        elif kind == "scenario":
+            if set(record) != scenario_keys:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: scenario shape differs: "
+                    f"missing={sorted(scenario_keys - set(record))!r} "
+                    f"extra={sorted(set(record) - scenario_keys)!r}"
+                )
+            scenario = record.get("scenario")
+            if not isinstance(scenario, str) or not scenario:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: scenario identity is missing"
+                )
+            if scenario in scenarios:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: duplicate scenario {scenario!r}"
+                )
+            order.append((1, scenario))
+            scenarios[scenario] = record
+            if not isinstance(record.get("owner"), str) or not record["owner"]:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: scenario owner is missing"
+                )
+            activation = record.get("activation")
+            if activation not in {"planned", "active", "blocked"}:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid scenario activation"
+                )
+            if record.get("claim_type") not in VERIFICATION_CLAIM_TYPES:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid scenario claim_type"
+                )
+            if record.get("evidence_kind") not in VERIFICATION_EVIDENCE_KINDS:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid scenario evidence_kind"
+                )
+            if record["claim_type"] in {"invariant", "proof"} and record[
+                "evidence_kind"
+            ] not in {"no_mock_e2e", "proof"}:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: {record['claim_type']} scenario has "
+                    f"insufficient {record['evidence_kind']} evidence"
+                )
+            require_manifest_string_array(
+                manifest_path, number, record, "gate_ids", nonempty=True
+            )
+            if not isinstance(record.get("ci_required"), bool):
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: ci_required must be boolean"
+                )
+            if activation != "active":
+                if (
+                    record["ci_required"]
+                    or record.get("ci_root") != "-"
+                    or record.get("artifact_kind") != "none"
+                    or record.get("artifact_name") != "-"
+                ):
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: planned/blocked scenario "
+                        "cannot count as executed"
+                    )
+            elif record["ci_required"]:
+                if (
+                    not isinstance(record.get("ci_root"), str)
+                    or not re.fullmatch(
+                        r"(?:check|e2e)/[a-z0-9][a-z0-9-]*", record["ci_root"]
+                    )
+                    or record.get("artifact_kind")
+                    not in {"direct", "single-bundle", "named-child"}
+                ):
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: active CI scenario lacks "
+                        "an exact artifact contract"
+                    )
+                if record["artifact_kind"] == "named-child":
+                    if (
+                        not isinstance(record.get("artifact_name"), str)
+                        or record["artifact_name"] in {"", "-"}
+                    ):
+                        raise EvidenceError(
+                            f"{manifest_path}:{number}: named child is missing"
+                        )
+                elif record.get("artifact_name") != "-":
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: non-named artifact has a child name"
+                    )
+            elif (
+                record.get("ci_root") != "-"
+                or record.get("artifact_kind") != "none"
+                or record.get("artifact_name") != "-"
+            ):
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: non-CI scenario claims CI artifacts"
+                )
+        else:
+            raise EvidenceError(
+                f"{manifest_path}:{number}: unknown manifest row kind {kind!r}"
+            )
+    if order != sorted(order):
+        raise EvidenceError(
+            f"{manifest_path}: rows must be coverage-then-scenario canonical order"
+        )
+
+    bead_states = bead_status_projection(beads_path)
+    current_ids = set(bead_states)
+    adopted = set(adoption_ids)
+    missing_adopted = sorted(adopted - current_ids)
+    if missing_adopted:
+        raise EvidenceError(
+            f"{manifest_path}: adopted beads disappeared: {missing_adopted!r}"
+        )
+    for bead_id in coverage:
+        if bead_id not in bead_states:
+            raise EvidenceError(
+                f"{manifest_path}: orphan coverage row for {bead_id!r}"
+            )
+        expected_states = {
+            "open": {"planned", "blocked"},
+            "in_progress": {"active"},
+            "closed": {"complete"},
+            "tombstone": {"complete"},
+        }[bead_states[bead_id]]
+        if coverage[bead_id]["state"] not in expected_states:
+            raise EvidenceError(
+                f"{manifest_path}: coverage state for {bead_id!r} is "
+                f"{coverage[bead_id]['state']!r}, but bead is "
+                f"{bead_states[bead_id]!r}"
+            )
+    required_coverage = current_ids - adopted
+    required_coverage.update(
+        bead_id
+        for bead_id in adoption_open_ids
+        if bead_states.get(bead_id) != "open"
+    )
+    missing_coverage = sorted(required_coverage - set(coverage))
+    if missing_coverage:
+        raise EvidenceError(
+            f"{manifest_path}: beads crossed the adoption boundary without "
+            f"coverage rows: {missing_coverage!r}"
+        )
+    for scenario, record in scenarios.items():
+        owner = record["owner"]
+        if owner not in bead_states:
+            raise EvidenceError(
+                f"{manifest_path}: scenario {scenario!r} has orphan owner {owner!r}"
+            )
+    for bead_id, record in coverage.items():
+        for scenario in record["scenarios"]:
+            registered = scenarios.get(scenario)
+            if registered is None:
+                raise EvidenceError(
+                    f"{manifest_path}: coverage {bead_id!r} names unregistered "
+                    f"scenario {scenario!r}"
+                )
+            if (
+                registered["owner"] != bead_id
+                or registered["activation"] != "active"
+                or registered["ci_required"] is not True
+            ):
+                raise EvidenceError(
+                    f"{manifest_path}: coverage {bead_id!r} cannot claim "
+                    f"unexecuted scenario {scenario!r}"
+                )
+    return {
+        "schema": "fln.validation/1",
+        "validator": VERIFICATION_MANIFEST_SCHEMA,
+        "subject": manifest_path.name,
+        "valid": True,
+        "sha256": manifest_digest,
+        "adoption_records": len(adoption_ids),
+        "current_beads": len(bead_states),
+        "coverage_rows": len(coverage),
+        "scenario_rows": len(scenarios),
+        "ci_scenarios": sorted(
+            scenario
+            for scenario, record in scenarios.items()
+            if record["activation"] == "active" and record["ci_required"]
+        ),
+    }
+
+
 def require_guard_keys(
     path: Path, record: Mapping[str, Any], expected: set[str], *, label: str
 ) -> None:
@@ -6066,6 +6640,8 @@ def validate_run(
         "parity_ledger_row",
         "scenario",
     }
+    if schema == "fln.check/2":
+        start_required.add("verification_manifest")
     missing = sorted(key for key in start_required if key not in records[0])
     if missing:
         raise EvidenceError(f"{path}: run_start missing fields {missing!r}")
@@ -6141,6 +6717,14 @@ def validate_run(
             path.parent / "ubs-inventory.json",
             Path(records[0]["cwd"]) if live_context else None,
         )
+    if schema == "fln.check/2":
+        if records[0].get("verification_manifest") != VERIFICATION_MANIFEST_PATH:
+            raise EvidenceError(
+                f"{path}: quality gate names an unknown verification manifest"
+            )
+        # The explicit verification-manifest stage is the execution authority.
+        # Re-reading mutable tracker state during terminal publication would
+        # turn a later bead transition into an unrelated bundle failure.
     if schema == "fln.e2e/2" or profile not in binding_free_profiles:
         if records[0].get("vendor_binding") != "vendor-binding.json":
             raise EvidenceError(f"{path}: run lacks its Reference vendor binding")
@@ -6244,44 +6828,133 @@ def validate_run(
             if not isinstance(record["stage"], str) or not record["stage"]:
                 raise EvidenceError(f"{path}:{index}: invalid stage identity")
             event_id = record["stage"]
-            if record["outcome"] != "skipped":
+            base_keys = {
+                "schema",
+                "event",
+                "run_id",
+                "bead",
+                "scenario",
+                "sequence",
+                "monotonic_ns",
+                "wall_time_utc",
+                "stage",
+                "outcome",
+                "reason_code",
+                "expected",
+                "actual",
+            }
+            if record["outcome"] == "not_run":
+                expected_keys = base_keys | {"causal_stage", "causal_reason"}
+                if set(record) != expected_keys:
+                    raise EvidenceError(
+                        f"{path}:{index}: not_run stage shape mismatch"
+                    )
+                if (
+                    record["reason_code"] != "blocked_by_prior_stage"
+                    or record["expected"] != "not_run"
+                    or record["actual"] != "not_run"
+                    or not isinstance(record.get("causal_stage"), str)
+                    or not record["causal_stage"]
+                    or not isinstance(record.get("causal_reason"), str)
+                    or not record["causal_reason"]
+                ):
+                    raise EvidenceError(
+                        f"{path}:{index}: invalid not_run causal record"
+                    )
+            elif record["outcome"] != "skipped":
                 if record.get("supervisor_available") is False:
+                    expected_keys = base_keys | {
+                        "supervisor_available",
+                        "wrapper_exit",
+                    }
+                    if set(record) != expected_keys:
+                        raise EvidenceError(
+                            f"{path}:{index}: missing-supervisor stage shape mismatch"
+                        )
                     if (
                         record["outcome"] != "internal_fault"
                         or record.get("reason_code") != "missing_supervisor_metadata"
+                        or record.get("expected") != "exit_zero"
+                        or record.get("actual") != "metadata_unavailable"
                         or record.get("wrapper_exit") != SETUP_FAILURE
                     ):
                         raise EvidenceError(
                             f"{path}:{index}: invalid missing-supervisor event"
                         )
                 else:
+                    expected_keys = base_keys | {"supervisor", "wrapper_exit"}
+                    if set(record) != expected_keys:
+                        raise EvidenceError(
+                            f"{path}:{index}: supervised stage shape mismatch"
+                        )
                     validate_supervisor_object(
                         path,
                         index,
                         record.get("supervisor"),
                         expected_stage_id=event_id,
                     )
-                    if record["supervisor"]["classification"] != record["outcome"]:
+                    wrapper_mismatch = (
+                        record.get("outcome") == "internal_fault"
+                        and record.get("reason_code") == "wrapper_exit_mismatch"
+                    )
+                    if (
+                        record["supervisor"]["classification"] != record["outcome"]
+                        and not wrapper_mismatch
+                    ):
                         raise EvidenceError(
                             f"{path}:{index}: stage/supervisor outcome mismatch"
                         )
                     if (
                         record.get("wrapper_exit")
                         != record["supervisor"]["wrapper_exit"]
+                        and not wrapper_mismatch
                     ):
                         raise EvidenceError(
                             f"{path}:{index}: stage/supervisor exit mismatch"
                         )
-            elif (
-                event_id != "ubs"
-                or records[0]["profile"] == "ci"
-                or record.get("reason_code") != "typed_limitation"
-                or record.get("expected") != "not_applicable"
-                or record.get("actual") != "skipped"
-                or not isinstance(record.get("limitation"), str)
-                or not record["limitation"]
-            ):
-                raise EvidenceError(f"{path}:{index}: invalid skipped obligation")
+                    if wrapper_mismatch and (
+                        record.get("wrapper_exit")
+                        == record["supervisor"]["wrapper_exit"]
+                    ):
+                        raise EvidenceError(
+                            f"{path}:{index}: false wrapper-exit mismatch"
+                        )
+                    if wrapper_mismatch:
+                        if (
+                            record.get("expected") != "supervisor_wrapper_exit"
+                            or record.get("actual")
+                            != "shell_wrapper_exit_mismatch"
+                        ):
+                            raise EvidenceError(
+                                f"{path}:{index}: malformed wrapper-exit mismatch"
+                            )
+                    elif (
+                        record.get("reason_code")
+                        != record["supervisor"]["reason_code"]
+                        or record.get("expected") != "exit_zero"
+                        or record.get("actual") != record["outcome"]
+                    ):
+                        raise EvidenceError(
+                            f"{path}:{index}: stage decision differs from supervisor"
+                        )
+            else:
+                expected_keys = base_keys | {"limitation"}
+                if set(record) != expected_keys:
+                    raise EvidenceError(
+                        f"{path}:{index}: skipped stage shape mismatch"
+                    )
+                if (
+                    event_id != "ubs"
+                    or records[0]["profile"] == "ci"
+                    or record.get("reason_code") != "typed_limitation"
+                    or record.get("expected") != "not_applicable"
+                    or record.get("actual") != "skipped"
+                    or not isinstance(record.get("limitation"), str)
+                    or not record["limitation"]
+                ):
+                    raise EvidenceError(
+                        f"{path}:{index}: invalid skipped obligation"
+                    )
         elif event == "step":
             required = {
                 "step_id",
@@ -6405,12 +7078,11 @@ def validate_run(
                 )
         else:
             expected_ids = CHECK_STAGE_ORDER
-            actual_ids = [
-                str(record.get("stage"))
-                for record in exercised
-                if record.get("event") == "stage"
+            stage_records = [
+                record for record in exercised if record.get("event") == "stage"
             ]
-            if len(actual_ids) != len(exercised):
+            actual_ids = [str(record.get("stage")) for record in stage_records]
+            if len(stage_records) != len(exercised):
                 raise EvidenceError(f"{path}: quality gate contains foreign events")
         if actual_ids != expected_ids[: len(actual_ids)]:
             raise EvidenceError(
@@ -6418,6 +7090,37 @@ def validate_run(
             )
         if expected_verdict == "pass" and actual_ids != expected_ids:
             raise EvidenceError(f"{path}: passing check omitted mandatory obligations")
+        failed_stage_records = [
+            record
+            for record in exercised
+            if record.get("event") == "stage"
+            and record.get("outcome")
+            not in {"pass", "skipped", "not_run"}
+        ]
+        if failed_stage_records:
+            if len(failed_stage_records) != 1 or actual_ids != expected_ids:
+                raise EvidenceError(
+                    f"{path}: failed check omitted explicit downstream not_run stages"
+                )
+            failed_record = failed_stage_records[0]
+            failed_index = exercised.index(failed_record)
+            for record in exercised[failed_index + 1 :]:
+                if (
+                    record.get("event") != "stage"
+                    or record.get("outcome") != "not_run"
+                    or record.get("causal_stage") != failed_record.get("stage")
+                    or record.get("causal_reason")
+                    != failed_record.get("reason_code")
+                ):
+                    raise EvidenceError(
+                        f"{path}: downstream stage lacks exact failure causality"
+                    )
+        elif any(
+            record.get("event") == "stage"
+            and record.get("outcome") == "not_run"
+            for record in exercised
+        ):
+            raise EvidenceError(f"{path}: not_run stages have no failed cause")
         bound_plant = records[0]["planted"]
         planted_events = [
             record
@@ -6435,7 +7138,6 @@ def validate_run(
                 profile != "self-test-plant"
                 or expected_verdict != "internal_fault"
                 or not unexpected_stage
-                or actual_ids[-1:] != [unexpected_stage]
                 or len(planted_events) != 1
                 or planted_events[0].get("stage") != unexpected_stage
                 or planted_events[0].get("outcome") != "internal_fault"
@@ -6448,7 +7150,6 @@ def validate_run(
             if (
                 profile != "self-test-plant"
                 or expected_verdict != "fail"
-                or actual_ids[-1:] != [bound_plant]
                 or len(planted_events) != 1
                 or planted_events[0].get("stage") != bound_plant
                 or planted_events[0].get("outcome") != "fail"
@@ -6518,6 +7219,17 @@ def validate_run(
             }:
                 raise EvidenceError(
                     f"{path}: an earlier stage failed before the requested plant"
+                )
+        for record in records[records.index(planted_record) + 1 : -1]:
+            if (
+                record.get("event") != "stage"
+                or record.get("outcome") != "not_run"
+                or record.get("causal_stage") != expected_planted_stage
+                or record.get("causal_reason")
+                != planted_record.get("reason_code")
+            ):
+                raise EvidenceError(
+                    f"{path}: planted failure lacks explicit downstream not_run records"
                 )
         if records[0].get("planted") != expected_planted_stage:
             raise EvidenceError(f"{path}: run start does not bind the requested plant")
@@ -8239,18 +8951,24 @@ def validate_ubs_inventory_document(inventory: Any) -> dict[str, Any]:
     return inventory
 
 
-def validate_ubs_inventory(path: Path, root: Path | None) -> dict[str, Any]:
+def validate_ubs_inventory(
+    path: Path,
+    root: Path | None,
+    *,
+    require_live_scope: bool = False,
+) -> dict[str, Any]:
     inventory = validate_ubs_inventory_document(read_json_object(path))
     if root is None:
         return inventory
     root = lexical_absolute(root)
     _root, descriptor = open_directory_nofollow(root, create=False)
     os.close(descriptor)
-    recomputed = collect_ubs_inventory(root, inventory["scope"])
-    if recomputed != inventory:
-        raise EvidenceError(
-            "UBS inventory does not exactly cover its declared live repository scope"
-        )
+    if require_live_scope:
+        recomputed = collect_ubs_inventory(root, inventory["scope"])
+        if recomputed != inventory:
+            raise EvidenceError(
+                "UBS inventory does not exactly cover its declared live repository scope"
+            )
     for row in inventory["files"]:
         rel = row["path"]
         candidate = require_within(root / rel, root, label="UBS inventory input")
@@ -8260,7 +8978,10 @@ def validate_ubs_inventory(path: Path, root: Path | None) -> dict[str, Any]:
         _data, size, digest = stable_file_facts(candidate)
         if row["bytes"] != size or not hmac.compare_digest(row["sha256"], digest):
             raise EvidenceError(f"UBS inventory input changed: {rel}")
-    if collect_ubs_inventory(root, inventory["scope"]) != inventory:
+    if (
+        require_live_scope
+        and collect_ubs_inventory(root, inventory["scope"]) != inventory
+    ):
         raise EvidenceError("UBS inventory scope changed during validation")
     return inventory
 
@@ -8562,6 +9283,10 @@ def cleanup_guardian_descendants(worker_pid: int, grace_s: float = 1.0) -> list[
 def artifact_role(rel: str) -> str:
     if rel == "run.ndjson":
         return "run_log"
+    if rel == CHECK_HUMAN_LOG:
+        return "human_semantic_log"
+    if rel == "human.log":
+        return "human_telemetry_log"
     if rel.startswith("fixtures/"):
         return "repro_fixture"
     if rel.endswith(".ndjson"):
@@ -8666,6 +9391,8 @@ def generate_manifest(
     if run_schema not in RUN_SCHEMAS:
         raise EvidenceError("run log has an unsupported schema")
     run_report = validate_run(run_log, run_schema, verdict)
+    if run_schema == "fln.check/2":
+        validate_check_human(run_log, art_dir / CHECK_HUMAN_LOG)
     start = run_records[0]
     terminal = run_records[-1]
     expected_identity = {
@@ -8702,6 +9429,8 @@ def generate_manifest(
     )
     present = {entry["path"] for entry in entries}
     required = {"run.ndjson", "run.validation.json"}
+    if run_schema == "fln.check/2":
+        required.add(CHECK_HUMAN_LOG)
     if not required.issubset(present):
         raise EvidenceError(
             f"manifest is missing required artifacts: {sorted(required - present)!r}"
@@ -8828,6 +9557,8 @@ def validate_manifest(
             f"manifest inventory mismatch: recorded={entries!r} actual={actual_entries!r}"
         )
     required = {"run.ndjson", "run.validation.json"}
+    if manifest["run_schema"] == "fln.check/2":
+        required.add(CHECK_HUMAN_LOG)
     if not required.issubset(seen_paths):
         raise EvidenceError(
             f"manifest is missing required artifacts: {sorted(required - seen_paths)!r}"
@@ -8839,6 +9570,8 @@ def validate_manifest(
         str(manifest.get("verdict")),
         live_context=live_context,
     )
+    if manifest["run_schema"] == "fln.check/2":
+        validate_check_human(run_log, art_dir / CHECK_HUMAN_LOG)
     if read_json_object(art_dir / "run.validation.json") != run_report:
         raise EvidenceError("manifested run validation report is stale or forged")
     terminal = load_ndjson(run_log)[-1]
@@ -9827,6 +10560,42 @@ def cmd_run(args: argparse.Namespace) -> int:
     raise EvidenceError(f"inner supervisor died unexpectedly with status {worker_exit}")
 
 
+def cmd_validate_verification_manifest(args: argparse.Namespace) -> int:
+    try:
+        report = validate_verification_manifest(
+            Path(args.manifest), Path(args.beads)
+        )
+    except (
+        EvidenceError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+    ) as error:
+        print(f"verification-manifest: {error}", file=sys.stderr)
+        return FAIL
+    if args.output:
+        write_new(Path(args.output), canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_render_check_human(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    run_path = require_exact_artifact_path(
+        Path(args.file), artifact_root, "run.ndjson", label="check run"
+    )
+    output = require_exact_artifact_path(
+        Path(args.output), artifact_root, CHECK_HUMAN_LOG, label="check human log"
+    )
+    records = load_ndjson(run_path)
+    write_new(output, render_check_human(records))
+    validate_check_human(run_path, output)
+    return PASS
+
+
 def cmd_validate_guard(args: argparse.Namespace) -> int:
     report = validate_guard(
         Path(args.file),
@@ -10070,12 +10839,16 @@ def cmd_ubs_inventory(args: argparse.Namespace) -> int:
     output = Path(args.output)
     require_within(output, Path(args.artifact_root), label="UBS inventory")
     write_new(output, canonical_json(inventory))
-    validate_ubs_inventory(output, root)
+    validate_ubs_inventory(output, root, require_live_scope=True)
     return PASS
 
 
 def cmd_validate_ubs_inventory(args: argparse.Namespace) -> int:
-    report = validate_ubs_inventory(Path(args.inventory), Path(args.root))
+    report = validate_ubs_inventory(
+        Path(args.inventory),
+        Path(args.root),
+        require_live_scope=args.require_live_scope,
+    )
     sys.stdout.buffer.write(canonical_json(report))
     return PASS
 
@@ -10513,6 +11286,450 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         path = art_dir / name
         path.mkdir()
         return path
+
+    # The verification registry is a closed schema with a frozen adoption
+    # boundary. Exercise both the real transition law and discriminating
+    # authority mutants before any repository stage can rely on it.
+    verification_root = case_dir("verification-manifest")
+    verification_beads = [
+        {"id": "baseline-closed", "status": "closed"},
+        {"id": "rur", "status": "in_progress"},
+    ]
+    verification_ids = sorted(record["id"] for record in verification_beads)
+    verification_header = {
+        "schema": VERIFICATION_MANIFEST_SCHEMA,
+        "kind": "adoption",
+        "source": ".beads/issues.jsonl",
+        "projection": "sorted-canonical-bead-ids-v1",
+        "hash_algorithm": "sha256",
+        "hash_preimage": (
+            "fln.verification-manifest.adoption.ids/1+nul+"
+            "u64le-length-prefixed-utf8"
+        ),
+        "record_count": len(verification_ids),
+        "projection_hash": verification_adoption_hash(verification_ids),
+        "adoption_ids": verification_ids,
+        "adoption_open_ids": ["rur"],
+    }
+    verification_authority_hash = verification_adoption_authority_hash(
+        verification_header["adoption_ids"],
+        verification_header["adoption_open_ids"],
+    )
+    verification_coverage = {
+        "schema": VERIFICATION_MANIFEST_SCHEMA,
+        "kind": "coverage",
+        "bead": "rur",
+        "state": "active",
+        "owner": "fixture",
+        "workstream": "W1",
+        "claim_type": "invariant",
+        "evidence_kind": "no_mock_e2e",
+        "mock_only": False,
+        "skip": "none",
+        "requirement_ids": ["REQ-QUALITY-GATE"],
+        "claim_ids": ["CLAIM-QUALITY-GATE"],
+        "invariant_ids": ["FL-INV-07"],
+        "parity_rows": ["not_applicable_fixture"],
+        "behavior_notes": [],
+        "gate_ids": ["G0"],
+        "unit": ["unit:happy"],
+        "boundary": ["unit:boundary"],
+        "error": ["unit:error"],
+        "resource": ["unit:resource"],
+        "cancellation": ["unit:cancellation"],
+        "failure_atomicity": ["unit:failure-atomicity"],
+        "property": [],
+        "metamorphic": [],
+        "fuzz": [],
+        "mutation": ["mutation:missing-stage"],
+        "fault": ["fault:cancellation"],
+        "scenarios": ["quality_gate"],
+        "negative_recovery": ["quality_gate:failure-recovery"],
+        "artifacts": ["human.log", "run.ndjson"],
+    }
+    verification_scenario = {
+        "schema": VERIFICATION_MANIFEST_SCHEMA,
+        "kind": "scenario",
+        "scenario": "quality_gate",
+        "owner": "rur",
+        "activation": "active",
+        "claim_type": "invariant",
+        "evidence_kind": "no_mock_e2e",
+        "gate_ids": ["G0"],
+        "ci_required": True,
+        "ci_root": "check/quality-gate",
+        "artifact_kind": "direct",
+        "artifact_name": "-",
+    }
+    verification_records = [
+        verification_header,
+        verification_coverage,
+        verification_scenario,
+    ]
+
+    def clone_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return parse_json(
+            json.dumps(records), subject="verification manifest self-test clone"
+        )
+
+    def write_verification_case(
+        name: str,
+        records: list[dict[str, Any]],
+        beads: list[dict[str, Any]] | None = None,
+    ) -> tuple[Path, Path]:
+        root = verification_root / name
+        root.mkdir()
+        manifest = root / "manifest.jsonl"
+        tracker = root / "issues.jsonl"
+        write_new(
+            manifest,
+            b"".join(canonical_json(record) for record in records),
+        )
+        write_new(
+            tracker,
+            b"".join(
+                canonical_json(record)
+                for record in (verification_beads if beads is None else beads)
+            ),
+        )
+        return manifest, tracker
+
+    positive_manifest, positive_beads = write_verification_case(
+        "positive", clone_records(verification_records)
+    )
+    positive_report = validate_verification_manifest(
+        positive_manifest,
+        positive_beads,
+        expected_adoption_authority_hash=verification_authority_hash,
+    )
+    require(
+        positive_report["coverage_rows"] == 1
+        and positive_report["ci_scenarios"] == ["quality_gate"],
+        "verification manifest positive report lost its authority rows",
+    )
+    verification_mutants = 0
+
+    def reject_verification_case(
+        name: str,
+        mutate: Callable[
+            [list[dict[str, Any]], list[dict[str, Any]]], None
+        ],
+    ) -> None:
+        nonlocal verification_mutants
+        records = clone_records(verification_records)
+        beads = clone_records(verification_beads)
+        mutate(records, beads)
+        manifest, tracker = write_verification_case(name, records, beads)
+        try:
+            validate_verification_manifest(
+                manifest,
+                tracker,
+                expected_adoption_authority_hash=verification_authority_hash,
+            )
+        except EvidenceError:
+            verification_mutants += 1
+        else:
+            raise EvidenceError(
+                f"verification manifest mutant survived: {name}"
+            )
+
+    reject_verification_case(
+        "absent-coverage",
+        lambda records, _beads: records.pop(1),
+    )
+    reject_verification_case(
+        "mock-only-invariant",
+        lambda records, _beads: records[1].update(
+            evidence_kind="mock", mock_only=True
+        ),
+    )
+    reject_verification_case(
+        "fuzz-closes-invariant",
+        lambda records, _beads: records[1].update(evidence_kind="fuzz"),
+    )
+    reject_verification_case(
+        "unclassified-skip",
+        lambda records, _beads: records[1].update(skip="silent"),
+    )
+    reject_verification_case(
+        "planned-counted-passed",
+        lambda records, _beads: records[2].update(activation="planned"),
+    )
+    reject_verification_case(
+        "mock-scenario-closes-invariant",
+        lambda records, _beads: records[2].update(evidence_kind="mock"),
+    )
+    reject_verification_case(
+        "active-scenario-not-ci-enforced",
+        lambda records, _beads: records[2].update(
+            ci_required=False,
+            ci_root="-",
+            artifact_kind="none",
+            artifact_name="-",
+        ),
+    )
+    reject_verification_case(
+        "orphan-scenario",
+        lambda records, _beads: records[2].update(owner="missing-owner"),
+    )
+    reject_verification_case(
+        "extra-field",
+        lambda records, _beads: records[1].update(extra="unreviewed"),
+    )
+    reject_verification_case(
+        "stale-adoption-hash",
+        lambda records, _beads: records[0].update(
+            projection_hash=f"sha256:{'0' * 64}"
+        ),
+    )
+    reject_verification_case(
+        "new-bead-without-row",
+        lambda _records, beads: beads.append(
+            {"id": "new-unregistered", "status": "open"}
+        ),
+    )
+
+    def expand_adoption_boundary(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        beads.append({"id": "new-grandfathered", "status": "open"})
+        adopted = sorted([*records[0]["adoption_ids"], "new-grandfathered"])
+        adopted_open = sorted(
+            [*records[0]["adoption_open_ids"], "new-grandfathered"]
+        )
+        records[0].update(
+            adoption_ids=adopted,
+            adoption_open_ids=adopted_open,
+            record_count=len(adopted),
+            projection_hash=verification_adoption_hash(adopted),
+        )
+
+    reject_verification_case(
+        "dynamic-unbounded-adoption",
+        expand_adoption_boundary,
+    )
+    reject_verification_case(
+        "closed-bead-active-row",
+        lambda _records, beads: beads[1].update(status="closed"),
+    )
+    reject_verification_case(
+        "duplicate-row",
+        lambda records, _beads: records.insert(2, dict(records[1])),
+    )
+
+    duplicate_root = verification_root / "duplicate-key"
+    duplicate_root.mkdir()
+    duplicate_manifest = duplicate_root / "manifest.jsonl"
+    duplicate_tracker = duplicate_root / "issues.jsonl"
+    duplicate_coverage = canonical_json(verification_coverage).rstrip(b"\n")
+    write_new(
+        duplicate_manifest,
+        canonical_json(verification_header)
+        + duplicate_coverage[:-1]
+        + b',"state":"active"}\n'
+        + canonical_json(verification_scenario),
+    )
+    write_new(
+        duplicate_tracker,
+        b"".join(canonical_json(record) for record in verification_beads),
+    )
+    try:
+        validate_verification_manifest(
+            duplicate_manifest,
+            duplicate_tracker,
+            expected_adoption_authority_hash=verification_authority_hash,
+        )
+    except EvidenceError:
+        verification_mutants += 1
+    else:
+        raise EvidenceError("duplicate manifest key was accepted")
+
+    truncated_root = verification_root / "truncated"
+    truncated_root.mkdir()
+    truncated_manifest = truncated_root / "manifest.jsonl"
+    truncated_tracker = truncated_root / "issues.jsonl"
+    write_new(
+        truncated_manifest,
+        b"".join(canonical_json(record) for record in verification_records)[:-1],
+    )
+    write_new(
+        truncated_tracker,
+        b"".join(canonical_json(record) for record in verification_beads),
+    )
+    try:
+        validate_verification_manifest(
+            truncated_manifest,
+            truncated_tracker,
+            expected_adoption_authority_hash=verification_authority_hash,
+        )
+    except EvidenceError:
+        verification_mutants += 1
+    else:
+        raise EvidenceError("truncated verification manifest was accepted")
+    require(
+        verification_mutants == 16,
+        "verification manifest mutation matrix is incomplete",
+    )
+    cases.append(
+        {
+            "case": "verification_manifest_model",
+            "ok": True,
+            "mutants_killed": verification_mutants,
+        }
+    )
+    cases.extend(
+        (
+            {
+                "case": "claim_evidence_authority",
+                "ok": True,
+                "mutants_killed": 3,
+            },
+            {
+                "case": "scenario_activation_registry",
+                "ok": True,
+                "mutants_killed": 3,
+            },
+        )
+    )
+
+    # A changed-scope inventory is frozen at run start. Git index/commit
+    # transitions can change the live "changed" set without changing any
+    # captured bytes, especially in the shared-tree swarm. Those transitions
+    # must not break terminal publication; actual byte drift remains fatal.
+    ubs_scope_root = case_dir("ubs_inventory_scope_snapshot")
+    ubs_scope_repo = ubs_scope_root / "repo"
+    ubs_scope_repo.mkdir()
+    git_init = subprocess.run(
+        ["git", "init", "-q", str(ubs_scope_repo)],
+        cwd=ubs_scope_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(
+        git_init.returncode == 0,
+        f"UBS scope fixture git init failed: {git_init.stderr[-300:]!r}",
+    )
+    tracked_input = ubs_scope_repo / "tracked.py"
+    stable_input = ubs_scope_repo / "stable.py"
+    write_new(tracked_input, b"value = 1\n")
+    write_new(stable_input, b"stable = True\n")
+    run_git(
+        ubs_scope_repo,
+        ["add", "tracked.py", "stable.py"],
+        subject="UBS scope fixture initial add",
+    )
+    run_git(
+        ubs_scope_repo,
+        [
+            "-c",
+            "user.name=FrankenLean Tribunal",
+            "-c",
+            "user.email=tribunal@invalid",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ],
+        subject="UBS scope fixture initial commit",
+    )
+    with tracked_input.open("ab") as handle:
+        handle.write(b"# captured change\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    captured_inventory = collect_ubs_inventory(ubs_scope_repo, "changed")
+    require(
+        [row["path"] for row in captured_inventory["files"]] == ["tracked.py"],
+        "UBS scope fixture did not capture the intended changed file",
+    )
+    captured_inventory_path = ubs_scope_root / "ubs-inventory.json"
+    write_new(captured_inventory_path, canonical_json(captured_inventory))
+    validate_ubs_inventory(
+        captured_inventory_path,
+        ubs_scope_repo,
+        require_live_scope=True,
+    )
+    captured_root = tree_hash(
+        ubs_scope_repo,
+        ["tracked.py", "stable.py"],
+        inventory_path=captured_inventory_path,
+    )
+    run_git(
+        ubs_scope_repo,
+        ["add", "tracked.py"],
+        subject="UBS scope fixture transition add",
+    )
+    run_git(
+        ubs_scope_repo,
+        [
+            "-c",
+            "user.name=FrankenLean Tribunal",
+            "-c",
+            "user.email=tribunal@invalid",
+            "commit",
+            "-q",
+            "-m",
+            "scope transition",
+        ],
+        subject="UBS scope fixture transition commit",
+    )
+    try:
+        validate_ubs_inventory(
+            captured_inventory_path,
+            ubs_scope_repo,
+            require_live_scope=True,
+        )
+    except EvidenceError as error:
+        require(
+            "declared live repository scope" in str(error),
+            f"UBS live-scope transition failed for the wrong reason: {error}",
+        )
+    else:
+        raise EvidenceError("UBS strict live-scope transition was not detected")
+    validate_ubs_inventory(captured_inventory_path, ubs_scope_repo)
+    transitioned_root = tree_hash(
+        ubs_scope_repo,
+        ["tracked.py", "stable.py"],
+        inventory_path=captured_inventory_path,
+    )
+    require(
+        transitioned_root == captured_root,
+        "Git-only UBS scope transition changed the immutable input root",
+    )
+    with stable_input.open("ab") as handle:
+        handle.write(b"# governed byte drift\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    drifted_root = tree_hash(
+        ubs_scope_repo,
+        ["tracked.py", "stable.py"],
+        inventory_path=captured_inventory_path,
+    )
+    require(
+        drifted_root != captured_root,
+        "governed byte drift did not change the immutable input root",
+    )
+    with tracked_input.open("ab") as handle:
+        handle.write(b"# captured byte drift\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        validate_ubs_inventory(captured_inventory_path, ubs_scope_repo)
+    except EvidenceError as error:
+        require(
+            "UBS inventory input changed: tracked.py" in str(error),
+            f"UBS captured-byte drift failed for the wrong reason: {error}",
+        )
+    else:
+        raise EvidenceError("UBS captured-byte drift was accepted")
+    cases.append(
+        {
+            "case": "ubs_inventory_scope_snapshot",
+            "ok": True,
+            "mutants_killed": 2,
+        }
+    )
 
     # The structure guard's robot stream is a versioned evidence contract, not a
     # best-effort JSON bag. Exercise one complete /3 stream and discriminating
@@ -12849,7 +14066,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         pass
     else:
         raise EvidenceError("unterminated run was accepted")
-    cases.append({"case": "malformed_evidence", "ok": True})
+    cases.append(
+        {"case": "strict_ndjson_validator", "ok": True, "mutants_killed": 2}
+    )
 
     collision_validation_root = case_dir("environment_collision_validation")
     collision_run_id = "collision-self-test"
@@ -14415,6 +15634,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "budgets": {"timeout_ms": 5000},
             "parity_ledger_row": "not_applicable_evidence_self_test",
             "planted": "",
+            "verification_manifest": VERIFICATION_MANIFEST_PATH,
         },
         {
             "schema": "fln.check/2",
@@ -14460,6 +15680,27 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     write_new(
         manifest_root / "run.ndjson",
         b"".join(canonical_json(record) for record in manifest_records),
+    )
+    human_render = render_check_human(manifest_records)
+    write_new(manifest_root / CHECK_HUMAN_LOG, human_render)
+    validate_check_human(
+        manifest_root / "run.ndjson", manifest_root / CHECK_HUMAN_LOG
+    )
+    human_mutant_root = case_dir("event_render_equivalence")
+    human_mutant = human_mutant_root / "human.semantic.mutant.log"
+    write_new(human_mutant, human_render + b"forged-extra-event\n")
+    try:
+        validate_check_human(manifest_root / "run.ndjson", human_mutant)
+    except EvidenceError:
+        pass
+    else:
+        raise EvidenceError("human/NDJSON divergence was accepted")
+    cases.append(
+        {
+            "case": "event_render_equivalence",
+            "ok": True,
+            "mutants_killed": 1,
+        }
     )
     run_report = validate_run(manifest_root / "run.ndjson", "fln.check/2", "pass")
     write_new(manifest_root / "run.validation.json", canonical_json(run_report))
@@ -15064,7 +16305,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         schema: str,
         expected_verdict: str,
         expected_reason: str,
-    ) -> None:
+    ) -> Path:
         repo = Path(__file__).resolve().parent.parent
         case_root = art_dir / case_name
         environment = {
@@ -15120,11 +16361,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         cases.append(
             {"case": case_name, "ok": True, "artifact": str(bundle_dir)}
         )
+        return bundle_dir
 
     consumer_check_script = str(
         Path(__file__).resolve().parent.parent / "scripts" / "check.sh"
     )
-    run_consumer_fault_case(
+    short_circuit_bundle = run_consumer_fault_case(
         "consumer_check_unexpected_stage",
         ["bash", consumer_check_script],
         {"FLN_CHECK_PLANT_UNEXPECTED": "evidence-self-test"},
@@ -15134,6 +16376,77 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "fln.check/2",
         "internal_fault",
         "evidence-self-test:unexpected_child_exit",
+    )
+
+    def clone_short_circuit_mutant(
+        name: str, mutate: Callable[[list[dict[str, Any]]], None]
+    ) -> Path:
+        mutant_root = case_dir(name)
+        for source in sorted(
+            short_circuit_bundle.rglob("*"),
+            key=lambda path: (len(path.relative_to(short_circuit_bundle).parts), str(path)),
+        ):
+            relative = source.relative_to(short_circuit_bundle)
+            target = mutant_root / relative
+            if source.is_dir():
+                target.mkdir()
+            elif source.is_file():
+                if relative == Path("run.ndjson"):
+                    continue
+                data, _size, _digest = stable_file_facts(source)
+                write_new(target, data)
+            else:
+                raise EvidenceError(
+                    f"short-circuit fixture contains a special file: {source}"
+                )
+        records = load_ndjson(short_circuit_bundle / "run.ndjson")
+        mutate(records)
+        for sequence, record in enumerate(records):
+            record["sequence"] = sequence
+        write_new(
+            mutant_root / "run.ndjson",
+            b"".join(canonical_json(record) for record in records),
+        )
+        return mutant_root / "run.ndjson"
+
+    omitted_not_run = clone_short_circuit_mutant(
+        "stage_short_circuit_omitted_not_run",
+        lambda records: records.pop(
+            next(
+                index
+                for index, record in enumerate(records)
+                if record.get("outcome") == "not_run"
+            )
+        ),
+    )
+    wrong_cause = clone_short_circuit_mutant(
+        "stage_short_circuit_wrong_cause",
+        lambda records: next(
+            record for record in records if record.get("outcome") == "not_run"
+        ).update(causal_reason="forged-cause"),
+    )
+    for mutant, expected_fragment in (
+        (omitted_not_run, "non-canonical check obligation order"),
+        (wrong_cause, "exact failure causality"),
+    ):
+        try:
+            validate_run(
+                mutant,
+                "fln.check/2",
+                "internal_fault",
+                live_context=False,
+            )
+        except EvidenceError as error:
+            require(
+                expected_fragment in str(error),
+                f"short-circuit mutant failed for the wrong reason: {error}",
+            )
+        else:
+            raise EvidenceError(
+                f"short-circuit mutant survived: {mutant.parent.name}"
+            )
+    cases.append(
+        {"case": "stage_short_circuit_model", "ok": True, "mutants_killed": 2}
     )
     run_consumer_fault_case(
         "consumer_check_drift",
@@ -15543,6 +16856,26 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     run_parser.set_defaults(func=cmd_run)
 
+    verification_manifest_parser = subparsers.add_parser(
+        "validate-verification-manifest",
+        help="validate the governed bead coverage and scenario-activation registry",
+    )
+    verification_manifest_parser.add_argument("--manifest", required=True)
+    verification_manifest_parser.add_argument("--beads", required=True)
+    verification_manifest_parser.add_argument("--output")
+    verification_manifest_parser.set_defaults(
+        func=cmd_validate_verification_manifest
+    )
+
+    check_human_parser = subparsers.add_parser(
+        "render-check-human",
+        help="render the canonical human event log from one fln.check/2 stream",
+    )
+    check_human_parser.add_argument("--file", required=True)
+    check_human_parser.add_argument("--output", required=True)
+    check_human_parser.add_argument("--artifact-root", required=True)
+    check_human_parser.set_defaults(func=cmd_render_check_human)
+
     guard_parser = subparsers.add_parser(
         "validate-guard", help="validate exact structure-guard NDJSON semantics"
     )
@@ -15698,10 +17031,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     inventory_validation = subparsers.add_parser(
         "validate-ubs-inventory",
-        help="verify an exact UBS inventory against the workspace",
+        help="verify captured UBS file facts against the workspace",
     )
     inventory_validation.add_argument("--root", required=True)
     inventory_validation.add_argument("--inventory", required=True)
+    inventory_validation.add_argument(
+        "--require-live-scope",
+        action="store_true",
+        help="also require the current Git-derived scope to equal the captured scope",
+    )
     inventory_validation.set_defaults(func=cmd_validate_ubs_inventory)
 
     inventory_execution = subparsers.add_parser(
