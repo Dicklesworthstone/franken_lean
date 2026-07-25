@@ -2132,9 +2132,75 @@ mod verdict_codec_fuzz {
 mod verdict_schema_no_mock_e2e {
     use super::test_support::*;
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::Path;
+
+    const E2E_MAX_WORKERS: usize = 41;
+
+    fn hex(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+
+    fn write_new(path: &Path, contents: &str) {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("Verdict E2E artifact path must be new and writable");
+        output
+            .write_all(contents.as_bytes())
+            .expect("Verdict E2E artifact write must complete");
+        output
+            .sync_all()
+            .expect("Verdict E2E artifact must be durable before test exit");
+    }
+
+    fn publish_e2e_artifacts(
+        semantic: &str,
+        observed_encoded_bytes: usize,
+        workers_spawned: usize,
+    ) {
+        let semantic_path = std::env::var_os("FLN_VERDICT_E2E_SEMANTIC_PATH");
+        let telemetry_path = std::env::var_os("FLN_VERDICT_E2E_TELEMETRY_PATH");
+        assert_eq!(
+            semantic_path.is_some(),
+            telemetry_path.is_some(),
+            "FLN_VERDICT_E2E_SEMANTIC_PATH and FLN_VERDICT_E2E_TELEMETRY_PATH must be paired"
+        );
+        match (semantic_path, telemetry_path) {
+            (None, None) => {}
+            (Some(semantic_path), Some(telemetry_path)) => {
+                assert!(
+                    workers_spawned <= E2E_MAX_WORKERS,
+                    "Verdict E2E exceeded its declared worker bound"
+                );
+                let telemetry = format!(
+                    "{{\"event\":\"phase_resources\",\"max_encoded_bytes\":{},\
+                     \"max_workers\":{E2E_MAX_WORKERS},\
+                     \"observed_encoded_bytes\":{observed_encoded_bytes},\
+                     \"schema\":\"fln.e2e.verdict-telemetry\",\
+                     \"timing_used_as_gate\":false,\"version\":1,\
+                     \"workers_spawned\":{workers_spawned}}}\n",
+                    SchemaLimits::default().max_encoded_bytes
+                );
+                write_new(Path::new(&semantic_path), semantic);
+                write_new(Path::new(&telemetry_path), &telemetry);
+            }
+            _ => {}
+        }
+    }
 
     #[test]
     fn real_positive_failure_recovery_and_thread_matrix_share_authoritative_bytes() {
+        let phase =
+            std::env::var("FLN_VERDICT_E2E_PHASE").unwrap_or_else(|_| "positive".to_owned());
         let cnf = sat_formula();
         let model = model();
         assert_eq!(model.satisfies(&cnf), Ok(true));
@@ -2151,32 +2217,105 @@ mod verdict_schema_no_mock_e2e {
         .expect("complete false model");
         assert_eq!(false_model.satisfies(&cnf), Ok(false));
 
-        let expected = cnf.to_canonical_bytes();
-        for workers in [1_usize, 8, 32] {
-            let mut handles = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                let cloned = cnf.clone();
-                handles.push(std::thread::spawn(move || cloned.to_canonical_bytes()));
-            }
-            for handle in handles {
-                assert_eq!(handle.join().expect("encoder thread"), expected);
-            }
-        }
-
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let model_bytes = model.to_canonical_bytes();
         let unsat = unsat_formula();
+        let unsat_bytes = unsat.to_canonical_bytes();
         let proof = proof(&unsat);
-        let mut corrupted = proof.to_canonical_bytes();
-        corrupted[WIRE_HEADER_BYTES + 8] = 0xff;
-        assert!(
-            UnsatProof::from_canonical_bytes(&corrupted, &unsat, SchemaLimits::default()).is_err()
-        );
-        assert_eq!(
-            UnsatProof::from_canonical_bytes(
-                &proof.to_canonical_bytes(),
-                &unsat,
-                SchemaLimits::default()
-            ),
-            Ok(proof)
-        );
+        let proof_bytes = proof.to_canonical_bytes();
+
+        match phase.as_str() {
+            "positive" => {
+                let mut thread_cnf_hex = Vec::new();
+                let mut workers_spawned = 0;
+                for workers in [1_usize, 8, 32] {
+                    let mut handles = Vec::with_capacity(workers);
+                    for _ in 0..workers {
+                        let cloned = cnf.clone();
+                        handles.push(std::thread::spawn(move || cloned.to_canonical_bytes()));
+                    }
+                    workers_spawned += handles.len();
+                    for handle in handles {
+                        assert_eq!(handle.join().expect("encoder thread"), cnf_bytes);
+                    }
+                    thread_cnf_hex.push(hex(&cnf_bytes));
+                }
+                let semantic = format!(
+                    "{{\"cnf_hex\":\"{}\",\"data_grade\":\"verified\",\
+                     \"event\":\"positive\",\"model_hex\":\"{}\",\"model_satisfies\":true,\
+                     \"proof_hex\":\"{}\",\"schema\":\"fln.e2e.verdict-semantic\",\
+                     \"status\":\"pass\",\"thread_cnf_hex\":[\"{}\",\"{}\",\"{}\"],\
+                     \"threads\":[1,8,32],\"unsat_cnf_hex\":\"{}\",\"version\":1}}\n",
+                    hex(&cnf_bytes),
+                    hex(&model_bytes),
+                    hex(&proof_bytes),
+                    thread_cnf_hex[0],
+                    thread_cnf_hex[1],
+                    thread_cnf_hex[2],
+                    hex(&unsat_bytes)
+                );
+                publish_e2e_artifacts(
+                    &semantic,
+                    cnf_bytes.len() + model_bytes.len() + unsat_bytes.len() + proof_bytes.len(),
+                    workers_spawned,
+                );
+            }
+            "failure" => {
+                let mut corrupted = proof_bytes.clone();
+                corrupted[WIRE_HEADER_BYTES + 8] = 0xff;
+                let error =
+                    UnsatProof::from_canonical_bytes(&corrupted, &unsat, SchemaLimits::default())
+                        .expect_err("unknown proof opcode must be refused");
+                assert_eq!(
+                    error,
+                    SchemaError::UnknownOpcode {
+                        schema: UNSAT_PROOF_SCHEMA,
+                        at: WIRE_HEADER_BYTES + 8,
+                        opcode: 0xff,
+                    }
+                );
+                let semantic = format!(
+                    "{{\"corrupted_proof_hex\":\"{}\",\"data_grade\":\"verified\",\
+                     \"error_at\":{},\"error_code\":\"unknown_opcode\",\"event\":\"failure\",\
+                     \"opcode\":255,\"partial_artifact_published\":false,\
+                     \"schema\":\"fln.e2e.verdict-semantic\",\"status\":\"refused\",\
+                     \"version\":1}}\n",
+                    hex(&corrupted),
+                    WIRE_HEADER_BYTES + 8
+                );
+                publish_e2e_artifacts(&semantic, corrupted.len(), 0);
+                println!(
+                    "FLN_VERDICT_E2E_EXPECTED_FAILURE: unknown proof opcode 255 at byte {}",
+                    WIRE_HEADER_BYTES + 8
+                );
+                assert_ne!(
+                    phase,
+                    "failure",
+                    "FLN_VERDICT_E2E_EXPECTED_FAILURE: unknown proof opcode 255 at byte {}",
+                    WIRE_HEADER_BYTES + 8
+                );
+            }
+            "recovery" => {
+                assert_eq!(
+                    Cnf::from_canonical_bytes(&cnf_bytes, SchemaLimits::default()),
+                    Ok(cnf)
+                );
+                assert_eq!(
+                    UnsatProof::from_canonical_bytes(&proof_bytes, &unsat, SchemaLimits::default()),
+                    Ok(proof)
+                );
+                let semantic = format!(
+                    "{{\"cnf_hex\":\"{}\",\"data_grade\":\"verified\",\
+                     \"event\":\"recovery\",\"proof_hex\":\"{}\",\
+                     \"recovered_after\":\"unknown_opcode\",\
+                     \"schema\":\"fln.e2e.verdict-semantic\",\"status\":\"pass\",\
+                     \"version\":1}}\n",
+                    hex(&cnf_bytes),
+                    hex(&proof_bytes)
+                );
+                publish_e2e_artifacts(&semantic, cnf_bytes.len() + proof_bytes.len(), 0);
+            }
+            other => assert_eq!(other, "recovery", "unknown FLN_VERDICT_E2E_PHASE"),
+        }
     }
 }

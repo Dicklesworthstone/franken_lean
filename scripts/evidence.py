@@ -155,6 +155,12 @@ E2E_STEP_ORDERS = {
         "collision_mutant",
         "collision_recovery",
     ],
+    "verdict_schema": [
+        "positive",
+        "failure",
+        "recovery",
+        "final_real_recheck",
+    ],
     "kernel_replay": [
         "decoder_suite",
         "admission_replay",
@@ -195,6 +201,19 @@ E2E_STEP_ORDERS = {
     ],
 }
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+VERDICT_SEMANTIC_SCHEMA = "fln.e2e.verdict-semantic"
+VERDICT_TELEMETRY_SCHEMA = "fln.e2e.verdict-telemetry"
+VERDICT_SCHEMA_VERSION = 1
+VERDICT_WIRE_MAGIC = b"FLNVRDCT"
+VERDICT_WIRE_HEADER_BYTES = 13
+VERDICT_MAX_SEMANTIC_BYTES = 65_536
+VERDICT_MAX_TELEMETRY_BYTES = 4_096
+VERDICT_MAX_ENCODED_BYTES = 256 * 1024 * 1024
+VERDICT_MAX_WORKERS = 41
+VERDICT_FAILURE_MARKER = (
+    "FLN_VERDICT_E2E_EXPECTED_FAILURE: unknown proof opcode 255 at byte 21"
+)
 
 ENVIRONMENT_COLLISION_SCHEMA = "fln.e2e.environment-collision"
 ENVIRONMENT_COLLISION_VERSION = 2
@@ -3563,6 +3582,526 @@ def validate_guard(
         "verdict": expected_verdict,
         "findings": actual_findings,
         "sha256": digest,
+    }
+
+
+class VerdictWireReader:
+    """Small independent reader for the frozen Verdict v1 evidence fixtures."""
+
+    def __init__(self, data: bytes, *, subject: str) -> None:
+        self.data = data
+        self.subject = subject
+        self.at = 0
+
+    def take(self, amount: int) -> bytes:
+        end = self.at + amount
+        if amount < 0 or end > len(self.data):
+            raise EvidenceError(
+                f"{self.subject}: truncated Verdict wire value at byte {self.at}"
+            )
+        value = self.data[self.at : end]
+        self.at = end
+        return value
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def u16(self) -> int:
+        return int.from_bytes(self.take(2), "little")
+
+    def u32(self) -> int:
+        return int.from_bytes(self.take(4), "little")
+
+    def u64(self) -> int:
+        return int.from_bytes(self.take(8), "little")
+
+    def header(self, expected_kind: int) -> None:
+        if self.take(len(VERDICT_WIRE_MAGIC)) != VERDICT_WIRE_MAGIC:
+            raise EvidenceError(f"{self.subject}: invalid Verdict wire magic")
+        kind = self.u8()
+        version = self.u16()
+        extensions = self.u16()
+        if kind != expected_kind:
+            raise EvidenceError(
+                f"{self.subject}: Verdict kind {kind}, expected {expected_kind}"
+            )
+        if version != VERDICT_SCHEMA_VERSION or extensions != 0:
+            raise EvidenceError(
+                f"{self.subject}: Verdict version/extensions are not frozen v1/0"
+            )
+
+    def finish(self) -> None:
+        if self.at != len(self.data):
+            raise EvidenceError(
+                f"{self.subject}: {len(self.data) - self.at} trailing Verdict bytes"
+            )
+
+
+def verdict_decode_hex(value: Any, *, label: str) -> bytes:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) % 2 != 0
+        or re.fullmatch(r"[0-9a-f]+", value) is None
+    ):
+        raise EvidenceError(f"Verdict {label} is not canonical lowercase hex")
+    if len(value) // 2 > VERDICT_MAX_ENCODED_BYTES:
+        raise EvidenceError(f"Verdict {label} exceeds the encoded-byte bound")
+    return bytes.fromhex(value)
+
+
+def verdict_read_clause(reader: VerdictWireReader) -> list[int]:
+    count = reader.u64()
+    if count > 64:
+        raise EvidenceError(f"{reader.subject}: fixture literal count is unbounded")
+    literals: list[int] = []
+    identities: set[int] = set()
+    for _ in range(count):
+        variable = reader.u32()
+        polarity = reader.u8()
+        if variable == 0 or polarity not in {0, 1}:
+            raise EvidenceError(f"{reader.subject}: malformed Verdict literal")
+        if variable in identities:
+            raise EvidenceError(
+                f"{reader.subject}: duplicate or tautological Verdict variable"
+            )
+        identities.add(variable)
+        literals.append(variable if polarity == 1 else -variable)
+    if literals != sorted(literals, key=lambda literal: (abs(literal), literal > 0)):
+        raise EvidenceError(f"{reader.subject}: Verdict literals are not canonical")
+    return literals
+
+
+def verdict_parse_cnf(data: bytes, *, subject: str) -> dict[str, Any]:
+    reader = VerdictWireReader(data, subject=subject)
+    reader.header(1)
+    variable_count = reader.u32()
+    count = reader.u64()
+    if variable_count > 64 or count > 64:
+        raise EvidenceError(f"{subject}: Verdict CNF fixture exceeds validator bounds")
+    clauses: list[dict[str, Any]] = []
+    previous_id = 0
+    for _ in range(count):
+        clause_id = reader.u64()
+        if clause_id <= previous_id:
+            raise EvidenceError(f"{subject}: Verdict clause ids are not canonical")
+        previous_id = clause_id
+        literals = verdict_read_clause(reader)
+        if any(abs(literal) > variable_count for literal in literals):
+            raise EvidenceError(f"{subject}: Verdict literal exceeds variable count")
+        clauses.append({"id": clause_id, "literals": literals})
+    reader.finish()
+    return {"variable_count": variable_count, "clauses": clauses}
+
+
+def verdict_parse_model(data: bytes, *, subject: str) -> dict[str, Any]:
+    reader = VerdictWireReader(data, subject=subject)
+    reader.header(2)
+    variable_count = reader.u32()
+    count = reader.u64()
+    if variable_count > 64 or count > 64:
+        raise EvidenceError(f"{subject}: Verdict model fixture exceeds validator bounds")
+    assignments: list[tuple[int, bool]] = []
+    previous_variable = 0
+    for _ in range(count):
+        variable = reader.u32()
+        raw_value = reader.u8()
+        if variable <= previous_variable or raw_value not in {0, 1}:
+            raise EvidenceError(f"{subject}: Verdict assignments are not canonical")
+        previous_variable = variable
+        assignments.append((variable, raw_value == 1))
+    reader.finish()
+    if [variable for variable, _value in assignments] != list(
+        range(1, variable_count + 1)
+    ):
+        raise EvidenceError(f"{subject}: Verdict model is not complete")
+    return {"variable_count": variable_count, "assignments": assignments}
+
+
+def verdict_parse_proof(data: bytes, *, subject: str) -> dict[str, Any]:
+    reader = VerdictWireReader(data, subject=subject)
+    reader.header(3)
+    count = reader.u64()
+    if count > 64:
+        raise EvidenceError(f"{subject}: Verdict proof fixture exceeds validator bounds")
+    steps: list[dict[str, Any]] = []
+    for _ in range(count):
+        opcode_at = reader.at
+        opcode = reader.u8()
+        if opcode == 1:
+            clause_id = reader.u64()
+            clause = verdict_read_clause(reader)
+            rule_opcode = reader.u8()
+            if rule_opcode == 1:
+                rule = {
+                    "kind": "resolution",
+                    "pivot": reader.u32(),
+                    "positive_parent": reader.u64(),
+                    "negative_parent": reader.u64(),
+                }
+            elif rule_opcode == 2:
+                dependencies = reader.u64()
+                if dependencies > 64:
+                    raise EvidenceError(
+                        f"{subject}: Verdict proof dependency count is unbounded"
+                    )
+                antecedents = [reader.u64() for _ in range(dependencies)]
+                if antecedents != sorted(set(antecedents)):
+                    raise EvidenceError(
+                        f"{subject}: Verdict proof dependencies are not canonical"
+                    )
+                rule = {"kind": "rup", "antecedents": antecedents}
+            else:
+                raise EvidenceError(
+                    f"{subject}: unknown Verdict proof rule opcode {rule_opcode}"
+                )
+            steps.append(
+                {"kind": "derive", "id": clause_id, "clause": clause, "rule": rule}
+            )
+        elif opcode == 2:
+            deletion_count = reader.u64()
+            if deletion_count > 64:
+                raise EvidenceError(
+                    f"{subject}: Verdict deletion count is unbounded"
+                )
+            clauses = [reader.u64() for _ in range(deletion_count)]
+            if not clauses or clauses != sorted(set(clauses)):
+                raise EvidenceError(
+                    f"{subject}: Verdict deletion targets are not canonical"
+                )
+            steps.append({"kind": "delete", "clauses": clauses})
+        elif opcode == 3:
+            steps.append({"kind": "conclude", "empty_clause": reader.u64()})
+        else:
+            raise EvidenceError(
+                f"{subject}: unknown Verdict proof opcode {opcode} at byte {opcode_at}"
+            )
+    reader.finish()
+    return {"steps": steps}
+
+
+def verdict_read_canonical_record(
+    path: Path, *, label: str, max_bytes: int
+) -> tuple[dict[str, Any], str]:
+    data, _size, digest = stable_file_facts(path, max_bytes=max_bytes)
+    record = parse_json(data, subject=label)
+    if not isinstance(record, dict):
+        raise EvidenceError(f"{label}: expected one JSON object")
+    if canonical_json(record) != data:
+        raise EvidenceError(f"{label}: record is not canonical single-row NDJSON")
+    return record, digest
+
+
+def verdict_exact_integer(record: Mapping[str, Any], key: str) -> int:
+    value = record.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise EvidenceError(f"Verdict {key} is not a non-negative integer")
+    return value
+
+
+def validate_verdict_schema_evidence(
+    semantic_path: Path,
+    telemetry_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    phase: str,
+    observed_exit: int,
+    *,
+    positive_semantic_path: Path | None,
+) -> dict[str, Any]:
+    semantic, semantic_digest = verdict_read_canonical_record(
+        semantic_path,
+        label=f"Verdict {phase} semantic evidence",
+        max_bytes=VERDICT_MAX_SEMANTIC_BYTES,
+    )
+    telemetry, telemetry_digest = verdict_read_canonical_record(
+        telemetry_path,
+        label=f"Verdict {phase} telemetry",
+        max_bytes=VERDICT_MAX_TELEMETRY_BYTES,
+    )
+    stdout, _stdout_size, stdout_digest = stable_file_facts(
+        stdout_path, max_bytes=MAX_LOG_BYTES
+    )
+    stderr, _stderr_size, stderr_digest = stable_file_facts(
+        stderr_path, max_bytes=MAX_LOG_BYTES
+    )
+    stdout_text = stdout.decode("utf-8", errors="strict")
+    stderr_text = stderr.decode("utf-8", errors="strict")
+
+    common_semantic = {
+        "data_grade": "verified",
+        "schema": VERDICT_SEMANTIC_SCHEMA,
+        "version": VERDICT_SCHEMA_VERSION,
+    }
+    for key, expected in common_semantic.items():
+        if semantic.get(key) != expected:
+            raise EvidenceError(
+                f"Verdict {phase} semantic {key} {semantic.get(key)!r}, "
+                f"expected {expected!r}"
+            )
+    forbidden_semantic_fragments = (
+        "duration",
+        "host",
+        "monotonic",
+        "path",
+        "pid",
+        "time",
+        "worker",
+    )
+    if any(
+        fragment in key
+        for key in semantic
+        for fragment in forbidden_semantic_fragments
+    ):
+        raise EvidenceError(
+            f"Verdict {phase} semantic row contains telemetry or host identity"
+        )
+
+    expected_telemetry_fields = {
+        "event",
+        "max_encoded_bytes",
+        "max_workers",
+        "observed_encoded_bytes",
+        "schema",
+        "timing_used_as_gate",
+        "version",
+        "workers_spawned",
+    }
+    if set(telemetry) != expected_telemetry_fields:
+        raise EvidenceError(
+            f"Verdict {phase} telemetry fields differ from the frozen schema"
+        )
+    if (
+        telemetry.get("schema") != VERDICT_TELEMETRY_SCHEMA
+        or telemetry.get("version") != VERDICT_SCHEMA_VERSION
+        or telemetry.get("event") != "phase_resources"
+        or telemetry.get("timing_used_as_gate") is not False
+    ):
+        raise EvidenceError(f"Verdict {phase} telemetry identity is malformed")
+    maximum_bytes = verdict_exact_integer(telemetry, "max_encoded_bytes")
+    maximum_workers = verdict_exact_integer(telemetry, "max_workers")
+    observed_bytes = verdict_exact_integer(telemetry, "observed_encoded_bytes")
+    workers_spawned = verdict_exact_integer(telemetry, "workers_spawned")
+    if (
+        maximum_bytes != VERDICT_MAX_ENCODED_BYTES
+        or observed_bytes > maximum_bytes
+        or maximum_workers != VERDICT_MAX_WORKERS
+        or workers_spawned > maximum_workers
+    ):
+        raise EvidenceError(f"Verdict {phase} telemetry exceeded or changed its bounds")
+
+    expected_sat_cnf = {
+        "variable_count": 3,
+        "clauses": [
+            {"id": 1, "literals": [1, -2]},
+            {"id": 2, "literals": [2]},
+            {"id": 3, "literals": [-1, 3]},
+        ],
+    }
+    expected_unsat_cnf = {
+        "variable_count": 1,
+        "clauses": [
+            {"id": 1, "literals": [1]},
+            {"id": 2, "literals": [-1]},
+        ],
+    }
+    expected_model = {
+        "variable_count": 3,
+        "assignments": [(1, True), (2, True), (3, True)],
+    }
+    expected_proof = {
+        "steps": [
+            {
+                "kind": "derive",
+                "id": 3,
+                "clause": [],
+                "rule": {
+                    "kind": "resolution",
+                    "pivot": 1,
+                    "positive_parent": 1,
+                    "negative_parent": 2,
+                },
+            },
+            {"kind": "conclude", "empty_clause": 3},
+        ]
+    }
+
+    if phase == "positive":
+        expected_fields = {
+            "cnf_hex",
+            "data_grade",
+            "event",
+            "model_hex",
+            "model_satisfies",
+            "proof_hex",
+            "schema",
+            "status",
+            "thread_cnf_hex",
+            "threads",
+            "unsat_cnf_hex",
+            "version",
+        }
+        if set(semantic) != expected_fields:
+            raise EvidenceError("Verdict positive semantic fields differ from v1")
+        if semantic.get("event") != "positive" or semantic.get("status") != "pass":
+            raise EvidenceError("Verdict positive semantic verdict is not pass")
+        cnf_bytes = verdict_decode_hex(semantic.get("cnf_hex"), label="CNF")
+        model_bytes = verdict_decode_hex(semantic.get("model_hex"), label="model")
+        unsat_bytes = verdict_decode_hex(
+            semantic.get("unsat_cnf_hex"), label="UNSAT CNF"
+        )
+        proof_bytes = verdict_decode_hex(semantic.get("proof_hex"), label="proof")
+        if verdict_parse_cnf(cnf_bytes, subject="positive CNF") != expected_sat_cnf:
+            raise EvidenceError("Verdict positive CNF semantic fixture differs")
+        parsed_model = verdict_parse_model(model_bytes, subject="positive model")
+        if parsed_model != expected_model:
+            raise EvidenceError("Verdict positive model semantic fixture differs")
+        if verdict_parse_cnf(
+            unsat_bytes, subject="positive UNSAT CNF"
+        ) != expected_unsat_cnf:
+            raise EvidenceError("Verdict positive UNSAT CNF semantic fixture differs")
+        if verdict_parse_proof(
+            proof_bytes, subject="positive proof"
+        ) != expected_proof:
+            raise EvidenceError("Verdict positive proof semantic fixture differs")
+        assignment = dict(parsed_model["assignments"])
+        independently_satisfies = all(
+            any(
+                (assignment[abs(literal)] and literal > 0)
+                or (not assignment[abs(literal)] and literal < 0)
+                for literal in clause["literals"]
+            )
+            for clause in expected_sat_cnf["clauses"]
+        )
+        if (
+            semantic.get("model_satisfies") is not True
+            or not independently_satisfies
+            or semantic.get("threads") != [1, 8, 32]
+            or semantic.get("thread_cnf_hex")
+            != [semantic["cnf_hex"], semantic["cnf_hex"], semantic["cnf_hex"]]
+        ):
+            raise EvidenceError("Verdict positive semantic equivalence claim differs")
+        expected_observed_bytes = sum(
+            map(len, (cnf_bytes, model_bytes, unsat_bytes, proof_bytes))
+        )
+        if workers_spawned != 41:
+            raise EvidenceError("Verdict positive worker count is not 1+8+32")
+    elif phase == "failure":
+        expected_fields = {
+            "corrupted_proof_hex",
+            "data_grade",
+            "error_at",
+            "error_code",
+            "event",
+            "opcode",
+            "partial_artifact_published",
+            "schema",
+            "status",
+            "version",
+        }
+        if set(semantic) != expected_fields:
+            raise EvidenceError("Verdict failure semantic fields differ from v1")
+        corrupted = verdict_decode_hex(
+            semantic.get("corrupted_proof_hex"), label="corrupted proof"
+        )
+        reader = VerdictWireReader(corrupted, subject="failure proof")
+        reader.header(3)
+        if reader.u64() != 2:
+            raise EvidenceError("Verdict failure proof changed its step count")
+        opcode_at = reader.at
+        opcode = reader.u8()
+        if (
+            semantic.get("event") != "failure"
+            or semantic.get("status") != "refused"
+            or semantic.get("error_code") != "unknown_opcode"
+            or semantic.get("error_at") != opcode_at
+            or semantic.get("opcode") != opcode
+            or opcode_at != VERDICT_WIRE_HEADER_BYTES + 8
+            or opcode != 255
+            or semantic.get("partial_artifact_published") is not False
+        ):
+            raise EvidenceError("Verdict failure refusal is not the intended opcode")
+        if stdout_text.count(VERDICT_FAILURE_MARKER) != 1:
+            raise EvidenceError("Verdict failure stdout lacks the exact mutant marker")
+        if stderr_text.count(VERDICT_FAILURE_MARKER) != 1:
+            raise EvidenceError("Verdict failure stderr lacks the exact mutant marker")
+        expected_observed_bytes = len(corrupted)
+        if workers_spawned != 0:
+            raise EvidenceError("Verdict failure unexpectedly spawned encoder workers")
+    elif phase == "recovery":
+        expected_fields = {
+            "cnf_hex",
+            "data_grade",
+            "event",
+            "proof_hex",
+            "recovered_after",
+            "schema",
+            "status",
+            "version",
+        }
+        if set(semantic) != expected_fields:
+            raise EvidenceError("Verdict recovery semantic fields differ from v1")
+        if (
+            semantic.get("event") != "recovery"
+            or semantic.get("status") != "pass"
+            or semantic.get("recovered_after") != "unknown_opcode"
+        ):
+            raise EvidenceError("Verdict recovery semantic verdict is malformed")
+        cnf_bytes = verdict_decode_hex(semantic.get("cnf_hex"), label="recovery CNF")
+        proof_bytes = verdict_decode_hex(
+            semantic.get("proof_hex"), label="recovery proof"
+        )
+        if verdict_parse_cnf(cnf_bytes, subject="recovery CNF") != expected_sat_cnf:
+            raise EvidenceError("Verdict recovery CNF differs")
+        if verdict_parse_proof(
+            proof_bytes, subject="recovery proof"
+        ) != expected_proof:
+            raise EvidenceError("Verdict recovery proof differs")
+        if positive_semantic_path is None:
+            raise EvidenceError("Verdict recovery lacks positive semantic baseline")
+        positive, _positive_digest = verdict_read_canonical_record(
+            positive_semantic_path,
+            label="Verdict recovery positive baseline",
+            max_bytes=VERDICT_MAX_SEMANTIC_BYTES,
+        )
+        if (
+            positive.get("event") != "positive"
+            or semantic.get("cnf_hex") != positive.get("cnf_hex")
+            or semantic.get("proof_hex") != positive.get("proof_hex")
+        ):
+            raise EvidenceError("Verdict recovery bytes differ from positive baseline")
+        expected_observed_bytes = len(cnf_bytes) + len(proof_bytes)
+        if workers_spawned != 0:
+            raise EvidenceError("Verdict recovery unexpectedly spawned encoder workers")
+    else:
+        raise EvidenceError(f"unknown Verdict evidence phase {phase!r}")
+
+    expected_exit = 101 if phase == "failure" else 0
+    if observed_exit != expected_exit:
+        raise EvidenceError(
+            f"Verdict {phase} child exit {observed_exit}, expected {expected_exit}"
+        )
+    if observed_bytes != expected_observed_bytes:
+        raise EvidenceError(
+            f"Verdict {phase} telemetry byte count disagrees with semantic bytes"
+        )
+    if phase == "failure":
+        if "test result: FAILED. 0 passed; 1 failed;" not in stdout_text:
+            raise EvidenceError("Verdict failure stdout lacks the one-test summary")
+        if "test result: ok. 1 passed; 0 failed;" in stdout_text + stderr_text:
+            raise EvidenceError("Verdict failure streams contain a passing summary")
+    elif "test result: ok. 1 passed; 0 failed;" not in stdout_text:
+        raise EvidenceError(f"Verdict {phase} stdout lacks the one-test pass summary")
+
+    return {
+        "phase": phase,
+        "schema": "fln.validation/1",
+        "semantic_sha256": semantic_digest,
+        "stderr_sha256": stderr_digest,
+        "stdout_sha256": stdout_digest,
+        "telemetry_sha256": telemetry_digest,
+        "valid": True,
+        "validator": "verdict-schema/1",
     }
 
 
@@ -8518,6 +9057,48 @@ def cmd_validate_environment_collision(args: argparse.Namespace) -> int:
             Path(args.output),
             artifact_root,
             label="environment-collision validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_verdict_schema(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    semantic_path = require_within(
+        Path(args.semantic), artifact_root, label="Verdict semantic evidence"
+    )
+    telemetry_path = require_within(
+        Path(args.telemetry), artifact_root, label="Verdict telemetry"
+    )
+    stdout_path = require_within(
+        Path(args.stdout), artifact_root, label="Verdict stdout"
+    )
+    stderr_path = require_within(
+        Path(args.stderr), artifact_root, label="Verdict stderr"
+    )
+    positive_semantic_path = (
+        require_within(
+            Path(args.positive_semantic),
+            artifact_root,
+            label="Verdict positive semantic baseline",
+        )
+        if args.positive_semantic
+        else None
+    )
+    report = validate_verdict_schema_evidence(
+        semantic_path,
+        telemetry_path,
+        stdout_path,
+        stderr_path,
+        args.phase,
+        args.observed_exit,
+        positive_semantic_path=positive_semantic_path,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output), artifact_root, label="Verdict schema validation"
         )
         write_new(output, canonical_json(report))
     else:
@@ -13650,6 +14231,23 @@ def build_parser() -> argparse.ArgumentParser:
     collision_parser.add_argument("--artifact-root", required=True)
     collision_parser.add_argument("--output")
     collision_parser.set_defaults(func=cmd_validate_environment_collision)
+
+    verdict_parser = subparsers.add_parser(
+        "validate-verdict-schema",
+        help="independently validate Verdict semantic NDJSON and bounded telemetry",
+    )
+    verdict_parser.add_argument("--semantic", required=True)
+    verdict_parser.add_argument("--telemetry", required=True)
+    verdict_parser.add_argument("--stdout", required=True)
+    verdict_parser.add_argument("--stderr", required=True)
+    verdict_parser.add_argument(
+        "--phase", required=True, choices=("positive", "failure", "recovery")
+    )
+    verdict_parser.add_argument("--observed-exit", type=int, required=True)
+    verdict_parser.add_argument("--positive-semantic")
+    verdict_parser.add_argument("--artifact-root", required=True)
+    verdict_parser.add_argument("--output")
+    verdict_parser.set_defaults(func=cmd_validate_verdict_schema)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",

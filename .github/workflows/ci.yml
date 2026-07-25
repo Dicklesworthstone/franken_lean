@@ -582,6 +582,39 @@ jobs:
           fi
           exit "$command_rc"
 
+      - name: e2e smoke — Verdict schema contract
+        id: verdict_schema
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/verdict-schema"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/verdict_schema.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "Verdict schema lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
       - name: verify and index complete evidence attempt
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
         shell: bash
@@ -598,6 +631,8 @@ jobs:
           ENVIRONMENT_COLLISION_EXIT: ${{ steps.environment_collision.outputs.command_exit }}
           VELLUM_NAMING_ARTIFACT: ${{ steps.vellum_naming.outputs.artifact_path }}
           VELLUM_NAMING_EXIT: ${{ steps.vellum_naming.outputs.command_exit }}
+          VERDICT_SCHEMA_ARTIFACT: ${{ steps.verdict_schema.outputs.artifact_path }}
+          VERDICT_SCHEMA_EXIT: ${{ steps.verdict_schema.outputs.command_exit }}
         run: |
           python3 -I - <<'PY'
           import hashlib
@@ -627,6 +662,7 @@ jobs:
                   "closure-audit",
                   "environment-collision",
                   "vellum-naming",
+                  "verdict-schema",
               },
           }
           for root, expected_names in expected_roots.items():
@@ -678,6 +714,13 @@ jobs:
                   os.environ.get("VELLUM_NAMING_ARTIFACT", ""),
                   os.environ.get("VELLUM_NAMING_EXIT", ""),
                   e2e_root / "vellum-naming",
+                  True,
+              ),
+              (
+                  "verdict_schema",
+                  os.environ.get("VERDICT_SCHEMA_ARTIFACT", ""),
+                  os.environ.get("VERDICT_SCHEMA_EXIT", ""),
+                  e2e_root / "verdict-schema",
                   True,
               ),
           )
