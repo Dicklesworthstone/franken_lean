@@ -861,7 +861,18 @@ fn corroborated_rows() -> Vec<fln_epoch_lab::derive::CorroboratedRow> {
                 .map(|t| t.crate_name.clone())
         })
         .collect();
-    fln_epoch_lab::derive::corroborate(&policy(), &graph, &edge_crates)
+    let closure = real_closure();
+    fln_epoch_lab::derive::corroborate(&policy(), &graph, &closure, &edge_crates)
+}
+
+/// The dependency closure as it stands over the REAL workspace.
+fn real_closure() -> fln_epoch_lab::derive::ClosureAvailability {
+    let graph_path = repo_root().join("ci/WORKSPACE_GRAPH.txt");
+    let kinds = fln_epoch_lab::derive::read_graph_kinds(&graph_path).expect("readable");
+    let edges = fln_epoch_lab::derive::read_graph_edges(&graph_path).expect("readable");
+    let targets = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    let roots = fln_epoch_lab::derive::product_binary_roots(targets.value(), &kinds);
+    fln_epoch_lab::derive::derive_dependency_closure(&edges, &roots)
 }
 
 #[test]
@@ -965,4 +976,149 @@ fn the_rows_that_would_suppress_a_finding_are_named() {
         1,
         "the set of finding-suppressing rows changed: {names:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8. The dependency-closure derivation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_closure_derivation_is_correct_over_a_known_graph() {
+    // The ALGORITHM, proven on a synthetic graph. Its applicability to this
+    // tree is a separate question, answered by the test below — separating the
+    // two is what lets the algorithm be evidence before the tree can supply it.
+    use fln_epoch_lab::derive::{ClosureAvailability, derive_dependency_closure};
+    let edges: Vec<(String, String)> = [
+        ("cli", "elab"),
+        ("elab", "kernel"),
+        ("kernel", "core"),
+        ("harness", "kernel"),
+        ("bench", "core"),
+    ]
+    .iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+
+    match derive_dependency_closure(&edges, &["cli".to_string()]) {
+        ClosureAvailability::Available { reachable } => {
+            // Transitive: cli -> elab -> kernel -> core, all four.
+            for want in ["cli", "elab", "kernel", "core"] {
+                assert!(reachable.contains(want), "{want} not reached");
+            }
+            // Nothing depends ON the roots from harness/bench, so neither is
+            // reachable: depending on a shipped crate does not make you shipped.
+            assert!(!reachable.contains("harness"), "reachability ran backwards");
+            assert!(!reachable.contains("bench"), "reachability ran backwards");
+        }
+        other => panic!("expected Available, got {other:?}"),
+    }
+
+    // A cycle must terminate rather than spin.
+    let cyclic: Vec<(String, String)> = [("a", "b"), ("b", "a")]
+        .iter()
+        .map(|(x, y)| (x.to_string(), y.to_string()))
+        .collect();
+    match derive_dependency_closure(&cyclic, &["a".to_string()]) {
+        ClosureAvailability::Available { reachable } => assert_eq!(reachable.len(), 2),
+        other => panic!("a cyclic graph produced {other:?}"),
+    }
+}
+
+#[test]
+fn an_empty_root_set_is_unavailable_not_the_answer_nothing_ships() {
+    // THE TRAP THIS DERIVATION HAD TO AVOID. Returning the empty closure as a
+    // positive answer would witness DevelopmentOnly for all 33 crates,
+    // corroborating every row in the policy and making the reachability scan
+    // trivially clean — while looking exactly like the independent evidence the
+    // classification was missing. A derivation that cannot answer must not
+    // answer, the same law `poison::scan` applies to itself.
+    use fln_epoch_lab::derive::{ClosureAvailability, derive_dependency_closure};
+    let edges: Vec<(String, String)> = vec![("a".to_string(), "b".to_string())];
+    match derive_dependency_closure(&edges, &[]) {
+        ClosureAvailability::Unavailable { why } => {
+            assert!(
+                why.contains("nothing ships"),
+                "the reason must name the trap: {why}"
+            );
+        }
+        other => panic!("an empty root set produced a positive answer: {other:?}"),
+    }
+}
+
+#[test]
+fn the_closure_is_honestly_unavailable_over_this_workspace_today() {
+    // The state of the tree, asserted so it is visible rather than assumed —
+    // and so that the day a product binary lands, this test fails and tells
+    // whoever landed it that a second source has just become available.
+    use fln_epoch_lab::derive::ClosureAvailability;
+    let graph_path = repo_root().join("ci/WORKSPACE_GRAPH.txt");
+    let kinds = fln_epoch_lab::derive::read_graph_kinds(&graph_path).expect("readable");
+    let targets = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    let roots = fln_epoch_lab::derive::product_binary_roots(targets.value(), &kinds);
+    assert!(
+        roots.is_empty(),
+        "a product binary now exists ({roots:?}) — the dependency-closure \
+         derivation has become available and every single-source row in \
+         SHIPPABILITY_POLICY.txt can now be independently witnessed. Wire it in \
+         and update fln-8fwh."
+    );
+    assert!(matches!(
+        real_closure(),
+        ClosureAvailability::Unavailable { .. }
+    ));
+}
+
+#[test]
+fn a_disagreement_preserves_both_answers_and_resolves_neither() {
+    // Whichever source one would instinctively trust is the one that will
+    // eventually be wrong, so a contradiction records every answer and picks
+    // none. A month from now the finding must still say what each source said.
+    use fln_epoch_lab::derive::{ClosureAvailability, Corroboration, corroborate};
+    use fln_epoch_lab::poison::Shippability;
+
+    let policy = vec![("harness".to_string(), Shippability::DevelopmentOnly)];
+    let closure = ClosureAvailability::Available {
+        reachable: ["harness".to_string()].into_iter().collect(),
+    };
+    let rows = corroborate(&policy, &[], &closure, &[]);
+    match &rows[0].standing {
+        Corroboration::Contradicted {
+            declared,
+            witnesses,
+        } => {
+            // The policy's answer is preserved...
+            assert_eq!(*declared, Shippability::DevelopmentOnly);
+            // ...and so is the source's, unresolved.
+            assert_eq!(witnesses.len(), 1);
+            assert_eq!(witnesses[0].says, Shippability::Shippable);
+            assert!(witnesses[0].source.contains("dependency closure"));
+        }
+        other => panic!("a disagreement was resolved instead of recorded: {other:?}"),
+    }
+    // And the report prints both, so the finding is debuggable from the log
+    // alone without re-running anything.
+    let text = fln_epoch_lab::derive::corroboration_report(&rows);
+    assert!(text.contains("policy_says=DevelopmentOnly"));
+    assert!(text.contains("source_says=Shippable"));
+    assert!(text.contains("verdict=contradicted"));
+}
+
+#[test]
+fn per_source_coverage_is_reported_so_partial_cannot_read_as_full() {
+    // "33 rows checked" must never be readable as "33 rows corroborated". Each
+    // source reports how many rows it actually witnessed, out of how many.
+    let rows = corroborated_rows();
+    let text = fln_epoch_lab::derive::corroboration_report(&rows);
+    assert!(
+        text.contains("source-coverage source=ci/WORKSPACE_GRAPH.txt kind=tool witnessed=1 of=33"),
+        "per-source coverage is not reported: {text}"
+    );
+    // The closure witnessed nothing today, so it must not appear as a source at
+    // all — a source with zero coverage listed alongside real ones would read
+    // as participation.
+    assert!(
+        !text.contains("source=dependency closure"),
+        "an unavailable source was reported as having participated: {text}"
+    );
+    assert!(text.contains("single_source=32"));
 }

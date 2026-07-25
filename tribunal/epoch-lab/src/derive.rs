@@ -41,7 +41,7 @@
 //! one is to have run a derivation.
 
 use fln_hash::domain::{Domain, DomainHasher};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::corpus::{OfficialTest, OfficialTestKind, PinScan};
@@ -1358,22 +1358,35 @@ pub fn read_shippability_policy(path: &Path) -> Result<Vec<(String, Shippability
 // 8. Corroboration — a classification with one source is an opinion
 // ---------------------------------------------------------------------------
 
-/// Whether a second, independent source witnesses a classification.
+/// One source's answer about one crate. Sources are never merged and never
+/// out-voted: a witness is a record of what a source said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Witness {
+    pub source: &'static str,
+    pub says: Shippability,
+}
+
+/// Whether independent sources witness a classification.
 ///
 /// A classification that only one derivation produces is an opinion with good
-/// hygiene. Two derivations from different sources that must agree is evidence,
-/// and disagreement becomes a typed finding rather than a silent wrong premise.
-/// Where no second source exists, [`Corroboration::SingleSource`] makes the
-/// weaker status VISIBLE rather than assuming it away.
+/// hygiene. Two derivations from different sources that must agree is evidence.
+/// Where no second source can witness a row, [`Corroboration::SingleSource`]
+/// makes the weaker status VISIBLE rather than assuming it away — partial
+/// coverage that presents as full coverage is the specific failure this bead
+/// exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Corroboration {
-    /// An independent source agrees.
-    Corroborated { source: &'static str },
-    /// An independent source disagrees. A typed finding: one of the two is
-    /// wrong and the scan cannot tell which, so neither may be trusted.
+    /// Every available source agrees with the declaration.
+    Corroborated { witnesses: Vec<Witness> },
+    /// A source disagrees.
+    ///
+    /// **Both answers are preserved and neither wins.** Resolving in favour of
+    /// either would discard the evidence that a month from now makes this
+    /// debuggable, and whichever source one would instinctively trust is the
+    /// one that will eventually be wrong.
     Contradicted {
-        source: &'static str,
-        says: Shippability,
+        declared: Shippability,
+        witnesses: Vec<Witness>,
     },
     /// No available source can witness this row, with the reason stated.
     SingleSource { why: &'static str },
@@ -1387,6 +1400,14 @@ impl Corroboration {
             Corroboration::SingleSource { .. } => "single-source",
         }
     }
+    /// Every source that spoke about this row, whatever it said.
+    pub fn witnesses(&self) -> &[Witness] {
+        match self {
+            Corroboration::Corroborated { witnesses }
+            | Corroboration::Contradicted { witnesses, .. } => witnesses,
+            Corroboration::SingleSource { .. } => &[],
+        }
+    }
 }
 
 /// One classified crate with the standing of its classification.
@@ -1395,10 +1416,9 @@ pub struct CorroboratedRow {
     pub crate_name: String,
     pub declared: Shippability,
     pub standing: Corroboration,
-    /// Whether this crate carries a discovered oracle edge. A single-source
-    /// `DevelopmentOnly` row on such a crate is the highest-risk row in the
-    /// whole classification: it is the row suppressing a real finding, on one
-    /// person's say-so.
+    /// Whether this crate carries a discovered oracle edge. A `DevelopmentOnly`
+    /// row on such a crate, without corroboration, is the highest-risk row in
+    /// the classification: it is the row suppressing a real finding.
     pub carries_oracle_edge: bool,
 }
 
@@ -1436,49 +1456,143 @@ pub fn read_graph_kinds(path: &Path) -> Result<Vec<(String, String)>, DeriveErro
     Ok(out)
 }
 
-/// Cross-check the declared shippability policy against the reviewed crate map.
+/// The declared dependency edges of the reviewed crate map.
+pub fn read_graph_edges(path: &Path) -> Result<Vec<(String, String)>, DeriveError> {
+    let text = read(path)?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        let Some(rest) = l.strip_prefix("edge ") else {
+            continue;
+        };
+        let Some((from, to)) = rest.split_once("->") else {
+            continue;
+        };
+        out.push((from.trim().to_string(), to.trim().to_string()));
+    }
+    Ok(out)
+}
+
+/// The result of attempting the dependency-closure derivation.
 ///
-/// **What the crate map can and cannot witness.** `kind=tool` is documented in
-/// that file as "dev apparatus, tools/", so it witnesses DevelopmentOnly.
-/// `kind=ordinary` and `kind=unsafe-boundary` mean "a ranked product crate
-/// under `crates/`" — a LAYERING fact, not a shipping one. Reading them as
-/// "shippable" would conflate two vocabularies, which is the failure this epic
-/// keeps warning about, so they witness nothing and their rows are
-/// single-source.
+/// Three-valued on purpose, and for the same reason [`crate::poison::scan`] is:
+/// a derivation that cannot answer must not answer. An empty root set does NOT
+/// mean "nothing ships" — it means the question cannot be asked yet, and
+/// returning the empty closure as a positive answer would corroborate every
+/// `DevelopmentOnly` row in the file and make the reachability scan trivially
+/// clean while looking like evidence. That is worse than having no second
+/// source at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosureAvailability {
+    /// The set of crates reachable from at least one product binary.
+    Available { reachable: BTreeSet<String> },
+    /// The closure cannot witness anything yet.
+    Unavailable { why: &'static str },
+}
+
+/// Which crates are reachable from a product binary, over declared edges.
 ///
-/// The dependency-closure derivation — a crate ships iff some released binary
-/// depends on it — is the second source that would cover the rest. It is
-/// unavailable today because no crate in this workspace produces a binary yet,
-/// and a vacuous oracle answering "nothing ships" would make the scan trivially
-/// clean, which is worse than no oracle at all.
+/// `roots` are the crates that produce a released binary. The propagation is
+/// mechanical; only the root set is a judgement, and it is a far smaller one
+/// than classifying thirty-three crates by hand.
+pub fn derive_dependency_closure(
+    edges: &[(String, String)],
+    roots: &[String],
+) -> ClosureAvailability {
+    if roots.is_empty() {
+        return ClosureAvailability::Unavailable {
+            why: "no crate in this workspace produces a product binary yet, so the \
+                  closure is empty; an empty closure is not the answer \"nothing ships\"",
+        };
+    }
+    let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (from, to) in edges {
+        adjacency
+            .entry(from.as_str())
+            .or_default()
+            .push(to.as_str());
+    }
+    let mut reachable: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<&str> = roots.iter().map(String::as_str).collect();
+    while let Some(n) = stack.pop() {
+        if !reachable.insert(n.to_string()) {
+            continue;
+        }
+        if let Some(next) = adjacency.get(n) {
+            stack.extend(next.iter().copied());
+        }
+    }
+    ClosureAvailability::Available { reachable }
+}
+
+/// The crates that produce a product binary: a bin target, in a crate the
+/// reviewed map does not call tooling.
+pub fn product_binary_roots(targets: &[TargetScan], graph: &[(String, String)]) -> Vec<String> {
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for t in targets {
+        if t.kind_str != "bin" {
+            continue;
+        }
+        let is_tool = graph.iter().any(|(n, k)| *n == t.crate_name && k == "tool");
+        if !is_tool {
+            roots.insert(t.crate_name.clone());
+        }
+    }
+    roots.into_iter().collect()
+}
+
+/// Cross-check the declared shippability policy against every available source.
+///
+/// **What each source can witness.** `ci/WORKSPACE_GRAPH.txt` documents
+/// `kind=tool` as "dev apparatus, tools/", so that value witnesses
+/// DevelopmentOnly. `kind=ordinary` and `kind=unsafe-boundary` mean "a ranked
+/// product crate under `crates/`" — a LAYERING fact — and witness nothing about
+/// shipping; reading them as shippability would conflate two vocabularies. The
+/// dependency closure witnesses both directions, but only when it is
+/// [`ClosureAvailability::Available`].
 pub fn corroborate(
     policy: &[(String, Shippability)],
     graph: &[(String, String)],
+    closure: &ClosureAvailability,
     oracle_edge_crates: &[String],
 ) -> Vec<CorroboratedRow> {
     let mut rows = Vec::new();
     for (name, declared) in policy {
-        let standing = match graph.iter().find(|(n, _)| n == name) {
-            Some((_, kind)) if kind == "tool" => {
-                if *declared == Shippability::DevelopmentOnly {
-                    Corroboration::Corroborated {
-                        source: "ci/WORKSPACE_GRAPH.txt kind=tool",
-                    }
+        let mut witnesses: Vec<Witness> = Vec::new();
+
+        if graph.iter().any(|(n, k)| n == name && k == "tool") {
+            witnesses.push(Witness {
+                source: "ci/WORKSPACE_GRAPH.txt kind=tool",
+                says: Shippability::DevelopmentOnly,
+            });
+        }
+        if let ClosureAvailability::Available { reachable } = closure {
+            witnesses.push(Witness {
+                source: "dependency closure from product binaries",
+                says: if reachable.contains(name) {
+                    Shippability::Shippable
                 } else {
-                    Corroboration::Contradicted {
-                        source: "ci/WORKSPACE_GRAPH.txt kind=tool",
-                        says: Shippability::DevelopmentOnly,
-                    }
-                }
+                    Shippability::DevelopmentOnly
+                },
+            });
+        }
+
+        let standing = if witnesses.is_empty() {
+            Corroboration::SingleSource {
+                why: match closure {
+                    ClosureAvailability::Unavailable { why } => why,
+                    _ => "no source witnesses this row",
+                },
             }
-            Some(_) => Corroboration::SingleSource {
-                why: "the crate map records layering, not shipping; \
-                      no released binary exists yet to close a dependency closure",
-            },
-            None => Corroboration::SingleSource {
-                why: "absent from the reviewed crate map",
-            },
+        } else if witnesses.iter().all(|w| w.says == *declared) {
+            Corroboration::Corroborated { witnesses }
+        } else {
+            Corroboration::Contradicted {
+                declared: *declared,
+                witnesses,
+            }
         };
+
         rows.push(CorroboratedRow {
             crate_name: name.clone(),
             declared: *declared,
@@ -1492,12 +1606,11 @@ pub fn corroborate(
 
 /// The rows where a wrong classification would SUPPRESS a real finding.
 ///
-/// A crate that carries an oracle edge and is called development-only on one
-/// source's say-so is doing all the work of keeping the reachability scan
-/// clean. If that call is wrong, the scan reports Clean over a shippable target
-/// that reaches the Reference — and reports it with full confidence, because
-/// the classification is the scan's own premise. These rows deserve a named
-/// reviewer, not a footnote.
+/// A crate that carries an oracle edge and is called development-only without
+/// corroboration is doing all the work of keeping the reachability scan clean.
+/// If that call is wrong, the scan reports Clean over a shippable target that
+/// reaches the Reference — with full confidence, because the classification is
+/// the scan's own premise.
 pub fn uncorroborated_suppressions(rows: &[CorroboratedRow]) -> Vec<&CorroboratedRow> {
     rows.iter()
         .filter(|r| {
@@ -1508,24 +1621,46 @@ pub fn uncorroborated_suppressions(rows: &[CorroboratedRow]) -> Vec<&Corroborate
         .collect()
 }
 
-/// Line-oriented corroboration report. Counts, and every weak row named.
+/// Line-oriented corroboration report.
+///
+/// Reports per-SOURCE coverage as well as totals, so "33 rows checked" can
+/// never be read as "33 rows corroborated". Every contradiction prints both
+/// answers.
 pub fn corroboration_report(rows: &[CorroboratedRow]) -> String {
     let mut out = String::new();
     let mut corroborated = 0usize;
     let mut single = 0usize;
     let mut contradicted = 0usize;
+    let mut by_source: BTreeMap<&str, usize> = BTreeMap::new();
+
     for r in rows {
+        for w in r.standing.witnesses() {
+            *by_source.entry(w.source).or_default() += 1;
+        }
         match &r.standing {
             Corroboration::Corroborated { .. } => corroborated += 1,
             Corroboration::SingleSource { .. } => single += 1,
-            Corroboration::Contradicted { source, says } => {
+            Corroboration::Contradicted {
+                declared,
+                witnesses,
+            } => {
                 contradicted += 1;
-                out.push_str(&format!(
-                    "shippability: contradicted crate={} declared={:?} source={source} says={says:?}\n",
-                    r.crate_name, r.declared
-                ));
+                // Both answers, neither resolved.
+                for w in witnesses {
+                    out.push_str(&format!(
+                        "shippability: contradicted crate={} policy_says={declared:?} \
+                         source={} source_says={:?}\n",
+                        r.crate_name, w.source, w.says
+                    ));
+                }
             }
         }
+    }
+    for (source, n) in &by_source {
+        out.push_str(&format!(
+            "shippability: source-coverage source={source} witnessed={n} of={}\n",
+            rows.len()
+        ));
     }
     for r in uncorroborated_suppressions(rows) {
         out.push_str(&format!(
