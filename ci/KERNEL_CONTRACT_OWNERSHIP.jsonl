@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":276,"projection_hash":"c0dabaf4afeeaf00c2ef39cd4745994370d324068c998ba4763bd3927757216d"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":277,"projection_hash":"a81a644127659b9e229adfbcb2eb673183d8c2892b2b0f847d51a48e3f6cd13c"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1f8v"}
@@ -78,6 +78,7 @@
 {"id":"fln-hq6i"}
 {"id":"fln-hqn"}
 {"id":"fln-i9so"}
+{"id":"fln-identity-path-mutant-recovery-mbco"}
 {"id":"fln-in1"}
 {"id":"fln-iron-target-profile-contract-ba9"}
 {"id":"fln-it70"}
