@@ -1979,6 +1979,88 @@ mod tests {
         );
     }
 
+    /// **`stop` and `status` are two representations of one fact, so they are pinned to
+    /// agree** (bead `fln-um4a`).
+    ///
+    /// This is the hazard cc_3 found in `fln-hash`'s canon decoder and recorded on this
+    /// bead: a stop held as side-channel state beside a returned value, where the two can
+    /// disagree and the type has no arm for "they disagree", so the disagreement resolves
+    /// silently in favour of acceptance. Folding the authority onto `Outcome` reintroduced
+    /// exactly that shape here — `status` says whether the run stopped, and `stop` says so
+    /// again with the finer fact attached.
+    ///
+    /// They cannot disagree today because `report_inconclusive` is the only thing that
+    /// builds either, but "only one function does it" is a property of today's code, not
+    /// of the type. This asserts the biconditional over every reachable outcome, so a
+    /// future path that sets one without the other fails here rather than shipping a
+    /// report whose two halves tell different stories.
+    #[test]
+    fn a_stop_is_present_exactly_when_the_outcome_is_a_resource_refusal() {
+        let graph = graph(vec![
+            ("A", true, vec![direct("C", 3)]),
+            ("B", true, vec![direct("A", 7)]),
+            ("C", true, vec![]),
+        ]);
+        let base = EffectiveImportRequest::new(
+            vec![direct("A", 2), direct("B", 3)],
+            GlobalOLeanLevel::Exported,
+        );
+
+        // A clean run: an answer, and therefore no stop.
+        let clean = compute_effective_imports(&graph, &base, None);
+        assert!(matches!(clean.status, Outcome::Complete(_)));
+        assert!(
+            clean.stop.is_none(),
+            "an answered request must not carry a resource stop"
+        );
+
+        // Cancellation: a non-answer, but NOT a resource refusal — so still no stop.
+        let cancelled = AtomicBool::new(true);
+        let stopped = compute_effective_imports(&graph, &base, Some(&cancelled));
+        assert!(matches!(stopped.status, Outcome::Inconclusive(_)));
+        assert!(
+            stopped.stop.is_none(),
+            "cancellation is not a resource refusal and must not claim one"
+        );
+
+        // Every resource refusal: a non-answer that DOES carry its finer fact.
+        for resource in [
+            ClosureResource::RootImportRows,
+            ClosureResource::PendingItems,
+            ClosureResource::WorkItems,
+            ClosureResource::StateUpgrades,
+            ClosureResource::WitnessSteps,
+        ] {
+            let mut request = base.clone();
+            match resource {
+                ClosureResource::RootImportRows => request.limits.max_root_import_rows = 0,
+                ClosureResource::PendingItems => request.limits.max_pending_items = 0,
+                ClosureResource::WorkItems => request.limits.max_work_items = 0,
+                ClosureResource::StateUpgrades => request.limits.max_state_upgrades = 0,
+                ClosureResource::WitnessSteps => request.limits.max_witness_steps = 0,
+            }
+            let report = compute_effective_imports(&graph, &request, None);
+            let is_resource_stop = matches!(
+                &report.status,
+                Outcome::Inconclusive(Inconclusive {
+                    cause: InconclusiveCause::ResourceExhausted { .. },
+                    ..
+                })
+            );
+            assert_eq!(
+                is_resource_stop,
+                report.stop.is_some(),
+                "`status` and `stop` must agree about whether this was a resource \
+                 refusal ({resource:?})"
+            );
+            assert_eq!(
+                report.stop.as_ref().map(|stop| stop.resource),
+                Some(resource),
+                "and the stop must name the resource that tripped"
+            );
+        }
+    }
+
     #[test]
     fn every_limit_is_typed_and_stops_before_over_budget_semantic_work() {
         let graph = graph(vec![
