@@ -5919,6 +5919,116 @@ fn permuted_block(arr_first: bool) -> (Vec<InductiveVal>, Vec<ConstructorVal>, V
     (types, ctors, recursors)
 }
 
+/// Step ceiling for admitting the cascading block. Deduplication is what makes
+/// the translation terminate at all — without it each minted copy's own
+/// self-occurrence mints another copy forever — so the cost covenant is the
+/// discriminating, TERMINATING form of that mutant: a run that mints redundant
+/// auxiliaries blows this ceiling and reports typed exhaustion instead of the
+/// verdict. Pinned at roughly twice the measured cost so ordinary refactors do
+/// not trip it. Measured cost at the time of pinning: 151 steps.
+const CASCADE_STEP_CAP: u64 = 300;
+
+#[test]
+fn kr608_same_head_at_two_instantiations_mints_distinct_auxiliaries() {
+    // MUTANT ("altered auxiliary names"): the minted names carry a per-copy
+    // uniquifier. It is load-bearing ONLY when one head is copied at two
+    // different instantiations in a single block — `MyList MyTree` and
+    // `MyList (MyList MyTree)` here. Lean.Syntax never does this (each of its
+    // heads is nested at one instantiation), so the real Prelude replay cannot
+    // see the uniquifier at all; without this fixture, dropping it is a
+    // surviving mutant. With the names collapsed, the translated block would
+    // declare the same auxiliary type twice and a LEGITIMATE block would be
+    // refused `already declared`.
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let list = |arg: Expr| Expr::app(Expr::const_(n("MyList"), vec![]), arg);
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested: 2,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(
+            nn("MyTree", "node"),
+            vec![],
+            Expr::forall_e(
+                n("shallow"),
+                list(tree()),
+                Expr::forall_e(n("deep"), list(list(tree())), tree(), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 2,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(vec![ind], vec![node], vec![]),
+        Budget::DEFAULT,
+    );
+    // Two DISTINCT auxiliaries were minted from the same head, so the
+    // translated block has three types and wants three recursors. The block
+    // deliberately declares none, which is how the count becomes observable
+    // without hand-building the telescopes; a name collision would instead
+    // fail earlier, and differently.
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    let message = reject_message(&verdict);
+    assert!(
+        message.contains("block declares 0 recursors, expected 3"),
+        "one head at two instantiations must mint two distinct auxiliaries: {message}"
+    );
+    assert!(
+        !message.contains("already declared"),
+        "auxiliary names must stay distinct across instantiations of one head: {message}"
+    );
+}
+
+#[test]
+fn kr608_deduplication_keeps_the_cascade_cost_bounded() {
+    // The capped run comes FIRST and is what makes this mutant terminating: a
+    // translation that mints a fresh auxiliary per reachability path never
+    // finishes (each copy's own self-occurrence mints another), so under a
+    // generous budget it would spin instead of failing. Bounded to the
+    // ceiling, it stops at typed exhaustion and the assertion below fires.
+    let (types, ctors, recursors) = cascaded_mytree_block();
+    let capped = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget {
+            steps: CASCADE_STEP_CAP,
+            depth: 4_096,
+        },
+    );
+    assert!(
+        capped.is_accepted(),
+        "the cascading block must admit within the pinned ceiling of \
+         {CASCADE_STEP_CAP} steps; got {capped:?}"
+    );
+    // Only then measure the real cost, so the ceiling keeps its margin honest.
+    let (types, ctors, recursors) = cascaded_mytree_block();
+    let measured = match check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    ) {
+        Verdict::Accepted { consumption } => consumption.steps_used,
+        other => panic!("the cascading block must admit; got {other:?}"),
+    };
+    assert!(
+        measured <= CASCADE_STEP_CAP,
+        "cascade cost {measured} exceeds the pinned ceiling {CASCADE_STEP_CAP}; \
+         a redundant auxiliary was minted"
+    );
+}
+
 #[test]
 fn kr608_permutation_arr_first_admits_byte_exact() {
     // Fields (MyArr MyTree, MyList MyTree): auxiliaries are minted
