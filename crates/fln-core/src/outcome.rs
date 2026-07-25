@@ -141,8 +141,37 @@ pub struct ResourceUsage {
 
 impl ResourceUsage {
     /// A stop must report spending past its allowance, or it is not a stop.
+    ///
+    /// It must also not contradict itself. `ResourceReason::Heartbeats` carries its own
+    /// `consumed`/`limit` for the D8 diagnostic path, so those numbers have a second home
+    /// here — and a second home is a place to disagree. Before bead franken_lean-vui8 this
+    /// checked only the outer pair, so a usage claiming `allowed: 10, observed: 20` while
+    /// its reason said `limit: 900` passed as a genuine exhaustion and no reader could tell
+    /// which number was the budget. Now the inner numbers must agree with the outer ones
+    /// wherever the reason carries them. `StructuralBudget` deliberately carries none, so
+    /// it cannot contradict anything.
+    ///
+    /// `Cancelled` is refused outright: cancellation is not exhaustion. It is a
+    /// `ResourceReason` because D8's `KernelInconclusive` uses that enum as its cause
+    /// vocabulary, but the *outcome* axis already has
+    /// [`InconclusiveCause::Cancelled`] for it. Accepting it here would let a cancellation
+    /// be reported as a budget overrun — a cause/outcome conflation, and exactly the
+    /// collapse the two axes exist to prevent.
     pub const fn is_genuine_exhaustion(&self) -> bool {
-        self.observed > self.allowed
+        if self.observed <= self.allowed {
+            return false;
+        }
+        match &self.reason {
+            ResourceReason::Heartbeats { consumed, limit } => {
+                *limit == self.allowed && *consumed == self.observed
+            }
+            ResourceReason::RecursionDepth { limit } => *limit == self.allowed,
+            ResourceReason::Memory { limit_bytes } => *limit_bytes == self.allowed,
+            // No numbers to contradict — the shape this variant was given on purpose.
+            ResourceReason::StructuralBudget { .. } => true,
+            // Not an exhaustion at all.
+            ResourceReason::Cancelled => false,
+        }
     }
 }
 
@@ -172,6 +201,27 @@ pub struct Inconclusive {
     /// the outcome is authoritative-by-absence: an inconclusive with no diagnostic is
     /// still an inconclusive, and a missing diagnostic must never upgrade it.
     pub diagnostic: Option<ErrorValue>,
+    /// **Where the work had got to** when it stopped — a byte offset, a declaration
+    /// name, a module (bead franken_lean-vui8).
+    ///
+    /// Purely diagnostic, and never an input to a decision: `ResourceUsage`'s
+    /// `allowed`/`observed` are what size a retry, and this must not be read as a budget.
+    /// It lives here rather than on `ResourceUsage` for two reasons. Semantically, "where
+    /// it stopped" is a property of *this stop*, not of the usage numbers, and it is just
+    /// as wanted for a cancellation as for an exhaustion. Practically, it is bounded text
+    /// rather than a number because adopters localize differently — a byte offset for a
+    /// codec, a declaration name for the kernel, a module for the closure walker — and a
+    /// `usize` offset would have been a codec-shaped field that lies everywhere else.
+    ///
+    /// Boxed, which is not decoration. `Inconclusive` travels in the `Err` position of
+    /// [`Outcome::into_complete`], so its size is paid by every `Result` in the program
+    /// that handles a non-answer. Measured: `ErrorValue` is 72 bytes and dominates, and an
+    /// inline `Option<BoundedText>` took `Inconclusive` from 112 to 144 — past the 128-byte
+    /// threshold at which clippy's `result_large_err` fires. Boxing costs 8 bytes and an
+    /// allocation only when progress is actually recorded, which keeps the lint live to
+    /// catch the *next* field someone adds. Silencing it instead would have spent a
+    /// standing guard to buy one inline field.
+    pub progress: Option<Box<BoundedText>>,
 }
 
 impl Inconclusive {
@@ -181,6 +231,7 @@ impl Inconclusive {
                 at: BoundedText::new(at),
             },
             diagnostic: None,
+            progress: None,
         }
     }
 
@@ -188,6 +239,7 @@ impl Inconclusive {
         Inconclusive {
             cause: InconclusiveCause::ResourceExhausted { usage },
             diagnostic: None,
+            progress: None,
         }
     }
 
@@ -197,6 +249,7 @@ impl Inconclusive {
                 what: BoundedText::new(what),
             },
             diagnostic: None,
+            progress: None,
         }
     }
 
@@ -206,11 +259,18 @@ impl Inconclusive {
                 what: BoundedText::new(what),
             },
             diagnostic: None,
+            progress: None,
         }
     }
 
     pub fn with_diagnostic(mut self, cause: ErrorValue) -> Inconclusive {
         self.diagnostic = Some(cause);
+        self
+    }
+
+    /// Record where the work had got to. Diagnostic only — see [`Inconclusive::progress`].
+    pub fn with_progress(mut self, progress: impl Into<String>) -> Inconclusive {
+        self.progress = Some(Box::new(BoundedText::new(progress)));
         self
     }
 }
@@ -654,5 +714,168 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// The structural budget axis (bead franken_lean-vui8), and the two guards it had to
+    /// clear: it must DISTINGUISH something no existing variant does, and it must not
+    /// become a way to express a different outcome.
+    #[test]
+    fn the_structural_axis_distinguishes_units_without_touching_the_outcome_axis() {
+        use crate::diag::StructuralUnit;
+
+        // DISTINGUISHES: three units, three distinct renderings, none of which borrows the
+        // vocabulary of an elaboration budget. A renderer saying "memory" for an
+        // input-byte cap was the false diagnostic this axis exists to stop.
+        let mut rendered = std::collections::BTreeSet::new();
+        for unit in StructuralUnit::ALL {
+            assert!(rendered.insert(unit.as_str()), "two units render alike");
+            assert!(!unit.as_str().contains("memory"));
+            assert!(!unit.as_str().contains("heartbeat"));
+            assert!(!unit.as_str().contains("depth"));
+        }
+        assert_eq!(rendered.len(), 3);
+
+        // Stored size and denoted size are the distinction most likely to be collapsed by
+        // someone tidying up, so it gets its own assertion rather than only a doc comment.
+        assert_ne!(
+            StructuralUnit::ProducedNodes.as_str(),
+            StructuralUnit::ExpandedWeight.as_str()
+        );
+
+        // DOES NOT TOUCH THE OUTCOME AXIS: whatever the reason, an Inconclusive is
+        // non-authoritative and cache-refused. A cause can never buy authority.
+        for unit in StructuralUnit::ALL {
+            let outcome: Outcome<u8> =
+                Outcome::Inconclusive(Inconclusive::resource(ResourceUsage {
+                    reason: ResourceReason::StructuralBudget { unit },
+                    allowed: 10,
+                    observed: 11,
+                }));
+            assert_eq!(outcome.authority(), Authority::NonAuthoritative);
+            assert_eq!(
+                outcome.cache_admission(),
+                CacheAdmission::Refused {
+                    authority: Authority::NonAuthoritative
+                }
+            );
+            assert!(outcome.as_complete().is_none());
+        }
+    }
+
+    /// `is_genuine_exhaustion` now refuses a usage that contradicts itself or that is not
+    /// an exhaustion at all (bead franken_lean-vui8).
+    #[test]
+    fn a_self_contradictory_or_cancelled_usage_is_not_a_genuine_exhaustion() {
+        use crate::diag::StructuralUnit;
+
+        // The pre-existing law: spending must exceed the allowance.
+        assert!(usage(10, 11).is_genuine_exhaustion());
+        assert!(!usage(10, 10).is_genuine_exhaustion());
+        assert!(!usage(10, 9).is_genuine_exhaustion());
+
+        // NEW: the reason's own numbers must agree with the outer pair. This is the hole —
+        // a usage could claim allowed=10/observed=20 while its reason said limit=900, and
+        // no reader could tell which number was the budget.
+        assert!(
+            !ResourceUsage {
+                reason: ResourceReason::Heartbeats {
+                    consumed: 20,
+                    limit: 900,
+                },
+                allowed: 10,
+                observed: 20,
+            }
+            .is_genuine_exhaustion(),
+            "an inner limit contradicting `allowed` must not pass"
+        );
+        assert!(
+            !ResourceUsage {
+                reason: ResourceReason::Heartbeats {
+                    consumed: 5,
+                    limit: 10,
+                },
+                allowed: 10,
+                observed: 20,
+            }
+            .is_genuine_exhaustion(),
+            "an inner consumed contradicting `observed` must not pass"
+        );
+        assert!(
+            !ResourceUsage {
+                reason: ResourceReason::RecursionDepth { limit: 7 },
+                allowed: 10,
+                observed: 20,
+            }
+            .is_genuine_exhaustion()
+        );
+        assert!(
+            ResourceUsage {
+                reason: ResourceReason::RecursionDepth { limit: 10 },
+                allowed: 10,
+                observed: 20,
+            }
+            .is_genuine_exhaustion(),
+            "an agreeing depth limit must still pass"
+        );
+
+        // NEW: cancellation is not exhaustion. Accepting it here would let a cancelled run
+        // be reported as a budget overrun, which is the cause/outcome collapse the two
+        // axes exist to prevent — InconclusiveCause::Cancelled is where it belongs.
+        assert!(
+            !ResourceUsage {
+                reason: ResourceReason::Cancelled,
+                allowed: 10,
+                observed: 20,
+            }
+            .is_genuine_exhaustion()
+        );
+
+        // StructuralBudget carries no numbers, so it has nothing to contradict — the
+        // reason it was given that shape.
+        assert!(
+            ResourceUsage {
+                reason: ResourceReason::StructuralBudget {
+                    unit: StructuralUnit::ExpandedWeight
+                },
+                allowed: 1_000,
+                observed: 1_000_001,
+            }
+            .is_genuine_exhaustion()
+        );
+    }
+
+    /// Progress is diagnostic and cannot upgrade anything (bead franken_lean-vui8).
+    #[test]
+    fn recorded_progress_localizes_a_stop_without_changing_it() {
+        let localized = Inconclusive::resource(usage(10, 11)).with_progress("byte 4096");
+        assert_eq!(
+            localized
+                .progress
+                .as_deref()
+                .map(crate::outcome::BoundedText::text),
+            Some("byte 4096")
+        );
+        // Available for a cancellation too, which is why it lives on Inconclusive rather
+        // than on ResourceUsage.
+        let cancelled = Inconclusive::cancelled("during import walk").with_progress("Init.Core");
+        assert!(cancelled.progress.is_some());
+
+        // And it moves nothing: same cause, same authority, same admission with or without.
+        let bare = Inconclusive::resource(usage(10, 11));
+        assert_eq!(localized.cause, bare.cause);
+        for inconclusive in [localized, bare] {
+            let outcome: Outcome<u8> = Outcome::Inconclusive(inconclusive);
+            assert_eq!(outcome.authority(), Authority::NonAuthoritative);
+            assert_eq!(
+                outcome.cache_admission(),
+                CacheAdmission::Refused {
+                    authority: Authority::NonAuthoritative
+                }
+            );
+        }
+
+        // Bounded like every other free-text field.
+        let huge = Inconclusive::cancelled("x").with_progress("y".repeat(BoundedText::LIMIT + 10));
+        assert!(huge.progress.as_deref().is_some_and(BoundedText::truncated));
     }
 }

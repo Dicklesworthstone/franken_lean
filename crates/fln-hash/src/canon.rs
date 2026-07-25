@@ -11,7 +11,7 @@
 //! Decoding is total over arbitrary bytes: every failure is a typed [`CanonError`],
 //! never a panic (D8 taxonomy).
 
-use fln_core::diag::{Diagnostic, ErrorValue, ResourceReason, Severity};
+use fln_core::diag::{Diagnostic, ErrorValue, ResourceReason, Severity, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
@@ -1252,9 +1252,20 @@ fn read_expr_iter(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
 
 // ---- Diagnostic (the D8 typed error taxonomy, versioned on the wire) -------------------
 
+/// **Version 2** since bead franken_lean-vui8 added `ResourceReason::StructuralBudget`
+/// (wire tag `RES_STRUCTURAL`).
+///
+/// Bumped even though no existing value's bytes moved and no golden was re-pinned. The
+/// reason is skew, not layout: a v1 reader meeting tag 4 fails closed with "unknown
+/// resource-reason tag", so if the version had stayed at 1 then two artifacts both
+/// labelled `fln.canon.diag/1` would exist — one every reader can decode and one only new
+/// readers can. A version whose value does not identify the language it names is worse
+/// than useless, because it invites exactly the confident misread it is supposed to
+/// prevent. The bump was free here: nothing persists a diagnostic encoding yet and no
+/// fixture or digest pins one, which was checked rather than assumed.
 pub const SCHEMA_DIAG: SchemaId = SchemaId {
     name: "fln.canon.diag",
-    version: 1,
+    version: 2,
 };
 
 const SEV_INFO: u8 = 0;
@@ -1265,6 +1276,30 @@ const RES_HEARTBEATS: u8 = 0;
 const RES_REC_DEPTH: u8 = 1;
 const RES_CANCELLED: u8 = 2;
 const RES_MEMORY: u8 = 3;
+/// Added with the structural budget axis (bead franken_lean-vui8). Tags are permanent
+/// once published; a new reason takes the next free value and never reuses one.
+const RES_STRUCTURAL: u8 = 4;
+
+const SU_INPUT_BYTES: u8 = 0;
+const SU_PRODUCED_NODES: u8 = 1;
+const SU_EXPANDED_WEIGHT: u8 = 2;
+
+fn write_structural_unit(w: &mut CanonWriter, unit: StructuralUnit) {
+    w.u8(match unit {
+        StructuralUnit::InputBytes => SU_INPUT_BYTES,
+        StructuralUnit::ProducedNodes => SU_PRODUCED_NODES,
+        StructuralUnit::ExpandedWeight => SU_EXPANDED_WEIGHT,
+    });
+}
+
+fn read_structural_unit(r: &mut CanonReader<'_>) -> Result<StructuralUnit, CanonError> {
+    Ok(match r.u8()? {
+        SU_INPUT_BYTES => StructuralUnit::InputBytes,
+        SU_PRODUCED_NODES => StructuralUnit::ProducedNodes,
+        SU_EXPANDED_WEIGHT => StructuralUnit::ExpandedWeight,
+        _ => return Err(r.err_public("unknown structural-unit tag")),
+    })
+}
 
 fn write_resource(w: &mut CanonWriter, resource: &ResourceReason) {
     match resource {
@@ -1282,6 +1317,12 @@ fn write_resource(w: &mut CanonWriter, resource: &ResourceReason) {
             w.u8(RES_MEMORY);
             w.u64(*limit_bytes);
         }
+        // No numbers: the variant carries only which quantity was bounded, because
+        // `allowed`/`observed` live in `ResourceUsage`.
+        ResourceReason::StructuralBudget { unit } => {
+            w.u8(RES_STRUCTURAL);
+            write_structural_unit(w, *unit);
+        }
     }
 }
 
@@ -1295,6 +1336,9 @@ fn read_resource(r: &mut CanonReader<'_>) -> Result<ResourceReason, CanonError> 
         RES_CANCELLED => ResourceReason::Cancelled,
         RES_MEMORY => ResourceReason::Memory {
             limit_bytes: r.u64()?,
+        },
+        RES_STRUCTURAL => ResourceReason::StructuralBudget {
+            unit: read_structural_unit(r)?,
         },
         _ => return Err(r.err_public("unknown resource-reason tag")),
     })
@@ -3069,94 +3113,82 @@ mod tests {
     /// The budget reaches the payloads decoded by their own readers, not just the
     /// top-level term walk — otherwise a hostile `Name` chain or `KVMap` inside an
     /// otherwise small artifact would be unmetered.
-    /// **The adoption blocker on bead fln-8gz3, held as a trigger rather than a note.**
+    /// **The fln-8gz3 blocker is CLEARED** — this is the positive statement of the
+    /// mapping it was waiting for (bead franken_lean-vui8).
     ///
-    /// fln-8gz3 folds [`Decoded`] into `fln_core::outcome::Outcome<Result<T, CanonError>>`.
-    /// Two of the three arms map cleanly — `Value` to `Complete(Ok(..))` and `Malformed`
-    /// to `Complete(Err(..))`, since malformed bytes are a real domain verdict and belong
-    /// inside the authoritative arm. The third does not, and the bead's own plan for it
-    /// ("BudgetLimit becoming the ResourceReason") was written without checking that the
-    /// vocabulary existed. It does not.
+    /// This test used to be a trigger: it matched `ResourceReason` and `BudgetLimit`
+    /// exhaustively so that adding a variant to either would fail to compile here, with
+    /// the reasoning attached, and tell whoever did it whether the blocker was cleared.
+    /// It fired exactly as designed when `StructuralBudget` landed. What replaces it is
+    /// the correspondence itself, kept as a total function so the taxonomy and the
+    /// decoder's limits cannot drift apart again in either direction.
     ///
-    /// `InconclusiveCause::ResourceExhausted` requires a `ResourceUsage`, which requires a
-    /// `ResourceReason` — the D8 taxonomy's *diagnostic* vocabulary, declared closed at
-    /// version 1. Its four entries are `maxHeartbeats`, `maxRecDepth`, cancellation, and a
-    /// declared memory budget. A canonical decode stops on neither: its limits are input
-    /// bytes consumed and values produced. Nothing in the taxonomy names either.
-    ///
-    /// So the fold cannot be completed honestly today, and the dishonest routes are worth
-    /// naming so nobody takes one by accident:
-    ///
-    /// * `Memory { limit_bytes }` for [`BudgetLimit::InputBytes`] would make a renderer
-    ///   print "memory budget exhausted" for a decode that stopped on an input-byte cap.
-    ///   The diagnostic would be false, and D8 diagnostics are a compatibility surface.
-    /// * `RecursionDepth` for [`BudgetLimit::ProducedNodes`] is worse: the produced-node
-    ///   meter exists *precisely because* a depth cap would refuse legitimately deep terms,
-    ///   which bead franken_lean-fnj forbids. Reporting it as a depth limit reintroduces
-    ///   the claim that bead exists to deny.
-    /// * Widening `ResourceReason` here would be a D8 taxonomy revision — a reviewed,
-    ///   spec-level act that breaks every exhaustive match in the workspace — smuggled in
-    ///   under a P3 in one crate.
-    ///
-    /// This test is the trigger. Both enums are matched exhaustively, so **adding a variant
-    /// to either fails to compile right here**, with this comment as the explanation: if the
-    /// new `ResourceReason` names a byte or work budget, the blocker is cleared and fln-8gz3
-    /// can be done; if it does not, record that fln-8gz3 is still blocked and move on.
+    /// The fold `Decoded<T>` -> `Outcome<Result<T, CanonError>>` is now expressible:
+    /// `Value` to `Complete(Ok(..))`, `Malformed` to `Complete(Err(..))` — a real domain
+    /// verdict about bytes, so it belongs inside the authoritative arm — and
+    /// `Inconclusive(Exhausted)` to `Inconclusive(ResourceExhausted{ usage })` with the
+    /// reason below, `allowed`/`observed` from the `Exhausted`, and `at` recorded through
+    /// `Inconclusive::with_progress`. fln-8gz3 does that adoption; this only proves the
+    /// vocabulary is there and says exactly one thing per limit.
     #[test]
-    fn the_outcome_adoption_blocker_is_a_missing_resource_vocabulary() {
-        // Exhaustive on purpose. A new arm here is the signal described above.
-        fn faithfully_names(reason: &ResourceReason, limit: BudgetLimit) -> bool {
-            match (reason, limit) {
-                (ResourceReason::Heartbeats { .. }, _)
-                | (ResourceReason::RecursionDepth { .. }, _)
-                | (ResourceReason::Cancelled, _)
-                | (ResourceReason::Memory { .. }, _) => false,
+    fn every_decode_budget_limit_maps_to_exactly_one_structural_unit() {
+        // Total and exhaustive both ways: a new BudgetLimit must be given a unit here, and
+        // a StructuralUnit that stops being reachable shows up in the coverage check below.
+        fn unit_for(limit: BudgetLimit) -> StructuralUnit {
+            match limit {
+                BudgetLimit::InputBytes => StructuralUnit::InputBytes,
+                BudgetLimit::ProducedNodes => StructuralUnit::ProducedNodes,
             }
         }
 
-        // Every limit a budgeted decode can stop on, exhaustively.
-        fn every_limit() -> Vec<BudgetLimit> {
-            let all = vec![BudgetLimit::InputBytes, BudgetLimit::ProducedNodes];
-            for limit in &all {
-                match limit {
-                    BudgetLimit::InputBytes | BudgetLimit::ProducedNodes => {}
-                }
-            }
-            all
+        let limits = [BudgetLimit::InputBytes, BudgetLimit::ProducedNodes];
+
+        // Injective: two limits must never collapse onto one unit, or a caller cannot tell
+        // which allowance to raise.
+        let mut mapped = std::collections::BTreeSet::new();
+        for limit in limits {
+            let unit = unit_for(limit);
+            assert!(
+                mapped.insert(unit.as_str()),
+                "two decode limits map onto {} — the distinction a retry needs is gone",
+                unit.as_str()
+            );
+        }
+        assert_eq!(mapped.len(), limits.len());
+
+        // The units a decoder uses are a strict subset of the axis: ExpandedWeight belongs
+        // to the term store (fln-49c), not to a byte decoder, and must NOT be reachable
+        // from a BudgetLimit. Asserting the gap keeps the two adopters from quietly
+        // borrowing each other's unit.
+        assert!(!mapped.contains(StructuralUnit::ExpandedWeight.as_str()));
+        assert_eq!(StructuralUnit::ALL.len(), 3);
+
+        // Each unit renders as itself and nothing else, so a diagnostic cannot say
+        // "memory" or "heartbeats" for a structural stop — the false-diagnostic problem
+        // that made this bead necessary.
+        for unit in StructuralUnit::ALL {
+            let rendered = ResourceReason::StructuralBudget { unit };
+            let mut writer = CanonWriter::new();
+            write_resource(&mut writer, &rendered);
+            let encoded = writer.into_bytes();
+            let mut reader = CanonReader::new(&encoded);
+            assert_eq!(
+                read_resource(&mut reader).expect("round-trip"),
+                rendered,
+                "the {} reason did not survive the wire",
+                unit.as_str()
+            );
+            assert!(!unit.as_str().contains("memory"));
+            assert!(!unit.as_str().contains("heartbeat"));
         }
 
-        let vocabulary = [
-            ResourceReason::Heartbeats {
-                consumed: 1,
-                limit: 0,
-            },
-            ResourceReason::RecursionDepth { limit: 0 },
-            ResourceReason::Cancelled,
-            ResourceReason::Memory { limit_bytes: 0 },
-        ];
-        for limit in every_limit() {
-            for reason in &vocabulary {
-                assert!(
-                    !faithfully_names(reason, limit),
-                    "ResourceReason::{reason:?} now claims to name {limit:?} — if that is \
-                     true, the fln-8gz3 blocker is CLEARED and Decoded should be folded \
-                     into fln_core::outcome::Outcome<Result<T, CanonError>>; if it is not, \
-                     fix the mapping rather than this assertion"
-                );
-            }
-        }
-
-        // The half that already maps needs no taxonomy change, and is asserted so the
-        // blocker is scoped to the inconclusive arm and not read as "the fold is
-        // impossible": a malformed decode is an authoritative domain rejection.
+        // And the arm that never needed a taxonomy change still behaves: a malformed
+        // decode is an authoritative domain rejection, not an inconclusive.
         let malformed: Decoded<Level> = Level::from_canonical_bytes_budgeted(
             b"not a canonical level",
             DecodeBudget::unlimited(),
         );
-        assert!(
-            matches!(malformed, Decoded::Malformed(_)),
-            "the Complete(Err(..)) half of the fold rests on this arm existing"
-        );
+        assert!(matches!(malformed, Decoded::Malformed(_)));
         assert!(!malformed.is_inconclusive());
     }
 

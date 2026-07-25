@@ -55,6 +55,74 @@ pub enum ResourceReason {
     Cancelled,
     /// A declared memory budget was exhausted.
     Memory { limit_bytes: u64 },
+    /// A **native budget over the size or work of a data structure** was exhausted
+    /// (bead franken_lean-vui8).
+    ///
+    /// The four entries above all name a specific *upstream* condition —
+    /// `maxHeartbeats`, `maxRecDepth`, cancellation, a declared memory budget. This one
+    /// does not: it is a FrankenLean-owned budget over our own structures, and it is
+    /// marked as one axis rather than scattered among the upstream option names so the
+    /// taxonomy keeps saying what kind of thing each entry is. Which quantity was bounded
+    /// is a *value* ([`StructuralUnit`]), not a comment, because consumers must act on it.
+    ///
+    /// **Deliberately carries no numbers.** `allowed` and `observed` live in
+    /// `ResourceUsage`, and `Heartbeats` duplicating them there is a known wart this
+    /// variant does not copy: one fact, one home.
+    StructuralBudget { unit: StructuralUnit },
+}
+
+/// Which structural quantity a [`ResourceReason::StructuralBudget`] bounded.
+///
+/// Three units rather than one catch-all, because each answers a different question and
+/// a consumer must do something different about it. That is the bar for a new unit: not
+/// "it is a different number" but "a caller has to react differently".
+///
+/// * [`InputBytes`](StructuralUnit::InputBytes) — how much serialized input was consumed.
+///   Hitting this while few values were produced means the input is padded, sparse, or
+///   garbage; the retry raises a byte allowance.
+/// * [`ProducedNodes`](StructuralUnit::ProducedNodes) — how much structure was actually
+///   materialized. Hitting this on few bytes means a high expansion ratio — a
+///   decompression bomb — and the retry raises a node allowance, or streams instead.
+///   Deliberately a count of *work*, not of nesting: a depth cap would refuse
+///   legitimately deep terms, which bead franken_lean-fnj forbids.
+/// * [`ExpandedWeight`](StructuralUnit::ExpandedWeight) — the size of the tree a shared
+///   DAG *denotes*, measured without building it.
+///
+/// The last is why `ProducedNodes` and `ExpandedWeight` are not one unit, which is the
+/// distinction most likely to be collapsed by someone tidying up. Stored size and denoted
+/// size differ by orders of magnitude on a shared DAG, and the correct reaction inverts:
+/// exceeding `ProducedNodes` means "bigger than I allowed to materialize", where raising
+/// the budget is a reasonable response; exceeding `ExpandedWeight` means "this small value
+/// denotes something astronomical", where raising the budget is usually the wrong move
+/// because the input is a DAG bomb. A single unit could not tell a caller which of those
+/// two situations it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralUnit {
+    /// Bytes consumed from a serialized input.
+    InputBytes,
+    /// Values materialized from it — nodes, entries, components.
+    ProducedNodes,
+    /// The denoted (fully expanded) tree size of a shared graph, computed without
+    /// expanding it.
+    ExpandedWeight,
+}
+
+impl StructuralUnit {
+    /// The unit's own name, for renderers and structured logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            StructuralUnit::InputBytes => "input bytes",
+            StructuralUnit::ProducedNodes => "produced nodes",
+            StructuralUnit::ExpandedWeight => "expanded weight",
+        }
+    }
+
+    /// Every unit, for taxonomy-wide tests.
+    pub const ALL: [StructuralUnit; 3] = [
+        StructuralUnit::InputBytes,
+        StructuralUnit::ProducedNodes,
+        StructuralUnit::ExpandedWeight,
+    ];
 }
 
 /// The D8 normative taxonomy, version 1. Closed: adding a variant is a reviewed
@@ -183,6 +251,14 @@ impl ErrorValue {
                 }
                 ResourceReason::Memory { limit_bytes } => format!(
                     "memory budget of {limit_bytes} bytes exhausted at `{}`",
+                    decl.to_display_string()
+                ),
+                // Names the unit and nothing else. The numbers belong to ResourceUsage,
+                // and a renderer that invented one here would be the second home this
+                // variant exists to avoid.
+                ResourceReason::StructuralBudget { unit } => format!(
+                    "{} budget exhausted at `{}`",
+                    unit.as_str(),
                     decl.to_display_string()
                 ),
             },
