@@ -40,7 +40,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use fln_core::diag::ResourceReason;
+use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
@@ -817,7 +817,9 @@ impl EmitCtx {
         start_us: u128,
     ) {
         let rejected_total: u64 = run.rejected.values().sum();
-        let checked = run.accepted + run.inconclusive + rejected_total;
+        // FL-INV-07: an inconclusive outcome was attempted, but it was not
+        // checked to a verdict and must not enter the checked census.
+        let checked = run.accepted + rejected_total;
         let end_us = self.started.elapsed().as_micros();
         println!(
             "{{{},\"phase\":{},\"threads\":{},\"status\":{},\"budget_steps\":{},\
@@ -1368,7 +1370,11 @@ fn prelude_replays_through_the_kernel() {
         }
     }
 
-    let checked = accepted + inconclusive + rejected.values().sum::<u64>();
+    // FL-INV-07: only complete Accepted/Rejected verdicts are checked.
+    // Any inconclusive outcome remains separately visible and makes the
+    // conservation assertion below fail instead of being laundered into this
+    // count.
+    let checked = accepted + rejected.values().sum::<u64>();
     let unchecked = &prep.unchecked;
     let artifact_incomplete = prep.artifact_incomplete_count();
     let artifact_witness = prep.artifact_witness_hex();
@@ -1560,6 +1566,14 @@ fn quot_item(prep: &PreparedReplay) -> &WorkItem {
         .expect("Init.Prelude has the quotient-initialization unit")
 }
 
+fn structural_unit_evidence_name(unit: StructuralUnit) -> &'static str {
+    match unit {
+        StructuralUnit::InputBytes => "InputBytes",
+        StructuralUnit::ProducedNodes => "ProducedNodes",
+        StructuralUnit::ExpandedWeight => "ExpandedWeight",
+    }
+}
+
 fn resource_usage_facts(usage: &ResourceUsage) -> (String, u64, u32) {
     match usage.reason {
         ResourceReason::Heartbeats { .. } => ("inconclusive:Steps".into(), usage.observed, 0),
@@ -1570,6 +1584,61 @@ fn resource_usage_facts(usage: &ResourceUsage) -> (String, u64, u32) {
         ),
         ResourceReason::Cancelled => ("inconclusive:Cancelled".into(), 0, 0),
         ResourceReason::Memory { .. } => ("inconclusive:Memory".into(), usage.observed, 0),
+        ResourceReason::StructuralBudget { unit } => (
+            format!(
+                "inconclusive:StructuralBudget:{}",
+                structural_unit_evidence_name(unit)
+            ),
+            // Structural allowances are neither kernel steps nor recursion
+            // depth. Their allowed/observed values remain typed on
+            // ResourceUsage instead of being mislabeled in these fields.
+            0,
+            0,
+        ),
+    }
+}
+
+fn assert_structural_budget_resource_facts_are_total() {
+    let expected = [
+        (
+            StructuralUnit::InputBytes,
+            "inconclusive:StructuralBudget:InputBytes",
+        ),
+        (
+            StructuralUnit::ProducedNodes,
+            "inconclusive:StructuralBudget:ProducedNodes",
+        ),
+        (
+            StructuralUnit::ExpandedWeight,
+            "inconclusive:StructuralBudget:ExpandedWeight",
+        ),
+    ];
+    assert_eq!(
+        expected.len(),
+        StructuralUnit::ALL.len(),
+        "every structural-budget unit needs an explicit evidence classification"
+    );
+    for ((unit, expected_outcome), registered_unit) in expected.into_iter().zip(StructuralUnit::ALL)
+    {
+        assert_eq!(
+            unit, registered_unit,
+            "structural-budget evidence order drifted from the D8 taxonomy"
+        );
+        let usage = ResourceUsage {
+            reason: ResourceReason::StructuralBudget { unit },
+            allowed: 64,
+            observed: 65,
+        };
+        assert!(usage.is_genuine_exhaustion());
+        assert_eq!(
+            resource_usage_facts(&usage),
+            (expected_outcome.to_string(), 0, 0)
+        );
+        assert_eq!(
+            (usage.allowed, usage.observed),
+            (64, 65),
+            "structural allowed/observed facts changed meaning"
+        );
     }
 }
 
@@ -1644,6 +1713,10 @@ fn verdict_facts(v: &Outcome<Verdict>) -> (String, Option<String>, String, u64, 
 
 #[test]
 fn admission_fault_matrix_is_typed_and_atomic() {
+    // This taxonomy-totality proof runs even when the pinned Reference is
+    // absent and the real-module portion below must skip.
+    assert_structural_budget_resource_facts_are_total();
+
     let Some((bytes, infos)) = decode_prelude() else {
         eprintln!(
             "SKIP admission_fault_matrix: pinned Reference stdlib not found \
