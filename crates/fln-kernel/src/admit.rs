@@ -2506,9 +2506,25 @@ fn compare_recursors(generated: &RecursorVal, decoded: &RecursorVal) -> KResult<
         );
     }
     if generated.base.level_params != decoded.base.level_params {
+        // Print BOTH lists. The message used to say only that they diverged,
+        // which made 228 corpus rows (bead `franken_lean-d17i`) impossible to
+        // classify from the log alone: a name difference, an order difference
+        // and a missing motive universe all read identically. A divergence
+        // report that does not say what diverged is a measurement defect.
+        let show = |ps: &[fln_core::name::Name]| -> String {
+            ps.iter()
+                .map(fln_core::name::Name::to_display_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         return reject(
             RejectClass::BlockMismatch,
-            format!("`{name}`: recursor level parameters diverge from regeneration"),
+            format!(
+                "`{name}`: recursor level parameters diverge from regeneration \
+                 (generated [{}], decoded [{}])",
+                show(&generated.base.level_params),
+                show(&decoded.base.level_params)
+            ),
         );
     }
     if generated.all != decoded.all
