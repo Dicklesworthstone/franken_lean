@@ -250,14 +250,18 @@ pub struct ConceptCensus {
 /// What this matrix does and does not govern. Data, not a doc comment, so it is printable at
 /// failure time.
 pub const GOVERNED_SCOPE: &str = "\
-Fifteen rows over three documents (README.md, AGENTS.md, crates/fln-olean/src/lib.rs) plus \
+Sixteen rows over four documents (README.md, AGENTS.md, \
+COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, crates/fln-olean/src/lib.rs) plus \
 three concept censuses over README.md, AGENTS.md and \
 COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, seeded from a measured read-only review \
-(bead franken_lean-claim-matrix-doc-ci-mhew). NOT covered: the overwhelming majority of \
+(bead franken_lean-claim-matrix-doc-ci-mhew). The document list is a correction: it said THREE \
+documents and omitted the plan while three row sites already pointed at it \
+(franken_lean-4o3n, 2026-07-25) — a scope statement that understates itself is the same defect \
+class as one that overstates. NOT covered: the overwhelming majority of \
 README.md (~41 KB) and the plan (~195 KB), every claim in every other crate header, and all \
 generated contracts. Only three concepts have a conservation census; every other repeated \
 claim in these documents is unwatched. Every row now cites at least one checkable fact \
-(sixteen citations over fifteen rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
+(seventeen citations over sixteen rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
 only rot someone anticipated well enough to cite, and it protects one clause of a \
 multi-clause evidence paragraph. B3-CONSENSUS-HALTS has nine factual clauses and one is \
 cited, and it is not the clause its state depends on. Both rows that actually rotted on \
@@ -315,6 +319,19 @@ const SITES_RECEIPTS: [ClaimSite; 1] = [site(
     README,
     "proof certificate; attested checks append to a transparency log",
 )];
+const SITES_FUEL_PARITY: [ClaimSite; 5] = [
+    site(README, "deterministic fuel parity"),
+    site(AGENTS, "deterministic fuel parity"),
+    site(
+        AGENTS,
+        "bug-for-bug observational parity with the pin, including fuel parity",
+    ),
+    site(PLAN, "deterministic fuel parity with the Reference"),
+    site(
+        PLAN,
+        "the heartbeat-counting law is replicated at its allocation-linked granularity",
+    ),
+];
 const SITES_DOCS_CI: [ClaimSite; 1] = [site(
     README,
     "documentation CI that rejects wording stronger than the evidence permits",
@@ -343,12 +360,17 @@ const SITES_GOLEM: [ClaimSite; 1] = [site(README, "runs unmodified on Golem")];
 
 /// **The claim matrix.**
 ///
-/// B3 is decomposed rather than carried as one row: its sentence asserts seven sub-claims
-/// whose honest states differ, and a single verdict over it would be wrong in both
-/// directions. Two of those sub-claims are `Supported` — the ≤ 12 KLOC covenant is real and
-/// CI-enforced, and the foreign-kernel witness genuinely runs — so the matrix does not imply
-/// the whole B3 sentence is unsupported.
-pub const CLAIM_MATRIX: [ClaimRow; 15] = [
+/// B3 is decomposed rather than carried as one row: its sentence asserts sub-claims whose
+/// honest states differ, and a single verdict over it would be wrong in both directions.
+/// Seven of them have rows below. Exactly one is `Supported` — the ≤ 12 KLOC covenant is
+/// real and CI-enforced — so the matrix does not imply the whole B3 sentence is unsupported.
+///
+/// Corrected 2026-07-25 (bead `franken_lean-4o3n`): this note said TWO sub-claims were
+/// `Supported`, counting the foreign-kernel witness. That witness genuinely runs
+/// (`scripts/tribunal/leanchecker_witness.sh`, wired into `scripts/check.sh`) — and it has no
+/// row here, so it is UNGOVERNED, not supported. A true clause with no row is exactly what a
+/// decomposition is supposed to make visible, and calling it supported hid it.
+pub const CLAIM_MATRIX: [ClaimRow; 16] = [
     // ---- B3, decomposed -------------------------------------------------------------
     ClaimRow {
         id: "B3-KERNEL-LOC-COVENANT",
@@ -416,7 +438,11 @@ pub const CLAIM_MATRIX: [ClaimRow; 15] = [
                    ->* fln-rt, ->* fln-unsafe-*. What the claim still promises beyond the tree \
                    is a second CHECKING ENGINE: what exists is the independence boundary and \
                    the data schema, not an implementation that decides verdicts. The \
-                   foreign-witness half is a separate, Supported row.",
+                   foreign-witness half genuinely runs \
+                   (scripts/tribunal/leanchecker_witness.sh, called from scripts/check.sh) and \
+                   has NO row in this matrix. Corrected 2026-07-25 (franken_lean-4o3n) from \
+                   'a separate, Supported row', which named a row that has never existed: \
+                   B3-KERNEL-LOC-COVENANT is the only Supported row here.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -429,13 +455,37 @@ pub const CLAIM_MATRIX: [ClaimRow; 15] = [
                    anywhere in the workspace.",
         enforcement: Enforcement::Acknowledged,
     },
+    ClaimRow {
+        id: "B3-FUEL-PARITY",
+        sites: &SITES_FUEL_PARITY,
+        claim_type: ClaimType::BoundedModel,
+        state: ClaimState::Targeted,
+        evidence: "Added 2026-07-25 (bead franken_lean-4o3n). The sentence asserts a RELATION \
+                   between two fuel counters, and neither side of it is measured. In-repo there \
+                   is one engine, so there is nothing to be at parity WITH (B3-DUAL-ENGINE). \
+                   Against the pin the corpus differential's oracle axis is a CONSTANT: \
+                   crates/fln-conformance/tests/kernel_replay.rs scores every corpus \
+                   declaration against CorpusAxisVerdict::Accepted, inferred from the \
+                   declaration being present in the pinned .olean — so no Reference fuel is \
+                   ever observed in our process, and the faithful-mode wording ('the \
+                   heartbeat-counting law is replicated ... so maxHeartbeats timeouts fire on \
+                   the same inputs') has no measurement anywhere in the tree. What DOES exist: \
+                   a typed fuel budget whose exhaustion is a typed Inconclusive (FL-INV-07), \
+                   and ci/PARITY_LEDGER.txt rows 204/206 for the maxHeartbeats OPTION surface \
+                   — the option exists and its default matches the pin, which says nothing \
+                   about consumption and is the row most likely to be quoted as if it did. The \
+                   kernel reports its step counter under ResourceReason::Heartbeats while \
+                   counting inference nodes, reduction steps and defeq queries rather than \
+                   allocations, so the NAME is already ahead of the quantity.",
+        enforcement: Enforcement::Acknowledged,
+    },
     // ---- the rest of the seeded corpus ----------------------------------------------
     ClaimRow {
         id: "B8-DOCS-CI-ENFORCES-WORDING",
         sites: &SITES_DOCS_CI,
         claim_type: ClaimType::Invariant,
         state: ClaimState::Targeted,
-        evidence: "This module is the enforcing slice and governs fifteen rows over three \
+        evidence: "This module is the enforcing slice and governs sixteen rows over four \
                    documents plus three censuses. The claim as written implies coverage of all \
                    documentation, which is not true and is why GOVERNED_SCOPE exists. Promote \
                    only when franken_lean-n8hw delivers the full matrix.",
@@ -548,8 +598,12 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
         ungoverned_allowance: 8,
         allowance_reason: "Eleven assertions exist (README 5, AGENTS 1, plan 5); three are \
                            governed by B3-DUAL-ENGINE. The remaining eight are two further \
-                           README mentions and every plan mention — the plan is not yet in \
-                           row scope at all, which is the largest single gap in this matrix.",
+                           README mentions and every plan mention — no plan occurrence of this \
+                           keyword is governed by any row, which is the largest single gap in \
+                           this matrix. Corrected 2026-07-25 (franken_lean-4o3n) from 'the plan \
+                           is not yet in row scope at all': rows DO cite plan sites (dual-engine, \
+                           consensus-halts, fuel-parity) in other phrasings, and only this \
+                           keyword's plan occurrences are ungoverned.",
     },
     ConceptCensus {
         concept: "consensus halting",
@@ -578,8 +632,9 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 /// naming no row is itself a fault and the two tables cannot drift apart silently — the same
 /// bidirectional discipline the corpus projection uses.
 ///
-/// This is a seed, not coverage: six citations over five rows. Most evidence prose here is
-/// still unchecked, and [`GOVERNED_SCOPE`] says so.
+/// This is a seed, not coverage: the first six entries below are the seeded citations over
+/// five rows, and the rest are the one-per-row ratchet. Most evidence prose here is still
+/// unchecked, and [`GOVERNED_SCOPE`] says so.
 /// Every row must carry at least one citation ([`every_row_cites_a_checkable_fact`] in the
 /// suite). That is a **ratchet, not coverage**: it guarantees each row has *a* tripwire, which
 /// is emphatically not the same as the row being current. A citation only catches rot someone
@@ -589,7 +644,7 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 /// floor under it.
 ///
 /// [`every_row_cites_a_checkable_fact`]: ../../tests/witness_claim_matrix.rs
-pub const EVIDENCE_CITATIONS: [(&str, Citation); 16] = [
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 17] = [
     // Corrected 2026-07-25 after this row asserted a stub that had grown to 149 lines.
     (
         "B3-INDEPENDENT-CHECKER",
@@ -662,6 +717,21 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 16] = [
             count: 0,
         },
     ),
+    // The load-bearing half of this row: the only heartbeat evidence that exists is the
+    // OPTION surface — two rows, both `option` kind, asserting the option exists and its
+    // default matches the pin. A third occurrence means somebody started recording
+    // heartbeat CONSUMPTION, which is the moment "fuel parity" stops being ungoverned
+    // prose and this row needs a human. Anchored in the generated ledger rather than in
+    // fln-kernel, whose fuel labelling is under active revision on franken_lean-4o3n:
+    // a tripwire in front of a change already in flight fires as noise, not as a finding.
+    (
+        "B3-FUEL-PARITY",
+        Citation::OccursExactly {
+            path: "ci/PARITY_LEDGER.txt",
+            needle: "maxHeartbeats",
+            count: 2,
+        },
+    ),
     (
         "B3-RECEIPTS-BY-DEFAULT",
         Citation::OccursExactly {
@@ -670,7 +740,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 16] = [
             count: 1,
         },
     ),
-    // This row's evidence says the matrix governs fifteen rows, so the citation tracks the
+    // This row's evidence says the matrix governs sixteen rows, so the citation tracks the
     // row count — but it must live in a DIFFERENT file than the needle describes. Citing
     // `witness.rs` for a literal inside `witness.rs` counts the citation itself: the first
     // attempt used `pub const CLAIM_MATRIX: [ClaimRow; 15]` and found it twice, once as the
@@ -681,7 +751,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 16] = [
         "B8-DOCS-CI-ENFORCES-WORDING",
         Citation::OccursExactly {
             path: "crates/fln-conformance/tests/witness_claim_matrix.rs",
-            needle: "report.acknowledged, 12",
+            needle: "report.acknowledged, 13",
             count: 1,
         },
     ),

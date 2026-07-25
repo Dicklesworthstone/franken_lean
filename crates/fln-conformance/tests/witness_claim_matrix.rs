@@ -126,7 +126,7 @@ fn the_matrix_and_the_censuses_are_clean_against_the_real_tree() {
         "the <= 12 KLOC covenant is earned and recorded as such, so the matrix does not imply \
          the whole B3 sentence is unsupported"
     );
-    assert_eq!(report.acknowledged, 12, "the standing overclaims");
+    assert_eq!(report.acknowledged, 13, "the standing overclaims");
     assert_eq!(
         report.censuses,
         CONCEPT_CENSUS.len(),
