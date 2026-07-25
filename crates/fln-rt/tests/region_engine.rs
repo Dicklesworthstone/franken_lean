@@ -305,3 +305,66 @@ fn mpz_header_extremes_are_typed_faults_not_panics() {
         "a coherent mpz must still audit clean"
     );
 }
+
+/// Two threads publishing the SAME target must never produce a mixture.
+///
+/// The staging file used to be keyed on the process id alone, so two threads
+/// publishing one target shared it: `File::create` truncates, so T1 could write
+/// half its bytes, T2 truncate and write its own, and T1 then fsync and rename
+/// the MIXTURE into place — a corrupt artifact published through the very path
+/// whose job is to make publication atomic. Keying the staging name on
+/// (process, thread, target) fixes it; `rename` does the rest.
+///
+/// The assertion is deliberately "equals one input exactly", not "is
+/// non-empty": a torn publication is usually still a plausible-looking file,
+/// which is exactly why it would survive a weaker check.
+#[test]
+fn concurrent_publication_of_one_target_never_yields_a_mixture() {
+    let dir = std::env::temp_dir().join(format!("fln-rt-pubrace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("region.bin");
+
+    // Distinct, equal-length payloads so a mixture is detectable but a
+    // truncation-based tear would not change the length.
+    let a = vec![0xAAu8; 64 * 1024];
+    let b = vec![0xBBu8; 64 * 1024];
+
+    for _round in 0..8 {
+        std::thread::scope(|s| {
+            for payload in [&a, &b] {
+                let target = target.clone();
+                s.spawn(move || {
+                    let _ = fln_rt::region::write_region_file(payload, &target);
+                });
+            }
+        });
+        let got = std::fs::read(&target).expect("target published");
+        assert!(
+            got == a || got == b,
+            "published region is a MIXTURE: len {}, first byte {:#x}, \
+             distinct bytes {:?}",
+            got.len(),
+            got.first().copied().unwrap_or(0),
+            {
+                let mut seen: Vec<u8> = got.to_vec();
+                seen.sort_unstable();
+                seen.dedup();
+                seen
+            }
+        );
+    }
+
+    // The staging names must actually differ per thread, which is the property
+    // the fix rests on.
+    let mine = fln_rt::region::staging_tmp_path(&target);
+    let theirs = std::thread::scope(|s| {
+        s.spawn(|| fln_rt::region::staging_tmp_path(&target))
+            .join()
+            .expect("thread")
+    });
+    assert_ne!(
+        mine, theirs,
+        "two threads must not share a staging file for the same target"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

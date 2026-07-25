@@ -49,11 +49,13 @@ pub struct Header {
 #[allow(unsafe_code)]
 pub(crate) unsafe fn read_header(o: *mut LeanObject) -> Header {
     debug_assert!(!is_scalar(o));
-    // SAFETY: live object per caller contract; plain reads mirror the C
-    // fast-path access discipline.
+    // SAFETY: live object per caller contract. `m_rc` goes through the atomic
+    // probe because it is concurrently modified on MT objects; the other three
+    // fields are plain reads, which is sound because nothing ever writes them
+    // after `init_st_header` — they are immutable for the object's lifetime.
     unsafe {
         Header {
-            rc: (&raw const (*o).m_rc).read(),
+            rc: atomic_rc(o).load(Ordering::Relaxed),
             cs_sz: (&raw const (*o).m_cs_sz).read(),
             other: (&raw const (*o).m_other).read(),
             tag: (&raw const (*o).m_tag).read(),
@@ -77,9 +79,33 @@ pub(crate) unsafe fn init_st_header(o: *mut LeanObject, tag: u8, other: u8) {
     }
 }
 
-/// `lean_get_rc_mt_addr` (`lean.h:552-554`): the MT branches address `m_rc`
-/// atomically while ST/persistent branches read it plainly — the exact mixed
-/// discipline the Reference compiles to.
+/// `lean_get_rc_mt_addr` (`lean.h:552-554`): the atomic view of `m_rc`.
+///
+/// EVERY read of `m_rc` goes through here as a `Relaxed` load, including the
+/// mode probes that only want to know which arm of the tri-state protocol
+/// applies. That is a deliberate DIVERGENCE from the Reference, which reads
+/// plainly on the ST/persistent branches.
+///
+/// The reason: on an MT object other threads are performing atomic
+/// read-modify-writes on this exact address, so a plain `ptr::read` races with
+/// them. Miri reports "Data race detected between (1) non-atomic read and (2)
+/// atomic read-modify-write" on precisely this shape, and `mt_stress` drives it
+/// thousands of times per run. Aligned 32-bit loads do not tear on any
+/// certified platform, so the value was never wrong in practice — but a data
+/// race is UB by the memory model whatever the hardware does, and the crate
+/// whose job is to promise memory safety across a threading boundary cannot
+/// rest on "the compiler probably will not exploit this". Upstream's C++ has
+/// the same shape and gets away with it because no sanitizer is pointed at it.
+///
+/// `Relaxed` is the right strength and costs nothing (the same `mov` on x86-64
+/// and aarch64): a probe deliberately accepts a possibly-stale value, and
+/// whichever arm it selects re-establishes its own guarantee — the MT arm
+/// through its `AcqRel` RMW, the ST arm through the single-owner invariant that
+/// makes a stale read impossible there.
+///
+/// The WRITE side still matches the Reference exactly: ST writes stay plain,
+/// because the single-owner invariant means nothing else can be touching them,
+/// and the ST-to-MT transition happens before the object is published.
 ///
 /// # Safety
 /// `o` live object; `m_rc` is 4-aligned by the header layout.
@@ -105,7 +131,7 @@ pub(crate) unsafe fn inc_ref_n(o: *mut LeanObject, n: usize) {
     // SAFETY: live object; ST branch has single-thread exclusivity by the
     // tri-state invariant, MT branch is atomic.
     unsafe {
-        let rc = (&raw const (*o).m_rc).read();
+        let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc > 0 {
             let n = i32::try_from(n).expect("rc increment overflows i32");
             // Faults in every profile, deliberately. A wrapped ST count is not
@@ -138,7 +164,7 @@ pub(crate) unsafe fn dec_ref(o: *mut LeanObject) {
     }
     // SAFETY: live object; branches mirror the upstream inline exactly.
     unsafe {
-        let rc = (&raw const (*o).m_rc).read();
+        let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc > 1 {
             (&raw mut (*o).m_rc).write(rc - 1);
         } else if rc != 0 {
@@ -163,7 +189,7 @@ unsafe fn dec_child(o: *mut LeanObject, todo: &mut Vec<*mut LeanObject>) {
     // SAFETY: live object; mirrors object.cpp's dec() including the MT
     // acquire-release handshake on the last release.
     unsafe {
-        let rc = (&raw const (*o).m_rc).read();
+        let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc > 1 {
             (&raw mut (*o).m_rc).write(rc - 1);
         } else if rc == 1 {
@@ -322,7 +348,7 @@ pub(crate) unsafe fn dec_ref_cold(o: *mut LeanObject) {
     // SAFETY: mirrors the upstream cold path exactly; the AcqRel fetch_add
     // pairs MT decrements so exactly one thread observes -1 and frees.
     unsafe {
-        let rc = (&raw const (*o).m_rc).read();
+        let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc == 1 || atomic_rc(o).fetch_add(1, Ordering::AcqRel) == -1 {
             let mut todo: Vec<*mut LeanObject> = Vec::new();
             del_core(o, &mut todo);
@@ -375,7 +401,7 @@ pub(crate) unsafe fn mark_mt(o: *mut LeanObject) {
     // SAFETY: as mark_persistent; only ST objects are flipped, exactly as
     // upstream (`if (lean_is_scalar(o) || !lean_is_st(o)) return`).
     unsafe {
-        if (&raw const (*o).m_rc).read() <= 0 {
+        if atomic_rc(o).load(Ordering::Relaxed) <= 0 {
             return;
         }
         let mut todo = vec![o];
