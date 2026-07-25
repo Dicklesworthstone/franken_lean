@@ -52,6 +52,144 @@ pub const BENCHMARK_BUNDLE_SCHEMA: SchemaId = SchemaId {
     version: BENCHMARK_EVIDENCE_VERSION,
 };
 
+/// The six durable benchmark-evidence shapes.
+///
+/// A kind identifies a byte shape, not an evidence claim. Registering one does not
+/// make a workload measured, a host qualified, or a bundle publishable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BenchmarkSchemaKind {
+    HostProfile,
+    Workload,
+    RawAttempts,
+    StatisticalSummary,
+    Telemetry,
+    Bundle,
+}
+
+impl BenchmarkSchemaKind {
+    pub const ALL: [Self; 6] = [
+        Self::HostProfile,
+        Self::Workload,
+        Self::RawAttempts,
+        Self::StatisticalSummary,
+        Self::Telemetry,
+        Self::Bundle,
+    ];
+}
+
+/// One registered durable shape owned by `fln-bench`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchmarkSchemaRow {
+    pub kind: BenchmarkSchemaKind,
+    pub id: SchemaId,
+    pub covers: &'static str,
+}
+
+/// Complete local registry for the durable benchmark evidence surface.
+///
+/// The rows deliberately contain no claim state or publication authority. Those can
+/// only come from [`validate_bundle`]; a schema row proves that bytes have a named,
+/// versioned shape and nothing more.
+pub const BENCHMARK_SCHEMA_REGISTRY: [BenchmarkSchemaRow; 6] = [
+    BenchmarkSchemaRow {
+        kind: BenchmarkSchemaKind::HostProfile,
+        id: BENCHMARK_HOST_PROFILE_SCHEMA,
+        covers: "captured host identity, build identity, capabilities, and isolation facts",
+    },
+    BenchmarkSchemaRow {
+        kind: BenchmarkSchemaKind::Workload,
+        id: BENCHMARK_WORKLOAD_SCHEMA,
+        covers: "predeclared workload, sample policy, cache state, and resource bounds",
+    },
+    BenchmarkSchemaRow {
+        kind: BenchmarkSchemaKind::RawAttempts,
+        id: BENCHMARK_ATTEMPTS_SCHEMA,
+        covers: "every started raw attempt, including invalid and interrupted attempts",
+    },
+    BenchmarkSchemaRow {
+        kind: BenchmarkSchemaKind::StatisticalSummary,
+        id: BENCHMARK_SUMMARY_SCHEMA,
+        covers: "deterministically regenerated distribution and tail statistics",
+    },
+    BenchmarkSchemaRow {
+        kind: BenchmarkSchemaKind::Telemetry,
+        id: BENCHMARK_TELEMETRY_SCHEMA,
+        covers: "operational attempt telemetry excluded from semantic benchmark identity",
+    },
+    BenchmarkSchemaRow {
+        kind: BenchmarkSchemaKind::Bundle,
+        id: BENCHMARK_BUNDLE_SCHEMA,
+        covers: "candidate evidence bundle joining claims, durable components, and roots",
+    },
+];
+
+/// Typed refusal at the schema-admission boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BenchmarkSchemaRefusal {
+    UnknownName {
+        name: String,
+    },
+    UnsupportedVersion {
+        name: &'static str,
+        seen: u16,
+        supported: u16,
+    },
+}
+
+impl BenchmarkSchemaRefusal {
+    pub const fn finding_code(&self) -> &'static str {
+        match self {
+            Self::UnknownName { .. } => "FLN-BENCH-SCHEMA-001",
+            Self::UnsupportedVersion { .. } => "FLN-BENCH-SCHEMA-002",
+        }
+    }
+}
+
+/// Decode or schema-admission failure for one independently stored evidence shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BenchmarkSchemaValidationError {
+    Decode(CanonError),
+    Refused(BenchmarkSchemaRefusal),
+}
+
+impl From<CanonError> for BenchmarkSchemaValidationError {
+    fn from(error: CanonError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+impl From<BenchmarkSchemaRefusal> for BenchmarkSchemaValidationError {
+    fn from(error: BenchmarkSchemaRefusal) -> Self {
+        Self::Refused(error)
+    }
+}
+
+/// Resolve an exact benchmark schema identity.
+///
+/// Looking up by name and then silently choosing the only decoder is forbidden: the
+/// caller must also present the registered version.
+pub fn registered_benchmark_schema(
+    name: &str,
+    version: u16,
+) -> Result<&'static BenchmarkSchemaRow, BenchmarkSchemaRefusal> {
+    let Some(row) = BENCHMARK_SCHEMA_REGISTRY
+        .iter()
+        .find(|row| row.id.name == name)
+    else {
+        return Err(BenchmarkSchemaRefusal::UnknownName {
+            name: name.to_string(),
+        });
+    };
+    if version != row.id.version {
+        return Err(BenchmarkSchemaRefusal::UnsupportedVersion {
+            name: row.id.name,
+            seen: version,
+            supported: row.id.version,
+        });
+    }
+    Ok(row)
+}
+
 pub const MAX_VALID_SAMPLES: u32 = 127;
 pub const MAX_ATTEMPTS: u32 = 10_000;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -1249,6 +1387,17 @@ fn decode_problem(what: &'static str) -> CanonError {
     CanonError { at: 0, what }
 }
 
+fn read_supported_evidence_version(
+    reader: &mut CanonReader<'_>,
+    unsupported: &'static str,
+) -> Result<u16, CanonError> {
+    let version = reader.u16()?;
+    if version != BENCHMARK_EVIDENCE_VERSION {
+        return Err(decode_problem(unsupported));
+    }
+    Ok(version)
+}
+
 fn write_source(writer: &mut CanonWriter, source: CaptureSource) {
     writer.u8(match source {
         CaptureSource::Procfs => 0,
@@ -1428,7 +1577,10 @@ fn write_host_body(writer: &mut CanonWriter, profile: &HostProfile) {
 
 fn read_host_body(reader: &mut CanonReader<'_>) -> Result<HostProfile, CanonError> {
     Ok(HostProfile {
-        schema_version: reader.u16()?,
+        schema_version: read_supported_evidence_version(
+            reader,
+            "unsupported benchmark host-profile version",
+        )?,
         cpu_sku: read_text_fact(reader)?,
         architecture: read_text_fact(reader)?,
         physical_cores: read_u64_fact(reader)?,
@@ -1595,7 +1747,8 @@ fn write_workload_body(writer: &mut CanonWriter, workload: &WorkloadManifest) {
 }
 
 fn read_workload_body(reader: &mut CanonReader<'_>) -> Result<WorkloadManifest, CanonError> {
-    let schema_version = reader.u16()?;
+    let schema_version =
+        read_supported_evidence_version(reader, "unsupported benchmark workload version")?;
     let workload_id = reader.str()?.to_string();
     if workload_id.len() > MAX_TEXT_BYTES {
         return Err(decode_problem("benchmark workload id exceeds limit"));
@@ -1798,6 +1951,19 @@ fn attempts_bytes(attempts_started: u32, attempts: &[AttemptRecord]) -> Vec<u8> 
     writer.into_bytes()
 }
 
+fn read_attempts_body(reader: &mut CanonReader<'_>) -> Result<(), CanonError> {
+    let _attempts_started = reader.u32()?;
+    let count = usize::try_from(reader.u64()?)
+        .map_err(|_| decode_problem("attempt count exceeds address space"))?;
+    if count > MAX_ATTEMPTS as usize {
+        return Err(decode_problem("attempt count exceeds limit"));
+    }
+    for _ in 0..count {
+        let _attempt = read_attempt_body(reader)?;
+    }
+    Ok(())
+}
+
 fn write_u128(writer: &mut CanonWriter, value: u128) {
     writer.bytes(&value.to_le_bytes());
 }
@@ -1883,7 +2049,8 @@ fn write_telemetry_body(writer: &mut CanonWriter, telemetry: &BenchmarkTelemetry
 }
 
 fn read_telemetry_body(reader: &mut CanonReader<'_>) -> Result<BenchmarkTelemetry, CanonError> {
-    let schema_version = reader.u16()?;
+    let schema_version =
+        read_supported_evidence_version(reader, "unsupported benchmark telemetry version")?;
     let count = usize::try_from(reader.u64()?)
         .map_err(|_| decode_problem("telemetry count exceeds address space"))?;
     if count > MAX_ATTEMPTS as usize {
@@ -2044,7 +2211,8 @@ impl Canonical for BenchmarkBundleCandidate {
     }
 
     fn read_body(reader: &mut CanonReader<'_>) -> Result<Self, CanonError> {
-        let schema_version = reader.u16()?;
+        let schema_version =
+            read_supported_evidence_version(reader, "unsupported benchmark bundle version")?;
         let run_id = read_limited_text(reader)?;
         let benchmark_claim = read_claim(reader)?;
         let repeatability_claim = read_claim(reader)?;
@@ -2097,6 +2265,44 @@ impl Canonical for BenchmarkBundleCandidate {
             claimed_roots,
         })
     }
+}
+
+/// Check the exact registered shape of independently stored benchmark evidence.
+///
+/// The schema header is admitted before its body is read, and the version-bearing
+/// bodies reject an unknown inner version before reading any later field. Success is
+/// deliberately weaker than [`validate_bundle`]: it grants no publication authority
+/// and cannot turn a schema registration into an observed benchmark claim.
+pub fn validate_benchmark_schema_bytes(
+    bytes: &[u8],
+) -> Result<BenchmarkSchemaKind, BenchmarkSchemaValidationError> {
+    let mut reader = CanonReader::new(bytes);
+    let name = reader.str()?;
+    if name.len() > MAX_TEXT_BYTES {
+        return Err(decode_problem("benchmark schema name exceeds limit").into());
+    }
+    let version = reader.u16()?;
+    let row = registered_benchmark_schema(name, version)?;
+    match row.kind {
+        BenchmarkSchemaKind::HostProfile => {
+            let _profile = read_host_body(&mut reader)?;
+        }
+        BenchmarkSchemaKind::Workload => {
+            let _workload = read_workload_body(&mut reader)?;
+        }
+        BenchmarkSchemaKind::RawAttempts => read_attempts_body(&mut reader)?,
+        BenchmarkSchemaKind::StatisticalSummary => {
+            let _summary = read_summary_body(&mut reader)?;
+        }
+        BenchmarkSchemaKind::Telemetry => {
+            let _telemetry = read_telemetry_body(&mut reader)?;
+        }
+        BenchmarkSchemaKind::Bundle => {
+            let _bundle = <BenchmarkBundleCandidate as Canonical>::read_body(&mut reader)?;
+        }
+    }
+    reader.finish()?;
+    Ok(row.kind)
 }
 
 fn gcd(mut left: u128, mut right: u128) -> u128 {
@@ -3014,6 +3220,114 @@ mod tests {
     use super::*;
     use std::hint::black_box;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DeclaredSchema {
+        name: String,
+        version: String,
+    }
+
+    fn matching_brace(rest: &str) -> Option<usize> {
+        let mut depth = 1usize;
+        for (index, character) in rest.char_indices() {
+            match character {
+                '{' => depth = depth.saturating_add(1),
+                '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn schema_field(body: &str, key: &str) -> Option<String> {
+        let offset = body.find(&format!("{key}:"))?;
+        let rest = body.get(offset + key.len() + 1..)?;
+        let end = rest.find(',').unwrap_or(rest.len());
+        Some(rest.get(..end)?.trim().to_string())
+    }
+
+    fn declared_schemas(source: &str) -> Vec<DeclaredSchema> {
+        const NEEDLE: &str = ": SchemaId = SchemaId {";
+        let mut declarations = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(offset) = source.get(cursor..).and_then(|rest| rest.find(NEEDLE)) {
+            let body_start = cursor + offset + NEEDLE.len();
+            cursor = body_start;
+            let Some(body_source) = source.get(body_start..) else {
+                break;
+            };
+            let Some(body_len) = matching_brace(body_source) else {
+                continue;
+            };
+            let Some(body) = body_source.get(..body_len) else {
+                continue;
+            };
+            let (Some(quoted_name), Some(version)) =
+                (schema_field(body, "name"), schema_field(body, "version"))
+            else {
+                continue;
+            };
+            let Some(name) = quoted_name
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+            else {
+                continue;
+            };
+            declarations.push(DeclaredSchema {
+                name: name.to_string(),
+                version,
+            });
+        }
+        declarations
+    }
+
+    fn resolve_declared_version(source: &str, version: &str) -> Option<u16> {
+        if let Ok(literal) = version.parse::<u16>() {
+            return Some(literal);
+        }
+        let declaration = format!("const {version}: u16 = ");
+        let offset = source.find(&declaration)?;
+        let rest = source.get(offset + declaration.len()..)?;
+        let end = rest.find(';')?;
+        rest.get(..end)?.trim().parse().ok()
+    }
+
+    fn declared_schema_pairs(source: &str) -> Result<Vec<(String, u16)>, String> {
+        let mut pairs = Vec::new();
+        for declaration in declared_schemas(source) {
+            let version =
+                resolve_declared_version(source, &declaration.version).ok_or_else(|| {
+                    format!(
+                        "cannot resolve version {} for {}",
+                        declaration.version, declaration.name
+                    )
+                })?;
+            pairs.push((declaration.name, version));
+        }
+        pairs.sort();
+        Ok(pairs)
+    }
+
+    fn registered_schema_pairs() -> Vec<(String, u16)> {
+        let mut pairs = BENCHMARK_SCHEMA_REGISTRY
+            .iter()
+            .map(|row| (row.id.name.to_string(), row.id.version))
+            .collect::<Vec<_>>();
+        pairs.sort();
+        pairs
+    }
+
+    fn production_source() -> Result<&'static str, String> {
+        include_str!("lib.rs")
+            .split_once("\n#[cfg(test)]")
+            .map(|(production, _)| production)
+            .ok_or_else(|| "fln-bench source has no cfg(test) boundary".to_string())
+    }
+
     fn digest(label: &str) -> Digest {
         hash(Domain::OperationalMeta, label.as_bytes())
     }
@@ -3236,6 +3550,236 @@ mod tests {
         let telemetry = fixture_telemetry(&attempts);
         assemble_bundle("fixture-run", host, workload, attempts, telemetry)
             .map_err(|error| format!("fixture must validate: {error:?}"))
+    }
+
+    fn fixture_schema_bytes(
+        kind: BenchmarkSchemaKind,
+        bundle: &BenchmarkBundleCandidate,
+    ) -> Result<Vec<u8>, String> {
+        match kind {
+            BenchmarkSchemaKind::HostProfile => bundle
+                .host_profile
+                .as_ref()
+                .map(host_profile_bytes)
+                .ok_or_else(|| "fixture has no host profile".to_string()),
+            BenchmarkSchemaKind::Workload => bundle
+                .workload
+                .as_ref()
+                .map(workload_bytes)
+                .ok_or_else(|| "fixture has no workload".to_string()),
+            BenchmarkSchemaKind::RawAttempts => {
+                Ok(attempts_bytes(bundle.attempts_started, &bundle.attempts))
+            }
+            BenchmarkSchemaKind::StatisticalSummary => bundle
+                .summary
+                .as_ref()
+                .map(summary_bytes)
+                .ok_or_else(|| "fixture has no statistical summary".to_string()),
+            BenchmarkSchemaKind::Telemetry => bundle
+                .telemetry
+                .as_ref()
+                .map(telemetry_bytes)
+                .ok_or_else(|| "fixture has no telemetry".to_string()),
+            BenchmarkSchemaKind::Bundle => Ok(bundle.to_canonical_bytes()),
+        }
+    }
+
+    fn schema_header_version_offset(row: &BenchmarkSchemaRow) -> usize {
+        std::mem::size_of::<u64>() + row.id.name.len()
+    }
+
+    #[test]
+    fn durable_schema_registry_is_complete_unique_and_bidirectional() -> Result<(), String> {
+        let source = production_source()?;
+        let declared = declared_schema_pairs(source)?;
+        let registered = registered_schema_pairs();
+        assert_eq!(
+            declared, registered,
+            "every durable SchemaId declaration must have exactly one local registry row, \
+             and every row must retain its declaration"
+        );
+        assert_eq!(registered.len(), BenchmarkSchemaKind::ALL.len());
+
+        let mut kinds = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        for row in BENCHMARK_SCHEMA_REGISTRY {
+            assert!(
+                kinds.insert(row.kind),
+                "duplicate schema kind: {:?}",
+                row.kind
+            );
+            assert!(
+                names.insert(row.id.name),
+                "duplicate schema name: {}",
+                row.id.name
+            );
+            assert!(row.id.name.starts_with("fln.bench."));
+            assert!(
+                row.id.name.bytes().all(|byte| byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || b".-".contains(&byte)),
+                "schema name is not canonical: {}",
+                row.id.name
+            );
+            assert!(!row.covers.is_empty());
+            assert_eq!(
+                registered_benchmark_schema(row.id.name, row.id.version),
+                Ok(&row)
+            );
+        }
+        assert_eq!(
+            kinds,
+            BenchmarkSchemaKind::ALL.into_iter().collect(),
+            "a durable shape is omitted or duplicated"
+        );
+
+        let mut unregistered_source = source.to_string();
+        unregistered_source.push_str("\npub const BENCHMARK_SNEAK_SCHEMA");
+        unregistered_source.push_str(": SchemaId = SchemaId {");
+        unregistered_source.push_str(
+            "\n    name: \"fln.bench.sneak\",\n    version: \
+             BENCHMARK_EVIDENCE_VERSION,\n};\n",
+        );
+        let unregistered = declared_schema_pairs(&unregistered_source)?;
+        assert!(
+            unregistered.iter().any(|pair| !registered.contains(pair)),
+            "the production declaration scanner missed a planted unregistered format"
+        );
+
+        let moved_source = source.replacen(
+            "name: \"fln.bench.bundle\"",
+            "name: \"fln.bench.bundle-moved\"",
+            1,
+        );
+        let moved = declared_schema_pairs(&moved_source)?;
+        assert!(
+            registered.iter().any(|pair| !moved.contains(pair)),
+            "a moved declaration must leave a detectable stale row"
+        );
+        assert!(
+            moved.iter().any(|pair| !registered.contains(pair)),
+            "a moved declaration must also be detectably unregistered"
+        );
+
+        let version_drift_source = source.replacen(
+            "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 1;",
+            "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 2;",
+            1,
+        );
+        let version_drift = declared_schema_pairs(&version_drift_source)?;
+        assert_ne!(
+            version_drift, registered,
+            "a declaration-side version bump must not agree with stale registry rows"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_registered_shape_refuses_unknown_headers_before_reading_body() -> Result<(), String> {
+        let bundle = fixture_bundle()?;
+        for row in BENCHMARK_SCHEMA_REGISTRY {
+            let bytes = fixture_schema_bytes(row.kind, &bundle)?;
+            assert_eq!(
+                validate_benchmark_schema_bytes(&bytes),
+                Ok(row.kind),
+                "{} live shape must decode under its exact registration",
+                row.id.name
+            );
+
+            let version_offset = schema_header_version_offset(&row);
+            let mut unknown_version = bytes;
+            unknown_version
+                .get_mut(version_offset..version_offset + std::mem::size_of::<u16>())
+                .ok_or_else(|| format!("{} fixture has no schema version", row.id.name))?
+                .copy_from_slice(&row.id.version.saturating_add(1).to_le_bytes());
+            unknown_version.truncate(version_offset + std::mem::size_of::<u16>());
+            let refusal = validate_benchmark_schema_bytes(&unknown_version);
+            assert_eq!(
+                refusal,
+                Err(BenchmarkSchemaValidationError::Refused(
+                    BenchmarkSchemaRefusal::UnsupportedVersion {
+                        name: row.id.name,
+                        seen: row.id.version.saturating_add(1),
+                        supported: row.id.version,
+                    }
+                )),
+                "{} must refuse an unknown version before trying to read the absent body",
+                row.id.name
+            );
+            assert_eq!(
+                refusal.err().and_then(|error| match error {
+                    BenchmarkSchemaValidationError::Refused(refusal) => {
+                        Some(refusal.finding_code())
+                    }
+                    BenchmarkSchemaValidationError::Decode(_) => None,
+                }),
+                Some("FLN-BENCH-SCHEMA-002")
+            );
+        }
+
+        let row = BENCHMARK_SCHEMA_REGISTRY
+            .first()
+            .ok_or_else(|| "benchmark schema registry is empty".to_string())?;
+        let mut unknown_name = fixture_schema_bytes(row.kind, &bundle)?;
+        let first_name_byte = unknown_name
+            .get_mut(std::mem::size_of::<u64>())
+            .ok_or_else(|| "host schema fixture has no name byte".to_string())?;
+        *first_name_byte = b'x';
+        let header_end = schema_header_version_offset(row) + std::mem::size_of::<u16>();
+        unknown_name.truncate(header_end);
+        assert!(matches!(
+            validate_benchmark_schema_bytes(&unknown_name),
+            Err(BenchmarkSchemaValidationError::Refused(
+                BenchmarkSchemaRefusal::UnknownName { .. }
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn version_bearing_shapes_refuse_unknown_inner_versions_before_later_fields()
+    -> Result<(), String> {
+        let bundle = fixture_bundle()?;
+        for (kind, expected_reason) in [
+            (
+                BenchmarkSchemaKind::HostProfile,
+                "unsupported benchmark host-profile version",
+            ),
+            (
+                BenchmarkSchemaKind::Workload,
+                "unsupported benchmark workload version",
+            ),
+            (
+                BenchmarkSchemaKind::Telemetry,
+                "unsupported benchmark telemetry version",
+            ),
+            (
+                BenchmarkSchemaKind::Bundle,
+                "unsupported benchmark bundle version",
+            ),
+        ] {
+            let row = BENCHMARK_SCHEMA_REGISTRY
+                .iter()
+                .find(|row| row.kind == kind)
+                .ok_or_else(|| format!("registry has no {kind:?} row"))?;
+            let mut bytes = fixture_schema_bytes(kind, &bundle)?;
+            let body_offset = schema_header_version_offset(row) + std::mem::size_of::<u16>();
+            bytes
+                .get_mut(body_offset..body_offset + std::mem::size_of::<u16>())
+                .ok_or_else(|| format!("{} fixture has no inner version", row.id.name))?
+                .copy_from_slice(&BENCHMARK_EVIDENCE_VERSION.saturating_add(1).to_le_bytes());
+            bytes.truncate(body_offset + std::mem::size_of::<u16>());
+            assert_eq!(
+                validate_benchmark_schema_bytes(&bytes),
+                Err(BenchmarkSchemaValidationError::Decode(CanonError {
+                    at: 0,
+                    what: expected_reason,
+                })),
+                "{} must reject its inner version before reading the truncated body",
+                row.id.name
+            );
+        }
+        Ok(())
     }
 
     #[test]
