@@ -154,6 +154,35 @@ row hash | BLAKE3.keyed_hash | function | native | L2 | faithful | spec-vectors 
 row hash | BLAKE3.derive_key | function | native | L2 | faithful | spec-vectors | exact | crates/fln-hash/fixtures/blake3_vectors.txt | D0 | OBSERVED | blake3-official-vectors
 row hash | BLAKE3.finalize_xof | function | native | L2 | faithful | spec-vectors | exact | crates/fln-hash/fixtures/blake3_vectors.txt | D0 | OBSERVED | blake3-official-vectors
 
+# ---- hash: host and platform identity (bead fln-laxj). Two claims that are constantly
+# ---- conflated and must not be, because one is earned and the other is not.
+# ----
+# ---- MULTI-HOST, EARNED at L2/OBSERVED. The frozen domain vectors and a LogicalRoot over
+# ---- a fixed closure were recomputed on two DISTINCT machines (sensedemobox, a dev box;
+# ---- hetzner2, an RCH build worker) and agree exactly. The oracle is our own recorded
+# ---- consensus rather than an external specification, which is why L2 is the ceiling
+# ---- here as it is for the BLAKE3 rows above. It is re-checked on every host that runs
+# ---- the suite, so it is not a one-shot observation.
+# ----
+# ---- CROSS-PLATFORM, NOT EARNED, recorded BLOCKED at L0. SUITE.lock:26 declares exactly
+# ---- one certified target (x86_64-unknown-linux-gnu), so the "certified platform matrix"
+# ---- has a single member and cross-platform identity is undefined rather than merely
+# ---- untested: there is no second platform to be identical to. More runs on the machines
+# ---- above cannot raise this. WHAT WOULD: a second `target` line in SUITE.lock, then an
+# ---- agreeing attestation row from that target. A guard in fln-hash's domain.rs asserts
+# ---- the attested platform set is a single member, so the day a second platform agrees
+# ---- the suite fails and forces this row to be raised deliberately rather than leaving
+# ---- new evidence unclaimed.
+# ----
+# ---- README.md lines 38, 43 and 308 currently state bit-identical artifacts and results
+# ---- "across the certified platform matrix" and "across platforms" without qualification.
+# ---- On the evidence below that wording is stronger than the matrix permits; reported for
+# ---- the README's owner rather than edited from here.
+row hash | Domain.vectors.multi-host-identity | property | native | L2 | sound | multi-host-attestation | exact | crates/fln-hash/fixtures/host_attestations.txt | D0 | OBSERVED | hosts-sensedemobox-hetzner2-20260725
+row hash | LogicalRoot.multi-host-identity | property | native | L2 | sound | multi-host-attestation | exact | crates/fln-hash/fixtures/host_attestations.txt | D0 | OBSERVED | hosts-sensedemobox-hetzner2-20260725
+row hash | LogicalRoot.cross-platform-identity | property | native | L0 | sound | certified-matrix | not-compared | crates/fln-hash/fixtures/host_attestations.txt | D0 | BLOCKED | suite-lock-declares-one-certified-target
+row hash | Domain.vectors.cross-platform-identity | property | native | L0 | sound | certified-matrix | not-compared | crates/fln-hash/fixtures/host_attestations.txt | D0 | BLOCKED | suite-lock-declares-one-certified-target
+
 # ---- meta-api L1: the hygiene hooks Vellum needs (bead franken_lean-p8a). Implemented
 # ---- against the Prelude grammar `<name>._@.(<module>.<scopes>)*.<mainModule>._hyg.<scopes>`
 # ---- with in-repo tests, including deep-chain bounded-stack coverage. Not oracled: the

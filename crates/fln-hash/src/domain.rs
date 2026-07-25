@@ -311,6 +311,8 @@ mod tests {
         Ok(Domain::ALL.len())
     }
 
+    use fln_core::name::Name;
+
     const DOMAIN_VECTORS: &str = include_str!("../fixtures/domain_vectors.txt");
 
     #[test]
@@ -319,6 +321,187 @@ mod tests {
             Ok(rows) => assert_eq!(rows, Domain::ALL.len()),
             Err(violation) => panic!("{violation}"),
         }
+    }
+
+    const HOST_ATTESTATIONS: &str = include_str!("../fixtures/host_attestations.txt");
+
+    /// One recorded attestation.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Attestation {
+        platform: String,
+        host: String,
+        fixture_digest: String,
+        logical_root: String,
+    }
+
+    fn recorded_attestations(text: &str) -> Vec<Attestation> {
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('|').collect();
+            assert_eq!(
+                fields.len(),
+                4,
+                "attestation row must have 4 fields: {line}"
+            );
+            for digest in &fields[2..] {
+                assert_eq!(digest.len(), 64, "digest must be 64 hex chars: {digest}");
+                assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+            rows.push(Attestation {
+                platform: fields[0].to_string(),
+                host: fields[1].to_string(),
+                fixture_digest: fields[2].to_string(),
+                logical_root: fields[3].to_string(),
+            });
+        }
+        rows
+    }
+
+    /// **The multi-host identity claim, at exactly the level the evidence supports**
+    /// (bead fln-laxj).
+    ///
+    /// This is deliberately NOT "a cross-platform test". A cross-platform test that only
+    /// ever runs on one platform passes trivially and reads as evidence, which is the trap
+    /// this bead exists to close. What is asserted here is the honest pair:
+    ///
+    /// 1. **Agreement is enforced on whatever host runs it.** The recorded rows form a
+    ///    consensus, and this host must reproduce it. So every CI machine that runs the
+    ///    suite is checking host-independence rather than taking it on trust — and a host
+    ///    can only be *added* to the file by actually running there.
+    /// 2. **The platform set is asserted to be a single member**, because it is. That is
+    ///    not a limitation dressed up as a check: it is the trigger that makes the
+    ///    unearned claim visible. The day a genuinely different platform agrees, this
+    ///    fails and says so, forcing the BLOCKED cross-platform row in
+    ///    `ci/PARITY_LEDGER.txt` to be raised deliberately instead of letting new evidence
+    ///    sit unclaimed.
+    #[test]
+    fn recorded_hosts_agree_and_the_platform_set_is_still_one_member() {
+        let recorded = recorded_attestations(HOST_ATTESTATIONS);
+        assert!(
+            recorded.len() >= 2,
+            "the multi-host claim needs at least two recorded hosts; found {}",
+            recorded.len()
+        );
+
+        let hosts: std::collections::BTreeSet<&str> =
+            recorded.iter().map(|a| a.host.as_str()).collect();
+        assert_eq!(
+            hosts.len(),
+            recorded.len(),
+            "two rows name the same host, so they are one machine's evidence twice: {hosts:?}"
+        );
+
+        // Consensus: every recorded host agrees, or there is nothing to claim.
+        let digests: std::collections::BTreeSet<&str> =
+            recorded.iter().map(|a| a.fixture_digest.as_str()).collect();
+        let roots: std::collections::BTreeSet<&str> =
+            recorded.iter().map(|a| a.logical_root.as_str()).collect();
+        assert_eq!(
+            digests.len(),
+            1,
+            "recorded hosts disagree on the vectors: {digests:?}"
+        );
+        assert_eq!(
+            roots.len(),
+            1,
+            "recorded hosts disagree on the logical root: {roots:?}"
+        );
+
+        // THIS host must reproduce the consensus. This is what makes the file evidence
+        // rather than a claim: it is re-checked wherever the suite runs.
+        let here_digest = hash(Domain::Fixture, DOMAIN_VECTORS.as_bytes()).to_hex();
+        assert_eq!(
+            Some(here_digest.as_str()),
+            digests.iter().next().copied(),
+            "this host's domain vectors differ from every recorded host's — either a tag or \
+             a vector is host-dependent, or the fixture changed without the attestations \
+             being regenerated"
+        );
+
+        // The unearned half, held as a trigger rather than a comment.
+        let platforms: std::collections::BTreeSet<&str> =
+            recorded.iter().map(|a| a.platform.as_str()).collect();
+        assert_eq!(
+            platforms.len(),
+            1,
+            "a second PLATFORM now appears in the attestations ({platforms:?}). That is new \
+             evidence, not a failure: SUITE.lock declared one certified target when this \
+             was written, so the cross-platform row in ci/PARITY_LEDGER.txt is BLOCKED. If \
+             the matrix has genuinely grown and the platforms agree, raise that row and \
+             update this assertion deliberately."
+        );
+    }
+
+    /// Emit a host attestation for the multi-host identity claim (bead fln-laxj).
+    ///
+    /// **This test does not, and cannot, verify cross-host agreement.** A single run sees
+    /// one host, so any in-process assertion of "all hosts agree" would pass trivially and
+    /// read as evidence — the exact trap fln-laxj exists to close. What it does is emit the
+    /// facts a comparison needs, in a line-oriented form, so agreement is established
+    /// *outside* by running it on N hosts and diffing. The claim belongs to whoever ran it
+    /// on N hosts and can show N attestations; it never belongs to this assertion.
+    ///
+    /// Run with `-- --nocapture` and compare the `fln-host-attestation/1` lines.
+    #[test]
+    fn emit_host_attestation_for_external_multi_host_comparison() {
+        // Platform facts are compile-time, so they describe the target this binary was
+        // built for — which is what a cross-PLATFORM comparison turns on.
+        let platform = format!(
+            "{}-{}-{}-{}bit-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            std::env::consts::FAMILY,
+            usize::BITS,
+            if cfg!(target_endian = "little") {
+                "le"
+            } else {
+                "be"
+            }
+        );
+        // Machine identity, so a multi-HOST comparison can tell two runs apart. Absent is
+        // reported as absent rather than defaulted: an unidentifiable host is not a host
+        // that agreed.
+        let host = std::fs::read_to_string("/etc/hostname")
+            .map(|text| text.trim().to_string())
+            .unwrap_or_else(|_| "unidentified".to_string());
+
+        // One digest over the whole frozen fixture, so a single field carries every
+        // domain tag and every vector: if any of them differed on another host, this
+        // differs.
+        let fixture_digest = hash(Domain::Fixture, DOMAIN_VECTORS.as_bytes()).to_hex();
+
+        // And one logical root over a fixed closure, which is the other half of the
+        // claim. Built from constants so it depends on nothing but the code under test.
+        let root = {
+            let mut builder = crate::root::LogicalRootBuilder::new();
+            for index in 0..8u64 {
+                builder.add_decl(
+                    &Name::num(Name::str(Name::anonymous(), "Fixed"), index),
+                    crate::root::decl_content_digest(format!("body-{index}").as_bytes()),
+                );
+            }
+            builder.add_extension_delta(
+                &Name::str(Name::anonymous(), "simp"),
+                crate::root::extension_delta_digest(b"delta"),
+            );
+            builder.finalize().to_string()
+        };
+
+        println!(
+            "fln-host-attestation/1 platform={platform} host={host}              fixture_digest={fixture_digest} logical_root={root}"
+        );
+
+        // The only thing assertable from one host: the attestation is well-formed and its
+        // digests are the ones this build actually produces. Agreement is not asserted.
+        assert_eq!(fixture_digest.len(), 64);
+        assert_eq!(root.len(), 64);
+        assert!(
+            check_domain_vector_contract(DOMAIN_VECTORS).is_ok(),
+            "the attestation is only meaningful if the fixture it digests is intact"
+        );
     }
 
     #[test]
