@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":330,"projection_hash":"f20a68a6da4e23e5c4a31760b1ed89fc4d44c858e2bb4b267758bdfa73c86f6f"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":331,"projection_hash":"edb211ed5381dfbde0ec01808f5e449f21e0fb03cd1a02421246a118e3e2c083"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -69,6 +69,7 @@
 {"id":"fln-attribute-state-census-h14"}
 {"id":"fln-bz4h"}
 {"id":"fln-c78c"}
+{"id":"fln-census-out-of-git-2ya9"}
 {"id":"fln-d4x"}
 {"id":"fln-dcv"}
 {"id":"fln-eae"}
