@@ -83,19 +83,172 @@ impl RejectClass {
 pub struct Budget {
     /// Counted work steps (inference nodes + reduction steps + defeq queries).
     pub steps: u64,
-    /// Maximum traversal depth — the recursion bound that makes host traversal
-    /// safe over attacker-controlled terms (well below stack capacity).
+    /// Maximum traversal depth. This is the bound that keeps the kernel's
+    /// mutually recursive descent inside the caller's **native stack**: the
+    /// kernel recurses on the host stack, and a stack overflow is the one
+    /// failure FL-INV-07 cannot convert into a typed answer, because it aborts
+    /// the process uncatchably. The safety therefore comes from the ceiling
+    /// being provably below the floor, never from recovery — see
+    /// [`Budget::depth_for_stack_bytes`].
     pub depth: u32,
 }
 
 impl Budget {
+    /// Steps are a work bound, not a stack bound; they are independent of the
+    /// stack calibration below and unchanged by it.
+    pub const DEFAULT_STEPS: u64 = 10_000_000;
+
+    /// The traversal depth [`Budget::DEFAULT`] offers.
+    ///
+    /// This one number is a **policy** choice — how much checking power the
+    /// default hands a caller — and it is the only free parameter here.
+    /// Everything else on this impl is measured or derived from it. Its cost
+    /// is [`Budget::MIN_STACK_BYTES`], which is what a caller must actually
+    /// provide; the pairing is asserted at compile time below.
+    pub const DEFAULT_DEPTH: u32 = 4_096;
+
+    /// **Measured** worst-case marginal native stack, in bytes, consumed per
+    /// unit of [`Budget::depth`] (bead `franken_lean-kxbj`).
+    ///
+    /// A unit of depth is not a stack frame. `whnf` calls `whnf_core` at the
+    /// *same* depth, `infer` calls `infer_core` at the same depth, and
+    /// `is_def_eq` calls `quick_def_eq_rules` at the same depth, so one level
+    /// of the ceiling buys several native frames of unknown width. This
+    /// constant is therefore measured end-to-end rather than modelled from
+    /// frame layouts: `crates/fln-kernel/tests/depth_stack_calibration.rs`
+    /// bisects the deepest surviving descent at two known stack sizes for each
+    /// of the four depth-threading descents (`forall` inference, `lam`
+    /// inference, application-spine inference, defeq binder congruence) and
+    /// takes the slope of the worst.
+    ///
+    /// Measured 2026-07-25 on `x86_64-unknown-linux-gnu` at the pinned
+    /// nightly. The three inference descents all land on the same slope
+    /// because the dominating cost is a single `infer_core` frame per level;
+    /// defeq binder congruence is cheaper per level despite using two frames.
+    ///
+    /// | profile | worst shape    | bytes/depth |
+    /// |---------|----------------|-------------|
+    /// | `dev`   | `forall_infer` | 5_935       |
+    /// | `release` | `forall_infer` | 640       |
+    ///
+    /// **The `dev` figure is the one shipped here**, deliberately: `cargo test`
+    /// is the profile the Tribunal and every kernel replay actually run under,
+    /// and it is 9.3x worse than `release`. Calibrating against the optimised
+    /// build would leave the tested configuration unbounded.
+    ///
+    /// Rerun `cargo test -p fln-kernel --test depth_stack_calibration -- \
+    /// --ignored --nocapture calibrate_stack_bytes_per_depth` after any change
+    /// to the descent, and move this number if it moved. It is a `benchmark`
+    /// class measurement (D7) on this target and toolchain; the safety factor
+    /// below is what carries it to the ones we have not measured.
+    pub const MEASURED_STACK_BYTES_PER_DEPTH: usize = 5_935;
+
+    /// Stack consumed before the metered descent begins (the caller's own
+    /// frames, the `check` entry path, `TypeChecker` construction). Measured
+    /// as the intercept of the same two-point fit — 21.8 KiB worst case —
+    /// and rounded up. Subtracted first so the per-level slope is never asked
+    /// to absorb a fixed cost.
+    pub const STACK_ENTRY_RESERVE_BYTES: usize = 64 * 1024;
+
+    /// Multiplier applied to the measurement before deriving a stack
+    /// requirement or a ceiling.
+    ///
+    /// The calibration is empirical over four planted descents on one target
+    /// at one optimisation level; it is not a proof that no Corpus term is
+    /// worse. This factor is what makes the derivation robust to a shape we
+    /// did not plant, to a future rustc that widens a frame, and to a target
+    /// whose ABI is fatter than this one.
+    pub const STACK_SAFETY_FACTOR: usize = 2;
+
+    /// The minimum usable native stack, in bytes, that [`Budget::DEFAULT`]
+    /// requires of its caller's thread.
+    ///
+    /// This is a **requirement on the caller**, stated so it can be met rather
+    /// than discovered by aborting. It is far above Rust's default spawned
+    /// thread (2 MiB) and above a typical main thread (8 MiB), because
+    /// `DEFAULT_DEPTH` at the measured `dev`-profile cost genuinely needs
+    /// `4096 * 5935 * 2 + 64 KiB` = 46.4 MiB; 64 MiB is the next round,
+    /// allocatable figure above it. Thread stacks are lazily committed, so
+    /// this is address space, not resident memory.
+    ///
+    /// A caller who cannot provide it must not use `DEFAULT`. They call
+    /// [`Budget::for_stack_bytes`] with the stack they actually have and get a
+    /// correspondingly shallower — and safe — ceiling.
+    pub const MIN_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+    /// The native stack a descent to `depth` requires, safety factor included.
+    /// The inverse of [`Budget::depth_for_stack_bytes`].
+    pub const fn stack_bytes_for_depth(depth: u32) -> usize {
+        let per_level = Budget::MEASURED_STACK_BYTES_PER_DEPTH * Budget::STACK_SAFETY_FACTOR;
+        (depth as usize) * per_level + Budget::STACK_ENTRY_RESERVE_BYTES
+    }
+
+    /// The largest depth ceiling that fits in `stack_bytes` of native stack,
+    /// under the measured per-level cost and the safety factor.
+    ///
+    /// Monotone in `stack_bytes` and never zero: a caller with a tiny stack
+    /// gets a ceiling of 1, which yields a typed depth non-answer on the first
+    /// descent rather than an abort.
+    pub const fn depth_for_stack_bytes(stack_bytes: usize) -> u32 {
+        let usable = stack_bytes.saturating_sub(Budget::STACK_ENTRY_RESERVE_BYTES);
+        let per_level = Budget::MEASURED_STACK_BYTES_PER_DEPTH * Budget::STACK_SAFETY_FACTOR;
+        let depth = usable / per_level;
+        if depth == 0 {
+            1
+        } else if depth > u32::MAX as usize {
+            u32::MAX
+        } else {
+            depth as u32
+        }
+    }
+
+    /// The budget for a caller with a **known** native stack.
+    ///
+    /// This is the constructor any caller running the kernel off a thread it
+    /// created should use. `std::thread` defaults to 2 MiB — a quarter of the
+    /// main thread and a small fraction of what `DEFAULT` needs — so a worker
+    /// pool that inherits the default and passes `DEFAULT` is precisely the
+    /// pairing that aborts. That pairing is the defect of bead
+    /// `franken_lean-kxbj`, and this function is how a caller avoids it
+    /// without having to know any of the constants above.
+    pub const fn for_stack_bytes(stack_bytes: usize) -> Budget {
+        Budget {
+            steps: Budget::DEFAULT_STEPS,
+            depth: Budget::depth_for_stack_bytes(stack_bytes),
+        }
+    }
+
     /// A generous default for interactive checking; callers with real budgets
     /// pass their own.
+    ///
+    /// Valid **only** on a thread carrying at least [`Budget::MIN_STACK_BYTES`]
+    /// of stack. Do not raise `depth` without re-deriving that floor — the
+    /// compile-time assertion below is what keeps the two in step.
     pub const DEFAULT: Budget = Budget {
-        steps: 10_000_000,
-        depth: 4_096,
+        steps: Budget::DEFAULT_STEPS,
+        depth: Budget::DEFAULT_DEPTH,
     };
 }
+
+/// The ceiling is below the floor, checked when the kernel compiles rather
+/// than when a Corpus declaration happens to be deep enough to find out.
+///
+/// FL-INV-07 requires resource exhaustion to be a typed `Inconclusive`, and a
+/// native stack overflow is the one exhaustion that cannot be — it aborts the
+/// process uncatchably, so there is no "after the fact" in which to type it.
+/// The guarantee has to be structural, and this is it.
+const _: () = assert!(
+    Budget::stack_bytes_for_depth(Budget::DEFAULT_DEPTH) <= Budget::MIN_STACK_BYTES,
+    "Budget::DEFAULT_DEPTH needs more stack than Budget::MIN_STACK_BYTES promises: \
+     raise the floor or lower the depth, but never leave them uncalibrated"
+);
+
+/// The two derivations must be mutual inverses at the shipped point, or one of
+/// them is lying about the other.
+const _: () = assert!(
+    Budget::depth_for_stack_bytes(Budget::MIN_STACK_BYTES) >= Budget::DEFAULT_DEPTH,
+    "the stack floor must admit at least the default depth"
+);
 
 /// What a completed run consumed — attached to every domain verdict (§8.2c).
 /// An interrupted run instead reports the exceeded dimension through

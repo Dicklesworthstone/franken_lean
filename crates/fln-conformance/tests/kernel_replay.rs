@@ -704,9 +704,13 @@ struct MatrixRun {
 // so inheriting it lets a valid deep term abort the whole Tribunal before the
 // kernel can return a typed depth-exhaustion outcome (franken_lean-kxbj).
 //
-// This is an explicit harness floor, not a calibration of the kernel's default
-// depth budget. The latter remains owned by franken_lean-kxbj.
-const KERNEL_REPLAY_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+// The floor is now the kernel's own stated requirement rather than a number
+// chosen here: `Budget::MIN_STACK_BYTES` is what `Budget::DEFAULT` (which this
+// harness passes) needs, derived from the measured per-depth stack cost. Bound
+// to the constant rather than copied from it so the two cannot drift apart —
+// the previous hand-written 16 MiB was empirically adequate for today's corpus
+// but below the measured worst case for depth 4096.
+const KERNEL_REPLAY_WORKER_STACK_BYTES: usize = Budget::MIN_STACK_BYTES;
 
 /// Check every prepared unit across `threads` workers pulling from a shared
 /// cursor (a genuinely nondeterministic schedule), then merge in canonical
