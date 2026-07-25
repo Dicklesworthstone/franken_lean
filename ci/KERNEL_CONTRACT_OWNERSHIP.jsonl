@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":320,"projection_hash":"8e556d722a1311b80840467fa81d0d14718074e565e70a44bada7bc5dd04e751"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":327,"projection_hash":"b4faf2a546a50e7574518cf093a50b24f07bd38947f8b04a78785b1d8acdab96"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -41,6 +41,7 @@
 {"id":"fln-8mj"}
 {"id":"fln-8u1d"}
 {"id":"fln-8w8"}
+{"id":"fln-8zsq"}
 {"id":"fln-9wya"}
 {"id":"fln-a6q"}
 {"id":"fln-amv"}
@@ -113,6 +114,7 @@
 {"id":"fln-oavg"}
 {"id":"fln-ob6"}
 {"id":"fln-okfb"}
+{"id":"fln-olean-doc-self-contradiction-myri"}
 {"id":"fln-pu6i"}
 {"id":"fln-publish-rewrite-indexes-gca"}
 {"id":"fln-pv1"}
@@ -124,6 +126,7 @@
 {"id":"fln-rzyk"}
 {"id":"fln-sr2z"}
 {"id":"fln-stc1"}
+{"id":"fln-sv7x"}
 {"id":"fln-t705"}
 {"id":"fln-td9"}
 {"id":"fln-um4a"}
@@ -203,6 +206,7 @@
 {"id":"franken_lean-cgt"}
 {"id":"franken_lean-ci0"}
 {"id":"franken_lean-ckus"}
+{"id":"franken_lean-claim-matrix-doc-ci-mhew"}
 {"id":"franken_lean-convergence-wip-governance-149"}
 {"id":"franken_lean-d17i"}
 {"id":"franken_lean-d2h5"}
@@ -232,6 +236,7 @@
 {"id":"franken_lean-hly"}
 {"id":"franken_lean-hn0t"}
 {"id":"franken_lean-htn"}
+{"id":"franken_lean-hv9m"}
 {"id":"franken_lean-io7w"}
 {"id":"franken_lean-irm"}
 {"id":"franken_lean-iwu"}
@@ -258,6 +263,7 @@
 {"id":"franken_lean-module-provenance-schema-cxn"}
 {"id":"franken_lean-mrlo"}
 {"id":"franken_lean-muon"}
+{"id":"franken_lean-mvak"}
 {"id":"franken_lean-n8hw"}
 {"id":"franken_lean-nix9"}
 {"id":"franken_lean-npl"}
@@ -281,6 +287,7 @@
 {"id":"franken_lean-qr74"}
 {"id":"franken_lean-r2st"}
 {"id":"franken_lean-r4m8"}
+{"id":"franken_lean-readme-install-oneliner-wao6"}
 {"id":"franken_lean-rps"}
 {"id":"franken_lean-rur"}
 {"id":"franken_lean-sk0"}
