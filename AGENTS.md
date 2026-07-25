@@ -253,6 +253,22 @@ What to know when it fires:
 
 ---
 
+### Closing a bead: the judgement row, and the one sanctioned exception to `ci/` ownership
+
+A closed bead derives verification state `complete`, and a `complete` coverage row whose evidence arrays are empty fails `validate-verification-manifest`. So the close and its judgement row **must be one commit**: closing first reddens the workspace for every pane in the gap between two commits.
+
+That collides with `ci/` being cod_2's. **Standing rule, decided 2026-07-25: atomicity wins, with disclosure.**
+
+- You MAY edit `ci/VERIFICATION_MANIFEST.jsonl` in the same commit as your close, **strictly limited to your own bead's coverage row**.
+- You MUST say so plainly in the commit message or a bead comment.
+- You may NOT touch any other row, and NO other file in `ci/`. The adoption record, the schema, other panes' rows, `WORKSPACE_GRAPH.txt`, and the ownership projection's algorithm all remain cod_2's sole authority.
+
+The trade is deliberate: a red workspace blocks six panes immediately and visibly, while a one-row edit by the person who owns the judgement is small, disclosed, and reviewable after the fact. Note that this is a **rule, not a guard** — nothing enforces the one-row limit, because commit authorship is not attributable in this shared tree.
+
+Practical notes: array fields must be sorted and duplicate-free or the validator refuses the row; and a row that records what the work did *not* establish is worth more than one that implies a win (`franken_lean-ext-observable-fixture-drift-gap-vqnu`'s row says the capture was never stale, only unchecked).
+
+---
+
 ## bv — Graph-Aware Triage
 
 `bv` computes PageRank/betweenness/critical-path/cycles over `.beads/beads.jsonl`. **Use ONLY `--robot-*` flags — bare `bv` launches a blocking TUI.** Start with `bv --robot-triage` (counts + top picks + quick wins + blockers). `bv --robot-plan` for parallel tracks; `bv --robot-insights` for full metrics (check `.Cycles` — must be empty).
