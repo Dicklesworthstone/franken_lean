@@ -1,10 +1,11 @@
 //! The product-mode and reproducibility contract (plan §4.2, D17, D18).
 //!
 //! This module owns values and pure admission rules only. It deliberately has no
-//! filesystem reader, byte codec, evidence-ledger reader, or structural source
-//! scanner: `fln-core` is the dependency root, while canonical encoding belongs in
-//! `fln-hash` and release-wide leak scanning belongs in `fln-conformance` and
-//! `tools/structure-guard`.
+//! filesystem reader, byte codec, evidence-ledger reader, or source extractor:
+//! `fln-core` is the dependency root, while canonical encoding belongs in `fln-hash`
+//! and release-wide source discovery belongs in `fln-conformance` and
+//! `tools/structure-guard`. The pure [`scan_mode_closure`] admission engine consumes
+//! the complete structural graph supplied by those outer layers and fails closed.
 //!
 //! Four axes remain distinct:
 //!
@@ -60,6 +61,7 @@
 //! admit_sound(artifact.into_mode_artifact());
 //! ```
 
+use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 
 pub const MODE_SCHEMA: &str = "fln.mode/1";
@@ -296,6 +298,10 @@ registry_id! {
 registry_id! {
     /// Registry identity of a mode-neutral schema.
     NeutralSchemaId
+}
+registry_id! {
+    /// Stable identity of one node in a structurally derived product closure.
+    ModeClosureNodeId
 }
 
 /// Content identity produced by `fln-hash`. Core carries it without choosing or
@@ -568,6 +574,425 @@ pub const fn validate_mode_product(
             }
         }
     }
+}
+
+/// How a frontier-only node reaches the product closure. The outer structural
+/// scanner derives this class from source, feature, capability, and product
+/// inventories; a runtime branch is never authority to downgrade it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FrontierSurface {
+    Source(FrontierFeature),
+    Feature(FrontierFeature),
+    CapabilityBypass(FrontierFeature),
+    Product(FrontierFeature),
+}
+
+impl FrontierSurface {
+    pub const fn feature(self) -> FrontierFeature {
+        match self {
+            FrontierSurface::Source(feature)
+            | FrontierSurface::Feature(feature)
+            | FrontierSurface::CapabilityBypass(feature)
+            | FrontierSurface::Product(feature) => feature,
+        }
+    }
+}
+
+/// Authoritative structural classification supplied by the source/manifest
+/// extractor. `Neutral` means registered mode-neutral code, not "unclassified".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StructuralModeRequirement {
+    Neutral,
+    ModeBound(Mode),
+    FrontierOnly(FrontierSurface),
+}
+
+/// Mode provenance observed on an untrusted structural node. Absence is explicit
+/// so stripped provenance cannot become an implicit neutral/default value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObservedModeProvenance {
+    Missing,
+    Neutral,
+    ModeBound { tag: u8 },
+}
+
+/// One source, feature, capability use, generated input, or product in a derived
+/// closure. The requirement and observed provenance are independent on purpose:
+/// the scanner compares an authoritative classification with an untrusted marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModeClosureNode {
+    pub id: ModeClosureNodeId,
+    pub requirement: StructuralModeRequirement,
+    pub observed_provenance: ObservedModeProvenance,
+}
+
+/// Structural reasons an edge can place a node in a product closure. Every variant
+/// is traversed. In particular, `FeatureGate` and `RuntimeBranch` are descriptions,
+/// not permission to omit the target from faithful or sound analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ModeClosureEdgeKind {
+    Dependency,
+    FeatureGate,
+    GeneratedInclude,
+    RuntimeBranch,
+    CapabilityUse,
+    ProductInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModeClosureEdge {
+    pub from: ModeClosureNodeId,
+    pub to: ModeClosureNodeId,
+    pub kind: ModeClosureEdgeKind,
+}
+
+/// Canonical witness selected by ascending root id, then ascending
+/// `(target id, edge kind)`, with breadth-first first discovery. That registered
+/// order makes the shortest refusal witness independent of input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeClosureWitness {
+    nodes: Vec<ModeClosureNodeId>,
+    edges: Vec<ModeClosureEdgeKind>,
+}
+
+impl ModeClosureWitness {
+    pub fn nodes(&self) -> &[ModeClosureNodeId] {
+        &self.nodes
+    }
+
+    pub fn edges(&self) -> &[ModeClosureEdgeKind] {
+        &self.edges
+    }
+}
+
+/// Complete untrusted graph for one product admission decision.
+#[derive(Debug, Clone, Copy)]
+pub struct ModeClosureRequest<'a> {
+    pub consumer: Mode,
+    pub roots: &'a [ModeClosureNodeId],
+    pub nodes: &'a [ModeClosureNode],
+    pub edges: &'a [ModeClosureEdge],
+}
+
+/// Private-constructor proof that every supplied node is reachable, structurally
+/// well-formed, provenance-consistent, and admissible in the consumer mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedModeClosure {
+    consumer: Mode,
+    roots: Vec<ModeClosureNodeId>,
+    nodes: Vec<ModeClosureNodeId>,
+    edge_count: usize,
+}
+
+impl ValidatedModeClosure {
+    pub const fn consumer(&self) -> Mode {
+        self.consumer
+    }
+
+    pub fn roots(&self) -> &[ModeClosureNodeId] {
+        &self.roots
+    }
+
+    pub fn nodes(&self) -> &[ModeClosureNodeId] {
+        &self.nodes
+    }
+
+    pub const fn edge_count(&self) -> usize {
+        self.edge_count
+    }
+}
+
+/// Stable typed D18 refusals. The code is part of the robot-facing contract used by
+/// the outer structural gate; variant payloads retain the exact structural witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeClosureRefusal {
+    FrontierLeak {
+        consumer: Mode,
+        node: ModeClosureNodeId,
+        surface: Option<FrontierSurface>,
+        witness: ModeClosureWitness,
+    },
+    MissingModeProvenance {
+        node: ModeClosureNodeId,
+        witness: ModeClosureWitness,
+    },
+    UnknownModeProvenance {
+        node: ModeClosureNodeId,
+        tag: u8,
+        witness: ModeClosureWitness,
+    },
+    ModeProvenanceMismatch {
+        node: ModeClosureNodeId,
+        expected: StructuralModeRequirement,
+        observed: ObservedModeProvenance,
+        witness: ModeClosureWitness,
+    },
+    MixedMode {
+        producer: Mode,
+        consumer: Mode,
+        node: ModeClosureNodeId,
+        witness: ModeClosureWitness,
+    },
+    DuplicateNode {
+        node: ModeClosureNodeId,
+    },
+    DuplicateRoot {
+        root: ModeClosureNodeId,
+    },
+    MissingRoot {
+        root: ModeClosureNodeId,
+    },
+    MissingEdgeEndpoint {
+        edge: ModeClosureEdge,
+        endpoint: ModeClosureNodeId,
+    },
+    DuplicateEdge {
+        edge: ModeClosureEdge,
+    },
+    EmptyRoots,
+    UnreachableNode {
+        node: ModeClosureNodeId,
+    },
+    InvalidProductRoot {
+        root: ModeClosureNodeId,
+        consumer: Mode,
+        requirement: StructuralModeRequirement,
+    },
+}
+
+impl ModeClosureRefusal {
+    pub const fn finding_code(&self) -> &'static str {
+        match self {
+            ModeClosureRefusal::FrontierLeak { .. } => "FLN-D18-001",
+            ModeClosureRefusal::MissingModeProvenance { .. } => "FLN-D18-002",
+            ModeClosureRefusal::UnknownModeProvenance { .. } => "FLN-D18-003",
+            ModeClosureRefusal::ModeProvenanceMismatch { .. } => "FLN-D18-004",
+            ModeClosureRefusal::MixedMode { .. } => "FLN-D18-005",
+            ModeClosureRefusal::DuplicateNode { .. } => "FLN-D18-006",
+            ModeClosureRefusal::DuplicateRoot { .. } => "FLN-D18-007",
+            ModeClosureRefusal::MissingRoot { .. } => "FLN-D18-008",
+            ModeClosureRefusal::MissingEdgeEndpoint { .. } => "FLN-D18-009",
+            ModeClosureRefusal::DuplicateEdge { .. } => "FLN-D18-010",
+            ModeClosureRefusal::EmptyRoots => "FLN-D18-011",
+            ModeClosureRefusal::UnreachableNode { .. } => "FLN-D18-012",
+            ModeClosureRefusal::InvalidProductRoot { .. } => "FLN-D18-013",
+        }
+    }
+}
+
+/// Validate a complete structural product closure.
+///
+/// The scan never consults hash iteration or runtime feature state. Inputs are
+/// sorted into a canonical policy before shape validation and traversal. Every
+/// listed node must be reachable from an explicitly mode-bound product root;
+/// missing nodes, disconnected nodes, duplicate facts, and stripped provenance are
+/// refusals rather than partial passes.
+pub fn scan_mode_closure(
+    request: ModeClosureRequest<'_>,
+) -> Result<ValidatedModeClosure, ModeClosureRefusal> {
+    let mut ordered_nodes = request.nodes.to_vec();
+    ordered_nodes.sort_by_key(|node| node.id);
+    let mut nodes = BTreeMap::new();
+    for node in ordered_nodes {
+        if nodes.insert(node.id, node).is_some() {
+            return Err(ModeClosureRefusal::DuplicateNode { node: node.id });
+        }
+    }
+
+    if request.roots.is_empty() {
+        return Err(ModeClosureRefusal::EmptyRoots);
+    }
+    let mut roots = request.roots.to_vec();
+    roots.sort_unstable();
+    for adjacent in roots.windows(2) {
+        let [first, second] = adjacent else {
+            continue;
+        };
+        if first.cmp(second).is_eq() {
+            return Err(ModeClosureRefusal::DuplicateRoot { root: *first });
+        }
+    }
+    for root in &roots {
+        let Some(node) = nodes.get(root) else {
+            return Err(ModeClosureRefusal::MissingRoot { root: *root });
+        };
+        if !valid_product_root(request.consumer, node.requirement) {
+            return Err(ModeClosureRefusal::InvalidProductRoot {
+                root: *root,
+                consumer: request.consumer,
+                requirement: node.requirement,
+            });
+        }
+    }
+
+    let mut edges = request.edges.to_vec();
+    edges.sort_unstable();
+    for adjacent in edges.windows(2) {
+        let [first, second] = adjacent else {
+            continue;
+        };
+        if first.cmp(second).is_eq() {
+            return Err(ModeClosureRefusal::DuplicateEdge { edge: *first });
+        }
+    }
+    let mut outgoing: BTreeMap<ModeClosureNodeId, Vec<(ModeClosureNodeId, ModeClosureEdgeKind)>> =
+        BTreeMap::new();
+    for edge in &edges {
+        for endpoint in [edge.from, edge.to] {
+            if !nodes.contains_key(&endpoint) {
+                return Err(ModeClosureRefusal::MissingEdgeEndpoint {
+                    edge: *edge,
+                    endpoint,
+                });
+            }
+        }
+        outgoing
+            .entry(edge.from)
+            .or_default()
+            .push((edge.to, edge.kind));
+    }
+
+    let mut queue = VecDeque::new();
+    let mut parents = BTreeMap::new();
+    for root in &roots {
+        parents.insert(*root, None);
+        queue.push_back(*root);
+    }
+    while let Some(parent) = queue.pop_front() {
+        let Some(children) = outgoing.get(&parent) else {
+            continue;
+        };
+        for (child, kind) in children {
+            if parents.contains_key(child) {
+                continue;
+            }
+            parents.insert(*child, Some((parent, *kind)));
+            queue.push_back(*child);
+        }
+    }
+
+    for node in nodes.keys() {
+        if !parents.contains_key(node) {
+            return Err(ModeClosureRefusal::UnreachableNode { node: *node });
+        }
+    }
+
+    for node_id in parents.keys() {
+        let Some(node) = nodes.get(node_id) else {
+            return Err(ModeClosureRefusal::MissingRoot { root: *node_id });
+        };
+        validate_closure_node(request.consumer, *node, &parents)?;
+    }
+
+    Ok(ValidatedModeClosure {
+        consumer: request.consumer,
+        roots,
+        nodes: parents.into_keys().collect(),
+        edge_count: edges.len(),
+    })
+}
+
+const fn valid_product_root(consumer: Mode, requirement: StructuralModeRequirement) -> bool {
+    matches!(
+        (consumer, requirement),
+        (
+            Mode::Faithful,
+            StructuralModeRequirement::ModeBound(Mode::Faithful)
+        ) | (
+            Mode::Sound,
+            StructuralModeRequirement::ModeBound(Mode::Sound)
+        ) | (
+            Mode::Frontier,
+            StructuralModeRequirement::ModeBound(Mode::Frontier)
+        ) | (
+            Mode::Frontier,
+            StructuralModeRequirement::FrontierOnly(FrontierSurface::Product(_))
+        )
+    )
+}
+
+fn validate_closure_node(
+    consumer: Mode,
+    node: ModeClosureNode,
+    parents: &BTreeMap<ModeClosureNodeId, Option<(ModeClosureNodeId, ModeClosureEdgeKind)>>,
+) -> Result<(), ModeClosureRefusal> {
+    let witness = || mode_closure_witness(node.id, parents);
+    let observed_mode = match node.observed_provenance {
+        ObservedModeProvenance::Missing => {
+            return Err(ModeClosureRefusal::MissingModeProvenance {
+                node: node.id,
+                witness: witness(),
+            });
+        }
+        ObservedModeProvenance::Neutral => None,
+        ObservedModeProvenance::ModeBound { tag } => {
+            let mode = Mode::from_tag(Some(tag)).map_err(|_| {
+                ModeClosureRefusal::UnknownModeProvenance {
+                    node: node.id,
+                    tag,
+                    witness: witness(),
+                }
+            })?;
+            Some(mode)
+        }
+    };
+
+    let expected_mode = match node.requirement {
+        StructuralModeRequirement::Neutral => None,
+        StructuralModeRequirement::ModeBound(mode) => Some(mode),
+        StructuralModeRequirement::FrontierOnly(_) => Some(Mode::Frontier),
+    };
+    if observed_mode != expected_mode {
+        return Err(ModeClosureRefusal::ModeProvenanceMismatch {
+            node: node.id,
+            expected: node.requirement,
+            observed: node.observed_provenance,
+            witness: witness(),
+        });
+    }
+
+    match node.requirement {
+        StructuralModeRequirement::Neutral => Ok(()),
+        StructuralModeRequirement::ModeBound(producer) if producer == consumer => Ok(()),
+        StructuralModeRequirement::ModeBound(Mode::Frontier) => {
+            Err(ModeClosureRefusal::FrontierLeak {
+                consumer,
+                node: node.id,
+                surface: None,
+                witness: witness(),
+            })
+        }
+        StructuralModeRequirement::ModeBound(producer) => Err(ModeClosureRefusal::MixedMode {
+            producer,
+            consumer,
+            node: node.id,
+            witness: witness(),
+        }),
+        StructuralModeRequirement::FrontierOnly(_) if consumer == Mode::Frontier => Ok(()),
+        StructuralModeRequirement::FrontierOnly(surface) => Err(ModeClosureRefusal::FrontierLeak {
+            consumer,
+            node: node.id,
+            surface: Some(surface),
+            witness: witness(),
+        }),
+    }
+}
+
+fn mode_closure_witness(
+    node: ModeClosureNodeId,
+    parents: &BTreeMap<ModeClosureNodeId, Option<(ModeClosureNodeId, ModeClosureEdgeKind)>>,
+) -> ModeClosureWitness {
+    let mut nodes = vec![node];
+    let mut edges = Vec::new();
+    let mut current = node;
+    while let Some(Some((parent, kind))) = parents.get(&current) {
+        nodes.push(*parent);
+        edges.push(*kind);
+        current = *parent;
+    }
+    nodes.reverse();
+    edges.reverse();
+    ModeClosureWitness { nodes, edges }
 }
 
 /// Authoritative registry row for a schema whose semantics are mode-neutral.
@@ -1280,6 +1705,464 @@ mod tests {
             ),
             Err(CompatibilityRefusal::NeutralRegistryRootMismatch { schema })
         );
+    }
+
+    #[test]
+    fn d18_planted_frontier_symbol_is_refused_and_repair_recovers() {
+        let product = ModeClosureNodeId::new(1);
+        let driver = ModeClosureNodeId::new(2);
+        let iron_entry = ModeClosureNodeId::new(3);
+        let surface = FrontierSurface::Source(FrontierFeature::IronJit);
+
+        for consumer in [Mode::Faithful, Mode::Sound] {
+            let nodes = [
+                ModeClosureNode {
+                    id: product,
+                    requirement: StructuralModeRequirement::ModeBound(consumer),
+                    observed_provenance: ObservedModeProvenance::ModeBound {
+                        tag: consumer.tag(),
+                    },
+                },
+                ModeClosureNode {
+                    id: driver,
+                    requirement: StructuralModeRequirement::Neutral,
+                    observed_provenance: ObservedModeProvenance::Neutral,
+                },
+                ModeClosureNode {
+                    id: iron_entry,
+                    requirement: StructuralModeRequirement::FrontierOnly(surface),
+                    observed_provenance: ObservedModeProvenance::ModeBound {
+                        tag: Mode::Frontier.tag(),
+                    },
+                },
+            ];
+            let edges = [
+                ModeClosureEdge {
+                    from: product,
+                    to: driver,
+                    kind: ModeClosureEdgeKind::Dependency,
+                },
+                ModeClosureEdge {
+                    from: driver,
+                    to: iron_entry,
+                    kind: ModeClosureEdgeKind::RuntimeBranch,
+                },
+            ];
+            let result = scan_mode_closure(ModeClosureRequest {
+                consumer,
+                roots: &[product],
+                nodes: &nodes,
+                edges: &edges,
+            });
+            let expected = ModeClosureRefusal::FrontierLeak {
+                consumer,
+                node: iron_entry,
+                surface: Some(surface),
+                witness: ModeClosureWitness {
+                    nodes: vec![product, driver, iron_entry],
+                    edges: vec![
+                        ModeClosureEdgeKind::Dependency,
+                        ModeClosureEdgeKind::RuntimeBranch,
+                    ],
+                },
+            };
+            assert_eq!(expected.finding_code(), "FLN-D18-001");
+            assert_eq!(result, Err(expected));
+        }
+
+        let frontier_nodes = [
+            ModeClosureNode {
+                id: product,
+                requirement: StructuralModeRequirement::ModeBound(Mode::Frontier),
+                observed_provenance: ObservedModeProvenance::ModeBound {
+                    tag: Mode::Frontier.tag(),
+                },
+            },
+            ModeClosureNode {
+                id: driver,
+                requirement: StructuralModeRequirement::Neutral,
+                observed_provenance: ObservedModeProvenance::Neutral,
+            },
+            ModeClosureNode {
+                id: iron_entry,
+                requirement: StructuralModeRequirement::FrontierOnly(surface),
+                observed_provenance: ObservedModeProvenance::ModeBound {
+                    tag: Mode::Frontier.tag(),
+                },
+            },
+        ];
+        let frontier_edges = [
+            ModeClosureEdge {
+                from: product,
+                to: driver,
+                kind: ModeClosureEdgeKind::Dependency,
+            },
+            ModeClosureEdge {
+                from: driver,
+                to: iron_entry,
+                kind: ModeClosureEdgeKind::RuntimeBranch,
+            },
+        ];
+        let frontier = scan_mode_closure(ModeClosureRequest {
+            consumer: Mode::Frontier,
+            roots: &[product],
+            nodes: &frontier_nodes,
+            edges: &frontier_edges,
+        });
+        assert_eq!(
+            frontier,
+            Ok(ValidatedModeClosure {
+                consumer: Mode::Frontier,
+                roots: vec![product],
+                nodes: vec![product, driver, iron_entry],
+                edge_count: 2,
+            })
+        );
+
+        let repaired_nodes = [
+            ModeClosureNode {
+                id: product,
+                requirement: StructuralModeRequirement::ModeBound(Mode::Sound),
+                observed_provenance: ObservedModeProvenance::ModeBound {
+                    tag: Mode::Sound.tag(),
+                },
+            },
+            ModeClosureNode {
+                id: driver,
+                requirement: StructuralModeRequirement::Neutral,
+                observed_provenance: ObservedModeProvenance::Neutral,
+            },
+        ];
+        let repaired_edges = [ModeClosureEdge {
+            from: product,
+            to: driver,
+            kind: ModeClosureEdgeKind::Dependency,
+        }];
+        assert_eq!(
+            scan_mode_closure(ModeClosureRequest {
+                consumer: Mode::Sound,
+                roots: &[product],
+                nodes: &repaired_nodes,
+                edges: &repaired_edges,
+            }),
+            Ok(ValidatedModeClosure {
+                consumer: Mode::Sound,
+                roots: vec![product],
+                nodes: vec![product, driver],
+                edge_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn d18_all_frontier_surfaces_are_structural() {
+        let product = ModeClosureNodeId::new(10);
+        let frontier = ModeClosureNodeId::new(11);
+        for (surface, kind) in [
+            (
+                FrontierSurface::Source(FrontierFeature::OleanNext),
+                ModeClosureEdgeKind::GeneratedInclude,
+            ),
+            (
+                FrontierSurface::Feature(FrontierFeature::EGraphPortfolio),
+                ModeClosureEdgeKind::FeatureGate,
+            ),
+            (
+                FrontierSurface::CapabilityBypass(FrontierFeature::McpWriteTools),
+                ModeClosureEdgeKind::CapabilityUse,
+            ),
+            (
+                FrontierSurface::Product(FrontierFeature::EpochBridge),
+                ModeClosureEdgeKind::ProductInput,
+            ),
+        ] {
+            let nodes = [
+                ModeClosureNode {
+                    id: product,
+                    requirement: StructuralModeRequirement::ModeBound(Mode::Sound),
+                    observed_provenance: ObservedModeProvenance::ModeBound {
+                        tag: Mode::Sound.tag(),
+                    },
+                },
+                ModeClosureNode {
+                    id: frontier,
+                    requirement: StructuralModeRequirement::FrontierOnly(surface),
+                    observed_provenance: ObservedModeProvenance::ModeBound {
+                        tag: Mode::Frontier.tag(),
+                    },
+                },
+            ];
+            let edges = [ModeClosureEdge {
+                from: product,
+                to: frontier,
+                kind,
+            }];
+            let result = scan_mode_closure(ModeClosureRequest {
+                consumer: Mode::Sound,
+                roots: &[product],
+                nodes: &nodes,
+                edges: &edges,
+            });
+            assert_eq!(
+                result,
+                Err(ModeClosureRefusal::FrontierLeak {
+                    consumer: Mode::Sound,
+                    node: frontier,
+                    surface: Some(surface),
+                    witness: ModeClosureWitness {
+                        nodes: vec![product, frontier],
+                        edges: vec![kind],
+                    },
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn d18_refuses_stripped_forged_and_incomplete_closures() {
+        let product = ModeClosureNodeId::new(20);
+        let omitted = ModeClosureNodeId::new(21);
+        let root_requirement = StructuralModeRequirement::ModeBound(Mode::Sound);
+
+        for (observed_provenance, expected) in [
+            (
+                ObservedModeProvenance::Missing,
+                ModeClosureRefusal::MissingModeProvenance {
+                    node: product,
+                    witness: ModeClosureWitness {
+                        nodes: vec![product],
+                        edges: Vec::new(),
+                    },
+                },
+            ),
+            (
+                ObservedModeProvenance::ModeBound { tag: 0xff },
+                ModeClosureRefusal::UnknownModeProvenance {
+                    node: product,
+                    tag: 0xff,
+                    witness: ModeClosureWitness {
+                        nodes: vec![product],
+                        edges: Vec::new(),
+                    },
+                },
+            ),
+            (
+                ObservedModeProvenance::ModeBound {
+                    tag: Mode::Frontier.tag(),
+                },
+                ModeClosureRefusal::ModeProvenanceMismatch {
+                    node: product,
+                    expected: root_requirement,
+                    observed: ObservedModeProvenance::ModeBound {
+                        tag: Mode::Frontier.tag(),
+                    },
+                    witness: ModeClosureWitness {
+                        nodes: vec![product],
+                        edges: Vec::new(),
+                    },
+                },
+            ),
+        ] {
+            let nodes = [ModeClosureNode {
+                id: product,
+                requirement: root_requirement,
+                observed_provenance,
+            }];
+            let result = scan_mode_closure(ModeClosureRequest {
+                consumer: Mode::Sound,
+                roots: &[product],
+                nodes: &nodes,
+                edges: &[],
+            });
+            assert_eq!(result, Err(expected));
+        }
+
+        let product_node = ModeClosureNode {
+            id: product,
+            requirement: root_requirement,
+            observed_provenance: ObservedModeProvenance::ModeBound {
+                tag: Mode::Sound.tag(),
+            },
+        };
+        let nodes = [product_node];
+        let missing_edge = ModeClosureEdge {
+            from: product,
+            to: omitted,
+            kind: ModeClosureEdgeKind::Dependency,
+        };
+        let omitted_result = scan_mode_closure(ModeClosureRequest {
+            consumer: Mode::Sound,
+            roots: &[product],
+            nodes: &nodes,
+            edges: &[missing_edge],
+        });
+        assert_eq!(
+            omitted_result,
+            Err(ModeClosureRefusal::MissingEdgeEndpoint {
+                edge: missing_edge,
+                endpoint: omitted,
+            })
+        );
+
+        let disconnected_nodes = [
+            product_node,
+            ModeClosureNode {
+                id: omitted,
+                requirement: StructuralModeRequirement::Neutral,
+                observed_provenance: ObservedModeProvenance::Neutral,
+            },
+        ];
+        assert_eq!(
+            scan_mode_closure(ModeClosureRequest {
+                consumer: Mode::Sound,
+                roots: &[product],
+                nodes: &disconnected_nodes,
+                edges: &[],
+            }),
+            Err(ModeClosureRefusal::UnreachableNode { node: omitted })
+        );
+        assert_eq!(
+            scan_mode_closure(ModeClosureRequest {
+                consumer: Mode::Sound,
+                roots: &[],
+                nodes: &nodes,
+                edges: &[],
+            }),
+            Err(ModeClosureRefusal::EmptyRoots)
+        );
+
+        let neutral_root = [ModeClosureNode {
+            id: product,
+            requirement: StructuralModeRequirement::Neutral,
+            observed_provenance: ObservedModeProvenance::Neutral,
+        }];
+        assert_eq!(
+            scan_mode_closure(ModeClosureRequest {
+                consumer: Mode::Sound,
+                roots: &[product],
+                nodes: &neutral_root,
+                edges: &[],
+            }),
+            Err(ModeClosureRefusal::InvalidProductRoot {
+                root: product,
+                consumer: Mode::Sound,
+                requirement: StructuralModeRequirement::Neutral,
+            })
+        );
+    }
+
+    #[test]
+    fn d18_scan_is_input_order_and_thread_count_independent() {
+        fn campaign(reverse: bool) -> Result<ValidatedModeClosure, ModeClosureRefusal> {
+            let first_product = ModeClosureNodeId::new(30);
+            let second_product = ModeClosureNodeId::new(31);
+            let first_path = ModeClosureNodeId::new(32);
+            let second_path = ModeClosureNodeId::new(33);
+            let frontier = ModeClosureNodeId::new(34);
+            let mut roots = vec![first_product, second_product];
+            let mut nodes = vec![
+                ModeClosureNode {
+                    id: first_product,
+                    requirement: StructuralModeRequirement::ModeBound(Mode::Sound),
+                    observed_provenance: ObservedModeProvenance::ModeBound {
+                        tag: Mode::Sound.tag(),
+                    },
+                },
+                ModeClosureNode {
+                    id: second_product,
+                    requirement: StructuralModeRequirement::ModeBound(Mode::Sound),
+                    observed_provenance: ObservedModeProvenance::ModeBound {
+                        tag: Mode::Sound.tag(),
+                    },
+                },
+                ModeClosureNode {
+                    id: first_path,
+                    requirement: StructuralModeRequirement::Neutral,
+                    observed_provenance: ObservedModeProvenance::Neutral,
+                },
+                ModeClosureNode {
+                    id: second_path,
+                    requirement: StructuralModeRequirement::Neutral,
+                    observed_provenance: ObservedModeProvenance::Neutral,
+                },
+                ModeClosureNode {
+                    id: frontier,
+                    requirement: StructuralModeRequirement::FrontierOnly(
+                        FrontierSurface::CapabilityBypass(FrontierFeature::IronJit),
+                    ),
+                    observed_provenance: ObservedModeProvenance::ModeBound {
+                        tag: Mode::Frontier.tag(),
+                    },
+                },
+            ];
+            let mut edges = vec![
+                ModeClosureEdge {
+                    from: first_product,
+                    to: first_path,
+                    kind: ModeClosureEdgeKind::FeatureGate,
+                },
+                ModeClosureEdge {
+                    from: second_product,
+                    to: second_path,
+                    kind: ModeClosureEdgeKind::RuntimeBranch,
+                },
+                ModeClosureEdge {
+                    from: first_path,
+                    to: frontier,
+                    kind: ModeClosureEdgeKind::CapabilityUse,
+                },
+                ModeClosureEdge {
+                    from: second_path,
+                    to: frontier,
+                    kind: ModeClosureEdgeKind::Dependency,
+                },
+            ];
+            if reverse {
+                roots.reverse();
+                nodes.reverse();
+                edges.reverse();
+            }
+            scan_mode_closure(ModeClosureRequest {
+                consumer: Mode::Sound,
+                roots: &roots,
+                nodes: &nodes,
+                edges: &edges,
+            })
+        }
+
+        let expected = campaign(false);
+        assert_eq!(campaign(true), expected);
+        assert_eq!(
+            expected,
+            Err(ModeClosureRefusal::FrontierLeak {
+                consumer: Mode::Sound,
+                node: ModeClosureNodeId::new(34),
+                surface: Some(FrontierSurface::CapabilityBypass(FrontierFeature::IronJit,)),
+                witness: ModeClosureWitness {
+                    nodes: vec![
+                        ModeClosureNodeId::new(30),
+                        ModeClosureNodeId::new(32),
+                        ModeClosureNodeId::new(34),
+                    ],
+                    edges: vec![
+                        ModeClosureEdgeKind::FeatureGate,
+                        ModeClosureEdgeKind::CapabilityUse,
+                    ],
+                },
+            })
+        );
+
+        for workers in [1_usize, 8, 32] {
+            let handles: Vec<_> = (0..workers)
+                .map(|worker| thread::spawn(move || campaign(worker % 2 == 0)))
+                .collect();
+            for handle in handles {
+                match handle.join() {
+                    Ok(actual) => assert_eq!(actual, expected),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+        }
     }
 
     #[test]
