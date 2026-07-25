@@ -7,4 +7,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod rope;
 pub mod source;
