@@ -10,3 +10,6 @@
 //! must never depend on `fln-kernel` or `fln-checker` (D3 law a).
 
 #![deny(unsafe_code)]
+// D3's SAFETY-note half, enforced here because this crate is clean
+// (FLN-STRUCT-040).
+#![deny(clippy::undocumented_unsafe_blocks)]

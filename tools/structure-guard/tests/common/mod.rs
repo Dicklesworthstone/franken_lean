@@ -436,7 +436,12 @@ pub fn manifest(name: &str, deps: &[&str]) -> String {
 
 pub fn lib_rs(boundary: bool) -> &'static str {
     if boundary {
-        "//! boundary stub\n#![deny(unsafe_code)]\n"
+        // The boundary stub carries the SAFETY-note lint because FLN-STRUCT-040 requires
+        // every boundary root to either enforce it or declare that it does not. A baseline
+        // fixture must satisfy every rule, not most of them: when this stub lagged the rule
+        // for a few minutes it made nine unrelated seeded tests fail, since each asserts an
+        // exact finding set and got an extra one.
+        "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n"
     } else {
         "//! stub\n#![forbid(unsafe_code)]\n"
     }

@@ -66,6 +66,18 @@
 //!   reviewed fln-kernel call sites. D6 reserves admission to the kernel, and no
 //!   type-level guarantee is available at this boundary because fln-env sits BELOW
 //!   fln-kernel and cannot name it (bead `franken_lean-oof9`).
+//! * `FLN-STRUCT-040` an unsafe boundary crate's root neither enables
+//!   `clippy::undocumented_unsafe_blocks` nor declares, with a bead, that it has not.
+//!   D3 requires a SAFETY note at every unsafe site; that lint decides it and nothing
+//!   else does, so a boundary crate silent about its posture leaves a reader unable to
+//!   tell an enforced rule from an unenforced one. The rule checks POSTURE, never
+//!   documentation itself: clippy owns that decision and a second implementation of one
+//!   property is how the two disagree (bead
+//!   `franken_lean-d3-safety-note-unenforced-cdbg`).
+//! * `FLN-STRUCT-041` a Python module in a trusted resolution directory shadows a
+//!   module the evidence bootstrap imports — Python resolves the script directory and
+//!   the cwd before the standard library, so such a file replaces the module that
+//!   computes the digests and decides the verdicts (bead `franken_lean-h40t`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -783,6 +795,23 @@ fn audit_repository_cargo_config(root: &Path, findings: &mut Vec<Finding>) -> Re
 /// whole run at exit 2 and hide every other finding, which turns one unreadable byte into
 /// a way to suppress the gate. The caller records the typed finding and skips the file, so
 /// the run can never be reported clean.
+/// A crate-root declaration that the SAFETY-note lint is knowingly not yet enabled,
+/// naming the bead that tracks the outstanding sites (`FLN-STRUCT-040`).
+///
+/// Comment-only and bead-bearing, both deliberately. Comment-only mirrors
+/// `ledger::marker_id`: a string literal containing the marker must not be able to waive
+/// a crate. Bead-bearing is what separates a declared remainder from a shrug — a waiver
+/// with nowhere to look is how a temporary exemption becomes permanent.
+fn safety_note_waiver(line: &str) -> Option<String> {
+    let comment = line.trim_start().strip_prefix("//")?.trim_start();
+    let rest = comment.strip_prefix("UNSAFE-NOTE-WAIVER:")?.trim();
+    let bead: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (bead.len() >= 8).then_some(bead)
+}
+
 fn read_governed(path: &Path, rel: &str, findings: &mut Vec<Finding>) -> Option<String> {
     match fs::read_to_string(path) {
         Ok(text) => Some(text),
@@ -1059,6 +1088,170 @@ fn unresolved_suffix(arity: Option<usize>) -> &'static str {
 /// Together with the manifest ban on build scripts/custom/proc-macro targets and the
 /// source-escape ban on `include!`/`#[path]`, this gives every generated fragment one
 /// reviewed source callsite inside `crates/fln-kernel/src/**`.
+/// FLN-STRUCT-041 — a Python module that can SHADOW an import of the trusted
+/// evidence bootstrap (bead `franken_lean-h40t`).
+///
+/// # The hole this closes
+///
+/// `scripts/evidence.py` computes the governed tree hashes, validates run
+/// records, and publishes the bundle whose verdict every gate depends on.
+/// Python resolves imports from the running script's OWN DIRECTORY first, and
+/// from the process cwd for `python3 -c`. So a file named `scripts/hashlib.py`,
+/// or a repository-root `tomllib.py`, replaces the module that computes the
+/// digests and decides the verdicts — and until this rule, structure-guard
+/// could not see it at all: `GOVERNED_ROOT_DIRS` is `ci`, `contracts`, `crates`,
+/// `tools`, so `scripts/` was outside the governed universe entirely, and
+/// nothing in this file had ever looked at a `.py`.
+///
+/// This is the sibling of a defect already PROVEN live on the CI surface under
+/// `fln-8mj`: with a shadow module on the path, `tomllib.loads("")` returned
+/// `{"toolchain": {"channel": "attacker-chosen-toolchain"}}` through both the
+/// script-directory vector and the `PYTHONPATH` vector.
+///
+/// # Why the shadowable set is DERIVED and not listed
+///
+/// A hand-written list of "dangerous module names" goes stale the moment the
+/// runner imports something new, and the staleness is silent — the guard keeps
+/// passing while the surface grows. So the set is read from the trusted scripts
+/// themselves: whatever they import is what can be shadowed. That is the same
+/// choice FLN-STRUCT-039 made when it derived its scan scope from the declared
+/// graph rather than from a hand-listed set of crates.
+///
+/// # Scope, and why it is per-directory
+///
+/// Python's script-directory resolution makes the hazard LOCAL: a module only
+/// shadows for scripts that live beside it. So the rule pairs each trusted
+/// script's own directory with that script's imports, and additionally treats
+/// the repository root as a resolution directory because inline `python3 -c`
+/// helpers in the shell lanes resolve from the cwd.
+///
+/// It ships with NOTHING to report — the only `.py` in `scripts/` is
+/// `evidence.py` itself and the repository root has none — so the first
+/// violation is a real event rather than a backlog. That is deliberate and is
+/// the same posture FLN-STRUCT-038 ships with.
+///
+/// # What this is NOT
+///
+/// It is not a substitute for interpreter isolation. `python3 -I` is what
+/// actually closes the channel; this rule closes the part isolation cannot,
+/// namely a shadow module committed into the tree where a future invocation
+/// that forgets `-I` would find it. The bead says so in its own words: no claim
+/// that source-level scanning substitutes for interpreter isolation.
+fn audit_python_import_shadowing(root: &Path, findings: &mut Vec<Finding>) {
+    let mut trusted: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    collect_trusted_python(&root.join("scripts"), &mut trusted, findings);
+
+    // The repository root is a resolution directory for the inline `python3 -c`
+    // helpers in the shell lanes, which resolve from the cwd rather than from a
+    // script directory. It has no trusted `.py` of its own, so it inherits the
+    // union of every trusted script's imports.
+    let union: BTreeSet<String> = trusted.values().flatten().cloned().collect();
+    trusted.entry(root.to_path_buf()).or_insert(union);
+
+    for (dir, importable) in &trusted {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        let mut names: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        names.sort();
+        for path in names {
+            if path.extension().and_then(OsStr::to_str) != Some("py") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if !importable.contains(stem) {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            findings.push(Finding {
+                code: "FLN-STRUCT-041",
+                path: rel,
+                detail: format!(
+                    "`{stem}` shadows a module the trusted evidence bootstrap imports; Python \
+                     resolves the script directory and the cwd BEFORE the standard library, so \
+                     this file replaces `{stem}` for every trusted invocation that reaches it"
+                ),
+            });
+        }
+    }
+}
+
+/// Reads every trusted Python script under `dir`, recording per-directory the
+/// module names it imports. A script that cannot be read is REPORTED, never
+/// skipped silently: an unreadable trusted script is an unestablished authority,
+/// not an absent hazard (FL-INV-07).
+fn collect_trusted_python(
+    dir: &Path,
+    out: &mut BTreeMap<PathBuf, BTreeSet<String>>,
+    findings: &mut Vec<Finding>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            collect_trusted_python(&path, out, findings);
+            continue;
+        }
+        if path.extension().and_then(OsStr::to_str) != Some("py") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            findings.push(Finding {
+                code: "FLN-STRUCT-041",
+                path: path.to_string_lossy().replace('\\', "/"),
+                detail: "a trusted Python script could not be read, so the set of modules it \
+                         can have shadowed is unestablished rather than empty"
+                    .to_string(),
+            });
+            continue;
+        };
+        let parent = path.parent().unwrap_or(dir).to_path_buf();
+        let entry = out.entry(parent).or_default();
+        for module in python_imports(&text) {
+            entry.insert(module);
+        }
+    }
+}
+
+/// The top-level module names a Python source imports: `import X`, `import X.Y`,
+/// `from X import ...`. Only the FIRST path segment matters, because that is the
+/// name Python resolves against the path.
+fn python_imports(text: &str) -> BTreeSet<String> {
+    let mut modules = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let rest = if let Some(rest) = line.strip_prefix("import ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("from ") {
+            rest
+        } else {
+            continue;
+        };
+        for part in rest.split([' ', ',']) {
+            let name = part.trim().split('.').next().unwrap_or("").trim();
+            if name.is_empty() || name == "import" || name.starts_with('_') {
+                continue;
+            }
+            if name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                modules.insert(name.to_string());
+            }
+        }
+    }
+    modules
+}
+
 fn audit_kernel_generated_authority(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
     const FUNCTION_MACROS: [&str; 5] = ["assert", "format", "matches", "unreachable", "vec"];
     const ATTRIBUTES: [&str; 4] = ["cfg", "derive", "forbid", "test"];
@@ -1969,6 +2162,46 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         if !is_boundary {
             continue;
         }
+
+        // FLN-STRUCT-040: D3 requires a SAFETY note at every unsafe site. That half of
+        // the rule is enforced by `clippy::undocumented_unsafe_blocks` and by nothing
+        // else, and the lint is not switched on anywhere — so the requirement rests on
+        // attentiveness in the three crates that exist because attentiveness is not
+        // enough (bead `franken_lean-d3-safety-note-unenforced-cdbg`).
+        //
+        // This does not re-implement the lint. Deciding whether a block is documented
+        // needs a real parser, clippy has one, and a second implementation of one
+        // property is how the two disagree. What it enforces is that each boundary root
+        // either TURNS THE LINT ON, or says out loud that it has not — with the bead
+        // that tracks the outstanding sites. An unenforced rule is survivable; an
+        // unenforced rule nobody can see is the defect.
+        let root_rel = format!("{}/src/lib.rs", c.rel);
+        if let Some(root_text) = read_governed(&c.dir.join("src/lib.rs"), &root_rel, &mut findings) {
+            let enforced = root_text.lines().any(|line| {
+                let t = line.trim();
+                (t.starts_with("#![deny(") || t.starts_with("#![forbid("))
+                    && t.contains("clippy::undocumented_unsafe_blocks")
+            });
+            let waived = root_text.lines().any(|line| safety_note_waiver(line).is_some());
+            if !enforced && !waived {
+                findings.push(Finding {
+                    code: "FLN-STRUCT-040",
+                    path: root_rel,
+                    detail: format!(
+                        "unsafe boundary `{}` neither enables the SAFETY-note lint nor \
+                         declares that it has not. Add \
+                         `#![deny(clippy::undocumented_unsafe_blocks)]` once the crate is \
+                         clean, or, while sites remain, a crate-root comment \
+                         `// UNSAFE-NOTE-WAIVER: <bead-id>` naming the bead that tracks \
+                         them. D3's SAFETY-note requirement is enforced by that lint and \
+                         by nothing else; a boundary crate that is silent about it leaves \
+                         readers unable to tell an enforced rule from an unenforced one.",
+                        c.name
+                    ),
+                });
+            }
+        }
+
         let src = c.dir.join("src");
         if !src.is_dir() {
             continue;
@@ -2163,6 +2396,8 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             audit_declaration_admission_surface(&text, &source_rel, &mut findings);
         }
     }
+
+    audit_python_import_shadowing(root, &mut findings);
 
     // ---- line-count covenants ----------------------------------------------------------
     for (crate_name, limit) in &g.covenants {

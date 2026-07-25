@@ -161,7 +161,10 @@ const GRAPH: &str = "\
 const LEDGER: &str = "schema fln-unsafe-ledger/1\n";
 
 const LIB: &str = "//! stub\n#![forbid(unsafe_code)]\n";
-const BOUNDARY_LIB: &str = "//! boundary stub\n#![deny(unsafe_code)]\n";
+// Carries the SAFETY-note lint because FLN-STRUCT-040 requires every boundary root to
+// enforce it or declare that it does not; a baseline fixture must satisfy every rule.
+const BOUNDARY_LIB: &str =
+    "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n";
 
 const SUITE_LOCK: &str = "\
 schema fln-suite-lock/1

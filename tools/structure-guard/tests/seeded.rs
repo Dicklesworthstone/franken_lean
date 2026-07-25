@@ -350,7 +350,17 @@ fn boundary_crate_with_forbid_is_flagged() {
     ws.write("crates/fln-unsafe-abi/src/lib.rs", lib_rs(false));
     let out = ws.run();
     assert!(!out.findings.is_empty());
-    assert!(codes(&out).iter().all(|c| *c == "FLN-STRUCT-012"));
+    // The planted body is the non-boundary stub, so it trips FLN-STRUCT-012 (forbid where
+    // deny belongs) and FLN-STRUCT-040 (no SAFETY-note posture) together. Both are correct;
+    // this test owns the first.
+    assert!(codes(&out).contains(&"FLN-STRUCT-012"));
+    assert!(
+        codes(&out)
+            .iter()
+            .all(|c| *c == "FLN-STRUCT-012" || *c == "FLN-STRUCT-040"),
+        "unexpected finding beyond the two this plant provokes: {:?}",
+        out.findings
+    );
 }
 
 #[test]
@@ -359,7 +369,7 @@ fn unledgered_allow_site_is_flagged_and_ledgered_site_passes() {
     base(&ws);
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "//! boundary stub\n#![deny(unsafe_code)]\n\n#[allow(unsafe_code)]\nfn peek() {}\n",
+        "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n\n#[allow(unsafe_code)]\nfn peek() {}\n",
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-013"]);
 
@@ -367,14 +377,14 @@ fn unledgered_allow_site_is_flagged_and_ledgered_site_passes() {
     // begins with an id.
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "//! boundary stub\n#![deny(unsafe_code)]\n\n// UNSAFE-LEDGER: FLN-UL-0001 extra words\n#[allow(unsafe_code)]\nfn peek() {}\n",
+        "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n\n// UNSAFE-LEDGER: FLN-UL-0001 extra words\n#[allow(unsafe_code)]\nfn peek() {}\n",
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-013"]);
 
     // Recovery: marker + matching ledger row make the same site legal.
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "//! boundary stub\n#![deny(unsafe_code)]\n\n// UNSAFE-LEDGER: FLN-UL-0001\n#[allow(unsafe_code)]\nfn peek() {}\n",
+        "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n\n// UNSAFE-LEDGER: FLN-UL-0001\n#[allow(unsafe_code)]\nfn peek() {}\n",
     );
     ws.write(
         "ci/UNSAFE_LEDGER.txt",
@@ -402,7 +412,7 @@ fn comment_mentions_of_allow_are_not_sites() {
     base(&ws);
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "//! docs may mention #[allow(unsafe_code)] freely\n#![deny(unsafe_code)]\n// a comment naming #[allow(unsafe_code)] is not a site either\n",
+        "//! docs may mention #[allow(unsafe_code)] freely\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n// a comment naming #[allow(unsafe_code)] is not a site either\n",
     );
     assert!(ws.run().findings.is_empty());
 }
@@ -515,7 +525,7 @@ fn conditional_cfg_attr_cannot_spoof_unsafe_posture() {
     base(&ordinary);
     ordinary.write(
         "crates/fln-hash/src/lib.rs",
-        "#![cfg_attr(any(), forbid(unsafe_code))]\n",
+        "#![cfg_attr(any(), forbid(unsafe_code))]\n#![deny(clippy::undocumented_unsafe_blocks)]\n",
     );
     assert_eq!(codes(&ordinary.run()), vec!["FLN-STRUCT-011"]);
 
@@ -523,7 +533,7 @@ fn conditional_cfg_attr_cannot_spoof_unsafe_posture() {
     base(&boundary);
     boundary.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "#![cfg_attr(any(), deny(unsafe_code))]\n",
+        "#![cfg_attr(any(), deny(unsafe_code))]\n#![deny(clippy::undocumented_unsafe_blocks)]\n",
     );
     assert_eq!(codes(&boundary.run()), vec!["FLN-STRUCT-012"]);
 }
@@ -542,7 +552,9 @@ fn nested_inner_attribute_cannot_spoof_crate_root_posture() {
     base(&boundary);
     boundary.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "mod decoy { #![deny(unsafe_code)] }\n",
+        // The lint line is real and at the root; only the `deny(unsafe_code)` is the decoy,
+        // so this plant provokes FLN-STRUCT-012 alone rather than 012 plus 040.
+        "#![deny(clippy::undocumented_unsafe_blocks)]\nmod decoy { #![deny(unsafe_code)] }\n",
     );
     assert_eq!(codes(&boundary.run()), vec!["FLN-STRUCT-012"]);
 }
@@ -584,7 +596,7 @@ fn all_structural_allow_variants_are_ledgered() {
     base(&ws);
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "#![deny(unsafe_code)]\n#[allow ( unsafe_code, dead_code )]\nfn one() {}\n#[cfg_attr(any(), allow(unsafe_code))]\nfn two() {}\n",
+        "#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n#[allow ( unsafe_code, dead_code )]\nfn one() {}\n#[cfg_attr(any(), allow(unsafe_code))]\nfn two() {}\n",
     );
     let out = ws.run();
     assert_eq!(codes(&out), vec!["FLN-STRUCT-013", "FLN-STRUCT-013"]);
@@ -597,7 +609,10 @@ fn alternate_lint_levels_cannot_lower_boundary_deny() {
         base(&ws);
         ws.write(
             "crates/fln-unsafe-abi/src/lib.rs",
-            &format!("#![deny(unsafe_code)]\n#[{level}(unsafe_code)]\nfn lowered() {{}}\n"),
+            &format!(
+                "#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n\
+                 #[{level}(unsafe_code)]\nfn lowered() {{}}\n"
+            ),
         );
         let out = ws.run();
         assert_eq!(codes(&out), vec!["FLN-STRUCT-013"]);
@@ -611,7 +626,7 @@ fn inner_unsafe_allow_is_never_narrowly_ledgerable() {
     base(&ws);
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "#![deny(unsafe_code)]\n#![allow(unsafe_code)]\n",
+        "#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n#![allow(unsafe_code)]\n",
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-013"]);
 }
@@ -622,7 +637,7 @@ fn unsafe_boundary_exports_fail_closed_until_type_aware_classification() {
     base(&ws);
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "#![deny(unsafe_code)]\npub fn forge<T>() -> T { loop {} }\n",
+        "#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\npub fn forge<T>() -> T { loop {} }\n",
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-022"]);
 
@@ -630,7 +645,7 @@ fn unsafe_boundary_exports_fail_closed_until_type_aware_classification() {
     base(&local);
     local.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "#![deny(unsafe_code)]\npub(crate) fn local_only() {}\n",
+        "#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\npub(crate) fn local_only() {}\n",
     );
     assert!(local.run().findings.is_empty());
 
@@ -638,7 +653,7 @@ fn unsafe_boundary_exports_fail_closed_until_type_aware_classification() {
     base(&macro_expansion);
     macro_expansion.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "#![deny(unsafe_code)]\nmacro_rules! hidden_policy { () => {} }\n",
+        "#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\nmacro_rules! hidden_policy { () => {} }\n",
     );
     assert_eq!(codes(&macro_expansion.run()), vec!["FLN-STRUCT-022"]);
 }
@@ -768,7 +783,7 @@ fn integration_targets_cannot_bypass_ordinary_unsafe_posture() {
     base(&boundary);
     boundary.write(
         "crates/fln-unsafe-abi/tests/bypass.rs",
-        "#![deny(unsafe_code)]\n#[allow(unsafe_code)]\nfn bypass() {}\n",
+        "#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n#[allow(unsafe_code)]\nfn bypass() {}\n",
     );
     assert_eq!(codes(&boundary.run()), vec!["FLN-STRUCT-013"]);
 }
@@ -966,7 +981,7 @@ fn status_fixture(alloc_status: &str, with_apply_row: bool, with_support: bool) 
     s
 }
 
-const EXPORTING_LIB: &str = "//! boundary stub\n#![deny(unsafe_code)]\n\n\
+const EXPORTING_LIB: &str = "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n\n\
     #[unsafe(export_name = \"lean_alloc_object\")]\n\
     extern \"C\" fn export_alloc() {}\n";
 
@@ -1005,7 +1020,7 @@ fn export_site_outside_the_exporting_crate_is_flagged() {
     ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
     ws.write(
         "crates/fln-unsafe-region/src/lib.rs",
-        "//! boundary stub\n#![deny(unsafe_code)]\n\n\
+        "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n\n\
          #[unsafe(export_name = \"lean_free_small\")]\n\
          extern \"C\" fn smuggled() {}\n",
     );
@@ -1085,7 +1100,7 @@ fn no_mangle_stays_banned_and_split_symbol_fails_closed() {
     );
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "//! boundary stub\n#![deny(unsafe_code)]\n\n\
+        "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n\n\
          #[unsafe(export_name = \"lean_alloc_object\")]\n\
          extern \"C\" fn export_alloc() {}\n\n\
          #[unsafe(no_mangle)]\n\
@@ -1103,7 +1118,7 @@ fn no_mangle_stays_banned_and_split_symbol_fails_closed() {
     );
     ws2.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "//! boundary stub\n#![deny(unsafe_code)]\n\n\
+        "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n\n\
          #[unsafe(export_name =\n\"lean_alloc_object\")]\n\
          extern \"C\" fn export_alloc() {}\n",
     );
@@ -1128,6 +1143,115 @@ fn missing_census_fails_closed_when_status_exists() {
 }
 
 // ---------------------------------------------------------------- fln-checker boundary
+
+/// The SAFETY-note posture rule (`FLN-STRUCT-040`, bead
+/// `franken_lean-d3-safety-note-unenforced-cdbg`).
+///
+/// D3 requires a SAFETY note at every unsafe site. That half of the rule is decided by
+/// `clippy::undocumented_unsafe_blocks` and by nothing else, and this guard does NOT
+/// re-implement it — deciding whether a block is documented needs a parser, and a second
+/// implementation of one property is how the two disagree. What it enforces is that a
+/// boundary crate either turns the lint on or says out loud that it has not.
+///
+/// Three plants, because the rule has three outcomes and a guard that only ever fires one
+/// way is an unenforced claim.
+#[test]
+fn a_boundary_root_silent_about_the_safety_note_lint_is_refused() {
+    let ws = TempWs::new("safety-note-silent");
+    base(&ws);
+    ws.write(
+        "crates/fln-unsafe-jit/src/lib.rs",
+        "//! stub\n#![deny(unsafe_code)]\n",
+    );
+    let out = ws.run();
+    assert!(
+        codes(&out).contains(&"FLN-STRUCT-040"),
+        "a boundary root that neither enforces nor declares must be refused: {:?}",
+        out.findings
+    );
+    assert!(
+        out.findings
+            .iter()
+            .any(|f| f.code == "FLN-STRUCT-040" && f.detail.contains("fln-unsafe-jit")),
+        "the finding must name the crate it refused: {:?}",
+        out.findings
+    );
+}
+
+/// PERMISSION HALF ONE: turning the lint on satisfies the rule.
+#[test]
+fn a_boundary_root_that_enables_the_lint_is_accepted() {
+    let ws = TempWs::new("safety-note-enforced");
+    base(&ws);
+    ws.write(
+        "crates/fln-unsafe-jit/src/lib.rs",
+        "//! stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n",
+    );
+    let out = ws.run();
+    assert!(
+        !codes(&out).contains(&"FLN-STRUCT-040"),
+        "enforcing the lint must satisfy the rule: {:?}",
+        out.findings
+    );
+}
+
+/// PERMISSION HALF TWO: declaring that it is not yet on, with the bead, also satisfies it.
+/// The waiver is the whole point — an unenforced rule is survivable, an unenforced rule
+/// nobody can see is the defect.
+#[test]
+fn a_boundary_root_that_declares_the_gap_with_a_bead_is_accepted() {
+    let ws = TempWs::new("safety-note-waived");
+    base(&ws);
+    ws.write(
+        "crates/fln-unsafe-jit/src/lib.rs",
+        "//! stub\n#![deny(unsafe_code)]\n// UNSAFE-NOTE-WAIVER: franken_lean-some-bead-abcd\n",
+    );
+    let out = ws.run();
+    assert!(
+        !codes(&out).contains(&"FLN-STRUCT-040"),
+        "a declared gap naming a bead must be accepted: {:?}",
+        out.findings
+    );
+}
+
+/// A waiver that names nothing is a shrug, not a declaration, and must not satisfy the
+/// rule — otherwise the marker becomes a way to switch the guard off.
+#[test]
+fn a_waiver_naming_no_bead_does_not_satisfy_the_rule() {
+    for bare in ["// UNSAFE-NOTE-WAIVER:", "// UNSAFE-NOTE-WAIVER: todo"] {
+        let ws = TempWs::new("safety-note-bare-waiver");
+        base(&ws);
+        ws.write(
+            "crates/fln-unsafe-jit/src/lib.rs",
+            &format!("//! stub\n#![deny(unsafe_code)]\n{bare}\n"),
+        );
+        let out = ws.run();
+        assert!(
+            codes(&out).contains(&"FLN-STRUCT-040"),
+            "a waiver naming no bead must not satisfy the rule ({bare:?}): {:?}",
+            out.findings
+        );
+    }
+}
+
+/// The marker is comment-only, mirroring the UNSAFE-LEDGER discipline: a string literal
+/// that happens to contain it must not waive a crate. Without this the rule would be
+/// defeatable by a doc example.
+#[test]
+fn a_waiver_inside_a_string_literal_does_not_waive_the_crate() {
+    let ws = TempWs::new("safety-note-string-waiver");
+    base(&ws);
+    ws.write(
+        "crates/fln-unsafe-jit/src/lib.rs",
+        "//! stub\n#![deny(unsafe_code)]\npub const S: &str = \"UNSAFE-NOTE-WAIVER: franken_lean-not-real-abcd\";\n",
+    );
+    let out = ws.run();
+    assert!(
+        codes(&out).contains(&"FLN-STRUCT-040"),
+        "a marker inside a string literal must not waive the crate: {:?}",
+        out.findings
+    );
+}
 
 /// The independence boundary (`FLN-STRUCT-037`, bead `franken_lean-r0xu`).
 ///
