@@ -316,7 +316,7 @@ pub fn null_kind() -> Name {
 pub fn longest_match(
     state: &mut ParserState,
     left: Option<Syntax>,
-    productions: &[Production],
+    productions: &[&Production],
 ) -> Resolution {
     if productions.is_empty() {
         state.set_error(ParseError::new("longestMatch: empty list", state.pos()));
@@ -340,7 +340,7 @@ pub fn longest_match(
     let mut tied: Vec<Syntax> = Vec::new();
     let mut tied_lhs_prec = MAX_PREC;
 
-    for production in productions {
+    for production in productions.iter().copied() {
         state.restore(start_size, start_pos);
         state.set_lhs_prec(entry_lhs_prec);
         if let Some(left) = &left {
@@ -504,8 +504,9 @@ mod tests {
     }
 
     fn run(productions: &[Production]) -> (Resolution, ParserState) {
+        let borrowed: Vec<&Production> = productions.iter().collect();
         let mut state = ParserState::new(0);
-        let resolution = longest_match(&mut state, None, productions);
+        let resolution = longest_match(&mut state, None, &borrowed);
         (resolution, state)
     }
 
@@ -620,7 +621,7 @@ mod tests {
         });
 
         let mut state = ParserState::new(0);
-        let resolution = longest_match(&mut state, None, &[tight, loose]);
+        let resolution = longest_match(&mut state, None, &[&tight, &loose]);
         assert_eq!(resolution, Resolution::Ambiguous { alternatives: 2 });
         assert_eq!(
             state.lhs_prec(),
@@ -644,7 +645,7 @@ mod tests {
         let mut state = ParserState::new(0);
         state.push(atom("pre-existing", 0, 0));
         let before = state.stack_size();
-        let resolution = longest_match(&mut state, None, &[messy, clean]);
+        let resolution = longest_match(&mut state, None, &[&messy, &clean]);
 
         assert_eq!(resolution, Resolution::Unique);
         assert_eq!(
@@ -680,7 +681,7 @@ mod tests {
         });
 
         let mut state = ParserState::new(0);
-        let resolution = longest_match(&mut state, Some(left.clone()), &[count_left, other]);
+        let resolution = longest_match(&mut state, Some(left.clone()), &[&count_left, &other]);
         assert_eq!(resolution, Resolution::Unique);
         assert_eq!(state.pos(), BytePos(8));
     }
@@ -700,7 +701,7 @@ mod tests {
         });
         let mut state = ParserState::new(0);
         state.set_lhs_prec(42);
-        longest_match(&mut state, None, std::slice::from_ref(&probe));
+        longest_match(&mut state, None, &[&probe]);
         assert_eq!(
             observed.lock().expect("lock").as_slice(),
             &[MAX_PREC],
@@ -710,7 +711,7 @@ mod tests {
         observed.lock().expect("lock").clear();
         let mut state = ParserState::new(0);
         state.set_lhs_prec(42);
-        longest_match(&mut state, Some(atom("left", 0, 0)), &[probe]);
+        longest_match(&mut state, Some(atom("left", 0, 0)), &[&probe]);
         assert_eq!(
             observed.lock().expect("lock").as_slice(),
             &[42],

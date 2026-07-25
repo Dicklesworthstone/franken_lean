@@ -5,4 +5,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod pratt;
 pub mod state;
