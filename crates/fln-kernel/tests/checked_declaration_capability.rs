@@ -31,6 +31,7 @@ use fln_env::environment::{DeclarationBudget, DeclarationCommitted, Environment}
 use fln_env::pmap::CollisionBudget;
 use fln_kernel::Declaration;
 use fln_kernel::capability::{Admitted, Published, admit};
+use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::Budget;
 
 fn n(s: &str) -> Name {
@@ -57,19 +58,25 @@ fn accepted<'e>(
     decl: Declaration,
 ) -> fln_kernel::capability::CheckedDecl<'e> {
     match admit(env, decl, Budget::DEFAULT) {
-        // The capability is boxed on the `Admitted` enum; unboxing here keeps
-        // every test below reading against `CheckedDecl` itself.
-        Outcome::Complete(Admitted::Accepted(cap)) => *cap,
-        other => panic!(
-            "expected an accepted admission, got {}",
-            match other {
-                Outcome::Complete(Admitted::Rejected { class, .. }) =>
-                    format!("rejected {class:?}"),
-                Outcome::Inconclusive(_) => "inconclusive".to_string(),
-                Outcome::InternalFault(_) => "internal fault".to_string(),
-                Outcome::Complete(Admitted::Accepted(_)) => unreachable!(),
+        // Through the council, because there is no other way (bead `fln-glml`).
+        // `Admitted::Accepted` carries a `Reviewable`, which has no `publish`
+        // and no route to a `CheckedDecl` outside `fln-kernel`; the empty
+        // council is the honest answer for these fixtures and now has to be
+        // SPELLED rather than skipped.
+        Outcome::Complete(admitted) => match convene(&Council::nobody_was_asked(), admitted) {
+            CouncilOutcome::Agreed(checked) => checked,
+            CouncilOutcome::KernelRejected { class, .. } => {
+                panic!("expected an accepted admission, got rejected {class:?}")
             }
-        ),
+            CouncilOutcome::Halted(halt) => {
+                panic!(
+                    "an empty council cannot object, yet it halted: {}",
+                    halt.summary()
+                )
+            }
+        },
+        Outcome::Inconclusive(_) => panic!("expected an accepted admission, got inconclusive"),
+        Outcome::InternalFault(fault) => panic!("admission faulted: {fault:?}"),
     }
 }
 
@@ -204,6 +211,64 @@ fn a_rejected_declaration_yields_no_capability() {
     //   let cap: CheckedDecl = Outcome::InternalFault(f).into();  // no From impl
 }
 
+/// PLANTED VIOLATION — publishing without naming a council does not compile
+/// (bead `fln-glml`).
+///
+/// This one is a compile-fail rather than a runtime test, and that is the
+/// point rather than a shortcut: a funnel enforced by the type system has no
+/// runtime behaviour to assert. There is no value of the bypassing program for
+/// a test to inspect, because the program does not exist.
+///
+/// What the bead found, and what this pins shut: `admit` used to hand back the
+/// `CheckedDecl` itself, so publishing without convening was a matter of simply
+/// not calling `convene` — and the one production publisher in the tree,
+/// `fln_verdict::reflection`, did exactly that. Nothing misbehaved, because an
+/// empty council agrees vacuously; the defect was that "policy decided nobody
+/// was asked" and "nobody thought to ask" were the same program.
+///
+/// Each of the following is refused by the compiler today. The first two were
+/// the actual bypass; the rest are the obvious ways around it.
+///
+/// ```text
+/// let Outcome::Complete(Admitted::Accepted(r)) = admit(&env, decl, budget);
+/// r.publish(..);              // error: no method `publish` on `Reviewable`
+/// let checked: CheckedDecl = r.into_checked();   // error: `into_checked` is
+///                                                // private to fln-kernel
+/// let checked: CheckedDecl = *r;                 // error: cannot dereference
+/// let checked = CheckedDecl { .. };              // error: fields are private
+/// ```
+///
+/// The empty council remains legal and remains vacuous. What it no longer is,
+/// is omissible: `Council::nobody_was_asked()` has to be written down, which is
+/// what makes a later audit of publication sites a `rg` rather than a reading.
+///
+/// The runtime half of the same property — that convening with objections
+/// yields no capability at all — is `tests/consensus_seat.rs`, which is where
+/// the seat's own behaviour is exercised.
+#[test]
+fn publishing_without_naming_a_council_is_not_expressible() {
+    // The positive half, so this test is not purely a comment: the legitimate
+    // route works and is the ONLY route. `accepted()` above goes through
+    // `convene`, because there is no other way to obtain the value it returns.
+    let env = Environment::new();
+    let cap = accepted(&env, axiom("Funnelled", sort1()));
+    match cap.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    ) {
+        Outcome::Complete(Published::Committed(DeclarationCommitted::Published(p))) => {
+            // The NEW environment gained it. `env` is untouched — publication
+            // returns a fresh environment rather than mutating the base, which
+            // is what keeps a capability from being replayed against a base
+            // that moved under it.
+            assert!(p.environment.find(&n("Funnelled")).is_some());
+            assert!(env.find(&n("Funnelled")).is_none());
+        }
+        other => panic!("the only route to publication did not commit: {other:?}"),
+    }
+}
+
 #[test]
 fn an_exhausted_budget_yields_no_capability() {
     // MUTANT `exhaustion`. A budget too small to complete the check must
@@ -302,7 +367,10 @@ fn a_block_declaration_publishes_nothing_through_this_handoff() {
     let quot = Declaration::Quotient(vec![]);
     // If the empty quotient block is not accepted the refusal is upstream and
     // equally fine — nothing was published either way.
-    if let Outcome::Complete(Admitted::Accepted(cap)) = admit(&env, quot, Budget::DEFAULT) {
+    let Outcome::Complete(admitted) = admit(&env, quot, Budget::DEFAULT) else {
+        return;
+    };
+    if let CouncilOutcome::Agreed(cap) = convene(&Council::nobody_was_asked(), admitted) {
         match cap.publish(
             DeclarationBudget::default(),
             CollisionBudget::default(),

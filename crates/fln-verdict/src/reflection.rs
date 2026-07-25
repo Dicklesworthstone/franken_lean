@@ -25,9 +25,8 @@ use fln_env::environment::{
 use fln_env::modules::CancellationProbe;
 use fln_env::pmap::CollisionBudget;
 use fln_kernel::Declaration;
-use fln_kernel::capability::{
-    Admitted as KernelAdmitted, Published as KernelPublished, admit as kernel_admit,
-};
+use fln_kernel::capability::{Published as KernelPublished, admit as kernel_admit};
+use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::{Budget as KernelBudget, Consumption as KernelConsumption, RejectClass};
 
 use crate::{
@@ -375,18 +374,45 @@ pub fn publish_reflected_theorem(
         provenance,
     } = artifact;
     let checked = match kernel_admit(environment, Declaration::Thm(theorem), limits.kernel) {
-        Outcome::Complete(KernelAdmitted::Accepted(checked)) => checked,
-        Outcome::Complete(KernelAdmitted::Rejected {
-            class,
-            message,
-            consumption,
-        }) => {
-            return ReflectedTheoremOutcome::Refused(ReflectedTheoremRefusal::Kernel {
+        // NAMES ITS COUNCIL (bead `fln-glml`, cross-crate consequence of a
+        // kernel change; cc_2, coordinated on that bead). This site published
+        // straight off the acceptance and was therefore invisible to the
+        // consensus seat — not misbehaving, since an empty council agrees
+        // vacuously and the outcome is byte-identical, but indistinguishable
+        // from a site that had a policy and skipped it. `Reviewable` no longer
+        // has a `publish`, so the question has to be answered here.
+        //
+        // The answer today is `nobody_was_asked`, and it is the honest one:
+        // §8.3c's sampling/full-closure/paranoid policies need seats, and there
+        // are no in-repo seats to convene. When there are, THIS is the line
+        // that changes, and it is now a line rather than an absence.
+        Outcome::Complete(admitted) => match convene(&Council::nobody_was_asked(), admitted) {
+            CouncilOutcome::Agreed(checked) => checked,
+            CouncilOutcome::KernelRejected {
                 class,
                 message,
                 consumption,
-            });
-        }
+            } => {
+                return ReflectedTheoremOutcome::Refused(ReflectedTheoremRefusal::Kernel {
+                    class,
+                    message,
+                    consumption,
+                });
+            }
+            // Unreachable with an empty council — it has no seat that could
+            // object — so reaching it means OUR accounting broke, which is an
+            // internal fault and never a verdict about the theorem (FL-INV-07).
+            // Typed rather than `unreachable!`: a panic here would be the same
+            // event with less information.
+            CouncilOutcome::Halted(halt) => {
+                return ReflectedTheoremOutcome::InternalFault(
+                    ReflectedTheoremInternalFault::Admission(InternalFault::new(
+                        "FL-INV-07",
+                        format!("an empty council halted publication: {}", halt.summary()),
+                    )),
+                );
+            }
+        },
         Outcome::Inconclusive(inconclusive) => {
             return ReflectedTheoremOutcome::Inconclusive(ReflectedTheoremInconclusive::Kernel(
                 inconclusive,

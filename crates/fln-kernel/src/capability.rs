@@ -81,24 +81,77 @@ pub struct CheckedDecl<'env> {
     _seal: Seal,
 }
 
-/// What [`admit`] concluded. The accepted arm is the only inhabitant of the
-/// capability type.
+/// A kernel acceptance that has not yet been put to a council (bead
+/// `fln-glml`).
 ///
-/// The capability is **boxed**, which is not decoration. [`CheckedDecl`] began
-/// carrying the calibrated [`crate::Budget`] it was checked under (bead
+/// # Why the acceptance and the publication right are different values
+///
+/// [`admit`] used to hand back the [`CheckedDecl`] itself, and publishing
+/// without convening a council was then a matter of simply not calling
+/// [`convene`](crate::council::convene). That is not hypothetical: the one
+/// production publisher in the tree, `fln_verdict::reflection`, did exactly
+/// that — obtained the capability and published, with no `Council` anywhere in
+/// the file. Nothing was misbehaving, because an empty council agrees
+/// vacuously and the outcome was identical. The defect was that **"policy
+/// decided nobody was asked" and "nobody thought to ask" were the same
+/// program**.
+///
+/// `fln-uc44` spelled [`Council::nobody_was_asked`](crate::council::Council::nobody_was_asked)
+/// so the empty case would be visible at the call site. It made that visibility
+/// *available*; this type makes it *required*. The empty council stays legal and
+/// stays vacuous — what changes is that a publication site can no longer omit
+/// the question.
+///
+/// # What it deliberately exposes, and what it does not
+///
+/// The reporting accessors are here because a caller that must decide *which*
+/// council to convene needs to know what it is convening about. What is not
+/// here is any route to the capability: [`CheckedDecl`] leaves this type only
+/// through `convene`, in the same crate, via a `pub(crate)` move.
+///
+/// Boxed, which is not decoration. [`CheckedDecl`] began carrying the
+/// calibrated [`crate::Budget`] it was checked under (bead
 /// `franken_lean-4o3n`), which took the accepted arm far past the rejected one
-/// and made every `Admitted` value pay that width. It is boxed rather than
+/// and made every [`Admitted`] value pay that width. It is boxed rather than
 /// `#[allow]`ed because FLN-STRUCT-030 admits no `allow` attribute inside
 /// `fln-kernel`: the reviewed builtin inventory is `cfg`, `derive`, `forbid`
-/// and `test`, so silencing a lint here is not an option the kernel has. That
-/// is the constraint working — a lint about a TCB type has to be answered, not
-/// annotated.
+/// and `test`, so silencing a lint here is not an option the kernel has.
+pub struct Reviewable<'env> {
+    checked: Box<CheckedDecl<'env>>,
+}
+
+impl<'env> Reviewable<'env> {
+    /// The name the kernel accepted, for choosing a council and for the record.
+    pub fn name(&self) -> Option<&Name> {
+        self.checked.name()
+    }
+
+    /// What the accepting check cost.
+    pub fn consumption(&self) -> Consumption {
+        self.checked.consumption()
+    }
+
+    /// The bound the accepting check ran under, carrying its calibration — what
+    /// a council's seats must be established comparable against (bead
+    /// `franken_lean-4o3n`).
+    pub fn budget(&self) -> crate::Budget {
+        self.checked.budget()
+    }
+
+    /// The one exit, and it is `pub(crate)`: only
+    /// [`convene`](crate::council::convene) can turn a reviewed acceptance into
+    /// a publication right.
+    pub(crate) fn into_checked(self) -> CheckedDecl<'env> {
+        *self.checked
+    }
+}
+
+/// What [`admit`] concluded.
 ///
-/// Boxing costs nothing the capability cared about: it is still not `Clone`,
-/// still not constructible outside this crate, and `publish` still consumes it
-/// by value, because a `Box<T>` method taking `self` moves out of the box.
+/// The accepted arm carries a [`Reviewable`], **not** a publication right: see
+/// that type for why the two are different values.
 pub enum Admitted<'env> {
-    Accepted(Box<CheckedDecl<'env>>),
+    Accepted(Reviewable<'env>),
     Rejected {
         class: RejectClass,
         message: String,
@@ -132,13 +185,15 @@ pub fn admit<'env>(
 ) -> Outcome<Admitted<'env>> {
     match check(base, &decl, budget) {
         Outcome::Complete(Verdict::Accepted { consumption }) => {
-            Outcome::complete(Admitted::Accepted(Box::new(CheckedDecl {
-                base,
-                decl,
-                consumption,
-                budget,
-                _seal: Seal,
-            })))
+            Outcome::complete(Admitted::Accepted(Reviewable {
+                checked: Box::new(CheckedDecl {
+                    base,
+                    decl,
+                    consumption,
+                    budget,
+                    _seal: Seal,
+                }),
+            }))
         }
         Outcome::Complete(Verdict::Rejected {
             class,

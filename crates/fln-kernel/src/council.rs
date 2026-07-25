@@ -441,18 +441,22 @@ pub fn convene<'env>(council: &Council, admitted: Admitted<'env>) -> CouncilOutc
             message,
             consumption,
         },
-        Admitted::Accepted(checked) => {
+        Admitted::Accepted(reviewable) => {
             let objections = council.objections();
             if objections.is_empty() {
-                CouncilOutcome::Agreed(*checked)
+                // The one place a `Reviewable` becomes a publication right
+                // (bead `fln-glml`). Unanimity includes the vacuous unanimity
+                // of an empty council — which is legal, and which the call site
+                // now had to spell.
+                CouncilOutcome::Agreed(reviewable.into_checked())
             } else {
                 // Read the kernel's bound BEFORE the drop: the halt has to
                 // record what the seats were being compared against, and after
                 // this line the capability — and everything it knows — is gone.
-                let kernel_budget = checked.budget();
-                // `checked` is not returned and not stored: dropping it here is
-                // the halt. Nothing downstream can reconstruct it.
-                drop(checked);
+                let kernel_budget = reviewable.budget();
+                // `reviewable` is not returned and not stored: dropping it here
+                // is the halt, and it never became a `CheckedDecl` at all.
+                drop(reviewable);
                 CouncilOutcome::Halted(Halt {
                     kernel_accepted: true,
                     kernel_budget,
