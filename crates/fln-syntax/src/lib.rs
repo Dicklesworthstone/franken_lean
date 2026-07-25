@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attach;
 pub mod rope;
 pub mod source;
 pub mod view;
