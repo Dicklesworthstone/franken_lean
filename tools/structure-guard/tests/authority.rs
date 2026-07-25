@@ -29,7 +29,9 @@ use std::time::Duration;
 
 use common::*;
 use structure_guard::checks::Authority;
-use structure_guard::{ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_POLICY_FILE};
+use structure_guard::{
+    ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_POLICY_FILE, OLEAN_ILEAN_FORMAT_FILE,
+};
 
 // Finding codes as named constants: a matrix suite reads better when the code under test
 // is named once, and it keeps `f.code == "FLN-..."` string-literal comparisons out of the
@@ -439,11 +441,16 @@ fn feature_profile_and_host_target_axes_are_closed() {
                 "row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le\nrow abi-layout:target:0002 kind=abi-layout support=required target-class=certified abi-class=lp64-le",
             )
             .replace(
+                "row artifact-format:olean:target:0001 kind=artifact-format support=required target-class=certified abi-class=lp64-le",
+                "row artifact-format:olean:target:0001 kind=artifact-format support=required target-class=certified abi-class=lp64-le\nrow artifact-format:olean:target:0002 kind=artifact-format support=required target-class=certified abi-class=lp64-le",
+            )
+            .replace(
                 "row toolchain",
                 "row target:0002 kind=target support=required target-class=certified abi-class=none\nrow toolchain",
             ),
     );
     targets.write(ABI_TARGET_LAYOUT_FILE, &abi_target_layout_fixture(2));
+    targets.write(OLEAN_ILEAN_FORMAT_FILE, &olean_ilean_format_fixture(2));
     let targets_out = targets.run();
     assert!(
         targets_out.findings.is_empty(),

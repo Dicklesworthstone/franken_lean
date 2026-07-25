@@ -1,16 +1,18 @@
 schema fln-contract-inventory-definition/1
 inventory-schema fln-contract-inventory/1
 policy-schema fln-contract-inventory-policy/1
-source-authority SUITE.lock,contracts/ABI_TARGET_LAYOUT.txt
+source-authority SUITE.lock,contracts/ABI_TARGET_LAYOUT.txt,contracts/OLEAN_ILEAN_FORMAT.txt
 extractor suite-lock version=1
 extractor lean-h-clang-layout version=1
+extractor lean-format-source-and-pin-artifacts version=1
 hash fnv1a64-noncryptographic domain=required fields=u64le-length-prefixed
 row-fields key,kind,extractor,extractor-version,source,target-class,abi-class,raw-evidence-hash,identity,authority,support
-root-fields schema,suite-lock,abi-target-layout,raw,policy,reference,canonical
+root-fields schema,suite-lock,abi-target-layout,olean-ilean-format,raw,policy,reference,canonical
 row-order canonical-key-byte-order
 pin-values forbidden-outside-source-authority
 policy-join exact-bijection
 authority-states observed
 publication candidate=contracts/PIN_TARGET_INVENTORY.txt.candidate commit=atomic-rename recovery=explicit-promotion
 source-publication contracts/ABI_TARGET_LAYOUT.txt candidate=contracts/ABI_TARGET_LAYOUT.txt.candidate commit=atomic-rename
+source-publication contracts/OLEAN_ILEAN_FORMAT.txt candidate=contracts/OLEAN_ILEAN_FORMAT.txt.candidate commit=atomic-rename
 limits source-bytes=1048576 rows=4096 line-bytes=8192

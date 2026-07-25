@@ -61,6 +61,10 @@ pub const CONTRACT_INVENTORY_POLICY_FILE: &str = "ci/PIN_TARGET_POLICY.txt";
 pub const ABI_TARGET_LAYOUT_FILE: &str = "contracts/ABI_TARGET_LAYOUT.txt";
 /// Interrupted ABI-layout publication. Its presence makes layout authority inconclusive.
 pub const ABI_TARGET_LAYOUT_CANDIDATE_FILE: &str = "contracts/ABI_TARGET_LAYOUT.txt.candidate";
+/// Exact OLEAN/ILEAN facts mechanically extracted from pinned source and artifacts.
+pub const OLEAN_ILEAN_FORMAT_FILE: &str = "contracts/OLEAN_ILEAN_FORMAT.txt";
+/// Interrupted exact-format publication. Presence makes format authority inconclusive.
+pub const OLEAN_ILEAN_FORMAT_CANDIDATE_FILE: &str = "contracts/OLEAN_ILEAN_FORMAT.txt.candidate";
 /// Workspace-relative path of the atomically published derived pin/target inventory.
 pub const CONTRACT_INVENTORY_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt";
 /// Interrupted-publication sibling. Its presence makes inventory authority inconclusive.

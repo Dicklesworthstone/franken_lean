@@ -24,7 +24,7 @@ use structure_guard::checks::{self, RunOutcome};
 use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
 use structure_guard::{
     ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
-    CONTRACT_INVENTORY_SCHEMA_FILE, SUITE_LOCK_FILE,
+    CONTRACT_INVENTORY_SCHEMA_FILE, OLEAN_ILEAN_FORMAT_FILE, SUITE_LOCK_FILE,
 };
 
 /// An immutable workspace recipe. Every execution materializes a fresh, uniquely named
@@ -82,20 +82,39 @@ impl TempWs {
 
         let mut files = self.files.borrow().clone();
         if !files.contains_key(CONTRACT_INVENTORY_FILE)
-            && let (Some(suite_lock), Some(schema), Some(policy), Some(abi_target_layout)) = (
+            && let (
+                Some(suite_lock),
+                Some(schema),
+                Some(policy),
+                Some(abi_target_layout),
+                Some(olean_ilean_format),
+            ) = (
                 files.get(SUITE_LOCK_FILE),
                 files.get(CONTRACT_INVENTORY_SCHEMA_FILE),
                 files.get(CONTRACT_INVENTORY_POLICY_FILE),
                 files.get(ABI_TARGET_LAYOUT_FILE),
+                files.get(OLEAN_ILEAN_FORMAT_FILE),
             )
-            && let (Ok(suite_lock), Ok(schema), Ok(policy), Ok(abi_target_layout)) = (
+            && let (
+                Ok(suite_lock),
+                Ok(schema),
+                Ok(policy),
+                Ok(abi_target_layout),
+                Ok(olean_ilean_format),
+            ) = (
                 std::str::from_utf8(suite_lock),
                 std::str::from_utf8(schema),
                 std::str::from_utf8(policy),
                 std::str::from_utf8(abi_target_layout),
+                std::str::from_utf8(olean_ilean_format),
             )
-            && let Ok(inventory) =
-                canonical_inventory_text(suite_lock, schema, policy, abi_target_layout)
+            && let Ok(inventory) = canonical_inventory_text(
+                suite_lock,
+                schema,
+                policy,
+                abi_target_layout,
+                olean_ilean_format,
+            )
         {
             files.insert(CONTRACT_INVENTORY_FILE.to_string(), inventory.into_bytes());
         }
@@ -191,6 +210,8 @@ corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665
 pub const CONTRACT_INVENTORY_POLICY_FIXTURE: &str = "\
 schema fln-contract-inventory-policy/1
 row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le
+row artifact-format:ilean kind=artifact-format support=required target-class=none abi-class=none
+row artifact-format:olean:target:0001 kind=artifact-format support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=required target-class=none abi-class=none
@@ -200,6 +221,8 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
 
 pub const ABI_TARGET_LAYOUT_FIXTURE: &str =
     include_str!("../../../../contracts/ABI_TARGET_LAYOUT.txt");
+pub const OLEAN_ILEAN_FORMAT_FIXTURE: &str =
+    include_str!("../../../../contracts/OLEAN_ILEAN_FORMAT.txt");
 
 fn fixture_hash_fields(domain: &str, fields: &[&[u8]]) -> u64 {
     let mut state = 0xcbf2_9ce4_8422_2325_u64;
@@ -245,6 +268,52 @@ pub fn abi_target_layout_fixture(target_count: usize) -> String {
     }
     let root = fixture_hash_fields(
         "fln.abi-target-layout.inventory-root/1",
+        &[output.as_bytes()],
+    );
+    output.push_str(&format!("inventory-root fnv1a64:{root:016x}\n"));
+    output
+}
+
+/// Test-only mechanical expansion of the checked-in exact-format observation. Each
+/// synthetic OLEAN target reuses the pinned LP64 little-endian format facts while
+/// receiving its own target identity and recomputed section/inventory roots.
+pub fn olean_ilean_format_fixture(target_count: usize) -> String {
+    assert!(target_count > 0, "fixture needs at least one target");
+    let lines: Vec<_> = OLEAN_ILEAN_FORMAT_FIXTURE.lines().collect();
+    let count_index = lines
+        .iter()
+        .position(|line| line.starts_with("target-count "))
+        .expect("fixture target count");
+    let olean_start = lines
+        .iter()
+        .position(|line| line.starts_with("section olean:target:0001 "))
+        .expect("fixture OLEAN section");
+    let olean_root = lines
+        .iter()
+        .position(|line| line.starts_with("section-root olean:target:0001 "))
+        .expect("fixture OLEAN section root");
+    assert_eq!(
+        olean_root + 1,
+        lines.len() - 1,
+        "one-target fixture must end with its OLEAN root and inventory root"
+    );
+
+    let mut output = format!(
+        "{}\ntarget-count {target_count}\n{}\n",
+        lines[..count_index].join("\n"),
+        lines[count_index + 1..olean_start].join("\n")
+    );
+    let block_template = format!("{}\n", lines[olean_start..olean_root].join("\n"));
+    for index in 1..=target_count {
+        let key = format!("target:{index:04}");
+        let block = block_template.replace("target:0001", &key);
+        output.push_str(&block);
+        let root =
+            fixture_hash_fields("fln.olean-ilean-format.section-root/1", &[block.as_bytes()]);
+        output.push_str(&format!("section-root olean:{key} fnv1a64:{root:016x}\n"));
+    }
+    let root = fixture_hash_fields(
+        "fln.olean-ilean-format.inventory-root/1",
         &[output.as_bytes()],
     );
     output.push_str(&format!("inventory-root fnv1a64:{root:016x}\n"));
@@ -358,6 +427,7 @@ pub fn base(ws: &TempWs) {
         CONTRACT_INVENTORY_POLICY_FIXTURE,
     );
     ws.write(ABI_TARGET_LAYOUT_FILE, ABI_TARGET_LAYOUT_FIXTURE);
+    ws.write(OLEAN_ILEAN_FORMAT_FILE, OLEAN_ILEAN_FORMAT_FIXTURE);
     ws.write("Cargo.lock", &fixture_cargo_lock());
     ws.write("ci/CLOSURE_ALLOWLIST.txt", &fixture_allowlist());
     ws.write("ci/WORKSPACE_GRAPH.txt", BASE_GRAPH);

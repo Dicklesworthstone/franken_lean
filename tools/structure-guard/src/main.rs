@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use structure_guard::contract_inventory::{
     self, ABI_EXTRACTOR_ID, ABI_EXTRACTOR_VERSION, DEFINITION_SCHEMA, EXTRACTOR_ID,
-    EXTRACTOR_VERSION, INVENTORY_SCHEMA, InventoryError, MAX_LINE_BYTES, MAX_ROWS,
-    MAX_SOURCE_BYTES, POLICY_SCHEMA, PublicationReceipt,
+    EXTRACTOR_VERSION, FORMAT_EXTRACTOR_ID, FORMAT_EXTRACTOR_VERSION, INVENTORY_SCHEMA,
+    InventoryError, MAX_LINE_BYTES, MAX_ROWS, MAX_SOURCE_BYTES, POLICY_SCHEMA, PublicationReceipt,
 };
 use structure_guard::{checks, report};
 
@@ -169,16 +169,18 @@ fn render_publication_success(receipt: &PublicationReceipt, duration_ms: u128) -
         snapshot.inventory_root
     );
     format!(
-        "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_inventory_publication\",\"run_id\":\"{}\",\"scenario_id\":\"{PUBLICATION_SCENARIO_ID}\",\"step_id\":\"{}\",\"action\":\"{action}\",\"verdict\":\"pass\",\"exit_code\":0,\"inventory_schema\":\"{INVENTORY_SCHEMA}\",\"definition_schema\":\"{DEFINITION_SCHEMA}\",\"policy_schema\":\"{POLICY_SCHEMA}\",\"extractor_id\":\"{EXTRACTOR_ID}\",\"extractor_version\":\"{EXTRACTOR_VERSION}\",\"abi_extractor_id\":\"{ABI_EXTRACTOR_ID}\",\"abi_extractor_version\":\"{ABI_EXTRACTOR_VERSION}\",\"reference_root\":\"{}\",\"suite_lock_root\":\"{}\",\"abi_target_layout_root\":\"{}\",\"schema_root\":\"{}\",\"target_facts\":{{\"rows\":{},\"certified_rows\":{},\"abi_rows\":{}}},\"raw_root\":\"{}\",\"canonical_root\":\"{}\",\"policy_root\":\"{}\",\"rows_total\":{},\"unresolved_rows\":{},\"resource_facts\":{{\"source_bytes\":{},\"canonical_bytes\":{},\"max_source_bytes\":{MAX_SOURCE_BYTES},\"max_rows\":{MAX_ROWS},\"max_line_bytes\":{MAX_LINE_BYTES}}},\"publication_stage\":\"{}\",\"authority\":\"complete\",\"cleanup\":\"candidate_absent\",\"final_published_root\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+        "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_inventory_publication\",\"run_id\":\"{}\",\"scenario_id\":\"{PUBLICATION_SCENARIO_ID}\",\"step_id\":\"{}\",\"action\":\"{action}\",\"verdict\":\"pass\",\"exit_code\":0,\"inventory_schema\":\"{INVENTORY_SCHEMA}\",\"definition_schema\":\"{DEFINITION_SCHEMA}\",\"policy_schema\":\"{POLICY_SCHEMA}\",\"extractor_id\":\"{EXTRACTOR_ID}\",\"extractor_version\":\"{EXTRACTOR_VERSION}\",\"abi_extractor_id\":\"{ABI_EXTRACTOR_ID}\",\"abi_extractor_version\":\"{ABI_EXTRACTOR_VERSION}\",\"format_extractor_id\":\"{FORMAT_EXTRACTOR_ID}\",\"format_extractor_version\":\"{FORMAT_EXTRACTOR_VERSION}\",\"reference_root\":\"{}\",\"suite_lock_root\":\"{}\",\"abi_target_layout_root\":\"{}\",\"olean_ilean_format_root\":\"{}\",\"schema_root\":\"{}\",\"target_facts\":{{\"rows\":{},\"certified_rows\":{},\"abi_rows\":{},\"format_rows\":{}}},\"raw_root\":\"{}\",\"canonical_root\":\"{}\",\"policy_root\":\"{}\",\"rows_total\":{},\"unresolved_rows\":{},\"resource_facts\":{{\"source_bytes\":{},\"canonical_bytes\":{},\"max_source_bytes\":{MAX_SOURCE_BYTES},\"max_rows\":{MAX_ROWS},\"max_line_bytes\":{MAX_LINE_BYTES}}},\"publication_stage\":\"{}\",\"authority\":\"complete\",\"cleanup\":\"candidate_absent\",\"final_published_root\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         report::json_escape(&run_id),
         success_step_id(action),
         report::json_escape(&snapshot.reference_root),
         report::json_escape(&snapshot.suite_lock_root),
         report::json_escape(&snapshot.abi_target_layout_root),
+        report::json_escape(&snapshot.olean_ilean_format_root),
         report::json_escape(&snapshot.schema_root),
         snapshot.target_row_count,
         snapshot.target_row_count,
         snapshot.abi_row_count,
+        snapshot.format_row_count,
         report::json_escape(&snapshot.raw_root),
         report::json_escape(&snapshot.inventory_root),
         report::json_escape(&snapshot.policy_root),
@@ -201,7 +203,7 @@ fn render_publication_failure(
         error.reason
     );
     format!(
-        "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_inventory_publication\",\"run_id\":\"{}\",\"scenario_id\":\"{PUBLICATION_SCENARIO_ID}\",\"step_id\":\"{}\",\"action\":\"{}\",\"verdict\":\"{}\",\"exit_code\":{},\"inventory_schema\":\"{INVENTORY_SCHEMA}\",\"definition_schema\":\"{DEFINITION_SCHEMA}\",\"policy_schema\":\"{POLICY_SCHEMA}\",\"extractor_id\":\"{EXTRACTOR_ID}\",\"extractor_version\":\"{EXTRACTOR_VERSION}\",\"abi_extractor_id\":\"{ABI_EXTRACTOR_ID}\",\"abi_extractor_version\":\"{ABI_EXTRACTOR_VERSION}\",\"reference_root\":null,\"suite_lock_root\":null,\"abi_target_layout_root\":null,\"schema_root\":null,\"target_facts\":null,\"raw_root\":null,\"canonical_root\":null,\"policy_root\":null,\"rows_total\":null,\"unresolved_rows\":null,\"resource_facts\":{{\"source_bytes\":null,\"canonical_bytes\":null,\"max_source_bytes\":{MAX_SOURCE_BYTES},\"max_rows\":{MAX_ROWS},\"max_line_bytes\":{MAX_LINE_BYTES}}},\"publication_stage\":\"refused-or-failed-before-clean-terminal-receipt\",\"authority\":\"{}\",\"cleanup\":\"not_established\",\"final_published_root\":null,\"reason\":\"{}\",\"path\":\"{}\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+        "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_inventory_publication\",\"run_id\":\"{}\",\"scenario_id\":\"{PUBLICATION_SCENARIO_ID}\",\"step_id\":\"{}\",\"action\":\"{}\",\"verdict\":\"{}\",\"exit_code\":{},\"inventory_schema\":\"{INVENTORY_SCHEMA}\",\"definition_schema\":\"{DEFINITION_SCHEMA}\",\"policy_schema\":\"{POLICY_SCHEMA}\",\"extractor_id\":\"{EXTRACTOR_ID}\",\"extractor_version\":\"{EXTRACTOR_VERSION}\",\"abi_extractor_id\":\"{ABI_EXTRACTOR_ID}\",\"abi_extractor_version\":\"{ABI_EXTRACTOR_VERSION}\",\"format_extractor_id\":\"{FORMAT_EXTRACTOR_ID}\",\"format_extractor_version\":\"{FORMAT_EXTRACTOR_VERSION}\",\"reference_root\":null,\"suite_lock_root\":null,\"abi_target_layout_root\":null,\"olean_ilean_format_root\":null,\"schema_root\":null,\"target_facts\":null,\"raw_root\":null,\"canonical_root\":null,\"policy_root\":null,\"rows_total\":null,\"unresolved_rows\":null,\"resource_facts\":{{\"source_bytes\":null,\"canonical_bytes\":null,\"max_source_bytes\":{MAX_SOURCE_BYTES},\"max_rows\":{MAX_ROWS},\"max_line_bytes\":{MAX_LINE_BYTES}}},\"publication_stage\":\"refused-or-failed-before-clean-terminal-receipt\",\"authority\":\"{}\",\"cleanup\":\"not_established\",\"final_published_root\":null,\"reason\":\"{}\",\"path\":\"{}\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         report::json_escape(&run_id),
         requested_step_id(requested_action),
         requested_action,
@@ -222,15 +224,17 @@ fn render_publication_success_human(receipt: &PublicationReceipt, duration_ms: u
         snapshot.inventory_root
     );
     format!(
-        "structure-guard: contract_inventory_publication run_id={run_id} scenario_id={PUBLICATION_SCENARIO_ID} step_id={} action={action} verdict=pass exit_code=0 inventory_schema={INVENTORY_SCHEMA} definition_schema={DEFINITION_SCHEMA} policy_schema={POLICY_SCHEMA} extractor_id={EXTRACTOR_ID} extractor_version={EXTRACTOR_VERSION} abi_extractor_id={ABI_EXTRACTOR_ID} abi_extractor_version={ABI_EXTRACTOR_VERSION} reference_root={} suite_lock_root={} abi_target_layout_root={} schema_root={} target_rows={} target_certified_rows={} abi_rows={} raw_root={} canonical_root={} policy_root={} rows_total={} unresolved_rows={} source_bytes={} canonical_bytes={} max_source_bytes={MAX_SOURCE_BYTES} max_rows={MAX_ROWS} max_line_bytes={MAX_LINE_BYTES} publication_stage={} authority=complete cleanup=candidate_absent final_published_root={} duration_ms={duration_ms}\n",
+        "structure-guard: contract_inventory_publication run_id={run_id} scenario_id={PUBLICATION_SCENARIO_ID} step_id={} action={action} verdict=pass exit_code=0 inventory_schema={INVENTORY_SCHEMA} definition_schema={DEFINITION_SCHEMA} policy_schema={POLICY_SCHEMA} extractor_id={EXTRACTOR_ID} extractor_version={EXTRACTOR_VERSION} abi_extractor_id={ABI_EXTRACTOR_ID} abi_extractor_version={ABI_EXTRACTOR_VERSION} format_extractor_id={FORMAT_EXTRACTOR_ID} format_extractor_version={FORMAT_EXTRACTOR_VERSION} reference_root={} suite_lock_root={} abi_target_layout_root={} olean_ilean_format_root={} schema_root={} target_rows={} target_certified_rows={} abi_rows={} format_rows={} raw_root={} canonical_root={} policy_root={} rows_total={} unresolved_rows={} source_bytes={} canonical_bytes={} max_source_bytes={MAX_SOURCE_BYTES} max_rows={MAX_ROWS} max_line_bytes={MAX_LINE_BYTES} publication_stage={} authority=complete cleanup=candidate_absent final_published_root={} duration_ms={duration_ms}\n",
         success_step_id(action),
         snapshot.reference_root,
         snapshot.suite_lock_root,
         snapshot.abi_target_layout_root,
+        snapshot.olean_ilean_format_root,
         snapshot.schema_root,
         snapshot.target_row_count,
         snapshot.target_row_count,
         snapshot.abi_row_count,
+        snapshot.format_row_count,
         snapshot.raw_root,
         snapshot.inventory_root,
         snapshot.policy_root,
@@ -253,7 +257,7 @@ fn render_publication_failure_human(
         error.reason
     );
     format!(
-        "structure-guard: contract_inventory_publication run_id={run_id} scenario_id={PUBLICATION_SCENARIO_ID} step_id={} action={requested_action} verdict={} exit_code={} inventory_schema={INVENTORY_SCHEMA} definition_schema={DEFINITION_SCHEMA} policy_schema={POLICY_SCHEMA} extractor_id={EXTRACTOR_ID} extractor_version={EXTRACTOR_VERSION} abi_extractor_id={ABI_EXTRACTOR_ID} abi_extractor_version={ABI_EXTRACTOR_VERSION} reference_root=unavailable suite_lock_root=unavailable abi_target_layout_root=unavailable schema_root=unavailable target_facts=unavailable raw_root=unavailable canonical_root=unavailable policy_root=unavailable rows_total=unavailable unresolved_rows=unavailable source_bytes=unavailable canonical_bytes=unavailable max_source_bytes={MAX_SOURCE_BYTES} max_rows={MAX_ROWS} max_line_bytes={MAX_LINE_BYTES} publication_stage=refused-or-failed-before-clean-terminal-receipt authority={} cleanup=not_established final_published_root=unavailable reason={} path={} detail={} duration_ms={duration_ms}\n",
+        "structure-guard: contract_inventory_publication run_id={run_id} scenario_id={PUBLICATION_SCENARIO_ID} step_id={} action={requested_action} verdict={} exit_code={} inventory_schema={INVENTORY_SCHEMA} definition_schema={DEFINITION_SCHEMA} policy_schema={POLICY_SCHEMA} extractor_id={EXTRACTOR_ID} extractor_version={EXTRACTOR_VERSION} abi_extractor_id={ABI_EXTRACTOR_ID} abi_extractor_version={ABI_EXTRACTOR_VERSION} format_extractor_id={FORMAT_EXTRACTOR_ID} format_extractor_version={FORMAT_EXTRACTOR_VERSION} reference_root=unavailable suite_lock_root=unavailable abi_target_layout_root=unavailable olean_ilean_format_root=unavailable schema_root=unavailable target_facts=unavailable raw_root=unavailable canonical_root=unavailable policy_root=unavailable rows_total=unavailable unresolved_rows=unavailable source_bytes=unavailable canonical_bytes=unavailable max_source_bytes={MAX_SOURCE_BYTES} max_rows={MAX_ROWS} max_line_bytes={MAX_LINE_BYTES} publication_stage=refused-or-failed-before-clean-terminal-receipt authority={} cleanup=not_established final_published_root=unavailable reason={} path={} detail={} duration_ms={duration_ms}\n",
         requested_step_id(requested_action),
         error.class.as_str(),
         error.class.exit_code(),
@@ -497,12 +501,14 @@ mod tests {
                 schema_root: "fnv1a64:0000000000000002".to_string(),
                 suite_lock_root: "fnv1a64:0000000000000003".to_string(),
                 abi_target_layout_root: "fnv1a64:0000000000000007".to_string(),
+                olean_ilean_format_root: "fnv1a64:0000000000000008".to_string(),
                 raw_root: "fnv1a64:0000000000000004".to_string(),
                 policy_root: "fnv1a64:0000000000000005".to_string(),
                 reference_root: "fnv1a64:0000000000000006".to_string(),
-                row_count: 6,
+                row_count: 8,
                 target_row_count: 1,
                 abi_row_count: 1,
+                format_row_count: 2,
                 unresolved_row_count: 0,
                 source_bytes: 300,
                 canonical_bytes: 700,
