@@ -21,10 +21,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+mod bitblast;
 mod checker;
 mod reflection;
 mod solver;
 
+pub use bitblast::{
+    BITBLAST_MANIFEST, BITBLAST_MANIFEST_ID, BITBLAST_MANIFEST_ROWS, BITBLAST_MANIFEST_VERSION,
+    BitblastArtifact, BitblastConstruct, BitblastDeterminismPolicy, BitblastFacts,
+    BitblastInconclusive, BitblastInputBinding, BitblastInputKind, BitblastInternalFault,
+    BitblastLimits, BitblastManifest, BitblastManifestRow, BitblastOutcome, BitblastRefusal,
+    BitblastResource, BitblastSupport, BitblastSymbol, BoolBinaryOp, BoolExpr, BvBinaryOp,
+    BvComparison, BvExpr, BvShiftOp, BvUnaryOp, CANONICAL_BITBLAST_POLICY,
+    CANONICAL_BITBLAST_POLICY_ID, UnsupportedBvOp, bitblast, bitblast_with_cancel,
+};
 pub use checker::{
     ProofCheckInconclusive, ProofCheckInternalFault, ProofCheckLimits, ProofCheckOutcome,
     ProofCheckReceipt, ProofCheckResource, ProofOpcodeClass, ProofRefusal, ProofStream,
