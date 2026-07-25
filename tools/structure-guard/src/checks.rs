@@ -1241,10 +1241,7 @@ fn python_imports(text: &str) -> BTreeSet<String> {
             if name.is_empty() || name == "import" || name.starts_with('_') {
                 continue;
             }
-            if name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 modules.insert(name.to_string());
             }
         }
@@ -2176,13 +2173,16 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         // that tracks the outstanding sites. An unenforced rule is survivable; an
         // unenforced rule nobody can see is the defect.
         let root_rel = format!("{}/src/lib.rs", c.rel);
-        if let Some(root_text) = read_governed(&c.dir.join("src/lib.rs"), &root_rel, &mut findings) {
+        if let Some(root_text) = read_governed(&c.dir.join("src/lib.rs"), &root_rel, &mut findings)
+        {
             let enforced = root_text.lines().any(|line| {
                 let t = line.trim();
                 (t.starts_with("#![deny(") || t.starts_with("#![forbid("))
                     && t.contains("clippy::undocumented_unsafe_blocks")
             });
-            let waived = root_text.lines().any(|line| safety_note_waiver(line).is_some());
+            let waived = root_text
+                .lines()
+                .any(|line| safety_note_waiver(line).is_some());
             if !enforced && !waived {
                 findings.push(Finding {
                     code: "FLN-STRUCT-040",

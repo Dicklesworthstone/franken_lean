@@ -1498,3 +1498,117 @@ fn admission_dependent(ws: &TempWs) {
         &graph_with_edges(&["fln-kernel -> fln-env"]),
     );
 }
+
+// ---------------------------------------------------------------------------
+// FLN-STRUCT-041 — Python import shadowing of the trusted evidence bootstrap
+// (bead `franken_lean-h40t`)
+// ---------------------------------------------------------------------------
+
+/// THE PLANTED VIOLATION. `scripts/evidence.py` computes the governed tree
+/// hashes and decides the verdicts every gate depends on, and Python resolves
+/// the running script's OWN DIRECTORY before the standard library. So a file
+/// named `scripts/hashlib.py` replaces the module that computes the digests.
+///
+/// This was invisible until the rule existed: `GOVERNED_ROOT_DIRS` is `ci`,
+/// `contracts`, `crates`, `tools`, so `scripts/` was outside the guard's
+/// universe entirely and nothing in `checks.rs` had ever looked at a `.py`.
+///
+/// The sibling defect was PROVEN live on the CI surface under `fln-8mj`: with a
+/// shadow module on the path, `tomllib.loads("")` returned
+/// `{"toolchain": {"channel": "attacker-chosen-toolchain"}}`.
+#[test]
+fn a_python_module_shadowing_a_trusted_import_is_refused() {
+    let ws = TempWs::new("python-shadow");
+    base(&ws);
+    ws.write("scripts/evidence.py", "import hashlib\nimport json\n");
+    ws.write("scripts/hashlib.py", "def sha256(*_a, **_k):\n    pass\n");
+    let out = ws.run();
+    assert!(
+        codes(&out).contains(&"FLN-STRUCT-041"),
+        "a module shadowing a trusted import must be refused: {:?}",
+        out.findings
+    );
+    assert!(
+        out.findings
+            .iter()
+            .any(|f| f.code == "FLN-STRUCT-041" && f.path.contains("scripts/hashlib.py")),
+        "the finding must name the shadowing file: {:?}",
+        out.findings
+    );
+}
+
+/// THE DISCRIMINATION TEST, and the reason the shadowable set is DERIVED rather
+/// than hand-listed. `scripts/helper.py` is not a module the bootstrap imports,
+/// so it shadows nothing and must not be refused. A rule that flagged every
+/// `.py` beside the runner would be refusing the runner's own toolbox, and the
+/// first person it inconvenienced would widen it to nothing.
+#[test]
+fn a_python_module_that_shadows_nothing_is_not_a_violation() {
+    let ws = TempWs::new("python-innocent");
+    base(&ws);
+    ws.write("scripts/evidence.py", "import hashlib\n");
+    ws.write("scripts/helper.py", "VALUE = 1\n");
+    let out = ws.run();
+    assert!(
+        !codes(&out).contains(&"FLN-STRUCT-041"),
+        "a module that shadows no trusted import must be accepted: {:?}",
+        out.findings
+    );
+}
+
+/// THE SET TRACKS THE IMPORTS. The same shadow file becomes a violation the
+/// moment the bootstrap starts importing that name — which is exactly what a
+/// hand-written list of dangerous names would have missed, silently, while the
+/// surface grew. FLN-STRUCT-039 made the same choice for the same reason.
+#[test]
+fn the_shadowable_set_follows_what_the_bootstrap_actually_imports() {
+    let ws = TempWs::new("python-derived-set");
+    base(&ws);
+    ws.write("scripts/evidence.py", "import json\n");
+    ws.write("scripts/tomllib.py", "def loads(*_a, **_k):\n    pass\n");
+    assert!(
+        !codes(&ws.run()).contains(&"FLN-STRUCT-041"),
+        "tomllib is not imported yet, so nothing is shadowed"
+    );
+
+    let ws = TempWs::new("python-derived-set-grown");
+    base(&ws);
+    ws.write("scripts/evidence.py", "import json\nimport tomllib\n");
+    ws.write("scripts/tomllib.py", "def loads(*_a, **_k):\n    pass\n");
+    assert!(
+        codes(&ws.run()).contains(&"FLN-STRUCT-041"),
+        "once the bootstrap imports tomllib, the same file shadows it"
+    );
+}
+
+/// THE CWD VECTOR. Inline `python3 -c` helpers in the shell lanes resolve from
+/// the process working directory, so a module at the repository ROOT shadows
+/// for them even though no trusted script lives beside it.
+#[test]
+fn a_repository_root_module_shadowing_a_trusted_import_is_refused() {
+    let ws = TempWs::new("python-shadow-root");
+    base(&ws);
+    ws.write("scripts/evidence.py", "import hashlib\n");
+    ws.write("hashlib.py", "def sha256(*_a, **_k):\n    pass\n");
+    let out = ws.run();
+    assert!(
+        out.findings
+            .iter()
+            .any(|f| f.code == "FLN-STRUCT-041" && f.path == "hashlib.py"),
+        "the cwd vector must be refused at the repository root: {:?}",
+        out.findings
+    );
+}
+
+/// THE BASELINE. Without it the four plants above could all be passing because
+/// the rule refuses everything.
+#[test]
+fn the_python_shadow_baseline_is_clean() {
+    let ws = TempWs::new("python-shadow-clean");
+    base(&ws);
+    ws.write("scripts/evidence.py", "import hashlib\nimport json\n");
+    assert!(
+        !codes(&ws.run()).contains(&"FLN-STRUCT-041"),
+        "a bootstrap with no shadow beside it must scan clean"
+    );
+}
