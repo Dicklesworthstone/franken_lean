@@ -1648,6 +1648,14 @@ mod propagation_conflict_property {
     use super::cdcl_state_model::{clause, cnf};
     use super::*;
 
+    const CAMPAIGN_SEEDS: [u64; 4] = [
+        0x8c67_4f3a_2d91_b5e7,
+        0x39a4_71d8_e2c6_0b5f,
+        0xd14f_02a9_6c83_7be5,
+        0x52be_c701_94ad_f638,
+    ];
+    const CASES_PER_SEED: u64 = 256;
+
     fn brute_force(formula: &Cnf) -> bool {
         let variables = formula.variable_count();
         assert!(variables <= 12);
@@ -1669,64 +1677,124 @@ mod propagation_conflict_property {
         false
     }
 
+    fn corrupt_conclusion_id(proof_bytes: &[u8]) -> Vec<u8> {
+        let mut corrupted = proof_bytes.to_vec();
+        let conclusion_id = corrupted
+            .len()
+            .checked_sub(8)
+            .expect("canonical proof has a conclusion clause id");
+        corrupted[conclusion_id..].fill(0);
+        corrupted
+    }
+
     #[test]
-    fn seeded_small_formulas_agree_with_exhaustive_truth_tables() {
-        let mut seed = 0x8c67_4f3a_2d91_b5e7_u64;
-        for round in 0..192_u64 {
-            let variables = (round % 5 + 1) as u32;
-            let row_count = (round % 10 + 1) as usize;
-            let mut rows = Vec::new();
-            for _ in 0..row_count {
-                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                let width = ((seed >> 32) % 3 + 1) as usize;
-                let mut selected = BTreeSet::new();
-                while selected.len() < width.min(variables as usize) {
-                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                    selected.insert((seed >> 32) as u32 % variables + 1);
+    fn seeded_solver_checker_campaign_accepts_every_artifact_and_refuses_every_mutation() {
+        let mut sat_cases = 0_u64;
+        let mut unsat_cases = 0_u64;
+        let mut refused_mutations = 0_u64;
+
+        for (seed_index, initial_seed) in CAMPAIGN_SEEDS.into_iter().enumerate() {
+            let mut state = initial_seed;
+            for round in 0..CASES_PER_SEED {
+                let variables = (round % 5 + 1) as u32;
+                let row_count = (round % 10 + 1) as usize;
+                let mut rows = Vec::new();
+                for _ in 0..row_count {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    let width = ((state >> 32) % 3 + 1) as usize;
+                    let mut selected = BTreeSet::new();
+                    while selected.len() < width.min(variables as usize) {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1);
+                        selected.insert((state >> 32) as u32 % variables + 1);
+                    }
+                    let mut literals = Vec::new();
+                    for variable in selected {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1);
+                        let signed = if state & 1 == 0 {
+                            i64::from(variable)
+                        } else {
+                            -i64::from(variable)
+                        };
+                        literals.push(signed);
+                    }
+                    rows.push(clause(&literals));
                 }
-                let mut literals = Vec::new();
-                for variable in selected {
-                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                    let signed = if seed & 1 == 0 {
-                        i64::from(variable)
-                    } else {
-                        -i64::from(variable)
-                    };
-                    literals.push(signed);
+                let formula = Cnf::new(
+                    variables,
+                    rows.into_iter()
+                        .enumerate()
+                        .map(|(index, row)| {
+                            InputClause::new(
+                                ClauseId::new(index as u64 + 1).expect("campaign id"),
+                                row,
+                            )
+                        })
+                        .collect(),
+                    SchemaLimits::default(),
+                )
+                .expect("campaign CNF");
+                let expected_sat = brute_force(&formula);
+                match solve(&formula, SolverLimits::default()) {
+                    SolverOutcome::Sat { artifact, .. } => {
+                        sat_cases += 1;
+                        assert!(
+                            expected_sat,
+                            "seed {seed_index} round {round} produced false SAT"
+                        );
+                        assert_eq!(artifact.cnf_bytes(), formula.to_canonical_bytes());
+                        let independently_decoded = SatModel::from_canonical_bytes(
+                            artifact.model_bytes(),
+                            SchemaLimits::default(),
+                        )
+                        .expect("checked SAT bytes must decode independently");
+                        assert_eq!(&independently_decoded, artifact.model());
+                        assert_eq!(independently_decoded.satisfies(&formula), Ok(true));
+                    }
+                    SolverOutcome::Unsat { artifact, .. } => {
+                        unsat_cases += 1;
+                        assert!(
+                            !expected_sat,
+                            "seed {seed_index} round {round} produced false UNSAT"
+                        );
+                        assert!(matches!(
+                            crate::check_unsat_streams(
+                                artifact.cnf_bytes(),
+                                artifact.proof_bytes(),
+                                ProofCheckLimits::default()
+                            ),
+                            ProofCheckOutcome::Verified(_)
+                        ));
+
+                        let corrupted = corrupt_conclusion_id(artifact.proof_bytes());
+                        assert!(matches!(
+                            crate::check_unsat_streams(
+                                artifact.cnf_bytes(),
+                                &corrupted[..],
+                                ProofCheckLimits::default()
+                            ),
+                            ProofCheckOutcome::Refused(ProofRefusal::InvalidClauseId { .. })
+                        ));
+                        refused_mutations += 1;
+                    }
+                    other => {
+                        panic!("seed {seed_index} round {round} produced non-verdict {other:?}")
+                    }
                 }
-                rows.push(clause(&literals));
-            }
-            let formula = Cnf::new(
-                variables,
-                rows.into_iter()
-                    .enumerate()
-                    .map(|(index, row)| {
-                        InputClause::new(ClauseId::new(index as u64 + 1).expect("property id"), row)
-                    })
-                    .collect(),
-                SchemaLimits::default(),
-            )
-            .expect("property CNF");
-            let expected_sat = brute_force(&formula);
-            match solve(&formula, SolverLimits::default()) {
-                SolverOutcome::Sat { artifact, .. } => {
-                    assert!(expected_sat, "round {round} false SAT");
-                    assert_eq!(artifact.model().satisfies(&formula), Ok(true));
-                }
-                SolverOutcome::Unsat { artifact, .. } => {
-                    assert!(!expected_sat, "round {round} false UNSAT");
-                    assert!(matches!(
-                        crate::check_unsat_streams(
-                            artifact.cnf_bytes(),
-                            artifact.proof_bytes(),
-                            ProofCheckLimits::default()
-                        ),
-                        ProofCheckOutcome::Verified(_)
-                    ));
-                }
-                other => panic!("round {round} produced non-verdict {other:?}"),
             }
         }
+
+        assert!(sat_cases > 0, "campaign must exercise checked SAT");
+        assert!(unsat_cases > 0, "campaign must exercise checked UNSAT");
+        assert_eq!(
+            refused_mutations, unsat_cases,
+            "every emitted proof must have a refused mutation"
+        );
 
         let unit_chain = cnf(4, &[&[1], &[-1, 2], &[-2, 3], &[-3, 4], &[-4]]);
         assert!(matches!(
