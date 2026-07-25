@@ -5928,6 +5928,377 @@ fn permuted_block(arr_first: bool) -> (Vec<InductiveVal>, Vec<ConstructorVal>, V
 /// not trip it. Measured cost at the time of pinning: 151 steps.
 const CASCADE_STEP_CAP: u64 = 300;
 
+// ---------------------------------------------------------------------------
+// KR-608 property lane (bead franken_lean-8ce). The fixtures above prove the
+// shapes I thought of. This proves the ones I did not: random nested shapes,
+// each checked against an INDEPENDENT model of the pin's discovery rule —
+// occurrences are the applications whose parameter mentions a block type, each
+// copy exposes its family's constructor fields instantiated at the occurrence,
+// and the worklist closes over what those expose, deduplicated.
+//
+// Deterministic and replayable: fixed seeds, a dependency-free SplitMix64, and
+// every failure prints the seed, the trial, the rendered constructor and the
+// exact permutation, so a red run reproduces without re-rolling.
+// ---------------------------------------------------------------------------
+
+/// SplitMix64 — the test apparatus obeys D1 too, so the generator is ours.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+/// The parameterized families the fixture environment declares.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Family {
+    List,
+    Arr,
+}
+
+impl Family {
+    fn name(self) -> Name {
+        match self {
+            Family::List => n("MyList"),
+            Family::Arr => n("MyArr"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Family::List => "MyList",
+            Family::Arr => "MyArr",
+        }
+    }
+
+    /// What a copy of this family exposes: its constructors' field types,
+    /// written over the family's own parameter. This is the model's only
+    /// knowledge of the environment, and it mirrors the rows `mylist_rows`
+    /// and `myarr_rows` declare — `MyList.cons : α → MyList α → MyList α`
+    /// (`MyList.nil` has no fields) and `MyArr.mk : MyList α → MyArr α`.
+    fn field_shapes(self) -> Vec<ParamShape> {
+        match self {
+            Family::List => vec![
+                ParamShape::Param,
+                ParamShape::App(Family::List, Box::new(ParamShape::Param)),
+            ],
+            Family::Arr => vec![ParamShape::App(Family::List, Box::new(ParamShape::Param))],
+        }
+    }
+}
+
+/// A generated field type: `MyTree`, `MyUnit`, or a family applied to another.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Shape {
+    Tree,
+    Unit,
+    App(Family, Box<Shape>),
+}
+
+/// A family's field type, written over its parameter.
+enum ParamShape {
+    Param,
+    App(Family, Box<ParamShape>),
+}
+
+impl Shape {
+    fn render(&self) -> String {
+        match self {
+            Shape::Tree => "MyTree".to_string(),
+            Shape::Unit => "MyUnit".to_string(),
+            Shape::App(f, arg) => format!("({} {})", f.label(), arg.render()),
+        }
+    }
+
+    fn to_expr(&self) -> Expr {
+        match self {
+            Shape::Tree => Expr::const_(n("MyTree"), vec![]),
+            Shape::Unit => Expr::const_(n("MyUnit"), vec![]),
+            Shape::App(f, arg) => Expr::app(Expr::const_(f.name(), vec![]), arg.to_expr()),
+        }
+    }
+
+    fn mentions_tree(&self) -> bool {
+        match self {
+            Shape::Tree => true,
+            Shape::Unit => false,
+            Shape::App(_, arg) => arg.mentions_tree(),
+        }
+    }
+
+    /// The pin's rule: an application is a nested occurrence exactly when one
+    /// of the head's parameters mentions a type of the block being declared.
+    /// The parameter is NOT descended into here — it is carried verbatim into
+    /// the occurrence key and only translated inside the copy, which is what
+    /// makes the worklist necessary.
+    fn occurrence(&self) -> Option<(Family, Shape)> {
+        match self {
+            Shape::App(f, arg) if arg.mentions_tree() => Some((*f, (**arg).clone())),
+            _ => None,
+        }
+    }
+}
+
+fn substitute(shape: &ParamShape, arg: &Shape) -> Shape {
+    match shape {
+        ParamShape::Param => arg.clone(),
+        ParamShape::App(f, inner) => Shape::App(*f, Box::new(substitute(inner, arg))),
+    }
+}
+
+/// The independent model: the deduplicated worklist closure of the auxiliaries
+/// a block with these constructor fields must mint, in creation order.
+fn expected_auxiliaries(fields: &[Shape]) -> Vec<(Family, Shape)> {
+    let mut auxes: Vec<(Family, Shape)> = Vec::new();
+    let push = |auxes: &mut Vec<(Family, Shape)>, occurrence: Option<(Family, Shape)>| {
+        if let Some(occurrence) = occurrence
+            && !auxes.contains(&occurrence)
+        {
+            auxes.push(occurrence);
+        }
+    };
+    for field in fields {
+        push(&mut auxes, field.occurrence());
+    }
+    let mut next = 0;
+    while next < auxes.len() {
+        let (family, arg) = auxes[next].clone();
+        for field_shape in family.field_shapes() {
+            let field = substitute(&field_shape, &arg);
+            push(&mut auxes, field.occurrence());
+        }
+        next += 1;
+    }
+    auxes
+}
+
+/// `MyUnit` — a nullary type, so a generated field can be legitimately
+/// NON-nested and the model is tested on what must not be minted too.
+fn property_env(arr_first: bool) -> Environment {
+    let unit = InductiveVal {
+        base: cval(n("MyUnit"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyUnit")],
+        ctors: vec![nn("MyUnit", "mk")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mk = ConstructorVal {
+        base: cval(
+            nn("MyUnit", "mk"),
+            vec![],
+            Expr::const_(n("MyUnit"), vec![]),
+        ),
+        induct: n("MyUnit"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+    cascade_env(arr_first)
+        .add_decl(ConstantInfo::Induct(unit))
+        .expect("env")
+        .add_decl(ConstantInfo::Ctor(mk))
+        .expect("env")
+}
+
+/// A generated block: `MyTree.node : fields… → MyTree`, declaring no recursors
+/// so the translated type count is observable as a typed rejection.
+fn generated_block(fields: &[Shape], num_nested: u32) -> Declaration {
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let mut ctor_type = tree();
+    for (index, field) in fields.iter().enumerate().rev() {
+        ctor_type = Expr::forall_e(
+            Name::str(Name::anonymous(), format!("f{index}")),
+            field.to_expr(),
+            ctor_type,
+            BinderInfo::Default,
+        );
+    }
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(nn("MyTree", "node"), vec![], ctor_type),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: fields.len() as u32,
+        is_unsafe: false,
+    };
+    block_decl(vec![ind], vec![node], vec![])
+}
+
+fn random_shape(rng: &mut SplitMix64, depth: usize) -> Shape {
+    if depth == 0 {
+        return if rng.below(2) == 0 {
+            Shape::Tree
+        } else {
+            Shape::Unit
+        };
+    }
+    match rng.below(4) {
+        0 => Shape::Tree,
+        1 => Shape::Unit,
+        2 => Shape::App(Family::List, Box::new(random_shape(rng, depth - 1))),
+        _ => Shape::App(Family::Arr, Box::new(random_shape(rng, depth - 1))),
+    }
+}
+
+fn render_fields(fields: &[Shape]) -> String {
+    let rendered: Vec<String> = fields.iter().map(Shape::render).collect();
+    format!("MyTree.node : {} → MyTree", rendered.join(" → "))
+}
+
+/// Fixed seeds; every trial is a fresh random block plus a random permutation
+/// of its fields, checked against both environment declaration orders.
+const PROPERTY_SEEDS: [u64; 4] = [
+    0x0000_0000_0000_002a,
+    0x5eed_0000_dead_beef,
+    0xa5a5_a5a5_5a5a_5a5a,
+    0x0123_4567_89ab_cdef,
+];
+const TRIALS_PER_SEED: usize = 120;
+
+#[test]
+fn kr608_random_nested_shapes_agree_with_the_independent_model() {
+    // Coverage counters. A property lane that generates only trivial shapes
+    // passes while proving nothing, so the corpus has to justify itself: the
+    // floors below are asserted after the loop.
+    let mut cascading = 0usize;
+    let mut multi_aux = 0usize;
+    let mut deepest = 0usize;
+    for seed in PROPERTY_SEEDS {
+        let mut rng = SplitMix64(seed);
+        for trial in 0..TRIALS_PER_SEED {
+            // Generate until the block actually nests: a block with no nested
+            // occurrence takes the ordinary path, which this lane is not about.
+            let (fields, auxes) = loop {
+                let count = 1 + rng.below(4);
+                let fields: Vec<Shape> = (0..count)
+                    .map(|_| {
+                        let depth = 1 + rng.below(3);
+                        random_shape(&mut rng, depth)
+                    })
+                    .collect();
+                let auxes = expected_auxiliaries(&fields);
+                if !auxes.is_empty() {
+                    break (fields, auxes);
+                }
+            };
+            // A random permutation of the fields (Fisher-Yates, same stream).
+            let mut permutation: Vec<usize> = (0..fields.len()).collect();
+            for i in (1..permutation.len()).rev() {
+                permutation.swap(i, rng.below(i + 1));
+            }
+            let permuted: Vec<Shape> = permutation.iter().map(|&i| fields[i].clone()).collect();
+            // The auxiliary SET is permutation-invariant, so both orders must
+            // report the same translated type count — only the order differs.
+            let permuted_auxes = expected_auxiliaries(&permuted);
+            assert_eq!(
+                auxes.len(),
+                permuted_auxes.len(),
+                "seed {seed:#x} trial {trial}: the model's own auxiliary count \
+                 moved under permutation {permutation:?}\n  original: {}\n  permuted: {}",
+                render_fields(&fields),
+                render_fields(&permuted)
+            );
+            // An auxiliary the fields do not name directly was discovered
+            // inside another copy — the cascade this bead exists for.
+            let direct = fields.iter().filter_map(Shape::occurrence).fold(
+                Vec::new(),
+                |mut seen: Vec<(Family, Shape)>, occurrence| {
+                    if !seen.contains(&occurrence) {
+                        seen.push(occurrence);
+                    }
+                    seen
+                },
+            );
+            if auxes.len() > direct.len() {
+                cascading += 1;
+            }
+            if auxes.len() >= 2 {
+                multi_aux += 1;
+            }
+            deepest = deepest.max(auxes.len());
+            let expected = format!(
+                "block declares 0 recursors, expected {} (main + auxiliary)",
+                1 + auxes.len()
+            );
+            for (label, order) in [("declared", &fields), ("permuted", &permuted)] {
+                for arr_first in [true, false] {
+                    let verdict = check(
+                        &property_env(arr_first),
+                        &generated_block(order, auxes.len() as u32),
+                        Budget::DEFAULT,
+                    );
+                    let context = format!(
+                        "seed {seed:#x} trial {trial} [{label} order, env arr_first={arr_first}]\n  \
+                         permutation: {permutation:?}\n  block: {}\n  model auxiliaries: {}",
+                        render_fields(order),
+                        auxes
+                            .iter()
+                            .map(|(f, arg)| format!("{} {}", f.label(), arg.render()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    match &verdict {
+                        Verdict::Rejected { class, message, .. } => {
+                            assert_eq!(
+                                *class,
+                                RejectClass::BlockMismatch,
+                                "{context}\n  expected a block-mismatch rejection, got {class:?}: {message}"
+                            );
+                            assert!(
+                                message.contains(&expected),
+                                "{context}\n  expected: {expected}\n  actual:   {message}"
+                            );
+                        }
+                        other => panic!(
+                            "{context}\n  expected the recursor-count rejection, got {other:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    let trials = PROPERTY_SEEDS.len() * TRIALS_PER_SEED;
+    assert!(
+        cascading * 10 >= trials,
+        "corpus is too shallow: only {cascading}/{trials} trials needed the \
+         worklist to reach an auxiliary no field names directly"
+    );
+    assert!(
+        multi_aux * 4 >= trials,
+        "corpus is too shallow: only {multi_aux}/{trials} trials minted two or \
+         more auxiliaries"
+    );
+    assert!(
+        deepest >= 3,
+        "corpus never reached a three-auxiliary block (deepest was {deepest})"
+    );
+}
+
 #[test]
 fn kr608_same_head_at_two_instantiations_mints_distinct_auxiliaries() {
     // MUTANT ("altered auxiliary names"): the minted names carry a per-copy
