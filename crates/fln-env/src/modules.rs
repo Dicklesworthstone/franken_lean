@@ -259,6 +259,24 @@ pub enum ModuleGraphResource {
     PayloadBytes,
 }
 
+/// Whether a plan claims a genuinely fallible pre-publication reservation.
+///
+/// A three-state fact rather than a boolean, because "we reserved nothing" and "there is
+/// nothing here that *can* be reserved" are different claims and a consumer must be able
+/// to tell them apart. See [`ModuleGraphAdmissionPlan::reservation`] for why this layer
+/// reports `Unsupported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationClaim {
+    /// Capacity was reserved through a demonstrably fallible call before publication, so
+    /// the final phase uses reserved storage and cannot fail for want of memory.
+    Reserved { units: usize },
+    /// No reservation was needed: the publication allocates nothing input-sized.
+    NotRequired,
+    /// A reservation is not expressible here, with the reason. **Not** a promise that
+    /// publication cannot fail — a promise that no such promise is being made.
+    Unsupported { reason: &'static str },
+}
+
 /// Exact dimensions reported when the same module identity is re-registered
 /// with a non-identical record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -761,6 +779,32 @@ pub struct ModuleGraphAdmissionPlan {
 impl ModuleGraphAdmissionPlan {
     /// Schema version of the plan itself.
     pub const VERSION: u16 = 1;
+
+    /// Whether this plan claims a genuinely fallible pre-publication reservation.
+    ///
+    /// **Always [`ReservationClaim::Unsupported`] at this layer, and that is a reported
+    /// fact rather than an omission.** `franken_lean-6sf3`'s acceptance asks for
+    /// reservations performed *where supported*, and here they are not supported: every
+    /// allocating path in a publication is infallible-or-abort. `Arc::new` aborts the
+    /// process on allocation failure, and [`PMap`](crate::pmap::PMap) allocates its nodes
+    /// internally through the same infallible primitives. There is no point at which this
+    /// code could ask for memory, be told no, and return a typed refusal.
+    ///
+    /// Claiming a reservation anyway would be the exact untruthful resource fact this
+    /// family of beads exists to remove — a promise to recover from an allocator abort
+    /// that no path can keep. So the claim is surfaced as a value, so a consumer
+    /// (notably `franken_lean-module-provenance-atomic-apply-as7`) cannot assume a
+    /// reservation happened.
+    ///
+    /// Making it genuine requires a fallible allocation path in `PMap` — a `try_insert`
+    /// built on `Vec::try_reserve` — which is a real change to a published contract and
+    /// belongs in its own bead rather than being smuggled in behind a plan field.
+    pub const fn reservation(&self) -> ReservationClaim {
+        ReservationClaim::Unsupported {
+            reason: "every allocating path in a module-graph publication is \
+                     infallible-or-abort (Arc::new, PMap node allocation)",
+        }
+    }
 
     pub fn version(&self) -> u16 {
         self.version
@@ -1934,6 +1978,37 @@ mod tests {
         for candidate in [&conflicting, &idempotent, &deep] {
             assert!(!base.plan_registration(candidate).publishes());
         }
+
+        // The reservation claim is a reported FACT, and it reports the honest answer.
+        //
+        // `franken_lean-6sf3` asks for reservations "where supported". They are not
+        // supported here and the plan says so, rather than staying silent and letting a
+        // consumer infer that reserved storage exists. `Unsupported` is not a promise
+        // that publication cannot fail — it is the refusal to make that promise.
+        for candidate in [&admitting, &conflicting, &idempotent, &deep] {
+            let claim = base.plan_registration(candidate).reservation();
+            assert!(
+                matches!(claim, ReservationClaim::Unsupported { .. }),
+                "the plan must state that no fallible reservation is available, got {claim:?}"
+            );
+            // Distinguishable from the other two states, which is the whole reason this
+            // is three-valued: "reserved nothing" and "nothing can be reserved" are
+            // different claims and a consumer must be able to tell them apart.
+            assert_ne!(claim, ReservationClaim::NotRequired);
+            assert_ne!(claim, ReservationClaim::Reserved { units: 0 });
+        }
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.module-plan-reservation-claim\",\"version\":1,\
+             \"bead\":\"franken_lean-6sf3\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"reservation-claim-is-a-reported-fact\",\
+             \"claim\":\"unsupported\",\
+             \"reason\":\"every allocating path in a publication is infallible-or-abort\",\
+             \"allocator_abort_recovery_promised\":false,\
+             \"would_become_genuine_via\":\"a fallible PMap try_insert on Vec::try_reserve\",\
+             \"owner_of_that_change\":\"its own bead, not a plan field\",\
+             \"status\":\"pass\"}}"
+        );
     }
 
     /// FROZEN units mean the plan and the real admission cannot drift. They share one
