@@ -819,11 +819,30 @@ impl Environment {
     /// Add a constant. One name, one constant — a duplicate is a typed refusal
     /// (the kernel's admission law; nothing here can overwrite a declaration).
     ///
-    /// This is the unbounded *semantic* operation: it never refuses a valid
-    /// declaration merely because its 64-bit hash collides with another's. An
-    /// admission boundary exposed to untrusted input must instead call
-    /// [`Environment::try_add_decl_with_budget`], which bounds the adversarial
-    /// full-hash-collision work without ever turning a collision into a rejection.
+    /// # NOT AUTHORITATIVE FOR RESOURCE PURPOSES (bead `franken_lean-j8h`)
+    ///
+    /// This path reports **no declaration work at all**. It traverses and buffers
+    /// input-sized state with no limit, no cancellation, and no usage facts, and its
+    /// `Result` has no way to express the difference between "this declaration is
+    /// invalid" and "we did not finish deciding" — so a caller cannot uphold FL-INV-07
+    /// through it even by trying. It survives as a convenience for fixtures and for
+    /// callers that have already established their input is trusted and bounded, and it
+    /// is named here as non-authoritative rather than quietly left looking equivalent.
+    ///
+    /// **Production admission of untrusted input goes through
+    /// [`Environment::plan_add_decl`]**, which measures the work, refuses as typed
+    /// [`Outcome::Inconclusive`], and makes hashing and insertion one atomic
+    /// transaction. `franken_lean-j8h` owns removing the remaining production callers
+    /// of this method; the ones outside this crate live in `fln-kernel` and are tracked
+    /// separately, so this is deliberately **not** `#[deprecated]` — turning a peer
+    /// crate red under `-D warnings` is not a migration.
+    ///
+    /// This is the unbounded *semantic* operation in the narrower sense too: it never
+    /// refuses a valid declaration merely because its 64-bit hash collides with
+    /// another's. [`Environment::try_add_decl_with_budget`] bounds that specific
+    /// adversarial collision work — but only that, and it takes the declaration's
+    /// weight as an unverified caller-supplied number, which is the defect
+    /// `plan_add_decl` fixes by measuring it.
     pub fn add_decl(&self, info: ConstantInfo) -> Result<Environment, EnvError> {
         let name = info.name().clone();
         if self.constants.contains_key(&name) {
@@ -852,6 +871,22 @@ impl Environment {
     /// `expanded_weight` is supplied by the caller because a generic map cannot
     /// infer the semantic weight of an opaque declaration; the decoder or
     /// admission boundary that parsed it can.
+    ///
+    /// # Partially authoritative, and the part it lacks is the point
+    /// (bead `franken_lean-j8h`)
+    ///
+    /// This bounds the persistent-map insertion and nothing else. `expanded_weight` is
+    /// an **unverified number crossing the boundary**: the caller asserts the
+    /// declaration's weight and this method charges what it was told, so a caller that
+    /// understates it buys unbounded insertion work with a small integer. It also
+    /// reports no identity work — nothing about canonical bytes, expression nodes, rows,
+    /// or depth — and its refusal is a `CollisionExhausted` error rather than a typed
+    /// [`Outcome::Inconclusive`], so it composes with `?` into ordinary error paths
+    /// where a non-answer can be read as a failure.
+    ///
+    /// [`Environment::plan_add_decl`] measures the weight instead of trusting it and
+    /// folds the refusal through the shared authority vocabulary.
+    /// `franken_lean-pmap-refusal-outcome-taxonomy-i1z9` owns migrating this signature.
     pub fn try_add_decl_with_budget(
         &self,
         info: ConstantInfo,
