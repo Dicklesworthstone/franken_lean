@@ -2434,6 +2434,100 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Instant;
 
+    /// **The field-boundary law for entry identity**, pinned as a property rather than
+    /// left as a consequence of the encoder happening to be right.
+    ///
+    /// `ExtensionEntryId::derive` binds an epoch tag, an epoch commit, a descriptor name,
+    /// three enum tags and a payload into ONE digest. Every such preimage is exposed to
+    /// the same failure, and this project has now hit it twice in other places:
+    /// `franken_lean-f6br`'s census witness and the intern key fixed in `bf9ef450`, both
+    /// through `Name::to_display_string`, which joins components with `.` without
+    /// escaping and renders a numeric component identically to a string one.
+    ///
+    /// The general shape behind all three: **a serialization is injective only if every
+    /// variable-length field is self-delimiting and every sum type carries its tag.**
+    /// Concatenate two variable-length fields without a length and the boundary between
+    /// them stops being recoverable, so two different inputs produce the same bytes.
+    ///
+    /// This id is correct today because `CanonWriter` length-prefixes every string and
+    /// byte run. That is a property of the ENCODER, not of this call site, so a future
+    /// hand-rolled preimage here — which is exactly what `intern.rs` had — would
+    /// reintroduce it silently. These cases fail if the boundary is ever lost.
+    ///
+    /// Note the asymmetry with the two earlier instances, because it decides urgency: an
+    /// id collision here cannot forge a restore on its own, since a suffix restore proves
+    /// its base by exact comparison and a FullJournal carries its own entries. This is a
+    /// defence-in-depth binding, not the sole gate. It is pinned anyway — the bead's
+    /// contract is that identity is exact under collisions, and "another check would
+    /// probably catch it" is not exactness.
+    #[test]
+    fn entry_identity_survives_the_field_boundary_attack() {
+        let payload: &[u8] = b"x";
+        let desc = descriptor(MergeSemantics::AppendOrdered, PayloadProvenance::Understood);
+
+        // 1. EPOCH TAG / COMMIT boundary. Two epochs whose concatenation is identical.
+        //    Without a length prefix, ("ab","c") and ("a","bc") are the same bytes.
+        let split_left = ModuleEpoch::new("ab", "c");
+        let split_right = ModuleEpoch::new("a", "bc");
+        assert_ne!(
+            ExtensionEntryId::derive(&split_left, &desc, payload),
+            ExtensionEntryId::derive(&split_right, &desc, payload),
+            "the epoch tag/commit boundary must be recoverable: an unlength-prefixed \
+             concatenation makes these two epochs the same preimage"
+        );
+
+        // 2. DESCRIPTOR NAME structure. Two components `a`,`b` versus one component
+        //    literally spelled `a.b` — the exact f6br collision, which reaches this
+        //    digest through the descriptor rather than through a declaration name.
+        let nested = ExtensionDescriptor {
+            name: Name::str(Name::str(Name::anonymous(), "a"), "b"),
+            ..desc.clone()
+        };
+        let flat = ExtensionDescriptor {
+            name: Name::str(Name::anonymous(), "a.b"),
+            ..desc.clone()
+        };
+        assert_eq!(
+            nested.name.to_display_string(),
+            flat.name.to_display_string(),
+            "premise: the display forms must actually collide, or this case proves nothing"
+        );
+        assert_ne!(
+            ExtensionEntryId::derive(&fixture_epoch(), &nested, payload),
+            ExtensionEntryId::derive(&fixture_epoch(), &flat, payload),
+            "a descriptor component containing the display separator must not forge a \
+             deeper path"
+        );
+
+        // 3. NAME / PAYLOAD boundary. The name's last component and the payload are
+        //    adjacent variable-length fields, so they are a boundary too.
+        let long_name = ExtensionDescriptor {
+            name: Name::str(Name::anonymous(), "ex"),
+            ..desc.clone()
+        };
+        let short_name = ExtensionDescriptor {
+            name: Name::str(Name::anonymous(), "e"),
+            ..desc.clone()
+        };
+        assert_ne!(
+            ExtensionEntryId::derive(&fixture_epoch(), &long_name, b"t"),
+            ExtensionEntryId::derive(&fixture_epoch(), &short_name, b"xt"),
+            "the descriptor-name/payload boundary must be recoverable"
+        );
+
+        // 4. SUM TYPES carry their tags: the three descriptor semantics are part of
+        //    identity, so two descriptors differing only in one must not collide.
+        let other_merge = ExtensionDescriptor {
+            merge: MergeSemantics::SetUnion,
+            ..desc.clone()
+        };
+        assert_ne!(
+            ExtensionEntryId::derive(&fixture_epoch(), &desc, payload),
+            ExtensionEntryId::derive(&fixture_epoch(), &other_merge, payload),
+            "declared merge semantics are part of entry identity"
+        );
+    }
+
     fn descriptor(merge: MergeSemantics, provenance: PayloadProvenance) -> ExtensionDescriptor {
         ExtensionDescriptor {
             name: Name::str(Name::anonymous(), "simpExt"),
