@@ -41,6 +41,8 @@
 //!   a project-defined macro, unreviewed macro invocation, procedural attribute, or
 //!   derive outside the exact compiler-builtin inventory could contribute checking
 //!   logic without a reviewed, LOC-counted source mapping.
+//! * `FLN-STRUCT-031` an active SUITE.lock checkout or its commit identity cannot be
+//!   verified, so dependency-closure authority is inconclusive rather than clean.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -2021,7 +2023,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     let authority = if findings.iter().any(|finding| {
         matches!(
             finding.code,
-            "FLN-STRUCT-027" | "FLN-STRUCT-028" | "FLN-STRUCT-029"
+            "FLN-STRUCT-027" | "FLN-STRUCT-028" | "FLN-STRUCT-029" | "FLN-STRUCT-031"
         )
     }) {
         Authority::Incomplete

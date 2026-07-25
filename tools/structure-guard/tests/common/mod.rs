@@ -201,11 +201,25 @@ pub const FIXTURE_CRATES: [(&str, bool); 32] = [
 ];
 
 pub fn fixture_cargo_lock() -> String {
+    fixture_cargo_lock_with_dependencies(&[])
+}
+
+pub fn fixture_cargo_lock_with_dependencies(dependencies: &[(&str, &[&str])]) -> String {
     let mut lock = String::from("version = 4\n");
     for (name, _) in FIXTURE_CRATES {
         lock.push_str(&format!(
             "\n[[package]]\nname = \"{name}\"\nversion = \"0.0.0\"\n"
         ));
+        if let Some((_, package_dependencies)) =
+            dependencies.iter().find(|(package, _)| *package == name)
+            && !package_dependencies.is_empty()
+        {
+            lock.push_str("dependencies = [\n");
+            for dependency in *package_dependencies {
+                lock.push_str(&format!(" \"{dependency}\",\n"));
+            }
+            lock.push_str("]\n");
+        }
     }
     lock
 }
@@ -215,7 +229,7 @@ pub fn fixture_allowlist() -> String {
     for (name, boundary) in FIXTURE_CRATES {
         let audit = if boundary { "deny-ledgered" } else { "forbid" };
         rows.push_str(&format!(
-            "package {name} version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit={audit} policy=runtime owner=fl upgrade=workspace reason=fixture\n"
+            "package {name} version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit={audit} policy=runtime owner=franken_lean upgrade=workspace reason=fixture\n"
         ));
     }
     rows

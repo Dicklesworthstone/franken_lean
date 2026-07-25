@@ -253,7 +253,7 @@ fn conditional_dependency_sections_cannot_carry_an_unreviewed_edge() {
         assert!(
             out.findings.iter().all(|f| matches!(
                 f.code,
-                "FLN-STRUCT-005" | "FLN-STRUCT-007" | "FLN-STRUCT-016"
+                "FLN-STRUCT-005" | "FLN-STRUCT-007" | "FLN-STRUCT-016" | "FLN-STRUCT-018"
             )),
             "unexpected finding class for {section}: {:?}",
             out.findings

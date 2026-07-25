@@ -43,7 +43,11 @@ fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
             .create_new(true)
             .open(&path)
             .expect("create fixture file without overwrite");
-        f.write_all(content.as_bytes()).expect("write");
+        let rendered = content.replace(
+            "@FIXTURE_ROOT@",
+            root.to_str().expect("temporary fixture root is UTF-8"),
+        );
+        f.write_all(rendered.as_bytes()).expect("write");
     }
     eprintln!("retained closure fixture: {}", root.display());
     root
@@ -176,7 +180,7 @@ fn base_files() -> Vec<(String, String)> {
             "\n[[package]]\nname = \"{name}\"\nversion = \"0.0.0\"\n"
         ));
         allowlist.push_str(&format!(
-            "package {name} version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit={} policy=runtime owner=fl upgrade=workspace reason=fixture\n",
+            "package {name} version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit={} policy=runtime owner=franken_lean upgrade=workspace reason=fixture\n",
             if boundary { "deny-ledgered" } else { "forbid" }
         ));
     }
@@ -220,6 +224,45 @@ fn replace_fragment(files: &mut [(String, String)], rel: &str, before: &str, aft
     *content = content.replacen(before, after, 1);
 }
 
+fn add_asupersync_dependency(files: &mut Vec<(String, String)>, declared_path: &str) {
+    replace_fragment(
+        files,
+        "SUITE.lock",
+        "path=/dp/asupersync",
+        "path=@FIXTURE_ROOT@/suite/asupersync",
+    );
+    replace_fragment(
+        files,
+        "crates/fln-core/Cargo.toml",
+        "\n[dependencies]\n",
+        &format!("\n[dependencies]\nasupersync = {{ path = \"{declared_path}\" }}\n"),
+    );
+    replace_fragment(
+        files,
+        "Cargo.lock",
+        "name = \"fln-core\"\nversion = \"0.0.0\"\n",
+        "name = \"fln-core\"\nversion = \"0.0.0\"\ndependencies = [\n \"asupersync\",\n]\n",
+    );
+    append(
+        files,
+        "Cargo.lock",
+        "\n[[package]]\nname = \"asupersync\"\nversion = \"0.1.0\"\n",
+    );
+    append(
+        files,
+        "ci/CLOSURE_ALLOWLIST.txt",
+        "package asupersync version=0.1.0 source=suite checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=external policy=runtime owner=asupersync upgrade=suite-lock reason=pinned fixture\n",
+    );
+    files.push((
+        "suite/asupersync/Cargo.toml".to_string(),
+        "[package]\nname = \"asupersync\"\nversion = \"0.1.0\"\nedition = \"2024\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies]\n".to_string(),
+    ));
+    files.push((
+        "suite/asupersync/.git/HEAD".to_string(),
+        "e464a484cb65c1a55be0d9c925e6e9c20318edcb\n".to_string(),
+    ));
+}
+
 #[test]
 fn clean_closure_passes() {
     let out = run_with("clean", |_| {});
@@ -249,7 +292,7 @@ fn unlisted_lock_package_is_flagged_and_recovers_when_allowlisted() {
         append(
             files,
             "ci/CLOSURE_ALLOWLIST.txt",
-            "package rogue version=0.1.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=fl upgrade=workspace reason=fixture\n",
+            "package rogue version=0.1.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=franken_lean upgrade=workspace reason=fixture\n",
         );
         let graph = GRAPH.replace(
             "suite-dep asupersync\n",
@@ -279,12 +322,45 @@ fn registry_sourced_package_is_prohibited_outright() {
 }
 
 #[test]
+fn malformed_cargo_lock_v4_is_a_typed_shape_finding() {
+    for (tag, mutation) in [
+        ("lock-missing-version", "missing"),
+        ("lock-wrong-version", "wrong"),
+        ("lock-duplicate-key", "duplicate"),
+        ("lock-unterminated-array", "unterminated"),
+    ] {
+        let out = run_with(tag, |files| match mutation {
+            "missing" => replace_fragment(files, "Cargo.lock", "version = 4\n", ""),
+            "wrong" => replace_fragment(files, "Cargo.lock", "version = 4", "version = 3"),
+            "duplicate" => replace_fragment(
+                files,
+                "Cargo.lock",
+                "name = \"fln-core\"\nversion = \"0.0.0\"",
+                "name = \"fln-core\"\nname = \"fln-core\"\nversion = \"0.0.0\"",
+            ),
+            "unterminated" => append(
+                files,
+                "Cargo.lock",
+                "\n[[package]]\nname = \"partial\"\nversion = \"0.1.0\"\ndependencies = [\n \"fln-core\",\n",
+            ),
+            _ => unreachable!("closed mutation inventory"),
+        });
+        assert_eq!(
+            codes(&out),
+            vec!["FLN-STRUCT-016"],
+            "{tag} did not fail as a typed lock shape: {:?}",
+            out.findings
+        );
+    }
+}
+
+#[test]
 fn stale_allowlist_row_is_flagged() {
     let out = run_with("stale-row", |files| {
         append(
             files,
             "ci/CLOSURE_ALLOWLIST.txt",
-            "package ghost version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=fl upgrade=workspace reason=fixture\n",
+            "package ghost version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=franken_lean upgrade=workspace reason=fixture\n",
         );
     });
     assert_eq!(codes(&out), vec!["FLN-STRUCT-019"]);
@@ -305,6 +381,38 @@ fn version_mismatch_is_flagged() {
 }
 
 #[test]
+fn checksum_and_every_allowlist_policy_field_are_semantic() {
+    let zero_checksum = "0".repeat(64);
+    let checksum_after = format!("checksum={zero_checksum}");
+    let mutations = [
+        ("checksum", "checksum=-", checksum_after.as_str()),
+        ("license", "license=MIT", "license=Apache-2.0"),
+        ("build-script", "build-script=no", "build-script=yes"),
+        ("proc-macro", "proc-macro=no", "proc-macro=yes"),
+        ("native-link", "native-link=no", "native-link=yes"),
+        (
+            "unsafe-audit",
+            "unsafe-audit=forbid",
+            "unsafe-audit=external",
+        ),
+        ("policy", "policy=runtime", "policy=dev"),
+        ("owner", "owner=franken_lean", "owner=another_team"),
+        ("upgrade", "upgrade=workspace", "upgrade=suite-lock"),
+    ];
+    for (tag, before, after) in mutations {
+        let out = run_with(tag, |files| {
+            replace_fragment(files, "ci/CLOSURE_ALLOWLIST.txt", before, after);
+        });
+        assert_eq!(
+            codes(&out),
+            vec!["FLN-STRUCT-018"],
+            "{tag} drift was not a single typed policy finding: {:?}",
+            out.findings
+        );
+    }
+}
+
+#[test]
 fn nightly_pin_mismatch_is_flagged() {
     let out = run_with("nightly-mismatch", |files| {
         replace(
@@ -314,6 +422,44 @@ fn nightly_pin_mismatch_is_flagged() {
         );
     });
     assert_eq!(codes(&out), vec!["FLN-STRUCT-020"]);
+}
+
+#[test]
+fn suite_dependency_path_and_checkout_commit_are_authoritative() {
+    let clean = run_with("suite-path-clean", |files| {
+        add_asupersync_dependency(files, "@FIXTURE_ROOT@/suite/asupersync");
+    });
+    assert!(
+        clean.findings.is_empty(),
+        "exact suite binding must recover: {:?}",
+        clean.findings
+    );
+
+    let wrong_path = run_with("suite-path-drift", |files| {
+        add_asupersync_dependency(files, "@FIXTURE_ROOT@/suite/not-pinned");
+        files.push((
+            "suite/not-pinned/Cargo.toml".to_string(),
+            "[package]\nname = \"asupersync\"\nversion = \"0.1.0\"\nedition = \"2024\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies]\n"
+                .to_string(),
+        ));
+    });
+    assert_eq!(codes(&wrong_path), vec!["FLN-STRUCT-020"]);
+    assert!(
+        wrong_path.findings[0]
+            .detail
+            .contains("package→repo→SUITE.lock")
+    );
+
+    let wrong_commit = run_with("suite-commit-drift", |files| {
+        add_asupersync_dependency(files, "@FIXTURE_ROOT@/suite/asupersync");
+        replace(
+            files,
+            "suite/asupersync/.git/HEAD",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        );
+    });
+    assert_eq!(codes(&wrong_commit), vec!["FLN-STRUCT-020"]);
+    assert!(wrong_commit.findings[0].detail.contains("checkout HEAD"));
 }
 
 #[test]

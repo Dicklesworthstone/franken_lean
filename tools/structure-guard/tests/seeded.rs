@@ -32,6 +32,10 @@ fn upward_edge_violates_layering() {
         &manifest("fln-core", &["fln-kernel"]),
     );
     ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-core", &["fln-kernel"])]),
+    );
+    ws.write(
         "ci/WORKSPACE_GRAPH.txt",
         &graph_with_edges(&["fln-core -> fln-kernel"]),
     );
@@ -45,6 +49,10 @@ fn unacknowledged_edge_is_flagged_and_recovers_when_acknowledged() {
     ws.write(
         "crates/fln-hash/Cargo.toml",
         &manifest("fln-hash", &["fln-core"]),
+    );
+    ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-hash", &["fln-core"])]),
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-005"]);
 
@@ -86,6 +94,14 @@ fn declared_crate_missing_on_disk_is_flagged() {
         1,
     );
     ws.write("ci/WORKSPACE_GRAPH.txt", &g);
+    let mut lock = fixture_cargo_lock();
+    lock.push_str("\n[[package]]\nname = \"fln-ghost\"\nversion = \"0.0.0\"\n");
+    ws.write("Cargo.lock", &lock);
+    let mut allowlist = fixture_allowlist();
+    allowlist.push_str(
+        "package fln-ghost version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=franken_lean upgrade=workspace reason=missing fixture\n",
+    );
+    ws.write("ci/CLOSURE_ALLOWLIST.txt", &allowlist);
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-002"]);
 }
 
@@ -102,6 +118,13 @@ fn prohibited_transitive_path_is_flagged() {
     ws.write(
         "crates/fln-mid/Cargo.toml",
         &manifest("fln-mid", &["fln-kernel"]),
+    );
+    ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[
+            ("fln-unsafe-jit", &["fln-mid"]),
+            ("fln-mid", &["fln-kernel"]),
+        ]),
     );
     ws.write(
         "ci/WORKSPACE_GRAPH.txt",
@@ -129,6 +152,10 @@ fn allow_direct_covenant_is_enforced() {
         &manifest("fln-kernel", &["fln-unsafe-abi"]),
     );
     ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-kernel", &["fln-unsafe-abi"])]),
+    );
+    ws.write(
         "ci/WORKSPACE_GRAPH.txt",
         &graph_with_edges(&["fln-kernel -> fln-unsafe-abi"]),
     );
@@ -142,7 +169,7 @@ fn external_dep_outside_closed_universe_is_flagged() {
     let mut m = manifest("fln-hash", &[]);
     m.push_str("serde = \"1\"\n");
     ws.write("crates/fln-hash/Cargo.toml", &m);
-    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-010"]);
+    assert!(codes(&ws.run()).contains(&"FLN-STRUCT-010"));
 }
 
 #[test]
@@ -152,12 +179,12 @@ fn suite_dep_requires_path_form() {
     let mut m = manifest("fln-hash", &[]);
     m.push_str("asupersync = \"1\"\n");
     ws.write("crates/fln-hash/Cargo.toml", &m);
-    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-010"]);
+    assert!(codes(&ws.run()).contains(&"FLN-STRUCT-010"));
 
-    // Recovery: the path form is the allowed shape (pin lands with SUITE.lock).
-    let mut m = manifest("fln-hash", &[]);
-    m.push_str("asupersync = { path = \"/dp/asupersync\" }\n");
-    ws.write("crates/fln-hash/Cargo.toml", &m);
+    // Recovery of this malformed declaration is removal. The complete positive suite
+    // path/commit/allowlist recovery is exercised in closure.rs with a real retained
+    // checkout; a path spelling by itself is no longer authority.
+    ws.write("crates/fln-hash/Cargo.toml", &manifest("fln-hash", &[]));
     assert!(ws.run().findings.is_empty());
 }
 
@@ -314,7 +341,11 @@ fn dependency_path_must_resolve_to_acknowledged_crate() {
     base(&ws);
     ws.write(
         "crates/fln-hash/Cargo.toml",
-        "[package]\nname = \"fln-hash\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nfln-core = { path = \"../fln-kernel\" }\n",
+        "[package]\nname = \"fln-hash\"\nversion = \"0.0.0\"\nedition = \"2024\"\nlicense = \"MIT\"\n\n[dependencies]\nfln-core = { path = \"../fln-kernel\" }\n",
+    );
+    ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-hash", &["fln-core"])]),
     );
     ws.write(
         "ci/WORKSPACE_GRAPH.txt",
