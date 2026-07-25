@@ -1890,6 +1890,203 @@ mod tests {
         }
     }
 
+    /// The `fln-amv.12` child matrix, as lane-consumable evidence.
+    ///
+    /// The unit coverage above already proves the substance; what it emits is
+    /// `fln.unit.*` on stderr, which is a developer-facing summary rather than a
+    /// record the shared env_snapshots lane can validate. This emits the same facts
+    /// as `fln.e2e.declaration-tag-matrix/1` on stdout, one row per tag case plus a
+    /// summary, so `fln-amv.14`'s authoritative bundle can carry a separately
+    /// identifiable fln-amv.12 child instead of citing unit-only evidence.
+    ///
+    /// Every number here is produced by real work through the real API in this run.
+    /// Nothing is restated from the unit test.
+    #[test]
+    fn declaration_tag_matrix_e2e_emits_detailed_real_path_evidence() {
+        let run_id = std::env::var("FLN_ENV_E2E_RUN_ID")
+            .unwrap_or_else(|_| "standalone-cargo-test".to_owned());
+        assert!(
+            run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "E2E run id must be JSON-safe ASCII"
+        );
+        let options = KVMap::new();
+        let started = std::time::Instant::now();
+        let mut digests = Vec::with_capacity(DeclarationTagCase::ALL.len());
+
+        for case in DeclarationTagCase::ALL {
+            let case_started = std::time::Instant::now();
+            let info = tagged_declaration(case, false);
+            let canonical_bytes =
+                modeled_tagged_declaration_bytes(case, &info, DeclarationTagDigestModel::Canonical);
+            let expected_digest = hash(Domain::DeclContent, &canonical_bytes);
+            let actual_digest = Environment::decl_content_digest(&info);
+            let repeated_digest =
+                Environment::decl_content_digest(&tagged_declaration(case, false));
+            let stream_hash = hash(Domain::Fixture, &canonical_bytes);
+            let environment = Environment::new()
+                .add_decl(info.clone())
+                .expect("single tagged declaration fixture builds");
+            let actual_root = environment.logical_root(&options);
+            let mut expected_root_builder = LogicalRootBuilder::new();
+            expected_root_builder.add_decl(info.name(), expected_digest);
+            expected_root_builder.set_options(&options);
+            let expected_root = expected_root_builder.finalize();
+
+            // The production tag must equal the frozen canonical tag: that identity is
+            // the whole point of fln-amv.12, since `as u8` would silently track source
+            // order instead.
+            assert_eq!(
+                case.production_tag(),
+                case.canonical_tag(),
+                "{}/{} production tag drifted from its frozen canonical tag",
+                case.family(),
+                case.variant()
+            );
+            assert_eq!(actual_digest, expected_digest);
+            assert_eq!(actual_digest, repeated_digest);
+            assert_eq!(actual_root, expected_root);
+            assert_eq!(canonical_bytes.len(), case.golden_stream_bytes());
+            assert_eq!(stream_hash.to_string(), case.golden_stream_hash());
+            assert_eq!(actual_digest.to_string(), case.golden_digest());
+            digests.push((case, actual_digest));
+
+            println!(
+                "{{\"schema\":\"fln.e2e.declaration-tag-matrix\",\"version\":1,\
+                 \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.12\",\"fln-amv.14\"],\
+                 \"scenario\":\"declaration-tag-matrix\",\"case\":\"{}/{}\",\
+                 \"family\":\"{}\",\"variant\":\"{}\",\"kind\":\"{}\",\
+                 \"canonical_tag\":{},\"production_tag\":{},\
+                 \"tag_source\":\"explicit_exhaustive_match\",\
+                 \"stream_bytes\":{},\"golden_stream_bytes\":{},\
+                 \"stream_hash\":\"{stream_hash}\",\"golden_stream_hash\":\"{}\",\
+                 \"expected_digest\":\"{expected_digest}\",\"actual_digest\":\"{actual_digest}\",\
+                 \"golden_digest\":\"{}\",\"repeated_digest\":\"{repeated_digest}\",\
+                 \"digest_relation\":\"equal\",\"repeat_relation\":\"equal\",\
+                 \"expected_root\":\"{expected_root}\",\"actual_root\":\"{actual_root}\",\
+                 \"root_relation\":\"equal\",\"model\":\"independent-complete-stream-v1\",\
+                 \"status\":\"pass\",\"elapsed_us\":{},\"final_state\":\"verified\"}}",
+                case.family(),
+                case.variant(),
+                case.family(),
+                case.variant(),
+                case.kind_name(),
+                case.canonical_tag(),
+                case.production_tag(),
+                canonical_bytes.len(),
+                case.golden_stream_bytes(),
+                case.golden_stream_hash(),
+                case.golden_digest(),
+                case_started.elapsed().as_micros()
+            );
+        }
+
+        // Pairwise distinctness, counted rather than asserted in bulk, so the record
+        // states how much comparison actually happened.
+        let mut pairwise_comparisons = 0usize;
+        for (index, (_, lhs)) in digests.iter().enumerate() {
+            for (_, rhs) in &digests[index + 1..] {
+                assert_ne!(lhs, rhs, "two declaration tag cases aliased");
+                pairwise_comparisons += 1;
+            }
+        }
+        assert_eq!(pairwise_comparisons, 21);
+
+        // The thread matrix, run for real: every worker builds the full seven-case
+        // environment under its own permutation and must land on one root.
+        let cases = DeclarationTagCase::ALL.to_vec();
+        let canonical_environment = tagged_environment(cases.iter().copied());
+        let canonical_root = canonical_environment.logical_root(&options);
+        let mut thread_rows = Vec::new();
+        for worker_count in [1usize, 8, 32] {
+            let thread_started = std::time::Instant::now();
+            let roots = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..worker_count)
+                    .map(|worker_index| {
+                        let permutation = permuted_tag_cases(&cases, worker_index);
+                        scope.spawn(move || {
+                            tagged_environment(permutation.iter().copied())
+                                .logical_root(&KVMap::new())
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("tag matrix worker joins"))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(roots.len(), worker_count);
+            let distinct: HashSet<_> = roots.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                1,
+                "{worker_count} workers disagreed on the aggregate root"
+            );
+            assert_eq!(roots[0], canonical_root);
+            thread_rows.push((worker_count, thread_started.elapsed().as_micros()));
+            println!(
+                "{{\"schema\":\"fln.e2e.declaration-tag-matrix\",\"version\":1,\
+                 \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.12\",\"fln-amv.14\"],\
+                 \"scenario\":\"declaration-tag-thread-matrix\",\
+                 \"worker_count\":{worker_count},\"distinct_root_count\":1,\
+                 \"expected_root\":\"{canonical_root}\",\"actual_root\":\"{}\",\
+                 \"root_relation\":\"equal\",\"order_independence\":\"proven\",\
+                 \"status\":\"pass\",\"elapsed_us\":{},\"final_state\":\"verified\"}}",
+                roots[0],
+                thread_started.elapsed().as_micros()
+            );
+        }
+
+        // The named defect: one tag encoded by source-order cast instead of its frozen
+        // value must move the aggregate root. Without this the matrix above would pass
+        // just as happily against a cast-based encoder.
+        let mut source_order_builder = LogicalRootBuilder::new();
+        for (index, case) in cases.iter().copied().enumerate() {
+            let info = tagged_declaration(case, true);
+            let model = if index == 0 {
+                DeclarationTagDigestModel::CastAfterSourceReorder
+            } else {
+                DeclarationTagDigestModel::Canonical
+            };
+            source_order_builder.add_decl(
+                info.name(),
+                modeled_tagged_declaration_digest(case, &info, model),
+            );
+        }
+        source_order_builder.set_options(&options);
+        let source_order_root = source_order_builder.finalize();
+        assert_ne!(source_order_root, canonical_root);
+
+        let omitted_root = tagged_environment(cases.iter().copied().skip(1)).logical_root(&options);
+        assert_ne!(omitted_root, canonical_root);
+
+        println!(
+            "{{\"schema\":\"fln.e2e.declaration-tag-matrix\",\"version\":1,\
+             \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.12\",\"fln-amv.14\"],\
+             \"scenario\":\"declaration-tag-summary\",\"case_count\":{},\
+             \"unique_digest_count\":{},\"pairwise_comparisons\":{pairwise_comparisons},\
+             \"expected_pairwise_comparisons\":21,\"thread_matrix\":[1,8,32],\
+             \"thread_matrix_roots_distinct\":1,\
+             \"canonical_root\":\"{canonical_root}\",\
+             \"source_order_defect_root\":\"{source_order_root}\",\
+             \"source_order_defect_relation\":\"differs\",\
+             \"omitted_declaration_root\":\"{omitted_root}\",\
+             \"omitted_declaration_relation\":\"differs\",\
+             \"named_defects_discriminated\":[\"cast_after_source_reorder\",\
+             \"omitted_declaration\"],\"claim_type\":\"bounded_model\",\
+             \"status\":\"pass\",\"elapsed_us\":{},\"final_state\":\"verified\"}}",
+            DeclarationTagCase::ALL.len(),
+            digests
+                .iter()
+                .map(|(_, digest)| *digest)
+                .collect::<HashSet<_>>()
+                .len(),
+            started.elapsed().as_micros()
+        );
+        assert_eq!(thread_rows.len(), 3);
+    }
+
     #[test]
     fn mutual_block_membership_changes_the_content_digest() {
         const LARGE_MEMBER_COUNT: usize = 4_096;
