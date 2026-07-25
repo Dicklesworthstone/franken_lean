@@ -65,6 +65,23 @@ pub const ABI_TARGET_LAYOUT_CANDIDATE_FILE: &str = "contracts/ABI_TARGET_LAYOUT.
 pub const OLEAN_ILEAN_FORMAT_FILE: &str = "contracts/OLEAN_ILEAN_FORMAT.txt";
 /// Interrupted exact-format publication. Presence makes format authority inconclusive.
 pub const OLEAN_ILEAN_FORMAT_CANDIDATE_FILE: &str = "contracts/OLEAN_ILEAN_FORMAT.txt.candidate";
+/// Rooted publication envelope for the exact extern and builtin environment walks.
+pub const EXTERN_BUILTIN_ENVIRONMENT_FILE: &str = "contracts/EXTERN_BUILTIN_ENVIRONMENT.txt";
+/// Interrupted legacy extern projection publication.
+pub const EXTERN_CENSUS_CANDIDATE_FILE: &str = "contracts/extern_census.tsv.candidate";
+/// Interrupted builtin observation publication.
+pub const BUILTIN_ENVIRONMENT_CANDIDATE_FILE: &str = "contracts/builtin_environment.tsv.candidate";
+/// Interrupted second builtin observation shard publication.
+pub const BUILTIN_ENVIRONMENT_001_CANDIDATE_FILE: &str =
+    "contracts/builtin_environment.001.tsv.candidate";
+/// Interrupted third builtin observation shard publication.
+pub const BUILTIN_ENVIRONMENT_002_CANDIDATE_FILE: &str =
+    "contracts/builtin_environment.002.tsv.candidate";
+/// Interrupted builtin policy projection publication.
+pub const BUILTIN_PARTITION_CANDIDATE_FILE: &str = "contracts/builtin_partition.tsv.candidate";
+/// Interrupted extern/builtin envelope publication.
+pub const EXTERN_BUILTIN_ENVIRONMENT_CANDIDATE_FILE: &str =
+    "contracts/EXTERN_BUILTIN_ENVIRONMENT.txt.candidate";
 /// Workspace-relative path of the atomically published derived pin/target inventory.
 pub const CONTRACT_INVENTORY_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt";
 /// Interrupted-publication sibling. Its presence makes inventory authority inconclusive.

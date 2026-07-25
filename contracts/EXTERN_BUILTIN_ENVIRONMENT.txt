@@ -1,0 +1,16 @@
+# EXTERN_BUILTIN_ENVIRONMENT.txt — GENERATED publication envelope.
+schema fln-extern-builtin-environment/1
+extractor	lean-reference-environment-walk-v2
+extern-census-sha256	4226ffe647fbb03f1224b3bc1562cb37c9d4fc7470d643722f7ba84734099899
+builtin-environment-sha256	c80b67bc307c865b24269c135cad8eeb6ca586d35c055f45a1f97571597605b9
+builtin-partition-sha256	fda0fca83a69a46222475f2bdb326c2a313fb21a2dfebef8fe6cf0ba507dd496
+partition-policy-sha256	db2d3d1688cd767534521912fb8b399b2efcceb7322b2d5adceaf210480df288
+constant-count	204543
+extern-count	954
+module-count	2270
+attribute-count	175
+toolchain-api-count	76938
+library-code-count	117149
+user-facing-data-count	10456
+unresolved-count	0
+manifest-root	sha256:62ba4b0d20580f3452467b2810d8abdd3612677643436a5fe23ddf164d5f2d5b

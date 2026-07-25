@@ -13,7 +13,10 @@ use std::path::Path;
 
 use common::*;
 use structure_guard::checks::{self, Authority};
-use structure_guard::{CONTRACT_INVENTORY_CANDIDATE_FILE, KERNEL_OWNERSHIP_CANDIDATE_FILE};
+use structure_guard::{
+    BUILTIN_ENVIRONMENT_001_CANDIDATE_FILE, CONTRACT_INVENTORY_CANDIDATE_FILE,
+    KERNEL_OWNERSHIP_CANDIDATE_FILE,
+};
 
 #[test]
 fn clean_fixture_passes() {
@@ -38,6 +41,26 @@ fn interrupted_contract_inventory_publication_is_typed_inconclusive() {
     assert_eq!(out.verdict(), "inconclusive");
     assert_eq!(out.exit_code(), 3);
     assert!(out.findings[0].detail.contains("reason=stale_candidate"));
+}
+
+#[test]
+fn interrupted_builtin_census_publication_is_typed_inconclusive() {
+    let ws = TempWs::new("builtin-census-candidate");
+    base(&ws);
+    ws.write(
+        BUILTIN_ENVIRONMENT_001_CANDIDATE_FILE,
+        "planted interrupted candidate\n",
+    );
+    let out = ws.run();
+    assert_eq!(codes(&out), vec!["FLN-STRUCT-033"]);
+    assert_eq!(out.authority, Authority::Incomplete);
+    assert_eq!(out.verdict(), "inconclusive");
+    assert_eq!(out.exit_code(), 3);
+    assert!(
+        out.findings[0]
+            .detail
+            .contains("reason=stale_source_candidate")
+    );
 }
 
 #[test]

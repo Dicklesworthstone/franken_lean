@@ -21,8 +21,12 @@ use std::path::{Component, Path, PathBuf};
 use crate::checks::Finding;
 use crate::lockfile::{SuiteLock, parse_suite_lock};
 use crate::{
-    ABI_TARGET_LAYOUT_CANDIDATE_FILE, ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_CANDIDATE_FILE,
-    CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE, CONTRACT_INVENTORY_SCHEMA_FILE,
+    ABI_TARGET_LAYOUT_CANDIDATE_FILE, ABI_TARGET_LAYOUT_FILE,
+    BUILTIN_ENVIRONMENT_001_CANDIDATE_FILE, BUILTIN_ENVIRONMENT_002_CANDIDATE_FILE,
+    BUILTIN_ENVIRONMENT_CANDIDATE_FILE, BUILTIN_PARTITION_CANDIDATE_FILE,
+    CONTRACT_INVENTORY_CANDIDATE_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
+    CONTRACT_INVENTORY_SCHEMA_FILE, EXTERN_BUILTIN_ENVIRONMENT_CANDIDATE_FILE,
+    EXTERN_BUILTIN_ENVIRONMENT_FILE, EXTERN_CENSUS_CANDIDATE_FILE,
     OLEAN_ILEAN_FORMAT_CANDIDATE_FILE, OLEAN_ILEAN_FORMAT_FILE, SUITE_LOCK_FILE,
 };
 
@@ -37,6 +41,9 @@ pub const ABI_TARGET_LAYOUT_SCHEMA: &str = "fln-abi-target-layout/1";
 pub const FORMAT_EXTRACTOR_ID: &str = "lean-format-source-and-pin-artifacts";
 pub const FORMAT_EXTRACTOR_VERSION: &str = "1";
 pub const OLEAN_ILEAN_FORMAT_SCHEMA: &str = "fln-olean-ilean-format/1";
+pub const CENSUS_EXTRACTOR_ID: &str = "lean-reference-environment-walk";
+pub const CENSUS_EXTRACTOR_VERSION: &str = "2";
+pub const EXTERN_BUILTIN_ENVIRONMENT_SCHEMA: &str = "fln-extern-builtin-environment/1";
 pub const MAX_SOURCE_BYTES: usize = 1_048_576;
 pub const MAX_ROWS: usize = 4_096;
 pub const MAX_LINE_BYTES: usize = 8_192;
@@ -48,10 +55,11 @@ pub const SCHEMA_DEFINITION: &str = "\
 schema fln-contract-inventory-definition/1
 inventory-schema fln-contract-inventory/1
 policy-schema fln-contract-inventory-policy/1
-source-authority SUITE.lock,contracts/ABI_TARGET_LAYOUT.txt,contracts/OLEAN_ILEAN_FORMAT.txt
+source-authority SUITE.lock,contracts/ABI_TARGET_LAYOUT.txt,contracts/OLEAN_ILEAN_FORMAT.txt,contracts/EXTERN_BUILTIN_ENVIRONMENT.txt
 extractor suite-lock version=1
 extractor lean-h-clang-layout version=1
 extractor lean-format-source-and-pin-artifacts version=1
+extractor lean-reference-environment-walk version=2
 hash fnv1a64-noncryptographic domain=required fields=u64le-length-prefixed
 row-fields key,kind,extractor,extractor-version,source,target-class,abi-class,raw-evidence-hash,identity,authority,support
 root-fields schema,suite-lock,abi-target-layout,olean-ilean-format,raw,policy,reference,canonical
@@ -62,6 +70,13 @@ authority-states observed
 publication candidate=contracts/PIN_TARGET_INVENTORY.txt.candidate commit=atomic-rename recovery=explicit-promotion
 source-publication contracts/ABI_TARGET_LAYOUT.txt candidate=contracts/ABI_TARGET_LAYOUT.txt.candidate commit=atomic-rename
 source-publication contracts/OLEAN_ILEAN_FORMAT.txt candidate=contracts/OLEAN_ILEAN_FORMAT.txt.candidate commit=atomic-rename
+source-publication contracts/EXTERN_BUILTIN_ENVIRONMENT.txt candidate=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt.candidate commit=atomic-rename group=extern-builtin-census
+source-publication contracts/extern_census.tsv candidate=contracts/extern_census.tsv.candidate commit=atomic-rename group=extern-builtin-census
+source-publication contracts/builtin_environment.tsv candidate=contracts/builtin_environment.tsv.candidate commit=atomic-rename group=extern-builtin-census
+source-publication contracts/builtin_environment.001.tsv candidate=contracts/builtin_environment.001.tsv.candidate commit=atomic-rename group=extern-builtin-census
+source-publication contracts/builtin_environment.002.tsv candidate=contracts/builtin_environment.002.tsv.candidate commit=atomic-rename group=extern-builtin-census
+source-publication contracts/builtin_partition.tsv candidate=contracts/builtin_partition.tsv.candidate commit=atomic-rename group=extern-builtin-census
+source-group-hash builtin-environment algorithm=sha256 framing=ordered-concatenation paths=contracts/builtin_environment.tsv,contracts/builtin_environment.001.tsv,contracts/builtin_environment.002.tsv
 limits source-bytes=1048576 rows=4096 line-bytes=8192
 ";
 
@@ -205,12 +220,29 @@ struct FormatSummaryRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct CensusManifest {
+    extern_sha256: String,
+    builtin_sha256: String,
+    partition_sha256: String,
+    policy_sha256: String,
+    constant_count: usize,
+    extern_count: usize,
+    module_count: usize,
+    attribute_count: usize,
+    toolchain_api_count: usize,
+    library_code_count: usize,
+    user_facing_data_count: usize,
+    manifest_root: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceSet {
     schema: Vec<u8>,
     suite_lock: Vec<u8>,
     policy: Vec<u8>,
     abi_target_layout: Vec<u8>,
     olean_ilean_format: Vec<u8>,
+    extern_builtin_environment: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -433,6 +465,7 @@ fn parse_policy(text: &str) -> Result<BTreeMap<String, PolicyRow>, InventoryErro
             kind,
             "abi-layout"
                 | "artifact-format"
+                | "environment-census"
                 | "toolchain"
                 | "target"
                 | "suite"
@@ -1639,10 +1672,186 @@ fn evidence_hash(kind: &str, source: &str, facts: &[&str]) -> u64 {
     hash_fields("fln.contract-inventory.raw-evidence/1", &fields)
 }
 
+fn parse_census_manifest(text: &str) -> Result<CensusManifest, InventoryError> {
+    validate_text_shape(
+        EXTERN_BUILTIN_ENVIRONMENT_FILE,
+        text,
+        ErrorClass::Violation,
+        "census_manifest_invalid",
+    )?;
+    let mut schema_seen = false;
+    let mut fields = BTreeMap::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == format!("schema {EXTERN_BUILTIN_ENVIRONMENT_SCHEMA}") {
+            if schema_seen {
+                return Err(InventoryError::new(
+                    ErrorClass::Violation,
+                    "census_manifest_invalid",
+                    EXTERN_BUILTIN_ENVIRONMENT_FILE,
+                    format!("line {line_number} duplicates the schema"),
+                ));
+            }
+            schema_seen = true;
+            continue;
+        }
+        let (key, value) = line.split_once('\t').ok_or_else(|| {
+            InventoryError::new(
+                ErrorClass::Violation,
+                "census_manifest_invalid",
+                EXTERN_BUILTIN_ENVIRONMENT_FILE,
+                format!("line {line_number} must contain one tab-separated field"),
+            )
+        })?;
+        if key.is_empty()
+            || value.is_empty()
+            || value.contains('\t')
+            || fields.insert(key.to_string(), value.to_string()).is_some()
+        {
+            return Err(InventoryError::new(
+                ErrorClass::Violation,
+                "census_manifest_invalid",
+                EXTERN_BUILTIN_ENVIRONMENT_FILE,
+                format!("line {line_number} is duplicate or noncanonical"),
+            ));
+        }
+    }
+    if !schema_seen {
+        return Err(InventoryError::new(
+            ErrorClass::Violation,
+            "census_manifest_invalid",
+            EXTERN_BUILTIN_ENVIRONMENT_FILE,
+            format!("expected `schema {EXTERN_BUILTIN_ENVIRONMENT_SCHEMA}`"),
+        ));
+    }
+    let expected_keys = BTreeSet::from([
+        "attribute-count",
+        "builtin-environment-sha256",
+        "builtin-partition-sha256",
+        "constant-count",
+        "extern-count",
+        "extern-census-sha256",
+        "extractor",
+        "library-code-count",
+        "manifest-root",
+        "module-count",
+        "partition-policy-sha256",
+        "toolchain-api-count",
+        "unresolved-count",
+        "user-facing-data-count",
+    ]);
+    let actual_keys = fields.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual_keys != expected_keys {
+        return Err(InventoryError::new(
+            ErrorClass::Violation,
+            "census_manifest_invalid",
+            EXTERN_BUILTIN_ENVIRONMENT_FILE,
+            format!(
+                "manifest field set differs: missing={:?} extra={:?}",
+                expected_keys.difference(&actual_keys).collect::<Vec<_>>(),
+                actual_keys.difference(&expected_keys).collect::<Vec<_>>()
+            ),
+        ));
+    }
+    if fields.get("extractor").map(String::as_str) != Some("lean-reference-environment-walk-v2") {
+        return Err(InventoryError::new(
+            ErrorClass::Violation,
+            "census_manifest_invalid",
+            EXTERN_BUILTIN_ENVIRONMENT_FILE,
+            "extractor must be lean-reference-environment-walk-v2",
+        ));
+    }
+    let sha = |key: &str| -> Result<String, InventoryError> {
+        let value = fields.get(key).expect("validated key set");
+        if !lower_hex(value, 64) {
+            return Err(InventoryError::new(
+                ErrorClass::Violation,
+                "census_manifest_invalid",
+                EXTERN_BUILTIN_ENVIRONMENT_FILE,
+                format!("{key} must be 64 lowercase hexadecimal digits"),
+            ));
+        }
+        Ok(value.clone())
+    };
+    let count = |key: &str| -> Result<usize, InventoryError> {
+        fields
+            .get(key)
+            .expect("validated key set")
+            .parse::<usize>()
+            .map_err(|error| {
+                InventoryError::new(
+                    ErrorClass::Violation,
+                    "census_manifest_invalid",
+                    EXTERN_BUILTIN_ENVIRONMENT_FILE,
+                    format!("{key} is not a canonical count: {error}"),
+                )
+            })
+    };
+    let constant_count = count("constant-count")?;
+    let extern_count = count("extern-count")?;
+    let module_count = count("module-count")?;
+    let attribute_count = count("attribute-count")?;
+    let toolchain_api_count = count("toolchain-api-count")?;
+    let library_code_count = count("library-code-count")?;
+    let user_facing_data_count = count("user-facing-data-count")?;
+    let unresolved_count = count("unresolved-count")?;
+    if constant_count == 0
+        || extern_count == 0
+        || extern_count > constant_count
+        || module_count == 0
+        || attribute_count == 0
+        || unresolved_count != 0
+        || toolchain_api_count
+            .checked_add(library_code_count)
+            .and_then(|total| total.checked_add(user_facing_data_count))
+            != Some(constant_count)
+    {
+        return Err(InventoryError::new(
+            ErrorClass::Inconclusive,
+            "census_manifest_incomplete",
+            EXTERN_BUILTIN_ENVIRONMENT_FILE,
+            "counts must be nonzero, externs bounded by declarations, partitions total, and unresolved zero",
+        ));
+    }
+    let manifest_root = fields
+        .get("manifest-root")
+        .expect("validated key set")
+        .strip_prefix("sha256:")
+        .filter(|value| lower_hex(value, 64))
+        .ok_or_else(|| {
+            InventoryError::new(
+                ErrorClass::Violation,
+                "census_manifest_invalid",
+                EXTERN_BUILTIN_ENVIRONMENT_FILE,
+                "manifest-root must be sha256:<64-lower-hex>",
+            )
+        })?
+        .to_string();
+    Ok(CensusManifest {
+        extern_sha256: sha("extern-census-sha256")?,
+        builtin_sha256: sha("builtin-environment-sha256")?,
+        partition_sha256: sha("builtin-partition-sha256")?,
+        policy_sha256: sha("partition-policy-sha256")?,
+        constant_count,
+        extern_count,
+        module_count,
+        attribute_count,
+        toolchain_api_count,
+        library_code_count,
+        user_facing_data_count,
+        manifest_root,
+    })
+}
+
 fn raw_rows(
     lock: &SuiteLock,
     abi_layout_text: &str,
     olean_ilean_format_text: &str,
+    extern_builtin_environment_text: &str,
 ) -> Result<BTreeMap<String, RawRow>, InventoryError> {
     let mut rows = BTreeMap::new();
     let mut insert = |row: RawRow| -> Result<(), InventoryError> {
@@ -1833,6 +2042,65 @@ fn raw_rows(
         })?;
     }
 
+    let census = parse_census_manifest(extern_builtin_environment_text)?;
+    let manifest_source_root = labeled_hash(hash_one(
+        "fln.contract-inventory.extern-builtin-manifest/1",
+        extern_builtin_environment_text.as_bytes(),
+    ));
+    let extern_count = census.extern_count.to_string();
+    let extern_source = format!("{EXTERN_BUILTIN_ENVIRONMENT_FILE}:extern");
+    insert(RawRow {
+        key: "environment-census:extern".to_string(),
+        kind: "environment-census",
+        extractor: CENSUS_EXTRACTOR_ID,
+        extractor_version: CENSUS_EXTRACTOR_VERSION,
+        source: extern_source.clone(),
+        observed_abi_class: None,
+        evidence_hash: evidence_hash(
+            "environment-census",
+            &extern_source,
+            &[
+                &census.extern_sha256,
+                &extern_count,
+                &census.policy_sha256,
+                &census.manifest_root,
+                &manifest_source_root,
+            ],
+        ),
+    })?;
+    let constant_count = census.constant_count.to_string();
+    let module_count = census.module_count.to_string();
+    let attribute_count = census.attribute_count.to_string();
+    let toolchain_api_count = census.toolchain_api_count.to_string();
+    let library_code_count = census.library_code_count.to_string();
+    let user_facing_data_count = census.user_facing_data_count.to_string();
+    let builtin_source = format!("{EXTERN_BUILTIN_ENVIRONMENT_FILE}:builtin");
+    insert(RawRow {
+        key: "environment-census:builtin".to_string(),
+        kind: "environment-census",
+        extractor: CENSUS_EXTRACTOR_ID,
+        extractor_version: CENSUS_EXTRACTOR_VERSION,
+        source: builtin_source.clone(),
+        observed_abi_class: None,
+        evidence_hash: evidence_hash(
+            "environment-census",
+            &builtin_source,
+            &[
+                &census.builtin_sha256,
+                &census.partition_sha256,
+                &census.policy_sha256,
+                &constant_count,
+                &module_count,
+                &attribute_count,
+                &toolchain_api_count,
+                &library_code_count,
+                &user_facing_data_count,
+                &census.manifest_root,
+                &manifest_source_root,
+            ],
+        ),
+    })?;
+
     Ok(rows)
 }
 
@@ -1842,6 +2110,7 @@ fn canonical_inventory(
     policy_text: &str,
     abi_target_layout_text: &str,
     olean_ilean_format_text: &str,
+    extern_builtin_environment_text: &str,
 ) -> Result<CanonicalInventory, InventoryError> {
     validate_text_shape(
         SUITE_LOCK_FILE,
@@ -1871,7 +2140,12 @@ fn canonical_inventory(
             detail,
         )
     })?;
-    let raw = raw_rows(&lock, abi_target_layout_text, olean_ilean_format_text)?;
+    let raw = raw_rows(
+        &lock,
+        abi_target_layout_text,
+        olean_ilean_format_text,
+        extern_builtin_environment_text,
+    )?;
     let policy = parse_policy(policy_text)?;
     if raw.len() > MAX_ROWS {
         return Err(InventoryError::new(
@@ -1968,6 +2242,7 @@ fn canonical_inventory(
         .and_then(|total| total.checked_add(policy_text.len()))
         .and_then(|total| total.checked_add(abi_target_layout_text.len()))
         .and_then(|total| total.checked_add(olean_ilean_format_text.len()))
+        .and_then(|total| total.checked_add(extern_builtin_environment_text.len()))
         .ok_or_else(|| {
             InventoryError::new(
                 ErrorClass::InternalFault,
@@ -2005,6 +2280,9 @@ fn canonical_inventory(
     ));
     output.push_str(&format!(
         "extractor {FORMAT_EXTRACTOR_ID} version={FORMAT_EXTRACTOR_VERSION}\n"
+    ));
+    output.push_str(&format!(
+        "extractor {CENSUS_EXTRACTOR_ID} version={CENSUS_EXTRACTOR_VERSION}\n"
     ));
     output.push_str(&format!("row-count {}\n", raw.len()));
     output.push_str(&format!("target-row-count {target_row_count}\n"));
@@ -2118,6 +2396,7 @@ pub fn canonical_inventory_text(
     policy_text: &str,
     abi_target_layout_text: &str,
     olean_ilean_format_text: &str,
+    extern_builtin_environment_text: &str,
 ) -> Result<String, InventoryError> {
     let inventory = canonical_inventory(
         suite_lock_text,
@@ -2125,6 +2404,7 @@ pub fn canonical_inventory_text(
         policy_text,
         abi_target_layout_text,
         olean_ilean_format_text,
+        extern_builtin_environment_text,
     )?;
     String::from_utf8(inventory.bytes).map_err(|error| {
         InventoryError::new(
@@ -2317,6 +2597,12 @@ fn read_sources(root: &Path) -> Result<SourceSet, InventoryError> {
             ErrorClass::Inconclusive,
             "source_unavailable",
         )?,
+        extern_builtin_environment: read_bounded(
+            root,
+            EXTERN_BUILTIN_ENVIRONMENT_FILE,
+            ErrorClass::Inconclusive,
+            "source_unavailable",
+        )?,
     })
 }
 
@@ -2351,6 +2637,12 @@ fn canonical_from_sources(sources: &SourceSet) -> Result<CanonicalInventory, Inv
             &sources.olean_ilean_format,
             ErrorClass::Violation,
             "olean_ilean_format_invalid",
+        )?,
+        utf8(
+            EXTERN_BUILTIN_ENVIRONMENT_FILE,
+            &sources.extern_builtin_environment,
+            ErrorClass::Violation,
+            "census_manifest_invalid",
         )?,
     )
 }
@@ -2421,9 +2713,43 @@ fn ensure_no_format_source_candidate(root: &Path) -> Result<(), InventoryError> 
     Ok(())
 }
 
+fn ensure_no_census_source_candidate(root: &Path) -> Result<(), InventoryError> {
+    for candidate in [
+        EXTERN_CENSUS_CANDIDATE_FILE,
+        BUILTIN_ENVIRONMENT_CANDIDATE_FILE,
+        BUILTIN_ENVIRONMENT_001_CANDIDATE_FILE,
+        BUILTIN_ENVIRONMENT_002_CANDIDATE_FILE,
+        BUILTIN_PARTITION_CANDIDATE_FILE,
+        EXTERN_BUILTIN_ENVIRONMENT_CANDIDATE_FILE,
+    ] {
+        validate_parent_chain(root, candidate)?;
+        match fs::symlink_metadata(root.join(candidate)) {
+            Ok(_) => {
+                return Err(InventoryError::new(
+                    ErrorClass::Inconclusive,
+                    "stale_source_candidate",
+                    candidate,
+                    "interrupted extern/builtin census group exists; refuse every raw projection and the derived canonical inventory",
+                ));
+            }
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => {}
+            Err(error) => {
+                return Err(InventoryError::new(
+                    ErrorClass::Inconclusive,
+                    "source_unavailable",
+                    candidate,
+                    format!("cannot inspect extern/builtin census candidate: {error}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_no_candidate(root: &Path) -> Result<(), InventoryError> {
     ensure_no_abi_source_candidate(root)?;
     ensure_no_format_source_candidate(root)?;
+    ensure_no_census_source_candidate(root)?;
     if candidate_exists(root)? {
         return Err(InventoryError::new(
             ErrorClass::Inconclusive,
@@ -2876,6 +3202,8 @@ corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665
 
     const TEST_ABI_TARGET_LAYOUT: &str = include_str!("../../../contracts/ABI_TARGET_LAYOUT.txt");
     const TEST_OLEAN_ILEAN_FORMAT: &str = include_str!("../../../contracts/OLEAN_ILEAN_FORMAT.txt");
+    const TEST_EXTERN_BUILTIN_ENVIRONMENT: &str =
+        include_str!("../../../contracts/EXTERN_BUILTIN_ENVIRONMENT.txt");
 
     const REQUIRED_POLICY: &str = "\
 schema fln-contract-inventory-policy/1
@@ -2883,6 +3211,8 @@ row abi-layout:target:0001 kind=abi-layout support=required target-class=certifi
 row artifact-format:ilean kind=artifact-format support=required target-class=none abi-class=none
 row artifact-format:olean:target:0001 kind=artifact-format support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
+row environment-census:builtin kind=environment-census support=required target-class=none abi-class=none
+row environment-census:extern kind=environment-census support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=required target-class=none abi-class=none
 row target:0001 kind=target support=required target-class=certified abi-class=none
@@ -2895,6 +3225,8 @@ row abi-layout:target:0001 kind=abi-layout support=required target-class=certifi
 row artifact-format:ilean kind=artifact-format support=required target-class=none abi-class=none
 row artifact-format:olean:target:0001 kind=artifact-format support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
+row environment-census:builtin kind=environment-census support=required target-class=none abi-class=none
+row environment-census:extern kind=environment-census support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=optional target-class=none abi-class=none
 row target:0001 kind=target support=required target-class=certified abi-class=none
@@ -2964,6 +3296,10 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             &root.join(OLEAN_ILEAN_FORMAT_FILE),
             TEST_OLEAN_ILEAN_FORMAT.as_bytes(),
         );
+        write_new(
+            &root.join(EXTERN_BUILTIN_ENVIRONMENT_FILE),
+            TEST_EXTERN_BUILTIN_ENVIRONMENT.as_bytes(),
+        );
         root
     }
 
@@ -3008,6 +3344,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             REQUIRED_POLICY,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .unwrap();
         let second = canonical_inventory_text(
@@ -3016,17 +3353,21 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             REQUIRED_POLICY,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .unwrap();
         assert_eq!(first, second);
         for required_header in [
             "raw-root fnv1a64:",
             "reference-root fnv1a64:",
-            "row-count 8\n",
+            "row-count 10\n",
             "target-row-count 1\n",
             "abi-row-count 1\n",
             "format-row-count 2\n",
             "unresolved-row-count 0\n",
+            "extractor lean-reference-environment-walk version=2\n",
+            "row environment-census:builtin kind=environment-census ",
+            "row environment-census:extern kind=environment-census ",
         ] {
             assert!(
                 first.contains(required_header),
@@ -3055,6 +3396,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             REQUIRED_POLICY,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .expect("another well-shaped Reference pin remains derivable");
         assert_ne!(
@@ -3076,6 +3418,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             &missing,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .expect_err("missing policy row must fail the bijection");
         assert_eq!(error.reason, "policy_join_not_bijective");
@@ -3088,6 +3431,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             &stale,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .expect_err("stale policy row must fail the bijection");
         assert_eq!(error.reason, "policy_join_not_bijective");
@@ -3102,6 +3446,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             &duplicate,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .expect_err("duplicate policy row must fail before the join");
         assert_eq!(error.reason, "policy_not_canonical");
@@ -3248,6 +3593,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             &wrong_class,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .expect_err("review policy cannot relabel the mechanically observed ABI");
         assert_eq!(error.class, ErrorClass::Violation);
@@ -3292,6 +3638,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             REQUIRED_POLICY,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .expect_err("bounded input must refuse exhaustion");
         assert_eq!(error.class, ErrorClass::Inconclusive);
@@ -3311,6 +3658,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             REQUIRED_POLICY,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .unwrap();
         write_new(
@@ -3403,6 +3751,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
             &ambiguous_policy,
             TEST_ABI_TARGET_LAYOUT,
             TEST_OLEAN_ILEAN_FORMAT,
+            TEST_EXTERN_BUILTIN_ENVIRONMENT,
         )
         .expect_err("ambiguous target classification is not authoritative");
         assert_eq!(error.class, ErrorClass::Inconclusive);
@@ -3535,4 +3884,61 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
         );
         assert_eq!(consume(&root).unwrap(), receipt.snapshot);
     }
+}
+
+#[cfg(test)]
+const EXTERN_BUILTIN_MANIFEST_FIXTURE: &str =
+    include_str!("../../../contracts/EXTERN_BUILTIN_ENVIRONMENT.txt");
+
+#[test]
+fn extern_builtin_census_model() {
+    let parsed = parse_census_manifest(EXTERN_BUILTIN_MANIFEST_FIXTURE)
+        .expect("checked-in census envelope is structurally total");
+    assert_eq!(parsed.constant_count, 204_543);
+    assert_eq!(parsed.extern_count, 954);
+    assert_eq!(parsed.toolchain_api_count, 76_938);
+    assert_eq!(parsed.library_code_count, 117_149);
+    assert_eq!(parsed.user_facing_data_count, 10_456);
+}
+
+#[test]
+fn reference_environment_walk_completeness() {
+    let parsed = parse_census_manifest(EXTERN_BUILTIN_MANIFEST_FIXTURE)
+        .expect("checked-in census envelope is structurally total");
+    assert_eq!(parsed.module_count, 2_270);
+    assert_eq!(parsed.attribute_count, 175);
+    assert_eq!(
+        parsed.toolchain_api_count + parsed.library_code_count + parsed.user_facing_data_count,
+        parsed.constant_count
+    );
+
+    let unresolved =
+        EXTERN_BUILTIN_MANIFEST_FIXTURE.replace("unresolved-count\t0", "unresolved-count\t1");
+    let error = parse_census_manifest(&unresolved)
+        .expect_err("an unresolved partition row cannot be authoritative");
+    assert_eq!(error.reason, "census_manifest_incomplete");
+}
+
+#[test]
+fn census_policy_bijection() {
+    let dropped_partition = EXTERN_BUILTIN_MANIFEST_FIXTURE
+        .replace("library-code-count\t117149", "library-code-count\t117148");
+    let error = parse_census_manifest(&dropped_partition)
+        .expect_err("partition counts must conserve the environment walk");
+    assert_eq!(error.reason, "census_manifest_incomplete");
+}
+
+#[test]
+fn oracle_only_census_boundary() {
+    let parsed =
+        parse_census_manifest(EXTERN_BUILTIN_MANIFEST_FIXTURE).expect("manifest is authoritative");
+    assert!(!parsed.manifest_root.is_empty());
+    assert!(
+        EXTERN_BUILTIN_MANIFEST_FIXTURE.contains("extractor\tlean-reference-environment-walk-v2\n")
+    );
+    assert!(SCHEMA_DEFINITION.contains(
+        "source-authority SUITE.lock,contracts/ABI_TARGET_LAYOUT.txt,contracts/OLEAN_ILEAN_FORMAT.txt,contracts/EXTERN_BUILTIN_ENVIRONMENT.txt\n"
+    ));
+    assert!(!SCHEMA_DEFINITION.contains(".elan"));
+    assert!(!SCHEMA_DEFINITION.contains("lean --run"));
 }

@@ -24,7 +24,8 @@ use structure_guard::checks::{self, RunOutcome};
 use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
 use structure_guard::{
     ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
-    CONTRACT_INVENTORY_SCHEMA_FILE, OLEAN_ILEAN_FORMAT_FILE, SUITE_LOCK_FILE,
+    CONTRACT_INVENTORY_SCHEMA_FILE, EXTERN_BUILTIN_ENVIRONMENT_FILE, OLEAN_ILEAN_FORMAT_FILE,
+    SUITE_LOCK_FILE,
 };
 
 /// An immutable workspace recipe. Every execution materializes a fresh, uniquely named
@@ -88,12 +89,14 @@ impl TempWs {
                 Some(policy),
                 Some(abi_target_layout),
                 Some(olean_ilean_format),
+                Some(extern_builtin_environment),
             ) = (
                 files.get(SUITE_LOCK_FILE),
                 files.get(CONTRACT_INVENTORY_SCHEMA_FILE),
                 files.get(CONTRACT_INVENTORY_POLICY_FILE),
                 files.get(ABI_TARGET_LAYOUT_FILE),
                 files.get(OLEAN_ILEAN_FORMAT_FILE),
+                files.get(EXTERN_BUILTIN_ENVIRONMENT_FILE),
             )
             && let (
                 Ok(suite_lock),
@@ -101,12 +104,14 @@ impl TempWs {
                 Ok(policy),
                 Ok(abi_target_layout),
                 Ok(olean_ilean_format),
+                Ok(extern_builtin_environment),
             ) = (
                 std::str::from_utf8(suite_lock),
                 std::str::from_utf8(schema),
                 std::str::from_utf8(policy),
                 std::str::from_utf8(abi_target_layout),
                 std::str::from_utf8(olean_ilean_format),
+                std::str::from_utf8(extern_builtin_environment),
             )
             && let Ok(inventory) = canonical_inventory_text(
                 suite_lock,
@@ -114,6 +119,7 @@ impl TempWs {
                 policy,
                 abi_target_layout,
                 olean_ilean_format,
+                extern_builtin_environment,
             )
         {
             files.insert(CONTRACT_INVENTORY_FILE.to_string(), inventory.into_bytes());
@@ -213,6 +219,8 @@ row abi-layout:target:0001 kind=abi-layout support=required target-class=certifi
 row artifact-format:ilean kind=artifact-format support=required target-class=none abi-class=none
 row artifact-format:olean:target:0001 kind=artifact-format support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
+row environment-census:builtin kind=environment-census support=required target-class=none abi-class=none
+row environment-census:extern kind=environment-census support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=required target-class=none abi-class=none
 row target:0001 kind=target support=required target-class=certified abi-class=none
@@ -223,6 +231,8 @@ pub const ABI_TARGET_LAYOUT_FIXTURE: &str =
     include_str!("../../../../contracts/ABI_TARGET_LAYOUT.txt");
 pub const OLEAN_ILEAN_FORMAT_FIXTURE: &str =
     include_str!("../../../../contracts/OLEAN_ILEAN_FORMAT.txt");
+pub const EXTERN_BUILTIN_ENVIRONMENT_FIXTURE: &str =
+    include_str!("../../../../contracts/EXTERN_BUILTIN_ENVIRONMENT.txt");
 
 fn fixture_hash_fields(domain: &str, fields: &[&[u8]]) -> u64 {
     let mut state = 0xcbf2_9ce4_8422_2325_u64;
@@ -428,6 +438,10 @@ pub fn base(ws: &TempWs) {
     );
     ws.write(ABI_TARGET_LAYOUT_FILE, ABI_TARGET_LAYOUT_FIXTURE);
     ws.write(OLEAN_ILEAN_FORMAT_FILE, OLEAN_ILEAN_FORMAT_FIXTURE);
+    ws.write(
+        EXTERN_BUILTIN_ENVIRONMENT_FILE,
+        EXTERN_BUILTIN_ENVIRONMENT_FIXTURE,
+    );
     ws.write("Cargo.lock", &fixture_cargo_lock());
     ws.write("ci/CLOSURE_ALLOWLIST.txt", &fixture_allowlist());
     ws.write("ci/WORKSPACE_GRAPH.txt", BASE_GRAPH);

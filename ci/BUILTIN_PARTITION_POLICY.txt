@@ -1,0 +1,13 @@
+schema fln-builtin-partition-policy/1
+classes toolchain-api,library-code,user-facing-data
+precedence first-match
+rule 01 extern=present partition=toolchain-api reason=extern-intrinsic
+rule 02 implemented-by=present partition=toolchain-api reason=implemented-by-intrinsic
+rule 03 kind=induct,ctor,rec,quot partition=user-facing-data reason=kernel-generated-data-surface
+rule 04 kind=thm partition=library-code reason=proof-library-source
+rule 05 meta=true partition=toolchain-api reason=meta-runtime
+rule 06 safety=unsafe,partial partition=toolchain-api reason=native-runtime-safety
+rule 07 effect=non-pure partition=toolchain-api reason=effectful-runtime
+rule 08 module-root=Lean partition=toolchain-api reason=lean-toolchain-namespace
+rule 09 otherwise partition=library-code reason=pure-library-source
+totality exactly-one-first-match

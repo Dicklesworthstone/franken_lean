@@ -14,7 +14,7 @@ use structure_guard::checks::{self, RunOutcome};
 use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
 use structure_guard::{
     ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
-    CONTRACT_INVENTORY_SCHEMA_FILE, OLEAN_ILEAN_FORMAT_FILE,
+    CONTRACT_INVENTORY_SCHEMA_FILE, EXTERN_BUILTIN_ENVIRONMENT_FILE, OLEAN_ILEAN_FORMAT_FILE,
 };
 
 /// Materialized retained fixture root (mirrors the seeded.rs no-deletion policy).
@@ -68,18 +68,21 @@ fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
             Some(policy),
             Some(abi_target_layout),
             Some(olean_ilean_format),
+            Some(extern_builtin_environment),
         ) = (
             source("SUITE.lock"),
             source(CONTRACT_INVENTORY_SCHEMA_FILE),
             source(CONTRACT_INVENTORY_POLICY_FILE),
             source(ABI_TARGET_LAYOUT_FILE),
             source(OLEAN_ILEAN_FORMAT_FILE),
+            source(EXTERN_BUILTIN_ENVIRONMENT_FILE),
         ) && let Ok(inventory) = canonical_inventory_text(
             suite_lock,
             schema,
             policy,
             abi_target_layout,
             olean_ilean_format,
+            extern_builtin_environment,
         ) {
             rendered_files.push((CONTRACT_INVENTORY_FILE.to_string(), inventory));
         }
@@ -167,6 +170,8 @@ row abi-layout:target:0001 kind=abi-layout support=required target-class=certifi
 row artifact-format:ilean kind=artifact-format support=required target-class=none abi-class=none
 row artifact-format:olean:target:0001 kind=artifact-format support=required target-class=certified abi-class=lp64-le
 row corpus kind=corpus support=required target-class=none abi-class=none
+row environment-census:builtin kind=environment-census support=required target-class=none abi-class=none
+row environment-census:extern kind=environment-census support=required target-class=none abi-class=none
 row reference kind=reference support=required target-class=none abi-class=none
 row suite:asupersync kind=suite support=required target-class=none abi-class=none
 row target:0001 kind=target support=required target-class=certified abi-class=none
@@ -175,6 +180,8 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
 
 const ABI_TARGET_LAYOUT: &str = include_str!("../../../contracts/ABI_TARGET_LAYOUT.txt");
 const OLEAN_ILEAN_FORMAT: &str = include_str!("../../../contracts/OLEAN_ILEAN_FORMAT.txt");
+const EXTERN_BUILTIN_ENVIRONMENT: &str =
+    include_str!("../../../contracts/EXTERN_BUILTIN_ENVIRONMENT.txt");
 
 const TOOLCHAIN: &str =
     "[toolchain]\nchannel = \"nightly-2026-07-13\"\ncomponents = [\"rustfmt\", \"clippy\"]\n";
@@ -235,6 +242,10 @@ fn base_files() -> Vec<(String, String)> {
         (
             OLEAN_ILEAN_FORMAT_FILE.to_string(),
             OLEAN_ILEAN_FORMAT.to_string(),
+        ),
+        (
+            EXTERN_BUILTIN_ENVIRONMENT_FILE.to_string(),
+            EXTERN_BUILTIN_ENVIRONMENT.to_string(),
         ),
         ("SUITE.lock".to_string(), SUITE_LOCK.to_string()),
         ("rust-toolchain.toml".to_string(), TOOLCHAIN.to_string()),
