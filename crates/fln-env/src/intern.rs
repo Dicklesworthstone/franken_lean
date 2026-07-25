@@ -44,8 +44,10 @@
 //!   `Inconclusive`, never a rejection, and the refusal is not cacheable. A term too large to
 //!   intern is not a malformed term.
 
+use crate::decl_closure::canonical_name_bytes;
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{Expr, ExprNode};
+use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 use std::collections::HashMap;
@@ -527,6 +529,28 @@ fn rebuild(expr: &Expr, done: &HashMap<*const ExprNode, TermId>, nodes: &[Expr])
 /// `expr` must be a node from the traversal, not a rebuilt one, so that `done` covers its children:
 /// see the note at the call site for why the two produce the same digest and why only one of them
 /// is affordable.
+/// Feed a [`Name`] into a digest by its **structural** encoding, length-prefixed.
+///
+/// Not `to_display_string`, and the difference is the one `franken_lean-f6br` was filed over.
+/// `Name::to_display_string` joins components with `.` **without escaping** and renders a numeric
+/// component and a string component identically, so `Name::num(a, 5)` and `Name::str(a, "5")`
+/// produce the same text, and a single component spelled `a.b` is indistinguishable from the two
+/// components `a` then `b`. The anonymous name renders as the literal `[anonymous]`, which a string
+/// component spelled that way collides with too. That is precisely how the census witness stopped
+/// discriminating, and it was fixed there by moving to this encoding.
+///
+/// Here the consequence was **not** a soundness hole, and that is worth stating so the fix is not
+/// mistaken for a bug repair: a digest is a bucket hint confirmed by full [`Expr`] equality, so
+/// colliding names cost a `bucket_misses` and can never overmerge. But `bucket_misses` is the one
+/// statistic that exists to reveal a key losing discrimination, and feeding it a known-lossy
+/// encoding blinds the instrument to the thing it measures. Length-prefixing keeps the stream
+/// self-delimiting, so the trailing NUL separators the display form needed are gone.
+fn update_name(hasher: &mut DomainHasher, name: &Name) {
+    let encoded = canonical_name_bytes(name);
+    hasher.update(&(encoded.len() as u64).to_le_bytes());
+    hasher.update(&encoded);
+}
+
 fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Digest {
     let mut hasher = DomainHasher::new(Domain::DeclContent);
     hasher.update(INTERN_TAG);
@@ -568,8 +592,7 @@ fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Dige
         }
         ExprNode::Const { name, levels } => {
             hasher.update(&[5]);
-            hasher.update(name.to_display_string().as_bytes());
-            hasher.update(&[0]);
+            update_name(&mut hasher, name);
             hasher.update(&(levels.len() as u64).to_le_bytes());
             for level in levels {
                 hasher.update(format!("{level:?}").as_bytes());
@@ -588,10 +611,9 @@ fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Dige
             binder_info,
         } => {
             hasher.update(&[7]);
-            // KEPT, unlike the alpha-canonical digest. This byte is the difference between
+            // KEPT, unlike the alpha-canonical digest. These bytes are the difference between
             // contractual interning and overmerge.
-            hasher.update(binder_name.to_display_string().as_bytes());
-            hasher.update(&[0]);
+            update_name(&mut hasher, binder_name);
             hasher.update(&child_id(binder_type).to_le_bytes());
             hasher.update(&child_id(body).to_le_bytes());
             hasher.update(&[*binder_info as u8]);
@@ -603,8 +625,7 @@ fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Dige
             binder_info,
         } => {
             hasher.update(&[8]);
-            hasher.update(binder_name.to_display_string().as_bytes());
-            hasher.update(&[0]);
+            update_name(&mut hasher, binder_name);
             hasher.update(&child_id(binder_type).to_le_bytes());
             hasher.update(&child_id(body).to_le_bytes());
             hasher.update(&[*binder_info as u8]);
@@ -617,8 +638,7 @@ fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Dige
             non_dep,
         } => {
             hasher.update(&[9]);
-            hasher.update(decl_name.to_display_string().as_bytes());
-            hasher.update(&[0]);
+            update_name(&mut hasher, decl_name);
             hasher.update(&child_id(type_).to_le_bytes());
             hasher.update(&child_id(value).to_le_bytes());
             hasher.update(&child_id(body).to_le_bytes());
@@ -642,8 +662,7 @@ fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Dige
             expr: inner,
         } => {
             hasher.update(&[12]);
-            hasher.update(struct_name.to_display_string().as_bytes());
-            hasher.update(&[0]);
+            update_name(&mut hasher, struct_name);
             hasher.update(&idx.to_le_bytes());
             hasher.update(&child_id(inner).to_le_bytes());
         }
@@ -1197,6 +1216,49 @@ mod tests {
         assert!(
             store.stats().is_none(),
             "a poisoned store has no statistics; zeroes would read as `nothing was interned`"
+        );
+    }
+
+    /// Names that `to_display_string` cannot tell apart are distinct in the identity digest.
+    ///
+    /// These are the exact collisions `franken_lean-f6br` was filed over, and they were live in
+    /// this digest until the five name sites moved to the structural encoding. Asserted at the
+    /// DIGEST rather than through the store, because the store would pass either way: a colliding
+    /// digest is a bucket hint and full `Expr` equality would still separate the two terms. That is
+    /// why this was not a soundness bug — and also why only a digest-level assertion can catch it.
+    /// A store-level test here would be the test that passes while the property is false.
+    #[test]
+    fn the_identity_digest_separates_names_the_display_form_collides() {
+        let done = HashMap::new();
+        let anon = Name::anonymous();
+
+        // A numeric component and a string component that render identically.
+        let numeric = Expr::const_(Name::num(anon.clone(), 5), Vec::new());
+        let stringy = Expr::const_(Name::str(anon.clone(), "5"), Vec::new());
+        assert_eq!(
+            Name::num(anon.clone(), 5).to_display_string(),
+            Name::str(anon.clone(), "5").to_display_string(),
+            "premise: the display form must actually collide, or this test proves nothing"
+        );
+        assert_ne!(
+            identity_digest(&numeric, &done),
+            identity_digest(&stringy, &done),
+            "a numeric component must not be able to imitate a string one"
+        );
+
+        // Two components `a`,`b` versus one component literally spelled `a.b`: the display form
+        // joins with `.` and does not escape, so both render as `a.b`.
+        let nested = Expr::const_(Name::str(Name::str(anon.clone(), "a"), "b"), Vec::new());
+        let flat = Expr::const_(Name::str(anon.clone(), "a.b"), Vec::new());
+        assert_eq!(
+            Name::str(Name::str(anon.clone(), "a"), "b").to_display_string(),
+            Name::str(anon.clone(), "a.b").to_display_string(),
+            "premise: the display form must actually collide, or this test proves nothing"
+        );
+        assert_ne!(
+            identity_digest(&nested, &done),
+            identity_digest(&flat, &done),
+            "a component containing the display separator must not forge a deeper path"
         );
     }
 

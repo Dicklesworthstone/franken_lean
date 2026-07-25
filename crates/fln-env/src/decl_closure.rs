@@ -191,7 +191,10 @@ pub struct DeclClosureInput {
 /// display separator cannot forge a deeper path. Reusing it — rather than writing a
 /// second name encoding here — is deliberate: a private encoding is exactly how the
 /// two would drift apart again.
-fn canonical_name_bytes(name: &Name) -> Vec<u8> {
+///
+/// `pub(crate)` for that same reason rather than as a convenience: [`crate::intern`]
+/// needs canonical name bytes too, and the alternative was a fourth private copy.
+pub(crate) fn canonical_name_bytes(name: &Name) -> Vec<u8> {
     let mut writer = CanonWriter::new();
     name.write_body(&mut writer);
     writer.into_bytes()
