@@ -652,7 +652,52 @@ impl Level {
             .any(|l| l.get_offset() >= max_explicit)
     }
 
+    /// A normalization fixpoint: apply [`Level::normalize`] until it stops changing.
+    ///
+    /// **This is not `Lean.Level.normalize` and must never be used where the pin's
+    /// output is the observable** — not for `faithful`-mode artifacts, not for the
+    /// `core_observables` oracle rows, not for anything a user metaprogram reads.
+    /// Upstream's `normalize` is not idempotent and neither is ours (bead fln-0uvk,
+    /// and `normalize_is_not_idempotent_and_the_pin_agrees` pins both steps against
+    /// the pinned binary), so matching it means reproducing that.
+    ///
+    /// It exists for the consumers that non-idempotence actually endangers: anything
+    /// that **stores, keys, digests, or caches** a normalized level and compares it
+    /// later. For those, one-pass output is not canonical — `is_equiv(x, y)` and
+    /// `is_equiv(x.normalize(), y)` can disagree (see
+    /// `pre_normalization_changes_an_is_equiv_verdict`), which makes a verdict depend
+    /// on how many times someone happened to normalize. That is the FL-INV-01 failure
+    /// mode: same inputs, different answer, decided by history rather than by content.
+    ///
+    /// The loop is bounded because a fixpoint that fails to converge must be a typed
+    /// outcome rather than a hang (FL-INV-07). Convergence within
+    /// [`Level::NORMALIZE_FIXPOINT_PASSES`] is asserted over the generated corpus by
+    /// `normalize_fixpoint_converges_and_is_idempotent`; the bound returns the last
+    /// form reached rather than looping forever, so the worst case is a value that is
+    /// merely normalized rather than canonical.
+    pub fn normalize_fixpoint(&self) -> Level {
+        let mut current = self.normalize();
+        for _ in 1..Level::NORMALIZE_FIXPOINT_PASSES {
+            let next = current.normalize();
+            if next == current {
+                return current;
+            }
+            current = next;
+        }
+        current
+    }
+
+    /// Passes [`Level::normalize_fixpoint`] will make before returning what it has.
+    /// Two suffice for every shape observed so far — the extra headroom is so that a
+    /// future normalization rule cannot turn a slow fixpoint into an unbounded loop.
+    pub const NORMALIZE_FIXPOINT_PASSES: usize = 8;
+
     /// `Level.normalize` (Level.lean:379-401).
+    ///
+    /// Bit-faithful to the pin, **including its non-idempotence**: for
+    /// `succ^k(imax a (succ b))` with `k ≥ 1` this collapses the `imax` to a `max`
+    /// but leaves the offset outside, and a second pass distributes it. Use
+    /// [`Level::normalize_fixpoint`] when a canonical form is what you need.
     pub fn normalize(&self) -> Level {
         if self.is_already_normalized_cheap() {
             return self.clone();
@@ -1346,6 +1391,174 @@ mod tests {
             !lhs.is_equiv(&rhs),
             "normalization is incomplete here and the pin agrees; closing this gap \
              would be a deliberate fidelity change, not a bug fix"
+        );
+    }
+
+    /// The consumer hazard fln-0uvk was filed for, demonstrated with parameters only
+    /// — no metavariable, so this shape occurs in ordinary kernel-checked universes,
+    /// not just mid-elaboration.
+    ///
+    /// Two callers holding the same universe get different answers because one of
+    /// them normalized first. Nothing in the workspace does this today (the analysis
+    /// on the bead maps every caller), which is why this is a latent hazard rather
+    /// than a live bug — but it is the reason `normalize_fixpoint` exists and the
+    /// reason no cache key may be taken over `normalize` output.
+    #[test]
+    fn pre_normalization_changes_an_is_equiv_verdict() {
+        let u = p("u");
+        let v = p("v");
+        // succ(imax v (succ u)) — the non-idempotent class.
+        let x = Level::imax(v, u.succ().expect("shallow"))
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        let y = x.normalize().normalize();
+
+        assert!(!x.is_equiv(&y), "one-pass forms differ, so isEquiv says no");
+        assert!(
+            x.normalize().is_equiv(&y),
+            "after a pre-normalization the very same pair says yes"
+        );
+
+        // The fixpoint form is stable under exactly that difference.
+        assert_eq!(x.normalize_fixpoint(), y.normalize_fixpoint());
+        assert_eq!(
+            x.normalize_fixpoint(),
+            x.normalize().normalize_fixpoint(),
+            "a canonical form cannot depend on how many times the caller normalized"
+        );
+    }
+
+    /// `normalize_fixpoint` is the true normal form the one-pass function is not.
+    ///
+    /// The generator deliberately emits `succ^k(imax(a, succ b))`, the only shape
+    /// class that is non-idempotent. An earlier version of this search covered 80,000
+    /// generated pairs and found zero — because it never built that shape. A search
+    /// whose zeros are not validated against a known positive is worth nothing, so
+    /// the known counterexample is checked first, here, every run.
+    #[test]
+    fn normalize_fixpoint_converges_and_is_idempotent() {
+        struct Gen(u64);
+        impl Gen {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn atom(&mut self) -> Level {
+                match self.next() % 4 {
+                    0 => Level::zero(),
+                    1 => p("u"),
+                    2 => p("v"),
+                    _ => Level::mvar(LMVarId(Name::str(Name::anonymous(), "m"))),
+                }
+            }
+            fn level(&mut self, depth: u32) -> Level {
+                if depth == 0 {
+                    return self.atom();
+                }
+                match self.next() % 7 {
+                    0 => self.level(depth - 1).succ().expect("shallow"),
+                    1 => Level::max(self.level(depth - 1), self.level(depth - 1)).expect("shallow"),
+                    2 => {
+                        Level::imax(self.level(depth - 1), self.level(depth - 1)).expect("shallow")
+                    }
+                    3 => Level::imax(self.level(depth - 1), Level::zero()).expect("shallow"),
+                    // The non-idempotent class, emitted on purpose.
+                    4 => Level::imax(
+                        self.level(depth - 1),
+                        self.level(depth - 1).succ().expect("shallow"),
+                    )
+                    .expect("shallow")
+                    .succ()
+                    .expect("shallow"),
+                    5 => self
+                        .level(depth - 1)
+                        .add_offset((self.next() % 3) as u32)
+                        .expect("shallow"),
+                    _ => self.atom(),
+                }
+            }
+        }
+
+        // Validate the search before trusting it: the known counterexample must be
+        // non-idempotent under `normalize` and stable under `normalize_fixpoint`.
+        let known = Level::imax(p("v"), p("u").succ().expect("shallow"))
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        assert_ne!(
+            known.normalize(),
+            known.normalize().normalize(),
+            "the harness cannot see the known non-idempotent case"
+        );
+        assert_eq!(
+            known.normalize_fixpoint(),
+            known.normalize_fixpoint().normalize()
+        );
+
+        let mut generator = Gen(0x5eed_0a1b_2c3d_4e5f);
+        let mut saw_non_idempotent = 0usize;
+        for round in 0..600 {
+            let x = generator.level(4);
+            let fixed = x.normalize_fixpoint();
+
+            if x.normalize() != x.normalize().normalize() {
+                saw_non_idempotent += 1;
+            }
+
+            // The fixpoint is a fixpoint.
+            assert_eq!(
+                fixed.normalize(),
+                fixed,
+                "round {round}: normalize_fixpoint output is not stable"
+            );
+            assert_eq!(
+                fixed.normalize_fixpoint(),
+                fixed,
+                "round {round}: normalize_fixpoint is not idempotent"
+            );
+
+            // And it is reached regardless of how many times the caller normalized
+            // first — the property the one-pass function does not have.
+            assert_eq!(
+                x.normalize().normalize_fixpoint(),
+                fixed,
+                "round {round}: pre-normalizing changed the canonical form"
+            );
+            assert_eq!(
+                x.normalize().normalize().normalize_fixpoint(),
+                fixed,
+                "round {round}: pre-normalizing twice changed the canonical form"
+            );
+
+            // Two passes are enough for every shape seen so far; if that ever stops
+            // holding, the bound is what keeps it from becoming a hang.
+            assert_eq!(
+                x.normalize().normalize(),
+                fixed,
+                "round {round}: the fixpoint took more than two passes"
+            );
+
+            // isEquiv agreeing implies the canonical forms agree. The converse does
+            // not hold, and must not be asserted: canonical comparison is coarser
+            // than the pin's isEquiv, which is exactly the difference this bead is
+            // about.
+            let y = generator.level(3);
+            if x.is_equiv(&y) {
+                assert_eq!(
+                    fixed,
+                    y.normalize_fixpoint(),
+                    "round {round}: isEquiv said yes but the canonical forms differ"
+                );
+            }
+        }
+        assert!(
+            saw_non_idempotent > 0,
+            "the generator never produced a non-idempotent level, so this search \
+             proved nothing — the same false negative an earlier version shipped"
         );
     }
 
