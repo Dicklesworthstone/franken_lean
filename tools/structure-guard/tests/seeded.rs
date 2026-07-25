@@ -167,6 +167,48 @@ fn fln_bench_snapshot_and_edge_laws_are_falsifiable() {
 }
 
 #[test]
+fn verdict_reflected_admission_edges_are_exact_and_falsifiable() {
+    let ws = TempWs::new("fln-verdict-reflected-admission-edges");
+    base(&ws);
+    let dependencies = ["fln-core", "fln-env", "fln-kernel"];
+    ws.write(
+        "crates/fln-verdict/Cargo.toml",
+        &manifest("fln-verdict", &dependencies),
+    );
+    ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-verdict", &dependencies)]),
+    );
+
+    let missing = ws.run();
+    assert_eq!(
+        codes(&missing),
+        vec!["FLN-STRUCT-005", "FLN-STRUCT-005", "FLN-STRUCT-005"]
+    );
+    for dependency in dependencies {
+        let expected = format!("dependency edge `fln-verdict -> {dependency}`");
+        assert!(
+            missing
+                .findings
+                .iter()
+                .any(|finding| finding.detail.contains(&expected)),
+            "missing exact reflected-admission finding for {dependency}: {:?}",
+            missing.findings
+        );
+    }
+
+    ws.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &graph_with_edges(&[
+            "fln-verdict -> fln-core",
+            "fln-verdict -> fln-env",
+            "fln-verdict -> fln-kernel",
+        ]),
+    );
+    assert!(ws.run().findings.is_empty());
+}
+
+#[test]
 fn stale_acknowledged_edge_is_flagged() {
     let ws = TempWs::new("stale-edge");
     base(&ws);
