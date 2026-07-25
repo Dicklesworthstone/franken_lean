@@ -50,6 +50,10 @@
 //!   operation could not establish one complete generation.
 //! * `FLN-STRUCT-034` kernel-contract ownership publication is inconclusive because an
 //!   interrupted/competing `.candidate` exists or its absence cannot be established.
+//! * `FLN-STRUCT-035` the canonical contract handoff is malformed, stale, or disagrees
+//!   with the exact current join of inventory, policy, and rendered output bytes.
+//! * `FLN-STRUCT-036` contract-handoff authority is inconclusive because publication
+//!   is interrupted, a governed source changed, or a bounded operation exhausted.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -82,6 +86,7 @@ pub struct RunOutcome {
     pub crate_count: usize,
     pub edge_count: usize,
     pub graph_digest: u64,
+    pub contract_handoff_root: Option<String>,
     pub root_identity: String,
     pub governed_root_before: u64,
     pub governed_root_after: u64,
@@ -1944,7 +1949,8 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // or malformed governance files degrade to findings, never to a silent skip.
     findings.extend(crate::lockfile::audit(root, &g));
     findings.extend(crate::contract_inventory::audit(root));
-    findings.extend(crate::contract_handoff::audit(root));
+    let (handoff_findings, contract_handoff) = crate::contract_handoff::audit_with_snapshot(root);
+    findings.extend(handoff_findings);
     findings.extend(crate::ownership_publication::audit(root));
 
     if compiler_identity.contract_declared && !compiler_identity.contract_match {
@@ -1981,6 +1987,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             });
         }
     }
+    // ubs:ignore — public structural input digests, not secret material.
     if governed_before.digest != governed_after.digest {
         findings.push(Finding {
             code: "FLN-STRUCT-028",
@@ -2040,6 +2047,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                 | "FLN-STRUCT-031"
                 | "FLN-STRUCT-033"
                 | "FLN-STRUCT-034"
+                | "FLN-STRUCT-036"
         )
     }) {
         Authority::Incomplete
@@ -2052,6 +2060,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         crate_count: discovered.len(),
         edge_count: actual_edges.len(),
         graph_digest,
+        contract_handoff_root: contract_handoff.map(|snapshot| snapshot.handoff_root),
         root_identity,
         governed_root_before: governed_before.digest,
         governed_root_after: governed_after.digest,

@@ -428,13 +428,13 @@ test -s "$root/contracts/CONTRACT_HANDOFF.txt"
 '
 
 run_step cold_regeneration_a "$SCRATCH_A" pass 0 0 \
-  '"verdict":"pass"' '"canonical_root":"fnv1a64:' \
+  '"verdict":"pass"' '"contract_handoff_root":"fnv1a64:' \
   env -i HOME="$HOME" PATH="$PATH" LANG=C LC_ALL=C TZ=UTC \
   CARGO_TARGET_DIR="$BUILD_A" /bin/bash -c "$regeneration_command" _ \
   "$SCRATCH_A" "$FULL_CENSUS"
 
 run_step cold_regeneration_b "$SCRATCH_B" pass 0 0 \
-  '"verdict":"pass"' '"canonical_root":"fnv1a64:' \
+  '"verdict":"pass"' '"contract_handoff_root":"fnv1a64:' \
   env -i HOME="$HOME" PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
   TZ=Pacific/Kiritimati SOURCE_DATE_EPOCH=123456789 RAYON_NUM_THREADS=8 \
   CARGO_TARGET_DIR="$BUILD_B" /bin/bash -c "$regeneration_command" _ \
@@ -496,7 +496,7 @@ GUARD="$BUILD_A/debug/structure-guard"
 
 retain_and_mutate ABI_CONTRACT.md markdown append $'\nplanted-render-drift\n'
 run_step markdown_only_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-034 published_handoff_invalid \
+  FLN-STRUCT-035 published_handoff_invalid \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation ABI_CONTRACT.md markdown
 run_step markdown_only_recovery "$SCRATCH_A" pass 0 0 \
@@ -505,7 +505,7 @@ run_step markdown_only_recovery "$SCRATCH_A" pass 0 0 \
 retain_and_mutate crates/fln-rt/src/abi.rs constants replace \
   'pub const TAG_CLOSURE: u8 = 245;' 'pub const TAG_CLOSURE: u8 = 244;'
 run_step constants_only_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-034 published_handoff_invalid \
+  FLN-STRUCT-035 published_handoff_invalid \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation crates/fln-rt/src/abi.rs constants
 run_step constants_only_recovery "$SCRATCH_A" pass 0 0 \
@@ -515,7 +515,7 @@ POLICY_ROW='row abi-contract-markdown path=ABI_CONTRACT.md domain=abi role=markd
 '
 retain_and_mutate ci/CONTRACT_HANDOFF_POLICY.txt policy drop "$POLICY_ROW"
 run_step policy_omission_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-034 handoff_policy_not_exact \
+  FLN-STRUCT-035 handoff_policy_not_exact \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation ci/CONTRACT_HANDOFF_POLICY.txt policy
 run_step policy_omission_recovery "$SCRATCH_A" pass 0 0 \
@@ -526,7 +526,7 @@ STALE_POLICY_ROW='row stale-output path=contracts/stale.txt domain=abi role=mark
 retain_and_mutate ci/CONTRACT_HANDOFF_POLICY.txt stale-policy append \
   "$STALE_POLICY_ROW"
 run_step stale_policy_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-034 handoff_policy_not_exact \
+  FLN-STRUCT-035 handoff_policy_not_exact \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation ci/CONTRACT_HANDOFF_POLICY.txt stale-policy
 run_step stale_policy_recovery "$SCRATCH_A" pass 0 0 \
@@ -535,7 +535,7 @@ run_step stale_policy_recovery "$SCRATCH_A" pass 0 0 \
 retain_and_mutate ci/CONTRACT_HANDOFF_POLICY.txt duplicate-policy append \
   "$POLICY_ROW"
 run_step duplicate_policy_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-034 handoff_policy_duplicate \
+  FLN-STRUCT-035 handoff_policy_duplicate \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation ci/CONTRACT_HANDOFF_POLICY.txt duplicate-policy
 run_step duplicate_policy_recovery "$SCRATCH_A" pass 0 0 \
@@ -545,7 +545,7 @@ retain_and_mutate contracts/CONTRACT_HANDOFF_V1.txt schema replace \
   'handoff-schema fln-contract-handoff/1' \
   'handoff-schema fln-contract-handoff/999'
 run_step incompatible_schema_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-034 handoff_schema_mismatch \
+  FLN-STRUCT-035 handoff_schema_mismatch \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation contracts/CONTRACT_HANDOFF_V1.txt schema
 run_step incompatible_schema_recovery "$SCRATCH_A" pass 0 0 \
@@ -582,8 +582,8 @@ run_step host_target_substitution_recovery "$SCRATCH_A" pass 0 0 \
 
 printf 'partial generated Rust\n' > \
   "$SCRATCH_A/crates/fln-rt/src/abi.rs.candidate"
-run_step partial_publication_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-035 stale_source_candidate \
+run_step partial_publication_mutant "$SCRATCH_A" fail 1 3 \
+  FLN-STRUCT-036 stale_source_candidate \
   "$GUARD" --root "$SCRATCH_A" --robot
 mv "$SCRATCH_A/crates/fln-rt/src/abi.rs.candidate" \
   "$RETAINED/partial-abi.rs.candidate"
@@ -594,16 +594,16 @@ cp --reflink=auto "$SCRATCH_A/contracts/CONTRACT_HANDOFF.txt" \
   "$SCRATCH_A/contracts/CONTRACT_HANDOFF.txt.candidate"
 cp --reflink=auto "$SCRATCH_A/contracts/CONTRACT_HANDOFF.txt.candidate" \
   "$RETAINED/cancelled-complete-handoff.candidate"
-run_step cancelled_publication_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-035 stale_candidate \
+run_step cancelled_publication_mutant "$SCRATCH_A" fail 1 3 \
+  FLN-STRUCT-036 stale_candidate \
   "$GUARD" --root "$SCRATCH_A" --robot
 run_step cancelled_publication_recovery "$SCRATCH_A" pass 0 0 \
   '"action":"recovered"' '"verdict":"pass"' \
   "$GUARD" --root "$SCRATCH_A" --recover-contract-handoff --robot
 
 retain_and_mutate ci/CONTRACT_HANDOFF_POLICY.txt resource resize 1048577
-run_step resource_exhaustion_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-035 resource_exhausted \
+run_step resource_exhaustion_mutant "$SCRATCH_A" fail 1 3 \
+  FLN-STRUCT-036 resource_exhausted \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation ci/CONTRACT_HANDOFF_POLICY.txt resource
 run_step resource_exhaustion_recovery "$SCRATCH_A" pass 0 0 \
@@ -622,7 +622,7 @@ run_step suppressed_drift_recovery "$SCRATCH_A" pass 0 0 \
 retain_and_mutate crates/fln-rt/src/abi.rs reference append \
   $'\nconst REFERENCE_RUNTIME: &str = ".elan/toolchains/reference";\n'
 run_step reference_path_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-034 reference_runtime_path_leak \
+  FLN-STRUCT-035 reference_runtime_path_leak \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation crates/fln-rt/src/abi.rs reference
 run_step reference_path_recovery "$SCRATCH_A" pass 0 0 \
@@ -631,14 +631,14 @@ run_step reference_path_recovery "$SCRATCH_A" pass 0 0 \
 retain_and_mutate crates/fln-rt/src/abi.rs mock append \
   $'\nconst FLN_MOCK_CONSUMER: bool = true;\n'
 run_step mock_consumer_mutant "$SCRATCH_A" fail 1 1 \
-  FLN-STRUCT-034 mock_consumer_substitution \
+  FLN-STRUCT-035 mock_consumer_substitution \
   "$GUARD" --root "$SCRATCH_A" --robot
 repair_mutation crates/fln-rt/src/abi.rs mock
 run_step mock_consumer_recovery "$SCRATCH_A" pass 0 0 \
   '"verdict":"pass"' - "$GUARD" --root "$SCRATCH_A" --robot
 
 run_step final_handoff "$SCRATCH_A" pass 0 0 \
-  '"verdict":"pass"' '"canonical_root":"fnv1a64:' \
+  '"verdict":"pass"' '"contract_handoff_root":"fnv1a64:' \
   "$GUARD" --root "$SCRATCH_A" --robot
 
 set_final pass all_contract_handoff_obligations_passed 0

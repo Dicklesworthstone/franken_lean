@@ -1229,32 +1229,39 @@ pub fn recover(root: &Path) -> Result<PublicationReceipt, HandoffError> {
     })
 }
 
-pub fn audit(root: &Path) -> Vec<Finding> {
+pub fn audit_with_snapshot(root: &Path) -> (Vec<Finding>, Option<HandoffSnapshot>) {
     // The lower-level inventory audit owns its own authority failures. Reporting a
     // second terminal-handoff error when that prerequisite is invalid obscures the
     // first divergence and breaks typed diagnosis.
     if contract_inventory::consume(root).is_err() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     match consume(root) {
-        Ok(_) => Vec::new(),
+        Ok(snapshot) => (Vec::new(), Some(snapshot)),
         Err(error) => {
             let code = match error.class {
-                ErrorClass::Violation => "FLN-STRUCT-034",
-                ErrorClass::Inconclusive | ErrorClass::InternalFault => "FLN-STRUCT-035",
+                ErrorClass::Violation => "FLN-STRUCT-035",
+                ErrorClass::Inconclusive | ErrorClass::InternalFault => "FLN-STRUCT-036",
             };
-            vec![Finding {
-                code,
-                path: error.path,
-                detail: format!(
-                    "contract-handoff {} reason={}: {}",
-                    error.class.as_str(),
-                    error.reason,
-                    error.detail
-                ),
-            }]
+            (
+                vec![Finding {
+                    code,
+                    path: error.path,
+                    detail: format!(
+                        "contract-handoff {} reason={}: {}",
+                        error.class.as_str(),
+                        error.reason,
+                        error.detail
+                    ),
+                }],
+                None,
+            )
         }
     }
+}
+
+pub fn audit(root: &Path) -> Vec<Finding> {
+    audit_with_snapshot(root).0
 }
 
 #[cfg(test)]
@@ -1287,9 +1294,11 @@ mod tests {
             ));
             match fs::create_dir(&path) {
                 Ok(()) => return path,
-                // ubs:ignore — retained test fixture collision, not secret material.
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("create retained root: {error}"),
+                Err(error) => assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists,
+                    "create retained root"
+                ),
             }
         }
     }
@@ -1381,6 +1390,9 @@ mod tests {
         let error = consume(&root).expect_err("one-sided output mutation must be refused");
         assert_eq!(error.class, ErrorClass::Violation);
         assert_eq!(error.reason, "published_handoff_invalid");
+        let findings = audit(&root);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "FLN-STRUCT-035");
     }
 
     #[test]
@@ -1440,6 +1452,9 @@ mod tests {
         let error = consume(&candidate).expect_err("source candidate must mask old handoff");
         assert_eq!(error.class, ErrorClass::Inconclusive);
         assert_eq!(error.reason, "stale_source_candidate");
+        let findings = audit(&candidate);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "FLN-STRUCT-036");
 
         let leaked = fixture_root("reference-path-leak");
         fs::write(

@@ -35,11 +35,12 @@ pub fn json_escape(s: &str) -> String {
 pub fn render_human(root_display: &str, outcome: &RunOutcome) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "structure-guard: root={root_display} root-identity={} crates={} edges={} graph-digest=fnv1a64:{:016x} governed-root=fnv1a64:{:016x}\n",
+        "structure-guard: root={root_display} root-identity={} crates={} edges={} graph-digest=fnv1a64:{:016x} contract-handoff-root={} governed-root=fnv1a64:{:016x}\n",
         outcome.root_identity,
         outcome.crate_count,
         outcome.edge_count,
         outcome.graph_digest,
+        outcome.contract_handoff_root.as_deref().unwrap_or("unavailable"),
         outcome.governed_root_after,
     ));
     for f in &outcome.findings {
@@ -107,11 +108,12 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
     ));
     lines.extend(outcome.findings.iter().map(finding_ndjson));
     lines.push(format!(
-        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"authority\":\"{}\",\"traversal\":{{\"directories_visited\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped_unreadable\":{}}},\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":{},\"governed_root_before\":\"fnv1a64:{:016x}\",\"governed_root_after\":\"fnv1a64:{:016x}\",\"governed_root_unchanged\":{},\"duration_ms\":{duration_ms}}}",
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"authority\":\"{}\",\"contract_handoff_root\":{},\"traversal\":{{\"directories_visited\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped_unreadable\":{}}},\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":{},\"governed_root_before\":\"fnv1a64:{:016x}\",\"governed_root_after\":\"fnv1a64:{:016x}\",\"governed_root_unchanged\":{},\"duration_ms\":{duration_ms}}}",
         outcome.verdict(),
         outcome.exit_code(),
         outcome.findings.len(),
         outcome.authority.as_str(),
+        optional_json_string(outcome.contract_handoff_root.as_deref()),
         outcome.traversal.directories_visited,
         outcome.traversal.files_discovered,
         outcome.traversal.files_scanned,
@@ -129,7 +131,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
 pub fn render_setup_failure_ndjson(root_display: &str, error: &str, duration_ms: u128) -> String {
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"contract_handoff_root\":null,\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(root_display),
         json_escape(error)
     )
@@ -140,7 +142,7 @@ pub fn render_setup_failure_ndjson(root_display: &str, error: &str, duration_ms:
 pub fn render_cli_failure_ndjson(root_display: &str, error: &str, duration_ms: u128) -> String {
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"contract_handoff_root\":null,\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(root_display),
         json_escape(error)
     )
@@ -152,7 +154,7 @@ pub fn render_help_ndjson(usage: &str, duration_ms: u128) -> String {
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":null,\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
          {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"help\",\"usage\":\"{}\"}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"authority\":\"not_applicable\",\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"authority\":\"not_applicable\",\"contract_handoff_root\":null,\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(usage)
     )
 }
