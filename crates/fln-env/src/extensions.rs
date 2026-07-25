@@ -833,7 +833,13 @@ struct CheckpointWork {
     captured_entries: usize,
 }
 
-fn merge_semantics_tag(semantics: MergeSemantics) -> u8 {
+/// Stable `Domain::ExtensionDelta` descriptor tags. These are schema values, not
+/// Rust enum discriminants: changing one requires an explicit identity/epoch
+/// decision. The `forbid` is the same compile-time guard `fln-env`'s declaration
+/// tags carry — it is stronger than a test, because a cast cannot be reintroduced
+/// silently even by an author who never reads this comment.
+#[forbid(clippy::as_conversions)]
+const fn merge_semantics_tag(semantics: MergeSemantics) -> u8 {
     match semantics {
         MergeSemantics::AppendOrdered => 0,
         MergeSemantics::SetUnion => 1,
@@ -841,14 +847,16 @@ fn merge_semantics_tag(semantics: MergeSemantics) -> u8 {
     }
 }
 
-fn checkpoint_semantics_tag(semantics: CheckpointSemantics) -> u8 {
+#[forbid(clippy::as_conversions)]
+const fn checkpoint_semantics_tag(semantics: CheckpointSemantics) -> u8 {
     match semantics {
         CheckpointSemantics::JournalSuffix => 0,
         CheckpointSemantics::FullJournal => 1,
     }
 }
 
-fn payload_provenance_tag(provenance: PayloadProvenance) -> u8 {
+#[forbid(clippy::as_conversions)]
+const fn payload_provenance_tag(provenance: PayloadProvenance) -> u8 {
     match provenance {
         PayloadProvenance::Understood => 0,
         PayloadProvenance::Opaque => 1,
@@ -1537,27 +1545,106 @@ mod tests {
         DescriptorAfterJournal,
     }
 
-    fn descriptor_identity_cases() -> Vec<DescriptorIdentityCase> {
-        let mut cases = Vec::with_capacity(12);
-        for merge in [
-            MergeSemantics::AppendOrdered,
-            MergeSemantics::SetUnion,
-            MergeSemantics::ConflictsRequireReview,
-        ] {
-            for checkpoint in [
-                CheckpointSemantics::JournalSuffix,
-                CheckpointSemantics::FullJournal,
-            ] {
-                for provenance in [PayloadProvenance::Understood, PayloadProvenance::Opaque] {
-                    cases.push(DescriptorIdentityCase {
-                        merge,
-                        checkpoint,
-                        provenance,
-                    });
-                }
-            }
+    /// Successor chains over every descriptor dimension that reaches
+    /// `Domain::ExtensionDelta`.
+    ///
+    /// The tag matches already force a new `MergeSemantics`, `CheckpointSemantics`
+    /// or `PayloadProvenance` variant to be *tagged*. These force it to be
+    /// *covered*: the combination matrix used to be three hand-written literal
+    /// arrays, so a new variant satisfied every exhaustive match and then quietly
+    /// stayed out of the 3x2x2 classification, the mutant matrix and the E2E
+    /// producer — tagged but untested identity. Rust has no enum reflection, so the
+    /// forcing function has to be an exhaustive match that *generates* the matrix.
+    /// Adding a variant fails to compile here until it joins a chain, and the chains
+    /// are what build the matrix, so tagging and covering are one edit. This is the
+    /// same convention `fln-amv.12` established for declaration tags rather than a
+    /// second scheme.
+    const fn succ_merge_semantics(semantics: MergeSemantics) -> Option<MergeSemantics> {
+        match semantics {
+            MergeSemantics::AppendOrdered => Some(MergeSemantics::SetUnion),
+            MergeSemantics::SetUnion => Some(MergeSemantics::ConflictsRequireReview),
+            MergeSemantics::ConflictsRequireReview => None,
         }
+    }
+
+    const fn succ_checkpoint_semantics(
+        semantics: CheckpointSemantics,
+    ) -> Option<CheckpointSemantics> {
+        match semantics {
+            CheckpointSemantics::JournalSuffix => Some(CheckpointSemantics::FullJournal),
+            CheckpointSemantics::FullJournal => None,
+        }
+    }
+
+    const fn succ_payload_provenance(provenance: PayloadProvenance) -> Option<PayloadProvenance> {
+        match provenance {
+            PayloadProvenance::Understood => Some(PayloadProvenance::Opaque),
+            PayloadProvenance::Opaque => None,
+        }
+    }
+
+    const FIRST_MERGE_SEMANTICS: MergeSemantics = MergeSemantics::AppendOrdered;
+    const FIRST_CHECKPOINT_SEMANTICS: CheckpointSemantics = CheckpointSemantics::JournalSuffix;
+    const FIRST_PAYLOAD_PROVENANCE: PayloadProvenance = PayloadProvenance::Understood;
+
+    /// Frozen per-dimension variant counts and the frozen product. Lengthening a
+    /// chain without bumping these fails const evaluation of the generator, and
+    /// shortening one fails it too — that is the single way to satisfy an exhaustive
+    /// match while orphaning a variant, so the count is checked in both directions
+    /// rather than as an upper bound. `scripts/evidence.py` pins the same 12 for the
+    /// `fln.e2e.extension-descriptor-matrix` bundle; the two move together.
+    const MERGE_SEMANTICS_VARIANTS: usize = 3;
+    const CHECKPOINT_SEMANTICS_VARIANTS: usize = 2;
+    const PAYLOAD_PROVENANCE_VARIANTS: usize = 2;
+    const DESCRIPTOR_COMBINATION_COUNT: usize =
+        MERGE_SEMANTICS_VARIANTS * CHECKPOINT_SEMANTICS_VARIANTS * PAYLOAD_PROVENANCE_VARIANTS;
+
+    const DESCRIPTOR_IDENTITY_CASES: [DescriptorIdentityCase; DESCRIPTOR_COMBINATION_COUNT] =
+        derive_descriptor_identity_cases();
+
+    const fn derive_descriptor_identity_cases()
+    -> [DescriptorIdentityCase; DESCRIPTOR_COMBINATION_COUNT] {
+        let mut cases = [DescriptorIdentityCase {
+            merge: FIRST_MERGE_SEMANTICS,
+            checkpoint: FIRST_CHECKPOINT_SEMANTICS,
+            provenance: FIRST_PAYLOAD_PROVENANCE,
+        }; DESCRIPTOR_COMBINATION_COUNT];
+        let mut filled = 0;
+        // Merge outermost, provenance innermost: the same order the hand-written
+        // loops produced, so no golden, record order or frozen count moves.
+        let mut merge = Some(FIRST_MERGE_SEMANTICS);
+        while let Some(current_merge) = merge {
+            let mut checkpoint = Some(FIRST_CHECKPOINT_SEMANTICS);
+            while let Some(current_checkpoint) = checkpoint {
+                let mut provenance = Some(FIRST_PAYLOAD_PROVENANCE);
+                while let Some(current_provenance) = provenance {
+                    // A chain that is too long, or one that cycles, is caught here
+                    // rather than by writing past the end of the array.
+                    assert!(
+                        filled < DESCRIPTOR_COMBINATION_COUNT,
+                        "descriptor successor chains yield more combinations than DESCRIPTOR_COMBINATION_COUNT"
+                    );
+                    cases[filled] = DescriptorIdentityCase {
+                        merge: current_merge,
+                        checkpoint: current_checkpoint,
+                        provenance: current_provenance,
+                    };
+                    filled += 1;
+                    provenance = succ_payload_provenance(current_provenance);
+                }
+                checkpoint = succ_checkpoint_semantics(current_checkpoint);
+            }
+            merge = succ_merge_semantics(current_merge);
+        }
+        assert!(
+            filled == DESCRIPTOR_COMBINATION_COUNT,
+            "descriptor successor chains yield fewer combinations than DESCRIPTOR_COMBINATION_COUNT: a variant is orphaned"
+        );
         cases
+    }
+
+    fn descriptor_identity_cases() -> Vec<DescriptorIdentityCase> {
+        DESCRIPTOR_IDENTITY_CASES.to_vec()
     }
 
     const fn modeled_merge_tag(semantics: MergeSemantics) -> u8 {
@@ -1925,6 +2012,166 @@ mod tests {
         );
         assert_eq!(payload_provenance_tag(PayloadProvenance::Understood), 0);
         assert_eq!(payload_provenance_tag(PayloadProvenance::Opaque), 1);
+    }
+
+    /// The coverage half of the `fln-amv.2` guard, and the same discipline
+    /// `fln-amv.12` uses for declaration tags rather than a second scheme.
+    ///
+    /// The tag matches force a new descriptor variant to be *tagged*; the successor
+    /// chains force it to be *covered*, and this proves the chains actually generate
+    /// the 3x2x2 matrix that the classification, the named mutants and the E2E
+    /// producer all iterate.
+    #[test]
+    fn descriptor_identity_matrix_is_generated_by_exhaustive_succ_chains() {
+        // Walk each dimension independently of the generated matrix, so it is checked
+        // against the chains rather than against itself.
+        let mut merge_chain: Vec<MergeSemantics> = Vec::new();
+        let mut merge = Some(FIRST_MERGE_SEMANTICS);
+        while let Some(current) = merge {
+            assert!(
+                !merge_chain.contains(&current),
+                "the MergeSemantics successor chain revisits {current:?}, which would \
+                 silently drop every variant after the cycle"
+            );
+            merge_chain.push(current);
+            merge = succ_merge_semantics(current);
+        }
+        let mut checkpoint_chain: Vec<CheckpointSemantics> = Vec::new();
+        let mut checkpoint = Some(FIRST_CHECKPOINT_SEMANTICS);
+        while let Some(current) = checkpoint {
+            assert!(
+                !checkpoint_chain.contains(&current),
+                "the CheckpointSemantics successor chain revisits {current:?}"
+            );
+            checkpoint_chain.push(current);
+            checkpoint = succ_checkpoint_semantics(current);
+        }
+        let mut provenance_chain: Vec<PayloadProvenance> = Vec::new();
+        let mut provenance = Some(FIRST_PAYLOAD_PROVENANCE);
+        while let Some(current) = provenance {
+            assert!(
+                !provenance_chain.contains(&current),
+                "the PayloadProvenance successor chain revisits {current:?}"
+            );
+            provenance_chain.push(current);
+            provenance = succ_payload_provenance(current);
+        }
+        assert_eq!(
+            merge_chain.as_slice(),
+            [
+                MergeSemantics::AppendOrdered,
+                MergeSemantics::SetUnion,
+                MergeSemantics::ConflictsRequireReview,
+            ]
+            .as_slice(),
+            "the MergeSemantics chain no longer enumerates every variant"
+        );
+        assert_eq!(
+            checkpoint_chain.as_slice(),
+            [
+                CheckpointSemantics::JournalSuffix,
+                CheckpointSemantics::FullJournal,
+            ]
+            .as_slice(),
+            "the CheckpointSemantics chain no longer enumerates every variant"
+        );
+        assert_eq!(
+            provenance_chain.as_slice(),
+            [PayloadProvenance::Understood, PayloadProvenance::Opaque].as_slice(),
+            "the PayloadProvenance chain no longer enumerates every variant"
+        );
+        assert_eq!(merge_chain.len(), MERGE_SEMANTICS_VARIANTS);
+        assert_eq!(checkpoint_chain.len(), CHECKPOINT_SEMANTICS_VARIANTS);
+        assert_eq!(provenance_chain.len(), PAYLOAD_PROVENANCE_VARIANTS);
+
+        // Exact equality against the independently built product, which is the
+        // both-directions assertion: every combination of chain members reaches the
+        // matrix, and the matrix holds nothing that is not such a combination. Either
+        // direction alone would accept a matrix that quietly dropped or invented one.
+        let mut expected = Vec::with_capacity(DESCRIPTOR_COMBINATION_COUNT);
+        for merge in merge_chain.iter().copied() {
+            for checkpoint in checkpoint_chain.iter().copied() {
+                for provenance in provenance_chain.iter().copied() {
+                    expected.push((merge, checkpoint, provenance));
+                }
+            }
+        }
+        let observed: Vec<_> = descriptor_identity_cases()
+            .into_iter()
+            .map(|case| (case.merge, case.checkpoint, case.provenance))
+            .collect();
+        assert_eq!(
+            observed.as_slice(),
+            expected.as_slice(),
+            "the generated descriptor matrix diverged from the successor chains"
+        );
+        assert_eq!(observed.len(), DESCRIPTOR_COMBINATION_COUNT);
+        assert_eq!(DESCRIPTOR_COMBINATION_COUNT, 12);
+
+        // Tags must be pairwise distinct within a dimension, and deliberately *not*
+        // dense: retiring a variant should retire its tag forever rather than force a
+        // renumbering, and silent renumbering is exactly what this bead forbids.
+        let merge_tags: Vec<u8> = merge_chain
+            .iter()
+            .copied()
+            .map(merge_semantics_tag)
+            .collect();
+        let checkpoint_tags: Vec<u8> = checkpoint_chain
+            .iter()
+            .copied()
+            .map(checkpoint_semantics_tag)
+            .collect();
+        let provenance_tags: Vec<u8> = provenance_chain
+            .iter()
+            .copied()
+            .map(payload_provenance_tag)
+            .collect();
+        for (dimension, tags) in [
+            ("merge", &merge_tags),
+            ("checkpoint", &checkpoint_tags),
+            ("provenance", &provenance_tags),
+        ] {
+            let distinct: HashSet<u8> = tags.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                tags.len(),
+                "two {dimension} variants share a tag, so descriptors that differ \
+                 collide on one identity"
+            );
+        }
+
+        // The frozen mutant counts are pinned to the matrix size, so growing a
+        // dimension cannot leave a stale expectation passing on a subset.
+        assert_eq!(
+            DESCRIPTOR_COMBINATION_COUNT * 5,
+            60,
+            "the frozen 60 universal mutant discriminations no longer match the matrix"
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.extension-descriptor-coverage\",\"version\":1,\
+             \"bead\":\"fln-amv.2\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"generated-descriptor-combination-matrix\",\
+             \"claim_scope\":\"descriptor_combination_coverage_only\",\
+             \"matrix_source\":\"generated_from_exhaustive_succ_chains\",\
+             \"convention\":\"shared-with-fln-amv.12\",\
+             \"guard_kind\":\"compile_time_and_const_eval\",\
+             \"added_variant_outcome\":\"compile_error\",\
+             \"source_reorder_outcome\":\"no_root_change\",\
+             \"retagged_variant_outcome\":\"root_relation_failure\",\
+             \"shortened_chain_outcome\":\"const_eval_assert\",\
+             \"merge_chain_length\":{},\"checkpoint_chain_length\":{},\
+             \"provenance_chain_length\":{},\
+             \"generated_combination_count\":{},\"frozen_combination_count\":{},\
+             \"tag_density_asserted\":false,\
+             \"tag_pairwise_distinct_within_dimension\":true,\
+             \"status\":\"pass\"}}",
+            merge_chain.len(),
+            checkpoint_chain.len(),
+            provenance_chain.len(),
+            observed.len(),
+            DESCRIPTOR_COMBINATION_COUNT
+        );
     }
 
     #[test]
