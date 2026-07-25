@@ -59,6 +59,13 @@
 //!   `Canonical` reader, or `fln-bignum` arithmetic. The crate graph cannot express
 //!   this: `fln-checker -> fln-hash` must stay permitted so the wire format is
 //!   shared, while the `Canonical` readers must not be (bead `franken_lean-r0xu`).
+//! * `FLN-STRUCT-038` `Environment::add_decl` — admission with no kernel check — is
+//!   called from production source in a crate that depends on fln-env. Allowlist is
+//!   empty: a first production caller is the violation (bead `franken_lean-oof9`).
+//! * `FLN-STRUCT-039` `Environment::plan_add_decl` is reachable outside the two
+//!   reviewed fln-kernel call sites. D6 reserves admission to the kernel, and no
+//!   type-level guarantee is available at this boundary because fln-env sits BELOW
+//!   fln-kernel and cannot name it (bead `franken_lean-oof9`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -948,6 +955,98 @@ fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &
                 site.name
             ),
         });
+    }
+}
+
+/// The two files that may plan a declaration admission outside fln-env.
+///
+/// Paths, not line numbers, and that is a measured choice rather than a stylistic one:
+/// over five hours on 2026-07-25 these two call sites did not change at all while their
+/// recorded positions moved (`admit.rs` 3032 -> 3035, `capability.rs` 182 -> 201). An
+/// allowlist keyed on positions would have gone stale without anything being wrong.
+///
+/// Two entries is the point. It is small enough to review by eye, and a third file
+/// appearing is a loud failure rather than a quiet spread of the raw surface.
+const PLANNED_ADMISSION_ALLOWLIST: [&str; 2] = [
+    "crates/fln-kernel/src/admit.rs",
+    "crates/fln-kernel/src/capability.rs",
+];
+
+/// Keep declaration admission unreachable outside the kernel, not merely unused
+/// (bead `franken_lean-oof9`).
+///
+/// D6 says nothing but the kernel may admit a constant. `fln-yswb` and
+/// `fln-kernel-bounded-decl-admission-ukzx` made that true by MIGRATION — no production
+/// caller uses the raw surface today — but `Environment::add_decl` and
+/// `Environment::plan_add_decl` are still `pub`, so it was true by audit rather than by
+/// construction, and an audit expires the moment someone writes the next caller.
+///
+/// # A build-gate is not the second-best mechanism here; it is the only one
+///
+/// The natural fix — making the raw entry points take a kernel-bound capability token —
+/// cannot be written. `fln-env` is rank 4 and `fln-kernel` is rank 6, so an
+/// `fln-env -> fln-kernel` edge is rejected by this same guard, mechanically. Nor can
+/// fln-env express "only the kernel may call this" without naming the kernel: sealing a
+/// trait excludes fln-kernel by the definition of sealing, an unsealed trait excludes
+/// nobody, and a token minted by fln-env proves nothing about who holds it. A Cargo
+/// feature is worse — features are additive and global, so any dependent re-opens the
+/// hole for the entire graph, silently.
+///
+/// A type-level guarantee therefore requires moving the raw surface above or beside
+/// fln-kernel, which is a plan amendment to section 5 layering, not an implementation
+/// choice. Anyone who reads this rule as a compromise and sets out to "upgrade" it will
+/// spend an hour rediscovering that. It is written down so they do not.
+///
+/// # Why the match is on arity
+///
+/// See [`ledger::method_call_sites`]. A bare name match is wrong here, not merely
+/// imprecise: `fln-hash`'s unrelated `LogicalRootBuilder::add_decl` shares the name.
+fn audit_declaration_admission_surface(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
+    for site in ledger::method_call_sites(text, &["add_decl", "plan_add_decl"]) {
+        if site.name == "add_decl" {
+            // Arity 2 is `fln_hash::LogicalRootBuilder::add_decl(name, digest)`, an
+            // unrelated method in a crate that cannot even depend on fln-env. Only the
+            // one-argument `Environment::add_decl(info)` is this rule's subject.
+            if site.arity == Some(2) {
+                continue;
+            }
+            findings.push(Finding {
+                code: "FLN-STRUCT-038",
+                path: format!("{source_rel}:{}", site.line),
+                detail: format!(
+                    "`Environment::add_decl` admits a constant with no kernel check{}. \
+                     D6 reserves admission to the kernel; route production admission \
+                     through `plan_add_decl` and a checked-declaration capability.",
+                    unresolved_suffix(site.arity)
+                ),
+            });
+            continue;
+        }
+        if PLANNED_ADMISSION_ALLOWLIST.contains(&source_rel) {
+            continue;
+        }
+        findings.push(Finding {
+            code: "FLN-STRUCT-039",
+            path: format!("{source_rel}:{}", site.line),
+            detail: format!(
+                "`Environment::plan_add_decl` is reachable outside the two reviewed \
+                 kernel call sites{}. The allowlist is {} and a third entry is a \
+                 decision, not an edit.",
+                unresolved_suffix(site.arity),
+                PLANNED_ADMISSION_ALLOWLIST.join(", ")
+            ),
+        });
+    }
+}
+
+/// Name an unresolved call shape in the finding rather than dropping the site.
+///
+/// An arity this scanner could not compute is reported, never skipped: a guard that
+/// silently ignores what it cannot parse has a hole shaped like the thing it failed on.
+fn unresolved_suffix(arity: Option<usize>) -> &'static str {
+    match arity {
+        Some(_) => "",
+        None => " (call shape unresolved; reported rather than skipped)",
     }
 }
 
@@ -2027,6 +2126,41 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                 continue;
             };
             audit_checker_independence_boundary(&text, &source_rel, &mut findings);
+        }
+    }
+
+    // ---- declaration-admission surface (bead franken_lean-oof9) ------------------------
+    // Scope is DERIVED FROM THE GRAPH, not hand-listed. Only a crate that declares an
+    // edge to fln-env can call these methods at all, and this guard already enforces
+    // rank(from) > rank(to) on every edge — so the scan set stays correct when an edge is
+    // added, instead of a hand-written crate list going stale the way the recorded call
+    // positions did. fln-env itself is excluded: it DEFINES the surface, and a fixture
+    // there legitimately needs raw access.
+    //
+    // `src/**` only, which is what makes this production-scoped. `tests/**` is a separate
+    // target and is deliberately untouched: a fixture needs the raw path, and that is the
+    // sole reason the surface still exists.
+    let mut admission_scanned: BTreeSet<&str> = BTreeSet::new();
+    for (from, to) in &g.edges {
+        if to != "fln-env" || from == "fln-env" || !admission_scanned.insert(from.as_str()) {
+            continue;
+        }
+        let Some(c) = on_disk.get(from.as_str()) else {
+            continue;
+        };
+        let src = c.dir.join("src");
+        let mut admission_sources = Vec::new();
+        collect_rs_files(&src, &mut admission_sources)?;
+        for source in admission_sources {
+            let source_rel = source
+                .strip_prefix(root)
+                .unwrap_or(&source)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
+                continue;
+            };
+            audit_declaration_admission_surface(&text, &source_rel, &mut findings);
         }
     }
 

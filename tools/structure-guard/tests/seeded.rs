@@ -1230,3 +1230,147 @@ fn the_boundary_is_scoped_to_fln_checker_alone() {
         out.findings
     );
 }
+
+// ---- declaration-admission surface (bead franken_lean-oof9) ---------------------------
+//
+// D6 reserves admission to the kernel. `fln-yswb` and `ukzx` made that true by migrating
+// every production caller off the raw surface; these tests make it true by CI, which is
+// the strongest mechanism available at this boundary — fln-env sits BELOW fln-kernel and
+// so can never name a kernel-bound capability type.
+
+/// A crate that depends on fln-env and admits nothing is clean.
+///
+/// Without this, every test below could pass because the scan never ran.
+#[test]
+fn the_admission_surface_baseline_is_clean() {
+    let ws = TempWs::new("admission-baseline");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn probe() -> bool {\n    true\n}\n",
+    );
+    let out = ws.run();
+    assert!(
+        out.findings.is_empty(),
+        "a dependent that admits nothing must be clean: {:?}",
+        out.findings
+    );
+}
+
+/// The raw surface has an EMPTY allowlist: a first production caller is the violation.
+#[test]
+fn raw_declaration_admission_is_refused_outside_fln_env() {
+    let ws = TempWs::new("admission-raw");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn admit(env: &Env, info: Info) -> Env {\n    \
+         env.add_decl(info)\n}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-038"]);
+}
+
+/// THE DISCRIMINATION TEST, and the reason this rule matches arity rather than a name.
+///
+/// `fln_hash::LogicalRootBuilder::add_decl(name, digest)` is an unrelated method that
+/// happens to share a name, in a crate at rank 1 that cannot even depend on fln-env. It
+/// has fifteen real call sites, and it coexists with the fln-env method inside one file
+/// this guard scans, so crate-scoping cannot separate them. A name match reports every
+/// one of them as a violation of a rule about a different crate.
+#[test]
+fn the_two_argument_add_decl_of_another_type_is_not_a_violation() {
+    let ws = TempWs::new("admission-arity");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn root(builder: &mut B, name: &N, digest: D) {\n    \
+         builder.add_decl(name, digest);\n}\n",
+    );
+    let out = ws.run();
+    assert!(
+        out.findings.is_empty(),
+        "a two-argument `add_decl` is another type's method: {:?}",
+        out.findings
+    );
+}
+
+/// The planned surface is allowlisted to two reviewed kernel files, by PATH. A call from
+/// any other file in a dependent crate is the violation.
+#[test]
+fn planned_admission_is_refused_outside_the_allowlisted_kernel_files() {
+    let ws = TempWs::new("admission-planned");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn plan(env: &Env, info: Info) -> P {\n    \
+         env.plan_add_decl(\n        info,\n        budget,\n        collisions,\n        cancellation,\n    )\n}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-039"]);
+}
+
+/// Scoped to crates that declare an edge to fln-env. Everything else provably cannot
+/// call these methods, and a rule that fired workspace-wide would be unusable.
+#[test]
+fn the_admission_surface_is_scoped_to_fln_env_dependents() {
+    let ws = TempWs::new("admission-scope");
+    base(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn admit(env: &Env, info: Info) -> Env {\n    \
+         env.add_decl(info)\n}\n",
+    );
+    let out = ws.run();
+    assert!(
+        out.findings.is_empty(),
+        "with no declared edge to fln-env the scan must not reach this crate: {:?}",
+        out.findings
+    );
+}
+
+/// Prose and string literals naming the method are not calls.
+///
+/// This is load-bearing rather than decorative: `fln-verdict` guards this very method by
+/// asserting its own source lacks the text, and writes the literal split
+/// (`concat!(".plan_", "add_decl(")`) precisely so a substring scanner does not match it.
+/// A lexeme scanner does not need that workaround, and this pins that it does not.
+#[test]
+fn naming_the_admission_methods_in_prose_is_not_a_violation() {
+    let ws = TempWs::new("admission-prose");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n//! never call `add_decl` or `plan_add_decl` here.\n\
+         /* block: .add_decl(x) and .plan_add_decl(a, b) are forbidden */\n\
+         pub fn doc() -> &'static str {\n    \".add_decl(info) .plan_add_decl(a, b, c, d)\"\n}\n",
+    );
+    let out = ws.run();
+    assert!(
+        out.findings.is_empty(),
+        "prose and string literals must not trip the surface: {:?}",
+        out.findings
+    );
+}
+
+/// Declaring the edge, the manifest dependency and the lock entry that together put a
+/// crate in the scan set. All three, because this guard cross-checks them against each
+/// other and a fixture that declares only the edge fails on the disagreement instead of
+/// on the thing under test.
+fn admission_dependent(ws: &TempWs) {
+    ws.write(
+        "crates/fln-kernel/Cargo.toml",
+        &manifest("fln-kernel", &["fln-env"]),
+    );
+    ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-kernel", &["fln-env"])]),
+    );
+    ws.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &graph_with_edges(&["fln-kernel -> fln-env"]),
+    );
+}

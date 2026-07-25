@@ -639,6 +639,108 @@ pub fn identifier_sites(text: &str, wanted: &[&str]) -> Vec<NamedMacroSite> {
     sites
 }
 
+/// One `.name(..)` method call, carrying the argument count that distinguishes
+/// same-named methods on different types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodCallSite {
+    pub line: usize,
+    pub name: String,
+    /// `None` when the call shape could not be resolved — a turbofish, or a
+    /// parenthesis that never closes in this file.
+    ///
+    /// A caller must treat `None` as a FINDING, never as an absence. A guard that
+    /// silently skips the call sites it cannot parse is a guard with a hole in
+    /// exactly the shape of whatever it failed to parse.
+    pub arity: Option<usize>,
+}
+
+/// Every `.name(..)` call of a `wanted` method, as lexemes rather than as text.
+///
+/// # Arity is part of the identity
+///
+/// This exists beside [`identifier_sites`] for one reason: **a method name is not
+/// injective over methods.** `fln_env::Environment::add_decl` takes one argument and
+/// `fln_hash::LogicalRootBuilder::add_decl` takes two, they are unrelated methods on
+/// unrelated types, and both are called from a single file this guard must scan
+/// (`crates/fln-conformance/tests/metamorphic_laws.rs`, lines 134 and 170). Matching the
+/// bare name conflates them and reports fifteen fln-hash call sites as violations of a
+/// rule about fln-env.
+///
+/// Crate-scoping does not rescue a name match, which is the part worth knowing before
+/// reaching for the simpler primitive: the two methods coexist inside a crate the rule
+/// legitimately scans, so the collision survives every scoping strategy and has to be
+/// discriminated directly.
+///
+/// That defect is a recorded, recurring shape in this tree — a projection used as an
+/// identity without checking it separates the values that must be told apart. See
+/// `franken_lean-f6br` (a display-form name encoding collided in a census witness) and
+/// `bf9ef450` (the same encoding reused as an intern key). This is the third instance,
+/// caught before it shipped rather than after.
+///
+/// Lexing rather than substring-matching is inherited from [`identifier_sites`] and
+/// matters for the same reason: a doc comment or string literal naming the forbidden
+/// method must not report itself. `fln-verdict` already guards this very method by
+/// asserting its own source lacks the text, using a split literal to avoid self-matching.
+pub fn method_call_sites(text: &str, wanted: &[&str]) -> Vec<MethodCallSite> {
+    let lexemes = rust_lexemes(text);
+    let mut sites = Vec::new();
+    for (idx, lexeme) in lexemes.iter().enumerate() {
+        if !wanted.contains(&lexeme.text.as_str()) {
+            continue;
+        }
+        // A method CALL, not a definition or an import: the name must be preceded by a
+        // field-access dot. `fn add_decl`, `use x::add_decl` and `Self::add_decl` are all
+        // correctly outside this rule's subject.
+        if idx == 0 || lexemes[idx - 1].text != "." {
+            continue;
+        }
+        sites.push(MethodCallSite {
+            line: lexeme.line,
+            name: lexeme.text.clone(),
+            arity: call_arity(&lexemes, idx),
+        });
+    }
+    sites.sort_by(|left, right| (&left.name, left.line).cmp(&(&right.name, right.line)));
+    sites.dedup();
+    sites
+}
+
+/// Arguments passed at `lexemes[name_idx]`'s call, or `None` if the shape is unresolved.
+///
+/// Depth bookkeeping follows `rust_lexemes`: an opening delimiter is recorded at the
+/// depth OUTSIDE it and a closing delimiter at the depth INSIDE it, so for a call opening
+/// at depth `d` the arguments and the matching `)` all sit at `d + 1`. Counting only
+/// commas at that exact depth is what keeps a nested call's arguments — or a closure body,
+/// or an array literal — from being counted as this call's.
+fn call_arity(lexemes: &[Lexeme], name_idx: usize) -> Option<usize> {
+    let open = lexemes.get(name_idx + 1)?;
+    if open.text != "(" {
+        // A turbofish or anything else between the name and its arguments. Unresolved
+        // rather than zero: see `MethodCallSite::arity`.
+        return None;
+    }
+    let inner = open.delimiter_depth + 1;
+    let mut commas = 0_usize;
+    let mut saw_argument_token = false;
+    let mut last_was_comma = false;
+    for lexeme in &lexemes[name_idx + 2..] {
+        if lexeme.delimiter_depth == inner && lexeme.text == ")" {
+            if !saw_argument_token {
+                return Some(0);
+            }
+            // A trailing comma closes an argument already counted, so a multi-line call
+            // does not report one argument more than it passes.
+            return Some(if last_was_comma { commas } else { commas + 1 });
+        }
+        saw_argument_token = true;
+        last_was_comma = lexeme.delimiter_depth == inner && lexeme.text == ",";
+        if last_was_comma {
+            commas += 1;
+        }
+    }
+    None
+}
+
 pub fn macro_invocations(text: &str) -> Vec<NamedMacroSite> {
     let lexemes = rust_lexemes(text);
     let mut sites = Vec::new();
