@@ -860,13 +860,28 @@ fn write_data_value(value: &DataValue, w: &mut CanonWriter) {
 /// This is a distinct schema, so its preimages can never be confused with the ordered
 /// encoding's — order-independence is a property of the projection, never something the
 /// canonical encoding quietly acquired.
-pub fn kvmap_canonical_set_bytes(map: &KVMap) -> Vec<u8> {
+///
+/// **Returns `None` for a map with duplicate keys**, which are representable and
+/// preserved since bead franken_lean-l84f. A set view of something that is not a set has
+/// no honest definition: sorting by key alone would leave the order of two same-key
+/// entries unpinned, and any first-match-wins rule would drop the shadowed value, so two
+/// maps upstream separates (its own `eqv` does) would project to identical bytes. That is
+/// a collision in a function whose entire purpose is identity — the defect class of bead
+/// franken_lean-f6br, where a lossy projection of `Name` made distinct finding sets share
+/// a witness. Refusing is the only answer that cannot lie; a caller that wants a set out
+/// of a duplicate-keyed map has to say which value wins, and that is its decision to
+/// make and to record, not this function's to guess.
+pub fn kvmap_canonical_set_bytes(map: &KVMap) -> Option<Vec<u8>> {
     let mut sorted: Vec<(Vec<u8>, &DataValue)> = map
         .entries()
         .iter()
         .map(|(key, value)| (key.to_canonical_bytes(), value))
         .collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    // Sorted, so duplicates are adjacent.
+    if sorted.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return None;
+    }
     let mut w = CanonWriter::new();
     w.schema(SCHEMA_KVMAP_SET);
     w.u64(sorted.len() as u64);
@@ -875,7 +890,7 @@ pub fn kvmap_canonical_set_bytes(map: &KVMap) -> Vec<u8> {
         w.bytes(&key_bytes);
         write_data_value(value, &mut w);
     }
-    w.into_bytes()
+    Some(w.into_bytes())
 }
 
 impl Canonical for KVMap {
@@ -895,25 +910,30 @@ impl Canonical for KVMap {
 
     fn read_body(r: &mut CanonReader<'_>) -> Result<KVMap, CanonError> {
         let count = r.u64()?;
-        let mut map = KVMap::new();
-        // `KVMap::insert` replaces an existing key in place, so a stream carrying the
-        // same key twice would fold two encoded entries into one value — and that
-        // value re-encodes shorter than the bytes it came from. One value would then
-        // have two encodings, which is exactly what this crate's canonicality law
-        // forbids and what every decl hash, logical root, and cache key rests on;
-        // worse, the vanished entry is a smuggling channel, since the bytes that were
-        // hashed are not the value that was used.
+        // Entries are collected POSITIONALLY and handed to `KVMap::from_entries`, never
+        // replayed through `KVMap::insert` (bead franken_lean-l84f).
         //
-        // No legitimate encoder can emit this: `KVMap` cannot hold a duplicate key,
-        // so rejecting it refuses no artifact any writer could have produced.
-        // Found by the seeded campaign in tests/canon_fuzz.rs (bead fln-1f8v).
-        let mut seen: std::collections::HashSet<Name> = std::collections::HashSet::new();
+        // The distinction is the whole bug that used to live here. `insert` mirrors
+        // `insertCore` and replaces the first match, so building the map with it FOLDS a
+        // duplicate-keyed stream: two distinct encodings collapsed onto one value, and
+        // that value re-encoded shorter than the bytes it came from. Bead fln-1f8v caught
+        // that and refused duplicate keys outright, which was right about the symptom —
+        // one value may have exactly one encoding, or every decl hash, logical root and
+        // cache key is built on sand — and wrong about the cause. The folding was the
+        // defect. Appending keeps the value/encoding correspondence injective over the
+        // larger value space, so canonicality holds *and* the input is representable.
+        //
+        // Refusing them was also a parity divergence on the artifact path, which is why
+        // it had to change rather than stay a convenient narrowing: `MData` *is* `KVMap`
+        // (`Lean/Expr.lean:116`), so a duplicate-keyed map rides inside any
+        // `Expr::MData`; the pin's module codec has no key-aware normalization anywhere,
+        // so upstream's loader materializes such a value from such bytes without
+        // complaint. We were rejecting an artifact the Reference can produce and read
+        // back — exactly the drift the Oracle-Only Law forbids.
+        let mut entries = Vec::with_capacity(count.min(1024) as usize);
         for _ in 0..count {
             r.charge_node()?;
             let key = Name::read_body(r)?;
-            if !seen.insert(key.clone()) {
-                return Err(r.err_public("duplicate KVMap key"));
-            }
             let value = match r.u8()? {
                 DV_STRING => DataValue::OfString(r.str()?.to_string()),
                 DV_BOOL => DataValue::OfBool(r.bool()?),
@@ -923,9 +943,9 @@ impl Canonical for KVMap {
                 DV_SYNTAX => DataValue::OfSyntax(SyntaxHandle(r.u64()?)),
                 _ => return Err(r.err_public("unknown data-value tag")),
             };
-            map.insert(key, value);
+            entries.push((key, value));
         }
-        Ok(map)
+        Ok(KVMap::from_entries(entries))
     }
 }
 
@@ -2426,18 +2446,121 @@ mod tests {
 
         // And the two views are never the same bytes, so a preimage under one can never
         // be replayed as a preimage under the other.
-        assert_ne!(
-            forward.to_canonical_bytes(),
-            kvmap_canonical_set_bytes(&forward)
-        );
+        let projected = kvmap_canonical_set_bytes(&forward).expect("unique keys project");
+        assert_ne!(forward.to_canonical_bytes(), projected);
         assert!(
-            kvmap_canonical_set_bytes(&forward).starts_with(&{
+            projected.starts_with(&{
                 let mut w = CanonWriter::new();
                 w.schema(SCHEMA_KVMAP_SET);
                 w.into_bytes()
             }),
             "the projection must carry its own schema header"
         );
+
+        // A DUPLICATE-KEYED MAP HAS NO SET VIEW, and the projection must say so rather
+        // than answer. Two maps that upstream's own `eqv` separates would otherwise land
+        // on identical bytes under any first-match-wins rule — a collision inside an
+        // identity function, which is the franken_lean-f6br defect class.
+        let shadowed = KVMap::from_entries(vec![
+            (pairs[0].0.clone(), pairs[0].1.clone()),
+            (pairs[0].0.clone(), DataValue::OfNat(99)),
+        ]);
+        let visible_only = KVMap::from_entries(vec![(pairs[0].0.clone(), pairs[0].1.clone())]);
+        assert_eq!(
+            shadowed.find(&pairs[0].0),
+            visible_only.find(&pairs[0].0),
+            "the two differ only in an entry that lookup cannot reach"
+        );
+        assert_ne!(
+            shadowed.to_canonical_bytes(),
+            visible_only.to_canonical_bytes(),
+            "the ordered encoding must keep them apart"
+        );
+        assert_eq!(
+            kvmap_canonical_set_bytes(&shadowed),
+            None,
+            "a map with duplicate keys must be refused a set view, not silently collapsed \
+             onto the projection of the map without the shadowed entry"
+        );
+        assert!(kvmap_canonical_set_bytes(&visible_only).is_some());
+    }
+
+    /// Duplicate keys are representable, preserved, and round-trip exactly (bead
+    /// franken_lean-l84f). This replaces the old refusal from bead fln-1f8v rather than
+    /// deleting its case: fln-1f8v was right that one value may have exactly one
+    /// encoding, and wrong that duplicates were the cause — the decoder folding them
+    /// through `insert` was. So the canonicality law it defended is asserted here on the
+    /// larger value space, which is the part that must not regress.
+    #[test]
+    fn duplicate_kvmap_keys_round_trip_exactly_and_stay_canonical() {
+        let key = Name::str(Name::anonymous(), "k");
+        let other = Name::str(Name::anonymous(), "other");
+        // The exact fixture measured against the pinned toolchain, so our behaviour is
+        // pinned to observed Reference behaviour rather than to my reading of it.
+        let dup = KVMap::from_entries(vec![
+            (key.clone(), DataValue::OfNat(1)),
+            (key.clone(), DataValue::OfNat(2)),
+            (other.clone(), DataValue::OfBool(true)),
+        ]);
+
+        // Round-trip preserves both entries, in order, byte-for-byte.
+        let bytes = dup.to_canonical_bytes();
+        let back = KVMap::from_canonical_bytes(&bytes).expect("duplicates are legal input");
+        assert_eq!(back, dup, "the shadowed entry did not survive the decode");
+        assert_eq!(back.entries(), dup.entries());
+        assert_eq!(back.to_canonical_bytes(), bytes, "re-encode drifted");
+
+        // Reference-observed semantics (pin v4.32.0): first match wins, size counts
+        // entries, erase removes every entry for the key, insert replaces the FIRST match
+        // in place and leaves the shadowed one.
+        assert_eq!(back.find(&key), Some(&DataValue::OfNat(1)));
+        assert_eq!(back.len(), 3);
+        let mut erased = back.clone();
+        erased.erase(&key);
+        assert_eq!(erased.entries(), &[(other, DataValue::OfBool(true))]);
+        let mut inserted = back.clone();
+        inserted.insert(key.clone(), DataValue::OfNat(9));
+        assert_eq!(
+            inserted.entries()[0].1,
+            DataValue::OfNat(9),
+            "insert must replace the first match"
+        );
+        assert_eq!(
+            inserted.entries()[1].1,
+            DataValue::OfNat(2),
+            "insert must not fold the shadowed entry"
+        );
+
+        // CANONICALITY ON THE LARGER SPACE — the law fln-1f8v was protecting. Distinct
+        // entry lists must not share an encoding, including lists that differ only in a
+        // shadowed value or in the order of two same-key entries.
+        let variants = [
+            vec![
+                (key.clone(), DataValue::OfNat(1)),
+                (key.clone(), DataValue::OfNat(2)),
+            ],
+            vec![
+                (key.clone(), DataValue::OfNat(2)),
+                (key.clone(), DataValue::OfNat(1)),
+            ],
+            vec![
+                (key.clone(), DataValue::OfNat(1)),
+                (key.clone(), DataValue::OfNat(3)),
+            ],
+            vec![(key.clone(), DataValue::OfNat(1))],
+        ];
+        let mut seen = std::collections::BTreeMap::new();
+        for entries in variants {
+            let map = KVMap::from_entries(entries);
+            let encoded = map.to_canonical_bytes();
+            assert_eq!(
+                KVMap::from_canonical_bytes(&encoded).expect("round-trip"),
+                map
+            );
+            if let Some(previous) = seen.insert(encoded, map.clone()) {
+                panic!("two distinct maps share an encoding: {previous:?} and {map:?}");
+            }
+        }
     }
 
     #[test]
@@ -3233,9 +3356,20 @@ mod tests {
     ///
     /// A bit flip made one key equal to an earlier key. `KVMap::insert` replaced in
     /// place, so a 2-entry stream decoded to a 1-entry map that re-encoded 27 bytes
-    /// shorter: one value, two encodings. Decoding must refuse it.
+    /// shorter: **one value, two encodings.**
+    ///
+    /// fln-1f8v fixed that by refusing duplicate keys, which cured the symptom and
+    /// misplaced the cause: the folding was the defect. Bead franken_lean-l84f showed the
+    /// refusal was also a parity divergence — `MData` is `KVMap`, so the Reference can
+    /// build and serialize exactly this value — so the decoder now appends positionally
+    /// and the input is accepted.
+    ///
+    /// This test is therefore **retargeted, not deleted**, and it is the more direct
+    /// statement of what fln-1f8v was protecting: the original stream must now decode to
+    /// a 2-entry map that re-encodes to the *same* bytes. If anyone reintroduces folding,
+    /// the re-encode shortens and this fails on the exact fixture that found it.
     #[test]
-    fn duplicate_kvmap_keys_are_refused_not_folded() {
+    fn the_fln_1f8v_duplicate_stream_round_trips_instead_of_folding() {
         let key = Name::str(Name::anonymous(), "a");
 
         let mut honest = CanonWriter::new();
@@ -3262,15 +3396,33 @@ mod tests {
         duplicate.u8(DV_NAT);
         duplicate.u64(2);
         let duplicate = duplicate.into_bytes();
+        let decoded = KVMap::from_canonical_bytes(&duplicate)
+            .expect("a duplicate-keyed stream is legal input the Reference can produce");
+        // THE ANTI-FOLD ASSERTION: two entries in, two entries out, same bytes back. The
+        // original defect was exactly the failure of this equality.
         assert_eq!(
-            KVMap::from_canonical_bytes(&duplicate)
-                .expect_err("a duplicate key is malformed input")
-                .what,
-            "duplicate KVMap key"
+            decoded.entries().len(),
+            2,
+            "the decoder folded the duplicate"
         );
+        assert_eq!(
+            decoded.to_canonical_bytes(),
+            duplicate,
+            "re-encode drifted from the bytes that were decoded — the fln-1f8v defect"
+        );
+        assert_eq!(
+            decoded.find(&key),
+            Some(&DataValue::OfNat(1)),
+            "first match"
+        );
+        // Distinct from the folded value it used to decode to, so the two are not
+        // confusable by any consumer that hashes the canonical bytes.
+        let folded = KVMap::from_entries(vec![(key.clone(), DataValue::OfNat(2))]);
+        assert_ne!(decoded.to_canonical_bytes(), folded.to_canonical_bytes());
 
-        // MData embeds a KVMap, so the same stream must be refused inside an Expr —
-        // that is the path a decl hash would have travelled.
+        // MData embeds a KVMap, so the same stream must decode inside an Expr too —
+        // that is the artifact path a decl hash travels, and the reason refusing it was
+        // a parity divergence rather than a safe narrowing.
         let mut mdata = CanonWriter::new();
         mdata.schema(SCHEMA_EXPR);
         mdata.u8(EXPR_MDATA);
@@ -3283,12 +3435,21 @@ mod tests {
         mdata.u64(2);
         mdata.u8(EXPR_BVAR);
         mdata.u32(0);
+        let mdata = mdata.into_bytes();
+        let expr = Expr::from_canonical_bytes(&mdata)
+            .expect("a duplicate key inside MData is a value the Reference can serialize");
         assert_eq!(
-            Expr::from_canonical_bytes(&mdata.into_bytes())
-                .expect_err("a duplicate key inside MData is malformed input")
-                .what,
-            "duplicate KVMap key"
+            expr.to_canonical_bytes(),
+            mdata,
+            "the Expr round trip must be byte-exact through a duplicate-keyed MData"
         );
+        match expr.node() {
+            ExprNode::MData { data, .. } => {
+                assert_eq!(data.entries().len(), 2, "MData folded the duplicate");
+                assert_eq!(data.find(&key), Some(&DataValue::OfNat(1)));
+            }
+            other => panic!("expected an MData node, got {other:?}"),
+        }
     }
 
     /// Arbitrary bytes are not a crash: corrupting a valid artifact may decode to

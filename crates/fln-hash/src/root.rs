@@ -121,9 +121,18 @@ impl LogicalRootBuilder {
     /// pins the other direction, so it cannot quietly become a digest that varies with
     /// everything either.
     ///
-    /// **What would reopen it:** Tribunal evidence that the Reference cannot observe
-    /// option order or duplicate keys in any surface we mirror. Absent that evidence the
-    /// fork is closed — reopen it on the bead, not here.
+    /// **The reopen condition has since been answered, in the negative — so this is now
+    /// closed more firmly, not still pending.** It was: Tribunal evidence that the
+    /// Reference cannot observe option order or duplicate keys in any surface we mirror.
+    /// Bead franken_lean-l84f went and looked, by running the pinned toolchain rather
+    /// than reading it: the Reference observes a duplicate key through `size`, `entries`,
+    /// `ToString`, `Repr`, the shape `insert` leaves behind, and — the one I had guessed
+    /// wrong — its own semantic `eqv`, which returns false for two maps that agree on
+    /// every `find`. Order is likewise visible through `entries` and rendering, though
+    /// not through `find`, `size`, or `eqv`. So the Reference can observe both, the
+    /// evidence that would have reopened this does not exist, and mirroring what the pin
+    /// distinguishes is the only reading left. Reopening now needs new evidence, on the
+    /// bead, not here.
     pub fn set_options(&mut self, options: &KVMap) -> &mut LogicalRootBuilder {
         self.options = Some(hash(Domain::OptionsSet, &options.to_canonical_bytes()));
         self
@@ -442,7 +451,10 @@ mod tests {
             permute(&mut indices, 0, &mut |order| {
                 let shuffled: Vec<(Name, DataValue)> =
                     order.iter().map(|&i| pairs[i].clone()).collect();
-                set.insert(crate::canon::kvmap_canonical_set_bytes(&map_of(&shuffled)));
+                set.insert(
+                    crate::canon::kvmap_canonical_set_bytes(&map_of(&shuffled))
+                        .expect("these option keys are unique, so a set view exists"),
+                );
             });
             set
         };

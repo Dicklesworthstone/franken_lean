@@ -51,6 +51,27 @@ impl KVMap {
         KVMap::default()
     }
 
+    /// The raw structure constructor (`KVMap.mk` / a `⟨[...]⟩` literal upstream).
+    ///
+    /// **Duplicate keys are legal here and are preserved**, because they are legal and
+    /// preserved upstream (bead franken_lean-l84f). `insert` cannot create one — it
+    /// mirrors `insertCore` and replaces the first match — so this is the only way to
+    /// build a value the Reference can build, and refusing it here would make our
+    /// representation strictly narrower than the pin's. That matters on the artifact
+    /// path, not only in theory: `MData` *is* `KVMap` (`Lean/Expr.lean:116`), so a
+    /// duplicate-keyed map rides inside any `Expr::MData`, and the module codec has no
+    /// key-aware normalization anywhere in it.
+    ///
+    /// What a duplicate does and does not affect, measured against the pinned toolchain
+    /// rather than inferred — `find` returns the first match and the shadowed entry is
+    /// unreachable by lookup, while `len` (`size`), the entry list, rendering, and
+    /// upstream's own `eqv` all observe it, and `erase` removes every entry for the key.
+    /// So this is not a value that merely looks different; upstream's semantic comparison
+    /// separates it.
+    pub fn from_entries(entries: Vec<(Name, DataValue)>) -> KVMap {
+        KVMap { entries }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -248,5 +269,74 @@ mod tests {
         map.insert(key.clone(), DataValue::OfNat(2));
         assert_eq!(map.find(&key), Some(&DataValue::OfNat(2)));
         assert_eq!(map.len(), 1, "a re-insert replaces rather than shadows");
+    }
+
+    /// A duplicate-keyed `KVMap` is representable and behaves exactly as the pinned
+    /// Reference does (bead franken_lean-l84f).
+    ///
+    /// Every expectation below is a value MEASURED by running
+    /// leanprover--lean4---v4.32.0 on the same fixture, not derived from reading
+    /// KVMap.lean — the run corrected one prediction of mine, so the source-reading was
+    /// demonstrably not sufficient. Fixture: `[(k,1), (k,2), (other,true)]`.
+    #[test]
+    fn duplicate_keys_are_representable_and_match_reference_semantics() {
+        let key = Name::str(Name::anonymous(), "k");
+        let other = Name::str(Name::anonymous(), "other");
+        let dup = KVMap::from_entries(vec![
+            (key.clone(), DataValue::OfNat(1)),
+            (key.clone(), DataValue::OfNat(2)),
+            (other.clone(), DataValue::OfBool(true)),
+        ]);
+
+        // `find` => some (ofNat 1): first match wins, the shadowed entry is unreachable.
+        assert_eq!(dup.find(&key), Some(&DataValue::OfNat(1)));
+        assert!(dup.contains(&key));
+        // `size` => 3: entries.length, so the duplicate IS observable by length.
+        assert_eq!(dup.len(), 3);
+        // The entry list keeps both, in order.
+        assert_eq!(
+            dup.entries(),
+            &[
+                (key.clone(), DataValue::OfNat(1)),
+                (key.clone(), DataValue::OfNat(2)),
+                (other.clone(), DataValue::OfBool(true)),
+            ]
+        );
+
+        // `insert k 9` => [(k,9),(k,2),(other,true)]: replaces the FIRST match in place
+        // and does NOT fold the shadowed one. Mirrors `insertCore`.
+        let mut inserted = dup.clone();
+        inserted.insert(key.clone(), DataValue::OfNat(9));
+        assert_eq!(inserted.len(), 3, "insert folded a shadowed entry");
+        assert_eq!(inserted.entries()[0].1, DataValue::OfNat(9));
+        assert_eq!(inserted.entries()[1].1, DataValue::OfNat(2));
+
+        // `erase k` => [(other,true)]: filter removes EVERY entry for the key.
+        let mut erased = dup.clone();
+        erased.erase(&key);
+        assert_eq!(erased.entries(), &[(other, DataValue::OfBool(true))]);
+
+        // Structurally distinct from the map without the shadowed entry, even though the
+        // two agree on every lookup. Upstream's own `eqv` also separates them (measured),
+        // so this is not a distinction only our representation makes.
+        let visible_only = KVMap::from_entries(vec![
+            (key.clone(), DataValue::OfNat(1)),
+            (
+                Name::str(Name::anonymous(), "other"),
+                DataValue::OfBool(true),
+            ),
+        ]);
+        assert_eq!(dup.find(&key), visible_only.find(&key));
+        assert_ne!(
+            dup, visible_only,
+            "the shadowed entry must not be erasable by equality"
+        );
+
+        // `insert` still cannot CREATE a duplicate — that is what makes `from_entries`
+        // the only route, and why removing it would narrow us below the pin.
+        let mut built = KVMap::new();
+        built.insert(key.clone(), DataValue::OfNat(1));
+        built.insert(key.clone(), DataValue::OfNat(2));
+        assert_eq!(built.len(), 1);
     }
 }
