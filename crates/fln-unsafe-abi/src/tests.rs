@@ -448,6 +448,40 @@ fn mark_mt_negates_and_atomics_conserve() {
     assert_eq!(s.header().rc, -1, "MT dec via atomic fetch_add");
 }
 
+/// An ST refcount that overflows must FAULT, not wrap (D3; FL-INV-07).
+///
+/// A wrapped positive count does not become "a very large count" — it becomes a
+/// NEGATIVE one, and `m_rc < 0` *is* the multi-threaded encoding in this ABI.
+/// `mark_mt_negates_and_atomics_conserve` above asserts exactly that negation,
+/// so an overflow silently reclassifies an object's threading discipline: every
+/// later dec takes the atomic MT path on an object nothing is synchronizing,
+/// and the tri-state invariant the whole RC surface rests on is gone.
+///
+/// The site's only guard was a `debug_assert!` sitting next to a
+/// `wrapping_add`, which is to say there was no guard in a release build at
+/// all — the shape this test exists to keep out.
+///
+/// Reachability: `lean_inc_ref_n` takes a caller-supplied `size_t n` at the pin
+/// (`lean.h:556`, and it is already specified in `fln_rt::abi::FUNCTION_CENSUS`),
+/// so once that export is wired this is one hostile call from C. Today it is
+/// only reachable internally, where `n` is always 1.
+#[test]
+#[should_panic(expected = "single-threaded RC overflow")]
+fn st_refcount_overflow_faults_rather_than_wrapping_into_the_mt_encoding() {
+    let _g = lock();
+    let s = Obj::mk_string("overflow");
+    assert_eq!(s.header().rc, 1);
+    // rc is 1, so one increment of i32::MAX carries it past i32::MAX.
+    // UNSAFE-LEDGER: FLN-UL-0180
+    #[allow(unsafe_code)]
+    unsafe {
+        // SAFETY: `s` keeps the object alive for the call; the pointer is this
+        // handle's own address. The call is expected to fault before it writes,
+        // leaving rc at 1 so the handle still drops cleanly.
+        crate::rc::inc_ref_n(s.identity_token() as *mut LeanObject, i32::MAX as usize);
+    }
+}
+
 #[test]
 fn mt_object_dies_on_last_dec() {
     let _g = lock();

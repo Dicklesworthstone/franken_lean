@@ -108,8 +108,15 @@ pub(crate) unsafe fn inc_ref_n(o: *mut LeanObject, n: usize) {
         let rc = (&raw const (*o).m_rc).read();
         if rc > 0 {
             let n = i32::try_from(n).expect("rc increment overflows i32");
-            debug_assert!(rc.checked_add(n).is_some(), "single-threaded RC overflow");
-            (&raw mut (*o).m_rc).write(rc.wrapping_add(n));
+            // Faults in every profile, deliberately. A wrapped ST count is not
+            // a large count — it is a negative one, and `m_rc < 0` *is* the MT
+            // encoding here, so wrapping would silently hand the object to the
+            // atomic path with nothing synchronizing it. This guard was a
+            // `debug_assert!` beside a `wrapping_add`, i.e. absent from release
+            // builds; `st_refcount_overflow_faults_rather_than_wrapping_into_the_mt_encoding`
+            // fails in `--release` without the `checked_add`.
+            let next = rc.checked_add(n).expect("single-threaded RC overflow");
+            (&raw mut (*o).m_rc).write(next);
         } else if rc != 0 {
             atomic_rc(o).fetch_sub(
                 i32::try_from(n).expect("rc increment overflows i32"),
