@@ -1006,44 +1006,56 @@ impl Environment {
     /// Capture one registered extension under its declared checkpoint contract.
     /// A suffix base is another immutable environment snapshot; full-journal mode
     /// requires `None` and carries no ambient extension history.
+    /// Cancellation is threaded through because capture proves ancestry by exact
+    /// comparison when the digest accelerator only passes, and an input-sized proof a
+    /// caller has withdrawn from must be abandonable. Exhaustion and cancellation are
+    /// FL-INV-07 non-answers and arrive as [`Outcome::Inconclusive`]; a wrong descriptor
+    /// or a non-prefix base is a completed verdict and arrives as `Err` inside
+    /// [`Outcome::Complete`] (bead `fln-extension-history-checkpoint-identity-41s`).
     pub fn checkpoint_extension(
         &self,
         extension: &Name,
         base: Option<&Environment>,
         limits: CheckpointLimits,
-    ) -> Result<ExtensionCheckpoint, EnvError> {
-        let state = self
-            .extension(extension)
-            .ok_or_else(|| EnvError::UnknownExtension {
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<Result<ExtensionCheckpoint, EnvError>> {
+        let Some(state) = self.extension(extension) else {
+            return Outcome::complete(Err(EnvError::UnknownExtension {
                 name: extension.clone(),
-            })?;
+            }));
+        };
         let base_state = match base {
-            Some(base) => {
-                Some(
-                    base.extension(extension)
-                        .ok_or_else(|| EnvError::UnknownExtension {
-                            name: extension.clone(),
-                        })?,
-                )
-            }
+            Some(base) => match base.extension(extension) {
+                Some(state) => Some(state),
+                None => {
+                    return Outcome::complete(Err(EnvError::UnknownExtension {
+                        name: extension.clone(),
+                    }));
+                }
+            },
             None => None,
         };
         state
-            .checkpoint(base_state, limits)
-            .map_err(EnvError::Checkpoint)
+            .try_checkpoint(base_state, limits, cancellation)
+            .map_complete(|captured| captured.map_err(EnvError::Checkpoint))
     }
 
     /// Apply a checkpoint to the matching registry slot and return a new isolated
     /// environment snapshot. Declarations and unrelated extensions remain shared.
+    /// Non-answers are threaded for the same reason as
+    /// [`Environment::checkpoint_extension`]: restore proves base identity by exact
+    /// comparison when structural identity does not apply, and a cancelled or exhausted
+    /// proof reached no verdict about the checkpoint.
     pub fn apply_extension_checkpoint(
         &self,
         checkpoint: &ExtensionCheckpoint,
         limits: CheckpointLimits,
-    ) -> Result<Environment, EnvError> {
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<Result<Environment, EnvError>> {
         let name = &checkpoint.descriptor().name;
-        let registered = self
-            .extension(name)
-            .ok_or_else(|| EnvError::UnknownExtension { name: name.clone() })?;
+        let Some(registered) = self.extension(name) else {
+            return Outcome::complete(Err(EnvError::UnknownExtension { name: name.clone() }));
+        };
         if checkpoint.mode() == CheckpointSemantics::FullJournal
             && registered.descriptor != *checkpoint.descriptor()
         {
@@ -1058,18 +1070,22 @@ impl Environment {
                     actual: registered.descriptor.clone(),
                 }
             };
-            return Err(EnvError::Checkpoint(error));
+            return Outcome::complete(Err(EnvError::Checkpoint(error)));
         }
         let base = match checkpoint.mode() {
             CheckpointSemantics::JournalSuffix => Some(registered),
             CheckpointSemantics::FullJournal => None,
         };
-        let restored =
-            ExtensionState::restore(base, checkpoint, limits).map_err(EnvError::Checkpoint)?;
-        Ok(Environment {
-            constants: self.constants.clone(),
-            extensions: self.extensions.insert(name.clone(), Arc::new(restored)),
-        })
+        ExtensionState::try_restore(base, checkpoint, limits, cancellation).map_complete(
+            |restored| {
+                restored
+                    .map(|state| Environment {
+                        constants: self.constants.clone(),
+                        extensions: self.extensions.insert(name.clone(), Arc::new(state)),
+                    })
+                    .map_err(EnvError::Checkpoint)
+            },
+        )
     }
 
     /// The canonical content digest of one constant (Domain::DeclContent): the
@@ -1942,11 +1958,10 @@ mod tests {
             .push_extension_entry(&n("simpExt"), &b"suffix-a"[..])
             .and_then(|env| env.push_extension_entry(&n("simpExt"), &b"suffix-b"[..]))
             .expect("target environment builds");
-        let checkpoint = target
-            .checkpoint_extension(&n("simpExt"), Some(&base), limits)
-            .expect("environment suffix captures");
-        let restored = base
-            .apply_extension_checkpoint(&checkpoint, limits)
+        let checkpoint =
+            completed(target.checkpoint_extension(&n("simpExt"), Some(&base), limits, None))
+                .expect("environment suffix captures");
+        let restored = completed(base.apply_extension_checkpoint(&checkpoint, limits, None))
             .expect("environment suffix applies");
 
         assert_eq!(restored, target);
@@ -1968,7 +1983,7 @@ mod tests {
             .and_then(|env| env.push_extension_entry(&n("otherExt"), &b"other"[..]))
             .expect("same-length divergent branch builds");
         assert!(matches!(
-            divergent.apply_extension_checkpoint(&checkpoint, limits),
+            completed(divergent.apply_extension_checkpoint(&checkpoint, limits, None)),
             Err(EnvError::Checkpoint(
                 CheckpointError::BaseHistoryMismatch { .. }
             ))
@@ -2001,11 +2016,9 @@ mod tests {
             .push_extension_entry(&n("fullExt"), &b"one"[..])
             .and_then(|env| env.push_extension_entry(&n("fullExt"), &b"two"[..]))
             .expect("source builds");
-        let checkpoint = source
-            .checkpoint_extension(&n("fullExt"), None, limits)
+        let checkpoint = completed(source.checkpoint_extension(&n("fullExt"), None, limits, None))
             .expect("full environment checkpoint captures");
-        let restored = destination
-            .apply_extension_checkpoint(&checkpoint, limits)
+        let restored = completed(destination.apply_extension_checkpoint(&checkpoint, limits, None))
             .expect("full checkpoint applies without a semantic base");
         assert_eq!(restored, source);
         assert_eq!(
@@ -2013,7 +2026,7 @@ mod tests {
             source.logical_root(&KVMap::new())
         );
         assert!(matches!(
-            source.checkpoint_extension(&n("ghost"), None, limits),
+            completed(source.checkpoint_extension(&n("ghost"), None, limits, None)),
             Err(EnvError::UnknownExtension { .. })
         ));
     }
@@ -3748,6 +3761,24 @@ mod tests {
     /// destructuring at each site keeps one extraction path and lets callers use the
     /// crate's usual `expect`, instead of three hand-written panics that would each
     /// have to agree about what a stop looks like.
+    /// Fold a checkpoint outcome to the `Result` these fixtures expect.
+    ///
+    /// Every fixture passes no cancellation probe, so a non-answer here is a test bug
+    /// rather than a scenario — surfaced as one instead of silently becoming an `Err`,
+    /// which is exactly the collapse the widened signature exists to prevent.
+    fn completed<T: std::fmt::Debug, E: std::fmt::Debug>(
+        outcome: Outcome<Result<T, E>>,
+    ) -> Result<T, E> {
+        assert!(
+            matches!(outcome, Outcome::Complete(_)),
+            "fixtures pass no probe, so a non-answer is a test bug: {outcome:?}"
+        );
+        match outcome {
+            Outcome::Complete(result) => result,
+            _ => unreachable!("asserted just above"),
+        }
+    }
+
     fn resource_stop(
         outcome: &Outcome<DeclarationUsage>,
     ) -> Option<(&ResourceUsage, Option<&str>)> {

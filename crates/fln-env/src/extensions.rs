@@ -16,8 +16,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use fln_core::name::Name;
+use fln_core::outcome::{Inconclusive, Outcome};
 use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, hash};
+
+use crate::modules::CancellationProbe;
 
 /// Declared merge semantics for one extension — the contract branch/merge consults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,6 +618,30 @@ fn first_entry_divergence(left: &ExtensionState, right: &ExtensionState) -> Opti
     }
 }
 
+/// Frozen cancellation observation points for the checkpoint identity proofs.
+///
+/// Numbered and fixed for the same reason the declaration-admission checkpoints are: a
+/// probe that trips must name the same point every run, or the outcome is
+/// schedule-dependent. The digest accelerators are deliberately *not* checkpoints —
+/// they are constant work and there is nothing to abandon there, and claiming a
+/// checkpoint that cannot fire is an untruthful contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointProofCheckpoint {
+    /// Before any input-sized base-identity proof work.
+    BeforeBaseProof,
+    /// After the proof succeeded and before the restored state is handed back.
+    BeforePublication,
+}
+
+impl std::fmt::Display for CheckpointProofCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckpointProofCheckpoint::BeforeBaseProof => write!(f, "before-base-proof"),
+            CheckpointProofCheckpoint::BeforePublication => write!(f, "before-publication"),
+        }
+    }
+}
+
 /// The first index at which `base` is not a prefix of `target`, or `None` when it is
 /// exactly a prefix.
 ///
@@ -1126,7 +1153,46 @@ impl ExtensionState {
     /// Capture this state according to the descriptor's declared checkpoint mode.
     /// Successful suffix capture performs only a bounded-depth prefix lookup plus
     /// work proportional to the suffix; it never flattens the base history.
-    pub fn checkpoint(
+    /// Capture a checkpoint, able to report a non-answer.
+    ///
+    /// The capture-side twin of [`ExtensionState::try_restore`], widened for the same
+    /// reason: ancestry is established by exact prefix comparison whenever the digest
+    /// accelerator only passes, and that comparison can be cancelled or — once bounded —
+    /// exhausted. Neither is a statement that the base is wrong, so neither may arrive
+    /// as a [`CheckpointError`].
+    pub fn try_checkpoint(
+        &self,
+        base: Option<&ExtensionState>,
+        limits: CheckpointLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<Result<ExtensionCheckpoint, CheckpointError>> {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                CheckpointProofCheckpoint::BeforeBaseProof.to_string(),
+            ));
+        }
+        let captured = self.checkpoint_unbounded(base, limits);
+        if captured.is_ok() && cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                CheckpointProofCheckpoint::BeforePublication.to_string(),
+            ));
+        }
+        Outcome::complete(captured)
+    }
+
+    /// Unbounded, uncancellable capture. **Fixture path only** — see
+    /// [`ExtensionState::restore`] for why this is `#[cfg(test)]` rather than a
+    /// documented public path.
+    #[cfg(test)]
+    fn checkpoint(
+        &self,
+        base: Option<&ExtensionState>,
+        limits: CheckpointLimits,
+    ) -> Result<ExtensionCheckpoint, CheckpointError> {
+        self.checkpoint_unbounded(base, limits)
+    }
+
+    fn checkpoint_unbounded(
         &self,
         base: Option<&ExtensionState>,
         limits: CheckpointLimits,
@@ -1254,7 +1320,69 @@ impl ExtensionState {
 
     /// Restore a checkpoint atomically. Inputs are immutable and every validation
     /// completes before the returned snapshot can become observable.
-    pub fn restore(
+    /// Restore a checkpoint, able to report a non-answer.
+    ///
+    /// # Why this returns an `Outcome` and the old `restore` could not
+    /// (bead `fln-extension-history-checkpoint-identity-41s`)
+    ///
+    /// Base identity is established by exact comparison whenever structural identity
+    /// does not apply, and an exact comparison over an input-sized history can run out
+    /// of budget or be cancelled. Both are FL-INV-07 **inconclusive**: no verdict was
+    /// reached about this checkpoint. [`CheckpointError`] is a *rejection* vocabulary
+    /// and cannot say "I ran out" — so reporting a budget stop through it would make a
+    /// resource exhaustion arrive as a failed comparison, which is precisely the
+    /// collapse this bead exists to prevent.
+    ///
+    /// So the type is widened **before** the proofs are bounded. A completed
+    /// determination — malformed checkpoint, wrong descriptor, base not exact — is a
+    /// `Result::Err` inside [`Outcome::Complete`], because a finished traversal
+    /// reporting a refusal is a verdict (decision `fln-um4a`). Only cancellation and,
+    /// once bounded, comparison exhaustion are non-answers.
+    ///
+    /// Cancellation is sampled at fixed [`CheckpointProofCheckpoint`]s and is never
+    /// cacheable. The comparison budget arrives in the next slice; this signature is
+    /// what makes it expressible.
+    pub fn try_restore(
+        base: Option<&ExtensionState>,
+        checkpoint: &ExtensionCheckpoint,
+        limits: CheckpointLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<Result<ExtensionState, CheckpointError>> {
+        // Sampled before any input-sized proof work: a caller who has given up must not
+        // pay for a comparison, and must not have a state restored on their behalf.
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                CheckpointProofCheckpoint::BeforeBaseProof.to_string(),
+            ));
+        }
+        let restored = ExtensionState::restore_unbounded(base, checkpoint, limits);
+        if restored.is_ok() && cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            // Proved, but the caller withdrew before publication. Discarding the result
+            // is correct: a restored state nobody asked for any more is not a verdict.
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                CheckpointProofCheckpoint::BeforePublication.to_string(),
+            ));
+        }
+        Outcome::complete(restored)
+    }
+
+    /// Unbounded, uncancellable restore. **Fixture path only.**
+    ///
+    /// `#[cfg(test)]` rather than documented-and-public, because with every production
+    /// caller migrated to [`ExtensionState::try_restore`] there is no reason for an
+    /// unbounded path to be reachable at all. Keeping it visible-but-public would be the
+    /// compatibility path this bead forbids; keeping it test-only makes it a fixture
+    /// helper whose non-authority is enforced by the compiler rather than by a comment.
+    #[cfg(test)]
+    fn restore(
+        base: Option<&ExtensionState>,
+        checkpoint: &ExtensionCheckpoint,
+        limits: CheckpointLimits,
+    ) -> Result<ExtensionState, CheckpointError> {
+        ExtensionState::restore_unbounded(base, checkpoint, limits)
+    }
+
+    fn restore_unbounded(
         base: Option<&ExtensionState>,
         checkpoint: &ExtensionCheckpoint,
         limits: CheckpointLimits,
@@ -1744,6 +1872,7 @@ mod tests {
     use super::*;
     use crate::environment::Environment;
     use fln_core::options::KVMap;
+    use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
     use std::collections::HashSet;
     use std::time::Instant;
 
@@ -2080,6 +2209,24 @@ mod tests {
 
     fn bytes(v: &[u8]) -> Arc<[u8]> {
         Arc::from(v.to_vec().into_boxed_slice())
+    }
+
+    /// Fold a checkpoint outcome to the `Result` these fixtures expect.
+    ///
+    /// Every fixture passes no cancellation probe, so a non-answer here is a test bug
+    /// rather than a scenario — surfaced as one instead of silently becoming an `Err`,
+    /// which is the collapse the widened signature exists to prevent.
+    fn completed<T: std::fmt::Debug, E: std::fmt::Debug>(
+        outcome: Outcome<Result<T, E>>,
+    ) -> Result<T, E> {
+        assert!(
+            matches!(outcome, Outcome::Complete(_)),
+            "fixtures pass no probe, so a non-answer is a test bug: {outcome:?}"
+        );
+        match outcome {
+            Outcome::Complete(result) => result,
+            _ => unreachable!("asserted just above"),
+        }
     }
 
     fn merge_with_test_limits(
@@ -4560,6 +4707,124 @@ mod tests {
         );
     }
 
+    /// A probe that trips at a chosen sample, so a test can pin the exact checkpoint
+    /// rather than only prove that cancellation happens.
+    struct TripAt {
+        trip_on: std::cell::Cell<u32>,
+    }
+
+    impl TripAt {
+        fn new(sample: u32) -> TripAt {
+            TripAt {
+                trip_on: std::cell::Cell::new(sample),
+            }
+        }
+    }
+
+    impl CancellationProbe for TripAt {
+        fn is_cancelled(&self) -> bool {
+            let remaining = self.trip_on.get();
+            if remaining == 0 {
+                return true;
+            }
+            self.trip_on.set(remaining - 1);
+            false
+        }
+    }
+
+    /// The widened signature has real inhabitants on the non-answer arm.
+    ///
+    /// This is the point of widening the type BEFORE bounding the proofs: a budget stop
+    /// has somewhere truthful to go. Cancellation is that inhabitant today; comparison
+    /// exhaustion joins it in the next slice. Until the type could express a non-answer,
+    /// a stop would have had to arrive as a `CheckpointError` — a rejection wearing a
+    /// resource-exhaustion hat, and the exact FL-INV-07 collapse this bead is about.
+    #[test]
+    fn cancellation_is_a_typed_non_answer_at_a_frozen_checkpoint() {
+        let base = state_with_checkpoint(3, CheckpointSemantics::JournalSuffix);
+        let target = base.push_entry(bytes(b"suffix"));
+        let checkpoint = target
+            .checkpoint(Some(&base), TEST_LIMITS)
+            .expect("checkpoint captures");
+
+        for (sample, expected) in [
+            (0u32, CheckpointProofCheckpoint::BeforeBaseProof),
+            (1, CheckpointProofCheckpoint::BeforePublication),
+        ] {
+            let probe = TripAt::new(sample);
+            let cancelled =
+                ExtensionState::try_restore(Some(&base), &checkpoint, TEST_LIMITS, Some(&probe));
+            let Outcome::Inconclusive(inconclusive) = &cancelled else {
+                unreachable!("a tripped probe must stop restore, got {cancelled:?}")
+            };
+            let InconclusiveCause::Cancelled { at } = &inconclusive.cause else {
+                unreachable!("cancellation must not be reported as exhaustion")
+            };
+            assert_eq!(
+                at.text(),
+                expected.to_string(),
+                "the probe must stop at the checkpoint it was set for"
+            );
+            // Not a refusal, and not cacheable: no verdict was reached about this
+            // checkpoint, so a cache that stored it would replay "we gave up" as "this
+            // checkpoint is bad".
+            assert_eq!(cancelled.authority(), Authority::NonAuthoritative);
+            assert_eq!(
+                cancelled.cache_admission(),
+                CacheAdmission::Refused {
+                    authority: Authority::NonAuthoritative
+                }
+            );
+        }
+
+        // Capture side, same contract.
+        let capture_probe = TripAt::new(0);
+        let cancelled_capture =
+            target.try_checkpoint(Some(&base), TEST_LIMITS, Some(&capture_probe));
+        assert_eq!(
+            cancelled_capture.authority(),
+            Authority::NonAuthoritative,
+            "a cancelled capture reached no verdict either"
+        );
+
+        // An untripped probe must not change the answer, on either side.
+        let quiet = TripAt::new(u32::MAX);
+        let restored =
+            ExtensionState::try_restore(Some(&base), &checkpoint, TEST_LIMITS, Some(&quiet))
+                .into_complete()
+                .expect("an untripped probe restores")
+                .expect("and the restore itself succeeds");
+        assert_eq!(
+            restored.content_digest(),
+            ExtensionState::restore(Some(&base), &checkpoint, TEST_LIMITS)
+                .expect("fixture path agrees")
+                .content_digest()
+        );
+        let quiet_capture = TripAt::new(u32::MAX);
+        assert_eq!(
+            target
+                .try_checkpoint(Some(&base), TEST_LIMITS, Some(&quiet_capture))
+                .into_complete()
+                .expect("an untripped probe captures")
+                .expect("and the capture itself succeeds"),
+            checkpoint
+        );
+
+        // A completed refusal stays a refusal: widening the type must not have turned a
+        // verdict into a non-answer.
+        let wrong = state_with_checkpoint(2, CheckpointSemantics::JournalSuffix);
+        let refused = ExtensionState::try_restore(Some(&wrong), &checkpoint, TEST_LIMITS, None);
+        assert_eq!(
+            refused.authority(),
+            Authority::Authoritative,
+            "a wrong base is a completed determination, not a non-answer"
+        );
+        assert!(
+            refused.into_complete().expect("completed").is_err(),
+            "and that determination is a refusal"
+        );
+    }
+
     /// CAPTURE side: a base that satisfies the prefix-digest accelerator but is not
     /// actually the prefix must be refused.
     ///
@@ -5218,15 +5483,14 @@ mod tests {
         );
 
         let suffix_started = Instant::now();
-        let checkpoint = target
-            .checkpoint_extension(&extension_name, Some(&base), limits)
-            .expect("capture through the real environment registry");
+        let checkpoint =
+            completed(target.checkpoint_extension(&extension_name, Some(&base), limits, None))
+                .expect("capture through the real environment registry");
         let (instrumented_checkpoint, suffix_work) = target_state
             .checkpoint_with_work(Some(base_state), limits)
             .expect("measure the same real suffix capture");
         assert_eq!(checkpoint, instrumented_checkpoint);
-        let restored = base
-            .apply_extension_checkpoint(&checkpoint, limits)
+        let restored = completed(base.apply_extension_checkpoint(&checkpoint, limits, None))
             .expect("apply through the real environment registry");
         assert_eq!(restored, target);
         let checkpoint_id = checkpoint_evidence_id(&checkpoint);
@@ -5271,17 +5535,16 @@ mod tests {
                 .push_extension_entry(&full_name, index.to_le_bytes().as_slice())
                 .expect("append full-journal entry");
         }
-        let full_checkpoint = full_target
-            .checkpoint_extension(&full_name, None, limits)
-            .expect("capture real full journal");
+        let full_checkpoint =
+            completed(full_target.checkpoint_extension(&full_name, None, limits, None))
+                .expect("capture real full journal");
         let (_, full_work) = full_target
             .extension(&full_name)
             .expect("full target extension exists")
             .checkpoint_with_work(None, limits)
             .expect("measure the same real full capture");
-        let full_restored = full_base
-            .apply_extension_checkpoint(&full_checkpoint, limits)
-            .expect("apply real full journal");
+        let full_restored = full_base.apply_extension_checkpoint(&full_checkpoint, limits, None);
+        let full_restored = completed(full_restored).expect("apply real full journal");
         assert_eq!(full_restored, full_target);
         println!(
             "{{\"schema\":\"fln.e2e.environment-state\",\"version\":1,\"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.7\"],\"scenario\":\"checkpoint-roundtrip\",\"mode\":\"full_journal\",\"status\":\"pass\",\"base_id\":null,\"checkpoint_id\":\"{}\",\"restored_id\":\"{}\",\"base_root\":null,\"checkpoint_base_root\":null,\"expected_root\":\"{}\",\"actual_root\":\"{}\",\"base_entries\":0,\"checkpoint_entries\":{},\"restored_entries\":{},\"payload_bytes\":{},\"prefix_lookup_steps\":{},\"capture_operations\":{},\"restore_operations\":{},\"entry_limit\":{},\"payload_byte_limit\":{},\"expected_outcome\":\"restored\",\"actual_outcome\":\"restored\",\"elapsed_us\":{},\"final_state\":\"verified\"}}",
@@ -5321,8 +5584,7 @@ mod tests {
                 .expect("append divergent base entry");
         }
         let divergent_root_before = divergent.logical_root(&KVMap::new());
-        let refusal = divergent
-            .apply_extension_checkpoint(&checkpoint, limits)
+        let refusal = completed(divergent.apply_extension_checkpoint(&checkpoint, limits, None))
             .expect_err("divergent base must receive a typed refusal");
         assert!(matches!(
             refusal,
@@ -5334,8 +5596,7 @@ mod tests {
             divergent_root_before,
             "failed apply is atomic"
         );
-        let recovered = base
-            .apply_extension_checkpoint(&checkpoint, limits)
+        let recovered = completed(base.apply_extension_checkpoint(&checkpoint, limits, None))
             .expect("clean recovery after typed refusal");
         assert_eq!(recovered, target);
         println!(
