@@ -679,7 +679,7 @@ fn kernel_source_inclusion_cannot_escape_the_loc_covenant() {
 }
 
 #[test]
-fn plan_rank_and_trust_allowlist_cannot_be_weakened() {
+fn plan_rank_and_trust_allowlists_cannot_be_weakened() {
     let rank = TempWs::new("rank-change");
     base(&rank);
     rank.write(
@@ -701,6 +701,28 @@ fn plan_rank_and_trust_allowlist_cannot_be_weakened() {
         ),
     );
     assert_eq!(codes(&allowlist.run()), vec!["FLN-STRUCT-024"]);
+
+    let checker_bignum = TempWs::new("checker-bignum-allowlist");
+    base(&checker_bignum);
+    checker_bignum.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &BASE_GRAPH.replace(
+            "allow-direct fln-checker = fln-core, fln-hash",
+            "allow-direct fln-checker = fln-core, fln-hash, fln-bignum",
+        ),
+    );
+    assert_eq!(codes(&checker_bignum.run()), vec!["FLN-STRUCT-024"]);
+
+    let checker_without_hash = TempWs::new("checker-without-shared-wire-schema");
+    base(&checker_without_hash);
+    checker_without_hash.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &BASE_GRAPH.replace(
+            "allow-direct fln-checker = fln-core, fln-hash",
+            "allow-direct fln-checker = fln-core",
+        ),
+    );
+    assert_eq!(codes(&checker_without_hash.run()), vec!["FLN-STRUCT-024"]);
 }
 
 #[test]

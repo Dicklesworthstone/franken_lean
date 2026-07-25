@@ -1206,10 +1206,7 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
             "fln-kernel",
             ["fln-core", "fln-hash", "fln-bignum", "fln-env"].as_slice(),
         ),
-        (
-            "fln-checker",
-            ["fln-core", "fln-hash", "fln-bignum"].as_slice(),
-        ),
+        ("fln-checker", ["fln-core", "fln-hash"].as_slice()),
     ] {
         let actual: BTreeSet<&str> = g
             .allow_direct

@@ -153,7 +153,7 @@ const GRAPH: &str = "\
 	prohibit fln-checker ->* fln-rt
 	prohibit fln-checker ->* fln-unsafe-*
 	allow-direct fln-kernel = fln-core, fln-hash, fln-bignum, fln-env
-	allow-direct fln-checker = fln-core, fln-hash, fln-bignum
+	allow-direct fln-checker = fln-core, fln-hash
 	covenant fln-kernel max-loc=12000
 	suite-dep asupersync
 	";

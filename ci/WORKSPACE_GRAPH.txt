@@ -107,7 +107,9 @@ prohibit fln-checker ->* fln-unsafe-*
 
 # ---- trust-base direct-dependency covenants (dependency-closure-on-one-page, §8) ------
 allow-direct fln-kernel  = fln-core, fln-hash, fln-bignum, fln-env
-allow-direct fln-checker = fln-core, fln-hash, fln-bignum
+# fln-hash stays so both engines speak one canonical wire schema and domain-tag
+# vocabulary; semantic readers remain checker-owned (franken_lean-r0xu, a873e73c).
+allow-direct fln-checker = fln-core, fln-hash
 
 # ---- the ≤ 12 KLOC kernel covenant (plan §8, D6) --------------------------------------
 covenant fln-kernel max-loc=12000
