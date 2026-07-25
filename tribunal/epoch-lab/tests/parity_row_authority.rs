@@ -1,4 +1,9 @@
-//! Suite `parity_ledger_schema` (bead `franken_lean-9pnc`; plan §18, doctrine D7).
+//! Suite `parity_row_authority` (bead `franken_lean-9pnc`; plan §18, doctrine D7).
+//!
+//! The name is the one `fln-euo` enumerates in its closure criteria, alongside
+//! `epoch_lab_hash_chain`, `oracle_outcome_authority` and `typed_normalizer_model`.
+//! The epic's coverage phrase for it — "row freshness/roots/claims" — is exactly
+//! what is tested here.
 //!
 //! # What is under test
 //!
