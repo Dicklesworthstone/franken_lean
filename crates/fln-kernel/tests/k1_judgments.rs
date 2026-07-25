@@ -125,6 +125,44 @@ fn kr970_the_one_name_one_constant_law() {
 }
 
 #[test]
+fn kr972_a_declaration_type_that_is_not_a_sort_is_rejected() {
+    // KR-972: a declaration's TYPE must itself check to a sort. The existing
+    // kr104_kr972 case covers the direction where it does; a mutation campaign
+    // found the refusal unguarded — deleting the check left all 98 tests
+    // passing, because nothing ever declared something whose type is not a
+    // type.
+    //
+    // `dd : D` and `D : Sort 1`, so the type expression `dd` infers to `D`,
+    // which is a Const and not a Sort. Admitting `bad : dd` would put a
+    // constant in the environment whose type is not a type at all, and every
+    // later judgment about `bad` would be reasoning about a non-type.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let env = admit(&env, &axiom("dd", Expr::const_(n("D"), vec![])));
+    let verdict = check(
+        &env,
+        &axiom("bad", Expr::const_(n("dd"), vec![])),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::SortExpected),
+        "a declaration whose type is not a sort must be refused; got {verdict:?}"
+    );
+
+    // CONTROL: the same shape one level up still admits, so this is not a
+    // blanket refusal of constants-as-types.
+    assert!(
+        check(
+            &env,
+            &axiom("fine", Expr::const_(n("D"), vec![])),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "a declaration whose type IS a sort-typed constant must still admit"
+    );
+}
+
+#[test]
 fn kr971_duplicate_level_params_are_rejected() {
     let env = Environment::new();
     let decl = Declaration::Axiom(AxiomVal {
@@ -2037,6 +2075,234 @@ fn kr317_k_like_recursor_reduces_an_opaque_proof() {
         )
         .is_accepted(),
         "K-like reduction fires on an opaque proof of a K-eligible inductive"
+    );
+}
+
+#[test]
+fn kr317_k_conversion_refuses_a_major_whose_index_does_not_match_the_constructor() {
+    // KR-317's GATE. K conversion replaces an opaque major with the nullary
+    // constructor, but only after checking that the constructor's type is defeq
+    // to the major's. `kr317_k_like_recursor_reduces_an_opaque_proof` above
+    // covers the direction where K must FIRE; a mutation campaign found the
+    // direction where it must NOT fire completely unguarded — replacing the
+    // defeq gate with `if false` left all 97 tests passing, even though the
+    // gate is reached (a planted panic there fires in exactly one test).
+    //
+    // SOUNDNESS STAKE, and it is the worst in the campaign so far. `E` here is
+    // Eq-shaped: one parameter, one index, one constructor `E.refl : (a : D) →
+    // E a a`. For an opaque `h : E x y` the nullary constructor at those
+    // parameters is `E.refl x : E x x`, which is NOT defeq to `E x y`. Without
+    // the gate the kernel rewrites `h` to `E.refl x` and iota-reduces, so a
+    // recursor application at index `y` computes as though it were at `x` —
+    // that is a proof of `x = y` for arbitrary distinct `x` and `y`.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let d = || Expr::const_(n("D"), vec![]);
+    let env = admit(&env, &axiom("x", d()));
+    let env = admit(&env, &axiom("y", d()));
+    let x = || Expr::const_(n("x"), vec![]);
+    let y = || Expr::const_(n("y"), vec![]);
+    let e = || Expr::const_(n("E"), vec![]);
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let u = n("u");
+
+    // E : (a : D) → D → Prop, with `a` a parameter and the second D an index.
+    let env = add_info(
+        &env,
+        ConstantInfo::Induct(InductiveVal {
+            base: cval(
+                n("E"),
+                vec![],
+                Expr::forall_e(
+                    n("a"),
+                    d(),
+                    Expr::forall_e(n("b"), d(), prop(), BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+            ),
+            num_params: 1,
+            num_indices: 1,
+            all: vec![n("E")],
+            ctors: vec![nn("E", "refl")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    // E.refl : (a : D) → E a a
+    let env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: cval(
+                nn("E", "refl"),
+                vec![],
+                Expr::forall_e(
+                    n("a"),
+                    d(),
+                    Expr::app(Expr::app(e(), bv(0)), bv(0)),
+                    BinderInfo::Default,
+                ),
+            ),
+            induct: n("E"),
+            cidx: 0,
+            num_params: 1,
+            num_fields: 0,
+            is_unsafe: false,
+        }),
+    );
+
+    // motive : (b : D) → E a b → Sort u   (under the `a` binder)
+    let motive_ty = Expr::forall_e(
+        n("b"),
+        d(),
+        Expr::forall_e(
+            n("h"),
+            Expr::app(Expr::app(e(), bv(1)), bv(0)),
+            Expr::sort(Level::param(u.clone())),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // refl_case : motive a (E.refl a)   (under a, motive)
+    let refl_case_ty = Expr::app(
+        Expr::app(bv(0), bv(1)),
+        Expr::app(Expr::const_(nn("E", "refl"), vec![]), bv(1)),
+    );
+    // E.rec : {a} {motive} (refl_case) {b} (h : E a b) → motive b h
+    let rec_ty = Expr::forall_e(
+        n("a"),
+        d(),
+        Expr::forall_e(
+            n("motive"),
+            motive_ty.clone(),
+            Expr::forall_e(
+                n("refl_case"),
+                refl_case_ty.clone(),
+                Expr::forall_e(
+                    n("b"),
+                    d(),
+                    Expr::forall_e(
+                        n("h"),
+                        Expr::app(Expr::app(e(), bv(3)), bv(0)),
+                        Expr::app(Expr::app(bv(3), bv(1)), bv(0)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Implicit,
+    );
+    // rule rhs: fun a motive refl_case => refl_case
+    let rhs = Expr::lam(
+        n("a"),
+        d(),
+        Expr::lam(
+            n("motive"),
+            motive_ty,
+            Expr::lam(n("refl_case"), refl_case_ty, bv(0), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: cval(nn("E", "rec"), vec![u], rec_ty),
+            all: vec![n("E")],
+            num_params: 1,
+            num_indices: 1,
+            num_motives: 1,
+            num_minors: 1,
+            rules: vec![RecursorRule {
+                ctor: nn("E", "refl"),
+                nfields: 0,
+                rhs,
+            }],
+            k: true,
+            is_unsafe: false,
+        }),
+    );
+    // EM : (b : D) → E x b → Sort 1;  ec : EM x (E.refl x);  h : E x y
+    let env = admit(
+        &env,
+        &axiom(
+            "EM",
+            Expr::forall_e(
+                n("b"),
+                d(),
+                Expr::forall_e(
+                    n("h"),
+                    Expr::app(Expr::app(e(), x()), bv(0)),
+                    sort1(),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        ),
+    );
+    let em = || Expr::const_(n("EM"), vec![]);
+    let env = admit(
+        &env,
+        &axiom(
+            "ec",
+            Expr::app(
+                Expr::app(em(), x()),
+                Expr::app(Expr::const_(nn("E", "refl"), vec![]), x()),
+            ),
+        ),
+    );
+    let env = admit(&env, &axiom("h", Expr::app(Expr::app(e(), x()), y())));
+
+    // E.rec.{1} x EM ec y h  —  stuck, because K may not rewrite `h : E x y`
+    // into `E.refl x : E x x`.
+    let mut lhs = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+    for arg in [
+        x(),
+        em(),
+        Expr::const_(n("ec"), vec![]),
+        y(),
+        Expr::const_(n("h"), vec![]),
+    ] {
+        lhs = Expr::app(lhs, arg);
+    }
+    assert!(
+        !check_def_eq(
+            &env,
+            &[],
+            &lhs,
+            &Expr::const_(n("ec"), vec![]),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "K conversion must NOT fire when the nullary constructor's type is not \
+         defeq to the major's: reducing here proves `x = y` for distinct x, y"
+    );
+
+    // CONTROL: at the MATCHING index the gate passes and K does fire, so the
+    // test is not merely asserting that this recursor never reduces.
+    let mut ok = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+    for arg in [
+        x(),
+        em(),
+        Expr::const_(n("ec"), vec![]),
+        x(),
+        Expr::app(Expr::const_(nn("E", "refl"), vec![]), x()),
+    ] {
+        ok = Expr::app(ok, arg);
+    }
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &ok,
+            &Expr::const_(n("ec"), vec![]),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "at the matching index the recursor must still reduce"
     );
 }
 
