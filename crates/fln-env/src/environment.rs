@@ -380,18 +380,20 @@ impl DeclarationDimension {
 /// unique `Arc` node counts. Two runs over the same declaration produce identical
 /// facts on any schedule.
 ///
-/// # What this deliberately does not yet claim
+/// # Maximum logical depth is now reported, and it is a fact rather than a limit
 ///
-/// `franken_lean-j8h` also names maximum logical depth, which is not reported here.
-/// Approximating it would be worse than omitting it:
+/// This block previously recorded depth as the one dimension `franken_lean-j8h` names
+/// that was not reported, because [`crate::terms::WeightReport`] did not carry it.
+/// It does now: depth folds beside the weight over the same post-order traversal, so
+/// the fact costs one `u64` per distinct node and no second walk.
 ///
-/// * **Expression nodes and expanded weight** are already measured, bounded and
-///   cancellable by [`crate::terms::expanded_weight`]; folding them in is the next
-///   slice, and doing it here would have meant one commit spanning two traversals.
-/// * **Maximum depth** is not reported by that traversal today. Its *safety* role is
-///   already discharged — the traversal is iterative, so a deep term is a measurement
-///   rather than a stack overflow — but the fact itself is not available, and
-///   `WeightReport` would have to grow to carry it.
+/// It is reported as an exact usage fact and is deliberately **not** yet a budgeted
+/// [`DeclarationDimension`]. A dimension needs a `StructuralUnit`, and none of the three
+/// says what a depth bound means: `InputBytes` and `ExpandedWeight` describe sizes, and
+/// `ProducedNodes` would render a depth stop as "produced nodes: 65, allowed 64" when
+/// the declaration in fact produced far more nodes than 65 — a false fact, which is the
+/// thing this whole struct exists to avoid. Adding the limit is a `fln-core` taxonomy
+/// question and is asked there rather than answered here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeclarationUsage {
     /// Level parameters on the constant's signature.
@@ -415,6 +417,13 @@ pub struct DeclarationUsage {
     /// without expanding it. `u128` because a shared graph denotes a tree that can
     /// exceed `u64` while the graph itself stays small.
     pub expanded_weight: u128,
+    /// Deepest root-to-leaf path across every expression of this declaration.
+    ///
+    /// The **maximum** of the per-expression depths, not their sum: a declaration is as
+    /// deep as its deepest expression, and adding a second shallow expression does not
+    /// make it deeper. Every other expression fact on this struct is a total, which is
+    /// exactly why this one says so.
+    pub max_logical_depth: u64,
 }
 
 impl DeclarationUsage {
@@ -524,6 +533,10 @@ pub fn preflight_declaration_rows(
         expressions: 0,
         expr_nodes: 0,
         expanded_weight: 0,
+        // Zero until an expression is measured. Zero is the honest starting value and
+        // also the honest final value for a declaration with no expressions: a
+        // declaration with nothing to descend into has no depth, rather than depth 1.
+        max_logical_depth: 0,
     };
 
     for dimension in DeclarationDimension::ORDER {
@@ -571,11 +584,13 @@ pub fn preflight_declaration_rows(
 /// provisional digest exists to be returned, logged, or cached, because preflight
 /// completes before hashing begins.
 ///
-/// # What is still missing, and it is named rather than approximated
+/// # Maximum logical depth is reported here as a fact, and is not a budget dimension
 ///
-/// Maximum logical depth remains unreported: [`crate::terms::WeightReport`] does not
-/// carry it today, and the iterative traversal already discharges depth's *safety* role
-/// even though the fact is unavailable.
+/// Depth's *safety* role was always discharged — the traversal is iterative, so a deep
+/// term is a measurement rather than a stack overflow — but the fact itself used to be
+/// unavailable. It is now measured exactly, as the maximum across the declaration's
+/// expressions. It is not a budgeted dimension; see [`DeclarationUsage`] for why that
+/// half is a `fln-core` taxonomy question rather than an omission.
 ///
 /// Canonical bytes ARE now reported, and exactly rather than modelled — the encoder runs
 /// once and its stream length is taken, so the fact describes the same bytes the digest is
@@ -693,6 +708,11 @@ fn preflight_declaration_expressions(
         };
         usage.expr_nodes = nodes;
         usage.expanded_weight = weight;
+        // MAX, not a running total, and not checked-add for that reason: a declaration is
+        // as deep as its deepest expression. There is no overflow to guard — the value
+        // never exceeds one expression's own depth, which `expanded_weight` already
+        // bounded by its distinct-node budget.
+        usage.max_logical_depth = usage.max_logical_depth.max(report.max_logical_depth);
     }
     None
 }

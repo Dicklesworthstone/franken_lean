@@ -244,6 +244,21 @@ pub struct WeightReport {
     pub distinct_nodes: u64,
     /// Child edges traversed.
     pub edges: u64,
+    /// Longest root-to-leaf path in the **denoted tree**, counting nodes. A leaf is 1.
+    ///
+    /// This is the fact `franken_lean-j8h` names and that this report previously did not
+    /// carry, which is why [`crate::environment::DeclarationUsage`] documented maximum
+    /// logical depth as absent rather than approximating it.
+    ///
+    /// It is the longest path, **not** the sum of paths and not the stored height: a
+    /// shared diamond denotes a tree deeper than its node count suggests in one
+    /// direction and shallower in the other, so depth folds with `max` where
+    /// `expanded_weight` folds with `+`. Sharing changes the weight and leaves the depth
+    /// alone, which is exactly the property that makes it worth reporting separately.
+    ///
+    /// Bounded by `distinct_nodes`: a path in a DAG cannot revisit a node, so this
+    /// cannot exceed the number of distinct nodes and cannot wrap.
+    pub max_logical_depth: u64,
 }
 
 impl WeightReport {
@@ -343,12 +358,18 @@ pub fn expanded_weight(root: &Expr, budget: &WeightBudget) -> Outcome<WeightRepo
     // small number that then passes.
     let allowed = u128::from(budget.max_expanded_weight);
     let mut weights: HashMap<*const ExprNode, u128> = HashMap::with_capacity(order.len());
+    // Depth folds beside the weight, over the same post-order, so it costs one `u64` per
+    // distinct node and no second traversal. `max` where the weight uses `+`: a node's
+    // depth is one more than its DEEPEST child, not the sum of its children.
+    let mut depths: HashMap<*const ExprNode, u64> = HashMap::with_capacity(order.len());
     for expr in &nodes {
         kids.clear();
         children(expr.node(), &mut kids);
         let mut weight: u128 = 1;
+        let mut deepest_child: u64 = 0;
         for child in &kids {
             edges = edges.saturating_add(1);
+            deepest_child = deepest_child.max(depths.get(&node_key(child)).copied().unwrap_or(1));
             let child_weight = weights.get(&node_key(child)).copied().unwrap_or(1);
             match weight.checked_add(child_weight) {
                 Some(next) => weight = next,
@@ -369,12 +390,18 @@ pub fn expanded_weight(root: &Expr, budget: &WeightBudget) -> Outcome<WeightRepo
             ));
         }
         weights.insert(node_key(expr), weight);
+        // Saturating rather than checked, and that is not a shortcut: a path in a DAG
+        // cannot revisit a node, so depth is bounded by `distinct_nodes`, which is itself
+        // already refused above `budget.max_distinct_nodes`. The saturation is
+        // unreachable; it is here so the arithmetic is total on its face.
+        depths.insert(node_key(expr), deepest_child.saturating_add(1));
     }
 
     Outcome::Complete(WeightReport {
         expanded_weight: weights.get(&node_key(root)).copied().unwrap_or(1),
         distinct_nodes: u64::try_from(order.len()).unwrap_or(u64::MAX),
         edges,
+        max_logical_depth: depths.get(&node_key(root)).copied().unwrap_or(1),
     })
 }
 
@@ -620,6 +647,78 @@ mod tests {
             report.sharing_factor(),
             1,
             "an unshared term shares nothing"
+        );
+    }
+
+    /// **Maximum logical depth**, the fact `franken_lean-j8h` names and that this report
+    /// did not carry until now.
+    ///
+    /// Depth folds with `max` where weight folds with `+`, and the diamond below is what
+    /// separates them: a node with two children of depth 2 is depth 3, never depth 5. A
+    /// `+` in that fold passes every weight assertion in this file and fails only here.
+    #[test]
+    fn maximum_logical_depth_is_the_longest_path_not_the_sum() {
+        assert_eq!(weight_of(&c("a")).max_logical_depth, 1, "a leaf is depth 1");
+        assert_eq!(
+            weight_of(&Expr::app(c("f"), c("a"))).max_logical_depth,
+            2,
+            "an application over two leaves is depth 2"
+        );
+
+        // A diamond: one shared child of depth 2, reached by both edges of an app.
+        let shared = Expr::app(c("f"), c("a"));
+        let diamond = Expr::app(shared.clone(), shared);
+        let report = weight_of(&diamond);
+        assert_eq!(
+            report.max_logical_depth, 3,
+            "1 + max(2, 2). Summing the children would say 5 and would be wrong"
+        );
+        assert_eq!(
+            report.expanded_weight, 7,
+            "the weight DOES sum, which is why the two folds cannot share an operator"
+        );
+
+        // Depth is a property of the denoted tree, so sharing must not move it. The
+        // unshared twin denotes the same tree with more stored nodes.
+        let twin = Expr::app(Expr::app(c("f"), c("a")), Expr::app(c("f"), c("a")));
+        let twin_report = weight_of(&twin);
+        assert_eq!(
+            twin_report.max_logical_depth, report.max_logical_depth,
+            "sharing changes distinct_nodes, never depth"
+        );
+        assert!(
+            twin_report.distinct_nodes > report.distinct_nodes,
+            "the fixture must actually differ in sharing or it proves nothing: {twin_report:?} vs \
+             {report:?}"
+        );
+    }
+
+    /// Depth tracks the input rather than being a constant that happens to agree, and it
+    /// is measured on a term deep enough that a recursive fold would not survive it.
+    #[test]
+    fn maximum_logical_depth_grows_with_nesting_and_is_stack_safe() {
+        let mut shallow = c("a");
+        for _ in 0..4 {
+            shallow = Expr::app(shallow, c("a"));
+        }
+        assert_eq!(
+            weight_of(&shallow).max_logical_depth,
+            5,
+            "four nestings over a leaf"
+        );
+
+        let mut deep = c("a");
+        for _ in 0..10_000 {
+            deep = Expr::app(deep, c("a"));
+        }
+        let report = weight_of(&deep);
+        assert_eq!(
+            report.max_logical_depth, 10_001,
+            "depth is exact at ten thousand nestings, not saturated or approximated"
+        );
+        assert!(
+            report.max_logical_depth <= report.distinct_nodes,
+            "a DAG path cannot revisit a node, so depth can never exceed distinct_nodes"
         );
     }
 
