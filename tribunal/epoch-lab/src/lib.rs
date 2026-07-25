@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod corpus;
 pub mod normalize;
 pub mod oracle;
 pub mod parity;
