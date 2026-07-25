@@ -250,8 +250,9 @@ pub struct ConceptCensus {
 /// What this matrix does and does not govern. Data, not a doc comment, so it is printable at
 /// failure time.
 pub const GOVERNED_SCOPE: &str = "\
-Sixteen rows over four documents (README.md, AGENTS.md, \
-COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, crates/fln-olean/src/lib.rs) plus \
+Seventeen rows over five documents (README.md, AGENTS.md, \
+COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, crates/fln-olean/src/lib.rs, \
+ci/PARITY_LEDGER.txt) plus \
 three concept censuses over README.md, AGENTS.md and \
 COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, seeded from a measured read-only review \
 (bead franken_lean-claim-matrix-doc-ci-mhew). The document list is a correction: it said THREE \
@@ -261,7 +262,7 @@ class as one that overstates. NOT covered: the overwhelming majority of \
 README.md (~41 KB) and the plan (~195 KB), every claim in every other crate header, and all \
 generated contracts. Only three concepts have a conservation census; every other repeated \
 claim in these documents is unwatched. Every row now cites at least one checkable fact \
-(seventeen citations over sixteen rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
+(eighteen citations over seventeen rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
 only rot someone anticipated well enough to cite, and it protects one clause of a \
 multi-clause evidence paragraph. B3-CONSENSUS-HALTS has nine factual clauses and one is \
 cited, and it is not the clause its state depends on. Both rows that actually rotted on \
@@ -278,6 +279,7 @@ const fn site(document: &'static str, text: &'static str) -> ClaimSite {
 const README: &str = "README.md";
 const AGENTS: &str = "AGENTS.md";
 const PLAN: &str = "COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md";
+const LEDGER: &str = "ci/PARITY_LEDGER.txt";
 
 // ---------------------------------------------------------------------------
 // Site tables — separate consts because a ClaimRow borrows its sites.
@@ -319,6 +321,21 @@ const SITES_RECEIPTS: [ClaimSite; 1] = [site(
     README,
     "proof certificate; attested checks append to a transparency log",
 )];
+/// The two places the SAME symbol is given two meanings. Unlike every other row here,
+/// these sites are not where a claim is asserted — they are where the term the claim is
+/// made in is DEFINED. That is the point: the disputed thing is the meaning, the 85
+/// assertions that depend on it are counted by this row's citation instead, and neither
+/// definition can be edited (including to resolve the split) without this row going red.
+const SITES_L2_DEFINITION: [ClaimSite; 2] = [
+    site(
+        PLAN,
+        "**L2 behavioral** (gated corpus passes; exclusions explicit)",
+    ),
+    site(
+        LEDGER,
+        "the pinned Reference binary produced the expected value",
+    ),
+];
 const SITES_FUEL_PARITY: [ClaimSite; 5] = [
     site(README, "deterministic fuel parity"),
     site(AGENTS, "deterministic fuel parity"),
@@ -370,7 +387,31 @@ const SITES_GOLEM: [ClaimSite; 1] = [site(README, "runs unmodified on Golem")];
 /// (`scripts/tribunal/leanchecker_witness.sh`, wired into `scripts/check.sh`) — and it has no
 /// row here, so it is UNGOVERNED, not supported. A true clause with no row is exactly what a
 /// decomposition is supposed to make visible, and calling it supported hid it.
-pub const CLAIM_MATRIX: [ClaimRow; 16] = [
+pub const CLAIM_MATRIX: [ClaimRow; 17] = [
+    // ---- the term itself, before any row that uses it -------------------------------
+    ClaimRow {
+        id: "PARITY-LEDGER-L2-MEANS-TWO-THINGS",
+        sites: &SITES_L2_DEFINITION,
+        claim_type: ClaimType::BoundedModel,
+        state: ClaimState::Targeted,
+        evidence: "Added 2026-07-25 (bead \
+                   franken_lean-parity-ledger-l2-definition-split-kl4h). L2 is defined twice, \
+                   differently, and each document is internally consistent — which is why no \
+                   single-document check can see it. The plan (§4.2) says L2 is `behavioral \
+                   (gated corpus passes; exclusions explicit)'. ci/PARITY_LEDGER.txt's header \
+                   says L2 is `the pinned Reference binary produced the expected value, and \
+                   ... compares ours to it on every run', with L1 for source-read evidence. \
+                   All 94 rows were earned against the SECOND; under the first, zero rows are \
+                   at L2, because no row in that file was compared on a corpus pass of any \
+                   kind. Readers resolve the first: README.md:42 and :94 advertise L0-L4 with \
+                   no local gloss, and the plan gates releases on it (R4 requires `all \
+                   mandatory rows L4'). THIS ROW DOES NOT DECIDE WHICH DEFINITION WINS — that \
+                   is a doctrine call above this matrix, and the bead states the cost of each \
+                   direction. What it does is make the split impossible to carry silently: \
+                   both definitions are governed sites, so editing either one — including to \
+                   resolve the split — fails this row until someone answers it.",
+        enforcement: Enforcement::Acknowledged,
+    },
     // ---- B3, decomposed -------------------------------------------------------------
     ClaimRow {
         id: "B3-KERNEL-LOC-COVENANT",
@@ -485,7 +526,7 @@ pub const CLAIM_MATRIX: [ClaimRow; 16] = [
         sites: &SITES_DOCS_CI,
         claim_type: ClaimType::Invariant,
         state: ClaimState::Targeted,
-        evidence: "This module is the enforcing slice and governs sixteen rows over four \
+        evidence: "This module is the enforcing slice and governs seventeen rows over five \
                    documents plus three censuses. The claim as written implies coverage of all \
                    documentation, which is not true and is why GOVERNED_SCOPE exists. Promote \
                    only when franken_lean-n8hw delivers the full matrix.",
@@ -644,7 +685,18 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 /// floor under it.
 ///
 /// [`every_row_cites_a_checkable_fact`]: ../../tests/witness_claim_matrix.rs
-pub const EVIDENCE_CITATIONS: [(&str, Citation); 17] = [
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 18] = [
+    // How many rows depend on the disputed definition. The sites pin the two definitions;
+    // this pins the population, and it fires the moment ANY row's level moves — which is
+    // exactly when "85 of 94, and zero under the plan's reading" stops being true.
+    (
+        "PARITY-LEDGER-L2-MEANS-TWO-THINGS",
+        Citation::OccursExactly {
+            path: "ci/PARITY_LEDGER.txt",
+            needle: "| L2 |",
+            count: 85,
+        },
+    ),
     // Corrected 2026-07-25 after this row asserted a stub that had grown to 149 lines.
     (
         "B3-INDEPENDENT-CHECKER",
@@ -740,7 +792,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 17] = [
             count: 1,
         },
     ),
-    // This row's evidence says the matrix governs sixteen rows, so the citation tracks the
+    // This row's evidence says the matrix governs seventeen rows, so the citation tracks the
     // row count — but it must live in a DIFFERENT file than the needle describes. Citing
     // `witness.rs` for a literal inside `witness.rs` counts the citation itself: the first
     // attempt used `pub const CLAIM_MATRIX: [ClaimRow; 15]` and found it twice, once as the
@@ -751,7 +803,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 17] = [
         "B8-DOCS-CI-ENFORCES-WORDING",
         Citation::OccursExactly {
             path: "crates/fln-conformance/tests/witness_claim_matrix.rs",
-            needle: "report.acknowledged, 13",
+            needle: "report.acknowledged, 14",
             count: 1,
         },
     ),

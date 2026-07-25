@@ -126,7 +126,7 @@ fn the_matrix_and_the_censuses_are_clean_against_the_real_tree() {
         "the <= 12 KLOC covenant is earned and recorded as such, so the matrix does not imply \
          the whole B3 sentence is unsupported"
     );
-    assert_eq!(report.acknowledged, 13, "the standing overclaims");
+    assert_eq!(report.acknowledged, 14, "the standing overclaims");
     assert_eq!(
         report.censuses,
         CONCEPT_CENSUS.len(),
@@ -365,6 +365,81 @@ fn a_silently_repaired_overclaim_is_caught() {
         faults.iter().any(|fault| matches!(
             fault,
             WitnessFault::StaleAcknowledgement { id, .. } if id == target.id
+        )),
+        "{faults:?}"
+    );
+}
+
+/// **The definition split cannot be carried, resolved, or diluted silently.**
+///
+/// `PARITY-LEDGER-L2-MEANS-TWO-THINGS` records that L2 is defined twice, differently, and
+/// that each document is internally consistent — which is why no single-document check sees
+/// it. This proves the row fires in all three directions that matter, because a row that
+/// only records a contradiction is a note, and a note is what everyone has already read past.
+///
+/// Note the second case especially: rewriting the ledger's local definition to MATCH the
+/// plan is the good outcome, and it still fails until someone updates this row. That is
+/// deliberate. The gate's job is not to prefer a definition — it is to make sure the moment
+/// anyone changes one, a human states which one now governs.
+#[test]
+fn neither_definition_of_l2_can_move_without_failing_the_row_that_records_the_split() {
+    const LEDGER: &str = "ci/PARITY_LEDGER.txt";
+    const PLAN: &str = "COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md";
+    let target = row("PARITY-LEDGER-L2-MEANS-TWO-THINGS");
+    assert_eq!(target.enforcement, Enforcement::Acknowledged);
+    assert_eq!(target.sites.len(), 2, "the split needs both definitions");
+
+    // 1. The ledger's local definition is rewritten to match the plan — the RESOLUTION.
+    let resolved = read_doc(LEDGER).replace(
+        "the pinned Reference binary produced the expected value",
+        "a gated corpus pass covered the symbol",
+    );
+    let faults = scan(&[*target], &[], &[], real_with_path(LEDGER, resolved))
+        .expect_err("resolving the split must still fail until the row is updated");
+    assert!(
+        faults.iter().any(|fault| matches!(
+            fault,
+            WitnessFault::StaleAcknowledgement { id, document } if id == target.id && document == LEDGER
+        )),
+        "{faults:?}"
+    );
+
+    // 2. The plan's ladder is widened to admit what the ledger already does — the opposite
+    //    resolution, which must fail identically. Neither document gets to move alone.
+    let widened = read_doc(PLAN).replace(
+        "**L2 behavioral** (gated corpus passes; exclusions explicit)",
+        "**L2 behavioral** (oracle-produced values compared; exclusions explicit)",
+    );
+    let faults = scan(&[*target], &[], &[], real_with_path(PLAN, widened))
+        .expect_err("widening the plan's ladder must fail until the row is updated");
+    assert!(
+        faults.iter().any(|fault| matches!(
+            fault,
+            WitnessFault::StaleAcknowledgement { id, document } if id == target.id && document == PLAN
+        )),
+        "{faults:?}"
+    );
+
+    // 3. Both definitions untouched, but ONE row's level moves. The population the evidence
+    //    counts is no longer 85, so the citation fires: the split is unchanged and the
+    //    sentence describing its blast radius is not.
+    let citation = EVIDENCE_CITATIONS
+        .iter()
+        .find(|(id, _)| *id == target.id)
+        .map(|(_, citation)| *citation)
+        .expect("the row cites the population that depends on the definition");
+    let demoted = read_doc(LEDGER).replacen("| L2 |", "| L1 |", 1);
+    let faults = scan(
+        &[*target],
+        &[],
+        &[(target.id, citation)],
+        real_with_path(LEDGER, demoted),
+    )
+    .expect_err("moving one row's level must make the recorded count stale");
+    assert!(
+        faults.iter().any(|fault| matches!(
+            fault,
+            WitnessFault::StaleEvidence { id, .. } if id == target.id
         )),
         "{faults:?}"
     );
