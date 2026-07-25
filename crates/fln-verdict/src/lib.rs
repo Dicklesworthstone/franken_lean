@@ -38,7 +38,7 @@ pub use bitblast::{
 pub use checker::{
     ProofCheckInconclusive, ProofCheckInternalFault, ProofCheckLimits, ProofCheckOutcome,
     ProofCheckReceipt, ProofCheckResource, ProofOpcodeClass, ProofRefusal, ProofStream,
-    check_unsat_streams, check_unsat_streams_with_cancel,
+    STREAMING_PROOF_CHECKER_POLICY_ID, check_unsat_streams, check_unsat_streams_with_cancel,
 };
 pub use reflection::{
     REFLECTED_THEOREM_POLICY_ID, ReflectedArtifactError, ReflectedTheoremArtifact,

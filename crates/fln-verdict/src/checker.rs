@@ -12,6 +12,12 @@ const CHECKER_SCHEMA_VERSION: u16 = 1;
 const CNF_KIND: u8 = 1;
 const UNSAT_PROOF_KIND: u8 = 3;
 
+/// Registered policy identity for the independent streaming proof checker.
+///
+/// This names an algorithm policy, not a new durable wire schema. The streams it
+/// consumes retain the registered CNF and UNSAT-proof schema identities.
+pub const STREAMING_PROOF_CHECKER_POLICY_ID: &str = "fln.verdict.streaming-proof-checker/1";
+
 /// Which independently decoded stream caused an outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofStream {

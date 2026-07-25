@@ -303,7 +303,7 @@ impl ReflectedTheoremPublication {
 #[derive(Debug)]
 #[must_use]
 pub enum ReflectedTheoremOutcome {
-    Published(ReflectedTheoremPublication),
+    Published(Box<ReflectedTheoremPublication>),
     Refused(ReflectedTheoremRefusal),
     Inconclusive(ReflectedTheoremInconclusive),
     InternalFault(ReflectedTheoremInternalFault),
@@ -407,7 +407,7 @@ pub fn publish_reflected_theorem(
     match checked.publish(limits.declaration, limits.collisions, cancellation) {
         Outcome::Complete(KernelPublished::Committed(DeclarationCommitted::Published(
             publication,
-        ))) => ReflectedTheoremOutcome::Published(ReflectedTheoremPublication {
+        ))) => ReflectedTheoremOutcome::Published(Box::new(ReflectedTheoremPublication {
             publication,
             proof_receipt,
             kernel_consumption,
@@ -415,7 +415,7 @@ pub fn publish_reflected_theorem(
             cnf_bytes,
             proof_bytes,
             bitblast_facts,
-        }),
+        })),
         Outcome::Complete(KernelPublished::Committed(DeclarationCommitted::DuplicateName {
             name,
         }))
@@ -565,7 +565,7 @@ mod tests {
         limits: ReflectedTheoremLimits,
     ) -> Result<super::ReflectedTheoremPublication, String> {
         match publish_reflected_theorem(environment, artifact, limits, None) {
-            ReflectedTheoremOutcome::Published(publication) => Ok(publication),
+            ReflectedTheoremOutcome::Published(publication) => Ok(*publication),
             other => Err(format!(
                 "expected reflected theorem publication, got {other:?}"
             )),
