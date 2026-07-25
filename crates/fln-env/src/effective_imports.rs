@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::modules::{DirectImport, ModuleGraph, ModuleId};
+use fln_core::diag::{ResourceReason, StructuralUnit};
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 
 /// The three Reference `.olean` loading profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +267,22 @@ pub enum ClosureResource {
     WitnessSteps,
 }
 
+impl ClosureResource {
+    /// The resource's own name, for renderers and structured logs.
+    ///
+    /// The shared [`ResourceUsage`] carries only the numbers and a unit, so this is what
+    /// tells a reader WHICH of the five bounded counts stopped the run.
+    pub const fn label(self) -> &'static str {
+        match self {
+            ClosureResource::RootImportRows => "root-import-rows",
+            ClosureResource::PendingItems => "pending-items",
+            ClosureResource::WorkItems => "work-items",
+            ClosureResource::StateUpgrades => "state-upgrades",
+            ClosureResource::WitnessSteps => "witness-steps",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InconclusiveReason {
     Cancelled {
@@ -315,13 +333,36 @@ pub enum ClosureInternalFault {
     },
 }
 
+/// The census's **verdict** about an import request — what a completed traversal
+/// concluded (bead `fln-um4a`).
+///
+/// All three arms are answers, which is why they live inside [`Outcome::Complete`]
+/// rather than beside it. `fln_core::outcome::Inconclusive`'s own documentation names
+/// this type when it draws the line: `Incomplete` and `Invalid` "are *completed*
+/// traversals reporting a verdict, exactly as a decoder's 'malformed' is a verdict about
+/// bytes". The traversal ran; it found a missing module or a malformed request and says
+/// so. Nothing was left unknown.
+///
+/// The non-answers — cancellation, budget exhaustion, and our own invariants breaking —
+/// are the other two [`Outcome`] arms and carry no domain payload at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClosureStatus {
+pub enum ClosureVerdict {
     Complete,
     Incomplete { missing: Vec<MissingModuleFinding> },
-    Inconclusive { reason: InconclusiveReason },
     Invalid { reason: InvalidImportRequest },
-    InternalFault { fault: ClosureInternalFault },
+}
+
+/// Which bounded resource stopped a closure, and where.
+///
+/// Present only on a resource stop, and it is the *finer* fact beside the shared
+/// [`ResourceUsage`], which carries the numbers. `Inconclusive` is payload-free by the
+/// `fln-171x` decision, so a caller with genuine domain detail keeps it on its own report
+/// and folds only the authority field — which is exactly what this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureStop {
+    pub resource: ClosureResource,
+    /// The module the limit tripped on, when the stop is attributable to one.
+    pub module: Option<ModuleId>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -431,8 +472,16 @@ impl EffectiveImportClosure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveImportReport {
     pub closure: EffectiveImportClosure,
-    pub status: ClosureStatus,
+    /// The authority: whether this report answers the question at all, and if so what it
+    /// answered (bead `fln-um4a`).
+    pub status: Outcome<ClosureVerdict>,
     pub facts: ClosureFacts,
+    /// Which resource stopped the run, on a resource stop only.
+    ///
+    /// `facts` already carries the cancellation checkpoint — `InconclusiveReason` used to
+    /// report `at_work_item`, and that value was always literally `facts.work_items`, so
+    /// folding cancellation onto the shared type dropped no fact.
+    pub stop: Option<ClosureStop>,
 }
 
 #[derive(Debug, Clone)]
@@ -508,22 +557,24 @@ pub fn compute_effective_imports(
         if import.module.name().is_anonymous() {
             return EffectiveImportReport {
                 closure,
-                status: ClosureStatus::Invalid {
+                status: Outcome::Complete(ClosureVerdict::Invalid {
                     reason: InvalidImportRequest::AnonymousRootImport { direct_row_index },
-                },
+                }),
                 facts,
+                stop: None,
             };
         }
         if name_has_overflow(import.module.name()) {
             return EffectiveImportReport {
                 closure,
-                status: ClosureStatus::Invalid {
+                status: Outcome::Complete(ClosureVerdict::Invalid {
                     reason: InvalidImportRequest::OverflowingRootModule {
                         module: import.module.clone(),
                         direct_row_index,
                     },
-                },
+                }),
                 facts,
+                stop: None,
             };
         }
     }
@@ -544,14 +595,14 @@ pub fn compute_effective_imports(
 
     while let Some(item) = stack.pop() {
         if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            // The checkpoint is `facts.work_items`, which the report already carries —
+            // `InconclusiveReason::Cancelled` reported exactly that value, so folding onto
+            // the shared cause dropped no fact. `at` names the phase, not the number.
             return EffectiveImportReport {
                 closure,
-                status: ClosureStatus::Inconclusive {
-                    reason: InconclusiveReason::Cancelled {
-                        at_work_item: facts.work_items,
-                    },
-                },
+                status: Outcome::Inconclusive(Inconclusive::cancelled("closure-worklist")),
                 facts,
+                stop: None,
             };
         }
         facts.work_items = facts.work_items.saturating_add(1);
@@ -598,10 +649,18 @@ pub fn compute_effective_imports(
                     Ok(Some(candidate)) => candidate,
                     Ok(None) => continue,
                     Err(fault) => {
+                        // Our own invariant broke, not the caller's request. The typed
+                        // domain fault is preserved in the detail rather than discarded,
+                        // because "which witness was missing, reaching which module"
+                        // is what makes this diagnosable.
                         return EffectiveImportReport {
                             closure,
-                            status: ClosureStatus::InternalFault { fault },
+                            status: Outcome::InternalFault(InternalFault::new(
+                                "fln-env.effective-imports.missing-component-witness",
+                                format!("{fault:?}"),
+                            )),
                             facts,
+                            stop: None,
                         };
                     }
                 };
@@ -710,13 +769,14 @@ pub fn compute_effective_imports(
             {
                 return EffectiveImportReport {
                     closure,
-                    status: ClosureStatus::Invalid {
+                    status: Outcome::Complete(ClosureVerdict::Invalid {
                         reason: InvalidImportRequest::NonModuleDirectImport {
                             module: import.module.clone(),
                             direct_row_index,
                         },
-                    },
+                    }),
                     facts,
+                    stop: None,
                 };
             }
         }
@@ -727,15 +787,19 @@ pub fn compute_effective_imports(
             .cmp(&right.module)
             .then_with(|| left.witness.cmp(&right.witness))
     });
-    let status = if missing.is_empty() {
-        ClosureStatus::Complete
+    // Both arms are ANSWERS. A missing module is what a finished traversal found, not a
+    // question it failed to settle, so it belongs inside `Complete` beside the clean
+    // verdict rather than in a non-authoritative arm.
+    let verdict = if missing.is_empty() {
+        ClosureVerdict::Complete
     } else {
-        ClosureStatus::Incomplete { missing }
+        ClosureVerdict::Incomplete { missing }
     };
     EffectiveImportReport {
         closure,
-        status,
+        status: Outcome::Complete(verdict),
         facts,
+        stop: None,
     }
 }
 
@@ -1008,17 +1072,33 @@ fn report_inconclusive(
     actual: usize,
     module: Option<ModuleId>,
 ) -> EffectiveImportReport {
+    // `StructuralUnit::ProducedNodes` for every one of these: each `ClosureResource` is a
+    // count of things this traversal MATERIALIZED — rows examined, work items, pending
+    // items, state upgrades, witness steps. None is a byte count and none is a denoted
+    // size, so the other two units would be untrue. Which of the five it was is the finer
+    // fact and rides `stop`, exactly as the row families' finer facts ride
+    // `DeclarationDimension` rather than multiplying the closed D8 unit taxonomy.
+    let mut inconclusive = Inconclusive::resource(ResourceUsage {
+        reason: ResourceReason::StructuralBudget {
+            unit: StructuralUnit::ProducedNodes,
+        },
+        allowed: limit as u64,
+        observed: actual as u64,
+    });
+    if let Some(module) = module.as_ref() {
+        inconclusive = inconclusive.with_progress(format!(
+            "{} at {}",
+            resource.label(),
+            module.name().to_display_string()
+        ));
+    } else {
+        inconclusive = inconclusive.with_progress(resource.label());
+    }
     EffectiveImportReport {
         closure,
-        status: ClosureStatus::Inconclusive {
-            reason: InconclusiveReason::ResourceLimitExceeded {
-                resource,
-                limit,
-                actual,
-                module,
-            },
-        },
+        status: Outcome::Inconclusive(inconclusive),
         facts,
+        stop: Some(ClosureStop { resource, module }),
     }
 }
 
@@ -1026,6 +1106,7 @@ fn report_inconclusive(
 mod tests {
     use super::*;
     use fln_core::name::Name;
+    use fln_core::outcome::InconclusiveCause;
     use fln_hash::domain::Digest;
 
     use crate::modules::{
@@ -1301,7 +1382,7 @@ mod tests {
             GlobalOLeanLevel::Exported,
         );
         let report = compute_effective_imports(&graph, &request, None);
-        assert_eq!(report.status, ClosureStatus::Complete);
+        assert_eq!(report.status, Outcome::Complete(ClosureVerdict::Complete));
         for bits in 0u8..8 {
             let state = report.closure.state(&id(&format!("M{bits}"))).unwrap();
             assert!(state.has_data);
@@ -1565,7 +1646,7 @@ mod tests {
             let expected = model_compute(&forward, &request);
             let actual = compute_effective_imports(&forward, &request, None);
             let reordered = compute_effective_imports(&reverse, &request, None);
-            assert_eq!(actual.status, ClosureStatus::Complete);
+            assert_eq!(actual.status, Outcome::Complete(ClosureVerdict::Complete));
             assert_eq!(actual, reordered);
             assert_eq!(actual.closure.reference_discovery(), expected.1);
             assert_eq!(actual.closure.len(), expected.0.len());
@@ -1677,7 +1758,7 @@ mod tests {
             &EffectiveImportRequest::new(roots, GlobalOLeanLevel::Exported),
             None,
         );
-        assert_eq!(report.status, ClosureStatus::Complete);
+        assert_eq!(report.status, Outcome::Complete(ClosureVerdict::Complete));
         assert!(report.facts.state_upgrades <= report.closure.len().saturating_mul(5));
         assert!(
             report.facts.direct_rows_examined
@@ -1708,12 +1789,16 @@ mod tests {
             GlobalOLeanLevel::Exported,
         );
         let report = compute_effective_imports(&graph, &request, None);
-        assert!(matches!(&report.status, ClosureStatus::Incomplete { .. }));
-        let missing = if let ClosureStatus::Incomplete { missing } = report.status {
-            missing
-        } else {
-            Vec::new()
-        };
+        assert!(matches!(
+            &report.status,
+            Outcome::Complete(ClosureVerdict::Incomplete { .. })
+        ));
+        let missing =
+            if let Outcome::Complete(ClosureVerdict::Incomplete { missing }) = report.status {
+                missing
+            } else {
+                Vec::new()
+            };
         assert_eq!(missing.len(), 2);
         let finding = missing
             .iter()
@@ -1740,7 +1825,10 @@ mod tests {
                 .with_root_is_exported(false),
             None,
         );
-        assert_eq!(overridden.status, ClosureStatus::Complete);
+        assert_eq!(
+            overridden.status,
+            Outcome::Complete(ClosureVerdict::Complete)
+        );
         assert!(!overridden.closure.state(&id("A")).unwrap().is_exported);
 
         let anonymous = EffectiveImportRequest::new(
@@ -1754,11 +1842,11 @@ mod tests {
         );
         assert_eq!(
             compute_effective_imports(&graph, &anonymous, None).status,
-            ClosureStatus::Invalid {
+            Outcome::Complete(ClosureVerdict::Invalid {
                 reason: InvalidImportRequest::AnonymousRootImport {
                     direct_row_index: 0,
                 }
-            }
+            })
         );
 
         let overflowed = ModuleId::new(Name::num_overflowing(Name::anonymous(), u64::MAX));
@@ -1768,12 +1856,12 @@ mod tests {
         );
         assert_eq!(
             compute_effective_imports(&graph, &overflow, None).status,
-            ClosureStatus::Invalid {
+            Outcome::Complete(ClosureVerdict::Invalid {
                 reason: InvalidImportRequest::OverflowingRootModule {
                     module: overflowed,
                     direct_row_index: 0,
                 }
-            }
+            })
         );
     }
 
@@ -1921,15 +2009,18 @@ mod tests {
                 ClosureResource::WitnessSteps => request.limits.max_witness_steps = 0,
             }
             let report = compute_effective_imports(&graph, &request, None);
-            assert!(matches!(
-                report.status,
-                ClosureStatus::Inconclusive {
-                    reason: InconclusiveReason::ResourceLimitExceeded {
-                        resource: actual,
-                        ..
-                    }
-                } if actual == resource
-            ));
+            assert!(
+                matches!(report.status, Outcome::Inconclusive(_)),
+                "a budget stop is a non-answer, never a verdict"
+            );
+            // The finer fact moved from the arm to the report when the authority folded
+            // onto the shared taxonomy (bead `fln-um4a`). It is still asserted: knowing a
+            // stop happened is useless without knowing WHICH of the five bounds tripped.
+            assert_eq!(
+                report.stop.as_ref().map(|stop| stop.resource),
+                Some(resource),
+                "the stop must name the resource that tripped"
+            );
             if resource == ClosureResource::StateUpgrades {
                 assert_eq!(report.facts.state_upgrades, 0);
                 // ATOMICITY OF THE REFUSED UPGRADE, checked across everything `merge_state`
@@ -1975,7 +2066,7 @@ mod tests {
             ),
             None,
         );
-        assert_eq!(report.status, ClosureStatus::Complete);
+        assert_eq!(report.status, Outcome::Complete(ClosureVerdict::Complete));
         let a = report.closure.state(&id("A")).unwrap();
         let c = report.closure.state(&id("C")).unwrap();
         assert!(a.has_data && a.import_all && a.is_exported);
@@ -2060,30 +2151,34 @@ mod tests {
         let request =
             EffectiveImportRequest::new(vec![direct("Missing", 2)], GlobalOLeanLevel::Exported);
         let missing = compute_effective_imports(&empty, &request, None);
-        assert!(matches!(missing.status, ClosureStatus::Incomplete { .. }));
+        assert!(matches!(
+            missing.status,
+            Outcome::Complete(ClosureVerdict::Incomplete { .. })
+        ));
         assert_eq!(missing.closure.reference_discovery(), [id("Missing")]);
 
         let cancelled = AtomicBool::new(true);
         let cancelled_report = compute_effective_imports(&empty, &request, Some(&cancelled));
         assert!(matches!(
             cancelled_report.status,
-            ClosureStatus::Inconclusive {
-                reason: InconclusiveReason::Cancelled { .. }
-            }
+            Outcome::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::Cancelled { .. },
+                ..
+            })
         ));
+        assert!(
+            cancelled_report.stop.is_none(),
+            "cancellation is not a resource stop and must not claim one"
+        );
 
         let mut limited_request = request.clone();
         limited_request.limits.max_work_items = 0;
         let limited = compute_effective_imports(&empty, &limited_request, None);
-        assert!(matches!(
-            limited.status,
-            ClosureStatus::Inconclusive {
-                reason: InconclusiveReason::ResourceLimitExceeded {
-                    resource: ClosureResource::WorkItems,
-                    ..
-                }
-            }
-        ));
+        assert!(matches!(limited.status, Outcome::Inconclusive(_)));
+        assert_eq!(
+            limited.stop.as_ref().map(|stop| stop.resource),
+            Some(ClosureResource::WorkItems)
+        );
 
         let nonmodule = graph(vec![("Legacy", false, vec![])]);
         let invalid = compute_effective_imports(
@@ -2093,12 +2188,12 @@ mod tests {
         );
         assert_eq!(
             invalid.status,
-            ClosureStatus::Invalid {
+            Outcome::Complete(ClosureVerdict::Invalid {
                 reason: InvalidImportRequest::NonModuleDirectImport {
                     module: id("Legacy"),
                     direct_row_index: 0,
                 }
-            }
+            })
         );
 
         let private = compute_effective_imports(
@@ -2106,7 +2201,7 @@ mod tests {
             &EffectiveImportRequest::new(vec![direct("Legacy", 0)], GlobalOLeanLevel::Private),
             None,
         );
-        assert_eq!(private.status, ClosureStatus::Complete);
+        assert_eq!(private.status, Outcome::Complete(ClosureVerdict::Complete));
         assert_eq!(
             private.closure.state(&id("Legacy")).unwrap().exposure(),
             ImportExposure::PrivateAll
