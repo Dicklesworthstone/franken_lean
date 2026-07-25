@@ -24,7 +24,8 @@ use crate::extensions::{
 };
 use crate::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, DirectImport, ModuleEpoch, ModuleGraph,
-    ModuleGraphError, ModuleGraphLimits, ModuleId, ModuleRecord, name_stats,
+    ModuleGraphAdmission, ModuleGraphError, ModuleGraphInconclusive, ModuleGraphLimits,
+    ModuleGraphResource, ModuleId, ModuleRecord, name_stats,
 };
 
 /// Frozen canonical schema for the complete provenance manifest.
@@ -647,6 +648,11 @@ pub enum ModuleProvenanceError {
         limit: u128,
         actual: u128,
     },
+    /// A layer below reported an outcome this construction path cannot request.
+    /// An invariant failure, never a verdict about a module (FL-INV-07).
+    GraphAdmissionFault {
+        what: &'static str,
+    },
     Canonical(CanonError),
     MalformedEncoding {
         what: &'static str,
@@ -761,6 +767,9 @@ impl std::fmt::Display for ModuleProvenanceError {
                 "module `{}` missing-dependency mismatch: expected {expected:?}, actual {actual:?}",
                 module.name().to_display_string()
             ),
+            Self::GraphAdmissionFault { what } => {
+                write!(formatter, "module-provenance internal fault: {what}")
+            }
             Self::ResourceLimitExceeded {
                 module,
                 resource,
@@ -850,10 +859,53 @@ impl ModuleProvenanceManifest {
         let mut graph = ModuleGraph::new(epoch.clone(), graph_limits)
             .map_err(ModuleProvenanceError::InvalidModuleGraph)?;
         for record in &records {
-            graph = graph
-                .register(record.module.clone())
-                .map_err(ModuleProvenanceError::InvalidModuleGraph)?
-                .graph;
+            // The three arms are kept apart deliberately. A rejection is a real
+            // determination about the record; an exhausted budget is not, and folding
+            // it into `InvalidModuleGraph` would report "this graph is invalid" for
+            // what is only "we ran out of room" (FL-INV-07, bead
+            // franken_lean-module-graph-resource-outcomes-46b).
+            graph = match graph.register(record.module.clone()) {
+                ModuleGraphAdmission::Complete(registration) => registration.graph,
+                ModuleGraphAdmission::Rejected(error) => {
+                    return Err(ModuleProvenanceError::InvalidModuleGraph(error));
+                }
+                ModuleGraphAdmission::Inconclusive(
+                    ModuleGraphInconclusive::ResourceLimitExceeded {
+                        module,
+                        resource,
+                        limit,
+                        actual,
+                    },
+                ) => {
+                    return Err(ModuleProvenanceError::ResourceLimitExceeded {
+                        module,
+                        resource: match resource {
+                            ModuleGraphResource::Modules => ModuleProvenanceResource::Modules,
+                            ModuleGraphResource::DirectImportRows => {
+                                ModuleProvenanceResource::DirectImportRows
+                            }
+                            ModuleGraphResource::NameDepth => ModuleProvenanceResource::NameDepth,
+                            // Unreachable here: this path sets the graph's payload
+                            // budget to `u128::MAX`, so only the three above can bind.
+                            ModuleGraphResource::PayloadBytes => {
+                                ModuleProvenanceResource::EncodedBytes
+                            }
+                        },
+                        limit,
+                        actual,
+                    });
+                }
+                ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::Cancelled {
+                    ..
+                }) => {
+                    // This path requests no cancellation, so a cancelled outcome is an
+                    // invariant failure of the layer below — never a verdict about the
+                    // module, and never a user-facing diagnostic.
+                    return Err(ModuleProvenanceError::GraphAdmissionFault {
+                        what: "module-graph registration reported cancellation without a request",
+                    });
+                }
+            };
         }
 
         let present: BTreeSet<ModuleId> = records

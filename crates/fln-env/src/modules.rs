@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fln_core::name::{LeafView, Name};
 use fln_hash::domain::Digest;
@@ -413,6 +414,182 @@ pub struct Registration {
     pub work: RegistrationWork,
 }
 
+/// Deterministic points at which a registration samples its cancellation flag.
+///
+/// Named rather than positional so a cancelled outcome says *how far the work
+/// got* — which is the difference between "we learned nothing" and "we learned
+/// the input was malformed but stopped before deciding".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegistrationCheckpoint {
+    /// Before any input was inspected.
+    Entry,
+    /// After the record validated, before the existing-record lookup.
+    AfterValidation,
+    /// After the conflict/idempotence lookup, before the budget checks.
+    AfterConflictLookup,
+    /// After the budgets passed, before the cycle scan and publication.
+    BeforePublication,
+}
+
+/// A source of cancellation for a registration.
+///
+/// An abstraction rather than a bare flag because callers do not all hold one: a
+/// scheduler may carry a capability context, a server a request-scoped token. It
+/// also makes the checkpoint contract *provable* — a test can supply a probe that
+/// trips at a chosen sample and pin the outcome for that exact checkpoint, which a
+/// pre-set `AtomicBool` can never do because it always trips at the first sample.
+pub trait CancellationProbe {
+    /// Sampled at each [`RegistrationCheckpoint`]. Must be cheap; registration
+    /// samples it a bounded number of times per call.
+    fn is_cancelled(&self) -> bool;
+}
+
+impl CancellationProbe for AtomicBool {
+    fn is_cancelled(&self) -> bool {
+        self.load(Ordering::Relaxed)
+    }
+}
+
+/// FL-INV-07 inconclusive outcomes of a registration: operational exhaustion and
+/// cancellation. Both mean *no verdict was reached about this record*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleGraphInconclusive {
+    /// A configured budget bound before publication.
+    ResourceLimitExceeded {
+        module: Option<ModuleId>,
+        resource: ModuleGraphResource,
+        limit: u128,
+        actual: u128,
+    },
+    /// The caller cancelled. The checkpoint records the last completed phase.
+    Cancelled {
+        module: ModuleId,
+        checkpoint: RegistrationCheckpoint,
+    },
+}
+
+/// The typed outcome of one module-graph registration (bead
+/// `franken_lean-module-graph-resource-outcomes-46b`).
+///
+/// Three arms, and the split is the point. A [`Rejected`](Self::Rejected) record is
+/// one the graph has *decided about* — malformed input, or a semantic conflict such
+/// as a nonidentical re-registration, a self-import, or a cycle. An
+/// [`Inconclusive`](Self::Inconclusive) record is one the graph *did not finish
+/// deciding*: a budget bound, or the caller cancelled. Collapsing the two would let
+/// "we ran out of room" be recorded, cached, and later replayed as "this module is
+/// invalid" — the same silent-wrong-value class as a colliding witness.
+///
+/// Registration is an immutable transition: the receiver is never mutated, so every
+/// non-`Complete` arm leaves the base graph observably identical and no partial
+/// module is ever reachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleGraphAdmission {
+    /// The record was inserted, or was an exact idempotent re-registration.
+    Complete(Registration),
+    /// A complete, resource-independent determination that the record is not
+    /// admissible.
+    Rejected(ModuleGraphError),
+    /// No verdict was reached. Never accepted, never rejected, never cacheable.
+    Inconclusive(ModuleGraphInconclusive),
+}
+
+impl ModuleGraphAdmission {
+    /// Stable evidence label, sharing the vocabulary of
+    /// [`DeclClosureStatus`](crate::decl_closure::DeclClosureStatus) and
+    /// [`ClosureStatus`](crate::effective_imports::ClosureStatus).
+    pub fn outcome_label(&self) -> &'static str {
+        match self {
+            ModuleGraphAdmission::Complete(_) => "complete",
+            ModuleGraphAdmission::Rejected(_) => "rejected",
+            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::Cancelled { .. }) => {
+                "inconclusive-cancelled"
+            }
+            ModuleGraphAdmission::Inconclusive(
+                ModuleGraphInconclusive::ResourceLimitExceeded { .. },
+            ) => "inconclusive-resource",
+        }
+    }
+
+    /// **Only a completed registration may be memoized.**
+    ///
+    /// This is the trap the bead exists to close: if an exhausted or cancelled
+    /// registration could be cached, a later run would replay the exhaustion as
+    /// though it were a real answer about the module. A rejection is a real answer,
+    /// but it is still not cached here — caching refusals is a separate decision
+    /// this seam does not make on the caller's behalf.
+    pub fn is_cacheable(&self) -> bool {
+        matches!(self, ModuleGraphAdmission::Complete(_))
+    }
+
+    /// Whether the outcome is in the inconclusive family.
+    pub fn is_inconclusive(&self) -> bool {
+        matches!(self, ModuleGraphAdmission::Inconclusive(_))
+    }
+
+    /// The graph to carry forward. `None` for both non-complete arms — the caller
+    /// keeps the graph it already held, unchanged.
+    pub fn graph(&self) -> Option<&ModuleGraph> {
+        match self {
+            ModuleGraphAdmission::Complete(registration) => Some(&registration.graph),
+            ModuleGraphAdmission::Rejected(_) | ModuleGraphAdmission::Inconclusive(_) => None,
+        }
+    }
+
+    /// The completed registration, if any.
+    pub fn registration(&self) -> Option<&Registration> {
+        match self {
+            ModuleGraphAdmission::Complete(registration) => Some(registration),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ModuleGraphAdmission {
+    /// Test-only destructuring helpers. They name the arm the assertion is about, so
+    /// a wrong-arm outcome fails with the outcome in the message instead of a bare
+    /// unwrap panic.
+    pub(crate) fn expect_complete(self, context: &str) -> Registration {
+        match self {
+            ModuleGraphAdmission::Complete(registration) => registration,
+            other => panic!("{context}: expected Complete, got {other:?}"),
+        }
+    }
+
+    fn expect_rejected(self, context: &str) -> ModuleGraphError {
+        match self {
+            ModuleGraphAdmission::Rejected(error) => error,
+            other => panic!("{context}: expected Rejected, got {other:?}"),
+        }
+    }
+
+    fn expect_inconclusive(self, context: &str) -> ModuleGraphInconclusive {
+        match self {
+            ModuleGraphAdmission::Inconclusive(reason) => reason,
+            other => panic!("{context}: expected Inconclusive, got {other:?}"),
+        }
+    }
+}
+
+/// Internal refusal carrier so one validation pass can raise either class without
+/// the caller having to re-derive which it was.
+enum Refusal {
+    Rejected(ModuleGraphError),
+    Inconclusive(ModuleGraphInconclusive),
+}
+
+impl From<ModuleGraphError> for Refusal {
+    fn from(error: ModuleGraphError) -> Self {
+        Refusal::Rejected(error)
+    }
+}
+
+impl From<ModuleGraphInconclusive> for Refusal {
+    fn from(inconclusive: ModuleGraphInconclusive) -> Self {
+        Refusal::Inconclusive(inconclusive)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphCompleteness {
     Complete,
@@ -451,6 +628,9 @@ impl ModuleGraph {
         }
         let payload_bytes = epoch.payload_bytes();
         if payload_bytes > limits.max_payload_bytes {
+            // Construction-time budget. `ModuleGraph::new` is not a registration, so
+            // it keeps its `Result`; the registration seam is the one this bead
+            // retypes. Recorded in the bead as a smaller follow-on.
             return Err(ModuleGraphError::ResourceLimitExceeded {
                 module: None,
                 resource: ModuleGraphResource::PayloadBytes,
@@ -536,12 +716,54 @@ impl ModuleGraph {
 
     /// Exact re-registration is idempotent. Any field or evidence difference
     /// is a conflict; registration never overwrites an existing record.
-    pub fn register(&self, record: ModuleRecord) -> Result<Registration, ModuleGraphError> {
-        let record_facts = self.validate_record(&record)?;
+    /// Register a module record. See [`ModuleGraphAdmission`] for the outcome
+    /// lattice; equivalent to [`register_cancellable`](Self::register_cancellable)
+    /// with no cancellation flag.
+    pub fn register(&self, record: ModuleRecord) -> ModuleGraphAdmission {
+        self.register_cancellable(record, None)
+    }
+
+    /// Register a module record, sampling `cancellation` at each
+    /// [`RegistrationCheckpoint`].
+    ///
+    /// Cancellation and budget exhaustion are FL-INV-07 inconclusive outcomes, never
+    /// rejections: the caller learns that no verdict was reached, not that the module
+    /// was refused. Because the receiver is never mutated — the record map is
+    /// persistent and publication is the returned graph — a cancelled or exhausted
+    /// registration leaves no half-registered module observable anywhere.
+    pub fn register_cancellable(
+        &self,
+        record: ModuleRecord,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> ModuleGraphAdmission {
+        let cancelled = |checkpoint: RegistrationCheckpoint| {
+            cancellation
+                .is_some_and(CancellationProbe::is_cancelled)
+                .then(|| {
+                    ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::Cancelled {
+                        module: record.id.clone(),
+                        checkpoint,
+                    })
+                })
+        };
+
+        if let Some(outcome) = cancelled(RegistrationCheckpoint::Entry) {
+            return outcome;
+        }
+        let record_facts = match self.validate_record(&record) {
+            Ok(facts) => facts,
+            Err(Refusal::Rejected(error)) => return ModuleGraphAdmission::Rejected(error),
+            Err(Refusal::Inconclusive(reason)) => {
+                return ModuleGraphAdmission::Inconclusive(reason);
+            }
+        };
+        if let Some(outcome) = cancelled(RegistrationCheckpoint::AfterValidation) {
+            return outcome;
+        }
         let direct_rows_validated = record.direct_imports().len();
         if let Some(existing) = self.state.records.get(&record.id) {
             if existing.as_ref() == &record {
-                return Ok(Registration {
+                return ModuleGraphAdmission::Complete(Registration {
                     graph: self.clone(),
                     disposition: RegistrationDisposition::Idempotent,
                     work: RegistrationWork {
@@ -551,54 +773,66 @@ impl ModuleGraph {
                     },
                 });
             }
+            // The conflict is authoritative only because the bounded lookup and
+            // comparison above both completed; an unfinished comparison would be
+            // inconclusive, never a rejection.
             let differing_fields = differing_record_fields(existing, &record);
             debug_assert!(!differing_fields.is_empty());
-            return Err(ModuleGraphError::ConflictingRecord {
+            return ModuleGraphAdmission::Rejected(ModuleGraphError::ConflictingRecord {
                 module: record.id,
                 differing_fields,
                 existing_artifact: Box::new(existing.artifact.clone()),
                 incoming_artifact: Box::new(record.artifact),
             });
         }
+        if let Some(outcome) = cancelled(RegistrationCheckpoint::AfterConflictLookup) {
+            return outcome;
+        }
 
         let modules = self.state.facts.modules.saturating_add(1);
-        enforce_limit(
-            Some(&record.id),
-            ModuleGraphResource::Modules,
-            self.limits.max_modules as u128,
-            modules as u128,
-        )?;
         let direct_import_rows = self
             .state
             .facts
             .direct_import_rows
             .saturating_add(record.direct_imports().len());
-        enforce_limit(
-            Some(&record.id),
-            ModuleGraphResource::DirectImportRows,
-            self.limits.max_edges as u128,
-            direct_import_rows as u128,
-        )?;
         let payload_bytes = self
             .state
             .facts
             .payload_bytes
             .saturating_add(record_facts.payload_bytes);
-        enforce_limit(
-            Some(&record.id),
-            ModuleGraphResource::PayloadBytes,
-            self.limits.max_payload_bytes,
-            payload_bytes,
-        )?;
+        for (resource, limit, actual) in [
+            (
+                ModuleGraphResource::Modules,
+                self.limits.max_modules as u128,
+                modules as u128,
+            ),
+            (
+                ModuleGraphResource::DirectImportRows,
+                self.limits.max_edges as u128,
+                direct_import_rows as u128,
+            ),
+            (
+                ModuleGraphResource::PayloadBytes,
+                self.limits.max_payload_bytes,
+                payload_bytes,
+            ),
+        ] {
+            if let Err(reason) = enforce_limit(Some(&record.id), resource, limit, actual) {
+                return ModuleGraphAdmission::Inconclusive(reason);
+            }
+        }
+        if let Some(outcome) = cancelled(RegistrationCheckpoint::BeforePublication) {
+            return outcome;
+        }
 
         let module = record.id.clone();
         let records = self.state.records.insert(module.clone(), Arc::new(record));
         let cycle_scan = cycle_through(&records, &module);
         if let Some(path) = cycle_scan.path {
-            return Err(ModuleGraphError::Cycle { path });
+            return ModuleGraphAdmission::Rejected(ModuleGraphError::Cycle { path });
         }
 
-        Ok(Registration {
+        ModuleGraphAdmission::Complete(Registration {
             graph: Self {
                 epoch: self.epoch.clone(),
                 limits: self.limits,
@@ -631,16 +865,17 @@ impl ModuleGraph {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
-    fn validate_record(&self, record: &ModuleRecord) -> Result<RecordFacts, ModuleGraphError> {
+    fn validate_record(&self, record: &ModuleRecord) -> Result<RecordFacts, Refusal> {
         if record.id.name().is_anonymous() {
-            return Err(ModuleGraphError::AnonymousModule);
+            return Err(ModuleGraphError::AnonymousModule.into());
         }
         if record.artifact.epoch != self.epoch {
-            return Err(ModuleGraphError::EpochMismatch {
+            return Err((ModuleGraphError::EpochMismatch {
                 module: record.id.clone(),
                 expected: self.epoch.clone(),
                 actual: record.artifact.epoch.clone(),
-            });
+            })
+            .into());
         }
 
         // Logical bytes inspected and retained by this layer: content digest
@@ -658,16 +893,18 @@ impl ModuleGraph {
             .enumerate()
         {
             if position > 0 && module.name().is_anonymous() {
-                return Err(ModuleGraphError::AnonymousImport {
+                return Err((ModuleGraphError::AnonymousImport {
                     owner: record.id.clone(),
                     import_index: position - 1,
-                });
+                })
+                .into());
             }
             let stats = name_stats(module.name());
             if stats.overflowing_component {
-                return Err(ModuleGraphError::OverflowingNameComponent {
+                return Err((ModuleGraphError::OverflowingNameComponent {
                     module: module.clone(),
-                });
+                })
+                .into());
             }
             enforce_limit(
                 Some(module),
@@ -685,10 +922,11 @@ impl ModuleGraph {
 
         for (import_index, import) in record.direct_imports().iter().enumerate() {
             if import.module == record.id {
-                return Err(ModuleGraphError::SelfImport {
+                return Err((ModuleGraphError::SelfImport {
                     module: record.id.clone(),
                     import_index,
-                });
+                })
+                .into());
             }
         }
 
@@ -761,14 +999,17 @@ pub(crate) fn name_stats(name: &Name) -> NameFacts {
     }
 }
 
+/// Operational budget check. Exhaustion is an FL-INV-07 inconclusive outcome, so
+/// this deliberately cannot produce a [`ModuleGraphError`]: there is no way to
+/// spell "the budget bound" as a rejection from here.
 fn enforce_limit(
     module: Option<&ModuleId>,
     resource: ModuleGraphResource,
     limit: u128,
     actual: u128,
-) -> Result<(), ModuleGraphError> {
+) -> Result<(), ModuleGraphInconclusive> {
     if actual > limit {
-        return Err(ModuleGraphError::ResourceLimitExceeded {
+        return Err(ModuleGraphInconclusive::ResourceLimitExceeded {
             module: module.cloned(),
             resource,
             limit,
@@ -892,7 +1133,7 @@ mod tests {
     }
 
     fn insert(graph: &ModuleGraph, record: ModuleRecord) -> ModuleGraph {
-        let registration = graph.register(record).expect("record inserts");
+        let registration = graph.register(record).expect_complete("record inserts");
         assert_eq!(registration.disposition, RegistrationDisposition::Inserted);
         registration.graph
     }
@@ -982,7 +1223,7 @@ mod tests {
                         );
                         let registration = graph
                             .register(expected.clone())
-                            .expect("field combination registers exactly");
+                            .expect_complete("field combination registers exactly");
                         assert_eq!(registration.disposition, RegistrationDisposition::Inserted);
                         assert_eq!(registration.work.direct_rows_validated, 1);
                         graph = registration.graph;
@@ -1001,11 +1242,13 @@ mod tests {
     fn registration_is_idempotent_but_never_overwrites_a_conflict() {
         let base = graph();
         let value = record("Root", vec![direct("Missing", 7)], 3);
-        let inserted = base.register(value.clone()).expect("first registration");
+        let inserted = base
+            .register(value.clone())
+            .expect_complete("first registration");
         let repeated = inserted
             .graph
             .register(value.clone())
-            .expect("exact registration is idempotent");
+            .expect_complete("exact registration is idempotent");
         assert_eq!(repeated.disposition, RegistrationDisposition::Idempotent);
         assert!(repeated.graph.shares_storage_with(&inserted.graph));
 
@@ -1034,7 +1277,7 @@ mod tests {
             let error = inserted
                 .graph
                 .register(changed)
-                .expect_err("changed record must conflict");
+                .expect_rejected("changed record must conflict");
             assert!(matches!(&error, ModuleGraphError::ConflictingRecord { .. }));
             if let ModuleGraphError::ConflictingRecord {
                 module,
@@ -1086,7 +1329,7 @@ mod tests {
         assert_eq!(
             empty
                 .register(record("Self", vec![direct("Self", 0)], 1))
-                .expect_err("self edge refused"),
+                .expect_rejected("self edge refused"),
             ModuleGraphError::SelfImport {
                 module: id("Self"),
                 import_index: 0,
@@ -1100,13 +1343,142 @@ mod tests {
         assert_eq!(
             graph
                 .register(record("C", vec![direct("A", 0)], 3))
-                .expect_err("late cycle refused"),
+                .expect_rejected("late cycle refused"),
             ModuleGraphError::Cycle {
                 path: vec![id("C"), id("A"), id("B"), id("C")]
             }
         );
         assert_eq!(graph, before);
         assert!(!graph.contains(&id("C")));
+    }
+
+    #[test]
+    fn module_graph_registration_separates_rejection_from_inconclusive() {
+        // A probe that trips on its Nth sample, so each checkpoint can be pinned
+        // exactly. A pre-set `AtomicBool` can only ever prove the first one.
+        struct TripAt {
+            trip: usize,
+            samples: std::cell::Cell<usize>,
+        }
+        impl CancellationProbe for TripAt {
+            fn is_cancelled(&self) -> bool {
+                let seen = self.samples.get();
+                self.samples.set(seen + 1);
+                seen >= self.trip
+            }
+        }
+
+        let base = insert(&graph(), record("Base", vec![], 1));
+        let before = base.clone();
+        let fresh = record("Fresh", vec![direct("Base", 0)], 2);
+
+        // ---- cancellation at every checkpoint, including mid-registration --------
+        let mut seen_checkpoints = BTreeSet::new();
+        for trip in 0..4 {
+            let probe = TripAt {
+                trip,
+                samples: std::cell::Cell::new(0),
+            };
+            let outcome = base.register_cancellable(fresh.clone(), Some(&probe));
+            let reason = outcome
+                .clone()
+                .expect_inconclusive(&format!("cancelled at sample {trip}"));
+            let ModuleGraphInconclusive::Cancelled { module, checkpoint } = reason else {
+                panic!("expected Cancelled, got {reason:?}");
+            };
+            assert_eq!(module, id("Fresh"));
+            seen_checkpoints.insert(checkpoint);
+
+            // FL-INV-07: not a rejection, not an acceptance, not cacheable.
+            assert!(outcome.is_inconclusive());
+            assert!(!outcome.is_cacheable(), "cancellation must never be cached");
+            assert_eq!(outcome.graph(), None);
+            assert_eq!(outcome.outcome_label(), "inconclusive-cancelled");
+
+            // No half-registered module is observable anywhere.
+            assert_eq!(base, before, "a cancelled registration mutated the graph");
+            assert!(!base.contains(&id("Fresh")));
+            assert!(base.contains(&id("Base")));
+        }
+        // Cancellation was genuinely sampled *after* work began, not only at entry —
+        // otherwise "mid-registration" would be untested.
+        assert_eq!(
+            seen_checkpoints,
+            BTreeSet::from([
+                RegistrationCheckpoint::Entry,
+                RegistrationCheckpoint::AfterValidation,
+                RegistrationCheckpoint::AfterConflictLookup,
+                RegistrationCheckpoint::BeforePublication,
+            ]),
+            "every checkpoint must be reachable"
+        );
+
+        // Recovery: the same record admits once cancellation is withdrawn, which is
+        // what makes the outcome inconclusive rather than a refusal of the record.
+        let admitted = base.register(fresh.clone());
+        assert_eq!(admitted.outcome_label(), "complete");
+        assert!(admitted.is_cacheable());
+        assert!(
+            admitted
+                .graph()
+                .expect("complete carries a graph")
+                .contains(&id("Fresh"))
+        );
+
+        // ---- budget exhaustion is typed, and is NOT cacheable --------------------
+        let one_module = ModuleGraph::new(
+            epoch(),
+            ModuleGraphLimits::new(1, usize::MAX, usize::MAX, u128::MAX),
+        )
+        .expect("empty graph fits");
+        let one_module = insert(&one_module, record("Only", vec![], 3));
+        let full_before = one_module.clone();
+        let exhausted = one_module.register(record("Overflow", vec![], 4));
+        let reason = exhausted
+            .clone()
+            .expect_inconclusive("a bound budget is inconclusive, never a rejection");
+        assert!(matches!(
+            reason,
+            ModuleGraphInconclusive::ResourceLimitExceeded {
+                resource: ModuleGraphResource::Modules,
+                limit: 1,
+                actual: 2,
+                ..
+            }
+        ));
+        assert_eq!(exhausted.outcome_label(), "inconclusive-resource");
+        assert!(
+            !exhausted.is_cacheable(),
+            "THE trap: memoizing an exhausted registration would let a later run \
+             replay the exhaustion as though it were a real answer about the module"
+        );
+        assert_eq!(exhausted.graph(), None);
+        assert_eq!(
+            one_module, full_before,
+            "an exhausted registration mutated the graph"
+        );
+        assert!(!one_module.contains(&id("Overflow")));
+
+        // ---- the classes must not be confusable ---------------------------------
+        // A conflict is a rejection and stays one; exhaustion is inconclusive and
+        // stays one. Neither may be spelled as the other.
+        let conflicting = ModuleRecord::new(id("Base"), false, vec![], evidence(9));
+        let rejected = base.register(conflicting);
+        assert_eq!(rejected.outcome_label(), "rejected");
+        assert!(!rejected.is_inconclusive());
+        assert!(!rejected.is_cacheable());
+
+        // And registration can never spell exhaustion as a `ModuleGraphError`: the
+        // budget path returns `ModuleGraphInconclusive`, so the old
+        // `Rejected(ResourceLimitExceeded)` shape is unrepresentable here.
+        for outcome in [exhausted, rejected] {
+            if let ModuleGraphAdmission::Rejected(error) = outcome {
+                assert!(
+                    !matches!(error, ModuleGraphError::ResourceLimitExceeded { .. }),
+                    "a registration reported resource exhaustion as a rejection"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1134,7 +1506,7 @@ mod tests {
         };
         assert!(matches!(
             base_graph.register(ModuleRecord::new(id("Wrong"), true, vec![], wrong_epoch)),
-            Err(ModuleGraphError::EpochMismatch { .. })
+            ModuleGraphAdmission::Rejected(ModuleGraphError::EpochMismatch { .. })
         ));
         assert_eq!(
             base_graph
@@ -1144,7 +1516,7 @@ mod tests {
                     vec![],
                     evidence(1),
                 ))
-                .expect_err("anonymous identity refused"),
+                .expect_rejected("anonymous identity refused"),
             ModuleGraphError::AnonymousModule
         );
         assert_eq!(
@@ -1160,7 +1532,7 @@ mod tests {
                     )],
                     evidence(1),
                 ))
-                .expect_err("anonymous import target refused"),
+                .expect_rejected("anonymous import target refused"),
             ModuleGraphError::AnonymousImport {
                 owner: id("Owner"),
                 import_index: 0,
@@ -1175,7 +1547,7 @@ mod tests {
                 vec![],
                 evidence(1),
             )),
-            Err(ModuleGraphError::OverflowingNameComponent { module }) if module == overflowed
+            ModuleGraphAdmission::Rejected(ModuleGraphError::OverflowingNameComponent { module }) if module == overflowed
         ));
         let overflowed_import = ModuleId::new(Name::num_overflowing(id("Prefix").into_name(), 17));
         assert!(matches!(
@@ -1190,7 +1562,7 @@ mod tests {
                 )],
                 evidence(1),
             )),
-            Err(ModuleGraphError::OverflowingNameComponent { module })
+            ModuleGraphAdmission::Rejected(ModuleGraphError::OverflowingNameComponent { module })
                 if module == overflowed_import
         ));
 
@@ -1199,7 +1571,7 @@ mod tests {
         let shallow_graph = ModuleGraph::new(epoch(), shallow_limits).expect("empty graph fits");
         assert!(matches!(
             shallow_graph.register(ModuleRecord::new(deep, true, vec![], evidence(2))),
-            Err(ModuleGraphError::ResourceLimitExceeded {
+            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
                 resource: ModuleGraphResource::NameDepth,
                 limit: 2,
                 actual: 3,
@@ -1214,7 +1586,7 @@ mod tests {
         .expect("empty graph fits");
         assert!(matches!(
             one_module.register(record("One", vec![], 3)),
-            Err(ModuleGraphError::ResourceLimitExceeded {
+            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
                 resource: ModuleGraphResource::Modules,
                 limit: 0,
                 actual: 1,
@@ -1227,7 +1599,7 @@ mod tests {
                 .expect("empty graph fits");
         assert!(matches!(
             zero_edges.register(record("One", vec![direct("Two", 0)], 4)),
-            Err(ModuleGraphError::ResourceLimitExceeded {
+            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
                 resource: ModuleGraphResource::DirectImportRows,
                 limit: 0,
                 actual: 1,
@@ -1244,7 +1616,7 @@ mod tests {
         );
         assert!(matches!(
             cumulative_edges.register(record("Second", vec![direct("Target", 1)], 5)),
-            Err(ModuleGraphError::ResourceLimitExceeded {
+            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
                 resource: ModuleGraphResource::DirectImportRows,
                 limit: 1,
                 actual: 2,
@@ -1271,7 +1643,8 @@ mod tests {
         assert!(
             exact
                 .register(record("Measured", vec![direct("Dep", 3)], 5))
-                .is_ok()
+                .registration()
+                .is_some()
         );
         let short = ModuleGraph::new(
             epoch(),
@@ -1280,7 +1653,7 @@ mod tests {
         .expect("epoch still fits");
         assert!(matches!(
             short.register(record("Measured", vec![direct("Dep", 3)], 5)),
-            Err(ModuleGraphError::ResourceLimitExceeded {
+            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
                 resource: ModuleGraphResource::PayloadBytes,
                 ..
             })
@@ -1410,7 +1783,7 @@ mod tests {
         ] {
             assert!(matches!(
                 graph.register(mutant),
-                Err(ModuleGraphError::ConflictingRecord { module, .. })
+                ModuleGraphAdmission::Rejected(ModuleGraphError::ConflictingRecord { module, .. })
                     if module == id("MutationTarget")
             ));
             println!(
@@ -1484,7 +1857,7 @@ mod tests {
                 .collect();
             let registration = sparse
                 .register(record(&format!("Sparse.M{index}"), imports, index as u8))
-                .expect("sparse DAG insertion");
+                .expect_complete("sparse DAG insertion");
             sparse_final_work = registration.work;
             sparse = registration.graph;
         }
@@ -1502,7 +1875,7 @@ mod tests {
                 .collect();
             let registration = dense
                 .register(record(&format!("Dense.M{index}"), imports, index as u8))
-                .expect("dense DAG insertion");
+                .expect_complete("dense DAG insertion");
             dense_final_work = registration.work;
             dense = registration.graph;
         }
@@ -1533,8 +1906,8 @@ mod tests {
         let graph = insert(&graph, record("Z", vec![direct("Root", 0)], 3));
         let left = record("Root", vec![direct("B", 0), direct("A", 0)], 4);
         let right = record("Root", vec![direct("A", 0), direct("B", 0)], 4);
-        let left_error = graph.register(left).expect_err("cycle refused");
-        let right_error = graph.register(right).expect_err("cycle refused");
+        let left_error = graph.register(left).expect_rejected("cycle refused");
+        let right_error = graph.register(right).expect_rejected("cycle refused");
         assert_eq!(left_error, right_error);
         assert_eq!(
             left_error,

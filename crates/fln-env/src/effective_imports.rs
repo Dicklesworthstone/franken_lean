@@ -1028,7 +1028,7 @@ mod tests {
                         grade: ArtifactGrade::OracleFixture,
                     },
                 ))
-                .expect("test module registers")
+                .expect_complete("test module registers")
                 .graph;
         }
         graph
