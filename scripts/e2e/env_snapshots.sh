@@ -281,7 +281,7 @@ for collision_input_path in "${COLLISION_INPUT_PATHS[@]}"; do
 done
 
 collision_note() {
-  printf '[env_snapshots:fln-amv.10] %s\n' "$*" | tee -a "$COLLISION_HUMAN" >&2
+  printf '[env_snapshots:%s] %s\n' "$COLLISION_BEAD" "$*" | tee -a "$COLLISION_HUMAN" >&2
 }
 
 collision_emit_event() {
@@ -648,6 +648,262 @@ python3 "$EVIDENCE" validate-bundle --art-dir "$COLLISION_ART_DIR" \
 
 emit collision_bundle passed \
   "\"child_bead\":\"fln-amv.10\",\"child_schema\":\"fln.e2e/2\",\"child_bundle\":\"collision-fln-amv.10/bundle.complete.json\",\"child_verdict\":\"pass\""
+
+# ---- nested fln-amv.13 collision resource-bound evidence bundle -----------------------
+# Reuse the fail-closed child helpers with a fresh identity and directory. The
+# child is disjoint from fln-amv.10: it binds the 1,000-entry resource model,
+# kills the inline-promotion threshold mutant, restores exact bytes, and proves
+# clean recovery before publishing its own commit marker.
+COLLISION_BEAD="fln-amv.13"
+COLLISION_SCENARIO="environment_resource_collision"
+COLLISION_RUN_ID="$RUN_ID-resource-collision-fln-amv-13"
+COLLISION_ART_DIR="$ART_DIR/resource-collision-fln-amv.13"
+COLLISION_LOG="$COLLISION_ART_DIR/run.ndjson"
+COLLISION_HUMAN="$COLLISION_ART_DIR/human.log"
+COLLISION_VENDOR_BINDING="$COLLISION_ART_DIR/vendor-binding.json"
+COLLISION_SEQ=0
+COLLISION_START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+COLLISION_TEST="pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence"
+COLLISION_CARGO_ARGV="cargo test --locked -q -p fln-env $COLLISION_TEST -- --exact --nocapture"
+
+if ! COLLISION_INPUT_ROOT="$(collision_hash_live)"; then
+  note "FAIL: cannot hash fln-amv.13 governed inputs"
+  exit 2
+fi
+if [ -e "$COLLISION_ART_DIR" ] || [ -L "$COLLISION_ART_DIR" ]; then
+  note "FAIL: refusing reused collision resource evidence directory $COLLISION_ART_DIR"
+  exit 2
+fi
+mkdir "$COLLISION_ART_DIR"
+python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+  --vendor-path "$COLLISION_VENDOR_PATH" --output "$COLLISION_VENDOR_BINDING" \
+  --artifact-root "$COLLISION_ART_DIR" || {
+    note "FAIL: cannot bind the pinned Reference tree for fln-amv.13"
+    exit 2
+  }
+
+COLLISION_LIVE_SUBJECT_SHA="$(collision_file_sha256 "$ROOT/crates/fln-env/src/pmap.rs")"
+COLLISION_LIVE_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
+collision_emit_event --new-log --string event run_start \
+  --json-value argv '["scripts/e2e/env_snapshots.sh"]' \
+  --string cwd "$ROOT" \
+  --append-string claim_ids fln-amv.13-resource-bounded-collisions \
+  --append-string invariant_ids FL-INV-01 \
+  --append-string gate_ids PG-5 \
+  --string parity_ledger_row not_applicable_internal_data_structure_resource_bound \
+  --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
+  --string platform "$(uname -srm)" \
+  --json-value host_facts "$(python3 -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
+  --integer thread_count 32 --string seed partition-rotation-v1 \
+  --json-value thread_matrix '[1,8,32]' \
+  --string cache_state "$COLLISION_CACHE_STATE" \
+  --string input_root "$COLLISION_INPUT_ROOT" \
+  --string vendor_binding vendor-binding.json \
+  --string live_head "$COLLISION_LIVE_HEAD" \
+  --string live_subject_sha256 "$COLLISION_LIVE_SUBJECT_SHA" \
+  --json-value budgets "{\"capture_bytes_per_stream\":$COLLISION_CAPTURE_BYTES,\"output_budget_bytes\":$COLLISION_OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$COLLISION_TIMEOUT_MS,\"kill_grace_ms\":$COLLISION_GRACE_MS,\"max_collision_cardinality\":1000,\"max_construction_comparisons\":18000,\"max_append_fresh_nodes\":18}"
+: > "$COLLISION_HUMAN"
+
+COLLISION_PRISTINE_SOURCE="$COLLISION_ART_DIR/pmap.pristine.rs"
+cp -- "$OVERLAY/fln-env/src/pmap.rs" "$COLLISION_PRISTINE_SOURCE"
+COLLISION_PRISTINE_SHA="$(collision_file_sha256 "$COLLISION_PRISTINE_SOURCE")"
+if [ "$COLLISION_PRISTINE_SHA" != "$COLLISION_LIVE_SUBJECT_SHA" ]; then
+  collision_note "FAIL: recovered overlay pmap.rs is not byte-identical to the live resource subject"
+  exit 3
+fi
+COLLISION_PRISTINE_SUBJECT_ROOT="$(collision_hash_subject "$OVERLAY" fln-env/src/pmap.rs)"
+
+# Positive: the live subject emits exactly the v1 rows and pinned roots for
+# thread counts 1, 8, and 32.
+COLLISION_POSITIVE_SUBJECT_BEFORE="$(collision_hash_subject "$ROOT" crates/fln-env/src/pmap.rs)"
+COLLISION_POSITIVE_GLOBAL_BEFORE="$(collision_hash_live)"
+collision_supervise resource_positive "$ROOT" none false \
+  env FLN_ENV_E2E_RUN_ID="$COLLISION_RUN_ID" \
+  FLN_ENV_E2E_STDOUT_ARTIFACT=resource_positive.out \
+  FLN_ENV_E2E_STDERR_ARTIFACT=resource_positive.err \
+  FLN_ENV_E2E_ARGV="$COLLISION_CARGO_ARGV" \
+  FLN_ENV_E2E_CACHE_STATE="$COLLISION_CACHE_STATE" \
+  CARGO_TARGET_DIR=target_local \
+  cargo test --locked -q -p fln-env \
+  pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence \
+  -- --exact --nocapture
+collision_assert_supervisor resource_positive pass 0 0 false
+COLLISION_POSITIVE_SUBJECT_AFTER="$(collision_hash_subject "$ROOT" crates/fln-env/src/pmap.rs)"
+COLLISION_POSITIVE_GLOBAL_AFTER="$(collision_hash_live)"
+collision_assert_unchanged resource_positive \
+  "$COLLISION_POSITIVE_SUBJECT_BEFORE" "$COLLISION_POSITIVE_SUBJECT_AFTER" \
+  "$COLLISION_POSITIVE_GLOBAL_BEFORE" "$COLLISION_POSITIVE_GLOBAL_AFTER"
+COLLISION_POSITIVE_VALIDATION="$COLLISION_ART_DIR/resource_positive.validation.json"
+python3 "$EVIDENCE" validate-environment-resource-collision \
+  --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase positive \
+  --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
+  --expected-cwd "$ROOT/crates/fln-env" --expected-argv "$COLLISION_CARGO_ARGV" \
+  --expected-stdout-artifact resource_positive.out \
+  --expected-stderr-artifact resource_positive.err \
+  --expected-cache-state "$COLLISION_CACHE_STATE" \
+  --artifact-root "$COLLISION_ART_DIR" --output "$COLLISION_POSITIVE_VALIDATION"
+collision_record_step resource_positive \
+  "environment-resource-collision/1:positive/pass/wrapper=0/child=0/sha256=$COLLISION_LIVE_SUBJECT_SHA" \
+  "$COLLISION_LAST_CLASS/wrapper=$COLLISION_LAST_RC/child=$COLLISION_LAST_CHILD/sha256=$COLLISION_LIVE_SUBJECT_SHA" \
+  resource_positive.validation.json pass 0 0 \
+  "$COLLISION_POSITIVE_SUBJECT_BEFORE" "$COLLISION_POSITIVE_SUBJECT_AFTER" \
+  "$COLLISION_POSITIVE_GLOBAL_BEFORE" "$COLLISION_POSITIVE_GLOBAL_AFTER"
+
+# Mutant: promote an inline bucket one entry too early. The exact test must fail
+# at the cloned-inline-work assertion; both split streams are checked before the
+# strict validator accepts the kill.
+if ! python3 - "$OVERLAY/fln-env/src/pmap.rs" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_bytes()
+anchor = b"if new_entries.len() <= INLINE_COLLISION_MAX {"
+replacement = b"if new_entries.len() < INLINE_COLLISION_MAX {"
+if source.count(anchor) != 1:
+    raise SystemExit("inline-threshold mutation anchor count is not exactly one")
+path.write_bytes(source.replace(anchor, replacement, 1))
+PY
+then
+  collision_note "FAIL: inline-threshold mutation did not match exactly one overlay anchor"
+  exit 2
+fi
+COLLISION_MUTANT_SHA="$(collision_file_sha256 "$OVERLAY/fln-env/src/pmap.rs")"
+if [ "$COLLISION_MUTANT_SHA" = "$COLLISION_PRISTINE_SHA" ]; then
+  collision_note "FAIL: inline-threshold mutation did not change the overlay subject"
+  exit 2
+fi
+COLLISION_MUTANT_SUBJECT_BEFORE="$(collision_hash_subject "$OVERLAY" fln-env/src/pmap.rs)"
+COLLISION_MUTANT_GLOBAL_BEFORE="$(collision_hash_live)"
+collision_supervise resource_mutant "$OVERLAY" 101 true \
+  env FLN_ENV_E2E_RUN_ID="$COLLISION_RUN_ID" \
+  FLN_ENV_E2E_STDOUT_ARTIFACT=resource_mutant.out \
+  FLN_ENV_E2E_STDERR_ARTIFACT=resource_mutant.err \
+  FLN_ENV_E2E_ARGV="$COLLISION_CARGO_ARGV" \
+  FLN_ENV_E2E_CACHE_STATE="$COLLISION_CACHE_STATE" \
+  CARGO_TARGET_DIR="$OVERLAY/target" \
+  cargo test --locked -q -p fln-env \
+  pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence \
+  -- --exact --nocapture
+collision_assert_supervisor resource_mutant fail 1 101 true
+if ! grep -Fq "$COLLISION_TEST --- FAILED" "$COLLISION_LAST_OUT"; then
+  collision_note "FAIL: resource mutant stdout lacks the exact failed test identity"
+  exit 1
+fi
+if ! grep -Fq 'left: 28' "$COLLISION_LAST_ERR" || \
+   ! grep -Fq 'right: 36' "$COLLISION_LAST_ERR"; then
+  collision_note "FAIL: resource mutant stderr lacks the intended inline-threshold assertion"
+  exit 1
+fi
+COLLISION_MUTANT_SUBJECT_AFTER="$(collision_hash_subject "$OVERLAY" fln-env/src/pmap.rs)"
+COLLISION_MUTANT_GLOBAL_AFTER="$(collision_hash_live)"
+collision_assert_unchanged resource_mutant \
+  "$COLLISION_MUTANT_SUBJECT_BEFORE" "$COLLISION_MUTANT_SUBJECT_AFTER" \
+  "$COLLISION_MUTANT_GLOBAL_BEFORE" "$COLLISION_MUTANT_GLOBAL_AFTER"
+COLLISION_MUTANT_VALIDATION="$COLLISION_ART_DIR/resource_mutant.validation.json"
+python3 "$EVIDENCE" validate-environment-resource-collision \
+  --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase mutant \
+  --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
+  --expected-stdout-artifact resource_mutant.out \
+  --expected-stderr-artifact resource_mutant.err \
+  --artifact-root "$COLLISION_ART_DIR" --output "$COLLISION_MUTANT_VALIDATION"
+collision_record_step resource_mutant \
+  "environment-resource-collision/1:mutant/fail/wrapper=1/child=101/pristine_sha256=$COLLISION_PRISTINE_SHA" \
+  "$COLLISION_LAST_CLASS/wrapper=$COLLISION_LAST_RC/child=$COLLISION_LAST_CHILD/mutant_sha256=$COLLISION_MUTANT_SHA" \
+  resource_mutant.validation.json fail 1 101 \
+  "$COLLISION_MUTANT_SUBJECT_BEFORE" "$COLLISION_MUTANT_SUBJECT_AFTER" \
+  "$COLLISION_MUTANT_GLOBAL_BEFORE" "$COLLISION_MUTANT_GLOBAL_AFTER"
+
+# Recovery: restore the retained pristine bytes before rerunning the exact
+# resource test and requiring all pinned roots and bounds again.
+cp -- "$COLLISION_PRISTINE_SOURCE" "$OVERLAY/fln-env/src/pmap.rs"
+COLLISION_RECOVERED_SHA="$(collision_file_sha256 "$OVERLAY/fln-env/src/pmap.rs")"
+if [ "$COLLISION_RECOVERED_SHA" != "$COLLISION_PRISTINE_SHA" ]; then
+  collision_note "FAIL: recovered resource pmap.rs does not byte-match the pristine overlay"
+  exit 3
+fi
+COLLISION_RECOVERY_SUBJECT_BEFORE="$(collision_hash_subject "$OVERLAY" fln-env/src/pmap.rs)"
+if [ "$COLLISION_RECOVERY_SUBJECT_BEFORE" != "$COLLISION_PRISTINE_SUBJECT_ROOT" ]; then
+  collision_note "FAIL: recovered resource pmap.rs tree root differs from the pristine overlay"
+  exit 3
+fi
+COLLISION_RECOVERY_GLOBAL_BEFORE="$(collision_hash_live)"
+collision_supervise resource_recovery "$OVERLAY" none false \
+  env FLN_ENV_E2E_RUN_ID="$COLLISION_RUN_ID" \
+  FLN_ENV_E2E_STDOUT_ARTIFACT=resource_recovery.out \
+  FLN_ENV_E2E_STDERR_ARTIFACT=resource_recovery.err \
+  FLN_ENV_E2E_ARGV="$COLLISION_CARGO_ARGV" \
+  FLN_ENV_E2E_CACHE_STATE="$COLLISION_CACHE_STATE" \
+  CARGO_TARGET_DIR="$OVERLAY/target" \
+  cargo test --locked -q -p fln-env \
+  pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence \
+  -- --exact --nocapture
+collision_assert_supervisor resource_recovery pass 0 0 false
+COLLISION_RECOVERY_SUBJECT_AFTER="$(collision_hash_subject "$OVERLAY" fln-env/src/pmap.rs)"
+COLLISION_RECOVERY_GLOBAL_AFTER="$(collision_hash_live)"
+collision_assert_unchanged resource_recovery \
+  "$COLLISION_RECOVERY_SUBJECT_BEFORE" "$COLLISION_RECOVERY_SUBJECT_AFTER" \
+  "$COLLISION_RECOVERY_GLOBAL_BEFORE" "$COLLISION_RECOVERY_GLOBAL_AFTER"
+COLLISION_RECOVERY_VALIDATION="$COLLISION_ART_DIR/resource_recovery.validation.json"
+python3 "$EVIDENCE" validate-environment-resource-collision \
+  --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase recovery \
+  --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
+  --expected-cwd "$OVERLAY/fln-env" --expected-argv "$COLLISION_CARGO_ARGV" \
+  --expected-stdout-artifact resource_recovery.out \
+  --expected-stderr-artifact resource_recovery.err \
+  --expected-cache-state "$COLLISION_CACHE_STATE" \
+  --artifact-root "$COLLISION_ART_DIR" --output "$COLLISION_RECOVERY_VALIDATION"
+collision_record_step resource_recovery \
+  "environment-resource-collision/1:recovery/pass/wrapper=0/child=0/sha256=$COLLISION_PRISTINE_SHA" \
+  "$COLLISION_LAST_CLASS/wrapper=$COLLISION_LAST_RC/child=$COLLISION_LAST_CHILD/sha256=$COLLISION_RECOVERED_SHA" \
+  resource_recovery.validation.json pass 0 0 \
+  "$COLLISION_RECOVERY_SUBJECT_BEFORE" "$COLLISION_RECOVERY_SUBJECT_AFTER" \
+  "$COLLISION_RECOVERY_GLOBAL_BEFORE" "$COLLISION_RECOVERY_GLOBAL_AFTER"
+
+COLLISION_FINAL_ROOT="$(collision_hash_live)"
+if [ "$COLLISION_FINAL_ROOT" != "$COLLISION_INPUT_ROOT" ]; then
+  collision_note "FAIL: collision resource child changed its governed live input"
+  exit 3
+fi
+collision_emit_event --string event run_end --string verdict pass \
+  --string reason_code all_obligations_passed --integer process_exit 0 \
+  --string active_step resource_recovery \
+  --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - COLLISION_START_NS ))" \
+  --string cleanup_status retained_by_policy \
+  --string final_state "$COLLISION_FINAL_ROOT" \
+  --string logical_root "$COLLISION_FINAL_ROOT" \
+  --string receipt_root not_applicable_internal_resource_bound \
+  --string first_divergence none \
+  --string evidence_manifest manifest.json \
+  --string bundle_commit bundle.complete.json \
+  --string evidence_state pending_bundle_commit
+
+python3 "$EVIDENCE" validate-run --file "$COLLISION_LOG" \
+  --schema "$COLLISION_SCHEMA" --expected-verdict pass \
+  --expected-active-stage resource_recovery \
+  --artifact-root "$COLLISION_ART_DIR" \
+  --output "$COLLISION_ART_DIR/run.validation.json"
+python3 "$EVIDENCE" manifest --art-dir "$COLLISION_ART_DIR" \
+  --output "$COLLISION_ART_DIR/manifest.json" \
+  --digest-output "$COLLISION_ART_DIR/manifest.digest" \
+  --run-id "$COLLISION_RUN_ID" --bead "$COLLISION_BEAD" \
+  --scenario "$COLLISION_SCENARIO" --verdict pass \
+  --input-root "$COLLISION_INPUT_ROOT" --final-root "$COLLISION_FINAL_ROOT"
+python3 "$EVIDENCE" complete-bundle --art-dir "$COLLISION_ART_DIR" \
+  --manifest "$COLLISION_ART_DIR/manifest.json" \
+  --digest "$COLLISION_ART_DIR/manifest.digest" \
+  --output "$COLLISION_ART_DIR/bundle.complete.json" \
+  --governed-root "$ROOT" "${COLLISION_GOVERNED_ARGS[@]}" \
+  --expected-root "$COLLISION_FINAL_ROOT" \
+  --vendor-path "$COLLISION_VENDOR_PATH"
+python3 "$EVIDENCE" validate-bundle --art-dir "$COLLISION_ART_DIR" \
+  --manifest "$COLLISION_ART_DIR/manifest.json" \
+  --digest "$COLLISION_ART_DIR/manifest.digest" \
+  --commit "$COLLISION_ART_DIR/bundle.complete.json" \
+  --artifact-root "$COLLISION_ART_DIR" >/dev/null
+
+emit resource_collision_bundle passed \
+  "\"child_bead\":\"fln-amv.13\",\"child_schema\":\"fln.e2e/2\",\"child_bundle\":\"resource-collision-fln-amv.13/bundle.complete.json\",\"child_verdict\":\"pass\""
 
 emit run_end passed "\"verdict\":\"pass\",\"artifacts_dir\":\"$ART_DIR\",\"cleanup_status\":\"retained_by_policy\""
 note "PASS — artifacts in $ART_DIR"

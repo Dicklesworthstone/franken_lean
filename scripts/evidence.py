@@ -155,6 +155,11 @@ E2E_STEP_ORDERS = {
         "collision_mutant",
         "collision_recovery",
     ],
+    "environment_resource_collision": [
+        "resource_positive",
+        "resource_mutant",
+        "resource_recovery",
+    ],
     "verdict_schema": [
         "positive",
         "failure",
@@ -277,6 +282,148 @@ ENVIRONMENT_COLLISION_FIELDS = {
     "lookup_complexity",
     "insert_complexity",
     "resource_followup",
+    "monotonic_start_us",
+    "monotonic_end_us",
+    "duration_us",
+    "timing_used_as_gate",
+    "process_exit",
+    "signal",
+    "first_divergence",
+    "cleanup_status",
+    "final_state",
+}
+
+ENVIRONMENT_RESOURCE_COLLISION_SCHEMA = "fln.e2e.environment-resource-collision"
+ENVIRONMENT_RESOURCE_COLLISION_VERSION = 1
+ENVIRONMENT_RESOURCE_COLLISION_THREADS = (1, 8, 32)
+ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY = 1_000
+ENVIRONMENT_RESOURCE_COLLISION_TEST = (
+    "pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence"
+)
+ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT = (
+    "fln-fixture:fe1a2f87707d8edea65e8d4d61db5a1882c838b3e1975ec55b136af78f154dfe"
+)
+ENVIRONMENT_RESOURCE_COLLISION_HASH = "955ee3fb336886cc"
+ENVIRONMENT_RESOURCE_COLLISION_ROOT = (
+    "0da9877d9661335524ca1609c621ea2f422477497f686f85192276e1eb05cee7"
+)
+ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT = (
+    "e4e233d685c5ee4e14cd844d572b2edf4e9d06c866725687ea420328acccdea1"
+)
+ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER = (
+    "assertion `left == right` failed\n  left: 28\n right: 36"
+)
+ENVIRONMENT_RESOURCE_COLLISION_INSERTION_ROOTS = {
+    1: (
+        "fln-fixture:08b7f939ec36c28d93fed144bb9a730d2503ec099edf0bb96a2721bdfc60e325",
+    ),
+    8: (
+        "fln-fixture:99505071fe809c63f3697903ffec2eda89e6c01863753411d836949edbc7a2e6",
+        "fln-fixture:8b04654a127358f5e2c8eb41f6b1cc7c13dc8b446158aa38d8aa1f9183865de5",
+        "fln-fixture:bc8b3d07a5bc1aac1d29cecbae910d3038d8513cc1ff82d45ffb825cdc0eeb03",
+        "fln-fixture:42f2d932971f941232fa0816cd9f98b5d904f8e204d39ee9f094d5fbc16d9fd7",
+        "fln-fixture:1fbe351925b9c7471949e52d40348549e32b9693940ebc053e119abb079cfdcc",
+        "fln-fixture:83cfa2c1a11bacabe8c9a7db97d3dd8feff2337d682f09e44a878c4307783409",
+        "fln-fixture:758772e6db8c89facab28fa52f2438b06d12bb1f87eb67c3ec3334484fdb36ea",
+        "fln-fixture:347431134d05dfe0684f987276f9ea0af399fdd8cda5908f7be63f1b27679a0a",
+    ),
+    32: (
+        "fln-fixture:dc8dfffd8012c09e9ce97bff90702d1dc0bd3f23b005086126c2e0e669df821a",
+        "fln-fixture:8851bb87719923be75013cff4ef4732c27b1ad6a82315e2f54e6268aa2f498cc",
+        "fln-fixture:fd3712db2016ece30d8475037e1229f560bb485d3038a21988099612d8ae3413",
+        "fln-fixture:c25f4e4895ec135269205442c0f598a76cd6d7dcb461c82caa3a841ccae2fe42",
+        "fln-fixture:75c3b37eb151113836a8185f0242a50d9a290574f7f6553b845d52b68d11d90a",
+        "fln-fixture:d5b92dcbe784c645232d77e9f7f970143e8c9eab45d29bdff3dcaf510b55f78d",
+        "fln-fixture:a5889ad8e06e4adc20cb5295e4586ea53c3287bba0027131ae2c38d657397cf3",
+        "fln-fixture:c835c428ac132b9aa01a612b95c72205f194392707184c5cf084888ab2782a08",
+        "fln-fixture:a2b3bdd0e6a2faac7afa1228cadf7f5d1b78b4b38e75aa8a583adfdf8fa4bfc0",
+        "fln-fixture:7f97ee3ac100deee413ad5b2be458fbe58e7ffe72f44075e524100fcceb09dd7",
+        "fln-fixture:fa7efe8ab864ea61ca56f6a9a8dbe710aab8cc28631599d23f13bdf7eafb622e",
+        "fln-fixture:2f2792a3cc195756d88edd8591a905a2f17ea7b709369069ada462d1ad0236cd",
+        "fln-fixture:845b34ac7ca419fc02974b6ecfb524de75b61b7bb4c96839c2aab506bc3636db",
+        "fln-fixture:bf437a9fc884c07f167dc1c1a319c5cd62f2ef3889f4b476c7f98657b79f821c",
+        "fln-fixture:35d9052b65b94ae647d57af45a275df3e8d0c4c0bc47d2075503360da781907a",
+        "fln-fixture:b436bdbb426509d697ed7553a624d2d02444ac27144bf961926b28618cbdb54d",
+        "fln-fixture:2d967bc6d3f7b5d9a60b5491f85c6d8947e51b350566e5fe48aeb48ec5ff0ef6",
+        "fln-fixture:15e7bf1d442d3efa38ffa2101f57317ce3d238c740c3309f69c3bbcf7374d619",
+        "fln-fixture:812e68d06a379f613d766067e62dc2b7372250ac3c457cb0b388fd8f01953121",
+        "fln-fixture:eef976e9839c50a6287ac3882ad0f1e42a5e6dae2d5fd634880eabb17465a664",
+        "fln-fixture:f129e4e550b451ffa6e304a2482ff09b82200f4f69d4736fd17d7cf60081f5c5",
+        "fln-fixture:c921b3088bce5c6a6389f02ace3a6fe2fde45d74de5d1236a60423d3c74a725c",
+        "fln-fixture:efd74cfe56fc7b3c9249b88d5a24bf7dd3cd746150ef5fdb284cea69139ef45f",
+        "fln-fixture:a918832f110875da273bac6892cfe0442bcc562504643bed55e6eadf70e5ef31",
+        "fln-fixture:22603dbfa9666ee2c1fd9e6f054aa61b81262458fec4f18c22e4400f8394e64a",
+        "fln-fixture:8b203ad6ccc731d032c23568280c3aa210dffffbdde97f13787df711d4c476c6",
+        "fln-fixture:7c98700104a2894bbd06b7caff021252fe24d53b73fd6db8247df57731e65d02",
+        "fln-fixture:d6deb752327aac38c2bd8d7a5f729e454a861b67cb24c1deb1b491f57875c0fd",
+        "fln-fixture:ca0a0d538ebcc735c82df9f0a3402d4c9678926954368b7c2e463b48afcffab1",
+        "fln-fixture:fef909b8b7aed09f264d00a87c263db945590bce848429488901d0f6e07336f2",
+        "fln-fixture:4749f2b23180c6a7ba4bab54cfe4f7fa6eff17be58af01d6102ac85710bf57aa",
+        "fln-fixture:c436f1f87725a813b5bc206d23e260a9fd3559006d8535556a92f28492ebbc2f",
+    ),
+}
+ENVIRONMENT_RESOURCE_COLLISION_FIELDS = {
+    "schema",
+    "version",
+    "run_id",
+    "bead",
+    "claim_id",
+    "claim_type",
+    "invariant_id",
+    "invariant_relation",
+    "gate_id",
+    "gate_relation",
+    "parity_ledger_row",
+    "data_grade",
+    "epoch",
+    "mode",
+    "profile",
+    "platform",
+    "seed",
+    "cache_state",
+    "canonical_input_root",
+    "scenario",
+    "schedule_id",
+    "status",
+    "cwd",
+    "argv",
+    "stdout_artifact",
+    "stderr_artifact",
+    "collision_cardinality",
+    "collision_hash",
+    "threads",
+    "workers_built",
+    "distinct_insertion_orders",
+    "representative_insertion_order",
+    "worker_insertion_order_roots",
+    "expected_order",
+    "actual_order",
+    "worker_enumeration_roots",
+    "expected_root",
+    "actual_root",
+    "worker_roots",
+    "expected_recovery_root",
+    "actual_recovery_root",
+    "worker_recovery_roots",
+    "representation_tier",
+    "secondary_identity",
+    "secondary_hashing",
+    "secondary_identity_collision_behavior",
+    "promotion_cardinality",
+    "demotion_cardinality",
+    "comparisons",
+    "fresh_map_nodes",
+    "fresh_collision_nodes",
+    "cloned_inline_entries",
+    "final_collision_nodes",
+    "snapshot_root_arc_bumps",
+    "snapshot_shared_collision_nodes",
+    "append_shared_collision_nodes",
+    "append_fresh_nodes",
+    "max_lookup_comparisons",
+    "budget",
+    "bounds",
+    "resources",
     "monotonic_start_us",
     "monotonic_end_us",
     "duration_us",
@@ -4577,6 +4724,672 @@ def validate_environment_collision(
         "canonical_input_root": shared_input_root,
         "collision_hash": shared_collision_hash,
         "environment_root": shared_environment_root,
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def read_environment_resource_collision_stream(
+    path: Path, artifact_root: Path, *, label: str
+) -> tuple[Path, bytes, str, str, str]:
+    root = lexical_absolute(artifact_root)
+    absolute = require_within(
+        path, root, label=f"environment-resource-collision {label}"
+    )
+    data, _size, digest = stable_file_facts(absolute, max_bytes=MAX_LOG_BYTES)
+    if data and not data.endswith(b"\n"):
+        raise EvidenceError(
+            f"environment-resource-collision {label} is unterminated: {absolute}"
+        )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"environment-resource-collision {label} is not UTF-8: {absolute}"
+        ) from error
+    for number, raw_line in enumerate(data.splitlines(), 1):
+        if len(raw_line) > MAX_RECORD_BYTES:
+            raise EvidenceError(
+                f"{absolute}:{number}: environment-resource-collision "
+                f"{label} line is too large"
+            )
+    return absolute, data, text, digest, absolute.relative_to(root).as_posix()
+
+
+def environment_resource_collision_failure_material(text: str) -> bool:
+    failed_forms = {
+        f"{ENVIRONMENT_RESOURCE_COLLISION_TEST} --- FAILED",
+        f"test {ENVIRONMENT_RESOURCE_COLLISION_TEST} ... FAILED",
+    }
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (
+            stripped in failed_forms
+            or stripped.startswith("test result: FAILED.")
+            or stripped.startswith("thread '")
+            and " panicked at " in stripped
+            or re.fullmatch(r"assertion .* failed(?:: .*)?", stripped) is not None
+            or stripped.startswith("error: test failed")
+            or stripped.startswith("error: could not compile")
+        ):
+            return True
+    return False
+
+
+def validate_environment_resource_collision(
+    stdout_path: Path,
+    stderr_path: Path,
+    phase: str,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+    expected_cwd: str | None = None,
+    expected_argv: str | None = None,
+    expected_cache_state: str | None = None,
+) -> dict[str, Any]:
+    if phase not in {"positive", "mutant", "recovery"}:
+        raise EvidenceError(
+            f"unsupported environment-resource-collision phase: {phase!r}"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", expected_run_id):
+        raise EvidenceError("environment-resource-collision run id is malformed")
+    if not isinstance(observed_exit, int) or isinstance(observed_exit, bool):
+        raise EvidenceError(
+            "environment-resource-collision observed exit is not an integer"
+        )
+    expected_exit = 101 if phase == "mutant" else 0
+    if observed_exit != expected_exit:
+        raise EvidenceError(
+            f"environment-resource-collision {phase} exit {observed_exit}, "
+            f"expected {expected_exit}"
+        )
+
+    root = lexical_absolute(artifact_root)
+    stdout_path, stdout_data, stdout_text, stdout_digest, stdout_relative = (
+        read_environment_resource_collision_stream(
+            stdout_path, root, label="stdout"
+        )
+    )
+    stderr_path, stderr_data, stderr_text, stderr_digest, stderr_relative = (
+        read_environment_resource_collision_stream(
+            stderr_path, root, label="stderr"
+        )
+    )
+    if stdout_path == stderr_path:
+        raise EvidenceError(
+            "environment-resource-collision stdout and stderr are not distinct"
+        )
+    for label, expected, actual in (
+        ("stdout", expected_stdout_artifact, stdout_relative),
+        ("stderr", expected_stderr_artifact, stderr_relative),
+    ):
+        expected_path = Path(expected)
+        if (
+            not expected
+            or expected_path.is_absolute()
+            or ".." in expected_path.parts
+            or expected == "."
+            or expected_path.as_posix() != expected
+        ):
+            raise EvidenceError(
+                "environment-resource-collision expected "
+                f"{label} artifact is not a canonical relative path"
+            )
+        if expected != actual:
+            raise EvidenceError(
+                f"environment-resource-collision {label} path {actual!r}, "
+                f"expected {expected!r}"
+            )
+
+    schema_marker = ENVIRONMENT_RESOURCE_COLLISION_SCHEMA.encode("ascii")
+    if schema_marker in stderr_data:
+        raise EvidenceError(
+            "environment-resource-collision detail rows leaked into stderr"
+        )
+    records: list[dict[str, Any]] = []
+    for number, raw_line in enumerate(stdout_data.splitlines(), 1):
+        if schema_marker not in raw_line:
+            continue
+        object_start = raw_line.find(b"{")
+        if object_start < 0:
+            raise EvidenceError(
+                f"{stdout_path}:{number}: resource-collision evidence "
+                "is not a JSON object"
+            )
+        value = parse_json(
+            raw_line[object_start:].strip(), subject=f"{stdout_path}:{number}"
+        )
+        if not isinstance(value, dict):
+            raise EvidenceError(
+                f"{stdout_path}:{number}: resource-collision evidence "
+                "is not an object"
+            )
+        records.append(value)
+
+    failed_forms = {
+        f"{ENVIRONMENT_RESOURCE_COLLISION_TEST} --- FAILED",
+        f"test {ENVIRONMENT_RESOURCE_COLLISION_TEST} ... FAILED",
+    }
+    if phase == "mutant":
+        if records:
+            raise EvidenceError(
+                "killed environment-resource-collision mutant emitted passing records"
+            )
+        failed_lines = [
+            line.strip()
+            for line in stdout_text.splitlines()
+            if line.strip() in failed_forms
+        ]
+        if len(failed_lines) != 1:
+            raise EvidenceError(
+                "resource-collision mutant stdout lacks exactly one named "
+                "FAILED test result"
+            )
+        if any(line.strip() in failed_forms for line in stderr_text.splitlines()):
+            raise EvidenceError(
+                "resource-collision mutant FAILED test result leaked into stderr"
+            )
+        if ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER in stdout_text:
+            raise EvidenceError(
+                "resource-collision mutant assertion marker leaked into stdout"
+            )
+        panic_identity = re.compile(
+            rf"^thread '{re.escape(ENVIRONMENT_RESOURCE_COLLISION_TEST)}'"
+            r"(?: \([1-9][0-9]*\))? panicked at ",
+            re.MULTILINE,
+        )
+        if len(panic_identity.findall(stderr_text)) != 1:
+            raise EvidenceError(
+                "resource-collision mutant stderr lacks exactly one named panic"
+            )
+        if stderr_text.count(ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER) != 1:
+            raise EvidenceError(
+                "resource-collision mutant stderr lacks the exact inline-threshold "
+                "assertion marker"
+            )
+        result_lines = [
+            line.strip()
+            for line in stdout_text.splitlines()
+            if line.strip().startswith("test result: FAILED.")
+        ]
+        if len(result_lines) != 1 or not re.match(
+            r"^test result: FAILED\. 0 passed; 1 failed;", result_lines[0]
+        ):
+            raise EvidenceError(
+                "resource-collision mutant stdout lacks the exact one-test "
+                "failure summary"
+            )
+        if any(
+            line.strip().startswith("test result: FAILED.")
+            for line in stderr_text.splitlines()
+        ):
+            raise EvidenceError(
+                "resource-collision mutant failure summary leaked into stderr"
+            )
+        if any(
+            line.strip().startswith("test result: ok.")
+            for line in (*stdout_text.splitlines(), *stderr_text.splitlines())
+        ):
+            raise EvidenceError(
+                "resource-collision mutant streams contain a passing summary"
+            )
+        if "error: could not compile" in stdout_text + stderr_text:
+            raise EvidenceError(
+                "resource-collision mutant was a compile failure, not a killed mutant"
+            )
+        return {
+            "schema": "fln.validation/1",
+            "validator": "environment-resource-collision/1",
+            "subject": stdout_relative,
+            "valid": True,
+            "phase": phase,
+            "run_id": expected_run_id,
+            "observed_exit": observed_exit,
+            "records": 0,
+            "failed_test": ENVIRONMENT_RESOURCE_COLLISION_TEST,
+            "assertion_marker": ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER,
+            "stdout_artifact": stdout_relative,
+            "stderr_artifact": stderr_relative,
+            "stdout_sha256": stdout_digest,
+            "stderr_sha256": stderr_digest,
+        }
+
+    required_cli_values = {
+        "expected cwd": expected_cwd,
+        "expected argv": expected_argv,
+        "expected cache state": expected_cache_state,
+    }
+    missing_cli = sorted(
+        label
+        for label, value in required_cli_values.items()
+        if not isinstance(value, str) or not value
+    )
+    if missing_cli:
+        raise EvidenceError(
+            f"environment-resource-collision {phase} validation "
+            f"lacks {missing_cli!r}"
+        )
+    if not Path(expected_cwd).is_absolute():
+        raise EvidenceError(
+            "environment-resource-collision expected cwd is not absolute"
+        )
+    if len(records) != len(ENVIRONMENT_RESOURCE_COLLISION_THREADS):
+        raise EvidenceError(
+            f"environment-resource-collision {phase} emitted {len(records)} "
+            f"detail records, expected "
+            f"{len(ENVIRONMENT_RESOURCE_COLLISION_THREADS)}"
+        )
+    if environment_resource_collision_failure_material(stdout_text):
+        raise EvidenceError(
+            f"environment-resource-collision {phase} stdout contains failure material"
+        )
+    if environment_resource_collision_failure_material(stderr_text):
+        raise EvidenceError(
+            f"environment-resource-collision {phase} stderr contains failure material"
+        )
+    pass_result_lines = [
+        line.strip()
+        for line in stdout_text.splitlines()
+        if line.strip().startswith("test result: ok.")
+    ]
+    if len(pass_result_lines) != 1 or not re.match(
+        r"^test result: ok\. 1 passed; 0 failed;", pass_result_lines[0]
+    ):
+        raise EvidenceError(
+            f"environment-resource-collision {phase} log lacks the exact "
+            "one-test pass summary"
+        )
+
+    expected_identity = {
+        "schema": ENVIRONMENT_RESOURCE_COLLISION_SCHEMA,
+        "bead": "fln-amv.13",
+        "claim_id": "fln-amv.13-resource-bounded-collisions",
+        "claim_type": "bounded_model",
+        "invariant_id": "FL-INV-01",
+        "invariant_relation": "supports-local-pmap-slice",
+        "gate_id": "PG-5",
+        "gate_relation": "partial-component-evidence",
+        "parity_ledger_row": (
+            "not_applicable_internal_data_structure_resource_bound"
+        ),
+        "data_grade": "verified",
+        "epoch": "lean-v4.32.0",
+        "mode": "sound",
+        "profile": "e2e",
+        "seed": "partition-rotation-v1",
+        "canonical_input_root": ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT,
+        "scenario": "collision-resource-schedule-matrix",
+        "status": "pass",
+        "collision_hash": ENVIRONMENT_RESOURCE_COLLISION_HASH,
+        "expected_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+        "actual_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+        "expected_recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+        "actual_recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+        "representation_tier": "persistent-avl",
+        "secondary_identity": "exact-PKey-Ord-with-Eq-consistency",
+        "secondary_hashing": "none",
+        "secondary_identity_collision_behavior": (
+            "Ord-equal-overwrites;Ord-distinct-path-copies"
+        ),
+        "cleanup_status": "retained_by_policy",
+        "final_state": "typed-refusal-followed-by-exact-bound-recovery",
+    }
+    expected_bounds = {
+        "construction_comparisons": 18_000,
+        "inline_cloned_entries": 36,
+        "append_minimum_shared_nodes": 983,
+        "lookup_comparisons": 14,
+        "maximum_avl_height": 14,
+        "tree_fresh_nodes_per_insert": 17,
+        "legacy_vector_copies": 499_500,
+    }
+    canonical_order = list(range(ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY))
+    shared_platform: str | None = None
+    previous_end = -1
+
+    def exact_integer(record: dict[str, Any], key: str, expected: int) -> None:
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value != expected:
+            raise EvidenceError(
+                f"environment-resource-collision {key} {value!r}, "
+                f"expected integer {expected}"
+            )
+
+    def integer_vector(value: Any, label: str, length: int) -> list[int]:
+        if (
+            not isinstance(value, list)
+            or len(value) != length
+            or any(
+                not isinstance(item, int) or isinstance(item, bool) or item < 0
+                for item in value
+            )
+        ):
+            raise EvidenceError(
+                f"environment-resource-collision {label} is not a "
+                f"{length}-element nonnegative integer array"
+            )
+        return value
+
+    for record, threads in zip(
+        records, ENVIRONMENT_RESOURCE_COLLISION_THREADS, strict=True
+    ):
+        if set(record) != ENVIRONMENT_RESOURCE_COLLISION_FIELDS:
+            missing = sorted(ENVIRONMENT_RESOURCE_COLLISION_FIELDS - set(record))
+            extra = sorted(set(record) - ENVIRONMENT_RESOURCE_COLLISION_FIELDS)
+            raise EvidenceError(
+                "environment-resource-collision v1 field mismatch: "
+                f"missing={missing!r} extra={extra!r}"
+            )
+        for key, expected in expected_identity.items():
+            if record.get(key) != expected:
+                raise EvidenceError(
+                    f"environment-resource-collision {key} "
+                    f"{record.get(key)!r}, expected {expected!r}"
+                )
+        exact_integer(
+            record, "version", ENVIRONMENT_RESOURCE_COLLISION_VERSION
+        )
+        exact_integer(
+            record,
+            "collision_cardinality",
+            ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+        )
+        exact_integer(record, "threads", threads)
+        exact_integer(record, "workers_built", threads)
+        exact_integer(record, "distinct_insertion_orders", threads)
+        exact_integer(record, "promotion_cardinality", 9)
+        exact_integer(record, "demotion_cardinality", 8)
+        exact_integer(record, "process_exit", 0)
+        if record.get("run_id") != expected_run_id:
+            raise EvidenceError(
+                "environment-resource-collision detail run id mismatch"
+            )
+        if record.get("cwd") != expected_cwd:
+            raise EvidenceError("environment-resource-collision detail cwd mismatch")
+        if record.get("argv") != [expected_argv]:
+            raise EvidenceError("environment-resource-collision detail argv mismatch")
+        if (
+            record.get("stdout_artifact") != expected_stdout_artifact
+            or record.get("stderr_artifact") != expected_stderr_artifact
+        ):
+            raise EvidenceError(
+                "environment-resource-collision detail artifact identity mismatch"
+            )
+        if record.get("cache_state") != expected_cache_state:
+            raise EvidenceError(
+                "environment-resource-collision detail cache-state mismatch"
+            )
+        platform_value = record.get("platform")
+        if (
+            not isinstance(platform_value, str)
+            or not platform_value
+            or "-" not in platform_value
+        ):
+            raise EvidenceError(
+                "environment-resource-collision platform identity is malformed"
+            )
+        if shared_platform is None:
+            shared_platform = platform_value
+        elif platform_value != shared_platform:
+            raise EvidenceError(
+                "environment-resource-collision platform changed across schedules"
+            )
+        if record.get("schedule_id") != f"partitioned-{threads}":
+            raise EvidenceError(
+                "environment-resource-collision schedule id mismatch"
+            )
+
+        expected_representative = environment_collision_insertion_order(
+            ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY, threads, 0
+        )
+        if record.get("representative_insertion_order") != expected_representative:
+            raise EvidenceError(
+                "environment-resource-collision representative insertion "
+                f"order differs for threads={threads}"
+            )
+        expected_insertion_roots = list(
+            ENVIRONMENT_RESOURCE_COLLISION_INSERTION_ROOTS[threads]
+        )
+        if record.get("worker_insertion_order_roots") != expected_insertion_roots:
+            raise EvidenceError(
+                "environment-resource-collision worker insertion roots "
+                f"differ for threads={threads}"
+            )
+        if len(set(expected_insertion_roots)) != threads:
+            raise EvidenceError(
+                "environment-resource-collision pinned worker schedules "
+                "are not distinct"
+            )
+        if record.get("expected_order") != canonical_order:
+            raise EvidenceError(
+                "environment-resource-collision expected order is not canonical"
+            )
+        if record.get("actual_order") != canonical_order:
+            raise EvidenceError(
+                "environment-resource-collision actual order is not canonical"
+            )
+        if record.get("worker_enumeration_roots") != [
+            ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision worker enumeration roots differ"
+            )
+        if record.get("worker_roots") != [
+            ENVIRONMENT_RESOURCE_COLLISION_ROOT
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision worker roots differ"
+            )
+        if record.get("worker_recovery_roots") != [
+            ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision worker recovery roots differ"
+            )
+
+        comparisons = integer_vector(record.get("comparisons"), "comparisons", threads)
+        fresh_map_nodes = integer_vector(
+            record.get("fresh_map_nodes"), "fresh_map_nodes", threads
+        )
+        fresh_collision_nodes = integer_vector(
+            record.get("fresh_collision_nodes"), "fresh_collision_nodes", threads
+        )
+        cloned_inline_entries = integer_vector(
+            record.get("cloned_inline_entries"), "cloned_inline_entries", threads
+        )
+        final_collision_nodes = integer_vector(
+            record.get("final_collision_nodes"), "final_collision_nodes", threads
+        )
+        snapshot_root_arc_bumps = integer_vector(
+            record.get("snapshot_root_arc_bumps"),
+            "snapshot_root_arc_bumps",
+            threads,
+        )
+        snapshot_shared_nodes = integer_vector(
+            record.get("snapshot_shared_collision_nodes"),
+            "snapshot_shared_collision_nodes",
+            threads,
+        )
+        append_shared_nodes = integer_vector(
+            record.get("append_shared_collision_nodes"),
+            "append_shared_collision_nodes",
+            threads,
+        )
+        append_fresh_nodes = integer_vector(
+            record.get("append_fresh_nodes"), "append_fresh_nodes", threads
+        )
+        lookup_comparisons = integer_vector(
+            record.get("max_lookup_comparisons"),
+            "max_lookup_comparisons",
+            threads,
+        )
+        if any(value <= 0 or value > 18_000 for value in comparisons):
+            raise EvidenceError(
+                "environment-resource-collision comparison bound exceeded"
+            )
+        if fresh_map_nodes != [ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY] * threads:
+            raise EvidenceError(
+                "environment-resource-collision fresh map-node count differs"
+            )
+        if any(value <= 0 or value > 18_000 for value in fresh_collision_nodes):
+            raise EvidenceError(
+                "environment-resource-collision construction allocation "
+                "bound exceeded"
+            )
+        if cloned_inline_entries != [36] * threads:
+            raise EvidenceError(
+                "environment-resource-collision inline clone count differs"
+            )
+        if final_collision_nodes != [
+            ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision final node count differs"
+            )
+        if snapshot_root_arc_bumps != [1] * threads:
+            raise EvidenceError(
+                "environment-resource-collision snapshot root identity differs"
+            )
+        if snapshot_shared_nodes != [
+            ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision snapshot sharing differs"
+            )
+        if any(
+            value < 983
+            or value > ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+            for value in append_shared_nodes
+        ):
+            raise EvidenceError(
+                "environment-resource-collision append sharing bound violated"
+            )
+        if any(value <= 0 or value > 18 for value in append_fresh_nodes):
+            raise EvidenceError(
+                "environment-resource-collision append allocation bound exceeded"
+            )
+        if any(value <= 0 or value > 14 for value in lookup_comparisons):
+            raise EvidenceError(
+                "environment-resource-collision lookup comparison bound exceeded"
+            )
+
+        budget = record.get("budget")
+        if not isinstance(budget, dict) or set(budget) != {
+            "max_collision_entries",
+            "max_expanded_weight",
+            "admission_max_fresh_nodes",
+            "refusal_max_fresh_nodes",
+            "refusal_resource",
+            "refusal_attempted",
+            "failure_atomic",
+            "exact_boundary_recovery",
+        }:
+            raise EvidenceError(
+                "environment-resource-collision budget is malformed"
+            )
+        for key in ("max_collision_entries", "max_expanded_weight"):
+            value = budget.get(key)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value != ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY + 1
+            ):
+                raise EvidenceError(
+                    f"environment-resource-collision budget {key} differs"
+                )
+        if integer_vector(
+            budget.get("admission_max_fresh_nodes"),
+            "budget.admission_max_fresh_nodes",
+            threads,
+        ) != [18] * threads:
+            raise EvidenceError(
+                "environment-resource-collision admission allocation differs"
+            )
+        if integer_vector(
+            budget.get("refusal_max_fresh_nodes"),
+            "budget.refusal_max_fresh_nodes",
+            threads,
+        ) != [17] * threads:
+            raise EvidenceError(
+                "environment-resource-collision refusal limit differs"
+            )
+        if integer_vector(
+            budget.get("refusal_attempted"),
+            "budget.refusal_attempted",
+            threads,
+        ) != [18] * threads:
+            raise EvidenceError(
+                "environment-resource-collision refusal attempt differs"
+            )
+        if budget.get("refusal_resource") != "FreshNodes":
+            raise EvidenceError(
+                "environment-resource-collision refusal resource differs"
+            )
+        if budget.get("failure_atomic") is not True:
+            raise EvidenceError(
+                "environment-resource-collision refusal was not failure-atomic"
+            )
+        if budget.get("exact_boundary_recovery") is not True:
+            raise EvidenceError(
+                "environment-resource-collision exact-bound recovery failed"
+            )
+        if record.get("bounds") != expected_bounds:
+            raise EvidenceError(
+                "environment-resource-collision bounds differ from the pin"
+            )
+        if record.get("resources") != {
+            "expanded_weight": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+            "environment_entries": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+            "timing_used_as_gate": False,
+        }:
+            raise EvidenceError(
+                "environment-resource-collision resource facts differ"
+            )
+
+        start_us = record.get("monotonic_start_us")
+        end_us = record.get("monotonic_end_us")
+        duration_us = record.get("duration_us")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (start_us, end_us, duration_us)
+        ):
+            raise EvidenceError(
+                "environment-resource-collision timing facts are malformed"
+            )
+        if end_us - start_us != duration_us or start_us < previous_end:
+            raise EvidenceError(
+                "environment-resource-collision timing facts are inconsistent"
+            )
+        previous_end = end_us
+        if record.get("timing_used_as_gate") is not False:
+            raise EvidenceError(
+                "environment-resource-collision timing was promoted to a gate"
+            )
+        if record.get("signal") is not None or record.get("first_divergence") is not None:
+            raise EvidenceError(
+                "passing environment-resource-collision claims a failure"
+            )
+
+    return {
+        "schema": "fln.validation/1",
+        "validator": "environment-resource-collision/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "phase": phase,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "thread_matrix": list(ENVIRONMENT_RESOURCE_COLLISION_THREADS),
+        "collision_cardinality": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+        "canonical_input_root": ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT,
+        "collision_hash": ENVIRONMENT_RESOURCE_COLLISION_HASH,
+        "environment_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+        "recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
         "stdout_artifact": stdout_relative,
         "stderr_artifact": stderr_relative,
         "stdout_sha256": stdout_digest,
@@ -9108,6 +9921,41 @@ def cmd_validate_verdict_schema(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_environment_resource_collision(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    stdout_path = require_within(
+        Path(args.file), artifact_root, label="environment-resource-collision log"
+    )
+    stderr_path = require_within(
+        Path(args.stderr_file),
+        artifact_root,
+        label="environment-resource-collision stderr",
+    )
+    report = validate_environment_resource_collision(
+        stdout_path,
+        stderr_path,
+        args.phase,
+        args.expected_run_id,
+        args.observed_exit,
+        artifact_root=artifact_root,
+        expected_stdout_artifact=args.expected_stdout_artifact,
+        expected_stderr_artifact=args.expected_stderr_artifact,
+        expected_cwd=args.expected_cwd,
+        expected_argv=args.expected_argv,
+        expected_cache_state=args.expected_cache_state,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="environment-resource-collision validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_validate_kernel_admission(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
     stdout_path = require_within(
@@ -12418,6 +13266,500 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         }
     )
 
+    resource_validation_root = case_dir(
+        "environment_resource_collision_validation"
+    )
+    resource_run_id = "resource-collision-self-test"
+    resource_cwd = str(art_dir)
+    resource_argv = (
+        "cargo test --locked -q -p fln-env "
+        f"{ENVIRONMENT_RESOURCE_COLLISION_TEST} -- --exact --nocapture"
+    )
+    resource_cache_state = "self-test-cache"
+    resource_order = list(range(ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY))
+
+    def resource_detail_record(
+        threads: int,
+        start_us: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema": ENVIRONMENT_RESOURCE_COLLISION_SCHEMA,
+            "version": ENVIRONMENT_RESOURCE_COLLISION_VERSION,
+            "run_id": resource_run_id,
+            "bead": "fln-amv.13",
+            "claim_id": "fln-amv.13-resource-bounded-collisions",
+            "claim_type": "bounded_model",
+            "invariant_id": "FL-INV-01",
+            "invariant_relation": "supports-local-pmap-slice",
+            "gate_id": "PG-5",
+            "gate_relation": "partial-component-evidence",
+            "parity_ledger_row": (
+                "not_applicable_internal_data_structure_resource_bound"
+            ),
+            "data_grade": "verified",
+            "epoch": "lean-v4.32.0",
+            "mode": "sound",
+            "profile": "e2e",
+            "platform": "linux-x86_64",
+            "seed": "partition-rotation-v1",
+            "cache_state": resource_cache_state,
+            "canonical_input_root": ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT,
+            "scenario": "collision-resource-schedule-matrix",
+            "schedule_id": f"partitioned-{threads}",
+            "status": "pass",
+            "cwd": resource_cwd,
+            "argv": [resource_argv],
+            "stdout_artifact": stdout_artifact,
+            "stderr_artifact": stderr_artifact,
+            "collision_cardinality": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+            "collision_hash": ENVIRONMENT_RESOURCE_COLLISION_HASH,
+            "threads": threads,
+            "workers_built": threads,
+            "distinct_insertion_orders": threads,
+            "representative_insertion_order": (
+                environment_collision_insertion_order(
+                    ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY, threads, 0
+                )
+            ),
+            "worker_insertion_order_roots": list(
+                ENVIRONMENT_RESOURCE_COLLISION_INSERTION_ROOTS[threads]
+            ),
+            "expected_order": resource_order,
+            "actual_order": resource_order,
+            "worker_enumeration_roots": [
+                ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT
+            ]
+            * threads,
+            "expected_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+            "actual_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+            "worker_roots": [ENVIRONMENT_RESOURCE_COLLISION_ROOT] * threads,
+            "expected_recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+            "actual_recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+            "worker_recovery_roots": [
+                ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT
+            ]
+            * threads,
+            "representation_tier": "persistent-avl",
+            "secondary_identity": "exact-PKey-Ord-with-Eq-consistency",
+            "secondary_hashing": "none",
+            "secondary_identity_collision_behavior": (
+                "Ord-equal-overwrites;Ord-distinct-path-copies"
+            ),
+            "promotion_cardinality": 9,
+            "demotion_cardinality": 8,
+            "comparisons": [9_000] * threads,
+            "fresh_map_nodes": [
+                ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+            ]
+            * threads,
+            "fresh_collision_nodes": [11_000] * threads,
+            "cloned_inline_entries": [36] * threads,
+            "final_collision_nodes": [
+                ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+            ]
+            * threads,
+            "snapshot_root_arc_bumps": [1] * threads,
+            "snapshot_shared_collision_nodes": [
+                ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+            ]
+            * threads,
+            "append_shared_collision_nodes": [990] * threads,
+            "append_fresh_nodes": [12] * threads,
+            "max_lookup_comparisons": [11] * threads,
+            "budget": {
+                "max_collision_entries": (
+                    ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY + 1
+                ),
+                "max_expanded_weight": (
+                    ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY + 1
+                ),
+                "admission_max_fresh_nodes": [18] * threads,
+                "refusal_max_fresh_nodes": [17] * threads,
+                "refusal_resource": "FreshNodes",
+                "refusal_attempted": [18] * threads,
+                "failure_atomic": True,
+                "exact_boundary_recovery": True,
+            },
+            "bounds": {
+                "construction_comparisons": 18_000,
+                "inline_cloned_entries": 36,
+                "append_minimum_shared_nodes": 983,
+                "lookup_comparisons": 14,
+                "maximum_avl_height": 14,
+                "tree_fresh_nodes_per_insert": 17,
+                "legacy_vector_copies": 499_500,
+            },
+            "resources": {
+                "expanded_weight": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+                "environment_entries": (
+                    ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+                ),
+                "timing_used_as_gate": False,
+            },
+            "monotonic_start_us": start_us,
+            "monotonic_end_us": start_us + 5,
+            "duration_us": 5,
+            "timing_used_as_gate": False,
+            "process_exit": 0,
+            "signal": None,
+            "first_divergence": None,
+            "cleanup_status": "retained_by_policy",
+            "final_state": "typed-refusal-followed-by-exact-bound-recovery",
+        }
+
+    def resource_records_for(
+        stdout_artifact: str, stderr_artifact: str
+    ) -> list[dict[str, Any]]:
+        return [
+            resource_detail_record(
+                threads, index * 10, stdout_artifact, stderr_artifact
+            )
+            for index, threads in enumerate(
+                ENVIRONMENT_RESOURCE_COLLISION_THREADS
+            )
+        ]
+
+    def resource_pass_log(records: list[dict[str, Any]]) -> bytes:
+        return (
+            b"running 1 test\n"
+            + b"".join(canonical_json(record) for record in records)
+            + b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
+        )
+
+    def resource_validate(
+        stdout_path: Path,
+        stderr_path: Path,
+        phase: str,
+        observed_exit: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+    ) -> dict[str, Any]:
+        return validate_environment_resource_collision(
+            stdout_path,
+            stderr_path,
+            phase,
+            resource_run_id,
+            observed_exit,
+            artifact_root=resource_validation_root,
+            expected_stdout_artifact=stdout_artifact,
+            expected_stderr_artifact=stderr_artifact,
+            expected_cwd=resource_cwd,
+            expected_argv=resource_argv,
+            expected_cache_state=resource_cache_state,
+        )
+
+    def expect_resource_rejection(
+        label: str,
+        stdout_path: Path,
+        stderr_path: Path,
+        phase: str,
+        observed_exit: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+        *,
+        expected_message: str | None = None,
+    ) -> None:
+        try:
+            resource_validate(
+                stdout_path,
+                stderr_path,
+                phase,
+                observed_exit,
+                stdout_artifact,
+                stderr_artifact,
+            )
+        except (EvidenceError, OSError) as error:
+            if expected_message is not None:
+                require(
+                    expected_message in str(error),
+                    f"{label} rejected for the wrong reason: {error}",
+                )
+        else:
+            raise EvidenceError(f"{label} was accepted")
+
+    resource_positive_stdout = "resource_positive.out"
+    resource_positive_stderr = "resource_positive.err"
+    resource_positive_records = resource_records_for(
+        resource_positive_stdout, resource_positive_stderr
+    )
+    resource_positive_bytes = resource_pass_log(resource_positive_records)
+    resource_positive = resource_validation_root / resource_positive_stdout
+    resource_positive_err = resource_validation_root / resource_positive_stderr
+    write_new(resource_positive, resource_positive_bytes)
+    write_new(resource_positive_err, b"")
+    resource_report = resource_validate(
+        resource_positive,
+        resource_positive_err,
+        "positive",
+        0,
+        resource_positive_stdout,
+        resource_positive_stderr,
+    )
+    require(
+        resource_report["records"]
+        == len(ENVIRONMENT_RESOURCE_COLLISION_THREADS),
+        "valid resource-collision evidence lost schedule records",
+    )
+    require(
+        resource_report["canonical_input_root"]
+        == ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT
+        and resource_report["environment_root"]
+        == ENVIRONMENT_RESOURCE_COLLISION_ROOT
+        and resource_report["recovery_root"]
+        == ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+        "valid resource-collision evidence lost its pinned roots",
+    )
+
+    resource_recovery_stdout = "resource_recovery.out"
+    resource_recovery_stderr = "resource_recovery.err"
+    resource_recovery = resource_validation_root / resource_recovery_stdout
+    resource_recovery_err = resource_validation_root / resource_recovery_stderr
+    write_new(
+        resource_recovery,
+        resource_pass_log(
+            resource_records_for(
+                resource_recovery_stdout, resource_recovery_stderr
+            )
+        ),
+    )
+    write_new(resource_recovery_err, b"warning: benign recovery diagnostic\n")
+    recovery_report = resource_validate(
+        resource_recovery,
+        resource_recovery_err,
+        "recovery",
+        0,
+        resource_recovery_stdout,
+        resource_recovery_stderr,
+    )
+    require(
+        recovery_report["phase"] == "recovery",
+        "valid resource-collision recovery lost its phase identity",
+    )
+
+    def resource_record_rejection(
+        label: str,
+        mutation: Callable[[list[dict[str, Any]]], None],
+        expected_message: str,
+    ) -> None:
+        stdout_artifact = f"resource_{label}.out"
+        stderr_artifact = f"resource_{label}.err"
+        records = parse_json(
+            json.dumps(resource_records_for(stdout_artifact, stderr_artifact)),
+            subject=f"resource-collision self-test {label}",
+        )
+        mutation(records)
+        stdout_path = resource_validation_root / stdout_artifact
+        stderr_path = resource_validation_root / stderr_artifact
+        write_new(stdout_path, resource_pass_log(records))
+        write_new(stderr_path, b"")
+        expect_resource_rejection(
+            label,
+            stdout_path,
+            stderr_path,
+            "positive",
+            0,
+            stdout_artifact,
+            stderr_artifact,
+            expected_message=expected_message,
+        )
+
+    resource_record_rejection(
+        "missing_field",
+        lambda records: records[0].pop("resources"),
+        "field mismatch",
+    )
+    resource_record_rejection(
+        "extra_field",
+        lambda records: records[0].__setitem__("unexpected", True),
+        "field mismatch",
+    )
+    resource_record_rejection(
+        "stale_input_root",
+        lambda records: records[0].__setitem__(
+            "canonical_input_root", f"fln-fixture:{'0' * 64}"
+        ),
+        "canonical_input_root",
+    )
+    resource_record_rejection(
+        "stale_environment_root",
+        lambda records: records[0].__setitem__("actual_root", "0" * 64),
+        "actual_root",
+    )
+    resource_record_rejection(
+        "wrong_order",
+        lambda records: records[1].__setitem__(
+            "actual_order", list(reversed(resource_order))
+        ),
+        "actual order is not canonical",
+    )
+    resource_record_rejection(
+        "duplicate_schedule",
+        lambda records: records[1]["worker_insertion_order_roots"].__setitem__(
+            1, records[1]["worker_insertion_order_roots"][0]
+        ),
+        "worker insertion roots differ",
+    )
+    resource_record_rejection(
+        "wrong_threshold",
+        lambda records: records[0].__setitem__("promotion_cardinality", 10),
+        "promotion_cardinality",
+    )
+    resource_record_rejection(
+        "comparison_over_bound",
+        lambda records: records[2]["comparisons"].__setitem__(0, 18_001),
+        "comparison bound exceeded",
+    )
+    resource_record_rejection(
+        "allocation_over_bound",
+        lambda records: records[2]["append_fresh_nodes"].__setitem__(0, 19),
+        "append allocation bound exceeded",
+    )
+    resource_record_rejection(
+        "false_atomicity",
+        lambda records: records[0]["budget"].__setitem__(
+            "failure_atomic", False
+        ),
+        "not failure-atomic",
+    )
+    resource_record_rejection(
+        "timing_gate",
+        lambda records: records[0].__setitem__("timing_used_as_gate", True),
+        "timing was promoted to a gate",
+    )
+
+    resource_mutant_stdout = "resource_mutant.out"
+    resource_mutant_stderr = "resource_mutant.err"
+    resource_mutant = resource_validation_root / resource_mutant_stdout
+    resource_mutant_err = resource_validation_root / resource_mutant_stderr
+    resource_mutant_stdout_bytes = (
+        "running 1 test\n"
+        f"{ENVIRONMENT_RESOURCE_COLLISION_TEST} --- FAILED\n\n"
+        "failures:\n"
+        f"    {ENVIRONMENT_RESOURCE_COLLISION_TEST}\n\n"
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n"
+    ).encode()
+    resource_mutant_stderr_bytes = (
+        f"thread '{ENVIRONMENT_RESOURCE_COLLISION_TEST}' "
+        "panicked at crates/fln-env/src/pmap.rs:3222:17:\n"
+        f"{ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER}\n"
+        "error: test failed, to rerun pass `-p fln-env --lib`\n"
+    ).encode()
+    write_new(resource_mutant, resource_mutant_stdout_bytes)
+    write_new(resource_mutant_err, resource_mutant_stderr_bytes)
+    resource_mutant_report = resource_validate(
+        resource_mutant,
+        resource_mutant_err,
+        "mutant",
+        101,
+        resource_mutant_stdout,
+        resource_mutant_stderr,
+    )
+    require(
+        resource_mutant_report["failed_test"]
+        == ENVIRONMENT_RESOURCE_COLLISION_TEST,
+        "resource-collision mutant validation lost the failed test identity",
+    )
+
+    resource_wrong_assertion = (
+        resource_validation_root / "resource_wrong_assertion.err"
+    )
+    write_new(
+        resource_wrong_assertion,
+        resource_mutant_stderr_bytes.replace(b"left: 28", b"left: 27"),
+    )
+    expect_resource_rejection(
+        "wrong resource-collision assertion",
+        resource_mutant,
+        resource_wrong_assertion,
+        "mutant",
+        101,
+        resource_mutant_stdout,
+        "resource_wrong_assertion.err",
+        expected_message="inline-threshold assertion marker",
+    )
+
+    resource_missing_marker = (
+        resource_validation_root / "resource_missing_marker.err"
+    )
+    write_new(
+        resource_missing_marker,
+        resource_mutant_stderr_bytes.replace(
+            ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER.encode(),
+            b"assertion failed without the planted threshold signature",
+        ),
+    )
+    expect_resource_rejection(
+        "missing resource-collision mutant marker",
+        resource_mutant,
+        resource_missing_marker,
+        "mutant",
+        101,
+        resource_mutant_stdout,
+        "resource_missing_marker.err",
+        expected_message="inline-threshold assertion marker",
+    )
+
+    resource_compile_stdout = "resource_compile_failure.out"
+    resource_compile_stderr = "resource_compile_failure.err"
+    resource_compile = resource_validation_root / resource_compile_stdout
+    resource_compile_err = resource_validation_root / resource_compile_stderr
+    write_new(resource_compile, b"running 0 tests\n")
+    write_new(
+        resource_compile_err, b"error: could not compile `fln-env` (lib test)\n"
+    )
+    expect_resource_rejection(
+        "resource-collision compile failure",
+        resource_compile,
+        resource_compile_err,
+        "mutant",
+        101,
+        resource_compile_stdout,
+        resource_compile_stderr,
+        expected_message="named FAILED test result",
+    )
+
+    resource_merged_stdout = "resource_merged.out"
+    resource_merged_stderr = "resource_merged.err"
+    resource_merged = resource_validation_root / resource_merged_stdout
+    resource_merged_err = resource_validation_root / resource_merged_stderr
+    write_new(
+        resource_merged,
+        resource_mutant_stdout_bytes + resource_mutant_stderr_bytes,
+    )
+    write_new(resource_merged_err, b"")
+    expect_resource_rejection(
+        "merged resource-collision streams",
+        resource_merged,
+        resource_merged_err,
+        "mutant",
+        101,
+        resource_merged_stdout,
+        resource_merged_stderr,
+        expected_message="assertion marker leaked into stdout",
+    )
+    expect_resource_rejection(
+        "surviving resource-collision mutant",
+        resource_positive,
+        resource_positive_err,
+        "mutant",
+        0,
+        resource_positive_stdout,
+        resource_positive_stderr,
+        expected_message="mutant exit 0",
+    )
+    cases.append(
+        {
+            "case": "environment_resource_collision_validation",
+            "ok": True,
+            "positive": str(resource_positive),
+            "mutant": str(resource_mutant),
+            "recovery": str(resource_recovery),
+            "negative_cases": 16,
+        }
+    )
+
     admission_validation_root = case_dir("kernel_admission_validation")
     admission_run_id = "kernel-admission-self-test"
     admission_cwd = str(art_dir)
@@ -14233,6 +15575,34 @@ def build_parser() -> argparse.ArgumentParser:
     collision_parser.add_argument("--artifact-root", required=True)
     collision_parser.add_argument("--output")
     collision_parser.set_defaults(func=cmd_validate_environment_collision)
+
+    resource_collision_parser = subparsers.add_parser(
+        "validate-environment-resource-collision",
+        help="validate fln-amv.13 collision resource-bound or mutant evidence",
+    )
+    resource_collision_parser.add_argument("--file", required=True)
+    resource_collision_parser.add_argument("--stderr-file", required=True)
+    resource_collision_parser.add_argument(
+        "--phase", required=True, choices=("positive", "mutant", "recovery")
+    )
+    resource_collision_parser.add_argument("--expected-run-id", required=True)
+    resource_collision_parser.add_argument(
+        "--observed-exit", type=int, required=True
+    )
+    resource_collision_parser.add_argument("--expected-cwd")
+    resource_collision_parser.add_argument("--expected-argv")
+    resource_collision_parser.add_argument(
+        "--expected-stdout-artifact", required=True
+    )
+    resource_collision_parser.add_argument(
+        "--expected-stderr-artifact", required=True
+    )
+    resource_collision_parser.add_argument("--expected-cache-state")
+    resource_collision_parser.add_argument("--artifact-root", required=True)
+    resource_collision_parser.add_argument("--output")
+    resource_collision_parser.set_defaults(
+        func=cmd_validate_environment_resource_collision
+    )
 
     verdict_parser = subparsers.add_parser(
         "validate-verdict-schema",
