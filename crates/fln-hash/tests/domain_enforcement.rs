@@ -54,6 +54,35 @@ fn code_before_comment(line: &str) -> &str {
     line
 }
 
+/// Whether `code` names the raw hasher as a Rust identifier rather than as part of a longer
+/// word.
+///
+/// A path segment is bounded by non-word characters on both sides: `fln_hash::blake3`,
+/// `blake3::hash`, `mod blake3`, `use ...::blake3 as _` all qualify; `convert_blake3_vectors`
+/// does not, because a `_` on either side makes it one longer identifier and no such
+/// identifier can resolve to the module.
+fn names_raw_hasher(code: &str) -> bool {
+    const NEEDLE: &str = "blake3";
+    let bytes = code.as_bytes();
+    let mut from = 0usize;
+    while let Some(offset) = code[from..].find(NEEDLE) {
+        let start = from + offset;
+        let end = start + NEEDLE.len();
+        let before_is_word = start
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        let after_is_word = bytes
+            .get(end)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if !before_is_word && !after_is_word {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// Occurrences of a raw-hashing reference in one file: (line number, line text).
 fn raw_hash_references(source: &str) -> Vec<(usize, String)> {
     let mut findings = Vec::new();
@@ -63,7 +92,15 @@ fn raw_hash_references(source: &str) -> Vec<(usize, String)> {
         // sanctioned vocabulary and never names `blake3`. Scanning the code portion
         // (comment stripped string-aware) keeps genuine comment mentions exempt while
         // never letting a string-embedded `//` hide a real reference.
-        if code_before_comment(line).contains("blake3") {
+        //
+        // The match must be on the WHOLE identifier. A substring match also fires on
+        // `convert_blake3_vectors.py` — a *filename* naming the extraction script that
+        // generates our fixtures, which is not a reference to the hasher at all. That
+        // false positive turned the workspace red for everyone, and loosening the guard
+        // to an exemption list would have been the wrong repair: the reference we are
+        // hunting is always a path segment, so requiring a path segment is both narrower
+        // and strictly more accurate than listing the files allowed to say the word.
+        if names_raw_hasher(code_before_comment(line)) {
             findings.push((idx + 1, line.trim().to_string()));
         }
     }
@@ -144,6 +181,39 @@ fn member_source_files(member_dir: &Path) -> Vec<PathBuf> {
         files.push(build_rs);
     }
     files
+}
+
+/// The scanner's own predicate, including the false positive that made this test fail and
+/// the blind spot the narrowing leaves behind.
+///
+/// The blind spot is asserted rather than hidden: a name like `blake3_hash` would not be
+/// caught by this text scan. That is acceptable *because this scan is the backstop, not the
+/// enforcement* — `blake3` is `pub(crate)`, so no such path compiles out of crate, and
+/// `rustc_refuses_an_out_of_crate_reference_to_the_raw_hasher` is what proves it. The text
+/// scan exists to catch the day someone widens that visibility. Recording the limit here
+/// keeps the two guards' division of labour explicit instead of implying this one is total.
+#[test]
+fn the_scanner_matches_a_path_segment_not_any_word_containing_it() {
+    // Real references, all of them path segments.
+    assert!(names_raw_hasher("use fln_hash::blake3;"));
+    assert!(names_raw_hasher("    let h = blake3::hash(b\"x\");"));
+    assert!(names_raw_hasher("pub(crate) mod blake3;"));
+    assert!(names_raw_hasher("fln_hash::blake3::Hasher::new()"));
+
+    // The false positive that turned the workspace red: a filename, not a reference.
+    assert!(!names_raw_hasher(
+        "\"scripts/extract/convert_blake3_vectors.py\","
+    ));
+    assert!(!names_raw_hasher("let convert_blake3_vectors = 1;"));
+
+    // The recorded blind spot, and why it is tolerable — see this test's doc comment.
+    assert!(
+        !names_raw_hasher("blake3_hash(b\"x\")"),
+        "a trailing word character is out of this scan's reach; the compile probe covers it"
+    );
+
+    assert!(!names_raw_hasher("DomainHasher::new(Domain::Fixture)"));
+    assert!(!names_raw_hasher(""));
 }
 
 #[test]
