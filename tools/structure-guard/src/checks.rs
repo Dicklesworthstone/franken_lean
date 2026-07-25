@@ -43,6 +43,11 @@
 //!   logic without a reviewed, LOC-counted source mapping.
 //! * `FLN-STRUCT-031` an active SUITE.lock checkout or its commit identity cannot be
 //!   verified, so dependency-closure authority is inconclusive rather than clean.
+//! * `FLN-STRUCT-032` the canonical pin/target inventory is malformed, stale, or not
+//!   the exact bijective join of current `SUITE.lock` facts and reviewed policy.
+//! * `FLN-STRUCT-033` pin/target inventory authority is inconclusive: a publication
+//!   candidate remains, a governed source is unavailable, or a bounded publication
+//!   operation could not establish one complete generation.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -196,7 +201,7 @@ struct RustcProbe {
 }
 
 const GOVERNED_ROOT_FILES: [&str; 4] = ["Cargo.toml", LOCK_FILE, SUITE_LOCK_FILE, TOOLCHAIN_FILE];
-const GOVERNED_ROOT_DIRS: [&str; 3] = ["ci", "crates", "tools"];
+const GOVERNED_ROOT_DIRS: [&str; 4] = ["ci", "contracts", "crates", "tools"];
 pub const AUTHORITY_COUNT_RULE: &str = "files_scanned+files_skipped_unreadable=files_discovered";
 
 fn fnv_update(mut state: u64, bytes: &[u8]) -> u64 {
@@ -1935,6 +1940,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // Cargo.lock ⇄ ci/CLOSURE_ALLOWLIST.txt ⇄ SUITE.lock ⇄ rust-toolchain.toml. Missing
     // or malformed governance files degrade to findings, never to a silent skip.
     findings.extend(crate::lockfile::audit(root, &g));
+    findings.extend(crate::contract_inventory::audit(root));
 
     if compiler_identity.contract_declared && !compiler_identity.contract_match {
         findings.push(Finding {
@@ -2023,7 +2029,11 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     let authority = if findings.iter().any(|finding| {
         matches!(
             finding.code,
-            "FLN-STRUCT-027" | "FLN-STRUCT-028" | "FLN-STRUCT-029" | "FLN-STRUCT-031"
+            "FLN-STRUCT-027"
+                | "FLN-STRUCT-028"
+                | "FLN-STRUCT-029"
+                | "FLN-STRUCT-031"
+                | "FLN-STRUCT-033"
         )
     }) {
         Authority::Incomplete

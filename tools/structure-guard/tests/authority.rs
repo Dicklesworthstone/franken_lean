@@ -28,6 +28,7 @@ use std::thread;
 use std::time::Duration;
 
 use common::*;
+use structure_guard::CONTRACT_INVENTORY_POLICY_FILE;
 use structure_guard::checks::Authority;
 
 // Finding codes as named constants: a matrix suite reads better when the code under test
@@ -428,6 +429,13 @@ fn feature_profile_and_host_target_axes_are_closed() {
         &SUITE_LOCK_FIXTURE.replace(
             "target x86_64-unknown-linux-gnu",
             "target aarch64-unknown-linux-gnu\ntarget x86_64-unknown-linux-gnu",
+        ),
+    );
+    targets.write(
+        CONTRACT_INVENTORY_POLICY_FILE,
+        &CONTRACT_INVENTORY_POLICY_FIXTURE.replace(
+            "row toolchain",
+            "row target:0002 kind=target support=required target-class=certified abi-class=none\nrow toolchain",
         ),
     );
     let targets_out = targets.run();

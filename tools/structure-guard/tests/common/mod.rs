@@ -21,6 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use structure_guard::checks::{self, RunOutcome};
+use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
+use structure_guard::{
+    CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE, CONTRACT_INVENTORY_SCHEMA_FILE,
+    SUITE_LOCK_FILE,
+};
 
 /// An immutable workspace recipe. Every execution materializes a fresh, uniquely named
 /// root and retains it for inspection, as required by the repository's no-deletion rule.
@@ -75,7 +80,24 @@ impl TempWs {
             }
         };
 
-        for (rel, content) in self.files.borrow().iter() {
+        let mut files = self.files.borrow().clone();
+        if !files.contains_key(CONTRACT_INVENTORY_FILE)
+            && let (Some(suite_lock), Some(schema), Some(policy)) = (
+                files.get(SUITE_LOCK_FILE),
+                files.get(CONTRACT_INVENTORY_SCHEMA_FILE),
+                files.get(CONTRACT_INVENTORY_POLICY_FILE),
+            )
+            && let (Ok(suite_lock), Ok(schema), Ok(policy)) = (
+                std::str::from_utf8(suite_lock),
+                std::str::from_utf8(schema),
+                std::str::from_utf8(policy),
+            )
+            && let Ok(inventory) = canonical_inventory_text(suite_lock, schema, policy)
+        {
+            files.insert(CONTRACT_INVENTORY_FILE.to_string(), inventory.into_bytes());
+        }
+
+        for (rel, content) in &files {
             let path = root.join(rel);
             let parent = path
                 .parent()
@@ -161,6 +183,15 @@ suite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asuper
 crate asupersync repo=asupersync
 reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91
 corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997
+";
+
+pub const CONTRACT_INVENTORY_POLICY_FIXTURE: &str = "\
+schema fln-contract-inventory-policy/1
+row corpus kind=corpus support=required target-class=none abi-class=none
+row reference kind=reference support=required target-class=none abi-class=none
+row suite:asupersync kind=suite support=required target-class=none abi-class=none
+row target:0001 kind=target support=required target-class=certified abi-class=none
+row toolchain kind=toolchain support=required target-class=none abi-class=none
 ";
 
 /// The crates every base fixture materializes (name, is-boundary) — must stay in
@@ -264,6 +295,11 @@ pub fn base(ws: &TempWs) {
     );
     ws.write("rust-toolchain.toml", TOOLCHAIN_PIN);
     ws.write("SUITE.lock", SUITE_LOCK_FIXTURE);
+    ws.write(CONTRACT_INVENTORY_SCHEMA_FILE, SCHEMA_DEFINITION);
+    ws.write(
+        CONTRACT_INVENTORY_POLICY_FILE,
+        CONTRACT_INVENTORY_POLICY_FIXTURE,
+    );
     ws.write("Cargo.lock", &fixture_cargo_lock());
     ws.write("ci/CLOSURE_ALLOWLIST.txt", &fixture_allowlist());
     ws.write("ci/WORKSPACE_GRAPH.txt", BASE_GRAPH);

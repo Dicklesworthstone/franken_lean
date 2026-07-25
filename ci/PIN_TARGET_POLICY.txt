@@ -1,0 +1,14 @@
+schema fln-contract-inventory-policy/1
+row corpus kind=corpus support=required target-class=none abi-class=none
+row reference kind=reference support=required target-class=none abi-class=none
+row suite:asupersync kind=suite support=required target-class=none abi-class=none
+row suite:atp kind=suite support=required target-class=none abi-class=none
+row suite:fastmcp_rust kind=suite support=required target-class=none abi-class=none
+row suite:franken_markdown kind=suite support=required target-class=none abi-class=none
+row suite:franken_networkx kind=suite support=required target-class=none abi-class=none
+row suite:frankensearch kind=suite support=required target-class=none abi-class=none
+row suite:frankensqlite kind=suite support=required target-class=none abi-class=none
+row suite:frankentorch kind=suite support=optional target-class=none abi-class=none
+row suite:frankentui kind=suite support=required target-class=none abi-class=none
+row target:0001 kind=target support=required target-class=certified abi-class=none
+row toolchain kind=toolchain support=required target-class=none abi-class=none

@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use structure_guard::checks::{self, RunOutcome};
+use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
+use structure_guard::{
+    CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE, CONTRACT_INVENTORY_SCHEMA_FILE,
+};
 
 /// Materialized retained fixture root (mirrors the seeded.rs no-deletion policy).
 fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
@@ -35,7 +39,38 @@ fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
         created.expect("create retained fixture root");
         break candidate;
     };
-    for (rel, content) in files {
+    let mut rendered_files: Vec<(String, String)> = files
+        .iter()
+        .map(|(rel, content)| {
+            (
+                rel.clone(),
+                content.replace(
+                    "@FIXTURE_ROOT@",
+                    root.to_str().expect("temporary fixture root is UTF-8"),
+                ),
+            )
+        })
+        .collect();
+    if !rendered_files
+        .iter()
+        .any(|(path, _)| path == CONTRACT_INVENTORY_FILE)
+    {
+        let source = |path: &str| {
+            rendered_files
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, content)| content.as_str())
+        };
+        if let (Some(suite_lock), Some(schema), Some(policy)) = (
+            source("SUITE.lock"),
+            source(CONTRACT_INVENTORY_SCHEMA_FILE),
+            source(CONTRACT_INVENTORY_POLICY_FILE),
+        ) && let Ok(inventory) = canonical_inventory_text(suite_lock, schema, policy)
+        {
+            rendered_files.push((CONTRACT_INVENTORY_FILE.to_string(), inventory));
+        }
+    }
+    for (rel, rendered) in &rendered_files {
         let path = root.join(rel);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         let mut f = OpenOptions::new()
@@ -43,10 +78,6 @@ fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
             .create_new(true)
             .open(&path)
             .expect("create fixture file without overwrite");
-        let rendered = content.replace(
-            "@FIXTURE_ROOT@",
-            root.to_str().expect("temporary fixture root is UTF-8"),
-        );
         f.write_all(rendered.as_bytes()).expect("write");
     }
     eprintln!("retained closure fixture: {}", root.display());
@@ -116,6 +147,15 @@ reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6
 corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997
 ";
 
+const CONTRACT_INVENTORY_POLICY: &str = "\
+schema fln-contract-inventory-policy/1
+row corpus kind=corpus support=required target-class=none abi-class=none
+row reference kind=reference support=required target-class=none abi-class=none
+row suite:asupersync kind=suite support=required target-class=none abi-class=none
+row target:0001 kind=target support=required target-class=certified abi-class=none
+row toolchain kind=toolchain support=required target-class=none abi-class=none
+";
+
 const TOOLCHAIN: &str =
     "[toolchain]\nchannel = \"nightly-2026-07-13\"\ncomponents = [\"rustfmt\", \"clippy\"]\n";
 
@@ -160,6 +200,14 @@ fn base_files() -> Vec<(String, String)> {
         ),
         ("ci/WORKSPACE_GRAPH.txt".to_string(), GRAPH.to_string()),
         ("ci/UNSAFE_LEDGER.txt".to_string(), LEDGER.to_string()),
+        (
+            CONTRACT_INVENTORY_SCHEMA_FILE.to_string(),
+            SCHEMA_DEFINITION.to_string(),
+        ),
+        (
+            CONTRACT_INVENTORY_POLICY_FILE.to_string(),
+            CONTRACT_INVENTORY_POLICY.to_string(),
+        ),
         ("SUITE.lock".to_string(), SUITE_LOCK.to_string()),
         ("rust-toolchain.toml".to_string(), TOOLCHAIN.to_string()),
     ];

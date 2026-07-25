@@ -24,6 +24,7 @@
 
 pub mod boundary_api;
 pub mod checks;
+pub mod contract_inventory;
 pub mod export_status;
 pub mod graph;
 pub mod ledger;
@@ -51,5 +52,13 @@ pub const SUITE_LOCK_FILE: &str = "SUITE.lock";
 pub const LOCK_FILE: &str = "Cargo.lock";
 /// Workspace-relative path of the toolchain pin that must agree with SUITE.lock.
 pub const TOOLCHAIN_FILE: &str = "rust-toolchain.toml";
+/// Workspace-relative path of the normative pin/target inventory schema.
+pub const CONTRACT_INVENTORY_SCHEMA_FILE: &str = "contracts/CONTRACT_INVENTORY_V1.txt";
+/// Workspace-relative path of the reviewed policy joined bijectively to raw pin rows.
+pub const CONTRACT_INVENTORY_POLICY_FILE: &str = "ci/PIN_TARGET_POLICY.txt";
+/// Workspace-relative path of the atomically published derived pin/target inventory.
+pub const CONTRACT_INVENTORY_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt";
+/// Interrupted-publication sibling. Its presence makes inventory authority inconclusive.
+pub const CONTRACT_INVENTORY_CANDIDATE_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt.candidate";
 /// NDJSON schema identifier for robot output.
 pub const NDJSON_SCHEMA: &str = "structure-guard/3";

@@ -12,7 +12,8 @@ mod common;
 use std::path::Path;
 
 use common::*;
-use structure_guard::checks;
+use structure_guard::CONTRACT_INVENTORY_CANDIDATE_FILE;
+use structure_guard::checks::{self, Authority};
 
 #[test]
 fn clean_fixture_passes() {
@@ -21,6 +22,22 @@ fn clean_fixture_passes() {
     let out = ws.run();
     assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
     assert_eq!(out.crate_count, FIXTURE_CRATES.len());
+}
+
+#[test]
+fn interrupted_contract_inventory_publication_is_typed_inconclusive() {
+    let ws = TempWs::new("contract-inventory-candidate");
+    base(&ws);
+    ws.write(
+        CONTRACT_INVENTORY_CANDIDATE_FILE,
+        "planted interrupted candidate\n",
+    );
+    let out = ws.run();
+    assert_eq!(codes(&out), vec!["FLN-STRUCT-033"]);
+    assert_eq!(out.authority, Authority::Incomplete);
+    assert_eq!(out.verdict(), "inconclusive");
+    assert_eq!(out.exit_code(), 3);
+    assert!(out.findings[0].detail.contains("reason=stale_candidate"));
 }
 
 #[test]
