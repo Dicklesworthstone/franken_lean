@@ -48,6 +48,8 @@
 //! * `FLN-STRUCT-033` pin/target inventory authority is inconclusive: a publication
 //!   candidate remains, a governed source is unavailable, or a bounded publication
 //!   operation could not establish one complete generation.
+//! * `FLN-STRUCT-034` kernel-contract ownership publication is inconclusive because an
+//!   interrupted/competing `.candidate` exists or its absence cannot be established.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -1941,6 +1943,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // or malformed governance files degrade to findings, never to a silent skip.
     findings.extend(crate::lockfile::audit(root, &g));
     findings.extend(crate::contract_inventory::audit(root));
+    findings.extend(crate::ownership_publication::audit(root));
 
     if compiler_identity.contract_declared && !compiler_identity.contract_match {
         findings.push(Finding {
@@ -2034,6 +2037,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                 | "FLN-STRUCT-029"
                 | "FLN-STRUCT-031"
                 | "FLN-STRUCT-033"
+                | "FLN-STRUCT-034"
         )
     }) {
         Authority::Incomplete

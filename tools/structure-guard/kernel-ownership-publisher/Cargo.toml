@@ -1,0 +1,15 @@
+[package]
+name = "kernel-ownership-publisher"
+version = "0.0.0"
+edition = "2024"
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+publish = false
+
+[dependencies]
+fln-hash = { path = "../../../crates/fln-hash" }
+
+# This tool is deliberately a nested workspace. Its dependency on the authoritative
+# fln-hash implementation must not add a tooling-only edge to the product workspace or
+# force unrelated agents to rewrite the root Cargo.lock.
+[workspace]
+resolver = "3"

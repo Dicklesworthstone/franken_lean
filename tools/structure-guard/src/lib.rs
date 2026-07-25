@@ -30,6 +30,7 @@ pub mod graph;
 pub mod ledger;
 pub mod lockfile;
 pub mod manifest;
+pub mod ownership_publication;
 pub mod report;
 
 /// Workspace-relative path of the reviewed graph acknowledgment file.
@@ -60,5 +61,7 @@ pub const CONTRACT_INVENTORY_POLICY_FILE: &str = "ci/PIN_TARGET_POLICY.txt";
 pub const CONTRACT_INVENTORY_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt";
 /// Interrupted-publication sibling. Its presence makes inventory authority inconclusive.
 pub const CONTRACT_INVENTORY_CANDIDATE_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt.candidate";
+/// Interrupted kernel-ownership publication. Presence makes evidence authority inconclusive.
+pub const KERNEL_OWNERSHIP_CANDIDATE_FILE: &str = "ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate";
 /// NDJSON schema identifier for robot output.
 pub const NDJSON_SCHEMA: &str = "structure-guard/3";
