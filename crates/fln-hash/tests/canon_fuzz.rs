@@ -40,7 +40,7 @@ use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap};
-use fln_hash::canon::{CanonError, Canonical};
+use fln_hash::canon::{CanonError, Canonical, DecodeBudget, Decoded, Exhausted};
 
 /// No single decode of these inputs may take longer than this. Generous enough to
 /// absorb a loaded CI box, tight enough that an unbounded allocation or a spin on a
@@ -166,6 +166,15 @@ enum Target {
     KVMap,
 }
 
+/// The budgeted outcome, flattened across the four artifact kinds so the sweep can
+/// reason about it without naming a type per target.
+enum Outcome {
+    Accepted,
+    NonCanonical { input: usize, canonical: usize },
+    Refused,
+    Inconclusive(Exhausted),
+}
+
 impl Target {
     /// Decode, then (on success) re-encode. `Ok(bytes)` is the canonical form the
     /// codec produced for whatever it accepted.
@@ -175,6 +184,32 @@ impl Target {
             Target::Level => Level::from_canonical_bytes(bytes).map(|v| v.to_canonical_bytes()),
             Target::Expr => Expr::from_canonical_bytes(bytes).map(|v| v.to_canonical_bytes()),
             Target::KVMap => KVMap::from_canonical_bytes(bytes).map(|v| v.to_canonical_bytes()),
+        }
+    }
+
+    fn round_trip_budgeted(self, bytes: &[u8], budget: DecodeBudget) -> Outcome {
+        fn classify<T: Canonical>(decoded: Decoded<T>, input: &[u8]) -> Outcome {
+            match decoded {
+                Decoded::Value(value) => {
+                    let canonical = value.to_canonical_bytes();
+                    if canonical == input {
+                        Outcome::Accepted
+                    } else {
+                        Outcome::NonCanonical {
+                            input: input.len(),
+                            canonical: canonical.len(),
+                        }
+                    }
+                }
+                Decoded::Malformed(_) => Outcome::Refused,
+                Decoded::Inconclusive(exhausted) => Outcome::Inconclusive(exhausted),
+            }
+        }
+        match self {
+            Target::Name => classify(Name::from_canonical_bytes_budgeted(bytes, budget), bytes),
+            Target::Level => classify(Level::from_canonical_bytes_budgeted(bytes, budget), bytes),
+            Target::Expr => classify(Expr::from_canonical_bytes_budgeted(bytes, budget), bytes),
+            Target::KVMap => classify(KVMap::from_canonical_bytes_budgeted(bytes, budget), bytes),
         }
     }
 }
@@ -264,6 +299,67 @@ fn check(target: Target, label: &str, bytes: &[u8], profile: &mut Profile) -> Op
             }
         }
     }
+}
+
+/// Budget-boundary sweep (bead fln-4zk8). The same bytes are decoded under a range
+/// of caller budgets, and the three-valued outcome is checked for properties that
+/// must hold whatever the budget was:
+///
+/// * an unlimited budget can never report exhaustion — if it does, the meter is
+///   charging something the caller never asked to limit;
+/// * an acceptance is canonical no matter how tight the budget was, so the meter
+///   cannot be a path to a sloppier accept;
+/// * a stop always reports spending more than it was allowed, so the record a
+///   caller would retry from is never nonsense;
+/// * decoding is monotone in the budget: what a small budget accepted, a bigger one
+///   must accept too. A meter that mutates decoder state would break this and
+///   nothing else would notice.
+fn check_budgets(target: Target, label: &str, bytes: &[u8]) -> Vec<String> {
+    let mut findings = Vec::new();
+    let unlimited = target.round_trip_budgeted(bytes, DecodeBudget::unlimited());
+    if let Outcome::Inconclusive(exhausted) = &unlimited {
+        findings.push(format!(
+            "{label}: an unlimited budget reported exhaustion ({exhausted:?})"
+        ));
+    }
+    let accepted_unlimited = matches!(unlimited, Outcome::Accepted);
+
+    let ceilings = [
+        DecodeBudget::new(u64::MAX, 0),
+        DecodeBudget::new(u64::MAX, 1),
+        DecodeBudget::new(u64::MAX, 8),
+        DecodeBudget::new(u64::MAX, 4096),
+        DecodeBudget::new(0, u64::MAX),
+        DecodeBudget::new(16, u64::MAX),
+        DecodeBudget::new(bytes.len() as u64, u64::MAX),
+    ];
+    for budget in ceilings {
+        match target.round_trip_budgeted(bytes, budget) {
+            Outcome::Accepted => {
+                if !accepted_unlimited {
+                    findings.push(format!(
+                        "{label}: budget {budget:?} accepted what an unlimited budget did not — \
+                         decoding is not monotone in the budget"
+                    ));
+                }
+            }
+            Outcome::NonCanonical { input, canonical } => findings.push(format!(
+                "{label}: budget {budget:?} accepted a non-canonical form \
+                 ({input} input bytes, {canonical} canonical)"
+            )),
+            Outcome::Refused => {}
+            Outcome::Inconclusive(exhausted) => {
+                if exhausted.observed <= exhausted.allowed {
+                    findings.push(format!(
+                        "{label}: budget {budget:?} tripped at observed={} allowed={} — a stop \
+                         must report spending past its limit",
+                        exhausted.observed, exhausted.allowed
+                    ));
+                }
+            }
+        }
+    }
+    findings
 }
 
 /// A valid artifact of each shape, from one seed.
@@ -449,6 +545,13 @@ fn hostile_and_generated_mutants_are_typed_refusals_or_canonical_accepts() {
                     ("splice", mutate_splice),
                     ("inflate-length", mutate_inflate_length),
                 ];
+                // Budget-boundary sweep on the intact artifact (bead fln-4zk8).
+                findings.extend(check_budgets(
+                    target,
+                    &format!("budget/valid/{target:?}/seed={seed:x}/iter={iteration}"),
+                    &valid,
+                ));
+
                 for (name, mutator) in mutators {
                     let mutant = mutator(&mut rng, &valid);
                     if mutant.len() > MAX_INPUT {
@@ -457,6 +560,15 @@ fn hostile_and_generated_mutants_are_typed_refusals_or_canonical_accepts() {
                     let label = format!("{name}/{target:?}/seed={seed:x}/iter={iteration}");
                     if let Some(finding) = check(target, &label, &mutant, &mut profile) {
                         findings.push(finding);
+                    }
+                    // Damaged bytes under a tight budget: the outcome must still be
+                    // one of the three, and a stop must never masquerade as a verdict.
+                    if iteration % 8 == 0 {
+                        findings.extend(check_budgets(
+                            target,
+                            &format!("budget/{name}/{target:?}/seed={seed:x}/iter={iteration}"),
+                            &mutant,
+                        ));
                     }
                 }
             }

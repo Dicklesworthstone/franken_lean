@@ -116,20 +116,175 @@ impl CanonWriter {
     }
 }
 
+/// Which caller-supplied limit stopped a decode (bead fln-4zk8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetLimit {
+    /// Bytes consumed from the input.
+    InputBytes,
+    /// Values built from it — `Expr` and `Level` nodes, `Name` components, `KVMap`
+    /// entries. Deliberately a count of *work*, not of nesting: a depth cap would
+    /// refuse legitimately deep terms, which is exactly what the decoder contract
+    /// forbids (bead franken_lean-fnj).
+    ProducedNodes,
+}
+
+/// The limits a caller is willing to spend on one decode.
+///
+/// Caller-supplied and passed by value into the decode call — not a global, not a
+/// compile-time constant, and not a property of the artifact. Two callers with
+/// different appetites decode the same bytes under different budgets in the same
+/// process, and neither can change the other's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeBudget {
+    max_input_bytes: u64,
+    max_produced_nodes: u64,
+}
+
+impl DecodeBudget {
+    pub const fn new(max_input_bytes: u64, max_produced_nodes: u64) -> DecodeBudget {
+        DecodeBudget {
+            max_input_bytes,
+            max_produced_nodes,
+        }
+    }
+
+    /// The budget the unbudgeted entry point runs under, so that
+    /// [`Canonical::from_canonical_bytes`] and
+    /// [`Canonical::from_canonical_bytes_budgeted`] are the same code path.
+    pub const fn unlimited() -> DecodeBudget {
+        DecodeBudget::new(u64::MAX, u64::MAX)
+    }
+
+    pub const fn max_input_bytes(self) -> u64 {
+        self.max_input_bytes
+    }
+
+    pub const fn max_produced_nodes(self) -> u64 {
+        self.max_produced_nodes
+    }
+}
+
+/// A decode that stopped because the caller's budget ran out.
+///
+/// It records which limit fired, what the caller allowed, and what had been spent
+/// when the meter tripped — enough to raise the budget and retry deliberately
+/// rather than by guesswork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exhausted {
+    pub limit: BudgetLimit,
+    pub allowed: u64,
+    pub observed: u64,
+    /// Byte offset the decode had reached.
+    pub at: usize,
+}
+
+/// The three-valued result of a budgeted decode (FL-INV-07).
+///
+/// Deliberately **not** a `Result`, and deliberately without any conversion into
+/// one: `Result` has exactly two arms, so every `?` and every `is_err()` would
+/// collapse [`Decoded::Inconclusive`] into the rejection arm — and an inconclusive
+/// outcome that is rendered, cached, or reported as a rejection is precisely the
+/// invariant violation this type exists to prevent. There is no `From<Exhausted>`
+/// for [`CanonError`] for the same reason. A caller that wants a verdict must
+/// decide, in its own code, what to do about not having one.
+#[derive(Debug)]
+#[must_use]
+pub enum Decoded<T> {
+    /// The artifact decoded. An acceptance.
+    Value(T),
+    /// The bytes are not a well-formed artifact. A rejection — a real verdict.
+    Malformed(CanonError),
+    /// The budget ran out first. **Not** a verdict: nothing was learned about
+    /// whether these bytes are a valid artifact, so this must never be stored as
+    /// acceptance or rejection, never cached, and never promoted to either by a
+    /// retry that silently drops it.
+    Inconclusive(Exhausted),
+}
+
+impl<T> Decoded<T> {
+    /// The decoded value, if the decode reached one.
+    pub fn value(self) -> Option<T> {
+        match self {
+            Decoded::Value(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn is_inconclusive(&self) -> bool {
+        matches!(self, Decoded::Inconclusive(_))
+    }
+}
+
 /// Canonical byte reader.
 #[derive(Debug)]
 pub struct CanonReader<'a> {
     bytes: &'a [u8],
     at: usize,
+    budget: DecodeBudget,
+    produced_nodes: u64,
+    /// Set by the first trip, and never cleared: once the meter has fired, the rest
+    /// of this decode is unwinding, and whatever `CanonError` surfaces from that
+    /// unwinding describes the stop, not the bytes.
+    exhausted: Option<Exhausted>,
 }
 
 impl<'a> CanonReader<'a> {
     pub fn new(bytes: &'a [u8]) -> CanonReader<'a> {
-        CanonReader { bytes, at: 0 }
+        CanonReader::with_budget(bytes, DecodeBudget::unlimited())
+    }
+
+    pub fn with_budget(bytes: &'a [u8], budget: DecodeBudget) -> CanonReader<'a> {
+        CanonReader {
+            bytes,
+            at: 0,
+            budget,
+            produced_nodes: 0,
+            exhausted: None,
+        }
+    }
+
+    /// The stop record, if this reader's budget ran out.
+    pub fn exhausted(&self) -> Option<Exhausted> {
+        self.exhausted
     }
 
     fn err(&self, what: &'static str) -> CanonError {
         CanonError { at: self.at, what }
+    }
+
+    /// Record the first trip and return the sentinel that unwinds the decode. The
+    /// caller-facing outcome is decided from [`CanonReader::exhausted`], never from
+    /// this error — it exists only to stop the readers through the same `?` path
+    /// they already use, without threading a second error type through every
+    /// signature.
+    fn trip(&mut self, limit: BudgetLimit, allowed: u64, observed: u64) -> CanonError {
+        if self.exhausted.is_none() {
+            self.exhausted = Some(Exhausted {
+                limit,
+                allowed,
+                observed,
+                at: self.at,
+            });
+        }
+        self.err("decode budget exhausted")
+    }
+
+    /// Charge one produced value against the budget. Called where values are built,
+    /// so the count is work actually done rather than bytes that might be skipped.
+    pub(crate) fn charge_node(&mut self) -> Result<(), CanonError> {
+        // Saturating rather than `+ 1`: reaching `u64::MAX` nodes would need more
+        // input bytes than an address space holds, but a counter that can only
+        // saturate cannot overflow into a wrap on any build profile.
+        let produced = self.produced_nodes.saturating_add(1);
+        if produced > self.budget.max_produced_nodes {
+            return Err(self.trip(
+                BudgetLimit::ProducedNodes,
+                self.budget.max_produced_nodes,
+                produced,
+            ));
+        }
+        self.produced_nodes = produced;
+        Ok(())
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], CanonError> {
@@ -138,6 +293,16 @@ impl<'a> CanonReader<'a> {
             .checked_add(n)
             .filter(|end| *end <= self.bytes.len())
             .ok_or_else(|| self.err("input truncated"))?;
+        // Charged on consumption, not on the artifact's total size: bytes never read
+        // are never spent, so a malformed prefix under a small budget still gets its
+        // rejection instead of being reported as "too expensive to judge".
+        if end as u64 > self.budget.max_input_bytes {
+            return Err(self.trip(
+                BudgetLimit::InputBytes,
+                self.budget.max_input_bytes,
+                end as u64,
+            ));
+        }
         let slice = &self.bytes[self.at..end];
         self.at = end;
         Ok(slice)
@@ -220,12 +385,58 @@ pub trait Canonical: Sized {
     }
 
     /// Total inverse of [`Canonical::to_canonical_bytes`].
+    ///
+    /// Runs under [`DecodeBudget::unlimited`], so it is two-valued by construction:
+    /// an unlimited budget cannot trip, and this signature therefore never has to
+    /// represent an inconclusive outcome. Callers decoding untrusted artifacts under
+    /// a resource contract want [`Canonical::from_canonical_bytes_budgeted`].
     fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonError> {
-        let mut r = CanonReader::new(bytes);
-        r.expect_schema(Self::SCHEMA)?;
-        let value = Self::read_body(&mut r)?;
-        r.finish()?;
-        Ok(value)
+        match Self::from_canonical_bytes_budgeted(bytes, DecodeBudget::unlimited()) {
+            Decoded::Value(value) => Ok(value),
+            Decoded::Malformed(error) => Err(error),
+            Decoded::Inconclusive(exhausted) => unreachable!(
+                "an unlimited budget cannot be exhausted, yet {exhausted:?} was reported"
+            ),
+        }
+    }
+
+    /// Decode under a caller-supplied budget (bead fln-4zk8).
+    ///
+    /// Exhaustion is reported as [`Decoded::Inconclusive`] and is never rendered as
+    /// acceptance or rejection: the meter is consulted *before* the error that
+    /// unwound the decode is interpreted, so a stop can never be mistaken for a
+    /// well-formedness verdict about the bytes (FL-INV-07). Decoding an artifact
+    /// that fits inside the budget is byte-for-byte the same computation as the
+    /// unbudgeted call.
+    fn from_canonical_bytes_budgeted(bytes: &[u8], budget: DecodeBudget) -> Decoded<Self> {
+        let mut r = CanonReader::with_budget(bytes, budget);
+        // Every step is checked the same way: if the meter tripped, the outcome is
+        // inconclusive regardless of which error surfaced.
+        macro_rules! step {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return match r.exhausted() {
+                            Some(exhausted) => Decoded::Inconclusive(exhausted),
+                            None => Decoded::Malformed(error),
+                        };
+                    }
+                }
+            };
+        }
+        step!(r.expect_schema(Self::SCHEMA));
+        let value = step!(Self::read_body(&mut r));
+        // `finish` consumes the reader and reads nothing, so it cannot trip the
+        // meter; the stop record is captured first and stays authoritative.
+        let exhausted = r.exhausted();
+        match r.finish() {
+            Ok(()) => Decoded::Value(value),
+            Err(error) => match exhausted {
+                Some(exhausted) => Decoded::Inconclusive(exhausted),
+                None => Decoded::Malformed(error),
+            },
+        }
     }
 }
 
@@ -271,6 +482,9 @@ impl Canonical for Name {
         let count = r.u64()?;
         let mut name = Name::anonymous();
         for _ in 0..count {
+            // One component is one produced value: a hostile count field spends the
+            // caller's budget rather than the machine's memory.
+            r.charge_node()?;
             name = match r.u8()? {
                 NAME_STR => Name::str(name, r.str()?),
                 NAME_NUM => Name::num(name, r.u64()?),
@@ -383,29 +597,32 @@ fn read_level_iter(r: &mut CanonReader<'_>) -> Result<Level, CanonError> {
     let mut values: Vec<Level> = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
-            LevelTask::Read => match r.u8()? {
-                LEVEL_ZERO => values.push(Level::zero()),
-                LEVEL_SUCC => {
-                    tasks.push(LevelTask::BuildSucc);
-                    tasks.push(LevelTask::Read);
+            LevelTask::Read => {
+                r.charge_node()?;
+                match r.u8()? {
+                    LEVEL_ZERO => values.push(Level::zero()),
+                    LEVEL_SUCC => {
+                        tasks.push(LevelTask::BuildSucc);
+                        tasks.push(LevelTask::Read);
+                    }
+                    LEVEL_MAX => {
+                        // Push the builder first (runs last), then the two child reads;
+                        // the LIFO order reads child `a` before child `b`, matching the
+                        // encoder's left-to-right emission.
+                        tasks.push(LevelTask::BuildMax);
+                        tasks.push(LevelTask::Read);
+                        tasks.push(LevelTask::Read);
+                    }
+                    LEVEL_IMAX => {
+                        tasks.push(LevelTask::BuildIMax);
+                        tasks.push(LevelTask::Read);
+                        tasks.push(LevelTask::Read);
+                    }
+                    LEVEL_PARAM => values.push(Level::param(Name::read_body(r)?)),
+                    LEVEL_MVAR => values.push(Level::mvar(LMVarId(Name::read_body(r)?))),
+                    _ => return Err(r.err_public("unknown level tag")),
                 }
-                LEVEL_MAX => {
-                    // Push the builder first (runs last), then the two child reads;
-                    // the LIFO order reads child `a` before child `b`, matching the
-                    // encoder's left-to-right emission.
-                    tasks.push(LevelTask::BuildMax);
-                    tasks.push(LevelTask::Read);
-                    tasks.push(LevelTask::Read);
-                }
-                LEVEL_IMAX => {
-                    tasks.push(LevelTask::BuildIMax);
-                    tasks.push(LevelTask::Read);
-                    tasks.push(LevelTask::Read);
-                }
-                LEVEL_PARAM => values.push(Level::param(Name::read_body(r)?)),
-                LEVEL_MVAR => values.push(Level::mvar(LMVarId(Name::read_body(r)?))),
-                _ => return Err(r.err_public("unknown level tag")),
-            },
+            }
             LevelTask::BuildSucc => {
                 let u = values.pop().ok_or_else(|| underflow(r))?;
                 values.push(u.succ().map_err(|_| too_deep(r))?);
@@ -491,6 +708,7 @@ impl Canonical for KVMap {
         // Found by the seeded campaign in tests/canon_fuzz.rs (bead fln-1f8v).
         let mut seen: std::collections::HashSet<Name> = std::collections::HashSet::new();
         for _ in 0..count {
+            r.charge_node()?;
             let key = Name::read_body(r)?;
             if !seen.insert(key.clone()) {
                 return Err(r.err_public("duplicate KVMap key"));
@@ -696,76 +914,79 @@ fn read_expr_iter(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
     let mut values: Vec<Expr> = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
-            ExprTask::Read => match r.u8()? {
-                EXPR_BVAR => values.push(
-                    Expr::bvar(r.u32()?)
-                        .map_err(|_| r.err_public("bvar exceeds the 20-bit range covenant"))?,
-                ),
-                EXPR_FVAR => values.push(Expr::fvar(FVarId(Name::read_body(r)?))),
-                EXPR_MVAR => values.push(Expr::mvar(MVarId(Name::read_body(r)?))),
-                EXPR_SORT => values.push(Expr::sort(read_level_iter(r)?)),
-                EXPR_CONST => {
-                    let name = Name::read_body(r)?;
-                    let count = r.u64()?;
-                    let mut levels = Vec::new();
-                    for _ in 0..count {
-                        levels.push(read_level_iter(r)?);
+            ExprTask::Read => {
+                r.charge_node()?;
+                match r.u8()? {
+                    EXPR_BVAR => values.push(
+                        Expr::bvar(r.u32()?)
+                            .map_err(|_| r.err_public("bvar exceeds the 20-bit range covenant"))?,
+                    ),
+                    EXPR_FVAR => values.push(Expr::fvar(FVarId(Name::read_body(r)?))),
+                    EXPR_MVAR => values.push(Expr::mvar(MVarId(Name::read_body(r)?))),
+                    EXPR_SORT => values.push(Expr::sort(read_level_iter(r)?)),
+                    EXPR_CONST => {
+                        let name = Name::read_body(r)?;
+                        let count = r.u64()?;
+                        let mut levels = Vec::new();
+                        for _ in 0..count {
+                            levels.push(read_level_iter(r)?);
+                        }
+                        values.push(Expr::const_(name, levels));
                     }
-                    values.push(Expr::const_(name, levels));
-                }
-                EXPR_APP => {
-                    // Builder first (runs last); the two child reads follow so LIFO
-                    // reads `f` before `a`, matching the encoder.
-                    tasks.push(ExprTask::BuildApp);
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_LAM => {
-                    let binder_name = Name::read_body(r)?;
-                    tasks.push(ExprTask::BuildLam(binder_name));
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_FORALL => {
-                    let binder_name = Name::read_body(r)?;
-                    tasks.push(ExprTask::BuildForall(binder_name));
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_LET => {
-                    let decl_name = Name::read_body(r)?;
-                    tasks.push(ExprTask::BuildLet(decl_name));
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_LIT_NAT => {
-                    let count = r.u64()?;
-                    let mut limbs = Vec::new();
-                    for _ in 0..count {
-                        limbs.push(r.u64()?);
+                    EXPR_APP => {
+                        // Builder first (runs last); the two child reads follow so LIFO
+                        // reads `f` before `a`, matching the encoder.
+                        tasks.push(ExprTask::BuildApp);
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
                     }
-                    let lit = NatLit::from_limbs_le(limbs.clone());
-                    if lit.limbs_le() != limbs.as_slice() {
-                        // Trailing zero limbs would give two encodings of one value.
-                        return Err(r.err_public("non-normalized nat literal limbs"));
+                    EXPR_LAM => {
+                        let binder_name = Name::read_body(r)?;
+                        tasks.push(ExprTask::BuildLam(binder_name));
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
                     }
-                    values.push(Expr::lit(Literal::Nat(lit)));
+                    EXPR_FORALL => {
+                        let binder_name = Name::read_body(r)?;
+                        tasks.push(ExprTask::BuildForall(binder_name));
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
+                    }
+                    EXPR_LET => {
+                        let decl_name = Name::read_body(r)?;
+                        tasks.push(ExprTask::BuildLet(decl_name));
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
+                    }
+                    EXPR_LIT_NAT => {
+                        let count = r.u64()?;
+                        let mut limbs = Vec::new();
+                        for _ in 0..count {
+                            limbs.push(r.u64()?);
+                        }
+                        let lit = NatLit::from_limbs_le(limbs.clone());
+                        if lit.limbs_le() != limbs.as_slice() {
+                            // Trailing zero limbs would give two encodings of one value.
+                            return Err(r.err_public("non-normalized nat literal limbs"));
+                        }
+                        values.push(Expr::lit(Literal::Nat(lit)));
+                    }
+                    EXPR_LIT_STR => values.push(Expr::lit(Literal::Str(r.str()?.to_string()))),
+                    EXPR_MDATA => {
+                        let data = KVMap::read_body(r)?;
+                        tasks.push(ExprTask::BuildMData(data));
+                        tasks.push(ExprTask::Read);
+                    }
+                    EXPR_PROJ => {
+                        let struct_name = Name::read_body(r)?;
+                        let idx = r.u64()?;
+                        tasks.push(ExprTask::BuildProj(struct_name, idx));
+                        tasks.push(ExprTask::Read);
+                    }
+                    _ => return Err(r.err_public("unknown expr tag")),
                 }
-                EXPR_LIT_STR => values.push(Expr::lit(Literal::Str(r.str()?.to_string()))),
-                EXPR_MDATA => {
-                    let data = KVMap::read_body(r)?;
-                    tasks.push(ExprTask::BuildMData(data));
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_PROJ => {
-                    let struct_name = Name::read_body(r)?;
-                    let idx = r.u64()?;
-                    tasks.push(ExprTask::BuildProj(struct_name, idx));
-                    tasks.push(ExprTask::Read);
-                }
-                _ => return Err(r.err_public("unknown expr tag")),
-            },
+            }
             ExprTask::BuildApp => {
                 let a = values.pop().ok_or_else(|| underflow(r))?;
                 let f = values.pop().ok_or_else(|| underflow(r))?;
@@ -2199,6 +2420,180 @@ mod tests {
             }
         }
         assert!(checked > 1_000, "the sweep must cover every field boundary");
+    }
+
+    /// Build a well-formed artifact big enough to outrun a small budget: a right
+    /// spine of `depth` applications over a shared leaf.
+    fn app_spine(depth: usize) -> Expr {
+        let leaf = Expr::bvar(0).expect("small");
+        let mut expr = leaf.clone();
+        for _ in 0..depth {
+            expr = Expr::app(expr, leaf.clone());
+        }
+        expr
+    }
+
+    /// The criterion franken_lean-fnj could not close until fln-4zk8 existed:
+    /// resource exhaustion surfaces through the typed inconclusive path, and never
+    /// as acceptance or rejection (FL-INV-07).
+    ///
+    /// The artifact here is **valid** — the same bytes decode cleanly with room to
+    /// work — so an outcome of `Malformed` would be a lie about the bytes, and an
+    /// outcome of `Value` would mean the budget was not honoured.
+    #[test]
+    fn budget_exhaustion_on_a_valid_artifact_is_inconclusive_never_a_verdict() {
+        let bytes = app_spine(5_000).to_canonical_bytes();
+
+        let stopped = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 64));
+        match stopped {
+            Decoded::Inconclusive(exhausted) => {
+                assert_eq!(exhausted.limit, BudgetLimit::ProducedNodes);
+                assert_eq!(exhausted.allowed, 64);
+                assert_eq!(exhausted.observed, 65, "the trip reports what was spent");
+                assert!(exhausted.at > 0, "the stop records where decoding reached");
+            }
+            Decoded::Malformed(error) => {
+                panic!("a budget stop was rendered as a rejection about the bytes: {error:?}")
+            }
+            Decoded::Value(_) => panic!("the budget was not honoured"),
+        }
+
+        // Same bytes, room to work: a real acceptance. The inconclusive outcome
+        // above therefore said nothing about the artifact, which is the point.
+        let allowed =
+            Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::unlimited()).value();
+        assert_eq!(
+            allowed.expect("the artifact is valid").to_canonical_bytes(),
+            bytes
+        );
+    }
+
+    /// The byte limit is charged on consumption, so it stops a large artifact part
+    /// way through rather than pre-judging it by its length.
+    #[test]
+    fn the_input_byte_limit_stops_consumption_and_reports_the_offset() {
+        let bytes = app_spine(2_000).to_canonical_bytes();
+        let cap = 128;
+        match Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(cap, u64::MAX)) {
+            Decoded::Inconclusive(exhausted) => {
+                assert_eq!(exhausted.limit, BudgetLimit::InputBytes);
+                assert_eq!(exhausted.allowed, cap);
+                assert!(exhausted.observed > cap);
+                assert!(
+                    (exhausted.at as u64) <= cap,
+                    "no byte beyond the cap was consumed"
+                );
+            }
+            other => panic!("expected an inconclusive stop, got {other:?}"),
+        }
+    }
+
+    /// The two outcomes must not collapse into each other. Malformed input under a
+    /// generous budget is a rejection — a real verdict — and stays one.
+    #[test]
+    fn malformed_input_under_a_generous_budget_is_still_a_rejection() {
+        let mut truncated = app_spine(4).to_canonical_bytes();
+        truncated.truncate(truncated.len() - 1);
+        match Expr::from_canonical_bytes_budgeted(&truncated, DecodeBudget::unlimited()) {
+            Decoded::Malformed(error) => assert_eq!(error.what, "input truncated"),
+            other => panic!("a malformed artifact must be rejected, got {other:?}"),
+        }
+
+        // And a malformed prefix under a *tiny* byte budget is still a rejection if
+        // the malformation is reached first: bytes never read are never spent.
+        let mut w = CanonWriter::new();
+        w.schema(SCHEMA_EXPR);
+        w.u8(0xfe);
+        let unknown_tag = w.into_bytes();
+        match Expr::from_canonical_bytes_budgeted(&unknown_tag, DecodeBudget::new(u64::MAX, 8)) {
+            Decoded::Malformed(error) => assert_eq!(error.what, "unknown expr tag"),
+            other => panic!("the malformation is reached first, got {other:?}"),
+        }
+    }
+
+    /// A budget that fits changes nothing: same value, same bytes, same hash, same
+    /// code path as the unbudgeted call.
+    #[test]
+    fn a_fitting_budget_decodes_identically_to_no_budget() {
+        for depth in [0usize, 1, 7, 64] {
+            let bytes = app_spine(depth).to_canonical_bytes();
+            let unbudgeted = Expr::from_canonical_bytes(&bytes).expect("valid artifact");
+            let budgeted =
+                Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, u64::MAX))
+                    .value()
+                    .expect("a fitting budget accepts");
+            assert_eq!(unbudgeted, budgeted);
+            assert_eq!(unbudgeted.hash(), budgeted.hash());
+            assert_eq!(budgeted.to_canonical_bytes(), bytes);
+        }
+    }
+
+    /// The budget reaches the payloads decoded by their own readers, not just the
+    /// top-level term walk — otherwise a hostile `Name` chain or `KVMap` inside an
+    /// otherwise small artifact would be unmetered.
+    #[test]
+    fn the_budget_is_honoured_inside_nested_name_and_kvmap_payloads() {
+        let mut deep_name = Name::anonymous();
+        for index in 0..512 {
+            deep_name = Name::num(deep_name, index);
+        }
+        let named = Expr::const_(deep_name.clone(), Vec::new()).to_canonical_bytes();
+        assert!(
+            Expr::from_canonical_bytes_budgeted(&named, DecodeBudget::new(u64::MAX, 16))
+                .is_inconclusive(),
+            "a deep Name payload must be charged"
+        );
+
+        let mut map = KVMap::new();
+        for index in 0..64 {
+            map.insert(Name::num(Name::anonymous(), index), DataValue::OfNat(index));
+        }
+        let mdata = Expr::mdata(map, Expr::bvar(0).expect("small")).to_canonical_bytes();
+        assert!(
+            Expr::from_canonical_bytes_budgeted(&mdata, DecodeBudget::new(u64::MAX, 16))
+                .is_inconclusive(),
+            "a KVMap payload must be charged"
+        );
+
+        // Both artifacts are valid: with room, they decode.
+        assert!(Expr::from_canonical_bytes(&named).is_ok());
+        assert!(Expr::from_canonical_bytes(&mdata).is_ok());
+    }
+
+    /// An exhausted decode must not be retryable into a verdict by accident: the
+    /// stop carries what it cost, so a caller raises the budget deliberately.
+    #[test]
+    fn a_stop_reports_enough_to_retry_deliberately() {
+        let bytes = app_spine(200).to_canonical_bytes();
+        let Decoded::Inconclusive(first) =
+            Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 32))
+        else {
+            panic!("expected a stop");
+        };
+        assert!(first.observed > first.allowed);
+
+        // Raising the limit past what the first attempt reported is not enough by
+        // itself — the stop reports the point of the trip, not the total cost — but
+        // the artifact must eventually decode as the limit grows, and never flip to
+        // a rejection on the way.
+        let mut limit = first.allowed;
+        let mut attempts = 0;
+        loop {
+            limit = limit.saturating_mul(4).max(4);
+            attempts += 1;
+            match Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, limit)) {
+                Decoded::Value(value) => {
+                    assert_eq!(value.to_canonical_bytes(), bytes);
+                    break;
+                }
+                Decoded::Inconclusive(_) => {
+                    assert!(attempts < 32, "budget growth did not converge")
+                }
+                Decoded::Malformed(error) => {
+                    panic!("raising a budget turned a valid artifact into a rejection: {error:?}")
+                }
+            }
+        }
     }
 
     /// Regression for the first finding of the seeded codec campaign (bead
