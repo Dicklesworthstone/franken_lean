@@ -4516,6 +4516,506 @@ mod tests {
         ));
     }
 
+    /// Named single-defect models for the declaration admission transaction.
+    ///
+    /// Each is an independent model of a *wrong* implementation, and each is killed by
+    /// an assertion on the specific typed signal that defect would corrupt. That
+    /// requirement is the point: a mutant that dies from a generic "the two differ"
+    /// assertion proves the suite is noisy, not that the check it targets exists.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AdmissionMutant {
+        /// Omits one budget dimension, so a declaration over only that dimension is
+        /// admitted. Killed on **authority**.
+        MissingCheck,
+        /// Measures the expensive expression dimensions before the cheap row families,
+        /// so a doubly-over declaration reports the wrong primary reason. Killed on the
+        /// **reported dimension**, which is what makes the order observable at all.
+        LateCheck,
+        /// Publishes into the base and only then discovers the refusal. Killed on the
+        /// **base logical root** across the refusal path.
+        PartialInsert,
+        /// Reports an `observed` that does not exceed `allowed`. Killed by
+        /// **`is_genuine_exhaustion`**, the typed predicate that exists for this.
+        WrongActual,
+        /// Reports cancellation as resource exhaustion. Killed on the **inconclusive
+        /// cause discriminant**.
+        CancellationAsRejection,
+        /// Publishes a digest that is not the canonical encoder's. Killed on **digest
+        /// equality** against the independent unbudgeted path.
+        DigestDrift,
+    }
+
+    impl AdmissionMutant {
+        const ALL: [AdmissionMutant; 6] = [
+            AdmissionMutant::MissingCheck,
+            AdmissionMutant::LateCheck,
+            AdmissionMutant::PartialInsert,
+            AdmissionMutant::WrongActual,
+            AdmissionMutant::CancellationAsRejection,
+            AdmissionMutant::DigestDrift,
+        ];
+
+        const fn label(self) -> &'static str {
+            match self {
+                AdmissionMutant::MissingCheck => "missing_check",
+                AdmissionMutant::LateCheck => "late_check",
+                AdmissionMutant::PartialInsert => "partial_insert",
+                AdmissionMutant::WrongActual => "wrong_actual",
+                AdmissionMutant::CancellationAsRejection => "cancellation_as_rejection",
+                AdmissionMutant::DigestDrift => "digest_drift",
+            }
+        }
+
+        /// The typed signal that kills this mutant, recorded so the evidence states
+        /// *how* each died rather than only that it did.
+        const fn kill_signal(self) -> &'static str {
+            match self {
+                AdmissionMutant::MissingCheck => "outcome_authority",
+                AdmissionMutant::LateCheck => "reported_primary_dimension",
+                AdmissionMutant::PartialInsert => "base_logical_root",
+                AdmissionMutant::WrongActual => "is_genuine_exhaustion",
+                AdmissionMutant::CancellationAsRejection => "inconclusive_cause_discriminant",
+                AdmissionMutant::DigestDrift => "published_digest_vs_unbudgeted_encoder",
+            }
+        }
+    }
+
+    /// Every named mutant dies for its own typed reason.
+    #[test]
+    fn declaration_admission_named_mutants_are_each_killed_by_their_own_typed_signal() {
+        let options = KVMap::new();
+        let base = Environment::new()
+            .add_decl(axiom("Existing"))
+            .expect("base builds");
+        let mut killed = Vec::new();
+
+        // ---- missing_check: killed on AUTHORITY -------------------------------------
+        // A declaration over the membership dimension only. Canonical refuses; a
+        // preflight that never consults that dimension admits.
+        let over_rows = all_bearing_decl(
+            AllBearingKind::Definition,
+            (0..6).map(|i| n(&format!("m{i}"))).collect(),
+        );
+        let bound = DeclarationBudget {
+            max_mutual_rows: 2,
+            ..DeclarationBudget::UNBOUNDED
+        };
+        let canonical = preflight_declaration(&over_rows, bound, None);
+        let mutant = preflight_declaration(
+            &over_rows,
+            DeclarationBudget {
+                // The modelled defect: this dimension is simply not checked.
+                max_mutual_rows: u64::MAX,
+                ..bound
+            },
+            None,
+        );
+        assert_eq!(canonical.authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            mutant.authority(),
+            Authority::Authoritative,
+            "the missing-check model must admit, or it is not modelling a missing check"
+        );
+        killed.push(AdmissionMutant::MissingCheck);
+
+        // ---- late_check: killed on the REPORTED PRIMARY DIMENSION ------------------
+        // Over BOTH rows and expressions. The frozen order puts rows first, so
+        // canonical names a row dimension; a preflight that measured expressions first
+        // names a structural unit instead. Same input, same refusal, different reason —
+        // which is precisely what makes the ordering observable rather than a comment.
+        let doubly_over = multi_node_recursor();
+        let both_bound = DeclarationBudget {
+            max_mutual_rows: 0,
+            max_expr_nodes: 1,
+            ..DeclarationBudget::UNBOUNDED
+        };
+        let canonical_reason = preflight_declaration(&doubly_over, both_bound, None);
+        let (_, canonical_progress) =
+            resource_stop(&canonical_reason).expect("a double breach must refuse");
+        assert_eq!(
+            canonical_progress,
+            Some(DeclarationDimension::MutualRows.as_str()),
+            "the cheap dimension must be the reported reason"
+        );
+        let mut late_usage = DeclarationUsage::default();
+        let late =
+            preflight_declaration_expressions(&doubly_over, both_bound, None, &mut late_usage)
+                .expect("the expression budget also binds, which is why this input is doubly over");
+        let (_, late_progress) = resource_stop(&late).expect("the late model refuses too");
+        assert_ne!(
+            late_progress, canonical_progress,
+            "expression-first ordering must report a different primary reason"
+        );
+        killed.push(AdmissionMutant::LateCheck);
+
+        // ---- partial_insert: killed on the BASE LOGICAL ROOT ----------------------
+        let root_before = base.logical_root(&options);
+        let refused = base
+            .plan_add_decl(
+                doubly_over.clone(),
+                both_bound,
+                CollisionBudget::UNBOUNDED,
+                None,
+            )
+            .into_complete();
+        assert!(refused.is_err(), "the budget must bind");
+        assert_eq!(
+            root_before,
+            base.logical_root(&options),
+            "the canonical refusal must leave the base root identical"
+        );
+        // The modelled defect: it inserted anyway. Its base root moves.
+        let partially_inserted = base
+            .add_decl(doubly_over.clone())
+            .expect("the model inserts unconditionally");
+        assert_ne!(
+            root_before,
+            partially_inserted.logical_root(&options),
+            "the partial-insert model must move the root, or it is not modelling a partial insert"
+        );
+        killed.push(AdmissionMutant::PartialInsert);
+
+        // ---- wrong_actual: killed by IS_GENUINE_EXHAUSTION -----------------------
+        let (canonical_usage, _) =
+            resource_stop(&canonical).expect("the membership stop is a resource stop");
+        assert!(
+            canonical_usage.is_genuine_exhaustion(),
+            "a canonical stop must report spending past its allowance"
+        );
+        let wrong_actual = ResourceUsage {
+            reason: canonical_usage.reason.clone(),
+            allowed: canonical_usage.allowed,
+            // The modelled defect: the actual is reported as the limit, so the stop
+            // claims a breach it does not evidence.
+            observed: canonical_usage.allowed,
+        };
+        assert!(
+            !wrong_actual.is_genuine_exhaustion(),
+            "the wrong-actual model must fail the typed exhaustion predicate"
+        );
+        killed.push(AdmissionMutant::WrongActual);
+
+        // ---- cancellation_as_rejection: killed on the CAUSE DISCRIMINANT ---------
+        let probe = TripAt::new(0);
+        let cancelled =
+            preflight_declaration(&doubly_over, DeclarationBudget::UNBOUNDED, Some(&probe));
+        let Outcome::Inconclusive(inconclusive) = &cancelled else {
+            unreachable!("a tripped probe must stop preflight")
+        };
+        assert!(
+            matches!(inconclusive.cause, InconclusiveCause::Cancelled { .. }),
+            "cancellation must be reported as cancellation"
+        );
+        assert!(
+            resource_stop(&cancelled).is_none(),
+            "cancellation must not present as a resource stop"
+        );
+        // And the taxonomy refuses the conflation from the other side too: a
+        // ResourceReason::Cancelled is not genuine exhaustion, so a model that dressed
+        // a cancellation as a budget overrun fails its own predicate.
+        let dressed_as_resource = ResourceUsage {
+            reason: ResourceReason::Cancelled,
+            allowed: 1,
+            observed: 2,
+        };
+        assert!(
+            !dressed_as_resource.is_genuine_exhaustion(),
+            "a cancellation dressed as exhaustion must not pass as exhaustion"
+        );
+        killed.push(AdmissionMutant::CancellationAsRejection);
+
+        // ---- digest_drift: killed on PUBLISHED DIGEST vs THE UNBUDGETED ENCODER --
+        let fresh = multi_node_recursor();
+        let published = match prepared(&base, fresh.clone(), DeclarationBudget::UNBOUNDED)
+            .commit(&base, None)
+            .into_complete()
+            .expect("commit publishes")
+        {
+            DeclarationCommitted::Published(publication) => publication,
+            DeclarationCommitted::DuplicateName { .. } => unreachable!("fresh name"),
+        };
+        let independent = Environment::decl_content_digest(&fresh);
+        assert_eq!(
+            published.digest, independent,
+            "the transaction must publish the canonical encoder's digest"
+        );
+        // The modelled defect: any other declaration's digest. Distinct by construction.
+        let drifted = Environment::decl_content_digest(&all_bearing_decl(
+            AllBearingKind::Definition,
+            vec![n("drift")],
+        ));
+        assert_ne!(
+            published.digest, drifted,
+            "the digest-drift model must differ, or it is not modelling drift"
+        );
+        killed.push(AdmissionMutant::DigestDrift);
+
+        // Coverage: every named mutant, each with a distinct kill signal, so no two are
+        // being killed by the same assertion wearing two names.
+        assert_eq!(killed.len(), AdmissionMutant::ALL.len());
+        for mutant in AdmissionMutant::ALL {
+            assert!(
+                killed.contains(&mutant),
+                "{} was not killed",
+                mutant.label()
+            );
+        }
+        let signals: HashSet<&str> = AdmissionMutant::ALL
+            .iter()
+            .map(|mutant| mutant.kill_signal())
+            .collect();
+        assert_eq!(
+            signals.len(),
+            AdmissionMutant::ALL.len(),
+            "two mutants share a kill signal, so one of them is not independently proved"
+        );
+
+        for mutant in AdmissionMutant::ALL {
+            eprintln!(
+                "{{\"schema\":\"fln.unit.declaration-admission-mutant\",\"version\":1,\
+                 \"bead\":\"franken_lean-j8h\",\"claim_type\":\"bounded_model\",\
+                 \"scenario\":\"named-admission-mutants\",\"mutant\":\"{}\",\
+                 \"kill_signal\":\"{}\",\"generic_assertion_used\":false,\
+                 \"status\":\"killed\"}}",
+                mutant.label(),
+                mutant.kill_signal()
+            );
+        }
+        eprintln!(
+            "{{\"schema\":\"fln.unit.declaration-admission-mutant-summary\",\"version\":1,\
+             \"bead\":\"franken_lean-j8h\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"named-admission-mutants\",\"mutants\":{},\
+             \"distinct_kill_signals\":{},\"status\":\"pass\"}}",
+            AdmissionMutant::ALL.len(),
+            signals.len()
+        );
+    }
+
+    /// Fixed seed for the schedule matrix. A constant, not a clock or an RNG: a
+    /// schedule proof whose input cannot be reproduced is a story about one run.
+    const SCHEDULE_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    /// Declaration count for the schedule matrix. Chosen so that the widest schedule
+    /// still gives every worker real work — 64 over 32 workers is two each, and the
+    /// test asserts no partition is empty.
+    const SCHEDULE_DECLARATIONS: usize = 64;
+
+    /// A declaration derived deterministically from `(seed, index)`.
+    ///
+    /// Shape varies with the index as well as the name, so workers are not all
+    /// measuring the same structure: a matrix where every item is identical cannot
+    /// distinguish a shared aggregate from a repeated one.
+    fn seeded_declaration(seed: u64, index: usize) -> ConstantInfo {
+        let mixed = seed ^ (usize_to_u64(index).wrapping_mul(0x1000_0000_01b3));
+        let members = (0..(mixed % 3) + 1)
+            .map(|member| n(&format!("member.{index}.{member}")))
+            .collect();
+        let depth = (mixed >> 8) % 3;
+        let mut value = Expr::const_(n(&format!("body.{index}")), vec![Level::param(n("u"))]);
+        for _ in 0..depth {
+            value = Expr::app(value, Expr::sort(Level::param(n("u"))));
+        }
+        ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: n(&format!("scheduled.{index}")),
+                level_params: vec![n("u")],
+                type_: Expr::sort(Level::param(n("u"))),
+            },
+            value,
+            hints: ReducibilityHints::Regular(u32::try_from(mixed % 4096).unwrap_or(0)),
+            safety: DefinitionSafety::Safe,
+            all: members,
+        })
+    }
+
+    /// Canonical, order-independent reduction over admitted declarations.
+    fn schedule_reduction(mut admitted: Vec<(Vec<u8>, Digest)>) -> Digest {
+        admitted.sort_unstable();
+        let mut w = CanonWriter::new();
+        w.str("fln.test.declaration-admission-schedule");
+        w.u16(1);
+        w.u64(usize_to_u64(admitted.len()));
+        for (name_bytes, digest) in admitted {
+            w.bytes(&name_bytes);
+            w.bytes(&digest.0);
+        }
+        hash(Domain::Fixture, &w.into_bytes())
+    }
+
+    fn canonical_name_bytes(name: &Name) -> Vec<u8> {
+        let mut w = CanonWriter::new();
+        name.write_body(&mut w);
+        w.into_bytes()
+    }
+
+    /// The 1/8/32 schedule matrix: productive partitions, real threads, one reduction.
+    ///
+    /// Productive is asserted, not asserted-by-labelling. Every partition must be
+    /// nonempty and the number of *distinct thread ids that did work* must equal the
+    /// worker count — so a step that quietly ran serially under a thread-count label
+    /// fails here rather than filling the matrix. That relabelling is itself a named
+    /// mutant elsewhere in this epic, which is why it gets an assertion and not a
+    /// comment.
+    ///
+    /// Workers do not share mutable state: each takes an O(1) persistent snapshot of
+    /// the base and grows its own fork, which is what makes concurrent admission
+    /// meaningful for a structurally-shared environment rather than a lock benchmark.
+    ///
+    /// Honest scope: this is bounded component evidence for declaration admission under
+    /// concurrency, not full closure for the bead.
+    #[test]
+    fn declaration_admission_is_stable_across_1_8_32_productive_schedules() {
+        let base = Environment::new()
+            .add_decl(axiom("Existing"))
+            .expect("base builds");
+        let declarations: Vec<ConstantInfo> = (0..SCHEDULE_DECLARATIONS)
+            .map(|index| seeded_declaration(SCHEDULE_SEED, index))
+            .collect();
+
+        // The sequential model, built independently of any schedule.
+        let sequential: Vec<(Vec<u8>, Digest)> = declarations
+            .iter()
+            .map(|info| {
+                (
+                    canonical_name_bytes(info.name()),
+                    Environment::decl_content_digest(info),
+                )
+            })
+            .collect();
+        let expected_reduction = schedule_reduction(sequential.clone());
+
+        let mut reductions = Vec::new();
+        for worker_count in [1usize, 8, 32] {
+            let (admitted, partition_sizes, thread_ids) = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..worker_count)
+                    .map(|worker| {
+                        let base = base.clone();
+                        let declarations = &declarations;
+                        scope.spawn(move || {
+                            let mut env = base;
+                            let mut mine = Vec::new();
+                            for (index, info) in declarations.iter().enumerate() {
+                                if index % worker_count != worker {
+                                    continue;
+                                }
+                                let plan = match env
+                                    .plan_add_decl(
+                                        info.clone(),
+                                        DeclarationBudget::UNBOUNDED,
+                                        CollisionBudget::UNBOUNDED,
+                                        None,
+                                    )
+                                    .into_complete()
+                                    .expect("unbounded planning admits")
+                                {
+                                    DeclarationPlan::Prepared(plan) => plan,
+                                    DeclarationPlan::DuplicateName { name } => {
+                                        unreachable!("seeded name {name:?} must be unique")
+                                    }
+                                };
+                                let published = match plan
+                                    .commit(&env, None)
+                                    .into_complete()
+                                    .expect("commit publishes")
+                                {
+                                    DeclarationCommitted::Published(publication) => publication,
+                                    DeclarationCommitted::DuplicateName { .. } => {
+                                        unreachable!("seeded names are unique")
+                                    }
+                                };
+                                mine.push((canonical_name_bytes(info.name()), published.digest));
+                                env = published.environment;
+                            }
+                            (mine, std::thread::current().id())
+                        })
+                    })
+                    .collect();
+                let mut admitted = Vec::new();
+                let mut sizes = Vec::new();
+                let mut ids = HashSet::new();
+                for handle in handles {
+                    let (mine, id) = handle.join().expect("worker completes");
+                    sizes.push(mine.len());
+                    ids.insert(id);
+                    admitted.extend(mine);
+                }
+                (admitted, sizes, ids)
+            });
+
+            // Productive: no idle worker, and as many real threads as workers.
+            assert_eq!(partition_sizes.len(), worker_count);
+            assert!(
+                partition_sizes.iter().all(|size| *size > 0),
+                "an empty partition means this worker count is a label, not a schedule \
+                 (sizes {partition_sizes:?})"
+            );
+            assert_eq!(
+                partition_sizes.iter().sum::<usize>(),
+                SCHEDULE_DECLARATIONS,
+                "the partitions must cover every declaration exactly once"
+            );
+            assert_eq!(
+                thread_ids.len(),
+                worker_count,
+                "work must be done by {worker_count} distinct threads, not relabelled serial work"
+            );
+
+            let reduction = schedule_reduction(admitted.clone());
+            assert_eq!(
+                reduction, expected_reduction,
+                "schedule with {worker_count} workers diverged from the sequential model"
+            );
+            reductions.push((worker_count, reduction, partition_sizes, thread_ids.len()));
+        }
+
+        // One reduction across the whole matrix.
+        let distinct: HashSet<Digest> = reductions
+            .iter()
+            .map(|(_, reduction, _, _)| *reduction)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "the reduction must not depend on the worker count"
+        );
+
+        // `distinct_worker_threads` carries the MEASURED thread count, not the worker
+        // count it was asserted equal to. Emitting the input where the row promises an
+        // observation is how a matrix comes to describe work it did not do.
+        for (worker_count, reduction, sizes, measured_threads) in &reductions {
+            let min = sizes.iter().min().copied().unwrap_or_default();
+            let max = sizes.iter().max().copied().unwrap_or_default();
+            eprintln!(
+                "{{\"schema\":\"fln.unit.declaration-admission-schedule\",\"version\":1,\
+                 \"bead\":\"franken_lean-j8h\",\"claim_type\":\"bounded_model\",\
+                 \"gate_relation\":\"partial-component-evidence\",\
+                 \"scenario\":\"productive-1-8-32-admission-matrix\",\
+                 \"seed\":\"{SCHEDULE_SEED:#018x}\",\
+                 \"declarations\":{SCHEDULE_DECLARATIONS},\
+                 \"worker_count\":{worker_count},\
+                 \"distinct_worker_threads\":{measured_threads},\
+                 \"partition_scheme\":\"index-modulo-worker-count-v1\",\
+                 \"min_partition\":{min},\"max_partition\":{max},\
+                 \"empty_partitions\":0,\
+                 \"execution_model\":\"independent_persistent_fork_per_worker\",\
+                 \"reduction\":\"canonical-sorted-name-digest-set-v1\",\
+                 \"reduction_digest\":\"{reduction}\",\
+                 \"matches_sequential_model\":true,\"status\":\"pass\"}}"
+            );
+        }
+        eprintln!(
+            "{{\"schema\":\"fln.unit.declaration-admission-schedule-summary\",\"version\":1,\
+             \"bead\":\"franken_lean-j8h\",\"claim_type\":\"bounded_model\",\
+             \"gate_relation\":\"partial-component-evidence\",\
+             \"scenario\":\"productive-1-8-32-admission-matrix\",\
+             \"seed\":\"{SCHEDULE_SEED:#018x}\",\"worker_counts\":[1,8,32],\
+             \"declarations\":{SCHEDULE_DECLARATIONS},\
+             \"distinct_reductions\":{},\"expected_distinct_reductions\":1,\
+             \"reduction_digest\":\"{expected_reduction}\",\"status\":\"pass\"}}",
+            distinct.len()
+        );
+    }
+
     /// An unset budget behaves exactly as the pre-budget code did, and preflight
     /// moves no identity.
     #[test]
