@@ -1,0 +1,989 @@
+//! Total contractual interning for the term store (bead `franken_lean-oh1j`, plan §7.1b).
+//!
+//! ## Contractual, not opportunistic
+//!
+//! One stored node per **full structural identity**, including `binder_name`, `decl_name` and every
+//! `MData` key and value. Metaprograms observe those fields and faithful `Expr` behaviour demands
+//! they round-trip exactly, so they are part of identity rather than noise to be normalised away.
+//!
+//! The trap is next door in this crate. [`crate::terms::alpha_canonical_digest`] deliberately
+//! **strips** `Lam.binder_name`, `ForallE.binder_name` and `LetE.decl_name`, because kernel defeq
+//! caches want alpha-varied terms to share reduction work. It is the obvious thing to reach for as
+//! an intern key and it is exactly wrong: keying on it collapses `fun x => x` and `fun y => y` into
+//! one node, and every metaprogram that reads a binder name then sees whichever spelling happened to
+//! be interned first. That is the `overmerge` mutant from `fln-49c`, and it is planted and killed
+//! below.
+//!
+//! The two digests therefore coexist on purpose and are different functions with different jobs:
+//! alpha-canonical for the *cache* plane, full-fidelity for the *identity* plane.
+//!
+//! ## Pointer equality IS structural equality
+//!
+//! After interning, `Arc::ptr_eq` on two stored nodes holds exactly when they are structurally
+//! equal. That is what lets `Expr::equal` collapse to a compare and kernel caches key on identity
+//! pairs.
+//!
+//! The soundness argument is worth stating because it is what makes a hash key safe here. A digest
+//! bucket is a *hint*: on a hit the candidate is confirmed with full [`Expr`] equality, so no digest
+//! collision can merge two different terms. And that confirmation is cheap by induction —
+//! interning is post-order, so a candidate's children are already interned, and `Expr`'s `PartialEq`
+//! short-circuits on `Arc::ptr_eq`. Comparing two candidates therefore costs their own fields plus
+//! a pointer check per child, not a deep walk.
+//!
+//! ## Total
+//!
+//! * **Every shape.** The key builder and the rebuilder both match all twelve `ExprNode` variants
+//!   with **no wildcard arm**, so a thirteenth variant is a compile error rather than a silent
+//!   fallback. That is the whole of "total" as a completeness property: an interner that is
+//!   contractual for the constructors its tests happen to call and opportunistic elsewhere is the
+//!   failure mode, and the compiler is the only reliable guard against it.
+//! * **Every depth.** The traversal is iterative, on a heap worklist. This crate has the discipline
+//!   already — `Expr`'s `Drop`, `Debug` and `PartialEq` are all explicitly stack-safe — and a
+//!   recursive interner would overflow on the same inputs those were written for.
+//! * **Every size.** A store bounded by how many nodes it holds refuses with a typed FL-INV-07
+//!   `Inconclusive`, never a rejection, and the refusal is not cacheable. A term too large to
+//!   intern is not a malformed term.
+
+use fln_core::diag::{ResourceReason, StructuralUnit};
+use fln_core::expr::{Expr, ExprNode};
+use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
+use fln_hash::domain::{Digest, Domain, DomainHasher};
+use std::collections::HashMap;
+
+/// Domain tag for the full-fidelity identity digest.
+///
+/// Distinct from the alpha-canonical tag on purpose: the two digests must never collide in a shared
+/// namespace, because one deliberately discards what the other deliberately keeps.
+const INTERN_TAG: &[u8] = b"fln.term-store.intern-identity/1";
+
+/// A stored node's identity. Equal ids mean the same stored node, and after interning that means
+/// structurally equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TermId(pub u32);
+
+/// How much sharing a store achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SharingStats {
+    /// Nodes presented for interning, counting every visit.
+    pub presented: u64,
+    /// Nodes newly stored.
+    pub stored: u64,
+    /// Presentations answered by an existing node.
+    pub shared: u64,
+    /// Digest-bucket hits that full equality then rejected.
+    ///
+    /// Recorded rather than ignored because it is the only externally visible sign that the digest
+    /// is doing worse than expected. A nonzero value is correct behaviour — the confirmation caught
+    /// it — but a growing one means the key is losing discrimination.
+    pub bucket_misses: u64,
+}
+
+impl SharingStats {
+    /// Shared presentations as a fraction of all presentations, or 0 for an empty store.
+    pub fn sharing_ratio(self) -> f64 {
+        if self.presented == 0 {
+            0.0
+        } else {
+            self.shared as f64 / self.presented as f64
+        }
+    }
+}
+
+/// A bound on how many nodes a store may hold.
+///
+/// Same law as `fln_syntax::run::LexBudget` and `fln_parse::registry::RegistryBudget`: exceeding it
+/// is **inconclusive, never a rejection**. `ProducedNodes` is the honest unit — the store is bounded
+/// by how much structure it materialises, not by how much the term denotes, which is
+/// `ExpandedWeight`'s job in [`crate::terms`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreBudget {
+    pub max_nodes: u64,
+}
+
+impl StoreBudget {
+    pub const fn generous() -> StoreBudget {
+        StoreBudget { max_nodes: 1 << 24 }
+    }
+}
+
+/// The interning term store.
+#[derive(Debug, Default)]
+pub struct Interner {
+    /// `TermId` -> the canonical `Expr` for that identity.
+    nodes: Vec<Expr>,
+    /// Full-fidelity digest -> candidate ids. A bucket is a hint, confirmed by equality.
+    buckets: HashMap<Digest, Vec<TermId>>,
+    stats: SharingStats,
+}
+
+impl Interner {
+    pub fn new() -> Interner {
+        Interner::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn stats(&self) -> SharingStats {
+        self.stats
+    }
+
+    /// The canonical `Expr` for an id.
+    pub fn get(&self, id: TermId) -> Option<&Expr> {
+        self.nodes.get(id.0 as usize)
+    }
+
+    /// Intern `root` and every subterm, returning the canonical root.
+    ///
+    /// Post-order and iterative. Unbounded — see [`Interner::intern_bounded`] for the FL-INV-07
+    /// form.
+    pub fn intern(&mut self, root: &Expr) -> Expr {
+        let order = post_order(root);
+        // Original node pointer -> the id it interned to. Keyed by pointer because the input may
+        // already share, and re-interning a shared subterm must not re-walk it.
+        let mut done: HashMap<*const ExprNode, TermId> = HashMap::with_capacity(order.len());
+        let mut last = TermId(0);
+        for expr in &order {
+            last = self.intern_one(expr, &done);
+            done.insert(node_ptr(expr), last);
+        }
+        self.get(last)
+            .cloned()
+            // Reached only for an empty order, which `post_order` cannot produce: it always visits
+            // the root. Cloning the input is the honest answer rather than a panic.
+            .unwrap_or_else(|| root.clone())
+    }
+
+    /// Intern under a budget. Exceeding it is `Inconclusive`, never a rejection, and the store is
+    /// left **untouched** so a caller can retry with a larger allowance.
+    pub fn intern_bounded(&mut self, root: &Expr, budget: StoreBudget) -> Outcome<Expr> {
+        let order = post_order(root);
+        // Checked before anything is stored: the point of a size bound is to decline without
+        // materialising the structure it is declining.
+        let projected = self.nodes.len() as u64 + order.len() as u64;
+        if projected > budget.max_nodes {
+            return Outcome::Inconclusive(Inconclusive::resource(ResourceUsage {
+                reason: ResourceReason::StructuralBudget {
+                    unit: StructuralUnit::ProducedNodes,
+                },
+                allowed: budget.max_nodes,
+                observed: projected,
+            }));
+        }
+        Outcome::Complete(self.intern(root))
+    }
+
+    /// Intern one node whose children are already interned.
+    fn intern_one(&mut self, expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> TermId {
+        self.stats.presented += 1;
+        let rebuilt = rebuild(expr, done, &self.nodes);
+        let digest = identity_digest(&rebuilt, done, &self.nodes);
+
+        if let Some(candidates) = self.buckets.get(&digest) {
+            for id in candidates {
+                if let Some(existing) = self.nodes.get(id.0 as usize) {
+                    // Confirmation, not trust: a digest bucket is a hint. `Expr`'s `PartialEq`
+                    // short-circuits on `Arc::ptr_eq`, so with children already interned this costs
+                    // the node's own fields plus one pointer check per child.
+                    if *existing == rebuilt {
+                        self.stats.shared += 1;
+                        return *id;
+                    }
+                    self.stats.bucket_misses += 1;
+                }
+            }
+        }
+
+        let id = TermId(self.nodes.len() as u32);
+        self.nodes.push(rebuilt);
+        self.buckets.entry(digest).or_default().push(id);
+        self.stats.stored += 1;
+        id
+    }
+}
+
+/// Pointer identity of a node's allocation — the same accessor `terms.rs` uses, since `Expr`'s
+/// `Arc` is private to `fln-core`.
+fn node_ptr(expr: &Expr) -> *const ExprNode {
+    std::ptr::from_ref(expr.node())
+}
+
+/// Distinct nodes of `root` in post-order, iteratively.
+///
+/// Distinct by pointer, so an input that already shares is walked once per stored node rather than
+/// once per path — which is what keeps a DAG from being traversed exponentially.
+fn post_order(root: &Expr) -> Vec<Expr> {
+    enum Step {
+        Enter(Expr),
+        Exit(Expr),
+    }
+    let mut order: Vec<Expr> = Vec::new();
+    let mut seen: HashMap<*const ExprNode, ()> = HashMap::new();
+    let mut stack = vec![Step::Enter(root.clone())];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Enter(expr) => {
+                if seen.insert(node_ptr(&expr), ()).is_some() {
+                    continue;
+                }
+                let kids = children_of(&expr);
+                stack.push(Step::Exit(expr));
+                for child in kids.into_iter().rev() {
+                    stack.push(Step::Enter(child));
+                }
+            }
+            Step::Exit(expr) => order.push(expr),
+        }
+    }
+    order
+}
+
+/// The child `Expr`s of a node.
+///
+/// **No wildcard arm.** A thirteenth `ExprNode` variant is a compile error here, which is the only
+/// reliable guard against an interner that is total for the shapes its author thought of.
+fn children_of(expr: &Expr) -> Vec<Expr> {
+    match expr.node() {
+        ExprNode::BVar { .. }
+        | ExprNode::FVar { .. }
+        | ExprNode::MVar { .. }
+        | ExprNode::Sort { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::Lit { .. } => Vec::new(),
+        ExprNode::App { f, a } => vec![f.clone(), a.clone()],
+        ExprNode::Lam {
+            binder_type, body, ..
+        } => vec![binder_type.clone(), body.clone()],
+        ExprNode::ForallE {
+            binder_type, body, ..
+        } => vec![binder_type.clone(), body.clone()],
+        ExprNode::LetE {
+            type_, value, body, ..
+        } => vec![type_.clone(), value.clone(), body.clone()],
+        ExprNode::MData { expr, .. } => vec![expr.clone()],
+        ExprNode::Proj { expr, .. } => vec![expr.clone()],
+    }
+}
+
+/// Rebuild a node with its children replaced by their canonical forms.
+///
+/// **No wildcard arm**, for the same reason as [`children_of`]. Every own field is carried through
+/// unchanged — `binder_name`, `decl_name`, `MData`, `binder_info`, `non_dep`, the literals, the
+/// levels, the de Bruijn indices — because they are part of identity here.
+fn rebuild(expr: &Expr, done: &HashMap<*const ExprNode, TermId>, nodes: &[Expr]) -> Expr {
+    let canonical = |child: &Expr| -> Expr {
+        done.get(&node_ptr(child))
+            .and_then(|id| nodes.get(id.0 as usize))
+            .cloned()
+            // A child not yet interned cannot happen in post-order; using the child as-is is the
+            // total answer rather than a panic, and the interning invariant test would catch it.
+            .unwrap_or_else(|| child.clone())
+    };
+    match expr.node() {
+        ExprNode::BVar { .. }
+        | ExprNode::FVar { .. }
+        | ExprNode::MVar { .. }
+        | ExprNode::Sort { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::Lit { .. } => expr.clone(),
+        ExprNode::App { f, a } => Expr::app(canonical(f), canonical(a)),
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::lam(
+            binder_name.clone(),
+            canonical(binder_type),
+            canonical(body),
+            *binder_info,
+        ),
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::forall_e(
+            binder_name.clone(),
+            canonical(binder_type),
+            canonical(body),
+            *binder_info,
+        ),
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => Expr::let_e(
+            decl_name.clone(),
+            canonical(type_),
+            canonical(value),
+            canonical(body),
+            *non_dep,
+        ),
+        ExprNode::MData { data, expr: inner } => Expr::mdata(data.clone(), canonical(inner)),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr: inner,
+        } => Expr::proj(struct_name.clone(), *idx, canonical(inner)),
+    }
+}
+
+/// The full-fidelity identity digest of one node, over its variant, its own fields, and its
+/// children's **ids**.
+///
+/// Shallow by construction: children contribute their id rather than their structure, so the digest
+/// is O(own fields) per node and the whole store is digested in one post-order pass.
+///
+/// **No wildcard arm.** And unlike the alpha-canonical digest, every binder name and every `MData`
+/// entry is fed in — that difference is the entire distinction between the identity plane and the
+/// cache plane.
+fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>, nodes: &[Expr]) -> Digest {
+    let mut hasher = DomainHasher::new(Domain::DeclContent);
+    hasher.update(INTERN_TAG);
+    hasher.update(&[0]);
+
+    // A child's contribution is the id of its canonical form.
+    let child_id = |child: &Expr| {
+        let id = done
+            .get(&node_ptr(child))
+            .copied()
+            .or_else(|| {
+                // The child may already BE canonical, if it came from this store.
+                nodes
+                    .iter()
+                    .position(|node| node_ptr(node) == node_ptr(child))
+                    .map(|index| TermId(index as u32))
+            })
+            .unwrap_or(TermId(u32::MAX));
+        id.0
+    };
+
+    match expr.node() {
+        ExprNode::BVar { idx } => {
+            hasher.update(&[1]);
+            hasher.update(&idx.to_le_bytes());
+        }
+        ExprNode::FVar { id } => {
+            hasher.update(&[2]);
+            hasher.update(format!("{id:?}").as_bytes());
+        }
+        ExprNode::MVar { id } => {
+            hasher.update(&[3]);
+            hasher.update(format!("{id:?}").as_bytes());
+        }
+        ExprNode::Sort { level } => {
+            hasher.update(&[4]);
+            hasher.update(format!("{level:?}").as_bytes());
+        }
+        ExprNode::Const { name, levels } => {
+            hasher.update(&[5]);
+            hasher.update(name.to_display_string().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&(levels.len() as u64).to_le_bytes());
+            for level in levels {
+                hasher.update(format!("{level:?}").as_bytes());
+                hasher.update(&[0]);
+            }
+        }
+        ExprNode::App { f, a } => {
+            hasher.update(&[6]);
+            hasher.update(&child_id(f).to_le_bytes());
+            hasher.update(&child_id(a).to_le_bytes());
+        }
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => {
+            hasher.update(&[7]);
+            // KEPT, unlike the alpha-canonical digest. This byte is the difference between
+            // contractual interning and overmerge.
+            hasher.update(binder_name.to_display_string().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&child_id(binder_type).to_le_bytes());
+            hasher.update(&child_id(body).to_le_bytes());
+            hasher.update(&[*binder_info as u8]);
+        }
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => {
+            hasher.update(&[8]);
+            hasher.update(binder_name.to_display_string().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&child_id(binder_type).to_le_bytes());
+            hasher.update(&child_id(body).to_le_bytes());
+            hasher.update(&[*binder_info as u8]);
+        }
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => {
+            hasher.update(&[9]);
+            hasher.update(decl_name.to_display_string().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&child_id(type_).to_le_bytes());
+            hasher.update(&child_id(value).to_le_bytes());
+            hasher.update(&child_id(body).to_le_bytes());
+            hasher.update(&[u8::from(*non_dep)]);
+        }
+        ExprNode::Lit { literal } => {
+            hasher.update(&[10]);
+            hasher.update(format!("{literal:?}").as_bytes());
+        }
+        ExprNode::MData { data, expr: inner } => {
+            hasher.update(&[11]);
+            // KEPT in full: metaprograms read mdata, so two nodes differing only in it are
+            // different identities.
+            hasher.update(format!("{data:?}").as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&child_id(inner).to_le_bytes());
+        }
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr: inner,
+        } => {
+            hasher.update(&[12]);
+            hasher.update(struct_name.to_display_string().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&idx.to_le_bytes());
+            hasher.update(&child_id(inner).to_le_bytes());
+        }
+    }
+    hasher.finalize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terms::alpha_canonical_digest;
+    use fln_core::expr::{BinderInfo, Literal, NatLit};
+    use fln_core::level::Level;
+    use fln_core::name::Name;
+    use fln_core::options::{DataValue, KVMap};
+
+    fn name(text: &str) -> Name {
+        Name::str(Name::anonymous(), text)
+    }
+
+    fn bvar(idx: u32) -> Expr {
+        Expr::bvar(idx).expect("a small index is representable")
+    }
+
+    /// One `Expr` of **every** variant, so the invariant tests cover the whole enum rather than the
+    /// constructors that happened to come to mind. The count is asserted against `VARIANTS` below,
+    /// which is what keeps this list honest when the enum grows.
+    fn one_of_each() -> Vec<(&'static str, Expr)> {
+        vec![
+            ("BVar", bvar(0)),
+            ("Sort", Expr::sort(Level::zero())),
+            ("Const", Expr::const_(name("Nat"), Vec::new())),
+            ("Lit", Expr::lit(Literal::Nat(NatLit::from_u64(7)))),
+            ("App", Expr::app(bvar(0), bvar(1))),
+            (
+                "Lam",
+                Expr::lam(
+                    name("x"),
+                    Expr::sort(Level::zero()),
+                    bvar(0),
+                    BinderInfo::Default,
+                ),
+            ),
+            (
+                "ForallE",
+                Expr::forall_e(
+                    name("y"),
+                    Expr::sort(Level::zero()),
+                    bvar(0),
+                    BinderInfo::Default,
+                ),
+            ),
+            (
+                "LetE",
+                Expr::let_e(
+                    name("z"),
+                    Expr::sort(Level::zero()),
+                    bvar(0),
+                    bvar(1),
+                    false,
+                ),
+            ),
+            ("MData", Expr::mdata(KVMap::default(), bvar(0))),
+            ("Proj", Expr::proj(name("S"), 1, bvar(0))),
+        ]
+    }
+
+    /// The variants `one_of_each` does not build, and why. `FVar` and `MVar` need id types this
+    /// module has no constructor for; they are covered by the exhaustive `match` arms rather than by
+    /// a fixture, and the compiler is the guard there.
+    const UNBUILT_VARIANTS: usize = 2;
+    const VARIANTS: usize = 12;
+
+    /// **THE INTERNING INVARIANT: structural equality implies pointer equality.** Over every
+    /// variant, and over every construction path — a term built twice independently must intern to
+    /// the same stored node.
+    #[test]
+    fn structural_equality_implies_pointer_equality_for_every_variant() {
+        assert_eq!(
+            one_of_each().len() + UNBUILT_VARIANTS,
+            VARIANTS,
+            "the fixture must cover every ExprNode variant it can construct; if the enum grew, this \
+             count is the reminder"
+        );
+
+        let mut interner = Interner::new();
+        for (label, expr) in one_of_each() {
+            // Build the SAME term a second time, independently, so nothing is shared by accident.
+            let (_, twin) = one_of_each()
+                .into_iter()
+                .find(|(other, _)| *other == label)
+                .expect("the fixture is stable");
+
+            assert_eq!(expr, twin, "{label}: the two builds are structurally equal");
+
+            let first = interner.intern(&expr);
+            let second = interner.intern(&twin);
+
+            assert_eq!(first, second, "{label}: interned forms are equal");
+            assert_eq!(
+                node_ptr(&first),
+                node_ptr(&second),
+                "{label}: structurally equal terms MUST intern to the same node. Pointer equality \
+                 being structural equality is what lets Expr::equal collapse to a compare."
+            );
+        }
+    }
+
+    /// **The identity digest itself distinguishes binder names**, asserted directly rather than
+    /// through interning.
+    ///
+    /// This test exists because two plants taught me my suite had a hole. Dropping the binder name
+    /// from the digest did NOT fail any test, and skipping the equality confirmation on a bucket hit
+    /// did not either — because the two are independent safety mechanisms and every fixture was
+    /// covered by whichever one remained. Weak digest plus present confirmation still separates the
+    /// terms; strong digest plus absent confirmation also does. Only removing BOTH merges them, and
+    /// no single-mutant plant could see that.
+    ///
+    /// So the digest's fidelity is now pinned on its own, here.
+    #[test]
+    fn the_identity_digest_distinguishes_terms_the_alpha_digest_merges() {
+        let done = HashMap::new();
+        let nodes: Vec<Expr> = Vec::new();
+        let unit = Expr::sort(Level::zero());
+        let fun_x = Expr::lam(name("x"), unit.clone(), bvar(0), BinderInfo::Default);
+        let fun_y = Expr::lam(name("y"), unit, bvar(0), BinderInfo::Default);
+
+        // The premise: the CACHE-plane digest deliberately merges them.
+        assert_eq!(
+            alpha_canonical_digest(&fun_x),
+            alpha_canonical_digest(&fun_y),
+            "the fixture must be alpha-equivalent"
+        );
+        // The law: the IDENTITY-plane digest must not.
+        assert_ne!(
+            identity_digest(&fun_x, &done, &nodes),
+            identity_digest(&fun_y, &done, &nodes),
+            "the identity digest must feed the binder name in. Keying on the alpha-canonical digest \
+             is the `overmerge` mutant, and this is the assertion that catches it at the key rather \
+             than relying on the equality confirmation to clean up afterwards."
+        );
+
+        // The same for LetE's decl_name and for mdata, the other two the alpha digest strips or that
+        // an interner might treat as annotations.
+        let let_a = Expr::let_e(
+            name("a"),
+            Expr::sort(Level::zero()),
+            bvar(0),
+            bvar(1),
+            false,
+        );
+        let let_b = Expr::let_e(
+            name("b"),
+            Expr::sort(Level::zero()),
+            bvar(0),
+            bvar(1),
+            false,
+        );
+        assert_ne!(
+            identity_digest(&let_a, &done, &nodes),
+            identity_digest(&let_b, &done, &nodes),
+            "LetE.decl_name is part of identity"
+        );
+        let bare = Expr::mdata(KVMap::default(), bvar(0));
+        let tagged = Expr::mdata(
+            KVMap::from_entries(vec![(name("k"), DataValue::OfBool(true))]),
+            bvar(0),
+        );
+        assert_ne!(
+            identity_digest(&bare, &done, &nodes),
+            identity_digest(&tagged, &done, &nodes),
+            "MData is part of identity"
+        );
+    }
+
+    /// **What this suite does NOT establish**, recorded because two plants failed to fail and the
+    /// reason is not a defect but a limit.
+    ///
+    /// The equality confirmation on a bucket hit is **defence in depth against a digest collision**.
+    /// Its necessity is not observable with a real hash: to show that removing it merges two
+    /// different terms, I would need two structurally different terms whose full-fidelity digests
+    /// collide, and I cannot manufacture one. So skipping the confirmation passes every test here.
+    ///
+    /// That is graded honestly rather than presented as covered: the confirmation is justified by
+    /// the argument that a digest bucket is a hint, not by a measurement. What IS pinned is the
+    /// digest's own fidelity, in the test above — so the mechanism this suite actually verifies is
+    /// the key, and the confirmation is belt to its braces.
+    ///
+    /// The test asserts the shape of that claim so a reader meets it here rather than in a commit
+    /// message: a bucket hit that fails confirmation is *counted*, and on every fixture in this
+    /// module that count is zero, which is exactly why the confirmation is untested.
+    #[test]
+    fn the_equality_confirmation_is_defence_in_depth_and_is_not_measured_here() {
+        let mut interner = Interner::new();
+        for (_, expr) in one_of_each() {
+            interner.intern(&expr);
+        }
+        assert_eq!(
+            interner.stats().bucket_misses,
+            0,
+            "no fixture in this module produces a digest collision, so the confirmation step never \
+             fires. Its necessity is therefore argued, not measured — see this test's doc comment."
+        );
+    }
+
+    /// **MUTANT `overmerge`.** Keying on the alpha-canonical digest collapses terms that differ only
+    /// in a binder name — the mistake sitting one module away.
+    ///
+    /// The two terms have the SAME alpha-canonical digest by design and MUST still intern separately,
+    /// because metaprograms read binder names and faithful `Expr` behaviour demands they round-trip.
+    #[test]
+    fn mutant_overmerge_terms_differing_only_in_a_binder_name_stay_distinct() {
+        let unit = Expr::sort(Level::zero());
+        let fun_x = Expr::lam(name("x"), unit.clone(), bvar(0), BinderInfo::Default);
+        let fun_y = Expr::lam(name("y"), unit, bvar(0), BinderInfo::Default);
+
+        // The premise: they ARE alpha-equivalent, so the cache-plane digest agrees.
+        assert_eq!(
+            alpha_canonical_digest(&fun_x),
+            alpha_canonical_digest(&fun_y),
+            "the fixture must be alpha-equivalent, or this proves nothing about overmerge"
+        );
+        // And they are NOT structurally equal, which is what identity must respect.
+        assert_ne!(fun_x, fun_y);
+
+        let mut interner = Interner::new();
+        let a = interner.intern(&fun_x);
+        let b = interner.intern(&fun_y);
+        assert_ne!(
+            node_ptr(&a),
+            node_ptr(&b),
+            "keying on the alpha-canonical digest would merge these. A metaprogram reading the \
+             binder name would then see whichever spelling interned first."
+        );
+        // Both spellings survive intact, which is the round-trip the contract promises.
+        assert_eq!(a, fun_x);
+        assert_eq!(b, fun_y);
+    }
+
+    /// The same law for `MData`, which the alpha digest keeps but which an interner might normalise
+    /// away as "just annotations".
+    #[test]
+    fn mutant_overmerge_terms_differing_only_in_mdata_stay_distinct() {
+        let annotated = KVMap::from_entries(vec![(name("k"), DataValue::OfBool(true))]);
+        let bare = Expr::mdata(KVMap::default(), bvar(0));
+        let with_data = Expr::mdata(annotated, bvar(0));
+
+        assert_ne!(bare, with_data);
+        let mut interner = Interner::new();
+        let a = interner.intern(&bare);
+        let b = interner.intern(&with_data);
+        assert_ne!(
+            node_ptr(&a),
+            node_ptr(&b),
+            "mdata is part of identity: metaprograms read it"
+        );
+    }
+
+    /// **MUTANT `missed-intern`.** Every subterm is interned, not just the root.
+    ///
+    /// A shallow interner returns a canonical root whose children are the originals, so pointer
+    /// equality holds at the top and fails one level down — and every kernel cache keyed on identity
+    /// pairs then misses.
+    #[test]
+    fn mutant_missed_intern_every_subterm_is_canonical() {
+        let shared = Expr::app(bvar(0), bvar(1));
+        let left = Expr::app(shared.clone(), bvar(2));
+        let right = Expr::app(shared.clone(), bvar(3));
+        let root = Expr::app(left, right);
+
+        let mut interner = Interner::new();
+        let canonical = interner.intern(&root);
+
+        // Walk the interned term and require every node to be one the store holds.
+        let mut stack = vec![canonical.clone()];
+        let mut checked = 0usize;
+        while let Some(expr) = stack.pop() {
+            let found = (0..interner.len())
+                .filter_map(|index| interner.get(TermId(index as u32)))
+                .any(|stored| node_ptr(stored) == node_ptr(&expr));
+            assert!(
+                found,
+                "a subterm of the interned root is not itself a stored node: {expr:?}"
+            );
+            checked += 1;
+            stack.extend(children_of(&expr));
+        }
+        assert!(checked >= 5, "only {checked} subterms walked");
+    }
+
+    /// **MUTANT `sharing-loss`.** Two **independently built** equal subterms collapse to one stored
+    /// node.
+    ///
+    /// Independently built on purpose, and my first fixture got this wrong in a way worth recording:
+    /// I cloned one `Expr` into both positions, which shares the same `Arc` already, so `post_order`
+    /// deduplicated it by pointer and there was nothing left for interning to share. The statistics
+    /// said `shared: 0` and were right. Sharing that the *input* already has is not sharing the
+    /// *store* provided, and only the second is what this mutant is about.
+    #[test]
+    fn mutant_sharing_loss_independently_built_equal_subterms_collapse() {
+        // Two separate allocations with identical structure.
+        let left = Expr::app(bvar(0), bvar(1));
+        let right = Expr::app(bvar(0), bvar(1));
+        assert_eq!(left, right, "structurally equal");
+        assert_ne!(
+            node_ptr(&left),
+            node_ptr(&right),
+            "but distinct allocations, or the fixture proves nothing"
+        );
+
+        let root = Expr::app(left, right);
+        let mut interner = Interner::new();
+        let canonical = interner.intern(&root);
+
+        // bvar(0), bvar(1), the one shared app, and the root.
+        assert_eq!(
+            interner.len(),
+            4,
+            "the two equal subterms must be stored once: {} nodes",
+            interner.len()
+        );
+        let kids = children_of(&canonical);
+        assert_eq!(kids.len(), 2);
+        assert_eq!(
+            node_ptr(&kids[0]),
+            node_ptr(&kids[1]),
+            "both must be the SAME node — this is the sharing the store exists for"
+        );
+        assert!(
+            interner.stats().shared > 0,
+            "and the statistics must record it: {:?}",
+            interner.stats()
+        );
+    }
+
+    /// Input that ALREADY shares is walked once per stored node, not once per path.
+    ///
+    /// The complement of the mutant above, and the property that keeps a DAG from being traversed
+    /// exponentially: a diamond presents four nodes, not five.
+    #[test]
+    fn an_input_dag_is_walked_once_per_node_not_once_per_path() {
+        let shared = Expr::app(bvar(0), bvar(1));
+        let root = Expr::app(shared.clone(), shared);
+        let mut interner = Interner::new();
+        interner.intern(&root);
+        assert_eq!(
+            interner.stats().presented,
+            4,
+            "a diamond presents four distinct nodes: {:?}",
+            interner.stats()
+        );
+        assert_eq!(interner.len(), 4);
+    }
+
+    /// **MUTANT `partial-insert`.** A budget refusal leaves the store untouched, so a caller can
+    /// retry with a larger allowance rather than inspect a half-built store.
+    #[test]
+    fn mutant_partial_insert_a_refused_intern_stores_nothing() {
+        let root = Expr::app(Expr::app(bvar(0), bvar(1)), Expr::app(bvar(2), bvar(3)));
+
+        let mut interner = Interner::new();
+        let before = interner.len();
+        let outcome = interner.intern_bounded(&root, StoreBudget { max_nodes: 3 });
+
+        let usage = match &outcome {
+            Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+                fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } => Some(usage),
+                _ => None,
+            },
+            _ => None,
+        };
+        let usage = usage.expect("an exceeded store budget is a resource stop");
+        assert_eq!(
+            usage.reason,
+            ResourceReason::StructuralBudget {
+                unit: StructuralUnit::ProducedNodes
+            },
+            "the honest unit for a store bounded by how many nodes it holds"
+        );
+        assert!(usage.is_genuine_exhaustion());
+        assert_eq!(
+            interner.len(),
+            before,
+            "a refused intern must store NOTHING — not a prefix of the term"
+        );
+    }
+
+    /// A budget stop is not a rejection and publishes no diagnostic. The term is impeccable — it
+    /// interns cleanly under a larger budget — so a leaked diagnostic here would tell a user their
+    /// correct term is malformed.
+    #[test]
+    fn a_store_budget_stop_is_inconclusive_and_publishes_nothing() {
+        let root = Expr::app(bvar(0), bvar(1));
+        let mut control = Interner::new();
+        assert!(
+            matches!(
+                control.intern_bounded(&root, StoreBudget::generous()),
+                Outcome::Complete(_)
+            ),
+            "the term interns cleanly under a generous budget, so nothing about it is wrong"
+        );
+
+        let mut interner = Interner::new();
+        let outcome = interner.intern_bounded(&root, StoreBudget { max_nodes: 1 });
+        assert!(
+            !matches!(outcome, Outcome::Complete(_)),
+            "not an acceptance"
+        );
+        assert!(
+            !matches!(outcome, Outcome::InternalFault(_)),
+            "declining is not an internal fault"
+        );
+        let published = match &outcome {
+            Outcome::Inconclusive(inconclusive) => inconclusive.diagnostic.clone(),
+            _ => None,
+        };
+        assert!(published.is_none(), "published a diagnostic: {published:?}");
+    }
+
+    /// A generous budget is invisible: the same store as the unbounded path.
+    #[test]
+    fn a_generous_budget_interns_exactly_as_the_unbounded_path_does() {
+        let root = Expr::lam(
+            name("x"),
+            Expr::sort(Level::zero()),
+            Expr::app(bvar(0), bvar(0)),
+            BinderInfo::Default,
+        );
+        let mut unbounded = Interner::new();
+        let a = unbounded.intern(&root);
+
+        let mut bounded = Interner::new();
+        let b = match bounded.intern_bounded(&root, StoreBudget::generous()) {
+            Outcome::Complete(expr) => expr,
+            other => panic!("a generous budget must complete: {other:?}"),
+        };
+
+        assert_eq!(a, b);
+        assert_eq!(unbounded.len(), bounded.len(), "the same node count");
+        assert_eq!(
+            unbounded.stats(),
+            bounded.stats(),
+            "and the same statistics"
+        );
+    }
+
+    /// **Total on depth.** A left-nested chain far deeper than any stack frame budget interns without
+    /// overflowing, because the traversal is a heap worklist.
+    #[test]
+    fn interning_is_total_on_a_deep_term() {
+        let mut deep = bvar(0);
+        for _ in 0..20_000 {
+            deep = Expr::app(deep, bvar(1));
+        }
+        let mut interner = Interner::new();
+        let canonical = interner.intern(&deep);
+        assert_eq!(canonical, deep, "the interned term equals the input");
+        // bvar(0), bvar(1), and one App per level.
+        assert_eq!(interner.len(), 20_002);
+    }
+
+    /// Re-interning an already-canonical term is idempotent: no new nodes, and the same pointer.
+    #[test]
+    fn interning_is_idempotent() {
+        let root = Expr::app(bvar(0), Expr::lit(Literal::Nat(NatLit::from_u64(3))));
+        let mut interner = Interner::new();
+        let once = interner.intern(&root);
+        let count = interner.len();
+        let twice = interner.intern(&once);
+        assert_eq!(
+            node_ptr(&once),
+            node_ptr(&twice),
+            "re-interning a canonical term returns the same node"
+        );
+        assert_eq!(interner.len(), count, "and stores nothing new");
+    }
+
+    /// Sharing statistics account for every presentation, and a nonzero `bucket_misses` would be
+    /// correct-but-notable rather than hidden.
+    #[test]
+    fn sharing_statistics_account_for_every_presentation() {
+        // Independently built, so there is sharing for the store to provide — see the note on
+        // `mutant_sharing_loss_independently_built_equal_subterms_collapse`.
+        let root = Expr::app(Expr::app(bvar(0), bvar(1)), Expr::app(bvar(0), bvar(1)));
+        let mut interner = Interner::new();
+        interner.intern(&root);
+        let stats = interner.stats();
+        assert_eq!(
+            stats.presented,
+            stats.stored + stats.shared,
+            "every presentation is either stored or shared: {stats:?}"
+        );
+        assert_eq!(stats.stored as usize, interner.len());
+        assert!(stats.sharing_ratio() > 0.0);
+        assert_eq!(
+            stats.bucket_misses, 0,
+            "no digest collision is expected on this fixture; a nonzero value here would be \
+             correct behaviour but worth investigating"
+        );
+    }
+
+    /// Distinct terms stay distinct — the other direction of the invariant. Without this, an
+    /// interner that merged everything would satisfy "structural equality implies pointer equality"
+    /// perfectly.
+    #[test]
+    fn structurally_different_terms_intern_to_different_nodes() {
+        let terms = one_of_each();
+        let mut interner = Interner::new();
+        let interned: Vec<(&str, Expr)> = terms
+            .iter()
+            .map(|(label, expr)| (*label, interner.intern(expr)))
+            .collect();
+
+        for (i, (label_a, a)) in interned.iter().enumerate() {
+            for (label_b, b) in interned.iter().skip(i + 1) {
+                assert_ne!(
+                    node_ptr(a),
+                    node_ptr(b),
+                    "{label_a} and {label_b} are different terms and must be different nodes. \
+                     Without this direction, an interner that merged everything would satisfy the \
+                     invariant."
+                );
+            }
+        }
+    }
+}
