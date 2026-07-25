@@ -3,8 +3,8 @@
 #
 #   * ci/KERNEL_CONTRACT_OWNERSHIP.jsonl may never lag .beads/issues.jsonl
 #     (bead franken_lean-projection-republish-mechanical-voz4).
-#   * ci/VERIFICATION_MANIFEST.jsonl must describe the prospective bead states
-#     whenever the tracker, manifest, or its validator changes
+#   * ci/VERIFICATION_MANIFEST.jsonl must carry complete human judgment for the
+#     prospective tracker whenever the tracker, manifest, or validator changes
 #     (bead franken_lean-e5k7).
 #
 # WHY THIS EXISTS. The projection is a canonical hash over the sorted id set of
@@ -47,9 +47,10 @@
 # The verification-coverage half uses the same prospective-tree rule and the
 # same single-authority rule. It extracts the prospective tracker, manifest, and
 # scripts/evidence.py from Git's index and executes that exact validator. It does
-# not reimplement the adoption boundary, state mapping, or evidence taxonomy in
-# shell. A comment-only tracker commit therefore passes, while a new bead or a
-# status transition without its matching coverage row refuses at the commit
+# not reimplement the adoption boundary, lifecycle derivation, or evidence
+# taxonomy in shell. Coverage lifecycle is projected from the tracker, so a
+# claim or close never needs a hand-maintained state edit. New beads still need
+# judgment rows, and a close whose judgment is incomplete refuses at the commit
 # which creates the debt. A manifest-only or validator-only corruption refuses
 # too, instead of waiting for scripts/check.sh stage 2.
 #
@@ -114,8 +115,9 @@ coverage_refuse() {
     coverage_say "REFUSED — $1"
     coverage_say ''
     coverage_say 'The prospective tracker and verification manifest must validate'
-    coverage_say 'together. New beads need planned rows; claims need active rows;'
-    coverage_say 'closures need complete evidence rows in the same commit.'
+    coverage_say 'together. Lifecycle is derived from the tracker; rows must not'
+    coverage_say 'declare it. New beads need judgment rows, and closed beads need'
+    coverage_say 'complete human-authored evidence in the same commit.'
     coverage_say ''
     coverage_say 'Check the exact prospective-tree obligation with:'
     coverage_say "  python3 -I -S ${VERIFICATION_VALIDATOR_RELATIVE} validate-verification-manifest \\"

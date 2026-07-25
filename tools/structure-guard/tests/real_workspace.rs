@@ -77,7 +77,8 @@ fn real_verification_manifest_covers_the_live_tracker() {
     );
     let stdout = String::from_utf8(output.stdout).expect("validator stdout is UTF-8");
     assert!(stdout.contains("\"schema\":\"fln.validation/1\""));
-    assert!(stdout.contains("\"validator\":\"fln.verification-manifest/1\""));
+    assert!(stdout.contains("\"validator\":\"fln.verification-manifest/2\""));
+    assert!(stdout.contains("\"coverage_state_source\":\".beads/issues.jsonl\""));
     assert!(stdout.contains("\"valid\":true"));
 }
 

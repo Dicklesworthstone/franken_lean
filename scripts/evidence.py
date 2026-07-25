@@ -45,7 +45,7 @@ INCONCLUSIVE = 3
 CANCELLED = 4
 
 RUN_SCHEMAS = {"fln.check/2", "fln.e2e/2"}
-VERIFICATION_MANIFEST_SCHEMA = "fln.verification-manifest/1"
+VERIFICATION_MANIFEST_SCHEMA = "fln.verification-manifest/2"
 VERIFICATION_MANIFEST_PATH = "ci/VERIFICATION_MANIFEST.jsonl"
 CHECK_HUMAN_SCHEMA = "fln.check-human/1"
 CHECK_HUMAN_LOG = "human.semantic.log"
@@ -3812,6 +3812,19 @@ def bead_status_projection(path: Path) -> dict[str, str]:
     return states
 
 
+def derived_verification_coverage_state(bead_status: str, skip: str) -> str:
+    """Derive lifecycle state from the tracker; coverage rows never declare it."""
+    if bead_status == "open":
+        return "blocked" if skip == "blocked" else "planned"
+    if bead_status == "in_progress":
+        return "active"
+    if bead_status in {"closed", "tombstone"}:
+        return "complete"
+    raise EvidenceError(
+        f"cannot derive verification coverage from bead status {bead_status!r}"
+    )
+
+
 def validate_verification_manifest(
     manifest_path: Path,
     beads_path: Path,
@@ -3885,7 +3898,6 @@ def validate_verification_manifest(
         "schema",
         "kind",
         "bead",
-        "state",
         "owner",
         "workstream",
         "claim_type",
@@ -3908,7 +3920,9 @@ def validate_verification_manifest(
         "artifact_kind",
         "artifact_name",
     }
+    bead_states = bead_status_projection(beads_path)
     coverage: dict[str, dict[str, Any]] = {}
+    coverage_numbers: dict[str, int] = {}
     scenarios: dict[str, dict[str, Any]] = {}
     order: list[tuple[int, str]] = []
     for number, record in enumerate(records[1:], 2):
@@ -3933,11 +3947,7 @@ def validate_verification_manifest(
                 )
             order.append((0, bead_id))
             coverage[bead_id] = record
-            state = record.get("state")
-            if state not in {"planned", "active", "complete", "blocked"}:
-                raise EvidenceError(
-                    f"{manifest_path}:{number}: invalid coverage state {state!r}"
-                )
+            coverage_numbers[bead_id] = number
             for field in ("owner", "workstream"):
                 if not isinstance(record.get(field), str) or not record[field]:
                     raise EvidenceError(
@@ -3966,24 +3976,13 @@ def validate_verification_manifest(
                 raise EvidenceError(
                     f"{manifest_path}:{number}: unclassified skip {skip!r}"
                 )
-            if state in {"active", "complete"} and skip != "none":
-                raise EvidenceError(
-                    f"{manifest_path}:{number}: authoritative coverage cannot be skipped"
-                )
-            if state == "blocked" and skip != "blocked":
-                raise EvidenceError(
-                    f"{manifest_path}:{number}: blocked coverage lacks blocked classification"
-                )
             for field in VERIFICATION_COVERAGE_ARRAY_FIELDS:
                 require_manifest_string_array(
                     manifest_path,
                     number,
                     record,
                     field,
-                    nonempty=(
-                        state in {"active", "complete"}
-                        and field in VERIFICATION_COVERAGE_REQUIRED_FIELDS
-                    ),
+                    nonempty=False,
                 )
             if claim_type in {"invariant", "proof"}:
                 if record["mock_only"] or evidence_kind not in {
@@ -4100,7 +4099,6 @@ def validate_verification_manifest(
             f"{manifest_path}: rows must be coverage-then-scenario canonical order"
         )
 
-    bead_states = bead_status_projection(beads_path)
     current_ids = set(bead_states)
     adopted = set(adoption_ids)
     missing_adopted = sorted(adopted - current_ids)
@@ -4108,23 +4106,41 @@ def validate_verification_manifest(
         raise EvidenceError(
             f"{manifest_path}: adopted beads disappeared: {missing_adopted!r}"
         )
-    for bead_id in coverage:
+    derived_state_counts = {
+        "planned": 0,
+        "active": 0,
+        "complete": 0,
+        "blocked": 0,
+    }
+    for bead_id, record in coverage.items():
         if bead_id not in bead_states:
             raise EvidenceError(
                 f"{manifest_path}: orphan coverage row for {bead_id!r}"
             )
-        expected_states = {
-            "open": {"planned", "blocked"},
-            "in_progress": {"active"},
-            "closed": {"complete"},
-            "tombstone": {"complete"},
-        }[bead_states[bead_id]]
-        if coverage[bead_id]["state"] not in expected_states:
+        derived_state = derived_verification_coverage_state(
+            bead_states[bead_id], record["skip"]
+        )
+        derived_state_counts[derived_state] += 1
+        number = coverage_numbers[bead_id]
+        if derived_state in {"active", "complete"} and record["skip"] != "none":
             raise EvidenceError(
-                f"{manifest_path}: coverage state for {bead_id!r} is "
-                f"{coverage[bead_id]['state']!r}, but bead is "
-                f"{bead_states[bead_id]!r}"
+                f"{manifest_path}:{number}: {derived_state} coverage cannot be skipped"
             )
+        if derived_state == "blocked" and record["skip"] != "blocked":
+            raise EvidenceError(
+                f"{manifest_path}:{number}: blocked coverage lacks blocked classification"
+            )
+        if derived_state == "complete":
+            for field in VERIFICATION_COVERAGE_ARRAY_FIELDS:
+                if field not in VERIFICATION_COVERAGE_REQUIRED_FIELDS:
+                    continue
+                require_manifest_string_array(
+                    manifest_path,
+                    number,
+                    record,
+                    field,
+                    nonempty=True,
+                )
     required_coverage = current_ids - adopted
     required_coverage.update(
         bead_id
@@ -4172,6 +4188,8 @@ def validate_verification_manifest(
         "adoption_records": len(adoption_ids),
         "current_beads": len(bead_states),
         "coverage_rows": len(coverage),
+        "coverage_state_source": ".beads/issues.jsonl",
+        "derived_state_counts": derived_state_counts,
         "scenario_rows": len(scenarios),
         "ci_scenarios": sorted(
             scenario
@@ -12948,7 +12966,6 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "schema": VERIFICATION_MANIFEST_SCHEMA,
         "kind": "coverage",
         "bead": "rur",
-        "state": "active",
         "owner": "fixture",
         "workstream": "W1",
         "claim_type": "invariant",
@@ -13044,6 +13061,33 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         and positive_report["scenario_rows"] == 1
         and positive_report["ci_scenarios"] == ["quality_gate"],
         "verification manifest shared scenario lost its authority rows",
+    )
+    require(
+        positive_report["coverage_state_source"] == ".beads/issues.jsonl"
+        and positive_report["derived_state_counts"]["active"] == 2,
+        "verification manifest did not derive active lifecycle from the tracker",
+    )
+
+    # The exact same human-authored judgment row remains valid when its bead
+    # closes: lifecycle is projected from the tracker, never edited into the
+    # manifest. This is the regression that killed three full-gate attempts
+    # before fln.verification-manifest/2.
+    closed_beads = clone_records(verification_beads)
+    closed_beads[1]["status"] = "closed"
+    derived_closed_manifest, derived_closed_tracker = write_verification_case(
+        "derived-closed-lifecycle",
+        clone_records(verification_records),
+        closed_beads,
+    )
+    derived_closed_report = validate_verification_manifest(
+        derived_closed_manifest,
+        derived_closed_tracker,
+        expected_adoption_authority_hash=verification_authority_hash,
+    )
+    require(
+        derived_closed_report["derived_state_counts"]["complete"] == 1
+        and derived_closed_report["derived_state_counts"]["active"] == 1,
+        "verification manifest did not derive closure from the tracker",
     )
     verification_mutants = 0
 
@@ -13146,9 +13190,19 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "dynamic-unbounded-adoption",
         expand_adoption_boundary,
     )
+    def close_without_complete_judgment(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        beads[1]["status"] = "closed"
+        records[1]["unit"] = []
+
     reject_verification_case(
-        "closed-bead-active-row",
-        lambda _records, beads: beads[1].update(status="closed"),
+        "closed-bead-without-complete-judgment",
+        close_without_complete_judgment,
+    )
+    reject_verification_case(
+        "hand-maintained-lifecycle-field",
+        lambda records, _beads: records[1].update(state="active"),
     )
     reject_verification_case(
         "duplicate-row",
@@ -13164,7 +13218,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         duplicate_manifest,
         canonical_json(verification_header)
         + duplicate_coverage[:-1]
-        + b',"state":"active"}\n'
+        + b',"owner":"duplicate-owner"}\n'
         + canonical_json(verification_scenario),
     )
     write_new(
@@ -13205,7 +13259,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     else:
         raise EvidenceError("truncated verification manifest was accepted")
     require(
-        verification_mutants == 16,
+        verification_mutants == 17,
         "verification manifest mutation matrix is incomplete",
     )
     cases.append(

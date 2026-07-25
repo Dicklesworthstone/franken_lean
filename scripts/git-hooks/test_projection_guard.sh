@@ -335,7 +335,7 @@ else
     PASSES=$((PASSES + 1))
 fi
 
-planned_row='{"artifacts":[],"bead":"franken_lean-hook-coverage-plant","behavior_notes":["prospective-tree test fixture"],"boundary":[],"cancellation":[],"claim_ids":[],"claim_type":"bounded_model","error":[],"evidence_kind":"unit","failure_atomicity":[],"fault":[],"fuzz":[],"gate_ids":["W1"],"invariant_ids":[],"kind":"coverage","metamorphic":[],"mock_only":false,"mutation":[],"negative_recovery":[],"owner":"guard-test","parity_rows":[],"property":[],"requirement_ids":[],"resource":[],"scenarios":[],"schema":"fln.verification-manifest/1","skip":"none","state":"planned","unit":[],"workstream":"W1"}'
+planned_row='{"artifacts":[],"bead":"franken_lean-hook-coverage-plant","behavior_notes":["prospective-tree test fixture"],"boundary":[],"cancellation":[],"claim_ids":[],"claim_type":"bounded_model","error":[],"evidence_kind":"unit","failure_atomicity":[],"fault":[],"fuzz":[],"gate_ids":["W1"],"invariant_ids":[],"kind":"coverage","metamorphic":[],"mock_only":false,"mutation":[],"negative_recovery":[],"owner":"guard-test","parity_rows":[],"property":[],"requirement_ids":[],"resource":[],"scenarios":[],"schema":"fln.verification-manifest/2","skip":"none","unit":[],"workstream":"W1"}'
 canonicalize_manifest_with "$planned_row"
 out=$(run_commit -q -o \
     .beads/issues.jsonl \
@@ -344,32 +344,63 @@ out=$(run_commit -q -o \
     -m 'new bead with planned coverage' 2>&1); code=$?
 check 'a new bead with matching planned coverage is accepted' 0 '' "$code" "$out"
 
-# Claiming the bead changes the required manifest state. The id-set projection
-# remains byte-identical, so only the verification validator can catch this.
+# Claiming the bead changes only the tracker. The same prospective judgment row
+# remains valid because lifecycle is derived from the prospective tracker.
 rewrite_tracker franken_lean-hook-coverage-plant in_progress
 coverage_republish
 out=$(run_commit -q -o \
     .beads/issues.jsonl \
     ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
-    -m 'claim with stale planned coverage' 2>&1); code=$?
-check 'a claim with stale planned coverage is refused' 1 \
-    "coverage state for 'franken_lean-hook-coverage-plant'" "$code" "$out"
+    -m 'claim with derived coverage lifecycle' 2>&1); code=$?
+check 'a claim needs no hand-maintained lifecycle transition' 0 '' "$code" "$out"
 
+# A state field is now a defect, not a source of authority. Planting one must
+# fail even when its value happens to match the tracker.
 jq -c '
     if .kind == "coverage" and .bead == "franken_lean-hook-coverage-plant" then
-        .artifacts = ["prospective-tree-active-fixture"] |
-        .boundary = ["prospective-tree-active-boundary"] |
-        .cancellation = ["prospective-tree-active-cancellation"] |
-        .claim_ids = ["HOOK-COVERAGE-ACTIVE"] |
-        .error = ["prospective-tree-active-error"] |
-        .failure_atomicity = ["prospective-tree-active-failure-atomicity"] |
+        .state = "active"
+    else .
+    end
+' ci/VERIFICATION_MANIFEST.jsonl > ci/VERIFICATION_MANIFEST.jsonl.next
+mv ci/VERIFICATION_MANIFEST.jsonl.next ci/VERIFICATION_MANIFEST.jsonl
+out=$(run_commit -q -o \
+    ci/VERIFICATION_MANIFEST.jsonl \
+    -m 'plant hand-maintained lifecycle' 2>&1); code=$?
+check 'a hand-maintained lifecycle field is refused' 1 \
+    'coverage shape differs' "$code" "$out"
+jq -c '
+    if .kind == "coverage" and .bead == "franken_lean-hook-coverage-plant" then
+        del(.state)
+    else .
+    end
+' ci/VERIFICATION_MANIFEST.jsonl > ci/VERIFICATION_MANIFEST.jsonl.next
+mv ci/VERIFICATION_MANIFEST.jsonl.next ci/VERIFICATION_MANIFEST.jsonl
+
+# Closing derives `complete`, but lifecycle derivation must not launder a
+# sparse prospective row into terminal evidence. The close refuses until the
+# bead owner supplies the human judgment fields.
+rewrite_tracker franken_lean-hook-coverage-plant closed
+coverage_republish
+out=$(run_commit -q -o \
+    .beads/issues.jsonl \
+    ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
+    -m 'close without complete judgment' 2>&1); code=$?
+check 'a close without complete human judgment is refused' 1 \
+    'requirement_ids must not be empty' "$code" "$out"
+jq -c '
+    if .kind == "coverage" and .bead == "franken_lean-hook-coverage-plant" then
+        .artifacts = ["prospective-tree-complete-fixture"] |
+        .boundary = ["prospective-tree-complete-boundary"] |
+        .cancellation = ["prospective-tree-complete-cancellation"] |
+        .claim_ids = ["HOOK-COVERAGE-COMPLETE"] |
+        .error = ["prospective-tree-complete-error"] |
+        .failure_atomicity = ["prospective-tree-complete-failure-atomicity"] |
         .gate_ids = ["W1"] |
-        .negative_recovery = ["prospective-tree-active-negative-recovery"] |
-        .requirement_ids = ["HOOK-COVERAGE-ACTIVE"] |
-        .resource = ["prospective-tree-active-resource"] |
+        .negative_recovery = ["prospective-tree-complete-negative-recovery"] |
+        .requirement_ids = ["HOOK-COVERAGE-COMPLETE"] |
+        .resource = ["prospective-tree-complete-resource"] |
         .scenarios = ["quality_gate"] |
-        .state = "active" |
-        .unit = ["prospective-tree-active-unit"]
+        .unit = ["prospective-tree-complete-unit"]
     else .
     end
 ' ci/VERIFICATION_MANIFEST.jsonl > ci/VERIFICATION_MANIFEST.jsonl.next
@@ -378,8 +409,8 @@ out=$(run_commit -q -o \
     .beads/issues.jsonl \
     ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
     ci/VERIFICATION_MANIFEST.jsonl \
-    -m 'claim with active coverage' 2>&1); code=$?
-check 'a claim with matching active coverage is accepted' 0 '' "$code" "$out"
+    -m 'close with complete judgment' 2>&1); code=$?
+check 'a close with complete human judgment is accepted' 0 '' "$code" "$out"
 
 # If the prospective validator itself cannot run, fail closed. The invalid
 # script is never committed; restoring the fixture makes the worktree clean.
