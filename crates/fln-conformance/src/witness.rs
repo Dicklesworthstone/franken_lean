@@ -145,6 +145,90 @@ pub struct ClaimRow {
     pub enforcement: Enforcement,
 }
 
+/// A machine-checkable fact that a row's `evidence` prose asserts.
+///
+/// **Why this exists.** Slice 2 checked anchors and conservation and never checked the
+/// *evidence*. Within hours of being written, two rows in this matrix were factually false
+/// — `B3-INDEPENDENT-CHECKER` said `fln-checker` was "a 6-line charter stub" when it had
+/// grown to 149 lines, and `B3-CONSENSUS-HALTS` said "there is no council to disagree"
+/// after `crates/fln-kernel/src/council.rs` landed. The gate was green throughout.
+///
+/// That is this matrix's own defect one level up: a row that reads as verified while its
+/// evidence describes a world that no longer exists. A claim matrix whose evidence rots
+/// silently is exactly the thing it was built to prevent, so the load-bearing facts are now
+/// cited and the citations are checked.
+///
+/// The direction matters. A citation should fail **when the fact changes**, which is when
+/// the row needs a human — not when it stays true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Citation {
+    /// "still a stub": the file is at most this many lines. Fails once it is implemented,
+    /// which is precisely when a row calling it a stub has become a lie.
+    FileAtMostLines {
+        path: &'static str,
+        max_lines: usize,
+    },
+    /// "no longer a stub": the file is at least this many lines. Fails if it is reverted or
+    /// emptied, which would make a row describing a real implementation wrong.
+    FileAtLeastLines {
+        path: &'static str,
+        min_lines: usize,
+    },
+    /// A named construct occurs exactly this many times in the cited file.
+    OccursExactly {
+        path: &'static str,
+        needle: &'static str,
+        count: usize,
+    },
+}
+
+impl Citation {
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Citation::FileAtMostLines { path, .. }
+            | Citation::FileAtLeastLines { path, .. }
+            | Citation::OccursExactly { path, .. } => path,
+        }
+    }
+
+    /// `None` when the cited fact still holds; otherwise why it no longer does.
+    fn check(&self, text: &str) -> Option<String> {
+        match self {
+            Citation::FileAtMostLines { path, max_lines } => {
+                let lines = text.lines().count();
+                (lines > *max_lines).then(|| {
+                    format!(
+                        "{path} is {lines} lines, over the cited maximum of {max_lines} — it is \
+                         no longer the stub this row's evidence describes"
+                    )
+                })
+            }
+            Citation::FileAtLeastLines { path, min_lines } => {
+                let lines = text.lines().count();
+                (lines < *min_lines).then(|| {
+                    format!(
+                        "{path} is {lines} lines, under the cited minimum of {min_lines} — the \
+                         implementation this row's evidence describes has shrunk or gone"
+                    )
+                })
+            }
+            Citation::OccursExactly {
+                path,
+                needle,
+                count,
+            } => {
+                let found = text.matches(needle).count();
+                (found != *count).then(|| {
+                    format!(
+                        "{path} contains `{needle}` {found} time(s), not the cited {count} — the \
+                         construct this row's evidence relies on has moved"
+                    )
+                })
+            }
+        }
+    }
+}
+
 /// A conservation law over one concept's assertions.
 ///
 /// `governed` is not stored: it is computed from the matrix, so it cannot drift from reality.
@@ -172,8 +256,11 @@ COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, seeded from a measured rea
 (bead franken_lean-claim-matrix-doc-ci-mhew). NOT covered: the overwhelming majority of \
 README.md (~41 KB) and the plan (~195 KB), every claim in every other crate header, and all \
 generated contracts. Only three concepts have a conservation census; every other repeated \
-claim in these documents is unwatched. A passing scan means no row and no census is violated. \
-It does not mean the documentation is accurate.";
+claim in these documents is unwatched. Six evidence citations over five rows are checked \
+against the tree; every other row's evidence prose is UNCHECKED and can rot exactly as two \
+rows did on 2026-07-25 while this gate stayed green. A passing scan means no row, no census \
+and no citation is violated. It does not mean the documentation is accurate, and it does not \
+mean the evidence is current.";
 
 const fn site(document: &'static str, text: &'static str) -> ClaimSite {
     ClaimSite { document, text }
@@ -296,14 +383,19 @@ pub const CLAIM_MATRIX: [ClaimRow; 15] = [
         sites: &SITES_CONSENSUS_HALTS,
         claim_type: ClaimType::Invariant,
         state: ClaimState::Targeted,
-        evidence: "There is no council to disagree. The word `consensus` occurs exactly once \
-                   across fln-kernel and fln-checker combined, in the 6-line stub's charter. \
-                   No vote, no halt path, and no canonical Judgment type — plan §8.3c \
-                   specifies `Judgment { input_digest, env_logical_root, verdict, engine_id, \
-                   fuel_profile }` as the substrate of consensus and no such type exists in \
-                   any crate. Note the plan states a STRONGER variant, 'never votes', whose \
-                   neighbouring clause about fln-checker non-sharing IS structurally proven \
-                   today by the WORKSPACE_GRAPH prohibitions.",
+        evidence: "SUPERSEDED EVIDENCE, corrected 2026-07-25: this row previously said 'there \
+                   is no council to disagree'. That became false when bead fln-uc44 landed \
+                   crates/fln-kernel/src/council.rs (commit 10c9a2e3), and the matrix did not \
+                   notice — which is why Citation exists. The seat is real and well made: \
+                   `convene` CONSUMES the Admitted capability and on a halt simply never hands \
+                   the non-Clone CheckedDecl back, so halting is not a flag anyone can ignore; \
+                   and there is no quorum, no tally and no seat count anywhere in the module, \
+                   so agreement is required rather than counted. What the sentence still \
+                   promises beyond the tree: `convene` has NO production caller — every call \
+                   site is in tests/consensus_seat.rs — because there is no publication path \
+                   to halt yet (fln-elab is a stub). The mechanism exists; the running \
+                   behaviour the wording describes does not. Also still absent: the canonical \
+                   Judgment type plan §8.3c specifies as the substrate of consensus.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -311,11 +403,15 @@ pub const CLAIM_MATRIX: [ClaimRow; 15] = [
         sites: &SITES_INDEPENDENT_CHECKER,
         claim_type: ClaimType::BoundedModel,
         state: ClaimState::Targeted,
-        evidence: "crates/fln-checker/src/lib.rs is a 6-line charter stub. Its INDEPENDENCE is \
-                   already enforced — structure-guard walks the prohibitions fln-checker ->* \
-                   fln-kernel, ->* fln-olean, ->* fln-rt, ->* fln-unsafe-* — so the layering \
-                   for a second engine is real before the engine is. The foreign-witness half \
-                   is a separate, Supported row.",
+        evidence: "SUPERSEDED EVIDENCE, corrected 2026-07-25: this row said \
+                   crates/fln-checker/src/lib.rs was 'a 6-line charter stub'. It is 149 lines \
+                   — the independence-boundary work (franken_lean-r0xu) filled it in while the \
+                   matrix went on asserting the stub, green. Its INDEPENDENCE has been enforced \
+                   throughout: structure-guard walks fln-checker ->* fln-kernel, ->* fln-olean, \
+                   ->* fln-rt, ->* fln-unsafe-*. What the claim still promises beyond the tree \
+                   is a second CHECKING ENGINE: what exists is the independence boundary and \
+                   the data schema, not an implementation that decides verdicts. The \
+                   foreign-witness half is a separate, Supported row.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -471,6 +567,62 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
     },
 ];
 
+/// **The load-bearing facts each row's evidence asserts, made checkable.**
+///
+/// Kept as a side table joined by claim id rather than a field on [`ClaimRow`], so a citation
+/// naming no row is itself a fault and the two tables cannot drift apart silently — the same
+/// bidirectional discipline the corpus projection uses.
+///
+/// This is a seed, not coverage: six citations over five rows. Most evidence prose here is
+/// still unchecked, and [`GOVERNED_SCOPE`] says so.
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 6] = [
+    // Corrected 2026-07-25 after this row asserted a stub that had grown to 149 lines.
+    (
+        "B3-INDEPENDENT-CHECKER",
+        Citation::FileAtLeastLines {
+            path: "crates/fln-checker/src/lib.rs",
+            min_lines: 100,
+        },
+    ),
+    // The seat this row's corrected evidence describes must still exist.
+    (
+        "B3-CONSENSUS-HALTS",
+        Citation::OccursExactly {
+            path: "crates/fln-kernel/src/council.rs",
+            needle: "pub fn convene",
+            count: 1,
+        },
+    ),
+    (
+        "DAEMON-WARM-ATTACH-SLO",
+        Citation::FileAtMostLines {
+            path: "crates/fln-server/src/lib.rs",
+            max_lines: 10,
+        },
+    ),
+    (
+        "TACTICS-ON-GOLEM",
+        Citation::FileAtMostLines {
+            path: "crates/fln-vm/src/lib.rs",
+            max_lines: 10,
+        },
+    ),
+    (
+        "TACTICS-ON-GOLEM",
+        Citation::FileAtMostLines {
+            path: "crates/fln-elab/src/lib.rs",
+            max_lines: 10,
+        },
+    ),
+    (
+        "PRODUCT-TOOLCHAIN-BINARIES",
+        Citation::FileAtMostLines {
+            path: "crates/fln-cli/src/lib.rs",
+            max_lines: 10,
+        },
+    ),
+];
+
 /// A way the documentation and the matrix disagree.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WitnessFault {
@@ -500,6 +652,11 @@ pub enum WitnessFault {
     DuplicateClaimId { id: String },
     /// A row with no sites decides nothing and would inflate the row count.
     EmptyClaimRow { id: String },
+    /// A fact a row's evidence asserts is no longer true. The row still passes its anchor
+    /// checks, which is exactly why this is needed: the wording is stable and the world moved.
+    StaleEvidence { id: String, detail: String },
+    /// A citation naming a row that does not exist, so it checks nothing.
+    CitationForUnknownRow { id: String },
 }
 
 impl fmt::Display for WitnessFault {
@@ -562,6 +719,20 @@ impl fmt::Display for WitnessFault {
                 f,
                 "{id} has no sites, so it decides nothing while counting as coverage."
             ),
+            WitnessFault::StaleEvidence { id, detail } => write!(
+                f,
+                "{id}: this row's EVIDENCE is out of date — {detail}.\n\
+                 The anchors still match, so nothing else would have caught this: the wording \
+                 in the documents did not change, the tree did. Re-read what the row claims \
+                 the tree supports, rewrite the evidence to what is true now, and move the \
+                 state if the claim is now earned or newly unsupported. Do not adjust the \
+                 citation to match reality and leave the prose alone — the citation exists to \
+                 force the prose to be re-read."
+            ),
+            WitnessFault::CitationForUnknownRow { id } => write!(
+                f,
+                "a citation names claim row {id}, which does not exist; it checks nothing."
+            ),
         }
     }
 }
@@ -579,6 +750,8 @@ pub struct WitnessReport {
     pub sites: usize,
     /// Concept censuses that balanced.
     pub censuses: usize,
+    /// Evidence citations whose cited fact still holds.
+    pub citations: usize,
     /// Governed documents actually read.
     pub documents: BTreeSet<String>,
 }
@@ -600,6 +773,7 @@ impl WitnessReport {
 pub fn scan(
     rows: &[ClaimRow],
     censuses: &[ConceptCensus],
+    citations: &[(&str, Citation)],
     mut read: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<WitnessReport, Vec<WitnessFault>> {
     let mut faults: Vec<WitnessFault> = Vec::new();
@@ -710,6 +884,29 @@ pub fn scan(
             });
         } else {
             report.censuses += 1;
+        }
+    }
+
+    for (id, citation) in citations {
+        if !rows.iter().any(|row| row.id == *id) {
+            faults.push(WitnessFault::CitationForUnknownRow {
+                id: (*id).to_string(),
+            });
+            continue;
+        }
+        let index = load(citation.path(), &mut cache);
+        match &cache[index].1 {
+            Ok(text) => match citation.check(text) {
+                Some(detail) => faults.push(WitnessFault::StaleEvidence {
+                    id: (*id).to_string(),
+                    detail,
+                }),
+                None => report.citations += 1,
+            },
+            Err(detail) => faults.push(WitnessFault::UnreadableDocument {
+                document: citation.path().to_string(),
+                detail: detail.clone(),
+            }),
         }
     }
 

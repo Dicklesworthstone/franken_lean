@@ -26,8 +26,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fln_conformance::witness::{
-    CLAIM_MATRIX, CONCEPT_CENSUS, ClaimRow, ClaimState, Enforcement, GOVERNED_SCOPE, WitnessFault,
-    governed_occurrences, scan,
+    CLAIM_MATRIX, CONCEPT_CENSUS, ClaimRow, ClaimState, EVIDENCE_CITATIONS, Enforcement,
+    GOVERNED_SCOPE, WitnessFault, governed_occurrences, scan,
 };
 
 fn workspace_root() -> PathBuf {
@@ -64,6 +64,19 @@ fn real_with(document: &'static str, text: String) -> impl FnMut(&str) -> Result
     }
 }
 
+/// Like [`real_with`] but for a non-`'static` path, which citation paths are.
+fn real_with_path(document: &str, text: String) -> impl FnMut(&str) -> Result<String, String> {
+    let root = workspace_root();
+    let document = document.to_string();
+    move |wanted: &str| {
+        if wanted == document {
+            Ok(text.clone())
+        } else {
+            fs::read_to_string(root.join(wanted)).map_err(|e| e.to_string())
+        }
+    }
+}
+
 fn row(id: &str) -> &'static ClaimRow {
     let found = CLAIM_MATRIX.iter().find(|row| row.id == id);
     assert!(found.is_some(), "no claim row {id}");
@@ -88,7 +101,12 @@ fn render(faults: &[WitnessFault]) -> String {
 
 #[test]
 fn the_matrix_and_the_censuses_are_clean_against_the_real_tree() {
-    let outcome = scan(&CLAIM_MATRIX, &CONCEPT_CENSUS, real_reader());
+    let outcome = scan(
+        &CLAIM_MATRIX,
+        &CONCEPT_CENSUS,
+        &EVIDENCE_CITATIONS,
+        real_reader(),
+    );
     let report = outcome.as_ref().err().map(|faults| render(faults));
     assert!(
         outcome.is_ok(),
@@ -119,6 +137,79 @@ fn the_matrix_and_the_censuses_are_clean_against_the_real_tree() {
         "multi-site rows exist, so sites must exceed rows: {} sites, {} rows",
         report.sites,
         CLAIM_MATRIX.len()
+    );
+    assert_eq!(
+        report.citations,
+        EVIDENCE_CITATIONS.len(),
+        "every cited fact still holds; if this falls, a row's evidence has rotted and the \
+         prose needs re-reading, not the citation adjusting"
+    );
+}
+
+/// The failure this whole mechanism was added for.
+///
+/// On 2026-07-25 two rows in this matrix were factually false — `B3-INDEPENDENT-CHECKER`
+/// called `fln-checker` "a 6-line charter stub" after it reached 149 lines, and
+/// `B3-CONSENSUS-HALTS` said "there is no council to disagree" after `council.rs` landed —
+/// and every anchor still matched, so the gate stayed green. The wording in the documents
+/// had not changed; the tree had. Nothing here could see that until citations existed.
+#[test]
+fn evidence_that_has_gone_stale_is_caught_even_though_the_anchors_still_match() {
+    let target = row("DAEMON-WARM-ATTACH-SLO");
+    let citation = EVIDENCE_CITATIONS
+        .iter()
+        .find(|(id, _)| *id == target.id)
+        .map(|(_, citation)| *citation);
+    assert!(citation.is_some(), "{} has a cited fact", target.id);
+    let citation = citation.expect("asserted Some above");
+
+    // The row's evidence says crates/fln-server is a stub. Implement it, and the row is
+    // wrong while its anchor in README.md is untouched.
+    let implemented = "x\n".repeat(400);
+    let faults = scan(
+        &[*target],
+        &[],
+        &[(target.id, citation)],
+        real_with_path(citation.path(), implemented),
+    )
+    .expect_err("a row whose cited fact moved must fail");
+
+    assert!(
+        faults.iter().any(|fault| matches!(
+            fault,
+            WitnessFault::StaleEvidence { id, .. } if id == target.id
+        )),
+        "expected StaleEvidence for {}: {faults:?}",
+        target.id
+    );
+    assert!(
+        render(&faults).contains("the wording in the documents did not change, the tree did"),
+        "the refusal must name why nothing else caught it"
+    );
+    assert!(
+        render(&faults).contains("Do not adjust the citation to match reality"),
+        "the refusal must close the obvious escape, which is to move the number"
+    );
+}
+
+#[test]
+fn a_citation_naming_no_row_is_refused() {
+    let citation = EVIDENCE_CITATIONS
+        .first()
+        .map(|(_, citation)| *citation)
+        .expect("the table is non-empty");
+    let faults = scan(
+        &CLAIM_MATRIX,
+        &[],
+        &[("NO-SUCH-CLAIM-ROW", citation)],
+        real_reader(),
+    )
+    .expect_err("a citation that checks nothing");
+    assert!(
+        faults
+            .iter()
+            .any(|fault| matches!(fault, WitnessFault::CitationForUnknownRow { .. })),
+        "{faults:?}"
     );
 }
 
@@ -160,7 +251,7 @@ fn a_repaired_overclaim_coming_back_is_caught() {
         );
 
         let regressed = format!("{live}\n\nand then someone put it back: {}\n", site.text);
-        let faults = scan(&[*target], &[], real_with(site.document, regressed))
+        let faults = scan(&[*target], &[], &[], real_with(site.document, regressed))
             .expect_err("restored wording must fail the gate");
         assert!(
             faults.iter().any(|fault| matches!(
@@ -184,6 +275,7 @@ fn a_partial_repair_within_one_document_cannot_pass() {
     );
     let faults = scan(
         &[*target],
+        &[],
         &[],
         planted(BTreeMap::from([(site.document, doc)])),
     )
@@ -219,7 +311,7 @@ fn repairing_all_but_one_site_of_a_multi_site_claim_fails() {
     }
     assert_ne!(repaired, readme, "the plant did not apply");
 
-    let faults = scan(&[*target], &[], real_with("README.md", repaired))
+    let faults = scan(&[*target], &[], &[], real_with("README.md", repaired))
         .expect_err("a partial repair across sites must not pass");
     assert!(
         faults.iter().any(|fault| matches!(
@@ -241,7 +333,7 @@ fn a_silently_repaired_overclaim_is_caught() {
     let site = target.sites.first().expect("has a site");
 
     let repaired = read_doc(site.document).replace(site.text, "warm attach is not yet measured");
-    let faults = scan(&[*target], &[], real_with(site.document, repaired))
+    let faults = scan(&[*target], &[], &[], real_with(site.document, repaired))
         .expect_err("a repair the matrix did not follow must fail");
     assert!(
         faults.iter().any(|fault| matches!(
@@ -266,7 +358,7 @@ fn a_vanishing_supported_claim_is_caught() {
     let site = target.sites.first().expect("has a site");
 
     let stripped = read_doc(site.document).replace(site.text, "the kernel is small");
-    let faults = scan(&[*target], &[], real_with(site.document, stripped))
+    let faults = scan(&[*target], &[], &[], real_with(site.document, stripped))
         .expect_err("a supported claim vanishing must fail");
     assert!(
         matches!(
@@ -299,6 +391,7 @@ fn a_new_ungoverned_assertion_breaks_the_census() {
     let faults = scan(
         &CLAIM_MATRIX,
         &CONCEPT_CENSUS,
+        &EVIDENCE_CITATIONS,
         real_with("README.md", readme),
     )
     .expect_err("an assertion added anywhere must break conservation");
@@ -324,6 +417,7 @@ fn deleting_an_ungoverned_assertion_also_breaks_the_census() {
     let faults = scan(
         &CLAIM_MATRIX,
         &CONCEPT_CENSUS,
+        &EVIDENCE_CITATIONS,
         real_with("README.md", readme),
     )
     .expect_err("an assertion removed anywhere must break conservation");
@@ -361,7 +455,7 @@ fn the_governed_half_of_the_census_is_computed_not_declared() {
 #[test]
 fn an_unreadable_governed_document_is_inconclusive_never_a_pass() {
     let target = row("B3-DUAL-ENGINE");
-    let faults = scan(&[*target], &[], |_document| {
+    let faults = scan(&[*target], &[], &[], |_document| {
         Err("permission denied".to_string())
     })
     .expect_err("a document that cannot be read establishes nothing");
@@ -381,8 +475,8 @@ fn an_unreadable_governed_document_is_inconclusive_never_a_pass() {
 #[test]
 fn a_duplicate_claim_id_is_refused() {
     let target = *row("TACTICS-ON-GOLEM");
-    let faults =
-        scan(&[target, target], &[], real_reader()).expect_err("one row would shadow the other");
+    let faults = scan(&[target, target], &[], &[], real_reader())
+        .expect_err("one row would shadow the other");
     assert!(
         faults.iter().any(|fault| matches!(
             fault,
@@ -398,7 +492,7 @@ fn a_row_with_no_sites_is_refused() {
         sites: &[],
         ..*row("TACTICS-ON-GOLEM")
     };
-    let faults = scan(&[empty], &[], real_reader()).expect_err("a row that decides nothing");
+    let faults = scan(&[empty], &[], &[], real_reader()).expect_err("a row that decides nothing");
     assert!(
         matches!(faults.first(), Some(WitnessFault::EmptyClaimRow { .. })),
         "{faults:?}"
@@ -417,14 +511,14 @@ fn the_gate_reports_every_disagreement_at_once_and_deterministically() {
         (acknowledged.sites[0].document, "nothing here".to_string()),
     ]);
     let faults =
-        scan(&[*enforced, *acknowledged], &[], planted(docs.clone())).expect_err("two faults");
+        scan(&[*enforced, *acknowledged], &[], &[], planted(docs.clone())).expect_err("two faults");
     assert_eq!(
         faults.len(),
         2,
         "both directions in one run, not stop at the first: {faults:?}"
     );
 
-    let again = scan(&[*enforced, *acknowledged], &[], planted(docs)).expect_err("two faults");
+    let again = scan(&[*enforced, *acknowledged], &[], &[], planted(docs)).expect_err("two faults");
     assert_eq!(faults, again, "same inputs, same report (FL-INV-01)");
     let mut sorted = faults.clone();
     sorted.sort();
