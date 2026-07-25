@@ -55,60 +55,20 @@ pub const G0_SCHEMA: &str = "fln-g0-spike-decision/1";
 /// One roster entry: a spike id and the exact §22.1 question it must answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterSpike {
-    pub id: &'static str,
-    pub question: &'static str,
+    pub id: String,
+    /// The bolded spike name as §22.1 states it.
+    pub name: String,
+    /// The question, verbatim from §22.1.
+    pub question: String,
 }
 
-/// The ten G0 spikes of §22.1.
-///
-/// **Provenance caveat.** These are transcribed from the plan, not extracted
-/// from it, so this table is exactly the kind of hand-listed artifact the rest
-/// of this crate refuses. It is a constant rather than a derivation because
-/// reading the plan file is the extraction slice's job; until then, a drift
-/// between this table and §22.1 is undetectable here, and that is recorded on
-/// the bead rather than hidden.
-pub const G0_ROSTER: [RosterSpike; 10] = [
-    RosterSpike {
-        id: "G0-1",
-        question: "ABI resurrection: parse a real mathlib .olean at the pin, walk every constant and extension entry, validate object-graph integrity against the extracted contract tables",
-    },
-    RosterSpike {
-        id: "G0-2",
-        question: "Independent check: prototype Crucible checks a nontrivial upstream module from its olean, verdicts diffed against lean4checker",
-    },
-    RosterSpike {
-        id: "G0-3",
-        question: "Golem execution: execute real user-class compiled Lean code through the prototype intrinsic table on ABI values, end to end",
-    },
-    RosterSpike {
-        id: "G0-4",
-        question: "Hygiene and syntax fidelity: compare Syntax trees, positions and hygiene observables against the Reference on macro-heavy Corpus files",
-    },
-    RosterSpike {
-        id: "G0-5",
-        question: "Byte-identical re-emit: read, rebuild and byte-diff Reference oleans; enumerate every serialization freedom and pin each with a policy",
-    },
-    RosterSpike {
-        id: "G0-6",
-        question: "Fuel parity: calibrate the heartbeat-counting law until faithful timeout behavior matches tick for tick; document any irreducible divergence class",
-    },
-    RosterSpike {
-        id: "G0-7",
-        question: "Defeq tail: the twenty nastiest Corpus defeq/whnf problems timed on the memoization design; decide cache keying and lazy-delta strategy",
-    },
-    RosterSpike {
-        id: "G0-8",
-        question: "Mirror-facade viability: census and facade stubs for a metaprogram-heavy slice; enumerate every API whose semantics resist native backing and assign each an honest L-level",
-    },
-    RosterSpike {
-        id: "G0-9",
-        question: "Instrumented oracle: dump unifier/instance/macro decision traces on a pilot corpus; prove the trace schema, volume and replay-rig design",
-    },
-    RosterSpike {
-        id: "G0-10",
-        question: "Dependency-closure audit: full transitive closure generated and allowlisted, SUITE.lock committed, extraction scripts stood up in CI",
-    },
-];
+// The transcribed `G0_ROSTER` constant that used to live here has been REMOVED
+// (bead `fln-8fwh`). It was hand-copied from §22.1, and deriving the roster
+// from the plan proved that **all ten** of its questions differed from the
+// plan's — so the verbatim-question check below was enforcing a paraphrase with
+// full confidence, which is precisely the failure this schema exists to
+// prevent. A roster is now obtained from
+// [`crate::derive::derive_g0_roster`], which reads the plan.
 
 /// A witness root, with its status in the type rather than in a comment.
 ///
@@ -456,18 +416,21 @@ pub fn verify(decisions: &[Decision], roster: &[RosterSpike]) -> Gate {
     let mut blocked = Vec::new();
 
     for r in roster {
-        let rows = by_spike.get(r.id).map(Vec::as_slice).unwrap_or(&[]);
+        let rows = by_spike
+            .get(r.id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         // MISSING. The hard-failure half of the boundary: you must WRITE the
         // Blocked row, you cannot achieve deferral by staying quiet.
         if rows.is_empty() {
             blocks.push(Block::MissingDecision {
-                spike: r.id.to_string(),
+                spike: r.id.clone(),
             });
             continue;
         }
         if rows.len() > 1 {
             blocks.push(Block::DuplicateDecision {
-                spike: r.id.to_string(),
+                spike: r.id.clone(),
             });
         }
         let d = rows[0];
@@ -475,18 +438,18 @@ pub fn verify(decisions: &[Decision], roster: &[RosterSpike]) -> Gate {
         // The exact question, verbatim. A paraphrase is a different question.
         if d.question != r.question {
             blocks.push(Block::QuestionMismatch {
-                spike: r.id.to_string(),
+                spike: r.id.clone(),
             });
         }
 
         if d.limitations.trim().is_empty() {
             blocks.push(Block::NoLimitationsStated {
-                spike: r.id.to_string(),
+                spike: r.id.clone(),
             });
         }
         if !d.resources.within_contract() {
             blocks.push(Block::ResourceContractExceeded {
-                spike: r.id.to_string(),
+                spike: r.id.clone(),
             });
         }
 
@@ -496,19 +459,19 @@ pub fn verify(decisions: &[Decision], roster: &[RosterSpike]) -> Gate {
                     Outcome::Ratified => ratified.push(r.id.to_string()),
                     Outcome::Amended(a) => {
                         amended.push(r.id.to_string());
-                        check_amendment(r.id, a, &mut blocks);
+                        check_amendment(&r.id, a, &mut blocks);
                     }
                     Outcome::NoGo(n) => {
                         no_go.push(r.id.to_string());
                         if n.rationale.trim().is_empty() {
                             blocks.push(Block::HollowNoGo {
-                                spike: r.id.to_string(),
+                                spike: r.id.clone(),
                                 missing: "rationale",
                             });
                         }
                         if n.affected_interfaces.is_empty() {
                             blocks.push(Block::HollowNoGo {
-                                spike: r.id.to_string(),
+                                spike: r.id.clone(),
                                 missing: "affected_interfaces",
                             });
                         }
@@ -523,7 +486,7 @@ pub fn verify(decisions: &[Decision], roster: &[RosterSpike]) -> Gate {
                     for (name, root) in d.witness.roots() {
                         if !root.is_recorded() {
                             blocks.push(Block::LaunderedNonEvidence {
-                                spike: r.id.to_string(),
+                                spike: r.id.clone(),
                                 root: name,
                                 status: root.status(),
                             });
@@ -535,13 +498,13 @@ pub fn verify(decisions: &[Decision], roster: &[RosterSpike]) -> Gate {
                 blocked.push(r.id.to_string());
                 if owner.trim().is_empty() {
                     blocks.push(Block::UnownedBlock {
-                        spike: r.id.to_string(),
+                        spike: r.id.clone(),
                         missing: "owner",
                     });
                 }
                 if note.trim().is_empty() {
                     blocks.push(Block::UnownedBlock {
-                        spike: r.id.to_string(),
+                        spike: r.id.clone(),
                         missing: "note",
                     });
                 }
@@ -590,27 +553,6 @@ pub fn report(g: &Gate) -> String {
 #[cfg(test)]
 mod structural {
     use super::*;
-
-    #[test]
-    fn the_roster_is_the_plans_ten_spikes_with_distinct_ids_and_questions() {
-        assert_eq!(G0_ROSTER.len(), 10);
-        let mut ids: Vec<&str> = G0_ROSTER.iter().map(|r| r.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), 10, "two roster spikes share an id");
-        let mut qs: Vec<&str> = G0_ROSTER.iter().map(|r| r.question).collect();
-        qs.sort_unstable();
-        qs.dedup();
-        assert_eq!(qs.len(), 10, "two roster spikes share a question");
-        for r in &G0_ROSTER {
-            assert!(r.id.starts_with("G0-"), "{} is not a G0 spike id", r.id);
-            assert!(
-                r.question.len() > 40,
-                "{} carries a question too short to be the section 22.1 one",
-                r.id
-            );
-        }
-    }
 
     #[test]
     fn blocked_is_not_an_outcome() {

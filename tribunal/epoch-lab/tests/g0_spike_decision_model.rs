@@ -52,10 +52,27 @@
 #![forbid(unsafe_code)]
 
 use fln_epoch_lab::corpus::CorpusFamily;
+use fln_epoch_lab::derive::derive_g0_roster;
 use fln_epoch_lab::g0::{
-    Amendment, Block, BlockedReason, Decision, G0_ROSTER, NoGo, Outcome, Resolution, Resources,
-    RosterSpike, Scope, Witness, WitnessRoot, report, verify,
+    Amendment, Block, BlockedReason, Decision, NoGo, Outcome, Resolution, Resources, RosterSpike,
+    Scope, Witness, WitnessRoot, report, verify,
 };
+use std::path::PathBuf;
+
+/// The roster, DERIVED from the plan rather than transcribed.
+///
+/// The constant this used to read was hand-copied, and `fln-8fwh` proved all
+/// ten of its questions differed from §22.1 — so the verbatim-question check
+/// was enforcing a paraphrase. Every test below now measures against what the
+/// plan actually says.
+fn roster() -> Vec<RosterSpike> {
+    let plan = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md");
+    match derive_g0_roster(&plan) {
+        Ok(d) => d.into_parts().0,
+        Err(e) => panic!("the G0 roster could not be derived from the plan: {e}"),
+    }
+}
 use fln_epoch_lab::oracle::{
     ClaimType, ComparisonClass, EvidenceState, Mode, OracleKind, Platform,
 };
@@ -117,7 +134,7 @@ fn decision(spike: &RosterSpike, resolution: Resolution) -> Decision {
 
 /// All ten spikes ratified on recorded evidence.
 fn all_ratified() -> Vec<Decision> {
-    G0_ROSTER
+    roster()
         .iter()
         .map(|s| decision(s, Resolution::Decided(Outcome::Ratified)))
         .collect()
@@ -133,7 +150,7 @@ fn reasons(blocks: &[Block]) -> Vec<&'static str> {
 
 #[test]
 fn ten_ratified_spikes_clear_the_gate() {
-    let g = verify(&all_ratified(), &G0_ROSTER);
+    let g = verify(&all_ratified(), &roster());
     assert!(
         g.clears(),
         "a complete ledger did not clear: {:?}",
@@ -150,10 +167,10 @@ fn a_well_formed_amendment_also_clears() {
     // around.
     let mut d = all_ratified();
     d[4] = decision(
-        &G0_ROSTER[4],
+        &roster()[4],
         Resolution::Decided(Outcome::Amended(good_amendment())),
     );
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     assert!(g.clears(), "{:?}", g.blocks);
     assert_eq!(g.amended, vec!["G0-5"]);
     assert_eq!(g.ratified.len(), 9);
@@ -169,7 +186,7 @@ fn a_spike_with_no_row_at_all_is_a_hard_failure() {
     // A verifier that walked the ROWS would find nothing wrong and report nine
     // green; only walking the ROSTER makes the tenth visible.
     let nine: Vec<Decision> = all_ratified().into_iter().take(9).collect();
-    let g = verify(&nine, &G0_ROSTER);
+    let g = verify(&nine, &roster());
     assert!(!g.clears(), "nine of ten cleared the gate");
     assert_eq!(reasons(&g.blocks), vec!["missing-decision"]);
     match &g.blocks[0] {
@@ -191,14 +208,14 @@ fn an_explicit_blocked_row_is_representable_and_does_not_clear() {
     // not license a downstream interface freeze.
     let mut d = all_ratified();
     d[9] = decision(
-        &G0_ROSTER[9],
+        &roster()[9],
         Resolution::Blocked {
             reason: BlockedReason::ApparatusMissing,
             owner: "cc_2".to_string(),
             note: "the closure allowlist generator does not exist yet".to_string(),
         },
     );
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     assert!(
         g.blocks.is_empty(),
         "a well-formed Blocked row was refused: {:?}",
@@ -219,18 +236,18 @@ fn silence_and_deferral_are_distinguishable() {
     let deferred = {
         let mut d = all_ratified();
         d[9] = decision(
-            &G0_ROSTER[9],
+            &roster()[9],
             Resolution::Blocked {
                 reason: BlockedReason::DeferredByOwner,
                 owner: "cod_3".to_string(),
                 note: "scheduled after the lane registrations".to_string(),
             },
         );
-        verify(&d, &G0_ROSTER)
+        verify(&d, &roster())
     };
     let silent = verify(
         &all_ratified().into_iter().take(9).collect::<Vec<_>>(),
-        &G0_ROSTER,
+        &roster(),
     );
 
     assert!(!deferred.clears() && !silent.clears(), "neither may clear");
@@ -246,14 +263,14 @@ fn a_blocked_row_without_an_owner_is_refused() {
     for (owner, note, missing) in [("", "a note", "owner"), ("cc_2", "  ", "note")] {
         let mut d = all_ratified();
         d[0] = decision(
-            &G0_ROSTER[0],
+            &roster()[0],
             Resolution::Blocked {
                 reason: BlockedReason::AwaitingDependency,
                 owner: owner.to_string(),
                 note: note.to_string(),
             },
         );
-        let g = verify(&d, &G0_ROSTER);
+        let g = verify(&d, &roster());
         assert!(
             g.blocks
                 .iter()
@@ -283,12 +300,12 @@ fn failed_evidence_cannot_be_normalised_into_an_amendment() {
     ] {
         let mut d = all_ratified();
         let mut row = decision(
-            &G0_ROSTER[4],
+            &roster()[4],
             Resolution::Decided(Outcome::Amended(good_amendment())),
         );
         row.witness.no_mock_e2e_root = status.clone();
         d[4] = row;
-        let g = verify(&d, &G0_ROSTER);
+        let g = verify(&d, &roster());
         assert!(!g.clears(), "{status:?} evidence supported an amendment");
         let found = g.blocks.iter().any(
             |b| matches!(b, Block::LaunderedNonEvidence { root, .. } if *root == "no_mock_e2e"),
@@ -310,7 +327,7 @@ fn every_witness_root_is_checked_not_just_the_e2e_one() {
     ];
     for name in names {
         let mut d = all_ratified();
-        let mut row = decision(&G0_ROSTER[0], Resolution::Decided(Outcome::Ratified));
+        let mut row = decision(&roster()[0], Resolution::Decided(Outcome::Ratified));
         match name {
             "fixture" => row.witness.fixture_root = WitnessRoot::Absent,
             "generated_contract" => row.witness.generated_contract_root = WitnessRoot::Absent,
@@ -319,7 +336,7 @@ fn every_witness_root_is_checked_not_just_the_e2e_one() {
             _ => row.witness.no_mock_e2e_root = WitnessRoot::Absent,
         }
         d[0] = row;
-        let g = verify(&d, &G0_ROSTER);
+        let g = verify(&d, &roster());
         assert!(
             g.blocks
                 .iter()
@@ -337,7 +354,7 @@ fn a_no_go_may_rest_on_failed_evidence_because_that_is_what_it_reports() {
     // people towards filing nothing at all.
     let mut d = all_ratified();
     let mut row = decision(
-        &G0_ROSTER[6],
+        &roster()[6],
         Resolution::Decided(Outcome::NoGo(NoGo {
             rationale: "the defeq tail does not fall within the budget".to_string(),
             affected_interfaces: vec!["fln-elab".to_string()],
@@ -345,7 +362,7 @@ fn a_no_go_may_rest_on_failed_evidence_because_that_is_what_it_reports() {
     );
     row.witness.no_mock_e2e_root = WitnessRoot::Failed;
     d[6] = row;
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     assert!(
         !g.blocks
             .iter()
@@ -369,13 +386,13 @@ fn a_hollow_no_go_is_refused() {
     ] {
         let mut d = all_ratified();
         d[6] = decision(
-            &G0_ROSTER[6],
+            &roster()[6],
             Resolution::Decided(Outcome::NoGo(NoGo {
                 rationale: rationale.to_string(),
                 affected_interfaces: ifaces,
             })),
         );
-        let g = verify(&d, &G0_ROSTER);
+        let g = verify(&d, &roster());
         assert!(
             g.blocks
                 .iter()
@@ -412,10 +429,10 @@ fn an_amendment_missing_any_mandatory_part_is_not_an_amendment() {
         break_it(&mut amendment);
         let mut d = all_ratified();
         d[4] = decision(
-            &G0_ROSTER[4],
+            &roster()[4],
             Resolution::Decided(Outcome::Amended(amendment)),
         );
-        let g = verify(&d, &G0_ROSTER);
+        let g = verify(&d, &roster());
         assert!(!g.clears(), "an amendment without {missing} cleared");
         assert!(
             g.blocks.iter().any(
@@ -434,10 +451,10 @@ fn an_amendment_whose_acceptance_tests_are_red_is_refused() {
     amendment.acceptance_green = false;
     let mut d = all_ratified();
     d[4] = decision(
-        &G0_ROSTER[4],
+        &roster()[4],
         Resolution::Decided(Outcome::Amended(amendment)),
     );
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     assert!(!g.clears());
     assert!(reasons(&g.blocks).contains(&"amendment-not-green"));
 }
@@ -452,7 +469,7 @@ fn a_paraphrased_question_is_answering_a_different_question() {
     // the answer you have fits it.
     let mut d = all_ratified();
     d[0].question = "ABI resurrection: parse an olean and check it looks right".to_string();
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     assert!(!g.clears(), "a paraphrased question cleared");
     assert_eq!(reasons(&g.blocks), vec!["question-mismatch"]);
 }
@@ -465,7 +482,7 @@ fn a_spike_that_blew_its_resource_contract_is_refused() {
         let mut d = all_ratified();
         d[6].resources.used_wall_ms = wall;
         d[6].resources.used_rss_bytes = rss;
-        let g = verify(&d, &G0_ROSTER);
+        let g = verify(&d, &roster());
         assert!(!g.clears(), "an overrun cleared: wall={wall} rss={rss}");
         assert!(reasons(&g.blocks).contains(&"resource-contract-exceeded"));
     }
@@ -475,7 +492,7 @@ fn a_spike_that_blew_its_resource_contract_is_refused() {
 fn a_row_with_no_stated_limitations_is_refused() {
     let mut d = all_ratified();
     d[2].limitations = "  ".to_string();
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     assert!(!g.clears());
     assert!(reasons(&g.blocks).contains(&"no-limitations-stated"));
 }
@@ -485,19 +502,20 @@ fn duplicate_and_unknown_rows_are_refused() {
     // "Exactly one row per spike" in both directions.
     let mut d = all_ratified();
     d.push(decision(
-        &G0_ROSTER[0],
+        &roster()[0],
         Resolution::Decided(Outcome::Ratified),
     ));
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     assert!(reasons(&g.blocks).contains(&"duplicate-decision"));
 
     let mut e = all_ratified();
     let ghost = RosterSpike {
-        id: "G0-11",
-        question: "a question nobody asked",
+        id: "G0-11".to_string(),
+        name: "Ghost spike".to_string(),
+        question: "a question nobody asked".to_string(),
     };
     e.push(decision(&ghost, Resolution::Decided(Outcome::Ratified)));
-    let g = verify(&e, &G0_ROSTER);
+    let g = verify(&e, &roster());
     assert!(reasons(&g.blocks).contains(&"unknown-spike"));
 }
 
@@ -521,7 +539,7 @@ fn the_gate_verdict_does_not_read_the_claim_type() {
         let mut base = all_ratified();
         base[0].witness.evidence_state = state;
         base[0].claim = ClaimType::Benchmark;
-        let want = verify(&base, &G0_ROSTER).clears();
+        let want = verify(&base, &roster()).clears();
 
         for claim in [
             ClaimType::Invariant,
@@ -535,7 +553,7 @@ fn the_gate_verdict_does_not_read_the_claim_type() {
             d[0].witness.evidence_state = state;
             d[0].claim = claim;
             assert!(
-                verify(&d, &G0_ROSTER).clears() == want,
+                verify(&d, &roster()).clears() == want,
                 "the gate verdict moved with the claim type (state {state:?}, claim {claim:?})"
             );
         }
@@ -550,7 +568,7 @@ fn the_scope_is_carried_per_row_and_is_not_a_global() {
     let mut d = all_ratified();
     d[0].scope.platform = Platform::MacOSAarch64;
     d[0].scope.mode = Mode::Faithful;
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     assert!(g.clears(), "{:?}", g.blocks);
     assert_eq!(d[0].scope.platform, Platform::MacOSAarch64);
     assert_eq!(d[1].scope.platform, Platform::LinuxX86_64);
@@ -564,7 +582,7 @@ fn every_block_is_reported_not_just_the_first() {
     d[1].limitations = String::new();
     d[2].resources.used_wall_ms = u64::MAX;
     d[3].witness.mutation_root = WitnessRoot::Unresolved;
-    let g = verify(&d, &G0_ROSTER);
+    let g = verify(&d, &roster());
     let r = reasons(&g.blocks);
     for want in [
         "question-mismatch",

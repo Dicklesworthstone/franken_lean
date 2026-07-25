@@ -53,7 +53,9 @@
 use fln_epoch_lab::oracle::{ClaimType, EvidenceState, LLevel, Mode, Platform};
 use fln_epoch_lab::parity::{
     Block, LEDGER_SCHEMA, Ledger, ROW_FIELDS, is_aggregate_symbol, parse, report, verify,
+    verify_with_fixtures,
 };
+use std::path::PathBuf;
 
 const HEAD: &str = "7e554b20907d81a272d10718c26da2c25e2e6d70b2e962dc87516bb24dc18a75";
 const ROOT_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -600,4 +602,70 @@ fn evidence_state_and_claim_type_survive_a_round_trip_unconflated() {
     assert_eq!(row.state, EvidenceState::Proven);
     assert_eq!(row.claim, ClaimType::Invariant);
     assert_eq!(row.level, LLevel::L4);
+}
+
+// ---------------------------------------------------------------------------
+// The fixture a row names must exist and must hash to what the row states
+// (bead fln-8fwh)
+// ---------------------------------------------------------------------------
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[test]
+fn a_row_that_invents_a_fixture_digest_is_refused() {
+    // THE GAP THIS BEAD CLOSED. Every field is well-formed: the fixture path
+    // exists, the digest is sixty-four valid hex characters, the roots agree,
+    // the claim is within its ceiling. It is simply not that file's digest, and
+    // before fln-8fwh the schema had no way to know.
+    let mut r = Row::valid("Nat.a");
+    r.symbol = "Nat.a".to_string();
+    let l = parsed(HEAD, &[r]);
+    // The row's fixture path is fixtures/nat.lean, which does not exist; point
+    // the check at a real file to isolate the DIGEST failure from the missing
+    // -file failure.
+    let blocks = verify_with_fixtures(&l, &["Nat.a"], HEAD, &repo_root());
+    assert!(
+        blocks.iter().any(|b| b.reason() == "fixture-unverified"),
+        "an invented fixture digest was recorded: {blocks:?}"
+    );
+}
+
+#[test]
+fn a_row_whose_fixture_verifies_is_accepted() {
+    // The counterweight: the check must be satisfiable, or it is a gate nobody
+    // can pass. Name a file that really exists and state its real digest.
+    let root = repo_root();
+    let fixture = "AGENTS.md";
+    let digest = fln_epoch_lab::derive::derive_fixture_digest(&root.join(fixture))
+        .expect("AGENTS.md is readable")
+        .into_parts()
+        .0;
+    let text = format!(
+        "{LEDGER_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n\
+         row Nat.a fixture={fixture} fixture_digest={digest} \
+         ours_root={ROOT_A} oracle_root={ROOT_A} oracle=reference-binary \
+         comparison=byte-identical normalizer=- claim=bounded_model \
+         evidence=differential state=observed level=L2 mode=sound \
+         platform=linux-x86_64 backing=real-reference freshness=current \
+         limits=no-known-limitations\n"
+    );
+    let l = parse(&text).expect("the ledger parses");
+    let blocks = verify_with_fixtures(&l, &["Nat.a"], HEAD, &root);
+    assert!(
+        blocks.is_empty(),
+        "a verifiable row was refused: {blocks:?}"
+    );
+}
+
+#[test]
+fn a_row_naming_a_fixture_that_does_not_exist_is_refused() {
+    let l = parsed(HEAD, &[Row::valid("Nat.a")]);
+    let blocks = verify_with_fixtures(&l, &["Nat.a"], HEAD, &repo_root());
+    let found = blocks.iter().any(|b| match b {
+        Block::FixtureUnverified { detail, .. } => detail.contains("cannot read"),
+        _ => false,
+    });
+    assert!(found, "a nonexistent fixture was accepted: {blocks:?}");
 }

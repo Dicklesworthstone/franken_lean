@@ -214,6 +214,12 @@ pub enum Block {
     AggregateRow { symbol: String },
     /// A comparison class and a normalizer declaration that disagree.
     IncoherentComparison { symbol: String, detail: String },
+    /// The row's fixture does not exist, or does not hash to the stated digest.
+    ///
+    /// Until `fln-8fwh` the schema could refuse a row that OMITTED a fixture and
+    /// not one that INVENTED one: `fixture_digest` was checked for shape and
+    /// never for truth. This is that refusal.
+    FixtureUnverified { symbol: String, detail: String },
 }
 
 impl Block {
@@ -233,6 +239,7 @@ impl Block {
             Block::OverclaimedClaim { .. } => "overclaimed-claim",
             Block::AggregateRow { .. } => "aggregate",
             Block::IncoherentComparison { .. } => "incoherent-comparison",
+            Block::FixtureUnverified { .. } => "fixture-unverified",
         }
     }
 }
@@ -754,6 +761,36 @@ pub fn verify(ledger: &Ledger, expected: &[&str], chain_head: &str) -> Vec<Block
     blocks
 }
 
+/// Verify a ledger AND check every row's fixture against the filesystem.
+///
+/// [`verify`] is the schema-only check and stays available for callers that
+/// have no tree to resolve against. This is the one a gate should run: a row
+/// naming a fixture that does not exist, or stating a digest that is not the
+/// file's, fails here rather than being recorded. `fixture_root` is the
+/// directory row paths are resolved against.
+pub fn verify_with_fixtures(
+    ledger: &Ledger,
+    expected: &[&str],
+    chain_head: &str,
+    fixture_root: &std::path::Path,
+) -> Vec<Block> {
+    let mut blocks = verify(ledger, expected, chain_head);
+    for row in &ledger.rows {
+        if is_aggregate_symbol(&row.symbol) {
+            continue;
+        }
+        if let Err(e) =
+            crate::derive::check_fixture(&fixture_root.join(&row.fixture), &row.fixture_digest)
+        {
+            blocks.push(Block::FixtureUnverified {
+                symbol: row.symbol.clone(),
+                detail: e.to_string(),
+            });
+        }
+    }
+    blocks
+}
+
 /// Line-oriented report. One line per block, machine-first, no decoration.
 ///
 /// Emits counts of BLOCKS and never a parity score, a percentage, or a pass
@@ -859,6 +896,10 @@ mod structural {
                 symbol: String::new(),
             },
             Block::IncoherentComparison {
+                symbol: String::new(),
+                detail: String::new(),
+            },
+            Block::FixtureUnverified {
                 symbol: String::new(),
                 detail: String::new(),
             },

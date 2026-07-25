@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 pub mod corpus;
+pub mod derive;
 pub mod g0;
 pub mod normalize;
 pub mod oracle;
