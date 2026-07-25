@@ -26,10 +26,22 @@
 
 set -euo pipefail
 
-command -v python3 >/dev/null 2>&1 || {
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || {
   echo "[kernel_replay] setup failure: python3 is required" >&2
   exit 2
 }
+PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[kernel_replay] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EVIDENCE="$ROOT/scripts/evidence.py"
@@ -37,7 +49,11 @@ RUN_ID="kernel-replay-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[kernel_replay] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 
 BEAD="franken_lean-z6c"
 SCHEMA="fln-e2e/1"
@@ -90,7 +106,7 @@ AP6_LOG="$AP6_ART_DIR/run.ndjson"
 AP6_HUMAN="$AP6_ART_DIR/human.log"
 AP6_VENDOR_PATH="vendor/lean4-src"
 AP6_SEQ=0
-AP6_START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+AP6_START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 AP6_CAPTURE_BYTES="${FLN_E2E_CAPTURE_BYTES:-262144}"
 AP6_OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-33554432}"
 AP6_TIMEOUT_MS="${FLN_E2E_TIMEOUT_MS:-1800000}"
@@ -127,21 +143,21 @@ ap6_note() {
 ap6_emit_event() {
   local sequence="$AP6_SEQ"
   AP6_SEQ=$((AP6_SEQ + 1))
-  python3 "$EVIDENCE" emit --file "$AP6_LOG" --artifact-root "$AP6_ART_DIR" \
+  "${PYTHON[@]}" "$EVIDENCE" emit --file "$AP6_LOG" --artifact-root "$AP6_ART_DIR" \
     --string schema "$AP6_SCHEMA" --string run_id "$AP6_RUN_ID" \
     --string bead "$AP6_BEAD" --string scenario "$AP6_SCENARIO" \
     --integer sequence "$sequence" \
-    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" "$@"
 }
 
 ap6_hash_live() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${AP6_HASH_ARGS[@]}" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${AP6_HASH_ARGS[@]}" \
     --vendor-path "$AP6_VENDOR_PATH"
 }
 
 ap6_meta_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json
 import pathlib
 import sys
@@ -159,7 +175,7 @@ PY
 }
 
 ap6_meta_resource_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json
 import pathlib
 import sys
@@ -194,7 +210,7 @@ ap6_supervise() {
   fi
   ap6_note "running step=$step cwd=$cwd"
   set +e
-  python3 -I -S "$EVIDENCE" run --cwd "$cwd" \
+  "${PYTHON[@]}" "$EVIDENCE" run --cwd "$cwd" \
     --metadata "$AP6_LAST_META" --stdout "$AP6_LAST_OUT" \
     --stderr "$AP6_LAST_ERR" --readiness "$AP6_LAST_READY" \
     --artifact-root "$AP6_ART_DIR" --capture-bytes "$AP6_CAPTURE_BYTES" \
@@ -227,7 +243,7 @@ ap6_assert_supervisor() {
 # The per-step subject: the kernel, the replay rig, and the fixture the lane
 # exercises — hashed before and after every step (unchanged or the step fails).
 ap6_hash_subject() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" \
     --path crates/fln-kernel \
     --path crates/fln-conformance/tests/kernel_replay.rs \
     --path tribunal/fixtures/c3/Init.SizeOfLemmas.olean
@@ -282,7 +298,7 @@ else
     exit 2
   fi
   mkdir "$AP6_ART_DIR"
-  python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+  "${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" \
     --vendor-path "$AP6_VENDOR_PATH" --output "$AP6_ART_DIR/vendor-binding.json" \
     --artifact-root "$AP6_ART_DIR" || {
       note "FAIL: cannot bind the pinned Reference tree for franken_lean-ap6"
@@ -301,7 +317,7 @@ else
     --string parity_ledger_row init-prelude-admission-replay \
     --string epoch "lean-$PIN_TAG" --string mode sound --string profile e2e \
     --string platform "$(uname -srm)" \
-    --json-value host_facts "$(python3 -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
+    --json-value host_facts "$("${PYTHON[@]}" -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
     --integer thread_count 32 --string seed module-order-kahn-v1 \
     --json-value thread_matrix '[1,8,32]' \
     --string cache_state "$AP6_CACHE_STATE" \
@@ -397,7 +413,7 @@ PY
     cargo test --locked -q -p fln-conformance --test kernel_replay -- --nocapture
   ap6_assert_supervisor admission_replay pass 0 0
   AP6_ADMISSION_VALIDATION="$AP6_ART_DIR/admission_replay.validation.json"
-  python3 "$EVIDENCE" validate-kernel-admission \
+  "${PYTHON[@]}" "$EVIDENCE" validate-kernel-admission \
     --file "$AP6_LAST_OUT" --stderr-file "$AP6_LAST_ERR" --phase positive \
     --expected-run-id "$AP6_RUN_ID" --observed-exit "$AP6_LAST_CHILD" \
     --expected-cwd "$ROOT/crates/fln-conformance" --expected-argv "$AP6_CARGO_ARGV" \
@@ -405,7 +421,7 @@ PY
     --expected-stderr-artifact admission_replay.err \
     --expected-cache-state "$AP6_CACHE_STATE" \
     --artifact-root "$AP6_ART_DIR" --output "$AP6_ADMISSION_VALIDATION"
-  AP6_FIXTURE_ROOT="$(python3 - "$AP6_ADMISSION_VALIDATION" <<'PY'
+  AP6_FIXTURE_ROOT="$("${PYTHON[@]}" - "$AP6_ADMISSION_VALIDATION" <<'PY'
 import json
 import pathlib
 import sys
@@ -413,7 +429,7 @@ import sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["canonical_input_root"])
 PY
 )"
-  AP6_VERDICT_DIGEST="$(python3 - "$AP6_ADMISSION_VALIDATION" <<'PY'
+  AP6_VERDICT_DIGEST="$("${PYTHON[@]}" - "$AP6_ADMISSION_VALIDATION" <<'PY'
 import json
 import pathlib
 import sys
@@ -431,7 +447,7 @@ PY
   # -- step: census_floor — the pinned verdict census may only move by bead ----
   AP6_SUBJECT_BEFORE="$(ap6_hash_subject)"
   ap6_supervise census_floor "$ROOT" 1 false \
-    python3 "$AP6_CENSUS_CHECK" "$AP6_ART_DIR/admission_replay.err"
+    "${PYTHON[@]}" "$AP6_CENSUS_CHECK" "$AP6_ART_DIR/admission_replay.err"
   ap6_assert_supervisor census_floor pass 0 0
   ap6_record_step census_floor \
     "checked=2198 accepted=2198 inconclusive=0 rejected={} unchecked={} artifact_incomplete=6 nested_partial_blocks=0 nested_full_blocks=1" \
@@ -442,7 +458,7 @@ PY
   # -- step: corruption — flipped bytes must die typed, never panic ------------
   AP6_SUBJECT_BEFORE="$(ap6_hash_subject)"
   ap6_supervise corruption "$ROOT" 1 false \
-    python3 "$AP6_CORRUPTION_SWEEP" "$DECODER" "$AP6_FIXTURE" "$AP6_ART_DIR"
+    "${PYTHON[@]}" "$AP6_CORRUPTION_SWEEP" "$DECODER" "$AP6_FIXTURE" "$AP6_ART_DIR"
   ap6_assert_supervisor corruption pass 0 0
   ap6_record_step corruption \
     "sweeps=8/panics=0/kills>=1/wrapper=0" \
@@ -509,7 +525,7 @@ PY
   AP6_LAST_READY="$AP6_ART_DIR/cancellation.ready.json"
   ap6_note "running step=cancellation (SIGTERM mid-replay)"
   set +e
-  python3 -I -S "$EVIDENCE" run --cwd "$ROOT" \
+  "${PYTHON[@]}" "$EVIDENCE" run --cwd "$ROOT" \
     --metadata "$AP6_LAST_META" --stdout "$AP6_LAST_OUT" \
     --stderr "$AP6_LAST_ERR" --readiness "$AP6_LAST_READY" \
     --artifact-root "$AP6_ART_DIR" --capture-bytes "$AP6_CAPTURE_BYTES" \
@@ -593,7 +609,7 @@ PY
   # -- step: final_real_recheck — retained evidence still validates against the
   #    pinned fixture root, and the pristine decode still passes ----------------
   AP6_RECHECK_VALIDATION="$AP6_ART_DIR/final_recheck.validation.json"
-  python3 "$EVIDENCE" validate-kernel-admission \
+  "${PYTHON[@]}" "$EVIDENCE" validate-kernel-admission \
     --file "$AP6_ART_DIR/admission_replay.out" \
     --stderr-file "$AP6_ART_DIR/admission_replay.err" --phase recovery \
     --expected-run-id "$AP6_RUN_ID" --observed-exit 0 \
@@ -621,7 +637,7 @@ PY
   ap6_emit_event --string event run_end --string verdict pass \
     --string reason_code all_obligations_passed --integer process_exit 0 \
     --string active_step final_real_recheck \
-    --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - AP6_START_NS ))" \
+    --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - AP6_START_NS ))" \
     --string cleanup_status retained_by_policy \
     --string final_state "$AP6_FINAL_ROOT" \
     --string logical_root "$AP6_FINAL_ROOT" \
@@ -631,25 +647,25 @@ PY
     --string bundle_commit bundle.complete.json \
     --string evidence_state pending_bundle_commit
 
-  python3 "$EVIDENCE" validate-run --file "$AP6_LOG" \
+  "${PYTHON[@]}" "$EVIDENCE" validate-run --file "$AP6_LOG" \
     --schema "$AP6_SCHEMA" --expected-verdict pass \
     --expected-active-stage final_real_recheck \
     --artifact-root "$AP6_ART_DIR" \
     --output "$AP6_ART_DIR/run.validation.json"
-  python3 "$EVIDENCE" manifest --art-dir "$AP6_ART_DIR" \
+  "${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$AP6_ART_DIR" \
     --output "$AP6_ART_DIR/manifest.json" \
     --digest-output "$AP6_ART_DIR/manifest.digest" \
     --run-id "$AP6_RUN_ID" --bead "$AP6_BEAD" \
     --scenario "$AP6_SCENARIO" --verdict pass \
     --input-root "$AP6_INPUT_ROOT" --final-root "$AP6_FINAL_ROOT"
-  python3 "$EVIDENCE" complete-bundle --art-dir "$AP6_ART_DIR" \
+  "${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$AP6_ART_DIR" \
     --manifest "$AP6_ART_DIR/manifest.json" \
     --digest "$AP6_ART_DIR/manifest.digest" \
     --output "$AP6_ART_DIR/bundle.complete.json" \
     --governed-root "$ROOT" "${AP6_GOVERNED_ARGS[@]}" \
     --expected-root "$AP6_FINAL_ROOT" \
     --vendor-path "$AP6_VENDOR_PATH"
-  python3 "$EVIDENCE" validate-bundle --art-dir "$AP6_ART_DIR" \
+  "${PYTHON[@]}" "$EVIDENCE" validate-bundle --art-dir "$AP6_ART_DIR" \
     --manifest "$AP6_ART_DIR/manifest.json" \
     --digest "$AP6_ART_DIR/manifest.digest" \
     --commit "$AP6_ART_DIR/bundle.complete.json" \
@@ -665,7 +681,7 @@ PY
   # --planted). By design this fault suppresses trustworthy metadata; the
   # contract is exactly "wrapper exit 2, never a pass, never a verdict".
   set +e
-  python3 -I -S "$EVIDENCE" run --cwd "$ROOT" \
+  "${PYTHON[@]}" "$EVIDENCE" run --cwd "$ROOT" \
     --metadata "$ART_DIR/capture_fault_probe.meta.json" \
     --stdout "$ART_DIR/capture_fault_probe.out" \
     --stderr "$ART_DIR/capture_fault_probe.err" \
@@ -742,7 +758,7 @@ sweeps=0
 for frac in 4 8 16 32 64 128 256 512; do
   CORRUPT="$ART_DIR/corrupt_$frac.olean"
   cp "$ROOT/tribunal/fixtures/c3/Init.SizeOfLemmas.olean" "$CORRUPT"
-  python3 - "$CORRUPT" "$frac" <<'EOF'
+  "${PYTHON[@]}" - "$CORRUPT" "$frac" <<'EOF'
 import sys
 path, frac = sys.argv[1], int(sys.argv[2])
 data = bytearray(open(path, "rb").read())

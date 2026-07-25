@@ -11,10 +11,30 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || {
+  echo "[bignum_vectors] setup failure: python3 is required" >&2
+  exit 2
+}
+PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[bignum_vectors] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
 RUN_ID="bignum-vectors-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_DIR="$ROOT/target/e2e/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[bignum_vectors] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 
 BEAD="franken_lean-npl"
 SCHEMA="fln-e2e/1"
@@ -35,7 +55,7 @@ emit run_start started "\"cwd\":\"$ROOT\",\"argv\":\"$0\""
 # ---- step 1: the golden corpus matches its generator -----------------------------------
 note "vector drift check (CPython ground truth)"
 set +e
-python3 "$ROOT/scripts/extract/gen_bignum_vectors.py" --check > "$ART_DIR/drift.log" 2>&1
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_bignum_vectors.py" --check > "$ART_DIR/drift.log" 2>&1
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
@@ -78,7 +98,7 @@ if ! grep -rn "fn div" "$OVERLAY/fln-bignum/src/nat.rs" > /dev/null; then
   note "FAIL: could not locate the div implementation to seed"
   exit 1
 fi
-python3 - "$OVERLAY/fln-bignum/src/nat.rs" <<'EOF'
+"${PYTHON[@]}" - "$OVERLAY/fln-bignum/src/nat.rs" <<'EOF'
 import sys
 p = sys.argv[1]
 s = open(p).read()

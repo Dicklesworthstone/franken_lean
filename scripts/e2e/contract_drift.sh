@@ -14,10 +14,30 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || {
+  echo "[contract_drift] setup failure: python3 is required" >&2
+  exit 2
+}
+PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[contract_drift] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
 RUN_ID="contract-drift-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_DIR="$ROOT/target/e2e/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[contract_drift] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 
 BEAD="franken_lean-53v"
 SCHEMA="fln-e2e/1"
@@ -38,7 +58,7 @@ emit run_start started "\"cwd\":\"$ROOT\",\"argv\":\"$0\""
 # ---- lane 1: ABI extraction is drift-free against the pin ------------------------------
 note "ABI contract drift check (lean.h -> inventory/MD/Rust)"
 set +e
-python3 "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/abi_check.log" 2>&1
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/abi_check.log" 2>&1
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
@@ -51,7 +71,7 @@ emit abi_drift passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"abi_
 # ---- lane 2: olean extraction is drift-free against the pin ----------------------------
 note "OLEAN contract drift check (module.cpp/compact/Lean structures)"
 set +e
-python3 "$ROOT/scripts/extract/gen_olean_contract.py" --check > "$ART_DIR/olean_check.log" 2>&1
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_olean_contract.py" --check > "$ART_DIR/olean_check.log" 2>&1
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
@@ -109,7 +129,7 @@ if ! grep -q '^pub const TAG_CLOSURE: u8 = 245;$' "$ABI_RS"; then
   note "FAIL: mutation seed anchor not found in abi.rs"
   exit 1
 fi
-python3 - "$ABI_RS" <<'EOF'
+"${PYTHON[@]}" - "$ABI_RS" <<'EOF'
 import sys
 path = sys.argv[1]
 text = open(path).read()
@@ -118,7 +138,7 @@ open(path, "w").write(text.replace(
     "pub const TAG_CLOSURE: u8 = 244;", 1))
 EOF
 set +e
-python3 "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/mutant_a_check.log" 2>&1
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/mutant_a_check.log" 2>&1
 check_rc=$?
 ( cd "$ROOT" && CARGO_TARGET_DIR=target_local cargo test -q -p fln-rt --test abi_contract ) \
   > "$ART_DIR/mutant_a_suite.log" 2>&1
@@ -145,7 +165,7 @@ BACKUP_MD="$ART_DIR/ABI_CONTRACT.md.orig"
 cp "$MD" "$BACKUP_MD"
 sha_before="$(sha256sum "$MD" | cut -d' ' -f1)"
 note "seeding mutant B: ABI_CONTRACT.md inventory digest desynchronized"
-python3 - "$MD" <<'EOF'
+"${PYTHON[@]}" - "$MD" <<'EOF'
 import re, sys
 path = sys.argv[1]
 text = open(path).read()
@@ -180,7 +200,7 @@ note "mutant B killed by the cross-artifact linkage test"
 # ---- lane 7: recovery — everything green again after restoration -----------------------
 note "recovery: drift checks and linkage green after restoration"
 set +e
-python3 "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/recovery_abi.log" 2>&1
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/recovery_abi.log" 2>&1
 rc1=$?
 ( cd "$ROOT" \
     && CARGO_TARGET_DIR=target_local cargo test -q -p fln-rt --test abi_contract \

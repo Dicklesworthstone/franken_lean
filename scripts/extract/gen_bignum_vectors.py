@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """gen_bignum_vectors.py — golden vectors for fln-bignum (bead franken_lean-npl).
 
 Python's arbitrary-precision integers are the ground truth; the LEAN-SPECIFIC
@@ -19,6 +19,7 @@ drift gate. Output: crates/fln-bignum/fixtures/nat_vectors.txt with rows
 Usage: gen_bignum_vectors.py [--check]
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -112,4 +113,23 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    hostile_python = sorted(name for name in os.environ if name.startswith("PYTHON"))
+    if not all(
+        (
+            sys.flags.isolated,
+            sys.flags.ignore_environment,
+            sys.flags.no_site,
+            sys.flags.no_user_site,
+            sys.flags.safe_path,
+        )
+    ):
+        sys.stderr.write("[gen_bignum_vectors] sealed_interpreter_unsealed_startup\n")
+        raise SystemExit(2)
+    if hostile_python:
+        sys.stderr.write(
+            "[gen_bignum_vectors] sealed_interpreter_hostile_environment names="
+            + ",".join(hostile_python)
+            + "\n"
+        )
+        raise SystemExit(2)
     raise SystemExit(main())

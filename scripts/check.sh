@@ -34,6 +34,16 @@ PYTHON_BIN="$(command -v python3 || true)"
   exit 2
 }
 PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[check] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
 command -v setsid >/dev/null 2>&1 || {
   echo "[check] setup failure: setsid is required by the evidence finalizer" >&2
   exit 2
@@ -96,7 +106,7 @@ fi
 THREAD_COUNT="${FLN_CHECK_THREAD_COUNT:-1}"
 SEED="${FLN_CHECK_SEED:-none}"
 CACHE_STATE="${FLN_CHECK_CACHE_STATE:-uncontrolled}"
-START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 SEQ=0
 ACTIVE_STAGE="setup"
 ACTIVE_RUNNER_PID=""
@@ -115,6 +125,7 @@ TERMINAL_EMITTED=0
 HUMAN_LOG_SEALED=0
 FINALIZING=0
 RUN_STARTED=0
+ART_DIR_CLAIMED=0
 EARLY_STEP=preflight
 FINALIZER_TRANSITION=0
 FINALIZER_PID=""
@@ -174,13 +185,13 @@ VENDOR_BINDING_BINDING=vendor-binding.json
 build_event_command() {
   local sequence="$SEQ"
   SEQ=$((SEQ + 1))
-  EVENT_COMMAND=(python3 "$EVIDENCE" emit --file "$NDJSON" --artifact-root "$ART_DIR" \
+  EVENT_COMMAND=("${PYTHON[@]}" "$EVIDENCE" emit --file "$NDJSON" --artifact-root "$ART_DIR" \
     --string schema "$SCHEMA" \
     --string run_id "$RUN_ID" \
     --string bead "$BEAD" \
     --string scenario "$SCENARIO" \
     --integer sequence "$sequence" \
-    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" \
     "$@")
 }
@@ -233,9 +244,9 @@ finalize_early_envelope() {
       set_final internal_fault "early_${EARLY_STEP}_unexpected_exit" 2
     fi
   fi
-  if [ -d "$ART_DIR" ]; then
+  if [ "$ART_DIR_CLAIMED" -eq 1 ] && [ -d "$ART_DIR" ]; then
     note "typed early-envelope fault: step=$EARLY_STEP reason=$FINAL_REASON verdict=$FINAL_VERDICT"
-    if ! python3 "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
+    if ! "${PYTHON[@]}" "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
         --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
         --step "$EARLY_STEP" --reason "$FINAL_REASON" \
         --classification "$FINAL_VERDICT" \
@@ -245,7 +256,7 @@ finalize_early_envelope() {
         "$ART_DIR" >&2
       exit 2
     fi
-    if ! python3 "$EVIDENCE" validate-partial-bundle --art-dir "$ART_DIR" \
+    if ! "${PYTHON[@]}" "$EVIDENCE" validate-partial-bundle --art-dir "$ART_DIR" \
         --artifact-root "$ART_DIR" >/dev/null; then
       printf '[check] INTERNAL FAULT: early evidence bundle did not validate: %s\n' \
         "$ART_DIR" >&2
@@ -299,7 +310,7 @@ build_terminal_command() {
     --string reason_code "$FINAL_REASON" \
     --integer process_exit "$FINAL_EXIT" \
     --string active_stage "$ACTIVE_STAGE" \
-    --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
+    --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
     --string cleanup_status retained_by_policy \
     --string final_state "$final_root" \
     --string logical_root "$final_root" \
@@ -329,7 +340,7 @@ bounded_readiness_wait() {
 # The launch gate guarantees that this direct child has not forked yet.
 terminate_unreleased_runner() {
   local pid="$1"
-  if ! setsid -- python3 "$EVIDENCE" kill-direct-child --pid "$pid" \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-direct-child --pid "$pid" \
       --expected-parent-pid "$$" --wait-ms 5000; then
     return 1
   fi
@@ -339,7 +350,7 @@ terminate_unreleased_runner() {
 release_guardian_launch() {
   local stage="$1" pid="$2" ticks="$3" ready="$4" output="$5"
   for _ in 1 2; do
-    if setsid -- python3 "$EVIDENCE" release-process-launch --ready "$ready" \
+    if setsid -- "${PYTHON[@]}" "$EVIDENCE" release-process-launch --ready "$ready" \
       --output "$output" --artifact-root "$ART_DIR" --stage-id "$stage" \
       --pid "$pid" --expected-start-ticks "$ticks" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS"; then
@@ -357,7 +368,7 @@ stop_active_runner() {
   [ -n "$pid" ] || return 0
   if bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" \
       && [ -n "$ACTIVE_RUNNER_START_TICKS" ]; then
-    python3 "$EVIDENCE" signal-bound-process --pid "$pid" \
+    "${PYTHON[@]}" "$EVIDENCE" signal-bound-process --pid "$pid" \
       --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal "$name" \
       >/dev/null 2>&1 || true
   fi
@@ -371,7 +382,7 @@ stop_active_runner() {
     state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
     if [ "$state" != Z ]; then
       if [ -f "$ACTIVE_READINESS" ]; then
-        if ! python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
+        if ! "${PYTHON[@]}" "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
           --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STAGE" \
           >/dev/null 2>&1; then
           cleanup_rc=1
@@ -402,11 +413,11 @@ stop_active_runner() {
         if [ "$cleanup_rc" -eq 0 ] && {
           [ "$runner_rc" -ne 4 ] \
             || [ -z "$runner_art_dir" ] \
-            || ! python3 "$EVIDENCE" validate-run \
+            || ! "${PYTHON[@]}" "$EVIDENCE" validate-run \
               --file "$runner_art_dir/run.ndjson" --schema "$SCHEMA" \
               --expected-verdict cancelled --artifact-root "$ART_DIR" \
               >/dev/null 2>&1 \
-            || ! python3 "$EVIDENCE" validate-bundle --art-dir "$runner_art_dir" \
+            || ! "${PYTHON[@]}" "$EVIDENCE" validate-bundle --art-dir "$runner_art_dir" \
               --manifest "$runner_art_dir/manifest.json" \
               --digest "$runner_art_dir/manifest.digest" \
               --commit "$runner_art_dir/bundle.complete.json" \
@@ -469,7 +480,7 @@ contain_bound_finalizer() {
     mark_process_tree_cleanup_unproven
     return 1
   fi
-  if ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
       --expected-start-ticks "$FINALIZER_START_TICKS" \
       --expected-parent-pid "$$" >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
@@ -477,7 +488,7 @@ contain_bound_finalizer() {
     mark_process_tree_cleanup_unproven
     return 1
   fi
-  if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" assert-process-group-empty \
       --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
     FINALIZER_WAIT_UNSAFE=1
@@ -530,7 +541,7 @@ run_finalizer_command() {
   [ "$FINALIZER_CLEANUP_UNPROVEN" -eq 0 ] || return 2
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
   if [ -s "$FINALIZATION_DECISION" ]; then trap '' HUP INT TERM; fi
-  setsid -- python3 "$EVIDENCE" stopped-exec \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" stopped-exec \
     --expected-parent-pid "$$" -- "$@" &
   FINALIZER_PID=$!
   if ! finalizer_test_checkpoint spawn_bind; then
@@ -543,7 +554,7 @@ run_finalizer_command() {
     return 2
   fi
   FINALIZER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
       --session-leader --stopped \
       2>/dev/null
@@ -564,7 +575,7 @@ run_finalizer_command() {
   # A terminal trap can interrupt Bash's command-substitution wait after the
   # isolated binder emitted a valid identity, so the canonical digits are the proof.
   if [ -z "$FINALIZATION_SIGNAL" ]; then
-    if ! setsid -- python3 "$EVIDENCE" resume-bound-process \
+    if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" resume-bound-process \
         --pid "$FINALIZER_PID" \
         --expected-start-ticks "$FINALIZER_START_TICKS" \
         --expected-parent-pid "$$"; then
@@ -656,10 +667,10 @@ on_exit() {
     [ "$FINALIZER_TEST_POINT" = active_wait ] \
       || [ "$FINALIZER_TEST_POINT" = helper_failure ];
   }; then
-    run_finalizer_command python3 -c 'import time; time.sleep(60)' \
+    run_finalizer_command "${PYTHON[@]}" -c 'import time; time.sleep(60)' \
       2>/dev/null || hash_rc=$?
   else
-    run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
       "${HASH_ARGS[@]}" "${HASH_CONTEXT_ARGS[@]}" \
       --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" \
       2>/dev/null || hash_rc=$?
@@ -684,13 +695,13 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" render-check-human \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" render-check-human \
       --file "$NDJSON" --output "$HUMAN_SEMANTIC" --artifact-root "$ART_DIR" \
       || publish_rc=2
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" validate-run \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" validate-run \
       --file "$NDJSON" --schema "$SCHEMA" --expected-verdict "$FINAL_VERDICT" \
       --artifact-root "$ART_DIR" --output "$ART_DIR/run.validation.json" || publish_rc=2
     abort_if_finalizer_signalled
@@ -706,7 +717,7 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" manifest \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" manifest \
       --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" \
       --digest-output "$ART_DIR/manifest.digest" \
@@ -731,13 +742,13 @@ on_exit() {
         --test-marker-pause-release "$FINALIZER_TEST_RELEASE"
       )
     fi
-    run_finalizer_command python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$GOVERNED_ROOT" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
       "${BUNDLE_CONTEXT_ARGS[@]}" "${MARKER_PAUSE_ARGS[@]}" || true
     if ! finalizer_test_checkpoint post_decision; then publish_rc=2; fi
-    if run_finalizer_command python3 "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
+    if run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
         --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
         --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
         >/dev/null; then
@@ -775,14 +786,15 @@ trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
 # (bead fln-evidence-runner-bootstrap-btk).
 EARLY_STEP=artifact_directory_creation
 mkdir -p "$(dirname "$ART_DIR")"
-if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
-  # A reused path is refused before any envelope exists; nothing we own is
-  # available to bundle into, and the foreign directory is never touched.
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  # The successful mkdir is the publisher-ownership linearization point. A
+  # competing lane can observe the directory only after another process owns
+  # it, so this process must disarm its finalizer and leave the winner untouched.
   trap - EXIT
-  echo "[check] setup failure: refusing reused evidence directory: $ART_DIR" >&2
+  echo "[check] setup failure: evidence directory already claimed: $ART_DIR" >&2
   exit 2
 fi
-mkdir "$ART_DIR"
+ART_DIR_CLAIMED=1
 if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = early_signal_hold ]; then
   # Deterministic early-signal window: the probe binds on the hold file and
   # delivers its signal while the envelope is still pre-run_start.
@@ -822,7 +834,7 @@ if [ "$FINALIZER_PROBE" -eq 1 ]; then
       ubs_inventory)
         EARLY_STEP=ubs_inventory
         mkdir "$UBS_INVENTORY"
-        python3 "$EVIDENCE" ubs-inventory --root "$ART_DIR" --scope all-tracked \
+        "${PYTHON[@]}" "$EVIDENCE" ubs-inventory --root "$ART_DIR" --scope all-tracked \
           --output "$UBS_INVENTORY" --artifact-root "$ART_DIR" \
           || early_fault early_ubs_inventory_failure "cannot inventory UBS inputs"
         early_fault early_ubs_inventory_failure "planted inventory collision did not fail"
@@ -830,7 +842,7 @@ if [ "$FINALIZER_PROBE" -eq 1 ]; then
       vendor_binding)
         EARLY_STEP=vendor_binding
         mkdir "$VENDOR_BINDING"
-        python3 "$EVIDENCE" vendor-binding --root "$ART_DIR" --vendor-path "$VENDOR_PATH" \
+        "${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ART_DIR" --vendor-path "$VENDOR_PATH" \
           --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" \
           || early_fault early_vendor_binding_failure "cannot verify the pinned Reference tree"
         early_fault early_vendor_binding_failure "planted vendor collision did not fail"
@@ -839,11 +851,11 @@ if [ "$FINALIZER_PROBE" -eq 1 ]; then
   fi
 else
   EARLY_STEP=ubs_inventory
-  python3 "$EVIDENCE" ubs-inventory --root "$REPO" --scope "$UBS_SCOPE" \
+  "${PYTHON[@]}" "$EVIDENCE" ubs-inventory --root "$REPO" --scope "$UBS_SCOPE" \
     --output "$UBS_INVENTORY" --artifact-root "$ART_DIR" \
     || early_fault early_ubs_inventory_failure "cannot inventory UBS inputs"
   EARLY_STEP=vendor_binding
-  python3 "$EVIDENCE" vendor-binding --root "$REPO" --vendor-path "$VENDOR_PATH" \
+  "${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$REPO" --vendor-path "$VENDOR_PATH" \
     --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" \
     || early_fault early_vendor_binding_failure "cannot verify the pinned Reference tree"
 fi
@@ -854,7 +866,7 @@ if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = initial_hash ]; the
   # while its snapshot is open — the ordinary stability law must fire.
   EARLY_HASH_ARGS=(--test-mutate-input probe-input)
 fi
-INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
+INPUT_ROOT="$("${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
   "${HASH_ARGS[@]}" "${HASH_CONTEXT_ARGS[@]}" "${EARLY_HASH_ARGS[@]}" \
   2>"$ART_DIR/initial-hash.err")" || {
   cat "$ART_DIR/initial-hash.err" >&2 || true
@@ -865,7 +877,7 @@ INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
   early_fault early_initial_hash_failure "cannot hash governed inputs"
 }
 EARLY_STEP=host_facts
-HOST_FACTS_JSON="$(python3 - <<'PY'
+HOST_FACTS_JSON="$("${PYTHON[@]}" - <<'PY'
 import json, platform
 print(json.dumps({
     "machine": platform.machine(),
@@ -877,7 +889,7 @@ PY
 )" || early_fault early_host_facts_failure "cannot capture host facts"
 
 EARLY_STEP=run_argv
-RUN_ARGV_JSON="$(python3 - "${BASH_SOURCE[0]}" "${1:-}" <<'PY'
+RUN_ARGV_JSON="$("${PYTHON[@]}" - "${BASH_SOURCE[0]}" "${1:-}" <<'PY'
 import json, sys
 argv = [sys.argv[1]]
 if sys.argv[2]:
@@ -950,7 +962,7 @@ if [ "$FINALIZER_PROBE" -eq 1 ]; then
 fi
 
 read_meta_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
 field = value[sys.argv[2]]
@@ -1044,7 +1056,7 @@ run_stage() {
   setsid -- "${runner[@]}" &
   ACTIVE_RUNNER_PID=$!
   if ! ACTIVE_RUNNER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" --session-leader \
       2>/dev/null
   )"; then
@@ -1215,7 +1227,7 @@ self_test() {
     child_pid=$!
     ACTIVE_RUNNER_PID="$child_pid"
     if ! ACTIVE_RUNNER_START_TICKS="$(
-      setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
+      setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$child_pid" \
         --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
         --session-leader 2>/dev/null
     )"; then
@@ -1296,11 +1308,11 @@ self_test() {
     ACTIVE_READINESS=""
     ACTIVE_RUNNER_PROTOCOL=""
     ACTIVE_RUNNER_ART_DIR=""
-    if [ "$rc" -eq 1 ] && python3 "$EVIDENCE" validate-run \
+    if [ "$rc" -eq 1 ] && "${PYTHON[@]}" "$EVIDENCE" validate-run \
       --file "$child/run.ndjson" --schema "$SCHEMA" --expected-verdict fail \
       --expected-active-stage "$stage" --expected-planted-stage "$stage" \
       --artifact-root "$ART_DIR" --output "$ART_DIR/selftest-$stage.validation.json" \
-      && python3 "$EVIDENCE" validate-bundle --art-dir "$child" \
+      && "${PYTHON[@]}" "$EVIDENCE" validate-bundle --art-dir "$child" \
         --manifest "$child/manifest.json" --digest "$child/manifest.digest" \
         --commit "$child/bundle.complete.json" --artifact-root "$child" >/dev/null; then
       echo "[check:self-test] ok — planted stage=$stage was caught and terminal" >&2
@@ -1338,7 +1350,7 @@ self_test() {
   child_pid=$!
   ACTIVE_RUNNER_PID="$child_pid"
   if ! ACTIVE_RUNNER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$child_pid" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
       --session-leader 2>/dev/null
   )"; then
@@ -1421,7 +1433,7 @@ self_test() {
   if [ ! -s "$child_stage_ready" ]; then
     stop_active_runner TERM || true
     rc=2
-  elif ! python3 "$EVIDENCE" signal-bound-process --pid "$child_pid" \
+  elif ! "${PYTHON[@]}" "$EVIDENCE" signal-bound-process --pid "$child_pid" \
       --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal TERM \
       >/dev/null 2>&1; then
     stop_active_runner TERM || true
@@ -1438,10 +1450,10 @@ self_test() {
     && [ "$(read_meta_field "$cancel_meta" classification)" = cancelled ] \
     && [ "$(read_meta_field "$cancel_meta" wrapper_exit)" = 4 ] \
     && [ "$(read_meta_field "$cancel_meta" child_exit)" = 143 ] \
-    && python3 "$EVIDENCE" validate-run \
+    && "${PYTHON[@]}" "$EVIDENCE" validate-run \
     --file "$child/run.ndjson" --schema "$SCHEMA" --expected-verdict cancelled \
     --artifact-root "$ART_DIR" --output "$ART_DIR/selftest-cancel-term.validation.json" \
-    && python3 "$EVIDENCE" validate-bundle --art-dir "$child" \
+    && "${PYTHON[@]}" "$EVIDENCE" validate-bundle --art-dir "$child" \
       --manifest "$child/manifest.json" --digest "$child/manifest.digest" \
       --commit "$child/bundle.complete.json" --artifact-root "$child" >/dev/null; then
     echo "[check:self-test] ok — TERM produced one validated cancelled terminal" >&2
@@ -1469,7 +1481,7 @@ fi
 # --locked makes Cargo.lock drift a failure instead of silently rewriting it.
 run_stage evidence-self-test "${PYTHON[@]}" scripts/evidence.py self-test \
   --art-dir "$ART_DIR/evidence-self-test"
-run_stage verification-manifest python3 scripts/evidence.py \
+run_stage verification-manifest "${PYTHON[@]}" scripts/evidence.py \
   validate-verification-manifest --manifest "$VERIFICATION_MANIFEST" \
   --beads "$REPO/.beads/issues.jsonl"
 run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
@@ -1491,16 +1503,16 @@ run_stage structure-guard cargo run -q --locked -p structure-guard -- --root "$R
 run_stage vendor-tree bash scripts/verify_vendor_tree.sh
 
 # The exact file set was materialized before run_start and is part of INPUT_ROOT.
-python3 "$EVIDENCE" validate-ubs-inventory --root "$REPO" \
+"${PYTHON[@]}" "$EVIDENCE" validate-ubs-inventory --root "$REPO" \
   --inventory "$UBS_INVENTORY" >/dev/null
 UBS_COUNT="$(read_meta_field "$UBS_INVENTORY" count)"
 if [ "$PLANT" = ubs ]; then
   run_stage ubs ubs --version
 elif command -v ubs >/dev/null 2>&1; then
   if [ "$UBS_COUNT" -gt 0 ]; then
-    run_stage ubs python3 "$EVIDENCE" exec-ubs-inventory \
+    run_stage ubs "${PYTHON[@]}" "$EVIDENCE" exec-ubs-inventory \
       --root "$REPO" --inventory "$UBS_INVENTORY" -- ubs --ci
-    python3 "$EVIDENCE" validate-ubs-inventory --root "$REPO" \
+    "${PYTHON[@]}" "$EVIDENCE" validate-ubs-inventory --root "$REPO" \
       --inventory "$UBS_INVENTORY" >/dev/null
   else
     skip_stage ubs "validated zero-file project-authored $UBS_SCOPE UBS scope"

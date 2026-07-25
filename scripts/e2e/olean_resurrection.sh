@@ -14,6 +14,22 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || {
+  echo "[olean_resurrection] setup failure: python3 is required" >&2
+  exit 2
+}
+PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[olean_resurrection] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
 MODE="${1:-full}"
 case "$MODE" in
   full|imports-only) ;;
@@ -25,7 +41,11 @@ esac
 RUN_ID="olean-resurrection-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_DIR="$ROOT/target/e2e/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[olean_resurrection] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 BUILD_TARGET="${FLN_E2E_CARGO_TARGET_DIR:-$ROOT/target_local}"
 
 BEAD="franken_lean-y24"
@@ -160,7 +180,7 @@ fi
 note "seeding corruption: single byte flipped in a copied region"
 CORRUPT="$ART_DIR/corrupt.olean"
 cp "$C3/Init.SizeOfLemmas.olean" "$CORRUPT"
-python3 - "$CORRUPT" <<'EOF'
+"${PYTHON[@]}" - "$CORRUPT" <<'EOF'
 import sys
 path = sys.argv[1]
 data = bytearray(open(path, "rb").read())

@@ -5,7 +5,23 @@
 
 set -Eeuo pipefail
 
-for required_command in python3 setsid cargo; do
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || {
+  echo "[verdict_schema] setup failure: python3 is required" >&2
+  exit 2
+}
+PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[verdict_schema] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
+for required_command in setsid cargo; do
   command -v "$required_command" >/dev/null 2>&1 || {
     echo "[verdict_schema] setup failure: $required_command is required" >&2
     exit 2
@@ -42,9 +58,10 @@ if [ "$READY_WAIT_MS" -gt 30000 ]; then
 fi
 MAX_SEMANTIC_BYTES=65536
 MAX_TELEMETRY_BYTES=4096
-START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 SEQ=0
 RUN_STARTED=0
+ART_DIR_CLAIMED=0
 FINAL_SET=0
 FINAL_VERDICT=internal_fault
 FINAL_REASON=uncommitted_exit
@@ -76,13 +93,13 @@ for subject_path in "${SUBJECT_PATHS[@]}"; do
 done
 
 if ! INPUT_ROOT="$(
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
     --vendor-path "$VENDOR_PATH"
 )"; then
   echo "[verdict_schema] setup failure: cannot hash governed inputs" >&2
   exit 2
 fi
-HOST_FACTS_JSON="$(python3 - <<'PY'
+HOST_FACTS_JSON="$("${PYTHON[@]}" - <<'PY'
 import json
 import platform
 
@@ -102,11 +119,11 @@ note() {
 build_event_command() {
   local sequence="$SEQ"
   SEQ=$((SEQ + 1))
-  EVENT_COMMAND=(python3 "$EVIDENCE" emit --file "$LOG" \
+  EVENT_COMMAND=("${PYTHON[@]}" "$EVIDENCE" emit --file "$LOG" \
     --artifact-root "$ART_DIR" --string schema "$SCHEMA" \
     --string run_id "$RUN_ID" --string bead "$BEAD" \
     --string scenario "$SCENARIO" --integer sequence "$sequence" \
-    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" "$@")
 }
 
@@ -123,7 +140,7 @@ set_final() {
 }
 
 read_meta_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json
 import pathlib
 import sys
@@ -134,17 +151,17 @@ PY
 }
 
 hash_governed() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
     --vendor-path "$VENDOR_PATH"
 }
 
 hash_subject() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${SUBJECT_HASH_ARGS[@]}"
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${SUBJECT_HASH_ARGS[@]}"
 }
 
 terminate_unreleased_runner() {
   local pid="$1"
-  setsid -- python3 "$EVIDENCE" kill-direct-child --pid "$pid" \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-direct-child --pid "$pid" \
     --expected-parent-pid "$$" --wait-ms 5000 || return 1
   wait "$pid" 2>/dev/null || true
 }
@@ -176,7 +193,7 @@ stop_active_runner() {
   if bounded_readiness_wait \
       "$ACTIVE_RUNNER_PID" "$ACTIVE_READINESS" "$READY_WAIT_MS" \
       && [ -n "$ACTIVE_RUNNER_START_TICKS" ]; then
-    python3 "$EVIDENCE" signal-bound-process \
+    "${PYTHON[@]}" "$EVIDENCE" signal-bound-process \
       --pid "$ACTIVE_RUNNER_PID" \
       --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" \
       --signal "$signal_name" >/dev/null 2>&1 || true
@@ -198,7 +215,7 @@ stop_active_runner() {
       awk '{print $3}' "/proc/$ACTIVE_RUNNER_PID/stat" 2>/dev/null || printf X
     )"
     if [ "$state" != Z ]; then
-      python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
+      "${PYTHON[@]}" "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
         --expected-wrapper-pid "$ACTIVE_RUNNER_PID" \
         --expected-stage-id "$ACTIVE_STEP" >/dev/null 2>&1 || return 1
     fi
@@ -231,8 +248,8 @@ publish_early_partial() {
       "$([ "$observed_rc" -eq 0 ] && printf early_uncommitted_success || printf early_unexpected_exit)" \
       2
   fi
-  if [ -d "$ART_DIR" ]; then
-    python3 "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
+  if [ "$ART_DIR_CLAIMED" -eq 1 ] && [ -d "$ART_DIR" ]; then
+    "${PYTHON[@]}" "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
       --step "$ACTIVE_STEP" --reason "$FINAL_REASON" \
       --classification "$FINAL_VERDICT" \
@@ -275,7 +292,7 @@ on_exit() {
   emit_event --string event run_end --string verdict "$FINAL_VERDICT" \
     --string reason_code "$FINAL_REASON" --integer process_exit "$FINAL_EXIT" \
     --string active_step "$ACTIVE_STEP" \
-    --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
+    --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
     --string cleanup_status retained_by_policy --string final_state "$final_root" \
     --string logical_root "$final_root" \
     --string receipt_root not_applicable_schema_contract \
@@ -284,12 +301,12 @@ on_exit() {
     --string bundle_commit bundle.complete.json \
     --string evidence_state pending_bundle_commit || publish_rc=2
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
+    "${PYTHON[@]}" "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
       --expected-verdict "$FINAL_VERDICT" --artifact-root "$ART_DIR" \
       --output "$ART_DIR/run.validation.json" || publish_rc=2
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
+    "${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" \
       --digest-output "$ART_DIR/manifest.digest" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
@@ -297,13 +314,13 @@ on_exit() {
       --final-root "$final_root" || publish_rc=2
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
+    "${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" \
       --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" \
       --governed-root "$ROOT" "${GOVERNED_ARGS[@]}" \
       --expected-root "$final_root" --vendor-path "$VENDOR_PATH" || true
-    python3 "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
+    "${PYTHON[@]}" "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" \
       --digest "$ART_DIR/manifest.digest" \
       --commit "$ART_DIR/bundle.complete.json" \
@@ -326,14 +343,16 @@ trap 'on_signal TERM 143' TERM
 trap 'on_exit "$?"' EXIT
 ACTIVE_STEP=artifact_directory_creation
 mkdir -p "$(dirname "$ART_DIR")"
-if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  # The leaf mkdir is the single-writer claim. The losing process owns no
+  # artifact path and therefore must not run its already-armed finalizer.
   trap - EXIT
-  echo "[verdict_schema] refusing reused evidence directory: $ART_DIR" >&2
+  echo "[verdict_schema] evidence directory already claimed: $ART_DIR" >&2
   exit 2
 fi
-mkdir "$ART_DIR"
+ART_DIR_CLAIMED=1
 ACTIVE_STEP=vendor_binding
-python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+"${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" \
   --vendor-path "$VENDOR_PATH" --output "$VENDOR_BINDING" \
   --artifact-root "$ART_DIR" || {
     set_final internal_fault early_vendor_binding_failure 2
@@ -378,7 +397,7 @@ supervise() {
   local launch_ready="$ART_DIR/$step.launch.ready.json"
   local launch_release="$ART_DIR/$step.launch.release.json"
   ACTIVE_STEP="$step"
-  setsid -- python3 -I -S "$EVIDENCE" run --cwd "$ROOT" \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" run --cwd "$ROOT" \
     --metadata "$LAST_META" --stdout "$LAST_OUT" --stderr "$LAST_ERR" \
     --readiness "$LAST_READY" --launch-ready "$launch_ready" \
     --launch-release "$launch_release" --artifact-root "$ART_DIR" \
@@ -388,7 +407,7 @@ supervise() {
     --stage-id "$step" "${semantic_args[@]}" -- "$@" &
   ACTIVE_RUNNER_PID=$!
   if ! ACTIVE_RUNNER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks \
       --pid "$ACTIVE_RUNNER_PID" --expected-parent-pid "$$" \
       --wait-ms "$READY_WAIT_MS" --session-leader 2>/dev/null
   )"; then
@@ -398,7 +417,7 @@ supervise() {
     exit 2
   fi
   ACTIVE_READINESS="$LAST_READY"
-  if ! setsid -- python3 "$EVIDENCE" release-process-launch \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" release-process-launch \
       --ready "$launch_ready" --output "$launch_release" \
       --artifact-root "$ART_DIR" --stage-id "$step" \
       --pid "$ACTIVE_RUNNER_PID" \
@@ -561,7 +580,7 @@ run_phase() {
     grep -Fq "$FAILURE_MARKER" "$LAST_ERR" || \
       record_failure "$phase" intended_reason_missing_from_stderr
   fi
-  if ! python3 "$EVIDENCE" validate-verdict-schema \
+  if ! "${PYTHON[@]}" "$EVIDENCE" validate-verdict-schema \
       --semantic "$semantic" --telemetry "$telemetry" \
       --stdout "$LAST_OUT" --stderr "$LAST_ERR" --phase "$phase" \
       --observed-exit "$LAST_CHILD_EXIT" "${validator_args[@]}" \

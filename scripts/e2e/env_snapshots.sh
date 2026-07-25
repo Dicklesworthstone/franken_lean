@@ -4,10 +4,22 @@
 
 set -Eeuo pipefail
 
-command -v python3 >/dev/null 2>&1 || {
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || {
   echo "[env_snapshots] setup failure: python3 is required" >&2
   exit 2
 }
+PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[env_snapshots] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
 command -v setsid >/dev/null 2>&1 || {
   echo "[env_snapshots] setup failure: setsid is required" >&2
   exit 2
@@ -32,7 +44,7 @@ TIMEOUT_MS="${FLN_E2E_TIMEOUT_MS:-1200000}"
 GRACE_MS="${FLN_E2E_KILL_GRACE_MS:-2000}"
 READY_WAIT_MS="${FLN_E2E_READY_WAIT_MS:-30000}"
 CACHE_STATE="${FLN_E2E_CACHE_STATE:-uncontrolled}"
-START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 SEQ=0
 ACTIVE_STEP=setup
 ACTIVE_RUNNER_PID=""
@@ -49,6 +61,7 @@ TERMINAL_EMITTED=0
 HUMAN_LOG_SEALED=0
 FINALIZING=0
 RUN_STARTED=0
+ART_DIR_CLAIMED=0
 EARLY_STEP=preflight
 FINALIZER_TRANSITION=0
 FINALIZER_PID=""
@@ -77,13 +90,13 @@ for input_path in "${INPUT_PATHS[@]}"; do
 done
 
 if ! INPUT_ROOT="$(
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
     --vendor-path "$VENDOR_PATH"
 )"; then
   echo "[env_snapshots] setup failure: cannot hash governed inputs" >&2
   exit 2
 fi
-HOST_FACTS_JSON="$(python3 - <<'PY'
+HOST_FACTS_JSON="$("${PYTHON[@]}" - <<'PY'
 import json
 import platform
 
@@ -107,11 +120,11 @@ note() {
 build_event_command() {
   local sequence="$SEQ"
   SEQ=$((SEQ + 1))
-  EVENT_COMMAND=(python3 "$EVIDENCE" emit --file "$LOG" \
+  EVENT_COMMAND=("${PYTHON[@]}" "$EVIDENCE" emit --file "$LOG" \
     --artifact-root "$ART_DIR" --string schema "$SCHEMA" \
     --string run_id "$RUN_ID" --string bead "$BEAD" \
     --string scenario "$SCENARIO" --integer sequence "$sequence" \
-    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" "$@")
 }
 
@@ -128,7 +141,7 @@ set_final() {
 }
 
 read_meta_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json
 import pathlib
 import sys
@@ -146,12 +159,12 @@ PY
 }
 
 hash_governed() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
     --vendor-path "$VENDOR_PATH"
 }
 
 hash_subject() {
-  python3 "$EVIDENCE" hash-tree --root "$1" --path "$2"
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$1" --path "$2"
 }
 
 mark_process_tree_cleanup_unproven() {
@@ -175,7 +188,7 @@ bounded_readiness_wait() {
 
 terminate_unreleased_runner() {
   local pid="$1"
-  setsid -- python3 "$EVIDENCE" kill-direct-child --pid "$pid" \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-direct-child --pid "$pid" \
     --expected-parent-pid "$$" --wait-ms 5000 || return 1
   wait "$pid" 2>/dev/null || true
 }
@@ -184,7 +197,7 @@ release_guardian_launch() {
   local stage="$1" pid="$2" ticks="$3" ready="$4" output="$5"
   local artifact_root="$6"
   for _ in 1 2; do
-    if setsid -- python3 "$EVIDENCE" release-process-launch --ready "$ready" \
+    if setsid -- "${PYTHON[@]}" "$EVIDENCE" release-process-launch --ready "$ready" \
       --output "$output" --artifact-root "$artifact_root" --stage-id "$stage" \
       --pid "$pid" --expected-start-ticks "$ticks" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS"; then
@@ -200,7 +213,7 @@ stop_active_runner() {
   [ -n "$pid" ] || return 0
   if bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" \
       && [ -n "$ACTIVE_RUNNER_START_TICKS" ]; then
-    python3 "$EVIDENCE" signal-bound-process --pid "$pid" \
+    "${PYTHON[@]}" "$EVIDENCE" signal-bound-process --pid "$pid" \
       --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal "$name" \
       >/dev/null 2>&1 || true
   fi
@@ -214,7 +227,7 @@ stop_active_runner() {
     state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
     if [ "$state" != Z ]; then
       if [ -f "$ACTIVE_READINESS" ] && \
-          python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
+          "${PYTHON[@]}" "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
             --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STEP" \
             >/dev/null 2>&1; then
         forced=1
@@ -271,7 +284,7 @@ contain_bound_finalizer() {
     mark_process_tree_cleanup_unproven
     return 1
   fi
-  if ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
       --expected-start-ticks "$FINALIZER_START_TICKS" \
       --expected-parent-pid "$$" >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
@@ -279,7 +292,7 @@ contain_bound_finalizer() {
     mark_process_tree_cleanup_unproven
     return 1
   fi
-  if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" assert-process-group-empty \
       --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
     FINALIZER_WAIT_UNSAFE=1
@@ -329,11 +342,11 @@ run_finalizer_command() {
   [ "$FINALIZER_CLEANUP_UNPROVEN" -eq 0 ] || return 2
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
   if [ -s "$FINALIZATION_DECISION" ]; then trap '' HUP INT TERM; fi
-  setsid -- python3 "$EVIDENCE" stopped-exec \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" stopped-exec \
     --expected-parent-pid "$$" -- "$@" &
   FINALIZER_PID=$!
   FINALIZER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
       --session-leader --stopped 2>/dev/null
   )" || true
@@ -349,7 +362,7 @@ run_finalizer_command() {
     return 2
   fi
   if [ -z "$FINALIZATION_SIGNAL" ]; then
-    if ! setsid -- python3 "$EVIDENCE" resume-bound-process \
+    if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" resume-bound-process \
         --pid "$FINALIZER_PID" \
         --expected-start-ticks "$FINALIZER_START_TICKS" \
         --expected-parent-pid "$$"; then
@@ -415,9 +428,9 @@ finalize_early_envelope() {
       set_final internal_fault "early_${EARLY_STEP}_unexpected_exit" 2
     fi
   fi
-  if [ -d "$ART_DIR" ]; then
+  if [ "$ART_DIR_CLAIMED" -eq 1 ] && [ -d "$ART_DIR" ]; then
     note "typed early-envelope fault: step=$EARLY_STEP reason=$FINAL_REASON"
-    python3 "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
+    "${PYTHON[@]}" "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
       --step "$EARLY_STEP" --reason "$FINAL_REASON" \
       --classification "$FINAL_VERDICT" \
@@ -447,7 +460,7 @@ on_exit() {
       "$([ "$observed_rc" -eq 0 ] && printf uncommitted_success || printf unexpected_shell_exit)" \
       2
   fi
-  run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$ROOT" \
+  run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" \
     "${HASH_ARGS[@]}" --vendor-path "$VENDOR_PATH" \
     --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" \
     2>/dev/null || hash_rc=$?
@@ -466,7 +479,7 @@ on_exit() {
     build_event_command --string event run_end --string verdict "$FINAL_VERDICT" \
       --string reason_code "$FINAL_REASON" --integer process_exit "$FINAL_EXIT" \
       --string active_step "$ACTIVE_STEP" \
-      --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
+      --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
       --string cleanup_status retained_by_policy --string final_state "$final_root" \
       --string logical_root "$final_root" \
       --string receipt_root not_applicable_environment_identity_matrix \
@@ -482,7 +495,7 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" validate-run --file "$LOG" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" validate-run --file "$LOG" \
       --schema "$SCHEMA" --expected-verdict "$FINAL_VERDICT" \
       --artifact-root "$ART_DIR" --output "$ART_DIR/run.validation.json" \
       || publish_rc=2
@@ -495,7 +508,7 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" \
       --digest-output "$ART_DIR/manifest.digest" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
@@ -504,13 +517,13 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" complete-bundle \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" complete-bundle \
       --art-dir "$ART_DIR" --manifest "$ART_DIR/manifest.json" \
       --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
       --vendor-path "$VENDOR_PATH" || true
-    if run_finalizer_command python3 "$EVIDENCE" adopt-bundle \
+    if run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" adopt-bundle \
         --art-dir "$ART_DIR" --manifest "$ART_DIR/manifest.json" \
         --digest "$ART_DIR/manifest.digest" \
         --commit "$ART_DIR/bundle.complete.json" \
@@ -537,14 +550,16 @@ trap 'on_signal TERM 143' TERM
 trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
 EARLY_STEP=artifact_directory_creation
 mkdir -p "$(dirname "$ART_DIR")"
-if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  # The leaf mkdir is the single-writer claim. The losing process owns no
+  # artifact path and therefore must not run its already-armed finalizer.
   trap - EXIT
-  echo "[env_snapshots] refusing reused evidence directory: $ART_DIR" >&2
+  echo "[env_snapshots] evidence directory already claimed: $ART_DIR" >&2
   exit 2
 fi
-mkdir "$ART_DIR"
+ART_DIR_CLAIMED=1
 EARLY_STEP=vendor_binding
-python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+"${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" \
   --vendor-path "$VENDOR_PATH" --output "$VENDOR_BINDING" \
   --artifact-root "$ART_DIR" || {
     set_final internal_fault early_vendor_binding_failure 2
@@ -595,7 +610,7 @@ supervise_in() {
   local launch_release="$artifact_dir/$step.launch.release.json"
   ACTIVE_STEP="$step"
   SPAWNING=1
-  setsid -- python3 -I -S "$EVIDENCE" run --cwd "$cwd" \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" run --cwd "$cwd" \
     --metadata "$LAST_META" --stdout "$LAST_OUT" --stderr "$LAST_ERR" \
     --readiness "$LAST_READY" --launch-ready "$launch_ready" \
     --launch-release "$launch_release" --artifact-root "$artifact_dir" \
@@ -605,7 +620,7 @@ supervise_in() {
     --stage-id "$step" "${semantic_args[@]}" -- "$@" &
   ACTIVE_RUNNER_PID=$!
   if ! ACTIVE_RUNNER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks \
       --pid "$ACTIVE_RUNNER_PID" --expected-parent-pid "$$" \
       --wait-ms "$READY_WAIT_MS" --session-leader 2>/dev/null
   )"; then
@@ -942,7 +957,7 @@ record_step extension_state_recovery pass pass/wrapper=0/child=0 \
 SET_UNION_OVERLAY_SOURCE="$OVERLAY/fln-env/src/extensions.rs"
 SET_UNION_PRISTINE_SOURCE="$ART_DIR/extensions.set-union.pristine.rs"
 cp -- "$SET_UNION_OVERLAY_SOURCE" "$SET_UNION_PRISTINE_SOURCE"
-if ! python3 - "$SET_UNION_OVERLAY_SOURCE" <<'PY'
+if ! "${PYTHON[@]}" - "$SET_UNION_OVERLAY_SOURCE" <<'PY'
 import pathlib
 import sys
 
@@ -1016,12 +1031,12 @@ record_step set_union_recovery pass pass/wrapper=0/child=0 \
 identity_emit_event() {
   local sequence="$IDENTITY_SEQ"
   IDENTITY_SEQ=$((IDENTITY_SEQ + 1))
-  python3 "$EVIDENCE" emit --file "$IDENTITY_LOG" \
+  "${PYTHON[@]}" "$EVIDENCE" emit --file "$IDENTITY_LOG" \
     --artifact-root "$IDENTITY_ART_DIR" \
     --string schema fln.e2e/2 --string run_id "$IDENTITY_RUN_ID" \
     --string bead "$IDENTITY_BEAD" --string scenario "$IDENTITY_SCENARIO" \
     --integer sequence "$sequence" \
-    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" "$@"
 }
 
@@ -1030,7 +1045,7 @@ validate_child_reference() {
   local child_dir="$ART_DIR/$child_rel"
   snapshot_before "$ART_DIR" "$child_rel" "$step"
   note "validating nested child=$child_rel"
-  supervise "$step" python3 "$EVIDENCE" validate-bundle \
+  supervise "$step" "${PYTHON[@]}" "$EVIDENCE" validate-bundle \
     --art-dir "$child_dir" --manifest "$child_dir/manifest.json" \
     --digest "$child_dir/manifest.digest" \
     --commit "$child_dir/bundle.complete.json" \
@@ -1059,7 +1074,7 @@ run_identity_child() {
   IDENTITY_LOG="$IDENTITY_ART_DIR/run.ndjson"
   IDENTITY_SEQ=0
   local child_start_ns child_input_root child_final_root
-  child_start_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  child_start_ns="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
   child_input_root="$(hash_governed)"
   if [ "$child_input_root" != "$INPUT_ROOT" ]; then
     set_final inconclusive "$scenario:governed_inputs_changed" 3
@@ -1070,7 +1085,7 @@ run_identity_child() {
     exit 2
   fi
   mkdir "$IDENTITY_ART_DIR"
-  python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+  "${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" \
     --vendor-path "$VENDOR_PATH" \
     --output "$IDENTITY_ART_DIR/vendor-binding.json" \
     --artifact-root "$IDENTITY_ART_DIR" || {
@@ -1117,7 +1132,7 @@ run_identity_child() {
     exit 1
   fi
   validation="$IDENTITY_ART_DIR/$scenario.validation.json"
-  python3 "$EVIDENCE" "$validator" --file "$LAST_OUT" \
+  "${PYTHON[@]}" "$EVIDENCE" "$validator" --file "$LAST_OUT" \
     --stderr-file "$LAST_ERR" --expected-run-id "$IDENTITY_RUN_ID" \
     --observed-exit "$LAST_CHILD_EXIT" \
     --expected-stdout-artifact "$scenario.out" \
@@ -1146,7 +1161,7 @@ run_identity_child() {
   identity_emit_event --string event run_end --string verdict pass \
     --string reason_code all_obligations_passed --integer process_exit 0 \
     --string active_step "$scenario" \
-    --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - child_start_ns ))" \
+    --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - child_start_ns ))" \
     --string cleanup_status retained_by_policy \
     --string final_state "$child_final_root" \
     --string logical_root "$child_final_root" \
@@ -1156,23 +1171,23 @@ run_identity_child() {
     --string evidence_state pending_bundle_commit
   printf '[env_snapshots:%s] terminal verdict=pass\n' "$scenario" \
     > "$IDENTITY_ART_DIR/human.log"
-  python3 "$EVIDENCE" validate-run --file "$IDENTITY_LOG" \
+  "${PYTHON[@]}" "$EVIDENCE" validate-run --file "$IDENTITY_LOG" \
     --schema fln.e2e/2 --expected-verdict pass \
     --expected-active-stage "$scenario" --artifact-root "$IDENTITY_ART_DIR" \
     --output "$IDENTITY_ART_DIR/run.validation.json"
-  python3 "$EVIDENCE" manifest --art-dir "$IDENTITY_ART_DIR" \
+  "${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$IDENTITY_ART_DIR" \
     --output "$IDENTITY_ART_DIR/manifest.json" \
     --digest-output "$IDENTITY_ART_DIR/manifest.digest" \
     --run-id "$IDENTITY_RUN_ID" --bead "$IDENTITY_BEAD" \
     --scenario "$IDENTITY_SCENARIO" --verdict pass \
     --input-root "$child_input_root" --final-root "$child_final_root"
-  python3 "$EVIDENCE" complete-bundle --art-dir "$IDENTITY_ART_DIR" \
+  "${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$IDENTITY_ART_DIR" \
     --manifest "$IDENTITY_ART_DIR/manifest.json" \
     --digest "$IDENTITY_ART_DIR/manifest.digest" \
     --output "$IDENTITY_ART_DIR/bundle.complete.json" \
     --governed-root "$ROOT" "${GOVERNED_ARGS[@]}" \
     --expected-root "$child_final_root" --vendor-path "$VENDOR_PATH"
-  python3 "$EVIDENCE" adopt-bundle --art-dir "$IDENTITY_ART_DIR" \
+  "${PYTHON[@]}" "$EVIDENCE" adopt-bundle --art-dir "$IDENTITY_ART_DIR" \
     --manifest "$IDENTITY_ART_DIR/manifest.json" \
     --digest "$IDENTITY_ART_DIR/manifest.digest" \
     --commit "$IDENTITY_ART_DIR/bundle.complete.json" \
@@ -1206,7 +1221,7 @@ COLLISION_HUMAN="$COLLISION_ART_DIR/human.log"
 COLLISION_VENDOR_PATH="vendor/lean4-src"
 COLLISION_VENDOR_BINDING="$COLLISION_ART_DIR/vendor-binding.json"
 COLLISION_SEQ=0
-COLLISION_START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+COLLISION_START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 COLLISION_CAPTURE_BYTES="${FLN_E2E_CAPTURE_BYTES:-262144}"
 COLLISION_OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-16777216}"
 COLLISION_TIMEOUT_MS="${FLN_E2E_TIMEOUT_MS:-300000}"
@@ -1233,25 +1248,25 @@ collision_note() {
 collision_emit_event() {
   local sequence="$COLLISION_SEQ"
   COLLISION_SEQ=$((COLLISION_SEQ + 1))
-  python3 "$EVIDENCE" emit --file "$COLLISION_LOG" --artifact-root "$COLLISION_ART_DIR" \
+  "${PYTHON[@]}" "$EVIDENCE" emit --file "$COLLISION_LOG" --artifact-root "$COLLISION_ART_DIR" \
     --string schema "$COLLISION_SCHEMA" --string run_id "$COLLISION_RUN_ID" \
     --string bead "$COLLISION_BEAD" --string scenario "$COLLISION_SCENARIO" \
     --integer sequence "$sequence" \
-    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" "$@"
 }
 
 collision_hash_live() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${COLLISION_HASH_ARGS[@]}" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${COLLISION_HASH_ARGS[@]}" \
     --vendor-path "$COLLISION_VENDOR_PATH"
 }
 
 collision_hash_subject() {
-  python3 "$EVIDENCE" hash-tree --root "$1" --path "$2"
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$1" --path "$2"
 }
 
 collision_file_sha256() {
-  python3 - "$1" <<'PY'
+  "${PYTHON[@]}" - "$1" <<'PY'
 import hashlib
 import pathlib
 import sys
@@ -1265,7 +1280,7 @@ PY
 }
 
 collision_meta_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json
 import pathlib
 import sys
@@ -1298,7 +1313,7 @@ collision_supervise() {
   fi
   collision_note "running step=$step cwd=$cwd"
   set +e
-  python3 -I -S "$EVIDENCE" run --cwd "$cwd" \
+  "${PYTHON[@]}" "$EVIDENCE" run --cwd "$cwd" \
     --metadata "$COLLISION_LAST_META" --stdout "$COLLISION_LAST_OUT" \
     --stderr "$COLLISION_LAST_ERR" --readiness "$COLLISION_LAST_READY" \
     --artifact-root "$COLLISION_ART_DIR" --capture-bytes "$COLLISION_CAPTURE_BYTES" \
@@ -1372,7 +1387,7 @@ if [ -e "$COLLISION_ART_DIR" ] || [ -L "$COLLISION_ART_DIR" ]; then
   exit 2
 fi
 mkdir "$COLLISION_ART_DIR"
-python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+"${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" \
   --vendor-path "$COLLISION_VENDOR_PATH" --output "$COLLISION_VENDOR_BINDING" \
   --artifact-root "$COLLISION_ART_DIR" || {
     note "FAIL: cannot bind the pinned Reference tree for fln-amv.10"
@@ -1390,7 +1405,7 @@ collision_emit_event --new-log --string event run_start \
   --string parity_ledger_row not_applicable_internal_data_structure_determinism \
   --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
   --string platform "$(uname -srm)" \
-  --json-value host_facts "$(python3 -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
+  --json-value host_facts "$("${PYTHON[@]}" -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
   --integer thread_count 32 --string seed partition-rotation-v1 \
   --json-value thread_matrix '[1,8,32]' \
   --string cache_state "$COLLISION_CACHE_STATE" \
@@ -1434,7 +1449,7 @@ collision_assert_unchanged collision_positive \
   "$COLLISION_POSITIVE_SUBJECT_BEFORE" "$COLLISION_POSITIVE_SUBJECT_AFTER" \
   "$COLLISION_POSITIVE_GLOBAL_BEFORE" "$COLLISION_POSITIVE_GLOBAL_AFTER"
 COLLISION_POSITIVE_VALIDATION="$COLLISION_ART_DIR/collision_positive.validation.json"
-python3 "$EVIDENCE" validate-environment-collision \
+"${PYTHON[@]}" "$EVIDENCE" validate-environment-collision \
   --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase positive \
   --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
   --expected-cwd "$ROOT/crates/fln-env" --expected-argv "$COLLISION_CARGO_ARGV" \
@@ -1451,7 +1466,7 @@ collision_record_step collision_positive \
 
 # Mutant: change exactly one anchor in the retained overlay and classify Cargo's
 # semantic test failure (101) as fail/wrapper=1, never as an internal fault.
-if ! python3 - "$OVERLAY/fln-env/src/pmap.rs" <<'PY'
+if ! "${PYTHON[@]}" - "$OVERLAY/fln-env/src/pmap.rs" <<'PY'
 import pathlib
 import sys
 
@@ -1491,7 +1506,7 @@ collision_assert_unchanged collision_mutant \
   "$COLLISION_MUTANT_SUBJECT_BEFORE" "$COLLISION_MUTANT_SUBJECT_AFTER" \
   "$COLLISION_MUTANT_GLOBAL_BEFORE" "$COLLISION_MUTANT_GLOBAL_AFTER"
 COLLISION_MUTANT_VALIDATION="$COLLISION_ART_DIR/collision_mutant.validation.json"
-python3 "$EVIDENCE" validate-environment-collision \
+"${PYTHON[@]}" "$EVIDENCE" validate-environment-collision \
   --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase mutant \
   --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
   --expected-stdout-artifact collision_mutant.out \
@@ -1535,7 +1550,7 @@ collision_assert_unchanged collision_recovery \
   "$COLLISION_RECOVERY_SUBJECT_BEFORE" "$COLLISION_RECOVERY_SUBJECT_AFTER" \
   "$COLLISION_RECOVERY_GLOBAL_BEFORE" "$COLLISION_RECOVERY_GLOBAL_AFTER"
 COLLISION_RECOVERY_VALIDATION="$COLLISION_ART_DIR/collision_recovery.validation.json"
-python3 "$EVIDENCE" validate-environment-collision \
+"${PYTHON[@]}" "$EVIDENCE" validate-environment-collision \
   --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase recovery \
   --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
   --expected-cwd "$OVERLAY/fln-env" --expected-argv "$COLLISION_CARGO_ARGV" \
@@ -1558,7 +1573,7 @@ fi
 collision_emit_event --string event run_end --string verdict pass \
   --string reason_code all_obligations_passed --integer process_exit 0 \
   --string active_step collision_recovery \
-  --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - COLLISION_START_NS ))" \
+  --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - COLLISION_START_NS ))" \
   --string cleanup_status retained_by_policy \
   --string final_state "$COLLISION_FINAL_ROOT" \
   --string logical_root "$COLLISION_FINAL_ROOT" \
@@ -1568,25 +1583,25 @@ collision_emit_event --string event run_end --string verdict pass \
   --string bundle_commit bundle.complete.json \
   --string evidence_state pending_bundle_commit
 
-python3 "$EVIDENCE" validate-run --file "$COLLISION_LOG" \
+"${PYTHON[@]}" "$EVIDENCE" validate-run --file "$COLLISION_LOG" \
   --schema "$COLLISION_SCHEMA" --expected-verdict pass \
   --expected-active-stage collision_recovery \
   --artifact-root "$COLLISION_ART_DIR" \
   --output "$COLLISION_ART_DIR/run.validation.json"
-python3 "$EVIDENCE" manifest --art-dir "$COLLISION_ART_DIR" \
+"${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$COLLISION_ART_DIR" \
   --output "$COLLISION_ART_DIR/manifest.json" \
   --digest-output "$COLLISION_ART_DIR/manifest.digest" \
   --run-id "$COLLISION_RUN_ID" --bead "$COLLISION_BEAD" \
   --scenario "$COLLISION_SCENARIO" --verdict pass \
   --input-root "$COLLISION_INPUT_ROOT" --final-root "$COLLISION_FINAL_ROOT"
-python3 "$EVIDENCE" complete-bundle --art-dir "$COLLISION_ART_DIR" \
+"${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$COLLISION_ART_DIR" \
   --manifest "$COLLISION_ART_DIR/manifest.json" \
   --digest "$COLLISION_ART_DIR/manifest.digest" \
   --output "$COLLISION_ART_DIR/bundle.complete.json" \
   --governed-root "$ROOT" "${COLLISION_GOVERNED_ARGS[@]}" \
   --expected-root "$COLLISION_FINAL_ROOT" \
   --vendor-path "$COLLISION_VENDOR_PATH"
-python3 "$EVIDENCE" validate-bundle --art-dir "$COLLISION_ART_DIR" \
+"${PYTHON[@]}" "$EVIDENCE" validate-bundle --art-dir "$COLLISION_ART_DIR" \
   --manifest "$COLLISION_ART_DIR/manifest.json" \
   --digest "$COLLISION_ART_DIR/manifest.digest" \
   --commit "$COLLISION_ART_DIR/bundle.complete.json" \
@@ -1607,7 +1622,7 @@ COLLISION_LOG="$COLLISION_ART_DIR/run.ndjson"
 COLLISION_HUMAN="$COLLISION_ART_DIR/human.log"
 COLLISION_VENDOR_BINDING="$COLLISION_ART_DIR/vendor-binding.json"
 COLLISION_SEQ=0
-COLLISION_START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+COLLISION_START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 COLLISION_TEST="pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence"
 COLLISION_CARGO_ARGV="cargo test --locked -q -p fln-env $COLLISION_TEST -- --exact --nocapture"
 
@@ -1620,7 +1635,7 @@ if [ -e "$COLLISION_ART_DIR" ] || [ -L "$COLLISION_ART_DIR" ]; then
   exit 2
 fi
 mkdir "$COLLISION_ART_DIR"
-python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+"${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" \
   --vendor-path "$COLLISION_VENDOR_PATH" --output "$COLLISION_VENDOR_BINDING" \
   --artifact-root "$COLLISION_ART_DIR" || {
     note "FAIL: cannot bind the pinned Reference tree for fln-amv.13"
@@ -1638,7 +1653,7 @@ collision_emit_event --new-log --string event run_start \
   --string parity_ledger_row not_applicable_internal_data_structure_resource_bound \
   --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
   --string platform "$(uname -srm)" \
-  --json-value host_facts "$(python3 -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
+  --json-value host_facts "$("${PYTHON[@]}" -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
   --integer thread_count 32 --string seed partition-rotation-v1 \
   --json-value thread_matrix '[1,8,32]' \
   --string cache_state "$COLLISION_CACHE_STATE" \
@@ -1679,7 +1694,7 @@ collision_assert_unchanged resource_positive \
   "$COLLISION_POSITIVE_SUBJECT_BEFORE" "$COLLISION_POSITIVE_SUBJECT_AFTER" \
   "$COLLISION_POSITIVE_GLOBAL_BEFORE" "$COLLISION_POSITIVE_GLOBAL_AFTER"
 COLLISION_POSITIVE_VALIDATION="$COLLISION_ART_DIR/resource_positive.validation.json"
-python3 "$EVIDENCE" validate-environment-resource-collision \
+"${PYTHON[@]}" "$EVIDENCE" validate-environment-resource-collision \
   --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase positive \
   --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
   --expected-cwd "$ROOT/crates/fln-env" --expected-argv "$COLLISION_CARGO_ARGV" \
@@ -1697,7 +1712,7 @@ collision_record_step resource_positive \
 # Mutant: promote an inline bucket one entry too early. The exact test must fail
 # at the cloned-inline-work assertion; both split streams are checked before the
 # strict validator accepts the kill.
-if ! python3 - "$OVERLAY/fln-env/src/pmap.rs" <<'PY'
+if ! "${PYTHON[@]}" - "$OVERLAY/fln-env/src/pmap.rs" <<'PY'
 import pathlib
 import sys
 
@@ -1746,7 +1761,7 @@ collision_assert_unchanged resource_mutant \
   "$COLLISION_MUTANT_SUBJECT_BEFORE" "$COLLISION_MUTANT_SUBJECT_AFTER" \
   "$COLLISION_MUTANT_GLOBAL_BEFORE" "$COLLISION_MUTANT_GLOBAL_AFTER"
 COLLISION_MUTANT_VALIDATION="$COLLISION_ART_DIR/resource_mutant.validation.json"
-python3 "$EVIDENCE" validate-environment-resource-collision \
+"${PYTHON[@]}" "$EVIDENCE" validate-environment-resource-collision \
   --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase mutant \
   --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
   --expected-stdout-artifact resource_mutant.out \
@@ -1790,7 +1805,7 @@ collision_assert_unchanged resource_recovery \
   "$COLLISION_RECOVERY_SUBJECT_BEFORE" "$COLLISION_RECOVERY_SUBJECT_AFTER" \
   "$COLLISION_RECOVERY_GLOBAL_BEFORE" "$COLLISION_RECOVERY_GLOBAL_AFTER"
 COLLISION_RECOVERY_VALIDATION="$COLLISION_ART_DIR/resource_recovery.validation.json"
-python3 "$EVIDENCE" validate-environment-resource-collision \
+"${PYTHON[@]}" "$EVIDENCE" validate-environment-resource-collision \
   --file "$COLLISION_LAST_OUT" --stderr-file "$COLLISION_LAST_ERR" --phase recovery \
   --expected-run-id "$COLLISION_RUN_ID" --observed-exit "$COLLISION_LAST_CHILD" \
   --expected-cwd "$OVERLAY/fln-env" --expected-argv "$COLLISION_CARGO_ARGV" \
@@ -1813,7 +1828,7 @@ fi
 collision_emit_event --string event run_end --string verdict pass \
   --string reason_code all_obligations_passed --integer process_exit 0 \
   --string active_step resource_recovery \
-  --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - COLLISION_START_NS ))" \
+  --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - COLLISION_START_NS ))" \
   --string cleanup_status retained_by_policy \
   --string final_state "$COLLISION_FINAL_ROOT" \
   --string logical_root "$COLLISION_FINAL_ROOT" \
@@ -1823,25 +1838,25 @@ collision_emit_event --string event run_end --string verdict pass \
   --string bundle_commit bundle.complete.json \
   --string evidence_state pending_bundle_commit
 
-python3 "$EVIDENCE" validate-run --file "$COLLISION_LOG" \
+"${PYTHON[@]}" "$EVIDENCE" validate-run --file "$COLLISION_LOG" \
   --schema "$COLLISION_SCHEMA" --expected-verdict pass \
   --expected-active-stage resource_recovery \
   --artifact-root "$COLLISION_ART_DIR" \
   --output "$COLLISION_ART_DIR/run.validation.json"
-python3 "$EVIDENCE" manifest --art-dir "$COLLISION_ART_DIR" \
+"${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$COLLISION_ART_DIR" \
   --output "$COLLISION_ART_DIR/manifest.json" \
   --digest-output "$COLLISION_ART_DIR/manifest.digest" \
   --run-id "$COLLISION_RUN_ID" --bead "$COLLISION_BEAD" \
   --scenario "$COLLISION_SCENARIO" --verdict pass \
   --input-root "$COLLISION_INPUT_ROOT" --final-root "$COLLISION_FINAL_ROOT"
-python3 "$EVIDENCE" complete-bundle --art-dir "$COLLISION_ART_DIR" \
+"${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$COLLISION_ART_DIR" \
   --manifest "$COLLISION_ART_DIR/manifest.json" \
   --digest "$COLLISION_ART_DIR/manifest.digest" \
   --output "$COLLISION_ART_DIR/bundle.complete.json" \
   --governed-root "$ROOT" "${COLLISION_GOVERNED_ARGS[@]}" \
   --expected-root "$COLLISION_FINAL_ROOT" \
   --vendor-path "$COLLISION_VENDOR_PATH"
-python3 "$EVIDENCE" validate-bundle --art-dir "$COLLISION_ART_DIR" \
+"${PYTHON[@]}" "$EVIDENCE" validate-bundle --art-dir "$COLLISION_ART_DIR" \
   --manifest "$COLLISION_ART_DIR/manifest.json" \
   --digest "$COLLISION_ART_DIR/manifest.digest" \
   --commit "$COLLISION_ART_DIR/bundle.complete.json" \

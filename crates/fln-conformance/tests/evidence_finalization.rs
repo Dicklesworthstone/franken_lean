@@ -50,7 +50,7 @@ fn terminal_human_log_is_sealed_before_manifest_generation() {
         .map(|offset| terminal_append + offset)
         .expect("the finalizer must seal human.log after its terminal record");
     let manifest_generation = finalizer
-        .find(r#"run_finalizer_command python3 "$EVIDENCE" manifest"#)
+        .find(r#"run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" manifest"#)
         .expect("the finalizer must generate an evidence manifest");
 
     let sealed_note_branch = note
@@ -88,14 +88,16 @@ fn env_snapshots_parent_is_authoritative_and_preserves_nested_children() {
         "env_snapshots must not retain the legacy parent schema"
     );
     assert!(
-        script.contains(r#"if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then"#),
-        "the parent must refuse reused or symlink artifact directories"
+        script.contains(r#"if ! mkdir "$ART_DIR" 2>/dev/null; then"#)
+            && script.contains("ART_DIR_CLAIMED=1"),
+        "the parent must acquire its single-writer artifact claim atomically"
     );
     assert!(
-        script.contains(r#"run_finalizer_command python3 "$EVIDENCE" validate-run"#)
-            && script.contains(r#"run_finalizer_command python3 "$EVIDENCE" manifest"#)
-            && script.contains(r#"run_finalizer_command python3 "$EVIDENCE" complete-bundle"#)
-            && script.contains(r#"run_finalizer_command python3 "$EVIDENCE" adopt-bundle"#),
+        script.contains(r#"run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" validate-run"#,)
+            && script.contains(r#"run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" manifest"#,)
+            && script
+                .contains(r#"run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" complete-bundle"#,)
+            && script.contains(r#"run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" adopt-bundle"#,),
         "the parent must validate, manifest, complete, and adopt through its durable finalizer"
     );
 
@@ -172,7 +174,7 @@ fn env_snapshots_seals_human_log_before_parent_manifest() {
         .map(|offset| terminal_append + offset)
         .expect("the parent finalizer must seal human.log");
     let manifest_generation = finalizer
-        .find(r#"run_finalizer_command python3 "$EVIDENCE" manifest"#)
+        .find(r#"run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" manifest"#)
         .expect("the parent finalizer must generate a manifest");
     let sealed_return = note
         .find(r#"if [ "$HUMAN_LOG_SEALED" -eq 1 ]; then"#)
@@ -203,22 +205,36 @@ fn every_supervisor_launcher_seals_python_configuration_before_imports() {
     );
 
     for relative in [
+        "scripts/check.sh",
+        "scripts/e2e/bignum_vectors.sh",
         "scripts/e2e/closure_audit.sh",
+        "scripts/e2e/contract_drift.sh",
         "scripts/e2e/env_snapshots.sh",
         "scripts/e2e/kernel_replay.sh",
+        "scripts/e2e/olean_resurrection.sh",
         "scripts/e2e/structure_gate.sh",
         "scripts/e2e/vellum_naming_no_mock_e2e.sh",
         "scripts/e2e/verdict_schema.sh",
     ] {
         let script = trusted_script(relative);
         assert!(
-            script.contains(r#"python3 -I -S "$EVIDENCE" run"#),
-            "{relative} must launch the supervisor through Python -I -S"
+            script.contains(r#"PYTHON_BIN="$(command -v python3 || true)""#)
+                && script.contains(r#"PYTHON=("$PYTHON_BIN" -I -S)"#)
+                && script.contains("HOSTILE_PYTHON_CONFIGURATION=()")
+                && script.contains("sealed_interpreter_hostile_environment names="),
+            "{relative} must resolve Python once, freeze -I -S, and refuse ambient Python configuration"
         );
-        assert!(
-            !script.contains(r#"python3 "$EVIDENCE" run"#),
-            "{relative} retains an unsealed supervisor launch"
-        );
+        for (line_number, line) in script.lines().enumerate() {
+            if line.contains("python3")
+                && !line.contains("command -v python3")
+                && !line.contains("python3 is required")
+            {
+                panic!(
+                    "{relative}:{} retains a bare Python token: {line}",
+                    line_number + 1
+                );
+            }
+        }
     }
 
     let stress = trusted_script("scripts/e2e/evidence_runner.sh");
@@ -226,4 +242,72 @@ fn every_supervisor_launcher_seals_python_configuration_before_imports() {
         stress.contains(r#""$PYTHON_BIN" -I -S "$EVIDENCE" run"#),
         "the evidence-runner stress lane must launch its supervisor through -I -S"
     );
+
+    let vendor = trusted_script("scripts/verify_vendor_tree.sh");
+    assert!(
+        vendor.contains(r#"exec "$PYTHON_BIN" -I -S "$ROOT/scripts/evidence.py""#)
+            && vendor.contains("sealed_interpreter_hostile_environment names="),
+        "the standalone vendor verifier must refuse ambient configuration and seal Python before imports"
+    );
+
+    for relative in [
+        "scripts/evidence.py",
+        "scripts/extract/convert_blake3_vectors.py",
+        "scripts/extract/gen_abi_contract.py",
+        "scripts/extract/gen_bignum_vectors.py",
+        "scripts/extract/gen_olean_contract.py",
+    ] {
+        let script = trusted_script(relative);
+        assert!(
+            script.starts_with("#!/usr/bin/env -S python3 -I -S\n")
+                && (relative == "scripts/evidence.py"
+                    || script.contains("sealed_interpreter_unsealed_startup")
+                        && script.contains("sealed_interpreter_hostile_environment")),
+            "{relative} must seal direct shebang execution and refuse bypassed startup"
+        );
+    }
+
+    let evidence = trusted_script("scripts/evidence.py");
+    assert!(
+        evidence.contains(r#"if args.subcommand != "run":"#)
+            && evidence.contains("prepare_sealed_interpreter(os.environ)"),
+        "direct evidence subcommands must refuse unsealed or hostile startup at runtime"
+    );
+}
+
+#[test]
+fn armed_finalizers_publish_only_after_their_process_wins_the_directory_claim() {
+    for relative in [
+        "scripts/check.sh",
+        "scripts/e2e/closure_audit.sh",
+        "scripts/e2e/env_snapshots.sh",
+        "scripts/e2e/structure_gate.sh",
+        "scripts/e2e/verdict_schema.sh",
+    ] {
+        let script = trusted_script(relative);
+        assert!(
+            script.contains("ART_DIR_CLAIMED=0")
+                && script.contains(r#"if ! mkdir "$ART_DIR" 2>/dev/null; then"#)
+                && script.contains("ART_DIR_CLAIMED=1")
+                && script
+                    .contains(r#"if [ "$ART_DIR_CLAIMED" -eq 1 ] && [ -d "$ART_DIR" ]; then"#,),
+            "{relative} must bind finalization authority to its successful atomic directory claim"
+        );
+
+        let claim = script
+            .find(r#"if ! mkdir "$ART_DIR" 2>/dev/null; then"#)
+            .expect("atomic claim must exist");
+        let owned = script[claim..]
+            .find("ART_DIR_CLAIMED=1")
+            .map(|offset| claim + offset)
+            .expect("successful claim must record ownership");
+        let first_artifact_write = script[owned..]
+            .find(r#""$ART_DIR/"#)
+            .map(|offset| owned + offset)
+            .expect("the claimed directory must eventually receive evidence");
+        assert!(
+            claim < owned && owned < first_artifact_write,
+            "{relative} must record ownership before writing its first artifact"
+        );
+    }
 }

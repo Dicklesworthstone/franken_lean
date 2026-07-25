@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """gen_abi_contract.py — D5/D9 contract extraction: the ABI contract from the pinned lean.h.
 
 The law (plan Appendix B, beads franken_lean-53v and franken_lean-b7n8): layout
@@ -1405,4 +1405,23 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    hostile_python = sorted(name for name in os.environ if name.startswith("PYTHON"))
+    if not all(
+        (
+            sys.flags.isolated,
+            sys.flags.ignore_environment,
+            sys.flags.no_site,
+            sys.flags.no_user_site,
+            sys.flags.safe_path,
+        )
+    ):
+        print("gen_abi_contract: sealed_interpreter_unsealed_startup", file=sys.stderr)
+        raise SystemExit(2)
+    if hostile_python:
+        print(
+            "gen_abi_contract: sealed_interpreter_hostile_environment names="
+            + ",".join(hostile_python),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     sys.exit(main())

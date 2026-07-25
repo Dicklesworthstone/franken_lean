@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Fail-closed evidence utilities for FrankenLean's shell quality gates.
 
 This is test/CI apparatus, not a FrankenLean runtime component.  It centralizes the
@@ -18179,6 +18179,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     hash_control = subprocess.run(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "hash-tree",
             "--root",
@@ -18200,6 +18202,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     hash_mutated = subprocess.run(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "hash-tree",
             "--root",
@@ -18394,7 +18398,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
     require(
         reused_probe.returncode == SETUP_FAILURE
-        and b"refusing reused evidence directory" in reused_probe.stderr,
+        and b"evidence directory already claimed" in reused_probe.stderr,
         f"reused-directory refusal lost its type: {reused_probe.stderr[-200:]!r}",
     )
     require(
@@ -18402,6 +18406,114 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "reused-directory refusal touched foreign state",
     )
     cases.append({"case": "early_fault_reused_directory", "ok": True})
+
+    # The shell finalizer is armed before the artifact root is claimed. Prove
+    # that its ownership state follows the atomic mkdir result rather than the
+    # mere existence of the path: a concurrent loser must exit typed without
+    # publishing into, truncating, or otherwise changing the winner's root.
+    claim_root = art_dir / "concurrent_artifact_directory_claim"
+    require(
+        not claim_root.exists() and not claim_root.is_symlink(),
+        "concurrent artifact-directory claim root was not fresh",
+    )
+    claim_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("FLN_CHECK_")
+        and not key.startswith("FLN_FINALIZER_")
+    }
+    claim_environment.update(
+        {
+            "FLN_CHECK_ART_DIR": str(claim_root),
+            "FLN_CHECK_TEST_EARLY_FAULT": "early_signal_hold",
+        }
+    )
+    claim_winner = subprocess.Popen(
+        ["bash", str(Path(__file__).resolve().parent.parent / "scripts" / "check.sh"),
+         "--early-fault-probe"],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=claim_environment,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        claim_hold = claim_root / "early.hold"
+        claim_deadline = time.monotonic() + 30
+        while (
+            not claim_hold.exists()
+            and claim_winner.poll() is None
+            and time.monotonic() < claim_deadline
+        ):
+            time.sleep(0.01)
+        require(
+            claim_hold.exists(),
+            "artifact-directory claim winner never reached its hold point",
+        )
+        before_loser = sorted(path.name for path in claim_root.iterdir())
+        require(
+            before_loser == ["early.hold"],
+            f"claim winner published unexpected pre-envelope state: {before_loser}",
+        )
+        hold_data, hold_size, hold_digest = stable_file_facts(claim_hold)
+        claim_loser = subprocess.run(
+            [
+                "bash",
+                str(Path(__file__).resolve().parent.parent / "scripts" / "check.sh"),
+                "--early-fault-probe",
+            ],
+            cwd=Path(__file__).resolve().parent.parent,
+            env=claim_environment,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        require(
+            claim_loser.returncode == SETUP_FAILURE
+            and b"evidence directory already claimed" in claim_loser.stderr,
+            "artifact-directory claim loser lost its typed refusal: "
+            f"{claim_loser.stderr[-300:]!r}",
+        )
+        after_loser = sorted(path.name for path in claim_root.iterdir())
+        require(
+            after_loser == before_loser,
+            "artifact-directory claim loser changed the winner's namespace",
+        )
+        repeated_data, repeated_size, repeated_digest = stable_file_facts(claim_hold)
+        require(
+            (repeated_data, repeated_size, repeated_digest)
+            == (hold_data, hold_size, hold_digest),
+            "artifact-directory claim loser changed the winner's hold artifact",
+        )
+        claim_winner.send_signal(signal.SIGTERM)
+        _claim_out, claim_err = claim_winner.communicate(timeout=120)
+    finally:
+        if claim_winner.poll() is None:
+            claim_winner.kill()
+            claim_winner.communicate(timeout=10)
+    require(
+        claim_winner.returncode == 143,
+        f"artifact-directory claim winner exit {claim_winner.returncode}: "
+        f"{claim_err[-300:]!r}",
+    )
+    claim_report = validate_partial_bundle(claim_root)
+    require(
+        claim_report["valid"] is True
+        and claim_report["committed"] is False
+        and claim_report["classification"] == "cancelled"
+        and claim_report["step"] == "artifact_directory_creation"
+        and claim_report["reason_code"] == "signal_TERM",
+        f"artifact-directory claim winner lost its bundle: {claim_report}",
+    )
+    cases.append(
+        {
+            "case": "concurrent_artifact_directory_claim",
+            "ok": True,
+            "loser_exit": SETUP_FAILURE,
+            "winner_artifact": str(claim_root),
+        }
+    )
 
     # --- deliberate consumer-outcome scenarios (bead
     # fln-evidence-runner-bootstrap-btk): the remaining outcome families for
@@ -18690,6 +18802,115 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         and shadow_before == b"shadow-imported\n",
         "unsealed PYTHONPATH negative control did not execute the planted shadow",
     )
+    direct_hash_argv = [
+        str(Path(__file__).resolve()),
+        "hash-tree",
+        "--root",
+        str(interpreter_root),
+        "--path",
+        "shadow",
+    ]
+    direct_unsealed = subprocess.run(
+        [sys.executable, *direct_hash_argv],
+        capture_output=True,
+        env=interpreter_base_env,
+        timeout=30,
+        check=False,
+    )
+    require(
+        direct_unsealed.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_unsealed_startup" in direct_unsealed.stderr
+        and direct_unsealed.stdout == b"",
+        "direct evidence command did not refuse unsealed startup typed",
+    )
+    direct_hostile = subprocess.run(
+        [sys.executable, "-I", "-S", *direct_hash_argv],
+        capture_output=True,
+        env=interpreter_hostile_env,
+        timeout=30,
+        check=False,
+    )
+    repeated_shadow, _shadow_size, _shadow_digest = stable_file_facts(shadow_marker)
+    require(
+        direct_hostile.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_hostile_environment" in direct_hostile.stderr
+        and direct_hostile.stdout == b""
+        and repeated_shadow == shadow_before,
+        "direct evidence command did not refuse hostile Python configuration",
+    )
+    direct_recovery = subprocess.run(
+        [sys.executable, "-I", "-S", *direct_hash_argv],
+        capture_output=True,
+        env=interpreter_base_env,
+        timeout=30,
+        check=False,
+    )
+    require(
+        direct_recovery.returncode == PASS
+        and direct_recovery.stdout.startswith(b"sha256:")
+        and len(direct_recovery.stdout.strip()) == len(b"sha256:") + 64,
+        f"sealed direct evidence command did not recover: {direct_recovery.stderr!r}",
+    )
+    trusted_repo = Path(__file__).resolve().parent.parent
+    hostile_shell_root = interpreter_root / "hostile-shell-must-not-exist"
+    hostile_shell_env = {
+        **interpreter_hostile_env,
+        "FLN_CHECK_ART_DIR": str(hostile_shell_root),
+        "FLN_CHECK_TEST_EARLY_FAULT": "probe_control",
+    }
+    hostile_shell = subprocess.run(
+        ["bash", str(trusted_repo / "scripts" / "check.sh"), "--early-fault-probe"],
+        cwd=trusted_repo,
+        capture_output=True,
+        env=hostile_shell_env,
+        timeout=30,
+        check=False,
+    )
+    require(
+        hostile_shell.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_hostile_environment names=PYTHONPATH"
+        in hostile_shell.stderr
+        and hostile_python_path.encode() not in hostile_shell.stderr
+        and not hostile_shell_root.exists()
+        and not hostile_shell_root.is_symlink(),
+        "trusted shell did not refuse hostile Python configuration before claiming artifacts",
+    )
+    generator = trusted_repo / "scripts" / "extract" / "gen_bignum_vectors.py"
+    generator_unsealed = subprocess.run(
+        [sys.executable, str(generator), "--check"],
+        cwd=trusted_repo,
+        capture_output=True,
+        env=interpreter_base_env,
+        timeout=30,
+        check=False,
+    )
+    generator_hostile = subprocess.run(
+        [sys.executable, "-I", "-S", str(generator), "--check"],
+        cwd=trusted_repo,
+        capture_output=True,
+        env=interpreter_hostile_env,
+        timeout=30,
+        check=False,
+    )
+    generator_recovery = subprocess.run(
+        [sys.executable, "-I", "-S", str(generator), "--check"],
+        cwd=trusted_repo,
+        capture_output=True,
+        env=interpreter_base_env,
+        timeout=30,
+        check=False,
+    )
+    require(
+        generator_unsealed.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_unsealed_startup" in generator_unsealed.stderr
+        and generator_hostile.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_hostile_environment names=PYTHONPATH"
+        in generator_hostile.stderr
+        and hostile_python_path.encode() not in generator_hostile.stderr
+        and generator_recovery.returncode == PASS
+        and b"no drift" in generator_recovery.stderr,
+        "trusted extraction script did not refuse both startup channels and recover",
+    )
 
     interpreter_case_counter = [0]
     interpreter_target_marker = interpreter_root / "target-executed"
@@ -18891,6 +19112,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "ok": True,
             "negative_control": "PYTHONPATH platform.py shadow executed unsealed",
             "typed_reason": "sealed_interpreter_hostile_environment",
+            "direct_cli_reasons": [
+                "sealed_interpreter_unsealed_startup",
+                "sealed_interpreter_hostile_environment",
+            ],
+            "trusted_shell_refusal": "PYTHONPATH refused before artifact claim",
+            "trusted_extraction_recovery": "gen_bignum_vectors --check",
             "mutants_killed": [
                 name for name, _source, _metadata, _mutate in interpreter_mutants
             ],
@@ -19646,7 +19873,20 @@ def main() -> int:
     try:
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         args = build_parser().parse_args()
+        # The supervisor has its own structured rejection path because it owns
+        # the metadata envelope needed to prove that no target was released.
+        # Every other evidence command still refuses an unsealed interpreter
+        # here. Trusted shell launchers structurally supply -I -S before imports;
+        # this runtime check is defense in depth for direct CLI use.
+        if args.subcommand != "run":
+            prepare_sealed_interpreter(os.environ)
         return int(args.func(args))
+    except SealedInterpreterRejection as error:
+        print(
+            f"evidence: {error.reason_token}: {error}",
+            file=sys.stderr,
+        )
+        return SETUP_FAILURE
     except (
         EvidenceError,
         OSError,

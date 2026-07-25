@@ -4,10 +4,22 @@
 
 set -Eeuo pipefail
 
-command -v python3 >/dev/null 2>&1 || {
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || {
   echo "[closure_audit] setup failure: python3 is required" >&2
   exit 2
 }
+PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[closure_audit] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
 command -v setsid >/dev/null 2>&1 || {
   echo "[closure_audit] setup failure: setsid is required" >&2
   exit 2
@@ -31,7 +43,7 @@ OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-16777216}"
 TIMEOUT_MS="${FLN_E2E_TIMEOUT_MS:-300000}"
 GRACE_MS="${FLN_E2E_KILL_GRACE_MS:-2000}"
 READY_WAIT_MS="${FLN_E2E_READY_WAIT_MS:-30000}"
-START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 SEQ=0
 ACTIVE_STEP="setup"
 ACTIVE_RUNNER_PID=""
@@ -59,6 +71,7 @@ FINALIZATION_DECISION="$ART_DIR/bundle.decision"
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 EVENT_COMMAND=()
 RUN_STARTED=0
+ART_DIR_CLAIMED=0
 EARLY_STEP=preflight
 TEST_EARLY_FAULT="${FLN_CA_TEST_EARLY_FAULT:-}"
 INPUT_PATHS=(
@@ -84,12 +97,12 @@ done
 
 # Hash the complete governed input before creating an artifact directory. A broken
 # preflight therefore cannot leave a directory that resembles a typed evidence run.
-if ! INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+if ! INPUT_ROOT="$("${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
   --vendor-path "$VENDOR_PATH")"; then
   echo "[closure_audit] setup failure: cannot hash governed inputs" >&2
   exit 2
 fi
-HOST_FACTS_JSON="$(python3 - <<'PY'
+HOST_FACTS_JSON="$("${PYTHON[@]}" - <<'PY'
 import json, platform
 print(json.dumps({
     "machine": platform.machine(),
@@ -105,10 +118,10 @@ note() { printf '[closure_audit] %s\n' "$*" | tee -a "$HUMAN" >&2; }
 build_event_command() {
   local sequence="$SEQ"
   SEQ=$((SEQ + 1))
-  EVENT_COMMAND=(python3 "$EVIDENCE" emit --file "$LOG" --artifact-root "$ART_DIR" \
+  EVENT_COMMAND=("${PYTHON[@]}" "$EVIDENCE" emit --file "$LOG" --artifact-root "$ART_DIR" \
     --string schema "$SCHEMA" --string run_id "$RUN_ID" --string bead "$BEAD" \
     --string scenario "$SCENARIO" --integer sequence "$sequence" \
-    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" "$@")
 }
 
@@ -141,9 +154,9 @@ finalize_early_envelope() {
       set_final internal_fault "early_${EARLY_STEP}_unexpected_exit" 2
     fi
   fi
-  if [ -d "$ART_DIR" ]; then
+  if [ "$ART_DIR_CLAIMED" -eq 1 ] && [ -d "$ART_DIR" ]; then
     note "typed early-envelope fault: step=$EARLY_STEP reason=$FINAL_REASON verdict=$FINAL_VERDICT"
-    if ! python3 "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
+    if ! "${PYTHON[@]}" "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
         --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
         --step "$EARLY_STEP" --reason "$FINAL_REASON" \
         --classification "$FINAL_VERDICT" \
@@ -153,7 +166,7 @@ finalize_early_envelope() {
         "$ART_DIR" >&2
       exit 2
     fi
-    if ! python3 "$EVIDENCE" validate-partial-bundle --art-dir "$ART_DIR" \
+    if ! "${PYTHON[@]}" "$EVIDENCE" validate-partial-bundle --art-dir "$ART_DIR" \
         --artifact-root "$ART_DIR" >/dev/null; then
       printf '[closure_audit] INTERNAL FAULT: early evidence bundle did not validate: %s\n' \
         "$ART_DIR" >&2
@@ -190,7 +203,7 @@ bounded_readiness_wait() {
 # The launch gate guarantees that this direct child has not forked yet.
 terminate_unreleased_runner() {
   local pid="$1"
-  if ! setsid -- python3 "$EVIDENCE" kill-direct-child --pid "$pid" \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-direct-child --pid "$pid" \
       --expected-parent-pid "$$" --wait-ms 5000; then
     return 1
   fi
@@ -200,7 +213,7 @@ terminate_unreleased_runner() {
 release_guardian_launch() {
   local stage="$1" pid="$2" ticks="$3" ready="$4" output="$5"
   for _ in 1 2; do
-    if setsid -- python3 "$EVIDENCE" release-process-launch --ready "$ready" \
+    if setsid -- "${PYTHON[@]}" "$EVIDENCE" release-process-launch --ready "$ready" \
       --output "$output" --artifact-root "$ART_DIR" --stage-id "$stage" \
       --pid "$pid" --expected-start-ticks "$ticks" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS"; then
@@ -217,7 +230,7 @@ stop_active_runner() {
   [ -n "$pid" ] || return 0
   if bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" \
       && [ -n "$ACTIVE_RUNNER_START_TICKS" ]; then
-    python3 "$EVIDENCE" signal-bound-process --pid "$pid" \
+    "${PYTHON[@]}" "$EVIDENCE" signal-bound-process --pid "$pid" \
       --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal "$name" \
       >/dev/null 2>&1 || true
   fi
@@ -231,7 +244,7 @@ stop_active_runner() {
     state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
     if [ "$state" != Z ]; then
       if [ -f "$ACTIVE_READINESS" ]; then
-        if ! python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
+        if ! "${PYTHON[@]}" "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
           --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STEP" \
           >/dev/null 2>&1; then
           cleanup_rc=1
@@ -294,7 +307,7 @@ contain_bound_finalizer() {
     mark_process_tree_cleanup_unproven
     return 1
   fi
-  if ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
       --expected-start-ticks "$FINALIZER_START_TICKS" \
       --expected-parent-pid "$$" >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
@@ -302,7 +315,7 @@ contain_bound_finalizer() {
     mark_process_tree_cleanup_unproven
     return 1
   fi
-  if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" assert-process-group-empty \
       --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
     FINALIZER_WAIT_UNSAFE=1
@@ -352,11 +365,11 @@ run_finalizer_command() {
   [ "$FINALIZER_CLEANUP_UNPROVEN" -eq 0 ] || return 2
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
   if [ -s "$FINALIZATION_DECISION" ]; then trap '' HUP INT TERM; fi
-  setsid -- python3 "$EVIDENCE" stopped-exec \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" stopped-exec \
     --expected-parent-pid "$$" -- "$@" &
   FINALIZER_PID=$!
   FINALIZER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
       --session-leader --stopped \
       2>/dev/null
@@ -377,7 +390,7 @@ run_finalizer_command() {
   # A terminal trap can interrupt Bash's command-substitution wait after the
   # isolated binder emitted a valid identity, so the canonical digits are the proof.
   if [ -z "$FINALIZATION_SIGNAL" ]; then
-    if ! setsid -- python3 "$EVIDENCE" resume-bound-process \
+    if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" resume-bound-process \
         --pid "$FINALIZER_PID" \
         --expected-start-ticks "$FINALIZER_START_TICKS" \
         --expected-parent-pid "$$"; then
@@ -452,7 +465,7 @@ on_exit() {
   if [ "$FINAL_SET" -eq 0 ]; then
     set_final internal_fault "$([ "$observed_rc" -eq 0 ] && printf uncommitted_success || printf unexpected_shell_exit)" 2
   fi
-  run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$ROOT" \
+  run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" \
     "${HASH_ARGS[@]}" --vendor-path "$VENDOR_PATH" \
     --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" 2>/dev/null || hash_rc=$?
   abort_if_finalizer_signalled
@@ -470,7 +483,7 @@ on_exit() {
     build_event_command --string event run_end --string verdict "$FINAL_VERDICT" \
       --string reason_code "$FINAL_REASON" --integer process_exit "$FINAL_EXIT" \
       --string active_step "$ACTIVE_STEP" \
-      --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
+      --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
       --string cleanup_status retained_by_policy --string final_state "$final_root" \
       --string logical_root "$final_root" \
       --string receipt_root not_applicable_dependency_closure \
@@ -486,13 +499,13 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
       --expected-verdict "$FINAL_VERDICT" --artifact-root "$ART_DIR" \
       --output "$ART_DIR/run.validation.json" || publish_rc=2
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" --digest-output "$ART_DIR/manifest.digest" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
       --verdict "$FINAL_VERDICT" --input-root "$INPUT_ROOT" --final-root "$final_root" \
@@ -500,12 +513,12 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
       --vendor-path "$VENDOR_PATH" || true
-    if run_finalizer_command python3 "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
+    if run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
         --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
         --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
         >/dev/null; then
@@ -536,12 +549,14 @@ trap 'on_signal TERM 143' TERM
 trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
 EARLY_STEP=artifact_directory_creation
 mkdir -p "$(dirname "$ART_DIR")"
-if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  # The leaf mkdir is the single-writer claim. The losing process owns no
+  # artifact path and therefore must not run its already-armed finalizer.
   trap - EXIT
-  echo "[closure_audit] refusing reused evidence directory: $ART_DIR" >&2
+  echo "[closure_audit] evidence directory already claimed: $ART_DIR" >&2
   exit 2
 fi
-mkdir "$ART_DIR"
+ART_DIR_CLAIMED=1
 if [ "$TEST_EARLY_FAULT" = early_signal_hold ]; then
   # Deterministic early-signal window for the deliberate fault scenarios.
   : > "$ART_DIR/early.hold"
@@ -555,7 +570,7 @@ if [ "$TEST_EARLY_FAULT" = vendor_binding ]; then
   # A directory at the output path makes the real write path fail typed.
   mkdir "$VENDOR_BINDING"
 fi
-python3 "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
+"${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
   --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" \
   || early_fault early_vendor_binding_failure "cannot verify the pinned Reference tree"
 
@@ -592,7 +607,7 @@ if [ "$TEST_EARLY_FAULT" = post_run_start_abort ]; then
 fi
 
 read_meta_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())[sys.argv[2]]
 print("null" if value is None else value)
@@ -600,12 +615,12 @@ PY
 }
 
 hash_governed() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
     --vendor-path "$VENDOR_PATH"
 }
 
 hash_subject() {
-  python3 "$EVIDENCE" hash-tree --root "$1" "${SUBJECT_HASH_ARGS[@]}"
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$1" "${SUBJECT_HASH_ARGS[@]}"
 }
 
 supervise() {
@@ -624,7 +639,7 @@ supervise() {
   local launch_release="$ART_DIR/$step.launch.release.json"
   ACTIVE_STEP="$step"
   SPAWNING=1
-  setsid -- python3 -I -S "$EVIDENCE" run --cwd "$ROOT" --metadata "$LAST_META" \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" run --cwd "$ROOT" --metadata "$LAST_META" \
     --stdout "$LAST_OUT" --stderr "$LAST_ERR" --readiness "$LAST_READY" \
     --launch-ready "$launch_ready" --launch-release "$launch_release" \
     --artifact-root "$ART_DIR" --capture-bytes "$CAPTURE_BYTES" \
@@ -632,7 +647,7 @@ supervise() {
     --grace-ms "$GRACE_MS" --stage-id "$step" "${semantic_args[@]}" -- "$@" &
   ACTIVE_RUNNER_PID=$!
   if ! ACTIVE_RUNNER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" --session-leader \
       2>/dev/null
   )"; then
@@ -864,7 +879,7 @@ guard_step() {
     set_final inconclusive "$step:governed_inputs_changed" 3
     exit 3
   fi
-  if ! python3 "$EVIDENCE" validate-guard --file "$LAST_OUT" \
+  if ! "${PYTHON[@]}" "$EVIDENCE" validate-guard --file "$LAST_OUT" \
     --expected-exit "$expected_exit" --expected-verdict "$expected_verdict" \
     --expected-root "$fixture_root" --observed-exit "$LAST_CHILD_EXIT" \
     --artifact-root "$ART_DIR" "${validate_args[@]}" --output "$validation"; then

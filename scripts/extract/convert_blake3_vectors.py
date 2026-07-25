@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Convert the official BLAKE3 test vectors JSON into the fln fixture line format.
 
 Input : test_vectors.json from the upstream BLAKE3 repository
@@ -14,6 +14,7 @@ Usage: python3 scripts/extract/convert_blake3_vectors.py <test_vectors.json> <ou
 """
 
 import json
+import os
 import sys
 
 SOURCE_URL = (
@@ -75,4 +76,23 @@ def main(argv: list[str]) -> None:
 
 
 if __name__ == "__main__":
+    hostile_python = sorted(name for name in os.environ if name.startswith("PYTHON"))
+    if not all(
+        (
+            sys.flags.isolated,
+            sys.flags.ignore_environment,
+            sys.flags.no_site,
+            sys.flags.no_user_site,
+            sys.flags.safe_path,
+        )
+    ):
+        print("error: sealed_interpreter_unsealed_startup", file=sys.stderr)
+        raise SystemExit(2)
+    if hostile_python:
+        print(
+            "error: sealed_interpreter_hostile_environment names="
+            + ",".join(hostile_python),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     main(sys.argv)

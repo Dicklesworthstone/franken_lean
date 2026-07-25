@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """gen_olean_contract.py — D5/D9 contract extraction: the .olean/.ilean contract from the pin.
 
 The law (plan Appendix B, bead franken_lean-53v): format constants are DERIVED,
@@ -1854,4 +1854,23 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    hostile_python = sorted(name for name in os.environ if name.startswith("PYTHON"))
+    if not all(
+        (
+            sys.flags.isolated,
+            sys.flags.ignore_environment,
+            sys.flags.no_site,
+            sys.flags.no_user_site,
+            sys.flags.safe_path,
+        )
+    ):
+        print("gen_olean_contract: sealed_interpreter_unsealed_startup", file=sys.stderr)
+        raise SystemExit(2)
+    if hostile_python:
+        print(
+            "gen_olean_contract: sealed_interpreter_hostile_environment names="
+            + ",".join(hostile_python),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     sys.exit(main())
