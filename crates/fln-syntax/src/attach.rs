@@ -282,6 +282,61 @@ pub fn attach(text: &SourceText, extents: &[TokenExtent]) -> Result<Attachment, 
     })
 }
 
+/// Which entries of an attachment an edit can possibly have changed.
+///
+/// The precision claim behind incremental reparse, at the layer that decides it. An
+/// incremental reparser is only correct if it re-derives *everything* an edit touched, and
+/// only useful if that set is small; this is the bound, and it is provable from the
+/// attachment rule rather than estimated.
+///
+/// **The rule's own shape gives the bound.** Reading [`attach`], an entry's trivia depends
+/// on exactly three things: its own extent, the start of the next present extent, and the
+/// previous entry's trailing stop. Nothing else. So a byte change inside token *i*'s trivia
+/// run can move `i`'s trailing stop, which moves `i + 1`'s leading start — and there the
+/// cascade **stops**, because `i + 1`'s own trailing stop is computed from its own run,
+/// which the edit did not touch.
+///
+/// So the bound is: the entries the edit overlaps, **plus at most one**. Never a suffix of
+/// the file, and never proportional to what follows the edit — which is the whole claim. A
+/// one-line edit in a large file damages one or two entries regardless of the file's size.
+/// (An earlier draft of this doc claimed a flat maximum of two entries; that is only true
+/// of an edit confined to a single trivia run, and the differential caught the overreach on
+/// a ten-byte edit spanning three tokens.)
+///
+/// That is the difference between "precise" and "conservative": a reparser that
+/// invalidated everything after an edit would also be sound, and would recompute the file
+/// on every keystroke, which is the cost the whole substrate exists to avoid.
+///
+/// Returned as an inclusive index range, empty when no entry can have changed (an edit
+/// falling entirely inside the epilogue). Callers must treat this as **at least** the
+/// damaged set: `damaged_entries_never_under_reports` asserts containment of the entries
+/// that actually differ, which is the direction that matters — missing damage leaves a
+/// stale tree, while over-reporting only costs work.
+pub fn damaged_entries(attachment: &Attachment, edited: ByteSpan) -> std::ops::Range<usize> {
+    let mut first = None;
+    let mut last = 0usize;
+    for (index, entry) in attachment.entries.iter().enumerate() {
+        let Some(span) = entry.contributed_span() else {
+            continue;
+        };
+        // An entry is touched if the edit overlaps its full extent, treating an empty edit
+        // (a pure insertion) at a boundary as touching the entry it lands inside or abuts.
+        let overlaps = edited.start().0 <= span.end().0 && edited.end().0 >= span.start().0;
+        if overlaps {
+            if first.is_none() {
+                first = Some(index);
+            }
+            last = index;
+        }
+    }
+    match first {
+        // The successor's leading start moves with its predecessor's trailing stop, so it
+        // joins the damaged set even when the edit never reached its bytes.
+        Some(start) => start..(last + 2).min(attachment.entries.len()),
+        None => 0..0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +557,167 @@ mod tests {
             ),
             Err(AttachError::MissingOutsideGap { index: 1, .. })
         ));
+    }
+
+    /// **The differential for the damage bound**, in the shape the rope and the line index
+    /// used: predict, then recompute fully, then require the prediction to contain the
+    /// truth. Same harness discipline rather than a third invention.
+    ///
+    /// The asserted direction is containment, not equality, because the two failures are
+    /// not symmetric: under-reporting leaves a stale entry in an incremental tree and is a
+    /// correctness bug, while over-reporting only wastes work. So the test demands
+    /// soundness and separately demands the bound be non-trivial — a prediction of "every
+    /// entry" would satisfy containment and be worthless, which is exactly the vacuous pass
+    /// a containment-only test invites.
+    #[test]
+    fn damaged_entries_never_under_reports_and_stays_tight() {
+        // Several tokens with varied trivia: same-line comments, own-line comments, blank
+        // lines, and a CRLF, so the trailing stops land in different places.
+        let raw = b"a -- one
+b
+-- own
+c /- blk -/ d
+e";
+        let text = text_of(raw);
+        let tokens = ["a", "b", "c", "d", "e"];
+        let extents = extents_of(text.as_str(), &tokens);
+        let before = attach(&text, &extents).expect("valid");
+        assert_eq!(before.entries().len(), 5);
+
+        let mut ever_tight = false;
+        for lo in 0..text.len_bytes() {
+            for hi in lo..=text.len_bytes() {
+                if !text.as_str().is_char_boundary(lo) || !text.as_str().is_char_boundary(hi) {
+                    continue;
+                }
+                let edited = ByteSpan::new(BytePos(lo), BytePos(hi)).expect("forward");
+
+                // Replace the span with the SAME number of bytes, so token extents do not
+                // move and the only thing that can change is trivia attachment. That
+                // isolates the property under test from the lexer's own damage, which is a
+                // different question owned by a different bead.
+                let mut bytes = raw.to_vec();
+                for byte in &mut bytes[lo..hi] {
+                    // Turn the region into newlines, the one byte the rule keys on, which
+                    // is the change most likely to move a trailing stop.
+                    *byte = b'\n';
+                }
+                let Ok(edited_text) = SourceText::from_utf8(&bytes) else {
+                    continue;
+                };
+                let after = attach(&edited_text, &extents).expect("extents unchanged");
+
+                // The truth: which entries actually differ.
+                let actual: Vec<usize> = (0..before.entries().len())
+                    .filter(|index| before.entries()[*index] != after.entries()[*index])
+                    .collect();
+                let predicted = damaged_entries(&before, edited);
+
+                for index in &actual {
+                    assert!(
+                        predicted.contains(index),
+                        "edit {lo}..{hi}: entry {index} changed but was not predicted \
+                         (predicted {predicted:?}, actual {actual:?})"
+                    );
+                }
+                // Non-trivial: the bound must not be "everything" for a small edit.
+                if predicted.len() < before.entries().len() {
+                    ever_tight = true;
+                }
+                // THE THEOREM, asserted rather than a fixed constant: the cascade adds
+                // at most ONE entry beyond those the edit overlaps. A flat bound would be
+                // wrong for a wide edit and would have hidden the real statement.
+                let overlapped = before
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        entry.contributed_span().is_some_and(|span| {
+                            edited.start().0 <= span.end().0 && edited.end().0 >= span.start().0
+                        })
+                    })
+                    .count();
+                assert!(
+                    predicted.len() <= overlapped + 1,
+                    "edit {lo}..{hi}: the bound must exceed the overlapped entries by at \
+                     most one (overlapped {overlapped}, predicted {predicted:?})"
+                );
+            }
+        }
+        assert!(
+            ever_tight,
+            "the bound was never narrower than the whole file, so containment passed \
+             vacuously"
+        );
+    }
+
+    /// The cascade stops at the successor — the claim that makes the bound two entries
+    /// rather than a suffix. Stated as its own case because it is the part a reader will
+    /// doubt.
+    #[test]
+    fn moving_a_trailing_stop_changes_only_that_entry_and_its_successor() {
+        //           0123456789
+        let raw = b"a b
+c
+d";
+        let text = text_of(raw);
+        let extents = extents_of(text.as_str(), &["a", "b", "c", "d"]);
+        let before = attach(&text, &extents).expect("valid");
+
+        // Turn the space after 'a' into a newline: 'a' loses its trailing, 'b' gains a
+        // leading newline. Nothing later can move, because 'b', 'c' and 'd' compute their
+        // trailing stops from their own runs.
+        let edited_bytes = b"a
+b
+c
+d";
+        let edited_text = text_of(edited_bytes);
+        let after = attach(&edited_text, &extents).expect("valid");
+
+        let differing: Vec<usize> = (0..before.entries().len())
+            .filter(|index| before.entries()[*index] != after.entries()[*index])
+            .collect();
+        assert_eq!(
+            differing,
+            vec![0, 1],
+            "only the entry whose trailing moved and its successor may change"
+        );
+        // And the prediction covers exactly that, without reaching further.
+        let predicted = damaged_entries(&before, ByteSpan::new(BytePos(1), BytePos(2)).unwrap());
+        for index in &differing {
+            assert!(predicted.contains(index));
+        }
+        assert!(
+            !predicted.contains(&3),
+            "the bound must not extend to the end of the file"
+        );
+        // Both texts still reconstruct exactly, so the edit did not break the tiling.
+        assert_eq!(before.reconstruct(&text).as_deref(), Some(&raw[..]));
+        assert_eq!(
+            after.reconstruct(&edited_text).as_deref(),
+            Some(&edited_bytes[..])
+        );
+    }
+
+    /// An edit entirely inside the epilogue damages no entry — the empty-range case, which
+    /// a bound that always returned something non-empty would get wrong.
+    #[test]
+    fn an_edit_in_the_epilogue_damages_no_entry() {
+        let raw = b"a
+-- trailing only
+";
+        let text = text_of(raw);
+        let extents = extents_of(text.as_str(), &["a"]);
+        let attachment = attach(&text, &extents).expect("valid");
+        assert!(
+            attachment.epilogue().len_bytes() > 0,
+            "the fixture needs a non-empty epilogue"
+        );
+        let in_epilogue = ByteSpan::new(
+            BytePos(attachment.epilogue().start().0 + 1),
+            BytePos(attachment.epilogue().end().0),
+        )
+        .expect("forward");
+        assert_eq!(damaged_entries(&attachment, in_epilogue), 0..0);
     }
 
     #[test]
