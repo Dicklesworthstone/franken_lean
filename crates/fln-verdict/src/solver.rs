@@ -161,6 +161,17 @@ impl CheckedSat {
     pub const fn model_bytes(&self) -> &[u8] {
         &self.model_bytes
     }
+
+    /// Move the exact independently decoded streams into another trust-boundary
+    /// consumer without allocating a second copy.
+    pub(crate) fn into_canonical_streams(self) -> (Box<[u8]>, Box<[u8]>) {
+        let Self {
+            model: _,
+            cnf_bytes,
+            model_bytes,
+        } = self;
+        (cnf_bytes, model_bytes)
+    }
 }
 
 /// An UNSAT artifact accepted by the independent streaming checker.

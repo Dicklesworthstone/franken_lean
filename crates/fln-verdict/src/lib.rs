@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 mod bitblast;
+mod bv_decide;
 mod checker;
 mod reflection;
 mod solver;
@@ -34,6 +35,12 @@ pub use bitblast::{
     BitblastResource, BitblastSupport, BitblastSymbol, BoolBinaryOp, BoolExpr, BvBinaryOp,
     BvComparison, BvExpr, BvShiftOp, BvUnaryOp, CANONICAL_BITBLAST_POLICY,
     CANONICAL_BITBLAST_POLICY_ID, UnsupportedBvOp, bitblast, bitblast_with_cancel,
+};
+pub use bv_decide::{
+    BV_DECIDE_POLICY_ID, BvDecideCounterexample, BvDecideInconclusive, BvDecideInputAssignment,
+    BvDecideInputValue, BvDecideInternalFault, BvDecideLimits, BvDecideOutcome,
+    BvDecidePublication, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry, bv_decide,
+    bv_decide_with_cancel,
 };
 pub use checker::{
     ProofCheckInconclusive, ProofCheckInternalFault, ProofCheckLimits, ProofCheckOutcome,
