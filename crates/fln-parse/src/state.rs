@@ -400,6 +400,14 @@ pub fn longest_match(
 
     state.restore(start_size, start_pos);
     if tied.len() > 1 {
+        // The choice node sits at the WINNER's end, not at the start. Found by parser_fuzz:
+        // `restore` puts the position back, and the ambiguous path never moved it forward, so an
+        // ambiguity left the cursor where the candidates began. The Pratt loop's no-progress guard
+        // would then stop the trailing chain and the rest of the expression would vanish — a
+        // silently truncated parse, on exactly the inputs where the language needs the elaborator
+        // to choose. Upstream keeps the winning state throughout `longestMatchStep`, so its
+        // position was never lost there in the first place.
+        state.set_pos(BytePos(score.end));
         state.set_lhs_prec(tied_lhs_prec);
         let kinds = tied.len();
         state.push(Syntax::node(choice_kind(), tied));
@@ -597,6 +605,13 @@ mod tests {
             "equal position, both successful, equal priority: this is an ambiguity"
         );
         assert_eq!(state.stack_size(), 1, "the choice node is one node");
+        assert_eq!(
+            state.pos(),
+            BytePos(5),
+            "the choice node sits at the winner's end. With the position left at the start, the \
+             Pratt loop's no-progress guard stops the chain and truncates the parse — found by \
+             parser_fuzz rather than here, which is why the assertion exists now."
+        );
         assert_eq!(
             describe(state.back()),
             "node choice[2]",

@@ -1,0 +1,43 @@
+# fln.parser-category-inventory/1
+# Derived mechanically from the pinned Reference; do not hand-edit.
+# See crates/fln-parse/tests/parser_category_inventory.rs -- the suite RE-DERIVES this
+# from the pin and fails if the pin has a category this file does not.
+# pin: leanprover/lean4 v4.32.0
+#
+# builtin <name> <behavior>   -- registered by registerBuiltinParserAttribute
+# declared <name>             -- declared with declare_syntax_cat in pin source
+builtin attr symbol
+builtin command default
+builtin doElem default
+builtin level default
+builtin prec both
+builtin prio both
+builtin structInstFieldDecl default
+builtin stx both
+builtin tactic both
+builtin term default
+declared arg_val
+declared binderPred
+declared block
+declared conv
+declared desc_item
+declared doc_arg
+declared grind
+declared grind_filter
+declared grind_ref
+declared inline
+declared json
+declared link_target
+declared list_item
+declared mcasesPat
+declared mintroPat
+declared mrefinePat
+declared mrevertPat
+declared rawStx
+declared rcasesPat
+declared rintroPat
+declared sym_discharger
+declared sym_dsimp_field
+declared sym_dsimproc
+declared sym_simp_field
+declared sym_simproc
