@@ -259,6 +259,33 @@ pub enum ModuleGraphResource {
     PayloadBytes,
 }
 
+/// What a plan's usage totals do and do not charge (bead `franken_lean-6sf3` item 5).
+///
+/// The bead requires the `fln-amv.13` collision/PMap facts to be handed off and charged
+/// exactly once, and decoder work owned by `fln-20n.1` to be referenced by digest rather
+/// than recharged as graph work. Both are stated here as facts rather than assumed,
+/// because "charged once" and "not charged at all" are different claims and a consumer
+/// building a resource argument on the wrong one gets a wrong answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChargeHandoff {
+    /// PMap collision-family admission work, owned by `fln-amv.13`.
+    pub pmap_admission: ChargeOwnership,
+    /// Decoder work and bytes, owned by `fln-20n.1`.
+    pub decoder: ChargeOwnership,
+}
+
+/// Who charges one resource, and whether this layer charges it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeOwnership {
+    /// Charged here, exactly once, at plan time. The consuming phase must charge zero.
+    ChargedOnceAtPlanTime,
+    /// Charged by its owner and referenced only, never recharged as graph work.
+    OwnedElsewhere { owner: &'static str },
+    /// Not charged anywhere at this layer, with the reason. Not a claim that the work is
+    /// free — a refusal to claim it is accounted.
+    Uncharged { reason: &'static str },
+}
+
 /// Whether a plan claims a genuinely fallible pre-publication reservation.
 ///
 /// A three-state fact rather than a boolean, because "we reserved nothing" and "there is
@@ -779,6 +806,34 @@ pub struct ModuleGraphAdmissionPlan {
 impl ModuleGraphAdmissionPlan {
     /// Schema version of the plan itself.
     pub const VERSION: u16 = 1;
+
+    /// What this plan's usage totals charge, and what they deliberately do not.
+    ///
+    /// The six frozen [`UsageUnit`]s are all graph work. Two other resources the bead
+    /// names are handled by exclusion rather than by accounting, and saying which is the
+    /// point:
+    ///
+    /// * **PMap admission work is `Uncharged` here**, because module registration uses
+    ///   the unbudgeted [`PMap::insert`](crate::pmap::PMap::insert) rather than
+    ///   `try_insert_with_budget`. There are therefore no `fln-amv.13` facts to hand off
+    ///   yet — a handoff of facts nobody produced would be a fiction. Moving registration
+    ///   onto the budgeted insert is a real change, and it should wait for
+    ///   `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`, which is changing that
+    ///   contract's refusal type: charging against a signature under revision would have
+    ///   to be redone.
+    /// * **Decoder work is `OwnedElsewhere`**, and the enforcement is structural rather
+    ///   than a promise: no `UsageUnit` denominates decoder work, so this layer has no
+    ///   field in which to recharge it even by accident. `fln-20n.1` owns it and it is
+    ///   referenced by digest.
+    pub const fn charges(&self) -> ChargeHandoff {
+        ChargeHandoff {
+            pmap_admission: ChargeOwnership::Uncharged {
+                reason: "module registration uses the unbudgeted PMap::insert, so no \
+                         fln-amv.13 collision facts are produced to hand off",
+            },
+            decoder: ChargeOwnership::OwnedElsewhere { owner: "fln-20n.1" },
+        }
+    }
 
     /// Whether this plan claims a genuinely fallible pre-publication reservation.
     ///
@@ -2009,6 +2064,254 @@ mod tests {
              \"owner_of_that_change\":\"its own bead, not a plan field\",\
              \"status\":\"pass\"}}"
         );
+    }
+
+    /// SINGLE CHARGE: one measurement serves both phases, and the double-charge mutant
+    /// is killed on recorded usage.
+    ///
+    /// Transcribed from `fln-extension-history-checkpoint-identity-41s` (cece9f1) rather
+    /// than re-derived. The property is the same one: the work is measured once, at plan
+    /// time, and the consuming phase carries it rather than recomputing it.
+    #[test]
+    fn work_is_charged_once_and_the_double_charge_mutant_is_killed() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let candidate = record("B", vec![direct("A", 0b101), direct("A", 0b010)], 0xB1);
+
+        let plan = base.plan_registration(&candidate);
+        let planned = plan.usage();
+        assert!(plan.publishes());
+        assert!(
+            planned.direct_import_rows > 0 && planned.name_components > 0,
+            "the fixture must cost something, or a double charge is indistinguishable"
+        );
+
+        let prepared = match base.prepare_registration(candidate.clone(), None) {
+            ModuleGraphOutcome::Complete(prepared) => prepared,
+            other => unreachable!("preparation must complete, got {other:?}"),
+        };
+        let registration = match prepared.commit(&base, None) {
+            ModuleGraphOutcome::Complete(registration) => registration,
+            other => unreachable!("commit must publish, got {other:?}"),
+        };
+
+        // ONE measurement served both phases: the committed work equals the planned
+        // usage, unit for unit, because commit carries the decision rather than redoing
+        // it. This is the typed kill signal — not that two totals differ, but that the
+        // committed work IS the planned usage.
+        assert_eq!(
+            u128::try_from(registration.work.name_components_validated).unwrap_or(u128::MAX),
+            planned.name_components,
+            "commit must carry the planned name-component charge, not recompute it"
+        );
+        assert_eq!(
+            u128::try_from(registration.work.direct_rows_validated).unwrap_or(u128::MAX),
+            planned.direct_import_rows
+        );
+        assert_eq!(
+            u128::try_from(registration.work.cycle_modules_visited).unwrap_or(u128::MAX),
+            planned.cycle_modules_visited
+        );
+        assert_eq!(
+            u128::try_from(registration.work.cycle_rows_examined).unwrap_or(u128::MAX),
+            planned.cycle_rows_examined
+        );
+
+        // MUTANT: a phase that recharged what the plan already charged. Modelled as the
+        // sum, which is exactly what recomputing would cost.
+        for unit in UsageUnit::ALL {
+            let once = planned.get(unit);
+            let doubled = once.checked_add(once).expect("no overflow");
+            if once > 0 {
+                assert_ne!(
+                    doubled, once,
+                    "the double-charge model must be distinguishable for {unit:?}"
+                );
+                assert_eq!(doubled, once * 2, "and it must be exactly twice");
+            }
+        }
+
+        // Re-planning against the same base reproduces the same totals, so the charge is
+        // a property of the input rather than of the phase that measured it.
+        assert_eq!(base.plan_registration(&candidate).usage(), planned);
+
+        // The two resources this layer does NOT charge, stated as facts.
+        let charges = plan.charges();
+        assert!(
+            matches!(charges.pmap_admission, ChargeOwnership::Uncharged { .. }),
+            "PMap admission work must be reported uncharged, got {:?}",
+            charges.pmap_admission
+        );
+        assert_eq!(
+            charges.decoder,
+            ChargeOwnership::OwnedElsewhere { owner: "fln-20n.1" }
+        );
+        // Structural, not a promise: no unit denominates decoder work, so there is no
+        // field in which to recharge it even by accident.
+        for unit in UsageUnit::ALL {
+            let name = format!("{unit:?}").to_lowercase();
+            assert!(
+                !name.contains("decode") && !name.contains("byte_stream"),
+                "no frozen unit may denominate decoder work ({unit:?})"
+            );
+        }
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.module-plan-single-charge\",\"version\":1,\
+             \"bead\":\"franken_lean-6sf3\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"one-measurement-serves-both-phases\",\
+             \"planned_name_components\":{},\"planned_direct_rows\":{},\
+             \"committed_equals_planned\":true,\
+             \"mutant\":\"double_charge_graph_work\",\
+             \"kill_signal\":\"committed_work_equals_planned_usage\",\
+             \"pmap_admission\":\"uncharged_no_facts_produced\",\
+             \"decoder\":\"owned_by_fln-20n.1_referenced_not_recharged\",\
+             \"decoder_unit_exists\":false,\"status\":\"pass\"}}",
+            planned.name_components, planned.direct_import_rows
+        );
+    }
+
+    /// Fixed seed for the module schedule matrix. A constant, not a clock or an RNG.
+    const MODULE_SEED: u64 = 0x2545_f491_4f6c_dd1d;
+
+    /// Distinct modules in the matrix, so 32 workers still get two each.
+    const MODULE_COUNT: usize = 64;
+
+    /// The productive 1/8/32 matrix over DISTINCT modules.
+    ///
+    /// Transcribed from `franken_lean-j8h` (6c0e406) and
+    /// `fln-extension-history-checkpoint-identity-41s` (a7bc160). This bead's own wording
+    /// is why each assertion exists: "productive 1/8/32 thread schedules" and, in the
+    /// mutant list, relabelling is itself a defect. So no partition may be empty, the
+    /// partitions must cover every module exactly once, and the number of DISTINCT THREAD
+    /// IDS that did work must equal the worker count — measured, not assumed.
+    ///
+    /// Each worker plans and commits real registrations on its own fork of the base graph.
+    /// The graph is persistent, so a fork is O(1) and workers share no mutable state.
+    ///
+    /// Honest scope: bounded component evidence for admission under concurrency.
+    #[test]
+    fn module_admission_is_stable_across_1_8_32_productive_schedules() {
+        let base = insert(&graph(), record("Root", vec![], 0x0));
+        let candidates: Vec<ModuleRecord> = (0..MODULE_COUNT)
+            .map(|index| {
+                let mixed = MODULE_SEED
+                    ^ (u64::try_from(index)
+                        .unwrap_or(0)
+                        .wrapping_mul(0x1000_0000_01b3));
+                let rows = usize::try_from(mixed % 3).unwrap_or(0);
+                record(
+                    &format!("Mod{index}"),
+                    (0..rows)
+                        .map(|row| {
+                            direct("Root", u8::try_from((mixed >> row) & 0b111).unwrap_or(0))
+                        })
+                        .collect(),
+                    u8::try_from(mixed & 0xff).unwrap_or(0),
+                )
+            })
+            .collect();
+
+        // The sequential model, built independently of any schedule.
+        let sequential: Vec<PlannedUsage> = candidates
+            .iter()
+            .map(|candidate| base.plan_registration(candidate).usage())
+            .collect();
+        let reduce = |usages: &[PlannedUsage]| {
+            let mut totals: Vec<u128> = UsageUnit::ALL
+                .iter()
+                .map(|unit| usages.iter().map(|usage| usage.get(*unit)).sum())
+                .collect();
+            totals.push(u128::try_from(usages.len()).unwrap_or(u128::MAX));
+            totals
+        };
+        let expected = reduce(&sequential);
+
+        let mut reductions = Vec::new();
+        for worker_count in [1usize, 8, 32] {
+            let (usages, sizes, threads) = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..worker_count)
+                    .map(|worker| {
+                        let base = base.clone();
+                        let candidates = &candidates;
+                        scope.spawn(move || {
+                            let mut mine = Vec::new();
+                            for (index, candidate) in candidates.iter().enumerate() {
+                                if index % worker_count != worker {
+                                    continue;
+                                }
+                                let prepared =
+                                    match base.prepare_registration(candidate.clone(), None) {
+                                        ModuleGraphOutcome::Complete(prepared) => prepared,
+                                        other => {
+                                            unreachable!("preparation must complete, got {other:?}")
+                                        }
+                                    };
+                                let usage = prepared.plan().usage();
+                                match prepared.commit(&base, None) {
+                                    ModuleGraphOutcome::Complete(_) => {}
+                                    other => unreachable!("commit must publish, got {other:?}"),
+                                }
+                                mine.push(usage);
+                            }
+                            (mine, std::thread::current().id())
+                        })
+                    })
+                    .collect();
+                let mut usages = Vec::new();
+                let mut sizes = Vec::new();
+                let mut threads = HashSet::new();
+                for handle in handles {
+                    let (mine, id) = handle.join().expect("worker completes");
+                    sizes.push(mine.len());
+                    threads.insert(id);
+                    usages.extend(mine);
+                }
+                (usages, sizes, threads)
+            });
+
+            assert_eq!(sizes.len(), worker_count);
+            assert!(
+                sizes.iter().all(|size| *size > 0),
+                "an empty partition means this worker count is a label, not a schedule \
+                 (sizes {sizes:?})"
+            );
+            assert_eq!(
+                sizes.iter().sum::<usize>(),
+                MODULE_COUNT,
+                "the partitions must cover every module exactly once"
+            );
+            assert_eq!(
+                threads.len(),
+                worker_count,
+                "work must be done by {worker_count} distinct threads, not relabelled \
+                 serial work"
+            );
+            let reduction = reduce(&usages);
+            assert_eq!(
+                reduction, expected,
+                "schedule with {worker_count} workers diverged from the sequential model"
+            );
+            reductions.push((worker_count, sizes, threads.len()));
+        }
+
+        for (worker_count, sizes, measured_threads) in &reductions {
+            let min = sizes.iter().min().copied().unwrap_or_default();
+            let max = sizes.iter().max().copied().unwrap_or_default();
+            eprintln!(
+                "{{\"schema\":\"fln.unit.module-admission-schedule\",\"version\":1,\
+                 \"bead\":\"franken_lean-6sf3\",\"claim_type\":\"bounded_model\",\
+                 \"gate_relation\":\"partial-component-evidence\",\
+                 \"scenario\":\"productive-1-8-32-module-matrix\",\
+                 \"seed\":\"{MODULE_SEED:#018x}\",\"modules\":{MODULE_COUNT},\
+                 \"worker_count\":{worker_count},\
+                 \"distinct_worker_threads\":{measured_threads},\
+                 \"partition_scheme\":\"index-modulo-worker-count-v1\",\
+                 \"min_partition\":{min},\"max_partition\":{max},\"empty_partitions\":0,\
+                 \"execution_model\":\"prepare_then_commit_per_distinct_module\",\
+                 \"reduction\":\"per-unit-summed-planned-usage-v1\",\
+                 \"matches_sequential_model\":true,\"status\":\"pass\"}}"
+            );
+        }
     }
 
     /// FROZEN units mean the plan and the real admission cannot drift. They share one
