@@ -10,6 +10,7 @@
 pub mod attach;
 pub mod rope;
 pub mod source;
+pub mod tree;
 pub mod view;
 
 #[cfg(test)]

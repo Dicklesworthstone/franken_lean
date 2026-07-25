@@ -171,6 +171,20 @@ impl Attachment {
     }
 }
 
+/// Build an attachment from an already-attached leaf sequence plus the file's epilogue.
+///
+/// The seam that lets a green tree delegate its reconstruction here instead of walking
+/// itself (bead franken_lean-tkr2). The tiling law has exactly one implementation, which
+/// is plant-proved; a second walk in the tree module would be a second place to get it
+/// wrong, and the two would drift the first time either changed.
+///
+/// Deliberately does no validation: the leaves came from a tree that came from an
+/// attachment, and [`Attachment::reconstruct`] re-checks the tiling anyway. A tree whose
+/// leaves do not tile gets `None` from reconstruct, which is the answer it deserves.
+pub fn attach_from_leaves(entries: Vec<Attached>, epilogue: ByteSpan) -> Attachment {
+    Attachment { entries, epilogue }
+}
+
 /// Attach trivia to a token sequence using the pin's rule.
 ///
 /// `extents` are the tokens' own spans, ascending and non-overlapping, as a lexer emits
