@@ -1271,6 +1271,80 @@ mod tests {
     /// digest is a bucket hint and full `Expr` equality would still separate the two terms. That is
     /// why this was not a soundness bug — and also why only a digest-level assertion can catch it.
     /// A store-level test here would be the test that passes while the property is false.
+    /// Interning changes SHARING, and canonical bytes must not notice
+    /// (bead `fln-sv7x`).
+    ///
+    /// # This is the opposite of what `fln-sv7x` asks for, and the opposite is correct
+    ///
+    /// That bead asks for "serialization preserving sharing exactly in both codecs" and
+    /// prescribes asserting it against `fln-hash`'s `Canonical` codec. For THAT codec the
+    /// property would be a **defect**, not a feature. `Canonical` is documented as "a value
+    /// with exactly one canonical encoding under a frozen schema"; sharing is not part of an
+    /// `Expr`'s identity, so a sharing-sensitive encoder would give one value many encodings
+    /// depending on how it happened to be built, and every content-addressed digest resting on
+    /// it — logical roots, witnesses, intern keys — would move with construction history.
+    ///
+    /// So the honest canon-side property is the DUAL of the bead's: the encoding must be
+    /// sharing-INDEPENDENT. `Expr::write_body` walks a work stack with no memo table and emits
+    /// the tree expansion deliberately, which is what makes that true. Sharing preservation is
+    /// a real requirement for the *olean* codec, where the artifact is storage rather than an
+    /// identity preimage — and no olean expression encoder exists yet.
+    ///
+    /// What this pins, which nothing else did: the interner is free to rewrite an `Expr`'s
+    /// sharing (that is its entire job), and doing so may not move a single canonical byte.
+    /// Without this, an interner change could silently move every digest downstream of it.
+    #[test]
+    fn interning_rewrites_sharing_and_canonical_bytes_do_not_move() {
+        let leaf = || Expr::const_(Name::str(Name::anonymous(), "leaf"), Vec::new());
+
+        // Same denotation, deliberately different sharing: `shared` reaches ONE node by two
+        // paths; `unshared` builds two independent equal nodes.
+        let once = leaf();
+        let shared = Expr::app(once.clone(), once.clone());
+        let unshared = Expr::app(leaf(), leaf());
+
+        // Premise: the sharing really does differ, or this test proves nothing.
+        let (f_shared, a_shared) = match shared.node() {
+            ExprNode::App { f, a } => (node_ptr(f), node_ptr(a)),
+            other => unreachable!("built an App, got {other:?}"),
+        };
+        let (f_unshared, a_unshared) = match unshared.node() {
+            ExprNode::App { f, a } => (node_ptr(f), node_ptr(a)),
+            other => unreachable!("built an App, got {other:?}"),
+        };
+        assert_eq!(
+            f_shared, a_shared,
+            "premise: the shared term aliases its children"
+        );
+        assert_ne!(
+            f_unshared, a_unshared,
+            "premise: the unshared term does not alias its children"
+        );
+        assert_eq!(shared, unshared, "premise: the two denote the same value");
+
+        // The property: one value, one encoding, whatever its sharing.
+        assert_eq!(
+            shared.to_canonical_bytes(),
+            unshared.to_canonical_bytes(),
+            "canonical bytes must not depend on how the term was built"
+        );
+
+        // And interning — which exists precisely to rewrite sharing — moves no byte.
+        let mut store = Interner::new();
+        let before = unshared.to_canonical_bytes();
+        let Outcome::Complete(interned) =
+            store.intern_bounded(&unshared, StoreBudget::representable())
+        else {
+            unreachable!("the largest representable budget interns a two-node term")
+        };
+        assert_eq!(interned, unshared, "interning preserves the value");
+        assert_eq!(
+            interned.to_canonical_bytes(),
+            before,
+            "interning rewrites sharing; canonical bytes must not notice"
+        );
+    }
+
     /// The level plane is keyed on the CANONICAL encoding, not on `Debug`.
     ///
     /// This test is written against the ENCODER rather than against discrimination, and that is
