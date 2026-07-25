@@ -318,6 +318,10 @@ fn mpz_header_extremes_are_typed_faults_not_panics() {
 /// The assertion is deliberately "equals one input exactly", not "is
 /// non-empty": a torn publication is usually still a plausible-looking file,
 /// which is exactly why it would survive a weaker check.
+///
+/// This test is part of the Miri concurrency guard and runs under it in ~2 s —
+/// see `crates/fln-unsafe-abi/MIRI_CONCURRENCY_GUARD.md` for the command, the
+/// flags each arm needs, and the proof that the guard fails on the real defect.
 #[test]
 fn concurrent_publication_of_one_target_never_yields_a_mixture() {
     let dir = std::env::temp_dir().join(format!("fln-rt-pubrace-{}", std::process::id()));
