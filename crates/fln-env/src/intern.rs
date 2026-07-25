@@ -46,7 +46,7 @@
 
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{Expr, ExprNode};
-use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 use std::collections::HashMap;
 
@@ -58,8 +58,27 @@ const INTERN_TAG: &[u8] = b"fln.term-store.intern-identity/1";
 
 /// A stored node's identity. Equal ids mean the same stored node, and after interning that means
 /// structurally equal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TermId(pub u32);
+///
+/// # An id is store-local and schedule-dependent. It must never escape.
+///
+/// Ids are handed out in **assignment order**, so the same term interned by the same program under
+/// a different thread count gets a different number. That is fine for what an id is *for* —
+/// answering "is this the same stored node" and keying a store-local memo — and it is a determinism
+/// defect (FL-INV-01) the moment an id reaches a digest, a cache key that outlives the store, an
+/// artifact, or a diagnostic. Same input closure must give the same artifacts at any thread count,
+/// and an id does not.
+///
+/// This is the same boundary [`crate::terms`] already draws for allocation identity, in the same
+/// crate and for the same reason: measurement and memoisation only, never a value that is written
+/// down. The interner inverts the *direction* of that relationship — here pointer identity BECOMES
+/// the identity — but the escape rule is unchanged.
+///
+/// So the inner `u32` is **private**, and `Ord` is **deliberately not derived**. Sorting by id is
+/// the trap: it yields a schedule-dependent order that looks canonical, which is exactly the
+/// "semantically free order not pinned by a registered policy" FL-INV-01 forbids. Code that needs a
+/// deterministic order over stored terms must derive it from the terms' own structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TermId(u32);
 
 /// How much sharing a store achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -275,6 +294,82 @@ impl Interner {
     }
 }
 
+/// One term store shared by many threads.
+///
+/// # The concurrency shape, and why it is this one (bead `franken_lean-oh1j`, item 5)
+///
+/// The choice was between ONE SHARED STORE behind a lock and PER-THREAD STORES with a deterministic
+/// merge. The second is the heavier machine, and its single advantage is that it can assign
+/// [`TermId`]s in a registered order, making them stable across thread counts.
+///
+/// **That advantage buys nothing here, because an id is not allowed to be observed in the first
+/// place.** An id is a store-local memo handle that never reaches a digest, an artifact or a
+/// diagnostic — the same boundary `terms.rs` already draws for allocation identity, now enforced by
+/// a private field rather than by a doc comment. Stabilising a value that must not escape is work
+/// spent making an unobservable thing reproducible. So: one shared store, and the id space stays
+/// schedule-dependent *by declaration* rather than by accident.
+///
+/// **What that leaves is a real FL-INV-01 claim, and it is exactly this.** At any thread count, for
+/// the same multiset of interned terms:
+///
+/// * every term's canonical form is the same term, structurally;
+/// * the set of stored nodes is the same set;
+/// * `presented`, `stored` and `shared` are the same numbers — dedup is by structural identity, so
+///   which thread arrives first changes who pays for a node, never how many exist.
+///
+/// **What is schedule-dependent, stated so nobody builds on it**: [`TermId`] values, the
+/// `identity_digest` bytes that are computed from them, and `bucket_misses` — which depends on the
+/// order candidates were added to a bucket, and is zero unless the digest genuinely collides.
+///
+/// This is a correctness-shaped store, not a throughput-shaped one: one lock serialises interning,
+/// and sharding it is a later, profile-driven change with these tests already in place to hold it
+/// honest. Correctness outranks speed, and a sharded store whose shards intern the same term twice
+/// would break the interning invariant this module exists to provide.
+#[derive(Debug, Default)]
+pub struct SharedInterner {
+    inner: std::sync::Mutex<Interner>,
+}
+
+impl SharedInterner {
+    pub fn new() -> SharedInterner {
+        SharedInterner::default()
+    }
+
+    /// Intern under a budget, from any thread. See [`Interner::intern_bounded`].
+    ///
+    /// A poisoned lock is an [`Outcome::InternalFault`], not an `Inconclusive` and not a panic. It
+    /// means another thread panicked while holding the store, so an invariant already broke; that is
+    /// a different claim from "a budget ran out", and FL-INV-07 says the two must not be spelled the
+    /// same. Unwrapping the lock would re-raise the original panic in a thread that did nothing
+    /// wrong, and would lose which invariant it was.
+    pub fn intern_bounded(&self, root: &Expr, budget: StoreBudget) -> Outcome<Expr> {
+        match self.inner.lock() {
+            Ok(mut store) => store.intern_bounded(root, budget),
+            Err(_) => Outcome::InternalFault(InternalFault::new(
+                "FL-INV-07",
+                "the shared term store's lock is poisoned: a thread panicked while interning",
+            )),
+        }
+    }
+
+    /// The store's sharing statistics, or `None` if the lock is poisoned.
+    ///
+    /// `None` rather than a default: a poisoned store has no statistics, and zeroes would read as
+    /// "nothing was interned".
+    pub fn stats(&self) -> Option<SharingStats> {
+        self.inner.lock().ok().map(|store| store.stats())
+    }
+
+    /// How many nodes the store holds, or `None` if the lock is poisoned.
+    pub fn len(&self) -> Option<usize> {
+        self.inner.lock().ok().map(|store| store.len())
+    }
+
+    pub fn is_empty(&self) -> Option<bool> {
+        self.inner.lock().ok().map(|store| store.is_empty())
+    }
+}
+
 /// Pointer identity of a node's allocation — the same accessor `terms.rs` uses, since `Expr`'s
 /// `Arc` is private to `fln-core`.
 fn node_ptr(expr: &Expr) -> *const ExprNode {
@@ -409,6 +504,21 @@ fn rebuild(expr: &Expr, done: &HashMap<*const ExprNode, TermId>, nodes: &[Expr])
 ///
 /// Shallow by construction: children contribute their id rather than their structure, so the digest
 /// is O(own fields) per node and the whole store is digested in one post-order pass.
+///
+/// # This is a bucket key, NOT a content address, and the difference is load-bearing
+///
+/// Because children contribute their **id**, and ids are assignment-ordered ([`TermId`]), this
+/// digest is a function of the store's history as well as of the term. The same term digests
+/// differently in two stores, and differently under two thread counts. Within one store it is
+/// perfectly well defined — structurally equal nodes have structurally equal children, hence the
+/// same canonical children, hence the same ids, hence the same digest — which is all a bucket key
+/// needs.
+///
+/// It is private for that reason and must stay private. It is the obvious thing to reach for as a
+/// content address for a term, and it would be silently wrong: schedule-dependent bytes in an
+/// artifact. `fln_hash`'s declaration digests and [`crate::terms::alpha_canonical_digest`] are
+/// content addresses; this is not. That makes three digests in this crate's orbit with three
+/// different jobs, which is why each one says which it is.
 ///
 /// **No wildcard arm.** And unlike the alpha-canonical digest, every binder name and every `MData`
 /// entry is fed in — that difference is the entire distinction between the identity plane and the
@@ -885,6 +995,209 @@ mod tests {
             interner.stats()
         );
         assert_eq!(interner.len(), 4);
+    }
+
+    /// The seed terms for the thread matrix: distinct shapes with heavy deliberate overlap, so the
+    /// schedule has something to get wrong.
+    ///
+    /// Overlap is the point. If every term were disjoint, every thread would store its own nodes and
+    /// no two threads would ever race for the same identity — the test would run at 32 threads and
+    /// prove nothing about sharing. These share `common` and share leaves, so the same structural
+    /// identity is genuinely presented by several threads at once, and whichever arrives first is
+    /// the one that stores it.
+    fn matrix_terms(count: usize) -> Vec<Expr> {
+        let common = Expr::app(bvar(0), bvar(1));
+        (0..count)
+            .map(|index| {
+                let leaf = bvar((index % 8) as u32);
+                let tagged = Expr::lam(
+                    name(["p", "q", "r", "s"][index % 4]),
+                    Expr::sort(Level::zero()),
+                    leaf,
+                    BinderInfo::Default,
+                );
+                Expr::app(common.clone(), tagged)
+            })
+            .collect()
+    }
+
+    /// Every stored term, in an order derived from the terms themselves rather than from their ids.
+    ///
+    /// Sorting by `TermId` would be the mistake this reduction exists to avoid: ids are assignment
+    /// ordered, so an id-sorted list is schedule-dependent and two thread counts would "differ" for
+    /// a reason that is not a defect. `Debug` on `Expr` is structural and stack-safe (that is stated
+    /// in this module's header and relied on by `Expr` itself), so it is a total structural key.
+    fn canonical_reduction(store: &SharedInterner) -> Vec<String> {
+        let count = store.len().expect("the store is not poisoned");
+        let guard = store.inner.lock().expect("the store is not poisoned");
+        let mut rendered: Vec<String> = (0..count)
+            .map(|index| {
+                let node = guard
+                    .get(TermId(index as u32))
+                    .expect("every id below len names a node");
+                format!("{node:?}")
+            })
+            .collect();
+        rendered.sort();
+        rendered
+    }
+
+    /// **FL-INV-01 for the term store**: the same terms interned at 1, 8 and 32 threads give the
+    /// same store.
+    ///
+    /// The claim is stated precisely on [`SharedInterner`] and asserted precisely here, because the
+    /// weak version of this test — "it did not crash at 32 threads" — is the one that passes while
+    /// the property is false. What is asserted is the SET of stored nodes and the presented/stored/
+    /// shared counts. What is deliberately NOT asserted is `TermId` values or `identity_digest`
+    /// bytes: both are assignment-ordered by design, both are unobservable outside this module, and
+    /// pinning them would pin the schedule dependence rather than remove it.
+    ///
+    /// The counts are the sharper half. `stored` being schedule-independent is the whole interning
+    /// invariant restated under concurrency: dedup is by structural identity, so which thread gets
+    /// there first decides who pays for a node, never how many nodes exist. A store that raced would
+    /// show it here as a `stored` that grows with the thread count.
+    ///
+    /// **The matrix is discriminating, measured rather than assumed.** A determinism test proves
+    /// nothing if the schedule never actually varies — it would report "identical at 32 threads"
+    /// about 32 threads that behaved like one. Probed on 2026-07-25 by rendering the store in `TermId`
+    /// order instead of structural order: at 8 and 32 workers that order differed from the 1-worker
+    /// order on 6 of 6 executions, while the structural reduction and all three counts were
+    /// identical every time. So the threads genuinely interleave and genuinely race for the same
+    /// identities, and what survives that is a property rather than an artefact of everything
+    /// happening to run in sequence.
+    ///
+    /// That probe is recorded here rather than kept as an assertion on purpose: "the ids differ" is
+    /// a statement about a race, so asserting it would be asserting that an unlucky-but-legal
+    /// schedule never happens, and a flaky guard is worse than a recorded measurement.
+    #[test]
+    fn interning_is_identical_at_1_8_and_32_threads() {
+        const TERMS: usize = 256;
+        let terms = matrix_terms(TERMS);
+
+        let mut baseline: Option<(Vec<String>, SharingStats)> = None;
+        for worker_count in [1usize, 8, 32] {
+            let store = SharedInterner::new();
+            let partition_sizes = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..worker_count)
+                    .map(|worker| {
+                        let store = &store;
+                        let terms = &terms;
+                        scope.spawn(move || {
+                            let mut mine = 0usize;
+                            for (index, term) in terms.iter().enumerate() {
+                                if index % worker_count != worker {
+                                    continue;
+                                }
+                                let outcome =
+                                    store.intern_bounded(term, StoreBudget::representable());
+                                let canonical = match outcome {
+                                    Outcome::Complete(canonical) => canonical,
+                                    other => {
+                                        unreachable!("interning must complete, got {other:?}")
+                                    }
+                                };
+                                assert_eq!(
+                                    &canonical, term,
+                                    "the canonical form must be structurally the term it came from"
+                                );
+                                mine += 1;
+                            }
+                            mine
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("worker completes"))
+                    .collect::<Vec<_>>()
+            });
+
+            // Productive, on the same standard as the declaration-admission matrix: an idle worker
+            // means this thread count is a label rather than a schedule, and a test that never ran
+            // 32 threads cannot have proved anything about 32 threads.
+            assert_eq!(partition_sizes.len(), worker_count);
+            assert!(
+                partition_sizes.iter().all(|size| *size > 0),
+                "an empty partition means this worker count is a label, not a schedule \
+                 (sizes {partition_sizes:?})"
+            );
+            assert_eq!(
+                partition_sizes.iter().sum::<usize>(),
+                TERMS,
+                "the partition must cover every term exactly once"
+            );
+
+            let reduction = canonical_reduction(&store);
+            let stats = store.stats().expect("the store is not poisoned");
+
+            match &baseline {
+                None => baseline = Some((reduction, stats)),
+                Some((expected_reduction, expected_stats)) => {
+                    assert_eq!(
+                        &reduction, expected_reduction,
+                        "the set of stored nodes must not depend on the thread count \
+                         (at {worker_count} workers)"
+                    );
+                    assert_eq!(
+                        stats.presented, expected_stats.presented,
+                        "presentations are a function of the input, not of the schedule"
+                    );
+                    assert_eq!(
+                        stats.stored, expected_stats.stored,
+                        "the interning invariant under concurrency: dedup is by structural \
+                         identity, so `stored` counts distinct identities and cannot grow with \
+                         the thread count (at {worker_count} workers)"
+                    );
+                    assert_eq!(
+                        stats.shared, expected_stats.shared,
+                        "shared is presented minus stored, so it inherits both"
+                    );
+                }
+            }
+        }
+
+        let (_, stats) = baseline.expect("the matrix ran at least once");
+        // The fixture must actually exercise sharing, or `stored` being stable is stable for the
+        // uninteresting reason that nothing was ever shared.
+        assert!(
+            stats.shared > 0 && stats.stored < stats.presented,
+            "the seed terms must overlap or this matrix proves nothing about dedup: {stats:?}"
+        );
+    }
+
+    /// A poisoned store reports an `InternalFault`, not an `Inconclusive` and not a panic.
+    ///
+    /// The distinction is FL-INV-07's: a poisoned lock means an invariant already broke in another
+    /// thread, which is a different claim from "a budget ran out". Collapsing the two would let a
+    /// caller retry with a larger budget against a store that is broken rather than full.
+    #[test]
+    fn a_poisoned_store_is_an_internal_fault_not_a_resource_stop() {
+        let store = SharedInterner::new();
+        let poisoned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = store.inner.lock().expect("the store starts healthy");
+                    panic!("deliberate: poison the store while holding it");
+                })
+                .join()
+                .is_err()
+        });
+        assert!(
+            poisoned,
+            "the helper thread must have panicked to poison it"
+        );
+
+        let outcome = store.intern_bounded(&bvar(0), StoreBudget::representable());
+        match outcome {
+            Outcome::InternalFault(fault) => {
+                assert_eq!(fault.invariant, "FL-INV-07");
+            }
+            other => panic!("a poisoned store must be an internal fault, got {other:?}"),
+        }
+        assert!(
+            store.stats().is_none(),
+            "a poisoned store has no statistics; zeroes would read as `nothing was interned`"
+        );
     }
 
     /// A budget larger than the id space does not raise the ceiling, it is clamped to it.
