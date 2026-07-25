@@ -1,10 +1,10 @@
 //! **fln-verdict** — Verdict's solver-independent contract plane.
 //!
 //! This crate owns the versioned, canonical schemas shared by the future bit-blaster,
-//! CDCL engine, proof logger, and independent proof checker (plan §12.5).  It does
-//! not solve or check SAT: those authorities arrive on later beads.  Keeping the
-//! vocabulary here independent prevents either producer from defining what its own
-//! evidence means.
+//! CDCL engine, proof logger, and independent proof checker (plan §12.5). The
+//! streaming checker validates raw proof bytes through its own bounded reader,
+//! state, and rule semantics; it never turns a solver claim directly into an
+//! environment authority.
 //!
 //! The v1 contract has four structural laws:
 //!
@@ -20,6 +20,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+mod checker;
+
+pub use checker::{
+    ProofCheckInconclusive, ProofCheckInternalFault, ProofCheckLimits, ProofCheckOutcome,
+    ProofCheckReceipt, ProofCheckResource, ProofOpcodeClass, ProofRefusal, ProofStream,
+    check_unsat_streams, check_unsat_streams_with_cancel,
+};
 
 const WIRE_MAGIC: [u8; 8] = *b"FLNVRDCT";
 #[cfg(test)]
@@ -2078,6 +2086,573 @@ mod proof_dependency_model {
 }
 
 #[cfg(test)]
+mod verdict_checker_state_model {
+    use super::test_support::*;
+    use super::*;
+
+    fn swapped_resolution_parents(mut bytes: Vec<u8>) -> Vec<u8> {
+        let positive_parent_at = WIRE_HEADER_BYTES + 8 + 1 + 8 + 8 + 1 + 4;
+        let negative_parent_at = positive_parent_at + 8;
+        let mut positive = [0_u8; 8];
+        let mut negative = [0_u8; 8];
+        positive.copy_from_slice(&bytes[positive_parent_at..positive_parent_at + 8]);
+        negative.copy_from_slice(&bytes[negative_parent_at..negative_parent_at + 8]);
+        bytes[positive_parent_at..positive_parent_at + 8].copy_from_slice(&negative);
+        bytes[negative_parent_at..negative_parent_at + 8].copy_from_slice(&positive);
+        bytes
+    }
+
+    #[test]
+    fn resolution_and_rup_proofs_are_checked_semantically() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let resolution_bytes = proof(&cnf).to_canonical_bytes();
+        let resolution = check_unsat_streams(
+            &cnf_bytes[..],
+            &resolution_bytes[..],
+            ProofCheckLimits::default(),
+        );
+        let receipt = resolution.receipt().expect("valid resolution is verified");
+        assert_eq!(receipt.input_clauses, 2);
+        assert_eq!(receipt.input_literals, 2);
+        assert_eq!(receipt.proof_steps, 2);
+        assert_eq!(receipt.derived_clauses, 1);
+        assert_eq!(receipt.dependencies, 3);
+
+        let rup = UnsatProof::new(
+            &cnf,
+            vec![
+                ProofStep::Derive {
+                    id: clause_id(3),
+                    clause: clause(&[]),
+                    rule: ProofRule::rup(vec![clause_id(1), clause_id(2)]),
+                },
+                ProofStep::Conclude {
+                    empty_clause: clause_id(3),
+                },
+            ],
+            SchemaLimits::default(),
+        )
+        .expect("RUP fixture is structurally valid")
+        .to_canonical_bytes();
+        assert!(matches!(
+            check_unsat_streams(&cnf_bytes[..], &rup[..], ProofCheckLimits::default()),
+            ProofCheckOutcome::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn corrupted_producer_accepted_proof_is_refused_not_rubber_stamped() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let corrupted = swapped_resolution_parents(proof(&cnf).to_canonical_bytes());
+
+        assert!(
+            UnsatProof::from_canonical_bytes(&corrupted, &cnf, SchemaLimits::default()).is_ok(),
+            "the producer-side structural decoder deliberately accepts this semantic mutant"
+        );
+        let outcome =
+            check_unsat_streams(&cnf_bytes[..], &corrupted[..], ProofCheckLimits::default());
+        assert_eq!(
+            outcome,
+            ProofCheckOutcome::Refused(ProofRefusal::InvalidResolutionPivot {
+                step: 3,
+                parent: 2,
+                pivot: 1,
+                expected_positive: true,
+            })
+        );
+        assert_eq!(outcome.receipt(), None);
+    }
+
+    #[test]
+    fn incomplete_rup_and_deleted_dependencies_are_refused() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let incomplete = UnsatProof::new(
+            &cnf,
+            vec![
+                ProofStep::Derive {
+                    id: clause_id(3),
+                    clause: clause(&[]),
+                    rule: ProofRule::rup(vec![clause_id(1)]),
+                },
+                ProofStep::Conclude {
+                    empty_clause: clause_id(3),
+                },
+            ],
+            SchemaLimits::default(),
+        )
+        .expect("incomplete RUP remains structurally well-formed")
+        .to_canonical_bytes();
+        assert_eq!(
+            check_unsat_streams(&cnf_bytes[..], &incomplete[..], ProofCheckLimits::default()),
+            ProofCheckOutcome::Refused(ProofRefusal::RupDidNotConflict { step: 3 })
+        );
+
+        let mut writer = Writer::new();
+        writer.header(SchemaKind::UnsatProof);
+        writer.u64(3);
+        writer.u8(2);
+        writer.u64(1);
+        writer.u64(1);
+        writer.u8(1);
+        writer.u64(3);
+        write_clause(&mut writer, &clause(&[]));
+        writer.u8(2);
+        writer.u64(2);
+        writer.u64(1);
+        writer.u64(2);
+        writer.u8(3);
+        writer.u64(3);
+        assert_eq!(
+            check_unsat_streams(
+                &cnf_bytes[..],
+                &writer.finish()[..],
+                ProofCheckLimits::default()
+            ),
+            ProofCheckOutcome::Refused(ProofRefusal::MissingDependency {
+                step: 3,
+                dependency: 1,
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod checker_independence_guard {
+    use super::test_support::*;
+    use super::*;
+    use std::io::Read;
+
+    #[derive(Debug)]
+    struct OneByteReader<'a> {
+        bytes: &'a [u8],
+        at: usize,
+        max_requested: usize,
+    }
+
+    impl<'a> OneByteReader<'a> {
+        const fn new(bytes: &'a [u8]) -> Self {
+            Self {
+                bytes,
+                at: 0,
+                max_requested: 0,
+            }
+        }
+    }
+
+    impl Read for OneByteReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            self.max_requested = self.max_requested.max(output.len());
+            if self.at == self.bytes.len() || output.is_empty() {
+                return Ok(0);
+            }
+            output[0] = self.bytes[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn checker_source_has_a_separate_reader_state_and_no_producer_decoder_calls() {
+        let source = include_str!("checker.rs");
+        let identifiers = source
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .collect::<BTreeSet<_>>();
+        for forbidden in ["UnsatProof", "ProofStep", "ProofRule", "SchemaError"] {
+            assert!(
+                !identifiers.contains(forbidden),
+                "independent checker source names forbidden producer type {forbidden}"
+            );
+        }
+        for forbidden_call in [
+            "Cnf::",
+            "Clause::",
+            "from_canonical_bytes",
+            "validate_dependencies",
+        ] {
+            assert!(
+                !source.contains(forbidden_call),
+                "independent checker source uses forbidden producer call {forbidden_call}"
+            );
+        }
+        assert!(source.contains("struct StreamDecoder"));
+        assert!(source.contains("struct CheckState"));
+        assert!(source.contains("fn check_resolution"));
+        assert!(source.contains("fn check_rup"));
+    }
+
+    #[test]
+    fn fragmented_readers_are_consumed_incrementally() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let proof_bytes = proof(&cnf).to_canonical_bytes();
+        let mut cnf_reader = OneByteReader::new(&cnf_bytes);
+        let mut proof_reader = OneByteReader::new(&proof_bytes);
+        assert!(matches!(
+            check_unsat_streams(
+                &mut cnf_reader,
+                &mut proof_reader,
+                ProofCheckLimits::default()
+            ),
+            ProofCheckOutcome::Verified(_)
+        ));
+        assert_eq!(cnf_reader.at, cnf_bytes.len());
+        assert_eq!(proof_reader.at, proof_bytes.len());
+        assert!(
+            cnf_reader.max_requested <= 8 && proof_reader.max_requested <= 8,
+            "the checker requested a materializing read"
+        );
+    }
+
+    #[test]
+    fn unknown_version_opcodes_truncation_and_trailing_bytes_fail_closed() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let proof_bytes = proof(&cnf).to_canonical_bytes();
+
+        let mut future = proof_bytes.clone();
+        future[version_offset()..version_offset() + 2].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            check_unsat_streams(&cnf_bytes[..], &future[..], ProofCheckLimits::default()),
+            ProofCheckOutcome::Refused(ProofRefusal::UnsupportedVersion {
+                stream: ProofStream::Proof,
+                found: 2,
+                supported: 1,
+            })
+        );
+
+        let mut unknown_step = proof_bytes.clone();
+        unknown_step[WIRE_HEADER_BYTES + 8] = 0xfe;
+        assert_eq!(
+            check_unsat_streams(
+                &cnf_bytes[..],
+                &unknown_step[..],
+                ProofCheckLimits::default()
+            ),
+            ProofCheckOutcome::Refused(ProofRefusal::UnknownOpcode {
+                class: ProofOpcodeClass::Step,
+                at: (WIRE_HEADER_BYTES + 8) as u64,
+                opcode: 0xfe,
+            })
+        );
+
+        let rule_at = WIRE_HEADER_BYTES + 8 + 1 + 8 + 8;
+        let mut unknown_rule = proof_bytes.clone();
+        unknown_rule[rule_at] = 0xfd;
+        assert_eq!(
+            check_unsat_streams(
+                &cnf_bytes[..],
+                &unknown_rule[..],
+                ProofCheckLimits::default()
+            ),
+            ProofCheckOutcome::Refused(ProofRefusal::UnknownOpcode {
+                class: ProofOpcodeClass::Rule,
+                at: rule_at as u64,
+                opcode: 0xfd,
+            })
+        );
+
+        assert!(matches!(
+            check_unsat_streams(
+                &cnf_bytes[..],
+                &proof_bytes[..proof_bytes.len() - 1],
+                ProofCheckLimits::default()
+            ),
+            ProofCheckOutcome::Refused(ProofRefusal::Truncated {
+                stream: ProofStream::Proof,
+                ..
+            })
+        ));
+
+        let mut trailing = proof_bytes;
+        trailing.push(0);
+        assert_eq!(
+            check_unsat_streams(&cnf_bytes[..], &trailing[..], ProofCheckLimits::default()),
+            ProofCheckOutcome::Refused(ProofRefusal::TrailingInput {
+                stream: ProofStream::Proof,
+                at: (trailing.len() - 1) as u64,
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod streaming_memory_boundaries {
+    use super::test_support::*;
+    use super::*;
+    use std::io::{Error, Read};
+
+    #[derive(Debug)]
+    struct FaultingReader<'a> {
+        prefix: &'a [u8],
+    }
+
+    #[derive(Debug)]
+    struct OverreportingReader;
+
+    impl Read for FaultingReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.prefix.is_empty() {
+                return Err(Error::other("injected read fault"));
+            }
+            let count = output.len().min(self.prefix.len());
+            output[..count].copy_from_slice(&self.prefix[..count]);
+            self.prefix = &self.prefix[count..];
+            Ok(count)
+        }
+    }
+
+    impl Read for OverreportingReader {
+        fn read(&mut self, _output: &mut [u8]) -> std::io::Result<usize> {
+            Ok(usize::MAX)
+        }
+    }
+
+    #[test]
+    fn exact_byte_state_and_work_budgets_pass_then_one_less_is_inconclusive() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let proof_bytes = proof(&cnf).to_canonical_bytes();
+        let baseline = check_unsat_streams(
+            &cnf_bytes[..],
+            &proof_bytes[..],
+            ProofCheckLimits::default(),
+        );
+        let receipt = *baseline.receipt().expect("baseline proof verifies");
+        let exact = ProofCheckLimits {
+            max_cnf_bytes: cnf_bytes.len() as u64,
+            max_proof_bytes: proof_bytes.len() as u64,
+            max_variables: 1,
+            max_input_clauses: 2,
+            max_proof_steps: 2,
+            max_live_clauses: receipt.peak_live_clauses,
+            max_live_literals: receipt.peak_live_literals,
+            max_clause_literals: 1,
+            max_dependencies: receipt.dependencies,
+            max_work_units: receipt.work_units,
+        };
+        assert!(matches!(
+            check_unsat_streams(&cnf_bytes[..], &proof_bytes[..], exact),
+            ProofCheckOutcome::Verified(_)
+        ));
+
+        let proof_byte_short = ProofCheckLimits {
+            max_proof_bytes: exact.max_proof_bytes - 1,
+            ..exact
+        };
+        assert!(matches!(
+            check_unsat_streams(&cnf_bytes[..], &proof_bytes[..], proof_byte_short),
+            ProofCheckOutcome::Inconclusive(ProofCheckInconclusive::ResourceExhausted {
+                resource: ProofCheckResource::ProofBytes,
+                ..
+            })
+        ));
+
+        let state_short = ProofCheckLimits {
+            max_live_clauses: exact.max_live_clauses - 1,
+            ..exact
+        };
+        assert!(matches!(
+            check_unsat_streams(&cnf_bytes[..], &proof_bytes[..], state_short),
+            ProofCheckOutcome::Inconclusive(ProofCheckInconclusive::ResourceExhausted {
+                resource: ProofCheckResource::LiveClauses,
+                ..
+            })
+        ));
+
+        let work_short = ProofCheckLimits {
+            max_work_units: exact.max_work_units - 1,
+            ..exact
+        };
+        let outcome = check_unsat_streams(&cnf_bytes[..], &proof_bytes[..], work_short);
+        assert!(matches!(
+            outcome,
+            ProofCheckOutcome::Inconclusive(ProofCheckInconclusive::ResourceExhausted {
+                resource: ProofCheckResource::WorkUnits,
+                ..
+            })
+        ));
+        assert_eq!(outcome.receipt(), None);
+    }
+
+    #[test]
+    fn cancellation_and_io_faults_are_non_verdicts() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let proof_bytes = proof(&cnf).to_canonical_bytes();
+        let mut observations = 0_u64;
+        let cancelled = check_unsat_streams_with_cancel(
+            &cnf_bytes[..],
+            &proof_bytes[..],
+            ProofCheckLimits::default(),
+            || {
+                observations += 1;
+                observations == 3
+            },
+        );
+        assert_eq!(
+            cancelled,
+            ProofCheckOutcome::Inconclusive(ProofCheckInconclusive::Cancelled)
+        );
+        assert_eq!(cancelled.receipt(), None);
+
+        let fault = check_unsat_streams(
+            FaultingReader {
+                prefix: &cnf_bytes[..8],
+            },
+            &proof_bytes[..],
+            ProofCheckLimits::default(),
+        );
+        assert_eq!(
+            fault,
+            ProofCheckOutcome::InternalFault(ProofCheckInternalFault::Io {
+                stream: ProofStream::Cnf,
+            })
+        );
+        assert_eq!(fault.receipt(), None);
+
+        let dishonest = std::panic::catch_unwind(|| {
+            check_unsat_streams(
+                OverreportingReader,
+                &proof_bytes[..],
+                ProofCheckLimits::default(),
+            )
+        })
+        .expect("contract-violating reader must not panic the checker");
+        assert_eq!(
+            dishonest,
+            ProofCheckOutcome::InternalFault(ProofCheckInternalFault::StateInvariant)
+        );
+    }
+
+    #[test]
+    fn impossible_collection_capacity_is_inconclusive_before_allocation() {
+        let mut cnf = Writer::new();
+        cnf.header(SchemaKind::Cnf);
+        cnf.u32(1);
+        cnf.u64(1);
+        cnf.u64(1);
+        cnf.u64(u64::MAX);
+        let limits = ProofCheckLimits {
+            max_clause_literals: u64::MAX,
+            max_live_literals: u64::MAX,
+            ..ProofCheckLimits::default()
+        };
+        assert!(matches!(
+            check_unsat_streams(&cnf.finish()[..], &[][..], limits),
+            ProofCheckOutcome::Inconclusive(ProofCheckInconclusive::ResourceExhausted {
+                resource: ProofCheckResource::AddressSpace,
+                ..
+            })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod proof_checker_fuzz {
+    use super::test_support::*;
+    use super::*;
+
+    #[test]
+    fn arbitrary_and_single_byte_mutated_streams_never_panic_and_checker_recovers() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let valid = proof(&cnf).to_canonical_bytes();
+        let mut seed = 0x43d7_913e_6f20_ba11_u64;
+
+        for length in 0_usize..192 {
+            let mut bytes = vec![0_u8; length];
+            for byte in &mut bytes {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *byte = (seed >> 32) as u8;
+            }
+            let result = std::panic::catch_unwind(|| {
+                check_unsat_streams(&cnf_bytes[..], &bytes[..], ProofCheckLimits::default())
+            });
+            assert!(result.is_ok(), "arbitrary proof length {length} panicked");
+        }
+
+        for index in 0..valid.len() {
+            let mut mutated = valid.clone();
+            mutated[index] ^= 0xa5;
+            let result = std::panic::catch_unwind(|| {
+                check_unsat_streams(&cnf_bytes[..], &mutated[..], ProofCheckLimits::default())
+            });
+            assert!(result.is_ok(), "proof mutation at byte {index} panicked");
+        }
+        assert!(matches!(
+            check_unsat_streams(&cnf_bytes[..], &valid[..], ProofCheckLimits::default()),
+            ProofCheckOutcome::Verified(_)
+        ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod verdict_checker_no_mock_e2e {
+    use super::test_support::*;
+    use super::*;
+    use std::io::Write;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    fn socket_stream(bytes: Vec<u8>) -> (UnixStream, std::thread::JoinHandle<()>) {
+        let (reader, mut writer) = UnixStream::pair().expect("kernel stream pair");
+        let handle = std::thread::spawn(move || {
+            for chunk in bytes.chunks(3) {
+                writer.write_all(chunk).expect("stream chunk");
+            }
+            writer
+                .shutdown(Shutdown::Write)
+                .expect("stream write shutdown");
+        });
+        (reader, handle)
+    }
+
+    fn run_over_kernel_streams(cnf: Vec<u8>, proof: Vec<u8>) -> ProofCheckOutcome {
+        let (cnf_reader, cnf_writer) = socket_stream(cnf);
+        let (proof_reader, proof_writer) = socket_stream(proof);
+        let outcome = check_unsat_streams(cnf_reader, proof_reader, ProofCheckLimits::default());
+        cnf_writer.join().expect("CNF writer final state");
+        proof_writer.join().expect("proof writer final state");
+        outcome
+    }
+
+    #[test]
+    fn real_stream_positive_semantic_failure_and_recovery_are_disjoint() {
+        let cnf = unsat_formula();
+        let cnf_bytes = cnf.to_canonical_bytes();
+        let valid = proof(&cnf).to_canonical_bytes();
+        assert!(matches!(
+            run_over_kernel_streams(cnf_bytes.clone(), valid.clone()),
+            ProofCheckOutcome::Verified(_)
+        ));
+
+        let positive_parent_at = WIRE_HEADER_BYTES + 8 + 1 + 8 + 8 + 1 + 4;
+        let negative_parent_at = positive_parent_at + 8;
+        let mut corrupted = valid.clone();
+        let mut positive = [0_u8; 8];
+        let mut negative = [0_u8; 8];
+        positive.copy_from_slice(&corrupted[positive_parent_at..positive_parent_at + 8]);
+        negative.copy_from_slice(&corrupted[negative_parent_at..negative_parent_at + 8]);
+        corrupted[positive_parent_at..positive_parent_at + 8].copy_from_slice(&negative);
+        corrupted[negative_parent_at..negative_parent_at + 8].copy_from_slice(&positive);
+        let refused = run_over_kernel_streams(cnf_bytes.clone(), corrupted);
+        assert!(matches!(
+            refused,
+            ProofCheckOutcome::Refused(ProofRefusal::InvalidResolutionPivot { .. })
+        ));
+        assert_eq!(refused.receipt(), None);
+
+        assert!(matches!(
+            run_over_kernel_streams(cnf_bytes, valid),
+            ProofCheckOutcome::Verified(_)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod verdict_codec_fuzz {
     use super::test_support::*;
     use super::*;
@@ -2226,6 +2801,14 @@ mod verdict_schema_no_mock_e2e {
 
         match phase.as_str() {
             "positive" => {
+                assert!(matches!(
+                    check_unsat_streams(
+                        &unsat_bytes[..],
+                        &proof_bytes[..],
+                        ProofCheckLimits::default()
+                    ),
+                    ProofCheckOutcome::Verified(_)
+                ));
                 let mut thread_cnf_hex = Vec::new();
                 let mut workers_spawned = 0;
                 for workers in [1_usize, 8, 32] {
@@ -2274,6 +2857,18 @@ mod verdict_schema_no_mock_e2e {
                         opcode: 0xff,
                     }
                 );
+                assert_eq!(
+                    check_unsat_streams(
+                        &unsat_bytes[..],
+                        &corrupted[..],
+                        ProofCheckLimits::default()
+                    ),
+                    ProofCheckOutcome::Refused(ProofRefusal::UnknownOpcode {
+                        class: ProofOpcodeClass::Step,
+                        at: (WIRE_HEADER_BYTES + 8) as u64,
+                        opcode: 0xff,
+                    })
+                );
                 let semantic = format!(
                     "{{\"corrupted_proof_hex\":\"{}\",\"data_grade\":\"verified\",\
                      \"error_at\":{},\"error_code\":\"unknown_opcode\",\"event\":\"failure\",\
@@ -2304,6 +2899,14 @@ mod verdict_schema_no_mock_e2e {
                     UnsatProof::from_canonical_bytes(&proof_bytes, &unsat, SchemaLimits::default()),
                     Ok(proof)
                 );
+                assert!(matches!(
+                    check_unsat_streams(
+                        &unsat_bytes[..],
+                        &proof_bytes[..],
+                        ProofCheckLimits::default()
+                    ),
+                    ProofCheckOutcome::Verified(_)
+                ));
                 let semantic = format!(
                     "{{\"cnf_hex\":\"{}\",\"data_grade\":\"verified\",\
                      \"event\":\"recovery\",\"proof_hex\":\"{}\",\
