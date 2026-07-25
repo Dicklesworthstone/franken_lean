@@ -181,6 +181,24 @@ hash_subject() {
     --vendor-path vendor/lean4-src
 }
 
+seal_archived_checkout() {
+  local checkout="$1"
+  local source_tree archived_tree
+  git init --quiet --initial-branch=main "$checkout"
+  git -C "$checkout" add --force -- .
+  git -C "$checkout" \
+    -c user.name=franken-lean-evidence \
+    -c user.email=franken-lean-evidence.invalid \
+    commit --quiet --message "retained archive of $SOURCE_COMMIT"
+  source_tree="$(git rev-parse "$SOURCE_COMMIT^{tree}")"
+  archived_tree="$(git -C "$checkout" rev-parse "HEAD^{tree}")"
+  if [ "$archived_tree" != "$source_tree" ]; then
+    printf '[contract_handoff] setup failure: archived tree drift source=%s archived=%s\n' \
+      "$source_tree" "$archived_tree" >&2
+    return 1
+  fi
+}
+
 read_meta() {
   "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json
@@ -314,6 +332,8 @@ note "materializing two retained cold checkouts from commit $SOURCE_COMMIT"
 mkdir -p "$SCRATCH_A" "$SCRATCH_B"
 git archive --format=tar "$SOURCE_COMMIT" | tar -xf - -C "$SCRATCH_A"
 git archive --format=tar "$SOURCE_COMMIT" | tar -xf - -C "$SCRATCH_B"
+seal_archived_checkout "$SCRATCH_A"
+seal_archived_checkout "$SCRATCH_B"
 
 run_step() {
   local step="$1" subject="$2" expected_class="$3" expected_wrapper="$4"
