@@ -230,6 +230,11 @@ pub enum ProofCheckInternalFault {
 }
 
 /// Bounded facts emitted only after the complete proof and both EOFs validate.
+///
+/// This counts-only value is not a standalone evidence artifact. It must not
+/// gain a serialization or evidence-projection path unless it also binds
+/// digests of both the CNF and proof; the test-only source guard below keeps
+/// that future format decision explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProofCheckReceipt {
     pub schema_version: u16,
@@ -1169,4 +1174,181 @@ fn exhausted_with_actual(resource: ProofCheckResource, limit: u64, actual: u64) 
         limit,
         actual,
     })
+}
+
+#[cfg(test)]
+mod receipt_serialization_guard {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const RECEIPT_DECLARATION: &str = "pub struct ProofCheckReceipt {";
+    const CNF_DIGEST_FIELD: &str = "cnf_digest:";
+    const PROOF_DIGEST_FIELD: &str = "proof_digest:";
+
+    fn collect_rust_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+        let entries = fs::read_dir(directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("cannot enumerate {}: {error}", directory.display()))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                collect_rust_paths(&path, paths)?;
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+            {
+                paths.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    fn production_source_corpus() -> Result<String, String> {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        collect_rust_paths(&source_root, &mut paths)?;
+        paths.sort();
+
+        let mut corpus = String::new();
+        for path in paths {
+            corpus.push_str(
+                &fs::read_to_string(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+            );
+            corpus.push('\n');
+        }
+        Ok(corpus)
+    }
+
+    fn receipt_definition(source: &str) -> Option<&str> {
+        let start = source.find(RECEIPT_DECLARATION)?;
+        let tail = &source[start..];
+        let end = tail.find("\n}")? + 2;
+        Some(&tail[..end])
+    }
+
+    fn compact(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    fn standalone_surface(source: &str) -> Option<&'static str> {
+        let markers = [
+            (
+                "inherent ProofCheckReceipt implementation",
+                concat!("impl", "ProofCheckReceipt"),
+            ),
+            (
+                "receipt trait implementation",
+                concat!("for", "ProofCheckReceipt"),
+            ),
+            (
+                "standalone receipt encoder",
+                concat!("fn", "encode_proof_check_receipt("),
+            ),
+            (
+                "standalone receipt serializer",
+                concat!("fn", "serialize_proof_check_receipt("),
+            ),
+            (
+                "standalone receipt writer",
+                concat!("fn", "write_proof_check_receipt("),
+            ),
+            (
+                "standalone evidence projection",
+                concat!("fn", "proof_check_receipt_to_evidence("),
+            ),
+        ];
+        markers
+            .iter()
+            .find(|(_, marker)| source.contains(marker))
+            .map(|(label, _)| *label)
+    }
+
+    fn require_content_binding(
+        receipt_source: &str,
+        production_source: &str,
+    ) -> Result<(), &'static str> {
+        let Some(definition) = receipt_definition(receipt_source) else {
+            return Err("ProofCheckReceipt definition is missing");
+        };
+        let has_content_binding =
+            definition.contains(CNF_DIGEST_FIELD) && definition.contains(PROOF_DIGEST_FIELD);
+        if has_content_binding {
+            return Ok(());
+        }
+
+        let compact_source = compact(production_source);
+        if let Some(surface) = standalone_surface(&compact_source) {
+            return Err(surface);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn proof_check_receipt_has_no_unbound_standalone_serialization_surface() {
+        let source = production_source_corpus();
+        assert!(
+            source.is_ok(),
+            "Verdict production sources must be readable"
+        );
+        let Ok(source) = source else {
+            return;
+        };
+        assert_eq!(
+            require_content_binding(&source, &source),
+            Ok(()),
+            "a standalone ProofCheckReceipt format must bind both CNF and proof digests"
+        );
+    }
+
+    #[test]
+    fn receipt_surface_guard_refuses_display_canonical_and_evidence_mutants() {
+        let counts_only = concat!(
+            "pub struct ",
+            "ProofCheckReceipt {\npub input_clauses: u64,\n}"
+        );
+        let display_mutant = concat!(
+            "impl std::fmt::",
+            "Display for ",
+            "ProofCheckReceipt {",
+            "fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }}",
+        );
+        let canonical_mutant = concat!(
+            "impl ",
+            "ProofCheckReceipt { pub fn ",
+            "to_canonical_bytes(&self) -> Vec<u8> { Vec::new() }}",
+        );
+        let evidence_mutant = concat!(
+            "fn ",
+            "proof_check_receipt_to_evidence(_: &ProofCheckReceipt) {}",
+        );
+
+        assert_eq!(
+            require_content_binding(counts_only, display_mutant),
+            Err("receipt trait implementation")
+        );
+        assert_eq!(
+            require_content_binding(counts_only, canonical_mutant),
+            Err("inherent ProofCheckReceipt implementation")
+        );
+        assert_eq!(
+            require_content_binding(counts_only, evidence_mutant),
+            Err("standalone evidence projection")
+        );
+
+        let content_bound = concat!(
+            "pub struct ",
+            "ProofCheckReceipt {\ncnf_digest: [u8; 32],\nproof_digest: [u8; 32],\n}",
+        );
+        assert_eq!(
+            require_content_binding(content_bound, display_mutant),
+            Ok(())
+        );
+    }
 }
