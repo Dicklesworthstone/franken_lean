@@ -57,7 +57,9 @@ fn accepted<'e>(
     decl: Declaration,
 ) -> fln_kernel::capability::CheckedDecl<'e> {
     match admit(env, decl, Budget::DEFAULT) {
-        Outcome::Complete(Admitted::Accepted(cap)) => cap,
+        // The capability is boxed on the `Admitted` enum; unboxing here keeps
+        // every test below reading against `CheckedDecl` itself.
+        Outcome::Complete(Admitted::Accepted(cap)) => *cap,
         other => panic!(
             "expected an accepted admission, got {}",
             match other {

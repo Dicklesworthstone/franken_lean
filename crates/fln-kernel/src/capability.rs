@@ -84,15 +84,21 @@ pub struct CheckedDecl<'env> {
 /// What [`admit`] concluded. The accepted arm is the only inhabitant of the
 /// capability type.
 ///
-/// The arms are lopsided since [`CheckedDecl`] began carrying the calibrated
-/// [`crate::Budget`] it was checked under (bead `franken_lean-4o3n`), and that
-/// is accepted rather than boxed. Boxing would buy back stack width at the cost
-/// of one heap allocation per *accepted declaration* — 158,608 of them in a
-/// single Corpus replay — to shrink a value that is returned, matched, and
-/// consumed immediately and is never stored in a collection.
-#[allow(clippy::large_enum_variant)]
+/// The capability is **boxed**, which is not decoration. [`CheckedDecl`] began
+/// carrying the calibrated [`crate::Budget`] it was checked under (bead
+/// `franken_lean-4o3n`), which took the accepted arm far past the rejected one
+/// and made every `Admitted` value pay that width. It is boxed rather than
+/// `#[allow]`ed because FLN-STRUCT-030 admits no `allow` attribute inside
+/// `fln-kernel`: the reviewed builtin inventory is `cfg`, `derive`, `forbid`
+/// and `test`, so silencing a lint here is not an option the kernel has. That
+/// is the constraint working — a lint about a TCB type has to be answered, not
+/// annotated.
+///
+/// Boxing costs nothing the capability cared about: it is still not `Clone`,
+/// still not constructible outside this crate, and `publish` still consumes it
+/// by value, because a `Box<T>` method taking `self` moves out of the box.
 pub enum Admitted<'env> {
-    Accepted(CheckedDecl<'env>),
+    Accepted(Box<CheckedDecl<'env>>),
     Rejected {
         class: RejectClass,
         message: String,
@@ -126,13 +132,13 @@ pub fn admit<'env>(
 ) -> Outcome<Admitted<'env>> {
     match check(base, &decl, budget) {
         Outcome::Complete(Verdict::Accepted { consumption }) => {
-            Outcome::complete(Admitted::Accepted(CheckedDecl {
+            Outcome::complete(Admitted::Accepted(Box::new(CheckedDecl {
                 base,
                 decl,
                 consumption,
                 budget,
                 _seal: Seal,
-            }))
+            })))
         }
         Outcome::Complete(Verdict::Rejected {
             class,

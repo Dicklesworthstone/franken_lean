@@ -179,12 +179,21 @@ pub enum Profile {
 
 impl Profile {
     /// The profile THIS build was compiled under.
+    ///
+    /// Spelled with `#[cfg]` rather than `cfg!`: FLN-STRUCT-030 admits the
+    /// `cfg` *attribute* into the kernel's reviewed builtin inventory and not
+    /// the `cfg!` macro, because an attribute deletes the other arm before it
+    /// is compiled while the macro leaves both in the LOC-counted body.
+    #[cfg(debug_assertions)]
     pub const fn current() -> Profile {
-        if cfg!(debug_assertions) {
-            Profile::Dev
-        } else {
-            Profile::Release
-        }
+        Profile::Dev
+    }
+
+    /// See the `debug_assertions` arm above; exactly one of the two exists in
+    /// any build.
+    #[cfg(not(debug_assertions))]
+    pub const fn current() -> Profile {
+        Profile::Release
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -1033,8 +1042,8 @@ mod tests {
     fn the_two_profiles_do_not_agree_about_what_one_depth_costs() {
         let dev = StackMeasurement::K1_DEV;
         let release = StackMeasurement::K1_RELEASE;
-        assert_eq!(dev.engine(), release.engine());
-        assert_ne!(dev.taken_in(), release.taken_in());
+        assert!(dev.engine() == release.engine());
+        assert!(dev.taken_in() != release.taken_in());
         assert!(
             dev.bytes_per_depth() > release.bytes_per_depth() * 5,
             "the measured dev/release gap is the evidence that a depth number is not a \
@@ -1042,9 +1051,9 @@ mod tests {
             dev.bytes_per_depth(),
             release.bytes_per_depth()
         );
-        assert_ne!(
-            dev.stack_bytes_for_depth(Budget::DEFAULT_DEPTH),
-            release.stack_bytes_for_depth(Budget::DEFAULT_DEPTH),
+        assert!(
+            dev.stack_bytes_for_depth(Budget::DEFAULT_DEPTH)
+                != release.stack_bytes_for_depth(Budget::DEFAULT_DEPTH),
             "identical depth, identical cost would mean the profile does not matter"
         );
     }
@@ -1054,13 +1063,12 @@ mod tests {
     fn narrowing_lowers_and_never_raises() {
         let base = Budget::DEFAULT;
         let narrowed = base.narrowed(10, 7);
-        assert_eq!((narrowed.steps, narrowed.depth), (10, 7));
-        assert_eq!(narrowed.calibration(), base.calibration());
+        assert!(narrowed.steps == 10 && narrowed.depth == 7);
+        assert!(narrowed.calibration() == base.calibration());
 
         let widened = base.narrowed(u64::MAX, u32::MAX);
-        assert_eq!(
-            (widened.steps, widened.depth),
-            (base.steps, base.depth),
+        assert!(
+            widened.steps == base.steps && widened.depth == base.depth,
             "narrowed() must clamp rather than trust its arguments"
         );
     }
@@ -1079,6 +1087,6 @@ mod tests {
         );
         assert!(degenerate.bytes_per_depth() >= 1);
         assert!(degenerate.safety_factor() >= 1);
-        assert_eq!(degenerate.depth_for_stack_bytes(usize::MAX), u32::MAX);
+        assert!(degenerate.depth_for_stack_bytes(usize::MAX) == u32::MAX);
     }
 }

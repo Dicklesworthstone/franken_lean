@@ -444,7 +444,7 @@ pub fn convene<'env>(council: &Council, admitted: Admitted<'env>) -> CouncilOutc
         Admitted::Accepted(checked) => {
             let objections = council.objections();
             if objections.is_empty() {
-                CouncilOutcome::Agreed(checked)
+                CouncilOutcome::Agreed(*checked)
             } else {
                 // Read the kernel's bound BEFORE the drop: the halt has to
                 // record what the seats were being compared against, and after
