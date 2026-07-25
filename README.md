@@ -14,10 +14,6 @@
 
 </div>
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_lean/main/scripts/install.sh | bash
-```
-
 > **A note on tense (read this first).** This README is written in the **present tense, as if the entire design in [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md`](./COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md) is fully realized**: the 1.0 target state where every performance gate is green and every subsystem is live. This is a deliberate choice. It lets the document describe the *finished* system so it gets **trued-up in place as milestones land** (§22's gates G0→G6) rather than rewritten from scratch later. Where the plan itself stages something as genuinely future work or a frontier lane, the README says so plainly. Everything else below is the spec of the system this repository builds.
 
 ---
@@ -216,11 +212,7 @@ fln identity --json                # implementation commit, epoch, profile, TCB 
 
 ## Installation
 
-**1. Install script (recommended).** Detects your platform, fetches the signed release binaries (`lean`, `leanc`, `lake`, `fln`), and installs an elan-compatible toolchain:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_lean/main/scripts/install.sh | bash
-```
+**1. Install script — *not yet available*.** The planned script detects your platform, fetches the signed release binaries (`lean`, `leanc`, `lake`, `fln`), and installs an elan-compatible toolchain. It is deliberately not shown as a runnable command here: `scripts/install.sh` does not exist yet, and there are no release binaries for it to install. This section becomes a command again when distribution ships one (bead `franken_lean-readme-install-oneliner-wao6`).
 
 Because the release layout is elan-compatible, a project's `lean-toolchain` file can simply name a FrankenLean toolchain and everything downstream — `lake`, the editor extension, CI — just works.
 
