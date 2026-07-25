@@ -11,8 +11,10 @@
 
 use std::sync::Arc;
 
+use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
+use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_hash::root::{LogicalRoot, LogicalRootBuilder};
@@ -60,6 +62,214 @@ const fn usize_to_u64(value: usize) -> u64 {
 /// The order and multiplicity are semantic input. Keep this as one forward pass:
 /// no sorting, deduplication, or structure proportional to the containing
 /// [`Environment`] belongs in declaration identity.
+/// Which declaration row family bound a [`DeclarationBudget`].
+///
+/// This is a fact on the outcome's own report, deliberately **not** a new
+/// [`StructuralUnit`]. All four families are `ProducedNodes` under the closed D8
+/// taxonomy, whose stated bar for a new unit is not "it is a different number" but
+/// "a caller has to react differently" — and a caller reacts to all four the same
+/// way, by shrinking the declaration. The finer fact still has to survive, so it
+/// lives here rather than growing a closed taxonomy that breaks every consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclarationDimension {
+    LevelParams,
+    MutualRows,
+    ConstructorRows,
+    RecursorRules,
+}
+
+impl DeclarationDimension {
+    /// Frozen order, and it is the reported-reason order for simultaneous breaches
+    /// (bead `franken_lean-j8h`). Signature before membership before the
+    /// per-variant families: most general first, so the primary reason names the
+    /// dimension a caller can act on with the least knowledge of the variant.
+    ///
+    /// Schedule-independent by construction — the scan is a fixed sequence over an
+    /// immutable value, so two threads preflighting the same declaration report the
+    /// same primary dimension.
+    const ORDER: [DeclarationDimension; 4] = [
+        DeclarationDimension::LevelParams,
+        DeclarationDimension::MutualRows,
+        DeclarationDimension::ConstructorRows,
+        DeclarationDimension::RecursorRules,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            DeclarationDimension::LevelParams => "level_params",
+            DeclarationDimension::MutualRows => "mutual_rows",
+            DeclarationDimension::ConstructorRows => "constructor_rows",
+            DeclarationDimension::RecursorRules => "recursor_rules",
+        }
+    }
+}
+
+/// Exact logical row facts for one declaration (bead `franken_lean-j8h`).
+///
+/// **Logical and reproducible**, which is the whole claim: these are counts of rows
+/// the canonical encoding visits, not CPU instructions, allocator-resident bytes, or
+/// unique `Arc` node counts. Two runs over the same declaration produce identical
+/// facts on any schedule.
+///
+/// # What this deliberately does not yet claim
+///
+/// `franken_lean-j8h` also names canonical output bytes, expression node counts, and
+/// maximum logical depth. None of the three is reported here, and approximating them
+/// would be worse than omitting them:
+///
+/// * **Canonical bytes** cannot be bounded from this crate at all. `CanonWriter` is a
+///   bare `Vec<u8>` with no length accessor, and `Canonical::write_body` takes it
+///   concretely, so a budgeted sink cannot be substituted from here — while
+///   `CanonReader` in the same file already has `with_budget`, `charge_node` and
+///   `Exhausted`. Reporting a modeled byte count as if it were measured is exactly
+///   the untruthful work fact this bead exists to remove.
+/// * **Expression nodes and expanded weight** are already measured, bounded and
+///   cancellable by [`crate::terms::expanded_weight`]; folding them in is the next
+///   slice, and doing it here would have meant one commit spanning two traversals.
+/// * **Maximum depth** is not reported by that traversal today. Its *safety* role is
+///   already discharged — the traversal is iterative, so a deep term is a measurement
+///   rather than a stack overflow — but the fact itself is not available, and
+///   `WeightReport` would have to grow to carry it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeclarationUsage {
+    /// Level parameters on the constant's signature.
+    pub level_params: u64,
+    /// Mutual-block member rows (`all`) on an all-bearing variant.
+    pub mutual_rows: u64,
+    /// Constructor-name rows on an inductive.
+    pub constructor_rows: u64,
+    /// Recursor rule rows.
+    pub recursor_rules: u64,
+}
+
+impl DeclarationUsage {
+    const fn get(&self, dimension: DeclarationDimension) -> u64 {
+        match dimension {
+            DeclarationDimension::LevelParams => self.level_params,
+            DeclarationDimension::MutualRows => self.mutual_rows,
+            DeclarationDimension::ConstructorRows => self.constructor_rows,
+            DeclarationDimension::RecursorRules => self.recursor_rules,
+        }
+    }
+}
+
+/// What a caller allows one declaration's row families to cost.
+///
+/// `UNBOUNDED` and the `Default` impl mirror [`CollisionBudget`] rather than
+/// inventing a second convention: an unset budget must behave exactly as the
+/// pre-budget code did, or adding the parameter would silently change identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclarationBudget {
+    pub max_level_params: u64,
+    pub max_mutual_rows: u64,
+    pub max_constructor_rows: u64,
+    pub max_recursor_rules: u64,
+}
+
+impl DeclarationBudget {
+    pub const UNBOUNDED: DeclarationBudget = DeclarationBudget {
+        max_level_params: u64::MAX,
+        max_mutual_rows: u64::MAX,
+        max_constructor_rows: u64::MAX,
+        max_recursor_rules: u64::MAX,
+    };
+
+    const fn get(&self, dimension: DeclarationDimension) -> u64 {
+        match dimension {
+            DeclarationDimension::LevelParams => self.max_level_params,
+            DeclarationDimension::MutualRows => self.max_mutual_rows,
+            DeclarationDimension::ConstructorRows => self.max_constructor_rows,
+            DeclarationDimension::RecursorRules => self.max_recursor_rules,
+        }
+    }
+}
+
+impl Default for DeclarationBudget {
+    fn default() -> Self {
+        Self::UNBOUNDED
+    }
+}
+
+/// Count the row families of `info`, then refuse if any exceeds `budget`.
+///
+/// This is the cheap half of declaration preflight and it runs first for the same
+/// reason [`Environment::try_add_decl_with_budget`] evaluates duplicate names first:
+/// every count here is a `len()` on an already-materialized vector, so the whole
+/// determination is constant work per family and cannot itself be the unbounded path.
+/// What it buys is refusing *before* the encoder is entered, so a declaration with a
+/// million mutual members never reaches the loop that would write a million rows.
+///
+/// # Authority
+///
+/// Exhaustion is [`Outcome::Inconclusive`], never a rejection: a declaration over
+/// budget has not been judged ill-formed, and the outcome's own `cache_admission`
+/// refuses to memoize it. Exact totals are returned only inside
+/// [`Outcome::Complete`]; a refusal carries its consumption as diagnostic `progress`
+/// rather than as authoritative facts, so there is no partial-work field for a caller
+/// to read while skipping the authority check (decision `fln-um4a`).
+///
+/// Nothing is published, computed, or cached on refusal — in particular no provisional
+/// digest exists to leak, because this runs before any hashing.
+///
+/// Cancellation is not sampled here and no checkpoint is claimed: there is no
+/// input-sized traversal to abandon. It arrives with the expression dimensions.
+pub fn preflight_declaration_rows(
+    info: &ConstantInfo,
+    budget: DeclarationBudget,
+) -> Outcome<DeclarationUsage> {
+    let base = info.constant_val();
+    let usage = DeclarationUsage {
+        level_params: usize_to_u64(base.level_params.len()),
+        mutual_rows: usize_to_u64(declaration_mutual_members(info).len()),
+        constructor_rows: match info {
+            ConstantInfo::Induct(v) => usize_to_u64(v.ctors.len()),
+            _ => 0,
+        },
+        recursor_rules: match info {
+            ConstantInfo::Rec(v) => usize_to_u64(v.rules.len()),
+            _ => 0,
+        },
+    };
+
+    for dimension in DeclarationDimension::ORDER {
+        let allowed = budget.get(dimension);
+        let observed = usage.get(dimension);
+        if observed > allowed {
+            return Outcome::Inconclusive(
+                Inconclusive::resource(ResourceUsage {
+                    reason: ResourceReason::StructuralBudget {
+                        unit: StructuralUnit::ProducedNodes,
+                    },
+                    allowed,
+                    // A stop must report spending past its allowance or it is not a
+                    // stop; `is_genuine_exhaustion` depends on it, and an
+                    // `observed == allowed` refusal is self-contradictory. The scan
+                    // has the exact count here, so the max is a floor, not a guess.
+                    observed: observed.max(allowed.saturating_add(1)),
+                })
+                .with_progress(dimension.as_str()),
+            );
+        }
+    }
+    Outcome::complete(usage)
+}
+
+/// The mutual-block members of `info`, or an empty slice for a variant that has none.
+///
+/// One place, so the preflight counts exactly the rows
+/// [`write_mutual_membership`] would write. Two independent lists is how a usage fact
+/// drifts from the work it claims to describe.
+fn declaration_mutual_members(info: &ConstantInfo) -> &[Name] {
+    match info {
+        ConstantInfo::Defn(v) => &v.all,
+        ConstantInfo::Thm(v) => &v.all,
+        ConstantInfo::Opaque(v) => &v.all,
+        ConstantInfo::Induct(v) => &v.all,
+        ConstantInfo::Rec(v) => &v.all,
+        ConstantInfo::Axiom(_) | ConstantInfo::Quot(_) | ConstantInfo::Ctor(_) => &[],
+    }
+}
+
 fn write_mutual_membership(w: &mut CanonWriter, members: &[Name]) {
     w.u64(usize_to_u64(members.len()));
     for member in members {
@@ -480,13 +690,14 @@ impl Environment {
 mod tests {
     use super::*;
     use crate::constants::{
-        AxiomVal, ConstantVal, DefinitionVal, InductiveVal, OpaqueVal, QuotVal, RecursorRule,
-        RecursorVal, TheoremVal,
+        AxiomVal, ConstantVal, ConstructorVal, DefinitionVal, InductiveVal, OpaqueVal, QuotVal,
+        RecursorRule, RecursorVal, TheoremVal,
     };
     use crate::pmap::CollisionResource;
     use fln_core::expr::Expr;
     use fln_core::level::Level;
     use fln_core::options::DataValue;
+    use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
     use std::collections::HashSet;
 
     fn n(s: &str) -> Name {
@@ -3024,5 +3235,314 @@ mod tests {
         // resource reasons, which is why the budgeted path had to be a sibling
         // rather than a replacement.
         assert!(base.add_decl(axiom("Fresh")).is_ok());
+    }
+
+    fn constructor_decl() -> ConstantInfo {
+        ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: n("d"),
+                level_params: vec![n("u")],
+                type_: Expr::sort(Level::param(n("u"))),
+            },
+            induct: n("Parent"),
+            cidx: 0,
+            num_params: 2,
+            num_fields: 3,
+            is_unsafe: false,
+        })
+    }
+
+    /// The resource facts and bound dimension of a preflight stop, or `None` if the
+    /// outcome was not a resource stop at all. Returning an `Option` rather than
+    /// destructuring at each site keeps one extraction path and lets callers use the
+    /// crate's usual `expect`, instead of three hand-written panics that would each
+    /// have to agree about what a stop looks like.
+    fn resource_stop(
+        outcome: &Outcome<DeclarationUsage>,
+    ) -> Option<(&ResourceUsage, Option<&str>)> {
+        let Outcome::Inconclusive(inconclusive) = outcome else {
+            return None;
+        };
+        let InconclusiveCause::ResourceExhausted { usage } = &inconclusive.cause else {
+            return None;
+        };
+        Some((
+            usage,
+            inconclusive
+                .progress
+                .as_ref()
+                .map(|progress| progress.text()),
+        ))
+    }
+
+    fn row_usage(info: &ConstantInfo) -> DeclarationUsage {
+        preflight_declaration_rows(info, DeclarationBudget::UNBOUNDED)
+            .into_complete()
+            .expect("an unbounded budget cannot refuse")
+    }
+
+    /// Exact row facts for every `ConstantInfo` variant, including the three that
+    /// carry no mutual block. Zero is a reported fact here, not an absent one: a
+    /// dimension that silently had no value would be a dimension a caller cannot
+    /// budget.
+    #[test]
+    fn declaration_row_usage_is_exact_for_every_variant() {
+        let members = vec![n("d"), n("peer"), n("third")];
+        for kind in AllBearingKind::ALL {
+            let info = all_bearing_decl(kind, members.clone());
+            let usage = row_usage(&info);
+            assert_eq!(usage.level_params, 1, "{}", kind.label());
+            assert_eq!(usage.mutual_rows, 3, "{}", kind.label());
+            assert_eq!(
+                usage.constructor_rows,
+                u64::from(matches!(kind, AllBearingKind::Inductive)) * 2,
+                "only an inductive carries constructor rows ({})",
+                kind.label()
+            );
+            assert_eq!(
+                usage.recursor_rules,
+                u64::from(matches!(kind, AllBearingKind::Recursor)) * 2,
+                "only a recursor carries rule rows ({})",
+                kind.label()
+            );
+        }
+
+        // The three variants with no mutual block report zero rather than being
+        // exempt from accounting.
+        let axiom_usage = row_usage(&axiom("A"));
+        assert_eq!(axiom_usage.mutual_rows, 0);
+        assert_eq!(axiom_usage.level_params, 0);
+        let quot_usage = row_usage(&tagged_declaration(
+            DeclarationTagCase::Quotient(QuotKind::Lift),
+            false,
+        ));
+        assert_eq!(quot_usage.mutual_rows, 0);
+        assert_eq!(quot_usage.level_params, 2);
+        let ctor_usage = row_usage(&constructor_decl());
+        assert_eq!(ctor_usage.mutual_rows, 0);
+        assert_eq!(ctor_usage.constructor_rows, 0);
+        assert_eq!(ctor_usage.recursor_rules, 0);
+    }
+
+    /// The counted rows are the rows the encoder writes.
+    ///
+    /// Both directions, because a count that merely *looks* right is how a usage fact
+    /// drifts from the work it claims to describe: the counted membership must equal
+    /// the list the encoder is handed, and adding one row must move the content
+    /// digest — proving the rows counted are content-bearing rather than incidental.
+    #[test]
+    fn declaration_row_usage_counts_exactly_what_the_encoder_writes() {
+        for kind in AllBearingKind::ALL {
+            for rows in 0..4usize {
+                let members: Vec<Name> = (0..rows).map(|i| n(&format!("m{i}"))).collect();
+                let info = all_bearing_decl(kind, members.clone());
+                assert_eq!(
+                    row_usage(&info).mutual_rows,
+                    usize_to_u64(declaration_mutual_members(&info).len()),
+                    "counted membership diverged from the encoder's list ({})",
+                    kind.label()
+                );
+                assert_eq!(row_usage(&info).mutual_rows, usize_to_u64(rows));
+
+                let mut grown = members;
+                grown.push(n("extra"));
+                assert_ne!(
+                    Environment::decl_content_digest(&info),
+                    Environment::decl_content_digest(&all_bearing_decl(kind, grown)),
+                    "a counted row did not reach the content digest ({})",
+                    kind.label()
+                );
+            }
+        }
+    }
+
+    /// Exact admits, one-over refuses, per dimension.
+    #[test]
+    fn declaration_row_preflight_admits_at_exact_and_refuses_one_over() {
+        let members = vec![n("d"), n("peer"), n("third")];
+        let cases: [(DeclarationDimension, ConstantInfo, u64); 3] = [
+            (
+                DeclarationDimension::MutualRows,
+                all_bearing_decl(AllBearingKind::Definition, members.clone()),
+                3,
+            ),
+            (
+                DeclarationDimension::ConstructorRows,
+                all_bearing_decl(AllBearingKind::Inductive, members.clone()),
+                2,
+            ),
+            (
+                DeclarationDimension::RecursorRules,
+                all_bearing_decl(AllBearingKind::Recursor, members.clone()),
+                2,
+            ),
+        ];
+        for (dimension, info, exact) in cases {
+            let at_exact = match dimension {
+                DeclarationDimension::MutualRows => DeclarationBudget {
+                    max_mutual_rows: exact,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+                DeclarationDimension::ConstructorRows => DeclarationBudget {
+                    max_constructor_rows: exact,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+                DeclarationDimension::RecursorRules => DeclarationBudget {
+                    max_recursor_rules: exact,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+                DeclarationDimension::LevelParams => unreachable!(),
+            };
+            assert!(
+                matches!(
+                    preflight_declaration_rows(&info, at_exact),
+                    Outcome::Complete(_)
+                ),
+                "an exact budget must admit ({})",
+                dimension.as_str()
+            );
+
+            let one_under = match dimension {
+                DeclarationDimension::MutualRows => DeclarationBudget {
+                    max_mutual_rows: exact - 1,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+                DeclarationDimension::ConstructorRows => DeclarationBudget {
+                    max_constructor_rows: exact - 1,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+                DeclarationDimension::RecursorRules => DeclarationBudget {
+                    max_recursor_rules: exact - 1,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+                DeclarationDimension::LevelParams => unreachable!(),
+            };
+            let refused = preflight_declaration_rows(&info, one_under);
+            assert!(
+                resource_stop(&refused).is_some(),
+                "one over budget must refuse with a resource stop ({})",
+                dimension.as_str()
+            );
+            let (usage, progress) = resource_stop(&refused).expect("asserted just above");
+            assert_eq!(usage.allowed, exact - 1);
+            assert!(
+                usage.observed > usage.allowed,
+                "a stop that did not report spending past its allowance is not a stop"
+            );
+            assert!(usage.is_genuine_exhaustion());
+            assert_eq!(
+                usage.reason,
+                ResourceReason::StructuralBudget {
+                    unit: StructuralUnit::ProducedNodes
+                }
+            );
+            assert_eq!(
+                progress,
+                Some(dimension.as_str()),
+                "a stop must name the dimension it bound"
+            );
+        }
+    }
+
+    /// A refusal is inconclusive, never a rejection, and is not cacheable.
+    #[test]
+    fn declaration_row_preflight_refusal_is_inconclusive_and_uncacheable() {
+        let info = all_bearing_decl(AllBearingKind::Definition, vec![n("a"), n("b")]);
+        let refused = preflight_declaration_rows(
+            &info,
+            DeclarationBudget {
+                max_mutual_rows: 0,
+                ..DeclarationBudget::UNBOUNDED
+            },
+        );
+        assert_eq!(refused.authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            refused.cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
+        );
+        // The domain result is unreachable without handling the non-answer: there is
+        // no partial-usage field to read while skipping the authority check.
+        assert!(refused.into_complete().is_err());
+
+        // And the declaration itself was not judged: the same declaration under an
+        // adequate budget is admitted with the same facts, so the refusal said
+        // nothing about admissibility.
+        let retried = preflight_declaration_rows(&info, DeclarationBudget::UNBOUNDED);
+        assert_eq!(
+            retried.into_complete().expect("adequate budget admits"),
+            row_usage(&info)
+        );
+    }
+
+    /// Simultaneous breaches report the frozen primary dimension.
+    #[test]
+    fn declaration_row_preflight_primary_dimension_is_frozen_under_simultaneous_breach() {
+        // A recursor breaching membership AND rules at once: `ORDER` puts membership
+        // first, so that is the reported reason while the rule overage is equally real.
+        let info = all_bearing_decl(AllBearingKind::Recursor, vec![n("a"), n("b"), n("c")]);
+        let refused = preflight_declaration_rows(
+            &info,
+            DeclarationBudget {
+                max_mutual_rows: 1,
+                max_recursor_rules: 1,
+                ..DeclarationBudget::UNBOUNDED
+            },
+        );
+        assert!(
+            resource_stop(&refused).is_some(),
+            "a double breach must refuse"
+        );
+        let (_, progress) = resource_stop(&refused).expect("asserted just above");
+        assert_eq!(
+            progress,
+            Some(DeclarationDimension::MutualRows.as_str()),
+            "the frozen order must select the primary reason"
+        );
+        assert_eq!(
+            DeclarationDimension::ORDER,
+            [
+                DeclarationDimension::LevelParams,
+                DeclarationDimension::MutualRows,
+                DeclarationDimension::ConstructorRows,
+                DeclarationDimension::RecursorRules,
+            ],
+            "the reported-reason order is frozen; changing it changes which reason \
+             callers see for the same declaration"
+        );
+
+        // Schedule independence: the scan is a fixed sequence over an immutable
+        // value, so repeating it cannot select a different primary dimension.
+        for _ in 0..8 {
+            let again = preflight_declaration_rows(
+                &info,
+                DeclarationBudget {
+                    max_mutual_rows: 1,
+                    max_recursor_rules: 1,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+            );
+            assert_eq!(again, refused);
+        }
+    }
+
+    /// An unset budget behaves exactly as the pre-budget code did, and preflight
+    /// moves no identity.
+    #[test]
+    fn declaration_row_preflight_is_identity_neutral_at_the_default_budget() {
+        assert_eq!(DeclarationBudget::default(), DeclarationBudget::UNBOUNDED);
+        for kind in AllBearingKind::ALL {
+            let info = all_bearing_decl(kind, vec![n("a"), n("b")]);
+            let before = Environment::decl_content_digest(&info);
+            let admitted = preflight_declaration_rows(&info, DeclarationBudget::default());
+            assert!(matches!(admitted, Outcome::Complete(_)));
+            assert_eq!(
+                before,
+                Environment::decl_content_digest(&info),
+                "preflight must be a pure measurement ({})",
+                kind.label()
+            );
+        }
     }
 }
