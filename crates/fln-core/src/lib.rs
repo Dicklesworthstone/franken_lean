@@ -30,6 +30,7 @@ pub mod expr;
 pub mod ids;
 pub mod lean_hash;
 pub mod level;
+pub mod mode;
 pub mod name;
 pub mod options;
 pub mod outcome;
