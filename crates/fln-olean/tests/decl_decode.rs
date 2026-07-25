@@ -148,3 +148,98 @@ fn budget_exhaustion_is_typed() {
     let r = decoder.decode_module_constants();
     assert!(matches!(r, Err(DeclError::Budget { .. })), "{r:?}");
 }
+
+/// A real pinned declaration decodes to a **DAG, not a tree** (bead `fln-sv7x`).
+///
+/// # The read half of "serialization preserving sharing exactly"
+///
+/// `fln-sv7x` asks for sharing to survive both codecs. Only half of that is even
+/// coherent, and only half is reachable today:
+///
+/// * `fln-hash`'s `Canonical` must be sharing-**independent** — it is documented as
+///   "a value with exactly one canonical encoding under a frozen schema", so a
+///   sharing-sensitive encoder there would give one value many encodings and move
+///   every content-addressed digest with construction history. Pinned separately by
+///   `fln-env`'s `interning_rewrites_sharing_and_canonical_bytes_do_not_move`.
+/// * The **olean** codec is where sharing preservation is a genuine requirement: the
+///   artifact is storage, not an identity preimage, and expanding a shared DAG into a
+///   tree is a real resource defect — `k` levels of two-way sharing become `2^k`
+///   written nodes.
+///
+/// The olean **writer does not exist** (`decode_expr` has no encoder beside it), so the
+/// round trip cannot be asserted yet. This pins the half that does exist and that the
+/// future encoder must match: `DeclDecoder::decode_expr` memoises on the object offset,
+/// so two slots pointing at one object become two references to one `Expr` node rather
+/// than two equal nodes.
+///
+/// # Why the assertion is on node identity rather than on a count
+///
+/// Structural equality cannot see this: a tree and a DAG denoting the same term are
+/// `==`. Neither can a round-trip check, which a sharing-losing decoder also passes. The
+/// only thing that discriminates is pointer identity of the decoded nodes, which is what
+/// this counts — and a failure here means either the decoder expanded, or the chosen
+/// fixture genuinely has no shared subterm, so the message says which to check.
+#[test]
+fn real_declarations_decode_to_shared_dags_not_expanded_trees() {
+    let bytes = fixture("Init.SizeOfLemmas.olean");
+    let view = OleanView::parse(&bytes).expect("parse");
+    let mut decoder = DeclDecoder::new(&view, WalkBudget::default());
+    let infos = decoder.decode_module_constants().expect("decode");
+
+    // Walk one type expression, counting tree POSITIONS against DISTINCT nodes.
+    // A tree has one node per position; a DAG has fewer.
+    fn measure(expr: &fln_core::expr::Expr) -> (usize, std::collections::HashSet<usize>) {
+        use fln_core::expr::ExprNode;
+        let mut positions = 0usize;
+        let mut distinct = std::collections::HashSet::new();
+        let mut stack = vec![expr];
+        while let Some(current) = stack.pop() {
+            positions += 1;
+            distinct.insert(std::ptr::from_ref(current.node()) as usize);
+            match current.node() {
+                ExprNode::App { f, a } => {
+                    stack.push(f);
+                    stack.push(a);
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    stack.push(binder_type);
+                    stack.push(body);
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    stack.push(type_);
+                    stack.push(value);
+                    stack.push(body);
+                }
+                // Both carry their single child under the same field name.
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    stack.push(expr);
+                }
+                _ => {}
+            }
+        }
+        (positions, distinct)
+    }
+
+    let mut shared_declarations = 0usize;
+    for info in &infos {
+        let (positions, distinct) = measure(&info.constant_val().type_);
+        if distinct.len() < positions {
+            shared_declarations += 1;
+        }
+    }
+
+    assert!(
+        shared_declarations > 0,
+        "no decoded declaration retained a shared subterm across {} constants: either \
+         decode_expr stopped memoising on the object offset (the defect this pins), or \
+         this fixture's declarations genuinely contain no shared subterm (pick another)",
+        infos.len()
+    );
+}
