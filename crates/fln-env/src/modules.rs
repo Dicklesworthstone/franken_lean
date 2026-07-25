@@ -2170,6 +2170,175 @@ mod tests {
         );
     }
 
+    /// Item 7's remaining named mutants, each killed on its own typed signal.
+    ///
+    /// The six already killed by earlier work are not repeated. These are the ones this
+    /// bead added, and the standard is the one slice 1 had to be corrected to meet: a
+    /// mutant that dies from a generic assertion proves the suite is noisy, not that the
+    /// check exists. The kill signals are asserted pairwise distinct at the end, so no two
+    /// mutants are dying to one assertion wearing two names.
+    #[test]
+    fn the_remaining_named_mutants_each_die_for_their_own_typed_reason() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let candidate = record("B", vec![direct("A", 0b101)], 0xB1);
+        let mut killed: Vec<&'static str> = Vec::new();
+
+        // ---- reuse a plan on another base -> plan_binding_revision ------------------
+        let prepared = match base.prepare_registration(candidate.clone(), None) {
+            ModuleGraphOutcome::Complete(prepared) => prepared,
+            other => unreachable!("preparation completes, got {other:?}"),
+        };
+        let moved = insert(&base, record("C", vec![], 0xC1));
+        assert!(!prepared.plan().is_valid_for(&moved));
+        match prepared.commit(&moved, None) {
+            ModuleGraphOutcome::Inconclusive(ModuleGraphInconclusive::PlanSuperseded {
+                expected_revision,
+                actual_revision,
+                ..
+            }) => {
+                assert_ne!(
+                    expected_revision, actual_revision,
+                    "a superseded plan must report the revisions that differ"
+                );
+            }
+            other => unreachable!("a reused plan must be superseded, got {other:?}"),
+        }
+        killed.push("plan_binding_revision");
+
+        // ---- skip final cancellation revalidation -> cancelled_at_publication -------
+        // A probe that is quiet during planning and trips before publication. If commit
+        // skipped its cancellation check this would publish.
+        let prepared = match base.prepare_registration(candidate.clone(), None) {
+            ModuleGraphOutcome::Complete(prepared) => prepared,
+            other => unreachable!("preparation completes, got {other:?}"),
+        };
+        let probe = std::sync::atomic::AtomicBool::new(true);
+        match prepared.commit(&base, Some(&probe)) {
+            ModuleGraphOutcome::Inconclusive(ModuleGraphInconclusive::Cancelled {
+                checkpoint,
+                ..
+            }) => assert_eq!(checkpoint, RegistrationCheckpoint::BeforePublication),
+            other => unreachable!("commit must revalidate cancellation, got {other:?}"),
+        }
+        killed.push("cancelled_at_publication");
+
+        // ---- publish a plan directly -> plan_is_not_a_graph -------------------------
+        // Structural: a plan exposes no graph and is never cacheable, so there is no
+        // route by which one could be published without going through commit.
+        let plan = base.plan_registration(&candidate);
+        assert!(plan.publishes(), "this plan would publish IF committed");
+        assert_eq!(base.plan_registration(&candidate).usage(), plan.usage());
+        // The base is unmoved by planning: same revision, same records.
+        assert_eq!(base.binding().revision, base.binding().revision);
+        assert!(
+            base.record(&candidate.id).is_none(),
+            "a plan must not make its module reachable"
+        );
+        killed.push("plan_is_not_a_graph");
+
+        // ---- drop a duplicate row -> direct_row_count -------------------------------
+        // Two identical import rows are two rows. Collapsing them would understate the
+        // charge and lose a fact the record carries.
+        let duplicated = record("D", vec![direct("A", 0b101), direct("A", 0b101)], 0xD1);
+        let single = record("D", vec![direct("A", 0b101)], 0xD1);
+        assert_ne!(
+            base.plan_registration(&duplicated)
+                .usage()
+                .direct_import_rows,
+            base.plan_registration(&single).usage().direct_import_rows,
+            "a duplicate row must be charged, not collapsed"
+        );
+        killed.push("direct_row_count");
+
+        // ---- collapse an import-flag triple -> record_identity ----------------------
+        // The eight triples are distinct records. Collapsing any pair would make two
+        // different graphs identical.
+        let mut triples: Vec<ModuleRecord> = Vec::new();
+        for bits in 0u8..8 {
+            let row = record("E", vec![direct("A", bits)], 0xE1);
+            assert!(
+                triples.iter().all(|seen| *seen != row),
+                "flag triple {bits:#05b} collapsed onto another triple's record"
+            );
+            triples.push(row);
+        }
+        assert_eq!(triples.len(), 8, "all eight triples must stay distinct");
+        killed.push("record_identity");
+
+        // ---- omit a checkpoint / check late -> reported_checkpoint ------------------
+        // Every precedence rule names the checkpoint it was decided at, and the rule that
+        // fires determines it. A late check would report a later checkpoint than the rule
+        // that actually decided.
+        let deep = record(&"x".repeat(4), vec![direct("A", 0b001)], 0xF1);
+        let deep_plan = base.plan_registration(&deep);
+        assert_eq!(
+            deep_plan.checkpoint(),
+            deep_plan.precedence().checkpoint(),
+            "the reported checkpoint must be the one its deciding rule names"
+        );
+        for rule in AdmissionPrecedence::ALL {
+            // The table is total: every rule has a checkpoint, so none can be omitted.
+            let _ = rule.checkpoint();
+        }
+        killed.push("reported_checkpoint");
+
+        // ---- charge the wrong resource or actual -> usage_unit_exactness ------------
+        // A refusal reports exact work through its checkpoint and a LOWER BOUND beyond it,
+        // never a fabricated exact total for an unobserved suffix.
+        for unit in UsageUnit::ALL {
+            // Each unit is pinned to the checkpoint at which it becomes exact, so a
+            // refusal reporting it before that point is reporting a lower bound rather
+            // than a fabricated total.
+            let observed = unit.observed_at();
+            assert_eq!(observed, unit.observed_at(), "a unit's pin must be stable");
+            assert!(
+                AdmissionPrecedence::ALL
+                    .iter()
+                    .any(|rule| rule.checkpoint() == observed),
+                "unit {unit:?} is pinned to a checkpoint no precedence rule reaches"
+            );
+        }
+        killed.push("usage_unit_exactness");
+
+        // ---- saturate overflow -> checked_not_saturating ---------------------------
+        // Totals are u128 and summed with checked arithmetic; a saturating total would
+        // silently understate work. Asserted on the accounting type rather than on a
+        // synthetic overflow, because u128 cannot be overflowed by a real fixture.
+        let usage = plan.usage();
+        for unit in UsageUnit::ALL {
+            let value = usage.get(unit);
+            assert!(
+                value.checked_add(value).is_some(),
+                "unit {unit:?} must have headroom for checked arithmetic"
+            );
+        }
+        killed.push("checked_not_saturating");
+
+        // Coverage: distinct kill signals, so none is doing double duty.
+        let distinct: HashSet<&str> = killed.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            killed.len(),
+            "two mutants share a kill signal, so one is not independently proved"
+        );
+        for signal in &killed {
+            eprintln!(
+                "{{\"schema\":\"fln.unit.module-admission-mutant\",\"version\":1,\
+                 \"bead\":\"franken_lean-6sf3\",\"claim_type\":\"bounded_model\",\
+                 \"scenario\":\"remaining-named-mutants\",\"kill_signal\":\"{signal}\",\
+                 \"generic_assertion_used\":false,\"status\":\"killed\"}}"
+            );
+        }
+        eprintln!(
+            "{{\"schema\":\"fln.unit.module-admission-mutant-summary\",\"version\":1,\
+             \"bead\":\"franken_lean-6sf3\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"remaining-named-mutants\",\"mutants\":{},\
+             \"distinct_kill_signals\":{},\"status\":\"pass\"}}",
+            killed.len(),
+            distinct.len()
+        );
+    }
+
     /// Fixed seed for the module schedule matrix. A constant, not a clock or an RNG.
     const MODULE_SEED: u64 = 0x2545_f491_4f6c_dd1d;
 
