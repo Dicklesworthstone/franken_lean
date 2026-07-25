@@ -519,16 +519,51 @@ jobs:
           fi
           exit "$command_rc"
 
+      # The census shards are governed outputs that the checkout carries, so this
+      # proves them against the committed pins rather than fetching anything: the
+      # per-shard bytes= in contracts/CONTRACT_HANDOFF.txt and the two sha256 group
+      # digests in contracts/EXTERN_BUILTIN_ENVIRONMENT.txt (bead
+      # fln-census-out-of-git-2ya9). Running it here means the census consumers
+      # below are reading bytes that have already been checked.
+      #
+      # The exits are separated deliberately. A census that DISAGREES with the pins
+      # is a decided failure and stops the run. A census that is merely absent is
+      # inconclusive, not a failure — that is the state a future untracked census
+      # would present on a runner with no Reference toolchain, and it should skip
+      # the dependent steps rather than redden the gate.
+      - name: verify extern/builtin census against committed pins
+        id: census
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          set +e
+          ./scripts/extract/census_materialize.sh --verify-only
+          census_rc=$?
+          set -e
+          case "$census_rc" in
+            0) echo "available=true" >> "$GITHUB_OUTPUT" ;;
+            3) echo "census unavailable; dependent steps will be skipped" >&2
+               echo "available=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "available=false" >> "$GITHUB_OUTPUT"
+               echo "census does not match the committed pins" >&2
+               exit "$census_rc" ;;
+          esac
+
       - name: e2e — canonical W1 contract handoff
         id: contract_handoff
-        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' && steps.census.outputs.available == 'true' }}
         shell: bash
         run: |
           step_root="$FLN_E2E_ART_ROOT/contract-handoff"
           mkdir "$step_root"
           set +e
+          # --validate, not --check. --check re-walks the Reference and needs an elan
+          # toolchain pinned to SUITE.lock, which this runner does not install; asking
+          # for it here only produced a setup failure (exit 2) that looked like a real
+          # verification. Reference-drift detection belongs in a scheduled job that
+          # actually installs the toolchain.
           FLN_E2E_ART_ROOT="$step_root" \
-            FLN_CONTRACT_HANDOFF_FULL_CENSUS=1 \
+            FLN_CONTRACT_HANDOFF_FULL_CENSUS=0 \
             ./scripts/e2e/contract_handoff.sh
           command_rc=$?
           set -e

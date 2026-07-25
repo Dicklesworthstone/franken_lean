@@ -124,3 +124,25 @@ __pycache__/
 # E2E run artifacts (NDJSON logs, captured stdout/stderr, scratch fixtures) — every
 # run is reproducible from the scenario script; artifacts are evidence, not source.
 /scripts/e2e/artifacts/
+
+# Proposed future exclusions for the extern/builtin census shards (bead
+# fln-census-out-of-git-2ya9). The paths remain tracked: this block has no effect
+# unless Jeffrey explicitly authorizes removal in a later change.
+#
+# 231.7 MB of the ~232 MB governed contract surface lives in these four files, and
+# they are derived, not authored: gen_extern_census.sh walks a Reference binary
+# pin-verified against SUITE.lock, and every projection is deterministic ("derived,
+# never remembered"). What makes them checkable is committed and tiny — the
+# publication envelope in contracts/EXTERN_BUILTIN_ENVIRONMENT.txt, and the exact
+# bytes=/content-root=/identity= pins per shard in contracts/CONTRACT_HANDOFF.txt.
+#
+# They are still required outputs: structure-guard reads their bytes and the
+# handoff root binds them. A future clean checkout would materialise them before
+# running the gate with
+#   scripts/extract/census_materialize.sh
+# which regenerates from the pin and refuses anything whose bytes disagree with the
+# committed publication envelope and CONTRACT_HANDOFF.txt lengths.
+/contracts/builtin_environment.tsv
+/contracts/builtin_environment.001.tsv
+/contracts/builtin_environment.002.tsv
+/contracts/builtin_partition.tsv

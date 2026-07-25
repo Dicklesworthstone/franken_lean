@@ -81,6 +81,7 @@ INPUT_PATHS=(
   scripts/extract/gen_abi_contract.py scripts/extract/gen_olean_contract.py
   scripts/extract/gen_extern_census.sh scripts/extract/gen_extern_census.lean
   scripts/extract/validate_extern_builtin_census.py
+  scripts/extract/census_materialize.sh
   scripts/e2e/contract_handoff.sh scripts/evidence.py scripts/check.sh
   tools/structure-guard .github/workflows/ci.yml vendor/NOTICE
 )
@@ -341,6 +342,43 @@ note "materializing two retained cold checkouts from commit $SOURCE_COMMIT"
 mkdir -p "$SCRATCH_A" "$SCRATCH_B"
 git archive --format=tar "$SOURCE_COMMIT" | tar -xf - -C "$SCRATCH_A"
 git archive --format=tar "$SOURCE_COMMIT" | tar -xf - -C "$SCRATCH_B"
+
+# The census shards are governed outputs, so a cold checkout must carry them before
+# the census consumers run. While they are tracked `git archive` already supplies
+# them and this is a no-op verification; if they ever become untracked (bead
+# fln-census-out-of-git-2ya9) `git archive` would emit tracked paths only and the
+# checkout would arrive without them, so seed from this worktree.
+#
+# Copying only what is missing keeps the tracked case free of a redundant 231 MB
+# copy per checkout. Seeding from one source rather than materialising each
+# checkout independently is deliberate: this scenario is a determinism test, and
+# both roots must start from identical bytes for a divergence to mean what it
+# claims. Under FULL_CENSUS=1 the regeneration step overwrites these from the
+# pinned Reference anyway.
+seed_census() {
+  local target="$1" shard relative
+  for relative in \
+    contracts/builtin_environment.tsv \
+    contracts/builtin_environment.001.tsv \
+    contracts/builtin_environment.002.tsv \
+    contracts/builtin_partition.tsv; do
+    [ -f "$target/$relative" ] && continue
+    shard="$ROOT/$relative"
+    if [ ! -f "$shard" ]; then
+      echo "[contract_handoff] setup failure: census shard $relative is absent from" \
+        "both the checkout and the worktree; run scripts/extract/census_materialize.sh" >&2
+      exit 2
+    fi
+    cp "$shard" "$target/$relative"
+  done
+  if ! "$target/scripts/extract/census_materialize.sh" --verify-only >&2; then
+    echo "[contract_handoff] setup failure: checkout census does not match the committed pins" >&2
+    exit 2
+  fi
+}
+seed_census "$SCRATCH_A"
+seed_census "$SCRATCH_B"
+
 seal_archived_checkout "$SCRATCH_A"
 seal_archived_checkout "$SCRATCH_B"
 
