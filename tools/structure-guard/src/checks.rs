@@ -54,6 +54,11 @@
 //!   with the exact current join of inventory, policy, and rendered output bytes.
 //! * `FLN-STRUCT-036` contract-handoff authority is inconclusive because publication
 //!   is interrupted, a governed source changed, or a bounded operation exhausted.
+//! * `FLN-STRUCT-037` `fln-checker` reaches a SEMANTIC item across its independence
+//!   boundary — a universe judgment, a traversal-pruning data-word answer, a
+//!   `Canonical` reader, or `fln-bignum` arithmetic. The crate graph cannot express
+//!   this: `fln-checker -> fln-hash` must stay permitted so the wire format is
+//!   shared, while the `Canonical` readers must not be (bead `franken_lean-r0xu`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -839,6 +844,105 @@ fn count_loc(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<usi
         }
     }
     Ok(total)
+}
+
+/// The semantic half of the `fln-checker` independence boundary
+/// (bead `franken_lean-r0xu`; plan §8.3b, `franken_lean-gii`).
+///
+/// `gii` requires `fln-checker` to share "only reviewed data schemas" with
+/// `fln-kernel`. `ci/WORKSPACE_GRAPH.txt` enforces the crate half — no
+/// `fln-kernel`, `fln-olean`, `fln-rt` or `fln-unsafe-*`, and no `fln-env` —
+/// and it **cannot** enforce this half, at any phrasing:
+///
+/// > `fln-checker -> fln-hash` must stay permitted so the wire format and the
+/// > domain tags are shared, while the `Canonical` readers must not be. That
+/// > asymmetry is exactly why an item-level rule is needed.
+///
+/// The same holds one level down: prohibiting `fln-core` would be absurd, since
+/// both implementations need `ExprNode` and `Name` to denote the same term —
+/// yet `Level::is_equiv` inside `fln-core` is a judgment `fln-kernel` returns
+/// directly as its verdict (`tc.rs:949`). Crate granularity is the wrong unit.
+///
+/// A cross-check is worth exactly the questions its two sides answer
+/// *separately*, so each entry below is an answer that would otherwise be
+/// shared — and therefore checked once and believed twice.
+///
+/// Names, not call sites: the rule rejects these identifiers anywhere in
+/// `fln-checker`, including as the checker's *own* definitions. That is
+/// deliberate. A reviewer who reads `is_equiv` in this crate cannot tell the
+/// shared judgment from a local reimplementation, and a boundary that requires
+/// the reader to resolve names is not a boundary. Bare `normalize` is
+/// deliberately **absent**: the checker's own eager normalization legitimately
+/// wants that name, while `normalize_fixpoint` is the distinctive `fln-core`
+/// entry point and is refused.
+fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
+    const SEMANTIC: [(&str, &str); 11] = [
+        (
+            "is_equiv",
+            "universe equivalence is a judgment fln-kernel returns as its verdict (KR-303); \
+             the checker must decide it independently",
+        ),
+        (
+            "normalize_fixpoint",
+            "universe normalization is a judgment; imax/max fixpoint is where unsoundness hides",
+        ),
+        (
+            "loose_bvar_range",
+            "a precomputed answer `instantiate` prunes traversal on (tc.rs:176); \
+             a shared wrong range makes both engines skip the same subterm",
+        ),
+        (
+            "has_fvar",
+            "a precomputed answer the `abstract_*` walks prune on (tc.rs:1645/1707/1779)",
+        ),
+        (
+            "has_expr_mvar",
+            "a precomputed data-word answer, not a schema",
+        ),
+        (
+            "has_level_mvar",
+            "a precomputed data-word answer, not a schema",
+        ),
+        (
+            "has_level_param",
+            "a precomputed data-word answer, not a schema",
+        ),
+        (
+            "approx_depth",
+            "a precomputed data-word answer, not a schema",
+        ),
+        (
+            "read_body",
+            "the Canonical reader: share the wire FORMAT, never the PARSER — decoding is \
+             where franken_lean-d17i measured 37 real defects",
+        ),
+        (
+            "from_canonical_bytes",
+            "the Canonical reader; fln-checker must bring its own decoder (gii)",
+        ),
+        (
+            "fln_bignum",
+            "kernel arithmetic is judgment: KR-313 decides definitional equality by computing, \
+             so a shared sum is a shared verdict",
+        ),
+    ];
+    let wanted: Vec<&str> = SEMANTIC.iter().map(|(name, _)| *name).collect();
+    for site in ledger::identifier_sites(text, &wanted) {
+        let why = SEMANTIC
+            .iter()
+            .find(|(name, _)| *name == site.name)
+            .map(|(_, why)| *why)
+            .unwrap_or("outside the reviewed fln-checker independence boundary");
+        findings.push(Finding {
+            code: "FLN-STRUCT-037",
+            path: format!("{source_rel}:{}", site.line),
+            detail: format!(
+                "`{}` is SEMANTIC across the fln-checker independence boundary: {why}. \
+                 See crates/fln-checker/src/lib.rs for the schema-versus-semantic rule.",
+                site.name
+            ),
+        });
+    }
 }
 
 /// Close the kernel's generated-code authority without treating expanded compiler
@@ -1899,6 +2003,29 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         export_rows.as_ref(),
         &abi_export_sites,
     ));
+
+    // ---- fln-checker independence boundary (bead franken_lean-r0xu) --------------------
+    // `fln-checker` carries no LOC covenant, so the covenant walk below never
+    // visits it; it gets its own pass. This is vacuous while the crate is a
+    // charter stub — which is the only honest moment to install it. A constraint
+    // written after the code exists gets written to whatever the code already
+    // does, because by then someone has working code and a deadline.
+    if let Some(c) = on_disk.get("fln-checker") {
+        let src = c.dir.join("src");
+        let mut checker_sources = Vec::new();
+        collect_rs_files(&src, &mut checker_sources)?;
+        for source in checker_sources {
+            let source_rel = source
+                .strip_prefix(root)
+                .unwrap_or(&source)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
+                continue;
+            };
+            audit_checker_independence_boundary(&text, &source_rel, &mut findings);
+        }
+    }
 
     // ---- line-count covenants ----------------------------------------------------------
     for (crate_name, limit) in &g.covenants {

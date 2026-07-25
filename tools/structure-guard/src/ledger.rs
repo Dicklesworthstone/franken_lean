@@ -618,6 +618,27 @@ fn is_rust_keyword(text: &str) -> bool {
     )
 }
 
+/// Every occurrence of a `wanted` identifier, as a lexeme rather than as text.
+///
+/// Lexing rather than substring-matching is the whole point here: the file that
+/// *defines* an independence boundary necessarily names every symbol the
+/// boundary forbids, in prose. `rust_lexemes` discards line comments, block
+/// comments and string literals, so a doc comment that says "never call
+/// `is_equiv`" does not report itself as a violation.
+pub fn identifier_sites(text: &str, wanted: &[&str]) -> Vec<NamedMacroSite> {
+    let mut sites: Vec<NamedMacroSite> = rust_lexemes(text)
+        .into_iter()
+        .filter(|lexeme| wanted.contains(&lexeme.text.as_str()))
+        .map(|lexeme| NamedMacroSite {
+            line: lexeme.line,
+            name: lexeme.text,
+        })
+        .collect();
+    sites.sort_by(|left, right| (&left.name, left.line).cmp(&(&right.name, right.line)));
+    sites.dedup();
+    sites
+}
+
 pub fn macro_invocations(text: &str) -> Vec<NamedMacroSite> {
     let lexemes = rust_lexemes(text);
     let mut sites = Vec::new();

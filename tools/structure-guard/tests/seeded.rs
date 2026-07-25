@@ -1104,3 +1104,106 @@ fn missing_census_fails_closed_when_status_exists() {
     ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-026"]);
 }
+
+// ---------------------------------------------------------------- fln-checker boundary
+
+/// The independence boundary (`FLN-STRUCT-037`, bead `franken_lean-r0xu`).
+///
+/// The rule is vacuous against the real tree today, because `fln-checker` is a
+/// charter crate with no checking code. A guard that has only ever been observed
+/// passing is an unenforced claim, which is the failure class this suite exists
+/// to prevent — so every entry in the semantic inventory is planted here and
+/// asserted to fire.
+const CHECKER_SEMANTIC_INVENTORY: [&str; 11] = [
+    "is_equiv",
+    "normalize_fixpoint",
+    "loose_bvar_range",
+    "has_fvar",
+    "has_expr_mvar",
+    "has_level_mvar",
+    "has_level_param",
+    "approx_depth",
+    "read_body",
+    "from_canonical_bytes",
+    "fln_bignum",
+];
+
+#[test]
+fn the_checker_boundary_baseline_is_clean() {
+    let ws = TempWs::new("checker-boundary-baseline");
+    base(&ws);
+    let out = ws.run();
+    assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
+}
+
+/// One planted violation per inventory item. Each must fire on its own, so a
+/// single over-broad matcher cannot make the suite look green.
+#[test]
+fn every_semantic_item_is_refused_inside_fln_checker() {
+    for item in CHECKER_SEMANTIC_INVENTORY {
+        let ws = TempWs::new(&format!("checker-boundary-{item}"));
+        base(&ws);
+        ws.write(
+            "crates/fln-checker/src/lib.rs",
+            &format!(
+                "//! stub\n#![forbid(unsafe_code)]\n\npub fn probe() -> bool {{\n    {item}()\n}}\n"
+            ),
+        );
+        let out = ws.run();
+        assert_eq!(
+            codes(&out),
+            vec!["FLN-STRUCT-037"],
+            "planting `{item}` inside fln-checker was not refused"
+        );
+        assert!(
+            out.findings[0].detail.contains(item),
+            "the finding must name the item it refused: {:?}",
+            out.findings[0]
+        );
+    }
+}
+
+/// The property that makes the rule usable at all: the file that DEFINES the
+/// boundary necessarily names every forbidden symbol in prose, so a substring
+/// matcher would flag the boundary document itself. Lexing must see through
+/// line comments, block comments and string literals.
+///
+/// Without this the rule would have been self-defeating — the real
+/// `crates/fln-checker/src/lib.rs` names all eleven items in its doc comments.
+#[test]
+fn naming_a_semantic_item_in_prose_is_not_a_violation() {
+    let ws = TempWs::new("checker-boundary-prose");
+    base(&ws);
+    let mut src = String::from("//! stub\n#![forbid(unsafe_code)]\n");
+    for item in CHECKER_SEMANTIC_INVENTORY {
+        src.push_str(&format!("//! never call `{item}` from this crate.\n"));
+        src.push_str(&format!("/* block: {item} is SEMANTIC */\n"));
+    }
+    src.push_str("pub fn doc() -> &'static str {\n    \"is_equiv fln_bignum read_body\"\n}\n");
+    ws.write("crates/fln-checker/src/lib.rs", &src);
+    let out = ws.run();
+    assert!(
+        out.findings.is_empty(),
+        "prose and string literals must not trip the boundary: {:?}",
+        out.findings
+    );
+}
+
+/// The refusal is scoped to `fln-checker`. The same identifiers are ordinary
+/// code elsewhere — `fln-kernel` calls `is_equiv` and `has_fvar` constantly —
+/// so a rule that fired workspace-wide would be unusable.
+#[test]
+fn the_boundary_is_scoped_to_fln_checker_alone() {
+    let ws = TempWs::new("checker-boundary-scope");
+    base(&ws);
+    ws.write(
+        "crates/fln-env/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn probe() -> bool {\n    is_equiv()\n}\n",
+    );
+    let out = ws.run();
+    assert!(
+        out.findings.is_empty(),
+        "the boundary must not fire outside fln-checker: {:?}",
+        out.findings
+    );
+}
