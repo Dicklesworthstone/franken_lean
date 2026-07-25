@@ -28,7 +28,7 @@ use crate::extensions::{
 #[cfg(test)]
 use crate::extensions::{MergeSemantics, PayloadProvenance};
 use crate::modules::{CancellationProbe, ModuleEpoch};
-use crate::pmap::{CollisionBudget, CollisionExhausted, PKey, PMap};
+use crate::pmap::{CollisionBudget, PKey, PMap};
 use crate::terms::WeightBudget;
 
 /// Stable `Domain::DeclContent` tags. These are schema values, not Rust enum
@@ -278,53 +278,29 @@ impl PreparedDeclarationAdmission {
                 DeclarationCheckpoint::BeforePublication.to_string(),
             ));
         }
-        match env.constants.try_insert_with_budget(
-            name,
-            Arc::clone(&self.info),
-            self.admission_weight,
-            self.collision_budget,
-        ) {
-            Ok(constants) => {
-                Outcome::complete(DeclarationCommitted::Published(DeclarationPublication {
+        // The PMap insert now speaks the shared vocabulary, so this is a fold rather than a
+        // translation. The `InternalFault` that used to live here — for a collision overage
+        // that could not be expressed in `ResourceUsage`'s `u64` fields — is GONE, because
+        // `CollisionBudget::max_expanded_weight` is now a `u64` limit and the numbers fit by
+        // construction (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`). Deleting it
+        // is how that bead proves it closed the gap instead of papering it.
+        env.constants
+            .try_insert_with_budget(
+                name,
+                Arc::clone(&self.info),
+                self.admission_weight,
+                self.collision_budget,
+            )
+            .map_complete(|constants| {
+                DeclarationCommitted::Published(DeclarationPublication {
                     environment: Environment {
                         constants,
                         extensions: env.extensions.clone(),
                     },
                     digest: self.provisional_digest,
                     usage: self.usage,
-                }))
-            }
-            // `CollisionExhausted` reports `u128` deliberately, so an exact overage
-            // survives instead of wrapping; `ResourceUsage` is `u64`. When the numbers
-            // fit, translate them. When they do not, there is no truthful `u64` stop to
-            // emit: clamping both to `u64::MAX` would produce `observed == allowed` —
-            // the self-contradictory stop `CollisionExhausted`'s own documentation
-            // exists to avoid, and `is_genuine_exhaustion` would then deny that a stop
-            // happened at all. Fabricating a gap to keep the invariant would be worse.
-            // `franken_lean-pmap-refusal-outcome-taxonomy-i1z9` owns closing this.
-            Err(exhausted) => {
-                match (
-                    u64::try_from(exhausted.limit),
-                    u64::try_from(exhausted.attempted),
-                ) {
-                    (Ok(allowed), Ok(observed)) => Outcome::Inconclusive(
-                        Inconclusive::resource(ResourceUsage {
-                            reason: ResourceReason::StructuralBudget {
-                                unit: StructuralUnit::ProducedNodes,
-                            },
-                            allowed,
-                            observed,
-                        })
-                        .with_progress("pmap-admission"),
-                    ),
-                    _ => Outcome::InternalFault(InternalFault::new(
-                        "fln-env.declaration-admission.untranslatable-collision-stop",
-                        "collision-budget overage exceeds the u64 ResourceUsage fields; \
-                         franken_lean-pmap-refusal-outcome-taxonomy-i1z9 owns the fix",
-                    )),
-                }
-            }
-        }
+                })
+            })
     }
 }
 
@@ -801,6 +777,15 @@ impl std::fmt::Display for EnvError {
 /// load-bearing — a rejection says *this declaration is not admissible*, while an
 /// inconclusive says *we did not find out*, and only the first may ever be cached,
 /// counted, or reported as a verdict.
+/// # Migrated onto the shared taxonomy
+/// (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`)
+///
+/// The `Inconclusive` arm used to carry a bespoke `CollisionExhausted`, which was a
+/// `std::error::Error` — so a non-answer could be `?`-propagated into an ordinary error
+/// path and reported as a failure. It now carries the shared [`Inconclusive`], the same
+/// value every other bounded path in this crate reports, so folding several bounded
+/// operations no longer needs a special case for this one. Special cases are where an
+/// inconclusive gets read as a rejection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeclAdmission {
     /// The declaration entered the returned environment.
@@ -812,7 +797,11 @@ pub enum DeclAdmission {
     /// rejected, not checked, not cacheable; the receiving environment is unchanged.
     /// A hash collision alone never produces this — only a collision large or heavy
     /// enough to exceed the reviewed envelope does.
-    Inconclusive(CollisionExhausted),
+    Inconclusive(Inconclusive),
+    /// A broken internal invariant. Not a verdict about the declaration and not a
+    /// resource stop — a fourth arm rather than a reuse of either, because reusing one
+    /// would make a fault indistinguishable from the thing it was folded into.
+    InternalFault(InternalFault),
 }
 
 impl DeclAdmission {
@@ -823,6 +812,7 @@ impl DeclAdmission {
             DeclAdmission::Admitted(_) => "admitted",
             DeclAdmission::Rejected(_) => "rejected",
             DeclAdmission::Inconclusive(_) => "inconclusive-collision-budget",
+            DeclAdmission::InternalFault(_) => "internal-fault",
         }
     }
 
@@ -838,7 +828,9 @@ impl DeclAdmission {
     pub fn environment(&self) -> Option<&Environment> {
         match self {
             DeclAdmission::Admitted(environment) => Some(environment),
-            DeclAdmission::Rejected(_) | DeclAdmission::Inconclusive(_) => None,
+            DeclAdmission::Rejected(_)
+            | DeclAdmission::Inconclusive(_)
+            | DeclAdmission::InternalFault(_) => None,
         }
     }
 
@@ -963,11 +955,17 @@ impl Environment {
             .constants
             .try_insert_with_budget(name, Arc::new(info), expanded_weight, budget)
         {
-            Ok(constants) => DeclAdmission::Admitted(Environment {
+            Outcome::Complete(constants) => DeclAdmission::Admitted(Environment {
                 constants,
                 extensions: self.extensions.clone(),
             }),
-            Err(exhausted) => DeclAdmission::Inconclusive(exhausted),
+            Outcome::Inconclusive(stop) => DeclAdmission::Inconclusive(stop),
+            // A fault is neither a verdict nor an exhaustion, so it gets its own arm. The
+            // bounded insert has no fault path today and this is unreachable — but mapping
+            // it onto `Rejected` would launder a broken invariant into "this declaration is
+            // inadmissible", and onto `Inconclusive` would report it as a budget stop.
+            // Both are the conflation this bead exists to remove.
+            Outcome::InternalFault(fault) => DeclAdmission::InternalFault(fault),
         }
     }
 
@@ -3828,8 +3826,22 @@ mod tests {
         let DeclAdmission::Inconclusive(exhausted) = &outcome else {
             unreachable!("asserted inconclusive above")
         };
-        assert_eq!(exhausted.resource, CollisionResource::Entries);
-        assert_eq!(exhausted.limit, 0);
+        // The refusal's finer facts moved from typed fields onto the shared outcome when
+        // the PMap stop folded onto the FL-INV-07 taxonomy: the numbers are in
+        // `ResourceUsage`, and which collision resource tripped is in `progress`.
+        let fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } = &exhausted.cause
+        else {
+            unreachable!("a collision-budget stop is resource exhaustion")
+        };
+        assert_eq!(usage.allowed, 0);
+        assert!(
+            exhausted
+                .progress
+                .as_ref()
+                .is_some_and(|p| p.text().contains("collision_entries")),
+            "the refused resource must remain identifiable: {:?}",
+            exhausted.progress
+        );
 
         // Atomic: the receiver is untouched, down to its logical root.
         assert!(!base.contains(&n("Fresh")));
