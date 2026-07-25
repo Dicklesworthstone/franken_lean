@@ -31,3 +31,4 @@ pub mod extensions;
 pub mod modules;
 pub mod pmap;
 pub mod provenance;
+pub mod terms;
