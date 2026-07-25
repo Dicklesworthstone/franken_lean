@@ -147,6 +147,23 @@ pub fn lex_run(text: &SourceText, table: &TokenTable) -> LexRun {
     }
 }
 
+/// Lex from an arbitrary offset, which must be a **resumable point**.
+///
+/// A resumable point is the start of a [`Event::Trivia`] event in a run of the same text: that
+/// is the driver's loop head, and lexing there reproduces exactly the tail of the run from that
+/// event. `lexer_state_model` asserts that as a law in both directions — including that
+/// resuming at a *token's* offset does not reproduce the tail, so the restriction is a real
+/// constraint rather than a convention.
+///
+/// Exposed because incremental re-lexing is not the only consumer that needs it: a parser
+/// re-entering a region, a diagnostic re-scanning a line, and the model suite all want the same
+/// entry point, and a second driver would be a second thing to drift.
+pub fn lex_run_from(text: &SourceText, table: &TokenTable, from: BytePos) -> LexRun {
+    LexRun {
+        events: lex_from(text, table, from),
+    }
+}
+
 /// The driver, from an arbitrary offset. Shared by the full and incremental paths so there is
 /// exactly one definition of what a run is — two drivers would be two things to drift, which
 /// is the same argument that keeps recovery from having its own lexer.
