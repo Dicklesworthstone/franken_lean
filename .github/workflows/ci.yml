@@ -510,7 +510,7 @@ jobs:
           fi
           exit "$command_rc"
 
-      - name: e2e smoke — environment collision determinism
+      - name: e2e smoke — environment collision determinism and resource bounds
         id: environment_collision
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
         shell: bash
@@ -527,6 +527,7 @@ jobs:
             find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
           )
           artifact=""
+          resource_artifact=""
           capture_rc=0
           if (( ${#parent_bundles[@]} != 1 )); then
             echo "environment collision lane published ${#parent_bundles[@]} parent bundles; expected exactly one" >&2
@@ -539,9 +540,17 @@ jobs:
             else
               artifact="$candidate"
             fi
+            resource_candidate="${parent_bundles[0]}/resource-collision-fln-amv.13"
+            if [[ -L "$resource_candidate" || ! -d "$resource_candidate" ]]; then
+              echo "environment resource collision child bundle is missing or not a real directory: $resource_candidate" >&2
+              capture_rc=2
+            else
+              resource_artifact="$resource_candidate"
+            fi
           fi
           {
             printf 'artifact_path=%s\n' "$artifact"
+            printf 'resource_artifact_path=%s\n' "$resource_artifact"
             printf 'command_exit=%s\n' "$command_rc"
           } >> "$GITHUB_OUTPUT"
           if (( capture_rc != 0 )); then
@@ -628,6 +637,7 @@ jobs:
           CLOSURE_ARTIFACT: ${{ steps.closure_audit.outputs.artifact_path }}
           CLOSURE_EXIT: ${{ steps.closure_audit.outputs.command_exit }}
           ENVIRONMENT_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.artifact_path }}
+          ENVIRONMENT_RESOURCE_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.resource_artifact_path }}
           ENVIRONMENT_COLLISION_EXIT: ${{ steps.environment_collision.outputs.command_exit }}
           VELLUM_NAMING_ARTIFACT: ${{ steps.vellum_naming.outputs.artifact_path }}
           VELLUM_NAMING_EXIT: ${{ steps.vellum_naming.outputs.command_exit }}
@@ -707,7 +717,14 @@ jobs:
                   os.environ.get("ENVIRONMENT_COLLISION_ARTIFACT", ""),
                   os.environ.get("ENVIRONMENT_COLLISION_EXIT", ""),
                   e2e_root / "environment-collision",
-                  "nested",
+                  "collision-fln-amv.10",
+              ),
+              (
+                  "environment_resource_collision",
+                  os.environ.get("ENVIRONMENT_RESOURCE_COLLISION_ARTIFACT", ""),
+                  os.environ.get("ENVIRONMENT_COLLISION_EXIT", ""),
+                  e2e_root / "environment-collision",
+                  "resource-collision-fln-amv.13",
               ),
               (
                   "vellum_naming",
@@ -738,7 +755,7 @@ jobs:
               if artifact.is_symlink() or not artifact.is_dir():
                   raise SystemExit(f"{label} artifact is not a real directory: {artifact}")
               artifact = artifact.resolve(strict=True)
-              if is_child == "nested":
+              if isinstance(is_child, str):
                   expected = expected.resolve(strict=True)
                   parent = artifact.parent
                   if parent.parent != expected:
@@ -746,7 +763,7 @@ jobs:
                           f"{label} artifact escaped its isolated nested root: {artifact}"
                       )
                   parents = list(expected.iterdir())
-                  if parents != [parent] or artifact.name != "collision-fln-amv.10":
+                  if parents != [parent] or artifact.name != is_child:
                       raise SystemExit(
                           f"{label} root does not contain exactly its named parent/child bundle"
                       )
