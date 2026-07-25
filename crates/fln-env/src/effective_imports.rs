@@ -617,6 +617,27 @@ pub fn compute_effective_imports(
                 }
 
                 if let Some(existing) = closure.states.get_mut(&import.module) {
+                    // THIS CLONE IS A TRANSACTION BOUNDARY. DO NOT REMOVE IT.
+                    //
+                    // It reads like pure waste — on the common non-upgrading edge the clone is
+                    // built and dropped — and it was flagged as exactly that by an allocation
+                    // audit under `franken_lean-mvak` before the audit was checked. Recording why
+                    // it is wrong here, because the next reader will have the same idea.
+                    //
+                    // `merge_state` mutates MORE than the condition it reports. `changed` is
+                    // "exactly the Reference five-field update condition" (see its doc), while the
+                    // body also fills witnesses via `retain_first_witness` and accumulates
+                    // `ir_requested`. So merging into `existing` directly would publish those two
+                    // even on paths that must not publish anything.
+                    //
+                    // The path that must not publish is immediately below: when the state-upgrade
+                    // budget is exhausted, `report_inconclusive` returns THIS closure, and an
+                    // FL-INV-07 non-answer must not carry a half-applied upgrade. Merging in place
+                    // would leave the refused module upgraded in the returned closure — a resource
+                    // stop that mutated the thing it declined to compute.
+                    //
+                    // `every_limit_is_typed_and_stops_before_over_budget_semantic_work` pins that,
+                    // so an in-place merge fails the suite rather than passing quietly.
                     let mut merged = existing.clone();
                     let upgraded = merge_state(&mut merged, candidate.state);
                     if !upgraded {
@@ -1911,7 +1932,29 @@ mod tests {
             ));
             if resource == ClosureResource::StateUpgrades {
                 assert_eq!(report.facts.state_upgrades, 0);
-                assert!(!report.closure.state(&id("A")).unwrap().import_all);
+                // ATOMICITY OF THE REFUSED UPGRADE, checked across everything `merge_state`
+                // touches rather than on one field.
+                //
+                // The five-field condition is what `merge_state` REPORTS, but its body also
+                // fills witnesses and accumulates `ir_requested`. Asserting only `import_all`
+                // leaves those two unpinned, so a merge that published them on the refused path
+                // would pass. They are the fields most at risk precisely because they sit
+                // outside the reported condition.
+                let refused = report.closure.state(&id("A")).unwrap();
+                assert!(
+                    !refused.import_all,
+                    "a refused upgrade must not publish the five-field merge"
+                );
+                assert!(
+                    !refused.ir_requested,
+                    "`ir_requested` is accumulated OUTSIDE the reported condition, so a refused \
+                     upgrade is exactly where it can leak"
+                );
+                assert!(
+                    refused.witnesses.import_all.is_none(),
+                    "`retain_first_witness` also runs outside the reported condition; a refused \
+                     upgrade must not leave the witness for a component it declined to set"
+                );
             }
         }
     }
