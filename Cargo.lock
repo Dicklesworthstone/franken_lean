@@ -116,6 +116,10 @@ dependencies = [
 [[package]]
 name = "fln-parse"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-syntax",
+]
 
 [[package]]
 name = "fln-rt"
