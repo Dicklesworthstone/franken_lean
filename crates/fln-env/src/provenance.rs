@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use fln_core::name::Name;
 use fln_hash::canon::{CanonError, CanonReader, CanonWriter, Canonical, SchemaId};
-use fln_hash::domain::{Digest, Domain, hash};
+use fln_hash::domain::{Digest, Domain, DomainHasher, hash};
 
 use crate::extensions::{
     CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
@@ -2057,7 +2057,22 @@ fn encode_manifest(epoch: &ModuleEpoch, records: &[ModuleContributionRecord]) ->
     writer.into_bytes()
 }
 
+/// One record's canonical encoding, as the four families that partition it.
+///
+/// The families are not a second encoding: [`write_contribution_record`] is exactly
+/// these four in this order, so a family's bytes are literally the slice of the
+/// committed canonical bytes that family owns. `subdigests_partition_the_canonical_
+/// encoding_without_gap_or_overlap` asserts that with zero residue, which is what
+/// makes a subdigest a projection of the record rather than an opinion about it.
 fn write_contribution_record(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
+    write_topology_family(record, writer);
+    write_artifact_family(record, writer);
+    write_contribution_family(record, writer);
+    write_completeness_family(record, writer);
+}
+
+/// Module identity and the import edges: who this module is and what it sees.
+fn write_topology_family(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
     record.module.id.name().write_body(writer);
     writer.bool(record.module.is_module);
     writer.u64(record.module.direct_imports().len() as u64);
@@ -2067,10 +2082,18 @@ fn write_contribution_record(record: &ModuleContributionRecord, writer: &mut Can
         writer.bool(import.is_exported);
         writer.bool(import.is_meta);
     }
+}
+
+/// The serialized artifact this record was read from: content digest, producer, grade.
+fn write_artifact_family(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
     writer.bytes(&record.module.artifact.content_digest.0);
     writer.u8(artifact_producer_tag(record.module.artifact.producer));
     writer.u8(artifact_grade_tag(record.module.artifact.grade));
+}
 
+/// What the module contributed: declarations, generated declarations, and the
+/// extension entries with their descriptors and journal anchors.
+fn write_contribution_family(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
     writer.u64(record.declarations.len() as u64);
     for name in record.declarations.iter() {
         name.write_body(writer);
@@ -2095,6 +2118,10 @@ fn write_contribution_record(record: &ModuleContributionRecord, writer: &mut Can
             writer.bytes(&entry.digest().0);
         }
     }
+}
+
+/// How much of the module was actually captured, and how legible its payloads are.
+fn write_completeness_family(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
     writer.u8(capture_status_tag(record.completeness.capture));
     writer.u8(payload_transparency_tag(record.completeness.transparency));
     writer.u64(record.completeness.missing_dependencies.len() as u64);
@@ -2491,6 +2518,161 @@ fn read_payload_transparency(tag: u8) -> Result<PayloadTransparency, ModuleProve
             what: "unknown payload transparency tag",
         }),
     }
+}
+
+/// The four families that partition a record's canonical encoding.
+///
+/// Order is the order they appear in [`write_contribution_record`], and that is not a
+/// coincidence to be maintained by hand: the partition test rebuilds the canonical
+/// bytes from these four and requires zero residue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProvenanceFamily {
+    /// Module identity and import edges.
+    Topology,
+    /// The serialized artifact the record was read from.
+    Artifact,
+    /// Declarations, generated declarations, and extension entries.
+    Contribution,
+    /// Capture status, payload transparency, and missing dependencies.
+    Completeness,
+}
+
+impl ProvenanceFamily {
+    /// Every family, in canonical (encoding) order.
+    pub const ALL: [ProvenanceFamily; 4] = [
+        Self::Topology,
+        Self::Artifact,
+        Self::Contribution,
+        Self::Completeness,
+    ];
+
+    /// Domain-separation tag. Distinct per family so that two families whose bytes
+    /// happen to coincide cannot produce the same subdigest, and versioned so a
+    /// layout change cannot silently reuse a published value.
+    const fn tag(self) -> &'static [u8] {
+        match self {
+            Self::Topology => b"fln.module-provenance.subdigest.topology/1",
+            Self::Artifact => b"fln.module-provenance.subdigest.artifact/1",
+            Self::Contribution => b"fln.module-provenance.subdigest.contribution/1",
+            Self::Completeness => b"fln.module-provenance.subdigest.completeness/1",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Topology => 0,
+            Self::Artifact => 1,
+            Self::Contribution => 2,
+            Self::Completeness => 3,
+        }
+    }
+
+    /// Write this family's slice of one record. Dispatches to the very functions
+    /// [`write_contribution_record`] calls, so there is no second encoder to drift.
+    fn write(self, record: &ModuleContributionRecord, writer: &mut CanonWriter) {
+        match self {
+            Self::Topology => write_topology_family(record, writer),
+            Self::Artifact => write_artifact_family(record, writer),
+            Self::Contribution => write_contribution_family(record, writer),
+            Self::Completeness => write_completeness_family(record, writer),
+        }
+    }
+
+    const fn disagreement(self) -> &'static str {
+        match self {
+            Self::Topology => "topology subdigest disagrees with the committed records",
+            Self::Artifact => "artifact subdigest disagrees with the committed records",
+            Self::Contribution => "contribution subdigest disagrees with the committed records",
+            Self::Completeness => "completeness subdigest disagrees with the committed records",
+        }
+    }
+}
+
+/// Named per-family digests, for diagnosis only.
+///
+/// **These are projections, not identities.** [`ModuleProvenanceRoot`] is computed
+/// from the canonical bytes and never from these values; deriving, holding, or
+/// dropping subdigests cannot move it. Their purpose is to answer *which family
+/// changed* when two manifests disagree — a question the aggregate root deliberately
+/// cannot answer, because one root over everything is what makes it an identity.
+///
+/// They are typed as [`Digest`] and never as [`ModuleProvenanceRoot`], and no
+/// constructor here produces a root. A subdigest is therefore not a thing that can be
+/// passed where an identity is expected, which is the structural half of "never
+/// authoritative"; the tested half is that none of them equals the root and that
+/// tampering with one is a fault rather than a second opinion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleProvenanceSubdigests {
+    /// Indexed by [`ProvenanceFamily::index`].
+    digests: [Digest; 4],
+    /// The aggregate root these were derived from. A back reference, never an
+    /// identity of its own.
+    derived_from: ModuleProvenanceRoot,
+}
+
+impl ModuleProvenanceSubdigests {
+    /// Derive one digest per family from the manifest's committed records.
+    pub fn derive(manifest: &ModuleProvenanceManifest) -> Self {
+        let records = manifest.records();
+        Self {
+            digests: ProvenanceFamily::ALL.map(|family| family_subdigest(family, records)),
+            derived_from: manifest.root(),
+        }
+    }
+
+    /// This family's digest.
+    pub fn of(&self, family: ProvenanceFamily) -> Digest {
+        self.digests[family.index()]
+    }
+
+    /// The aggregate root these were derived from.
+    pub fn derived_from(&self) -> ModuleProvenanceRoot {
+        self.derived_from
+    }
+
+    /// Re-derive and confirm every family still agrees with the committed records.
+    ///
+    /// Names the family that disagrees, because the whole point of the subdigests is
+    /// to localize a disagreement the root can only report as "different".
+    pub fn verify(&self, manifest: &ModuleProvenanceManifest) -> Result<(), ModuleProvenanceError> {
+        if self.derived_from != manifest.root() {
+            return Err(ModuleProvenanceError::InternalFault {
+                what: "subdigest projection was derived from a different committed root",
+                held: self.derived_from,
+                recomputed: manifest.root(),
+            });
+        }
+        let rebuilt = Self::derive(manifest);
+        for family in ProvenanceFamily::ALL {
+            if rebuilt.of(family) != self.of(family) {
+                return Err(ModuleProvenanceError::GraphAdmissionFault {
+                    what: family.disagreement(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Hash one family's slice across every record.
+///
+/// The record count is bound first so that a family whose per-record bytes are empty
+/// (an artifact-only manifest, say) still distinguishes two records from three, and
+/// the byte length is bound before the bytes so no two family encodings can be
+/// concatenation-confused.
+fn family_subdigest(family: ProvenanceFamily, records: &[ModuleContributionRecord]) -> Digest {
+    let mut writer = CanonWriter::new();
+    writer.u64(records.len() as u64);
+    for record in records {
+        family.write(record, &mut writer);
+    }
+    let bytes = writer.into_bytes();
+    let mut hasher = DomainHasher::new(Domain::ModuleProvenance);
+    hasher.update(family.tag());
+    hasher.update(&[0]);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    hasher.finalize()
 }
 
 /// Where one extension entry occurrence lives: the contributing module, its
@@ -3902,6 +4084,261 @@ mod tests {
                 .verify(&manifest),
             Ok(())
         );
+    }
+
+    /// A manifest identical to `sample_manifest` except in exactly one family.
+    ///
+    /// Every variant edits one field of module `A` and nothing else, so "only this
+    /// subdigest moved" is a statement about the family partition rather than about
+    /// how much of the fixture the edit happened to touch.
+    fn single_family_variant(family: ProvenanceFamily) -> ModuleProvenanceManifest {
+        let mut records = sample_records();
+        let a = &records[0];
+        let (module, declarations, extra, contributions, completeness) = (
+            a.module.clone(),
+            a.declarations.to_vec(),
+            a.extra_declarations.to_vec(),
+            a.extension_contributions.to_vec(),
+            a.completeness.clone(),
+        );
+        records[0] = match family {
+            // One import flag flips: import_all on A's existing edge to B. The graph
+            // itself is untouched, so nothing outside topology can move.
+            ProvenanceFamily::Topology => ModuleContributionRecord::new(
+                ModuleRecord::new(
+                    id("A"),
+                    true,
+                    vec![
+                        DirectImport::new(id("B"), true, true, false),
+                        DirectImport::new(id("Ghost"), true, false, true),
+                    ],
+                    evidence(0xA1),
+                ),
+                declarations,
+                extra,
+                contributions,
+                completeness,
+            ),
+            // A different serialized artifact behind the same module.
+            ProvenanceFamily::Artifact => ModuleContributionRecord::new(
+                ModuleRecord::new(
+                    id("A"),
+                    true,
+                    module.direct_imports().to_vec(),
+                    evidence(0xA9),
+                ),
+                declarations,
+                extra,
+                contributions,
+                completeness,
+            ),
+            // One declaration renamed.
+            ProvenanceFamily::Contribution => ModuleContributionRecord::new(
+                module,
+                vec![name("A.one"), name("A.three")],
+                extra,
+                contributions,
+                completeness,
+            ),
+            // Capture downgraded, alone. It has to be capture: transparency is
+            // *recomputed* from the descriptors and refused if it disagrees
+            // (`PayloadTransparencyMismatch`), so it is not independently settable in
+            // validated state. Capture is knowledge from outside the record and is the
+            // one completeness field a variant can move on its own.
+            ProvenanceFamily::Completeness => ModuleContributionRecord::new(
+                module,
+                declarations,
+                extra,
+                contributions,
+                ProvenanceCompleteness::new(
+                    CaptureStatus::Partial,
+                    PayloadTransparency::Understood,
+                    vec![id("Ghost")],
+                ),
+            ),
+        };
+        ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+            .expect("single-family variant validates")
+    }
+
+    /// The subdigests are a partition of the committed canonical bytes, not a second
+    /// encoding of the same facts. Header plus the four families, in canonical order,
+    /// must reproduce the manifest byte for byte with zero residue -- which is what
+    /// makes each one a projection of the record rather than an opinion about it.
+    #[test]
+    fn subdigests_partition_the_canonical_encoding_without_gap_or_overlap() {
+        let manifest = sample_manifest();
+        let canonical = manifest.to_canonical_bytes();
+
+        let mut header = CanonWriter::new();
+        header.schema(MODULE_PROVENANCE_SCHEMA);
+        header.str(manifest.epoch().tag());
+        header.str(manifest.epoch().commit());
+        header.u64(manifest.records().len() as u64);
+        let header = header.into_bytes();
+
+        let mut rebuilt = header.clone();
+        let mut family_bytes = 0usize;
+        for record in manifest.records() {
+            for family in ProvenanceFamily::ALL {
+                let mut writer = CanonWriter::new();
+                family.write(record, &mut writer);
+                let bytes = writer.into_bytes();
+                family_bytes += bytes.len();
+                rebuilt.extend_from_slice(&bytes);
+            }
+        }
+
+        assert_eq!(
+            rebuilt, canonical,
+            "the four families do not partition the record encoding"
+        );
+        // The same statement as arithmetic: every canonical byte is either header --
+        // which belongs to no family by design -- or owned by exactly one family.
+        assert_eq!(header.len() + family_bytes, canonical.len(), "residue");
+
+        // And no family is a no-op, so `ALL` is not carrying a decorative variant.
+        for family in ProvenanceFamily::ALL {
+            let mut writer = CanonWriter::new();
+            for record in manifest.records() {
+                family.write(record, &mut writer);
+            }
+            assert!(
+                !writer.into_bytes().is_empty(),
+                "family {family:?} owns no bytes"
+            );
+        }
+    }
+
+    /// Subdigests answer *which family changed* -- the one question the aggregate root
+    /// cannot answer, because one root over everything is what makes it an identity.
+    /// They must earn that without ever becoming an identity themselves.
+    #[test]
+    fn subdigests_localize_a_change_and_are_never_authoritative() {
+        let manifest = sample_manifest();
+        let root_before = manifest.root();
+        let bytes_before = manifest.to_canonical_bytes();
+        let subdigests = ModuleProvenanceSubdigests::derive(&manifest);
+
+        assert_eq!(subdigests.verify(&manifest), Ok(()));
+        assert_eq!(subdigests.derived_from(), root_before);
+
+        // NEVER AUTHORITATIVE: deriving and dropping cannot move the identity, and no
+        // family digest is ever equal to the aggregate root.
+        let _ = ModuleProvenanceSubdigests::derive(&manifest);
+        assert_eq!(manifest.root(), root_before, "a subdigest moved the root");
+        assert_eq!(manifest.to_canonical_bytes(), bytes_before);
+        for family in ProvenanceFamily::ALL {
+            assert_ne!(
+                subdigests.of(family),
+                root_before.0,
+                "{family:?} subdigest equals the aggregate root"
+            );
+        }
+        // Mutually distinct on this fixture: the per-family tags are doing work.
+        for (position, family) in ProvenanceFamily::ALL.iter().enumerate() {
+            for other in &ProvenanceFamily::ALL[position + 1..] {
+                assert_ne!(
+                    subdigests.of(*family),
+                    subdigests.of(*other),
+                    "{family:?} and {other:?} share a digest"
+                );
+            }
+        }
+
+        // LOCALIZATION: change exactly one family and exactly that subdigest moves,
+        // while the aggregate root moves for every one of them.
+        for family in ProvenanceFamily::ALL {
+            let variant = single_family_variant(family);
+            let moved = ModuleProvenanceSubdigests::derive(&variant);
+            assert_ne!(
+                variant.root(),
+                root_before,
+                "the {family:?} variant did not move the aggregate root"
+            );
+            assert_ne!(
+                moved.of(family),
+                subdigests.of(family),
+                "the {family:?} subdigest did not move with its own family"
+            );
+            for other in ProvenanceFamily::ALL.iter().filter(|f| **f != family) {
+                assert_eq!(
+                    moved.of(*other),
+                    subdigests.of(*other),
+                    "a {family:?} change leaked into the {other:?} subdigest"
+                );
+            }
+        }
+
+        // THE CAVEAT, PINNED RATHER THAN LEFT TO A READER: the families partition the
+        // *bytes*, which does not make them causally independent. `transparency` lives
+        // in the completeness family but is recomputed from the contribution family's
+        // descriptors, so flipping a descriptor to Opaque legitimately moves two
+        // subdigests. A consumer that reads "only family X moved" as "only family X
+        // was edited" is wrong in exactly this case, and the .9.3 handoff has to say
+        // so.
+        let mut opaque_records = sample_records();
+        let opaque_descriptor = extension_descriptor("simpExt", PayloadProvenance::Opaque);
+        opaque_records[0] = ModuleContributionRecord::new(
+            opaque_records[0].module.clone(),
+            opaque_records[0].declarations.to_vec(),
+            opaque_records[0].extra_declarations.to_vec(),
+            vec![ExtensionContribution::new(
+                opaque_descriptor.clone(),
+                7,
+                Digest([0x31; 32]),
+                vec![
+                    entry_for(&opaque_descriptor, &[0x41]),
+                    entry_for(&opaque_descriptor, &[0x42]),
+                ],
+            )],
+            ProvenanceCompleteness::new(
+                CaptureStatus::Complete,
+                PayloadTransparency::Opaque,
+                vec![id("Ghost")],
+            ),
+        );
+        let opaque = ModuleProvenanceManifest::new(epoch(), opaque_records, TEST_LIMITS)
+            .expect("opaque variant validates");
+        let opaque_subdigests = ModuleProvenanceSubdigests::derive(&opaque);
+        assert_ne!(
+            opaque_subdigests.of(ProvenanceFamily::Contribution),
+            subdigests.of(ProvenanceFamily::Contribution)
+        );
+        assert_ne!(
+            opaque_subdigests.of(ProvenanceFamily::Completeness),
+            subdigests.of(ProvenanceFamily::Completeness),
+            "transparency is derived from the descriptors, so completeness must move too"
+        );
+        assert_eq!(
+            opaque_subdigests.of(ProvenanceFamily::Topology),
+            subdigests.of(ProvenanceFamily::Topology)
+        );
+        assert_eq!(
+            opaque_subdigests.of(ProvenanceFamily::Artifact),
+            subdigests.of(ProvenanceFamily::Artifact)
+        );
+
+        // A tampered projection is a fault that NAMES ITS FAMILY, not a second
+        // opinion -- and tampering cannot touch the identity it projects.
+        let mut tampered = subdigests;
+        tampered.digests[ProvenanceFamily::Contribution.index()] = Digest([0x00; 32]);
+        assert!(matches!(
+            tampered.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "contribution subdigest disagrees with the committed records",
+            })
+        ));
+        assert_eq!(manifest.root(), root_before);
+
+        // Carried across to a different manifest: caught by the back reference.
+        assert!(matches!(
+            subdigests.verify(&other_manifest()),
+            Err(ModuleProvenanceError::InternalFault {
+                what: "subdigest projection was derived from a different committed root",
+                ..
+            })
+        ));
     }
 
     /// Count conservation is the half that re-derivation cannot supply.
