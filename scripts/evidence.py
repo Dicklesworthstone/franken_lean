@@ -4312,6 +4312,7 @@ def validate_guard(
         "exit_code",
         "findings",
         "authority",
+        "contract_handoff_root",
         "traversal",
         "authority_count_rule",
         "authority_count_rule_holds",
@@ -4381,6 +4382,19 @@ def validate_guard(
             target_count < crate_count or target_triples == 0
         ):
             raise EvidenceError(f"{path}: passing authority inventory is not closed")
+
+        contract_handoff_root = terminal.get("contract_handoff_root")
+        if contract_handoff_root is None:
+            if expected_verdict == "pass":
+                raise EvidenceError(
+                    f"{path}: passing guard lacks a contract handoff root"
+                )
+        else:
+            require_guard_fnv(
+                path,
+                contract_handoff_root,
+                label="contract_handoff_root",
+            )
 
         compiler = start.get("effective_compiler_identity")
         if not isinstance(compiler, dict):
@@ -4541,6 +4555,7 @@ def validate_guard(
             raise EvidenceError(f"{path}: setup failure claims structural authority")
         if (
             terminal.get("authority") != "not_established"
+            or terminal.get("contract_handoff_root") is not None
             or terminal.get("traversal") is not None
             or terminal.get("governed_root_before") is not None
             or terminal.get("governed_root_after") is not None
@@ -13516,6 +13531,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "exit_code": 0,
         "findings": 0,
         "authority": "complete",
+        "contract_handoff_root": "fnv1a64:0123456789abcdef",
         "traversal": {
             "directories_visited": 3,
             "files_discovered": 4,
@@ -13555,6 +13571,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     def extra_guard_field(records: list[dict[str, Any]]) -> None:
         records[1]["unversioned_claim"] = True
 
+    def missing_guard_handoff_root(records: list[dict[str, Any]]) -> None:
+        records[1]["contract_handoff_root"] = None
+
+    def malformed_guard_handoff_root(records: list[dict[str, Any]]) -> None:
+        records[1]["contract_handoff_root"] = "fnv1a64:not-a-root"
+
     def broken_guard_conservation(records: list[dict[str, Any]]) -> None:
         records[1]["traversal"]["files_scanned"] = 3
 
@@ -13571,6 +13593,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         ("old-schema", old_guard_schema),
         ("missing-field", missing_guard_field),
         ("extra-field", extra_guard_field),
+        ("missing-contract-handoff-root", missing_guard_handoff_root),
+        ("malformed-contract-handoff-root", malformed_guard_handoff_root),
         ("broken-conservation", broken_guard_conservation),
         ("false-root-equality", false_guard_root_equality),
         ("unbound-compiler", unbound_guard_compiler),
@@ -18654,6 +18678,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         schema: str,
         expected_verdict: str,
         expected_reason: str,
+        expected_stderr_fragment: bytes | None = None,
     ) -> Path:
         repo = Path(__file__).resolve().parent.parent
         case_root = art_dir / case_name
@@ -18680,6 +18705,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             child.returncode == expected_exit,
             f"{case_name}: exit {child.returncode}: {child.stderr[-300:]!r}",
         )
+        if expected_stderr_fragment is not None:
+            require(
+                expected_stderr_fragment in child.stderr,
+                f"{case_name}: expected stderr fragment was not emitted: "
+                f"{child.stderr[-300:]!r}",
+            )
         if art_glob is None:
             bundle_dir = case_root
         else:
@@ -18839,7 +18870,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             / "e2e"
             / lane_script_name
         )
-        run_consumer_fault_case(
+        unexpected_bundle = run_consumer_fault_case(
             f"consumer_{lane_tag}_unexpected_step",
             ["bash", lane_script],
             {lane_env: "unexpected_first_step"},
@@ -18849,7 +18880,58 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "fln.e2e/2",
             "internal_fault",
             "build_guard:unexpected_child_exit",
+            (
+                b"[structure_gate] post-seal diagnostic probe: "
+                b"unexpected_first_step"
+                if lane_tag == "structure_gate"
+                else None
+            ),
         )
+        if lane_tag == "structure_gate":
+            manifest = read_json_object(unexpected_bundle / "manifest.json")
+            human_rows = [
+                row
+                for row in manifest["artifacts"]
+                if row.get("path") == "human.log"
+            ]
+            require(
+                len(human_rows) == 1,
+                "consumer_structure_gate_unexpected_step: manifest must bind "
+                "human.log exactly once",
+            )
+            human_data, human_size, human_digest = stable_file_facts(
+                unexpected_bundle / "human.log"
+            )
+            expected_terminal = (
+                b"[structure_gate] terminal verdict=internal_fault "
+                b"reason=build_guard:unexpected_child_exit process_exit=2\n"
+            )
+            require(
+                human_data.endswith(expected_terminal),
+                "consumer_structure_gate_unexpected_step: human.log was not "
+                "sealed after its terminal semantic record",
+            )
+            require(
+                b"post-seal diagnostic probe" not in human_data,
+                "consumer_structure_gate_unexpected_step: a post-seal "
+                "diagnostic mutated human.log",
+            )
+            require(
+                human_rows[0].get("bytes") == human_size
+                and human_rows[0].get("sha256") == human_digest,
+                "consumer_structure_gate_unexpected_step: manifested human.log "
+                "facts differ from the final file",
+            )
+            cases.append(
+                {
+                    "case": (
+                        "consumer_structure_gate_unexpected_step_human_log_sealed"
+                    ),
+                    "ok": True,
+                    "bytes": human_size,
+                    "sha256": human_digest,
+                }
+            )
         run_consumer_fault_case(
             f"consumer_{lane_tag}_abort",
             ["bash", lane_script],

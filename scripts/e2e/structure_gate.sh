@@ -60,6 +60,7 @@ FINAL_VERDICT="internal_fault"
 FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
+HUMAN_LOG_SEALED=0
 FINALIZING=0
 FINALIZER_TRANSITION=0
 FINALIZER_PID=""
@@ -99,6 +100,10 @@ for subject_path in "${SUBJECT_PATHS[@]}"; do
 done
 
 note() {
+  if [ "$HUMAN_LOG_SEALED" -eq 1 ]; then
+    printf '[structure_gate] %s\n' "$*" >&2
+    return 0
+  fi
   printf '[structure_gate] %s\n' "$*" | tee -a "$HUMAN" >&2
 }
 
@@ -498,12 +503,28 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
+    # human.log is a manifested artifact. Append its terminal semantic record,
+    # then permanently seal it before the manifest inventories any artifact.
+    # Later publisher diagnostics remain visible on stderr but cannot invalidate
+    # the manifest's byte count or digest.
+    note "terminal verdict=$FINAL_VERDICT reason=$FINAL_REASON process_exit=$FINAL_EXIT" \
+      || publish_rc=2
+    HUMAN_LOG_SEALED=1
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
     run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" --digest-output "$ART_DIR/manifest.digest" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
       --verdict "$FINAL_VERDICT" --input-root "$INPUT_ROOT" --final-root "$final_root" \
       || publish_rc=2
     abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ] && [ "$TEST_EARLY_FAULT" = unexpected_first_step ]; then
+    # Regression probe for fln-g6d1: this diagnostic is deliberately emitted
+    # after manifest generation. It must remain stderr-only so the independently
+    # validated complete bundle still binds the final human.log bytes.
+    note "post-seal diagnostic probe: unexpected_first_step"
   fi
   if [ "$publish_rc" -eq 0 ]; then
     run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
@@ -953,9 +974,11 @@ copy_fixture() {
   snapshot_before "$ROOT" "$step"
   mkdir "$destination"
   note "running step=$step: supervised source copy to $destination"
-  supervise "$step" cp -R -- "$ROOT/ci" "$ROOT/crates" "$ROOT/tools" \
+  supervise "$step" cp -R --reflink=auto -- \
+    "$ROOT/ci" "$ROOT/contracts" "$ROOT/crates" "$ROOT/tools" \
     "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" "$ROOT/SUITE.lock" \
-    "$ROOT/rust-toolchain.toml" "$destination/"
+    "$ROOT/rust-toolchain.toml" "$ROOT/ABI_CONTRACT.md" \
+    "$ROOT/OLEAN_CONTRACT.md" "$destination/"
   inspect_supervisor "$step"
   propagate_supervisor_taxonomy "$step" none
   snapshot_after "$ROOT" "$step"
@@ -1144,9 +1167,11 @@ guard_step robot_setup_failure "$SETUP_ERROR_ROOT" 2 setup_error
 
 # The seeded fln-core -> fln-kernel edge now also completes the prohibited
 # transitive path fln-unsafe-abi -> fln-bignum -> fln-core -> fln-kernel
-# (FLN-STRUCT-008, the D3 layering law), and the manifest/lock disagreement it
-# introduces makes the FLN-STRUCT-025 expansion covenant (bead fln-lld) fail
-# closed with two typed findings per boundary crate (lib, lib+test-cfg).
+# (FLN-STRUCT-008, the D3 layering law). Because the plant intentionally changes
+# Cargo.toml without regenerating Cargo.lock, FLN-STRUCT-018 also records that
+# exact manifest/lock disagreement; the same unresolved edge makes the
+# FLN-STRUCT-025 expansion covenant (bead fln-lld) fail closed with two typed
+# findings per boundary crate (lib, lib+test-cfg).
 UNACKNOWLEDGED="$SCRATCH_ROOT/unacknowledged"
 copy_fixture copy_unacknowledged "$UNACKNOWLEDGED"
 printf 'fln-kernel = { path = "../fln-kernel" }\n' >> "$UNACKNOWLEDGED/crates/fln-core/Cargo.toml"
@@ -1154,6 +1179,7 @@ guard_step seeded_unacknowledged "$UNACKNOWLEDGED" 1 fail \
   FLN-STRUCT-005@crates/fln-core/Cargo.toml \
   FLN-STRUCT-007@crates/fln-core/Cargo.toml \
   FLN-STRUCT-008@crates/fln-unsafe-abi \
+  FLN-STRUCT-018@crates/fln-core/Cargo.toml \
   FLN-STRUCT-025@crates/fln-unsafe-abi/src \
   FLN-STRUCT-025@crates/fln-unsafe-abi/src \
   FLN-STRUCT-025@crates/fln-unsafe-region/src \
@@ -1166,6 +1192,7 @@ printf 'edge fln-core -> fln-kernel\n' >> "$ACKNOWLEDGED/ci/WORKSPACE_GRAPH.txt"
 guard_step seeded_acknowledged "$ACKNOWLEDGED" 1 fail \
   FLN-STRUCT-007@crates/fln-core/Cargo.toml \
   FLN-STRUCT-008@crates/fln-unsafe-abi \
+  FLN-STRUCT-018@crates/fln-core/Cargo.toml \
   FLN-STRUCT-025@crates/fln-unsafe-abi/src \
   FLN-STRUCT-025@crates/fln-unsafe-abi/src \
   FLN-STRUCT-025@crates/fln-unsafe-region/src \
