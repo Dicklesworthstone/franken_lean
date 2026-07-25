@@ -39,6 +39,7 @@ const DEP_PATH: &str = "FLN-STRUCT-023";
 const INCONCLUSIVE: &str = "FLN-STRUCT-027";
 const SOURCE_CHANGED: &str = "FLN-STRUCT-028";
 const COMPILER_IDENTITY: &str = "FLN-STRUCT-029";
+const GENERATED_AUTHORITY: &str = "FLN-STRUCT-030";
 const LAYERING: &str = "FLN-STRUCT-007";
 const PRIMARY_LIB: &str = "crates/fln-hash/src/lib.rs";
 
@@ -378,6 +379,127 @@ fn symlinked_source_cannot_escape_the_scanned_closure() {
             .any(|f| f.code == SHAPE && f.path.contains("escape") && f.detail.contains("symlink")),
         "symlink escape not caught: {:?}",
         out.findings
+    );
+}
+
+/// Feature, profile, and host-target axes are closed structurally rather than sampled.
+/// Every feature-gated source line is scanned, custom profiles are rejected, and the
+/// complete declared target set is inventoried while the effective host must remain a
+/// member of it.
+#[test]
+fn feature_profile_and_host_target_axes_are_closed() {
+    let feature = TempWs::new("authority-feature-axis");
+    base(&feature);
+    feature.write(
+        "crates/fln-kernel/Cargo.toml",
+        &format!(
+            "{}\n[features]\nfrontier = []\n",
+            manifest("fln-kernel", &[])
+        ),
+    );
+    feature.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n#[cfg(feature = \"frontier\")]\ninclude!(\"../../../feature_hidden.rs\");\n",
+    );
+    feature.write("feature_hidden.rs", "pub fn hidden_authority() {}\n");
+    let feature_out = feature.run();
+    assert_eq!(feature_out.authority_inventory.features, 1);
+    assert!(
+        feature_out
+            .findings
+            .iter()
+            .any(|finding| finding.code == COVENANT),
+        "feature-gated source escaped the structural scan: {:?}",
+        feature_out.findings
+    );
+
+    let profile = TempWs::new("authority-profile-axis");
+    base(&profile);
+    profile.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\", \"tools/*\"]\n\n[profile.release]\nlto = true\n",
+    );
+    assert_eq!(codes(&profile.run()), vec!["FLN-STRUCT-021"]);
+
+    let targets = TempWs::new("authority-host-target-axis");
+    base(&targets);
+    targets.write(
+        "SUITE.lock",
+        &SUITE_LOCK_FIXTURE.replace(
+            "target x86_64-unknown-linux-gnu",
+            "target aarch64-unknown-linux-gnu\ntarget x86_64-unknown-linux-gnu",
+        ),
+    );
+    let targets_out = targets.run();
+    assert!(
+        targets_out.findings.is_empty(),
+        "complete target inventory should stay clean: {:?}",
+        targets_out.findings
+    );
+    assert_eq!(targets_out.authority_inventory.target_triples, 2);
+}
+
+/// Kernel macro output is admitted only through an exact compiler-builtin inventory.
+/// Project-defined/function-like/procedural/derive macros otherwise create generated
+/// checking logic with no reviewed source mapping and must fail closed.
+#[test]
+fn kernel_generated_authority_is_callsite_closed() {
+    for (tag, source) in [
+        (
+            "authority-kernel-macro-definition",
+            "macro_rules! hidden_admission { () => { pub fn admit() {} } }\n",
+        ),
+        (
+            "authority-kernel-macro-invocation",
+            "hidden_admission!();\n",
+        ),
+        (
+            "authority-kernel-attribute",
+            "#[admit_constant]\npub fn hidden() {}\n",
+        ),
+        (
+            "authority-kernel-derive",
+            "#[derive(AdmitConstant)]\npub struct Hidden;\n",
+        ),
+    ] {
+        let ws = TempWs::new(tag);
+        base(&ws);
+        ws.write(
+            "crates/fln-kernel/src/lib.rs",
+            &format!("//! stub\n#![forbid(unsafe_code)]\n{source}"),
+        );
+        let out = ws.run();
+        assert!(
+            out.findings
+                .iter()
+                .any(|finding| finding.code == GENERATED_AUTHORITY),
+            "{tag} was not refused: {:?}",
+            out.findings
+        );
+    }
+
+    let recovery = TempWs::new("authority-kernel-builtin-macro-recovery");
+    base(&recovery);
+    recovery.write(
+        "crates/fln-kernel/src/lib.rs",
+        concat!(
+            "//! stub\n",
+            "#![forbid(unsafe_code)]\n",
+            "#[derive(Debug, Clone, PartialEq, Eq)]\n",
+            "pub struct Counted;\n",
+            "pub fn counted(value: bool) {\n",
+            "    assert!(matches!(value, true));\n",
+            "    let _ = format!(\"{value}\");\n",
+            "    let _: Vec<u8> = vec![];\n",
+            "    if false { unreachable!(); }\n",
+            "}\n",
+        ),
+    );
+    let recovery_out = recovery.run();
+    assert!(
+        recovery_out.findings.is_empty(),
+        "reviewed builtin callsites should remain clean: {:?}",
+        recovery_out.findings
     );
 }
 

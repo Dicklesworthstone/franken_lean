@@ -497,7 +497,10 @@ fn kernel_source_inclusion_cannot_escape_the_loc_covenant() {
         "#![forbid(unsafe_code)]\n#[cfg_attr(not(any()), path = \"../hidden.rs\")]\nmod hidden;\n",
     );
     conditional.write("crates/fln-kernel/hidden.rs", "fn hidden() {}\n");
-    assert_eq!(codes(&conditional.run()), vec!["FLN-STRUCT-015"]);
+    assert_eq!(
+        codes(&conditional.run()),
+        vec!["FLN-STRUCT-015", "FLN-STRUCT-030"]
+    );
 }
 
 #[test]

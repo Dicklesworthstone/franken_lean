@@ -398,6 +398,12 @@ pub struct LocatedExportSite {
     pub detail: &'static str,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NamedMacroSite {
+    pub line: usize,
+    pub name: String,
+}
+
 pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
     let lexemes = rust_lexemes(text);
     let mut sites = Vec::new();
@@ -435,9 +441,9 @@ pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
 /// failing in `checks.rs`. Macro INVOCATIONS are verified by the expansion
 /// covenant ([`expanded_surface_violations`] + [`expanded_public_items`]
 /// over `-Zunpretty=expanded` output).
-pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
+pub fn macro_definition_sites(text: &str) -> Vec<ExportSite> {
     let lexemes = rust_lexemes(text);
-    let mut sites = source_escape_sites(text);
+    let mut sites = Vec::new();
     for (idx, lexeme) in lexemes.iter().enumerate() {
         let declarative_definition = lexeme.text == "macro_rules"
             && lexemes.get(idx + 1).is_some_and(|next| next.text == "!");
@@ -460,6 +466,14 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
             });
         }
     }
+    sites.sort_by_key(|site| (site.line, site.detail));
+    sites.dedup_by_key(|site| (site.line, site.detail));
+    sites
+}
+
+pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
+    let mut sites = source_escape_sites(text);
+    sites.extend(macro_definition_sites(text));
     for attribute in attributes(text) {
         for (name, detail) in [
             ("macro_export", "exported macro"),
@@ -545,14 +559,74 @@ pub fn export_name_attr_sites(text: &str) -> Vec<ExportNameSite> {
 /// excluding `include!` (a source-escape finding) and macro definitions (an
 /// export finding). Any such line makes the boundary crate subject to the
 /// expansion covenant.
-pub fn macro_invocation_lines(text: &str) -> Vec<usize> {
+fn is_rust_keyword(text: &str) -> bool {
+    matches!(
+        text,
+        "Self"
+            | "abstract"
+            | "as"
+            | "async"
+            | "await"
+            | "become"
+            | "box"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "do"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "final"
+            | "fn"
+            | "for"
+            | "gen"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "macro"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "override"
+            | "priv"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "union"
+            | "unsafe"
+            | "unsized"
+            | "use"
+            | "virtual"
+            | "where"
+            | "while"
+            | "yield"
+    )
+}
+
+pub fn macro_invocations(text: &str) -> Vec<NamedMacroSite> {
     let lexemes = rust_lexemes(text);
-    let mut lines = Vec::new();
+    let mut sites = Vec::new();
     for (idx, lexeme) in lexemes.iter().enumerate() {
         let macro_invocation = lexeme.text == "!"
             && idx > 0
             && lexemes[idx - 1].text != "include"
             && lexemes[idx - 1].text != "macro_rules"
+            && !is_rust_keyword(&lexemes[idx - 1].text)
             && lexemes
                 .get(idx + 1)
                 .is_some_and(|next| matches!(next.text.as_str(), "(" | "[" | "{"))
@@ -562,11 +636,72 @@ pub fn macro_invocation_lines(text: &str) -> Vec<usize> {
                 .next()
                 .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
         if macro_invocation {
-            lines.push(lexeme.line);
+            sites.push(NamedMacroSite {
+                line: lexeme.line,
+                name: lexemes[idx - 1].text.clone(),
+            });
         }
     }
+    sites.sort_by(|left, right| (&left.name, left.line).cmp(&(&right.name, right.line)));
+    sites.dedup();
+    sites
+}
+
+pub fn macro_invocation_lines(text: &str) -> Vec<usize> {
+    let mut lines: Vec<usize> = macro_invocations(text)
+        .into_iter()
+        .map(|site| site.line)
+        .collect();
+    lines.sort_unstable();
     lines.dedup();
     lines
+}
+
+/// Attribute macros and derive macros are generated authority too. Return their
+/// source callsites so the kernel covenant can admit only a reviewed compiler-builtin
+/// set while still charging every invocation line to the source LOC covenant.
+pub fn attribute_invocations(text: &str) -> Vec<NamedMacroSite> {
+    let mut sites = Vec::new();
+    for attribute in attributes(text) {
+        if let Some(name) = attribute.lexemes.first() {
+            sites.push(NamedMacroSite {
+                line: attribute.line,
+                name: name.text.clone(),
+            });
+        }
+    }
+    sites.sort_by(|left, right| (&left.name, left.line).cmp(&(&right.name, right.line)));
+    sites.dedup();
+    sites
+}
+
+pub fn derive_macro_invocations(text: &str) -> Vec<NamedMacroSite> {
+    let mut sites = Vec::new();
+    for attribute in attributes(text) {
+        if !attribute
+            .lexemes
+            .first()
+            .is_some_and(|lexeme| lexeme.text == "derive")
+        {
+            continue;
+        }
+        for lexeme in attribute.lexemes.iter().skip(1) {
+            if lexeme
+                .text
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            {
+                sites.push(NamedMacroSite {
+                    line: attribute.line,
+                    name: lexeme.text.clone(),
+                });
+            }
+        }
+    }
+    sites.sort_by(|left, right| (&left.name, left.line).cmp(&(&right.name, right.line)));
+    sites.dedup();
+    sites
 }
 
 /// The expansion covenant's surface scan (bead fln-lld): run over the FULLY
@@ -1030,8 +1165,64 @@ fn two() {}
             macro_invocation_lines("assert!(x);\nhidden_policy!(y);\n"),
             vec![1, 2]
         );
+        assert_eq!(
+            macro_invocations("assert!(x);\nhidden_policy!(y);\n"),
+            vec![
+                NamedMacroSite {
+                    line: 1,
+                    name: "assert".to_string(),
+                },
+                NamedMacroSite {
+                    line: 2,
+                    name: "hidden_policy".to_string(),
+                },
+            ]
+        );
         assert!(macro_invocation_lines("include!(\"f.rs\");\n").is_empty());
         assert!(macro_invocation_lines("macro_rules! m { () => {} }\n").is_empty());
+        assert_eq!(
+            macro_invocations("if !(matches!(x, Y)) {}\n"),
+            vec![NamedMacroSite {
+                line: 1,
+                name: "matches".to_string(),
+            }]
+        );
+        assert_eq!(
+            macro_definition_sites("macro_rules! m { () => {} }\n").len(),
+            1
+        );
+        assert_eq!(
+            attribute_invocations(
+                "#![forbid(unsafe_code)]\n#[cfg(test)]\n#[derive(Debug, Clone)]\nstruct S;\n"
+            ),
+            vec![
+                NamedMacroSite {
+                    line: 2,
+                    name: "cfg".to_string(),
+                },
+                NamedMacroSite {
+                    line: 3,
+                    name: "derive".to_string(),
+                },
+                NamedMacroSite {
+                    line: 1,
+                    name: "forbid".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            derive_macro_invocations("#[derive(Debug, Clone)]\nstruct S;\n"),
+            vec![
+                NamedMacroSite {
+                    line: 1,
+                    name: "Clone".to_string(),
+                },
+                NamedMacroSite {
+                    line: 1,
+                    name: "Debug".to_string(),
+                },
+            ]
+        );
     }
 
     /// Seeded expansion-covenant defects (bead fln-lld): each laundering shape

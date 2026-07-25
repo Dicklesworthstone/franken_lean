@@ -37,6 +37,10 @@
 //!   inconclusive rather than being attached to a hybrid source root.
 //! * `FLN-STRUCT-029` the effective compiler identity disagrees with the complete
 //!   `SUITE.lock` compiler contract, so compiler authority is inconclusive.
+//! * `FLN-STRUCT-030` kernel generated authority is not source-callsite closed:
+//!   a project-defined macro, unreviewed macro invocation, procedural attribute, or
+//!   derive outside the exact compiler-builtin inventory could contribute checking
+//!   logic without a reviewed, LOC-counted source mapping.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -823,6 +827,65 @@ fn count_loc(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<usi
     Ok(total)
 }
 
+/// Close the kernel's generated-code authority without treating expanded compiler
+/// boilerplate as project-authored TCB source.
+///
+/// Project-defined macros are forbidden in the kernel. Every admitted function-like
+/// macro, attribute, and derive is an exact compiler/std builtin whose invocation line
+/// is already charged by `count_loc`; all other generated-code entrances fail closed.
+/// Together with the manifest ban on build scripts/custom/proc-macro targets and the
+/// source-escape ban on `include!`/`#[path]`, this gives every generated fragment one
+/// reviewed source callsite inside `crates/fln-kernel/src/**`.
+fn audit_kernel_generated_authority(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
+    const FUNCTION_MACROS: [&str; 5] = ["assert", "format", "matches", "unreachable", "vec"];
+    const ATTRIBUTES: [&str; 4] = ["cfg", "derive", "forbid", "test"];
+    const DERIVES: [&str; 6] = ["Clone", "Copy", "Debug", "Default", "Eq", "PartialEq"];
+
+    for site in ledger::macro_definition_sites(text) {
+        findings.push(Finding {
+            code: "FLN-STRUCT-030",
+            path: format!("{source_rel}:{}", site.line),
+            detail: "project-defined macro in fln-kernel has no exact expanded-authority mapping; kernel macros are forbidden".to_string(),
+        });
+    }
+    for site in ledger::macro_invocations(text) {
+        if !FUNCTION_MACROS.contains(&site.name.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-030",
+                path: format!("{source_rel}:{}", site.line),
+                detail: format!(
+                    "macro invocation `{}` is outside the reviewed kernel builtin inventory; generated checking authority must map to an admitted LOC-counted callsite",
+                    site.name
+                ),
+            });
+        }
+    }
+    for site in ledger::attribute_invocations(text) {
+        if !ATTRIBUTES.contains(&site.name.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-030",
+                path: format!("{source_rel}:{}", site.line),
+                detail: format!(
+                    "attribute `{}` is outside the reviewed kernel builtin inventory; procedural generated authority is forbidden",
+                    site.name
+                ),
+            });
+        }
+    }
+    for site in ledger::derive_macro_invocations(text) {
+        if !DERIVES.contains(&site.name.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-030",
+                path: format!("{source_rel}:{}", site.line),
+                detail: format!(
+                    "derive `{}` is outside the reviewed kernel builtin inventory; generated checking authority is forbidden",
+                    site.name
+                ),
+            });
+        }
+    }
+}
+
 /// Root files whose lint posture is checked: whichever of `src/lib.rs`/`src/main.rs` exist.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(dir) {
@@ -1100,7 +1163,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         .to_str()
         .map(|identity| identity.replace('\\', "/"))
         .ok_or_else(|| "authoritative workspace root is not UTF-8".to_string())?;
-    let governed_before = governed_snapshot(&root);
+    let governed_before = governed_snapshot(root);
     let admitted_environment = admitted_environment();
     let compiler_identity = compiler_identity(root);
     let mut findings: Vec<Finding> = Vec::new();
@@ -1108,8 +1171,8 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // Reject links before any recursive scanner runs. Git can store symlinks, and
     // following one here could omit authoritative code from a covenant, authorize a
     // boundary site under the wrong path, escape the workspace, or recurse forever.
-    audit_governed_symlinks(&root, &mut findings)?;
-    audit_repository_cargo_config(&root, &mut findings)?;
+    audit_governed_symlinks(root, &mut findings)?;
+    audit_repository_cargo_config(root, &mut findings)?;
 
     // ---- load the reviewed files -------------------------------------------------------
     let graph_path = root.join(GRAPH_FILE);
@@ -1150,8 +1213,8 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
 
     // ---- discover the actual workspace -------------------------------------------------
     let mut discovered: Vec<DiscoveredCrate> = Vec::new();
-    discover(&root, "crates", &mut discovered)?;
-    discover(&root, "tools", &mut discovered)?;
+    discover(root, "crates", &mut discovered)?;
+    discover(root, "tools", &mut discovered)?;
 
     for c in &mut discovered {
         let manifest_rel = format!("{}/Cargo.toml", c.rel);
@@ -1839,6 +1902,9 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
                 continue;
             };
+            if crate_name == "fln-kernel" {
+                audit_kernel_generated_authority(&text, &source_rel, &mut findings);
+            }
             for escape in ledger::source_escape_sites(&text) {
                 let rel = source_rel.clone();
                 findings.push(Finding {
@@ -1866,7 +1932,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // ---- dependency-closure audit (D1; bead franken_lean-xwf) --------------------------
     // Cargo.lock ⇄ ci/CLOSURE_ALLOWLIST.txt ⇄ SUITE.lock ⇄ rust-toolchain.toml. Missing
     // or malformed governance files degrade to findings, never to a silent skip.
-    findings.extend(crate::lockfile::audit(&root, &g));
+    findings.extend(crate::lockfile::audit(root, &g));
 
     if compiler_identity.contract_declared && !compiler_identity.contract_match {
         findings.push(Finding {
@@ -1883,7 +1949,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         });
     }
 
-    let governed_after = governed_snapshot(&root);
+    let governed_after = governed_snapshot(root);
     for (path, detail) in governed_before
         .unreadable
         .iter()
