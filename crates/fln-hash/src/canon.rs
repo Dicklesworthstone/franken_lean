@@ -16,6 +16,7 @@ use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, MVarId, NatLit
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap, SyntaxHandle};
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_core::pos::Position;
 
 /// A frozen schema identity: name + version. Bumping the version is the only legal
@@ -331,40 +332,55 @@ pub struct Exhausted {
     pub at: usize,
 }
 
-/// The three-valued result of a budgeted decode (FL-INV-07).
+/// The outcome of a budgeted decode: `Outcome<Result<T, CanonError>>` (bead fln-8gz3).
 ///
-/// Deliberately **not** a `Result`, and deliberately without any conversion into
-/// one: `Result` has exactly two arms, so every `?` and every `is_err()` would
-/// collapse [`Decoded::Inconclusive`] into the rejection arm — and an inconclusive
-/// outcome that is rendered, cached, or reported as a rejection is precisely the
-/// invariant violation this type exists to prevent. There is no `From<Exhausted>`
-/// for [`CanonError`] for the same reason. A caller that wants a verdict must
-/// decide, in its own code, what to do about not having one.
-#[derive(Debug)]
-#[must_use]
-pub enum Decoded<T> {
-    /// The artifact decoded. An acceptance.
-    Value(T),
-    /// The bytes are not a well-formed artifact. A rejection — a real verdict.
-    Malformed(CanonError),
-    /// The budget ran out first. **Not** a verdict: nothing was learned about
-    /// whether these bytes are a valid artifact, so this must never be stored as
-    /// acceptance or rejection, never cached, and never promoted to either by a
-    /// retry that silently drops it.
-    Inconclusive(Exhausted),
-}
+/// This replaces the hand-rolled three-valued `Decoded` enum that lived here. The shape
+/// is the same three claims, said in the program's one vocabulary
+/// ([`fln_core::outcome`]) instead of a fourth private lattice:
+///
+/// | was | is | why |
+/// |---|---|---|
+/// | `Value(v)` | `Complete(Ok(v))` | ran to completion, domain answer is "these bytes are this value" |
+/// | `Malformed(e)` | `Complete(Err(e))` | ran to completion; "not a well-formed artifact" is a real verdict ABOUT the bytes, so it belongs inside the authoritative arm |
+/// | `Inconclusive(Exhausted)` | `Inconclusive(ResourceExhausted{..})` | did not complete; nothing was learned |
+///
+/// The property the old type was protecting is preserved and now enforced further out:
+/// `Outcome` has no `From<Outcome<T>> for Result<T, E>`, no `Option` accessor and no
+/// `unwrap_or`, so a caller still cannot `?` a resource stop into a rejection. What it
+/// gains is a fourth claim the old enum could not make — see
+/// [`Canonical::from_canonical_bytes_budgeted`] on the accounting fault.
+pub type DecodeOutcome<T> = Outcome<Result<T, CanonError>>;
 
-impl<T> Decoded<T> {
-    /// The decoded value, if the decode reached one.
-    pub fn value(self) -> Option<T> {
-        match self {
-            Decoded::Value(value) => Some(value),
-            _ => None,
+impl Exhausted {
+    /// The structural unit this stop bounded.
+    ///
+    /// Total and injective, and asserted so in
+    /// `every_decode_budget_limit_maps_to_exactly_one_structural_unit`: two limits must
+    /// never collapse onto one unit, or a caller cannot tell which allowance to raise.
+    pub const fn unit(self) -> StructuralUnit {
+        match self.limit {
+            BudgetLimit::InputBytes => StructuralUnit::InputBytes,
+            BudgetLimit::ProducedNodes => StructuralUnit::ProducedNodes,
         }
     }
 
-    pub fn is_inconclusive(&self) -> bool {
-        matches!(self, Decoded::Inconclusive(_))
+    /// This stop as the program's typed non-answer (bead franken_lean-vui8's axis).
+    ///
+    /// `allowed`/`observed` become the [`ResourceUsage`] a caller sizes a retry from, and
+    /// `at` — which has no field in `ResourceUsage`, deliberately — is recorded through
+    /// `with_progress`, where it is diagnostic only and cannot be mistaken for a budget.
+    ///
+    /// This is the reusable half for any adopter with a structural budget: build a
+    /// `ResourceUsage` naming the unit, put the numbers in it, and localize with
+    /// `with_progress`. The term store (bead fln-49c) wants the same shape with
+    /// [`StructuralUnit::ExpandedWeight`].
+    pub fn into_inconclusive(self) -> Inconclusive {
+        Inconclusive::resource(ResourceUsage {
+            reason: ResourceReason::StructuralBudget { unit: self.unit() },
+            allowed: self.allowed,
+            observed: self.observed,
+        })
+        .with_progress(format!("byte {}", self.at))
     }
 }
 
@@ -545,23 +561,46 @@ pub trait Canonical: Sized {
     /// a resource contract want [`Canonical::from_canonical_bytes_budgeted`].
     fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonError> {
         match Self::from_canonical_bytes_budgeted(bytes, DecodeBudget::unlimited()) {
-            Decoded::Value(value) => Ok(value),
-            Decoded::Malformed(error) => Err(error),
-            Decoded::Inconclusive(exhausted) => unreachable!(
-                "an unlimited budget cannot be exhausted, yet {exhausted:?} was reported"
+            Outcome::Complete(result) => result,
+            // Both non-answers are unreachable under an unlimited budget: nothing can
+            // trip, so no stop can be recorded and no accounting fault can be detected.
+            // A panic is the right encoding rather than a lie: this signature cannot
+            // carry a non-answer, and reaching here would mean an invariant broke, which
+            // is never a user diagnostic (FL-INV-07). Budgeted callers get the typed
+            // outcome instead.
+            Outcome::Inconclusive(inconclusive) => unreachable!(
+                "an unlimited budget cannot be exhausted, yet a stop was reported: {:?}",
+                inconclusive.cause
+            ),
+            Outcome::InternalFault(fault) => unreachable!(
+                "an unlimited budget cannot record a stop, so no accounting fault is \
+                 possible, yet one was reported: {fault:?}"
             ),
         }
     }
 
     /// Decode under a caller-supplied budget (bead fln-4zk8).
     ///
-    /// Exhaustion is reported as [`Decoded::Inconclusive`] and is never rendered as
+    /// Exhaustion is reported as [`Outcome::Inconclusive`] and is never rendered as
     /// acceptance or rejection: the meter is consulted *before* the error that
     /// unwound the decode is interpreted, so a stop can never be mistaken for a
     /// well-formedness verdict about the bytes (FL-INV-07). Decoding an artifact
     /// that fits inside the budget is byte-for-byte the same computation as the
     /// unbudgeted call.
-    fn from_canonical_bytes_budgeted(bytes: &[u8], budget: DecodeBudget) -> Decoded<Self> {
+    ///
+    /// **Budget and malformedness are not conflated, and the fold is what made that
+    /// checkable rather than argued.** A trip records itself in the reader and returns a
+    /// sentinel error purely to unwind through the `?` path the readers already use, so
+    /// every failure arrives through one channel and is separated afterwards by consulting
+    /// the meter. That separation was correct but rested on a *non-local* property — that
+    /// no reader anywhere swallows an error — and the old three-arm enum had no way to say
+    /// otherwise: with a stop recorded and a successful parse it could only return
+    /// `Value`, silently accepting an over-budget decode. There is no such swallow today
+    /// (checked, not assumed: every read path uses `?`), which is exactly why the case
+    /// deserves a typed refusal rather than a comment. `Outcome::InternalFault` is that
+    /// refusal — our accounting contradicting itself is an invariant failure, not a
+    /// verdict about anyone's bytes, and it is never cacheable.
+    fn from_canonical_bytes_budgeted(bytes: &[u8], budget: DecodeBudget) -> DecodeOutcome<Self> {
         let mut r = CanonReader::with_budget(bytes, budget);
         // Every step is checked the same way: if the meter tripped, the outcome is
         // inconclusive regardless of which error surfaced.
@@ -571,8 +610,11 @@ pub trait Canonical: Sized {
                     Ok(value) => value,
                     Err(error) => {
                         return match r.exhausted() {
-                            Some(exhausted) => Decoded::Inconclusive(exhausted),
-                            None => Decoded::Malformed(error),
+                            Some(exhausted) => Outcome::Inconclusive(exhausted.into_inconclusive()),
+                            // A completed run whose domain answer is "not a well-formed
+                            // artifact" — a real verdict about the bytes, so it belongs
+                            // inside the authoritative arm.
+                            None => Outcome::Complete(Err(error)),
                         };
                     }
                 }
@@ -584,10 +626,29 @@ pub trait Canonical: Sized {
         // meter; the stop record is captured first and stays authoritative.
         let exhausted = r.exhausted();
         match r.finish() {
-            Ok(()) => Decoded::Value(value),
+            Ok(()) => match exhausted {
+                None => Outcome::Complete(Ok(value)),
+                // Parsed cleanly *and* a stop was recorded. Unreachable while no reader
+                // swallows a trip, and refused rather than trusted precisely because that
+                // premise lives in every reader rather than here.
+                Some(exhausted) => Outcome::InternalFault(
+                    InternalFault::new(
+                        "FL-INV-07",
+                        format!(
+                            "decode completed while a {} budget stop was recorded at byte {}: \
+                             allowed={}, observed={}",
+                            exhausted.unit().as_str(),
+                            exhausted.at,
+                            exhausted.allowed,
+                            exhausted.observed
+                        ),
+                    )
+                    .with_evidence("fln_hash::canon::from_canonical_bytes_budgeted"),
+                ),
+            },
             Err(error) => match exhausted {
-                Some(exhausted) => Decoded::Inconclusive(exhausted),
-                None => Decoded::Malformed(error),
+                Some(exhausted) => Outcome::Inconclusive(exhausted.into_inconclusive()),
+                None => Outcome::Complete(Err(error)),
             },
         }
     }
@@ -1576,6 +1637,54 @@ impl Canonical for Diagnostic {
 mod tests {
     use super::*;
     use fln_core::level::Level;
+
+    use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
+
+    /// The stop facts a budgeted decode records, so assertions that used to read
+    /// `Exhausted` fields directly keep asserting exactly the same things after the fold
+    /// to `Outcome` (bead fln-8gz3). Panics loudly on any other outcome shape, so a test
+    /// cannot pass by silently getting a different arm than it meant.
+    fn stop_of<T: std::fmt::Debug>(outcome: &DecodeOutcome<T>) -> (StructuralUnit, u64, u64) {
+        match outcome {
+            Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+                InconclusiveCause::ResourceExhausted { usage } => match usage.reason {
+                    ResourceReason::StructuralBudget { unit } => {
+                        (unit, usage.allowed, usage.observed)
+                    }
+                    ref other => panic!("expected a structural budget, got {other:?}"),
+                },
+                other => panic!("expected resource exhaustion, got {other:?}"),
+            },
+            other => panic!("expected an inconclusive outcome, got {other:?}"),
+        }
+    }
+
+    /// Where the stop was localized — the `at` offset the pre-fold `Exhausted` carried.
+    fn stop_progress<T: std::fmt::Debug>(outcome: &DecodeOutcome<T>) -> String {
+        match outcome {
+            Outcome::Inconclusive(inconclusive) => inconclusive
+                .progress
+                .as_deref()
+                .map(|text| text.text().to_string())
+                .expect("a budget stop records where it stopped"),
+            other => panic!("expected an inconclusive outcome, got {other:?}"),
+        }
+    }
+
+    fn is_inconclusive<T>(outcome: &DecodeOutcome<T>) -> bool {
+        matches!(outcome, Outcome::Inconclusive(_))
+    }
+
+    /// The decoded value if the run completed AND accepted — the pre-fold
+    /// `Decoded::value()`. Deliberately collapses only the two arms that were already
+    /// collapsed: a non-answer and a rejection both yield `None`, and callers that need to
+    /// tell them apart match the `Outcome` directly.
+    fn decoded_value<T>(outcome: DecodeOutcome<T>) -> Option<T> {
+        match outcome {
+            Outcome::Complete(Ok(value)) => Some(value),
+            _ => None,
+        }
+    }
 
     #[test]
     fn schema_names_are_unique_and_well_shaped() {
@@ -3028,22 +3137,33 @@ mod tests {
 
         let stopped = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 64));
         match stopped {
-            Decoded::Inconclusive(exhausted) => {
-                assert_eq!(exhausted.limit, BudgetLimit::ProducedNodes);
-                assert_eq!(exhausted.allowed, 64);
-                assert_eq!(exhausted.observed, 65, "the trip reports what was spent");
-                assert!(exhausted.at > 0, "the stop records where decoding reached");
+            Outcome::Inconclusive(_) => {
+                assert_eq!(
+                    stop_of(&stopped),
+                    (StructuralUnit::ProducedNodes, 64, 65),
+                    "the trip reports its unit and what was spent"
+                );
+                assert_ne!(
+                    stop_progress(&stopped),
+                    "byte 0",
+                    "the stop records where decoding reached"
+                );
             }
-            Decoded::Malformed(error) => {
+            Outcome::Complete(Err(error)) => {
                 panic!("a budget stop was rendered as a rejection about the bytes: {error:?}")
             }
-            Decoded::Value(_) => panic!("the budget was not honoured"),
+            Outcome::Complete(Ok(_)) => panic!("the budget was not honoured"),
+            Outcome::InternalFault(fault) => {
+                panic!("the decoder's own budget accounting broke: {fault:?}")
+            }
         }
 
         // Same bytes, room to work: a real acceptance. The inconclusive outcome
         // above therefore said nothing about the artifact, which is the point.
-        let allowed =
-            Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::unlimited()).value();
+        let allowed = decoded_value(Expr::from_canonical_bytes_budgeted(
+            &bytes,
+            DecodeBudget::unlimited(),
+        ));
         assert_eq!(
             allowed.expect("the artifact is valid").to_canonical_bytes(),
             bytes
@@ -3057,14 +3177,16 @@ mod tests {
         let bytes = app_spine(2_000).to_canonical_bytes();
         let cap = 128;
         match Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(cap, u64::MAX)) {
-            Decoded::Inconclusive(exhausted) => {
-                assert_eq!(exhausted.limit, BudgetLimit::InputBytes);
-                assert_eq!(exhausted.allowed, cap);
-                assert!(exhausted.observed > cap);
-                assert!(
-                    (exhausted.at as u64) <= cap,
-                    "no byte beyond the cap was consumed"
-                );
+            ref stopped @ Outcome::Inconclusive(_) => {
+                let (unit, allowed, observed) = stop_of(stopped);
+                assert_eq!(unit, StructuralUnit::InputBytes);
+                assert_eq!(allowed, cap);
+                assert!(observed > cap);
+                let at: u64 = stop_progress(stopped)
+                    .trim_start_matches("byte ")
+                    .parse()
+                    .expect("progress localizes to a byte offset");
+                assert!(at <= cap, "no byte beyond the cap was consumed");
             }
             other => panic!("expected an inconclusive stop, got {other:?}"),
         }
@@ -3077,7 +3199,7 @@ mod tests {
         let mut truncated = app_spine(4).to_canonical_bytes();
         truncated.truncate(truncated.len() - 1);
         match Expr::from_canonical_bytes_budgeted(&truncated, DecodeBudget::unlimited()) {
-            Decoded::Malformed(error) => assert_eq!(error.what, "input truncated"),
+            Outcome::Complete(Err(error)) => assert_eq!(error.what, "input truncated"),
             other => panic!("a malformed artifact must be rejected, got {other:?}"),
         }
 
@@ -3088,7 +3210,7 @@ mod tests {
         w.u8(0xfe);
         let unknown_tag = w.into_bytes();
         match Expr::from_canonical_bytes_budgeted(&unknown_tag, DecodeBudget::new(u64::MAX, 8)) {
-            Decoded::Malformed(error) => assert_eq!(error.what, "unknown expr tag"),
+            Outcome::Complete(Err(error)) => assert_eq!(error.what, "unknown expr tag"),
             other => panic!("the malformation is reached first, got {other:?}"),
         }
     }
@@ -3100,10 +3222,11 @@ mod tests {
         for depth in [0usize, 1, 7, 64] {
             let bytes = app_spine(depth).to_canonical_bytes();
             let unbudgeted = Expr::from_canonical_bytes(&bytes).expect("valid artifact");
-            let budgeted =
-                Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, u64::MAX))
-                    .value()
-                    .expect("a fitting budget accepts");
+            let budgeted = decoded_value(Expr::from_canonical_bytes_budgeted(
+                &bytes,
+                DecodeBudget::new(u64::MAX, u64::MAX),
+            ))
+            .expect("a fitting budget accepts");
             assert_eq!(unbudgeted, budgeted);
             assert_eq!(unbudgeted.hash(), budgeted.hash());
             assert_eq!(budgeted.to_canonical_bytes(), bytes);
@@ -3184,12 +3307,12 @@ mod tests {
 
         // And the arm that never needed a taxonomy change still behaves: a malformed
         // decode is an authoritative domain rejection, not an inconclusive.
-        let malformed: Decoded<Level> = Level::from_canonical_bytes_budgeted(
+        let malformed: DecodeOutcome<Level> = Level::from_canonical_bytes_budgeted(
             b"not a canonical level",
             DecodeBudget::unlimited(),
         );
-        assert!(matches!(malformed, Decoded::Malformed(_)));
-        assert!(!malformed.is_inconclusive());
+        assert!(matches!(malformed, Outcome::Complete(Err(_))));
+        assert!(!is_inconclusive(&malformed));
     }
 
     #[test]
@@ -3200,8 +3323,10 @@ mod tests {
         }
         let named = Expr::const_(deep_name.clone(), Vec::new()).to_canonical_bytes();
         assert!(
-            Expr::from_canonical_bytes_budgeted(&named, DecodeBudget::new(u64::MAX, 16))
-                .is_inconclusive(),
+            is_inconclusive(&Expr::from_canonical_bytes_budgeted(
+                &named,
+                DecodeBudget::new(u64::MAX, 16)
+            )),
             "a deep Name payload must be charged"
         );
 
@@ -3211,8 +3336,10 @@ mod tests {
         }
         let mdata = Expr::mdata(map, Expr::bvar(0).expect("small")).to_canonical_bytes();
         assert!(
-            Expr::from_canonical_bytes_budgeted(&mdata, DecodeBudget::new(u64::MAX, 16))
-                .is_inconclusive(),
+            is_inconclusive(&Expr::from_canonical_bytes_budgeted(
+                &mdata,
+                DecodeBudget::new(u64::MAX, 16)
+            )),
             "a KVMap payload must be charged"
         );
 
@@ -3221,37 +3348,95 @@ mod tests {
         assert!(Expr::from_canonical_bytes(&mdata).is_ok());
     }
 
+    /// **The fold is behaviour-preserving at the boundary** (bead fln-8gz3): each of the
+    /// three outcomes the old `Decoded` enum could report maps to exactly one `Outcome`
+    /// arm with the same observable meaning, and the FL-INV-07 properties are now
+    /// enforced by the shared type rather than restated here.
+    ///
+    /// What the fold *adds* is the cacheability axis, which `Decoded` had no way to
+    /// express: a completed run is admissible whether its domain answer was acceptance or
+    /// rejection, because "these bytes are not a well-formed artifact" is a durable fact
+    /// about those bytes; a stop is refused, because nothing was learned.
+    #[test]
+    fn each_decoded_outcome_folds_to_one_outcome_arm_with_the_same_meaning() {
+        let bytes = app_spine(200).to_canonical_bytes();
+
+        // ACCEPTANCE -> Complete(Ok): authoritative, and cacheable.
+        let accepted = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::unlimited());
+        assert!(matches!(accepted, Outcome::Complete(Ok(_))));
+        assert_eq!(accepted.authority(), Authority::Authoritative);
+        assert_eq!(accepted.cache_admission(), CacheAdmission::Admissible);
+
+        // REJECTION -> Complete(Err): also authoritative and cacheable. A malformed
+        // verdict is a real answer about the bytes, which is exactly why it belongs
+        // inside the Complete arm rather than beside it.
+        let rejected =
+            Expr::from_canonical_bytes_budgeted(b"not an expr", DecodeBudget::unlimited());
+        assert!(matches!(rejected, Outcome::Complete(Err(_))));
+        assert_eq!(rejected.authority(), Authority::Authoritative);
+        assert_eq!(rejected.cache_admission(), CacheAdmission::Admissible);
+
+        // STOP -> Inconclusive: non-authoritative, NEVER cacheable, and unable to
+        // masquerade as either of the two above.
+        let stopped = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 32));
+        assert!(matches!(stopped, Outcome::Inconclusive(_)));
+        assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            stopped.cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
+        );
+        assert!(
+            stopped.as_complete().is_none(),
+            "a stop must not yield a domain result of either polarity"
+        );
+        assert_eq!(stop_of(&stopped).0, StructuralUnit::ProducedNodes);
+
+        // The three are genuinely distinct outcomes over the SAME artifact, separated
+        // only by the budget — so a caller can tell "invalid" from "too expensive to
+        // judge", which is the distinction the whole three-valued design exists for.
+        assert_ne!(
+            std::mem::discriminant(&accepted),
+            std::mem::discriminant(&stopped)
+        );
+        assert!(matches!(
+            (&accepted, &rejected),
+            (Outcome::Complete(Ok(_)), Outcome::Complete(Err(_)))
+        ));
+    }
+
     /// An exhausted decode must not be retryable into a verdict by accident: the
     /// stop carries what it cost, so a caller raises the budget deliberately.
     #[test]
     fn a_stop_reports_enough_to_retry_deliberately() {
         let bytes = app_spine(200).to_canonical_bytes();
-        let Decoded::Inconclusive(first) =
-            Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 32))
-        else {
-            panic!("expected a stop");
-        };
-        assert!(first.observed > first.allowed);
+        let first = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 32));
+        let (_, first_allowed, first_observed) = stop_of(&first);
+        assert!(first_observed > first_allowed);
 
         // Raising the limit past what the first attempt reported is not enough by
         // itself — the stop reports the point of the trip, not the total cost — but
         // the artifact must eventually decode as the limit grows, and never flip to
         // a rejection on the way.
-        let mut limit = first.allowed;
+        let mut limit = first_allowed;
         let mut attempts = 0;
         loop {
             limit = limit.saturating_mul(4).max(4);
             attempts += 1;
             match Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, limit)) {
-                Decoded::Value(value) => {
+                Outcome::Complete(Ok(value)) => {
                     assert_eq!(value.to_canonical_bytes(), bytes);
                     break;
                 }
-                Decoded::Inconclusive(_) => {
+                Outcome::Inconclusive(_) => {
                     assert!(attempts < 32, "budget growth did not converge")
                 }
-                Decoded::Malformed(error) => {
+                Outcome::Complete(Err(error)) => {
                     panic!("raising a budget turned a valid artifact into a rejection: {error:?}")
+                }
+                Outcome::InternalFault(fault) => {
+                    panic!("raising a budget broke the decoder's own accounting: {fault:?}")
                 }
             }
         }
@@ -3297,18 +3482,19 @@ mod tests {
                     DecodeBudget::new(u64::MAX, 1_000),
                 );
                 match stopped {
-                    Decoded::Inconclusive(exhausted) => {
-                        assert_eq!(exhausted.limit, BudgetLimit::ProducedNodes);
-                        assert_eq!(exhausted.allowed, 1_000);
-                        assert!(
-                            exhausted.observed > exhausted.allowed,
-                            "a stop reports what it cost"
-                        );
+                    Outcome::Inconclusive(_) => {
+                        let (unit, allowed, observed) = stop_of(&stopped);
+                        assert_eq!(unit, StructuralUnit::ProducedNodes);
+                        assert_eq!(allowed, 1_000);
+                        assert!(observed > allowed, "a stop reports what it cost");
                     }
-                    Decoded::Malformed(error) => panic!(
+                    Outcome::Complete(Err(error)) => panic!(
                         "budget exhaustion was reported as a claim about the bytes: {error:?}"
                     ),
-                    Decoded::Value(_) => panic!("the budget was not honoured"),
+                    Outcome::Complete(Ok(_)) => panic!("the budget was not honoured"),
+                    Outcome::InternalFault(fault) => {
+                        panic!("the decoder's own budget accounting broke: {fault:?}")
+                    }
                 }
 
                 // Nothing to cache: an inconclusive outcome carries no value, so a
@@ -3317,16 +3503,16 @@ mod tests {
                     &hostile,
                     DecodeBudget::new(u64::MAX, 1_000),
                 );
-                assert!(stopped.is_inconclusive());
+                assert!(is_inconclusive(&stopped));
                 assert!(
-                    stopped.value().is_none(),
+                    stopped.as_complete().is_none(),
                     "an inconclusive decode must not yield a value"
                 );
 
                 // The SAME bytes with room to work are a rejection — a real verdict
                 // about the input, and a different answer from the stop above.
                 match Expr::from_canonical_bytes_budgeted(&hostile, DecodeBudget::unlimited()) {
-                    Decoded::Malformed(error) => assert_eq!(
+                    Outcome::Complete(Err(error)) => assert_eq!(
                         error.what, "input truncated",
                         "the operands never arrive, and that is a well-formedness fact"
                     ),
@@ -3338,9 +3524,13 @@ mod tests {
                     &hostile,
                     DecodeBudget::new(512, u64::MAX),
                 ) {
-                    Decoded::Inconclusive(exhausted) => {
-                        assert_eq!(exhausted.limit, BudgetLimit::InputBytes);
-                        assert!((exhausted.at as u64) <= 512);
+                    ref stopped @ Outcome::Inconclusive(_) => {
+                        assert_eq!(stop_of(stopped).0, StructuralUnit::InputBytes);
+                        let at: u64 = stop_progress(stopped)
+                            .trim_start_matches("byte ")
+                            .parse()
+                            .expect("progress localizes to a byte offset");
+                        assert!(at <= 512);
                     }
                     other => panic!("expected a byte-budget stop, got {other:?}"),
                 }
@@ -3354,22 +3544,20 @@ mod tests {
                     deep = Expr::app(deep, leaf.clone());
                 }
                 let deep_bytes = deep.to_canonical_bytes();
-                let decoded = Expr::from_canonical_bytes_budgeted(
+                let decoded = decoded_value(Expr::from_canonical_bytes_budgeted(
                     &deep_bytes,
                     DecodeBudget::new(u64::MAX, u64::MAX),
-                )
-                .value()
+                ))
                 .expect("a valid deep artifact decodes when the budget allows it");
                 assert_eq!(decoded.to_canonical_bytes(), deep_bytes);
 
                 // And the same artifact under a budget it does not fit is a stop, not
                 // a rejection: the artifact is fine, the caller was not willing to pay.
                 assert!(
-                    Expr::from_canonical_bytes_budgeted(
+                    is_inconclusive(&Expr::from_canonical_bytes_budgeted(
                         &deep_bytes,
                         DecodeBudget::new(u64::MAX, 64)
-                    )
-                    .is_inconclusive(),
+                    )),
                     "a valid artifact over budget is inconclusive, never rejected"
                 );
             })

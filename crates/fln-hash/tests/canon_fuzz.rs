@@ -36,11 +36,13 @@
 
 use std::time::{Duration, Instant};
 
+use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap};
-use fln_hash::canon::{CanonError, Canonical, DecodeBudget, Decoded, Exhausted};
+use fln_core::outcome::{InconclusiveCause, Outcome as CoreOutcome};
+use fln_hash::canon::{CanonError, Canonical, DecodeBudget, DecodeOutcome};
 
 /// No single decode of these inputs may take longer than this. Generous enough to
 /// absorb a loaded CI box, tight enough that an unbounded allocation or a spin on a
@@ -170,9 +172,20 @@ enum Target {
 /// reason about it without naming a type per target.
 enum Outcome {
     Accepted,
-    NonCanonical { input: usize, canonical: usize },
+    NonCanonical {
+        input: usize,
+        canonical: usize,
+    },
     Refused,
-    Inconclusive(Exhausted),
+    Inconclusive {
+        unit: StructuralUnit,
+        allowed: u64,
+        observed: u64,
+    },
+    /// The decoder's own budget accounting contradicted itself. Its own arm because a
+    /// fuzz run that produces one has found a defect in us, not in the input, and it must
+    /// not be absorbed into any of the arms above (bead fln-8gz3).
+    Fault(String),
 }
 
 impl Target {
@@ -188,9 +201,9 @@ impl Target {
     }
 
     fn round_trip_budgeted(self, bytes: &[u8], budget: DecodeBudget) -> Outcome {
-        fn classify<T: Canonical>(decoded: Decoded<T>, input: &[u8]) -> Outcome {
+        fn classify<T: Canonical>(decoded: DecodeOutcome<T>, input: &[u8]) -> Outcome {
             match decoded {
-                Decoded::Value(value) => {
+                CoreOutcome::Complete(Ok(value)) => {
                     let canonical = value.to_canonical_bytes();
                     if canonical == input {
                         Outcome::Accepted
@@ -201,8 +214,23 @@ impl Target {
                         }
                     }
                 }
-                Decoded::Malformed(_) => Outcome::Refused,
-                Decoded::Inconclusive(exhausted) => Outcome::Inconclusive(exhausted),
+                CoreOutcome::Complete(Err(_)) => Outcome::Refused,
+                CoreOutcome::Inconclusive(inconclusive) => match inconclusive.cause {
+                    InconclusiveCause::ResourceExhausted { usage } => match usage.reason {
+                        ResourceReason::StructuralBudget { unit } => Outcome::Inconclusive {
+                            unit,
+                            allowed: usage.allowed,
+                            observed: usage.observed,
+                        },
+                        other => Outcome::Fault(format!(
+                            "a decode stop named a non-structural resource: {other:?}"
+                        )),
+                    },
+                    other => Outcome::Fault(format!(
+                        "a decode stop was not a resource exhaustion: {other:?}"
+                    )),
+                },
+                CoreOutcome::InternalFault(fault) => Outcome::Fault(format!("{fault:?}")),
             }
         }
         match self {
@@ -317,10 +345,20 @@ fn check(target: Target, label: &str, bytes: &[u8], profile: &mut Profile) -> Op
 fn check_budgets(target: Target, label: &str, bytes: &[u8]) -> Vec<String> {
     let mut findings = Vec::new();
     let unlimited = target.round_trip_budgeted(bytes, DecodeBudget::unlimited());
-    if let Outcome::Inconclusive(exhausted) = &unlimited {
+    if let Outcome::Inconclusive {
+        unit,
+        allowed,
+        observed,
+    } = &unlimited
+    {
         findings.push(format!(
-            "{label}: an unlimited budget reported exhaustion ({exhausted:?})"
+            "{label}: an unlimited budget reported exhaustion ({} allowed={allowed} \
+             observed={observed})",
+            unit.as_str()
         ));
+    }
+    if let Outcome::Fault(detail) = &unlimited {
+        findings.push(format!("{label}: unlimited decode faulted: {detail}"));
     }
     let accepted_unlimited = matches!(unlimited, Outcome::Accepted);
 
@@ -348,15 +386,19 @@ fn check_budgets(target: Target, label: &str, bytes: &[u8]) -> Vec<String> {
                  ({input} input bytes, {canonical} canonical)"
             )),
             Outcome::Refused => {}
-            Outcome::Inconclusive(exhausted) => {
-                if exhausted.observed <= exhausted.allowed {
+            Outcome::Inconclusive {
+                allowed, observed, ..
+            } => {
+                if observed <= allowed {
                     findings.push(format!(
-                        "{label}: budget {budget:?} tripped at observed={} allowed={} — a stop \
-                         must report spending past its limit",
-                        exhausted.observed, exhausted.allowed
+                        "{label}: budget {budget:?} tripped at observed={observed} \
+                         allowed={allowed} — a stop must report spending past its limit"
                     ));
                 }
             }
+            Outcome::Fault(detail) => findings.push(format!(
+                "{label}: budget {budget:?} broke the decoder's own accounting: {detail}"
+            )),
         }
     }
     findings

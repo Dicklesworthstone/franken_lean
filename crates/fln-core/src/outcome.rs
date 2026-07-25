@@ -20,7 +20,8 @@
 //! `fln_kernel::verdict::Verdict` fused accept/reject/inconclusive into one enum,
 //! `fln_env::decl_closure` grew its own cancellation-and-resource pair,
 //! `fln_hash::canon::Decoded` grew a third, and the artifact-incomplete family a
-//! fourth. Each was right on its own and none of them could be checked against the
+//! fourth. `Decoded` is now folded into this type (bead fln-8gz3) and no longer exists;
+//! the others are tracked by their own adoption beads. Each was right on its own and none of them could be checked against the
 //! others. Five copies of an invariant are five chances to drift.
 //!
 //! ## Outcome and cause are orthogonal axes
