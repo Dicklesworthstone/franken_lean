@@ -37,7 +37,9 @@
 
 use crate::category::{Category, LeadingIdentBehavior};
 use crate::state::Production;
+use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
+use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 use std::collections::BTreeMap;
 
 /// A point in the registration history — upstream's parser state as of one command.
@@ -371,6 +373,165 @@ impl std::fmt::Debug for Registry {
             .field("hooks", &self.hooks.len())
             .finish()
     }
+}
+
+/// A canonical projection of the whole grammar — the value FL-INV-01 requires to be identical at
+/// every thread count.
+///
+/// A *string* rather than a hash, deliberately: when two roots differ the diff has to say what
+/// differs, and a digest says only that something did. The projection is ordered by construction
+/// (categories sorted, tokens sorted, kinds in registration order) so equal grammars have equal
+/// roots and unequal ones are legible.
+///
+/// Kinds are in **registration order** and not sorted, because that order is semantically load
+/// bearing: shadowing is additive, so the sequence of productions under a token is part of the
+/// grammar rather than an artefact of how it was built. Sorting them here would hide a real
+/// difference and make the determinism claim weaker than it looks.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GrammarRoot(pub String);
+
+/// A registration request, carrying the key that decides its canonical position.
+///
+/// The key exists because registration order is **not** semantically free here — additive
+/// shadowing means the order of productions under a token is part of the grammar. So concurrent
+/// registration cannot be made schedule-independent by locking alone: a mutex gives *a* result,
+/// not *the same* result. The batch is applied in key order, which is the registered tie-break the
+/// determinism doctrine asks for (FL-INV-01, and franken_networkx's CGSE policy shape).
+pub struct Request {
+    /// The canonical key — in practice a declaration's source order or its name.
+    pub key: (u64, String),
+    pub category: Name,
+    pub token: String,
+    pub production: Production,
+    pub scoped: bool,
+}
+
+/// A bound on how much a registry may hold.
+///
+/// Same shape and same law as `fln_syntax::run::LexBudget` (bead franken_lean-81oq): exceeding it
+/// is **inconclusive, never a rejection**. A grammar too large to hold is not a malformed grammar,
+/// and saying so would tell a user their correct file has an error in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryBudget {
+    pub max_categories: u64,
+    pub max_productions: u64,
+}
+
+impl RegistryBudget {
+    pub const fn generous() -> RegistryBudget {
+        RegistryBudget {
+            max_categories: 4096,
+            max_productions: 1 << 20,
+        }
+    }
+}
+
+impl Registry {
+    /// The canonical projection of the whole grammar as of `epoch`.
+    pub fn grammar_root(&self, epoch: GrammarEpoch) -> GrammarRoot {
+        let mut out = String::new();
+        for (key, state) in &self.categories {
+            out.push_str(&format!("cat {key} {:?}\n", state.behavior));
+            for (token, productions) in &state.leading {
+                let live: Vec<String> = productions
+                    .iter()
+                    .filter(|entry| entry.at <= epoch)
+                    .map(|entry| entry.production.kind.to_display_string())
+                    .collect();
+                if !live.is_empty() {
+                    out.push_str(&format!("  lead {token} [{}]\n", live.join(",")));
+                }
+            }
+            for (token, productions) in &state.trailing {
+                let live: Vec<String> = productions
+                    .iter()
+                    .filter(|entry| entry.at <= epoch)
+                    .map(|entry| entry.production.kind.to_display_string())
+                    .collect();
+                if !live.is_empty() {
+                    out.push_str(&format!("  trail {token} [{}]\n", live.join(",")));
+                }
+            }
+        }
+        GrammarRoot(out)
+    }
+
+    /// How many productions are registered, live at the current epoch.
+    pub fn production_count(&self) -> u64 {
+        self.categories
+            .values()
+            .map(|state| {
+                let count: usize = state
+                    .leading
+                    .values()
+                    .chain(state.trailing.values())
+                    .map(Vec::len)
+                    .sum();
+                count as u64
+            })
+            .sum()
+    }
+
+    /// Apply a batch of requests in **canonical key order**, whatever order they arrive in.
+    ///
+    /// This is what makes concurrent registration schedule-independent. Sorting by key rather than
+    /// applying on arrival is the whole mechanism: because shadowing is additive, arrival order
+    /// would otherwise change the sequence of productions under a token and therefore the grammar
+    /// root itself.
+    pub fn apply_batch(
+        &mut self,
+        mut requests: Vec<Request>,
+    ) -> Result<GrammarEpoch, RegisterError> {
+        requests.sort_by(|a, b| a.key.cmp(&b.key));
+        for request in requests {
+            self.add_leading(
+                &request.category,
+                request.token,
+                request.production,
+                request.scoped,
+            )?;
+        }
+        Ok(self.epoch)
+    }
+
+    /// Apply a batch under a budget. Exceeding it is `Inconclusive`, never a rejection.
+    pub fn apply_batch_bounded(
+        &mut self,
+        requests: Vec<Request>,
+        budget: RegistryBudget,
+    ) -> Outcome<Result<GrammarEpoch, RegisterError>> {
+        let categories = self.categories.len() as u64;
+        if categories > budget.max_categories {
+            return exhausted(
+                StructuralUnit::ProducedNodes,
+                budget.max_categories,
+                categories,
+            );
+        }
+        let projected = self.production_count() + requests.len() as u64;
+        if projected > budget.max_productions {
+            // Checked BEFORE applying anything, so a refused batch leaves the grammar untouched —
+            // the atomicity a caller needs to retry with a larger allowance.
+            return exhausted(
+                StructuralUnit::ProducedNodes,
+                budget.max_productions,
+                projected,
+            );
+        }
+        Outcome::Complete(self.apply_batch(requests))
+    }
+}
+
+fn exhausted(
+    unit: StructuralUnit,
+    allowed: u64,
+    observed: u64,
+) -> Outcome<Result<GrammarEpoch, RegisterError>> {
+    Outcome::Inconclusive(Inconclusive::resource(ResourceUsage {
+        reason: ResourceReason::StructuralBudget { unit },
+        allowed,
+        observed,
+    }))
 }
 
 #[cfg(test)]

@@ -458,7 +458,7 @@ mod tests {
         }
     }
 
-    fn checked_contradiction() -> crate::CheckedUnsat {
+    fn checked_contradiction() -> Result<crate::CheckedUnsat, String> {
         let variable = VariableId::new(1).expect("test variable is nonzero");
         let positive = Clause::new(vec![Literal::new(variable, Polarity::Positive)])
             .expect("test clause is valid");
@@ -480,8 +480,8 @@ mod tests {
         )
         .expect("test CNF is valid");
         match solve(&cnf, SolverLimits::default()) {
-            SolverOutcome::Unsat { artifact, .. } => artifact,
-            other => panic!("unit contradiction must be UNSAT, got {other:?}"),
+            SolverOutcome::Unsat { artifact, .. } => Ok(artifact),
+            other => Err(format!("unit contradiction must be UNSAT, got {other:?}")),
         }
     }
 
@@ -495,17 +495,23 @@ mod tests {
     }
 
     fn artifact(theorem: TheoremVal) -> ReflectedTheoremArtifact {
-        ReflectedTheoremArtifact::from_checked_unsat(checked_contradiction(), theorem, provenance())
+        ReflectedTheoremArtifact::from_checked_unsat(
+            checked_contradiction().expect("test contradiction produces a certificate"),
+            theorem,
+            provenance(),
+        )
     }
 
     fn published(
         environment: &Environment,
         artifact: ReflectedTheoremArtifact,
         limits: ReflectedTheoremLimits,
-    ) -> super::ReflectedTheoremPublication {
+    ) -> Result<super::ReflectedTheoremPublication, String> {
         match publish_reflected_theorem(environment, artifact, limits, None) {
-            ReflectedTheoremOutcome::Published(publication) => publication,
-            other => panic!("expected reflected theorem publication, got {other:?}"),
+            ReflectedTheoremOutcome::Published(publication) => Ok(publication),
+            other => Err(format!(
+                "expected reflected theorem publication, got {other:?}"
+            )),
         }
     }
 
@@ -516,7 +522,8 @@ mod tests {
             &environment,
             artifact(valid_theorem("reflected.identity")),
             ReflectedTheoremLimits::default(),
-        );
+        )
+        .expect("valid reflected theorem publishes");
 
         assert!(
             environment.is_empty(),
@@ -674,7 +681,8 @@ mod tests {
             &Environment::new(),
             artifact(valid_theorem("reflected.duplicate")),
             ReflectedTheoremLimits::default(),
-        );
+        )
+        .expect("first declaration publishes");
         let environment = first.publication.environment;
         let before = environment.logical_root(&KVMap::new());
         let outcome = publish_reflected_theorem(
@@ -695,7 +703,7 @@ mod tests {
     }
 
     fn replay_identity() -> (Vec<u8>, Vec<u8>, String, crate::ProofCheckReceipt) {
-        let checked = checked_contradiction();
+        let checked = checked_contradiction().expect("test contradiction produces a certificate");
         let cnf_bytes = checked.cnf_bytes().to_vec();
         let proof_bytes = checked.proof_bytes().to_vec();
         let publication = published(
@@ -706,7 +714,8 @@ mod tests {
                 provenance(),
             ),
             ReflectedTheoremLimits::default(),
-        );
+        )
+        .expect("determinism sample publishes");
         (
             cnf_bytes,
             proof_bytes,
