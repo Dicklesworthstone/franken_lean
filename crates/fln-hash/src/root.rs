@@ -201,37 +201,117 @@ mod tests {
         assert_eq!(forward.finalize(), reverse.finalize());
     }
 
+    /// Accumulate a commit with declarations added in `order`.
+    fn accumulate(entries: &[(Name, Digest)], order: &[usize]) -> LogicalRoot {
+        let mut builder = LogicalRootBuilder::new();
+        for &index in order {
+            let (name, digest) = &entries[index];
+            builder.add_decl(name, *digest);
+        }
+        builder.finalize()
+    }
+
+    /// The full input closure of a commit, rendered for diagnosis.
+    ///
+    /// The acceptance criterion asks for this by name — "the full input closure logged in
+    /// the test output for diagnosis on mismatch" — because a bare "roots differ" tells
+    /// whoever is paged nothing about *which* input moved. Declarations are listed in
+    /// canonical-byte order so two reports diff cleanly regardless of accumulation order,
+    /// and the accumulation order is printed separately since that is the variable under
+    /// test.
+    fn closure_report(label: &str, entries: &[(Name, Digest)], order: &[usize]) -> String {
+        let mut out = format!(
+            "input closure [{label}]: {} declarations, accumulated in order [{}]\n",
+            entries.len(),
+            order
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut sorted: Vec<&(Name, Digest)> = entries.iter().collect();
+        sorted.sort_by_key(|(name, _)| name.to_canonical_bytes());
+        for (name, digest) in sorted {
+            out.push_str(&format!(
+                "  decl {} -> {}\n",
+                name.to_display_string(),
+                digest.to_hex()
+            ));
+        }
+        out
+    }
+
     #[test]
-    fn root_is_schedule_independent_across_thread_counts() {
-        // The FL-INV-01 posture at this layer: {1, 8} threads, arbitrary interleaving,
-        // same commit ⇒ same root.
+    fn root_is_schedule_independent_across_the_thread_matrix() {
         let entries = sample_entries();
-        let sequential = {
-            let mut b = LogicalRootBuilder::new();
-            for (n, d) in &entries {
-                b.add_decl(n, *d);
-            }
-            b.finalize()
-        };
-        for threads in [2usize, 8] {
-            let chunks: Vec<Vec<(Name, Digest)>> = entries
-                .chunks(entries.len().div_ceil(threads))
-                .map(<[(Name, Digest)]>::to_vec)
-                .collect();
-            let collected = std::thread::scope(|scope| {
-                let handles: Vec<_> = chunks
-                    .iter()
-                    .map(|chunk| scope.spawn(move || chunk.clone()))
-                    .collect();
-                let mut b = LogicalRootBuilder::new();
-                for handle in handles {
-                    for (n, d) in handle.join().expect("worker") {
-                        b.add_decl(&n, d);
-                    }
+        let canonical: Vec<usize> = (0..entries.len()).collect();
+        let baseline = accumulate(&entries, &canonical);
+
+        // DETERMINISTIC ADVERSARIAL ORDERS FIRST. The previous version of this test
+        // joined worker handles in spawn order, so the builder always received entries
+        // in the same sequence no matter how many threads produced them — it could not
+        // have detected an order-dependent accumulator, which is the only thing it
+        // claimed to test. These orders cover non-identity schedules without depending
+        // on the scheduler doing anything interesting.
+        let reversed: Vec<usize> = canonical.iter().rev().copied().collect();
+        let rotated: Vec<usize> = canonical[7..]
+            .iter()
+            .chain(&canonical[..7])
+            .copied()
+            .collect();
+        let swapped_pairs: Vec<usize> = canonical
+            .chunks(2)
+            .flat_map(|pair| pair.iter().rev().copied())
+            .collect();
+        for (label, order) in [
+            ("reversed", &reversed),
+            ("rotated", &rotated),
+            ("adjacent-swaps", &swapped_pairs),
+        ] {
+            assert_eq!(
+                accumulate(&entries, order),
+                baseline,
+                "{label} accumulation moved the root\n{}{}",
+                closure_report("baseline", &entries, &canonical),
+                closure_report(label, &entries, order)
+            );
+        }
+
+        // THEN REAL CONCURRENCY, at the project's thread matrix {1, 8, 32} (PG-5 /
+        // FL-INV-01 — the old [2, 8] matched neither the doctrine nor its own comment).
+        // Arrival order is decided by lock contention rather than by join order, so the
+        // accumulation sequence genuinely varies run to run.
+        for threads in [1usize, 8, 32] {
+            let arrived: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            let chunk_size = entries.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                for chunk in canonical.chunks(chunk_size) {
+                    let arrived = &arrived;
+                    scope.spawn(move || {
+                        for &index in chunk {
+                            arrived.lock().expect("not poisoned").push(index);
+                        }
+                    });
                 }
-                b.finalize()
             });
-            assert_eq!(collected, sequential, "{threads} threads diverged");
+            let order = arrived.into_inner().expect("not poisoned");
+            assert_eq!(
+                order.len(),
+                entries.len(),
+                "{threads} workers dropped or duplicated an entry: [{}]",
+                order
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            assert_eq!(
+                accumulate(&entries, &order),
+                baseline,
+                "{threads} threads diverged\n{}{}",
+                closure_report("baseline", &entries, &canonical),
+                closure_report(&format!("{threads}-threads"), &entries, &order)
+            );
         }
     }
 
