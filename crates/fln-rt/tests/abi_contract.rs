@@ -4,6 +4,15 @@
 //! independently-recorded expectations (marked TRIPWIRE) exist so that a seeded
 //! mutation of the generated constants is killed by a named test even before
 //! the extractor's `--check` lane runs.
+//!
+//! **What verifies the digests is not here** (bead `franken_lean-pnav`).
+//! [`pin_binding_is_present`] asserts *presence and shape* — that `PIN_COMMIT`
+//! is 40 hex characters and the two digests are 64 — and deliberately not that
+//! any of them matches its content. The binding against the pin lives in
+//! `scripts/e2e/contract_drift.sh`, which regenerates from the vendored header
+//! via `gen_abi_contract.py --check` and carries seeded mutants it must kill;
+//! it is registered in `scripts/check.sh`. Read the name literally: *present*,
+//! not *verified*.
 
 #![forbid(unsafe_code)]
 
@@ -146,6 +155,13 @@ fn tripwire_known_symbols_have_recorded_shapes() {
 #[test]
 fn layout_constants_are_recorded() {
     // TRIPWIRE: independently recorded from lean.h at the pin.
+    //
+    // Scope, stated because the word "independently" invites a stronger reading
+    // (bead `franken_lean-pnav`): these values were transcribed from what the
+    // generator emitted, so this kills a LATER regeneration bug — a constant that
+    // moves without the pin moving. It cannot catch a value that was already wrong
+    // at extraction time, because the transcription came from the same source. The
+    // check against the pin itself is `scripts/e2e/contract_drift.sh`.
     assert_eq!(abi::CLOSURE_MAX_ARGS, 16);
     assert_eq!(abi::OBJECT_SIZE_DELTA, 8);
     assert_eq!(abi::MAX_SMALL_OBJECT_SIZE, 4096);

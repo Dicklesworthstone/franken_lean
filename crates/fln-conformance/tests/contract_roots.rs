@@ -4,6 +4,29 @@
 //! the extern census must be internally coherent. A hand edit to any one
 //! artifact breaks the linkage here; drift against the pin itself is caught by
 //! the extractors' `--check` lanes (scripts/e2e/contract_drift.sh).
+//!
+//! ## What this suite does NOT verify, and why (bead `franken_lean-pnav`)
+//!
+//! [`assert_linked`] compares the inventory digest *labels* the Markdown and the
+//! generated Rust each carry, and checks the inventory file is non-empty. It does
+//! **not** recompute a digest from content, so a reader should not take a green
+//! run here as "the contracts match the pin".
+//!
+//! That is not laziness, and it is worth recording why rather than leaving it as
+//! an apparent oversight: `INVENTORY_DIGEST` is **sha256** of the inventory text
+//! (`gen_abi_contract.py:1348`), and the closed dependency universe (D1) contains
+//! **no sha256** — `fln-hash` implements BLAKE3. So no Rust in this workspace can
+//! recompute that digest, and the only thing that can verify it is the Python
+//! extractor that produced it. Implementing sha256 to satisfy a test would be the
+//! wrong trade; recording that the verification is single-sourced is the honest
+//! one.
+//!
+//! What this suite *can* do is refuse to let the delegation go silently missing —
+//! see [`the_lane_this_suite_delegates_to_is_present_and_registered`]. The risk
+//! `franken_lean-pnav` names is structural: if `contract_drift.sh` is ever removed
+//! or unregistered, this shape-only cluster becomes the only remaining check on
+//! the ABI and olean contracts, and nothing in these tests would change colour.
+//! Now it would.
 
 #![forbid(unsafe_code)]
 
@@ -50,6 +73,54 @@ fn assert_linked(md_rel: &str, rs_rel: &str, inv_rel: &str) {
     assert!(
         md.contains("@generated") && rs.contains("@generated"),
         "rendered artifacts must carry the @generated marker"
+    );
+}
+
+/// The delegation in this module's header must stay true.
+///
+/// Every shape-only assertion in this cluster — here, `fln-rt`'s
+/// `pin_binding_is_present`, and `fln-olean`'s — points at one lane for the real
+/// verification. A pointer to a lane that no longer exists, or exists but is no
+/// longer wired into the gate, is worse than no pointer: it reads as coverage.
+/// So the existence and the registration are both asserted, and the second is the
+/// one that matters — a script can sit in the tree unrun for months.
+#[test]
+fn the_lane_this_suite_delegates_to_is_present_and_registered() {
+    let root = root();
+    const LANE: &str = "scripts/e2e/contract_drift.sh";
+
+    let lane = fs::read_to_string(root.join(LANE));
+    assert!(
+        lane.is_ok(),
+        "{LANE} is missing, and three test suites delegate their digest \
+         verification to it. Either restore it or stop claiming the delegation in \
+         those headers — a dangling pointer reads as coverage."
+    );
+    let lane = lane.expect("asserted above");
+    assert!(
+        lane.contains("--check"),
+        "{LANE} no longer invokes an extractor --check lane, so the delegation it \
+         receives is no longer honoured"
+    );
+
+    let gate = fs::read_to_string(root.join("scripts/check.sh"));
+    assert!(gate.is_ok(), "scripts/check.sh: {:?}", gate.as_ref().err());
+    let gate = gate.expect("asserted above");
+    assert!(
+        gate.contains(LANE),
+        "{LANE} exists but scripts/check.sh no longer names it, so it is not run by \
+         the gate. That is the exact failure franken_lean-pnav describes: the \
+         shape-only assertions silently become the only remaining check."
+    );
+
+    // Negative control. A registration check whose `contains` is true for anything
+    // proves nothing, and this suite exists precisely because a test can look like
+    // verification without being it — so the discriminating power is demonstrated
+    // here rather than assumed.
+    assert!(
+        !gate.contains("scripts/e2e/contract_drift_that_does_not_exist.sh"),
+        "the registration check matches a lane that was never written, so it cannot \
+         distinguish a registered lane from an absent one"
     );
 }
 

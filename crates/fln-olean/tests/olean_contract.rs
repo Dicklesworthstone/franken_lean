@@ -3,6 +3,11 @@
 //! internally coherent (contiguous offsets, packed size), and TRIPWIRE
 //! expectations — independently recorded from the pin — kill a seeded mutation
 //! of the generated constants by a named test.
+//!
+//! **What verifies `INVENTORY_DIGEST` is not here** (bead `franken_lean-pnav`).
+//! [`pin_binding_is_present`] asserts its *shape* (64 characters), never that it
+//! matches `contracts/olean_inventory.json`. That binding lives in
+//! `scripts/e2e/contract_drift.sh`, registered in `scripts/check.sh`.
 
 #![forbid(unsafe_code)]
 
