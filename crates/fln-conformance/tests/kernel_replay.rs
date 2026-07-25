@@ -699,6 +699,15 @@ struct MatrixRun {
     duration_us: u128,
 }
 
+// Rust's default spawned-thread stack is 2 MiB on this target. That is below
+// the depth at which `Budget::DEFAULT` can still permit the kernel to recurse,
+// so inheriting it lets a valid deep term abort the whole Tribunal before the
+// kernel can return a typed depth-exhaustion outcome (franken_lean-kxbj).
+//
+// This is an explicit harness floor, not a calibration of the kernel's default
+// depth budget. The latter remains owned by franken_lean-kxbj.
+const KERNEL_REPLAY_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 /// Check every prepared unit across `threads` workers pulling from a shared
 /// cursor (a genuinely nondeterministic schedule), then merge in canonical
 /// unit order. The kernel is pure and each unit's inputs are fixed by
@@ -710,20 +719,27 @@ fn check_matrix_run(prep: &PreparedReplay, threads: usize, budget: Budget) -> Ma
     let slots: Vec<OnceLock<Outcome<Verdict>>> = (0..n).map(|_| OnceLock::new()).collect();
     let cursor = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = cursor.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    let item = &prep.items[i];
-                    let verdict = fln_kernel::check(&item.env, &item.decl, budget);
-                    slots[i]
-                        .set(verdict)
-                        .expect("each unit is checked exactly once");
-                }
-            });
+        let mut workers = Vec::with_capacity(threads);
+        for worker_index in 0..threads {
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("fln-kernel-replay-{worker_index}"))
+                    .stack_size(KERNEL_REPLAY_WORKER_STACK_BYTES)
+                    .spawn_scoped(scope, || {
+                        loop {
+                            let i = cursor.fetch_add(1, Ordering::Relaxed);
+                            if i >= n {
+                                break;
+                            }
+                            let item = &prep.items[i];
+                            let verdict = fln_kernel::check(&item.env, &item.decl, budget);
+                            slots[i]
+                                .set(verdict)
+                                .expect("each unit is checked exactly once");
+                        }
+                    })
+                    .expect("spawn kernel replay worker with the explicit stack contract"),
+            );
         }
     });
     let mut outcomes = Vec::with_capacity(n);
