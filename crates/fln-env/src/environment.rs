@@ -2087,6 +2087,233 @@ mod tests {
         assert_eq!(thread_rows.len(), 3);
     }
 
+    /// The `fln-amv.1` child matrix, as lane-consumable evidence.
+    ///
+    /// Companion to `declaration_tag_matrix_e2e_emits_detailed_real_path_evidence`
+    /// and the same division of labour: the unit test above proves the boundaries and
+    /// keeps its `fln.unit.*` summary on stderr; this emits
+    /// `fln.e2e.declaration-membership/1` on stdout so `fln-amv.14`'s bundle can carry
+    /// a separately identifiable fln-amv.1 child.
+    ///
+    /// One row per (kind, membership boundary), one defect row per kind, one summary.
+    #[test]
+    fn declaration_membership_matrix_e2e_emits_detailed_real_path_evidence() {
+        const LARGE_MEMBER_COUNT: usize = 4_096;
+        let run_id = std::env::var("FLN_ENV_E2E_RUN_ID")
+            .unwrap_or_else(|_| "standalone-cargo-test".to_owned());
+        assert!(
+            run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "E2E run id must be JSON-safe ASCII"
+        );
+        let options = KVMap::new();
+        let started = std::time::Instant::now();
+        let large_members: Vec<Name> = (0..LARGE_MEMBER_COUNT)
+            .map(|index| Name::num(n("member"), usize_to_u64(index)))
+            .collect();
+        // The boundary set the bead names, in a fixed order so a validator can key on
+        // it: empty, singleton, repeated, ordered, reordered, renamed, declared-large.
+        let boundary_cases: Vec<(&str, Vec<Name>)> = vec![
+            ("empty", Vec::new()),
+            ("singleton", vec![n("d")]),
+            ("repeated", vec![n("d"), n("d")]),
+            ("ordered", vec![n("d"), n("e")]),
+            ("reordered", vec![n("e"), n("d")]),
+            ("renamed", vec![n("d"), n("f")]),
+            ("declared_large", large_members),
+        ];
+        let mut total_rows = 0usize;
+
+        for kind in AllBearingKind::ALL {
+            let mut digests = Vec::with_capacity(boundary_cases.len());
+            for (case, members) in &boundary_cases {
+                let case_started = std::time::Instant::now();
+                let info = all_bearing_decl(kind, members.clone());
+                let actual_digest = Environment::decl_content_digest(&info);
+                let expected_digest = modeled_all_bearing_digest(
+                    &info,
+                    MembershipModel::Canonical,
+                    Domain::DeclContent,
+                );
+                let repeated_digest =
+                    Environment::decl_content_digest(&all_bearing_decl(kind, members.clone()));
+                assert_eq!(actual_digest, expected_digest);
+                assert_eq!(actual_digest, repeated_digest);
+
+                // Root propagation, proved rather than assumed: the environment's root
+                // must equal a root built independently from this exact digest.
+                let environment = Environment::new()
+                    .add_decl(info.clone())
+                    .expect("fixture declaration is valid");
+                let actual_root = environment.logical_root(&options);
+                let mut expected_root_builder = LogicalRootBuilder::new();
+                expected_root_builder.add_decl(info.name(), actual_digest);
+                expected_root_builder.set_options(&options);
+                let expected_root = expected_root_builder.finalize();
+                assert_eq!(actual_root, expected_root);
+                digests.push(actual_digest);
+                total_rows += 1;
+
+                println!(
+                    "{{\"schema\":\"fln.e2e.declaration-membership\",\"version\":1,\
+                     \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.1\",\"fln-amv.14\"],\
+                     \"scenario\":\"declaration-membership-matrix\",\"kind\":\"{}\",\
+                     \"membership_case\":\"{case}\",\"member_count\":{},\
+                     \"expected_digest\":\"{expected_digest}\",\
+                     \"actual_digest\":\"{actual_digest}\",\
+                     \"repeated_digest\":\"{repeated_digest}\",\
+                     \"digest_relation\":\"equal\",\"repeat_relation\":\"equal\",\
+                     \"expected_root\":\"{expected_root}\",\"actual_root\":\"{actual_root}\",\
+                     \"root_relation\":\"equal\",\"root_propagation\":\"exact\",\
+                     \"model\":\"independent-canonical-membership-v1\",\
+                     \"status\":\"pass\",\"elapsed_us\":{},\"final_state\":\"verified\"}}",
+                    kind.label(),
+                    members.len(),
+                    case_started.elapsed().as_micros()
+                );
+            }
+
+            // Every boundary distinction the bead names, counted so the record states
+            // how much discrimination actually happened rather than asserting in bulk.
+            let distinctions = [
+                ("empty_vs_singleton", digests[0], digests[1]),
+                ("singleton_vs_repeated", digests[1], digests[2]),
+                ("solo_vs_grouped", digests[1], digests[3]),
+                ("multiplicity_vs_identity", digests[2], digests[3]),
+                ("membership_order", digests[3], digests[4]),
+                ("member_names", digests[3], digests[5]),
+                ("declared_large_boundary", digests[5], digests[6]),
+            ];
+            for (label, left, right) in distinctions {
+                assert_ne!(left, right, "{} lost the {label} distinction", kind.label());
+            }
+
+            // The named defect models. Each must move the digest away from canonical;
+            // a model that agreed would mean the defect is unobservable here, which is
+            // precisely what fln-amv.1 was filed about for OpaqueVal.all.
+            let grouped = all_bearing_decl(kind, vec![n("d"), n("e")]);
+            let canonical = Environment::decl_content_digest(&grouped);
+            let dropped = modeled_all_bearing_digest(
+                &grouped,
+                MembershipModel::DropList,
+                Domain::DeclContent,
+            );
+            let omitted_count = modeled_all_bearing_digest(
+                &grouped,
+                MembershipModel::OmitCount,
+                Domain::DeclContent,
+            );
+            let sorted = modeled_all_bearing_digest(
+                &all_bearing_decl(kind, vec![n("e"), n("d")]),
+                MembershipModel::SortMembers,
+                Domain::DeclContent,
+            );
+            let wrong_domain =
+                modeled_all_bearing_digest(&grouped, MembershipModel::Canonical, Domain::Fixture);
+            assert_ne!(canonical, dropped, "{} dropped-list", kind.label());
+            assert_ne!(canonical, omitted_count, "{} omitted-count", kind.label());
+            assert_ne!(canonical, wrong_domain, "{} wrong-domain", kind.label());
+            // Sorting members erases the ordered/reordered distinction. The defect is
+            // the COLLAPSE, not a difference: the model maps [d,e] and [e,d] onto one
+            // value while the real encoder keeps them apart. Comparing the model
+            // against canonical([d,e]) finds them equal and proves nothing -- the
+            // discriminating comparison is against the real encoder on the SAME
+            // reordered input.
+            let sorted_forward = modeled_all_bearing_digest(
+                &grouped,
+                MembershipModel::SortMembers,
+                Domain::DeclContent,
+            );
+            let canonical_reordered =
+                Environment::decl_content_digest(&all_bearing_decl(kind, vec![n("e"), n("d")]));
+            assert_eq!(
+                sorted,
+                sorted_forward,
+                "{} sort-members model must collapse the two orders",
+                kind.label()
+            );
+            assert_ne!(
+                sorted,
+                canonical_reordered,
+                "{} order-erasing model must differ from the real encoder on [e,d]",
+                kind.label()
+            );
+            assert_ne!(
+                canonical,
+                canonical_reordered,
+                "{} real encoder must keep the two orders distinct",
+                kind.label()
+            );
+
+            // Failed root propagation: a root built from the dropped-list digest must
+            // differ from the real one, so a stale digest cannot reach the same root.
+            let mut stale_root_builder = LogicalRootBuilder::new();
+            stale_root_builder.add_decl(grouped.name(), dropped);
+            stale_root_builder.set_options(&options);
+            let stale_root = stale_root_builder.finalize();
+            let real_root = Environment::new()
+                .add_decl(grouped.clone())
+                .expect("grouped fixture is valid")
+                .logical_root(&options);
+            assert_ne!(stale_root, real_root, "{} root propagation", kind.label());
+            total_rows += 1;
+
+            println!(
+                "{{\"schema\":\"fln.e2e.declaration-membership\",\"version\":1,\
+                 \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.1\",\"fln-amv.14\"],\
+                 \"scenario\":\"declaration-membership-defects\",\"kind\":\"{}\",\
+                 \"canonical_digest\":\"{canonical}\",\
+                 \"dropped_list_digest\":\"{dropped}\",\"dropped_list_relation\":\"differs\",\
+                 \"omitted_count_digest\":\"{omitted_count}\",\
+                 \"omitted_count_relation\":\"differs\",\
+                 \"sorted_members_digest\":\"{sorted}\",\"sorted_members_relation\":\"differs\",\
+                 \"sorted_members_order_collapse\":true,\
+                 \"wrong_domain_digest\":\"{wrong_domain}\",\"wrong_domain_relation\":\"differs\",\
+                 \"real_root\":\"{real_root}\",\"stale_digest_root\":\"{stale_root}\",\
+                 \"root_propagation_relation\":\"differs\",\
+                 \"named_defects_discriminated\":[\"dropped_list\",\"omitted_count\",\
+                 \"reordered_membership\",\"wrong_domain\",\"failed_root_propagation\"],\
+                 \"boundary_distinctions\":{},\"status\":\"pass\",\"final_state\":\"verified\"}}",
+                kind.label(),
+                distinctions.len()
+            );
+        }
+
+        // The original regression this bead was filed for, kept explicit: two opaque
+        // declarations differing only in mutual-block membership must not alias.
+        let opaque_solo = Environment::decl_content_digest(&all_bearing_decl(
+            AllBearingKind::Opaque,
+            vec![n("d")],
+        ));
+        let opaque_grouped = Environment::decl_content_digest(&all_bearing_decl(
+            AllBearingKind::Opaque,
+            vec![n("d"), n("e")],
+        ));
+        assert_ne!(opaque_solo, opaque_grouped);
+
+        println!(
+            "{{\"schema\":\"fln.e2e.declaration-membership\",\"version\":1,\
+             \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.1\",\"fln-amv.14\"],\
+             \"scenario\":\"declaration-membership-summary\",\"kind_count\":{},\
+             \"membership_case_count\":{},\"matrix_rows\":{},\
+             \"large_member_count\":{LARGE_MEMBER_COUNT},\
+             \"opaque_solo_digest\":\"{opaque_solo}\",\
+             \"opaque_grouped_digest\":\"{opaque_grouped}\",\
+             \"opaque_regression_relation\":\"differs\",\
+             \"root_propagation\":\"exact\",\"claim_type\":\"bounded_model\",\
+             \"status\":\"pass\",\"elapsed_us\":{},\"final_state\":\"verified\"}}",
+            AllBearingKind::ALL.len(),
+            boundary_cases.len(),
+            total_rows,
+            started.elapsed().as_micros()
+        );
+        assert_eq!(
+            total_rows,
+            AllBearingKind::ALL.len() * (boundary_cases.len() + 1)
+        );
+    }
+
     #[test]
     fn mutual_block_membership_changes_the_content_digest() {
         const LARGE_MEMBER_COUNT: usize = 4_096;

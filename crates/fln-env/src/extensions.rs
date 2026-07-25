@@ -2008,6 +2008,210 @@ mod tests {
         assert_eq!(roots.len(), 12);
     }
 
+    /// The `fln-amv.2` child matrix, as lane-consumable evidence.
+    ///
+    /// Third of the three producers `fln-amv.14` needs, and the same division as the
+    /// declaration matrices in `environment.rs`: the unit tests keep their
+    /// `fln.unit.*` summaries on stderr, this emits
+    /// `fln.e2e.extension-descriptor-matrix/1` on stdout so the authoritative bundle
+    /// can carry a separately identifiable fln-amv.2 child.
+    ///
+    /// Twelve combination rows, one defect row per combination, one summary.
+    #[test]
+    fn extension_descriptor_matrix_e2e_emits_detailed_real_path_evidence() {
+        let run_id = std::env::var("FLN_ENV_E2E_RUN_ID")
+            .unwrap_or_else(|_| "standalone-cargo-test".to_owned());
+        assert!(
+            run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "E2E run id must be JSON-safe ASCII"
+        );
+        let cases = descriptor_identity_cases();
+        assert_eq!(cases.len(), 12, "the complete 3x2x2 matrix is required");
+        let options = KVMap::new();
+        let started = Instant::now();
+        let mut digests = HashSet::with_capacity(cases.len());
+        let mut roots = HashSet::with_capacity(cases.len());
+        let mut rows = 0usize;
+
+        for case in cases {
+            let case_started = Instant::now();
+            let state = identity_state(case, false);
+            let actual_digest = state.content_digest();
+            let expected_digest =
+                modeled_extension_content_digest(&state, DescriptorDigestModel::Canonical);
+            let repeated_digest = identity_state(case, false).content_digest();
+            assert_eq!(actual_digest, expected_digest);
+            assert_eq!(actual_digest, repeated_digest);
+
+            // Real registration and real appends, then root propagation proved against
+            // an independently built root over the same delta digest.
+            let name = state.descriptor.name.clone();
+            let environment = Environment::new()
+                .register_extension(state.descriptor.clone())
+                .and_then(|next| next.push_extension_entry(&name, bytes(b"alpha")))
+                .and_then(|next| next.push_extension_entry(&name, bytes(b"beta")))
+                .expect("descriptor fixture builds");
+            let actual_root = environment.logical_root(&options);
+            let mut expected_root_builder = fln_hash::root::LogicalRootBuilder::new();
+            expected_root_builder.add_extension_delta(&name, actual_digest);
+            expected_root_builder.set_options(&options);
+            let expected_root = expected_root_builder.finalize();
+            assert_eq!(actual_root, expected_root);
+            assert!(digests.insert(actual_digest), "descriptor delta aliased");
+            assert!(roots.insert(actual_root), "descriptor root aliased");
+            rows += 1;
+
+            println!(
+                "{{\"schema\":\"fln.e2e.extension-descriptor-matrix\",\"version\":1,\
+                 \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.2\",\"fln-amv.14\"],\
+                 \"scenario\":\"extension-descriptor-matrix\",\
+                 \"merge\":\"{}\",\"merge_tag\":{},\"checkpoint\":\"{}\",\
+                 \"checkpoint_tag\":{},\"provenance\":\"{}\",\"provenance_tag\":{},\
+                 \"descriptor_position\":\"before_journal\",\"journal_entries\":2,\
+                 \"expected_digest\":\"{expected_digest}\",\
+                 \"actual_digest\":\"{actual_digest}\",\
+                 \"repeated_digest\":\"{repeated_digest}\",\
+                 \"digest_relation\":\"equal\",\"repeat_relation\":\"equal\",\
+                 \"expected_root\":\"{expected_root}\",\"actual_root\":\"{actual_root}\",\
+                 \"root_relation\":\"equal\",\"root_propagation\":\"exact\",\
+                 \"model\":\"independent-descriptor-layout-v1\",\"status\":\"pass\",\
+                 \"elapsed_us\":{},\"final_state\":\"verified\"}}",
+                merge_label(case.merge),
+                modeled_merge_tag(case.merge),
+                checkpoint_label(case.checkpoint),
+                modeled_checkpoint_tag(case.checkpoint),
+                provenance_label(case.provenance),
+                modeled_provenance_tag(case.provenance),
+                case_started.elapsed().as_micros()
+            );
+
+            // The named defects, each on this same combination. Every one must move the
+            // delta digest: a dimension that can be omitted, a tag that can be swapped,
+            // a debug rendering, or a descriptor written after the journal would each
+            // let two semantically different extensions share an identity, which is
+            // exactly what fln-amv.2 was filed about.
+            let omit_merge =
+                modeled_extension_content_digest(&state, DescriptorDigestModel::OmitMerge);
+            let omit_checkpoint =
+                modeled_extension_content_digest(&state, DescriptorDigestModel::OmitCheckpoint);
+            let omit_provenance =
+                modeled_extension_content_digest(&state, DescriptorDigestModel::OmitProvenance);
+            let swapped_tags =
+                modeled_extension_content_digest(&state, DescriptorDigestModel::SwapMergeTagValues);
+            let swapped_fields = modeled_extension_content_digest(
+                &state,
+                DescriptorDigestModel::SwapMergeAndCheckpointFields,
+            );
+            let debug_text =
+                modeled_extension_content_digest(&state, DescriptorDigestModel::DebugText);
+            let after_journal = modeled_extension_content_digest(
+                &state,
+                DescriptorDigestModel::DescriptorAfterJournal,
+            );
+            for (label, modeled) in [
+                ("omit_merge", omit_merge),
+                ("omit_checkpoint", omit_checkpoint),
+                ("omit_provenance", omit_provenance),
+                ("debug_text", debug_text),
+                ("descriptor_after_journal", after_journal),
+            ] {
+                assert_ne!(
+                    actual_digest,
+                    modeled,
+                    "{label} did not move the delta digest for {}/{}/{}",
+                    merge_label(case.merge),
+                    checkpoint_label(case.checkpoint),
+                    provenance_label(case.provenance)
+                );
+            }
+
+            // The two swap models are CONDITIONALLY discriminating, and saying so is
+            // the point: swapping a tag value is a no-op when the swapped value equals
+            // the original, and swapping two adjacent fields is a no-op when they
+            // already hold the same tag. A validator that demanded "differs" here
+            // would fail on the legitimate cases; one that ignored these rows would
+            // miss a real regression. So the record carries the expected relation,
+            // derived from the same predicate the assertion uses.
+            let merge_tag_swap_must_change = case.merge != MergeSemantics::ConflictsRequireReview;
+            let field_swap_must_change =
+                modeled_merge_tag(case.merge) != modeled_checkpoint_tag(case.checkpoint);
+            assert_eq!(
+                swapped_tags != actual_digest,
+                merge_tag_swap_must_change,
+                "merge-tag swap had the wrong effect for {}/{}/{}",
+                merge_label(case.merge),
+                checkpoint_label(case.checkpoint),
+                provenance_label(case.provenance)
+            );
+            assert_eq!(
+                swapped_fields != actual_digest,
+                field_swap_must_change,
+                "adjacent field swap had the wrong effect for {}/{}/{}",
+                merge_label(case.merge),
+                checkpoint_label(case.checkpoint),
+                provenance_label(case.provenance)
+            );
+            rows += 1;
+
+            println!(
+                "{{\"schema\":\"fln.e2e.extension-descriptor-matrix\",\"version\":1,\
+                 \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.2\",\"fln-amv.14\"],\
+                 \"scenario\":\"extension-descriptor-defects\",\
+                 \"merge\":\"{}\",\"checkpoint\":\"{}\",\"provenance\":\"{}\",\
+                 \"canonical_digest\":\"{actual_digest}\",\
+                 \"omit_merge_digest\":\"{omit_merge}\",\"omit_merge_relation\":\"differs\",\
+                 \"omit_checkpoint_digest\":\"{omit_checkpoint}\",\
+                 \"omit_checkpoint_relation\":\"differs\",\
+                 \"omit_provenance_digest\":\"{omit_provenance}\",\
+                 \"omit_provenance_relation\":\"differs\",\
+                 \"swapped_tag_digest\":\"{swapped_tags}\",\
+                 \"swapped_tag_relation\":\"{}\",\
+                 \"swapped_tag_discriminating\":{merge_tag_swap_must_change},\
+                 \"swapped_field_digest\":\"{swapped_fields}\",\
+                 \"swapped_field_relation\":\"{}\",\
+                 \"swapped_field_discriminating\":{field_swap_must_change},\
+                 \"debug_text_digest\":\"{debug_text}\",\"debug_text_relation\":\"differs\",\
+                 \"after_journal_digest\":\"{after_journal}\",\
+                 \"after_journal_relation\":\"differs\",\
+                 \"named_defects_discriminated\":[\"omitted_dimension\",\"swapped_tag\",\
+                 \"debug_text\",\"after_journal\"],\"status\":\"pass\",\
+                 \"final_state\":\"verified\"}}",
+                merge_label(case.merge),
+                checkpoint_label(case.checkpoint),
+                provenance_label(case.provenance),
+                if merge_tag_swap_must_change {
+                    "differs"
+                } else {
+                    "equal_by_construction"
+                },
+                if field_swap_must_change {
+                    "differs"
+                } else {
+                    "equal_by_construction"
+                }
+            );
+        }
+
+        assert_eq!(digests.len(), 12);
+        assert_eq!(roots.len(), 12);
+        println!(
+            "{{\"schema\":\"fln.e2e.extension-descriptor-matrix\",\"version\":1,\
+             \"run_id\":\"{run_id}\",\"beads\":[\"fln-amv.2\",\"fln-amv.14\"],\
+             \"scenario\":\"extension-descriptor-summary\",\"combination_count\":12,\
+             \"merge_variants\":3,\"checkpoint_variants\":2,\"provenance_variants\":2,\
+             \"distinct_delta_digests\":{},\"distinct_logical_roots\":{},\
+             \"descriptor_position\":\"before_journal\",\"matrix_rows\":{rows},\
+             \"root_propagation\":\"exact\",\"claim_type\":\"bounded_model\",\
+             \"status\":\"pass\",\"elapsed_us\":{},\"final_state\":\"verified\"}}",
+            digests.len(),
+            roots.len(),
+            started.elapsed().as_micros()
+        );
+        assert_eq!(rows, 24);
+    }
+
     #[test]
     fn descriptor_identity_named_mutants_are_discriminated() {
         let mut always_killed = 0usize;
