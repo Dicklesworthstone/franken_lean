@@ -615,6 +615,24 @@ fn first_entry_divergence(left: &ExtensionState, right: &ExtensionState) -> Opti
     }
 }
 
+/// The first index at which `base` is not a prefix of `target`, or `None` when it is
+/// exactly a prefix.
+///
+/// The capture-side counterpart of [`first_entry_divergence`], and the proof that the
+/// stored cumulative prefix digest cannot supply. `base` shorter than `target` is the
+/// normal case; a base that runs longer than the target is a divergence at the target's
+/// length, which the caller's own length arithmetic would otherwise underflow on.
+fn prefix_divergence(target: &ExtensionState, base: &ExtensionState) -> Option<usize> {
+    let mut target_entries = target.entries();
+    for (index, base_entry) in base.entries().enumerate() {
+        match target_entries.next() {
+            Some(target_entry) if target_entry == base_entry => {}
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
 /// The logical footprint a checkpoint retains beyond the entries it carries.
 ///
 /// **Logical attributed accounting, not allocator ownership.** These are counts of
@@ -1080,6 +1098,21 @@ impl ExtensionState {
 
     /// Stable semantic identity for the extension contract and its exact ordered
     /// journal. The cached history digest makes this O(1) in journal length.
+    /// Bounded test seam: forge this state's journal digest and payload byte count so a
+    /// *wrong* base satisfies the capture-side accelerator.
+    ///
+    /// Distinct from [`ExtensionCheckpoint::forge_recorded_base_digests`] because the
+    /// two defects live on opposite sides: capture compares a base's OWN digest against
+    /// a prefix digest computed from the target, so simulating that collision means
+    /// forging the base, not the checkpoint. Test-only, and it constructs no state a
+    /// production path can reach.
+    #[cfg(test)]
+    fn forge_journal_facts(mut self, digest: Digest, payload_bytes: u128) -> Self {
+        self.journal.digest = digest;
+        self.journal.payload_bytes = payload_bytes;
+        self
+    }
+
     pub fn content_digest(&self) -> Digest {
         let mut w = CanonWriter::new();
         w.str("fln.extension-state");
@@ -1126,6 +1159,26 @@ impl ExtensionState {
                     || prefix_payload_bytes != base.journal.payload_bytes
                 {
                     return Err(history_mismatch(base, self));
+                }
+
+                // The check above is a REJECTION ACCELERATOR, exactly as on the restore
+                // side. `prefix_digest` is a cumulative digest stored on this journal's
+                // entry at `base.len() - 1`; it agreeing with the base's own digest can
+                // rule out a base that plainly is not our prefix, but it cannot
+                // establish that this base IS that prefix — that is the same
+                // "equality proves a relation" error, wearing the ancestry hat instead
+                // of the base-equality one.
+                //
+                // Ancestry is proved here: compare the claimed prefix of `self` against
+                // the base's entries, in order, exactly. `records()` yields this
+                // journal's entries from the start, so taking `base.len()` of them IS
+                // the claimed prefix.
+                if let Some(divergence) = prefix_divergence(self, base) {
+                    return Err(CheckpointError::BaseNotExact {
+                        extension: self.descriptor.name.clone(),
+                        base_len: base.len(),
+                        first_divergence: divergence,
+                    });
                 }
 
                 let captured_entries = self.len() - base.len();
@@ -4337,12 +4390,54 @@ mod tests {
         let sibling = state_with_checkpoint(2, CheckpointSemantics::JournalSuffix)
             .push_entry(bytes(&2u64.to_le_bytes()));
         assert_eq!(sibling.content_digest(), captured_base.content_digest());
+        assert!(
+            !sibling.journal.is_same_structure(&captured_base.journal),
+            "a sibling reached by a different path must not share structure"
+        );
         assert_eq!(
             ExtensionState::restore(Some(&sibling), &checkpoint, TEST_LIMITS)
                 .expect("a sibling base must restore")
                 .content_digest(),
             expected.content_digest()
         );
+
+        // Boundaries, because one length proves one length. Empty and singleton bases
+        // are where an off-by-one in the comparison or a wrong empty-journal identity
+        // would hide: an empty base has no root node at all, so structural identity
+        // there is a different code path from the shared-node one.
+        for base_len in 0..5usize {
+            let original = state_with_checkpoint(base_len, CheckpointSemantics::JournalSuffix);
+            let grown = original.push_entry(bytes(b"boundary-suffix"));
+            let captured = grown.checkpoint(Some(&original), TEST_LIMITS);
+            assert!(
+                captured.is_ok(),
+                "capture must succeed at base_len {base_len}: {captured:?}"
+            );
+            let point = captured.expect("asserted just above");
+            let independent = state_with_checkpoint(base_len, CheckpointSemantics::JournalSuffix);
+            assert_eq!(
+                independent.content_digest(),
+                original.content_digest(),
+                "the rebuilt base must be content-identical at base_len {base_len}"
+            );
+            let outcome = ExtensionState::restore(Some(&independent), &point, TEST_LIMITS);
+            assert!(
+                outcome.is_ok(),
+                "a rebuilt base must restore at base_len {base_len}: {outcome:?}"
+            );
+            let restored = outcome.expect("asserted just above");
+            assert_eq!(
+                restored.content_digest(),
+                grown.content_digest(),
+                "restoring a rebuilt base must reproduce the captured target at base_len \
+                 {base_len}"
+            );
+            assert_eq!(
+                point.retained_base_facts().map(|facts| facts.entries),
+                Some(base_len),
+                "the retained footprint must report the real base length"
+            );
+        }
     }
 
     /// Equal-length and equal-digest UNEQUAL histories FAIL.
@@ -4413,6 +4508,143 @@ mod tests {
         );
         let honest = ExtensionState::restore(Some(&captured_base), &checkpoint, TEST_LIMITS);
         assert!(honest.is_ok(), "the unforged checkpoint restores normally");
+
+        // A collision that diverges LATE, which is the case that actually exercises the
+        // comparison loop rather than its first iteration. Two bases sharing a two-entry
+        // prefix and differing only at the last entry, with the digests forged to agree:
+        // the refusal must name entry 2, not entry 0, or the divergence index is
+        // decoration rather than a fact a caller can act on.
+        let mut shared_prefix = ExtensionState::new(descriptor_with_checkpoint(
+            CheckpointSemantics::JournalSuffix,
+        ));
+        for index in 0..2u64 {
+            shared_prefix = shared_prefix.push_entry(bytes(&index.to_le_bytes()));
+        }
+        let late_divergent = shared_prefix.push_entry(bytes(b"diverges-here"));
+        assert_eq!(late_divergent.len(), captured_base.len());
+        assert_eq!(
+            first_entry_divergence(&captured_base, &late_divergent),
+            Some(2),
+            "the two bases must share exactly a two-entry prefix"
+        );
+        let late_collision = checkpoint.clone().forge_recorded_base_digests(
+            late_divergent.journal.digest,
+            late_divergent.content_digest(),
+        );
+        let late_caught =
+            ExtensionState::restore(Some(&late_divergent), &late_collision, TEST_LIMITS)
+                .expect_err("a late-diverging equal-digest history must still be refused");
+        let CheckpointError::BaseNotExact {
+            first_divergence: late_index,
+            ..
+        } = &late_caught
+        else {
+            unreachable!("expected the exact comparison to refuse, got {late_caught:?}")
+        };
+        assert_eq!(
+            *late_index, 2,
+            "the reported divergence must be where the histories actually parted"
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-base-identity\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"scenario\":\"digest-is-accelerator-not-proof\",\
+             \"equal_length_unequal_history\":\"refused_by_digest_accelerator\",\
+             \"equal_digest_unequal_history_divergence_0\":\"refused_by_exact_comparison\",\
+             \"equal_digest_unequal_history_divergence_2\":\"refused_by_exact_comparison\",\
+             \"reported_divergence_indices\":[0,2],\
+             \"collision_source\":\"bounded_test_seam_forging_recorded_digests_only\",\
+             \"unforged_checkpoint_still_restores\":true,\"status\":\"pass\"}}"
+        );
+    }
+
+    /// CAPTURE side: a base that satisfies the prefix-digest accelerator but is not
+    /// actually the prefix must be refused.
+    ///
+    /// The symmetric half of the restore-side defect. `prefix_facts(base.len())` yields
+    /// a cumulative digest stored on the target's journal; comparing it to the base's
+    /// own digest can reject a base that plainly is not the prefix, but it cannot prove
+    /// one that is. Simulated through a seam that forges the BASE's journal facts —
+    /// necessarily a different seam from the restore-side one, because the two defects
+    /// compare different pairs of values.
+    #[test]
+    fn capture_refuses_a_base_that_only_matches_the_prefix_digest() {
+        let real_base = state_with_checkpoint(3, CheckpointSemantics::JournalSuffix);
+        let target = real_base.push_entry(bytes(b"suffix"));
+
+        // A same-length base sharing a two-entry prefix and differing at the last.
+        let mut wrong = ExtensionState::new(descriptor_with_checkpoint(
+            CheckpointSemantics::JournalSuffix,
+        ));
+        for index in 0..2u64 {
+            wrong = wrong.push_entry(bytes(&index.to_le_bytes()));
+        }
+        let wrong = wrong.push_entry(bytes(b"not-the-real-third"));
+        assert_eq!(wrong.len(), real_base.len());
+
+        // Without forging, the accelerator already rejects it — asserted so the cheap
+        // path is still proved to work.
+        let refused = target
+            .checkpoint(Some(&wrong), TEST_LIMITS)
+            .expect_err("a different history must be refused at capture");
+        assert!(
+            matches!(refused, CheckpointError::HistoryMismatch { .. }),
+            "expected the digest-level rejection, got {refused:?}"
+        );
+
+        // Forge the base's own journal facts to those of the real base, so the
+        // accelerator accepts and only the exact prefix proof can refuse.
+        let colliding = wrong
+            .clone()
+            .forge_journal_facts(real_base.journal.digest, real_base.journal.payload_bytes);
+        let caught = target
+            .checkpoint(Some(&colliding), TEST_LIMITS)
+            .expect_err("an equal-digest non-prefix base must still be refused at capture");
+        let CheckpointError::BaseNotExact {
+            base_len,
+            first_divergence,
+            ..
+        } = &caught
+        else {
+            unreachable!("expected the exact prefix proof to refuse, got {caught:?}")
+        };
+        assert_eq!(*base_len, 3);
+        assert_eq!(
+            *first_divergence, 2,
+            "the divergence must name the entry where the base stopped being a prefix"
+        );
+
+        // And the honest base still captures, so the proof is discriminating rather
+        // than refusing everything.
+        assert!(
+            target.checkpoint(Some(&real_base), TEST_LIMITS).is_ok(),
+            "the real base must still capture"
+        );
+        // Including at the boundaries, where an off-by-one in the prefix walk would show.
+        for base_len in 0..4usize {
+            let base = state_with_checkpoint(base_len, CheckpointSemantics::JournalSuffix);
+            let grown = base.push_entry(bytes(b"boundary"));
+            assert!(
+                grown.checkpoint(Some(&base), TEST_LIMITS).is_ok(),
+                "capture must succeed at base_len {base_len}"
+            );
+            assert_eq!(prefix_divergence(&grown, &base), None);
+        }
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-capture-ancestry\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"scenario\":\"prefix-digest-is-accelerator-not-proof\",\
+             \"unforged_non_prefix_base\":\"refused_by_digest_accelerator\",\
+             \"equal_digest_non_prefix_base\":\"refused_by_exact_prefix_proof\",\
+             \"reported_divergence\":2,\
+             \"collision_source\":\"bounded_test_seam_forging_base_journal_facts_only\",\
+             \"honest_base_still_captures\":true,\
+             \"boundary_base_lengths\":[0,1,2,3],\"status\":\"pass\"}}"
+        );
     }
 
     /// A digest match is an accelerator: passing it must not be the last word, and a
