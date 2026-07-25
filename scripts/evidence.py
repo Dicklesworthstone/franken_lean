@@ -254,6 +254,21 @@ E2E_STEP_ORDERS = {
     "extension_descriptor_matrix": [
         "extension_descriptor_matrix",
     ],
+    "env_snapshots": [
+        "environment_suite",
+        "environment_state",
+        "extension_merge_refusals",
+        "set_union",
+        "extension_state_mutant",
+        "extension_state_recovery",
+        "set_union_mutant",
+        "set_union_recovery",
+        "declaration_tag_matrix",
+        "declaration_membership",
+        "extension_descriptor_matrix",
+        "environment_collision",
+        "environment_resource_collision",
+    ],
     "verdict_schema": [
         "positive",
         "failure",

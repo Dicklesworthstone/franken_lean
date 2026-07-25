@@ -1,138 +1,876 @@
 #!/usr/bin/env bash
-# env_snapshots.sh — shared E2E scenario for the Grimoire environment (bead fln-amv).
-#
-# Real-path, no-mock: runs the real fln-env suite (persistent-map model tests,
-# snapshot isolation, logical-root determinism across thread counts), captures
-# detailed journal/checkpoint and extension-merge evidence through the real
-# Environment APIs, then seeds REAL bug classes into an overlay workspace —
-# add_decl silently dropping extension state and SetUnion silently dropping raw
-# duplicates — and proves the suite KILLS both mutants (a surviving mutant is a
-# failed scenario), then delegates the historical full-hash bucket append-order
-# proof to an authoritative nested fln.e2e/2 evidence bundle. NDJSON under
-# target/e2e/.
+# Authoritative, no-mock Grimoire environment evidence. The outer run owns the
+# fln.e2e/2 lifecycle and references each nested child exactly once.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 command -v python3 >/dev/null 2>&1 || {
   echo "[env_snapshots] setup failure: python3 is required" >&2
   exit 2
 }
+command -v setsid >/dev/null 2>&1 || {
+  echo "[env_snapshots] setup failure: setsid is required" >&2
+  exit 2
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 EVIDENCE="$ROOT/scripts/evidence.py"
+SCHEMA="fln.e2e/2"
+BEAD="franken_lean-1umc"
+SCENARIO="env_snapshots"
 RUN_ID="env-snapshots-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+HUMAN="$ART_DIR/human.log"
+VENDOR_PATH="vendor/lean4-src"
+VENDOR_BINDING="$ART_DIR/vendor-binding.json"
+CAPTURE_BYTES="${FLN_E2E_CAPTURE_BYTES:-262144}"
+OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-67108864}"
+TIMEOUT_MS="${FLN_E2E_TIMEOUT_MS:-1200000}"
+GRACE_MS="${FLN_E2E_KILL_GRACE_MS:-2000}"
+READY_WAIT_MS="${FLN_E2E_READY_WAIT_MS:-30000}"
+CACHE_STATE="${FLN_E2E_CACHE_STATE:-uncontrolled}"
+START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+SEQ=0
+ACTIVE_STEP=setup
+ACTIVE_RUNNER_PID=""
+ACTIVE_RUNNER_START_TICKS=""
+ACTIVE_READINESS=""
+SPAWNING=0
+PENDING_SIGNAL=""
+PENDING_SIGNAL_EXIT=0
+FINAL_SET=0
+FINAL_VERDICT=internal_fault
+FINAL_REASON=uncommitted_exit
+FINAL_EXIT=2
+TERMINAL_EMITTED=0
+HUMAN_LOG_SEALED=0
+FINALIZING=0
+RUN_STARTED=0
+EARLY_STEP=preflight
+FINALIZER_TRANSITION=0
+FINALIZER_PID=""
+FINALIZER_START_TICKS=""
+FINALIZER_CLEANUP_UNPROVEN=0
+FINALIZER_WAIT_UNSAFE=0
+PROCESS_TREE_CLEANUP_UNPROVEN=0
+FINALIZATION_SIGNAL=""
+FINALIZATION_SIGNAL_EXIT=0
+FINALIZATION_SIGNAL_GENERATION=0
+FINALIZATION_DECISION="$ART_DIR/bundle.decision"
+FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
+EVENT_COMMAND=()
+INPUT_PATHS=(
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
+  crates/fln-core crates/fln-hash crates/fln-env
+  vendor/NOTICE
+  scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
+  scripts/e2e/env_snapshots.sh .github/workflows/ci.yml
+)
+HASH_ARGS=()
+GOVERNED_ARGS=()
+for input_path in "${INPUT_PATHS[@]}"; do
+  HASH_ARGS+=(--path "$input_path")
+  GOVERNED_ARGS+=(--governed-path "$input_path")
+done
 
-BEAD="fln-amv"
-SCHEMA="fln-e2e/1"
-HOST="$(uname -sr)"
-start_ns=$(date +%s%N)
+if ! INPUT_ROOT="$(
+  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+    --vendor-path "$VENDOR_PATH"
+)"; then
+  echo "[env_snapshots] setup failure: cannot hash governed inputs" >&2
+  exit 2
+fi
+HOST_FACTS_JSON="$(python3 - <<'PY'
+import json
+import platform
 
-emit() { # emit <step_id> <status> <detail-json-fragment>
-  local now_ns
-  now_ns=$(date +%s%N)
-  printf '{"schema":"%s","run_id":"%s","bead":"%s","scenario":"env_snapshots","step":"%s","status":"%s","elapsed_ms":%d,"host":"%s",%s}\n' \
-    "$SCHEMA" "$RUN_ID" "$BEAD" "$1" "$2" $(( (now_ns - start_ns) / 1000000 )) "$HOST" "$3" >> "$LOG"
+print(json.dumps({
+    "machine": platform.machine(),
+    "python": platform.python_version(),
+    "release": platform.release(),
+    "system": platform.system(),
+}, sort_keys=True, separators=(",", ":")))
+PY
+)"
+
+note() {
+  if [ "$HUMAN_LOG_SEALED" -eq 1 ]; then
+    printf '[env_snapshots] %s\n' "$*" >&2
+    return 0
+  fi
+  printf '[env_snapshots] %s\n' "$*" | tee -a "$HUMAN" >&2
 }
 
-note() { echo "[env_snapshots] $*" >&2; }
+build_event_command() {
+  local sequence="$SEQ"
+  SEQ=$((SEQ + 1))
+  EVENT_COMMAND=(python3 "$EVIDENCE" emit --file "$LOG" \
+    --artifact-root "$ART_DIR" --string schema "$SCHEMA" \
+    --string run_id "$RUN_ID" --string bead "$BEAD" \
+    --string scenario "$SCENARIO" --integer sequence "$sequence" \
+    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --string wall_time_utc "$(date -u -Is)" "$@")
+}
 
-emit run_start started "\"cwd\":\"$ROOT\",\"argv\":\"$0\""
+emit_event() {
+  build_event_command "$@"
+  "${EVENT_COMMAND[@]}"
+}
 
-# ---- step 1: the real suite ------------------------------------------------------------
-note "running the fln-env suite (pmap model, isolation, root determinism)"
-set +e
-( cd "$ROOT" && CARGO_TARGET_DIR=target_local cargo test --locked -q -p fln-env ) \
-  > "$ART_DIR/suite.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -ne 0 ]; then
-  emit suite failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"suite.log\""
-  note "FAIL: fln-env suite failed (see $ART_DIR/suite.log)"
-  exit 1
-fi
-emit suite passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"suite.log\""
+set_final() {
+  FINAL_SET=1
+  FINAL_VERDICT="$1"
+  FINAL_REASON="$2"
+  FINAL_EXIT="$3"
+}
 
-# ---- step 2: detailed persistent-journal and checkpoint evidence -----------------------
-note "capturing real Environment journal/checkpoint evidence"
-set +e
-( cd "$ROOT" && FLN_ENV_E2E_RUN_ID="$RUN_ID" CARGO_TARGET_DIR=target_local \
-    cargo test --locked -q -p fln-env \
-      extensions::tests::environment_state_e2e_emits_detailed_real_path_evidence \
-      -- --exact --nocapture ) > "$ART_DIR/environment_state.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -ne 0 ]; then
-  emit environment_state failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"environment_state.log\""
-  note "FAIL: real environment-state scenario failed (see $ART_DIR/environment_state.log)"
-  exit 1
-fi
-evidence_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.environment-state\",\"version\":1") == 1 { count++ } END { print count + 0 }' "$ART_DIR/environment_state.log")
-passed_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.environment-state\",\"version\":1") == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' "$ART_DIR/environment_state.log")
-if [ "$evidence_count" -ne 4 ] || [ "$passed_count" -ne 4 ]; then
-  emit environment_state failed "\"expected_records\":4,\"actual_records\":$evidence_count,\"passed_records\":$passed_count,\"artifact\":\"environment_state.log\""
-  note "FAIL: environment-state evidence was missing, malformed, or non-passing"
-  exit 1
-fi
-awk 'index($0, "{\"schema\":\"fln.e2e.environment-state\",\"version\":1") == 1 { print }' \
-  "$ART_DIR/environment_state.log" >> "$LOG"
-emit environment_state passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$evidence_count,\"artifact\":\"environment_state.log\""
+read_meta_field() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import pathlib
+import sys
 
-# ---- step 3: typed extension-merge refusals and clean recovery -------------------------
-note "capturing descriptor/history merge-refusal evidence"
-set +e
-( cd "$ROOT" && FLN_ENV_E2E_RUN_ID="$RUN_ID" CARGO_TARGET_DIR=target_local \
-    cargo test --locked -q -p fln-env \
-      extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence \
-      -- --exact --nocapture ) > "$ART_DIR/extension_merge_refusals.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -ne 0 ]; then
-  emit extension_merge_refusals failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"extension_merge_refusals.log\""
-  note "FAIL: typed extension-merge refusal scenario failed"
-  exit 1
-fi
-refusal_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.extension-merge-refusal\",\"version\":1") == 1 { count++ } END { print count + 0 }' "$ART_DIR/extension_merge_refusals.log")
-refusal_passed_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.extension-merge-refusal\",\"version\":1") == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' "$ART_DIR/extension_merge_refusals.log")
-if [ "$refusal_count" -ne 2 ] || [ "$refusal_passed_count" -ne 2 ]; then
-  emit extension_merge_refusals failed "\"expected_records\":2,\"actual_records\":$refusal_count,\"passed_records\":$refusal_passed_count,\"artifact\":\"extension_merge_refusals.log\""
-  note "FAIL: extension-merge refusal evidence was missing, malformed, or non-passing"
-  exit 1
-fi
-awk 'index($0, "{\"schema\":\"fln.e2e.extension-merge-refusal\",\"version\":1") == 1 { print }' \
-  "$ART_DIR/extension_merge_refusals.log" >> "$LOG"
-emit extension_merge_refusals passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$refusal_count,\"artifact\":\"extension_merge_refusals.log\""
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))[sys.argv[2]]
+if value is None:
+    print("null")
+elif value is True:
+    print("true")
+elif value is False:
+    print("false")
+else:
+    print(value)
+PY
+}
 
-# ---- step 4: SetUnion raw/semantic split and branch permutation ------------------------
-note "capturing lossless SetUnion merge evidence"
-set +e
-( cd "$ROOT" && FLN_ENV_E2E_RUN_ID="$RUN_ID" CARGO_TARGET_DIR=target_local \
-    cargo test --locked -q -p fln-env \
-      extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
-      -- --exact --nocapture ) > "$ART_DIR/set_union.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -ne 0 ]; then
-  emit set_union failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"set_union.log\""
-  note "FAIL: lossless SetUnion scenario failed"
-  exit 1
-fi
-set_union_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 { count++ } END { print count + 0 }' "$ART_DIR/set_union.log")
-set_union_passed_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' "$ART_DIR/set_union.log")
-if [ "$set_union_count" -ne 4 ] || [ "$set_union_passed_count" -ne 4 ]; then
-  emit set_union failed "\"expected_records\":4,\"actual_records\":$set_union_count,\"passed_records\":$set_union_passed_count,\"artifact\":\"set_union.log\""
-  note "FAIL: SetUnion evidence was missing, malformed, or non-passing"
-  exit 1
-fi
-awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 { print }' \
-  "$ART_DIR/set_union.log" >> "$LOG"
-emit set_union passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$set_union_count,\"artifact\":\"set_union.log\""
+hash_governed() {
+  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+    --vendor-path "$VENDOR_PATH"
+}
 
-# ---- step 5: extension-state mutant must be killed -------------------------------------
+hash_subject() {
+  python3 "$EVIDENCE" hash-tree --root "$1" --path "$2"
+}
+
+mark_process_tree_cleanup_unproven() {
+  PROCESS_TREE_CLEANUP_UNPROVEN=1
+  trap '' HUP INT TERM
+  set_final internal_fault process_tree_cleanup_unproven 2
+}
+
+bounded_readiness_wait() {
+  local pid="$1" ready_path="$2" limit_ms="$3" state
+  local ticks=$(( (limit_ms + 19) / 20 )) index
+  for ((index = 0; index < ticks; index += 1)); do
+    if [ -s "$ready_path" ]; then return 0; fi
+    if [ ! -r "/proc/$pid/stat" ]; then return 1; fi
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
+    if [ "$state" = Z ]; then return 1; fi
+    sleep 0.02
+  done
+  return 1
+}
+
+terminate_unreleased_runner() {
+  local pid="$1"
+  setsid -- python3 "$EVIDENCE" kill-direct-child --pid "$pid" \
+    --expected-parent-pid "$$" --wait-ms 5000 || return 1
+  wait "$pid" 2>/dev/null || true
+}
+
+release_guardian_launch() {
+  local stage="$1" pid="$2" ticks="$3" ready="$4" output="$5"
+  local artifact_root="$6"
+  for _ in 1 2; do
+    if setsid -- python3 "$EVIDENCE" release-process-launch --ready "$ready" \
+      --output "$output" --artifact-root "$artifact_root" --stage-id "$stage" \
+      --pid "$pid" --expected-start-ticks "$ticks" \
+      --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+stop_active_runner() {
+  local name="$1" pid="$ACTIVE_RUNNER_PID" state cleanup_rc=0 forced=0
+  local guardian_rc=0
+  [ -n "$pid" ] || return 0
+  if bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" \
+      && [ -n "$ACTIVE_RUNNER_START_TICKS" ]; then
+    python3 "$EVIDENCE" signal-bound-process --pid "$pid" \
+      --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal "$name" \
+      >/dev/null 2>&1 || true
+  fi
+  for _ in $(seq 1 500); do
+    if [ ! -r "/proc/$pid/stat" ]; then break; fi
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
+    [ "$state" = Z ] && break
+    sleep 0.02
+  done
+  if [ -r "/proc/$pid/stat" ]; then
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
+    if [ "$state" != Z ]; then
+      if [ -f "$ACTIVE_READINESS" ] && \
+          python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
+            --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STEP" \
+            >/dev/null 2>&1; then
+        forced=1
+      else
+        cleanup_rc=1
+      fi
+    fi
+  fi
+  if [ "$cleanup_rc" -ne 0 ]; then
+    ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    ACTIVE_READINESS=""
+    return "$cleanup_rc"
+  fi
+  wait "$pid" 2>/dev/null || guardian_rc=$?
+  if [ "$forced" -eq 0 ]; then
+    case "$guardian_rc" in 0|1|3|4) ;; *) cleanup_rc=1 ;; esac
+  fi
+  ACTIVE_RUNNER_PID=""
+  ACTIVE_RUNNER_START_TICKS=""
+  ACTIVE_READINESS=""
+  return "$cleanup_rc"
+}
+
+# shellcheck disable=SC2317
+on_signal() {
+  local name="$1" exit_code="$2"
+  if [ "$FINALIZER_TRANSITION" -eq 1 ]; then
+    on_finalizer_signal "$name" "$exit_code"
+    return 0
+  fi
+  trap '' HUP INT TERM
+  if [ "$SPAWNING" -eq 1 ]; then
+    PENDING_SIGNAL="$name"
+    PENDING_SIGNAL_EXIT="$exit_code"
+    trap 'on_signal HUP 129' HUP
+    trap 'on_signal INT 130' INT
+    trap 'on_signal TERM 143' TERM
+    return 0
+  fi
+  if [ -n "$ACTIVE_RUNNER_PID" ] && ! stop_active_runner "$name"; then
+    mark_process_tree_cleanup_unproven
+    exit 2
+  fi
+  set_final cancelled "signal_$name" "$exit_code"
+  exit "$exit_code"
+}
+
+# shellcheck disable=SC2317
+contain_bound_finalizer() {
+  if [ -z "$FINALIZER_PID" ] || [ -z "$FINALIZER_START_TICKS" ]; then
+    FINALIZER_CLEANUP_UNPROVEN=1
+    FINALIZER_WAIT_UNSAFE=1
+    mark_process_tree_cleanup_unproven
+    return 1
+  fi
+  if ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+      --expected-start-ticks "$FINALIZER_START_TICKS" \
+      --expected-parent-pid "$$" >/dev/null 2>&1; then
+    FINALIZER_CLEANUP_UNPROVEN=1
+    FINALIZER_WAIT_UNSAFE=1
+    mark_process_tree_cleanup_unproven
+    return 1
+  fi
+  if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
+      --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
+    FINALIZER_CLEANUP_UNPROVEN=1
+    FINALIZER_WAIT_UNSAFE=1
+    mark_process_tree_cleanup_unproven
+    return 1
+  fi
+  return 0
+}
+
+# shellcheck disable=SC2317
+on_finalizer_signal() {
+  local name="$1" exit_code="$2" noclobber_was_set=0
+  trap '' HUP INT TERM
+  if [ "$PROCESS_TREE_CLEANUP_UNPROVEN" -ne 0 ]; then return 0; fi
+  case $- in *C*) noclobber_was_set=1 ;; esac
+  set -o noclobber
+  : 2>/dev/null > "$FINALIZATION_DECISION" || true
+  [ "$noclobber_was_set" -eq 1 ] || set +o noclobber
+  FINALIZATION_SIGNAL_GENERATION=$((FINALIZATION_SIGNAL_GENERATION + 1))
+  if [ -s "$FINALIZATION_DECISION" ]; then
+    trap '' HUP INT TERM
+    return 0
+  fi
+  if [ -z "$FINALIZATION_SIGNAL" ]; then
+    FINALIZATION_SIGNAL="$name"
+    FINALIZATION_SIGNAL_EXIT="$exit_code"
+  fi
+  if [ -n "$FINALIZER_PID" ]; then
+    if [ -n "$FINALIZER_START_TICKS" ]; then
+      contain_bound_finalizer || return 0
+    elif ! terminate_unreleased_runner "$FINALIZER_PID"; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+      FINALIZER_WAIT_UNSAFE=1
+      mark_process_tree_cleanup_unproven
+      return 0
+    fi
+  fi
+  trap 'on_finalizer_signal HUP 129' HUP
+  trap 'on_finalizer_signal INT 130' INT
+  trap 'on_finalizer_signal TERM 143' TERM
+}
+
+# shellcheck disable=SC2317
+run_finalizer_command() {
+  local rc=0 generation binding_valid=1 resume_failed=0 wait_safe=1
+  [ "$PROCESS_TREE_CLEANUP_UNPROVEN" -eq 0 ] || return 2
+  [ "$FINALIZER_CLEANUP_UNPROVEN" -eq 0 ] || return 2
+  [ -z "$FINALIZATION_SIGNAL" ] || return 125
+  if [ -s "$FINALIZATION_DECISION" ]; then trap '' HUP INT TERM; fi
+  setsid -- python3 "$EVIDENCE" stopped-exec \
+    --expected-parent-pid "$$" -- "$@" &
+  FINALIZER_PID=$!
+  FINALIZER_START_TICKS="$(
+    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
+      --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
+      --session-leader --stopped 2>/dev/null
+  )" || true
+  case "$FINALIZER_START_TICKS" in ''|*[!0-9]*) binding_valid=0 ;; esac
+  if [ "$binding_valid" -eq 0 ]; then
+    if ! terminate_unreleased_runner "$FINALIZER_PID"; then
+      FINALIZER_CLEANUP_UNPROVEN=1
+      FINALIZER_WAIT_UNSAFE=1
+      mark_process_tree_cleanup_unproven
+    fi
+    FINALIZER_PID=""
+    FINALIZER_START_TICKS=""
+    return 2
+  fi
+  if [ -z "$FINALIZATION_SIGNAL" ]; then
+    if ! setsid -- python3 "$EVIDENCE" resume-bound-process \
+        --pid "$FINALIZER_PID" \
+        --expected-start-ticks "$FINALIZER_START_TICKS" \
+        --expected-parent-pid "$$"; then
+      contain_bound_finalizer || wait_safe=0
+      resume_failed=1
+    fi
+  fi
+  if [ -n "$FINALIZATION_SIGNAL" ] && [ -n "$FINALIZER_START_TICKS" ]; then
+    contain_bound_finalizer || wait_safe=0
+  fi
+  if [ "$wait_safe" -eq 1 ]; then
+    while true; do
+      generation="$FINALIZATION_SIGNAL_GENERATION"
+      wait "$FINALIZER_PID" && rc=0 || rc=$?
+      if [ "$FINALIZER_WAIT_UNSAFE" -ne 0 ]; then
+        rc=2
+        break
+      fi
+      case "$rc" in
+        129|130|143)
+          if [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ]; then
+            continue
+          fi
+          ;;
+      esac
+      break
+    done
+  else
+    rc=2
+  fi
+  FINALIZER_PID=""
+  FINALIZER_START_TICKS=""
+  if [ "$resume_failed" -ne 0 ]; then return 2; fi
+  return "$rc"
+}
+
+# shellcheck disable=SC2317
+abort_if_finalizer_signalled() {
+  if [ "$PROCESS_TREE_CLEANUP_UNPROVEN" -ne 0 ]; then
+    note "INTERNAL FAULT: process-tree cleanup was not proven"
+    exit 2
+  fi
+  if [ "$FINALIZER_CLEANUP_UNPROVEN" -ne 0 ]; then
+    note "INTERNAL FAULT: finalizer cleanup was not proven"
+    exit 2
+  fi
+  if [ -n "$FINALIZATION_SIGNAL" ]; then
+    if [ -s "$FINALIZATION_DECISION" ]; then return 0; fi
+    note "CANCELLED: signal_$FINALIZATION_SIGNAL won bundle decision: $ART_DIR"
+    exit "$FINALIZATION_SIGNAL_EXIT"
+  fi
+}
+
+# shellcheck disable=SC2317
+finalize_early_envelope() {
+  local observed_rc="$1"
+  trap '' HUP INT TERM
+  set +e
+  if [ "$FINAL_SET" -eq 0 ]; then
+    if [ "$observed_rc" -eq 0 ]; then
+      set_final internal_fault "early_${EARLY_STEP}_uncommitted_success" 2
+    else
+      set_final internal_fault "early_${EARLY_STEP}_unexpected_exit" 2
+    fi
+  fi
+  if [ -d "$ART_DIR" ]; then
+    note "typed early-envelope fault: step=$EARLY_STEP reason=$FINAL_REASON"
+    python3 "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
+      --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
+      --step "$EARLY_STEP" --reason "$FINAL_REASON" \
+      --classification "$FINAL_VERDICT" \
+      --argv-json '["scripts/e2e/env_snapshots.sh"]' --cwd "$ROOT" \
+      >/dev/null 2>&1 || true
+  fi
+  exit "$FINAL_EXIT"
+}
+
+# shellcheck disable=SC2317
+on_exit() {
+  local observed_rc="$1" final_root=unavailable first_divergence=none
+  local publish_rc=0 hash_rc=0
+  if [ "$RUN_STARTED" -eq 0 ]; then
+    trap - EXIT
+    finalize_early_envelope "$observed_rc"
+  fi
+  trap 'on_finalizer_signal HUP 129' HUP
+  trap 'on_finalizer_signal INT 130' INT
+  trap 'on_finalizer_signal TERM 143' TERM
+  trap - EXIT
+  set +e
+  if [ "$FINALIZING" -ne 0 ]; then exit 2; fi
+  FINALIZING=1
+  if [ "$FINAL_SET" -eq 0 ]; then
+    set_final internal_fault \
+      "$([ "$observed_rc" -eq 0 ] && printf uncommitted_success || printf unexpected_shell_exit)" \
+      2
+  fi
+  run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$ROOT" \
+    "${HASH_ARGS[@]}" --vendor-path "$VENDOR_PATH" \
+    --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" \
+    2>/dev/null || hash_rc=$?
+  abort_if_finalizer_signalled
+  if [ "$hash_rc" -eq 0 ]; then
+    IFS= read -r final_root < "$FINAL_ROOT_FILE" || hash_rc=2
+  fi
+  if [ "$hash_rc" -ne 0 ]; then
+    set_final internal_fault final_workspace_hash_unavailable 2
+    final_root=unavailable
+  elif [ "$FINAL_VERDICT" = pass ] && [ "$final_root" != "$INPUT_ROOT" ]; then
+    set_final inconclusive final_workspace_changed 3
+  fi
+  if [ "$FINAL_VERDICT" != pass ]; then first_divergence="$FINAL_REASON"; fi
+  if [ "$TERMINAL_EMITTED" -eq 0 ]; then
+    build_event_command --string event run_end --string verdict "$FINAL_VERDICT" \
+      --string reason_code "$FINAL_REASON" --integer process_exit "$FINAL_EXIT" \
+      --string active_step "$ACTIVE_STEP" \
+      --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
+      --string cleanup_status retained_by_policy --string final_state "$final_root" \
+      --string logical_root "$final_root" \
+      --string receipt_root not_applicable_environment_identity_matrix \
+      --string first_divergence "$first_divergence" \
+      --string evidence_manifest manifest.json \
+      --string bundle_commit bundle.complete.json \
+      --string evidence_state pending_bundle_commit
+    if run_finalizer_command "${EVENT_COMMAND[@]}"; then
+      TERMINAL_EMITTED=1
+    else
+      publish_rc=2
+    fi
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
+    run_finalizer_command python3 "$EVIDENCE" validate-run --file "$LOG" \
+      --schema "$SCHEMA" --expected-verdict "$FINAL_VERDICT" \
+      --artifact-root "$ART_DIR" --output "$ART_DIR/run.validation.json" \
+      || publish_rc=2
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
+    note "terminal verdict=$FINAL_VERDICT reason=$FINAL_REASON process_exit=$FINAL_EXIT" \
+      || publish_rc=2
+    HUMAN_LOG_SEALED=1
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
+    run_finalizer_command python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
+      --output "$ART_DIR/manifest.json" \
+      --digest-output "$ART_DIR/manifest.digest" \
+      --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
+      --verdict "$FINAL_VERDICT" --input-root "$INPUT_ROOT" \
+      --final-root "$final_root" || publish_rc=2
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
+    run_finalizer_command python3 "$EVIDENCE" complete-bundle \
+      --art-dir "$ART_DIR" --manifest "$ART_DIR/manifest.json" \
+      --digest "$ART_DIR/manifest.digest" \
+      --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
+      "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
+      --vendor-path "$VENDOR_PATH" || true
+    if run_finalizer_command python3 "$EVIDENCE" adopt-bundle \
+        --art-dir "$ART_DIR" --manifest "$ART_DIR/manifest.json" \
+        --digest "$ART_DIR/manifest.digest" \
+        --commit "$ART_DIR/bundle.complete.json" \
+        --artifact-root "$ART_DIR" >/dev/null; then
+      trap '' HUP INT TERM
+    else
+      abort_if_finalizer_signalled
+      publish_rc=2
+    fi
+  fi
+  if [ "$publish_rc" -ne 0 ]; then
+    note "INTERNAL FAULT: incomplete bundle $ART_DIR"
+    exit 2
+  fi
+  if [ "$FINAL_VERDICT" = pass ]; then
+    printf '[env_snapshots] PASS — committed evidence: %s\n' "$ART_DIR" >&2
+  fi
+  exit "$FINAL_EXIT"
+}
+
+trap 'on_signal HUP 129' HUP
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
+EARLY_STEP=artifact_directory_creation
+mkdir -p "$(dirname "$ART_DIR")"
+if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
+  trap - EXIT
+  echo "[env_snapshots] refusing reused evidence directory: $ART_DIR" >&2
+  exit 2
+fi
+mkdir "$ART_DIR"
+EARLY_STEP=vendor_binding
+python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+  --vendor-path "$VENDOR_PATH" --output "$VENDOR_BINDING" \
+  --artifact-root "$ART_DIR" || {
+    set_final internal_fault early_vendor_binding_failure 2
+    exit 2
+  }
+EARLY_STEP=run_start_emission
+emit_event --new-log --string event run_start \
+  --json-value argv '["scripts/e2e/env_snapshots.sh"]' --string cwd "$ROOT" \
+  --append-string claim_ids franken_lean-1umc-environment-identity \
+  --append-string invariant_ids FL-INV-01 \
+  --append-string invariant_ids FL-INV-07 \
+  --append-string gate_ids W2-environment \
+  --append-string gate_ids PG-5 \
+  --string parity_ledger_row not_applicable_internal_environment_identity \
+  --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
+  --string platform "$(uname -srm)" --json-value host_facts "$HOST_FACTS_JSON" \
+  --integer thread_count 32 --json-value thread_matrix '[1,8,32]' \
+  --string seed environment-identity-v1 --string cache_state "$CACHE_STATE" \
+  --string input_root "$INPUT_ROOT" --string vendor_binding vendor-binding.json \
+  --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"readiness_wait_ms\":$READY_WAIT_MS}"
+: > "$HUMAN"
+RUN_STARTED=1
+
+supervise_in() {
+  local artifact_dir="$1" step="$2" cwd="$3"
+  shift 3
+  local -a semantic_args=()
+  while true; do
+    case "${1:-}" in
+      --semantic-failure-exit)
+        semantic_args+=(--semantic-failure-exit "$2")
+        shift 2
+        ;;
+      --planted)
+        semantic_args+=(--planted)
+        shift
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  LAST_META="$artifact_dir/$step.meta.json"
+  LAST_OUT="$artifact_dir/$step.out"
+  LAST_ERR="$artifact_dir/$step.err"
+  LAST_READY="$artifact_dir/$step.ready.json"
+  local launch_ready="$artifact_dir/$step.launch.ready.json"
+  local launch_release="$artifact_dir/$step.launch.release.json"
+  ACTIVE_STEP="$step"
+  SPAWNING=1
+  setsid -- python3 "$EVIDENCE" run --cwd "$cwd" \
+    --metadata "$LAST_META" --stdout "$LAST_OUT" --stderr "$LAST_ERR" \
+    --readiness "$LAST_READY" --launch-ready "$launch_ready" \
+    --launch-release "$launch_release" --artifact-root "$artifact_dir" \
+    --capture-bytes "$CAPTURE_BYTES" \
+    --output-budget-bytes "$OUTPUT_BUDGET_BYTES" \
+    --timeout-ms "$TIMEOUT_MS" --grace-ms "$GRACE_MS" \
+    --stage-id "$step" "${semantic_args[@]}" -- "$@" &
+  ACTIVE_RUNNER_PID=$!
+  if ! ACTIVE_RUNNER_START_TICKS="$(
+    setsid -- python3 "$EVIDENCE" process-start-ticks \
+      --pid "$ACTIVE_RUNNER_PID" --expected-parent-pid "$$" \
+      --wait-ms "$READY_WAIT_MS" --session-leader 2>/dev/null
+  )"; then
+    if ! terminate_unreleased_runner "$ACTIVE_RUNNER_PID"; then
+      mark_process_tree_cleanup_unproven
+      exit 2
+    fi
+    SPAWNING=0
+    ACTIVE_RUNNER_PID=""
+    if [ -n "$PENDING_SIGNAL" ]; then
+      local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+      PENDING_SIGNAL=""
+      set_final cancelled "signal_$pending_name" "$pending_exit"
+      exit "$pending_exit"
+    fi
+    set_final internal_fault "$step:active_runner_identity_unproven" 2
+    exit 2
+  fi
+  if [ -n "$PENDING_SIGNAL" ]; then
+    local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+    PENDING_SIGNAL=""
+    if ! terminate_unreleased_runner "$ACTIVE_RUNNER_PID"; then
+      mark_process_tree_cleanup_unproven
+      exit 2
+    fi
+    SPAWNING=0
+    ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    set_final cancelled "signal_$pending_name" "$pending_exit"
+    exit "$pending_exit"
+  fi
+  ACTIVE_READINESS="$LAST_READY"
+  if ! release_guardian_launch "$step" "$ACTIVE_RUNNER_PID" \
+      "$ACTIVE_RUNNER_START_TICKS" "$launch_ready" "$launch_release" \
+      "$artifact_dir"; then
+    local release_cleanup_failed=0
+    if [ -s "$launch_release" ]; then
+      stop_active_runner TERM || release_cleanup_failed=1
+    else
+      terminate_unreleased_runner "$ACTIVE_RUNNER_PID" || release_cleanup_failed=1
+    fi
+    if [ "$release_cleanup_failed" -ne 0 ]; then
+      mark_process_tree_cleanup_unproven
+      exit 2
+    fi
+    SPAWNING=0
+    ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    if [ -n "$PENDING_SIGNAL" ]; then
+      local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+      PENDING_SIGNAL=""
+      set_final cancelled "signal_$pending_name" "$pending_exit"
+      exit "$pending_exit"
+    fi
+    set_final internal_fault "$step:active_runner_launch_unproven" 2
+    exit 2
+  fi
+  SPAWNING=0
+  if [ -n "$PENDING_SIGNAL" ]; then
+    local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+    PENDING_SIGNAL=""
+    if ! stop_active_runner "$pending_name"; then
+      mark_process_tree_cleanup_unproven
+      exit 2
+    fi
+    set_final cancelled "signal_$pending_name" "$pending_exit"
+    exit "$pending_exit"
+  fi
+  if wait "$ACTIVE_RUNNER_PID"; then LAST_RC=0; else LAST_RC=$?; fi
+  ACTIVE_RUNNER_PID=""
+  ACTIVE_RUNNER_START_TICKS=""
+  ACTIVE_READINESS=""
+}
+
+supervise() {
+  local step="$1"
+  shift
+  supervise_in "$ART_DIR" "$step" "$ROOT" "$@"
+}
+
+inspect_supervisor() {
+  local step="$1" expected_class
+  if [ ! -s "$LAST_META" ]; then
+    set_final internal_fault "$step:missing_supervisor_metadata" 2
+    exit 2
+  fi
+  if ! LAST_CLASSIFICATION="$(read_meta_field "$LAST_META" classification)" || \
+     ! LAST_REASON="$(read_meta_field "$LAST_META" reason_code)" || \
+     ! LAST_META_WRAPPER="$(read_meta_field "$LAST_META" wrapper_exit)" || \
+     ! LAST_CHILD_EXIT="$(read_meta_field "$LAST_META" child_exit)"; then
+    set_final internal_fault "$step:malformed_supervisor_metadata" 2
+    exit 2
+  fi
+  case "$LAST_RC" in
+    0) expected_class=pass ;;
+    1) expected_class=fail ;;
+    2) expected_class=internal_fault ;;
+    3) expected_class=inconclusive ;;
+    4) expected_class=cancelled ;;
+    *)
+      set_final internal_fault "$step:unknown_wrapper_exit_$LAST_RC" 2
+      exit 2
+      ;;
+  esac
+  if [ "$LAST_META_WRAPPER" != "$LAST_RC" ] || \
+     [ "$LAST_CLASSIFICATION" != "$expected_class" ]; then
+    set_final internal_fault "$step:supervisor_envelope_disagreement" 2
+    exit 2
+  fi
+  case "$LAST_RC" in
+    2)
+      set_final internal_fault "$step:$LAST_REASON" 2
+      exit 2
+      ;;
+    3)
+      set_final inconclusive "$step:$LAST_REASON" 3
+      exit 3
+      ;;
+    4)
+      set_final cancelled "$step:$LAST_REASON" 4
+      exit 4
+      ;;
+  esac
+}
+
+record_step() {
+  local step="$1" assertion="$2" expected="$3" actual="$4" validation="$5"
+  local expected_classification="$6" expected_wrapper="$7" expected_child="$8"
+  local subject_root="$9" subject_final_state="${10}"
+  local input_root="${11}" final_state="${12}"
+  local -a child_field
+  if [ "$expected_child" = null ]; then
+    child_field=(--null expected_child_exit)
+  else
+    child_field=(--integer expected_child_exit "$expected_child")
+  fi
+  emit_event --string event step --string step_id "$step" \
+    --string assertion "$assertion" --string expected "$expected" \
+    --string actual "$actual" --string input_root "$input_root" \
+    --string final_state "$final_state" \
+    --string validation_artifact "$validation" \
+    --string expected_supervisor_classification "$expected_classification" \
+    --integer expected_wrapper_exit "$expected_wrapper" "${child_field[@]}" \
+    --string subject_root "$subject_root" \
+    --string subject_final_state "$subject_final_state" \
+    --json-file supervisor "$LAST_META"
+}
+
+snapshot_before() {
+  local subject_root="$1" subject_path="$2" step="$3"
+  if ! SUBJECT_BEFORE="$(hash_subject "$subject_root" "$subject_path")" || \
+     ! GLOBAL_BEFORE="$(hash_governed)"; then
+    set_final internal_fault "$step:pre_assertion_hash_unavailable" 2
+    exit 2
+  fi
+}
+
+snapshot_after() {
+  local subject_root="$1" subject_path="$2" step="$3"
+  if ! SUBJECT_AFTER="$(hash_subject "$subject_root" "$subject_path")" || \
+     ! GLOBAL_AFTER="$(hash_governed)"; then
+    set_final internal_fault "$step:post_assertion_hash_unavailable" 2
+    exit 2
+  fi
+}
+
+require_unchanged() {
+  local step="$1"
+  if [ "$SUBJECT_BEFORE" != "$SUBJECT_AFTER" ] || \
+     [ "$GLOBAL_BEFORE" != "$INPUT_ROOT" ] || \
+     [ "$GLOBAL_AFTER" != "$INPUT_ROOT" ]; then
+    note "INCONCLUSIVE step=$step: governed_inputs_changed"
+    set_final inconclusive "$step:governed_inputs_changed" 3
+    exit 3
+  fi
+}
+
+record_contract_failure() {
+  local step="$1" reason="$2"
+  note "FAIL step=$step: $reason"
+  record_step "$step" fail "$reason" \
+    "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+    not_applicable "$LAST_CLASSIFICATION" "$LAST_RC" "$LAST_CHILD_EXIT" \
+    "$SUBJECT_BEFORE" "$SUBJECT_AFTER" "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+  set_final fail "$step:$reason" 1
+  exit 1
+}
+
+run_pass_step() {
+  local step="$1" subject_root="$2" subject_path="$3"
+  shift 3
+  snapshot_before "$subject_root" "$subject_path" "$step"
+  note "running step=$step"
+  supervise "$step" "$@"
+  inspect_supervisor "$step"
+  snapshot_after "$subject_root" "$subject_path" "$step"
+  require_unchanged "$step"
+  if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] || \
+     [ "$LAST_CHILD_EXIT" != 0 ]; then
+    record_contract_failure "$step" unexpected_command_failure
+  fi
+  record_step "$step" pass pass/wrapper=0/child=0 \
+    "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+    not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+    "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+}
+
+# The real crate suite is one supervised parent obligation.
+run_pass_step environment_suite "$ROOT" crates/fln-env \
+  env CARGO_TARGET_DIR=target_local cargo test --locked -q -p fln-env
+
+run_structured_positive_step() {
+  local step="$1" test_name="$2" schema_prefix="$3" expected_records="$4"
+  snapshot_before "$ROOT" crates/fln-env "$step"
+  note "running structured producer step=$step"
+  supervise "$step" env FLN_ENV_E2E_RUN_ID="$RUN_ID-$step" \
+    CARGO_TARGET_DIR=target_local cargo test --locked -q -p fln-env \
+    "$test_name" -- --exact --nocapture
+  inspect_supervisor "$step"
+  snapshot_after "$ROOT" crates/fln-env "$step"
+  require_unchanged "$step"
+  if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] || \
+     [ "$LAST_CHILD_EXIT" != 0 ]; then
+    record_contract_failure "$step" unexpected_command_failure
+  fi
+  local actual_records passed_records leaked_records
+  actual_records="$(
+    awk -v prefix="$schema_prefix" \
+      'index($0, prefix) == 1 { count++ } END { print count + 0 }' "$LAST_OUT"
+  )"
+  passed_records="$(
+    awk -v prefix="$schema_prefix" \
+      'index($0, prefix) == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' \
+      "$LAST_OUT"
+  )"
+  leaked_records="$(
+    awk -v prefix="$schema_prefix" \
+      'index($0, prefix) == 1 { count++ } END { print count + 0 }' "$LAST_ERR"
+  )"
+  if [ "$actual_records" -ne "$expected_records" ] || \
+     [ "$passed_records" -ne "$expected_records" ] || \
+     [ "$leaked_records" -ne 0 ]; then
+    record_contract_failure "$step" malformed_or_misrouted_evidence
+  fi
+  record_step "$step" pass \
+    "records=$expected_records/stdout_only/pass/wrapper=0/child=0" \
+    "records=$actual_records/stderr_records=$leaked_records/$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+    not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+    "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+}
+
+run_structured_positive_step environment_state \
+  extensions::tests::environment_state_e2e_emits_detailed_real_path_evidence \
+  '{"schema":"fln.e2e.environment-state","version":1' 4
+run_structured_positive_step extension_merge_refusals \
+  extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence \
+  '{"schema":"fln.e2e.extension-merge-refusal","version":1' 2
+run_structured_positive_step set_union \
+  extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
+  '{"schema":"fln.e2e.set-union","version":1' 4
+
+# Retained overlay for the two named mutation kills and the historical collision
+# children. Every mutation is restored byte-for-byte before the next phase.
 OVERLAY="$ART_DIR/overlay"
-mkdir -p "$OVERLAY"
+mkdir "$OVERLAY"
 for crate in fln-core fln-hash fln-env; do
   cp -r "$ROOT/crates/$crate" "$OVERLAY/$crate"
 done
@@ -143,43 +881,64 @@ members = ["fln-core", "fln-hash", "fln-env"]
 EOF
 cp "$ROOT/rust-toolchain.toml" "$OVERLAY/rust-toolchain.toml"
 cp "$ROOT/Cargo.lock" "$OVERLAY/Cargo.lock"
-# The mutant: add_decl silently discards extension state (a real bug class the
-# snapshot/root tests exist to kill).
-sed -i 's/extensions: self.extensions.clone(),/extensions: crate::pmap::PMap::new(),/' \
-  "$OVERLAY/fln-env/src/environment.rs"
-if ! grep -q "PMap::new()," "$OVERLAY/fln-env/src/environment.rs"; then
-  emit seeded_mutant failed "\"detail\":\"mutation seed was a no-op\""
-  note "FAIL: mutation seed did not apply"
-  exit 1
+EXTENSION_STATE_SOURCE="$OVERLAY/fln-env/src/environment.rs"
+EXTENSION_STATE_PRISTINE="$ART_DIR/environment.extension-state.pristine.rs"
+cp -- "$EXTENSION_STATE_SOURCE" "$EXTENSION_STATE_PRISTINE"
+sed -i \
+  's/extensions: self.extensions.clone(),/extensions: crate::pmap::PMap::new(),/' \
+  "$EXTENSION_STATE_SOURCE"
+if cmp -s "$EXTENSION_STATE_SOURCE" "$EXTENSION_STATE_PRISTINE"; then
+  set_final internal_fault extension_state_mutation_seed_noop 2
+  exit 2
 fi
-set +e
-( cd "$OVERLAY" && CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env ) \
-  > "$ART_DIR/mutant.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 0 ]; then
-  emit seeded_mutant failed "\"expected_exit\":\"nonzero\",\"actual_exit\":0,\"artifact\":\"mutant.log\""
-  note "FAIL: the extension-dropping mutant SURVIVED the suite"
-  exit 1
-fi
-emit seeded_mutant passed "\"expected_exit\":\"nonzero\",\"actual_exit\":$rc,\"detected\":\"extension-state-dropping mutant killed\",\"artifact\":\"mutant.log\""
 
-# ---- step 6: extension-state recovery — pristine overlay passes ------------------------
-sed -i 's/extensions: crate::pmap::PMap::new(),/extensions: self.extensions.clone(),/' \
-  "$OVERLAY/fln-env/src/environment.rs"
-set +e
-( cd "$OVERLAY" && CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env ) \
-  > "$ART_DIR/recovered.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -ne 0 ]; then
-  emit recovery failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"recovered.log\""
-  note "FAIL: pristine overlay no longer passes"
-  exit 1
+snapshot_before "$OVERLAY" fln-env/src/environment.rs extension_state_mutant
+note "running extension-state mutant"
+supervise_in "$ART_DIR" extension_state_mutant "$OVERLAY" \
+  --semantic-failure-exit 101 --planted \
+  env CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
+  environment::tests::add_decl_preserves_extension_state -- --exact --nocapture
+inspect_supervisor extension_state_mutant
+snapshot_after "$OVERLAY" fln-env/src/environment.rs extension_state_mutant
+require_unchanged extension_state_mutant
+if [ "$LAST_CLASSIFICATION" != fail ] || [ "$LAST_RC" -ne 1 ] || \
+   [ "$LAST_CHILD_EXIT" != 101 ]; then
+  record_contract_failure extension_state_mutant mutant_survived_or_wrong_exit
 fi
-emit recovery passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"recovered.log\""
+if ! grep -Fq \
+    'environment::tests::add_decl_preserves_extension_state --- FAILED' \
+    "$LAST_OUT" || \
+   ! grep -Fq 'extension state survives add_decl' "$LAST_ERR"; then
+  record_contract_failure extension_state_mutant intended_failure_signature_missing
+fi
+record_step extension_state_mutant pass \
+  mutation-killed/fail/wrapper=1/child=101 \
+  "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+  not_applicable fail 1 101 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+  "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 
-# ---- step 7: one-sided SetUnion dedup mutant must be killed ----------------------------
+cp -- "$EXTENSION_STATE_PRISTINE" "$EXTENSION_STATE_SOURCE"
+if ! cmp -s "$EXTENSION_STATE_SOURCE" "$EXTENSION_STATE_PRISTINE"; then
+  set_final internal_fault extension_state_recovery_not_byte_exact 2
+  exit 2
+fi
+snapshot_before "$OVERLAY" fln-env/src/environment.rs extension_state_recovery
+note "running extension-state recovery"
+supervise_in "$ART_DIR" extension_state_recovery "$OVERLAY" \
+  env CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
+  environment::tests::add_decl_preserves_extension_state -- --exact --nocapture
+inspect_supervisor extension_state_recovery
+snapshot_after "$OVERLAY" fln-env/src/environment.rs extension_state_recovery
+require_unchanged extension_state_recovery
+if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] || \
+   [ "$LAST_CHILD_EXIT" != 0 ]; then
+  record_contract_failure extension_state_recovery recovery_failed
+fi
+record_step extension_state_recovery pass pass/wrapper=0/child=0 \
+  "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+  not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+  "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+
 SET_UNION_OVERLAY_SOURCE="$OVERLAY/fln-env/src/extensions.rs"
 SET_UNION_PRISTINE_SOURCE="$ART_DIR/extensions.set-union.pristine.rs"
 cp -- "$SET_UNION_OVERLAY_SOURCE" "$SET_UNION_PRISTINE_SOURCE"
@@ -196,60 +955,247 @@ if source.count(anchor) != 1:
 path.write_bytes(source.replace(anchor, replacement, 1))
 PY
 then
-  emit set_union_mutant failed "\"detail\":\"mutation anchor did not match exactly once\""
-  note "FAIL: SetUnion mutation did not apply exactly once"
+  set_final internal_fault set_union_mutation_anchor_mismatch 2
   exit 2
 fi
 if cmp -s "$SET_UNION_OVERLAY_SOURCE" "$SET_UNION_PRISTINE_SOURCE"; then
-  emit set_union_mutant failed "\"detail\":\"mutation seed was a no-op\""
-  note "FAIL: SetUnion mutation did not change the overlay"
+  set_final internal_fault set_union_mutation_seed_noop 2
   exit 2
 fi
-set +e
-( cd "$OVERLAY" && FLN_ENV_E2E_RUN_ID="$RUN_ID-set-union-mutant" \
-    CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
-      extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
-      -- --exact --nocapture ) > "$ART_DIR/set_union_mutant.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -ne 101 ]; then
-  emit set_union_mutant failed "\"expected_exit\":101,\"actual_exit\":$rc,\"artifact\":\"set_union_mutant.log\""
-  note "FAIL: one-sided SetUnion dedup mutant was not killed by the exact test"
-  exit 1
-fi
-emit set_union_mutant passed "\"expected_exit\":101,\"actual_exit\":101,\"detected\":\"one-sided raw-entry dedup mutant killed\",\"artifact\":\"set_union_mutant.log\""
 
-# ---- step 8: SetUnion recovery — exact pristine bytes and evidence pass ----------------
+snapshot_before "$OVERLAY" fln-env/src/extensions.rs set_union_mutant
+note "running SetUnion mutant"
+supervise_in "$ART_DIR" set_union_mutant "$OVERLAY" \
+  --semantic-failure-exit 101 --planted \
+  env FLN_ENV_E2E_RUN_ID="$RUN_ID-set-union-mutant" \
+  CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
+  extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
+  -- --exact --nocapture
+inspect_supervisor set_union_mutant
+snapshot_after "$OVERLAY" fln-env/src/extensions.rs set_union_mutant
+require_unchanged set_union_mutant
+if [ "$LAST_CLASSIFICATION" != fail ] || [ "$LAST_RC" -ne 1 ] || \
+   [ "$LAST_CHILD_EXIT" != 101 ]; then
+  record_contract_failure set_union_mutant mutant_survived_or_wrong_exit
+fi
+if ! grep -Fq \
+    'extensions::tests::set_union_e2e_emits_detailed_real_path_evidence --- FAILED' \
+    "$LAST_OUT" || \
+   ! grep -Fq 'raw replay must be byte-lossless' "$LAST_ERR"; then
+  record_contract_failure set_union_mutant intended_failure_signature_missing
+fi
+record_step set_union_mutant pass mutation-killed/fail/wrapper=1/child=101 \
+  "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+  not_applicable fail 1 101 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+  "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+
 cp -- "$SET_UNION_PRISTINE_SOURCE" "$SET_UNION_OVERLAY_SOURCE"
 if ! cmp -s "$SET_UNION_OVERLAY_SOURCE" "$SET_UNION_PRISTINE_SOURCE"; then
-  emit set_union_recovery failed "\"detail\":\"recovered source differs from pristine bytes\""
-  note "FAIL: SetUnion recovery did not restore pristine bytes"
-  exit 3
+  set_final internal_fault set_union_recovery_not_byte_exact 2
+  exit 2
 fi
-set +e
-( cd "$OVERLAY" && FLN_ENV_E2E_RUN_ID="$RUN_ID-set-union-recovery" \
-    CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
-      extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
-      -- --exact --nocapture ) > "$ART_DIR/set_union_recovered.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -ne 0 ]; then
-  emit set_union_recovery failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"set_union_recovered.log\""
-  note "FAIL: pristine SetUnion overlay did not recover"
-  exit 1
+snapshot_before "$OVERLAY" fln-env/src/extensions.rs set_union_recovery
+note "running SetUnion recovery"
+supervise_in "$ART_DIR" set_union_recovery "$OVERLAY" \
+  env FLN_ENV_E2E_RUN_ID="$RUN_ID-set-union-recovery" \
+  CARGO_TARGET_DIR="$OVERLAY/target" cargo test --locked -q -p fln-env \
+  extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
+  -- --exact --nocapture
+inspect_supervisor set_union_recovery
+snapshot_after "$OVERLAY" fln-env/src/extensions.rs set_union_recovery
+require_unchanged set_union_recovery
+if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] || \
+   [ "$LAST_CHILD_EXIT" != 0 ]; then
+  record_contract_failure set_union_recovery recovery_failed
 fi
-set_union_recovered_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 { count++ } END { print count + 0 }' "$ART_DIR/set_union_recovered.log")
-set_union_recovered_passed_count=$(awk 'index($0, "{\"schema\":\"fln.e2e.set-union\",\"version\":1") == 1 && index($0, "\"status\":\"pass\"") > 0 { count++ } END { print count + 0 }' "$ART_DIR/set_union_recovered.log")
-if [ "$set_union_recovered_count" -ne 4 ] || [ "$set_union_recovered_passed_count" -ne 4 ]; then
-  emit set_union_recovery failed "\"expected_records\":4,\"actual_records\":$set_union_recovered_count,\"passed_records\":$set_union_recovered_passed_count,\"artifact\":\"set_union_recovered.log\""
-  note "FAIL: recovered SetUnion evidence was missing, malformed, or non-passing"
-  exit 1
-fi
-emit set_union_recovery passed "\"expected_exit\":0,\"actual_exit\":0,\"evidence_records\":$set_union_recovered_count,\"artifact\":\"set_union_recovered.log\",\"final_state\":\"clean_recovery\""
+record_step set_union_recovery pass pass/wrapper=0/child=0 \
+  "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+  not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+  "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+
+identity_emit_event() {
+  local sequence="$IDENTITY_SEQ"
+  IDENTITY_SEQ=$((IDENTITY_SEQ + 1))
+  python3 "$EVIDENCE" emit --file "$IDENTITY_LOG" \
+    --artifact-root "$IDENTITY_ART_DIR" \
+    --string schema fln.e2e/2 --string run_id "$IDENTITY_RUN_ID" \
+    --string bead "$IDENTITY_BEAD" --string scenario "$IDENTITY_SCENARIO" \
+    --integer sequence "$sequence" \
+    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --string wall_time_utc "$(date -u -Is)" "$@"
+}
+
+validate_child_reference() {
+  local step="$1" child_rel="$2"
+  local child_dir="$ART_DIR/$child_rel"
+  snapshot_before "$ART_DIR" "$child_rel" "$step"
+  note "validating nested child=$child_rel"
+  supervise "$step" python3 "$EVIDENCE" validate-bundle \
+    --art-dir "$child_dir" --manifest "$child_dir/manifest.json" \
+    --digest "$child_dir/manifest.digest" \
+    --commit "$child_dir/bundle.complete.json" \
+    --artifact-root "$child_dir"
+  inspect_supervisor "$step"
+  snapshot_after "$ART_DIR" "$child_rel" "$step"
+  require_unchanged "$step"
+  if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] || \
+     [ "$LAST_CHILD_EXIT" != 0 ]; then
+    record_contract_failure "$step" child_bundle_validation_failed
+  fi
+  record_step "$step" pass \
+    "child=$child_rel/bundle.complete.json/pass/wrapper=0/child=0" \
+    "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+    "$child_rel/run.validation.json" pass 0 0 \
+    "$SUBJECT_BEFORE" "$SUBJECT_AFTER" "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+}
+
+run_identity_child() {
+  local scenario="$1" child_bead="$2" child_rel="$3" test_name="$4"
+  local validator="$5" claim_id="$6"
+  IDENTITY_SCENARIO="$scenario"
+  IDENTITY_BEAD="$child_bead"
+  IDENTITY_RUN_ID="$RUN_ID-$scenario"
+  IDENTITY_ART_DIR="$ART_DIR/$child_rel"
+  IDENTITY_LOG="$IDENTITY_ART_DIR/run.ndjson"
+  IDENTITY_SEQ=0
+  local child_start_ns child_input_root child_final_root
+  child_start_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  child_input_root="$(hash_governed)"
+  if [ "$child_input_root" != "$INPUT_ROOT" ]; then
+    set_final inconclusive "$scenario:governed_inputs_changed" 3
+    exit 3
+  fi
+  if [ -e "$IDENTITY_ART_DIR" ] || [ -L "$IDENTITY_ART_DIR" ]; then
+    set_final internal_fault "$scenario:reused_child_directory" 2
+    exit 2
+  fi
+  mkdir "$IDENTITY_ART_DIR"
+  python3 "$EVIDENCE" vendor-binding --root "$ROOT" \
+    --vendor-path "$VENDOR_PATH" \
+    --output "$IDENTITY_ART_DIR/vendor-binding.json" \
+    --artifact-root "$IDENTITY_ART_DIR" || {
+      set_final internal_fault "$scenario:vendor_binding_failed" 2
+      exit 2
+    }
+  identity_emit_event --new-log --string event run_start \
+    --json-value argv '["scripts/e2e/env_snapshots.sh"]' \
+    --string cwd "$ROOT" --append-string claim_ids "$claim_id" \
+    --append-string invariant_ids FL-INV-01 \
+    --append-string gate_ids PG-5 \
+    --string parity_ledger_row not_applicable_internal_environment_identity \
+    --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
+    --string platform "$(uname -srm)" \
+    --json-value host_facts "$HOST_FACTS_JSON" --integer thread_count 32 \
+    --json-value thread_matrix '[1,8,32]' \
+    --string seed "$scenario-v1" --string cache_state "$CACHE_STATE" \
+    --string input_root "$child_input_root" \
+    --string vendor_binding vendor-binding.json \
+    --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS}"
+  : > "$IDENTITY_ART_DIR/human.log"
+
+  local child_subject_before child_subject_after child_global_before
+  local child_global_after validation
+  child_subject_before="$(hash_subject "$ROOT" crates/fln-env)"
+  child_global_before="$(hash_governed)"
+  note "running identity child=$scenario"
+  supervise_in "$IDENTITY_ART_DIR" "$scenario" "$ROOT" \
+    env FLN_ENV_E2E_RUN_ID="$IDENTITY_RUN_ID" \
+    CARGO_TARGET_DIR=target_local cargo test --locked -q -p fln-env \
+    "$test_name" -- --exact --nocapture
+  inspect_supervisor "$scenario"
+  child_subject_after="$(hash_subject "$ROOT" crates/fln-env)"
+  child_global_after="$(hash_governed)"
+  if [ "$child_subject_before" != "$child_subject_after" ] || \
+     [ "$child_global_before" != "$child_input_root" ] || \
+     [ "$child_global_after" != "$child_input_root" ]; then
+    set_final inconclusive "$scenario:governed_inputs_changed" 3
+    exit 3
+  fi
+  if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] || \
+     [ "$LAST_CHILD_EXIT" != 0 ]; then
+    set_final fail "$scenario:producer_failed" 1
+    exit 1
+  fi
+  validation="$IDENTITY_ART_DIR/$scenario.validation.json"
+  python3 "$EVIDENCE" "$validator" --file "$LAST_OUT" \
+    --stderr-file "$LAST_ERR" --expected-run-id "$IDENTITY_RUN_ID" \
+    --observed-exit "$LAST_CHILD_EXIT" \
+    --expected-stdout-artifact "$scenario.out" \
+    --expected-stderr-artifact "$scenario.err" \
+    --artifact-root "$IDENTITY_ART_DIR" --output "$validation" || {
+      set_final fail "$scenario:strict_validation_failed" 1
+      exit 1
+    }
+  identity_emit_event --string event step --string step_id "$scenario" \
+    --string assertion pass \
+    --string expected "strict-validator/pass/wrapper=0/child=0" \
+    --string actual "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+    --string input_root "$child_global_before" \
+    --string final_state "$child_global_after" \
+    --string validation_artifact "$scenario.validation.json" \
+    --string expected_supervisor_classification pass \
+    --integer expected_wrapper_exit 0 --integer expected_child_exit 0 \
+    --string subject_root "$child_subject_before" \
+    --string subject_final_state "$child_subject_after" \
+    --json-file supervisor "$LAST_META"
+  child_final_root="$(hash_governed)"
+  if [ "$child_final_root" != "$child_input_root" ]; then
+    set_final inconclusive "$scenario:governed_inputs_changed" 3
+    exit 3
+  fi
+  identity_emit_event --string event run_end --string verdict pass \
+    --string reason_code all_obligations_passed --integer process_exit 0 \
+    --string active_step "$scenario" \
+    --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - child_start_ns ))" \
+    --string cleanup_status retained_by_policy \
+    --string final_state "$child_final_root" \
+    --string logical_root "$child_final_root" \
+    --string receipt_root not_applicable_environment_identity_matrix \
+    --string first_divergence none --string evidence_manifest manifest.json \
+    --string bundle_commit bundle.complete.json \
+    --string evidence_state pending_bundle_commit
+  printf '[env_snapshots:%s] terminal verdict=pass\n' "$scenario" \
+    > "$IDENTITY_ART_DIR/human.log"
+  python3 "$EVIDENCE" validate-run --file "$IDENTITY_LOG" \
+    --schema fln.e2e/2 --expected-verdict pass \
+    --expected-active-stage "$scenario" --artifact-root "$IDENTITY_ART_DIR" \
+    --output "$IDENTITY_ART_DIR/run.validation.json"
+  python3 "$EVIDENCE" manifest --art-dir "$IDENTITY_ART_DIR" \
+    --output "$IDENTITY_ART_DIR/manifest.json" \
+    --digest-output "$IDENTITY_ART_DIR/manifest.digest" \
+    --run-id "$IDENTITY_RUN_ID" --bead "$IDENTITY_BEAD" \
+    --scenario "$IDENTITY_SCENARIO" --verdict pass \
+    --input-root "$child_input_root" --final-root "$child_final_root"
+  python3 "$EVIDENCE" complete-bundle --art-dir "$IDENTITY_ART_DIR" \
+    --manifest "$IDENTITY_ART_DIR/manifest.json" \
+    --digest "$IDENTITY_ART_DIR/manifest.digest" \
+    --output "$IDENTITY_ART_DIR/bundle.complete.json" \
+    --governed-root "$ROOT" "${GOVERNED_ARGS[@]}" \
+    --expected-root "$child_final_root" --vendor-path "$VENDOR_PATH"
+  python3 "$EVIDENCE" adopt-bundle --art-dir "$IDENTITY_ART_DIR" \
+    --manifest "$IDENTITY_ART_DIR/manifest.json" \
+    --digest "$IDENTITY_ART_DIR/manifest.digest" \
+    --commit "$IDENTITY_ART_DIR/bundle.complete.json" \
+    --artifact-root "$IDENTITY_ART_DIR" >/dev/null
+  validate_child_reference "$scenario" "$child_rel"
+}
+
+run_identity_child declaration_tag_matrix fln-amv.12 \
+  declaration-tag-matrix-fln-amv.12 \
+  environment::tests::declaration_tag_matrix_e2e_emits_detailed_real_path_evidence \
+  validate-declaration-tag-matrix fln-amv.12-declaration-tag-matrix
+run_identity_child declaration_membership fln-amv.1 \
+  declaration-membership-fln-amv.1 \
+  environment::tests::declaration_membership_matrix_e2e_emits_detailed_real_path_evidence \
+  validate-declaration-membership fln-amv.1-declaration-membership
+run_identity_child extension_descriptor_matrix fln-amv.2 \
+  extension-descriptor-matrix-fln-amv.2 \
+  extensions::tests::extension_descriptor_matrix_e2e_emits_detailed_real_path_evidence \
+  validate-extension-descriptor-matrix fln-amv.2-extension-descriptor-matrix
 
 # ---- nested fln-amv.10 collision evidence bundle --------------------------------------
-# Collision detail belongs exclusively to this authoritative fln.e2e/2 child. The
-# legacy parent journal receives one pointer only after the child bundle commits.
+# Collision detail belongs exclusively to this authoritative fln.e2e/2 child.
+# The parent records one supervised validation reference after the child commits.
 COLLISION_SCHEMA="fln.e2e/2"
 COLLISION_BEAD="fln-amv.10"
 COLLISION_SCENARIO="environment_collision"
@@ -646,8 +1592,7 @@ python3 "$EVIDENCE" validate-bundle --art-dir "$COLLISION_ART_DIR" \
   --commit "$COLLISION_ART_DIR/bundle.complete.json" \
   --artifact-root "$COLLISION_ART_DIR" >/dev/null
 
-emit collision_bundle passed \
-  "\"child_bead\":\"fln-amv.10\",\"child_schema\":\"fln.e2e/2\",\"child_bundle\":\"collision-fln-amv.10/bundle.complete.json\",\"child_verdict\":\"pass\""
+validate_child_reference environment_collision collision-fln-amv.10
 
 # ---- nested fln-amv.13 collision resource-bound evidence bundle -----------------------
 # Reuse the fail-closed child helpers with a fresh identity and directory. The
@@ -902,8 +1847,9 @@ python3 "$EVIDENCE" validate-bundle --art-dir "$COLLISION_ART_DIR" \
   --commit "$COLLISION_ART_DIR/bundle.complete.json" \
   --artifact-root "$COLLISION_ART_DIR" >/dev/null
 
-emit resource_collision_bundle passed \
-  "\"child_bead\":\"fln-amv.13\",\"child_schema\":\"fln.e2e/2\",\"child_bundle\":\"resource-collision-fln-amv.13/bundle.complete.json\",\"child_verdict\":\"pass\""
+validate_child_reference environment_resource_collision \
+  resource-collision-fln-amv.13
 
-emit run_end passed "\"verdict\":\"pass\",\"artifacts_dir\":\"$ART_DIR\",\"cleanup_status\":\"retained_by_policy\""
-note "PASS — artifacts in $ART_DIR"
+ACTIVE_STEP=environment_resource_collision
+set_final pass all_obligations_passed 0
+exit 0
