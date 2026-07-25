@@ -2242,6 +2242,95 @@ mod tests {
         ids
     }
 
+    /// A narrow-width mirror of the accounting, so the checked path can actually be made
+    /// to trip.
+    ///
+    /// The production counters are `u128`. No fixture can overflow one, so asserting
+    /// headroom on them — which the mutant test does — proves the arithmetic is checked but
+    /// never exercises what happens when a check FIRES. This mirrors the same accumulate
+    /// step at `u8` width, where the boundary is two lines away, and asserts the behaviour
+    /// the wide path is claimed to have: `checked_add` refuses at the boundary rather than
+    /// wrapping or saturating.
+    ///
+    /// A model, and named as one: it proves the discipline is correct, not that the wide
+    /// counters were computed by this code. The wide path's guarantee is that it uses the
+    /// same `checked_add` shape, which the mutant test pins.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct NarrowUsage {
+        modules: u8,
+    }
+
+    impl NarrowUsage {
+        /// The accumulate step, at `u8` instead of `u128`. `None` is a refusal, never a
+        /// clamp: a saturating total silently understates work, which is the defect the
+        /// wide path's `checked_add` exists to avoid.
+        fn charge(self, amount: u8) -> Option<NarrowUsage> {
+            Some(NarrowUsage {
+                modules: self.modules.checked_add(amount)?,
+            })
+        }
+    }
+
+    #[test]
+    fn the_checked_accumulate_refuses_at_its_boundary_in_a_reduced_width_model() {
+        // One under the boundary accumulates.
+        let almost = NarrowUsage {
+            modules: u8::MAX - 1,
+        };
+        assert_eq!(
+            almost.charge(1),
+            Some(NarrowUsage { modules: u8::MAX }),
+            "one under the boundary must still accumulate"
+        );
+
+        // Exactly at the boundary, any further charge REFUSES.
+        let full = NarrowUsage { modules: u8::MAX };
+        assert_eq!(full.charge(1), None, "at the boundary a charge must refuse");
+        assert_eq!(full.charge(u8::MAX), None);
+
+        // And it refuses rather than wrapping or saturating — the two wrong answers.
+        assert_ne!(
+            full.charge(1),
+            Some(NarrowUsage { modules: 0 }),
+            "a wrapped total is a silent wrong value"
+        );
+        assert_ne!(
+            full.charge(1),
+            Some(NarrowUsage { modules: u8::MAX }),
+            "a saturated total silently understates the work"
+        );
+
+        // Zero is a valid charge at the boundary: refusing it would make a no-op fail.
+        assert_eq!(full.charge(0), Some(full));
+
+        // The wide path uses the same shape, which is what makes this model relevant
+        // rather than decorative: every unit's real total has headroom for one more
+        // checked_add, and the production code takes that path rather than a saturating
+        // one.
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let usage = base
+            .plan_registration(&record("B", vec![direct("A", 0b101)], 0xB1))
+            .usage();
+        for unit in UsageUnit::ALL {
+            let value = usage.get(unit);
+            assert!(
+                value.checked_add(value).is_some(),
+                "unit {unit:?} must have checked headroom"
+            );
+        }
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.module-usage-overflow-model\",\"version\":1,\
+             \"bead\":\"franken_lean-6sf3\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"reduced-width-checked-accumulate\",\
+             \"model_width_bits\":8,\"production_width_bits\":128,\
+             \"one_under_boundary\":\"accumulates\",\"at_boundary\":\"refuses\",\
+             \"wraps\":false,\"saturates\":false,\"zero_charge_at_boundary\":\"accepted\",\
+             \"claim\":\"the discipline is correct; the wide counters are not computed by \
+             this model\",\"status\":\"pass\"}}"
+        );
+    }
+
     /// Item 6: graph SHAPES — sparse, dense, and all-collision.
     ///
     /// The all-collision case is the one that earns its keep. A hash-keyed structure can
