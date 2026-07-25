@@ -378,7 +378,7 @@ supervise() {
   local launch_ready="$ART_DIR/$step.launch.ready.json"
   local launch_release="$ART_DIR/$step.launch.release.json"
   ACTIVE_STEP="$step"
-  setsid -- python3 "$EVIDENCE" run --cwd "$ROOT" \
+  setsid -- python3 -I -S "$EVIDENCE" run --cwd "$ROOT" \
     --metadata "$LAST_META" --stdout "$LAST_OUT" --stderr "$LAST_ERR" \
     --readiness "$LAST_READY" --launch-ready "$launch_ready" \
     --launch-release "$launch_release" --artifact-root "$ART_DIR" \

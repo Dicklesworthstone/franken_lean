@@ -159,10 +159,10 @@ PYTHON_CONFIGURATION_ENV_EXACT = frozenset(
     }
 )
 PYTHON_CONFIGURATION_ENV_PREFIXES = ("PYTHON",)
-# Scrubbed-and-overridden by the lane itself, never treated as hostile.
-SEALED_ENV_OVERRIDDEN = frozenset(
-    {"CARGO_HOME", "CARGO_TARGET_DIR", *PYTHON_CONFIGURATION_ENV_EXACT}
-)
+# Compiler state intentionally replaced by the sealed-cargo lane. Python
+# configuration is not in this set: the interpreter envelope rejects it
+# before target spawn instead of silently sanitizing it.
+SEALED_ENV_OVERRIDDEN = frozenset({"CARGO_HOME", "CARGO_TARGET_DIR"})
 # Ambient variables admitted into the sealed child environment as-is. PATH is
 # REBUILT (pinned toolchain bin first), never inherited.
 SEALED_ENV_ALLOWLIST = frozenset(
@@ -853,15 +853,28 @@ class SealedCompilerRejection(EvidenceError):
         self.facts = facts
 
 
+class SealedInterpreterRejection(EvidenceError):
+    """The evidence supervisor refused to run under an unsealed or hostile
+    Python configuration. The trusted interpreter still publishes a typed
+    terminal envelope, but the target is never spawned."""
+
+    def __init__(
+        self, reason_token: str, detail: str, facts: dict[str, Any]
+    ) -> None:
+        super().__init__(detail)
+        self.reason_token = reason_token
+        self.facts = facts
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
 
 
 def overridden_python_environment(environ: Mapping[str, str]) -> list[str]:
-    """Return ambient Python configuration names neutralized by ``-I``.
+    """Return ambient Python configuration names ignored by ``-I`` and refused.
 
-    Values are deliberately never copied into evidence: names prove that the
-    channel was classified, while values may contain paths or other host data.
+    Values are deliberately never copied into evidence: names prove the
+    attempted channel was classified, while values may contain host data.
     """
 
     return sorted(
@@ -891,11 +904,46 @@ def effective_interpreter_identity(
         "flags": {
             "isolated": bool(sys.flags.isolated),
             "ignore_environment": bool(sys.flags.ignore_environment),
+            "no_site": bool(sys.flags.no_site),
             "no_user_site": bool(sys.flags.no_user_site),
             "safe_path": bool(sys.flags.safe_path),
         },
         "overridden_env": overridden_python_environment(source_environment),
     }
+
+
+def prepare_sealed_interpreter(
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    """Prove the interpreter authority before any supervised target starts.
+
+    ``-I -S`` is structural authority, not an environment sanitizer. Python
+    configuration variables remain visible so their attempted use can be
+    rejected and recorded by name without retaining their values.
+    """
+
+    facts = effective_interpreter_identity(environ)
+    expected_flags = {
+        "isolated": True,
+        "ignore_environment": True,
+        "no_site": True,
+        "no_user_site": True,
+        "safe_path": True,
+    }
+    if facts["flags"] != expected_flags:
+        raise SealedInterpreterRejection(
+            "sealed_interpreter_unsealed_startup",
+            "evidence interpreter requires isolated no-site startup",
+            facts,
+        )
+    if facts["overridden_env"]:
+        raise SealedInterpreterRejection(
+            "sealed_interpreter_hostile_environment",
+            "hostile Python configuration channels present: "
+            + ",".join(facts["overridden_env"]),
+            facts,
+        )
+    return facts
 
 
 def canonical_json(value: Any) -> bytes:
@@ -2295,7 +2343,9 @@ def _run_supervised_impl(
     exec_success_observed_live = False
     target_exec_failure: dict[str, Any] | None = None
     sealed_rejection: str | None = None
+    sealed_interpreter_rejection: str | None = None
     sealed_compiler_facts: dict[str, Any] | None = None
+    sealed_interpreter_facts: dict[str, Any] | None = None
     child_env: dict[str, str] | None = None
     child_exit: int | None = None
     child_signal: str | None = None
@@ -2486,6 +2536,7 @@ def _run_supervised_impl(
         for signum in watched_signals:
             signal.signal(signum, remember_signal)
         setup_deadline = setup_deadline_ns / 1_000_000_000
+        sealed_interpreter_facts = prepare_sealed_interpreter(os.environ)
         if sealed_cargo:
             # The compiler-environment sealing step of the evidence envelope:
             # a rejection here is a typed setup fault recorded in the terminal
@@ -2858,6 +2909,12 @@ def _run_supervised_impl(
             sealed_compiler_facts = error.facts
         errors.append(f"sealed compiler rejection: {error}")
         cleanup_failed_child(signal.SIGTERM)
+    except SealedInterpreterRejection as error:
+        setup_finished_ns = setup_finished_ns or time.monotonic_ns()
+        sealed_interpreter_rejection = error.reason_token
+        sealed_interpreter_facts = error.facts
+        errors.append(f"sealed interpreter rejection: {error}")
+        cleanup_failed_child(signal.SIGTERM)
     except BaseException as error:
         setup_finished_ns = setup_finished_ns or time.monotonic_ns()
         errors.append(f"supervisor failure: {type(error).__name__}: {error}")
@@ -2979,6 +3036,8 @@ def _run_supervised_impl(
     def classify_terminal(observed_cancel: int | None) -> tuple[str, str, int]:
         if capture_publication_failed:
             return "internal_fault", "artifact_publication_failure", SETUP_FAILURE
+        if sealed_interpreter_rejection is not None:
+            return "internal_fault", sealed_interpreter_rejection, SETUP_FAILURE
         if sealed_rejection is not None:
             return "internal_fault", sealed_rejection, SETUP_FAILURE
         if errors:
@@ -3026,7 +3085,7 @@ def _run_supervised_impl(
     )
 
     metadata: dict[str, Any] = {
-        "schema": "fln.supervisor/4",
+        "schema": "fln.supervisor/5",
         "stage_id": stage_id,
         "argv": rendered_argv,
         "argv_redacted": had_redaction,
@@ -3034,6 +3093,7 @@ def _run_supervised_impl(
         "classification": classification,
         "reason_code": reason_code,
         "sealed_compiler": sealed_compiler_facts,
+        "sealed_interpreter": sealed_interpreter_facts,
         "wrapper_exit": wrapper_exit,
         "child_exit": child_exit,
         "child_signal": child_signal,
@@ -3193,7 +3253,7 @@ def _run_supervised_impl(
         wrapper_exit = int(selected["wrapper_exit"])
     except BaseException as error:
         fallback = {
-            "schema": "fln.supervisor/4",
+            "schema": "fln.supervisor/5",
             "classification": "internal_fault",
             "reason_code": "metadata_publication_failure",
             "metadata_path": str(metadata_path),
@@ -3432,7 +3492,6 @@ def prepare_sealed_cargo(
                 for name in environ
                 if name in SEALED_ENV_OVERRIDDEN
             }
-            | set(overridden_python_environment(environ))
         ),
         "rejected_env": [],
         "original_argv0": original_argv0,
@@ -8418,6 +8477,7 @@ def validate_supervisor_object(
         "fln.supervisor/2",
         "fln.supervisor/3",
         "fln.supervisor/4",
+        "fln.supervisor/5",
     }:
         raise EvidenceError(f"{path}:{record_number}: missing supervisor envelope")
     schema = value["schema"]
@@ -8447,17 +8507,28 @@ def validate_supervisor_object(
         "errors",
         "host",
     }
-    if schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}:
+    if schema in {
+        "fln.supervisor/2",
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         expected_keys.update({"phase_timing", "target_exec"})
-    if schema in {"fln.supervisor/3", "fln.supervisor/4"}:
+    if schema in {
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         expected_keys.add("test_control")
-    if schema == "fln.supervisor/4":
+    if schema in {"fln.supervisor/4", "fln.supervisor/5"}:
         expected_keys.add("sealed_compiler")
+    if schema == "fln.supervisor/5":
+        expected_keys.add("sealed_interpreter")
     if set(value) != expected_keys:
         raise EvidenceError(
             f"{path}:{record_number}: supervisor envelope shape mismatch"
         )
-    if schema == "fln.supervisor/4":
+    if schema in {"fln.supervisor/4", "fln.supervisor/5"}:
         sealed = value["sealed_compiler"]
         if sealed is not None:
             if not isinstance(sealed, dict):
@@ -8489,6 +8560,85 @@ def validate_supervisor_object(
                         f"{path}:{record_number}: sealed-compiler "
                         f"{environment_field} is malformed"
                     )
+    if schema == "fln.supervisor/5":
+        sealed_interpreter = value["sealed_interpreter"]
+        if not isinstance(sealed_interpreter, dict):
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed-interpreter facts are not an object"
+            )
+        expected_interpreter_keys = {
+            "executable",
+            "version",
+            "stdlib_prefix",
+            "base_prefix",
+            "exec_prefix",
+            "flags",
+            "overridden_env",
+        }
+        if set(sealed_interpreter) != expected_interpreter_keys:
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed-interpreter shape mismatch"
+            )
+        host_identity = effective_interpreter_identity({})
+        for identity_field in (
+            "executable",
+            "version",
+            "stdlib_prefix",
+            "base_prefix",
+            "exec_prefix",
+        ):
+            if sealed_interpreter[identity_field] != host_identity[identity_field]:
+                raise EvidenceError(
+                    f"{path}:{record_number}: sealed-interpreter "
+                    f"{identity_field} is stale"
+                )
+        flags = sealed_interpreter["flags"]
+        expected_flags = {
+            "isolated": True,
+            "ignore_environment": True,
+            "no_site": True,
+            "no_user_site": True,
+            "safe_path": True,
+        }
+        if (
+            not isinstance(flags, dict)
+            or set(flags) != set(expected_flags)
+            or not all(isinstance(flag, bool) for flag in flags.values())
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed-interpreter flags are malformed"
+            )
+        overridden_env = sealed_interpreter["overridden_env"]
+        if (
+            not isinstance(overridden_env, list)
+            or not all(
+                isinstance(name, str) and name.startswith("PYTHON")
+                for name in overridden_env
+            )
+            or overridden_env != sorted(set(overridden_env))
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed-interpreter environment names "
+                "are malformed"
+            )
+        if value["reason_code"] == "sealed_interpreter_unsealed_startup":
+            if flags == expected_flags:
+                raise EvidenceError(
+                    f"{path}:{record_number}: unsealed-startup reason lacks effect"
+                )
+        elif flags != expected_flags:
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed interpreter lacks -I -S facts"
+            )
+        if value["reason_code"] == "sealed_interpreter_hostile_environment":
+            if not overridden_env:
+                raise EvidenceError(
+                    f"{path}:{record_number}: hostile-interpreter reason lacks names"
+                )
+        elif overridden_env:
+            raise EvidenceError(
+                f"{path}:{record_number}: non-hostile result carries Python channels"
+            )
     if not isinstance(value["argv"], list) or not value["argv"] or not all(
         isinstance(item, str) for item in value["argv"]
     ):
@@ -8580,7 +8730,12 @@ def validate_supervisor_object(
             raise EvidenceError(f"{path}:{record_number}: malformed supervisor timing")
     if value["monotonic_end_ns"] - value["monotonic_start_ns"] != value["duration_ns"]:
         raise EvidenceError(f"{path}:{record_number}: supervisor duration mismatch")
-    if schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}:
+    if schema in {
+        "fln.supervisor/2",
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         phase = value["phase_timing"]
         expected_phase_keys = {
             "admission_protocol",
@@ -8593,7 +8748,11 @@ def validate_supervisor_object(
             "child_reaped_ns",
             "execution_duration_ns",
         }
-        if schema in {"fln.supervisor/3", "fln.supervisor/4"}:
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }:
             expected_phase_keys.update(
                 {
                     "setup_deadline_ns",
@@ -8619,7 +8778,16 @@ def validate_supervisor_object(
             "setup_start_ns",
             "setup_end_ns",
             "setup_duration_ns",
-            *(("setup_deadline_ns",) if schema in {"fln.supervisor/3", "fln.supervisor/4"} else ()),
+            *(
+                ("setup_deadline_ns",)
+                if schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
+                else ()
+            ),
         ):
             if (
                 not isinstance(phase[key], int)
@@ -8637,10 +8805,24 @@ def validate_supervisor_object(
             "execution_duration_ns",
             *(
                 ("synthetic_cancel_deadline_ns", "termination_decision_ns")
-                if schema in {"fln.supervisor/3", "fln.supervisor/4"}
+                if schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
                 else ()
             ),
-            *(("child_terminal_observed_ns",) if schema in {"fln.supervisor/3", "fln.supervisor/4"} else ()),
+            *(
+                ("child_terminal_observed_ns",)
+                if schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
+                else ()
+            ),
         ):
             if phase[key] is not None and (
                 not isinstance(phase[key], int)
@@ -8676,7 +8858,12 @@ def validate_supervisor_object(
             readiness_ns is None
             or not readiness_ns <= release_ns <= phase["setup_end_ns"]
             or (
-                schema in {"fln.supervisor/3", "fln.supervisor/4"}
+                schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
                 and release_ns >= phase["setup_deadline_ns"]
             )
         ):
@@ -8708,14 +8895,22 @@ def validate_supervisor_object(
                 raise EvidenceError(
                     f"{path}:{record_number}: inconsistent execution phase timing"
                 )
-        if schema in {"fln.supervisor/3", "fln.supervisor/4"} and synthetic_cancel_deadline_ns is not None and (
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        } and synthetic_cancel_deadline_ns is not None and (
             execution_ns is None
             or synthetic_cancel_deadline_ns < execution_ns
         ):
             raise EvidenceError(
                 f"{path}:{record_number}: synthetic cancellation predates execution"
             )
-        if schema in {"fln.supervisor/3", "fln.supervisor/4"} and termination_decision_ns is not None and not (
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        } and termination_decision_ns is not None and not (
             phase["setup_start_ns"]
             <= termination_decision_ns
             <= value["monotonic_end_ns"]
@@ -8734,7 +8929,12 @@ def validate_supervisor_object(
                     "termination_decision_ns",
                     "child_terminal_observed_ns",
                 )
-                if schema in {"fln.supervisor/3", "fln.supervisor/4"}
+                if schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
                 else ()
             ),
         ):
@@ -8749,7 +8949,11 @@ def validate_supervisor_object(
                 raise EvidenceError(
                     f"{path}:{record_number}: phase timestamp lies outside run: {key}"
                 )
-        if schema in {"fln.supervisor/3", "fln.supervisor/4"} and (
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        } and (
             (child_terminal_observed_ns is None)
             != (child_reaped_ns is None)
             or (
@@ -8841,7 +9045,11 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: unreleased target has a semantic outcome"
             )
-        if schema in {"fln.supervisor/3", "fln.supervisor/4"}:
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }:
             test_control = value["test_control"]
             if (
                 not isinstance(test_control, dict)
@@ -8981,6 +9189,8 @@ def validate_supervisor_object(
             "sealed_compiler_probe_failure",
             "sealed_compiler_identity_mismatch",
             "sealed_compiler_build_root_unavailable",
+            "sealed_interpreter_unsealed_startup",
+            "sealed_interpreter_hostile_environment",
         },
         "inconclusive": {
             "setup_timeout",
@@ -9026,12 +9236,25 @@ def validate_supervisor_object(
                 for error in value["errors"]
             )
         )
+        and not (
+            value["reason_code"].startswith("sealed_interpreter_")
+            and any(
+                error.startswith("sealed interpreter rejection:")
+                for error in value["errors"]
+            )
+        )
     ):
         raise EvidenceError(
             f"{path}:{record_number}: recorded errors do not bind terminal reason"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}
+        schema
+        in {
+            "fln.supervisor/2",
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }
         and value["reason_code"] == "target_exec_failure"
         and value["target_exec"]["status"] != "failed"
     ):
@@ -9093,7 +9316,13 @@ def validate_supervisor_object(
     if (
         classification == "internal_fault"
         and not (
-            schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}
+            schema
+            in {
+                "fln.supervisor/2",
+                "fln.supervisor/3",
+                "fln.supervisor/4",
+                "fln.supervisor/5",
+            }
             and value["reason_code"] == "target_exec_failure"
             and value["target_exec"]["status"] == "failed"
         )
@@ -9144,7 +9373,11 @@ def validate_supervisor_object(
             "setup_timeout_ms",
             "timeout_ms",
         )
-    elif schema in {"fln.supervisor/3", "fln.supervisor/4"}:
+    elif schema in {
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         positive_integer_facts = (
             *positive_integer_facts,
             "setup_timeout_ms",
@@ -9158,7 +9391,11 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: malformed resource fact {key}"
             )
-    if schema in {"fln.supervisor/3", "fln.supervisor/4"}:
+    if schema in {
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         cancel_after = resource_facts.get("cancel_after_ms")
         if cancel_after is not None and (
             not isinstance(cancel_after, int)
@@ -9290,7 +9527,13 @@ def validate_supervisor_object(
             f"{path}:{record_number}: inconclusive outcome carries cancellation"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}
+        schema
+        in {
+            "fln.supervisor/2",
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }
         and value["reason_code"].startswith("child_signal_")
         and (
             value["phase_timing"]["execution_start_ns"] is None
@@ -9301,7 +9544,13 @@ def validate_supervisor_object(
             f"{path}:{record_number}: child signal lacks released target execution"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}
+        schema
+        in {
+            "fln.supervisor/2",
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }
         and value["reason_code"] == "target_exec_failure"
         and (
             value["phase_timing"]["execution_start_ns"] is None
@@ -9373,7 +9622,12 @@ def validate_supervisor_object(
         schema == "fln.supervisor/2"
         and readiness.get("schema") != "fln.supervisor-readiness/2"
     ) or (
-        schema in {"fln.supervisor/3", "fln.supervisor/4"}
+        schema
+        in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }
         and readiness.get("schema") != "fln.supervisor-readiness/3"
     ):
         raise EvidenceError(f"{path}:{record_number}: supervisor/readiness version drift")
@@ -9411,7 +9665,12 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: readiness/terminal classification mismatch"
             )
-    if schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}:
+    if schema in {
+        "fln.supervisor/2",
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         phase = value["phase_timing"]
         if readiness_status == "ready":
             if readiness["monotonic_ns"] != phase["readiness_ns"]:
@@ -13951,6 +14210,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     wrapper = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "run",
             "--cwd",
@@ -14050,6 +14311,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         terminal_wrapper = subprocess.Popen(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 str(Path(__file__).resolve()),
                 "run",
                 "--cwd",
@@ -14157,6 +14420,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 )
             boundary_argv = [
                 sys.executable,
+                "-I",
+                "-S",
                 str(Path(__file__).resolve()),
                 "run",
                 "--cwd",
@@ -14384,6 +14649,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                         subprocess.Popen(
                             [
                                 sys.executable,
+                                "-I",
+                                "-S",
                                 str(Path(__file__).resolve()),
                                 "run",
                                 "--cwd",
@@ -14513,6 +14780,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     emergency_wrapper = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "run",
             "--cwd",
@@ -14670,6 +14939,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     guardian_wrapper = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "run",
             "--cwd",
@@ -14738,6 +15009,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     guardian_fault_wrapper = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "run",
             "--cwd",
@@ -18380,6 +18653,250 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     require(race_data in {b"first\n", b"second\n"}, "collision race corrupted evidence")
     cases.append({"case": "write_collision_race", "ok": True})
 
+    # --- sealed interpreter environment (bead franken_lean-h40t): prove the
+    # negative control first. A real unsealed evidence.py import must execute a
+    # PYTHONPATH shadow; the real -I -S supervisor must then refuse that same
+    # channel typed before spawning its target, retain names only, and recover.
+    interpreter_root = case_dir("sealed_interpreter_validation")
+    interpreter_shadow = interpreter_root / "shadow"
+    interpreter_shadow.mkdir()
+    shadow_marker = interpreter_root / "shadow-imported"
+    (interpreter_shadow / "platform.py").write_text(
+        "with open("
+        + repr(str(shadow_marker))
+        + ", 'ab') as marker:\n"
+        "    marker.write(b'shadow-imported\\n')\n"
+        "raise RuntimeError('planted PYTHONPATH shadow executed')\n"
+    )
+    interpreter_base_env = {
+        "PATH": SEALED_PATH_TAIL,
+        "HOME": os.environ.get("HOME", str(Path.home())),
+    }
+    hostile_python_path = str(interpreter_shadow)
+    interpreter_hostile_env = {
+        **interpreter_base_env,
+        "PYTHONPATH": hostile_python_path,
+    }
+    negative_control = subprocess.run(  # ubs:ignore — exact current interpreter and checked-in evidence utility prove the planted import channel.
+        [sys.executable, str(Path(__file__).resolve()), "--help"],
+        capture_output=True,
+        env=interpreter_hostile_env,
+        timeout=30,
+        check=False,
+    )
+    shadow_before, _shadow_size, _shadow_digest = stable_file_facts(shadow_marker)
+    require(
+        negative_control.returncode != PASS
+        and shadow_before == b"shadow-imported\n",
+        "unsealed PYTHONPATH negative control did not execute the planted shadow",
+    )
+
+    interpreter_case_counter = [0]
+    interpreter_target_marker = interpreter_root / "target-executed"
+
+    def run_interpreter_case(
+        label: str,
+        *,
+        environment: Mapping[str, str],
+        expected_reason: str,
+        expected_class: str,
+        expected_exit: int,
+    ) -> tuple[dict[str, Any], Path]:
+        interpreter_case_counter[0] += 1
+        stem = f"{label}-{interpreter_case_counter[0]}"
+        metadata = interpreter_root / f"{stem}.meta.json"
+        invocation = subprocess.run(  # ubs:ignore — exact isolated interpreter launches the checked-in evidence supervisor with a fixed planted target.
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(Path(__file__).resolve()),
+                "run",
+                "--cwd",
+                str(interpreter_root),
+                "--metadata",
+                str(metadata),
+                "--stdout",
+                str(interpreter_root / f"{stem}.out"),
+                "--stderr",
+                str(interpreter_root / f"{stem}.err"),
+                "--readiness",
+                str(interpreter_root / f"{stem}.ready.json"),
+                "--artifact-root",
+                str(interpreter_root),
+                "--capture-bytes",
+                "4096",
+                "--output-budget-bytes",
+                "65536",
+                "--timeout-ms",
+                "30000",
+                "--grace-ms",
+                "500",
+                "--stage-id",
+                stem,
+                "--",
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                (
+                    "from pathlib import Path;"
+                    f"Path({str(interpreter_target_marker)!r}).write_text('target-ran')"
+                ),
+            ],
+            capture_output=True,
+            env=dict(environment),
+            timeout=60,
+            check=False,
+        )
+        require(
+            invocation.returncode == expected_exit,
+            f"sealed interpreter case {label}: exit {invocation.returncode}, "
+            f"expected {expected_exit}: {invocation.stderr!r}",
+        )
+        envelope = read_json_object(metadata)
+        validate_supervisor_object(
+            metadata, 1, envelope, expected_stage_id=stem
+        )
+        require(
+            envelope["classification"] == expected_class
+            and envelope["reason_code"] == expected_reason,
+            f"sealed interpreter case {label}: {envelope['classification']}/"
+            f"{envelope['reason_code']}, expected {expected_class}/{expected_reason}",
+        )
+        return envelope, metadata
+
+    hostile_interpreter, hostile_metadata = run_interpreter_case(
+        "hostile-pythonpath",
+        environment=interpreter_hostile_env,
+        expected_reason="sealed_interpreter_hostile_environment",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+    )
+    shadow_after, _shadow_size, _shadow_digest = stable_file_facts(shadow_marker)
+    hostile_metadata_bytes, _metadata_size, _metadata_digest = stable_file_facts(
+        hostile_metadata
+    )
+    require(
+        shadow_after == shadow_before,
+        "sealed interpreter imported the planted PYTHONPATH shadow",
+    )
+    require(
+        not interpreter_target_marker.exists()
+        and hostile_interpreter["target_exec"]["status"] == "not_released",
+        "hostile Python configuration reached target execution",
+    )
+    require(
+        hostile_interpreter["sealed_interpreter"]["overridden_env"]
+        == ["PYTHONPATH"],
+        "hostile Python configuration name was not retained exactly",
+    )
+    require(
+        hostile_python_path.encode() not in hostile_metadata_bytes,
+        "hostile Python configuration value leaked into evidence",
+    )
+
+    recovery_interpreter, recovery_metadata = run_interpreter_case(
+        "clean-recovery",
+        environment=interpreter_base_env,
+        expected_reason="exit_zero",
+        expected_class="pass",
+        expected_exit=PASS,
+    )
+    require(
+        interpreter_target_marker.read_text() == "target-ran"
+        and recovery_interpreter["sealed_interpreter"]["overridden_env"] == []
+        and recovery_interpreter["sealed_interpreter"]["flags"]
+        == {
+            "isolated": True,
+            "ignore_environment": True,
+            "no_site": True,
+            "no_user_site": True,
+            "safe_path": True,
+        },
+        "sealed interpreter did not recover with exact -I -S identity",
+    )
+
+    def reject_interpreter_mutation(
+        label: str,
+        source: dict[str, Any],
+        metadata: Path,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> None:
+        candidate = parse_json(
+            canonical_json(source),
+            subject=f"sealed interpreter mutation {label}",
+        )
+        if not isinstance(candidate, dict):
+            raise EvidenceError("sealed interpreter mutation source is not an object")
+        mutate(candidate)
+        try:
+            validate_supervisor_object(
+                metadata,
+                1,
+                candidate,
+                expected_stage_id=candidate["stage_id"],
+            )
+        except EvidenceError:
+            return
+        raise EvidenceError(
+            f"sealed interpreter validator accepted mutation: {label}"
+        )
+
+    interpreter_mutants = (
+        (
+            "missing-identity",
+            recovery_interpreter,
+            recovery_metadata,
+            lambda candidate: candidate.pop("sealed_interpreter"),
+        ),
+        (
+            "extra-identity-field",
+            recovery_interpreter,
+            recovery_metadata,
+            lambda candidate: candidate["sealed_interpreter"].__setitem__(
+                "unexpected", True
+            ),
+        ),
+        (
+            "stale-identity",
+            recovery_interpreter,
+            recovery_metadata,
+            lambda candidate: candidate["sealed_interpreter"].__setitem__(
+                "version", "0.0.0-stale"
+            ),
+        ),
+        (
+            "remove-no-site",
+            recovery_interpreter,
+            recovery_metadata,
+            lambda candidate: candidate["sealed_interpreter"]["flags"].__setitem__(
+                "no_site", False
+            ),
+        ),
+        (
+            "drop-python-classification",
+            hostile_interpreter,
+            hostile_metadata,
+            lambda candidate: candidate["sealed_interpreter"].__setitem__(
+                "overridden_env", []
+            ),
+        ),
+    )
+    for mutant_name, source, metadata, mutate in interpreter_mutants:
+        reject_interpreter_mutation(mutant_name, source, metadata, mutate)
+    cases.append(
+        {
+            "case": "sealed_interpreter_validation",
+            "ok": True,
+            "negative_control": "PYTHONPATH platform.py shadow executed unsealed",
+            "typed_reason": "sealed_interpreter_hostile_environment",
+            "mutants_killed": [
+                name for name, _source, _metadata, _mutate in interpreter_mutants
+            ],
+        }
+    )
+
     # --- sealed compiler environment (bead fln-evidence-runner-bootstrap-btk):
     # the hostile-environment matrix, no-mock: every case is a REAL
     # `evidence.py run --sealed-cargo` subprocess. Hostile channels must be
@@ -18423,6 +18940,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         invocation = subprocess.run(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 str(Path(__file__).resolve()),
                 "run",
                 "--cwd",

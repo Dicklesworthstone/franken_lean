@@ -28,10 +28,12 @@ case "${1:-}" in
   *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
 esac
 
-command -v python3 >/dev/null 2>&1 || {
+PYTHON_BIN="$(command -v python3 || true)"
+[[ -n "$PYTHON_BIN" ]] || {
   echo "[check] setup failure: python3 is required by the evidence harness" >&2
   exit 2
 }
+PYTHON=("$PYTHON_BIN" -I -S)
 command -v setsid >/dev/null 2>&1 || {
   echo "[check] setup failure: setsid is required by the evidence finalizer" >&2
   exit 2
@@ -1022,7 +1024,7 @@ run_stage() {
       ;;
   esac
   note "stage=$name: ${argv[*]}"
-  local -a runner=(python3 "$EVIDENCE" run
+  local -a runner=("${PYTHON[@]}" "$EVIDENCE" run
     --cwd "$REPO"
     --metadata "$meta"
     --stdout "$out"
@@ -1197,7 +1199,7 @@ self_test() {
     wrapper_launch_release="$ART_DIR/selftest-$stage.guardian.launch.release.json"
     ACTIVE_STAGE="selftest-$stage"
     SPAWNING=1
-    setsid -- python3 "$EVIDENCE" run --cwd "$REPO" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" run --cwd "$REPO" \
       --metadata "$ART_DIR/selftest-$stage.guardian.meta.json" \
       --stdout "$ART_DIR/selftest-$stage.console.out" \
       --stderr "$ART_DIR/selftest-$stage.console.err" \
@@ -1320,7 +1322,7 @@ self_test() {
   cancel_meta="$ART_DIR/selftest-cancel-term.guardian.meta.json"
   ACTIVE_STAGE=selftest-cancel-term
   SPAWNING=1
-  setsid -- python3 "$EVIDENCE" run --cwd "$REPO" \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" run --cwd "$REPO" \
     --metadata "$cancel_meta" \
     --stdout "$ART_DIR/selftest-cancel-term.console.out" \
     --stderr "$ART_DIR/selftest-cancel-term.console.err" \
@@ -1465,7 +1467,7 @@ if [ "${1:-}" = "--self-test" ]; then
 fi
 
 # --locked makes Cargo.lock drift a failure instead of silently rewriting it.
-run_stage evidence-self-test python3 scripts/evidence.py self-test \
+run_stage evidence-self-test "${PYTHON[@]}" scripts/evidence.py self-test \
   --art-dir "$ART_DIR/evidence-self-test"
 run_stage verification-manifest python3 scripts/evidence.py \
   validate-verification-manifest --manifest "$VERIFICATION_MANIFEST" \

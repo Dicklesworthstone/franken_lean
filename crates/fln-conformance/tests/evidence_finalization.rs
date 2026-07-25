@@ -15,6 +15,13 @@ fn env_snapshots_script() -> String {
     fs::read_to_string(path).expect("scripts/e2e/env_snapshots.sh must be readable")
 }
 
+fn trusted_script(relative: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative);
+    fs::read_to_string(path).unwrap_or_else(|error| panic!("{relative} must be readable: {error}"))
+}
+
 #[test]
 fn terminal_human_log_is_sealed_before_manifest_generation() {
     let script = check_script();
@@ -182,5 +189,41 @@ fn env_snapshots_seals_human_log_before_parent_manifest() {
     assert!(
         sealed_return < human_append,
         "post-seal diagnostics must not reach the human.log append"
+    );
+}
+
+#[test]
+fn every_supervisor_launcher_seals_python_configuration_before_imports() {
+    let check = check_script();
+    assert!(
+        check.contains(r#"PYTHON=("$PYTHON_BIN" -I -S)"#)
+            && check.contains(r#"local -a runner=("${PYTHON[@]}" "$EVIDENCE" run"#)
+            && check.contains(r#"setsid -- "${PYTHON[@]}" "$EVIDENCE" run"#),
+        "check.sh must use its resolved -I -S interpreter argv for every supervisor"
+    );
+
+    for relative in [
+        "scripts/e2e/closure_audit.sh",
+        "scripts/e2e/env_snapshots.sh",
+        "scripts/e2e/kernel_replay.sh",
+        "scripts/e2e/structure_gate.sh",
+        "scripts/e2e/vellum_naming_no_mock_e2e.sh",
+        "scripts/e2e/verdict_schema.sh",
+    ] {
+        let script = trusted_script(relative);
+        assert!(
+            script.contains(r#"python3 -I -S "$EVIDENCE" run"#),
+            "{relative} must launch the supervisor through Python -I -S"
+        );
+        assert!(
+            !script.contains(r#"python3 "$EVIDENCE" run"#),
+            "{relative} retains an unsealed supervisor launch"
+        );
+    }
+
+    let stress = trusted_script("scripts/e2e/evidence_runner.sh");
+    assert!(
+        stress.contains(r#""$PYTHON_BIN" -I -S "$EVIDENCE" run"#),
+        "the evidence-runner stress lane must launch its supervisor through -I -S"
     );
 }

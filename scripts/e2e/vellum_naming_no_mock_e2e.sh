@@ -556,7 +556,7 @@ supervise() {
   local launch_release="$ART_DIR/$step.launch.release.json"
   ACTIVE_STEP="$step"
   SPAWNING=1
-  setsid -- python3 "$EVIDENCE" run --cwd "$ROOT" --metadata "$LAST_META" \
+  setsid -- python3 -I -S "$EVIDENCE" run --cwd "$ROOT" --metadata "$LAST_META" \
     --stdout "$LAST_OUT" --stderr "$LAST_ERR" --readiness "$LAST_READY" \
     --launch-ready "$launch_ready" --launch-release "$launch_release" \
     --artifact-root "$ART_DIR" --capture-bytes "$CAPTURE_BYTES" \

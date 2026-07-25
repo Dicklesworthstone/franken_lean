@@ -194,7 +194,7 @@ ap6_supervise() {
   fi
   ap6_note "running step=$step cwd=$cwd"
   set +e
-  python3 "$EVIDENCE" run --cwd "$cwd" \
+  python3 -I -S "$EVIDENCE" run --cwd "$cwd" \
     --metadata "$AP6_LAST_META" --stdout "$AP6_LAST_OUT" \
     --stderr "$AP6_LAST_ERR" --readiness "$AP6_LAST_READY" \
     --artifact-root "$AP6_ART_DIR" --capture-bytes "$AP6_CAPTURE_BYTES" \
@@ -509,7 +509,7 @@ PY
   AP6_LAST_READY="$AP6_ART_DIR/cancellation.ready.json"
   ap6_note "running step=cancellation (SIGTERM mid-replay)"
   set +e
-  python3 "$EVIDENCE" run --cwd "$ROOT" \
+  python3 -I -S "$EVIDENCE" run --cwd "$ROOT" \
     --metadata "$AP6_LAST_META" --stdout "$AP6_LAST_OUT" \
     --stderr "$AP6_LAST_ERR" --readiness "$AP6_LAST_READY" \
     --artifact-root "$AP6_ART_DIR" --capture-bytes "$AP6_CAPTURE_BYTES" \
@@ -665,7 +665,7 @@ PY
   # --planted). By design this fault suppresses trustworthy metadata; the
   # contract is exactly "wrapper exit 2, never a pass, never a verdict".
   set +e
-  python3 "$EVIDENCE" run --cwd "$ROOT" \
+  python3 -I -S "$EVIDENCE" run --cwd "$ROOT" \
     --metadata "$ART_DIR/capture_fault_probe.meta.json" \
     --stdout "$ART_DIR/capture_fault_probe.out" \
     --stderr "$ART_DIR/capture_fault_probe.err" \

@@ -657,7 +657,7 @@ launch_supervisor() {
   # the guard from a member directory instead, which is how the acceptance requires the
   # invocation-directory independence of the verdict to be demonstrated. It is reset by
   # the caller after each such step so no later step inherits it.
-  setsid -- python3 "$EVIDENCE" run --cwd "${STEP_CWD:-$ROOT}" --metadata "$LAST_META" \
+  setsid -- python3 -I -S "$EVIDENCE" run --cwd "${STEP_CWD:-$ROOT}" --metadata "$LAST_META" \
     --stdout "$LAST_OUT" --stderr "$LAST_ERR" --readiness "$LAST_READY" \
     --launch-ready "$launch_ready" --launch-release "$launch_release" \
     --artifact-root "$ART_DIR" --capture-bytes "$capture_bytes" \

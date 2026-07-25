@@ -595,7 +595,7 @@ supervise_in() {
   local launch_release="$artifact_dir/$step.launch.release.json"
   ACTIVE_STEP="$step"
   SPAWNING=1
-  setsid -- python3 "$EVIDENCE" run --cwd "$cwd" \
+  setsid -- python3 -I -S "$EVIDENCE" run --cwd "$cwd" \
     --metadata "$LAST_META" --stdout "$LAST_OUT" --stderr "$LAST_ERR" \
     --readiness "$LAST_READY" --launch-ready "$launch_ready" \
     --launch-release "$launch_release" --artifact-root "$artifact_dir" \
@@ -1298,7 +1298,7 @@ collision_supervise() {
   fi
   collision_note "running step=$step cwd=$cwd"
   set +e
-  python3 "$EVIDENCE" run --cwd "$cwd" \
+  python3 -I -S "$EVIDENCE" run --cwd "$cwd" \
     --metadata "$COLLISION_LAST_META" --stdout "$COLLISION_LAST_OUT" \
     --stderr "$COLLISION_LAST_ERR" --readiness "$COLLISION_LAST_READY" \
     --artifact-root "$COLLISION_ART_DIR" --capture-bytes "$COLLISION_CAPTURE_BYTES" \
