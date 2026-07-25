@@ -225,6 +225,152 @@ pub fn parse(text: &str) -> Result<Ledger, LedgerError> {
     Ok(ledger)
 }
 
+/// Oracle kinds under which somebody outside this repo **produced a value** that a row's
+/// comparison ran against.
+///
+/// `pinned-source` is deliberately absent, and that absence is the whole law below. Reading
+/// upstream's source tells you what the Reference is *written to do*; asking the pinned
+/// binary tells you what it *does*. D8 makes the Reference the differential **oracle**, and
+/// an oracle that is read rather than asked has been replaced by our reading of it. The
+/// failure is silent by construction: source and built binary agree almost always, so a
+/// source-read row is green right up until they diverge — which is precisely the class of
+/// divergence the Tribunal exists to catch, arriving in the one place nothing is watching.
+pub const VALUE_PRODUCING_ORACLES: [&str; 4] = [
+    "pinned-binary",
+    "spec-vectors",
+    "multi-host-attestation",
+    "certified-matrix",
+];
+
+/// The rows that break the law today, declared so that the FOURTEENTH cannot.
+///
+/// A declared remainder, not a silent one — the same discipline the concept censuses use in
+/// [`crate::witness::CONCEPT_CENSUS`]. Landing the law as a bare assertion would fail the
+/// build until thirteen published levels are re-earned or re-stated, and a gate that cannot
+/// be green is a gate people learn to bypass (the `franken_lean-e5k7` lesson). Landing it
+/// with a shrinking allowance stops the class from growing while its existing members are
+/// triaged.
+///
+/// The list is checked in BOTH directions: an entry whose row no longer breaks the law is
+/// itself a failure, so the remainder cannot quietly outlive the defect it records.
+pub const SOURCE_READ_ABOVE_L1_ALLOWANCE: [&str; 13] = [
+    "Lean.DataValue.ctorInventory",
+    "Lean.Expr.ctorInventory",
+    "Lean.Level.ctorInventory",
+    "Lean.Name.ctorInventory",
+    "exponentiation.threshold",
+    "maxErrors",
+    "maxHeartbeats",
+    "maxRecDepth",
+    "maxSynthPendingDepth",
+    "maxUniverseOffset",
+    "mixHash",
+    "synthInstance.maxHeartbeats",
+    "synthInstance.maxSize",
+];
+
+/// Why each group is still in the remainder, so the list is reviewable rather than a
+/// grandfather clause nobody can shrink.
+pub const SOURCE_READ_ALLOWANCE_REASON: &str = "\
+Bead fln-parity-ledger-l2-pinned-source-qydn. Thirteen rows carry L2 with oracle-kind \
+pinned-source, which the ledger's own tier note defines as L1 (`no Reference-produced value \
+is compared'). Three groups, three different repairs:\n\
+  * The eight option defaults now HAVE a value-producing oracle — \
+crates/fln-conformance/tests/pin_option_defaults.rs asks the pinned binary for its \
+registered option table on every run and compares all eight. What remains is the row edit \
+itself, in ci/PARITY_LEDGER.txt, which is cod_2's artifact.\n\
+  * The four ctorInventory rows have no route yet. A constructor list has no printed \
+default in the sense an option does; walking the pin's environment for it is plausible and \
+untried, and is not claimed here.\n\
+  * mixHash is not a level question at all: its oracle-kind says pinned-source while its \
+cited fixture is crates/fln-conformance/fixtures/core_observables.txt, which IS \
+binary-produced. One of that row's two fields is simply wrong and this law cannot say which.";
+
+/// Every way a row's level outruns the oracle that backs it, reported together and in file
+/// order so the result is a diffable artifact rather than whichever one was hit first.
+///
+/// Two distinct failures, kept apart because they have opposite repairs: a row that breaks
+/// the law without being declared, and a declared row that no longer breaks it.
+pub fn validate_level_is_supported_by_its_oracle(ledger: &Ledger) -> Result<(), Vec<LedgerError>> {
+    let breaks_law = |row: &Row| {
+        row.level > LLevel::L1 && !VALUE_PRODUCING_ORACLES.contains(&row.oracle_kind.as_str())
+    };
+    let mut errors: Vec<LedgerError> = Vec::new();
+
+    for row in &ledger.rows {
+        if breaks_law(row) && !SOURCE_READ_ABOVE_L1_ALLOWANCE.contains(&row.symbol.as_str()) {
+            errors.push(LedgerError {
+                line: row.line,
+                what: format!(
+                    "`{}` claims {:?} with oracle-kind `{}`, which produced no value to \
+                     compare against. Levels above L1 require an oracle that was ASKED, not \
+                     read: {:?}. Either earn the level against one of those, or state the \
+                     level the evidence supports. If this row is a known exception, it must \
+                     join SOURCE_READ_ABOVE_L1_ALLOWANCE with a reason — the remainder is \
+                     declared, never silent.",
+                    row.symbol, row.level, row.oracle_kind, VALUE_PRODUCING_ORACLES
+                ),
+            });
+        }
+    }
+
+    for symbol in SOURCE_READ_ABOVE_L1_ALLOWANCE {
+        // Rows absent from this slice are the orphan question, which is a whole-file
+        // property and lives in `validate_allowance_has_no_orphans`.
+        let Some(row) = ledger.rows.iter().find(|row| row.symbol == symbol) else {
+            continue;
+        };
+        if breaks_law(row) {
+            continue;
+        }
+        errors.push(LedgerError {
+            line: row.line,
+            what: format!(
+                "`{symbol}` no longer breaks the oracle-supports-level law (it is now {:?} via \
+                 `{}`), so its entry in SOURCE_READ_ABOVE_L1_ALLOWANCE is stale. Shrink the \
+                 allowance in the same change that repaired the row — a remainder that does \
+                 not shrink stops being a record of work outstanding.",
+                row.level, row.oracle_kind
+            ),
+        });
+    }
+
+    errors.sort_by_key(|error| error.line);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Every declared exception must name a row that exists.
+///
+/// Split from the law itself because the two have different SCOPES, and conflating them
+/// made the law unusable on any subset of the ledger — which is how the planted permission
+/// case caught this. The law is a per-row property and holds on any slice; orphan detection
+/// is a property of the whole file and is meaningful only against it.
+///
+/// An allowance that outlives its row is a grandfather clause: the next row to take that
+/// symbol would silently inherit an exemption nobody granted it.
+pub fn validate_allowance_has_no_orphans(ledger: &Ledger) -> Result<(), Vec<LedgerError>> {
+    let orphans: Vec<LedgerError> = SOURCE_READ_ABOVE_L1_ALLOWANCE
+        .iter()
+        .filter(|symbol| !ledger.rows.iter().any(|row| &row.symbol == *symbol))
+        .map(|symbol| LedgerError {
+            line: 0,
+            what: format!(
+                "SOURCE_READ_ABOVE_L1_ALLOWANCE lists `{symbol}`, which is not a row in this \
+                 ledger. Remove it in the change that removed the row."
+            ),
+        })
+        .collect();
+    if orphans.is_empty() {
+        Ok(())
+    } else {
+        Err(orphans)
+    }
+}
+
 /// Validate fixture references against the workspace root: every cited fixture must
 /// exist. A ledger citing a missing fixture is marketing, not evidence.
 pub fn validate_fixtures(ledger: &Ledger, root: &Path) -> Result<(), LedgerError> {
