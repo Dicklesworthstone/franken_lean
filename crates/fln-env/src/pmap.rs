@@ -776,6 +776,27 @@ impl<K: PKey, V: Clone> PMap<K, V> {
         self.len == 0
     }
 
+    /// Whether these are the same map **by construction** — the same root node, not
+    /// merely equal contents.
+    ///
+    /// `O(1)`, and deliberately conservative in one direction: two independently built
+    /// maps with identical contents answer `false`. That asymmetry is the point when
+    /// this is used to ask whether a decision made against one snapshot is still
+    /// meaningful against another. A false negative costs a redecision, which is
+    /// inconclusive and recoverable; a false positive would publish work facts
+    /// measured against a different trie shape, which is a silent wrong value.
+    ///
+    /// The pointer is **compared, never recorded**. No address enters a digest, a
+    /// canonical encoding, or any evidence record — those are content-addressed, and an
+    /// allocation address is not content.
+    pub fn is_same_structure(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (None, None) => true,
+            (Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs),
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
     pub fn get(&self, key: &K) -> Option<&V> {
         let hash = key.key_hash();
         let mut node = self.root.as_ref()?;

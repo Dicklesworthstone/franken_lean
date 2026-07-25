@@ -95,6 +95,10 @@ pub enum DeclarationCheckpoint {
     /// Before measuring the expression at this frozen index. See
     /// [`declaration_expressions`] for the order.
     BeforeExpression(usize),
+    /// After a plan revalidated its base and before it publishes. The last point at
+    /// which a caller who gave up can still prevent a declaration being published on
+    /// their behalf.
+    BeforePublication,
 }
 
 impl std::fmt::Display for DeclarationCheckpoint {
@@ -104,6 +108,212 @@ impl std::fmt::Display for DeclarationCheckpoint {
         match self {
             DeclarationCheckpoint::BeforeExpression(index) => {
                 write!(f, "before-expression/{index}")
+            }
+            DeclarationCheckpoint::BeforePublication => write!(f, "before-publication"),
+        }
+    }
+}
+
+/// The schema of a [`PreparedDeclarationAdmission`]. Bumping it invalidates every plan
+/// in flight, which is the point: a plan decided under one identity schema must not be
+/// committed under another.
+const DECLARATION_PLAN_SCHEMA: u16 = 1;
+
+/// What preflighting one declaration against a base concluded.
+///
+/// A duplicate name is [`DeclarationPlan::DuplicateName`] rather than a non-answer,
+/// because it is a *completed determination about the declaration* — the bounded lookup
+/// finished and the answer is no. Per decision `fln-um4a` a domain rejection belongs
+/// inside [`Outcome::Complete`], never beside `Inconclusive` where the two would look
+/// symmetric and invite one being read as the other.
+#[derive(Debug)]
+pub enum DeclarationPlan {
+    /// Admissible as far as this base can tell. Commit to publish.
+    Prepared(PreparedDeclarationAdmission),
+    /// Already present. No plan exists, because there is nothing to publish.
+    DuplicateName { name: Name },
+}
+
+/// One published declaration, with the identity that publication made authoritative.
+#[derive(Debug, Clone)]
+pub struct DeclarationPublication {
+    /// The one immutable environment this transaction published.
+    pub environment: Environment,
+    /// The content digest of the admitted declaration.
+    ///
+    /// Authoritative **because it was published**. The same value existed inside the
+    /// plan as a provisional digest with no accessor, so a plan that never commits
+    /// cannot hand it out, log it, or have it cached — a provisional identity that
+    /// escapes is a cache key for a declaration nobody admitted.
+    pub digest: Digest,
+    /// Exact preflight facts for the admitted declaration.
+    pub usage: DeclarationUsage,
+}
+
+/// The result of committing a prepared admission.
+#[derive(Debug, Clone)]
+pub enum DeclarationCommitted {
+    Published(DeclarationPublication),
+    /// The name was taken between planning and committing. A completed determination,
+    /// not a non-answer: the lookup finished.
+    DuplicateName {
+        name: Name,
+    },
+}
+
+/// An immutable, non-authoritative declaration admission decided against one base.
+///
+/// Holding material is not authority. Nothing here is reachable as an environment, it
+/// is never cacheable, and [`Self::commit`] revalidates before publishing. The type is
+/// the twin of `ModuleGraphAdmissionPlan`/`PreparedAdmission` in
+/// [`crate::modules`] on purpose rather than a second invention: one plan shape in the
+/// crate, so a reader who has understood one has understood both.
+#[derive(Debug)]
+pub struct PreparedDeclarationAdmission {
+    schema: u16,
+    info: Arc<ConstantInfo>,
+    /// Never exposed. See [`DeclarationPublication::digest`].
+    provisional_digest: Digest,
+    usage: DeclarationUsage,
+    /// The base this plan was decided against, held as an O(1) persistent snapshot.
+    base: Environment,
+    /// The insertion weight to charge, **measured** rather than supplied.
+    admission_weight: u64,
+    collision_budget: CollisionBudget,
+}
+
+impl PreparedDeclarationAdmission {
+    /// **Never.** A plan is a decision in flight, not a result.
+    pub const fn is_cacheable(&self) -> bool {
+        false
+    }
+
+    /// The declaration this plan would admit.
+    pub fn declaration(&self) -> &ConstantInfo {
+        &self.info
+    }
+
+    /// Exact preflight facts. Available before commit because they describe the
+    /// *input*, which is already known; the identity they support is not.
+    pub const fn usage(&self) -> &DeclarationUsage {
+        &self.usage
+    }
+
+    /// Whether this plan is still meaningful against `env`.
+    ///
+    /// Same constants map by construction. Deliberately conservative: an environment
+    /// rebuilt to identical contents answers `false` and the plan must be re-decided,
+    /// which is inconclusive and recoverable. The alternative — accepting it — would
+    /// publish a measured insertion weight taken against a different trie shape.
+    pub fn is_valid_for(&self, env: &Environment) -> bool {
+        self.schema == DECLARATION_PLAN_SCHEMA
+            && self.base.constants.is_same_structure(&env.constants)
+    }
+
+    /// Revalidate against `env` and publish exactly once.
+    ///
+    /// Four things are rechecked immediately before publication and **nothing is
+    /// recomputed**: the plan's own schema, the duplicate-name observation, the base
+    /// binding, and cancellation — in that order, because a taken name is a complete
+    /// verdict about the declaration that publishes nothing, whereas a moved base is
+    /// only a statement about this plan. Checking the base first would make the
+    /// duplicate branch unreachable, since an environment that gained a name is a
+    /// different persistent value. The canonical bytes, the digest, and the measured
+    /// insertion weight are consumed as decided — recomputing them here would make the
+    /// commit a second measurement that could disagree with the one the plan was
+    /// decided on, and charging the insertion twice is one of the defects this bead
+    /// names.
+    ///
+    /// A superseded base is [`InconclusiveCause::AuthorityIncomplete`]: its own
+    /// definition is a source that changed underfoot, and the base moving says nothing
+    /// about whether this declaration is admissible. Caching it as a refusal would
+    /// record "the environment was busy" as "this declaration is invalid".
+    ///
+    /// Atomicity is structural, not procedural. `Environment` is immutable and
+    /// persistent, so no path through this function can mutate `env`: every non-published
+    /// arm leaves the caller's environment the same value it already held, with the same
+    /// logical root and the same structural sharing. There is no partial-insert state to
+    /// roll back because there is no in-place insert.
+    pub fn commit(
+        self,
+        env: &Environment,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<DeclarationCommitted> {
+        if self.schema != DECLARATION_PLAN_SCHEMA {
+            return Outcome::Inconclusive(Inconclusive::authority_incomplete(
+                "declaration admission plan carries a superseded schema",
+            ));
+        }
+        // Re-observed on the commit target, not trusted from the plan, and deliberately
+        // *before* the base binding.
+        //
+        // The name being taken is a complete determination about this declaration and it
+        // is true of the environment being committed against, whichever base the plan was
+        // decided on — and reporting it publishes nothing, so no stale fact is consumed.
+        // Checking the base first would make this branch unreachable: an environment that
+        // gained a name is a different persistent value, so the base binding would
+        // already have refused, and "superseded" is strictly less informative than
+        // "that name is taken". A check that cannot fire is not defence in depth, it is
+        // an untruthful contract.
+        let name = self.info.name().clone();
+        if env.constants.contains_key(&name) {
+            return Outcome::complete(DeclarationCommitted::DuplicateName { name });
+        }
+        if !self.is_valid_for(env) {
+            return Outcome::Inconclusive(Inconclusive::authority_incomplete(
+                "declaration admission plan decided against a superseded environment",
+            ));
+        }
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                DeclarationCheckpoint::BeforePublication.to_string(),
+            ));
+        }
+        match env.constants.try_insert_with_budget(
+            name,
+            Arc::clone(&self.info),
+            self.admission_weight,
+            self.collision_budget,
+        ) {
+            Ok(constants) => {
+                Outcome::complete(DeclarationCommitted::Published(DeclarationPublication {
+                    environment: Environment {
+                        constants,
+                        extensions: env.extensions.clone(),
+                    },
+                    digest: self.provisional_digest,
+                    usage: self.usage,
+                }))
+            }
+            // `CollisionExhausted` reports `u128` deliberately, so an exact overage
+            // survives instead of wrapping; `ResourceUsage` is `u64`. When the numbers
+            // fit, translate them. When they do not, there is no truthful `u64` stop to
+            // emit: clamping both to `u64::MAX` would produce `observed == allowed` —
+            // the self-contradictory stop `CollisionExhausted`'s own documentation
+            // exists to avoid, and `is_genuine_exhaustion` would then deny that a stop
+            // happened at all. Fabricating a gap to keep the invariant would be worse.
+            // `franken_lean-pmap-refusal-outcome-taxonomy-i1z9` owns closing this.
+            Err(exhausted) => {
+                match (
+                    u64::try_from(exhausted.limit),
+                    u64::try_from(exhausted.attempted),
+                ) {
+                    (Ok(allowed), Ok(observed)) => Outcome::Inconclusive(
+                        Inconclusive::resource(ResourceUsage {
+                            reason: ResourceReason::StructuralBudget {
+                                unit: StructuralUnit::ProducedNodes,
+                            },
+                            allowed,
+                            observed,
+                        })
+                        .with_progress("pmap-admission"),
+                    ),
+                    _ => Outcome::InternalFault(InternalFault::new(
+                        "fln-env.declaration-admission.untranslatable-collision-stop",
+                        "collision-budget overage exceeds the u64 ResourceUsage fields; \
+                         franken_lean-pmap-refusal-outcome-taxonomy-i1z9 owns the fix",
+                    )),
+                }
             }
         }
     }
@@ -662,6 +872,61 @@ impl Environment {
             }),
             Err(exhausted) => DeclAdmission::Inconclusive(exhausted),
         }
+    }
+
+    /// Preflight one declaration's identity and admission as a single decision
+    /// (bead `franken_lean-j8h`).
+    ///
+    /// This is the bounded entry point: hashing and admission become one preflighted
+    /// transaction rather than two independent calls, so there is no window in which a
+    /// declaration has been hashed but not admitted and no way to publish work facts
+    /// that describe a different base.
+    ///
+    /// # Order, and why it is this order
+    ///
+    /// 1. **Duplicate name.** A single bounded lookup and a complete determination, so
+    ///    it runs first and nothing further is spent on a declaration that cannot be
+    ///    admitted.
+    /// 2. **Row families.** Constant work per family, and refusing here means the
+    ///    encoder is never entered.
+    /// 3. **Expressions.** The only input-sized measurement, bounded and cancellable.
+    /// 4. **The digest.** Computed last, so a declaration that was going to be refused
+    ///    never had a provisional identity computed for it at all.
+    ///
+    /// # The insertion weight is measured, not supplied
+    ///
+    /// [`Environment::try_add_decl_with_budget`] takes `expanded_weight` as a caller
+    /// -supplied `u64`, which means that boundary trusts a number instead of measuring
+    /// one — the concrete form of this bead's complaint that no API can truthfully
+    /// report declaration work. Here the weight comes from the preflight's own
+    /// measurement. A total that exceeds `u64` saturates to `u64::MAX`, which charges
+    /// the most rather than the least: the conservative direction refuses, and a charge
+    /// that silently understated the work would be the untruthful fact.
+    pub fn plan_add_decl(
+        &self,
+        info: ConstantInfo,
+        budget: DeclarationBudget,
+        collision_budget: CollisionBudget,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<DeclarationPlan> {
+        let name = info.name().clone();
+        if self.constants.contains_key(&name) {
+            return Outcome::complete(DeclarationPlan::DuplicateName { name });
+        }
+        let usage = match preflight_declaration(&info, budget, cancellation).non_answer_for() {
+            Ok(non_answer) => return non_answer,
+            Err(usage) => usage,
+        };
+        let provisional_digest = Environment::decl_content_digest(&info);
+        Outcome::complete(DeclarationPlan::Prepared(PreparedDeclarationAdmission {
+            schema: DECLARATION_PLAN_SCHEMA,
+            info: Arc::new(info),
+            provisional_digest,
+            usage,
+            base: self.clone(),
+            admission_weight: u64::try_from(usage.expanded_weight).unwrap_or(u64::MAX),
+            collision_budget,
+        }))
     }
 
     /// Register an extension with its declared contracts.
@@ -3976,6 +4241,244 @@ mod tests {
             "an adequate-budget retry must reproduce the same logical root"
         );
         assert_ne!(base_root, published.logical_root(&options));
+    }
+
+    fn prepared(
+        env: &Environment,
+        info: ConstantInfo,
+        budget: DeclarationBudget,
+    ) -> PreparedDeclarationAdmission {
+        match env
+            .plan_add_decl(info, budget, CollisionBudget::UNBOUNDED, None)
+            .into_complete()
+            .expect("planning admits")
+        {
+            DeclarationPlan::Prepared(plan) => plan,
+            DeclarationPlan::DuplicateName { name } => {
+                unreachable!("fixture name {name:?} must be fresh")
+            }
+        }
+    }
+
+    /// One preflighted transaction: plan then commit, publishing exactly once.
+    #[test]
+    fn declaration_admission_is_one_preflighted_transaction() {
+        let options = KVMap::new();
+        let base = Environment::new()
+            .add_decl(axiom("Existing"))
+            .expect("base builds");
+        let info = multi_node_recursor();
+
+        let plan = prepared(&base, info.clone(), DeclarationBudget::UNBOUNDED);
+        // A plan is material, not authority, and it is never cacheable.
+        assert!(!plan.is_cacheable());
+        assert_eq!(plan.declaration(), &info);
+        assert!(plan.is_valid_for(&base));
+        assert_eq!(plan.usage().expressions, 3);
+
+        let committed = plan
+            .commit(&base, None)
+            .into_complete()
+            .expect("commit publishes");
+        let DeclarationCommitted::Published(publication) = committed else {
+            unreachable!("a fresh name must publish")
+        };
+        // The digest becomes reachable only through publication, and it is the same
+        // value the unbudgeted encoder produces — the transaction does not redefine
+        // identity, it only bounds the work of establishing it.
+        assert_eq!(publication.digest, Environment::decl_content_digest(&info));
+        assert_eq!(publication.environment.len(), base.len() + 1);
+        assert!(publication.environment.find(info.name()).is_some());
+        assert_ne!(
+            base.logical_root(&options),
+            publication.environment.logical_root(&options)
+        );
+    }
+
+    /// A forced failure leaves the base observably identical — proved by comparing
+    /// roots, contents and sharing before and after, not by reading the code path.
+    #[test]
+    fn a_failed_declaration_admission_leaves_the_base_untouched() {
+        let options = KVMap::new();
+        let base = Environment::new()
+            .add_decl(axiom("Existing"))
+            .expect("base builds")
+            .add_decl(axiom("Second"))
+            .expect("base builds");
+        let info = multi_node_recursor();
+
+        let root_before = base.logical_root(&options);
+        let operational_before = Environment::operational_root(&options);
+        let len_before = base.len();
+        // A snapshot taken before the failure: if a failure disturbed structural
+        // sharing, this and `base` would stop agreeing.
+        let snapshot = base.clone();
+
+        // Three independent forced failures, each a different arm.
+        let starved = base
+            .plan_add_decl(
+                info.clone(),
+                DeclarationBudget {
+                    max_expr_nodes: 1,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+                CollisionBudget::UNBOUNDED,
+                None,
+            )
+            .into_complete();
+        assert!(starved.is_err(), "the node budget must bind");
+
+        let probe = TripAt::new(0);
+        let cancelled = base
+            .plan_add_decl(
+                info.clone(),
+                DeclarationBudget::UNBOUNDED,
+                CollisionBudget::UNBOUNDED,
+                Some(&probe),
+            )
+            .into_complete();
+        assert!(cancelled.is_err(), "a tripped probe must stop planning");
+
+        // A plan committed against a moved base: superseded, and inconclusive rather
+        // than a rejection, because the base moving says nothing about admissibility.
+        let plan = prepared(&base, info.clone(), DeclarationBudget::UNBOUNDED);
+        let moved = base.add_decl(axiom("Interloper")).expect("base moves");
+        assert!(!plan.is_valid_for(&moved));
+        let superseded = plan.commit(&moved, None);
+        let Outcome::Inconclusive(inconclusive) = &superseded else {
+            unreachable!("a superseded plan must not publish")
+        };
+        assert!(
+            matches!(
+                inconclusive.cause,
+                InconclusiveCause::AuthorityIncomplete { .. }
+            ),
+            "a base that changed underfoot is an authority failure, not exhaustion"
+        );
+        assert_eq!(superseded.authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            superseded.cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
+        );
+
+        // The base is untouched after all three: same value, same roots, same length,
+        // same contents, and still sharing with the pre-failure snapshot.
+        assert_eq!(root_before, base.logical_root(&options));
+        assert_eq!(root_before, snapshot.logical_root(&options));
+        assert_eq!(operational_before, Environment::operational_root(&options));
+        assert_eq!(len_before, base.len());
+        assert_eq!(base, snapshot);
+        assert!(base.find(&n("Existing")).is_some());
+        assert!(base.find(&n("Second")).is_some());
+        assert!(
+            base.find(info.name()).is_none(),
+            "a refused declaration must be unreachable in the base"
+        );
+        assert!(
+            base.find(&n("Interloper")).is_none(),
+            "publishing onto a fork must not touch the fork's base"
+        );
+    }
+
+    /// An adequate-budget retry yields the same digest and root as the unlimited model.
+    #[test]
+    fn an_adequate_budget_retry_matches_the_unlimited_model() {
+        let options = KVMap::new();
+        let base = Environment::new()
+            .add_decl(axiom("Existing"))
+            .expect("base builds");
+        let info = multi_node_recursor();
+
+        // The unlimited mathematical model: the unbudgeted path, which is what the
+        // bounded transaction must agree with exactly.
+        let unlimited = base.add_decl(info.clone()).expect("unbudgeted admits");
+        let unlimited_root = unlimited.logical_root(&options);
+        let unlimited_digest = Environment::decl_content_digest(&info);
+
+        // Refuse first, so the retry is a genuine retry after a failure.
+        assert!(
+            base.plan_add_decl(
+                info.clone(),
+                DeclarationBudget {
+                    max_expr_nodes: 1,
+                    ..DeclarationBudget::UNBOUNDED
+                },
+                CollisionBudget::UNBOUNDED,
+                None,
+            )
+            .into_complete()
+            .is_err()
+        );
+
+        let publication = match prepared(&base, info.clone(), DeclarationBudget::UNBOUNDED)
+            .commit(&base, None)
+            .into_complete()
+            .expect("the retry publishes")
+        {
+            DeclarationCommitted::Published(publication) => publication,
+            DeclarationCommitted::DuplicateName { name } => {
+                unreachable!("{name:?} was refused, not admitted")
+            }
+        };
+        assert_eq!(publication.digest, unlimited_digest);
+        assert_eq!(
+            publication.environment.logical_root(&options),
+            unlimited_root,
+            "the bounded transaction must land on the unlimited model's root"
+        );
+        assert_eq!(publication.environment, unlimited);
+
+        // And repeating the whole transaction reproduces it, so the agreement is a
+        // property of the operation rather than of one run.
+        let again = match prepared(&base, info.clone(), DeclarationBudget::UNBOUNDED)
+            .commit(&base, None)
+            .into_complete()
+            .expect("publishes again")
+        {
+            DeclarationCommitted::Published(publication) => publication,
+            DeclarationCommitted::DuplicateName { .. } => unreachable!("still fresh"),
+        };
+        assert_eq!(again.digest, publication.digest);
+        assert_eq!(
+            again.environment.logical_root(&options),
+            publication.environment.logical_root(&options)
+        );
+    }
+
+    /// A duplicate is a completed verdict at both stages, never a non-answer.
+    #[test]
+    fn a_duplicate_name_is_a_completed_verdict_not_a_non_answer() {
+        let info = multi_node_recursor();
+        let occupied = Environment::new()
+            .add_decl(info.clone())
+            .expect("first admission");
+
+        // At planning time: complete, with the verdict inside.
+        let planned = occupied
+            .plan_add_decl(
+                info.clone(),
+                DeclarationBudget::UNBOUNDED,
+                CollisionBudget::UNBOUNDED,
+                None,
+            )
+            .into_complete()
+            .expect("a duplicate is a completed determination, not a stop");
+        assert!(matches!(planned, DeclarationPlan::DuplicateName { .. }));
+
+        // And at commit time, for a name taken after the plan was made: the plan is
+        // still valid for its base, so this is a verdict rather than a supersession.
+        let base = Environment::new();
+        let plan = prepared(&base, info.clone(), DeclarationBudget::UNBOUNDED);
+        let committed = plan
+            .commit(&occupied, None)
+            .into_complete()
+            .expect("a duplicate at commit is still a completed determination");
+        assert!(matches!(
+            committed,
+            DeclarationCommitted::DuplicateName { .. }
+        ));
     }
 
     /// An unset budget behaves exactly as the pre-budget code did, and preflight
