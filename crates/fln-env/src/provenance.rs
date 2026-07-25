@@ -25,7 +25,7 @@ use crate::extensions::{
 use crate::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, DirectImport, ModuleEpoch, ModuleGraph,
     ModuleGraphAdmission, ModuleGraphError, ModuleGraphInconclusive, ModuleGraphLimits,
-    ModuleGraphResource, ModuleId, ModuleRecord, name_stats,
+    ModuleGraphOutcome, ModuleGraphResource, ModuleId, ModuleRecord, name_stats,
 };
 
 /// Frozen canonical schema for the complete provenance manifest.
@@ -856,8 +856,28 @@ impl ModuleProvenanceManifest {
             limits.max_name_depth,
             u128::MAX,
         );
-        let mut graph = ModuleGraph::new(epoch.clone(), graph_limits)
-            .map_err(ModuleProvenanceError::InvalidModuleGraph)?;
+        // Construction splits the same way registration does: a malformed epoch is a
+        // rejection, a bound payload budget is inconclusive. This path sets the
+        // graph's payload budget to `u128::MAX`, so only the rejection arm is
+        // reachable — but it is matched explicitly rather than assumed away.
+        let mut graph = match ModuleGraph::new(epoch.clone(), graph_limits) {
+            ModuleGraphOutcome::Complete(graph) => graph,
+            ModuleGraphOutcome::Rejected(error) => {
+                return Err(ModuleProvenanceError::InvalidModuleGraph(error));
+            }
+            ModuleGraphOutcome::Inconclusive(reason) => {
+                return Err(ModuleProvenanceError::GraphAdmissionFault {
+                    what: match reason {
+                        ModuleGraphInconclusive::ResourceLimitExceeded { .. } => {
+                            "module-graph construction bound a budget this path sets to u128::MAX"
+                        }
+                        ModuleGraphInconclusive::Cancelled { .. } => {
+                            "module-graph construction reported cancellation without a request"
+                        }
+                    },
+                });
+            }
+        };
         for record in &records {
             // The three arms are kept apart deliberately. A rejection is a real
             // determination about the record; an exhausted budget is not, and folding

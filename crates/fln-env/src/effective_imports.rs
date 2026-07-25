@@ -1014,7 +1014,7 @@ mod tests {
             epoch.clone(),
             ModuleGraphLimits::new(10_000, 100_000, 1_000, u128::MAX),
         )
-        .expect("test epoch");
+        .expect_complete("test epoch");
         for (index, (module, is_module, imports)) in records.into_iter().enumerate() {
             graph = graph
                 .register(ModuleRecord::new(

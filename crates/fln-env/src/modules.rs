@@ -483,89 +483,112 @@ pub enum ModuleGraphInconclusive {
 /// non-`Complete` arm leaves the base graph observably identical and no partial
 /// module is ever reachable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModuleGraphAdmission {
-    /// The record was inserted, or was an exact idempotent re-registration.
-    Complete(Registration),
-    /// A complete, resource-independent determination that the record is not
+pub enum ModuleGraphOutcome<T> {
+    /// The operation finished and produced `T`.
+    Complete(T),
+    /// A complete, resource-independent determination that the input is not
     /// admissible.
     Rejected(ModuleGraphError),
     /// No verdict was reached. Never accepted, never rejected, never cacheable.
     Inconclusive(ModuleGraphInconclusive),
 }
 
-impl ModuleGraphAdmission {
+/// The typed outcome of one module-graph **registration**.
+pub type ModuleGraphAdmission = ModuleGraphOutcome<Registration>;
+
+/// The typed outcome of module-graph **construction**.
+///
+/// Construction is the other half of the same law. Retyping only registration
+/// would leave a graph able to be *born* over its payload budget even though it
+/// can no longer *grow* over its module or edge budgets — and a construction that
+/// bound its budget, if memoized, replays on a later run as though it were a real
+/// answer about that epoch and limit pair.
+pub type ModuleGraphConstruction = ModuleGraphOutcome<ModuleGraph>;
+
+impl<T> ModuleGraphOutcome<T> {
     /// Stable evidence label, sharing the vocabulary of
     /// [`DeclClosureStatus`](crate::decl_closure::DeclClosureStatus) and
     /// [`ClosureStatus`](crate::effective_imports::ClosureStatus).
     pub fn outcome_label(&self) -> &'static str {
         match self {
-            ModuleGraphAdmission::Complete(_) => "complete",
-            ModuleGraphAdmission::Rejected(_) => "rejected",
-            ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::Cancelled { .. }) => {
+            ModuleGraphOutcome::Complete(_) => "complete",
+            ModuleGraphOutcome::Rejected(_) => "rejected",
+            ModuleGraphOutcome::Inconclusive(ModuleGraphInconclusive::Cancelled { .. }) => {
                 "inconclusive-cancelled"
             }
-            ModuleGraphAdmission::Inconclusive(
-                ModuleGraphInconclusive::ResourceLimitExceeded { .. },
-            ) => "inconclusive-resource",
+            ModuleGraphOutcome::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
+                ..
+            }) => "inconclusive-resource",
         }
     }
 
-    /// **Only a completed registration may be memoized.**
+    /// **Only a completed outcome may be memoized.**
     ///
-    /// This is the trap the bead exists to close: if an exhausted or cancelled
-    /// registration could be cached, a later run would replay the exhaustion as
-    /// though it were a real answer about the module. A rejection is a real answer,
-    /// but it is still not cached here — caching refusals is a separate decision
-    /// this seam does not make on the caller's behalf.
+    /// The trap this closes: if an exhausted or cancelled outcome could be cached, a
+    /// later run would replay the exhaustion as though it were a real answer. A
+    /// rejection is a real answer, but it is still not cached here — caching refusals
+    /// is a separate decision this seam does not make on the caller's behalf.
     pub fn is_cacheable(&self) -> bool {
-        matches!(self, ModuleGraphAdmission::Complete(_))
+        matches!(self, ModuleGraphOutcome::Complete(_))
     }
 
     /// Whether the outcome is in the inconclusive family.
     pub fn is_inconclusive(&self) -> bool {
-        matches!(self, ModuleGraphAdmission::Inconclusive(_))
+        matches!(self, ModuleGraphOutcome::Inconclusive(_))
     }
 
-    /// The graph to carry forward. `None` for both non-complete arms — the caller
-    /// keeps the graph it already held, unchanged.
-    pub fn graph(&self) -> Option<&ModuleGraph> {
+    /// The completed value, if any. `None` for both non-complete arms.
+    pub fn complete(&self) -> Option<&T> {
         match self {
-            ModuleGraphAdmission::Complete(registration) => Some(&registration.graph),
-            ModuleGraphAdmission::Rejected(_) | ModuleGraphAdmission::Inconclusive(_) => None,
+            ModuleGraphOutcome::Complete(value) => Some(value),
+            ModuleGraphOutcome::Rejected(_) | ModuleGraphOutcome::Inconclusive(_) => None,
         }
     }
 
-    /// The completed registration, if any.
-    pub fn registration(&self) -> Option<&Registration> {
+    /// Take the completed value, if any.
+    pub fn into_complete(self) -> Option<T> {
         match self {
-            ModuleGraphAdmission::Complete(registration) => Some(registration),
-            _ => None,
+            ModuleGraphOutcome::Complete(value) => Some(value),
+            ModuleGraphOutcome::Rejected(_) | ModuleGraphOutcome::Inconclusive(_) => None,
         }
     }
 }
 
-#[cfg(test)]
 impl ModuleGraphAdmission {
+    /// The graph to carry forward. `None` for both non-complete arms — the caller
+    /// keeps the graph it already held, unchanged.
+    pub fn graph(&self) -> Option<&ModuleGraph> {
+        self.complete().map(|registration| &registration.graph)
+    }
+
+    /// The completed registration, if any.
+    pub fn registration(&self) -> Option<&Registration> {
+        self.complete()
+    }
+}
+
+#[cfg(test)]
+impl<T: std::fmt::Debug> ModuleGraphOutcome<T> {
     /// Test-only destructuring helpers. They name the arm the assertion is about, so
     /// a wrong-arm outcome fails with the outcome in the message instead of a bare
     /// unwrap panic.
-    pub(crate) fn expect_complete(self, context: &str) -> Registration {
+    pub(crate) fn expect_complete(self, context: &str) -> T {
         match self {
-            ModuleGraphAdmission::Complete(registration) => registration,
+            ModuleGraphOutcome::Complete(value) => value,
             other => panic!("{context}: expected Complete, got {other:?}"),
         }
     }
 
     fn expect_rejected(self, context: &str) -> ModuleGraphError {
         match self {
-            ModuleGraphAdmission::Rejected(error) => error,
+            ModuleGraphOutcome::Rejected(error) => error,
             other => panic!("{context}: expected Rejected, got {other:?}"),
         }
     }
 
     fn expect_inconclusive(self, context: &str) -> ModuleGraphInconclusive {
         match self {
-            ModuleGraphAdmission::Inconclusive(reason) => reason,
+            ModuleGraphOutcome::Inconclusive(reason) => reason,
             other => panic!("{context}: expected Inconclusive, got {other:?}"),
         }
     }
@@ -619,26 +642,36 @@ pub struct ModuleGraph {
 }
 
 impl ModuleGraph {
-    pub fn new(epoch: ModuleEpoch, limits: ModuleGraphLimits) -> Result<Self, ModuleGraphError> {
+    /// Construct an empty graph pinned to `epoch` under `limits`.
+    ///
+    /// The same FL-INV-07 split as [`register`](Self::register): a malformed epoch is
+    /// a *rejection* — a complete determination about the input — while a bound
+    /// payload budget is *inconclusive*, because no verdict was reached about this
+    /// epoch/limits pair. Construction does no unbounded work and therefore takes no
+    /// cancellation probe; it can never yield
+    /// [`ModuleGraphInconclusive::Cancelled`].
+    pub fn new(epoch: ModuleEpoch, limits: ModuleGraphLimits) -> ModuleGraphConstruction {
         if !epoch.is_well_formed() {
-            return Err(ModuleGraphError::MalformedEpoch {
+            return ModuleGraphOutcome::Rejected(ModuleGraphError::MalformedEpoch {
                 tag: Arc::clone(&epoch.tag),
                 commit: Arc::clone(&epoch.commit),
             });
         }
         let payload_bytes = epoch.payload_bytes();
         if payload_bytes > limits.max_payload_bytes {
-            // Construction-time budget. `ModuleGraph::new` is not a registration, so
-            // it keeps its `Result`; the registration seam is the one this bead
-            // retypes. Recorded in the bead as a smaller follow-on.
-            return Err(ModuleGraphError::ResourceLimitExceeded {
-                module: None,
-                resource: ModuleGraphResource::PayloadBytes,
-                limit: limits.max_payload_bytes,
-                actual: payload_bytes,
-            });
+            // A graph must not be able to be *born* over budget just because it can no
+            // longer *grow* over budget. Exhaustion here is inconclusive, never a
+            // rejection, and never cacheable.
+            return ModuleGraphOutcome::Inconclusive(
+                ModuleGraphInconclusive::ResourceLimitExceeded {
+                    module: None,
+                    resource: ModuleGraphResource::PayloadBytes,
+                    limit: limits.max_payload_bytes,
+                    actual: payload_bytes,
+                },
+            );
         }
-        Ok(Self {
+        ModuleGraphOutcome::Complete(Self {
             epoch,
             limits,
             state: Arc::new(ModuleGraphState {
@@ -1129,7 +1162,7 @@ mod tests {
     }
 
     fn graph() -> ModuleGraph {
-        ModuleGraph::new(epoch(), TEST_LIMITS).expect("valid pinned graph")
+        ModuleGraph::new(epoch(), TEST_LIMITS).expect_complete("valid pinned graph")
     }
 
     fn insert(graph: &ModuleGraph, record: ModuleRecord) -> ModuleGraph {
@@ -1353,6 +1386,91 @@ mod tests {
     }
 
     #[test]
+    fn module_graph_construction_separates_rejection_from_inconclusive() {
+        // A payload budget one byte under what the epoch itself costs: the graph
+        // cannot be born, though nothing is wrong with the epoch.
+        let epoch = epoch();
+        let epoch_cost = epoch.payload_bytes();
+        let too_small = ModuleGraphLimits::new(8, 8, 8, epoch_cost - 1);
+
+        let outcome = ModuleGraph::new(epoch.clone(), too_small);
+        let reason = outcome
+            .clone()
+            .expect_inconclusive("a construction budget bound is never a rejection");
+        assert!(matches!(
+            reason,
+            ModuleGraphInconclusive::ResourceLimitExceeded {
+                module: None,
+                resource: ModuleGraphResource::PayloadBytes,
+                ..
+            }
+        ));
+        assert_eq!(outcome.outcome_label(), "inconclusive-resource");
+
+        // The construction-seam form of the trap: a memoized "construction failed by
+        // budget" is indistinguishable from a real answer about this epoch/limits
+        // pair on replay, so it must never be cacheable.
+        assert!(
+            !outcome.is_cacheable(),
+            "a budget-bound construction must never be memoized"
+        );
+        assert!(outcome.is_inconclusive());
+        assert_eq!(
+            outcome.complete(),
+            None,
+            "no graph may escape a bound construction"
+        );
+
+        // Exactly at the budget it is born, so the refusal is about the bound and not
+        // about the epoch — the recovery half of the same claim.
+        let exact = ModuleGraph::new(epoch.clone(), ModuleGraphLimits::new(8, 8, 8, epoch_cost));
+        assert_eq!(exact.outcome_label(), "complete");
+        assert!(exact.is_cacheable());
+        let exact = exact.expect_complete("the exact budget admits");
+        assert!(exact.is_empty());
+
+        // A malformed epoch is the other class: a complete determination about the
+        // input, so it is a rejection and stays one under a generous budget.
+        let malformed = ModuleGraph::new(
+            ModuleEpoch::new("v4.32.0", "short"),
+            ModuleGraphLimits::new(8, 8, 8, u128::MAX),
+        );
+        assert_eq!(malformed.outcome_label(), "rejected");
+        assert!(!malformed.is_inconclusive());
+        assert!(!malformed.is_cacheable());
+        assert!(matches!(
+            malformed.expect_rejected("a malformed epoch is decided, not unfinished"),
+            ModuleGraphError::MalformedEpoch { .. }
+        ));
+
+        // Construction can never spell exhaustion as a `ModuleGraphError`: the budget
+        // path returns `ModuleGraphInconclusive`, so the old shape is unrepresentable.
+        for outcome in [
+            ModuleGraph::new(epoch.clone(), too_small),
+            ModuleGraph::new(ModuleEpoch::new("v4.32.0", "short"), too_small),
+        ] {
+            if let ModuleGraphOutcome::Rejected(error) = outcome {
+                assert!(
+                    !matches!(error, ModuleGraphError::ResourceLimitExceeded { .. }),
+                    "construction reported resource exhaustion as a rejection"
+                );
+            }
+        }
+
+        // Construction does no unbounded work, so it takes no probe and can never
+        // report cancellation. Stated as an assertion rather than left to the doc.
+        for limits in [too_small, ModuleGraphLimits::new(8, 8, 8, u128::MAX)] {
+            assert!(
+                !matches!(
+                    ModuleGraph::new(epoch.clone(), limits),
+                    ModuleGraphOutcome::Inconclusive(ModuleGraphInconclusive::Cancelled { .. })
+                ),
+                "construction requests no cancellation and must never report it"
+            );
+        }
+    }
+
+    #[test]
     fn module_graph_registration_separates_rejection_from_inconclusive() {
         // A probe that trips on its Nth sample, so each checkpoint can be pinned
         // exactly. A pre-set `AtomicBool` can only ever prove the first one.
@@ -1430,7 +1548,7 @@ mod tests {
             epoch(),
             ModuleGraphLimits::new(1, usize::MAX, usize::MAX, u128::MAX),
         )
-        .expect("empty graph fits");
+        .expect_complete("empty graph fits");
         let one_module = insert(&one_module, record("Only", vec![], 3));
         let full_before = one_module.clone();
         let exhausted = one_module.register(record("Overflow", vec![], 4));
@@ -1485,18 +1603,18 @@ mod tests {
     fn epoch_name_and_every_resource_boundary_fail_closed() {
         assert!(matches!(
             ModuleGraph::new(ModuleEpoch::new("v4.32.0", "short"), TEST_LIMITS),
-            Err(ModuleGraphError::MalformedEpoch { .. })
+            ModuleGraphOutcome::Rejected(ModuleGraphError::MalformedEpoch { .. })
         ));
         assert!(matches!(
             ModuleGraph::new(ModuleEpoch::new(" v4.32.0", PIN_COMMIT), TEST_LIMITS),
-            Err(ModuleGraphError::MalformedEpoch { .. })
+            ModuleGraphOutcome::Rejected(ModuleGraphError::MalformedEpoch { .. })
         ));
         assert!(matches!(
             ModuleGraph::new(
                 ModuleEpoch::new("v4.32.0", PIN_COMMIT.to_ascii_uppercase()),
                 TEST_LIMITS,
             ),
-            Err(ModuleGraphError::MalformedEpoch { .. })
+            ModuleGraphOutcome::Rejected(ModuleGraphError::MalformedEpoch { .. })
         ));
 
         let base_graph = graph();
@@ -1568,7 +1686,8 @@ mod tests {
 
         let deep = ModuleId::new(Name::from_components(["a", "b", "c"]));
         let shallow_limits = ModuleGraphLimits::new(1, 1, 2, u128::MAX);
-        let shallow_graph = ModuleGraph::new(epoch(), shallow_limits).expect("empty graph fits");
+        let shallow_graph =
+            ModuleGraph::new(epoch(), shallow_limits).expect_complete("empty graph fits");
         assert!(matches!(
             shallow_graph.register(ModuleRecord::new(deep, true, vec![], evidence(2))),
             ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
@@ -1583,7 +1702,7 @@ mod tests {
             epoch(),
             ModuleGraphLimits::new(0, usize::MAX, usize::MAX, u128::MAX),
         )
-        .expect("empty graph fits");
+        .expect_complete("empty graph fits");
         assert!(matches!(
             one_module.register(record("One", vec![], 3)),
             ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
@@ -1596,7 +1715,7 @@ mod tests {
 
         let zero_edges =
             ModuleGraph::new(epoch(), ModuleGraphLimits::new(1, 0, usize::MAX, u128::MAX))
-                .expect("empty graph fits");
+                .expect_complete("empty graph fits");
         assert!(matches!(
             zero_edges.register(record("One", vec![direct("Two", 0)], 4)),
             ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
@@ -1609,7 +1728,7 @@ mod tests {
 
         let cumulative_edges =
             ModuleGraph::new(epoch(), ModuleGraphLimits::new(2, 1, usize::MAX, u128::MAX))
-                .expect("empty graph fits");
+                .expect_complete("empty graph fits");
         let cumulative_edges = insert(
             &cumulative_edges,
             record("First", vec![direct("Target", 0)], 4),
@@ -1639,7 +1758,7 @@ mod tests {
             epoch(),
             ModuleGraphLimits::new(1, 1, usize::MAX, exact_payload),
         )
-        .expect("epoch fits");
+        .expect_complete("epoch fits");
         assert!(
             exact
                 .register(record("Measured", vec![direct("Dep", 3)], 5))
@@ -1650,7 +1769,7 @@ mod tests {
             epoch(),
             ModuleGraphLimits::new(1, 1, usize::MAX, exact_payload - 1),
         )
-        .expect("epoch still fits");
+        .expect_complete("epoch still fits");
         assert!(matches!(
             short.register(record("Measured", vec![direct("Dep", 3)], 5)),
             ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::ResourceLimitExceeded {
