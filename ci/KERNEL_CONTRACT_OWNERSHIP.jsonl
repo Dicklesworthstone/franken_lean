@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":301,"projection_hash":"698a02bd230d4cdcb598eb2567c23a178e299e81facd79832275c137c613d233"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":302,"projection_hash":"3dcc81871bf19049fad619ac06bc89e6c5e60049901538129c178e1a55d31806"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -57,6 +57,7 @@
 {"id":"fln-amv.9.2"}
 {"id":"fln-amv.9.3"}
 {"id":"fln-amv.9.4"}
+{"id":"fln-atgf"}
 {"id":"fln-attribute-native-state-m7l"}
 {"id":"fln-attribute-real-fixtures-epj"}
 {"id":"fln-attribute-state-census-h14"}

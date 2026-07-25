@@ -1353,3 +1353,198 @@ pub fn read_shippability_policy(path: &Path) -> Result<Vec<(String, Shippability
     }
     Ok(out)
 }
+
+// ---------------------------------------------------------------------------
+// 8. Corroboration — a classification with one source is an opinion
+// ---------------------------------------------------------------------------
+
+/// Whether a second, independent source witnesses a classification.
+///
+/// A classification that only one derivation produces is an opinion with good
+/// hygiene. Two derivations from different sources that must agree is evidence,
+/// and disagreement becomes a typed finding rather than a silent wrong premise.
+/// Where no second source exists, [`Corroboration::SingleSource`] makes the
+/// weaker status VISIBLE rather than assuming it away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Corroboration {
+    /// An independent source agrees.
+    Corroborated { source: &'static str },
+    /// An independent source disagrees. A typed finding: one of the two is
+    /// wrong and the scan cannot tell which, so neither may be trusted.
+    Contradicted {
+        source: &'static str,
+        says: Shippability,
+    },
+    /// No available source can witness this row, with the reason stated.
+    SingleSource { why: &'static str },
+}
+
+impl Corroboration {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Corroboration::Corroborated { .. } => "corroborated",
+            Corroboration::Contradicted { .. } => "contradicted",
+            Corroboration::SingleSource { .. } => "single-source",
+        }
+    }
+}
+
+/// One classified crate with the standing of its classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorroboratedRow {
+    pub crate_name: String,
+    pub declared: Shippability,
+    pub standing: Corroboration,
+    /// Whether this crate carries a discovered oracle edge. A single-source
+    /// `DevelopmentOnly` row on such a crate is the highest-risk row in the
+    /// whole classification: it is the row suppressing a real finding, on one
+    /// person's say-so.
+    pub carries_oracle_edge: bool,
+}
+
+/// What `ci/WORKSPACE_GRAPH.txt` says about a crate.
+///
+/// Read-only: that file is the reviewed crate map owned elsewhere, and this
+/// module never writes it.
+pub fn read_graph_kinds(path: &Path) -> Result<Vec<(String, String)>, DeriveError> {
+    let text = read(path)?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        let Some(rest) = l.strip_prefix("crate ") else {
+            continue;
+        };
+        let mut name = None;
+        let mut kind = None;
+        for tok in rest.split_whitespace() {
+            if let Some(k) = tok.strip_prefix("kind=") {
+                kind = Some(k.to_string());
+            } else if name.is_none() {
+                name = Some(tok.to_string());
+            }
+        }
+        if let (Some(n), Some(k)) = (name, kind) {
+            out.push((n, k));
+        }
+    }
+    if out.is_empty() {
+        return Err(DeriveError::EmptyScan {
+            path: path.display().to_string(),
+            rule: rules::TARGETS,
+        });
+    }
+    Ok(out)
+}
+
+/// Cross-check the declared shippability policy against the reviewed crate map.
+///
+/// **What the crate map can and cannot witness.** `kind=tool` is documented in
+/// that file as "dev apparatus, tools/", so it witnesses DevelopmentOnly.
+/// `kind=ordinary` and `kind=unsafe-boundary` mean "a ranked product crate
+/// under `crates/`" — a LAYERING fact, not a shipping one. Reading them as
+/// "shippable" would conflate two vocabularies, which is the failure this epic
+/// keeps warning about, so they witness nothing and their rows are
+/// single-source.
+///
+/// The dependency-closure derivation — a crate ships iff some released binary
+/// depends on it — is the second source that would cover the rest. It is
+/// unavailable today because no crate in this workspace produces a binary yet,
+/// and a vacuous oracle answering "nothing ships" would make the scan trivially
+/// clean, which is worse than no oracle at all.
+pub fn corroborate(
+    policy: &[(String, Shippability)],
+    graph: &[(String, String)],
+    oracle_edge_crates: &[String],
+) -> Vec<CorroboratedRow> {
+    let mut rows = Vec::new();
+    for (name, declared) in policy {
+        let standing = match graph.iter().find(|(n, _)| n == name) {
+            Some((_, kind)) if kind == "tool" => {
+                if *declared == Shippability::DevelopmentOnly {
+                    Corroboration::Corroborated {
+                        source: "ci/WORKSPACE_GRAPH.txt kind=tool",
+                    }
+                } else {
+                    Corroboration::Contradicted {
+                        source: "ci/WORKSPACE_GRAPH.txt kind=tool",
+                        says: Shippability::DevelopmentOnly,
+                    }
+                }
+            }
+            Some(_) => Corroboration::SingleSource {
+                why: "the crate map records layering, not shipping; \
+                      no released binary exists yet to close a dependency closure",
+            },
+            None => Corroboration::SingleSource {
+                why: "absent from the reviewed crate map",
+            },
+        };
+        rows.push(CorroboratedRow {
+            crate_name: name.clone(),
+            declared: *declared,
+            standing,
+            carries_oracle_edge: oracle_edge_crates.contains(name),
+        });
+    }
+    rows.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+    rows
+}
+
+/// The rows where a wrong classification would SUPPRESS a real finding.
+///
+/// A crate that carries an oracle edge and is called development-only on one
+/// source's say-so is doing all the work of keeping the reachability scan
+/// clean. If that call is wrong, the scan reports Clean over a shippable target
+/// that reaches the Reference — and reports it with full confidence, because
+/// the classification is the scan's own premise. These rows deserve a named
+/// reviewer, not a footnote.
+pub fn uncorroborated_suppressions(rows: &[CorroboratedRow]) -> Vec<&CorroboratedRow> {
+    rows.iter()
+        .filter(|r| {
+            r.carries_oracle_edge
+                && r.declared == Shippability::DevelopmentOnly
+                && !matches!(r.standing, Corroboration::Corroborated { .. })
+        })
+        .collect()
+}
+
+/// Line-oriented corroboration report. Counts, and every weak row named.
+pub fn corroboration_report(rows: &[CorroboratedRow]) -> String {
+    let mut out = String::new();
+    let mut corroborated = 0usize;
+    let mut single = 0usize;
+    let mut contradicted = 0usize;
+    for r in rows {
+        match &r.standing {
+            Corroboration::Corroborated { .. } => corroborated += 1,
+            Corroboration::SingleSource { .. } => single += 1,
+            Corroboration::Contradicted { source, says } => {
+                contradicted += 1;
+                out.push_str(&format!(
+                    "shippability: contradicted crate={} declared={:?} source={source} says={says:?}\n",
+                    r.crate_name, r.declared
+                ));
+            }
+        }
+    }
+    for r in uncorroborated_suppressions(rows) {
+        out.push_str(&format!(
+            "shippability: uncorroborated-suppression crate={} declared=development-only \
+             carries_oracle_edge=true standing={}\n",
+            r.crate_name,
+            r.standing.reason()
+        ));
+    }
+    out.push_str(&format!(
+        "shippability: verdict={} crates={} corroborated={corroborated} \
+         single_source={single} contradicted={contradicted} suppressions={}\n",
+        if contradicted == 0 {
+            "no-contradiction"
+        } else {
+            "contradicted"
+        },
+        rows.len(),
+        uncorroborated_suppressions(rows).len()
+    ));
+    out
+}

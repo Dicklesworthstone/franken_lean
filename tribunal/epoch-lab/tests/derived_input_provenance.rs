@@ -837,3 +837,132 @@ fn the_discovered_oracle_edges_are_real_and_all_development_only() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 7. The classification's own standing
+// ---------------------------------------------------------------------------
+
+fn corroborated_rows() -> Vec<fln_epoch_lab::derive::CorroboratedRow> {
+    let graph =
+        fln_epoch_lab::derive::read_graph_kinds(&repo_root().join("ci/WORKSPACE_GRAPH.txt"))
+            .expect("the reviewed crate map is readable");
+    let targets = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
+    let edges = fln_epoch_lab::derive::derive_oracle_edges(&repo_root(), targets.value())
+        .expect("readable");
+    // Map each edge's target back to the crate that owns it.
+    let edge_crates: Vec<String> = edges
+        .value()
+        .iter()
+        .filter_map(|e| {
+            targets
+                .value()
+                .iter()
+                .find(|t| t.name == e.target)
+                .map(|t| t.crate_name.clone())
+        })
+        .collect();
+    fln_epoch_lab::derive::corroborate(&policy(), &graph, &edge_crates)
+}
+
+#[test]
+fn no_classification_row_is_contradicted_by_the_reviewed_crate_map() {
+    // The premise check. `ci/WORKSPACE_GRAPH.txt` is authored and reviewed
+    // elsewhere, so where it CAN witness a row it is a genuinely independent
+    // source. A contradiction means one of the two is wrong and the scan cannot
+    // tell which, so neither may be trusted.
+    let rows = corroborated_rows();
+    let bad: Vec<_> = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.standing,
+                fln_epoch_lab::derive::Corroboration::Contradicted { .. }
+            )
+        })
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "the crate map contradicts the policy: {bad:?}"
+    );
+    assert_eq!(rows.len(), 33, "every crate must have a standing");
+}
+
+#[test]
+fn the_crate_map_is_not_read_as_a_shippability_oracle() {
+    // The correction this cross-check produced. `kind=ordinary` means "a ranked
+    // product crate under crates/" — a LAYERING fact. Reading it as "shippable"
+    // conflates two vocabularies, and doing so would have reported two false
+    // disagreements (fln-bench, fln-conformance) and hidden the real situation,
+    // which is that the crate map simply cannot witness those rows.
+    let rows = corroborated_rows();
+    for name in ["fln-bench", "fln-conformance", "fln-kernel"] {
+        let r = rows
+            .iter()
+            .find(|r| r.crate_name == name)
+            .unwrap_or_else(|| panic!("{name} missing"));
+        assert!(
+            matches!(
+                r.standing,
+                fln_epoch_lab::derive::Corroboration::SingleSource { .. }
+            ),
+            "{name} was given a standing the crate map cannot support: {:?}",
+            r.standing
+        );
+    }
+    // And where it CAN witness, it does: the one tool crate is corroborated.
+    let sg = rows
+        .iter()
+        .find(|r| r.crate_name == "structure-guard")
+        .expect("structure-guard missing");
+    assert!(matches!(
+        sg.standing,
+        fln_epoch_lab::derive::Corroboration::Corroborated { .. }
+    ));
+}
+
+#[test]
+fn the_single_source_rows_are_counted_and_named_not_assumed_away() {
+    // A classification that only one derivation produces is an opinion with
+    // good hygiene. The weakness must be a number on the page.
+    let rows = corroborated_rows();
+    let single = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.standing,
+                fln_epoch_lab::derive::Corroboration::SingleSource { .. }
+            )
+        })
+        .count();
+    assert_eq!(single, 32, "the single-source count moved without review");
+    let text = fln_epoch_lab::derive::corroboration_report(&rows);
+    assert!(text.contains("single_source=32"));
+    assert!(text.contains("corroborated=1"));
+    assert!(text.contains("verdict=no-contradiction"));
+}
+
+#[test]
+fn the_rows_that_would_suppress_a_finding_are_named() {
+    // THE HIGHEST-RISK ROWS IN THE CLASSIFICATION. A crate carrying a real
+    // oracle edge, called development-only on one source's say-so, is doing all
+    // the work of keeping the reachability scan clean. If that call is wrong
+    // the scan reports Clean over a shippable target that reaches the
+    // Reference — with full confidence, because the classification is its own
+    // premise. These get named, so a reviewer is told where to look.
+    let rows = corroborated_rows();
+    let suppressions = fln_epoch_lab::derive::uncorroborated_suppressions(&rows);
+    let names: Vec<&str> = suppressions.iter().map(|r| r.crate_name.as_str()).collect();
+    assert!(
+        names.contains(&"fln-conformance"),
+        "fln-conformance carries an ORACLE_FALLBACK edge and is development-only \
+         on a single source; it must be flagged. got {names:?}"
+    );
+    let text = fln_epoch_lab::derive::corroboration_report(&rows);
+    assert!(text.contains("uncorroborated-suppression crate=fln-conformance"));
+    // The count is asserted so a new suppression cannot appear silently.
+    assert_eq!(
+        suppressions.len(),
+        1,
+        "the set of finding-suppressing rows changed: {names:?}"
+    );
+}
