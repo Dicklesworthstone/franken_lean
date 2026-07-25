@@ -20,9 +20,11 @@
 //! `fln_kernel::verdict::Verdict` fused accept/reject/inconclusive into one enum,
 //! `fln_env::decl_closure` grew its own cancellation-and-resource pair,
 //! `fln_hash::canon::Decoded` grew a third, and the artifact-incomplete family a
-//! fourth. `Decoded` is now folded into this type (bead fln-8gz3) and no longer exists;
-//! the others are tracked by their own adoption beads. Each was right on its own and none of them could be checked against the
-//! others. Five copies of an invariant are five chances to drift.
+//! fourth. Each was right on its own and none of them could be checked against the
+//! others: five copies of an invariant are five chances to drift. `Decoded` is now folded
+//! into this type (bead fln-8gz3) and no longer exists; the rest are tracked by their own
+//! adoption beads, and fln-env's stays deliberately local for the reason recorded on
+//! [`Inconclusive`].
 //!
 //! ## Outcome and cause are orthogonal axes
 //!
@@ -195,6 +197,48 @@ pub enum InconclusiveCause {
 
 /// An operation that did not complete, with the cause and the diagnostic vocabulary
 /// entry a renderer would use.
+///
+/// # This arm carries no domain payload, and that is a decision (bead fln-um4a)
+///
+/// Decided 2026-07-25 after a third adopter reached for one. `Inconclusive` will not gain
+/// a payload parameter, so there is no `Outcome<T, I>` and no `Inconclusive<T>`. Three
+/// reasons, in order of weight:
+///
+/// 1. **A payload here is the FL-INV-07 footgun this module exists to remove.** The arm's
+///    entire meaning is "nothing was learned about the domain question". Putting domain
+///    content inside it invites `if let Inconclusive { partial } = outcome` — and now a
+///    partial result flows onward with the authority check skipped, which is exactly how
+///    an inconclusive becomes an answer. The type would be handing out the hazard it was
+///    built to take away.
+/// 2. **The need is rarer than it looks, and usually a misread of which arm the payload
+///    belongs in.** fln-hash and fln-kernel both folded without wanting one: a
+///    half-decoded `Expr` and a half-checked proof are not usable objects. fln-env
+///    appeared to need one, but four of its five `ClosureStatus` arms are not non-answers
+///    at all — `Incomplete { missing }` and `Invalid { reason }` are *completed*
+///    traversals reporting a verdict, exactly as a decoder's "malformed" is a verdict
+///    about bytes. Those belong inside [`Outcome::Complete`], where a domain payload is
+///    expected and safe. Once they move there, what remains on the stop is two scalar
+///    reasons that [`ResourceUsage`] and `progress` already carry.
+/// 3. **The cost is paid by every signature in the program** for a need one caller in
+///    three has, and a second type parameter that is `()` almost everywhere is a tax on
+///    readers who will never use it.
+///
+/// **So a caller with genuine partial progress keeps its own report type and folds only
+/// the authority field**, e.g. `Report { work, status: Outcome<Verdict>, facts }`. Nothing
+/// is dropped: the partial work and the facts stay where they always were, on the report,
+/// available on every path including a stop. What changes is that the *authority* is no
+/// longer a hand-rolled arm set. `Outcome::non_answer_for` is the compile-time witness
+/// that this arm is payload-free — see its note.
+///
+/// A caller doing this must make its partial work unreachable without consulting the
+/// status, because a struct whose `work` field is readable while `status` says
+/// inconclusive has the same hazard as a payload here, only spelled differently.
+///
+/// **What would reopen this:** a caller that needs to *resume* from partial progress —
+/// where the partial value is an input to a subsequent operation rather than material for
+/// diagnosis. Diagnosis is served by `progress`; resumption is a different claim, and it
+/// would still more likely want a domain resume-token than a payload on the authority
+/// type. Bring the caller, not the hypothetical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inconclusive {
     pub cause: InconclusiveCause,
@@ -402,6 +446,26 @@ impl<T> Outcome<T> {
         match self {
             Outcome::Complete(value) => Some(value),
             Outcome::Inconclusive(_) | Outcome::InternalFault(_) => None,
+        }
+    }
+
+    /// Re-type a non-answer for a different domain result, or hand back the value.
+    ///
+    /// **This is the compile-time witness that the non-answer arms carry no domain
+    /// content** (bead fln-um4a). An `Inconclusive` or an `InternalFault` is meaningful
+    /// independently of what the operation would have returned, so it can be moved to an
+    /// `Outcome<U>` unchanged — and if either arm ever gained a payload of `T`, this
+    /// function could not be written. So it is both a convenience for a caller adapting a
+    /// non-answer across a layer boundary and the guard on the decision recorded in
+    /// [`Inconclusive`]'s docs: deleting the decision means deleting this.
+    ///
+    /// `Err(value)` for the complete arm rather than a panic or a silent drop, because a
+    /// domain result is exactly what this cannot carry across.
+    pub fn non_answer_for<U>(self) -> Result<Outcome<U>, T> {
+        match self {
+            Outcome::Complete(value) => Err(value),
+            Outcome::Inconclusive(inconclusive) => Ok(Outcome::Inconclusive(inconclusive)),
+            Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
         }
     }
 
@@ -842,6 +906,74 @@ mod tests {
                 observed: 1_000_001,
             }
             .is_genuine_exhaustion()
+        );
+    }
+
+    /// The non-answer arms are payload-free, and this is what that means in practice
+    /// (bead fln-um4a): a stop is meaningful independently of what the operation would
+    /// have returned, so it moves between result types unchanged.
+    ///
+    /// If `Inconclusive` ever gained a domain payload, `non_answer_for` could not compile,
+    /// so this test is the guard on that decision and not merely a check of a helper.
+    #[test]
+    fn a_non_answer_is_independent_of_the_result_type_it_came_from() {
+        use crate::diag::StructuralUnit;
+
+        let stop = Inconclusive::resource(ResourceUsage {
+            reason: ResourceReason::StructuralBudget {
+                unit: StructuralUnit::ExpandedWeight,
+            },
+            allowed: 10,
+            observed: 11,
+        })
+        .with_progress("work item 7");
+
+        // A stop produced where the answer would have been a String moves to an Outcome
+        // over a completely unrelated type, carrying cause, diagnostic and progress
+        // untouched. That is only possible because the arm holds no domain content.
+        let from_string: Outcome<String> = Outcome::Inconclusive(stop.clone());
+        let retyped: Outcome<Vec<u64>> = from_string
+            .non_answer_for()
+            .expect("a stop is not a complete result");
+        match retyped {
+            Outcome::Inconclusive(moved) => {
+                assert_eq!(moved.cause, stop.cause);
+                assert_eq!(moved.diagnostic, stop.diagnostic);
+                assert_eq!(
+                    moved.progress.as_deref().map(BoundedText::text),
+                    Some("work item 7"),
+                    "progress must survive the move"
+                );
+            }
+            other => panic!("expected the stop to move unchanged, got {other:?}"),
+        }
+
+        // Same for a fault.
+        let fault: Outcome<u8> = Outcome::InternalFault(InternalFault::new("FL-INV-07", "x"));
+        assert!(matches!(
+            fault.non_answer_for::<String>(),
+            Ok(Outcome::InternalFault(_))
+        ));
+
+        // And a COMPLETE result cannot cross: it hands the value back rather than being
+        // dropped or panicking, because a domain result is precisely what does not
+        // transfer between result types.
+        let complete: Outcome<String> = Outcome::complete("answer".to_string());
+        assert_eq!(
+            complete.non_answer_for::<u8>(),
+            Err("answer".to_string()),
+            "a complete result must be returned, never silently discarded"
+        );
+
+        // Re-typing changes nothing about authority or admissibility.
+        let source: Outcome<String> = Outcome::Inconclusive(stop);
+        let again: Outcome<()> = source.non_answer_for().expect("still a stop");
+        assert_eq!(again.authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            again.cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
         );
     }
 
