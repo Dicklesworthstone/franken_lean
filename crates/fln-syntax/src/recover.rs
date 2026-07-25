@@ -138,16 +138,7 @@ pub fn lex_recovering(text: &SourceText) -> Lexed {
                 at = BytePos(next_boundary(text, end));
             }
             Err(error) => {
-                // Resume past the refusal. For an unterminated comment there is nothing
-                // after it, so the skip runs to end of text; for a tab or a stray carriage
-                // return one byte is enough.
-                let resume = match error {
-                    TriviaError::Tab { at } | TriviaError::IsolatedCarriageReturn { at } => {
-                        at.0 + 1
-                    }
-                    TriviaError::UnterminatedComment { .. } => text.len_bytes(),
-                };
-                let resume = resume.min(text.len_bytes());
+                let resume = resume_after_trivia_error(text, error).0;
                 errors.push(Recovered {
                     error,
                     skipped: span_or_empty(error.at(), BytePos(resume)),
@@ -163,6 +154,24 @@ pub fn lex_recovering(text: &SourceText) -> Lexed {
         }
     }
     Lexed { boundaries, errors }
+}
+
+/// Where scanning resumes after a trivia refusal.
+///
+/// One definition, shared by [`lex_recovering`] and [`crate::run`]'s driver. A second copy of
+/// the resume policy would be a second thing to drift, and the two drifting apart is exactly
+/// how a recovery path acquires behaviour its differential never tested.
+///
+/// For a tab or a stray carriage return the offending byte is the whole problem, so one byte
+/// is enough. For an unterminated comment there is by definition nothing after it to resume
+/// into, so the skip runs to end of text — pretending otherwise would invent tokens out of
+/// comment body.
+pub fn resume_after_trivia_error(text: &SourceText, error: TriviaError) -> BytePos {
+    let resume = match error {
+        TriviaError::Tab { at } | TriviaError::IsolatedCarriageReturn { at } => at.0 + 1,
+        TriviaError::UnterminatedComment { .. } => text.len_bytes(),
+    };
+    BytePos(resume.min(text.len_bytes()))
 }
 
 /// The span from `from` to `to`, or the empty span at `from` if that runs backwards.

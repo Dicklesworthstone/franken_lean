@@ -159,6 +159,51 @@ impl LiteralError {
         }
     }
 
+    /// The same refusal with its offset moved by `delta` bytes.
+    ///
+    /// Exhaustive on purpose. An incremental re-lex reuses refusals from after an edit, and
+    /// this is where a reused diagnostic acquires its new position; a variant that forgot to
+    /// move would underline the wrong character, which is the kind of wrongness a user sees
+    /// and a test does not — unless the test is a differential, which is how the omission was
+    /// caught in the first place.
+    pub fn shifted(&self, delta: isize) -> LiteralError {
+        let moved = |at: BytePos| BytePos((at.0 as isize + delta).max(0) as usize);
+        match self {
+            LiteralError::EndOfInput { at } => LiteralError::EndOfInput { at: moved(*at) },
+            LiteralError::UnterminatedString { opened_at } => LiteralError::UnterminatedString {
+                opened_at: moved(*opened_at),
+            },
+            LiteralError::InvalidEscape { at } => LiteralError::InvalidEscape { at: moved(*at) },
+            LiteralError::MissingEndOfCharLiteral { at } => {
+                LiteralError::MissingEndOfCharLiteral { at: moved(*at) }
+            }
+            LiteralError::AdditionalNewlineInStringGap { at } => {
+                LiteralError::AdditionalNewlineInStringGap { at: moved(*at) }
+            }
+            LiteralError::MissingExponentDigits { at } => {
+                LiteralError::MissingExponentDigits { at: moved(*at) }
+            }
+            LiteralError::IdentifierAfterDecimalPoint { at } => {
+                LiteralError::IdentifierAfterDecimalPoint { at: moved(*at) }
+            }
+            LiteralError::ExpectedDigit { at, expecting } => LiteralError::ExpectedDigit {
+                at: moved(*at),
+                expecting,
+            },
+            LiteralError::InvalidNameLiteral { at } => {
+                LiteralError::InvalidNameLiteral { at: moved(*at) }
+            }
+            LiteralError::UnterminatedIdentifierEscape { at } => {
+                LiteralError::UnterminatedIdentifierEscape { at: moved(*at) }
+            }
+            LiteralError::UnterminatedRawString { opened_at } => {
+                LiteralError::UnterminatedRawString {
+                    opened_at: moved(*opened_at),
+                }
+            }
+        }
+    }
+
     pub fn at(&self) -> BytePos {
         match self {
             LiteralError::EndOfInput { at }

@@ -72,6 +72,23 @@ impl TriviaError {
         }
     }
 
+    /// The same refusal with its offset moved by `delta` bytes.
+    ///
+    /// An exhaustive match, deliberately: a variant added later fails to compile here rather
+    /// than silently keeping an offset that points into the text the user had before an edit.
+    pub fn shifted(self, delta: isize) -> TriviaError {
+        let moved = |at: BytePos| BytePos((at.0 as isize + delta).max(0) as usize);
+        match self {
+            TriviaError::Tab { at } => TriviaError::Tab { at: moved(at) },
+            TriviaError::IsolatedCarriageReturn { at } => {
+                TriviaError::IsolatedCarriageReturn { at: moved(at) }
+            }
+            TriviaError::UnterminatedComment { opened_at } => TriviaError::UnterminatedComment {
+                opened_at: moved(opened_at),
+            },
+        }
+    }
+
     pub const fn at(self) -> BytePos {
         match self {
             TriviaError::Tab { at } | TriviaError::IsolatedCarriageReturn { at } => at,

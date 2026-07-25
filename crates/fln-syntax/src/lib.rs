@@ -11,6 +11,7 @@ pub mod attach;
 pub mod literal;
 pub mod recover;
 pub mod rope;
+pub mod run;
 pub mod source;
 pub mod token;
 pub mod tree;

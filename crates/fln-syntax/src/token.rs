@@ -137,6 +137,28 @@ impl TokenTable {
         best
     }
 
+    /// The longest token in the table, in bytes.
+    ///
+    /// This is the lexer's *lookahead bound* for table matching: `match_prefix` walks the trie
+    /// as far as it has children, which can be further than the token it finally returns —
+    /// with `<`, `<=` and `<==>` in the table, matching at `<==x` reads four bytes and emits
+    /// one. An incremental re-lex has to back up by at least this much or an edit inside the
+    /// walked-but-not-emitted region can silently change a decision it never revisits.
+    /// [`crate::run`] consumes it for exactly that.
+    pub fn max_token_len(&self) -> usize {
+        fn deepest(node: &TrieNode, depth: usize, best: &mut usize) {
+            if node.value.is_some() {
+                *best = (*best).max(depth);
+            }
+            for child in node.children.values() {
+                deepest(child, depth + 1, best);
+            }
+        }
+        let mut best = 0;
+        deepest(&self.root, 0, &mut best);
+        best
+    }
+
     pub fn contains(&self, token: &str) -> bool {
         let mut node = &self.root;
         for byte in token.as_bytes() {
@@ -194,6 +216,26 @@ impl TokenError {
             TokenError::NotAToken { .. } => "token",
             TokenError::UnterminatedIdentifierEscape { .. } => "unterminated identifier escape",
             TokenError::Literal(error) => error.message(),
+        }
+    }
+
+    /// The same refusal with its offset moved by `delta` bytes, literal refusals included.
+    ///
+    /// The nested literal error delegates rather than being flattened here — that is what
+    /// makes the delegation exhaustive on both levels. An earlier version of this reasoned
+    /// that a reused literal refusal was unreachable and left it unshifted; the incremental
+    /// property disagreed, with a char-literal refusal pointing seven bytes past its own
+    /// token. The lesson is not that the argument was careless, it is that an argument is not
+    /// a substitute for the differential.
+    pub fn shifted(&self, delta: isize) -> TokenError {
+        let moved = |at: BytePos| BytePos((at.0 as isize + delta).max(0) as usize);
+        match self {
+            TokenError::EndOfInput { at } => TokenError::EndOfInput { at: moved(*at) },
+            TokenError::NotAToken { at } => TokenError::NotAToken { at: moved(*at) },
+            TokenError::UnterminatedIdentifierEscape { at } => {
+                TokenError::UnterminatedIdentifierEscape { at: moved(*at) }
+            }
+            TokenError::Literal(error) => TokenError::Literal(error.shifted(delta)),
         }
     }
 
