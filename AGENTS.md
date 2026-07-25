@@ -230,6 +230,27 @@ br sync --flush-only     # export to JSONL (NO git ops)
 
 Conventions: use the bead ID (e.g. `br-123`) as the Agent-Mail `thread_id` and prefix subjects with `[br-123]`; put the issue ID in the file-reservation `reason`; include `br-###` in commit messages. Map beads to workstreams (W1 Substrate & Contracts … W12 Distribution & Epochs) and gates (G0–G6) from §22 of the plan.
 
+### The projection guard (bead `franken_lean-projection-republish-mechanical-voz4`)
+
+`ci/KERNEL_CONTRACT_OWNERSHIP.jsonl` is a canonical projection over the sorted id set of `.beads/issues.jsonl`. A commit carrying the JSONL with a stale projection turns `cargo test` red **workspace-wide**, for every agent — and four separate agents produced that state on 2026-07-24/25 alone, each of whom knew the rule. One of them had not touched beads at all: an incidental `git add` swept the JSONL into their commit.
+
+So it is enforced rather than remembered. `scripts/git-hooks/pre-commit` refuses any commit whose prospective tree changes `.beads/issues.jsonl` without a matching projection. Install once per clone (all panes share one):
+
+```bash
+bash scripts/git-hooks/install.sh          # sets core.hooksPath; idempotent
+bash scripts/git-hooks/test_projection_guard.sh \
+  scripts/git-hooks/pre-commit "${CARGO_TARGET_DIR:-target}/debug/kernel-ownership-publisher"
+```
+
+What to know when it fires:
+
+- It refuses only when the **id set** moves. Status, comment and closure edits leave the projection valid and commit normally — the guard is precise, not a nag.
+- It judges the **commit**, not the checkout, so it is correct under `git commit -o` (mandatory here) where the index and working tree differ.
+- It compares the regenerated manifest **byte-for-byte** using the publisher binary. A record-count check would pass two equal-sized id sets with different members, and a second copy of the projection algorithm could drift from the real one.
+- It refuses on a leftover `ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate` (structure-guard reads that state as typed inconclusive) and on anything it cannot decide — never exits 0 on an unanswered question.
+- It chains to `.git/hooks/pre-commit` if one exists, so an Agent-Mail guard installed there keeps working.
+- `--no-verify` bypasses it. That is a real limit: this closes the feedback loop at the moment of the mistake, it does not make the failure impossible.
+
 ---
 
 ## bv — Graph-Aware Triage

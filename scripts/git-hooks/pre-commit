@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Pre-commit guard: ci/KERNEL_CONTRACT_OWNERSHIP.jsonl may never lag
+# .beads/issues.jsonl in a commit (bead franken_lean-projection-republish-mechanical-voz4).
+#
+# WHY THIS EXISTS. The projection is a canonical hash over the sorted id set of
+# .beads/issues.jsonl. A commit that carries the JSONL without a matching
+# projection leaves HEAD with a binding over the wrong id set, and the
+# kernel_contract suite then fails `bead-evidence/stale-binding` — turning
+# cargo test red WORKSPACE-WIDE for every agent, not just the one who committed.
+#
+# It is a missing mechanism, not a knowledge gap. Four separate agents violated
+# the rule on 2026-07-25 alone, each of whom knew it and had followed it
+# correctly earlier the same day. The reasons are structural: the two files live
+# in unrelated trees, nothing fails at commit time, and the agent who forgets is
+# never the one who sees the red. The fourth instance was worse — an incidental
+# `git add` by an agent who had not touched beads at all swept the JSONL into
+# its commit, so no amount of care by the bead's author could have prevented it.
+#
+# WHAT IT CHECKS, and why each detail matters:
+#
+#   * It fires on ANY commit whose prospective tree changes the JSONL, including
+#     an incidental sweep by someone who never ran `br`. A guard scoped to
+#     "commits that look like bead commits" would miss the fourth instance,
+#     which is the one no agent could have caught by being careful.
+#   * It projects from the PROSPECTIVE tree, not the working tree. Under
+#     `git commit --only` (which this project treats as mandatory on a shared
+#     tree) the index and the working tree differ, and git hands the hook a
+#     temporary index through GIT_INDEX_FILE describing exactly what will be
+#     committed. `git cat-file blob :<path>` reads that, so the guard judges the
+#     commit rather than the checkout.
+#   * It compares BYTE-FOR-BYTE against a freshly regenerated manifest, never by
+#     counting records. Two id sets of equal size with different members produce
+#     the same count and a different projection hash, so a count check passes a
+#     stale binding.
+#   * It regenerates using the publisher BINARY, never a reimplementation of the
+#     projection. A second copy of the algorithm here could drift from the real
+#     one and the guard would certify staleness as fresh.
+#   * A leftover ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate refuses too:
+#     structure-guard already treats that state as typed inconclusive, so
+#     committing across it hands the next agent an unexplained gate failure.
+#
+# Bypassable with `git commit --no-verify`, which is a deliberate limit: this is
+# a guard that closes the feedback loop at the moment of the mistake, not a
+# proof. Making the failure impossible is Option A on the bead (have whatever
+# writes the JSONL republish), and this does not pretend to be that.
+#
+# Exit codes: 0 pass, 1 refusal (the commit is stale), 2 the guard itself could
+# not decide. It never exits 0 on a question it could not answer.
+
+set -euo pipefail
+
+SOURCE_RELATIVE='.beads/issues.jsonl'
+MANIFEST_RELATIVE='ci/KERNEL_CONTRACT_OWNERSHIP.jsonl'
+CANDIDATE_RELATIVE='ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate'
+PUBLISHER_DIR='tools/structure-guard/kernel-ownership-publisher'
+PUBLISHER_BIN_NAME='kernel-ownership-publisher'
+WAIT_MS=30000
+
+say() { printf 'projection-guard: %s\n' "$1" >&2; }
+
+# This hook is reached through core.hooksPath, which makes git ignore
+# .git/hooks/ entirely. Anything installed there — MCP Agent Mail's file
+# reservation guard, most likely — would be silently disabled, and a guard that
+# disables another guard is worse than no guard. So every passing path runs it.
+pass() {
+    local chained='.git/hooks/pre-commit'
+    if [ -x "$chained" ] && ! [ "$chained" -ef "${BASH_SOURCE[0]}" ]; then
+        exec "$chained" "$@"
+    fi
+    exit 0
+}
+
+refuse() {
+    say "REFUSED — $1"
+    say ''
+    say 'This commit changes .beads/issues.jsonl, so it owes a matching'
+    say 'ci/KERNEL_CONTRACT_OWNERSHIP.jsonl. Without one, HEAD binds the wrong id'
+    say 'set and cargo test goes red workspace-wide for every agent.'
+    say ''
+    say 'Fix, then commit both files together:'
+    say "  (cd ${PUBLISHER_DIR} && cargo run --quiet -- --root \"\$(git rev-parse --show-toplevel)\" --wait-ms 30000 --robot)"
+    say "  git add ${MANIFEST_RELATIVE}"
+    say ''
+    say 'If you are certain this commit should not carry a projection, re-run with'
+    say '--no-verify and say why in the commit message.'
+    exit 1
+}
+
+undecided() {
+    say "COULD NOT DECIDE — $1"
+    say 'Refusing rather than passing: an unanswered staleness question is the'
+    say 'state this guard exists to prevent. Resolve and retry.'
+    exit 2
+}
+
+repo_root=$(git rev-parse --show-toplevel) || undecided 'not inside a git work tree'
+cd "$repo_root" || undecided "cannot enter $repo_root"
+
+# An initial commit has no HEAD to diff against; treat every path as changed.
+if git rev-parse --verify --quiet HEAD >/dev/null; then
+    if git diff --cached --quiet HEAD -- "$SOURCE_RELATIVE"; then
+        pass "$@"
+    fi
+elif ! git ls-files --cached --error-unmatch -- "$SOURCE_RELATIVE" >/dev/null 2>&1; then
+    pass "$@"
+fi
+
+# From here the commit changes the tracker export and owes a projection.
+
+if ! git cat-file -e ":$SOURCE_RELATIVE" 2>/dev/null; then
+    refuse "the commit removes $SOURCE_RELATIVE; a projection cannot be derived from an absent source"
+fi
+if ! git cat-file -e ":$MANIFEST_RELATIVE" 2>/dev/null; then
+    refuse "$SOURCE_RELATIVE changes but $MANIFEST_RELATIVE is not in the commit at all"
+fi
+if git cat-file -e ":$CANDIDATE_RELATIVE" 2>/dev/null; then
+    refuse "the commit carries $CANDIDATE_RELATIVE; a leftover candidate is typed inconclusive to structure-guard"
+fi
+if [ -e "$CANDIDATE_RELATIVE" ]; then
+    refuse "$CANDIDATE_RELATIVE exists in the working tree; a previous publish died mid-flight and must be resolved first"
+fi
+
+# The publisher binary, never a second copy of the projection algorithm.
+publisher=''
+for candidate_bin in \
+    "${CARGO_TARGET_DIR:-target}/debug/$PUBLISHER_BIN_NAME" \
+    "${CARGO_TARGET_DIR:-target}/release/$PUBLISHER_BIN_NAME" \
+    "$PUBLISHER_DIR/target/debug/$PUBLISHER_BIN_NAME" \
+    "$PUBLISHER_DIR/target/release/$PUBLISHER_BIN_NAME"; do
+    if [ -x "$candidate_bin" ]; then
+        publisher=$candidate_bin
+        break
+    fi
+done
+if [ -z "$publisher" ]; then
+    say "building $PUBLISHER_BIN_NAME once (no prebuilt binary found)"
+    (cd "$PUBLISHER_DIR" && cargo build --quiet) \
+        || undecided "cannot build $PUBLISHER_BIN_NAME"
+    for candidate_bin in \
+        "${CARGO_TARGET_DIR:-target}/debug/$PUBLISHER_BIN_NAME" \
+        "$PUBLISHER_DIR/target/debug/$PUBLISHER_BIN_NAME"; do
+        if [ -x "$candidate_bin" ]; then
+            publisher=$candidate_bin
+            break
+        fi
+    done
+    [ -n "$publisher" ] || undecided "built $PUBLISHER_BIN_NAME but cannot find the binary"
+fi
+publisher=$(cd "$(dirname "$publisher")" && pwd)/$(basename "$publisher")
+
+# A throwaway root shaped like the workspace, holding exactly what the commit
+# will contain. The publisher rewrites the manifest in place, so the prospective
+# one is kept aside for the comparison.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/fln-projection-guard.XXXXXXXX") \
+    || undecided 'cannot create a scratch directory'
+
+# Explicit, named cleanup. No recursive delete and no globbing: every path
+# removed here is one this script wrote itself.
+cleanup() {
+    rm -f -- \
+        "$scratch/$SOURCE_RELATIVE" \
+        "$scratch/$MANIFEST_RELATIVE" \
+        "$scratch/$CANDIDATE_RELATIVE" \
+        "$scratch/expected-manifest" >/dev/null 2>&1 || true
+    rmdir -- "$scratch/ci" "$scratch/.beads" "$scratch" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+mkdir -p -- "$scratch/.beads" "$scratch/ci" || undecided 'cannot lay out the scratch root'
+git cat-file blob ":$SOURCE_RELATIVE" > "$scratch/$SOURCE_RELATIVE" \
+    || undecided "cannot read the prospective $SOURCE_RELATIVE"
+git cat-file blob ":$MANIFEST_RELATIVE" > "$scratch/expected-manifest" \
+    || undecided "cannot read the prospective $MANIFEST_RELATIVE"
+cp -- "$scratch/expected-manifest" "$scratch/$MANIFEST_RELATIVE" \
+    || undecided 'cannot seed the scratch manifest'
+
+publisher_status=0
+publisher_output=$("$publisher" --root "$scratch" --wait-ms "$WAIT_MS" --robot 2>&1) \
+    || publisher_status=$?
+case "$publisher_status" in
+    0) ;;
+    3) undecided "a publish is in flight and the lock did not free within ${WAIT_MS}ms; retry" ;;
+    *) undecided "the publisher refused the prospective tree (exit $publisher_status): $publisher_output" ;;
+esac
+
+if cmp -s -- "$scratch/$MANIFEST_RELATIVE" "$scratch/expected-manifest"; then
+    cleanup
+    trap - EXIT
+    pass "$@"
+fi
+
+staged_count=$(head -n 1 -- "$scratch/expected-manifest" | grep -o '"record_count":[0-9]*' || true)
+fresh_count=$(head -n 1 -- "$scratch/$MANIFEST_RELATIVE" | grep -o '"record_count":[0-9]*' || true)
+refuse "the committed projection is not a projection of the committed ${SOURCE_RELATIVE} (committed ${staged_count:-record_count:?}, derived ${fresh_count:-record_count:?})"
