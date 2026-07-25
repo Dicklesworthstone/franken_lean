@@ -5717,6 +5717,188 @@ mod tests {
         );
     }
 
+    /// Fixed seed for the branch matrix. A constant, not a clock or an RNG: a schedule
+    /// proof whose input cannot be reproduced is a story about one run.
+    const BRANCH_SEED: u64 = 0xa5a5_5a5a_c3c3_3c3c;
+
+    /// Distinct branches in the matrix. Chosen so the widest schedule still gives every
+    /// worker real work — 64 over 32 workers is two each, and the test asserts no
+    /// partition is empty.
+    const BRANCH_COUNT: usize = 64;
+
+    /// The 1/8/32 matrix over DISTINCT branches, productive by assertion.
+    ///
+    /// Transcribed from `franken_lean-j8h`'s declaration-admission matrix (6c0e406)
+    /// rather than re-derived, and the bead's own wording is why every assertion here
+    /// exists: "relabeling one sequential loop is insufficient." So the test asserts no
+    /// empty partition, full coverage, AND that the number of distinct thread ids that
+    /// did work equals the worker count — measured, not assumed.
+    ///
+    /// Each worker plans and commits real checkpoint restores on its own branches. The
+    /// branches are genuinely distinct values, and the reduction is order-independent, so
+    /// one digest must hold across 1, 8 and 32 workers and equal a sequential model.
+    ///
+    /// Honest scope: bounded component evidence for checkpoint identity under
+    /// concurrency, not closure for the bead.
+    #[test]
+    fn checkpoint_identity_is_stable_across_1_8_32_productive_branch_schedules() {
+        // Each branch is a base of seed-varied length plus a seed-varied suffix, so no
+        // two branches are the same value and a matrix of identical items cannot pass by
+        // accident.
+        let branches: Vec<(ExtensionState, ExtensionCheckpoint)> = (0..BRANCH_COUNT)
+            .map(|index| {
+                let mixed = BRANCH_SEED
+                    ^ (u64::try_from(index)
+                        .unwrap_or(0)
+                        .wrapping_mul(0x100_0000_01b3));
+                let base_len = usize::try_from(mixed % 5).unwrap_or(0) + 1;
+                let mut base = ExtensionState::new(descriptor_with_checkpoint(
+                    CheckpointSemantics::JournalSuffix,
+                ));
+                for entry in 0..base_len {
+                    base =
+                        base.push_entry(bytes(format!("branch.{index}.base.{entry}").as_bytes()));
+                }
+                let target = base.push_entry(bytes(format!("branch.{index}.suffix").as_bytes()));
+                let checkpoint = target
+                    .checkpoint(Some(&base), TEST_LIMITS)
+                    .expect("branch checkpoint captures");
+                (base, checkpoint)
+            })
+            .collect();
+
+        // The sequential model, built independently of any schedule.
+        let sequential: Vec<Digest> = branches
+            .iter()
+            .map(|(base, checkpoint)| {
+                ExtensionState::restore(Some(base), checkpoint, TEST_LIMITS)
+                    .expect("sequential restore")
+                    .content_digest()
+            })
+            .collect();
+        let reduce = |mut digests: Vec<Digest>| {
+            digests.sort_unstable();
+            let mut w = CanonWriter::new();
+            w.str("fln.test.checkpoint-branch-schedule");
+            w.u16(1);
+            w.u64(u64::try_from(digests.len()).unwrap_or(u64::MAX));
+            for digest in digests {
+                w.bytes(&digest.0);
+            }
+            hash(Domain::Fixture, &w.into_bytes())
+        };
+        let expected = reduce(sequential.clone());
+
+        let mut reductions = Vec::new();
+        for worker_count in [1usize, 8, 32] {
+            let (digests, sizes, threads) = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..worker_count)
+                    .map(|worker| {
+                        let branches = &branches;
+                        scope.spawn(move || {
+                            let mut mine = Vec::new();
+                            for (index, (base, checkpoint)) in branches.iter().enumerate() {
+                                if index % worker_count != worker {
+                                    continue;
+                                }
+                                // The full transaction: plan, then commit.
+                                let plan = ExtensionState::plan_history_restore(
+                                    Some(base),
+                                    checkpoint,
+                                    TEST_LIMITS,
+                                    ProofBudget::UNBOUNDED,
+                                )
+                                .expect("unbounded proof cannot bind")
+                                .expect("planning succeeds");
+                                let restored =
+                                    plan.commit(Some(base), None).expect("commit applies");
+                                mine.push(restored.state.content_digest());
+                            }
+                            (mine, std::thread::current().id())
+                        })
+                    })
+                    .collect();
+                let mut digests = Vec::new();
+                let mut sizes = Vec::new();
+                let mut threads = HashSet::new();
+                for handle in handles {
+                    let (mine, id) = handle.join().expect("worker completes");
+                    sizes.push(mine.len());
+                    threads.insert(id);
+                    digests.extend(mine);
+                }
+                (digests, sizes, threads)
+            });
+
+            assert_eq!(sizes.len(), worker_count);
+            assert!(
+                sizes.iter().all(|size| *size > 0),
+                "an empty partition means this worker count is a label, not a schedule \
+                 (sizes {sizes:?})"
+            );
+            assert_eq!(
+                sizes.iter().sum::<usize>(),
+                BRANCH_COUNT,
+                "the partitions must cover every branch exactly once"
+            );
+            assert_eq!(
+                threads.len(),
+                worker_count,
+                "work must be done by {worker_count} distinct threads, not relabelled \
+                 serial work"
+            );
+            let reduction = reduce(digests);
+            assert_eq!(
+                reduction, expected,
+                "schedule with {worker_count} workers diverged from the sequential model"
+            );
+            reductions.push((worker_count, reduction, sizes, threads.len()));
+        }
+
+        let distinct: HashSet<Digest> = reductions
+            .iter()
+            .map(|(_, reduction, _, _)| *reduction)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "the reduction must not depend on the worker count"
+        );
+
+        for (worker_count, reduction, sizes, measured_threads) in &reductions {
+            let min = sizes.iter().min().copied().unwrap_or_default();
+            let max = sizes.iter().max().copied().unwrap_or_default();
+            eprintln!(
+                "{{\"schema\":\"fln.unit.checkpoint-branch-schedule\",\"version\":1,\
+                 \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+                 \"claim_type\":\"bounded_model\",\
+                 \"gate_relation\":\"partial-component-evidence\",\
+                 \"scenario\":\"productive-1-8-32-branch-matrix\",\
+                 \"seed\":\"{BRANCH_SEED:#018x}\",\"branches\":{BRANCH_COUNT},\
+                 \"worker_count\":{worker_count},\
+                 \"distinct_worker_threads\":{measured_threads},\
+                 \"partition_scheme\":\"index-modulo-worker-count-v1\",\
+                 \"min_partition\":{min},\"max_partition\":{max},\"empty_partitions\":0,\
+                 \"execution_model\":\"plan_then_commit_per_distinct_branch\",\
+                 \"reduction\":\"canonical-sorted-restored-digest-set-v1\",\
+                 \"reduction_digest\":\"{reduction}\",\
+                 \"matches_sequential_model\":true,\"status\":\"pass\"}}"
+            );
+        }
+        eprintln!(
+            "{{\"schema\":\"fln.unit.checkpoint-branch-schedule-summary\",\"version\":1,\
+             \"bead\":\"fln-extension-history-checkpoint-identity-41s\",\
+             \"claim_type\":\"bounded_model\",\
+             \"gate_relation\":\"partial-component-evidence\",\
+             \"scenario\":\"productive-1-8-32-branch-matrix\",\
+             \"seed\":\"{BRANCH_SEED:#018x}\",\"worker_counts\":[1,8,32],\
+             \"branches\":{BRANCH_COUNT},\"distinct_reductions\":{},\
+             \"expected_distinct_reductions\":1,\"reduction_digest\":\"{expected}\",\
+             \"status\":\"pass\"}}",
+            distinct.len()
+        );
+    }
+
     /// The proof budget binds, and a stop is a non-answer — never a divergence.
     ///
     /// This is the payoff of widening the type first. The comparison can now run out,
