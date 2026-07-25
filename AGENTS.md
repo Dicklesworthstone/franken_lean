@@ -213,28 +213,31 @@ A mail-like layer for agents to coordinate via MCP tools/resources: identities, 
 
 ---
 
-## The Build Gate — what "governed write" actually means
+## The Build Gate — while a lane runs, the repository is frozen
 
-Long-running e2e lanes re-hash their `INPUT_PATHS` around every supervised step and flip `inconclusive: governed_inputs_changed` if any of them moved. A write during someone else's lane does not corrupt anything — it *voids their run*, and they start over.
+**The mechanism, so nobody re-derives a weaker rule from it.** `scripts/evidence.py:10296-10307` samples `repository_state() -> (head, tree)` **three times**, calling `scan_index_and_worktree()` between samples, and raises `Reference repository state changed during verification` unless all three are identical. It is not hashing a list of paths. It asserts that **the whole repository held still**.
 
-One command decides it, always:
+That distinction is the entire rule, and getting it wrong has cost two lanes:
 
 ```bash
 flock -n /data/tmp/fln-gate.lockfile -c true    # exit 0 = free, exit 1 = HELD
 ```
 
-**A failed probe is an answer, not an obstacle.** If you wrote `flock -n … && git commit …` and the chain exits 1 with no commit, the plumbing worked: the gate said *held*. Do not re-run the command without the guard. This is written from a real one — on 2026-07-25 cc_3 diagnosed the short-circuit correctly, read it as shell friction, committed directly 16 seconds into cod_2's `env_snapshots` lane, and cost a rerun.
+> **HELD means the repository is frozen. Make no change of any kind inside it.** No commits. No edits. No file creation. No `br` command that writes. Not `crates/`, not `ci/`, not `scripts/` — and **not `AGENTS.md`, `README.md` or the plan either.**
 
-**THE HALF THAT IS EASY TO MISS: `.beads/issues.jsonl` is `INPUT_PATHS` line 150.** Everyone correctly pictures `crates/`, `ci/` and `scripts/` and then files a bead. So, while the lock is held:
+**Why three people derived three wrong rules.** `INPUT_PATHS` in `scripts/check.sh` is real, and it *looks* like the boundary — it is an explicit, short, authoritative-looking list, so everyone reads it as "these are the files that matter". It governs a different check (`governed_inputs_changed`). The freeze above is separate and stricter, and it is the one that ends a lane. If you remember one thing, remember the strict one: **the lock freezes the repo, not a subset of it.**
 
-- **No `br create`, `br close`, `br update`, `br dep add`, `br sync`.** Filing a bead is a governed write. So is closing one.
-- **No `br` command at all without `--no-auto-flush`** — `br` auto-flushes the JSONL on ordinary *reads*, so even `br show` writes.
-- No committing `.beads/` or `ci/KERNEL_CONTRACT_OWNERSHIP.jsonl`.
-- Draft the bead text into a scratch file and file it the moment the lane releases.
+The three attempts, recorded because each was made in good faith by someone following the rule as then stated:
 
-**Where to go instead**, so a held gate is not an idle one — none of these are in `INPUT_PATHS`: `AGENTS.md`, `README.md`, `COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md`, and anything under `/data/tmp`. Reading is always safe. If unsure about a path, check it against the `INPUT_PATHS` array in `scripts/check.sh` (~line 149) rather than guessing — the list is explicit and short.
+1. "No writes to governed paths" — missed that `.beads/issues.jsonl` is `INPUT_PATHS` line 150, so *filing a bead* is a write. Cost the first `env_snapshots` lane.
+2. "…and `AGENTS.md` is outside `INPUT_PATHS`, so it is safe mid-lane" — wrong for the reason above. `24b16eeb`, an `AGENTS.md` commit at 21:30:59, killed the rerun at 21:31:10. **The section you are reading replaces the one that did it.**
+3. This one, taken from the source line rather than inferred from a path list.
 
-**Do not use `pgrep -f` to decide whether a lane is running.** It matches its own command line and will report a lane that is your own grep. Use `ps -eo pid,ppid,args` and exclude your own process tree, or just trust the lock.
+**What is safe while the lock is held:** reading anything; `br` **only** with `--no-auto-flush` (it auto-flushes the JSONL on ordinary *reads*, so a bare `br show` writes); thinking, planning, drafting; and writing **outside the repository**, i.e. under `/data/tmp`. Draft the bead body, the commit message, the diff into the scratchpad and apply them the moment the lane releases. Avoid `cargo` too — it can rewrite `Cargo.lock`.
+
+**A failed probe is an answer, not an obstacle.** If `flock -n … && git commit …` exits 1 with no commit, the plumbing worked: the gate said *held*. Do not re-run without the guard. Written from a real one — on 2026-07-25 cc_3 diagnosed the short-circuit correctly, read it as shell friction, committed directly 16 seconds into a running lane (`bb561892`), and cost the rerun before this one.
+
+**Do not use `pgrep -f` to decide whether a lane is running.** It matches its own command line and will report a lane that is your own grep. Use `ps -eo pid,ppid,args` with your own process tree excluded — or just trust the lock, which is what it is for.
 
 ---
 
@@ -357,7 +360,21 @@ Hard-won facts that will bite you if unknown:
 2. **The kernel-admission census (`fln.e2e.kernel-admission`, version 2) moves only by bead**, and its pins must move together: the expected-rows array in `crates/fln-conformance/tests/kernel_replay.rs`, and `KERNEL_ADMISSION_CENSUS` / `KERNEL_ADMISSION_ARTIFACT_ROWS` / `KERNEL_ADMISSION_ARTIFACT_WITNESS` / `KERNEL_ADMISSION_VERSION` in `scripts/evidence.py`, plus the census needles in `scripts/e2e/kernel_replay.sh`. The witness digest recomputes via `fln_env::decl_closure::witness_digest` (tag `fln.artifact-incomplete-witness/2`; binds declaration, safety class, and missing refs). Version 2 binds the **structural** `Name` — component kinds and lengths — not its display form: `to_display_string` joins components with `.` without escaping and renders numeric and string components alike, so distinct names collided and the witness stopped discriminating (bead `franken_lean-f6br`). Note the witness *hex* is not itself a pin in `kernel_replay.rs` — that file recomputes it; only the census rows are pinned there.
 3. **ArtifactIncomplete is an FL-INV-07 inconclusive-family outcome** (`fln_env::decl_closure`): a declaration whose serialized artifact cannot supply its dependency closure is never Accepted, never Rejected, never counted checked, never cacheable, and never enters an environment. Do not fold it into any success total; the validator enforces count conservation (`checked + artifact_incomplete == decls_total`).
 4. **Writing a new `fln.e2e/2` lane**: model on `scripts/e2e/closure_audit.sh`; every `--wait-ms` for the process-identity guards is capped at **30000** (a larger value makes the guard raise instantly and the lane SIGKILLs its own runner with a bare "Killed"); every scenario MUST be registered with its exact ordered step list in `E2E_STEP_ORDERS` at the top of `scripts/evidence.py`; register the script in `scripts/check.sh` (INPUT_PATHS + shellcheck stage) and as a `.github/workflows/ci.yml` step (new e2e steps must also join the verify-step's `expected_roots` set and `specs` tuple — the roots set is closed). Expected-fail cargo steps use `--semantic-failure-exit 101` and must grep BOTH `.out` and `.err` captures for the intended reason (libtest panics print to stderr under `--nocapture`).
-5. **Never edit a governed file while an e2e lane is running** (even `cargo fmt`): lanes re-hash their INPUT_PATHS around every supervised step and flip `inconclusive: governed_inputs_changed`.
+5. **While an e2e lane holds the gate lock, change NOTHING inside the repository.** Not `crates/`, not `ci/`, not `scripts/` — and not `AGENTS.md`, `README.md` or the plan either. No commits, no edits, no file creation, no `br` command that writes. One command answers it: `flock -n /data/tmp/fln-gate.lockfile -c true` — **exit 1 means held means the repository is frozen.**
+
+   **Two separate mechanisms enforce this, and reasoning from the wrong one is how a lane dies under a rule you were following.** Three env_snapshots lanes were lost on 2026-07-25 to panes each obeying the rule as then written.
+   - **INPUT_PATHS** (`scripts/check.sh:149-171`) is a *path list*: `.beads/issues.jsonl`, `ci`, `crates`, `tools`, `contracts`, `tribunal`, the `scripts/e2e/*` lanes, `scripts/evidence.py`. Lanes re-hash it around every supervised step and flip `inconclusive: governed_inputs_changed`. `AGENTS.md` is **not** on this list.
+   - **`repository_state()`** (`scripts/evidence.py:10297-10307`) is *path-agnostic*: the lane samples `(head, tree)` **three times**, calling `scan_index_and_worktree()` between samples, and raises `Reference repository state changed during verification` unless all three match. **A commit moves `head`; an edit to any tracked file moves `tree`.** `AGENTS.md` is tracked, so editing it kills the lane despite being absent from INPUT_PATHS.
+
+   INPUT_PATHS tells you which files are *governed inputs*; `repository_state()` tells you that during a lane **every tracked file is effectively one**. Consulting only the first is how "I checked the list and my file wasn't on it" produces a dead lane — item 7's defect family, one floor down: the claim and its evidence live in two artifacts and neither names the other.
+
+   **`br` writes the repository.** `br create`, `br close`, `br update` and `br sync --flush-only` all write `.beads/issues.jsonl`, which is INPUT_PATHS line 150 *and* tracked. Plain `br` **auto-flushes that file on ordinary reads**, so even a status query is a governed write unless you pass `--no-auto-flush`. The beads *database* (`.beads/beads.db`, `-wal`, `last-touched`) is gitignored and cannot move `tree` — which is exactly why read-only `br --no-auto-flush` is safe.
+
+   **Probing cannot gate a write.** `flock -n … -c true` answers "is it held *right now*", and the answer is stale the instant it returns; the lane acquires with `flock -w 2400`, so it can be dispatched and queued while the lock still reads free. Nor should you wrap the write in `flock -w …` — that queues it to fire the moment the lock frees, which is precisely when the next lane takes it.
+
+   **Safe while frozen:** reading anything; `br --no-auto-flush`; thinking, planning, drafting; and writing **outside** the repository, under `/data/tmp`. Draft the commit message, the bead body, the diff into scratch and apply after release. A *static* dirty tree is fine — it does not move `tree` — so an unfinished edit you stop touching is acceptable and a rushed commit is not.
+
+   **A lane can kill itself.** Its own script and `scripts/evidence.py` are both INPUT_PATHS and both tracked, so the pane running the lane must finish editing them *before* launching, not merely refrain during.
 6. **The pinned Reference toolchain** lives at `~/.elan/toolchains/leanprover--lean4---v4.32.0/` (install with `elan toolchain install leanprover/lean4:v4.32.0` if absent; the kernel-replay suites SKIP typed without it). RCH remote workers do NOT have it — run pin-dependent tests locally (a small wrapper script avoids the RCH cargo hook). Lanes longer than the 10-minute tool timeout should be launched detached (`setsid nohup … &`) and watched.
 7. **The recurring defect: evidence must be produced where the claim is made.** Stated once, generally, because it has now been found six times in four subsystems and every single time by somebody *reading carefully* rather than by a check:
 
