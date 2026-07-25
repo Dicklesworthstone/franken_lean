@@ -89,12 +89,29 @@ impl SharingStats {
     }
 }
 
+/// The largest number of nodes any store can hold, whatever budget a caller asks for.
+///
+/// This is a property of [`TermId`] rather than a policy. Ids are `u32`, so the node after
+/// `u32::MAX` would wrap and **alias two structurally different nodes onto one id** — silently, and
+/// in the one direction the whole module exists to prevent. Every entry point clamps its budget to
+/// this ceiling and refuses beyond it on the same `ProducedNodes` unit, which is what makes
+/// `intern_one`'s `as u32` total rather than merely unlikely to be reached.
+///
+/// Reaching it needs over 4.29e9 stored nodes, so this closes a latent class rather than a live
+/// defect. It is closed anyway because a bead whose title is "total" should not carry a size above
+/// which the store starts lying, and because the alternative — trusting the caller's budget to be
+/// sane — is the same shape of trust that `intern_bounded` exists to withhold.
+pub const MAX_STORED_NODES: u64 = u32::MAX as u64;
+
 /// A bound on how many nodes a store may hold.
 ///
 /// Same law as `fln_syntax::run::LexBudget` and `fln_parse::registry::RegistryBudget`: exceeding it
 /// is **inconclusive, never a rejection**. `ProducedNodes` is the honest unit — the store is bounded
 /// by how much structure it materialises, not by how much the term denotes, which is
 /// `ExpandedWeight`'s job in [`crate::terms`].
+///
+/// A budget above [`MAX_STORED_NODES`] does not raise the ceiling; it is clamped to it. See
+/// [`StoreBudget::effective_max_nodes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreBudget {
     pub max_nodes: u64,
@@ -103,6 +120,26 @@ pub struct StoreBudget {
 impl StoreBudget {
     pub const fn generous() -> StoreBudget {
         StoreBudget { max_nodes: 1 << 24 }
+    }
+
+    /// The largest budget that means anything: every node the id space can name.
+    ///
+    /// This is what a caller who wants "as much as the store can hold" should ask for, and it is
+    /// the reason there is no unbounded public entry point. An `intern` that could not refuse would
+    /// be the unbounded-growth path item 3 of `franken_lean-oh1j` rules out by name.
+    pub const fn representable() -> StoreBudget {
+        StoreBudget {
+            max_nodes: MAX_STORED_NODES,
+        }
+    }
+
+    /// The budget actually enforced: what was asked for, clamped to what ids can name.
+    pub const fn effective_max_nodes(self) -> u64 {
+        if self.max_nodes < MAX_STORED_NODES {
+            self.max_nodes
+        } else {
+            MAX_STORED_NODES
+        }
     }
 }
 
@@ -140,9 +177,12 @@ impl Interner {
 
     /// Intern `root` and every subterm, returning the canonical root.
     ///
-    /// Post-order and iterative. Unbounded — see [`Interner::intern_bounded`] for the FL-INV-07
-    /// form.
-    pub fn intern(&mut self, root: &Expr) -> Expr {
+    /// Post-order and iterative. **Private on purpose**: it cannot refuse, so it is only ever
+    /// reached through [`Interner::intern_bounded`], which has already established that the store
+    /// has room. A public infallible entry point would be exactly the unbounded-growth path
+    /// item 3 of `franken_lean-oh1j` rules out, and having one next door to the bounded one is how
+    /// a caller ends up on it by accident.
+    fn intern(&mut self, root: &Expr) -> Expr {
         let order = post_order(root);
         // Original node pointer -> the id it interned to. Keyed by pointer because the input may
         // already share, and re-interning a shared subterm must not re-walk it.
@@ -161,17 +201,29 @@ impl Interner {
 
     /// Intern under a budget. Exceeding it is `Inconclusive`, never a rejection, and the store is
     /// left **untouched** so a caller can retry with a larger allowance.
+    ///
+    /// The enforced limit is [`StoreBudget::effective_max_nodes`], not the raw request: a budget
+    /// above [`MAX_STORED_NODES`] is clamped, so asking for more than ids can name yields a typed
+    /// refusal rather than a truncated id. `allowed` in the reported usage is the limit actually
+    /// applied, so a caller that asked for more can see that it was not granted.
+    ///
+    /// The bound is on the **store**, not on the traversal, and the difference is worth knowing
+    /// before treating this as a cheap doorman: `post_order` runs first and materialises one entry
+    /// per distinct node, so a hostile input still pays a full distinct-node walk before being
+    /// declined. That is the honest reading of `ProducedNodes` — it names what the store holds — and
+    /// [`crate::terms::expanded_weight`] is the preflight for the denoted-size axis.
     pub fn intern_bounded(&mut self, root: &Expr, budget: StoreBudget) -> Outcome<Expr> {
         let order = post_order(root);
         // Checked before anything is stored: the point of a size bound is to decline without
         // materialising the structure it is declining.
+        let allowed = budget.effective_max_nodes();
         let projected = self.nodes.len() as u64 + order.len() as u64;
-        if projected > budget.max_nodes {
+        if projected > allowed {
             return Outcome::Inconclusive(Inconclusive::resource(ResourceUsage {
                 reason: ResourceReason::StructuralBudget {
                     unit: StructuralUnit::ProducedNodes,
                 },
-                allowed: budget.max_nodes,
+                allowed,
                 observed: projected,
             }));
         }
@@ -182,7 +234,16 @@ impl Interner {
     fn intern_one(&mut self, expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> TermId {
         self.stats.presented += 1;
         let rebuilt = rebuild(expr, done, &self.nodes);
-        let digest = identity_digest(&rebuilt, done, &self.nodes);
+        // Digested from the ORIGINAL node, not from `rebuilt`, and the two are provably the same
+        // digest: `rebuild` carries every own field through unchanged, and children contribute only
+        // their id, which is the same id whichever of the two you ask. The difference is cost.
+        // `done` is keyed by the original child's pointer, so digesting `rebuilt` — whose non-leaf
+        // children are freshly allocated canonical forms — missed `done` on every non-leaf child and
+        // fell back to a linear scan of the whole store. That made interning an N-node term into an
+        // S-node store cost O(N*S) pointer comparisons, so a single 1e6-node term was ~5e11
+        // comparisons: a budget that says "yes" at 1<<24 nodes and then appears to hang. Digesting
+        // the original makes every child lookup a hash hit.
+        let digest = identity_digest(expr, done);
 
         if let Some(candidates) = self.buckets.get(&digest) {
             for id in candidates {
@@ -199,6 +260,13 @@ impl Interner {
             }
         }
 
+        // Total, not merely lucky: `intern_bounded` has already refused anything that would push
+        // `nodes.len()` past `MAX_STORED_NODES`, which is `u32::MAX`, so this cast cannot wrap. The
+        // assertion states the precondition rather than trusting the reader to reconstruct it.
+        debug_assert!(
+            self.nodes.len() as u64 <= MAX_STORED_NODES,
+            "intern_bounded must refuse before an id can wrap"
+        );
         let id = TermId(self.nodes.len() as u32);
         self.nodes.push(rebuilt);
         self.buckets.entry(digest).or_default().push(id);
@@ -345,25 +413,30 @@ fn rebuild(expr: &Expr, done: &HashMap<*const ExprNode, TermId>, nodes: &[Expr])
 /// **No wildcard arm.** And unlike the alpha-canonical digest, every binder name and every `MData`
 /// entry is fed in — that difference is the entire distinction between the identity plane and the
 /// cache plane.
-fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>, nodes: &[Expr]) -> Digest {
+///
+/// `expr` must be a node from the traversal, not a rebuilt one, so that `done` covers its children:
+/// see the note at the call site for why the two produce the same digest and why only one of them
+/// is affordable.
+fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Digest {
     let mut hasher = DomainHasher::new(Domain::DeclContent);
     hasher.update(INTERN_TAG);
     hasher.update(&[0]);
 
-    // A child's contribution is the id of its canonical form.
+    // A child's contribution is the id of its canonical form, in O(1).
+    //
+    // The lookup is total by construction and the sentinel is unreachable: `post_order` pushes
+    // every child before its parent's `Exit`, so by the time a node is digested each of its children
+    // has been interned and recorded in `done`. It is a sentinel rather than a panic because an
+    // unreachable branch that panics is still a panic (FL-INV-07: panics are invariant failures,
+    // never diagnostics), and because the failure mode if it ever did fire is benign in the one
+    // direction that matters: two nodes sharing a sentinel collide in a digest BUCKET, and a bucket
+    // is a hint confirmed by full `Expr` equality. It could cost a bucket miss. It could never
+    // overmerge.
     let child_id = |child: &Expr| {
-        let id = done
-            .get(&node_ptr(child))
+        done.get(&node_ptr(child))
             .copied()
-            .or_else(|| {
-                // The child may already BE canonical, if it came from this store.
-                nodes
-                    .iter()
-                    .position(|node| node_ptr(node) == node_ptr(child))
-                    .map(|index| TermId(index as u32))
-            })
-            .unwrap_or(TermId(u32::MAX));
-        id.0
+            .unwrap_or(TermId(u32::MAX))
+            .0
     };
 
     match expr.node() {
@@ -583,7 +656,6 @@ mod tests {
     #[test]
     fn the_identity_digest_distinguishes_terms_the_alpha_digest_merges() {
         let done = HashMap::new();
-        let nodes: Vec<Expr> = Vec::new();
         let unit = Expr::sort(Level::zero());
         let fun_x = Expr::lam(name("x"), unit.clone(), bvar(0), BinderInfo::Default);
         let fun_y = Expr::lam(name("y"), unit, bvar(0), BinderInfo::Default);
@@ -596,8 +668,8 @@ mod tests {
         );
         // The law: the IDENTITY-plane digest must not.
         assert_ne!(
-            identity_digest(&fun_x, &done, &nodes),
-            identity_digest(&fun_y, &done, &nodes),
+            identity_digest(&fun_x, &done),
+            identity_digest(&fun_y, &done),
             "the identity digest must feed the binder name in. Keying on the alpha-canonical digest \
              is the `overmerge` mutant, and this is the assertion that catches it at the key rather \
              than relying on the equality confirmation to clean up afterwards."
@@ -620,8 +692,8 @@ mod tests {
             false,
         );
         assert_ne!(
-            identity_digest(&let_a, &done, &nodes),
-            identity_digest(&let_b, &done, &nodes),
+            identity_digest(&let_a, &done),
+            identity_digest(&let_b, &done),
             "LetE.decl_name is part of identity"
         );
         let bare = Expr::mdata(KVMap::default(), bvar(0));
@@ -630,8 +702,8 @@ mod tests {
             bvar(0),
         );
         assert_ne!(
-            identity_digest(&bare, &done, &nodes),
-            identity_digest(&tagged, &done, &nodes),
+            identity_digest(&bare, &done),
+            identity_digest(&tagged, &done),
             "MData is part of identity"
         );
     }
@@ -813,6 +885,55 @@ mod tests {
             interner.stats()
         );
         assert_eq!(interner.len(), 4);
+    }
+
+    /// A budget larger than the id space does not raise the ceiling, it is clamped to it.
+    ///
+    /// The defect this closes — `TermId(self.nodes.len() as u32)` wrapping and aliasing two
+    /// structurally different nodes onto one id — needs over 4.29e9 stored nodes to reach, which no
+    /// test can build. So the clamp is asserted where it is *decided* rather than by exhausting it,
+    /// and the two things a test genuinely can prove are proved: that an over-large budget is not
+    /// granted, and that the clamp does not distort an ordinary one. A clamp that quietly rewrote
+    /// every reported `allowed` would be its own defect, and it would be invisible from the first
+    /// assertion alone.
+    #[test]
+    fn a_budget_above_the_id_space_is_clamped_to_it() {
+        assert_eq!(
+            StoreBudget::representable().max_nodes,
+            MAX_STORED_NODES,
+            "`representable` must name the whole id space and nothing beyond it"
+        );
+        assert_eq!(
+            StoreBudget {
+                max_nodes: u64::MAX
+            }
+            .effective_max_nodes(),
+            MAX_STORED_NODES,
+            "a budget above the id space must be clamped, not granted: granting it is how an id wraps"
+        );
+        assert_eq!(
+            StoreBudget::generous().effective_max_nodes(),
+            StoreBudget::generous().max_nodes,
+            "an ordinary budget must pass through untouched"
+        );
+
+        // And the refusal reports the limit actually ENFORCED, so a caller who asked for more can
+        // see that it was not granted.
+        let root = Expr::app(bvar(0), bvar(1));
+        let mut interner = Interner::new();
+        let outcome = interner.intern_bounded(&root, StoreBudget { max_nodes: 1 });
+        let usage = match &outcome {
+            Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+                fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } => Some(usage),
+                _ => None,
+            },
+            _ => None,
+        };
+        let usage = usage.expect("an exceeded store budget is a resource stop");
+        assert_eq!(
+            usage.allowed, 1,
+            "a budget below the ceiling must report itself, not the ceiling"
+        );
     }
 
     /// **MUTANT `partial-insert`.** A budget refusal leaves the store untouched, so a caller can
