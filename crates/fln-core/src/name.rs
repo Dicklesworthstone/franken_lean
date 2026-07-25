@@ -24,6 +24,13 @@ const ANONYMOUS_HASH: u64 = 1723;
 /// `num` component fallback when the literal exceeds `UInt64.size` (Prelude:4717).
 const NUM_OVERFLOW_HASH: u64 = 17;
 
+/// The component that marks a hygienic name (`Name.hasMacroScopes`, Prelude:5599).
+/// The grammar is `<name>._@.(<module>.<scopes>)*.<mainModule>._hyg.<scopes>`.
+const MACRO_SCOPES_MARKER: &str = "_hyg";
+/// The component that separates the original name from its hygienic decoration
+/// (`eraseMacroScopesAux`, Prelude:5604).
+const MACRO_SCOPES_SEPARATOR: &str = "_@";
+
 /// A hierarchical name. Immutable and cheaply clonable; component sharing mirrors the
 /// upstream persistent structure (a name is its parent plus one component).
 #[derive(Clone)]
@@ -145,6 +152,110 @@ impl Name {
     /// Build `a.b.c`-style names from string components (test/tooling convenience).
     pub fn from_components<'a>(components: impl IntoIterator<Item = &'a str>) -> Name {
         components.into_iter().fold(Name::anonymous(), Name::str)
+    }
+
+    /// `Name.appendCore` (Init/Prelude.lean:4796-4799): graft `other`'s components
+    /// onto `self`, with no regard for macro scopes.
+    ///
+    /// Upstream recurses down `other`; this walks it onto a heap vector first, for
+    /// the reason every traversal in this file is iterative (bead
+    /// franken_lean-p8a.1): a name's component chain is unbounded and attacker-
+    /// reachable, and a recursive walk of a deep one aborts the process.
+    pub fn append_core(&self, other: &Name) -> Name {
+        let mut components: Vec<&Name> = Vec::new();
+        let mut cursor = other;
+        while !cursor.is_anonymous() {
+            components.push(cursor);
+            cursor = match &cursor.0 {
+                Repr::Str(node) => &node.pre,
+                Repr::Num(node) => &node.pre,
+                Repr::Anonymous => unreachable!("loop guard excludes anonymous"),
+            };
+        }
+        let mut out = self.clone();
+        // Root-to-leaf, so `a` ++ `b.c` is `a.b.c` and not `a.c.b`.
+        for component in components.iter().rev() {
+            out = match &component.0 {
+                Repr::Str(node) => Name::str(out, node.component.as_str()),
+                Repr::Num(node) if node.overflowed => Name::num_overflowing(out, node.component),
+                Repr::Num(node) => Name::num(out, node.component),
+                Repr::Anonymous => unreachable!("anonymous was excluded above"),
+            };
+        }
+        out
+    }
+
+    /// `Name.hasMacroScopes` (Init/Prelude.lean:5598-5601): a hygienic name ends in
+    /// `_hyg` followed by numeric scopes, so the check walks the numeric tail and
+    /// then tests the first string component it meets.
+    pub fn has_macro_scopes(&self) -> bool {
+        let mut cursor = self;
+        loop {
+            match &cursor.0 {
+                Repr::Str(node) => return node.component == MACRO_SCOPES_MARKER,
+                Repr::Num(node) => cursor = &node.pre,
+                Repr::Anonymous => return false,
+            }
+        }
+    }
+
+    /// `eraseMacroScopesAux` (Init/Prelude.lean:5603-5608): walk toward the root
+    /// until the `_@` separator, and return what preceded it.
+    fn erase_macro_scopes_aux(&self) -> Name {
+        let mut cursor = self;
+        loop {
+            match &cursor.0 {
+                Repr::Str(node) => {
+                    if node.component == MACRO_SCOPES_SEPARATOR {
+                        return node.pre.clone();
+                    }
+                    cursor = &node.pre;
+                }
+                Repr::Num(node) => cursor = &node.pre,
+                Repr::Anonymous => return Name::anonymous(),
+            }
+        }
+    }
+
+    /// `Name.eraseMacroScopes` (Init/Prelude.lean:5610-5615). A name without macro
+    /// scopes is returned unchanged, sharing its nodes.
+    pub fn erase_macro_scopes(&self) -> Name {
+        if self.has_macro_scopes() {
+            self.erase_macro_scopes_aux()
+        } else {
+            self.clone()
+        }
+    }
+
+    /// `Name.simpMacroScopes` (Init/Prelude.lean:5617-5625): keep the numeric tail
+    /// that distinguishes binder names, erase the hygienic decoration under it.
+    /// Used for binder names that must be readable but need not be unique.
+    pub fn simp_macro_scopes(&self) -> Name {
+        if !self.has_macro_scopes() {
+            return self.clone();
+        }
+        // `simpMacroScopesAux` rebuilds `.num` components on top of the erased
+        // prefix; collect them leaf-first, then replay them root-first.
+        let mut numeric: Vec<(u64, bool)> = Vec::new();
+        let mut cursor = self;
+        let base = loop {
+            match &cursor.0 {
+                Repr::Num(node) => {
+                    numeric.push((node.component, node.overflowed));
+                    cursor = &node.pre;
+                }
+                _ => break cursor.erase_macro_scopes_aux(),
+            }
+        };
+        let mut out = base;
+        for (component, overflowed) in numeric.iter().rev() {
+            out = if *overflowed {
+                Name::num_overflowing(out, *component)
+            } else {
+                Name::num(out, *component)
+            };
+        }
+        out
     }
 
     /// Dot-rendered form; anonymous renders as `[anonymous]` (upstream convention).
@@ -788,6 +899,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The hygiene hooks Vellum needs (bead franken_lean-p8a), against the grammar
+    /// `<name>._@.(<module>.<scopes>)*.<mainModule>._hyg.<scopes>`.
+    ///
+    /// A hygienic name is built here the way the elaborator builds one, rather than
+    /// asserting on a literal, so the test states the shape it depends on.
+    #[test]
+    fn macro_scope_hooks_follow_the_pin_grammar() {
+        let plain = Name::from_components(["Foo", "bar"]);
+        assert!(
+            !plain.has_macro_scopes(),
+            "an ordinary name is not hygienic"
+        );
+        assert_eq!(
+            plain.erase_macro_scopes(),
+            plain,
+            "erase is identity off-scope"
+        );
+        assert_eq!(
+            plain.simp_macro_scopes(),
+            plain,
+            "simp is identity off-scope"
+        );
+
+        // Foo.bar._@.Mod._hyg.7
+        let hygienic = Name::num(
+            Name::str(Name::str(Name::str(plain.clone(), "_@"), "Mod"), "_hyg"),
+            7,
+        );
+        assert!(
+            hygienic.has_macro_scopes(),
+            "the _hyg marker is found past the numeric tail"
+        );
+        assert_eq!(
+            hygienic.erase_macro_scopes(),
+            plain,
+            "erase returns what preceded the _@ separator"
+        );
+        // simp keeps the numeric tail on top of the erased prefix: Foo.bar.7
+        assert_eq!(hygienic.simp_macro_scopes(), Name::num(plain.clone(), 7));
+
+        // Several scopes: the whole numeric tail survives simp, in order.
+        let two_scopes = Name::num(hygienic.clone(), 9);
+        assert!(two_scopes.has_macro_scopes());
+        assert_eq!(two_scopes.erase_macro_scopes(), plain);
+        assert_eq!(
+            two_scopes.simp_macro_scopes(),
+            Name::num(Name::num(plain.clone(), 7), 9)
+        );
+
+        // A `_hyg` marker with no `_@` separator erases to anonymous, exactly as
+        // eraseMacroScopesAux does when it runs off the root.
+        let no_separator = Name::num(Name::str(Name::anonymous(), "_hyg"), 1);
+        assert!(no_separator.has_macro_scopes());
+        assert_eq!(no_separator.erase_macro_scopes(), Name::anonymous());
+    }
+
+    /// `Name.appendCore` grafts the right-hand components onto the left, in order.
+    #[test]
+    fn append_core_grafts_components_root_first() {
+        let a = Name::from_components(["Foo", "bar"]);
+        let b = Name::from_components(["baz", "qux"]);
+        assert_eq!(
+            a.append_core(&b),
+            Name::from_components(["Foo", "bar", "baz", "qux"])
+        );
+        assert_eq!(
+            a.append_core(&Name::anonymous()),
+            a,
+            "anonymous is the unit"
+        );
+        assert_eq!(Name::anonymous().append_core(&b), b, "on the left too");
+
+        // Numeric components keep their kind, and an overflowed component keeps the
+        // saturation flag that changes its observable hash.
+        let numeric = Name::num(Name::str(Name::anonymous(), "s"), 3);
+        assert_eq!(
+            a.append_core(&numeric),
+            Name::num(Name::str(a.clone(), "s"), 3)
+        );
+        let overflowed = Name::num_overflowing(Name::anonymous(), 5);
+        let appended = a.append_core(&overflowed);
+        assert!(
+            appended.component_overflowed(),
+            "overflow flag survives the graft"
+        );
+        assert_eq!(appended.hash(), Name::num_overflowing(a, 5).hash());
+    }
+
+    /// Deep chains go through the same iterative walks as the rest of this type
+    /// (bead franken_lean-p8a.1): the hooks must not reintroduce recursion.
+    #[test]
+    fn macro_scope_hooks_are_stack_bounded_on_deep_names() {
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 100_000;
+                let deep = mixed_name(DEPTH);
+                assert!(!deep.has_macro_scopes());
+                assert_eq!(deep.erase_macro_scopes(), deep);
+
+                let hygienic = Name::num(Name::str(Name::str(deep.clone(), "_@"), "_hyg"), 1);
+                assert!(hygienic.has_macro_scopes());
+                assert_eq!(hygienic.erase_macro_scopes(), deep);
+                assert_eq!(hygienic.simp_macro_scopes(), Name::num(deep.clone(), 1));
+
+                let grafted = deep.append_core(&Name::from_components(["tail"]));
+                assert_eq!(
+                    grafted.to_display_string().len(),
+                    deep.to_display_string().len() + 5
+                );
+            })
+            .expect("spawn bounded-stack hygiene worker")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "a macro-scope hook exhausted the bounded worker stack"
+        );
     }
 
     /// `Name.quickLt` had no caller and no test anywhere in the workspace — found

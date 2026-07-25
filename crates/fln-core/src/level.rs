@@ -1123,6 +1123,287 @@ mod tests {
         );
     }
 
+    /// Seeded property test for the normalization laws (bead franken_lean-p8a).
+    ///
+    /// These are laws of the universe algebra, written from the algebra and not read
+    /// off `normalize`: if the implementation and the law disagree, the law wins and
+    /// the failure is a finding. `imax u 0 ≡ 0` is the load-bearing one — Prop
+    /// impredicativity depends on it, and it is the reason `imax` cannot simply be
+    /// `max`.
+    #[test]
+    fn normalization_laws_hold_over_generated_levels() {
+        struct Gen(u64);
+        impl Gen {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn level(&mut self, depth: u32) -> Level {
+                if depth == 0 {
+                    return match self.next() % 4 {
+                        0 => Level::zero(),
+                        1 => p("u"),
+                        2 => p("v"),
+                        _ => Level::mvar(LMVarId(Name::str(Name::anonymous(), "m"))),
+                    };
+                }
+                match self.next() % 5 {
+                    0 => self.level(depth - 1).succ().expect("shallow"),
+                    1 => Level::max(self.level(depth - 1), self.level(depth - 1)).expect("shallow"),
+                    2 => {
+                        Level::imax(self.level(depth - 1), self.level(depth - 1)).expect("shallow")
+                    }
+                    3 => self
+                        .level(depth - 1)
+                        .add_offset(self.next() as u32 % 3)
+                        .expect("shallow"),
+                    _ => self.level(0),
+                }
+            }
+        }
+
+        let zero = Level::zero();
+        let mut generator = Gen(0x9e37_79b9_7f4a_7c15);
+        for round in 0..400 {
+            let u = generator.level(3);
+            let v = generator.level(3);
+            let w = generator.level(2);
+            let at = |law: &str| format!("round {round}: {law}");
+
+            // NB: `normalize` is NOT idempotent, and the pin's is not either — see
+            // `normalize_is_not_idempotent_and_the_pin_agrees`. Asserting idempotence
+            // here, the obvious law for anything called a normal form, would assert
+            // something upstream does not hold to.
+
+            // isEquiv is an equivalence relation.
+            assert!(u.is_equiv(&u), "{}", at("isEquiv is reflexive"));
+            assert_eq!(
+                u.is_equiv(&v),
+                v.is_equiv(&u),
+                "{}",
+                at("isEquiv is symmetric")
+            );
+            if u.is_equiv(&v) && v.is_equiv(&w) {
+                assert!(u.is_equiv(&w), "{}", at("isEquiv is transitive"));
+            }
+
+            // The impredicativity law: `imax u 0` collapses to `0`, whatever `u` is.
+            let imax_zero = Level::imax(u.clone(), zero.clone()).expect("shallow");
+            assert!(
+                imax_zero.is_equiv(&zero),
+                "{}",
+                at("imax u 0 ≡ 0 — Prop impredicativity")
+            );
+
+            // `imax` above a successor is just `max`: the right side cannot be Prop.
+            let succ_v = v.clone().succ().expect("shallow");
+            assert!(
+                Level::imax(u.clone(), succ_v.clone())
+                    .expect("shallow")
+                    .is_equiv(&Level::max(u.clone(), succ_v.clone()).expect("shallow")),
+                "{}",
+                at("imax u (succ v) ≡ max u (succ v)")
+            );
+
+            // max is idempotent, commutative and associative, with zero as unit.
+            assert!(
+                Level::max(u.clone(), u.clone())
+                    .expect("shallow")
+                    .is_equiv(&u),
+                "{}",
+                at("max u u ≡ u")
+            );
+            assert!(
+                Level::max(u.clone(), v.clone())
+                    .expect("shallow")
+                    .is_equiv(&Level::max(v.clone(), u.clone()).expect("shallow")),
+                "{}",
+                at("max is commutative")
+            );
+            let left = Level::max(
+                Level::max(u.clone(), v.clone()).expect("shallow"),
+                w.clone(),
+            )
+            .expect("shallow");
+            let right = Level::max(
+                u.clone(),
+                Level::max(v.clone(), w.clone()).expect("shallow"),
+            )
+            .expect("shallow");
+            assert!(left.is_equiv(&right), "{}", at("max is associative"));
+            assert!(
+                Level::max(u.clone(), zero.clone())
+                    .expect("shallow")
+                    .is_equiv(&u),
+                "{}",
+                at("max u 0 ≡ u")
+            );
+
+            // NB: `succ (max u v)` vs `max (succ u) (succ v)` is deliberately NOT
+            // asserted here. The two are semantically equal but `isEquiv` compares
+            // NORMAL FORMS, and normalization is not complete for semantic equality
+            // — see `is_equiv_compares_normal_forms_not_semantic_equality`, whose
+            // counterexample was checked against the pinned Reference.
+
+            // An offset is iterated succ, and normalization preserves that.
+            let k = (round % 4) as u32;
+            let by_offset = u.clone().add_offset(k).expect("shallow");
+            let mut by_succ = u.clone();
+            for _ in 0..k {
+                by_succ = by_succ.succ().expect("shallow");
+            }
+            assert!(
+                by_offset.is_equiv(&by_succ),
+                "{}",
+                at("addOffset k ≡ succ^k")
+            );
+
+            // The smart constructors agree with the plain ones up to equivalence —
+            // they exist to avoid building nodes, not to change meaning.
+            assert!(
+                Level::smart_max(u.clone(), v.clone())
+                    .is_equiv(&Level::max(u.clone(), v.clone()).expect("shallow")),
+                "{}",
+                at("mkLevelMax' agrees with max")
+            );
+            assert!(
+                Level::smart_imax(u.clone(), v.clone())
+                    .is_equiv(&Level::imax(u.clone(), v.clone()).expect("shallow")),
+                "{}",
+                at("mkLevelIMax' agrees with imax")
+            );
+        }
+    }
+
+    /// `Level.isEquiv` is `u == v || u.normalize == v.normalize` — equality of
+    /// NORMAL FORMS, not of meanings. Normalization is incomplete for semantic
+    /// equality, so two levels that denote the same universe under every assignment
+    /// can still compare unequal.
+    ///
+    /// This is not our approximation: the counterexample below was run through the
+    /// PINNED Reference binary (v4.32.0, commit 8c9756b2), which produces the same
+    /// two normal forms and the same `false`:
+    ///
+    /// ```text
+    /// lhs.normalize = max (u + 3) (v + 3)
+    /// rhs.normalize = max (max (u + 3) (v + 1)) ((max (u + 2) (v + 2)) + 1)
+    /// isEquiv       = false
+    /// ```
+    ///
+    /// `faithful` mode means matching that, incompleteness included. The test exists
+    /// so a future "improvement" to normalize that closes this gap is caught as the
+    /// fidelity change it is, rather than landing silently.
+    ///
+    /// Found by the property test above, which asserted succ/max distributivity and
+    /// was wrong to.
+    #[test]
+    fn is_equiv_compares_normal_forms_not_semantic_equality() {
+        let u = p("u");
+        let v = p("v");
+
+        // Distributivity DOES hold for atoms, which is why the general law looked
+        // plausible.
+        let simple_lhs = Level::max(u.clone(), v.clone())
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        let simple_rhs = Level::max(
+            u.clone().succ().expect("shallow"),
+            v.clone().succ().expect("shallow"),
+        )
+        .expect("shallow");
+        assert!(simple_lhs.is_equiv(&simple_rhs), "atoms distribute");
+
+        // The Reference-checked counterexample: both sides denote max(u,v)+3.
+        let left = Level::imax(
+            u.clone(),
+            Level::max(v.clone(), u.clone())
+                .expect("shallow")
+                .add_offset(2)
+                .expect("shallow"),
+        )
+        .expect("shallow");
+        let right = Level::max(
+            Level::max(Level::zero(), u.clone().add_offset(2).expect("shallow")).expect("shallow"),
+            v.clone(),
+        )
+        .expect("shallow");
+
+        let lhs = Level::max(left.clone(), right.clone())
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        let rhs = Level::max(
+            left.succ().expect("shallow"),
+            right.succ().expect("shallow"),
+        )
+        .expect("shallow");
+
+        assert!(
+            !lhs.is_equiv(&rhs),
+            "normalization is incomplete here and the pin agrees; closing this gap \
+             would be a deliberate fidelity change, not a bug fix"
+        );
+    }
+
+    /// `Level.normalize` is **not** idempotent, and neither is the pin's.
+    ///
+    /// Found by the property test above, which asserted idempotence — the obvious law
+    /// for anything called a normal form — and was wrong to. The counterexample was
+    /// run through the PINNED Reference binary (v4.32.0, commit 8c9756b2), which
+    /// produces the same two forms and the same verdict:
+    ///
+    /// ```text
+    /// u             = (imax v (m + 1)) + 1
+    /// u.normalize   = (max v (m + 1)) + 1
+    /// u.normalize^2 = max (v + 1) (m + 2)
+    /// idempotent    = false
+    /// ```
+    ///
+    /// The first pass turns `imax` into `max` — the right side is a `succ`, so it
+    /// cannot be zero — but leaves the outer offset outside; the second pass then
+    /// distributes it. `faithful` mode means reproducing that, so both steps are
+    /// pinned here. Making normalization reach its fixpoint in one pass would be a
+    /// deliberate fidelity decision with a Behavior Note, not a tidy-up.
+    #[test]
+    fn normalize_is_not_idempotent_and_the_pin_agrees() {
+        let v = p("v");
+        let m = Level::mvar(LMVarId(Name::str(Name::anonymous(), "m")));
+
+        let u = Level::imax(v.clone(), m.clone().succ().expect("shallow"))
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+
+        // First pass: imax collapses to max, the outer succ stays where it was.
+        let once = u.normalize();
+        let expected_once = Level::max(v.clone(), m.clone().succ().expect("shallow"))
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        assert_eq!(once, expected_once, "first pass diverged from the pin");
+
+        // Second pass: the offset distributes into the max arguments.
+        let twice = once.normalize();
+        let expected_twice = Level::max(
+            v.succ().expect("shallow"),
+            m.succ().expect("shallow").succ().expect("shallow"),
+        )
+        .expect("shallow");
+        assert_eq!(twice, expected_twice, "second pass diverged from the pin");
+        assert_ne!(once, twice, "the pin's normalize is not a fixpoint here");
+
+        // Non-idempotence is one step, not an oscillation.
+        assert_eq!(
+            twice.normalize(),
+            twice,
+            "normalization settles after the second pass"
+        );
+    }
+
     /// `Level.geq` had no test anywhere in the workspace — found while auditing what
     /// ci/PARITY_LEDGER.txt could honestly claim. It decides "≥ under every parameter
     /// assignment" for KR-604 constructor-field universes, so it is load-bearing for
