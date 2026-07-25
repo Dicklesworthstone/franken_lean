@@ -4584,6 +4584,94 @@ fn kr701_a_single_constructor_prop_carrying_data_is_elimination_restricted() {
 }
 
 #[test]
+fn kr302_binder_congruence_compares_the_domain_not_only_the_body() {
+    // KR-302: two binders are defeq only if their DOMAINS are defeq and their
+    // bodies agree under a shared local. Dropping the domain half leaves the
+    // body comparison, which still succeeds — so `B -> A` would be accepted
+    // where `A -> A` was declared, for arbitrary unrelated `A` and `B`.
+    //
+    // A mutation campaign found this unguarded: replacing the domain check
+    // with `if false` left all 94 kernel tests passing. Every pre-existing
+    // binder-congruence case (KR-312 eta, KR-202 beta, the lambda cases) had
+    // matching domains, so nothing ever exercised the disagreeing branch.
+    //
+    // SOUNDNESS STAKE: function types would become defeq up to their argument
+    // types, so a proof about `B -> A` could be used where `A -> A` is
+    // required, and the kernel would admit the substitution silently.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let env = admit(&env, &axiom("B", sort1()));
+    let env = admit(&env, &axiom("a", Expr::const_(n("A"), vec![])));
+    let a_ty = || Expr::const_(n("A"), vec![]);
+    let b_ty = || Expr::const_(n("B"), vec![]);
+
+    // value : A -> A  (fun _ : A => a)
+    let value = Expr::lam(
+        n("x"),
+        a_ty(),
+        Expr::const_(n("a"), vec![]),
+        BinderInfo::Default,
+    );
+    // declared : B -> A — same body type, DIFFERENT domain.
+    let declared = Expr::forall_e(n("x"), b_ty(), a_ty(), BinderInfo::Default);
+    let verdict = check(&env, &defn("f", declared, value), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "a binder whose DOMAIN differs must not be defeq; got {verdict:?}"
+    );
+
+    // The matching-domain version still admits, so the rule is not a blanket
+    // refusal of binder congruence.
+    let ok = Expr::forall_e(n("x"), a_ty(), a_ty(), BinderInfo::Default);
+    let value_ok = Expr::lam(
+        n("x"),
+        a_ty(),
+        Expr::const_(n("a"), vec![]),
+        BinderInfo::Default,
+    );
+    assert!(
+        check(&env, &defn("g", ok, value_ok), Budget::DEFAULT).is_accepted(),
+        "matching domains must still admit"
+    );
+}
+
+#[test]
+fn kr802_decoded_recursor_arity_observables_are_cross_checked() {
+    // KR-802: the decoded recursor's observables are REGENERATED, never
+    // trusted. `num_motives` and `num_minors` are not decoration — tc.rs uses
+    // them to locate the major premise in an application spine
+    // (num_params + num_motives + num_minors + num_indices), so a decoded lie
+    // makes iota reduce against the WRONG argument while the recursor's own
+    // type still checks out.
+    //
+    // A mutation campaign found both unguarded: deleting either comparison
+    // from the observables check left all 94 kernel tests passing. The type
+    // comparison beside it does not cover them, because these are separate
+    // decoded fields that can disagree with a perfectly well-formed type.
+    // kr607 pins the decoded *flags* (is_rec); nothing pinned the arities.
+    for (label, corrupt) in [
+        (
+            "num_minors",
+            (|r: &mut RecursorVal| r.num_minors += 1) as fn(&mut RecursorVal),
+        ),
+        ("num_motives", |r: &mut RecursorVal| r.num_motives += 1),
+    ] {
+        let (types, ctors, mut recursors) = mynat_block();
+        corrupt(&mut recursors[0]);
+        let verdict = check(
+            &Environment::new(),
+            &block_decl(types, ctors, recursors),
+            Budget::DEFAULT,
+        );
+        assert_eq!(
+            reject_class(&verdict),
+            Some(RejectClass::BlockMismatch),
+            "a decoded recursor overstating {label} must be rejected; got {verdict:?}"
+        );
+    }
+}
+
+#[test]
 fn kr607_decoded_flags_are_cross_checked() {
     // The decoded is_rec flag is UNTRUSTED: MyNat decoded as non-recursive
     // must reject (a flags-comparison-drop mutant dies here).
