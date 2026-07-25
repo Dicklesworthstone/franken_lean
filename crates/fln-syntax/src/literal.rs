@@ -37,13 +37,30 @@
 //! * **An unterminated string is reported at its opening quote**, not at end of file, which
 //!   is the only position that helps.
 //!
-//! ## Not in this slice
+//! ## Raw strings, and the one state nobody expects
 //!
-//! Raw strings (`r#"..."#`) are refused with a typed [`LiteralError::RawStringNotYetLexed`].
-//! Their delimiter is `#`-counted (`isRawStrLitStart`, `Basic.lean:736`) — a different
-//! grammar, where the closing delimiter depends on how the opening one was spelled — and
-//! half-implementing it would mean lexing `r#"a"#` as `r` then a string. A typed refusal
-//! keeps the gap visible.
+//! A raw string's delimiter is `#`-counted (`isRawStrLitStart`, `Basic.lean:736`): the closing
+//! delimiter depends on how the opening one was spelled, so `r##"..."##` needs two `#` to
+//! close and a lone `"#` inside it is content.
+//!
+//! The state machine has three states, and the third is the one that gets omitted
+//! (`Basic.lean:750-809`). While counting closing `#`s, a **second `"` restarts the count at
+//! zero** rather than dropping back to scanning content:
+//!
+//! ```text
+//! closingState num closingNum:
+//!   '#' -> if closingNum + 1 == num then done else keep counting
+//!   '"' -> closingState num 0        -- a NEW candidate closer, not content
+//!   _   -> normalState num
+//! ```
+//!
+//! Without that restart, `r#"a""#` — a raw string whose content is `a"` — fails to close,
+//! because the first `"` consumes the candidacy and the second is treated as content. The
+//! test below walks `r##"a"#"##` for the same reason: it closes only on the *second* run of
+//! `#`s, after an interior `"#` that looks exactly like a terminator.
+//!
+//! Escapes are inert in a raw string — that is the whole point of the form — so `r"\n"` is
+//! four characters and not a newline, and it can never raise an escape error.
 
 use crate::source::{BytePos, ByteSpan, SourceText};
 use crate::token::{ID_BEGIN_ESCAPE, is_id_first};
@@ -112,9 +129,10 @@ pub enum LiteralError {
     UnterminatedIdentifierEscape {
         at: BytePos,
     },
-    /// Deliberately out of this slice — see the module docs.
-    RawStringNotYetLexed {
-        at: BytePos,
+    /// `rawStrLitFnAux`'s `errorUnterminated` — reported at the opening `r`, like the
+    /// ordinary string's refusal and for the same reason.
+    UnterminatedRawString {
+        opened_at: BytePos,
     },
 }
 
@@ -137,7 +155,7 @@ impl LiteralError {
             LiteralError::ExpectedDigit { .. } => "unexpected character",
             LiteralError::InvalidNameLiteral { .. } => "invalid Name literal",
             LiteralError::UnterminatedIdentifierEscape { .. } => "unterminated identifier escape",
-            LiteralError::RawStringNotYetLexed { .. } => "raw string lexing is not implemented yet",
+            LiteralError::UnterminatedRawString { .. } => "unterminated raw string literal",
         }
     }
 
@@ -151,9 +169,9 @@ impl LiteralError {
             | LiteralError::IdentifierAfterDecimalPoint { at }
             | LiteralError::ExpectedDigit { at, .. }
             | LiteralError::InvalidNameLiteral { at }
-            | LiteralError::UnterminatedIdentifierEscape { at }
-            | LiteralError::RawStringNotYetLexed { at } => *at,
-            LiteralError::UnterminatedString { opened_at } => *opened_at,
+            | LiteralError::UnterminatedIdentifierEscape { at } => *at,
+            LiteralError::UnterminatedString { opened_at }
+            | LiteralError::UnterminatedRawString { opened_at } => *opened_at,
         }
     }
 }
@@ -191,7 +209,7 @@ pub fn lex_literal(text: &SourceText, from: BytePos) -> Result<LexedLiteral, Lit
     };
     if first == 'r' {
         // Reached only when `starts_literal` saw a raw-string opener.
-        return Err(LiteralError::RawStringNotYetLexed { at: from });
+        return lex_raw_string(s, from);
     }
     match first {
         '"' => lex_string(s, from),
@@ -484,6 +502,80 @@ fn string_gap(s: &str, at: usize) -> Result<usize, LiteralError> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Raw strings
+// ---------------------------------------------------------------------------------------
+
+/// `rawStrLitFnAux` (`Basic.lean:750`). `from` is the opening `r`.
+///
+/// Byte-stepping rather than scalar-stepping: every character this machine branches on
+/// (`"`, `#`) is ASCII, and a UTF-8 continuation byte can never equal an ASCII byte, so the
+/// two agree on every input. Recorded because it is a deliberate divergence from the pin's
+/// `c.next'`, not an oversight about multi-byte content.
+fn lex_raw_string(s: &str, from: BytePos) -> Result<LexedLiteral, LiteralError> {
+    let bytes = s.as_bytes();
+    let unterminated = LiteralError::UnterminatedRawString { opened_at: from };
+
+    // `initState`: count the `#`s after the `r`, then require the opening quote.
+    let mut at = from.0 + 1;
+    let mut hashes = 0usize;
+    while bytes.get(at) == Some(&b'#') {
+        hashes += 1;
+        at += 1;
+    }
+    if bytes.get(at) != Some(&b'"') {
+        // Upstream calls this state unreachable given `isRawStrLitStart`. Refusing rather
+        // than asserting keeps `lex_raw_string` total even if a caller skips that check.
+        return Err(unterminated);
+    }
+    at += 1;
+
+    // `normalState`, with `closingState` inlined as the inner loop.
+    loop {
+        match bytes.get(at) {
+            None => return Err(unterminated),
+            Some(&b'"') => {
+                at += 1;
+                if hashes == 0 {
+                    return Ok(str_literal(from, at));
+                }
+                let mut closing = 0usize;
+                loop {
+                    match bytes.get(at) {
+                        None => return Err(unterminated),
+                        Some(&b'#') => {
+                            at += 1;
+                            closing += 1;
+                            if closing == hashes {
+                                return Ok(str_literal(from, at));
+                            }
+                        }
+                        // THE RESTART: this quote is a new candidate closer, not content.
+                        Some(&b'"') => {
+                            at += 1;
+                            closing = 0;
+                        }
+                        Some(_) => {
+                            at += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(_) => at += 1,
+        }
+    }
+}
+
+/// A raw string and an ordinary string share `strLitKind` upstream, so they share a kind
+/// here. Giving raw strings their own kind would invent a distinction the pin does not make.
+fn str_literal(from: BytePos, stop: usize) -> LexedLiteral {
+    LexedLiteral {
+        kind: LiteralKind::Str,
+        extent: span(from, BytePos(stop)),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Name literals
 // ---------------------------------------------------------------------------------------
 
@@ -743,26 +835,100 @@ mod tests {
         assert!(!starts_literal(&text, BytePos(0)), "a bare backtick");
     }
 
-    /// Raw strings are refused with a typed error rather than mis-lexed. `r#"a"#` must not
-    /// become the identifier `r` followed by a string, which is what a fall-through would do.
+    /// Raw strings: the `#` count decides the closer, so an interior `"` or `"#` is content.
     #[test]
-    fn raw_strings_are_refused_by_type_not_guessed() {
+    fn a_raw_strings_closer_is_spelled_the_way_its_opener_was() {
+        assert_eq!(lex(r##"r"a""##), "Str 4");
+        assert_eq!(lex(r##"r#"a"#"##), "Str 6");
+        assert_eq!(lex(r###"r##"a"##"###), "Str 8");
+        // An interior `#` is content when no quote precedes it.
+        assert_eq!(lex(r##"r#"a#"#"##), "Str 7");
+    }
+
+    /// **The state nobody implements.** While counting closing `#`s, a second `"` restarts
+    /// the count — it is a new candidate closer, not content. Without the restart, a raw
+    /// string whose content ends in a quote never closes.
+    #[test]
+    fn a_quote_while_counting_closing_hashes_restarts_the_count() {
+        // Content is `a"`. The first `"` opens a candidacy, the second replaces it, the `#`
+        // completes it.
+        assert_eq!(lex(r##"r#"a""#"##), "Str 7");
+        // Content is `a"#`, which contains a complete-looking terminator for a ONE-hash raw
+        // string. Only the second run of `#`s closes this two-hash one.
+        assert_eq!(lex(r###"r##"a"#"##"###), "Str 10");
+    }
+
+    /// Escapes are inert in a raw string. That is the form's entire purpose, so a raw string
+    /// can never raise an escape error, and `r"\n"` is two characters of content.
+    #[test]
+    fn escapes_are_inert_inside_a_raw_string() {
+        assert_eq!(lex(r##"r"\n""##), "Str 5");
+        assert_eq!(
+            lex(r##"r"\""##),
+            "Str 4",
+            "a backslash does not escape the closer"
+        );
+        // The same bytes in an ORDINARY string do process the escape, which is the contrast
+        // that makes the claim mean something.
+        assert_eq!(lex(r#""\n""#), "Str 4");
+        assert!(
+            lex(r#""\q""#).starts_with("error"),
+            "an ordinary string refuses an unknown escape"
+        );
+        assert_eq!(
+            lex(r##"r"\q""##),
+            "Str 5",
+            "a raw string has no opinion about \\q"
+        );
+    }
+
+    /// An unterminated raw string is reported at its opening `r` — the same choice the
+    /// ordinary string makes, for the same reason.
+    #[test]
+    fn an_unterminated_raw_string_points_at_its_opening_r() {
+        assert_eq!(
+            lex(r##"r"a"##),
+            format!(
+                "error {:?}",
+                LiteralError::UnterminatedRawString {
+                    opened_at: BytePos(0)
+                }
+            )
+        );
+        // Closed with too few `#`s is unterminated, not closed.
+        assert!(
+            lex(r##"r##"a"#"##).starts_with("error"),
+            "one # closes nothing"
+        );
+        assert!(
+            lex(r##"r#"a""##).starts_with("error"),
+            "quote without its #"
+        );
+        assert_eq!(
+            LiteralError::UnterminatedRawString {
+                opened_at: BytePos(0)
+            }
+            .message(),
+            "unterminated raw string literal"
+        );
+    }
+
+    /// `r` is only an opener when a raw string actually starts there.
+    #[test]
+    fn a_plain_r_identifier_is_not_a_raw_string_opener() {
+        for raw in ["rfl", "rw", "r", "rec"] {
+            let text = text_of(raw);
+            assert!(
+                !starts_literal(&text, BytePos(0)),
+                "{raw:?} is an identifier"
+            );
+        }
         for raw in [r##"r"a""##, r##"r#"a"#"##, r###"r##"a"##"###] {
             let text = text_of(raw);
             assert!(
                 starts_literal(&text, BytePos(0)),
-                "{raw:?} is recognised as a raw-string opener"
-            );
-            assert!(
-                matches!(
-                    lex_literal(&text, BytePos(0)),
-                    Err(LiteralError::RawStringNotYetLexed { .. })
-                ),
-                "{raw:?} is refused by type"
+                "{raw:?} is a raw-string opener"
             );
         }
-        // And a plain `r` identifier is NOT a raw-string opener.
-        let text = text_of("rfl");
-        assert!(!starts_literal(&text, BytePos(0)), "`rfl` is an identifier");
     }
 }
