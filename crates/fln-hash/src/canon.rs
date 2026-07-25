@@ -43,6 +43,148 @@ pub const SCHEMA_KVMAP: SchemaId = SchemaId {
     version: 1,
 };
 
+/// The crate that defines a durable format's codec.
+///
+/// Formats live in the crate that encodes them — the registry does not centralize the
+/// *codecs*, only the *identities*. That is forced by the crate map (§21): dependency
+/// edges point strictly downward and fln-hash sits below fln-env and fln-verdict, so
+/// this crate cannot import their constants even to compare them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SchemaOwner {
+    /// `fln-hash` — the term plane and the diagnostic taxonomy (this module).
+    Hash,
+    /// `fln-env` — Grimoire's module and provenance identities.
+    Env,
+    /// `fln-verdict` — the CNF / model / proof wire formats.
+    Verdict,
+}
+
+impl SchemaOwner {
+    pub const fn crate_name(self) -> &'static str {
+        match self {
+            SchemaOwner::Hash => "fln-hash",
+            SchemaOwner::Env => "fln-env",
+            SchemaOwner::Verdict => "fln-verdict",
+        }
+    }
+
+    /// The source file whose `SchemaId` constants define this owner's formats. This is
+    /// the join target: the registry is checked against these files in both directions,
+    /// so a format cannot be added, moved, or version-bumped without the registry
+    /// agreeing.
+    pub const fn declaration_file(self) -> &'static str {
+        match self {
+            SchemaOwner::Hash => "crates/fln-hash/src/canon.rs",
+            SchemaOwner::Env => "crates/fln-env/src/provenance.rs",
+            SchemaOwner::Verdict => "crates/fln-verdict/src/lib.rs",
+        }
+    }
+
+    pub const ALL: [SchemaOwner; 3] = [SchemaOwner::Hash, SchemaOwner::Env, SchemaOwner::Verdict];
+}
+
+/// One durable format of the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaRow {
+    pub id: SchemaId,
+    pub owner: SchemaOwner,
+    /// What the format serializes — the reviewable half of the row.
+    pub covers: &'static str,
+}
+
+/// **The registry of every durable format in the program** (bead franken_lean-rps
+/// requirement b; plan §7.3 and Appendix B: "every durable format specified once").
+///
+/// Before this existed, three crates declared `SchemaId` constants independently and
+/// nothing joined them: two formats could claim one name, a version could move on one
+/// side of a codec, or a format could be introduced with no published identity, and no
+/// artifact would disagree. Prose in a module header cannot be joined against a
+/// decoder; a table can.
+///
+/// The rows are checked, not asserted:
+/// * names are unique and shaped `fln.<subsystem>.<format>`, lowercase (`schema_names_
+///   are_unique_and_well_shaped`);
+/// * fln-hash's own rows are joined against the real constants at compile time, so this
+///   table and the codec cannot drift (`registry_rows_match_the_constants_they_name`);
+/// * every owner's declaration file is scanned and joined **in both directions** — an
+///   unregistered format and a row whose codec has vanished both fail
+///   (`tests/schema_registry.rs`).
+///
+/// Adding a durable format means adding a row here. That is the point: the registry is
+/// the reviewed inventory the conformance corpus is meant to be a projection of.
+pub const SCHEMA_REGISTRY: [SchemaRow; 10] = [
+    SchemaRow {
+        id: SCHEMA_NAME,
+        owner: SchemaOwner::Hash,
+        covers: "a hierarchical Lean name (string/numeric components)",
+    },
+    SchemaRow {
+        id: SCHEMA_LEVEL,
+        owner: SchemaOwner::Hash,
+        covers: "a universe level term",
+    },
+    SchemaRow {
+        id: SCHEMA_EXPR,
+        owner: SchemaOwner::Hash,
+        covers: "a term-plane expression",
+    },
+    SchemaRow {
+        id: SCHEMA_KVMAP,
+        owner: SchemaOwner::Hash,
+        covers: "an options / key-value map",
+    },
+    SchemaRow {
+        id: SCHEMA_DIAG,
+        owner: SchemaOwner::Hash,
+        covers: "a diagnostic under the D8 typed error taxonomy",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.env.module-provenance",
+            version: 1,
+        },
+        owner: SchemaOwner::Env,
+        covers: "the module topology + contribution provenance manifest",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.env.module-provenance.entry-id",
+            version: 1,
+        },
+        owner: SchemaOwner::Env,
+        covers: "content identity of one extension journal entry",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.verdict.cnf",
+            version: 1,
+        },
+        owner: SchemaOwner::Verdict,
+        covers: "a CNF formula on the wire",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.verdict.sat-model",
+            version: 1,
+        },
+        owner: SchemaOwner::Verdict,
+        covers: "a satisfying assignment on the wire",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.verdict.unsat-proof",
+            version: 1,
+        },
+        owner: SchemaOwner::Verdict,
+        covers: "an unsatisfiability proof on the wire",
+    },
+];
+
+/// The registry row for a schema, if it is registered.
+pub fn registered(name: &str) -> Option<&'static SchemaRow> {
+    SCHEMA_REGISTRY.iter().find(|row| row.id.name == name)
+}
+
 /// Typed decode failure. `at` is the byte offset of the failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonError {
@@ -1311,6 +1453,128 @@ impl Canonical for Diagnostic {
 mod tests {
     use super::*;
     use fln_core::level::Level;
+
+    #[test]
+    fn schema_names_are_unique_and_well_shaped() {
+        let mut seen = std::collections::BTreeSet::new();
+        for row in SCHEMA_REGISTRY {
+            assert!(
+                seen.insert(row.id.name),
+                "two durable formats claim the schema name `{}` — a name is an identity, \
+                 and a collision means one decoder can be handed the other's bytes and \
+                 accept them",
+                row.id.name
+            );
+            assert!(
+                row.id.version >= 1,
+                "`{}` has no version; version 0 is not a published format",
+                row.id.name
+            );
+            assert!(
+                row.id.name.starts_with("fln."),
+                "`{}` is outside the `fln.` namespace",
+                row.id.name
+            );
+            // `fln.<subsystem>.<format>` at minimum, so a name says who owns it.
+            assert!(
+                row.id.name.split('.').count() >= 3,
+                "`{}` must be shaped fln.<subsystem>.<format>",
+                row.id.name
+            );
+            assert!(
+                row.id.name.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'.'
+                    || b == b'-'),
+                "`{}` must be lowercase ascii with `.`/`-` separators; a name that varies \
+                 by case is two names to a byte comparison",
+                row.id.name
+            );
+            assert!(
+                !row.covers.is_empty(),
+                "`{}` has no description; an unreviewable row is not a registration",
+                row.id.name
+            );
+        }
+        assert_eq!(seen.len(), SCHEMA_REGISTRY.len());
+    }
+
+    #[test]
+    fn registry_rows_match_the_constants_they_name() {
+        // fln-hash's own rows are joined against the real constants rather than
+        // transcribed beside them, so this table cannot drift from the codec it
+        // describes. The other owners' rows are joined against their sources in
+        // tests/schema_registry.rs, which is the closest this crate can get to the
+        // same check without depending upward.
+        for (constant, expected) in [
+            (SCHEMA_NAME, "fln.canon.name"),
+            (SCHEMA_LEVEL, "fln.canon.level"),
+            (SCHEMA_EXPR, "fln.canon.expr"),
+            (SCHEMA_KVMAP, "fln.canon.kvmap"),
+            (SCHEMA_DIAG, "fln.canon.diag"),
+        ] {
+            assert_eq!(constant.name, expected);
+            let row = registered(constant.name)
+                .unwrap_or_else(|| panic!("{expected} is not in SCHEMA_REGISTRY"));
+            assert_eq!(
+                row.id, constant,
+                "the row for {expected} is not the constant"
+            );
+            assert_eq!(row.owner, SchemaOwner::Hash);
+        }
+        // And every Hash-owned row is one of those five: a row added here without a
+        // constant would otherwise pass the loop above by never being visited.
+        let hash_rows = SCHEMA_REGISTRY
+            .iter()
+            .filter(|row| row.owner == SchemaOwner::Hash)
+            .count();
+        assert_eq!(
+            hash_rows, 5,
+            "fln-hash owns a schema the constant join above does not cover"
+        );
+    }
+
+    #[test]
+    fn every_owner_is_represented_and_names_a_real_declaration_file() {
+        for owner in SchemaOwner::ALL {
+            let rows = SCHEMA_REGISTRY
+                .iter()
+                .filter(|row| row.owner == owner)
+                .count();
+            assert!(
+                rows > 0,
+                "{} is a registered owner with no formats — remove the owner or the \
+                 registry is incomplete",
+                owner.crate_name()
+            );
+            assert!(
+                owner
+                    .declaration_file()
+                    .starts_with(&format!("crates/{}/", owner.crate_name())),
+                "{}'s declaration file must live in its own crate, not {}",
+                owner.crate_name(),
+                owner.declaration_file()
+            );
+            // Every row's name must name its own subsystem, so the owner column and the
+            // name cannot disagree about who defines a format.
+            let subsystem = owner.crate_name().trim_start_matches("fln-");
+            let prefix = match owner {
+                // The term-plane formats predate the crate split and are named for the
+                // module (`canon`) rather than the crate; recorded here rather than
+                // renamed, because a schema name is frozen once published.
+                SchemaOwner::Hash => "fln.canon.".to_string(),
+                _ => format!("fln.{subsystem}."),
+            };
+            for row in SCHEMA_REGISTRY.iter().filter(|row| row.owner == owner) {
+                assert!(
+                    row.id.name.starts_with(&prefix),
+                    "`{}` is owned by {} but is not named `{prefix}*`",
+                    row.id.name,
+                    owner.crate_name()
+                );
+            }
+        }
+    }
 
     // Test-only mutations used by the no-mock E2E lane. They deliberately restore
     // the exact bug class: syntax-depth recursion on a bounded worker stack. The
