@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capability;
 pub mod verdict;
 
 mod admit;
