@@ -1944,6 +1944,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // or malformed governance files degrade to findings, never to a silent skip.
     findings.extend(crate::lockfile::audit(root, &g));
     findings.extend(crate::contract_inventory::audit(root));
+    findings.extend(crate::contract_handoff::audit(root));
     findings.extend(crate::ownership_publication::audit(root));
 
     if compiler_identity.contract_declared && !compiler_identity.contract_match {

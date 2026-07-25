@@ -2,7 +2,9 @@
 //!
 //! Usage: `structure-guard [--root <path>] [--robot]
 //!        structure-guard --publish-contract-inventory [--root <path>] [--robot]
-//!        structure-guard --recover-contract-inventory [--root <path>] [--robot]`
+//!        structure-guard --recover-contract-inventory [--root <path>] [--robot]
+//!        structure-guard --publish-contract-handoff [--root <path>] [--robot]
+//!        structure-guard --recover-contract-handoff [--root <path>] [--robot]`
 //! Exit codes: 0 = clean, 1 = findings, 2 = setup/parse failure at the root.
 
 #![forbid(unsafe_code)]
@@ -12,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use structure_guard::contract_handoff;
 use structure_guard::contract_inventory::{
     self, ABI_EXTRACTOR_ID, ABI_EXTRACTOR_VERSION, DEFINITION_SCHEMA, EXTRACTOR_ID,
     EXTRACTOR_VERSION, FORMAT_EXTRACTOR_ID, FORMAT_EXTRACTOR_VERSION, INVENTORY_SCHEMA,
@@ -20,14 +23,19 @@ use structure_guard::contract_inventory::{
 use structure_guard::{checks, report};
 
 const PUBLICATION_SCENARIO_ID: &str = "fln-k5rr.contract-inventory-atomic-publication";
+const HANDOFF_SCENARIO_ID: &str = "franken_lean-w75y.contract-handoff-atomic-publication";
 
 const USAGE: &str = "usage: structure-guard [--root <path>] [--robot]\n\
        structure-guard --publish-contract-inventory [--root <path>] [--robot]\n\
        structure-guard --recover-contract-inventory [--root <path>] [--robot]\n\
+       structure-guard --publish-contract-handoff [--root <path>] [--robot]\n\
+       structure-guard --recover-contract-handoff [--root <path>] [--robot]\n\
   --root <path>  workspace root to check (default: current directory)\n\
   --robot        NDJSON output (schema structure-guard/3) on stdout\n\
   --publish-contract-inventory  validate, sync, and atomically publish a candidate\n\
   --recover-contract-inventory  validate and atomically promote a leftover candidate\n\
+  --publish-contract-handoff  validate every rendered contract output and atomically publish their join\n\
+  --recover-contract-handoff  validate and atomically promote a leftover handoff candidate\n\
 exit codes: 0 clean, 1 findings, 2 setup failure, 3 inconclusive authority";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -35,6 +43,8 @@ enum CliAction {
     Run { root: PathBuf, robot: bool },
     PublishInventory { root: PathBuf, robot: bool },
     RecoverInventory { root: PathBuf, robot: bool },
+    PublishHandoff { root: PathBuf, robot: bool },
+    RecoverHandoff { root: PathBuf, robot: bool },
     Help { robot: bool },
 }
 
@@ -104,12 +114,32 @@ fn parse_cli(args: &[OsString]) -> Result<CliAction, CliError> {
                 });
             }
         } else if arg == "--recover-contract-inventory" {
-            if publication_action.replace("recover").is_some() {
+            if publication_action.replace("recover-inventory").is_some() {
                 return Err(CliError {
                     root,
                     robot,
                     detail:
                         "contract inventory recovery action given more than once or conflicts with publication"
+                            .to_string(),
+                });
+            }
+        } else if arg == "--publish-contract-handoff" {
+            if publication_action.replace("publish-handoff").is_some() {
+                return Err(CliError {
+                    root,
+                    robot,
+                    detail:
+                        "contract publication action given more than once or conflicts with another publication action"
+                            .to_string(),
+                });
+            }
+        } else if arg == "--recover-contract-handoff" {
+            if publication_action.replace("recover-handoff").is_some() {
+                return Err(CliError {
+                    root,
+                    robot,
+                    detail:
+                        "contract publication action given more than once or conflicts with another publication action"
                             .to_string(),
                 });
             }
@@ -130,7 +160,9 @@ fn parse_cli(args: &[OsString]) -> Result<CliAction, CliError> {
     } else {
         match publication_action {
             Some("publish") => Ok(CliAction::PublishInventory { root, robot }),
-            Some("recover") => Ok(CliAction::RecoverInventory { root, robot }),
+            Some("recover-inventory") => Ok(CliAction::RecoverInventory { root, robot }),
+            Some("publish-handoff") => Ok(CliAction::PublishHandoff { root, robot }),
+            Some("recover-handoff") => Ok(CliAction::RecoverHandoff { root, robot }),
             None => Ok(CliAction::Run { root, robot }),
             Some(_) => unreachable!("closed publication action parser"),
         }
@@ -319,6 +351,95 @@ fn execute_publication(
     }
 }
 
+fn execute_handoff_publication(
+    root: &Path,
+    robot: bool,
+    requested_action: &'static str,
+    started: Instant,
+) -> ExitCode {
+    let result = match requested_action {
+        "publish" => contract_handoff::publish(root),
+        "recover" => contract_handoff::recover(root),
+        _ => unreachable!("closed handoff publication action"),
+    };
+    match result {
+        Ok(receipt) => {
+            let snapshot = &receipt.snapshot;
+            let action = receipt.action.as_str();
+            let duration_ms = started.elapsed().as_millis();
+            if robot {
+                println!(
+                    "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_handoff_publication\",\"scenario_id\":\"{HANDOFF_SCENARIO_ID}\",\"step_id\":\"{action}.atomic-commit\",\"action\":\"{action}\",\"verdict\":\"pass\",\"exit_code\":0,\"handoff_schema\":\"{}\",\"definition_schema\":\"{}\",\"policy_schema\":\"{}\",\"canonical_root\":\"{}\",\"inventory_root\":\"{}\",\"suite_lock_root\":\"{}\",\"definition_root\":\"{}\",\"policy_root\":\"{}\",\"output_root\":\"{}\",\"rows_total\":{},\"domains_total\":{},\"resource_facts\":{{\"output_bytes\":{},\"canonical_bytes\":{},\"max_output_bytes\":{}}},\"publication_stage\":\"candidate-validated-renamed-and-directory-synced\",\"authority\":\"complete\",\"cleanup\":\"candidate_absent\",\"final_published_root\":\"{}\",\"duration_ms\":{duration_ms}}}",
+                    contract_handoff::HANDOFF_SCHEMA,
+                    contract_handoff::DEFINITION_SCHEMA,
+                    contract_handoff::POLICY_SCHEMA,
+                    report::json_escape(&snapshot.handoff_root),
+                    report::json_escape(&snapshot.inventory_root),
+                    report::json_escape(&snapshot.suite_lock_root),
+                    report::json_escape(&snapshot.definition_root),
+                    report::json_escape(&snapshot.policy_root),
+                    report::json_escape(&snapshot.output_root),
+                    snapshot.row_count,
+                    snapshot.domain_count,
+                    snapshot.output_bytes,
+                    snapshot.canonical_bytes,
+                    contract_handoff::MAX_OUTPUT_BYTES,
+                    report::json_escape(&snapshot.handoff_root),
+                );
+            } else {
+                println!(
+                    "structure-guard: contract_handoff_publication scenario_id={HANDOFF_SCENARIO_ID} step_id={action}.atomic-commit action={action} verdict=pass exit_code=0 handoff_schema={} definition_schema={} policy_schema={} canonical_root={} inventory_root={} suite_lock_root={} definition_root={} policy_root={} output_root={} rows_total={} domains_total={} output_bytes={} canonical_bytes={} max_output_bytes={} publication_stage=candidate-validated-renamed-and-directory-synced authority=complete cleanup=candidate_absent final_published_root={} duration_ms={duration_ms}",
+                    contract_handoff::HANDOFF_SCHEMA,
+                    contract_handoff::DEFINITION_SCHEMA,
+                    contract_handoff::POLICY_SCHEMA,
+                    snapshot.handoff_root,
+                    snapshot.inventory_root,
+                    snapshot.suite_lock_root,
+                    snapshot.definition_root,
+                    snapshot.policy_root,
+                    snapshot.output_root,
+                    snapshot.row_count,
+                    snapshot.domain_count,
+                    snapshot.output_bytes,
+                    snapshot.canonical_bytes,
+                    contract_handoff::MAX_OUTPUT_BYTES,
+                    snapshot.handoff_root,
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let duration_ms = started.elapsed().as_millis();
+            if robot {
+                println!(
+                    "{{\"schema\":\"structure-guard/3\",\"event\":\"contract_handoff_publication\",\"scenario_id\":\"{HANDOFF_SCENARIO_ID}\",\"step_id\":\"{requested_action}.refused\",\"action\":\"{requested_action}\",\"verdict\":\"{}\",\"exit_code\":{},\"handoff_schema\":\"{}\",\"definition_schema\":\"{}\",\"policy_schema\":\"{}\",\"canonical_root\":null,\"inventory_root\":null,\"suite_lock_root\":null,\"definition_root\":null,\"policy_root\":null,\"output_root\":null,\"rows_total\":null,\"domains_total\":null,\"resource_facts\":{{\"output_bytes\":null,\"canonical_bytes\":null,\"max_output_bytes\":{}}},\"publication_stage\":\"refused-or-failed-before-clean-terminal-receipt\",\"authority\":\"{}\",\"cleanup\":\"not_established\",\"final_published_root\":null,\"reason\":\"{}\",\"path\":\"{}\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}",
+                    error.class.as_str(),
+                    error.class.exit_code(),
+                    contract_handoff::HANDOFF_SCHEMA,
+                    contract_handoff::DEFINITION_SCHEMA,
+                    contract_handoff::POLICY_SCHEMA,
+                    contract_handoff::MAX_OUTPUT_BYTES,
+                    error.class.as_str(),
+                    report::json_escape(error.reason),
+                    report::json_escape(&error.path),
+                    report::json_escape(&error.detail),
+                );
+            } else {
+                eprintln!(
+                    "structure-guard: contract_handoff_publication scenario_id={HANDOFF_SCENARIO_ID} step_id={requested_action}.refused action={requested_action} verdict={} exit_code={} authority={} cleanup=not_established reason={} path={} detail={} duration_ms={duration_ms}",
+                    error.class.as_str(),
+                    error.class.exit_code(),
+                    error.class.as_str(),
+                    error.reason,
+                    error.path,
+                    error.detail.replace('\n', "\\n"),
+                );
+            }
+            ExitCode::from(error.class.exit_code())
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let started = Instant::now();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -347,6 +468,12 @@ fn main() -> ExitCode {
         }
         CliAction::RecoverInventory { root, robot } => {
             return execute_publication(&root, robot, "recover", started);
+        }
+        CliAction::PublishHandoff { root, robot } => {
+            return execute_handoff_publication(&root, robot, "publish", started);
+        }
+        CliAction::RecoverHandoff { root, robot } => {
+            return execute_handoff_publication(&root, robot, "recover", started);
         }
         CliAction::Help { robot } => {
             if robot {
@@ -480,11 +607,36 @@ mod tests {
                 robot: false,
             })
         );
+        assert_eq!(
+            parse_cli(&arguments(&[
+                "--publish-contract-handoff",
+                "--root",
+                "/a",
+                "--robot",
+            ])),
+            Ok(CliAction::PublishHandoff {
+                root: PathBuf::from("/a"),
+                robot: true,
+            })
+        );
+        assert_eq!(
+            parse_cli(&arguments(&["--recover-contract-handoff"])),
+            Ok(CliAction::RecoverHandoff {
+                root: PathBuf::from("."),
+                robot: false,
+            })
+        );
         let error = parse_cli(&arguments(&[
             "--publish-contract-inventory",
             "--recover-contract-inventory",
         ]))
         .expect_err("publication and recovery cannot share one request");
+        assert!(error.detail.contains("conflicts"));
+        let error = parse_cli(&arguments(&[
+            "--publish-contract-inventory",
+            "--publish-contract-handoff",
+        ]))
+        .expect_err("inventory and handoff publication cannot share one request");
         assert!(error.detail.contains("conflicts"));
     }
 

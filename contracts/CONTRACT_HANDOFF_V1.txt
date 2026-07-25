@@ -1,0 +1,14 @@
+schema fln-contract-handoff-definition/1
+handoff-schema fln-contract-handoff/1
+policy-schema fln-contract-handoff-policy/1
+inventory-authority contracts/PIN_TARGET_INVENTORY.txt
+output-authority ci/CONTRACT_HANDOFF_POLICY.txt
+hash fnv1a64-noncryptographic domain=required fields=u64le-length-prefixed
+row-fields key,path,domain,role,bytes,content-root,identity,authority,support
+root-fields definition,inventory,policy,outputs,canonical
+row-order canonical-key-byte-order
+policy-join exact-bijection
+authority-states observed
+publication candidate=contracts/CONTRACT_HANDOFF.txt.candidate commit=atomic-rename recovery=explicit-promotion
+source-candidate rule=sibling-dot-candidate outcome=inconclusive
+limits output-bytes=536870912 rows=64 line-bytes=8192

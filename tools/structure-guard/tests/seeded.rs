@@ -876,7 +876,8 @@ fn unreadable_governed_source_is_inconclusive_not_clean_and_masks_nothing() {
 
 fn census_fixture() -> &'static str {
     // The stable one-AbiFn-per-line rendering the covenant's extractor reads.
-    "pub static FUNCTION_CENSUS: &[AbiFn] = &[\n\
+    "//! @generated fixture for the ABI census/export join.\n\
+     pub static FUNCTION_CENSUS: &[AbiFn] = &[\n\
      \x20   AbiFn { name: \"lean_alloc_object\", linkage: Linkage::Export, line: 503 },\n\
      \x20   AbiFn { name: \"lean_apply_1\", linkage: Linkage::Export, line: 827 },\n\
      \x20   AbiFn { name: \"lean_align\", linkage: Linkage::Inline, line: 390 },\n\

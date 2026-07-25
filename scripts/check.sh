@@ -159,7 +159,8 @@ INPUT_PATHS=(
   scripts/extract/convert_blake3_vectors.py scripts/extract/gen_bignum_vectors.py
   scripts/extract/gen_abi_contract.py scripts/extract/gen_olean_contract.py
   scripts/extract/gen_extern_census.sh scripts/extract/gen_extern_census.lean
-  scripts/e2e/contract_drift.sh scripts/e2e/olean_resurrection.sh
+  scripts/e2e/contract_drift.sh scripts/e2e/contract_handoff.sh
+  scripts/e2e/olean_resurrection.sh
   scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh
   scripts/e2e/verdict_schema.sh
   scripts/tribunal/leanchecker_witness.sh
@@ -1535,7 +1536,8 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh \
   scripts/e2e/env_snapshots.sh scripts/e2e/bignum_vectors.sh \
-  scripts/e2e/contract_drift.sh scripts/e2e/olean_resurrection.sh \
+  scripts/e2e/contract_drift.sh scripts/e2e/contract_handoff.sh \
+  scripts/e2e/olean_resurrection.sh \
   scripts/extract/gen_extern_census.sh \
   scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh \
   scripts/e2e/verdict_schema.sh \

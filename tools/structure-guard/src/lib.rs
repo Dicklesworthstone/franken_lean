@@ -24,6 +24,7 @@
 
 pub mod boundary_api;
 pub mod checks;
+pub mod contract_handoff;
 pub mod contract_inventory;
 pub mod export_status;
 pub mod graph;
@@ -86,6 +87,14 @@ pub const EXTERN_BUILTIN_ENVIRONMENT_CANDIDATE_FILE: &str =
 pub const CONTRACT_INVENTORY_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt";
 /// Interrupted-publication sibling. Its presence makes inventory authority inconclusive.
 pub const CONTRACT_INVENTORY_CANDIDATE_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt.candidate";
+/// Normative schema for the terminal W1 cross-surface handoff.
+pub const CONTRACT_HANDOFF_SCHEMA_FILE: &str = "contracts/CONTRACT_HANDOFF_V1.txt";
+/// Reviewed exact list of generated outputs bound by the terminal handoff.
+pub const CONTRACT_HANDOFF_POLICY_FILE: &str = "ci/CONTRACT_HANDOFF_POLICY.txt";
+/// Atomically published terminal W1 handoff over every generated contract surface.
+pub const CONTRACT_HANDOFF_FILE: &str = "contracts/CONTRACT_HANDOFF.txt";
+/// Interrupted handoff publication. Its presence makes consumption inconclusive.
+pub const CONTRACT_HANDOFF_CANDIDATE_FILE: &str = "contracts/CONTRACT_HANDOFF.txt.candidate";
 /// Interrupted kernel-ownership publication. Presence makes evidence authority inconclusive.
 pub const KERNEL_OWNERSHIP_CANDIDATE_FILE: &str = "ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate";
 /// NDJSON schema identifier for robot output.

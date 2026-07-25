@@ -21,9 +21,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use structure_guard::checks::{self, RunOutcome};
+use structure_guard::contract_handoff::{
+    REQUIRED_OUTPUTS, SCHEMA_DEFINITION as HANDOFF_SCHEMA_DEFINITION,
+};
 use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
 use structure_guard::{
-    ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
+    ABI_TARGET_LAYOUT_FILE, CONTRACT_HANDOFF_FILE, CONTRACT_HANDOFF_POLICY_FILE,
+    CONTRACT_HANDOFF_SCHEMA_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
     CONTRACT_INVENTORY_SCHEMA_FILE, EXTERN_BUILTIN_ENVIRONMENT_FILE, OLEAN_ILEAN_FORMAT_FILE,
     SUITE_LOCK_FILE,
 };
@@ -53,6 +57,13 @@ impl TempWs {
         self.files
             .borrow_mut()
             .insert(rel.to_string(), content.to_vec());
+    }
+
+    pub fn write_bytes_if_absent(&self, rel: &str, content: &[u8]) {
+        self.files
+            .borrow_mut()
+            .entry(rel.to_string())
+            .or_insert_with(|| content.to_vec());
     }
 
     /// Drop recipe entries whose workspace-relative path fails `keep`. Used to model a
@@ -139,6 +150,15 @@ impl TempWs {
                 .map_err(|error| format!("create fixture file {rel} without overwrite: {error}"))?;
             file.write_all(content)
                 .map_err(|error| format!("write fixture file {rel}: {error}"))?;
+        }
+        if !files.contains_key(CONTRACT_HANDOFF_FILE)
+            && files.contains_key(CONTRACT_HANDOFF_SCHEMA_FILE)
+            && files.contains_key(CONTRACT_HANDOFF_POLICY_FILE)
+        {
+            // Deliberately best-effort for negative fixtures: when a lower-level
+            // inventory source is the planted defect, that audit owns the first
+            // divergence and the handoff adapter suppresses its dependent finding.
+            let _ = structure_guard::contract_handoff::publish(&root);
         }
         eprintln!("retained structure-guard fixture: {}", root.display());
         Ok(root)
@@ -434,6 +454,11 @@ pub fn base(ws: &TempWs) {
     ws.write("rust-toolchain.toml", TOOLCHAIN_PIN);
     ws.write("SUITE.lock", SUITE_LOCK_FIXTURE);
     ws.write(CONTRACT_INVENTORY_SCHEMA_FILE, SCHEMA_DEFINITION);
+    ws.write(CONTRACT_HANDOFF_SCHEMA_FILE, HANDOFF_SCHEMA_DEFINITION);
+    ws.write(
+        CONTRACT_HANDOFF_POLICY_FILE,
+        include_str!("../../../../ci/CONTRACT_HANDOFF_POLICY.txt"),
+    );
     ws.write(
         CONTRACT_INVENTORY_POLICY_FILE,
         CONTRACT_INVENTORY_POLICY_FIXTURE,
@@ -444,6 +469,18 @@ pub fn base(ws: &TempWs) {
         EXTERN_BUILTIN_ENVIRONMENT_FILE,
         EXTERN_BUILTIN_ENVIRONMENT_FIXTURE,
     );
+    for output in REQUIRED_OUTPUTS {
+        if output.path == CONTRACT_INVENTORY_FILE {
+            // `materialize` derives this prerequisite from the six governed
+            // sources. A placeholder here would mask that derivation and turn
+            // every unrelated negative fixture into stale-inventory noise.
+            continue;
+        }
+        ws.write_bytes_if_absent(
+            output.path,
+            format!("@generated fixture {}\n", output.key).as_bytes(),
+        );
+    }
     ws.write("Cargo.lock", &fixture_cargo_lock());
     ws.write("ci/CLOSURE_ALLOWLIST.txt", &fixture_allowlist());
     ws.write("ci/WORKSPACE_GRAPH.txt", BASE_GRAPH);

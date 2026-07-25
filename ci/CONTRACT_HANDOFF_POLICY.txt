@@ -1,0 +1,18 @@
+schema fln-contract-handoff-policy/1
+row abi-contract-markdown path=ABI_CONTRACT.md domain=abi role=markdown support=required
+row abi-inventory path=contracts/abi_inventory.json domain=abi role=canonical-intermediate support=required
+row abi-layout path=contracts/ABI_TARGET_LAYOUT.txt domain=abi role=target-contract support=required
+row abi-rust-boundary path=crates/fln-unsafe-abi/src/contract.rs domain=abi role=rust-boundary support=required
+row abi-rust-public path=crates/fln-rt/src/abi.rs domain=abi role=rust-public support=required
+row builtin-environment-000 path=contracts/builtin_environment.tsv domain=environment role=observation-shard support=required
+row builtin-environment-001 path=contracts/builtin_environment.001.tsv domain=environment role=observation-shard support=required
+row builtin-environment-002 path=contracts/builtin_environment.002.tsv domain=environment role=observation-shard support=required
+row builtin-partition path=contracts/builtin_partition.tsv domain=environment role=policy-projection support=required
+row contract-inventory path=contracts/PIN_TARGET_INVENTORY.txt domain=inventory role=canonical-join support=required
+row extern-census path=contracts/extern_census.tsv domain=environment role=extern-census support=required
+row extern-environment-envelope path=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt domain=environment role=publication-envelope support=required
+row format-contract-markdown path=OLEAN_CONTRACT.md domain=format role=markdown support=required
+row format-inventory path=contracts/olean_inventory.json domain=format role=canonical-intermediate support=required
+row format-rust-public path=crates/fln-olean/src/format.rs domain=format role=rust-public support=required
+row format-rust-region path=crates/fln-rt/src/region_contract.rs domain=format role=rust-region support=required
+row olean-ilean-format path=contracts/OLEAN_ILEAN_FORMAT.txt domain=format role=exact-format-contract support=required

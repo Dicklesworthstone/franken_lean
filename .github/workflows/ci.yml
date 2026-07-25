@@ -519,6 +519,39 @@ jobs:
           fi
           exit "$command_rc"
 
+      - name: e2e — canonical W1 contract handoff
+        id: contract_handoff
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/contract-handoff"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_CONTRACT_HANDOFF_FULL_CENSUS=1 \
+            ./scripts/e2e/contract_handoff.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "contract handoff published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
       - name: e2e smoke — environment collision determinism and resource bounds
         id: environment_collision
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
@@ -645,6 +678,8 @@ jobs:
           STRUCTURE_EXIT: ${{ steps.structure_gate.outputs.command_exit }}
           CLOSURE_ARTIFACT: ${{ steps.closure_audit.outputs.artifact_path }}
           CLOSURE_EXIT: ${{ steps.closure_audit.outputs.command_exit }}
+          CONTRACT_HANDOFF_ARTIFACT: ${{ steps.contract_handoff.outputs.artifact_path }}
+          CONTRACT_HANDOFF_EXIT: ${{ steps.contract_handoff.outputs.command_exit }}
           ENVIRONMENT_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.artifact_path }}
           ENVIRONMENT_RESOURCE_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.resource_artifact_path }}
           ENVIRONMENT_COLLISION_EXIT: ${{ steps.environment_collision.outputs.command_exit }}
@@ -679,6 +714,7 @@ jobs:
               e2e_root: {
                   "structure-gate",
                   "closure-audit",
+                  "contract-handoff",
                   "environment-collision",
                   "vellum-naming",
                   "verdict-schema",
@@ -719,6 +755,13 @@ jobs:
                   os.environ.get("CLOSURE_ARTIFACT", ""),
                   os.environ.get("CLOSURE_EXIT", ""),
                   e2e_root / "closure-audit",
+                  True,
+              ),
+              (
+                  "contract_handoff",
+                  os.environ.get("CONTRACT_HANDOFF_ARTIFACT", ""),
+                  os.environ.get("CONTRACT_HANDOFF_EXIT", ""),
+                  e2e_root / "contract-handoff",
                   True,
               ),
               (

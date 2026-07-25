@@ -11,9 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use structure_guard::checks::{self, RunOutcome};
+use structure_guard::contract_handoff::{
+    REQUIRED_OUTPUTS, SCHEMA_DEFINITION as HANDOFF_SCHEMA_DEFINITION,
+};
 use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
 use structure_guard::{
-    ABI_TARGET_LAYOUT_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
+    ABI_TARGET_LAYOUT_FILE, CONTRACT_HANDOFF_FILE, CONTRACT_HANDOFF_POLICY_FILE,
+    CONTRACT_HANDOFF_SCHEMA_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
     CONTRACT_INVENTORY_SCHEMA_FILE, EXTERN_BUILTIN_ENVIRONMENT_FILE, OLEAN_ILEAN_FORMAT_FILE,
 };
 
@@ -96,6 +100,12 @@ fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
             .open(&path)
             .expect("create fixture file without overwrite");
         f.write_all(rendered.as_bytes()).expect("write");
+    }
+    if !rendered_files
+        .iter()
+        .any(|(path, _)| path == CONTRACT_HANDOFF_FILE)
+    {
+        let _ = structure_guard::contract_handoff::publish(&root);
     }
     eprintln!("retained closure fixture: {}", root.display());
     root
@@ -238,6 +248,14 @@ fn base_files() -> Vec<(String, String)> {
             CONTRACT_INVENTORY_POLICY.to_string(),
         ),
         (
+            CONTRACT_HANDOFF_SCHEMA_FILE.to_string(),
+            HANDOFF_SCHEMA_DEFINITION.to_string(),
+        ),
+        (
+            CONTRACT_HANDOFF_POLICY_FILE.to_string(),
+            include_str!("../../../ci/CONTRACT_HANDOFF_POLICY.txt").to_string(),
+        ),
+        (
             ABI_TARGET_LAYOUT_FILE.to_string(),
             ABI_TARGET_LAYOUT.to_string(),
         ),
@@ -252,6 +270,19 @@ fn base_files() -> Vec<(String, String)> {
         ("SUITE.lock".to_string(), SUITE_LOCK.to_string()),
         ("rust-toolchain.toml".to_string(), TOOLCHAIN.to_string()),
     ];
+    for output in REQUIRED_OUTPUTS {
+        if output.path == CONTRACT_INVENTORY_FILE {
+            // `materialize` derives the canonical prerequisite after applying
+            // fixture substitutions; never shadow it with a dummy output.
+            continue;
+        }
+        if !files.iter().any(|(path, _)| path == output.path) {
+            files.push((
+                output.path.to_string(),
+                format!("@generated fixture {}\n", output.key),
+            ));
+        }
+    }
     let mut cargo_lock = "version = 4\n".to_string();
     let mut allowlist = "schema fln-closure-allowlist/1\n".to_string();
     for (name, boundary) in crates {
