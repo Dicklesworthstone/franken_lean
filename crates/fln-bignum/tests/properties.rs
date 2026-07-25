@@ -26,6 +26,8 @@
 //! covers the apparatus too), and every failure prints the operands in decimal
 //! and limb form plus the seed and trial that produced them.
 
+#![forbid(unsafe_code)]
+
 use fln_bignum::interop::{bignat_from_literal, literal_from_bignat};
 use fln_bignum::nat::BigNat;
 
