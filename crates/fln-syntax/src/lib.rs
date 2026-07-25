@@ -11,3 +11,14 @@ pub mod attach;
 pub mod rope;
 pub mod source;
 pub mod view;
+
+#[cfg(test)]
+mod edge_smoke {
+    /// The edge declared in ci/WORKSPACE_GRAPH.txt is real: fln-core is reachable, which
+    /// is what the Syntax forms need for SyntaxNodeKind and ident (bead franken_lean-vrmi).
+    #[test]
+    fn fln_core_is_reachable_from_fln_syntax() {
+        let name = fln_core::name::Name::str(fln_core::name::Name::anonymous(), "Nat");
+        assert_eq!(name.to_display_string(), "Nat");
+    }
+}
