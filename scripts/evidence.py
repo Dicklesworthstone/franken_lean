@@ -15130,7 +15130,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     pdeath_pid_file = pdeath_root / "pids.txt"
     pdeath_program = (
         "import os,pathlib,subprocess,sys,time;"
-        "p=subprocess.Popen([sys.executable,"
+        "p=subprocess.Popen([sys.executable,'-I','-S',"
         f"{str(Path(__file__).resolve())!r},'stopped-exec',"
         "'--expected-parent-pid',str(os.getpid()),'--',sys.executable,'-c',"
         "'import time;time.sleep(60)'],start_new_session=True,"
@@ -15272,6 +15272,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         identity_probe = subprocess.run(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 str(Path(__file__).resolve()),
                 "process-start-ticks",
                 "--pid",
@@ -15409,6 +15411,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     bound_group_child = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "stopped-exec",
             "--expected-parent-pid",
