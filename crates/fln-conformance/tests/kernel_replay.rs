@@ -21,13 +21,27 @@
 //! limitation: a nested block (Lean.Syntax) admits under the partial ruleset
 //! (no positivity, no regeneration) and is surfaced by the census.
 //!
-//! Evidence discipline (the ap6 acceptance contract): the replay runs a
-//! deterministic {1, 8, 32} worker-thread matrix. Environment construction is
-//! canonical (module-order Kahn) and shared; each unit is checked against the
-//! O(1) environment snapshot it would see in the sequential replay, so the
-//! authoritative verdict stream — classes, diagnostics, and consumption — is
+//! Evidence discipline (the ap6 acceptance contract): the PRELUDE replay
+//! (`prelude_replays_through_the_kernel`) runs a deterministic {1, 8, 32}
+//! worker-thread matrix. Environment construction is canonical (module-order
+//! Kahn) and shared; each unit is checked against the O(1) environment
+//! snapshot it would see in the sequential replay, so the authoritative
+//! verdict stream — classes, diagnostics, and consumption — is
 //! schedule-independent by construction, and the matrix PROVES it byte-equal
-//! at every width. Machine rows go to stdout as schema-versioned NDJSON
+//! at every width on that input.
+//!
+//! **The matrix does not cover the corpus** (bead `fln-8zsq`). The corpus
+//! differential (`pinned_present_olean_kernel_differential`) runs at a single
+//! width chosen per module by a size heuristic, so its schedule-independence
+//! is INFERRED — from the Prelude matrix result plus the same purity and
+//! merge-determinism argument — and is not measured on the corpus itself.
+//! That is a `bounded_model` claim standing where PG-5 asks for a measured
+//! invariant, and D7 forbids reading the stronger one into the corpus census
+//! numbers. Closing the gap for real means running the corpus across the
+//! matrix and comparing stream digests; that is deliberately a follow-up lane,
+//! not a blocker on reporting the census honestly today.
+//!
+//! Machine rows go to stdout as schema-versioned NDJSON
 //! (`fln.e2e.kernel-admission`/`fln.e2e.kernel-admission-fault`, validated by
 //! `scripts/evidence.py validate-kernel-admission`); human logs stay on
 //! stderr — the two streams must never merge.
@@ -2800,6 +2814,14 @@ fn pinned_present_olean_kernel_differential() {
                 &active_infos,
                 false,
             );
+            // A throughput heuristic, NOT a determinism matrix (bead `fln-8zsq`).
+            // Two modules of different sizes run at different widths, so the
+            // corpus census is not even produced at one consistent width — and
+            // no run of it compares stream digests ACROSS widths, which is what
+            // PG-5 actually asks for. The census below reports this limitation
+            // rather than letting the Prelude matrix be read as covering it.
+            // Whoever pins this for the real matrix lane should fix the width
+            // explicitly instead of leaving it size-dependent.
             let threads = if prep.items.len() < 64 { 1 } else { 8 };
             let run = check_matrix_run(&prep, threads, Budget::DEFAULT);
             (
@@ -2889,7 +2911,8 @@ fn pinned_present_olean_kernel_differential() {
          {} disagreements, split by direction: unsoundly_permissive={} \
          restrictive_with_carve_out={} restrictive_without_carve_out={}; \
          unscorable={} oracle_skipped={} subject_no_answer={} modules={} \
-         missing_imports={} fixture_hash={}",
+         missing_imports={} fixture_hash={} \
+         schedule_independence=inferred_not_measured",
         total.compared,
         total.decoded,
         total.disagreements(),
@@ -2902,6 +2925,17 @@ fn pinned_present_olean_kernel_differential() {
         inventory.modules.len(),
         inventory.missing_imports.len(),
         inventory.fixture_hash
+    );
+    // The claim class that belongs to the numbers above, printed with them so it
+    // cannot be dropped when they are quoted (bead `fln-8zsq`). PG-5 asks for a
+    // measured invariant across {1, 8, 32}; what this run supports is weaker,
+    // and D7 forbids the weaker class standing in for the stronger one.
+    println!(
+        "kernel_reference_corpus CLAIM-CLASS: schedule_independence=inferred_not_measured \
+         basis=prelude_matrix_{{1,8,32}}+kernel_purity+deterministic_merge \
+         corpus_widths=size_heuristic_per_module_never_compared_across_widths \
+         means=these_counts_are_NOT_evidence_of_deterministic_corpus_checking \
+         bead=fln-8zsq"
     );
     assert!(
         total.compared >= PINNED_ORACLE_APPLICABLE_FLOOR,
