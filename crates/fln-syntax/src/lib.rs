@@ -11,6 +11,7 @@ pub mod attach;
 pub mod recover;
 pub mod rope;
 pub mod source;
+pub mod token;
 pub mod tree;
 pub mod trivia;
 pub mod view;
