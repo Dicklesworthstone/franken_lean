@@ -188,6 +188,18 @@ impl CheckedUnsat {
     pub const fn proof_bytes(&self) -> &[u8] {
         &self.proof_bytes
     }
+
+    /// Move the exact independently checked streams into another trust-boundary
+    /// consumer without re-encoding or copying them.
+    pub(crate) fn into_canonical_streams(self) -> (Box<[u8]>, Box<[u8]>) {
+        let Self {
+            proof: _,
+            receipt: _,
+            cnf_bytes,
+            proof_bytes,
+        } = self;
+        (cnf_bytes, proof_bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

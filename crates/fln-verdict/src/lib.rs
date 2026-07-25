@@ -22,12 +22,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 mod checker;
+mod reflection;
 mod solver;
 
 pub use checker::{
     ProofCheckInconclusive, ProofCheckInternalFault, ProofCheckLimits, ProofCheckOutcome,
     ProofCheckReceipt, ProofCheckResource, ProofOpcodeClass, ProofRefusal, ProofStream,
     check_unsat_streams, check_unsat_streams_with_cancel,
+};
+pub use reflection::{
+    REFLECTED_THEOREM_POLICY_ID, ReflectedArtifactError, ReflectedTheoremArtifact,
+    ReflectedTheoremCheckpoint, ReflectedTheoremInconclusive, ReflectedTheoremInternalFault,
+    ReflectedTheoremLimits, ReflectedTheoremOutcome, ReflectedTheoremProvenance,
+    ReflectedTheoremPublication, ReflectedTheoremRefusal, publish_reflected_theorem,
 };
 pub use solver::{
     CdclDeterminismPolicy, CheckedSat, CheckedSolverArtifact, CheckedUnsat,
