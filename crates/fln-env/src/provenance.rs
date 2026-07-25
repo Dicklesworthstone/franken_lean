@@ -28,6 +28,752 @@ use crate::modules::{
     ModuleGraphOutcome, ModuleGraphResource, ModuleId, ModuleRecord, name_stats,
 };
 
+// ---------------------------------------------------------------------------------
+// The normative V1 contribution table (bead `franken_lean-3ldh`).
+//
+// The schema layout used to live only in prose plus a set of sensitivity tests. Prose
+// cannot be joined against the encoder, so a field could be added, moved, or silently
+// dropped from the root without any artifact disagreeing. This table is the normative
+// statement, in data, and the tests below hold it to the standard the design set:
+// **missing, duplicate, stale, or unclassified rows block closure.**
+// ---------------------------------------------------------------------------------
+
+/// Whether a field is a scalar, an ordered replay sequence, a canonical set, or a
+/// count derived from the sequence it introduces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1SequenceLaw {
+    Scalar,
+    /// Order is semantic replay data and duplicates are retained.
+    OrderedSequence,
+    /// Order is canonical (sorted) and duplicates are removed.
+    CanonicalSet,
+    /// A length introducing the sequence that follows it.
+    DerivedCount,
+}
+
+/// The ordinal namespace a row's position belongs to. Separate namespaces are what
+/// keep an ordinary declaration and an extra generated declaration from sharing a
+/// coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1OrdinalNamespace {
+    None,
+    DirectImport,
+    OrdinaryContribution,
+    ExtraContribution,
+    ExtensionSource,
+    MissingDependency,
+}
+
+/// What happens when the same value appears twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1DuplicatePolicy {
+    NotApplicable,
+    /// Retained verbatim — this is ordered replay data.
+    Retained,
+    /// A typed refusal: the same declaration cannot be published twice.
+    RefusedAsConflict,
+    /// Sorted and deduplicated as part of canonicalization.
+    DedupedCanonically,
+}
+
+/// Whether a row carries identity or points at payload owned elsewhere. The schema is
+/// identity-only by design: values and raw bytes stay `Arc`-backed in the Environment
+/// and the extension journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Ownership {
+    /// The row *is* identity — a name, tag, count, or digest.
+    Identity,
+    /// The row names payload owned by another layer and never copied here.
+    PayloadOwnedElsewhere,
+}
+
+/// How a row reaches [`ModuleProvenanceRoot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1RootParticipation {
+    /// Written into the canonical bytes; changing it changes the root.
+    Direct,
+    /// Not written, because validation pins it to a value that is written. Omitting
+    /// it is safe *only* while that validation exists — the join is the evidence.
+    ViaValidation,
+    /// Deliberately excluded from the canonical bytes.
+    Excluded,
+}
+
+/// Which completeness axis a row feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1CompletenessAxis {
+    None,
+    Capture,
+    Transparency,
+    MissingDependencies,
+}
+
+/// Exact canonical width, so the table can predict a manifest's byte length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Width {
+    /// A fixed number of bytes (`u8`/`bool` = 1, `u64` = 8, …).
+    Fixed(usize),
+    /// `CanonWriter::bytes`: an 8-byte length prefix plus the payload.
+    LengthPrefixed(usize),
+    /// A `Name` body, whose width depends on the name and is measured from the
+    /// fixture rather than guessed.
+    NameBody,
+    /// `CanonWriter::schema`: a length-prefixed name plus a `u16` version.
+    SchemaHeader,
+}
+
+/// How many times a row occurs in a manifest, so the width prediction can be scaled
+/// by the manifest's own facts instead of a hand-counted constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Multiplicity {
+    Once,
+    PerModule,
+    PerDirectImportRow,
+    PerDeclaration,
+    PerExtraDeclaration,
+    PerExtensionContribution,
+    PerExtensionEntry,
+    PerMissingDependency,
+    /// Present in the value but not in the canonical bytes.
+    NotEncoded,
+}
+
+/// One row of the normative V1 contribution table.
+#[derive(Debug, Clone, Copy)]
+pub struct V1FieldRow {
+    /// Stable field tag. Unique across the table — duplicates block closure.
+    pub tag: &'static str,
+    /// The decoder source field this row is pinned to.
+    pub decoder_source: &'static str,
+    pub value_type: &'static str,
+    pub sequence_law: V1SequenceLaw,
+    pub ordinal_namespace: V1OrdinalNamespace,
+    /// Ordinal width in bits, where the row has an ordinal.
+    pub ordinal_width_bits: Option<u32>,
+    pub duplicate_policy: V1DuplicatePolicy,
+    /// The canonical inputs that decide this row's identity.
+    pub identity_inputs: &'static str,
+    pub ownership: V1Ownership,
+    pub root_participation: V1RootParticipation,
+    pub completeness_axis: V1CompletenessAxis,
+    /// The typed outcome a malformed value earns.
+    pub malformed_outcome: &'static str,
+    /// The resource this row is charged against, if any.
+    pub resource_charge: Option<ModuleProvenanceResource>,
+    pub width: V1Width,
+    pub multiplicity: V1Multiplicity,
+    /// The label of the field-family sensitivity observation that witnesses this
+    /// row's root participation, where one exists. Every `Direct` row must either
+    /// carry a witness or be a `DerivedCount` (whose sensitivity is witnessed by the
+    /// sequence it introduces).
+    pub sensitivity_witness: Option<&'static str>,
+}
+
+/// The normative V1 contribution table. One row per field of the canonical
+/// encoding, in encoder order, plus the rows that are deliberately *not* encoded.
+///
+/// This is the artifact the design asked for: per row, the field tag, its pinned
+/// decoder source, value type, ordered-sequence versus canonical-set law, ordinal
+/// namespace and width, duplicate policy, canonical identity inputs,
+/// payload-versus-identity ownership, root participation, completeness-axis effect,
+/// malformed outcome, and resource charge.
+pub const MODULE_PROVENANCE_V1_TABLE: &[V1FieldRow] = &[
+    V1FieldRow {
+        tag: "schema",
+        decoder_source: "MODULE_PROVENANCE_SCHEMA",
+        value_type: "SchemaId",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "schema name and version",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding / UnsupportedSchemaVersion",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::SchemaHeader,
+        multiplicity: V1Multiplicity::Once,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "epoch.tag",
+        decoder_source: "ModuleEpoch::tag",
+        value_type: "str",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "exact tag bytes",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "InvalidModuleGraph(MalformedEpoch)",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::LengthPrefixed(0),
+        multiplicity: V1Multiplicity::Once,
+        sensitivity_witness: Some("epoch.tag"),
+    },
+    V1FieldRow {
+        tag: "epoch.commit",
+        decoder_source: "ModuleEpoch::commit",
+        value_type: "str",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "exact commit bytes",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "InvalidModuleGraph(MalformedEpoch)",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::LengthPrefixed(0),
+        multiplicity: V1Multiplicity::Once,
+        sensitivity_witness: Some("epoch.commit"),
+    },
+    V1FieldRow {
+        tag: "records.count",
+        decoder_source: "records.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "module-record cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(Modules) / MalformedEncoding",
+        resource_charge: Some(ModuleProvenanceResource::Modules),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::Once,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "module.id",
+        decoder_source: "ModuleRecord::id",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::CanonicalSet,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::RefusedAsConflict,
+        identity_inputs: "structural Name",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "DuplicateModule / InvalidModuleGraph(AnonymousModule)",
+        resource_charge: Some(ModuleProvenanceResource::NameDepth),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("module.id"),
+    },
+    V1FieldRow {
+        tag: "module.is_module",
+        decoder_source: "ModuleRecord::is_module",
+        value_type: "bool",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "flag value",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("module.is_module"),
+    },
+    V1FieldRow {
+        tag: "module.direct_imports.count",
+        decoder_source: "ModuleRecord::direct_imports().len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "direct-row cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(DirectImportRows)",
+        resource_charge: Some(ModuleProvenanceResource::DirectImportRows),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "direct_import.module",
+        decoder_source: "DirectImport::module",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::DirectImport,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "structural Name at this ordinal",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::MissingDependencies,
+        malformed_outcome: "InvalidModuleGraph(AnonymousImport)",
+        resource_charge: Some(ModuleProvenanceResource::DirectImportRows),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerDirectImportRow,
+        sensitivity_witness: Some("direct_import.module+missing_dependency"),
+    },
+    V1FieldRow {
+        tag: "direct_import.import_all",
+        decoder_source: "DirectImport::import_all",
+        value_type: "bool",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::DirectImport,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "flag value at this ordinal",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerDirectImportRow,
+        sensitivity_witness: Some("direct_import.import_all"),
+    },
+    V1FieldRow {
+        tag: "direct_import.is_exported",
+        decoder_source: "DirectImport::is_exported",
+        value_type: "bool",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::DirectImport,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "flag value at this ordinal",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerDirectImportRow,
+        sensitivity_witness: Some("direct_import.is_exported"),
+    },
+    V1FieldRow {
+        tag: "direct_import.is_meta",
+        decoder_source: "DirectImport::is_meta",
+        value_type: "bool",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::DirectImport,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "flag value at this ordinal",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerDirectImportRow,
+        sensitivity_witness: Some("direct_import.is_meta"),
+    },
+    V1FieldRow {
+        tag: "artifact.content_digest",
+        decoder_source: "ArtifactEvidence::content_digest",
+        value_type: "Digest",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "exact 32 digest bytes",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::LengthPrefixed(32),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("artifact.content_digest"),
+    },
+    V1FieldRow {
+        tag: "artifact.producer",
+        decoder_source: "ArtifactEvidence::producer",
+        value_type: "ArtifactProducer tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding(unknown artifact producer tag)",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("artifact.producer"),
+    },
+    V1FieldRow {
+        tag: "artifact.grade",
+        decoder_source: "ArtifactEvidence::grade",
+        value_type: "ArtifactGrade tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding(unknown artifact grade tag)",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("artifact.grade"),
+    },
+    V1FieldRow {
+        tag: "artifact.epoch",
+        decoder_source: "ArtifactEvidence::epoch",
+        value_type: "ModuleEpoch",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "pinned equal to the manifest epoch by validation",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::ViaValidation,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "InvalidModuleGraph(EpochMismatch)",
+        resource_charge: None,
+        width: V1Width::Fixed(0),
+        multiplicity: V1Multiplicity::NotEncoded,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "declarations.count",
+        decoder_source: "ModuleContributionRecord::declarations.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "ordinary-contribution cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(DeclarationNames)",
+        resource_charge: Some(ModuleProvenanceResource::DeclarationNames),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "declarations.name",
+        decoder_source: "ModuleContributionRecord::declarations[i]",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::OrdinaryContribution,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::RefusedAsConflict,
+        identity_inputs: "structural Name at this ordinal",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "DuplicateDeclaration / ConflictingDeclarationOwner / AnonymousDeclaration",
+        resource_charge: Some(ModuleProvenanceResource::DeclarationNames),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerDeclaration,
+        sensitivity_witness: Some("declarations.order"),
+    },
+    V1FieldRow {
+        tag: "extra_declarations.count",
+        decoder_source: "ModuleContributionRecord::extra_declarations.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "extra-contribution cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(DeclarationNames)",
+        resource_charge: Some(ModuleProvenanceResource::DeclarationNames),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "extra_declarations.name",
+        decoder_source: "ModuleContributionRecord::extra_declarations[i]",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::ExtraContribution,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::RefusedAsConflict,
+        identity_inputs: "structural Name at this ordinal, in its own namespace",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "DuplicateDeclaration / ConflictingDeclarationOwner",
+        resource_charge: Some(ModuleProvenanceResource::DeclarationNames),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerExtraDeclaration,
+        sensitivity_witness: Some("extra_declarations.identity"),
+    },
+    V1FieldRow {
+        tag: "extension_contributions.count",
+        decoder_source: "ModuleContributionRecord::extension_contributions.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "contribution cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(ExtensionContributions)",
+        resource_charge: Some(ModuleProvenanceResource::ExtensionContributions),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "extension.descriptor.name",
+        decoder_source: "ExtensionDescriptor::name",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::ExtensionSource,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "structural Name",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "AnonymousExtension",
+        resource_charge: Some(ModuleProvenanceResource::NameDepth),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.name"),
+    },
+    V1FieldRow {
+        tag: "extension.descriptor.merge",
+        decoder_source: "ExtensionDescriptor::merge",
+        value_type: "MergeSemantics tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding(unknown merge policy tag)",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.merge"),
+    },
+    V1FieldRow {
+        tag: "extension.descriptor.checkpoint",
+        decoder_source: "ExtensionDescriptor::checkpoint",
+        value_type: "CheckpointSemantics tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding(unknown checkpoint policy tag)",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.checkpoint"),
+    },
+    V1FieldRow {
+        tag: "extension.descriptor.provenance",
+        decoder_source: "ExtensionDescriptor::provenance",
+        value_type: "PayloadProvenance tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::Transparency,
+        malformed_outcome: "MalformedEncoding / PayloadTransparencyMismatch",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.provenance+transparency"),
+    },
+    V1FieldRow {
+        tag: "extension.range_start",
+        decoder_source: "ExtensionContribution::start",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "target-journal start; scoped to one root and extension, NOT stable content identity",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "EntryRangeOverflow",
+        resource_charge: None,
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.range_start"),
+    },
+    V1FieldRow {
+        tag: "extension.base_history_digest",
+        decoder_source: "ExtensionContribution::base_history_digest",
+        value_type: "Digest",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "exact 32 digest bytes",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::LengthPrefixed(32),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.base_history_digest"),
+    },
+    V1FieldRow {
+        tag: "extension.entries.count",
+        decoder_source: "ExtensionContribution::entries.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "occurrence cardinality; also the applied range length",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "EmptyExtensionContribution / ResourceLimitExceeded(ExtensionEntries)",
+        resource_charge: Some(ModuleProvenanceResource::ExtensionEntries),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.entry_count"),
+    },
+    V1FieldRow {
+        tag: "extension.entry_id",
+        decoder_source: "ExtensionContribution::entries[j]",
+        value_type: "ExtensionEntryId",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::ExtensionSource,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "entry schema, epoch, descriptor identity, exact payload bytes",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: Some(ModuleProvenanceResource::ExtensionEntries),
+        width: V1Width::LengthPrefixed(32),
+        multiplicity: V1Multiplicity::PerExtensionEntry,
+        sensitivity_witness: Some("extension.entry_id"),
+    },
+    V1FieldRow {
+        tag: "extension.target_position",
+        decoder_source: "derived: start + source ordinal",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::ExtensionSource,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "none: a derived coordinate, never an identity input",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Excluded,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "EntryRangeOverflow",
+        resource_charge: None,
+        width: V1Width::Fixed(0),
+        multiplicity: V1Multiplicity::NotEncoded,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "completeness.capture",
+        decoder_source: "ProvenanceCompleteness::capture",
+        value_type: "CaptureStatus tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::Capture,
+        malformed_outcome: "MalformedEncoding / CaptureStatusContradicted",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("completeness.capture"),
+    },
+    V1FieldRow {
+        tag: "completeness.transparency",
+        decoder_source: "ProvenanceCompleteness::transparency",
+        value_type: "PayloadTransparency tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag, recomputed from descriptors",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::Transparency,
+        malformed_outcome: "MalformedEncoding / PayloadTransparencyMismatch",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("completeness.transparency"),
+    },
+    V1FieldRow {
+        tag: "completeness.missing_dependencies.count",
+        decoder_source: "ProvenanceCompleteness::missing_dependencies.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "missing-target cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::MissingDependencies,
+        malformed_outcome: "ResourceLimitExceeded(MissingDependencies)",
+        resource_charge: Some(ModuleProvenanceResource::MissingDependencies),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "completeness.missing_dependencies.name",
+        decoder_source: "ProvenanceCompleteness::missing_dependencies[i]",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::CanonicalSet,
+        ordinal_namespace: V1OrdinalNamespace::MissingDependency,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::DedupedCanonically,
+        identity_inputs: "structural Name, sorted and deduplicated",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::MissingDependencies,
+        malformed_outcome: "MissingDependenciesMismatch",
+        resource_charge: Some(ModuleProvenanceResource::MissingDependencies),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerMissingDependency,
+        sensitivity_witness: Some("completeness.missing_dependency_set"),
+    },
+];
+
 /// Frozen canonical schema for the complete provenance manifest.
 ///
 /// Version 1 is positional and length-delimited:
@@ -2225,7 +2971,12 @@ mod tests {
         let baseline_bytes = baseline.to_canonical_bytes();
         let baseline_root = baseline.root();
         let mut roots = BTreeSet::from([baseline_root]);
+        // Collected so the normative V1 table can be joined against what was actually
+        // witnessed: a table row claiming root participation with no observation is
+        // stale, and an observation with no row means the table is missing one.
+        let mut witnessed: BTreeSet<&'static str> = BTreeSet::new();
         let mut observe = |field: &'static str, variant_epoch: ModuleEpoch, records: Vec<_>| {
+            witnessed.insert(field);
             let candidate = ModuleProvenanceManifest::new(variant_epoch, records, TEST_LIMITS)
                 .expect("field variant remains structurally valid");
             let bytes = candidate.to_canonical_bytes();
@@ -2444,7 +3195,7 @@ mod tests {
             PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
-        observe("completeness.decode", epoch(), records);
+        observe("completeness.capture", epoch(), records);
 
         let mut records = sample_records();
         records[0].module = ModuleRecord::new(
@@ -2464,7 +3215,276 @@ mod tests {
         );
         observe("completeness.missing_dependency_set", epoch(), records);
 
-        assert_eq!(roots.len(), 24, "baseline plus every field-family variant");
+        // One gap the normative V1 table exposed: transparency was only ever
+        // witnessed together with the descriptor's provenance, so it was never known
+        // to reach the root on its own. (The three import flags turned out to be
+        // witnessed already, by the loop above — the table's job is to make that
+        // checkable either way.)
+
+        let mut records = sample_records();
+        let contribution = records[0].extension_contributions[0].clone();
+        records[0].extension_contributions = vec![
+            contribution.clone(),
+            ExtensionContribution::new(
+                extension_descriptor("opaqueExt", PayloadProvenance::Opaque),
+                0,
+                Digest([0x77; 32]),
+                vec![entry_for(
+                    &extension_descriptor("opaqueExt", PayloadProvenance::Opaque),
+                    &[0x5A],
+                )],
+            ),
+        ]
+        .into();
+        records[0].completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Complete,
+            PayloadTransparency::Mixed,
+            vec![id("Ghost")],
+        );
+        observe("completeness.transparency", epoch(), records);
+
+        assert_eq!(roots.len(), 25, "baseline plus every field-family variant");
+
+        // ---- the join: the table and the witnesses must agree exactly -----------
+        let claimed: BTreeSet<&'static str> = MODULE_PROVENANCE_V1_TABLE
+            .iter()
+            .filter_map(|row| row.sensitivity_witness)
+            .collect();
+        assert_eq!(
+            claimed.difference(&witnessed).copied().collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "a V1 table row claims a sensitivity witness that was never observed (stale row)"
+        );
+        assert_eq!(
+            witnessed.difference(&claimed).copied().collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "a field family was observed with no V1 table row (missing row)"
+        );
+    }
+
+    /// Canonical width of one `Name` body, measured rather than guessed.
+    fn name_body_len(name: &Name) -> usize {
+        let mut writer = CanonWriter::new();
+        name.write_body(&mut writer);
+        writer.into_bytes().len()
+    }
+
+    /// The V1 table is normative, so it must be well formed on its own terms:
+    /// unique tags, and every row classified on every axis the design requires.
+    /// An unclassified row is exactly as bad as a missing one — it looks specified.
+    #[test]
+    fn the_v1_table_has_unique_and_fully_classified_rows() {
+        let mut tags = BTreeSet::new();
+        for row in MODULE_PROVENANCE_V1_TABLE {
+            assert!(
+                tags.insert(row.tag),
+                "duplicate V1 table row for tag `{}`",
+                row.tag
+            );
+            for (column, value) in [
+                ("decoder_source", row.decoder_source),
+                ("value_type", row.value_type),
+                ("identity_inputs", row.identity_inputs),
+                ("malformed_outcome", row.malformed_outcome),
+            ] {
+                assert!(
+                    !value.is_empty(),
+                    "row `{}` leaves `{column}` unclassified",
+                    row.tag
+                );
+            }
+            // An ordinal namespace and an ordinal width are one fact in two halves;
+            // declaring either alone leaves the coordinate ambiguous.
+            assert_eq!(
+                row.ordinal_namespace != V1OrdinalNamespace::None,
+                row.ordinal_width_bits.is_some(),
+                "row `{}` declares an ordinal namespace without a width, or vice versa",
+                row.tag
+            );
+            // Ordered replay data and canonical sets must state a duplicate policy.
+            if matches!(
+                row.sequence_law,
+                V1SequenceLaw::OrderedSequence | V1SequenceLaw::CanonicalSet
+            ) {
+                assert_ne!(
+                    row.duplicate_policy,
+                    V1DuplicatePolicy::NotApplicable,
+                    "row `{}` is a sequence or set but declares no duplicate policy",
+                    row.tag
+                );
+            }
+            // Encoded rows must have a width; unencoded rows must not claim one.
+            let encoded = row.multiplicity != V1Multiplicity::NotEncoded;
+            assert_eq!(
+                encoded,
+                row.root_participation == V1RootParticipation::Direct,
+                "row `{}`: only directly-encoded rows may claim Direct root participation",
+                row.tag
+            );
+            if !encoded {
+                assert_eq!(
+                    row.width,
+                    V1Width::Fixed(0),
+                    "row `{}` is not encoded yet claims a width",
+                    row.tag
+                );
+            }
+        }
+        // The two deliberately-unencoded rows are the ones this schema reasons about
+        // most: the artifact epoch (pinned by validation) and the target journal
+        // position (derived, and excluded from entry identity on purpose).
+        let unencoded: Vec<_> = MODULE_PROVENANCE_V1_TABLE
+            .iter()
+            .filter(|row| row.multiplicity == V1Multiplicity::NotEncoded)
+            .map(|row| row.tag)
+            .collect();
+        assert_eq!(
+            unencoded,
+            vec!["artifact.epoch", "extension.target_position"],
+            "the set of deliberately-unencoded fields changed without a table update"
+        );
+    }
+
+    /// **Completeness, mechanically.** The table predicts the exact canonical byte
+    /// length of a manifest from its own rows plus that manifest's facts. If the
+    /// encoder writes a field the table does not list — or stops writing one it does
+    /// — the totals disagree. This is what makes "missing rows block closure"
+    /// enforceable instead of aspirational.
+    #[test]
+    fn the_v1_table_predicts_the_exact_canonical_byte_length() {
+        let manifest = sample_manifest();
+        let facts = manifest.facts();
+        let actual = manifest.to_canonical_bytes().len();
+
+        // Data-dependent widths are measured from the fixture; the table supplies
+        // which fields exist and how each is framed.
+        let sum_names = |names: Vec<&Name>| names.iter().map(|n| name_body_len(n)).sum::<usize>();
+        let module_ids: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .map(|r| r.module().id.name())
+            .collect();
+        let import_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| r.module().direct_imports().iter().map(|i| i.module.name()))
+            .collect();
+        let declaration_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| r.declarations().iter())
+            .collect();
+        let extra_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| r.extra_declarations().iter())
+            .collect();
+        let extension_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| {
+                r.extension_contributions()
+                    .iter()
+                    .map(|c| &c.descriptor().name)
+            })
+            .collect();
+        let missing_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| r.completeness().missing_dependencies().iter())
+            .map(|m| m.name())
+            .collect();
+
+        let mut predicted = 0usize;
+        for row in MODULE_PROVENANCE_V1_TABLE {
+            let occurrences = match row.multiplicity {
+                V1Multiplicity::Once => 1,
+                V1Multiplicity::PerModule => facts.modules,
+                V1Multiplicity::PerDirectImportRow => facts.direct_import_rows,
+                V1Multiplicity::PerDeclaration => facts.declarations,
+                V1Multiplicity::PerExtraDeclaration => facts.extra_declarations,
+                V1Multiplicity::PerExtensionContribution => facts.extension_contributions,
+                V1Multiplicity::PerExtensionEntry => facts.extension_entries,
+                V1Multiplicity::PerMissingDependency => facts.missing_dependencies,
+                V1Multiplicity::NotEncoded => 0,
+            };
+            predicted += match (row.width, row.tag) {
+                (V1Width::Fixed(width), _) => width * occurrences,
+                (V1Width::LengthPrefixed(_), "epoch.tag") => 8 + manifest.epoch().tag().len(),
+                (V1Width::LengthPrefixed(_), "epoch.commit") => 8 + manifest.epoch().commit().len(),
+                (V1Width::LengthPrefixed(payload), _) => (8 + payload) * occurrences,
+                (V1Width::SchemaHeader, _) => 8 + MODULE_PROVENANCE_SCHEMA.name.len() + 2,
+                (V1Width::NameBody, "module.id") => sum_names(module_ids.clone()),
+                (V1Width::NameBody, "direct_import.module") => sum_names(import_names.clone()),
+                (V1Width::NameBody, "declarations.name") => sum_names(declaration_names.clone()),
+                (V1Width::NameBody, "extra_declarations.name") => sum_names(extra_names.clone()),
+                (V1Width::NameBody, "extension.descriptor.name") => {
+                    sum_names(extension_names.clone())
+                }
+                (V1Width::NameBody, "completeness.missing_dependencies.name") => {
+                    sum_names(missing_names.clone())
+                }
+                (width, tag) => panic!("unhandled V1 width {width:?} for row `{tag}`"),
+            };
+        }
+        assert_eq!(
+            predicted, actual,
+            "the V1 table no longer accounts for every canonical byte — a field was \
+             added to or removed from the encoder without a table row"
+        );
+        assert_eq!(actual, 669, "the pinned canonical size is unchanged");
+    }
+
+    /// **Identity-only, proved rather than asserted.** Declaration values and raw
+    /// extension payload bytes stay `Arc`-backed in the Environment and the journal;
+    /// this schema stores names, tags, counts and digests. A second copy of semantic
+    /// payload state here would be a durability and divergence hazard, so the table
+    /// records ownership per row and this test holds the encoding to it.
+    #[test]
+    fn the_v1_schema_is_identity_only_and_copies_no_payload() {
+        // Payload bytes that exist only inside the extension journal, never here.
+        const SECRET_PAYLOAD: &[u8] = b"PAYLOAD-BYTES-THAT-MUST-NOT-BE-COPIED";
+        let descriptor = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let mut records = sample_records();
+        records[0].extension_contributions = vec![ExtensionContribution::new(
+            descriptor.clone(),
+            7,
+            Digest([0x31; 32]),
+            vec![ExtensionEntryId::derive(
+                &epoch(),
+                &descriptor,
+                SECRET_PAYLOAD,
+            )],
+        )]
+        .into();
+        let manifest = ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+            .expect("the payload-bearing fixture validates");
+        let bytes = manifest.to_canonical_bytes();
+
+        assert!(
+            !bytes
+                .windows(SECRET_PAYLOAD.len())
+                .any(|window| window == SECRET_PAYLOAD),
+            "raw extension payload bytes leaked into the canonical provenance encoding"
+        );
+        // The entry is still fully identified — identity-only is not identity-poor.
+        assert_eq!(
+            manifest.records()[0].extension_contributions()[0].entries()[0],
+            ExtensionEntryId::derive(&epoch(), &descriptor, SECRET_PAYLOAD)
+        );
+
+        // Every row that names payload owned elsewhere stores a fixed-width digest or
+        // a name, never the payload itself.
+        for row in MODULE_PROVENANCE_V1_TABLE
+            .iter()
+            .filter(|row| row.ownership == V1Ownership::PayloadOwnedElsewhere)
+        {
+            assert!(
+                matches!(row.width, V1Width::LengthPrefixed(32) | V1Width::NameBody),
+                "row `{}` claims to own payload elsewhere but is not a digest or a name",
+                row.tag
+            );
+        }
     }
 
     #[test]
@@ -2502,6 +3522,66 @@ mod tests {
             logical_before.0,
             "typed domains do not alias even for unrelated current values"
         );
+
+        // Non-interference across field families, not just one variant: move a
+        // representative field from each independently-rooted family and assert the
+        // environment's logical root never observes any of it, and that no provenance
+        // root ever aliases it. Building, varying, encoding and decoding provenance is
+        // all invisible to the environment by construction — this pins that.
+        let mut transparency = sample_records();
+        transparency[0].extension_contributions = vec![ExtensionContribution::new(
+            extension_descriptor("opaqueExt", PayloadProvenance::Opaque),
+            7,
+            Digest([0x31; 32]),
+            vec![entry_for(
+                &extension_descriptor("opaqueExt", PayloadProvenance::Opaque),
+                &[0x41],
+            )],
+        )]
+        .into();
+        transparency[0].completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Complete,
+            PayloadTransparency::Opaque,
+            vec![id("Ghost")],
+        );
+
+        let mut capture = sample_records();
+        capture[0].completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
+            vec![id("Ghost")],
+        );
+
+        let mut artifact = sample_records();
+        artifact[0].module.artifact.content_digest = Digest([0xEE; 32]);
+
+        let mut roots = BTreeSet::from([base.root()]);
+        for (family, records) in [
+            ("transparency", transparency),
+            ("capture", capture),
+            ("artifact", artifact),
+        ] {
+            let manifest = ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+                .expect("variant validates");
+            // Round-trip too: decoding is equally invisible to the environment.
+            let decoded = ModuleProvenanceManifest::from_canonical_bytes(
+                &manifest.to_canonical_bytes(),
+                TEST_LIMITS,
+            )
+            .expect("variant round-trips");
+            assert_eq!(decoded.root(), manifest.root(), "family={family}");
+            assert!(roots.insert(manifest.root()), "family={family} is distinct");
+            assert_eq!(
+                logical_before,
+                environment.logical_root(&KVMap::new()),
+                "family={family} disturbed the environment's logical root"
+            );
+            assert_ne!(
+                manifest.root().0,
+                logical_before.0,
+                "family={family} provenance root aliased the logical root"
+            );
+        }
     }
 
     #[test]
