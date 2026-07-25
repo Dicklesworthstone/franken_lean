@@ -2657,6 +2657,105 @@ mod verdict_codec_fuzz {
     use super::test_support::*;
     use super::*;
 
+    const DECODER_CORPUS: &str = include_str!("../tests/corpus/decoder_cases.hex");
+
+    fn decode_hex(encoded: &str) -> Result<Vec<u8>, &'static str> {
+        if encoded == "-" {
+            return Ok(Vec::new());
+        }
+        if !encoded.len().is_multiple_of(2) {
+            return Err("hex input has odd length");
+        }
+        let mut decoded = Vec::with_capacity(encoded.len() / 2);
+        for pair in encoded.as_bytes().as_chunks::<2>().0 {
+            let high = char::from(pair[0])
+                .to_digit(16)
+                .ok_or("hex input has an invalid high nibble")?;
+            let low = char::from(pair[1])
+                .to_digit(16)
+                .ok_or("hex input has an invalid low nibble")?;
+            decoded.push(((high << 4) | low) as u8);
+        }
+        Ok(decoded)
+    }
+
+    #[test]
+    fn checked_in_decoder_corpus_is_typed_and_canonical() -> Result<(), String> {
+        let proof_context = unsat_formula();
+        let mut cases = 0_usize;
+
+        for (line_index, line) in DECODER_CORPUS.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            cases += 1;
+            let mut fields = line.split('|');
+            let line_number = line_index + 1;
+            let target = fields
+                .next()
+                .ok_or_else(|| format!("decoder corpus line {line_number} has no target"))?;
+            let expectation = fields.next().ok_or_else(|| {
+                format!("decoder corpus line {line_number} ({target}) has no expectation")
+            })?;
+            let name = fields.next().ok_or_else(|| {
+                format!("decoder corpus line {line_number} ({target}) has no name")
+            })?;
+            let encoded = fields.next().ok_or_else(|| {
+                format!("decoder corpus line {line_number} ({name}) has no encoded bytes")
+            })?;
+            assert!(
+                fields.next().is_none(),
+                "decoder corpus line {line_number} has extra fields"
+            );
+            let bytes = decode_hex(encoded).map_err(|error| {
+                format!("decoder corpus line {line_number} ({name}) has invalid hex: {error}")
+            })?;
+
+            let outcome = match target {
+                "cnf" => Cnf::from_canonical_bytes(&bytes, SchemaLimits::default())
+                    .map(|cnf| cnf.to_canonical_bytes()),
+                "proof" => UnsatProof::from_canonical_bytes(
+                    &bytes,
+                    &proof_context,
+                    SchemaLimits::default(),
+                )
+                .map(|proof| proof.to_canonical_bytes()),
+                other => {
+                    return Err(format!(
+                        "decoder corpus line {line_number} ({name}) has unknown target {other}"
+                    ));
+                }
+            };
+
+            match expectation {
+                "canonical" => assert_eq!(
+                    outcome.as_deref(),
+                    Ok(bytes.as_slice()),
+                    "decoder corpus line {line_number} ({name}) failed canonical round-trip"
+                ),
+                "invalid" => assert!(
+                    matches!(
+                        outcome,
+                        Err(error) if !matches!(error, SchemaError::ResourceLimitExceeded { .. })
+                    ),
+                    "decoder corpus line {line_number} ({name}) did not produce a typed malformed refusal"
+                ),
+                "budget" => assert!(
+                    matches!(outcome, Err(SchemaError::ResourceLimitExceeded { .. })),
+                    "decoder corpus line {line_number} ({name}) did not produce a resource refusal"
+                ),
+                other => {
+                    return Err(format!(
+                        "decoder corpus line {line_number} ({name}) has unknown expectation {other}"
+                    ));
+                }
+            }
+        }
+
+        assert_eq!(cases, 10, "decoder corpus row count drifted");
+        Ok(())
+    }
+
     #[test]
     fn arbitrary_and_mutated_streams_never_panic_and_decoder_recovers() {
         let cnf = unsat_formula();
