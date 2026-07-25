@@ -493,6 +493,327 @@ pub enum ModuleGraphOutcome<T> {
     Inconclusive(ModuleGraphInconclusive),
 }
 
+/// Frozen logical usage units, version 1 (bead `franken_lean-6sf3`).
+///
+/// "Frozen" is the load-bearing word. If the plan says a registration costs N of a
+/// unit and admission then charges M, the plan is decoration. These units are the
+/// shared vocabulary both sides account in, each pinned to the deterministic
+/// observation point at which it is charged, so a drift between plan and execution
+/// is a test failure rather than a discrepancy nobody notices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UsageUnit {
+    /// Modules the graph would hold after this registration.
+    Modules,
+    /// Direct import rows the graph would hold after this registration.
+    DirectImportRows,
+    /// Name components inspected while validating this record.
+    NameComponents,
+    /// Artifact payload bytes the graph would account after this registration.
+    PayloadBytes,
+    /// Modules visited by the cycle scan.
+    CycleModulesVisited,
+    /// Import rows examined by the cycle scan.
+    CycleRowsExamined,
+}
+
+impl UsageUnit {
+    /// Every unit, in the order they are charged.
+    pub const ALL: [UsageUnit; 6] = [
+        Self::NameComponents,
+        Self::Modules,
+        Self::DirectImportRows,
+        Self::PayloadBytes,
+        Self::CycleModulesVisited,
+        Self::CycleRowsExamined,
+    ];
+
+    /// Version of the unit vocabulary itself. A unit added, removed, or redefined
+    /// moves this, because a consumer comparing usage across versions is comparing
+    /// two different accounting systems.
+    pub const VERSION: u16 = 1;
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Modules => "modules",
+            Self::DirectImportRows => "direct_import_rows",
+            Self::NameComponents => "name_components",
+            Self::PayloadBytes => "payload_bytes",
+            Self::CycleModulesVisited => "cycle_modules_visited",
+            Self::CycleRowsExamined => "cycle_rows_examined",
+        }
+    }
+
+    /// The deterministic observation point at which this unit becomes exact.
+    ///
+    /// A refusal before this point cannot report the unit exactly, which is why
+    /// [`UsageExactness`] exists rather than a total that quietly means different
+    /// things depending on where the work stopped.
+    pub const fn observed_at(self) -> RegistrationCheckpoint {
+        match self {
+            Self::NameComponents => RegistrationCheckpoint::AfterValidation,
+            Self::Modules | Self::DirectImportRows | Self::PayloadBytes => {
+                RegistrationCheckpoint::AfterConflictLookup
+            }
+            Self::CycleModulesVisited | Self::CycleRowsExamined => {
+                RegistrationCheckpoint::BeforePublication
+            }
+        }
+    }
+}
+
+/// Whether a usage total is exact or a witnessed lower bound.
+///
+/// A refusal reports the work actually observed through its checkpoint plus the
+/// knowledge that more was required — never a scan of the unobserved suffix merely
+/// to claim an exact total, which would make refusal cost more than success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageExactness {
+    /// Every unit was observed to completion.
+    Exact,
+    /// Work stopped at the recorded checkpoint; totals are a lower bound on the
+    /// work the operation would have required.
+    LowerBound,
+}
+
+/// Phase-local usage in [frozen units](UsageUnit).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlannedUsage {
+    pub modules: u128,
+    pub direct_import_rows: u128,
+    pub name_components: u128,
+    pub payload_bytes: u128,
+    pub cycle_modules_visited: u128,
+    pub cycle_rows_examined: u128,
+}
+
+impl PlannedUsage {
+    /// Total for one unit. Exhaustive by construction so a new unit cannot be
+    /// silently unaccounted.
+    pub const fn get(&self, unit: UsageUnit) -> u128 {
+        match unit {
+            UsageUnit::Modules => self.modules,
+            UsageUnit::DirectImportRows => self.direct_import_rows,
+            UsageUnit::NameComponents => self.name_components,
+            UsageUnit::PayloadBytes => self.payload_bytes,
+            UsageUnit::CycleModulesVisited => self.cycle_modules_visited,
+            UsageUnit::CycleRowsExamined => self.cycle_rows_examined,
+        }
+    }
+}
+
+/// The **total** precedence order over admission outcomes (bead `franken_lean-6sf3`).
+///
+/// Every registration resolves to exactly one of these, and the declaration order IS
+/// the precedence order — [`rank`](Self::rank) is derived from [`ALL`](Self::ALL)
+/// rather than hand-numbered, so the table cannot disagree with itself. Two inputs
+/// that breach simultaneously must resolve to the earlier rule on every schedule;
+/// that is what makes the outcome schedule-independent (FL-INV-01) instead of a race
+/// between which check happened to run first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AdmissionPrecedence {
+    CancelledAtEntry,
+    MalformedInput,
+    ResourceNameDepth,
+    CancelledAfterValidation,
+    ExistingRecordIdempotent,
+    ExistingRecordConflict,
+    CancelledAfterConflictLookup,
+    ResourceModules,
+    ResourceDirectImportRows,
+    ResourcePayloadBytes,
+    CancelledBeforePublication,
+    CycleDetected,
+    Admitted,
+}
+
+impl AdmissionPrecedence {
+    /// Every rule, in precedence order. This array is the normative table.
+    pub const ALL: [AdmissionPrecedence; 13] = [
+        Self::CancelledAtEntry,
+        Self::MalformedInput,
+        Self::ResourceNameDepth,
+        Self::CancelledAfterValidation,
+        Self::ExistingRecordIdempotent,
+        Self::ExistingRecordConflict,
+        Self::CancelledAfterConflictLookup,
+        Self::ResourceModules,
+        Self::ResourceDirectImportRows,
+        Self::ResourcePayloadBytes,
+        Self::CancelledBeforePublication,
+        Self::CycleDetected,
+        Self::Admitted,
+    ];
+
+    /// Position in the precedence order; lower wins a tie.
+    pub fn rank(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|entry| *entry == self)
+            .expect("ALL covers every precedence rule")
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CancelledAtEntry => "cancelled_at_entry",
+            Self::MalformedInput => "malformed_input",
+            Self::ResourceNameDepth => "resource_name_depth",
+            Self::CancelledAfterValidation => "cancelled_after_validation",
+            Self::ExistingRecordIdempotent => "existing_record_idempotent",
+            Self::ExistingRecordConflict => "existing_record_conflict",
+            Self::CancelledAfterConflictLookup => "cancelled_after_conflict_lookup",
+            Self::ResourceModules => "resource_modules",
+            Self::ResourceDirectImportRows => "resource_direct_import_rows",
+            Self::ResourcePayloadBytes => "resource_payload_bytes",
+            Self::CancelledBeforePublication => "cancelled_before_publication",
+            Self::CycleDetected => "cycle_detected",
+            Self::Admitted => "admitted",
+        }
+    }
+
+    /// The checkpoint through which work is observed when this rule decides.
+    pub const fn checkpoint(self) -> RegistrationCheckpoint {
+        match self {
+            Self::CancelledAtEntry => RegistrationCheckpoint::Entry,
+            Self::MalformedInput | Self::ResourceNameDepth | Self::CancelledAfterValidation => {
+                RegistrationCheckpoint::AfterValidation
+            }
+            Self::ExistingRecordIdempotent
+            | Self::ExistingRecordConflict
+            | Self::CancelledAfterConflictLookup
+            | Self::ResourceModules
+            | Self::ResourceDirectImportRows
+            | Self::ResourcePayloadBytes => RegistrationCheckpoint::AfterConflictLookup,
+            Self::CancelledBeforePublication | Self::CycleDetected | Self::Admitted => {
+                RegistrationCheckpoint::BeforePublication
+            }
+        }
+    }
+
+    /// Whether a plan decided by this rule would publish when consumed.
+    pub const fn publishes(self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+}
+
+/// What a base graph a plan was computed against must still look like at consumption.
+///
+/// **This is a lineage binding, not a content root.** It pins the epoch, the limits,
+/// the observable facts, and a monotonic per-lineage revision, which together detect
+/// any mutation of the graph the plan was computed against — the `revision` moves on
+/// every publication, so a plan can never be consumed against a base that has since
+/// grown. What it deliberately does NOT claim is content equality across unrelated
+/// lineages: two graphs that never shared history could in principle present the same
+/// epoch, limits, facts, and revision. Closing that needs a content root over the
+/// record map, which this layer does not have and will not compute per plan because
+/// it would make planning O(n) in the graph. Stated rather than implied, because a
+/// consumer that reads this as a content root would be relying on something it does
+/// not prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleGraphBinding {
+    pub epoch: ModuleEpoch,
+    pub limits: ModuleGraphLimits,
+    pub facts: ModuleGraphFacts,
+    pub revision: u64,
+}
+
+/// A **nonpublishing** account of what one registration would do.
+///
+/// The whole point is in the first word. Computing a plan mutates nothing
+/// observable: the base graph is untouched (it is immutable anyway), no environment
+/// changes, no logical root moves, and the plan itself is never cacheable — a plan
+/// that published would just be admission with extra steps.
+///
+/// It is also not decoration: [`ModuleGraph::plan_registration`] and
+/// [`ModuleGraph::register_cancellable`] run the *same* decision procedure, so the
+/// precedence rule, the checkpoint, and every frozen usage unit agree by
+/// construction rather than by a test that hopes two implementations stayed in step.
+///
+/// A plan is non-authoritative until consumed. It carries no authority to admit
+/// anything on its own, and `is_cacheable()` is false for every plan, including one
+/// predicting a clean admission: caching a prediction would let a stale prediction
+/// stand in for a decision, and caching one that predicted exhaustion would replay an
+/// FL-INV-07 inconclusive as though it were an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleGraphAdmissionPlan {
+    version: u16,
+    usage_version: u16,
+    base: ModuleGraphBinding,
+    request: ModuleId,
+    precedence: AdmissionPrecedence,
+    checkpoint: RegistrationCheckpoint,
+    usage: PlannedUsage,
+    exactness: UsageExactness,
+    predicted_facts: Option<ModuleGraphFacts>,
+}
+
+impl ModuleGraphAdmissionPlan {
+    /// Schema version of the plan itself.
+    pub const VERSION: u16 = 1;
+
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Version of the [`UsageUnit`] vocabulary the totals are denominated in.
+    pub fn usage_version(&self) -> u16 {
+        self.usage_version
+    }
+
+    pub fn base(&self) -> &ModuleGraphBinding {
+        &self.base
+    }
+
+    /// The module this plan was computed for.
+    pub fn request(&self) -> &ModuleId {
+        &self.request
+    }
+
+    /// The precedence rule that decided this plan.
+    pub fn precedence(&self) -> AdmissionPrecedence {
+        self.precedence
+    }
+
+    /// The deterministic observation point the decision reached.
+    pub fn checkpoint(&self) -> RegistrationCheckpoint {
+        self.checkpoint
+    }
+
+    pub fn usage(&self) -> PlannedUsage {
+        self.usage
+    }
+
+    pub fn exactness(&self) -> UsageExactness {
+        self.exactness
+    }
+
+    /// The facts the graph would carry if this plan were consumed and published.
+    /// `None` unless the plan predicts publication.
+    pub fn predicted_facts(&self) -> Option<&ModuleGraphFacts> {
+        self.predicted_facts.as_ref()
+    }
+
+    /// Whether consuming this plan would publish a new graph state.
+    pub fn publishes(&self) -> bool {
+        self.precedence.publishes()
+    }
+
+    /// **Never.** A plan is a prediction, not a decision.
+    pub const fn is_cacheable(&self) -> bool {
+        false
+    }
+
+    /// Whether the plan is still valid against `graph`.
+    ///
+    /// Revalidated immediately before consumption, never trusted from when it was
+    /// computed: the base may have moved, and a plan computed against one base is
+    /// meaningless against another.
+    pub fn is_valid_for(&self, graph: &ModuleGraph) -> bool {
+        self.version == Self::VERSION
+            && self.usage_version == UsageUnit::VERSION
+            && self.base == graph.binding()
+    }
+}
+
 /// The typed outcome of one module-graph **registration**.
 pub type ModuleGraphAdmission = ModuleGraphOutcome<Registration>;
 
@@ -631,6 +952,36 @@ pub struct ModuleGraphFacts {
 struct ModuleGraphState {
     records: PMap<ModuleId, Arc<ModuleRecord>>,
     facts: ModuleGraphFacts,
+    /// Monotonic within one lineage, incremented on every publication. This is what
+    /// makes a plan computed against an earlier state detectably stale; see
+    /// [`ModuleGraphBinding`] for what it does and does not prove.
+    revision: u64,
+}
+
+/// The outcome shape of the shared decision procedure, before publication.
+enum DecisionOutcome {
+    /// Would publish: the candidate record map, the facts that go with it, and the
+    /// work actually performed.
+    Admit {
+        records: PMap<ModuleId, Arc<ModuleRecord>>,
+        facts: ModuleGraphFacts,
+        work: RegistrationWork,
+    },
+    /// The identical record is already present; nothing would publish.
+    Idempotent {
+        work: RegistrationWork,
+    },
+    Rejected(ModuleGraphError),
+    Inconclusive(ModuleGraphInconclusive),
+}
+
+/// One admission decision: the rule that decided, the usage observed reaching it,
+/// and the outcome. Produced once and consumed either as a plan or as a publication.
+struct AdmissionDecision {
+    precedence: AdmissionPrecedence,
+    usage: PlannedUsage,
+    exactness: UsageExactness,
+    outcome: DecisionOutcome,
 }
 
 /// Immutable module DAG. Clone is one bounded `Arc` increment.
@@ -682,6 +1033,8 @@ impl ModuleGraph {
                     payload_bytes,
                     maximum_name_depth: 0,
                 },
+                // A freshly constructed graph starts its own lineage.
+                revision: 0,
             }),
         })
     }
@@ -769,57 +1122,182 @@ impl ModuleGraph {
         record: ModuleRecord,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> ModuleGraphAdmission {
-        let cancelled = |checkpoint: RegistrationCheckpoint| {
-            cancellation
-                .is_some_and(CancellationProbe::is_cancelled)
-                .then(|| {
-                    ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::Cancelled {
-                        module: record.id.clone(),
-                        checkpoint,
-                    })
-                })
-        };
-
-        if let Some(outcome) = cancelled(RegistrationCheckpoint::Entry) {
-            return outcome;
+        // One decision procedure, then publication. Admission does not re-derive
+        // anything the decision already established, so a plan of the same input
+        // cannot disagree with it.
+        let decision = self.decide(&record, cancellation);
+        match decision.outcome {
+            DecisionOutcome::Rejected(error) => ModuleGraphAdmission::Rejected(error),
+            DecisionOutcome::Inconclusive(reason) => ModuleGraphAdmission::Inconclusive(reason),
+            DecisionOutcome::Idempotent { work } => ModuleGraphAdmission::Complete(Registration {
+                graph: self.clone(),
+                disposition: RegistrationDisposition::Idempotent,
+                work,
+            }),
+            DecisionOutcome::Admit {
+                records,
+                facts,
+                work,
+            } => ModuleGraphAdmission::Complete(Registration {
+                graph: Self {
+                    epoch: self.epoch.clone(),
+                    limits: self.limits,
+                    state: Arc::new(ModuleGraphState {
+                        records,
+                        facts,
+                        // The lineage moves exactly once per publication, which is
+                        // what makes a plan computed against the old state
+                        // detectably stale.
+                        revision: self.state.revision.saturating_add(1),
+                    }),
+                },
+                disposition: RegistrationDisposition::Inserted,
+                work,
+            }),
         }
-        let record_facts = match self.validate_record(&record) {
+    }
+
+    /// What this graph's observable identity must still be for a plan to be consumed.
+    pub fn binding(&self) -> ModuleGraphBinding {
+        ModuleGraphBinding {
+            epoch: self.epoch.clone(),
+            limits: self.limits,
+            facts: self.state.facts,
+            revision: self.state.revision,
+        }
+    }
+
+    /// Compute, **without publishing anything**, what registering `record` would do.
+    ///
+    /// Nothing observable changes: this graph is immutable and is not consulted for
+    /// anything but reads, no environment moves, no logical root moves, and the
+    /// returned plan is never cacheable. See [`ModuleGraphAdmissionPlan`].
+    pub fn plan_registration(&self, record: &ModuleRecord) -> ModuleGraphAdmissionPlan {
+        self.plan_registration_cancellable(record, None)
+    }
+
+    /// [`plan_registration`](Self::plan_registration), sampling `cancellation` at the
+    /// same checkpoints admission samples.
+    pub fn plan_registration_cancellable(
+        &self,
+        record: &ModuleRecord,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> ModuleGraphAdmissionPlan {
+        let decision = self.decide(record, cancellation);
+        // The candidate record map computed for an admitting decision is dropped
+        // here rather than carried: a plan describes what would happen and holds no
+        // material with which to make it happen.
+        let predicted_facts = match &decision.outcome {
+            DecisionOutcome::Admit { facts, .. } => Some(*facts),
+            _ => None,
+        };
+        ModuleGraphAdmissionPlan {
+            version: ModuleGraphAdmissionPlan::VERSION,
+            usage_version: UsageUnit::VERSION,
+            base: self.binding(),
+            request: record.id.clone(),
+            precedence: decision.precedence,
+            checkpoint: decision.precedence.checkpoint(),
+            usage: decision.usage,
+            exactness: decision.exactness,
+            predicted_facts,
+        }
+    }
+
+    /// The single admission decision procedure, shared by planning and registration.
+    ///
+    /// Every early return records the precedence rule that decided, so the outcome
+    /// and the reason for it are produced together and cannot drift apart. Usage is
+    /// accumulated as it is observed, and marked `LowerBound` whenever the decision
+    /// stops before the remaining required work could be measured — a refusal never
+    /// scans the unobserved suffix merely to report an exact total.
+    fn decide(
+        &self,
+        record: &ModuleRecord,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> AdmissionDecision {
+        let is_cancelled = || cancellation.is_some_and(CancellationProbe::is_cancelled);
+        let mut usage = PlannedUsage::default();
+
+        let cancelled_at =
+            |precedence: AdmissionPrecedence, usage: PlannedUsage| -> AdmissionDecision {
+                AdmissionDecision {
+                    precedence,
+                    usage,
+                    exactness: UsageExactness::LowerBound,
+                    outcome: DecisionOutcome::Inconclusive(ModuleGraphInconclusive::Cancelled {
+                        module: record.id.clone(),
+                        checkpoint: precedence.checkpoint(),
+                    }),
+                }
+            };
+
+        if is_cancelled() {
+            return cancelled_at(AdmissionPrecedence::CancelledAtEntry, usage);
+        }
+        let record_facts = match self.validate_record(record) {
             Ok(facts) => facts,
-            Err(Refusal::Rejected(error)) => return ModuleGraphAdmission::Rejected(error),
+            Err(Refusal::Rejected(error)) => {
+                return AdmissionDecision {
+                    precedence: AdmissionPrecedence::MalformedInput,
+                    usage,
+                    exactness: UsageExactness::LowerBound,
+                    outcome: DecisionOutcome::Rejected(error),
+                };
+            }
             Err(Refusal::Inconclusive(reason)) => {
-                return ModuleGraphAdmission::Inconclusive(reason);
+                return AdmissionDecision {
+                    precedence: AdmissionPrecedence::ResourceNameDepth,
+                    usage,
+                    exactness: UsageExactness::LowerBound,
+                    outcome: DecisionOutcome::Inconclusive(reason),
+                };
             }
         };
-        if let Some(outcome) = cancelled(RegistrationCheckpoint::AfterValidation) {
-            return outcome;
+        usage.name_components = record_facts.name_components as u128;
+        if is_cancelled() {
+            return cancelled_at(AdmissionPrecedence::CancelledAfterValidation, usage);
         }
+
         let direct_rows_validated = record.direct_imports().len();
         if let Some(existing) = self.state.records.get(&record.id) {
-            if existing.as_ref() == &record {
-                return ModuleGraphAdmission::Complete(Registration {
-                    graph: self.clone(),
-                    disposition: RegistrationDisposition::Idempotent,
-                    work: RegistrationWork {
-                        name_components_validated: record_facts.name_components,
-                        direct_rows_validated,
-                        ..RegistrationWork::default()
-                    },
-                });
+            let work = RegistrationWork {
+                name_components_validated: record_facts.name_components,
+                direct_rows_validated,
+                ..RegistrationWork::default()
+            };
+            if existing.as_ref() == record {
+                // Idempotence publishes nothing, so the graph's totals are already
+                // the totals: exact, with no cycle scan required.
+                usage.modules = self.state.facts.modules as u128;
+                usage.direct_import_rows = self.state.facts.direct_import_rows as u128;
+                usage.payload_bytes = self.state.facts.payload_bytes;
+                return AdmissionDecision {
+                    precedence: AdmissionPrecedence::ExistingRecordIdempotent,
+                    usage,
+                    exactness: UsageExactness::Exact,
+                    outcome: DecisionOutcome::Idempotent { work },
+                };
             }
             // The conflict is authoritative only because the bounded lookup and
             // comparison above both completed; an unfinished comparison would be
             // inconclusive, never a rejection.
-            let differing_fields = differing_record_fields(existing, &record);
+            let differing_fields = differing_record_fields(existing, record);
             debug_assert!(!differing_fields.is_empty());
-            return ModuleGraphAdmission::Rejected(ModuleGraphError::ConflictingRecord {
-                module: record.id,
-                differing_fields,
-                existing_artifact: Box::new(existing.artifact.clone()),
-                incoming_artifact: Box::new(record.artifact),
-            });
+            return AdmissionDecision {
+                precedence: AdmissionPrecedence::ExistingRecordConflict,
+                usage,
+                exactness: UsageExactness::LowerBound,
+                outcome: DecisionOutcome::Rejected(ModuleGraphError::ConflictingRecord {
+                    module: record.id.clone(),
+                    differing_fields,
+                    existing_artifact: Box::new(existing.artifact.clone()),
+                    incoming_artifact: Box::new(record.artifact.clone()),
+                }),
+            };
         }
-        if let Some(outcome) = cancelled(RegistrationCheckpoint::AfterConflictLookup) {
-            return outcome;
+        if is_cancelled() {
+            return cancelled_at(AdmissionPrecedence::CancelledAfterConflictLookup, usage);
         }
 
         let modules = self.state.facts.modules.saturating_add(1);
@@ -827,70 +1305,94 @@ impl ModuleGraph {
             .state
             .facts
             .direct_import_rows
-            .saturating_add(record.direct_imports().len());
+            .saturating_add(direct_rows_validated);
         let payload_bytes = self
             .state
             .facts
             .payload_bytes
             .saturating_add(record_facts.payload_bytes);
-        for (resource, limit, actual) in [
+        usage.modules = modules as u128;
+        usage.direct_import_rows = direct_import_rows as u128;
+        usage.payload_bytes = payload_bytes;
+
+        // Checked in this exact order, and the precedence table names the same
+        // order, so simultaneous breaches always resolve to the same rule.
+        for (precedence, resource, limit, actual) in [
             (
+                AdmissionPrecedence::ResourceModules,
                 ModuleGraphResource::Modules,
                 self.limits.max_modules as u128,
                 modules as u128,
             ),
             (
+                AdmissionPrecedence::ResourceDirectImportRows,
                 ModuleGraphResource::DirectImportRows,
                 self.limits.max_edges as u128,
                 direct_import_rows as u128,
             ),
             (
+                AdmissionPrecedence::ResourcePayloadBytes,
                 ModuleGraphResource::PayloadBytes,
                 self.limits.max_payload_bytes,
                 payload_bytes,
             ),
         ] {
             if let Err(reason) = enforce_limit(Some(&record.id), resource, limit, actual) {
-                return ModuleGraphAdmission::Inconclusive(reason);
+                return AdmissionDecision {
+                    precedence,
+                    usage,
+                    exactness: UsageExactness::LowerBound,
+                    outcome: DecisionOutcome::Inconclusive(reason),
+                };
             }
         }
-        if let Some(outcome) = cancelled(RegistrationCheckpoint::BeforePublication) {
-            return outcome;
+        if is_cancelled() {
+            return cancelled_at(AdmissionPrecedence::CancelledBeforePublication, usage);
         }
 
+        // A persistent insert produces a candidate map; the receiver is untouched, so
+        // computing this is not publication. Only `register_cancellable` adopts it.
         let module = record.id.clone();
-        let records = self.state.records.insert(module.clone(), Arc::new(record));
+        let records = self
+            .state
+            .records
+            .insert(module.clone(), Arc::new(record.clone()));
         let cycle_scan = cycle_through(&records, &module);
+        usage.cycle_modules_visited = cycle_scan.modules_visited as u128;
+        usage.cycle_rows_examined = cycle_scan.rows_examined as u128;
         if let Some(path) = cycle_scan.path {
-            return ModuleGraphAdmission::Rejected(ModuleGraphError::Cycle { path });
+            return AdmissionDecision {
+                precedence: AdmissionPrecedence::CycleDetected,
+                usage,
+                exactness: UsageExactness::Exact,
+                outcome: DecisionOutcome::Rejected(ModuleGraphError::Cycle { path }),
+            };
         }
 
-        ModuleGraphAdmission::Complete(Registration {
-            graph: Self {
-                epoch: self.epoch.clone(),
-                limits: self.limits,
-                state: Arc::new(ModuleGraphState {
-                    records,
-                    facts: ModuleGraphFacts {
-                        modules,
-                        direct_import_rows,
-                        payload_bytes,
-                        maximum_name_depth: self
-                            .state
-                            .facts
-                            .maximum_name_depth
-                            .max(record_facts.maximum_name_depth),
-                    },
-                }),
+        AdmissionDecision {
+            precedence: AdmissionPrecedence::Admitted,
+            usage,
+            exactness: UsageExactness::Exact,
+            outcome: DecisionOutcome::Admit {
+                records,
+                facts: ModuleGraphFacts {
+                    modules,
+                    direct_import_rows,
+                    payload_bytes,
+                    maximum_name_depth: self
+                        .state
+                        .facts
+                        .maximum_name_depth
+                        .max(record_facts.maximum_name_depth),
+                },
+                work: RegistrationWork {
+                    name_components_validated: record_facts.name_components,
+                    direct_rows_validated,
+                    cycle_modules_visited: cycle_scan.modules_visited,
+                    cycle_rows_examined: cycle_scan.rows_examined,
+                },
             },
-            disposition: RegistrationDisposition::Inserted,
-            work: RegistrationWork {
-                name_components_validated: record_facts.name_components,
-                direct_rows_validated,
-                cycle_modules_visited: cycle_scan.modules_visited,
-                cycle_rows_examined: cycle_scan.rows_examined,
-            },
-        })
+        }
     }
 
     /// Pointer-identity probe for snapshot/sharing evidence.
@@ -1169,6 +1671,452 @@ mod tests {
         let registration = graph.register(record).expect_complete("record inserts");
         assert_eq!(registration.disposition, RegistrationDisposition::Inserted);
         registration.graph
+    }
+
+    /// A probe that trips on its `trip_at`-th sample, so a test can pin a
+    /// cancellation to one exact checkpoint. A preset flag can only ever produce the
+    /// first checkpoint.
+    struct TripAt {
+        trip_at: usize,
+        samples: std::cell::Cell<usize>,
+    }
+
+    impl TripAt {
+        fn new(trip_at: usize) -> Self {
+            Self {
+                trip_at,
+                samples: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl CancellationProbe for TripAt {
+        fn is_cancelled(&self) -> bool {
+            let seen = self.samples.get() + 1;
+            self.samples.set(seen);
+            seen >= self.trip_at
+        }
+    }
+
+    /// NONPUBLISHING is the whole point: a plan that published would just be
+    /// admission with extra steps.
+    #[test]
+    fn plans_are_nonpublishing_and_never_cacheable() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let environment = crate::environment::Environment::new();
+        let options = fln_core::options::KVMap::new();
+
+        let root_before = environment.logical_root(&options);
+        let binding_before = base.binding();
+        let facts_before = base.facts();
+        let base_before = base.clone();
+
+        // One plan per outcome family, including the one that would publish.
+        let admitting = record("B", vec![direct("A", 0b011)], 0xB1);
+        let conflicting = record("A", vec![], 0xFF);
+        let idempotent = record("A", vec![], 0xA1);
+        let deep = ModuleRecord::new(
+            ModuleId::new(Name::from_components(std::iter::repeat_n(
+                "deep",
+                TEST_LIMITS.max_name_depth + 2,
+            ))),
+            true,
+            vec![],
+            evidence(0xD1),
+        );
+        for candidate in [&admitting, &conflicting, &idempotent, &deep] {
+            let plan = base.plan_registration(candidate);
+
+            // Nothing was published, cached, or made authoritative.
+            assert!(!plan.is_cacheable(), "a plan must never be cacheable");
+            assert_eq!(plan.version(), ModuleGraphAdmissionPlan::VERSION);
+            assert_eq!(plan.usage_version(), UsageUnit::VERSION);
+            assert!(plan.is_valid_for(&base));
+
+            // The base is observably untouched, by value, by facts, by lineage, and
+            // by storage identity.
+            assert_eq!(base, base_before, "planning mutated the graph");
+            assert_eq!(base.binding(), binding_before, "planning moved the binding");
+            assert_eq!(base.facts(), facts_before);
+            assert!(base.shares_storage_with(&base_before));
+            assert_eq!(
+                base.state.revision, binding_before.revision,
+                "planning moved the lineage revision"
+            );
+            // And the module a publishing plan predicts is still absent.
+            if plan.publishes() {
+                assert!(
+                    base.record(plan.request()).is_none(),
+                    "a nonpublishing plan made its module reachable"
+                );
+            }
+            // The environment's logical root cannot move: planning reaches nothing
+            // that feeds it. Asserted rather than assumed, so wiring the graph into
+            // the environment later cannot quietly break it.
+            assert_eq!(environment.logical_root(&options), root_before);
+        }
+
+        // Only the admitting plan claims it would publish.
+        assert!(base.plan_registration(&admitting).publishes());
+        for candidate in [&conflicting, &idempotent, &deep] {
+            assert!(!base.plan_registration(candidate).publishes());
+        }
+    }
+
+    /// FROZEN units mean the plan and the real admission cannot drift. They share one
+    /// decision procedure, so this test is a regression guard on that structure
+    /// rather than a hope that two implementations stayed in step.
+    #[test]
+    fn plan_and_execute_agree_on_every_precedence_rule() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let cyclic_base = insert(&base, record("C", vec![direct("D", 0b001)], 0xC1));
+
+        // (label, base, record, cancellation trip point, expected rule)
+        let deep_name = ModuleId::new(Name::from_components(std::iter::repeat_n(
+            "deep",
+            TEST_LIMITS.max_name_depth + 2,
+        )));
+        let cases: Vec<(
+            &str,
+            &ModuleGraph,
+            ModuleRecord,
+            Option<usize>,
+            AdmissionPrecedence,
+        )> = vec![
+            (
+                "admitted",
+                &base,
+                record("B", vec![direct("A", 0b011)], 0xB1),
+                None,
+                AdmissionPrecedence::Admitted,
+            ),
+            (
+                "idempotent",
+                &base,
+                record("A", vec![], 0xA1),
+                None,
+                AdmissionPrecedence::ExistingRecordIdempotent,
+            ),
+            (
+                "conflict",
+                &base,
+                record("A", vec![], 0xFF),
+                None,
+                AdmissionPrecedence::ExistingRecordConflict,
+            ),
+            (
+                "malformed",
+                &base,
+                ModuleRecord::new(
+                    ModuleId::new(Name::anonymous()),
+                    true,
+                    vec![],
+                    evidence(0x01),
+                ),
+                None,
+                AdmissionPrecedence::MalformedInput,
+            ),
+            (
+                "name_depth",
+                &base,
+                ModuleRecord::new(deep_name, true, vec![], evidence(0xD1)),
+                None,
+                AdmissionPrecedence::ResourceNameDepth,
+            ),
+            (
+                "cycle",
+                &cyclic_base,
+                record("D", vec![direct("C", 0b001)], 0xD2),
+                None,
+                AdmissionPrecedence::CycleDetected,
+            ),
+            (
+                "cancel_entry",
+                &base,
+                record("B", vec![], 0xB1),
+                Some(1),
+                AdmissionPrecedence::CancelledAtEntry,
+            ),
+            (
+                "cancel_after_validation",
+                &base,
+                record("B", vec![], 0xB1),
+                Some(2),
+                AdmissionPrecedence::CancelledAfterValidation,
+            ),
+            (
+                "cancel_after_conflict_lookup",
+                &base,
+                record("B", vec![], 0xB1),
+                Some(3),
+                AdmissionPrecedence::CancelledAfterConflictLookup,
+            ),
+            (
+                "cancel_before_publication",
+                &base,
+                record("B", vec![], 0xB1),
+                Some(4),
+                AdmissionPrecedence::CancelledBeforePublication,
+            ),
+        ];
+
+        for (label, source, candidate, trip, expected) in cases {
+            // Fresh probes: plan and execute each run the decision once.
+            let plan_probe = trip.map(TripAt::new);
+            let exec_probe = trip.map(TripAt::new);
+            let plan = source.plan_registration_cancellable(
+                &candidate,
+                plan_probe.as_ref().map(|p| p as &dyn CancellationProbe),
+            );
+            let executed = source.register_cancellable(
+                candidate.clone(),
+                exec_probe.as_ref().map(|p| p as &dyn CancellationProbe),
+            );
+
+            assert_eq!(plan.precedence(), expected, "{label} precedence");
+            assert_eq!(
+                plan.checkpoint(),
+                expected.checkpoint(),
+                "{label} checkpoint disagrees with the table"
+            );
+
+            // Outcome families must correspond exactly.
+            match (&executed, expected) {
+                (ModuleGraphOutcome::Complete(registration), AdmissionPrecedence::Admitted) => {
+                    assert_eq!(
+                        registration.disposition,
+                        RegistrationDisposition::Inserted,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        plan.predicted_facts(),
+                        Some(&registration.graph.facts()),
+                        "{label} predicted the wrong published facts"
+                    );
+                    // The units the two sides both report must match exactly.
+                    assert_eq!(
+                        plan.usage().name_components,
+                        registration.work.name_components_validated as u128,
+                        "{label} name components"
+                    );
+                    assert_eq!(
+                        plan.usage().cycle_modules_visited,
+                        registration.work.cycle_modules_visited as u128,
+                        "{label} cycle modules"
+                    );
+                    assert_eq!(
+                        plan.usage().cycle_rows_examined,
+                        registration.work.cycle_rows_examined as u128,
+                        "{label} cycle rows"
+                    );
+                    assert_eq!(plan.exactness(), UsageExactness::Exact, "{label}");
+                    // Publication moved the lineage exactly one step.
+                    assert_eq!(
+                        registration.graph.binding().revision,
+                        source.binding().revision + 1,
+                        "{label} revision"
+                    );
+                }
+                (
+                    ModuleGraphOutcome::Complete(registration),
+                    AdmissionPrecedence::ExistingRecordIdempotent,
+                ) => {
+                    assert_eq!(
+                        registration.disposition,
+                        RegistrationDisposition::Idempotent
+                    );
+                    assert!(
+                        plan.predicted_facts().is_none(),
+                        "{label} predicted a publish"
+                    );
+                    assert_eq!(plan.exactness(), UsageExactness::Exact, "{label}");
+                    assert_eq!(
+                        registration.graph.binding(),
+                        source.binding(),
+                        "{label} idempotence moved the base"
+                    );
+                }
+                (ModuleGraphOutcome::Rejected(_), rule) => {
+                    assert!(
+                        matches!(
+                            rule,
+                            AdmissionPrecedence::MalformedInput
+                                | AdmissionPrecedence::ExistingRecordConflict
+                                | AdmissionPrecedence::CycleDetected
+                        ),
+                        "{label} rejected under {rule:?}"
+                    );
+                    assert!(!executed.is_cacheable(), "{label}");
+                }
+                (ModuleGraphOutcome::Inconclusive(_), rule) => {
+                    assert!(
+                        matches!(
+                            rule,
+                            AdmissionPrecedence::ResourceNameDepth
+                                | AdmissionPrecedence::CancelledAtEntry
+                                | AdmissionPrecedence::CancelledAfterValidation
+                                | AdmissionPrecedence::CancelledAfterConflictLookup
+                                | AdmissionPrecedence::CancelledBeforePublication
+                        ),
+                        "{label} inconclusive under {rule:?}"
+                    );
+                    // The plan must not become a back door that caches exhaustion.
+                    assert!(!executed.is_cacheable(), "{label} cached an inconclusive");
+                    assert!(!plan.is_cacheable(), "{label} plan cached an inconclusive");
+                    assert_eq!(plan.exactness(), UsageExactness::LowerBound, "{label}");
+                }
+                (outcome, rule) => panic!("{label}: {rule:?} produced {outcome:?}"),
+            }
+        }
+    }
+
+    /// The table is total, self-consistent, and decides ties the same way every time.
+    #[test]
+    fn admission_precedence_is_a_total_deterministic_order() {
+        let mut seen = BTreeSet::new();
+        for (position, rule) in AdmissionPrecedence::ALL.iter().enumerate() {
+            assert!(seen.insert(*rule), "{rule:?} appears twice in the table");
+            assert_eq!(rule.rank(), position, "rank disagrees with table position");
+            assert!(!rule.label().is_empty());
+        }
+        assert_eq!(seen.len(), AdmissionPrecedence::ALL.len());
+        // Exactly one rule publishes.
+        assert_eq!(
+            AdmissionPrecedence::ALL
+                .iter()
+                .filter(|rule| rule.publishes())
+                .count(),
+            1
+        );
+        // Precedence never runs backwards through the checkpoints: a later rule can
+        // only decide at the same or a later observation point.
+        for pair in AdmissionPrecedence::ALL.windows(2) {
+            assert!(
+                pair[0].checkpoint() <= pair[1].checkpoint(),
+                "{:?} -> {:?} moves the checkpoint backwards",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Frozen units: every unit is charged at a declared point and is reachable
+        // through `get`, so a new unit cannot be silently unaccounted.
+        let mut units = BTreeSet::new();
+        for unit in UsageUnit::ALL {
+            assert!(units.insert(unit), "{unit:?} appears twice");
+            assert!(!unit.label().is_empty());
+            let usage = PlannedUsage {
+                modules: 1,
+                direct_import_rows: 2,
+                name_components: 3,
+                payload_bytes: 4,
+                cycle_modules_visited: 5,
+                cycle_rows_examined: 6,
+            };
+            assert!(usage.get(unit) > 0, "{unit:?} is not reachable through get");
+            let _ = unit.observed_at();
+        }
+        assert_eq!(units.len(), UsageUnit::ALL.len());
+
+        // THE TIE TEST, and it has to JOIN THE TABLE TO THE CODE rather than restate
+        // the table. A self-consistent table proves nothing: ranks derived from ALL
+        // stay consistent no matter how ALL is ordered, so a table that disagrees
+        // with `decide` would go unnoticed -- which is the decoration failure this
+        // bead exists to prevent. So the expected winner is COMPUTED from the table
+        // (the minimum-rank rule among those actually breaching) and compared against
+        // what the decision procedure really does. Reordering ALL now changes the
+        // expectation and fails.
+        let breaching = record("A", vec![direct("B", 0b001)], 0xA1);
+        let roomy = graph().facts().payload_bytes.saturating_mul(64).max(4096);
+        let generous = ModuleGraphLimits::new(64, 64, 64, roomy);
+        // Each dimension tightened alone, to establish that it breaches by itself.
+        let alone = [
+            (
+                AdmissionPrecedence::ResourceModules,
+                ModuleGraphLimits::new(0, 64, 64, roomy),
+            ),
+            (
+                AdmissionPrecedence::ResourceDirectImportRows,
+                ModuleGraphLimits::new(64, 0, 64, roomy),
+            ),
+            (
+                AdmissionPrecedence::ResourcePayloadBytes,
+                ModuleGraphLimits::new(64, 64, 64, graph().facts().payload_bytes),
+            ),
+        ];
+        let mut breaching_rules = Vec::new();
+        for (rule, limits) in alone {
+            let graph = ModuleGraph::new(epoch(), limits).expect_complete("single-dimension graph");
+            assert_eq!(
+                graph.plan_registration(&breaching).precedence(),
+                rule,
+                "{rule:?} does not breach on its own dimension"
+            );
+            breaching_rules.push(rule);
+        }
+        // Sanity: with room on every dimension the same record is admitted, so the
+        // breaches above are caused by the limits and not by the record.
+        let roomy_graph = ModuleGraph::new(epoch(), generous).expect_complete("roomy graph");
+        assert_eq!(
+            roomy_graph.plan_registration(&breaching).precedence(),
+            AdmissionPrecedence::Admitted
+        );
+
+        // All three at once. The winner is whichever of the breaching rules the
+        // TABLE ranks first -- read from ALL, never hardcoded.
+        let expected_winner = *breaching_rules
+            .iter()
+            .min_by_key(|rule| rule.rank())
+            .expect("at least one dimension breaches");
+        let tight = ModuleGraph::new(
+            epoch(),
+            ModuleGraphLimits::new(0, 0, 64, graph().facts().payload_bytes),
+        )
+        .expect_complete("tight graph constructs");
+        for _ in 0..8 {
+            let plan = tight.plan_registration(&breaching);
+            assert_eq!(
+                plan.precedence(),
+                expected_winner,
+                "simultaneous breach did not resolve to the table's first rule"
+            );
+            // And the executed outcome names the same resource, so the table binds
+            // the real refusal and not just the plan's opinion of it.
+            let expected_resource = match expected_winner {
+                AdmissionPrecedence::ResourceModules => ModuleGraphResource::Modules,
+                AdmissionPrecedence::ResourceDirectImportRows => {
+                    ModuleGraphResource::DirectImportRows
+                }
+                AdmissionPrecedence::ResourcePayloadBytes => ModuleGraphResource::PayloadBytes,
+                other => panic!("unexpected winner {other:?}"),
+            };
+            match tight.register(breaching.clone()) {
+                ModuleGraphOutcome::Inconclusive(
+                    ModuleGraphInconclusive::ResourceLimitExceeded { resource, .. },
+                ) => assert_eq!(resource, expected_resource),
+                other => panic!("expected a resource refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A plan is bound to the base it was computed against, so it cannot be replayed
+    /// onto another one. This is the "reuse a plan on another base" mutant.
+    #[test]
+    fn a_plan_is_invalid_against_a_moved_base() {
+        let base = insert(&graph(), record("A", vec![], 0xA1));
+        let plan = base.plan_registration(&record("B", vec![], 0xB1));
+        assert!(plan.is_valid_for(&base));
+
+        // Any publication moves the lineage, and the plan goes stale with it.
+        let moved = insert(&base, record("Z", vec![], 0x5A));
+        assert!(
+            !plan.is_valid_for(&moved),
+            "a plan survived a publication on its base"
+        );
+        assert_ne!(base.binding().revision, moved.binding().revision);
+        // An unrelated graph with different facts is likewise refused.
+        assert!(!plan.is_valid_for(&graph()));
+        // And the original remains valid: staleness is detection, not blanket refusal.
+        assert!(plan.is_valid_for(&base));
     }
 
     #[test]
