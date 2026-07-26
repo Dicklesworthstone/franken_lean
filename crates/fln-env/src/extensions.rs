@@ -9990,4 +9990,637 @@ mod tests {
             observed.len(),
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // The productive 1/8/32 worker matrix over one fixed input closure (bead dt5).
+    // ---------------------------------------------------------------------------
+
+    /// What a merge answered, without its facts — the property a minimizer must preserve.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum MergeDiscriminant {
+        Complete,
+        DescriptorMismatch,
+        HistoryMismatch,
+        ConcurrentChanges,
+        Inconclusive(SetUnionResource),
+    }
+
+    fn merge_discriminant(
+        outcome: &Result<ExtensionMergeOutcome, MergeConflict>,
+    ) -> MergeDiscriminant {
+        match outcome {
+            Ok(ExtensionMergeOutcome::Complete { .. }) => MergeDiscriminant::Complete,
+            Ok(ExtensionMergeOutcome::Inconclusive { reason, .. }) => {
+                MergeDiscriminant::Inconclusive(reason.resource)
+            }
+            Err(MergeConflict::DescriptorMismatch { .. }) => MergeDiscriminant::DescriptorMismatch,
+            Err(MergeConflict::HistoryMismatch { .. }) => MergeDiscriminant::HistoryMismatch,
+            Err(MergeConflict::ConcurrentChanges { .. }) => MergeDiscriminant::ConcurrentChanges,
+        }
+    }
+
+    /// One member of the fixed input closure.
+    #[derive(Clone)]
+    struct MatrixScenario {
+        name: &'static str,
+        base_descriptor: ExtensionDescriptor,
+        ours_descriptor: ExtensionDescriptor,
+        theirs_descriptor: ExtensionDescriptor,
+        journals: MatrixJournals,
+        limits: SetUnionLimits,
+    }
+
+    /// The three journals of a scenario, as models. Shrinking moves only these.
+    type MatrixJournals = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    fn run_matrix_scenario(
+        scenario: &MatrixScenario,
+        journals: &MatrixJournals,
+    ) -> Result<ExtensionMergeOutcome, MergeConflict> {
+        let (base, ours, theirs) = journals;
+        ExtensionState::merge(
+            &state_from_model(&scenario.base_descriptor, base),
+            &state_from_model(&scenario.ours_descriptor, ours),
+            &state_from_model(&scenario.theirs_descriptor, theirs),
+            scenario.limits,
+        )
+    }
+
+    /// Every one-step reduction of a scenario's journals, in a **fixed** order.
+    ///
+    /// Two step kinds, and both strictly reduce `entries + payload bytes`, which is what
+    /// makes the greedy loop terminate: drop one entry, or halve one payload. The order is
+    /// base, then ours, then theirs, ascending by index, drops before truncations — fixed
+    /// because the minimizer's output has to be identical on every worker, and a
+    /// candidate order that depended on a hash map's iteration would not be.
+    fn matrix_shrink_candidates(journals: &MatrixJournals) -> Vec<MatrixJournals> {
+        let mut candidates = Vec::new();
+        let sequences = [&journals.0, &journals.1, &journals.2];
+
+        let rebuild = |which: usize, replacement: Vec<Vec<u8>>| -> MatrixJournals {
+            let mut out = journals.clone();
+            match which {
+                0 => out.0 = replacement,
+                1 => out.1 = replacement,
+                _ => out.2 = replacement,
+            }
+            out
+        };
+
+        for (which, sequence) in sequences.iter().enumerate() {
+            for index in 0..sequence.len() {
+                let mut reduced = (*sequence).clone();
+                reduced.remove(index);
+                candidates.push(rebuild(which, reduced));
+            }
+        }
+        for (which, sequence) in sequences.iter().enumerate() {
+            for index in 0..sequence.len() {
+                if sequence[index].is_empty() {
+                    continue;
+                }
+                let mut reduced = (*sequence).clone();
+                reduced[index].truncate(sequence[index].len() / 2);
+                candidates.push(rebuild(which, reduced));
+            }
+        }
+        candidates
+    }
+
+    /// Greedily minimize a scenario while preserving its answer.
+    ///
+    /// Deterministic: no randomness, no hash-map iteration, first accepted candidate wins.
+    /// So every worker that minimizes the same scenario produces the same bytes, which is
+    /// the property the 1/8/32 matrix asserts.
+    fn minimize_matrix_scenario(scenario: &MatrixScenario) -> MatrixJournals {
+        let target = merge_discriminant(&run_matrix_scenario(scenario, &scenario.journals));
+        let mut current = scenario.journals.clone();
+        loop {
+            let mut reduced = None;
+            for candidate in matrix_shrink_candidates(&current) {
+                if merge_discriminant(&run_matrix_scenario(scenario, &candidate)) == target {
+                    reduced = Some(candidate);
+                    break;
+                }
+            }
+            match reduced {
+                Some(next) => current = next,
+                None => return current,
+            }
+        }
+    }
+
+    fn render_model(model: &[Vec<u8>]) -> String {
+        let mut rendered = String::from("[");
+        for (index, entry) in model.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            rendered.push_str(&entry.len().to_string());
+            rendered.push(':');
+            for byte in entry {
+                rendered.push_str(&format!("{byte:02x}"));
+            }
+        }
+        rendered.push(']');
+        rendered
+    }
+
+    fn render_journals(journals: &MatrixJournals) -> String {
+        format!(
+            "base={} ours={} theirs={}",
+            render_model(&journals.0),
+            render_model(&journals.1),
+            render_model(&journals.2)
+        )
+    }
+
+    /// What one worker records for one scenario.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct ScenarioRecord {
+        name: &'static str,
+        diagnostic: String,
+        product_root: String,
+        input_roots: String,
+        work_facts: String,
+        minimized: String,
+    }
+
+    fn process_matrix_scenario(scenario: &MatrixScenario) -> ScenarioRecord {
+        let (base, ours, theirs) = &scenario.journals;
+        let base_state = state_from_model(&scenario.base_descriptor, base);
+        let ours_state = state_from_model(&scenario.ours_descriptor, ours);
+        let theirs_state = state_from_model(&scenario.theirs_descriptor, theirs);
+        let outcome =
+            ExtensionState::merge(&base_state, &ours_state, &theirs_state, scenario.limits);
+
+        let diagnostic = match &outcome {
+            Ok(ExtensionMergeOutcome::Complete { .. }) => "complete".to_string(),
+            Ok(ExtensionMergeOutcome::Inconclusive { reason, .. }) => format!(
+                "inconclusive resource={:?} limit={} actual={}",
+                reason.resource, reason.limit, reason.actual
+            ),
+            Err(conflict) => conflict.to_string(),
+        };
+        let product_root = match &outcome {
+            Ok(ExtensionMergeOutcome::Complete { state, .. }) => state.content_digest().to_string(),
+            _ => "none".to_string(),
+        };
+        let work_facts = match &outcome {
+            Ok(ExtensionMergeOutcome::Complete {
+                set_union_facts: Some(facts),
+                ..
+            })
+            | Ok(ExtensionMergeOutcome::Inconclusive { facts, .. }) => format!(
+                "raw_entries={} raw_payload_bytes={} examined_entries={} \
+                 examined_payload_bytes={} maximum_entry_bytes={} semantic_entries={} \
+                 duplicate_entries={}",
+                facts.raw_entries,
+                facts.raw_payload_bytes,
+                facts.examined_entries,
+                facts.examined_payload_bytes,
+                facts.maximum_entry_bytes,
+                facts.semantic_entries,
+                facts.duplicate_entries
+            ),
+            _ => "none".to_string(),
+        };
+        // The inputs' roots AFTER the merge: a refusal that moved one would show here.
+        let input_roots = format!(
+            "{}/{}/{}",
+            base_state.content_digest(),
+            ours_state.content_digest(),
+            theirs_state.content_digest()
+        );
+
+        let minimized = if matches!(merge_discriminant(&outcome), MergeDiscriminant::Complete) {
+            "none".to_string()
+        } else {
+            let minimal = minimize_matrix_scenario(scenario);
+            // Replayable: rebuilt from the minimized journals alone, it answers the same.
+            assert_eq!(
+                merge_discriminant(&run_matrix_scenario(scenario, &minimal)),
+                merge_discriminant(&outcome),
+                "{}: the minimized counterexample must replay to the same answer",
+                scenario.name
+            );
+            // Minimal with respect to the declared step set: no further single step
+            // preserves the answer. Without this, "minimized" would only mean "shrunk".
+            assert!(
+                matrix_shrink_candidates(&minimal)
+                    .into_iter()
+                    .all(|candidate| {
+                        merge_discriminant(&run_matrix_scenario(scenario, &candidate))
+                            != merge_discriminant(&outcome)
+                    }),
+                "{}: a further reduction still reproduces the answer, so this is not \
+                 minimal for the declared steps",
+                scenario.name
+            );
+            render_journals(&minimal)
+        };
+
+        ScenarioRecord {
+            name: scenario.name,
+            diagnostic,
+            product_root,
+            input_roots,
+            work_facts,
+            minimized,
+        }
+    }
+
+    fn factorial(count: usize) -> usize {
+        (1..=count).product()
+    }
+
+    /// The `index`-th permutation of `0..count` in lexicographic order (Lehmer code).
+    ///
+    /// A bijection from `0..count!`, so distinct indices give distinct permutations by
+    /// construction rather than by a coprimality argument that has to be rechecked when
+    /// the case count changes.
+    fn nth_permutation(count: usize, index: usize) -> Vec<usize> {
+        assert!(
+            index < factorial(count),
+            "worker {index} has no distinct permutation of {count} scenarios"
+        );
+        let mut available: Vec<usize> = (0..count).collect();
+        let mut remaining = index;
+        let mut permutation = Vec::with_capacity(count);
+        while !available.is_empty() {
+            let block = factorial(available.len() - 1);
+            let choice = remaining / block;
+            remaining %= block;
+            permutation.push(available.remove(choice));
+        }
+        permutation
+    }
+
+    fn matrix_digest(tag: &str, records: &[ScenarioRecord]) -> Digest {
+        let mut writer = CanonWriter::new();
+        writer.str(tag);
+        writer.u16(1);
+        writer.u64(records.len() as u64);
+        for record in records {
+            writer.str(record.name);
+            writer.str(&record.diagnostic);
+            writer.str(&record.product_root);
+            writer.str(&record.input_roots);
+            writer.str(&record.work_facts);
+            writer.str(&record.minimized);
+        }
+        hash(Domain::Fixture, &writer.into_bytes())
+    }
+
+    /// The fixed input closure: nine scenarios spanning every pipeline stage and outcome.
+    fn matrix_scenarios() -> Vec<MatrixScenario> {
+        let payload = |text: &str| text.as_bytes().to_vec();
+        let append = descriptor(MergeSemantics::AppendOrdered, PayloadProvenance::Understood);
+        let union = descriptor(MergeSemantics::SetUnion, PayloadProvenance::Understood);
+        let review = descriptor(
+            MergeSemantics::ConflictsRequireReview,
+            PayloadProvenance::Understood,
+        );
+        let same =
+            |contract: &ExtensionDescriptor| (contract.clone(), contract.clone(), contract.clone());
+
+        type Descriptors = (
+            ExtensionDescriptor,
+            ExtensionDescriptor,
+            ExtensionDescriptor,
+        );
+        fn push(
+            scenarios: &mut Vec<MatrixScenario>,
+            name: &'static str,
+            descriptors: Descriptors,
+            journals: MatrixJournals,
+            limits: SetUnionLimits,
+        ) {
+            scenarios.push(MatrixScenario {
+                name,
+                base_descriptor: descriptors.0,
+                ours_descriptor: descriptors.1,
+                theirs_descriptor: descriptors.2,
+                journals,
+                limits,
+            });
+        }
+
+        let mut scenarios = Vec::new();
+        push(
+            &mut scenarios,
+            "descriptor_mismatch_ours",
+            (
+                append.clone(),
+                perturb_field(&append, DescriptorField::Provenance, 0),
+                append.clone(),
+            ),
+            (
+                vec![payload("a")],
+                vec![payload("a"), payload("o")],
+                vec![payload("a"), payload("t")],
+            ),
+            TEST_SET_UNION_LIMITS,
+        );
+        push(
+            &mut scenarios,
+            "descriptor_mismatch_both_branches",
+            (
+                append.clone(),
+                perturb_fields(&append, &[DescriptorField::Name, DescriptorField::Merge], 0),
+                perturb_field(&append, DescriptorField::Checkpoint, 1),
+            ),
+            (
+                vec![payload("a")],
+                vec![payload("a"), payload("o")],
+                vec![payload("a")],
+            ),
+            TEST_SET_UNION_LIMITS,
+        );
+        push(
+            &mut scenarios,
+            "ancestry_truncated_ours",
+            same(&append),
+            (
+                vec![payload("a"), payload("b")],
+                vec![payload("a")],
+                vec![payload("a"), payload("b"), payload("t")],
+            ),
+            TEST_SET_UNION_LIMITS,
+        );
+        push(
+            &mut scenarios,
+            "ancestry_diverges_theirs",
+            same(&append),
+            (
+                vec![payload("a"), payload("b"), payload("c")],
+                vec![payload("a"), payload("b"), payload("c"), payload("o")],
+                vec![payload("a"), payload("x"), payload("c")],
+            ),
+            TEST_SET_UNION_LIMITS,
+        );
+        push(
+            &mut scenarios,
+            "ancestry_invalid_on_both_branches",
+            same(&append),
+            (
+                vec![payload("a"), payload("b")],
+                vec![payload("x")],
+                vec![payload("a"), payload("y"), payload("z")],
+            ),
+            TEST_SET_UNION_LIMITS,
+        );
+        push(
+            &mut scenarios,
+            "append_ordered_complete",
+            same(&append),
+            (
+                vec![payload("a")],
+                vec![payload("a"), payload("o1"), payload("o2")],
+                vec![payload("a"), payload("t1")],
+            ),
+            TEST_SET_UNION_LIMITS,
+        );
+        push(
+            &mut scenarios,
+            "set_union_complete_with_duplicates",
+            same(&union),
+            (
+                vec![payload("d"), payload("d")],
+                vec![payload("d"), payload("d"), payload("x")],
+                vec![payload("d"), payload("d"), payload("x"), payload("y")],
+            ),
+            TEST_SET_UNION_LIMITS,
+        );
+        push(
+            &mut scenarios,
+            "set_union_entry_bytes_inconclusive",
+            same(&union),
+            (vec![], vec![payload("aa")], vec![payload("ccccc")]),
+            SetUnionLimits::new(100, u128::MAX, 2),
+        );
+        push(
+            &mut scenarios,
+            "review_required_concurrent",
+            same(&review),
+            (
+                vec![payload("a")],
+                vec![payload("a"), payload("o")],
+                vec![payload("a"), payload("t")],
+            ),
+            TEST_SET_UNION_LIMITS,
+        );
+        scenarios
+    }
+
+    /// **The productive 1/8/32 worker matrix.**
+    ///
+    /// # What it discharges
+    ///
+    /// The clause "Productive 1/8/32 worker matrices process distinct cases and yield
+    /// identical canonical diagnostics, roots, work facts, and minimized replayable
+    /// counterexamples for one fixed input closure", in its four parts:
+    ///
+    /// * **Productive, and distinct.** Every worker builds the closure itself, minimizes
+    ///   every refusing scenario itself, and receives its own permutation from a Lehmer
+    ///   code — a bijection from `0..n!`, so distinct workers get distinct orders by
+    ///   construction. Nothing is shared, cached or hoisted; 32 workers do 32 times the
+    ///   work, which is what "productive" is asking for.
+    /// * **Identical canonically.** The digest over the name-sorted records is asserted
+    ///   equal across every worker and across all three worker counts.
+    /// * **The negative control that stops that being trivial.** The digest over the
+    ///   records in *processing order* must be **distinct** for every worker. Without it,
+    ///   "identical after sorting" would hold just as well if every worker had processed
+    ///   the same order — the assertion would be measuring the sort, not the schedule.
+    /// * **Minimized and replayable.** Each refusing scenario is reduced by a
+    ///   deterministic greedy shrinker, the result is re-run from its own journals alone
+    ///   to prove it replays to the same answer, and no further single step preserves that
+    ///   answer — so "minimized" means minimal for the declared step set, not merely
+    ///   smaller.
+    ///
+    /// # The counterexamples are themselves evidence
+    ///
+    /// The minimal reproduction of a descriptor mismatch has **three empty journals**.
+    /// Nothing here arranged that: the shrinker removes whatever it can and the journals
+    /// go to nothing, which is a derived restatement of stage 1's journal-freeness,
+    /// produced by a search rather than by an assertion someone wrote to match the claim.
+    ///
+    /// # What it does not discharge — and this half was measured, not assumed
+    ///
+    /// Concurrency here is *replication*: every worker runs the whole closure
+    /// independently and the results are compared. It is not a test of a parallel merge
+    /// implementation, because `ExtensionState::merge` is a pure function over persistent
+    /// values with no shared mutable state for a schedule to disturb. It establishes
+    /// schedule-independence of the closure's canonical answer, not FL-INV-01 for an
+    /// elaboration pipeline.
+    ///
+    /// **The comparison is against this implementation, so it cannot see a *uniform*
+    /// behaviour change.** `expected` is produced by the same code the workers run, so a
+    /// defect that changes every worker's answer the same way leaves them agreeing and
+    /// this test green. Measured at `6d2f215d`, one mutant at a time in a pinned
+    /// worktree:
+    ///
+    /// | planted mutant | this test |
+    /// |---|---|
+    /// | `ancestry_only_length` | **killed it** |
+    /// | `policy_before_validation` | **killed it** |
+    /// | `set_union_sorts_suffix_block` | **survived** — every worker agreed on the wrong answer |
+    ///
+    /// The two kills come from the *correctness anchors* — the refusing-scenario count
+    /// and the empty-journal assertion on the minimized counterexamples — not from the
+    /// schedule comparison, which by construction cannot fail for a uniform change.
+    /// Recorded here rather than left implicit, because a matrix that kills two of three
+    /// mutants reads like a correctness test and is not one. Correctness is the other
+    /// four tables' job; `the_set_union_case_table_covers_every_named_shape_by_computed_predicate`
+    /// is what catches the third.
+    #[test]
+    fn merge_validation_is_canonical_across_1_8_32_productive_workers() {
+        let closure = matrix_scenarios();
+        let scenario_count = closure.len();
+        assert!(
+            factorial(scenario_count) >= 32,
+            "the closure must admit a distinct permutation for every worker"
+        );
+
+        let mut expected: Vec<ScenarioRecord> =
+            closure.iter().map(process_matrix_scenario).collect();
+        expected.sort_by(|left, right| left.name.cmp(right.name));
+        let expected_digest = matrix_digest("fln.test.merge-validation-canonical", &expected);
+
+        // The counterexamples the search produced, checked for the property they should
+        // have if stage 1 really cannot reach a journal.
+        for record in &expected {
+            if record.name.starts_with("descriptor_mismatch") {
+                assert_eq!(
+                    record.minimized, "base=[] ours=[] theirs=[]",
+                    "{}: a descriptor refusal needs no journal at all, so the search must \
+                     drive all three to empty",
+                    record.name
+                );
+            }
+        }
+        let refusing = expected
+            .iter()
+            .filter(|record| record.minimized != "none")
+            .count();
+        assert_eq!(
+            refusing, 7,
+            "seven of the nine scenarios refuse, so seven carry a minimized \
+             counterexample and two carry none"
+        );
+
+        let mut digests_by_worker_count = Vec::new();
+        for worker_count in [1usize, 8, 32] {
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..worker_count)
+                    .map(|worker_index| {
+                        scope.spawn(move || {
+                            // Built inside the worker: nothing is shared or hoisted.
+                            let scenarios = matrix_scenarios();
+                            let order = nth_permutation(scenarios.len(), worker_index);
+                            let processed: Vec<ScenarioRecord> = order
+                                .iter()
+                                .map(|index| process_matrix_scenario(&scenarios[*index]))
+                                .collect();
+                            let processing_digest = matrix_digest(
+                                "fln.test.merge-validation-processing-order",
+                                &processed,
+                            );
+                            let mut canonical = processed;
+                            canonical.sort_by(|left, right| left.name.cmp(right.name));
+                            let canonical_digest =
+                                matrix_digest("fln.test.merge-validation-canonical", &canonical);
+                            (order, processing_digest, canonical_digest, canonical)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("every merge worker joins"))
+                    .collect::<Vec<_>>()
+            });
+
+            assert_eq!(results.len(), worker_count);
+            let orders: HashSet<Vec<usize>> = results
+                .iter()
+                .map(|(order, _, _, _)| order.clone())
+                .collect();
+            assert_eq!(
+                orders.len(),
+                worker_count,
+                "every worker must process a DISTINCT case order"
+            );
+            let processing_digests: HashSet<Digest> = results
+                .iter()
+                .map(|(_, processing, _, _)| *processing)
+                .collect();
+            assert_eq!(
+                processing_digests.len(),
+                worker_count,
+                "distinct orders must produce distinct processing-order digests, or the \
+                 canonical agreement below is measuring the sort rather than the schedule"
+            );
+            for (order, _, canonical_digest, canonical) in &results {
+                assert_eq!(
+                    *canonical_digest, expected_digest,
+                    "canonical digest diverged at {worker_count} workers for order {order:?}"
+                );
+                assert_eq!(
+                    canonical, &expected,
+                    "canonical records diverged at {worker_count} workers for order \
+                     {order:?} — diagnostics, roots, work facts and minimized \
+                     counterexamples are all inside this comparison"
+                );
+            }
+            digests_by_worker_count.push((worker_count, *canonical_digest_of(&results)));
+        }
+
+        let distinct: HashSet<Digest> = digests_by_worker_count
+            .iter()
+            .map(|(_, digest)| *digest)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "1, 8 and 32 workers must agree on one canonical digest: {digests_by_worker_count:?}"
+        );
+
+        // The counterexamples themselves, not merely their digest. A digest proves the
+        // workers agreed; the criteria ask for minimized replayable counterexamples, and
+        // a reader who cannot see one cannot replay it.
+        let counterexamples: Vec<String> = expected
+            .iter()
+            .filter(|record| record.minimized != "none")
+            .map(|record| format!("{}={}", record.name, record.minimized))
+            .collect();
+        eprintln!(
+            "{{\"schema\":\"fln.unit.extension-merge-validation-table\",\"version\":1,\
+             \"bead\":\"fln-extension-merge-validation-proof-debt-dt5\",\
+             \"claim_type\":\"bounded_model\",\"table\":\"productive_worker_matrix\",\
+             \"execution_model\":\"independent_complete_closure_per_worker\",\
+             \"closure_scenarios\":{scenario_count},\"refusing_scenarios\":{refusing},\
+             \"worker_counts\":[1,8,32],\"distinct_permutations_required\":32,\
+             \"available_permutations\":{},\"canonical_digest\":\"{expected_digest}\",\
+             \"minimized_counterexamples\":{counterexamples:?},\"status\":\"pass\"}}",
+            factorial(scenario_count),
+        );
+    }
+
+    /// The canonical digest shared by a worker-count tier's results.
+    ///
+    /// Extracted so the per-tier value is read from the results rather than recomputed,
+    /// which keeps the cross-tier comparison honest: it compares what the workers
+    /// produced, not what this test would have produced.
+    fn canonical_digest_of(
+        results: &[(Vec<usize>, Digest, Digest, Vec<ScenarioRecord>)],
+    ) -> &Digest {
+        let first = &results
+            .first()
+            .expect("every tier runs at least one worker")
+            .2;
+        for (_, _, digest, _) in results {
+            assert_eq!(digest, first, "a tier must be internally consistent");
+        }
+        first
+    }
 }
