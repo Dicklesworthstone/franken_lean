@@ -1080,6 +1080,16 @@ fn decode_prelude() -> Option<(Vec<u8>, Vec<ConstantInfo>)> {
 const PINNED_PRESENT_OLEAN_FLOOR: u64 = 2_433;
 const PINNED_DECODED_DECL_FLOOR: u64 = 158_608;
 const PINNED_ORACLE_APPLICABLE_FLOOR: u64 = 157_183;
+/// The single, explicitly pinned worker count the corpus census is produced at
+/// (R1 of bead `fln-corpus-thread-matrix-93te`).
+///
+/// This replaced a size heuristic under which two modules of different sizes ran at
+/// different widths, so the census was not produced at one consistent configuration —
+/// and runs that were not produced under comparable configurations cannot support a
+/// determinism claim at all. Pinning is therefore a prerequisite for the matrix, not a
+/// substitute for it: one pinned width still compares no stream digests ACROSS widths,
+/// so corpus schedule-independence stays INFERRED, NOT MEASURED.
+const CORPUS_CENSUS_WIDTH: usize = 8;
 const MAX_PINNED_OLEAN_BYTES: u64 = 512 * 1024 * 1024;
 const LEANCHECKER_TIMEOUT: Duration = Duration::from_secs(300);
 const ORACLE_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
@@ -2814,15 +2824,21 @@ fn pinned_present_olean_kernel_differential() {
                 &active_infos,
                 false,
             );
-            // A throughput heuristic, NOT a determinism matrix (bead `fln-8zsq`).
-            // Two modules of different sizes run at different widths, so the
-            // corpus census is not even produced at one consistent width — and
-            // no run of it compares stream digests ACROSS widths, which is what
-            // PG-5 actually asks for. The census below reports this limitation
-            // rather than letting the Prelude matrix be read as covering it.
-            // Whoever pins this for the real matrix lane should fix the width
-            // explicitly instead of leaving it size-dependent.
-            let threads = if prep.items.len() < 64 { 1 } else { 8 };
+            // ONE PINNED WIDTH, still NOT a determinism matrix (R1 of bead
+            // `fln-corpus-thread-matrix-93te`). This was a size heuristic —
+            // `if prep.items.len() < 64 { 1 } else { 8 }` — under which two
+            // modules of different sizes ran at DIFFERENT widths, so the census
+            // was not even produced at one consistent configuration. Comparing
+            // runs that were not produced under comparable configurations cannot
+            // support a determinism claim at all, which is why pinning comes
+            // first and the matrix second.
+            //
+            // What this does NOT buy: the corpus still runs at exactly one width
+            // and still compares no stream digests ACROSS widths, which is what
+            // PG-5 asks for. Corpus schedule-independence remains INFERRED, NOT
+            // MEASURED. R2/R3 add the {1, 8, 32} matrix and the per-width-pair
+            // comparison; until then the census keeps reporting this limitation.
+            let threads = CORPUS_CENSUS_WIDTH;
             let run = check_matrix_run(&prep, threads, Budget::DEFAULT);
             (
                 score_accepted_reference_module(
@@ -4248,19 +4264,33 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
          reads as covering the corpus differential too (bead fln-8zsq)"
     );
 
-    // 4. The class may not silently strengthen. Claiming `measured` while the corpus
-    //    width is still the per-module size heuristic is false by construction: two
-    //    modules of different sizes run at different widths and nothing has ever
-    //    compared stream digests ACROSS widths. D7 forbids the weaker class standing
-    //    in for the stronger one, and this is that check in the direction nobody
-    //    watches — a strengthened claim, rather than a deleted one.
+    // 4. The class may not silently strengthen. Claiming `measured` while the corpus test
+    //    runs no matrix is false by construction: nothing has compared stream digests
+    //    ACROSS widths. D7 forbids the weaker class standing in for the stronger one, and
+    //    this is that check in the direction nobody watches — a strengthened claim rather
+    //    than a deleted one.
+    //
+    //    The probe asks whether the CORPUS TEST runs a matrix, not whether the old size
+    //    heuristic is still present. Keying it to the heuristic conflated "the width is
+    //    size-derived" with "no matrix exists", so pinning the width under R1 of
+    //    `fln-corpus-thread-matrix-93te` would have silently disarmed this assertion while
+    //    the corpus remained single-width. Scope the probe to the site whose property is
+    //    actually in question.
     let strengthened = census.contains("schedule_independence=measured");
-    let size_heuristic = census.contains("if prep.items.len() < 64 { 1 } else { 8 }");
+    let corpus_start = census
+        .find("fn pinned_present_olean_kernel_differential")
+        .expect("the corpus differential must exist");
+    let corpus_end = census[corpus_start..]
+        .find("fn prelude_replays_through_the_kernel")
+        .map(|offset| corpus_start + offset)
+        .expect("the Prelude replay must follow the corpus differential");
+    let corpus_runs_no_matrix = !census[corpus_start..corpus_end].contains("for threads in [");
     assert!(
-        !(strengthened && size_heuristic),
-        "the census claims schedule_independence=measured while the corpus width is still \
-         chosen by the per-module size heuristic; no run compares stream digests across \
-         widths, so the measured class is unearned (bead fln-8zsq, D7, PG-5)"
+        !(strengthened && corpus_runs_no_matrix),
+        "the census claims schedule_independence=measured while the corpus differential \
+         runs no thread matrix at all; no run compares stream digests across widths, so \
+         the measured class is unearned (beads fln-8zsq, fln-corpus-thread-matrix-93te, \
+         D7, PG-5)"
     );
 }
 
@@ -4290,9 +4320,22 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         .expect("the first source-reading guard marks the end of production code");
     let production = &SOURCE[..production_end];
 
-    // Derived, not declared: the corpus is single-width exactly while this heuristic
-    // stands. `prelude_replays_through_the_kernel` is the only real matrix.
-    let corpus_is_single_width = production.contains("if prep.items.len() < 64 { 1 } else { 8 }");
+    // Derived, not declared, and scoped to the CORPUS TEST rather than to production as a
+    // whole. The first version of this probe asked whether the size heuristic was still
+    // present, which conflated two different things: "the width is size-derived" and "no
+    // corpus matrix exists". Pinning the width (R1 of `fln-corpus-thread-matrix-93te`)
+    // removes the heuristic while leaving the corpus emphatically single-width, so that
+    // probe would have silently stopped demanding a qualifier that is still true. What
+    // actually matters is whether the corpus test runs a matrix at all.
+    let corpus_start = production
+        .find("fn pinned_present_olean_kernel_differential")
+        .expect("the corpus differential must exist");
+    let corpus_end = production[corpus_start..]
+        .find("fn prelude_replays_through_the_kernel")
+        .map(|offset| corpus_start + offset)
+        .expect("the Prelude replay must follow the corpus differential");
+    let corpus = &production[corpus_start..corpus_end];
+    let corpus_is_single_width = !corpus.contains("for threads in [");
     assert!(
         production.contains("for threads in [1usize, 8, 32]"),
         "the Prelude thread matrix disappeared; the claim would then have no support at \
@@ -4321,9 +4364,10 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
             assert!(
                 QUALIFIERS.iter().any(|word| line.contains(word)),
                 "{doc}:{} states the {{1, 8, 32}} determinism claim without naming its \
-                 scope, while the corpus differential still runs at a single size-derived \
-                 width and no run compares stream digests across widths. A reader takes \
-                 this as covering the corpus (beads fln-8zsq, franken_lean-2ki4):\n  {line}",
+                 scope, while the corpus differential runs no thread matrix at all — one \
+                 pinned width, no comparison of stream digests across widths. A reader \
+                 takes this as covering the corpus (beads fln-8zsq, franken_lean-2ki4, \
+                 fln-corpus-thread-matrix-93te):\n  {line}",
                 index + 1
             );
         }
