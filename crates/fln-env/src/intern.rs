@@ -49,6 +49,7 @@ use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::level::Level;
 use fln_core::name::Name;
+use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
@@ -558,9 +559,11 @@ fn update_name(hasher: &mut DomainHasher, name: &Name) {
 /// # Finishing `bf9ef450` in its own function
 ///
 /// That commit replaced `Name::to_display_string` with the structural encoding above, and left
-/// three sibling call sites in [`identity_digest`] feeding `format!("{:?}")` — `Sort`'s level,
-/// `Const`'s level list, and the `FVar`/`MVar` ids. The correct encoder was already reachable and
-/// already used one line away. Keying an identity on a RENDERER is the defect `franken_lean-f6br`
+/// sibling call sites in [`identity_digest`] feeding `format!("{:?}")`. This one fixed three of
+/// them — `Sort`'s level, `Const`'s level list, and the `FVar`/`MVar` ids — and, as written, read
+/// as though those were all of them. **They were not: there were five.** The remaining two were
+/// `MData`'s payload and `Lit`'s literal, both fixed under `franken_lean-oh1j`; see
+/// [`update_kvmap`]. The correct encoder was already reachable and already used one line away. Keying an identity on a RENDERER is the defect `franken_lean-f6br`
 /// and `bf9ef450` were both filed over; it was fixed here for names and not for levels.
 ///
 /// # This one was latent, not active, and the difference is the whole point
@@ -586,6 +589,70 @@ fn update_name(hasher: &mut DomainHasher, name: &Name) {
 fn update_level(hasher: &mut DomainHasher, level: &Level) {
     let mut writer = CanonWriter::new();
     level.write_body(&mut writer);
+    let encoded = writer.into_bytes();
+    hasher.update(&(encoded.len() as u64).to_le_bytes());
+    hasher.update(&encoded);
+}
+
+/// Feed an [`MData`](ExprNode::MData) payload into a digest by its **canonical** encoding,
+/// length-prefixed.
+///
+/// # The fifth instance, found by auditing the function the fourth was found in
+///
+/// `bf9ef450` fixed the name site. `franken_lean-hv9m` fixed the level and id sites and its own
+/// note above enumerates "three sibling call sites" — but there were **five**, and the two it did
+/// not name are this one and `Lit`'s. That undercount is why the sentence above has been corrected
+/// rather than left standing: a doc that names three of five reads as a completed inventory, which
+/// is how the next reader concludes there is nothing left to find.
+///
+/// The shape is exactly the one `hv9m` described for levels, one crate over:
+/// [`Canonical`](fln_hash::canon::Canonical) for `KVMap` already exists in `fln-hash`, and it is
+/// used one line away by `update_name` and `update_level`.
+///
+/// **The sharpest form of the defect is local to this function.** A [`Name`] appearing *directly*
+/// on a node — a `Const`'s name, a binder name, a `Proj`'s struct name — went through
+/// [`update_name`]'s structural encoding, while the *same* `Name` appearing as a key inside an
+/// `MData` `KVMap` went through `format!("{:?}")`. One type, two encodings, in one digest function,
+/// decided by where the value happened to sit.
+///
+/// Latent rather than active, and stated as such: `KVMap`, `DataValue`, `SyntaxHandle` and `Name`
+/// all derive or hand-write a structural `Debug`, so no two distinct payloads collide today.
+/// Nothing was wrong and no digest was mis-keyed. What was wrong is that it held by accident —
+/// a field added to `DataValue`, or a `Debug` made prettier for humans, moves every digest preimage
+/// silently, because a digest here is a bucket hint confirmed by full [`Expr`] equality and every
+/// test stays green while `bucket_misses` quietly changes meaning.
+fn update_kvmap(hasher: &mut DomainHasher, data: &KVMap) {
+    let mut writer = CanonWriter::new();
+    data.write_body(&mut writer);
+    let encoded = writer.into_bytes();
+    hasher.update(&(encoded.len() as u64).to_le_bytes());
+    hasher.update(&encoded);
+}
+
+/// Feed a [`Lit`](ExprNode::Lit) node into a digest by **its own canonical `Expr` encoding**,
+/// length-prefixed.
+///
+/// The sixth instance, and the one place where reusing the whole-node encoder is not only safe but
+/// the *better* answer. `Literal` has no `Canonical` impl of its own, so the alternatives were to
+/// hand-copy `canon.rs`'s literal framing into this file — a second encoding of one value, free to
+/// drift from the first — or to add an impl to `fln-hash`, which is not this crate's to change.
+///
+/// Neither is necessary: a `Lit` node is a **leaf**. `Canonical for Expr`'s `write_body` pushes
+/// children onto a worklist and writes nothing else, so for a childless node it emits exactly that
+/// node's own bytes — `EXPR_LIT_NAT` plus little-endian limbs, or `EXPR_LIT_STR` plus the string.
+/// Encoding the node therefore *is* encoding the literal, through the single literal encoder the
+/// program already has, with no copy and no new allocation.
+///
+/// This is why the caller passes the node rather than the `Literal`: the leaf property is what
+/// makes it correct, and the signature says so. Do not reach for this on a node with children —
+/// it would deep-walk them and cost the O(1)-per-node property the child-id scheme exists for.
+fn update_literal_leaf(hasher: &mut DomainHasher, leaf: &Expr) {
+    debug_assert!(
+        matches!(leaf.node(), ExprNode::Lit { .. }),
+        "update_literal_leaf is only correct for a childless node"
+    );
+    let mut writer = CanonWriter::new();
+    leaf.write_body(&mut writer);
     let encoded = writer.into_bytes();
     hasher.update(&(encoded.len() as u64).to_le_bytes());
     hasher.update(&encoded);
@@ -688,16 +755,17 @@ fn identity_digest(expr: &Expr, done: &HashMap<*const ExprNode, TermId>) -> Dige
             hasher.update(&child_id(body).to_le_bytes());
             hasher.update(&[u8::from(*non_dep)]);
         }
-        ExprNode::Lit { literal } => {
+        ExprNode::Lit { .. } => {
             hasher.update(&[10]);
-            hasher.update(format!("{literal:?}").as_bytes());
+            update_literal_leaf(&mut hasher, expr);
         }
         ExprNode::MData { data, expr: inner } => {
             hasher.update(&[11]);
             // KEPT in full: metaprograms read mdata, so two nodes differing only in it are
-            // different identities.
-            hasher.update(format!("{data:?}").as_bytes());
-            hasher.update(&[0]);
+            // different identities. By its CANONICAL encoding, not its `Debug` rendering — see
+            // `update_kvmap`. No NUL separator: the encoding is length-prefixed and therefore
+            // self-delimiting, so a separator would be a second, weaker mechanism.
+            update_kvmap(&mut hasher, data);
             hasher.update(&child_id(inner).to_le_bytes());
         }
         ExprNode::Proj {
@@ -1389,6 +1457,103 @@ mod tests {
             canonical.as_slice(),
             format!("{level:?}").as_bytes(),
             "premise: the canonical encoding must differ from the Debug rendering"
+        );
+    }
+
+    /// The two sites `franken_lean-hv9m` did not name, pinned the same way it pinned the three it
+    /// did (bead `franken_lean-oh1j`).
+    ///
+    /// **Written against the encoder, not against discrimination**, and that is the whole design of
+    /// the test. `KVMap`, `DataValue`, `SyntaxHandle`, `Name` and `NatLit` all render structurally,
+    /// so `Debug` *does* discriminate here today: a test that merely asserted two different
+    /// payloads get different digests passed identically before this fix and after it, proving
+    /// nothing and quietly certifying the defect. So the preimage is recomputed independently from
+    /// the canonical encoders and `identity_digest` is required to agree.
+    ///
+    /// The kill was verified by reverting each site to `format!("{:?}")` and running this test.
+    #[test]
+    fn the_identity_digest_keys_mdata_and_literals_on_the_canonical_encoding_not_on_debug() {
+        let done = HashMap::new();
+        // `done` is empty, so a child contributes the documented sentinel rather than an id.
+        let absent_child = TermId(u32::MAX).0;
+
+        // ---- MData: the payload is a KVMap, and fln-hash has had a Canonical for it all along.
+        let data = KVMap::from_entries(vec![(name("k"), DataValue::OfString("v".to_string()))]);
+        let annotated = Expr::mdata(data.clone(), bvar(0));
+
+        let mut writer = CanonWriter::new();
+        data.write_body(&mut writer);
+        let canonical_data = writer.into_bytes();
+
+        let mut expected = DomainHasher::new(Domain::DeclContent);
+        expected.update(INTERN_TAG);
+        expected.update(&[0]);
+        expected.update(&[11]);
+        expected.update(&(canonical_data.len() as u64).to_le_bytes());
+        expected.update(&canonical_data);
+        expected.update(&absent_child.to_le_bytes());
+
+        assert_eq!(
+            identity_digest(&annotated, &done),
+            expected.finalize(),
+            "an MData's identity preimage must be the canonical KVMap bytes, length-prefixed"
+        );
+        assert_ne!(
+            canonical_data.as_slice(),
+            format!("{data:?}").as_bytes(),
+            "premise: the canonical encoding must differ from the Debug rendering"
+        );
+
+        // ---- Lit: no Canonical for `Literal`, but a Lit node is a LEAF, so the node's own
+        // canonical bytes ARE the literal's — one encoder, no second copy.
+        for literal in [
+            Literal::Nat(NatLit::from_u64(7)),
+            Literal::Str("7".to_string()),
+        ] {
+            let leaf = Expr::lit(literal.clone());
+            let mut writer = CanonWriter::new();
+            leaf.write_body(&mut writer);
+            let canonical_leaf = writer.into_bytes();
+
+            let mut expected = DomainHasher::new(Domain::DeclContent);
+            expected.update(INTERN_TAG);
+            expected.update(&[0]);
+            expected.update(&[10]);
+            expected.update(&(canonical_leaf.len() as u64).to_le_bytes());
+            expected.update(&canonical_leaf);
+
+            assert_eq!(
+                identity_digest(&leaf, &done),
+                expected.finalize(),
+                "a Lit's identity preimage must be its own canonical leaf bytes, length-prefixed"
+            );
+            assert_ne!(
+                canonical_leaf.as_slice(),
+                format!("{literal:?}").as_bytes(),
+                "premise: the canonical encoding must differ from the Debug rendering"
+            );
+        }
+
+        // The two literal shapes stay distinct under the tagged encoding, so collapsing the tag
+        // would not go unnoticed: `Nat(7)` and `Str("7")` are different identities.
+        assert_ne!(
+            identity_digest(&Expr::lit(Literal::Nat(NatLit::from_u64(7))), &done),
+            identity_digest(&Expr::lit(Literal::Str("7".to_string())), &done),
+        );
+
+        // ONE TYPE, ONE ENCODING. The defect's sharpest form was local: a `Name` on a node went
+        // through `update_name`'s structural encoding while the same `Name` inside an MData KVMap
+        // went through `Debug`. Both now reach the same bytes for the same name, so the function no
+        // longer encodes one type two ways depending on where the value sits.
+        let key = name("k");
+        let mut direct = CanonWriter::new();
+        key.write_body(&mut direct);
+        let key_bytes = direct.into_bytes();
+        assert!(
+            canonical_data
+                .windows(key_bytes.len())
+                .any(|window| window == key_bytes.as_slice()),
+            "the canonical KVMap bytes must contain the key's own canonical name encoding"
         );
     }
 
