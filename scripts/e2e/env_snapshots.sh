@@ -1113,52 +1113,68 @@ mutations = {
 }""",
     ),
     "descriptor_validation_deferred": (
-        b"""        validate_descriptor_admission(&base.descriptor, &ours.descriptor, &theirs.descriptor)?;
-        let ours_common_prefix = base
-            .entries()
-            .zip(ours.entries())
-            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
-            .count();
-        let theirs_common_prefix = base
-            .entries()
-            .zip(theirs.entries())
-            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
-            .count();
-        if ours_common_prefix != base.len() || theirs_common_prefix != base.len() {
-            return Err(MergeConflict::HistoryMismatch {
-                extension: base.descriptor.name.clone(),
-                base_len: base.len(),
-                ours_len: ours.len(),
-                theirs_len: theirs.len(),
-                ours_common_prefix,
-                theirs_common_prefix,
-            });
-        }""",
-        b"""        let ours_common_prefix = base
-            .entries()
-            .zip(ours.entries())
-            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
-            .count();
-        let theirs_common_prefix = base
-            .entries()
-            .zip(theirs.entries())
-            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
-            .count();
-        if ours_common_prefix != base.len() || theirs_common_prefix != base.len() {
-            return Err(MergeConflict::HistoryMismatch {
-                extension: base.descriptor.name.clone(),
-                base_len: base.len(),
-                ours_len: ours.len(),
-                theirs_len: theirs.len(),
-                ours_common_prefix,
-                theirs_common_prefix,
-            });
+        b"""        match admit_descriptors_within(
+            &base.descriptor,
+            &ours.descriptor,
+            &theirs.descriptor,
+            limits.descriptor,
+        ) {""",
+        b"""        match validate_branch_ancestry(
+            base.entries(),
+            ours.entries(),
+            base.entries(),
+            theirs.entries(),
+            limits.ancestry,
+        ) {
+            Err((dimension, limit, actual)) => {
+                return Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::Ancestry {
+                    extension: extension.clone(),
+                    dimension,
+                    limit,
+                    actual,
+                }));
+            }
+            Ok(Err(divergence)) => {
+                return Err(divergence.into_conflict(
+                    extension,
+                    base.len(),
+                    ours.len(),
+                    theirs.len(),
+                ));
+            }
+            Ok(Ok(_facts)) => {}
         }
-        validate_descriptor_admission(&base.descriptor, &ours.descriptor, &theirs.descriptor)?;""",
+
+        match admit_descriptors_within(
+            &base.descriptor,
+            &ours.descriptor,
+            &theirs.descriptor,
+            limits.descriptor,
+        ) {""",
+    ),
+    "policy_before_validation": (
+        b"""        match admit_descriptors_within(
+            &base.descriptor,
+            &ours.descriptor,
+            &theirs.descriptor,
+            limits.descriptor,
+        ) {""",
+        b"""        if matches!(base.descriptor.merge, MergeSemantics::AppendOrdered) {
+            return Self::merge_under_policy(base, ours, theirs, set_union_limits);
+        }
+
+        match admit_descriptors_within(
+            &base.descriptor,
+            &ours.descriptor,
+            &theirs.descriptor,
+            limits.descriptor,
+        ) {""",
     ),
     "ancestry_only_length": (
-        b"""        if ours_common_prefix != base.len() || theirs_common_prefix != base.len() {""",
-        b"""        if ours.len() < base.len() || theirs.len() < base.len() {""",
+        b"""    if facts.ours.verdict == BranchAncestry::Descends
+        && facts.theirs.verdict == BranchAncestry::Descends""",
+        b"""    if !matches!(facts.ours.verdict, BranchAncestry::BranchEndedAt(_))
+        && !matches!(facts.theirs.verdict, BranchAncestry::BranchEndedAt(_))""",
     ),
     "declaration_budget_check_omission": (
         b"""    const ORDER: [DeclarationDimension; 5] = [
@@ -1316,6 +1332,11 @@ run_identity_path_mutant_recovery extension_descriptor_validation_deferred \
   extensions::tests::mismatched_descriptors_are_typed_conflicts_on_either_branch \
   'extensions::tests::mismatched_descriptors_are_typed_conflicts_on_either_branch --- FAILED' \
   'HistoryMismatch'
+run_identity_path_mutant_recovery extension_policy_order \
+  fln-env/src/extensions.rs policy_before_validation \
+  extensions::tests::mismatched_descriptors_are_typed_conflicts_on_either_branch \
+  'extensions::tests::mismatched_descriptors_are_typed_conflicts_on_either_branch --- FAILED' \
+  'ours contract mismatch is refused'
 run_identity_path_mutant_recovery extension_ancestry_only_length \
   fln-env/src/extensions.rs ancestry_only_length \
   extensions::tests::invalid_branch_history_is_a_typed_conflict \

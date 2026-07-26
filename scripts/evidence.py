@@ -49,6 +49,28 @@ VERIFICATION_MANIFEST_SCHEMA = "fln.verification-manifest/2"
 VERIFICATION_MANIFEST_PATH = "ci/VERIFICATION_MANIFEST.jsonl"
 CHECK_HUMAN_SCHEMA = "fln.check-human/1"
 CHECK_HUMAN_LOG = "human.semantic.log"
+CENSUS_AVAILABILITY_SCHEMA = "fln.census-availability/1"
+CENSUS_AVAILABILITY_STAGE = "contract-handoff-no-mock"
+CENSUS_AVAILABILITY_RECEIPT = f"{CENSUS_AVAILABILITY_STAGE}.availability.json"
+CENSUS_SKIP_LIMITATION_SUFFIX = (
+    "the three named contract-handoff no-mock tests are typed skipped"
+)
+CENSUS_REQUIRED_OUTPUTS = (
+    "contracts/builtin_environment.tsv",
+    "contracts/builtin_environment.001.tsv",
+    "contracts/builtin_environment.002.tsv",
+    "contracts/builtin_partition.tsv",
+)
+CENSUS_PIN_INPUTS = (
+    "contracts/CONTRACT_HANDOFF.txt",
+    "contracts/EXTERN_BUILTIN_ENVIRONMENT.txt",
+    "SUITE.lock",
+)
+CENSUS_NO_MOCK_TESTS = (
+    "contract_handoff::tests::contract_handoff_no_mock_e2e",
+    "real_workspace_is_structurally_clean",
+    "robot_real_workspace_binds_complete_authority_evidence",
+)
 # Frozen with the migration commit. This binds both the complete adopted ID set
 # and which adopted beads were still open at adoption time. Expanding or
 # weakening the grandfathered set therefore requires an explicit validator
@@ -181,6 +203,7 @@ CHECK_STAGE_ORDER = [
     "fmt",
     "check",
     "clippy",
+    CENSUS_AVAILABILITY_STAGE,
     "test",
     "tribunal-manifest-inventory",
     "epoch-lab-test",
@@ -320,6 +343,8 @@ E2E_STEP_ORDERS = {
         "extension_descriptor_recovery",
         "extension_descriptor_validation_deferred_mutant",
         "extension_descriptor_validation_deferred_recovery",
+        "extension_policy_order_mutant",
+        "extension_policy_order_recovery",
         "extension_ancestry_only_length_mutant",
         "extension_ancestry_only_length_recovery",
         "declaration_budget_check_omission_mutant",
@@ -9036,6 +9061,237 @@ def validate_kernel_admission(
     }
 
 
+def census_skip_limitation(probe_root: str) -> str:
+    if not probe_root or not Path(probe_root).is_absolute():
+        raise EvidenceError("census probe root is not an absolute path")
+    return (
+        f"census evidence is absent under probe_root={probe_root}; "
+        f"{CENSUS_SKIP_LIMITATION_SUFFIX}"
+    )
+
+
+def validate_census_availability_receipt(
+    path: Path,
+    *,
+    expected_probe_root: str | None = None,
+) -> dict[str, Any]:
+    receipt = read_json_object(path)
+    expected_keys = {
+        "schema",
+        "outcome",
+        "reason_code",
+        "authority",
+        "child_exit",
+        "probe",
+        "probe_root",
+        "required_outputs",
+        "pin_inputs",
+        "no_mock_tests",
+    }
+    if set(receipt) != expected_keys:
+        raise EvidenceError(f"{path}: census-availability receipt shape mismatch")
+    if receipt.get("schema") != CENSUS_AVAILABILITY_SCHEMA:
+        raise EvidenceError(f"{path}: census-availability schema mismatch")
+    if receipt.get("probe") != "scripts/extract/census_materialize.sh --verify-only":
+        raise EvidenceError(f"{path}: census-availability probe is not authoritative")
+    probe_root = receipt.get("probe_root")
+    if (
+        not isinstance(probe_root, str)
+        or not probe_root
+        or not Path(probe_root).is_absolute()
+    ):
+        raise EvidenceError(f"{path}: census-availability probe root is malformed")
+    if expected_probe_root is not None and probe_root != expected_probe_root:
+        raise EvidenceError(
+            f"{path}: census-availability probe root {probe_root!r} does not "
+            f"match the run root {expected_probe_root!r}"
+        )
+    for key, expected in (
+        ("required_outputs", CENSUS_REQUIRED_OUTPUTS),
+        ("pin_inputs", CENSUS_PIN_INPUTS),
+        ("no_mock_tests", CENSUS_NO_MOCK_TESTS),
+    ):
+        if receipt.get(key) != list(expected):
+            raise EvidenceError(f"{path}: census-availability {key} drifted")
+    expected_outcomes = {
+        "available": ("census_matches_pins", "complete", 0),
+        "inconclusive": ("census_absent", "inconclusive", 3),
+    }
+    outcome = receipt.get("outcome")
+    if outcome not in expected_outcomes:
+        raise EvidenceError(f"{path}: unknown census-availability outcome")
+    reason, authority, child_exit = expected_outcomes[outcome]
+    if (
+        receipt.get("reason_code") != reason
+        # ubs:ignore — public evidence authority label, not secret material.
+        or receipt.get("authority") != authority
+        or receipt.get("child_exit") != child_exit
+    ):
+        raise EvidenceError(f"{path}: census-availability outcome facts disagree")
+    return receipt
+
+
+def validate_quality_gate_census_join(
+    path: Path,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    profile: str,
+    planted: str,
+) -> None:
+    stage_records = {
+        str(record.get("stage")): record
+        for record in records
+        if record.get("event") == "stage"
+    }
+    census = stage_records.get(CENSUS_AVAILABILITY_STAGE)
+    test = stage_records.get("test")
+    structure_guard = stage_records.get("structure-guard")
+    if census is None:
+        return
+    if census.get("outcome") in {"not_run", "fail", "internal_fault", "cancelled"}:
+        return
+    if planted in {
+        CENSUS_AVAILABILITY_STAGE,
+        f"unexpected:{CENSUS_AVAILABILITY_STAGE}",
+    }:
+        return
+
+    receipt_path = path.parent / CENSUS_AVAILABILITY_RECEIPT
+    expected_probe_root = str(Path(records[0]["cwd"]))
+    receipt = validate_census_availability_receipt(
+        receipt_path,
+        expected_probe_root=expected_probe_root,
+    )
+    expected_probe_argv = [
+        str(Path(records[0]["cwd"]) / "scripts/evidence.py"),
+        "classify-census-availability",
+        "--root",
+        str(Path(records[0]["cwd"])),
+        "--output",
+        str(receipt_path),
+        "--artifact-root",
+        str(path.parent),
+    ]
+
+    if census.get("outcome") == "pass":
+        supervisor = census.get("supervisor")
+    elif census.get("outcome") == "skipped":
+        supervisor = read_json_object(
+            path.parent / f"{CENSUS_AVAILABILITY_STAGE}.meta.json"
+        )
+        validate_supervisor_object(
+            path,
+            records.index(census) + 1,
+            supervisor,
+            expected_stage_id=CENSUS_AVAILABILITY_STAGE,
+        )
+    else:
+        raise EvidenceError(f"{path}: census stage has an unregistered outcome")
+    if not isinstance(supervisor, dict):
+        raise EvidenceError(f"{path}: census stage lacks its supervised probe")
+    probe_argv = supervisor.get("argv")
+    if (
+        not isinstance(probe_argv, list)
+        or len(probe_argv) != len(expected_probe_argv) + 3
+        or probe_argv[1:3] != ["-I", "-S"]
+        or probe_argv[3:] != expected_probe_argv
+    ):
+        raise EvidenceError(f"{path}: census stage did not invoke the exact probe")
+    if (
+        supervisor.get("classification") != "pass"
+        or supervisor.get("wrapper_exit") != 0
+        or supervisor.get("child_exit") != 0
+    ):
+        raise EvidenceError(f"{path}: census classifier did not complete cleanly")
+
+    if receipt["outcome"] == "available":
+        if census.get("outcome") != "pass":
+            raise EvidenceError(f"{path}: available census was rendered as a skip")
+        expected_test_argv = ["cargo", "test", "--locked"]
+    else:
+        if (
+            census.get("outcome") != "skipped"
+            or census.get("reason_code") != "typed_limitation"
+            or census.get("limitation")
+            != census_skip_limitation(expected_probe_root)
+        ):
+            raise EvidenceError(f"{path}: absent census was not a typed visible skip")
+        expected_test_argv = [
+            "cargo",
+            "test",
+            "--locked",
+            "--",
+            *(
+                item
+                for test_name in CENSUS_NO_MOCK_TESTS
+                for item in ("--skip", test_name)
+            ),
+        ]
+
+    test_is_planted = planted in {"test", "unexpected:test"}
+    if test is not None and isinstance(test.get("supervisor"), dict):
+        if not test_is_planted and test["supervisor"].get("argv") != expected_test_argv:
+            raise EvidenceError(
+                f"{path}: workspace test invocation disagrees with census availability"
+            )
+    elif test is not None and test.get("outcome") == "pass":
+        raise EvidenceError(f"{path}: census join lacks a completed workspace test")
+
+    guard_is_planted = planted in {"structure-guard", "unexpected:structure-guard"}
+    if structure_guard is not None and isinstance(
+        structure_guard.get("supervisor"), dict
+    ):
+        guard_argv = structure_guard["supervisor"].get("argv")
+        if receipt["outcome"] == "available":
+            expected_guard_argv = [
+                "cargo",
+                "run",
+                "-q",
+                "--locked",
+                "-p",
+                "structure-guard",
+                "--",
+                "--root",
+                str(Path(records[0]["cwd"])),
+                "--robot",
+            ]
+        else:
+            expected_guard_tail = [
+                str(Path(records[0]["cwd"]) / "scripts/evidence.py"),
+                "exec-structure-guard-census-inconclusive",
+                "--root",
+                str(Path(records[0]["cwd"])),
+                "--receipt",
+                str(receipt_path),
+                "--output",
+                str(path.parent / "structure-guard.census-inconclusive.ndjson"),
+                "--validation",
+                str(
+                    path.parent / "structure-guard.census-inconclusive.validation.json"
+                ),
+                "--artifact-root",
+                str(path.parent),
+            ]
+            expected_guard_argv = (
+                guard_argv
+                if isinstance(guard_argv, list)
+                and len(guard_argv) == len(expected_guard_tail) + 3
+                and guard_argv[1:3] == ["-I", "-S"]
+                and guard_argv[3:] == expected_guard_tail
+                else None
+            )
+        if not guard_is_planted and guard_argv != expected_guard_argv:
+            raise EvidenceError(
+                f"{path}: structure-guard invocation disagrees with census availability"
+            )
+    if profile == "ci" and receipt["outcome"] == "inconclusive":
+        # CI is allowed to proceed only because the no-mock obligation is explicit
+        # above. This branch is deliberately present so deleting the CI allowance
+        # from the validator cannot silently turn a skip into an ordinary green.
+        if census.get("outcome") != "skipped":
+            raise EvidenceError(f"{path}: CI hid an absent census")
+
+
 def validate_run(
     path: Path,
     schema: str,
@@ -9412,9 +9668,16 @@ def validate_run(
                     raise EvidenceError(
                         f"{path}:{index}: skipped stage shape mismatch"
                     )
+                ordinary_local_skip = (
+                    event_id == "ubs" and records[0]["profile"] != "ci"
+                )
+                census_skip = (
+                    event_id == CENSUS_AVAILABILITY_STAGE
+                    and record.get("limitation")
+                    == census_skip_limitation(str(records[0]["cwd"]))
+                )
                 if (
-                    event_id != "ubs"
-                    or records[0]["profile"] == "ci"
+                    not (ordinary_local_skip or census_skip)
                     or record.get("reason_code") != "typed_limitation"
                     or record.get("expected") != "not_applicable"
                     or record.get("actual") != "skipped"
@@ -9626,6 +9889,12 @@ def validate_run(
                 raise EvidenceError(f"{path}: planted failure contract is inconsistent")
         elif planted_events:
             raise EvidenceError(f"{path}: unbound planted failure evidence")
+        validate_quality_gate_census_join(
+            path,
+            records,
+            profile=profile,
+            planted=bound_plant,
+        )
     else:
         if scenario not in E2E_STEP_ORDERS:
             raise EvidenceError(f"{path}: unknown E2E scenario {scenario!r}")
@@ -13303,6 +13572,167 @@ def cmd_render_check_human(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_classify_census_availability(args: argparse.Namespace) -> int:
+    root = lexical_absolute(Path(args.root)).resolve(strict=True)
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    output = require_within(
+        Path(args.output), artifact_root, label="census-availability receipt"
+    )
+    if output.name != CENSUS_AVAILABILITY_RECEIPT:
+        raise EvidenceError("census-availability receipt has a non-canonical name")
+    script = root / "scripts/extract/census_materialize.sh"
+    if script.is_symlink() or not script.is_file():
+        raise EvidenceError("census materializer is not a regular repository script")
+    command = ["bash", str(script), "--verify-only"]
+    try:
+        probe = subprocess.run(  # ubs:ignore — fixed repository script and fixed flag.
+            command,
+            cwd=root,
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as error:
+        print(f"census availability probe timed out: {error}", file=sys.stderr)
+        return SETUP_FAILURE
+    if len(probe.stdout) + len(probe.stderr) > MAX_LOG_BYTES:
+        print("census availability probe exceeded its evidence bound", file=sys.stderr)
+        return SETUP_FAILURE
+    sys.stdout.buffer.write(probe.stdout)
+    sys.stderr.buffer.write(probe.stderr)
+
+    if probe.returncode == PASS:
+        outcome = "available"
+        reason_code = "census_matches_pins"
+        authority = "complete"
+    elif probe.returncode == INCONCLUSIVE:
+        reasons = re.findall(
+            r"^\[census_materialize\] inconclusive reason=([a-z0-9_]+):",
+            probe.stderr.decode("utf-8", "replace"),
+            flags=re.MULTILINE,
+        )
+        if reasons != ["census_absent"]:
+            print(
+                "census availability is inconclusive for a reason other than "
+                f"plain absence: {reasons!r}",
+                file=sys.stderr,
+            )
+            return SETUP_FAILURE
+        outcome = "inconclusive"
+        reason_code = "census_absent"
+        authority = "inconclusive"
+    elif probe.returncode == FAIL:
+        return FAIL
+    elif probe.returncode == SETUP_FAILURE:
+        return SETUP_FAILURE
+    else:
+        print(
+            f"census materializer returned unregistered exit {probe.returncode}",
+            file=sys.stderr,
+        )
+        return SETUP_FAILURE
+
+    receipt = {
+        "schema": CENSUS_AVAILABILITY_SCHEMA,
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "authority": authority,
+        "child_exit": probe.returncode,
+        "probe": "scripts/extract/census_materialize.sh --verify-only",
+        "probe_root": str(root),
+        "required_outputs": list(CENSUS_REQUIRED_OUTPUTS),
+        "pin_inputs": list(CENSUS_PIN_INPUTS),
+        "no_mock_tests": list(CENSUS_NO_MOCK_TESTS),
+    }
+    write_new(output, canonical_json(receipt))
+    validate_census_availability_receipt(
+        output,
+        expected_probe_root=str(root),
+    )
+    return PASS
+
+
+def cmd_exec_structure_guard_census_inconclusive(
+    args: argparse.Namespace,
+) -> int:
+    root = lexical_absolute(Path(args.root)).resolve(strict=True)
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    receipt_path = require_within(
+        Path(args.receipt), artifact_root, label="census-availability receipt"
+    )
+    receipt = validate_census_availability_receipt(
+        receipt_path,
+        expected_probe_root=str(root),
+    )
+    if receipt["outcome"] != "inconclusive":
+        raise EvidenceError(
+            "census-inconclusive guard adapter requires an inconclusive receipt"
+        )
+    output = require_within(
+        Path(args.output), artifact_root, label="structure-guard census output"
+    )
+    validation = require_within(
+        Path(args.validation),
+        artifact_root,
+        label="structure-guard census validation",
+    )
+    command = [
+        "cargo",
+        "run",
+        "-q",
+        "--locked",
+        "-p",
+        "structure-guard",
+        "--",
+        "--root",
+        str(root),
+        "--robot",
+    ]
+    try:
+        guard = subprocess.run(  # ubs:ignore — fixed guard argv over the explicit root.
+            command,
+            cwd=root,
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as error:
+        print(f"structure-guard census adapter timed out: {error}", file=sys.stderr)
+        return SETUP_FAILURE
+    if len(guard.stdout) + len(guard.stderr) > MAX_LOG_BYTES:
+        print(
+            "structure-guard census adapter exceeded its evidence bound",
+            file=sys.stderr,
+        )
+        return SETUP_FAILURE
+    write_new(output, guard.stdout)
+    sys.stderr.buffer.write(guard.stderr)
+    if guard.returncode != INCONCLUSIVE:
+        print(
+            "census receipt was inconclusive but structure-guard returned "
+            f"{guard.returncode}",
+            file=sys.stderr,
+        )
+        return FAIL if guard.returncode in {PASS, FAIL} else SETUP_FAILURE
+    try:
+        report = validate_guard(
+            output,
+            INCONCLUSIVE,
+            "inconclusive",
+            ["FLN-STRUCT-036@contracts/builtin_environment.tsv"],
+            str(root),
+            guard.returncode,
+        )
+    except EvidenceError as error:
+        print(
+            f"structure-guard census-inconclusive join failed: {error}",
+            file=sys.stderr,
+        )
+        return FAIL
+    write_new(validation, canonical_json(report))
+    return PASS
+
+
 def cmd_validate_guard(args: argparse.Namespace) -> int:
     report = validate_guard(
         Path(args.file),
@@ -14338,6 +14768,76 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         path = art_dir / name
         path.mkdir()
         return path
+
+    census_receipt_root = case_dir("census_availability_receipt")
+    census_probe_root = str(art_dir)
+    census_receipt = {
+        "schema": CENSUS_AVAILABILITY_SCHEMA,
+        "outcome": "inconclusive",
+        "reason_code": "census_absent",
+        "authority": "inconclusive",
+        "child_exit": INCONCLUSIVE,
+        "probe": "scripts/extract/census_materialize.sh --verify-only",
+        "probe_root": census_probe_root,
+        "required_outputs": list(CENSUS_REQUIRED_OUTPUTS),
+        "pin_inputs": list(CENSUS_PIN_INPUTS),
+        "no_mock_tests": list(CENSUS_NO_MOCK_TESTS),
+    }
+    census_receipt_path = census_receipt_root / CENSUS_AVAILABILITY_RECEIPT
+    write_new(census_receipt_path, canonical_json(census_receipt))
+    validate_census_availability_receipt(
+        census_receipt_path,
+        expected_probe_root=census_probe_root,
+    )
+
+    census_receipt_mutants: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
+        (
+            "missing_pin_input",
+            lambda receipt: receipt["pin_inputs"].pop(),
+        ),
+        (
+            "wrong_required_output",
+            lambda receipt: receipt["required_outputs"].__setitem__(
+                0, "contracts/not-the-census.tsv"
+            ),
+        ),
+        (
+            "wrong_probe_root",
+            lambda receipt: receipt.__setitem__(
+                "probe_root", str(census_receipt_root)
+            ),
+        ),
+        (
+            "inconclusive_promoted_to_available",
+            lambda receipt: receipt.__setitem__("outcome", "available"),
+        ),
+    ]
+    for mutant_name, mutate in census_receipt_mutants:
+        mutant = parse_json(
+            json.dumps(census_receipt),
+            subject=f"census receipt mutant {mutant_name}",
+        )
+        mutate(mutant)
+        mutant_path = census_receipt_root / f"{mutant_name}.json"
+        write_new(mutant_path, canonical_json(mutant))
+        try:
+            validate_census_availability_receipt(
+                mutant_path,
+                expected_probe_root=census_probe_root,
+            )
+        except EvidenceError:
+            pass
+        else:
+            raise EvidenceError(
+                f"census-availability receipt survived mutant {mutant_name}"
+            )
+    cases.append(
+        {
+            "case": "census_availability_receipt",
+            "ok": True,
+            "mutants_killed": [name for name, _mutate in census_receipt_mutants],
+        }
+    )
 
     # A supervisor may begin only when it owns no other child lifetime. Recreate
     # the Git 2.54 auto-maintenance topology directly: a launcher forks a
@@ -21704,6 +22204,26 @@ def build_parser() -> argparse.ArgumentParser:
     check_human_parser.add_argument("--output", required=True)
     check_human_parser.add_argument("--artifact-root", required=True)
     check_human_parser.set_defaults(func=cmd_render_check_human)
+
+    census_availability_parser = subparsers.add_parser(
+        "classify-census-availability",
+        help="turn the census materializer taxonomy into a checked availability receipt",
+    )
+    census_availability_parser.add_argument("--root", required=True)
+    census_availability_parser.add_argument("--output", required=True)
+    census_availability_parser.add_argument("--artifact-root", required=True)
+    census_availability_parser.set_defaults(func=cmd_classify_census_availability)
+
+    census_guard_parser = subparsers.add_parser(
+        "exec-structure-guard-census-inconclusive",
+        help="run the full guard and accept only the exact typed absent-census result",
+    )
+    census_guard_parser.add_argument("--root", required=True)
+    census_guard_parser.add_argument("--receipt", required=True)
+    census_guard_parser.add_argument("--output", required=True)
+    census_guard_parser.add_argument("--validation", required=True)
+    census_guard_parser.add_argument("--artifact-root", required=True)
+    census_guard_parser.set_defaults(func=cmd_exec_structure_guard_census_inconclusive)
 
     guard_parser = subparsers.add_parser(
         "validate-guard", help="validate exact structure-guard NDJSON semantics"

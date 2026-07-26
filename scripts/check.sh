@@ -60,9 +60,9 @@ BEAD="franken_lean-rur"
 VERIFICATION_MANIFEST_REL="ci/VERIFICATION_MANIFEST.jsonl"
 VERIFICATION_MANIFEST="$REPO/$VERIFICATION_MANIFEST_REL"
 CHECK_STAGE_ORDER=(
-  evidence-self-test verification-manifest shellcheck fmt check clippy test
-  tribunal-manifest-inventory epoch-lab-test epoch-lab-live-verify
-  structure-guard vendor-tree ubs
+  evidence-self-test verification-manifest shellcheck fmt check clippy
+  contract-handoff-no-mock test tribunal-manifest-inventory epoch-lab-test
+  epoch-lab-live-verify structure-guard vendor-tree ubs
 )
 RUN_ID="check-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_CHECK_ART_ROOT:-$REPO/target/check}"
@@ -145,6 +145,13 @@ FINALIZER_TEST_READY="$FINALIZER_TEST_CONTROL/ready"
 FINALIZER_TEST_RELEASE="$FINALIZER_TEST_CONTROL/release"
 FINALIZER_TEST_ACK="$FINALIZER_TEST_CONTROL/signal-ack"
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
+CENSUS_AVAILABILITY_RECEIPT="$ART_DIR/contract-handoff-no-mock.availability.json"
+CENSUS_SKIP_LIMITATION="census evidence is absent under probe_root=$REPO; the three named contract-handoff no-mock tests are typed skipped"
+CENSUS_NO_MOCK_TESTS=(
+  contract_handoff::tests::contract_handoff_no_mock_e2e
+  real_workspace_is_structurally_clean
+  robot_real_workspace_binds_complete_authority_evidence
+)
 EVENT_COMMAND=()
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml .beads/issues.jsonl
@@ -1066,7 +1073,8 @@ run_stage() {
     semantic_args=()
   else
     case "$name" in
-      verification-manifest|shellcheck|fmt|tribunal-manifest-inventory|\
+      verification-manifest|shellcheck|fmt|contract-handoff-no-mock|\
+        tribunal-manifest-inventory|\
         epoch-lab-live-verify|structure-guard|vendor-tree|ubs)
         semantic_args=(--semantic-failure-exit 1)
         ;;
@@ -1216,6 +1224,24 @@ run_stage() {
     set_final internal_fault "$name:wrapper_exit_mismatch" 2
     exit 2
   fi
+  if [ "$wrapper_rc" -eq 0 ] && [ "$classification" = pass ]; then
+    if [ "$name" = contract-handoff-no-mock ] \
+      && [ "$(read_meta_field "$CENSUS_AVAILABILITY_RECEIPT" outcome)" = inconclusive ]; then
+      skip_stage "$name" "$CENSUS_SKIP_LIMITATION"
+      return 0
+    fi
+    emit_event \
+      --string event stage \
+      --string stage "$name" \
+      --string outcome "$classification" \
+      --string reason_code "$reason" \
+      --string expected exit_zero \
+      --string actual "$classification" \
+      --integer wrapper_exit "$wrapper_rc" \
+    --json-file supervisor "$meta"
+    note "ok stage=$name"
+    return 0
+  fi
   emit_event \
     --string event stage \
     --string stage "$name" \
@@ -1225,10 +1251,6 @@ run_stage() {
     --string actual "$classification" \
     --integer wrapper_exit "$wrapper_rc" \
     --json-file supervisor "$meta"
-  if [ "$wrapper_rc" -eq 0 ] && [ "$classification" = pass ]; then
-    note "ok stage=$name"
-    return 0
-  fi
   note "$classification stage=$name reason=$reason wrapper_exit=$wrapper_rc"
   note "captured stderr tail follows ($name)"
   tail -n 40 "$err" >&2 || true
@@ -1552,7 +1574,26 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets
 run_stage clippy cargo clippy --locked --all-targets -- -D warnings
-run_stage test cargo test --locked
+run_stage contract-handoff-no-mock "${PYTHON[@]}" "$EVIDENCE" \
+  classify-census-availability --root "$REPO" \
+  --output "$CENSUS_AVAILABILITY_RECEIPT" --artifact-root "$ART_DIR"
+CENSUS_AVAILABILITY="$(read_meta_field "$CENSUS_AVAILABILITY_RECEIPT" outcome)"
+case "$CENSUS_AVAILABILITY" in
+  available)
+    run_stage test cargo test --locked
+    ;;
+  inconclusive)
+    census_test_args=()
+    for census_test in "${CENSUS_NO_MOCK_TESTS[@]}"; do
+      census_test_args+=(--skip "$census_test")
+    done
+    run_stage test cargo test --locked -- "${census_test_args[@]}"
+    ;;
+  *)
+    set_final internal_fault census_availability_receipt_invalid 2
+    exit 2
+    ;;
+esac
 run_stage tribunal-manifest-inventory \
   bash scripts/check.sh --tribunal-manifest-inventory
 run_stage epoch-lab-test cargo test --locked \
@@ -1562,7 +1603,17 @@ run_stage epoch-lab-test cargo test --locked \
 # so the enclosing gate cannot misreport an inconclusive oracle as rejection.
 run_stage epoch-lab-live-verify cargo run --locked \
   --manifest-path tribunal/epoch-lab/Cargo.toml -- verify v4.32.0
-run_stage structure-guard cargo run -q --locked -p structure-guard -- --root "$REPO" --robot
+if [ "$CENSUS_AVAILABILITY" = available ]; then
+  run_stage structure-guard cargo run -q --locked -p structure-guard -- \
+    --root "$REPO" --robot
+else
+  run_stage structure-guard "${PYTHON[@]}" "$EVIDENCE" \
+    exec-structure-guard-census-inconclusive --root "$REPO" \
+    --receipt "$CENSUS_AVAILABILITY_RECEIPT" \
+    --output "$ART_DIR/structure-guard.census-inconclusive.ndjson" \
+    --validation "$ART_DIR/structure-guard.census-inconclusive.validation.json" \
+    --artifact-root "$ART_DIR"
+fi
 run_stage vendor-tree bash scripts/verify_vendor_tree.sh
 
 # The exact file set was materialized before run_start and is part of INPUT_ROOT.
