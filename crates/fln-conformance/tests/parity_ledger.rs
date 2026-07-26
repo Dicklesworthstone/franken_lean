@@ -100,9 +100,7 @@ fn the_real_ledger_never_earns_a_level_its_oracle_did_not_produce() {
     );
 }
 
-/// THE FOURTEENTH. A new source-read row above L1 is refused even though thirteen exactly
-/// like it are permitted — which is the entire value of a declared remainder over a
-/// grandfather clause.
+/// A new source-read row above L1 is refused now that the declared remainder is empty.
 #[test]
 fn an_undeclared_source_read_row_above_l1_is_refused() {
     let planted = synthetic(&[&format!(
@@ -129,8 +127,9 @@ fn a_declared_row_that_was_repaired_fails_until_the_allowance_shrinks() {
         "row meta-api | maxRecDepth | option | native | L2 | faithful | pinned-binary | \
          exact | {OK_FIXTURE} | D0 | OBSERVED | pin-census-v4.32.0"
     )]);
-    let errors = ledger::validate_level_is_supported_by_its_oracle(&repaired)
-        .expect_err("a stale allowance entry must fail");
+    let errors =
+        ledger::validate_level_is_supported_by_its_oracle_against(&repaired, &["maxRecDepth"])
+            .expect_err("a stale allowance entry must fail");
     assert!(
         errors
             .iter()
@@ -148,9 +147,8 @@ fn an_allowance_entry_naming_no_row_is_refused() {
         "row meta-api | Lean.Unrelated.symbol | function | native | L1 | faithful | \
          pinned-source | exact | {OK_FIXTURE} | D0 | OBSERVED | pin-census-v4.32.0"
     )]);
-    let errors = ledger::validate_allowance_has_no_orphans(&gone)
+    let errors = ledger::validate_allowance_has_no_orphans_against(&gone, &["Lean.Gone.symbol"])
         .expect_err("an allowance entry with no row must fail");
-    assert_eq!(errors.len(), ledger::SOURCE_READ_ABOVE_L1_ALLOWANCE.len());
     assert!(
         errors
             .iter()
@@ -161,6 +159,10 @@ fn an_allowance_entry_naming_no_row_is_refused() {
     let text = std::fs::read_to_string(workspace_root().join("ci/PARITY_LEDGER.txt"))
         .expect("ledger exists");
     let real = ledger::parse(&text).expect("ledger parses");
+    assert!(
+        ledger::SOURCE_READ_ABOVE_L1_ALLOWANCE.is_empty(),
+        "qydn repaired all thirteen rows, so its declared remainder must be empty"
+    );
     assert!(
         ledger::validate_allowance_has_no_orphans(&real).is_ok(),
         "every declared exception must name a row that exists in the real ledger"
@@ -260,11 +262,8 @@ fn the_successor_law_admits_a_full_repair_and_ignores_an_undeclared_repair() {
         "a row citing the rig that produced its value is exactly what this law asks for"
     );
 
-    // Still in the remainder: not this law's business, whatever it cites.
-    assert!(
-        ledger::SOURCE_READ_ABOVE_L1_ALLOWANCE.contains(&"maxRecDepth"),
-        "precondition: maxRecDepth is still declared"
-    );
+    // Still at pinned-source: not this law's business, whatever it cites. The oracle law
+    // refuses it now that the declared remainder is empty.
     let unrepaired = synthetic(&[
         "row meta-api | maxRecDepth | option | native | L2 | faithful | pinned-source | exact \
          | crates/fln-core/tests/pin_inventory_census.rs | D0 | OBSERVED | pin-census-v4.32.0",
@@ -377,11 +376,10 @@ fn the_real_ledger_never_names_a_source_reading_run_for_a_produced_value() {
         "a row claims a produced value on a source-reading evidence run:\n  {rendered}"
     );
 
-    // NON-VACUITY, and it is the whole-file half. All three declared tags must still be
-    // carried by some row: a scan whose subject has vanished reports a clean tree because it
-    // looked for nothing, which is the `uagk` shape.
-    ledger::validate_source_reading_freshness_tags_are_live(&parsed)
-        .expect("every declared source-reading tag is still carried by a row");
+    assert!(
+        ledger::SOURCE_READING_FRESHNESS_TAGS.contains(&"pin-census-v4.32.0"),
+        "a known source-reading tag remains denied after the last real row moves off it"
+    );
 }
 
 /// THE TWO-FIELD REPAIR — the gap this law exists for, planted permanently rather than
@@ -478,21 +476,34 @@ fn the_three_field_repair_is_admitted_and_an_unrepaired_row_is_untouched() {
     );
 }
 
-/// A declared tag that no row carries is refused, so the remainder cannot outlive its rows.
+/// A known source-reading tag stays denied after no real row carries it.
+///
+/// This is a denylist, not an allowance: forgetting a retired tag would let a later
+/// produced-value row reuse the known source-reading provenance and pass.
 #[test]
-fn a_declared_source_reading_tag_that_no_row_carries_is_refused() {
-    let none_carried = synthetic(&[
+fn a_known_source_reading_tag_stays_denied_after_no_real_row_carries_it() {
+    let real_text = std::fs::read_to_string(workspace_root().join("ci/PARITY_LEDGER.txt"))
+        .expect("ledger exists");
+    let real = ledger::parse(&real_text).expect("ledger parses");
+    assert!(
+        !real
+            .rows
+            .iter()
+            .any(|row| row.freshness == "pin-census-v4.32.0"),
+        "precondition: qydn moved every real row off the source-reading run"
+    );
+
+    let reused = synthetic(&[
         "row meta-api | Lean.Unrelated.symbol | function | native | L2 | faithful | \
          pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | \
-         OBSERVED | core-observables-v4.32.0",
+         OBSERVED | pin-census-v4.32.0",
     ]);
-    let errors = ledger::validate_source_reading_freshness_tags_are_live(&none_carried)
-        .expect_err("a declared tag no row carries must fail");
-    assert_eq!(errors.len(), ledger::SOURCE_READING_FRESHNESS_TAGS.len());
+    let errors = ledger::validate_freshness_names_the_oracle_it_claims(&reused)
+        .expect_err("a known source-reading tag must stay denied after retirement");
     assert!(
         errors
             .iter()
-            .any(|error| error.what.contains("no row in this ledger")),
+            .any(|error| error.what.contains("pin-census-v4.32.0")),
         "{errors:?}"
     );
 }

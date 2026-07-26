@@ -19,7 +19,7 @@ row meta-api | Lean.Level.normalize | function | native | L2 | faithful | pinned
 row meta-api | Lean.Level.isEquiv | function | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
 row meta-api | Lean.Expr.data | computed-field | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
 row meta-api | String.hash | function | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt,crates/fln-hash/fixtures/blake3_vectors.txt | D0 | OBSERVED | core-observables-v4.32.0
-row meta-api | mixHash | function | native | L2 | faithful | pinned-source | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+row meta-api | mixHash | function | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
 
 # ---- meta-api: inventoried, shape pending (recognized only — precise unsupported) -----
 row meta-api | Lean.Expr.mkData | function | native | L0 | faithful | pinned-source | exact | , | D0 | TARGETED | inventory-v4.32.0
@@ -192,20 +192,18 @@ row meta-api | Lean.Name.hasMacroScopes | function | native | L2 | faithful | pi
 row meta-api | Lean.Name.eraseMacroScopes | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 row meta-api | Lean.Name.simpMacroScopes | function | native | L2 | faithful | pinned-binary | exact | crates/fln-core/fixtures/core_ext_observables.txt,crates/fln-core/tests/pin_ext_observables.rs | D0 | OBSERVED | core-ext-observables-v4.32.0
 
-# ---- meta-api: the constructor inventory and the resource limits are now MECHANICALLY
-# ---- checked against the pinned sources on every run (D5/D9) rather than transcribed:
-# ---- crates/fln-core/tests/pin_inventory_census.rs reads vendor/lean4-src and compares.
-# ---- The oracle is the pin's own source, so the comparison is exact and the row moves
-# ---- only when the pin does.
-row meta-api | Lean.Expr.ctorInventory | census | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Expr.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | Lean.Level.ctorInventory | census | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Level.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | Lean.Name.ctorInventory | census | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Init/Prelude.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | Lean.DataValue.ctorInventory | census | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Data/KVMap.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | maxHeartbeats | option | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/CoreM.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | maxRecDepth | option | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Init/Prelude.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | synthInstance.maxHeartbeats | option | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Meta/SynthInstance.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | synthInstance.maxSize | option | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Meta/SynthInstance.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | maxSynthPendingDepth | option | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Meta/Basic.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | maxUniverseOffset | option | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Elab/Level.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | exponentiation.threshold | option | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Util/SafeExponentiation.lean | D0 | OBSERVED | pin-census-v4.32.0
-row meta-api | maxErrors | option | native | L2 | faithful | pinned-source | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Language/Basic.lean | D0 | OBSERVED | pin-census-v4.32.0
+# ---- meta-api: constructor inventories and option defaults are compared to values
+# ---- produced by the unpatched pinned binary wherever the pin is installed; the rigs
+# ---- typed-SKIP otherwise. The source census remains supplemental D5/D9 evidence.
+row meta-api | Lean.Expr.ctorInventory | census | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Expr.lean,crates/fln-conformance/tests/pin_ctor_inventory.rs | D0 | OBSERVED | pin-ctor-inventory-v4.32.0
+row meta-api | Lean.Level.ctorInventory | census | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Level.lean,crates/fln-conformance/tests/pin_ctor_inventory.rs | D0 | OBSERVED | pin-ctor-inventory-v4.32.0
+row meta-api | Lean.Name.ctorInventory | census | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Init/Prelude.lean,crates/fln-conformance/tests/pin_ctor_inventory.rs | D0 | OBSERVED | pin-ctor-inventory-v4.32.0
+row meta-api | Lean.DataValue.ctorInventory | census | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Data/KVMap.lean,crates/fln-conformance/tests/pin_ctor_inventory.rs | D0 | OBSERVED | pin-ctor-inventory-v4.32.0
+row meta-api | maxHeartbeats | option | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/CoreM.lean,crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | pin-option-defaults-v4.32.0
+row meta-api | maxRecDepth | option | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Init/Prelude.lean,crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | pin-option-defaults-v4.32.0
+row meta-api | synthInstance.maxHeartbeats | option | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Meta/SynthInstance.lean,crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | pin-option-defaults-v4.32.0
+row meta-api | synthInstance.maxSize | option | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Meta/SynthInstance.lean,crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | pin-option-defaults-v4.32.0
+row meta-api | maxSynthPendingDepth | option | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Meta/Basic.lean,crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | pin-option-defaults-v4.32.0
+row meta-api | maxUniverseOffset | option | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Elab/Level.lean,crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | pin-option-defaults-v4.32.0
+row meta-api | exponentiation.threshold | option | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Util/SafeExponentiation.lean,crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | pin-option-defaults-v4.32.0
+row meta-api | maxErrors | option | native | L2 | faithful | pinned-binary | exact | crates/fln-core/tests/pin_inventory_census.rs,vendor/lean4-src/src/Lean/Language/Basic.lean,crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | pin-option-defaults-v4.32.0
