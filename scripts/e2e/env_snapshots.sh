@@ -841,6 +841,7 @@ run_pass_step environment_suite "$ROOT" crates/fln-env \
 
 run_structured_positive_step() {
   local step="$1" test_name="$2" schema_prefix="$3" expected_records="$4"
+  local validator="${5:-}" validation=not_applicable
   snapshot_before "$ROOT" crates/fln-env "$step"
   note "running structured producer step=$step"
   supervise "$step" env FLN_ENV_E2E_RUN_ID="$RUN_ID-$step" \
@@ -872,16 +873,28 @@ run_structured_positive_step() {
      [ "$leaked_records" -ne 0 ]; then
     record_contract_failure "$step" malformed_or_misrouted_evidence
   fi
+  if [ -n "$validator" ]; then
+    validation="$step.validation.json"
+    "${PYTHON[@]}" "$EVIDENCE" "$validator" --file "$LAST_OUT" \
+      --stderr-file "$LAST_ERR" --expected-run-id "$RUN_ID-$step" \
+      --observed-exit "$LAST_CHILD_EXIT" \
+      --expected-stdout-artifact "$step.out" \
+      --expected-stderr-artifact "$step.err" \
+      --artifact-root "$ART_DIR" --output "$ART_DIR/$validation" || {
+        record_contract_failure "$step" strict_validation_failed
+      }
+  fi
   record_step "$step" pass \
     "records=$expected_records/stdout_only/pass/wrapper=0/child=0" \
     "records=$actual_records/stderr_records=$leaked_records/$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
-    not_applicable pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+    "$validation" pass 0 0 "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
     "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 }
 
 run_structured_positive_step environment_state \
   extensions::tests::environment_state_e2e_emits_detailed_real_path_evidence \
-  '{"schema":"fln.e2e.environment-state","version":1' 4
+  '{"schema":"fln.e2e.environment-state","version":1' 4 \
+  validate-environment-state
 run_structured_positive_step extension_merge_refusals \
   extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence \
   '{"schema":"fln.e2e.extension-merge-refusal","version":1' 2

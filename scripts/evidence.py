@@ -488,6 +488,10 @@ EXTENSION_DESCRIPTOR_MATRIX_TEST = (
     "extensions::tests::"
     "extension_descriptor_matrix_e2e_emits_detailed_real_path_evidence"
 )
+ENVIRONMENT_STATE_SCHEMA = "fln.e2e.environment-state"
+ENVIRONMENT_STATE_TEST = (
+    "extensions::tests::environment_state_e2e_emits_detailed_real_path_evidence"
+)
 ENVIRONMENT_IDENTITY_VERSION = 1
 DECLARATION_TAG_GOLDENS = {
     ("definition_safety", "unsafe"): (
@@ -6428,6 +6432,7 @@ def require_environment_identity_fields(
     expected_run_id: str,
     expected_beads: list[str],
     label: str,
+    expected_final_state: str = "verified",
 ) -> None:
     if set(record) != expected_fields:
         missing = sorted(expected_fields - set(record))
@@ -6441,7 +6446,7 @@ def require_environment_identity_fields(
         or record.get("run_id") != expected_run_id
         or record.get("beads") != expected_beads
         or record.get("status") != "pass"
-        or record.get("final_state") != "verified"
+        or record.get("final_state") != expected_final_state
     ):
         raise EvidenceError(f"{label} shared identity fields differ")
 
@@ -7281,6 +7286,359 @@ def validate_extension_descriptor_matrix(
         "records": len(records),
         "combination_count": len(matrix),
         "defect_rows": len(defects),
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def validate_environment_state(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    """Validate the exact checkpoint/history evidence contract (bead 41s).
+
+    A schema prefix and record count cannot distinguish a duplicated scenario,
+    two interleaved runs, a transposed record, or a checkpoint rebound to the
+    wrong base. This validator binds the four real producer rows, their order,
+    their typed final states, and the identities shared across those rows.
+    """
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=ENVIRONMENT_STATE_SCHEMA,
+        test_name=ENVIRONMENT_STATE_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=4,
+    )
+    common = {
+        "schema",
+        "version",
+        "run_id",
+        "beads",
+        "scenario",
+        "status",
+        "elapsed_us",
+        "final_state",
+    }
+    persistent_fields = common | {
+        "entry_count",
+        "chunk_capacity",
+        "chunk_count",
+        "node_count",
+        "shared_node_count",
+        "fresh_node_count",
+        "append_operations",
+        "replay_operations",
+        "node_allocations",
+        "copied_child_slots",
+        "copied_entry_slots",
+        "payload_bytes",
+        "expected_order_hash",
+        "actual_order_hash",
+        "expected_root",
+        "actual_root",
+        "snapshot_root",
+    }
+    checkpoint_fields = common | {
+        "mode",
+        "base_id",
+        "checkpoint_id",
+        "restored_id",
+        "base_root",
+        "checkpoint_base_root",
+        "expected_root",
+        "actual_root",
+        "base_entries",
+        "checkpoint_entries",
+        "restored_entries",
+        "payload_bytes",
+        "prefix_lookup_steps",
+        "capture_operations",
+        "restore_operations",
+        "entry_limit",
+        "payload_byte_limit",
+        "expected_outcome",
+        "actual_outcome",
+    }
+    recovery_fields = common | {
+        "mode",
+        "base_id",
+        "checkpoint_id",
+        "restored_id",
+        "base_root_before",
+        "base_root_after",
+        "expected_root",
+        "actual_root",
+        "base_entries",
+        "checkpoint_entries",
+        "restored_entries",
+        "entry_limit",
+        "payload_byte_limit",
+        "expected_outcome",
+        "actual_outcome",
+        "recovery_outcome",
+    }
+    expected_keys = [
+        ("persistent-journal", None),
+        ("checkpoint-roundtrip", "journal_suffix"),
+        ("checkpoint-roundtrip", "full_journal"),
+        ("checkpoint-negative-recovery", "journal_suffix"),
+    ]
+    actual_keys = [
+        (record.get("scenario"), record.get("mode")) for record in records
+    ]
+    if actual_keys != expected_keys:
+        raise EvidenceError(
+            "environment-state scenario order or identity differs: "
+            f"{actual_keys!r}"
+        )
+
+    persistent, suffix, full, recovery = records
+    require_environment_identity_fields(
+        persistent,
+        persistent_fields,
+        schema=ENVIRONMENT_STATE_SCHEMA,
+        expected_run_id=expected_run_id,
+        expected_beads=["fln-amv.5", "fln-amv.7"],
+        label="environment-state persistent-journal",
+    )
+    for label, record in (
+        ("journal-suffix", suffix),
+        ("full-journal", full),
+    ):
+        require_environment_identity_fields(
+            record,
+            checkpoint_fields,
+            schema=ENVIRONMENT_STATE_SCHEMA,
+            expected_run_id=expected_run_id,
+            expected_beads=["fln-amv.7"],
+            label=f"environment-state {label}",
+        )
+    require_environment_identity_fields(
+        recovery,
+        recovery_fields,
+        schema=ENVIRONMENT_STATE_SCHEMA,
+        expected_run_id=expected_run_id,
+        expected_beads=["fln-amv.7"],
+        label="environment-state negative-recovery",
+        expected_final_state="clean_recovery",
+    )
+
+    stable_contracts: list[tuple[str, dict[str, Any], dict[str, Any]]] = [
+        (
+            "persistent-journal",
+            persistent,
+            {
+                "entry_count": 69,
+                "chunk_capacity": 32,
+                "chunk_count": 3,
+                "node_count": 4,
+                "shared_node_count": 2,
+                "fresh_node_count": 2,
+                "append_operations": 69,
+                "replay_operations": 69,
+                "node_allocations": 106,
+                "copied_child_slots": 77,
+                "copied_entry_slots": 1002,
+                "payload_bytes": 552,
+                "expected_order_hash": "8ac9a67f1111de29",
+                "actual_order_hash": "8ac9a67f1111de29",
+                "expected_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "actual_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "snapshot_root": (
+                    "8f1976245ae9dce33f3eb0d3febd2bc"
+                    "32e2b5f1f88710c7aa579b80b0c1705ab"
+                ),
+            },
+        ),
+        (
+            "journal-suffix",
+            suffix,
+            {
+                "mode": "journal_suffix",
+                "base_id": (
+                    "a9c5fd7d6f4e70ce4c0a6cd3f90c9355"
+                    "46bcc9c5ff573f4f9d93997677d632ee"
+                ),
+                "checkpoint_id": "v1-suffix-5-7567db5a9df19e29",
+                "restored_id": (
+                    "8d00a22b42354950b09dc8f2e927c523"
+                    "7dc7357cbd2bec7985fff5770b753972"
+                ),
+                "base_root": (
+                    "8f1976245ae9dce33f3eb0d3febd2bc"
+                    "32e2b5f1f88710c7aa579b80b0c1705ab"
+                ),
+                "checkpoint_base_root": (
+                    "a9c5fd7d6f4e70ce4c0a6cd3f90c9355"
+                    "46bcc9c5ff573f4f9d93997677d632ee"
+                ),
+                "expected_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "actual_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "base_entries": 64,
+                "checkpoint_entries": 5,
+                "restored_entries": 69,
+                "payload_bytes": 40,
+                "prefix_lookup_steps": 2,
+                "capture_operations": 5,
+                "restore_operations": 5,
+                "entry_limit": 1000,
+                "payload_byte_limit": 64000,
+                "expected_outcome": "restored",
+                "actual_outcome": "restored",
+            },
+        ),
+        (
+            "full-journal",
+            full,
+            {
+                "mode": "full_journal",
+                "base_id": None,
+                "checkpoint_id": "v1-full-37-38b8cd0e43c2cb09",
+                "restored_id": (
+                    "56b471fc08e0aaf91410cb01467c5a865"
+                    "23f6cfb0efd037c782c61818c6c988b"
+                ),
+                "base_root": None,
+                "checkpoint_base_root": None,
+                "expected_root": (
+                    "0af8c87b8a15bb34bc78108eadf4f6b0"
+                    "640051ba9678536bd17645d11263c131"
+                ),
+                "actual_root": (
+                    "0af8c87b8a15bb34bc78108eadf4f6b0"
+                    "640051ba9678536bd17645d11263c131"
+                ),
+                "base_entries": 0,
+                "checkpoint_entries": 37,
+                "restored_entries": 37,
+                "payload_bytes": 296,
+                "prefix_lookup_steps": 0,
+                "capture_operations": 37,
+                "restore_operations": 37,
+                "entry_limit": 1000,
+                "payload_byte_limit": 64000,
+                "expected_outcome": "restored",
+                "actual_outcome": "restored",
+            },
+        ),
+        (
+            "negative-recovery",
+            recovery,
+            {
+                "mode": "journal_suffix",
+                "base_id": (
+                    "c0f8dd130cf1f9eccd9dd575a0ee9ddd"
+                    "75654c7afd999ffcfbb1bb557ca2f203"
+                ),
+                "checkpoint_id": "v1-suffix-5-7567db5a9df19e29",
+                "restored_id": (
+                    "8d00a22b42354950b09dc8f2e927c523"
+                    "7dc7357cbd2bec7985fff5770b753972"
+                ),
+                "base_root_before": (
+                    "525e3fa4730a11ab0cbc6c56d10282c3"
+                    "80cd0b043751888bb15174fd17df5bbc"
+                ),
+                "base_root_after": (
+                    "525e3fa4730a11ab0cbc6c56d10282c3"
+                    "80cd0b043751888bb15174fd17df5bbc"
+                ),
+                "expected_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "actual_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "base_entries": 64,
+                "checkpoint_entries": 5,
+                "restored_entries": 69,
+                "entry_limit": 1000,
+                "payload_byte_limit": 64000,
+                "expected_outcome": "base_history_mismatch",
+                "actual_outcome": "base_history_mismatch",
+                "recovery_outcome": "restored",
+            },
+        ),
+    ]
+    for label, record, expected in stable_contracts:
+        for field, expected_value in expected.items():
+            if record.get(field) != expected_value:
+                raise EvidenceError(
+                    f"environment-state {label} {field} differs: "
+                    f"{record.get(field)!r}"
+                )
+        require_environment_identity_count(
+            record.get("elapsed_us"),
+            label=f"environment-state {label} elapsed_us",
+        )
+
+    if (
+        suffix["base_id"] != suffix["checkpoint_base_root"]
+        or suffix["base_root"] != persistent["snapshot_root"]
+        or suffix["expected_root"] != persistent["actual_root"]
+        or suffix["actual_root"] != persistent["actual_root"]
+    ):
+        raise EvidenceError(
+            "environment-state suffix checkpoint is rebound to another base or root"
+        )
+    if (
+        recovery["checkpoint_id"] != suffix["checkpoint_id"]
+        or recovery["restored_id"] != suffix["restored_id"]
+        or recovery["expected_root"] != suffix["expected_root"]
+        or recovery["actual_root"] != suffix["actual_root"]
+        or recovery["base_root_before"] != recovery["base_root_after"]
+    ):
+        raise EvidenceError(
+            "environment-state refusal/recovery is stale or uses another checkpoint"
+        )
+
+    return {
+        "schema": "fln.validation/1",
+        "validator": "environment-state/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "record_keys": [
+            scenario if mode is None else f"{scenario}/{mode}"
+            for scenario, mode in expected_keys
+        ],
+        "checkpoint_id": suffix["checkpoint_id"],
+        "logical_root": persistent["actual_root"],
         "stdout_artifact": stdout_relative,
         "stderr_artifact": stderr_relative,
         "stdout_sha256": stdout_digest,
@@ -12310,6 +12668,14 @@ def cmd_validate_extension_descriptor_matrix(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_validate_environment_state(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_environment_state,
+        label="environment-state",
+    )
+
+
 def cmd_validate_kernel_admission(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
     stdout_path = require_within(
@@ -16316,6 +16682,242 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         validate_extension_descriptor_matrix,
         descriptor_false_conditional,
     )
+
+    environment_state_records = [
+        {
+            "schema": ENVIRONMENT_STATE_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.5", "fln-amv.7"],
+            "scenario": "persistent-journal",
+            "status": "pass",
+            "entry_count": 69,
+            "chunk_capacity": 32,
+            "chunk_count": 3,
+            "node_count": 4,
+            "shared_node_count": 2,
+            "fresh_node_count": 2,
+            "append_operations": 69,
+            "replay_operations": 69,
+            "node_allocations": 106,
+            "copied_child_slots": 77,
+            "copied_entry_slots": 1002,
+            "payload_bytes": 552,
+            "expected_order_hash": "8ac9a67f1111de29",
+            "actual_order_hash": "8ac9a67f1111de29",
+            "expected_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "actual_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "snapshot_root": (
+                "8f1976245ae9dce33f3eb0d3febd2bc"
+                "32e2b5f1f88710c7aa579b80b0c1705ab"
+            ),
+            "elapsed_us": 1,
+            "final_state": "verified",
+        },
+        {
+            "schema": ENVIRONMENT_STATE_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.7"],
+            "scenario": "checkpoint-roundtrip",
+            "mode": "journal_suffix",
+            "status": "pass",
+            "base_id": (
+                "a9c5fd7d6f4e70ce4c0a6cd3f90c9355"
+                "46bcc9c5ff573f4f9d93997677d632ee"
+            ),
+            "checkpoint_id": "v1-suffix-5-7567db5a9df19e29",
+            "restored_id": (
+                "8d00a22b42354950b09dc8f2e927c523"
+                "7dc7357cbd2bec7985fff5770b753972"
+            ),
+            "base_root": (
+                "8f1976245ae9dce33f3eb0d3febd2bc"
+                "32e2b5f1f88710c7aa579b80b0c1705ab"
+            ),
+            "checkpoint_base_root": (
+                "a9c5fd7d6f4e70ce4c0a6cd3f90c9355"
+                "46bcc9c5ff573f4f9d93997677d632ee"
+            ),
+            "expected_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "actual_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "base_entries": 64,
+            "checkpoint_entries": 5,
+            "restored_entries": 69,
+            "payload_bytes": 40,
+            "prefix_lookup_steps": 2,
+            "capture_operations": 5,
+            "restore_operations": 5,
+            "entry_limit": 1000,
+            "payload_byte_limit": 64000,
+            "expected_outcome": "restored",
+            "actual_outcome": "restored",
+            "elapsed_us": 2,
+            "final_state": "verified",
+        },
+        {
+            "schema": ENVIRONMENT_STATE_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.7"],
+            "scenario": "checkpoint-roundtrip",
+            "mode": "full_journal",
+            "status": "pass",
+            "base_id": None,
+            "checkpoint_id": "v1-full-37-38b8cd0e43c2cb09",
+            "restored_id": (
+                "56b471fc08e0aaf91410cb01467c5a865"
+                "23f6cfb0efd037c782c61818c6c988b"
+            ),
+            "base_root": None,
+            "checkpoint_base_root": None,
+            "expected_root": (
+                "0af8c87b8a15bb34bc78108eadf4f6b0"
+                "640051ba9678536bd17645d11263c131"
+            ),
+            "actual_root": (
+                "0af8c87b8a15bb34bc78108eadf4f6b0"
+                "640051ba9678536bd17645d11263c131"
+            ),
+            "base_entries": 0,
+            "checkpoint_entries": 37,
+            "restored_entries": 37,
+            "payload_bytes": 296,
+            "prefix_lookup_steps": 0,
+            "capture_operations": 37,
+            "restore_operations": 37,
+            "entry_limit": 1000,
+            "payload_byte_limit": 64000,
+            "expected_outcome": "restored",
+            "actual_outcome": "restored",
+            "elapsed_us": 3,
+            "final_state": "verified",
+        },
+        {
+            "schema": ENVIRONMENT_STATE_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.7"],
+            "scenario": "checkpoint-negative-recovery",
+            "mode": "journal_suffix",
+            "status": "pass",
+            "base_id": (
+                "c0f8dd130cf1f9eccd9dd575a0ee9ddd"
+                "75654c7afd999ffcfbb1bb557ca2f203"
+            ),
+            "checkpoint_id": "v1-suffix-5-7567db5a9df19e29",
+            "restored_id": (
+                "8d00a22b42354950b09dc8f2e927c523"
+                "7dc7357cbd2bec7985fff5770b753972"
+            ),
+            "base_root_before": (
+                "525e3fa4730a11ab0cbc6c56d10282c3"
+                "80cd0b043751888bb15174fd17df5bbc"
+            ),
+            "base_root_after": (
+                "525e3fa4730a11ab0cbc6c56d10282c3"
+                "80cd0b043751888bb15174fd17df5bbc"
+            ),
+            "expected_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "actual_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "base_entries": 64,
+            "checkpoint_entries": 5,
+            "restored_entries": 69,
+            "entry_limit": 1000,
+            "payload_byte_limit": 64000,
+            "expected_outcome": "base_history_mismatch",
+            "actual_outcome": "base_history_mismatch",
+            "recovery_outcome": "restored",
+            "elapsed_us": 4,
+            "final_state": "clean_recovery",
+        },
+    ]
+    state_stdout, state_stderr = write_identity_fixture(
+        "environment_state_valid", environment_state_records
+    )
+    require(
+        identity_validator_call(
+            validate_environment_state,
+            state_stdout,
+            state_stderr,
+        )["records"]
+        == 4,
+        "valid environment-state evidence was not accepted",
+    )
+    expect_identity_rejection(
+        "environment_state_missing",
+        validate_environment_state,
+        environment_state_records[:-1],
+    )
+    state_extra = json.loads(json.dumps(environment_state_records))
+    state_extra.append(json.loads(json.dumps(state_extra[-1])))
+    expect_identity_rejection(
+        "environment_state_extra",
+        validate_environment_state,
+        state_extra,
+    )
+    state_duplicate = json.loads(json.dumps(environment_state_records))
+    state_duplicate[2] = json.loads(json.dumps(state_duplicate[1]))
+    expect_identity_rejection(
+        "environment_state_duplicate",
+        validate_environment_state,
+        state_duplicate,
+    )
+    state_swapped = json.loads(json.dumps(environment_state_records))
+    state_swapped[1], state_swapped[2] = state_swapped[2], state_swapped[1]
+    expect_identity_rejection(
+        "environment_state_swapped",
+        validate_environment_state,
+        state_swapped,
+    )
+    state_wrong_collision = json.loads(json.dumps(environment_state_records))
+    state_wrong_collision[3]["checkpoint_id"] = state_wrong_collision[2][
+        "checkpoint_id"
+    ]
+    expect_identity_rejection(
+        "environment_state_wrong_collision",
+        validate_environment_state,
+        state_wrong_collision,
+    )
+    state_stale = json.loads(json.dumps(environment_state_records))
+    state_stale[3]["base_root_after"] = state_stale[1]["base_root"]
+    expect_identity_rejection(
+        "environment_state_stale",
+        validate_environment_state,
+        state_stale,
+    )
+    state_merged = json.loads(json.dumps(environment_state_records))
+    state_merged[2]["run_id"] = "another-run"
+    expect_identity_rejection(
+        "environment_state_merged_stream",
+        validate_environment_state,
+        state_merged,
+    )
+    state_incomplete = json.loads(json.dumps(environment_state_records))
+    del state_incomplete[3]["final_state"]
+    expect_identity_rejection(
+        "environment_state_incomplete",
+        validate_environment_state,
+        state_incomplete,
+    )
     expect_identity_rejection(
         "tag_stderr_leak",
         validate_declaration_tag_matrix,
@@ -16326,8 +16928,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         {
             "case": "environment_identity_matrix_validation",
             "ok": True,
-            "validators": 3,
-            "mutants_killed": 5,
+            "validators": 4,
+            "mutants_killed": 13,
         }
     )
 
@@ -19744,6 +20346,11 @@ def build_parser() -> argparse.ArgumentParser:
             "validate-extension-descriptor-matrix",
             "strictly validate the fln-amv.2 extension-descriptor matrix",
             cmd_validate_extension_descriptor_matrix,
+        ),
+        (
+            "validate-environment-state",
+            "strictly validate the 41s checkpoint/history identity evidence",
+            cmd_validate_environment_state,
         ),
     ):
         identity_parser = subparsers.add_parser(command, help=help_text)
