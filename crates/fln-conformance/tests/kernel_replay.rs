@@ -2807,6 +2807,224 @@ fn reconstruct_import_context(
     }
 }
 
+/// One completed run of the corpus thread matrix, retained (bead `franken_lean-p6x1`).
+///
+/// **Why anything is retained at all.** A run that leaves nothing behind cannot be told
+/// apart later from a run that never happened, and the sentences in AGENTS.md and README
+/// that describe the observation would then rest on a memory. The row binds the three
+/// things that decide whether the observation is about *this* world: the Reference pin,
+/// the corpus revision (`corpus_fixture_hash`, which is the inventory's own hash over
+/// every present module and its bytes), and the host it ran on.
+///
+/// **Why the file is keyed by pin rather than by date.** The receipt lives at
+/// `evidence/corpus_thread_matrix/<pin>.jsonl`, so the path itself carries the binding the
+/// waiver expires on: when `SUITE.lock` advances the Reference, the file for the new epoch
+/// does not exist and the guard fails. Nothing has to remember a date, and nothing has to
+/// read a clock — which matters, because a gate that reads the wall clock returns
+/// different answers for the same inputs and contradicts FL-INV-01 on the way to enforcing
+/// it.
+///
+/// **`lane_source_digest_at_run` is provenance, not freshness.** It is the lane file under
+/// the project hasher (`Domain::Fixture`, the same algorithm every other digest here uses),
+/// computed by the run over its own source so it cannot be forgotten or mistyped. It records
+/// which source
+/// produced the row and never becomes false. It is deliberately NOT gated: the cone that
+/// invalidates the observation (`fln-kernel`, `fln-env`, `fln-core`, `fln-hash`) took 148
+/// commits in the seven days before this bead, so a gate on it would be red several times
+/// a day with a 32-minute clear. A red that fires that often is one everybody learns to
+/// ignore — a ritual, not a guard. That churn is also the honest reason the class is
+/// `bounded_model` and not an invariant, and it is recorded here rather than smoothed over.
+#[derive(Clone, PartialEq, Eq)]
+struct CorpusMatrixReceipt {
+    bead: String,
+    pin: String,
+    observed_unix_s: u64,
+    corpus_fixture_hash: String,
+    modules: u64,
+    decoded: u64,
+    units_compared: u64,
+    widths: Vec<u64>,
+    corpus_digests: Vec<String>,
+    diverging_modules: u64,
+    unmatrixed_modules: u64,
+    wall_ms: u64,
+    per_width_ms: Vec<u64>,
+    profile: String,
+    target: String,
+    available_parallelism: u64,
+    lane_source_digest_at_run: String,
+    class: String,
+}
+
+const CORPUS_MATRIX_RECEIPT_SCHEMA: &str = "fln.corpus-thread-matrix-receipt/1";
+
+impl CorpusMatrixReceipt {
+    /// The canonical one-line form. Field order is fixed and is part of the format: a
+    /// receipt that does not re-serialize to the bytes it was read from is refused rather
+    /// than repaired, so there is exactly one spelling of a given observation.
+    fn to_row(&self) -> String {
+        let numbers = |values: &[u64]| {
+            values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let strings = |values: &[String]| {
+            values
+                .iter()
+                .map(|value| json_string(value))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "{{\"schema\":{},\"bead\":{},\"pin\":{},\"observed_unix_s\":{},\
+             \"corpus_fixture_hash\":{},\"modules\":{},\"decoded\":{},\"units_compared\":{},\
+             \"widths\":[{}],\"corpus_digests\":[{}],\"diverging_modules\":{},\
+             \"unmatrixed_modules\":{},\"wall_ms\":{},\"per_width_ms\":[{}],\"profile\":{},\
+             \"target\":{},\"available_parallelism\":{},\"lane_source_digest_at_run\":{},\
+             \"class\":{}}}",
+            json_string(CORPUS_MATRIX_RECEIPT_SCHEMA),
+            json_string(&self.bead),
+            json_string(&self.pin),
+            self.observed_unix_s,
+            json_string(&self.corpus_fixture_hash),
+            self.modules,
+            self.decoded,
+            self.units_compared,
+            numbers(&self.widths),
+            strings(&self.corpus_digests),
+            self.diverging_modules,
+            self.unmatrixed_modules,
+            self.wall_ms,
+            numbers(&self.per_width_ms),
+            json_string(&self.profile),
+            json_string(&self.target),
+            self.available_parallelism,
+            json_string(&self.lane_source_digest_at_run),
+            json_string(&self.class),
+        )
+    }
+
+    /// Read a row, then prove the read was faithful by re-serializing it.
+    ///
+    /// Extraction is by key and so tolerant of order; the round-trip is what makes the
+    /// format strict. A parser that silently accepted a row it could not reproduce would
+    /// let the guard below check a value nobody wrote — the same join defect one floor
+    /// down, between a file and the meaning taken from it.
+    fn from_row(row: &str) -> Result<CorpusMatrixReceipt, String> {
+        fn text(row: &str, key: &str) -> Result<String, String> {
+            let needle = format!("\"{key}\":\"");
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing string field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find('"')
+                .ok_or_else(|| format!("unterminated string field `{key}`"))?;
+            Ok(rest[..end].to_string())
+        }
+        fn number(row: &str, key: &str) -> Result<u64, String> {
+            let needle = format!("\"{key}\":");
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing numeric field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end]
+                .parse()
+                .map_err(|_| format!("field `{key}` is not a u64"))
+        }
+        fn array<'a>(row: &'a str, key: &str) -> Result<&'a str, String> {
+            let needle = format!("\"{key}\":[");
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing array field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find(']')
+                .ok_or_else(|| format!("unterminated array field `{key}`"))?;
+            Ok(&rest[..end])
+        }
+        let numbers = |key: &str| -> Result<Vec<u64>, String> {
+            array(row, key)?
+                .split(',')
+                .filter(|item| !item.is_empty())
+                .map(|item| {
+                    item.parse::<u64>()
+                        .map_err(|_| format!("array `{key}` holds a non-u64"))
+                })
+                .collect()
+        };
+        let strings = |key: &str| -> Result<Vec<String>, String> {
+            Ok(array(row, key)?
+                .split(',')
+                .filter(|item| !item.is_empty())
+                .map(|item| item.trim_matches('"').to_string())
+                .collect())
+        };
+        let schema = text(row, "schema")?;
+        if schema != CORPUS_MATRIX_RECEIPT_SCHEMA {
+            return Err(format!(
+                "receipt schema is `{schema}`, expected `{CORPUS_MATRIX_RECEIPT_SCHEMA}`"
+            ));
+        }
+        let receipt = CorpusMatrixReceipt {
+            bead: text(row, "bead")?,
+            pin: text(row, "pin")?,
+            observed_unix_s: number(row, "observed_unix_s")?,
+            corpus_fixture_hash: text(row, "corpus_fixture_hash")?,
+            modules: number(row, "modules")?,
+            decoded: number(row, "decoded")?,
+            units_compared: number(row, "units_compared")?,
+            widths: numbers("widths")?,
+            corpus_digests: strings("corpus_digests")?,
+            diverging_modules: number(row, "diverging_modules")?,
+            unmatrixed_modules: number(row, "unmatrixed_modules")?,
+            wall_ms: number(row, "wall_ms")?,
+            per_width_ms: numbers("per_width_ms")?,
+            profile: text(row, "profile")?,
+            target: text(row, "target")?,
+            available_parallelism: number(row, "available_parallelism")?,
+            lane_source_digest_at_run: text(row, "lane_source_digest_at_run")?,
+            class: text(row, "class")?,
+        };
+        if receipt.to_row() != row {
+            return Err(format!(
+                "receipt is not in canonical form; it was read as\n  {}\nbut the file holds\n  {row}",
+                receipt.to_row()
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
+/// Where the retained receipts for a given Reference pin live, relative to this crate.
+fn corpus_matrix_receipt_path(pin: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("evidence/corpus_thread_matrix")
+        .join(format!("{pin}.jsonl"))
+}
+
+/// The Reference pin `SUITE.lock` currently governs — the one ceremony that moves it.
+fn suite_lock_reference_pin() -> String {
+    const SUITE_LOCK: &str = include_str!("../../../SUITE.lock");
+    SUITE_LOCK
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix("tag="))
+        })
+        .expect("SUITE.lock must pin the Reference with a tag= field")
+        .to_string()
+}
+
 /// The executable corpus obligation. It remains ignored while fln-7odd is
 /// open because the selected oracle itself supplies no verdict for 1,425
 /// decoded rows; enabling a gate that is known to fail before that contract is
@@ -3411,6 +3629,67 @@ fn present_olean_corpus_thread_matrix_compares_stream_digests() {
          means=a_green_run_here_does_NOT_make_FL-INV-01_measured_over_the_corpus \
          bead=fln-corpus-thread-matrix-93te"
     );
+
+    // THE RETAINED EVIDENCE (bead `franken_lean-p6x1`). The row is always printed, so a
+    // run that nobody thought to capture still leaves its identity in the log; it is
+    // written into the tree only when the operator names a path, because a test that
+    // edits a tracked file on its own would be a governed-input mutation and could void
+    // somebody else's lane. `observed_utc` is supplied by the caller for the same reason
+    // the class is derived from the run: a value invented here could not be checked.
+    let receipt = CorpusMatrixReceipt {
+        bead: "fln-corpus-thread-matrix-93te".to_string(),
+        pin: suite_lock_reference_pin(),
+        observed_unix_s: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0),
+        corpus_fixture_hash: inventory.fixture_hash.clone(),
+        modules: matrixed_modules,
+        decoded: matrixed_decls,
+        units_compared: matrixed_units,
+        widths: CORPUS_MATRIX_WIDTHS.iter().map(|w| *w as u64).collect(),
+        corpus_digests: corpus_digests.clone(),
+        diverging_modules: divergences.len() as u64,
+        unmatrixed_modules,
+        wall_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        per_width_ms: width_micros
+            .iter()
+            .map(|micros| u64::try_from(micros / 1_000).unwrap_or(u64::MAX))
+            .collect(),
+        profile: if cfg!(debug_assertions) {
+            "dev"
+        } else {
+            "release"
+        }
+        .to_string(),
+        target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+        available_parallelism: std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(0),
+        // The lane digests its OWN source, so the provenance cannot be forgotten by an
+        // operator or mistyped by one.
+        lane_source_digest_at_run: hash(
+            Domain::Fixture,
+            include_str!("kernel_replay.rs").as_bytes(),
+        )
+        .to_hex(),
+        class: if divergences.is_empty() {
+            "observed_once_not_an_invariant"
+        } else {
+            "refuted_this_run_found_a_width_disagreement"
+        }
+        .to_string(),
+    };
+    let row = receipt.to_row();
+    eprintln!("kernel_reference_corpus_matrix RECEIPT: {row}");
+    if let Ok(path) = std::env::var("FLN_CORPUS_MATRIX_RECEIPT") {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("open receipt {path}: {error}"));
+        writeln!(file, "{row}").unwrap_or_else(|error| panic!("append receipt {path}: {error}"));
+    }
 
     // One direction only. A differing fold with no per-module divergence is impossible and
     // means the summary and the evidence it summarises disagree. The converse is NOT a
@@ -5036,6 +5315,219 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         "only {checked} determinism claim lines found across AGENTS.md and README.md; the \
          scan is looking in the wrong place and would pass over a bare claim"
     );
+}
+
+/// The PG-5 waiver expires when the Reference pin moves, and this is what notices
+/// (bead `franken_lean-p6x1`).
+///
+/// **The decision this encodes, priced.** PG-5 asks for {1, 8, 32} per commit. The corpus
+/// lane costs 1,926,656 ms — 32.1 minutes — measured, on a 64-way host, and CI installs no
+/// Reference toolchain at all (`.github/workflows/ci.yml` says Reference-drift detection
+/// "belongs in a scheduled job that actually installs the toolchain"; no such job exists).
+/// So per-commit is not available, and the honest instrument is a waiver rather than a
+/// cadence nobody dispatches.
+///
+/// **Why the expiry is a correspondence and not a date.** A waiver whose expiry nothing
+/// checks is the recurring defect in a compliance costume. Three candidate triggers were
+/// priced:
+///
+/// - *a calendar* — nothing in this repository gates on the wall clock, and a gate that
+///   reads it answers differently for identical inputs, which contradicts FL-INV-01 on the
+///   way to enforcing it. There is also no scheduled runner to lapse against.
+/// - *the invalidating cone* (`fln-kernel`, `fln-env`, `fln-core`, `fln-hash`) — 148
+///   commits in seven days. A red there fires several times a day and clears only by
+///   paying 32 minutes; everyone would learn to ignore it. That is a ritual, and it is
+///   also the honest reason this claim is `bounded_model`.
+/// - *the Reference pin* — moved once in the project's life, by a reviewed ceremony. Rare,
+///   deterministic, and its firing is exactly the moment the observation stops being about
+///   the corpus in the tree.
+///
+/// The pin wins, and the binding is structural rather than declared: the receipt lives at
+/// `evidence/corpus_thread_matrix/<pin>.jsonl`, so advancing `SUITE.lock` makes the file
+/// the guard looks for cease to exist. No field to update, nothing to remember.
+///
+/// **When this fires, the reader has two actions and both are honest** — re-run the lane
+/// (the message prints the command and what it cost last time) or delete the observation
+/// sentences and let the claim fall back to inferred. The second is cheap and legitimate,
+/// which is what keeps the red from being extortion.
+#[test]
+fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
+    let pin = suite_lock_reference_pin();
+    let path = corpus_matrix_receipt_path(&pin);
+    let text = fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "THE PG-5 WAIVER HAS EXPIRED. SUITE.lock now pins the Reference at {pin}, and no \
+             corpus thread-matrix receipt exists for it ({}: {error}). Any observation on \
+             file was of a different Reference, so the sentences in AGENTS.md and README \
+             that describe it no longer describe this tree.\n\
+             \n\
+             Two ways to clear this, both honest:\n\
+             (1) Re-run the lane at the new pin and commit the receipt it appends:\n\
+             \x20   FLN_CORPUS_MATRIX_RECEIPT={} \\\n\
+             \x20     cargo test --locked -p fln-conformance --test kernel_replay \\\n\
+             \x20     present_olean_corpus_thread_matrix_compares_stream_digests \\\n\
+             \x20     -- --ignored --exact --nocapture\n\
+             \x20   It cost 1,926,656 ms (32.1 min) at v4.32.0 on a 64-way host; the width-1 \
+             column is three quarters of that.\n\
+             (2) Weaken the claim instead: remove the observation sentences from AGENTS.md \
+             and README and let corpus schedule-independence go back to INFERRED. This is \
+             cheaper than (1) and is a legitimate outcome — the claim is allowed to shrink.\n\
+             \n\
+             Deleting this test is not a third option: it is the only thing joining those \
+             sentences to a run (bead franken_lean-p6x1).",
+            path.display(),
+            path.display(),
+        )
+    });
+
+    let rows = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !rows.is_empty(),
+        "{} exists but holds no rows. An empty receipt is not a lighter claim than a \
+         missing one; it is the same claim with the evidence removed",
+        path.display()
+    );
+    let receipts = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            CorpusMatrixReceipt::from_row(row)
+                .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), index + 1))
+        })
+        .collect::<Vec<_>>();
+
+    for (index, receipt) in receipts.iter().enumerate() {
+        let number = index + 1;
+        assert_eq!(
+            receipt.pin,
+            pin,
+            "{}:{number}: row records pin {} but the file is the {pin} epoch's. The path IS \
+             the binding; a row filed under the wrong epoch would make the guard check an \
+             observation of another Reference",
+            path.display(),
+            receipt.pin
+        );
+        assert_eq!(
+            receipt.widths,
+            CORPUS_MATRIX_WIDTHS
+                .iter()
+                .map(|w| *w as u64)
+                .collect::<Vec<_>>(),
+            "{}:{number}: row records widths {:?}, but the lane runs {CORPUS_MATRIX_WIDTHS:?}. \
+             An observation at other widths is not evidence for the widths PG-5 names",
+            path.display(),
+            receipt.widths
+        );
+        assert_eq!(
+            receipt.diverging_modules,
+            0,
+            "{}:{number}: row records {} diverging module(s). A refutation must not sit \
+             quietly in an evidence file while the documents claim schedule-independence — \
+             this is release-blocking, not a receipt",
+            path.display(),
+            receipt.diverging_modules
+        );
+        assert!(
+            receipt
+                .corpus_digests
+                .iter()
+                .all(|digest| *digest == receipt.corpus_digests[0]),
+            "{}:{number}: per-width corpus digests differ while diverging_modules is 0; the \
+             row contradicts itself",
+            path.display()
+        );
+        assert_eq!(
+            receipt.class,
+            "observed_once_not_an_invariant",
+            "{}:{number}: row claims class {}, which this lane cannot earn",
+            path.display(),
+            receipt.class
+        );
+    }
+
+    // The claim must be re-derived when the evidence grows, not only when it decays. One
+    // row is one observation; several are repeated observations over one corpus revision,
+    // which is a different (still not invariant) class, and the documents would then be
+    // understating rather than overstating. Both directions are wrong.
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let single_run_wording = ["run once", "one observation", "once at the pin"];
+    let mut says_once = false;
+    for doc in ["AGENTS.md", "README.md"] {
+        let doc_text = fs::read_to_string(repo.join(doc))
+            .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
+        says_once |= doc_text
+            .lines()
+            .any(|line| single_run_wording.iter().any(|w| line.contains(w)));
+    }
+    if receipts.len() == 1 {
+        assert!(
+            says_once,
+            "the receipt holds exactly one observation but neither AGENTS.md nor README.md \
+             says so. A reader cannot tell one run from a kept cadence, which is the whole \
+             difference between bounded_model and statistical (bead franken_lean-p6x1)"
+        );
+    } else {
+        assert!(
+            !says_once,
+            "the receipt now holds {} observations, but AGENTS.md or README.md still \
+             describes a single run. Re-derive the class deliberately: repeated observations \
+             over the covered corpus buy a statistical claim, never the invariant PG-5 asks \
+             for (D7, bead franken_lean-p6x1)",
+            receipts.len()
+        );
+    }
+}
+
+/// The receipt format is checked against the committed receipt, not only against fixtures.
+///
+/// `from_row` re-serializes what it read and refuses on any difference, so this exercises
+/// the real bytes on disk through the real serializer. A fixture-only test would prove the
+/// pair is self-consistent while the committed file said something else entirely — the
+/// join between an artifact and the code that claims to read it.
+#[test]
+fn the_corpus_matrix_receipt_round_trips_through_its_own_serializer() {
+    let pin = suite_lock_reference_pin();
+    let path = corpus_matrix_receipt_path(&pin);
+    let text = fs::read_to_string(&path).expect("the retained receipt must be readable");
+    for (index, row) in text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let receipt = CorpusMatrixReceipt::from_row(row)
+            .unwrap_or_else(|error| panic!("{}:{}: {error}", path.display(), index + 1));
+        assert_eq!(receipt.to_row(), row, "canonical round trip");
+    }
+
+    // A planted malformation must be refused rather than read past. Note what this can and
+    // cannot see: a row whose CONTENT was altered still round-trips, because it is a
+    // well-formed row saying something false. Content is the guard's job above (digests all
+    // equal, diverging_modules zero, pin matches the path); format is this one's. Two
+    // checks, and neither pretends to be the other.
+    let sample = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("at least one row");
+    for (mutation, damaged) in [
+        ("schema moved", sample.replace("receipt/1", "receipt/2")),
+        (
+            "field renamed away",
+            sample.replacen("\"modules\":", "\"module_count\":", 1),
+        ),
+        (
+            "one byte of whitespace",
+            sample.replacen("{\"schema\"", "{ \"schema\"", 1),
+        ),
+    ] {
+        assert!(
+            CorpusMatrixReceipt::from_row(&damaged).is_err(),
+            "a receipt with `{mutation}` was accepted; the reader must refuse what it cannot \
+             reproduce"
+        );
+    }
 }
 
 /// Planted divergences for `first_divergence_across_widths` (R3 of bead
