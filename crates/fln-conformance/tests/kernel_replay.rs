@@ -30,16 +30,22 @@
 //! schedule-independent by construction, and the matrix PROVES it byte-equal
 //! at every width on that input.
 //!
-//! **The matrix does not cover the corpus** (bead `fln-8zsq`). The corpus
-//! differential (`pinned_present_olean_kernel_differential`) runs at a single
-//! width chosen per module by a size heuristic, so its schedule-independence
-//! is INFERRED — from the Prelude matrix result plus the same purity and
-//! merge-determinism argument — and is not measured on the corpus itself.
-//! That is a `bounded_model` claim standing where PG-5 asks for a measured
-//! invariant, and D7 forbids reading the stronger one into the corpus census
-//! numbers. Closing the gap for real means running the corpus across the
-//! matrix and comparing stream digests; that is deliberately a follow-up lane,
-//! not a blocker on reporting the census honestly today.
+//! **The per-commit matrix does not cover the corpus** (beads `fln-8zsq`,
+//! `fln-corpus-thread-matrix-93te`). The corpus differential
+//! (`pinned_present_olean_kernel_differential`) scores verdicts at a single
+//! explicitly pinned width and compares no digests across widths at all. The
+//! cross-width comparison is a separate lane,
+//! `present_olean_corpus_thread_matrix_compares_stream_digests`, which replays
+//! the same reconstructed environments at every width in
+//! `CORPUS_MATRIX_WIDTHS` and names the diverging pair and unit if they ever
+//! disagree.
+//!
+//! What that lane earns is bounded and is stated where it is claimed: it is
+//! `#[ignore]`d for cost and SKIPs typed without the pin, so a green run is ONE
+//! OBSERVATION at one corpus revision, pin and host — class `bounded_model`,
+//! never `invariant`. PG-5 asks for {1, 8, 32} PER COMMIT; an on-demand lane is
+//! a DOCUMENTED SHORTFALL against that gate rather than compliance with it, and
+//! D7 forbids the observation standing in for the invariant.
 //!
 //! Machine rows go to stdout as schema-versioned NDJSON
 //! (`fln.e2e.kernel-admission`/`fln.e2e.kernel-admission-fault`, validated by
@@ -1151,8 +1157,25 @@ const PINNED_ORACLE_APPLICABLE_FLOOR: u64 = 157_183;
 /// and runs that were not produced under comparable configurations cannot support a
 /// determinism claim at all. Pinning is therefore a prerequisite for the matrix, not a
 /// substitute for it: one pinned width still compares no stream digests ACROSS widths,
-/// so corpus schedule-independence stays INFERRED, NOT MEASURED.
+/// so the census's own numbers say nothing about schedules in either direction. The
+/// comparison across widths is `CORPUS_MATRIX_WIDTHS` and its lane, whose class is
+/// bounded by what an on-demand run can earn.
 const CORPUS_CENSUS_WIDTH: usize = 8;
+/// The widths PG-5 names, and the widths the corpus thread matrix actually runs
+/// (R2 of bead `fln-corpus-thread-matrix-93te`).
+///
+/// Spelled out rather than derived. `CORPUS_CENSUS_WIDTH` must be one of these, so the
+/// census's own run is the matrix's middle column rather than a fourth, unrelated
+/// configuration — but writing that constant INTO the array would invert the dependency:
+/// repinning the census width would then silently move the matrix off the widths PG-5
+/// names, while every `{1, 8, 32}` line in the documents stayed green. The relationship is
+/// therefore CHECKED, at compile time, and the widths are the literal ones being claimed.
+const CORPUS_MATRIX_WIDTHS: [usize; 3] = [1, 8, 32];
+const _: () = assert!(
+    CORPUS_MATRIX_WIDTHS[1] == CORPUS_CENSUS_WIDTH,
+    "the corpus census must be scored at one of the matrix's widths, or its run is a \
+     configuration the matrix never compared"
+);
 const MAX_PINNED_OLEAN_BYTES: u64 = 512 * 1024 * 1024;
 const LEANCHECKER_TIMEOUT: Duration = Duration::from_secs(300);
 const ORACLE_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
@@ -2688,6 +2711,102 @@ fn present_olean_import_contexts_accept_reference_extended_duplicates() {
     );
 }
 
+/// One module's accumulated state in the canonical corpus walk: the PRESENT-import
+/// closure it was reconstructed from, the fixture context that closure produces, its
+/// decoded active rows, and whether that reconstruction was faithfully representable.
+struct CorpusFixtureState {
+    closure: BTreeSet<String>,
+    context: ReferenceFixtureContext,
+    active_infos: Vec<ConstantInfo>,
+    faithful: bool,
+}
+
+/// One module's reconstructed import context, plus the merge findings that decided
+/// whether it is faithfully representable. `collisions` is `(dependency, colliding
+/// names)` in merge order and is empty exactly when `faithful` is not falsified here.
+struct ReconstructedImportContext {
+    imported: ReferenceFixtureContext,
+    closure: BTreeSet<String>,
+    faithful: bool,
+    collisions: Vec<(String, Vec<String>)>,
+}
+
+/// Rebuild exactly the union of a module's PRESENT direct-import closures from decoded
+/// rows. Starting from the largest direct import preserves structural sharing; only
+/// contributions absent from that base are inserted.
+///
+/// **Why this is shared rather than copied** (R2 of bead `fln-corpus-thread-matrix-93te`).
+/// The corpus census (`pinned_present_olean_kernel_differential`) scores verdicts produced
+/// in these environments; the corpus thread matrix
+/// (`present_olean_corpus_thread_matrix_compares_stream_digests`) compares stream digests
+/// produced in them. A second copy would let the two drift, and the matrix's digests would
+/// then be evidence about a computation the census does not perform — with nothing
+/// objecting, because each test would still read as internally consistent. That is exactly
+/// the join-between-two-artifacts defect AGENTS.md item 7 records, and it is the same
+/// argument that made R3 extract `first_divergence_across_widths` instead of writing a
+/// second comparator.
+fn reconstruct_import_context(
+    module: &CorpusModule,
+    inventory: &CorpusInventory,
+    order_index: &HashMap<String, usize>,
+    states: &BTreeMap<String, CorpusFixtureState>,
+) -> ReconstructedImportContext {
+    let direct_imports = module
+        .imports
+        .iter()
+        .filter(|import| inventory.modules.contains_key(*import) && import.as_str() != module.name)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut closure = BTreeSet::new();
+    let mut faithful = true;
+    for import in &direct_imports {
+        let state = states
+            .get(import)
+            .unwrap_or_else(|| panic!("{} imported before {import}", module.name));
+        closure.insert(import.clone());
+        closure.extend(state.closure.iter().cloned());
+        faithful &= state.faithful;
+    }
+    let base = direct_imports
+        .iter()
+        .max_by_key(|import| states[*import].closure.len());
+    let (mut imported, mut included) = match base {
+        Some(base) => {
+            let state = &states[base];
+            let mut included = state.closure.clone();
+            included.insert(base.clone());
+            (state.context.clone(), included)
+        }
+        None => (ReferenceFixtureContext::new(), BTreeSet::new()),
+    };
+    let mut missing = closure.difference(&included).cloned().collect::<Vec<_>>();
+    missing.sort_by_key(|name| order_index[name]);
+    let mut collisions = Vec::new();
+    for dependency in missing {
+        let state = &states[&dependency];
+        let (next, merge) =
+            extend_reference_fixture_environment(imported, &state.active_infos, &dependency)
+                .expect("merge a decoded import contribution");
+        imported = next;
+        included.insert(dependency.clone());
+        if !merge.collisions.is_empty() {
+            faithful = false;
+            collisions.push((dependency, merge.collisions));
+        }
+    }
+    assert_eq!(
+        included, closure,
+        "{} import-context reconstruction omitted a present dependency",
+        module.name
+    );
+    ReconstructedImportContext {
+        imported,
+        closure,
+        faithful,
+        collisions,
+    }
+}
+
 /// The executable corpus obligation. It remains ignored while fln-7odd is
 /// open because the selected oracle itself supplies no verdict for 1,425
 /// decoded rows; enabling a gate that is known to fail before that contract is
@@ -2778,19 +2897,12 @@ fn pinned_present_olean_kernel_differential() {
         }
     }
 
-    struct FixtureState {
-        closure: BTreeSet<String>,
-        context: ReferenceFixtureContext,
-        active_infos: Vec<ConstantInfo>,
-        faithful: bool,
-    }
-
     let order_index = order
         .iter()
         .enumerate()
         .map(|(index, name)| (name.clone(), index))
         .collect::<HashMap<_, _>>();
-    let mut states = BTreeMap::<String, FixtureState>::new();
+    let mut states = BTreeMap::<String, CorpusFixtureState>::new();
     let mut total = CorpusCounts::default();
     for (index, module_name) in order.iter().enumerate() {
         let module = &inventory.modules[module_name];
@@ -2822,62 +2934,22 @@ fn pinned_present_olean_kernel_differential() {
         );
         let (active_infos, active_to_decoded, shadowed) = reference_active_rows(&infos);
 
-        // Reconstruct exactly the union of PRESENT direct-import closures.
-        // Starting from the largest direct import preserves structural sharing;
-        // only contributions absent from that base are inserted.
-        let direct_imports = module
-            .imports
-            .iter()
-            .filter(|import| {
-                inventory.modules.contains_key(*import) && import.as_str() != module.name
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut closure = BTreeSet::new();
-        let mut context_faithful = true;
-        for import in &direct_imports {
-            let state = states
-                .get(import)
-                .unwrap_or_else(|| panic!("{} imported before {import}", module.name));
-            closure.insert(import.clone());
-            closure.extend(state.closure.iter().cloned());
-            context_faithful &= state.faithful;
-        }
-        let base = direct_imports
-            .iter()
-            .max_by_key(|import| states[*import].closure.len());
-        let (mut imported_context, mut included) = match base {
-            Some(base) => {
-                let state = &states[base];
-                let mut included = state.closure.clone();
-                included.insert(base.clone());
-                (state.context.clone(), included)
-            }
-            None => (ReferenceFixtureContext::new(), BTreeSet::new()),
-        };
-        let mut missing = closure.difference(&included).cloned().collect::<Vec<_>>();
-        missing.sort_by_key(|name| order_index[name]);
-        for dependency in missing {
-            let state = &states[&dependency];
-            let (next, merge) = extend_reference_fixture_environment(
-                imported_context,
-                &state.active_infos,
-                &dependency,
-            )
-            .expect("merge a decoded import contribution");
-            imported_context = next;
-            included.insert(dependency.clone());
-            if !merge.collisions.is_empty() {
-                context_faithful = false;
-                eprintln!(
-                    "kernel_reference_corpus finding: module={} direction=unscorable \
-                     reason=import_context_collision dependency={} affected={} first={:?}",
-                    module.name,
-                    dependency,
-                    merge.collisions.len(),
-                    merge.collisions.iter().take(5).collect::<Vec<_>>()
-                );
-            }
+        let reconstructed = reconstruct_import_context(module, &inventory, &order_index, &states);
+        let ReconstructedImportContext {
+            imported: imported_context,
+            closure,
+            faithful: mut context_faithful,
+            collisions,
+        } = reconstructed;
+        for (dependency, names) in &collisions {
+            eprintln!(
+                "kernel_reference_corpus finding: module={} direction=unscorable \
+                 reason=import_context_collision dependency={} affected={} first={:?}",
+                module.name,
+                dependency,
+                names.len(),
+                names.iter().take(5).collect::<Vec<_>>()
+            );
         }
 
         let (counts, stream_digest) = if context_faithful {
@@ -2887,20 +2959,23 @@ fn pinned_present_olean_kernel_differential() {
                 &active_infos,
                 false,
             );
-            // ONE PINNED WIDTH, still NOT a determinism matrix (R1 of bead
-            // `fln-corpus-thread-matrix-93te`). This was a size heuristic —
-            // `if prep.items.len() < 64 { 1 } else { 8 }` — under which two
-            // modules of different sizes ran at DIFFERENT widths, so the census
-            // was not even produced at one consistent configuration. Comparing
-            // runs that were not produced under comparable configurations cannot
-            // support a determinism claim at all, which is why pinning comes
-            // first and the matrix second.
+            // ONE PINNED WIDTH. This census scores verdicts against the oracle; it
+            // is not, and after R2 still is not, a determinism matrix. The width was
+            // a size heuristic — `if prep.items.len() < 64 { 1 } else { 8 }` — under
+            // which two modules of different sizes ran at DIFFERENT widths, so the
+            // census was not even produced at one consistent configuration, and runs
+            // not produced under comparable configurations cannot support a
+            // determinism claim at all (R1 of bead `fln-corpus-thread-matrix-93te`).
             //
-            // What this does NOT buy: the corpus still runs at exactly one width
-            // and still compares no stream digests ACROSS widths, which is what
-            // PG-5 asks for. Corpus schedule-independence remains INFERRED, NOT
-            // MEASURED. R2/R3 add the {1, 8, 32} matrix and the per-width-pair
-            // comparison; until then the census keeps reporting this limitation.
+            // The cross-width comparison lives in
+            // `present_olean_corpus_thread_matrix_compares_stream_digests`, which
+            // replays the SAME reconstructed environments at every width in
+            // `CORPUS_MATRIX_WIDTHS`. `CORPUS_CENSUS_WIDTH` is one of those widths, so
+            // this run is that matrix's middle column rather than a fourth
+            // configuration — but nothing HERE compares digests across widths, so
+            // these counts remain evidence about verdict agreement only. What the
+            // matrix earns is a separate, weaker-than-invariant claim, stated in the
+            // CLAIM-CLASS row below and in the matrix test's own census.
             let threads = CORPUS_CENSUS_WIDTH;
             let run = check_matrix_run(&prep, threads, Budget::DEFAULT);
             (
@@ -2976,7 +3051,7 @@ fn pinned_present_olean_kernel_differential() {
         }
         states.insert(
             module.name.clone(),
-            FixtureState {
+            CorpusFixtureState {
                 closure,
                 context,
                 active_infos,
@@ -2991,7 +3066,7 @@ fn pinned_present_olean_kernel_differential() {
          restrictive_with_carve_out={} restrictive_without_carve_out={}; \
          unscorable={} oracle_skipped={} subject_no_answer={} modules={} \
          missing_imports={} fixture_hash={} \
-         schedule_independence=inferred_not_measured",
+         schedule_independence=not_measured_in_this_run",
         total.compared,
         total.decoded,
         total.disagreements(),
@@ -3009,12 +3084,21 @@ fn pinned_present_olean_kernel_differential() {
     // cannot be dropped when they are quoted (bead `fln-8zsq`). PG-5 asks for a
     // measured invariant across {1, 8, 32}; what this run supports is weaker,
     // and D7 forbids the weaker class standing in for the stronger one.
+    //
+    // The cross-width matrix now EXISTS (R2 of `fln-corpus-thread-matrix-93te`) and is
+    // named here so a reader of these counts can find it — but it is a different lane
+    // with a different, still-not-invariant class, and it does not run per commit. The
+    // row therefore points at it and states the shortfall rather than inheriting its
+    // result: pointing at evidence is not the same as carrying it.
     println!(
-        "kernel_reference_corpus CLAIM-CLASS: schedule_independence=inferred_not_measured \
+        "kernel_reference_corpus CLAIM-CLASS: schedule_independence=not_measured_in_this_run \
+         corpus_widths=one_pinned_width_no_cross_width_comparison_here \
          basis=prelude_matrix_{{1,8,32}}+kernel_purity+deterministic_merge \
-         corpus_widths=size_heuristic_per_module_never_compared_across_widths \
+         matrix_lane=present_olean_corpus_thread_matrix_compares_stream_digests \
+         matrix_class=see_that_lanes_own_CLAIM-CLASS_row_it_is_not_an_invariant \
+         cadence=corpus_matrix_is_on_demand_NOT_per_commit_a_documented_PG-5_shortfall \
          means=these_counts_are_NOT_evidence_of_deterministic_corpus_checking \
-         bead=fln-8zsq"
+         bead=fln-8zsq,fln-corpus-thread-matrix-93te"
     );
     assert!(
         total.compared >= PINNED_ORACLE_APPLICABLE_FLOOR,
@@ -3033,6 +3117,317 @@ fn pinned_present_olean_kernel_differential() {
     assert_eq!(
         total.unscorable, 0,
         "a non-answer from either side agrees with nothing"
+    );
+}
+
+/// The corpus-scale `{1, 8, 32}` thread matrix (R2 of bead
+/// `fln-corpus-thread-matrix-93te`) — and, just as load-bearing, the one claim a green run
+/// of it is allowed to buy.
+///
+/// **What it does.** Every present pinned module is decoded, its PRESENT-import closure is
+/// reconstructed by `reconstruct_import_context` — the same function the corpus census
+/// uses, so these are the same environments — and the prepared units are replayed at every
+/// width in `CORPUS_MATRIX_WIDTHS` through the same `check_matrix_run` the Prelude matrix
+/// uses. The three runs go to `first_divergence_across_widths`, which names the PAIR of
+/// widths, the unit index and the lead. That is R3's requirement that the assertion be
+/// scoped to the site producing the digests rather than to "some equality held somewhere
+/// in the run".
+///
+/// **No oracle is involved, deliberately.** Comparing our own stream digests across widths
+/// needs no Reference verdict at all, so this lane is reachable while `fln-7odd` keeps
+/// `pinned_present_olean_kernel_differential` ignored. Removing that attribute to get a
+/// matrix running would have coupled the matrix half to the oracle half for no reason.
+///
+/// **What a green run earns, stated because the whole bead is about not overclaiming.**
+/// ONE OBSERVATION: this corpus revision, this pin, this host, this build, this run. Class
+/// `bounded_model`, never `invariant`. FL-INV-01 is an invariant claim and PG-5 asks for
+/// {1, 8, 32} PER COMMIT; this lane is `#[ignore]`d for cost and additionally SKIPs typed
+/// where the pin is absent, so it gates nothing and a SKIP produces no evidence at all.
+/// The gap between one observation and the invariant is a DOCUMENTED SHORTFALL against
+/// PG-5, not compliance with it, and D7 forbids the observation standing in for the
+/// invariant. A lane that has not executed earns strictly nothing.
+///
+/// **Scope decided rather than assumed.** The comparison is PER MODULE, over each module's
+/// own unit stream, because that is the unit the census scores and the unit whose
+/// environment `prepare_replay_from` fixes. The per-width corpus digest in the SUMMARY is
+/// a fold over those per-module digests: a summary OF the evidence, never the evidence
+/// itself, which is why the comparison that fails the lane lives at the module site.
+///
+/// Human rows go to stderr, per the module doc's stream contract — also the only thing
+/// that keeps this lane's output from corrupting an NDJSON capture if it is ever run
+/// inside one. It emits no `fln.e2e.kernel-admission` rows because nothing consumes them
+/// yet; wiring that up is part of what a real cadence would cost.
+///
+/// Run it explicitly:
+///
+/// `cargo test --locked -p fln-conformance --test kernel_replay \
+///  present_olean_corpus_thread_matrix_compares_stream_digests -- --ignored --exact --nocapture`
+#[test]
+#[ignore = "cost: the whole pinned corpus replayed at three widths; on-demand lane, not per commit — a documented PG-5 shortfall (bead fln-corpus-thread-matrix-93te R4). The measured wall time is reported by the run itself, in the SUMMARY row, rather than copied here where it would rot"]
+fn present_olean_corpus_thread_matrix_compares_stream_digests() {
+    let Some(reference_lib) = reference_lib() else {
+        eprintln!(
+            "SKIP present_olean_corpus_thread_matrix: pinned Reference stdlib not found; \
+             pin-dependent lane. A skip is a typed absence of evidence, never a pass"
+        );
+        return;
+    };
+    let started = Instant::now();
+    let inventory =
+        inventory_present_oleans(&reference_lib).expect("inventory every present pinned olean");
+    let order = corpus_module_order(&inventory).expect("canonical present-module order");
+    assert!(
+        inventory.modules.len() as u64 >= PINNED_PRESENT_OLEAN_FLOOR,
+        "present-module coverage floor: {} < {PINNED_PRESENT_OLEAN_FLOOR}",
+        inventory.modules.len()
+    );
+    assert!(
+        inventory.decoded >= PINNED_DECODED_DECL_FLOOR,
+        "decoded-declaration coverage floor: {} < {PINNED_DECODED_DECL_FLOOR}",
+        inventory.decoded
+    );
+    let order_index = order
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    let mut states = BTreeMap::<String, CorpusFixtureState>::new();
+    let mut divergences: Vec<String> = Vec::new();
+    let mut matrixed_modules = 0_u64;
+    let mut matrixed_units = 0_u64;
+    let mut matrixed_decls = 0_u64;
+    let mut unmatrixed_modules = 0_u64;
+    let mut unmatrixed_decls = 0_u64;
+    let mut width_micros = [0_u128; CORPUS_MATRIX_WIDTHS.len()];
+    let mut width_streams = vec![String::new(); CORPUS_MATRIX_WIDTHS.len()];
+
+    for (index, module_name) in order.iter().enumerate() {
+        let module = &inventory.modules[module_name];
+        let (bytes, infos) =
+            decode_corpus_module(&module.path).expect("decode governed corpus module");
+        // The census's own two identity checks. A corpus that moved under the run would
+        // make every digest below evidence about an input nobody named.
+        let current_hash = tagged_fixture_hash(
+            b"fln.kernel-reference-corpus.olean/1",
+            &[module.name.as_bytes(), &bytes],
+        );
+        assert_eq!(
+            current_hash, module.olean_hash,
+            "{} changed between inventory and replay",
+            module.name
+        );
+        assert_eq!(
+            infos.len() as u64,
+            module.decoded,
+            "{} declaration census changed between passes",
+            module.name
+        );
+        let (active_infos, _, _) = reference_active_rows(&infos);
+        let ReconstructedImportContext {
+            imported: imported_context,
+            closure,
+            faithful: mut context_faithful,
+            collisions,
+        } = reconstruct_import_context(module, &inventory, &order_index, &states);
+        for (dependency, names) in &collisions {
+            eprintln!(
+                "kernel_reference_corpus_matrix finding: module={} index={index} \
+                 direction=unmatrixed reason=import_context_collision dependency={} \
+                 affected={} first={:?}",
+                module.name,
+                dependency,
+                names.len(),
+                names.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+
+        if context_faithful {
+            let prep = prepare_replay_from(
+                imported_context.environment.clone(),
+                Some(&imported_context),
+                &active_infos,
+                false,
+            );
+            let mut runs = Vec::with_capacity(CORPUS_MATRIX_WIDTHS.len());
+            for (slot, &threads) in CORPUS_MATRIX_WIDTHS.iter().enumerate() {
+                let run = check_matrix_run(&prep, threads, Budget::DEFAULT);
+                width_micros[slot] = width_micros[slot].saturating_add(run.duration_us);
+                width_streams[slot].push_str(&module.name);
+                width_streams[slot].push('\u{1f}');
+                width_streams[slot].push_str(&run.stream_digest);
+                width_streams[slot].push('\n');
+                runs.push(run);
+            }
+            // THE COMPARISON SITE (R3). It runs on the three runs this module just
+            // produced, and its report names the diverging PAIR and the unit — never
+            // "the corpus disagreed somewhere".
+            //
+            // A divergence is recorded and the walk continues, so a schedule-dependent
+            // corpus yields every diverging module rather than a panic at the first one.
+            // The assertion at the end is what fails the lane.
+            let divergence = first_divergence_across_widths(&runs);
+            if let Some(divergence) = &divergence {
+                eprintln!(
+                    "kernel_reference_corpus_matrix finding: module={} index={index} \
+                     direction=schedule_dependent {divergence}",
+                    module.name
+                );
+                divergences.push(format!("module={} {divergence}", module.name));
+            }
+            matrixed_modules += 1;
+            matrixed_units += prep.items.len() as u64;
+            matrixed_decls += module.decoded;
+            let digests = runs
+                .iter()
+                .map(|run| format!("{}:{}", run.threads, run.stream_digest))
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "kernel_reference_corpus_matrix module={} index={index} decoded={} units={} \
+                 widths={CORPUS_MATRIX_WIDTHS:?} digests={digests} \
+                 identical_across_widths={} matrix_us={}",
+                module.name,
+                module.decoded,
+                prep.items.len(),
+                divergence.is_none(),
+                runs.iter().map(|run| run.duration_us).sum::<u128>()
+            );
+        } else {
+            unmatrixed_modules += 1;
+            unmatrixed_decls += module.decoded;
+            eprintln!(
+                "kernel_reference_corpus_matrix finding: module={} index={index} \
+                 direction=unmatrixed reason=import_context_not_faithfully_representable \
+                 affected={}",
+                module.name, module.decoded
+            );
+        }
+
+        let (context, current_merge) =
+            extend_reference_fixture_environment(imported_context, &active_infos, &module.name)
+                .expect("publish decoded module into non-authoritative Reference fixture context");
+        if !current_merge.collisions.is_empty() {
+            context_faithful = false;
+            eprintln!(
+                "kernel_reference_corpus_matrix finding: module={} index={index} \
+                 direction=unmatrixed reason=current_module_context_collision affected={} \
+                 first={:?}",
+                module.name,
+                current_merge.collisions.len(),
+                current_merge.collisions.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+        states.insert(
+            module.name.clone(),
+            CorpusFixtureState {
+                closure,
+                context,
+                active_infos,
+                faithful: context_faithful,
+            },
+        );
+    }
+
+    // Count conservation, in the same spirit as `CorpusCounts::assert_conservation`: every
+    // decoded declaration is either inside the matrix or explicitly outside it, so no row
+    // can go missing between the inventory and the comparison.
+    assert_eq!(
+        matrixed_decls + unmatrixed_decls,
+        inventory.decoded,
+        "matrix coverage lost declarations: {matrixed_decls} + {unmatrixed_decls} != {}",
+        inventory.decoded
+    );
+    assert_eq!(
+        unmatrixed_modules, 0,
+        "{unmatrixed_modules} module(s) covering {unmatrixed_decls} declarations were left \
+         OUT of the matrix; the observation below would then be about a subset nobody \
+         named. Every present import closure is representable at this pin \
+         (`present_olean_import_contexts_accept_reference_extended_duplicates` asserts \
+         zero collisions), so this is a real regression, not a tolerance"
+    );
+
+    let corpus_digests = width_streams
+        .iter()
+        .map(|stream| {
+            tagged_fixture_hash(
+                b"fln.kernel-reference-corpus.matrix-stream/1",
+                &[stream.as_bytes()],
+            )
+        })
+        .collect::<Vec<_>>();
+    let folds_agree = corpus_digests
+        .iter()
+        .all(|digest| *digest == corpus_digests[0]);
+    let per_width_ms = width_micros
+        .iter()
+        .zip(CORPUS_MATRIX_WIDTHS)
+        .map(|(micros, threads)| format!("{threads}:{}", micros / 1_000))
+        .collect::<Vec<_>>()
+        .join(",");
+    // The class both rows carry must describe THIS run. A fixed `observed_...` token would
+    // keep claiming an observation of schedule-independence in exactly the case where the
+    // run REFUTED it — and the census rows print before the assertions, deliberately, so
+    // that a failing run still leaves machine evidence. A row that survives the failure
+    // must not survive it saying the opposite of what happened.
+    let observed = if divergences.is_empty() {
+        "schedule_independence=observed_once_not_an_invariant"
+    } else {
+        "schedule_independence=refuted_this_run_found_a_width_disagreement"
+    };
+    // `units` is what was actually compared; `decoded_in_matrixed_modules` is only the
+    // attribution of decoded rows to modules that entered the matrix. They are reported
+    // separately on purpose: a decoded row can be shadowed, unchecked or
+    // ArtifactIncomplete and so never become a unit, and naming the larger number as
+    // coverage would claim comparisons that never happened.
+    eprintln!(
+        "kernel_reference_corpus_matrix SUMMARY: modules={matrixed_modules} of {} present, \
+         decoded_in_matrixed_modules={matrixed_decls} of {}, units_compared={matrixed_units}, \
+         widths={CORPUS_MATRIX_WIDTHS:?}, diverging_modules={}, unmatrixed_modules={unmatrixed_modules}, \
+         corpus_digests={}, folds_agree={folds_agree}, per_width_ms={per_width_ms}, \
+         wall_ms={}, fixture_hash={} {observed}",
+        inventory.modules.len(),
+        inventory.decoded,
+        divergences.len(),
+        corpus_digests
+            .iter()
+            .zip(CORPUS_MATRIX_WIDTHS)
+            .map(|(digest, threads)| format!("{threads}:{digest}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        started.elapsed().as_millis(),
+        inventory.fixture_hash
+    );
+    // The claim class travels WITH the numbers (bead `fln-8zsq`), and separately as its
+    // own row, because the numbers are what gets quoted. `wall_ms` above is the price of
+    // one observation and is therefore the input to the cadence question, not decoration.
+    eprintln!(
+        "kernel_reference_corpus_matrix CLAIM-CLASS: {observed} \
+         class=bounded_model_NOT_invariant \
+         earns=one_observation_at_this_corpus_revision_this_pin_this_host_this_run \
+         scope=per_module_verdict_stream_and_consumption_compared_across_{{1,8,32}} \
+         cadence=on_demand_ignored_by_default_and_skips_typed_without_the_pin \
+         pg5=a_PER_COMMIT_corpus_matrix_is_STILL_ABSENT_this_is_a_documented_shortfall_not_compliance \
+         means=a_green_run_here_does_NOT_make_FL-INV-01_measured_over_the_corpus \
+         bead=fln-corpus-thread-matrix-93te"
+    );
+
+    // One direction only. A differing fold with no per-module divergence is impossible and
+    // means the summary and the evidence it summarises disagree. The converse is NOT a
+    // contradiction: `first_divergence_across_widths` also reports differing step and depth
+    // consumption at identical digests, which the digest fold cannot see — FL-INV-01 covers
+    // exact consumption, not just verdicts.
+    assert!(
+        folds_agree || !divergences.is_empty(),
+        "the per-width corpus digest fold differs while every per-module comparison agreed; \
+         the fold and the evidence it summarises cannot both be right: {corpus_digests:?}"
+    );
+    assert!(
+        divergences.is_empty(),
+        "corpus replay is schedule-DEPENDENT across widths {CORPUS_MATRIX_WIDTHS:?}: {} \
+         module(s) diverged. First: {}",
+        divergences.len(),
+        divergences[0]
     );
 }
 
@@ -4214,35 +4609,66 @@ fn admission_fault_matrix_is_typed_and_atomic() {
     }
 }
 
-/// The corpus census must keep disclosing its own claim class, and must not
-/// strengthen that class without the evidence that would justify it.
+/// Both corpus censuses must keep disclosing their own claim class, and neither may
+/// strengthen that class beyond what its own code produces.
 ///
-/// **Why this is a source-level guard and not a log assertion.** The census is
-/// printed by `pinned_present_olean_kernel_differential`, which is `#[ignore]`d
-/// pending `fln-7odd`. It does not run under an ordinary `cargo test`, so a lane
-/// that greps stdout would observe nothing at all — not a missing disclosure, just
-/// silence. Reading the source is the only check that discriminates here.
+/// **Why this is a source-level guard and not a log assertion.** Both censuses are printed
+/// by `#[ignore]`d tests — the oracle differential pending `fln-7odd`, the thread matrix
+/// for cost — so a lane that greps stdout observes nothing at all: not a missing
+/// disclosure, just silence. Reading the source is the only check that discriminates here.
 ///
-/// **What it is for.** AGENTS.md's recurring-defect table records `fln-8zsq` as the
-/// one entry caught by *nothing*: the census disclosed its own limit in prose, and
-/// deleting that prose left every gate green. A disclosure protecting a claim, with
-/// nothing protecting the disclosure. This is the missing half.
+/// **What it is for.** AGENTS.md's recurring-defect table records `fln-8zsq` as the one
+/// entry caught by *nothing*: the census disclosed its own limit in prose, and deleting
+/// that prose left every gate green. A disclosure protecting a claim, with nothing
+/// protecting the disclosure. This is the missing half.
 ///
-/// **What it does NOT earn, stated because the whole bead is about not overclaiming.**
-/// Mechanising the disclosure does not make corpus schedule-independence *measured*.
-/// It remains INFERRED — from the Prelude matrix on different inputs, plus kernel
-/// purity and a deterministic merge. Closing that for real means running the corpus
-/// differential across {1, 8, 32} and comparing stream digests, which is a separate
-/// nightly lane and is deliberately not done here.
+/// **What R2 of `fln-corpus-thread-matrix-93te` changed here.** Stream digests are now
+/// compared across {1, 8, 32} over the corpus, so the honest class moved from *inferred*
+/// to *one observation*. It did not become an invariant: the lane is `#[ignore]`d, it SKIPs
+/// typed without the pin, and PG-5 asks for {1, 8, 32} **per commit**. So the check is no
+/// longer "is the word `measured` present" — it pins each region's class token to what
+/// that region's code actually does, in both directions, and refuses when the code that
+/// earned a token changes underneath it.
 #[test]
 fn corpus_census_keeps_disclosing_its_claim_class() {
     const SOURCE: &str = include_str!("kernel_replay.rs");
 
-    // This guard must not be able to satisfy itself. Every needle below also occurs
-    // in this function's own body, so a whole-file search would match the assertion
-    // text and stay green after the census stopped disclosing anything — the exact
-    // vacuity this bead exists to prevent, one level up. The search region is
-    // therefore the file strictly BEFORE this guard.
+    /// The source of the print macro that emits `needle`, from the needle to the end of
+    /// that macro call.
+    ///
+    /// Every assertion below is scoped to ONE row's site. A file-wide `contains` was
+    /// satisfied by a *different* row while the row under test was gutted, and the planted
+    /// mutant survived — the wrong-scope defect `fln-8zsq` is about, reproduced inside its
+    /// own first fix.
+    fn emitting_row<'a>(source: &'a str, needle: &str) -> &'a str {
+        let start = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("the census row `{needle}` must exist"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    );")
+            .unwrap_or_else(|| panic!("`{needle}` must sit inside a print macro call"));
+        &rest[..end]
+    }
+
+    /// The token following `schedule_independence=` at `start`, read to the first character
+    /// that cannot be part of it.
+    ///
+    /// Token-exact on purpose. `contains("schedule_independence=measured")` is a PREFIX
+    /// match, so it cannot tell `measured` from `measured_one_observation` — a projection
+    /// used as an identity without checking it is injective, which is the defect shape this
+    /// file has now hit three times.
+    fn class_token(rest: &str) -> &str {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    // This guard must not be able to satisfy itself. Every needle below also occurs in this
+    // function's own body, so a whole-file search would match the assertion text and stay
+    // green after the census stopped disclosing anything. The search region is the file
+    // strictly BEFORE this guard, which is also strictly before every other guard.
     let guard = SOURCE
         .find("fn corpus_census_keeps_disclosing_its_claim_class")
         .expect("the guard must be able to locate its own definition");
@@ -4253,88 +4679,215 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
          these assertions would be checking almost nothing",
         census.len()
     );
+    // Every probe about what the code DOES runs over `code`, with comments removed. The
+    // first version of this guard read raw source and failed on the oracle census — whose
+    // comment NAMES `CORPUS_MATRIX_WIDTHS` while its code runs one width. Prose describing
+    // a property is not the property; a guard that cannot tell them apart is the same
+    // self-match that has now bitten this file four times. `census` itself is used only
+    // where the prose IS the subject, which is assertion 3.
+    let code = comment_free(census);
+    let code = code.as_str();
 
-    // 1. The qualifier must travel WITH the numbers, because the numbers are what
-    //    gets quoted out of this file. This is deliberately scoped to the SUMMARY
-    //    row rather than to the file: a whole-file `contains` is satisfied by the
-    //    standalone CLAIM-CLASS row below, so it stays green while the SUMMARY is
-    //    gutted and the counts travel bare. That mutant survived the first version
-    //    of this guard, which is the same wrong-scope defect the bead is about.
-    let summary_start = census
-        .find("kernel_reference_corpus SUMMARY:")
-        .expect("the census SUMMARY row must exist");
-    let claim_start = census
-        .find("kernel_reference_corpus CLAIM-CLASS:")
-        .expect("the census CLAIM-CLASS row must exist");
+    // The two censuses make two different claims from two different runs, so the regions
+    // below are per test, and the CODE regions deliberately start at `fn` rather than at
+    // the doc comment: prose that *describes* a matrix would otherwise satisfy a probe for
+    // one. A guard's search space must exclude every text that merely claims the property.
+    let oracle_start = code
+        .find("fn pinned_present_olean_kernel_differential")
+        .expect("the corpus differential must exist");
+    let matrix_start = code
+        .find("fn present_olean_corpus_thread_matrix_compares_stream_digests")
+        .expect(
+            "the corpus thread matrix must exist (R2 of fln-corpus-thread-matrix-93te); the \
+             census rows below name it as the lane that measures what they do not",
+        );
+    let matrix_item_start = code[..matrix_start]
+        .rfind("\n\n")
+        .map(|offset| offset + 2)
+        .expect("the matrix test must be preceded by another item");
+    let matrix_end = code[matrix_start..]
+        .find("fn prelude_replays_through_the_kernel")
+        .map(|offset| matrix_start + offset)
+        .expect("the Prelude replay must follow the corpus thread matrix");
     assert!(
-        summary_start < claim_start,
-        "the CLAIM-CLASS row must follow the SUMMARY row; the region split below \
-         assumes it"
+        oracle_start < matrix_item_start,
+        "the region split assumes the oracle census precedes the thread matrix"
     );
-    let summary = &census[summary_start..claim_start];
-    assert!(
-        summary.contains("schedule_independence=inferred_not_measured"),
-        "the census SUMMARY row no longer carries its claim class inline, so its \
-         compared/decoded counts can be quoted bare and would read as evidence of \
-         deterministic corpus checking; the standalone CLAIM-CLASS row does not travel \
-         with the numbers (bead fln-8zsq)"
-    );
+    let oracle_code = &code[oracle_start..matrix_item_start];
+    let matrix_code = &code[matrix_start..matrix_end];
 
-    // 2. The standalone CLAIM-CLASS row must keep naming its basis and its limit.
-    //    Losing `means=` is the worst case: the row would still look like evidence.
-    for needle in [
-        "kernel_reference_corpus CLAIM-CLASS:",
-        "basis=prelude_matrix_",
-        "means=these_counts_are_NOT_evidence_of_deterministic_corpus_checking",
+    // 1. Each SUMMARY row carries its class INLINE, because the numbers are what gets
+    //    quoted out of this file and a standalone CLAIM-CLASS row does not travel with
+    //    them.
+    //
+    //    The oracle census's class is fixed — its run measures nothing about schedules
+    //    either way. The matrix's is not: it interpolates `{observed}`, whose two branches
+    //    are checked below, because the census rows print BEFORE the assertions so a
+    //    failing run still leaves machine evidence. A fixed token would have that surviving
+    //    row claim an observation of schedule-independence in exactly the run that refuted
+    //    it.
+    for (row, token) in [
+        (
+            "kernel_reference_corpus SUMMARY:",
+            "schedule_independence=not_measured_in_this_run",
+        ),
+        ("kernel_reference_corpus_matrix SUMMARY:", "{observed}"),
     ] {
         assert!(
-            census.contains(needle),
-            "the census CLAIM-CLASS row lost `{needle}`, so it no longer states what the \
-             numbers are not evidence of (bead fln-8zsq)"
+            emitting_row(code, row).contains(token),
+            "`{row}` no longer carries `{token}` inline, so its counts can be quoted bare \
+             and would read as evidence of deterministic corpus checking (bead fln-8zsq)"
+        );
+    }
+    for branch in [
+        "schedule_independence=observed_once_not_an_invariant",
+        "schedule_independence=refuted_this_run_found_a_width_disagreement",
+    ] {
+        assert!(
+            matrix_code.contains(branch),
+            "the matrix census lost the `{branch}` branch of its class binding. Both must \
+             exist, or a run that found a width disagreement reports the class of one that \
+             did not — in a row that prints before the assertion precisely so it survives \
+             the failure"
         );
     }
 
-    // 3. The module doc must keep scoping the Prelude matrix result. Before fln-8zsq
-    //    it said the matrix "PROVES it byte-equal at every width" with no input named,
-    //    sitting above both tests, which is how the corpus got read into it.
+    // 2. Each CLAIM-CLASS row keeps naming its basis, its limit, and the cadence. Losing
+    //    `means=` is the worst case: the row would still look like evidence.
+    let oracle_claim = emitting_row(code, "kernel_reference_corpus CLAIM-CLASS:");
+    for needle in [
+        "basis=prelude_matrix_",
+        "means=these_counts_are_NOT_evidence_of_deterministic_corpus_checking",
+        "shortfall",
+        // The join: this row points at the lane that measures what it cannot, so it must
+        // name that lane exactly. A rename that did not reach here would leave a pointer
+        // to nothing, which is the failure AGENTS.md item 7 keeps recording.
+        "matrix_lane=present_olean_corpus_thread_matrix_compares_stream_digests",
+    ] {
+        assert!(
+            oracle_claim.contains(needle),
+            "the oracle census CLAIM-CLASS row lost `{needle}`, so it no longer states what \
+             its numbers are not evidence of, or where the missing evidence lives (beads \
+             fln-8zsq, fln-corpus-thread-matrix-93te)"
+        );
+    }
+    let matrix_claim = emitting_row(code, "kernel_reference_corpus_matrix CLAIM-CLASS:");
+    for needle in [
+        "class=bounded_model_NOT_invariant",
+        "earns=one_observation",
+        "means=a_green_run_here_does_NOT_make_FL-INV-01_measured_over_the_corpus",
+        "shortfall",
+    ] {
+        assert!(
+            matrix_claim.contains(needle),
+            "the matrix census CLAIM-CLASS row lost `{needle}`; a green matrix run is one \
+             observation at one revision, pin and host, and D7 forbids it standing in for \
+             the invariant PG-5 asks for (bead fln-corpus-thread-matrix-93te R5)"
+        );
+    }
+
+    // 3. The module doc must keep scoping the PER-COMMIT matrix. Before fln-8zsq it said
+    //    the matrix "PROVES it byte-equal at every width" with no input named, sitting
+    //    above both tests, which is how the corpus got read into it.
     assert!(
-        census.contains("The matrix does not cover the corpus"),
-        "the module doc no longer scopes the {{1, 8, 32}} matrix to the Prelude, so it \
-         reads as covering the corpus differential too (bead fln-8zsq)"
+        census.contains("The per-commit matrix does not cover the corpus"),
+        "the module doc no longer scopes the per-commit {{1, 8, 32}} matrix to the Prelude, \
+         so it reads as covering the corpus too (beads fln-8zsq, \
+         fln-corpus-thread-matrix-93te)"
     );
 
-    // 4. The class may not silently strengthen. Claiming `measured` while the corpus test
-    //    runs no matrix is false by construction: nothing has compared stream digests
-    //    ACROSS widths. D7 forbids the weaker class standing in for the stronger one, and
-    //    this is that check in the direction nobody watches — a strengthened claim rather
-    //    than a deleted one.
-    //
-    //    The probe asks whether the CORPUS TEST runs a matrix, not whether the old size
-    //    heuristic is still present. Keying it to the heuristic conflated "the width is
-    //    size-derived" with "no matrix exists", so pinning the width under R1 of
-    //    `fln-corpus-thread-matrix-93te` would have silently disarmed this assertion while
-    //    the corpus remained single-width. Scope the probe to the site whose property is
-    //    actually in question.
-    let strengthened = census.contains("schedule_independence=measured");
-    let corpus_start = census
-        .find("fn pinned_present_olean_kernel_differential")
-        .expect("the corpus differential must exist");
-    let corpus_end = census[corpus_start..]
-        .find("fn prelude_replays_through_the_kernel")
-        .map(|offset| corpus_start + offset)
-        .expect("the Prelude replay must follow the corpus differential");
-    let corpus_runs_no_matrix = !census[corpus_start..corpus_end].contains("for threads in [");
+    // 4. The class may not silently strengthen — checked as an exact token against a
+    //    declared allowance, in BOTH directions, so the allowance shrinks when a row is
+    //    repaired instead of accumulating dead permissions.
+    const PERMITTED_CLASSES: [&str; 3] = [
+        "not_measured_in_this_run",
+        "observed_once_not_an_invariant",
+        "refuted_this_run_found_a_width_disagreement",
+    ];
+    let mut cursor = code;
+    while let Some(offset) = cursor.find("schedule_independence=") {
+        let rest = &cursor[offset + "schedule_independence=".len()..];
+        let token = class_token(rest);
+        assert!(
+            PERMITTED_CLASSES.contains(&token),
+            "a census claims schedule_independence={token}, which is not one of the classes \
+             this file's code earns {PERMITTED_CLASSES:?}. The corpus is checked at one \
+             pinned width by the oracle census and compared across {{1, 8, 32}} by an \
+             on-demand lane that gates nothing, so nothing here earns an invariant. If the \
+             evidence really changed, change this allowance deliberately (D7, PG-5, beads \
+             fln-8zsq, fln-corpus-thread-matrix-93te)"
+        );
+        cursor = rest;
+    }
+    for permitted in PERMITTED_CLASSES {
+        assert!(
+            code.contains(&format!("schedule_independence={permitted}")),
+            "the allowance permits `{permitted}` but nothing states it; a permission that \
+             outlives the row it was written for is how a strengthened claim slips through"
+        );
+    }
+
+    // 5. Each class token must be earned by the code in its own region. This is assertion 4
+    //    in the direction that matters: a token is a claim ABOUT code, so the guard checks
+    //    the code. The oracle census scores at exactly one width and must keep saying so;
+    //    the matrix census may claim its observation only while it really replays every
+    //    width over one prepared module and compares the runs.
     assert!(
-        !(strengthened && corpus_runs_no_matrix),
-        "the census claims schedule_independence=measured while the corpus differential \
-         runs no thread matrix at all; no run compares stream digests across widths, so \
-         the measured class is unearned (beads fln-8zsq, fln-corpus-thread-matrix-93te, \
-         D7, PG-5)"
+        oracle_code.contains("let threads = CORPUS_CENSUS_WIDTH;"),
+        "the oracle census no longer runs at the single pinned width its CLAIM-CLASS row \
+         describes"
     );
+    assert!(
+        !oracle_code.contains("CORPUS_MATRIX_WIDTHS"),
+        "the oracle census now runs a matrix of its own, so `not_measured_in_this_run` has \
+         become false in the understating direction; re-derive its class rather than \
+         leaving a stale one"
+    );
+    for needle in [
+        "for (slot, &threads) in CORPUS_MATRIX_WIDTHS.iter().enumerate()",
+        "check_matrix_run(&prep, threads, Budget::DEFAULT)",
+        "first_divergence_across_widths(&runs)",
+    ] {
+        assert!(
+            matrix_code.contains(needle),
+            "the corpus matrix lost `{needle}`, so its `observed_once_not_an_invariant` \
+             class is unearned: nothing compares stream digests across widths any more \
+             (beads fln-8zsq, fln-corpus-thread-matrix-93te, D7, PG-5)"
+        );
+    }
+}
+
+/// `source` with comment text removed, for probes that ask what the code DOES.
+///
+/// Defined between the two source-reading guards so it sits outside both of their search
+/// regions: a helper they both read would otherwise be production text to one of them.
+///
+/// **Why it exists.** A comment that *describes* a property satisfies a raw-source probe
+/// for that property. The oracle census's own comment names `CORPUS_MATRIX_WIDTHS` while
+/// its code runs one width, and the corpus matrix's doc comment writes `#[ignore]` while
+/// explaining the attribute — so a probe for either would have read prose as code, in the
+/// direction that reports evidence which is not there. That is the fourth self-match in
+/// this file's guards; the search space must exclude every text that merely claims the
+/// property.
+///
+/// Line comments and doc comments only. Nothing in these regions uses block comments, and
+/// one appearing here would be a reason to extend this rather than to trust it.
+fn comment_free(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                ""
+            } else {
+                line.split(" // ").next().unwrap_or(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The `{1, 8, 32}` determinism claim must name its scope everywhere it appears, for as
-/// long as the corpus differential still runs at one size-derived width.
+/// long as the corpus-scale matrix is not the per-commit gate PG-5 names.
 ///
 /// `fln-8zsq` scoped the claim inside this file. It stayed unscoped in AGENTS.md, README
 /// and the plan, which is the same defect one level up: the claim is repository-wide and
@@ -4342,60 +4895,117 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
 /// test is the join between the two artifacts, which is exactly where this project keeps
 /// finding the gap.
 ///
-/// The probe for "does a corpus matrix exist" is read from the code rather than
-/// declared, so the day someone builds the corpus-scale matrix and deletes the size
-/// heuristic, this guard stops requiring the qualifier instead of demanding a stale one.
+/// **What R2 changed, and the trap it opened.** The corpus matrix now exists, so the old
+/// probe — "does a corpus matrix loop exist?" — would have stood this guard down the moment
+/// the code landed, leaving the documents free to state the claim bare. That is calibrated
+/// to the wrong signal: per R5 of `fln-corpus-thread-matrix-93te` a lane that has not run
+/// earns NOTHING and a lane that runs on demand earns one observation, so source existing
+/// is not evidence of anything. The probe now asks whether the matrix GATES, and the
+/// qualifier stays required while it does not.
+///
+/// It also checks the direction nothing watched before: a document may no longer say the
+/// corpus matrix is unbuilt, because it is built. A stale qualifier is a false statement
+/// too, and catching it must not depend on someone remembering.
 #[test]
 fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     const SOURCE: &str = include_str!("kernel_replay.rs");
-    // The probe region must exclude EVERY guard body, not merely this one. The heuristic
-    // literal below also appears inside `corpus_census_keeps_disclosing_its_claim_class`'s
-    // strengthening assertion, so a region that stopped at this function still matched a
-    // *test's* text and reported the production heuristic present after it was removed —
-    // the same self-match that has now bitten three times in this session, here across two
-    // guards rather than inside one. Cutting at the FIRST guard leaves production code only.
+    // The probe region must exclude EVERY guard body, not merely this one. The needles
+    // below also appear inside `corpus_census_keeps_disclosing_its_claim_class`, so a
+    // region that stopped at this function would match a *test's* text and report
+    // production properties that had been deleted — the self-match that has now bitten
+    // three times here. Cutting at the FIRST guard leaves production code only.
     let production_end = SOURCE
         .find("fn corpus_census_keeps_disclosing_its_claim_class")
         .expect("the first source-reading guard marks the end of production code");
-    let production = &SOURCE[..production_end];
+    // Comments removed for the same reason `comment_free` exists: the matrix test's doc
+    // comment writes `#[ignore]` while explaining the attribute, so a raw-source probe for
+    // the attribute would keep reporting the lane gated after someone removed it — a false
+    // negative in exactly the direction that widens a claim.
+    let production = comment_free(&SOURCE[..production_end]);
+    let production = production.as_str();
 
-    // Derived, not declared, and scoped to the CORPUS TEST rather than to production as a
-    // whole. The first version of this probe asked whether the size heuristic was still
-    // present, which conflated two different things: "the width is size-derived" and "no
-    // corpus matrix exists". Pinning the width (R1 of `fln-corpus-thread-matrix-93te`)
-    // removes the heuristic while leaving the corpus emphatically single-width, so that
-    // probe would have silently stopped demanding a qualifier that is still true. What
-    // actually matters is whether the corpus test runs a matrix at all.
-    let corpus_start = production
-        .find("fn pinned_present_olean_kernel_differential")
-        .expect("the corpus differential must exist");
-    let corpus_end = production[corpus_start..]
-        .find("fn prelude_replays_through_the_kernel")
-        .map(|offset| corpus_start + offset)
-        .expect("the Prelude replay must follow the corpus differential");
-    let corpus = &production[corpus_start..corpus_end];
-    let corpus_is_single_width = !corpus.contains("for threads in [");
     assert!(
         production.contains("for threads in [1usize, 8, 32]"),
         "the Prelude thread matrix disappeared; the claim would then have no support at \
          any scope"
     );
-    if !corpus_is_single_width {
-        // A corpus-scale matrix now exists. The documents may state the claim without a
-        // Prelude qualifier, and this guard must not demand a qualifier that has become
-        // false.
-        return;
-    }
+    // The widths the documents name must be the widths the code runs. Without this the
+    // array could move to [1, 4, 32] while every `{1, 8, 32}` line below stayed green —
+    // a claim and the thing that produces it, unjoined, which is AGENTS.md item 7 exactly.
+    assert!(
+        production.contains("const CORPUS_MATRIX_WIDTHS: [usize; 3] = [1, 8, 32];"),
+        "the corpus matrix no longer runs the widths PG-5 names and the documents claim; \
+         the {{1, 8, 32}} lines below would then describe a matrix that does not exist"
+    );
+
+    // Two facts, derived separately because they license different things: whether a
+    // corpus matrix EXISTS, and whether it GATES anything. Conflating them is what would
+    // have let landing R2 widen the documents' claim with nothing objecting.
+    let matrix_start =
+        production.find("fn present_olean_corpus_thread_matrix_compares_stream_digests");
+    assert!(
+        matrix_start.is_some(),
+        "the corpus thread matrix disappeared (R2 of fln-corpus-thread-matrix-93te). If \
+         that was deliberate, the documents must go back to saying the corpus-scale matrix \
+         does not exist, and this guard must be re-derived rather than deleted"
+    );
+    let matrix_start = matrix_start.expect("checked immediately above");
+    let matrix_item_start = production[..matrix_start]
+        .rfind("\n\n")
+        .map(|offset| offset + 2)
+        .expect("the matrix test must be preceded by another item");
+    let matrix_gates = !production[matrix_item_start..matrix_start].contains("#[ignore");
+    assert!(
+        !matrix_gates,
+        "the corpus matrix is no longer `#[ignore]`d. That is progress and it is NOT by \
+         itself the per-commit gate PG-5 names: the lane still SKIPs typed on any host \
+         without the pin, so a green `cargo test` there proves nothing about the corpus. \
+         Re-derive this guard and the class the documents may state, deliberately, rather \
+         than letting a removed attribute widen a claim (R5 of \
+         fln-corpus-thread-matrix-93te)"
+    );
 
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    // Any of these words makes the line honest: it either names the scope or names the
-    // gap. The set is deliberately generous — the failure this catches is a bare claim.
-    const QUALIFIERS: [&str; 6] = ["Prelude", "prelude", "unbuilt", "inferred", "2ki4", "8zsq"];
+    // Any of these makes the line honest: it names the per-commit matrix's scope, the class
+    // one on-demand run earns, or the cadence gap. `unbuilt` and `inferred` used to be in
+    // this set and were removed with R2 — they describe a world that no longer exists, and
+    // a qualifier that has gone stale stops being a qualifier.
+    const QUALIFIERS: [&str; 7] = [
+        "Prelude",
+        "prelude",
+        "observation",
+        "observed",
+        "shortfall",
+        "on demand",
+        "93te",
+    ];
+    // A document may not still describe the corpus matrix as missing. Scoped to lines that
+    // mention a matrix so ordinary uses of these words elsewhere are not swept in.
+    const STALE: [&str; 4] = ["unbuilt", "does not exist", "is not built", "not built yet"];
+    // R4 asks for the cadence STATED WHERE THE CLAIM IS MADE, so this is checked per claim
+    // site, not per document. The first version checked per document and a planted mutant
+    // survived it: stripping the cadence from the B4 bullet left the reader of that bullet
+    // with a bare per-commit claim, while a paragraph 340 lines away kept the document
+    // green. Same wrong-scope shape as fln-8zsq's first guard, one artifact up.
+    // Both spellings, because `on-demand` does not contain `on demand` and the mutant that
+    // taught me the first lesson also slipped past on the hyphen.
+    const CADENCE: [&str; 3] = ["shortfall", "on demand", "on-demand"];
     let mut checked = 0usize;
     for doc in ["AGENTS.md", "README.md"] {
         let text = fs::read_to_string(repo.join(doc))
             .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
         for (index, line) in text.lines().enumerate() {
+            if line.contains("matrix") {
+                for stale in STALE {
+                    assert!(
+                        !line.contains(stale),
+                        "{doc}:{} still describes the corpus-scale matrix as missing, but it \
+                         exists and has been run (R2 of fln-corpus-thread-matrix-93te). A \
+                         stale qualifier is a false statement in the other direction:\n  {line}",
+                        index + 1
+                    );
+                }
+            }
             if !line.contains("{1, 8, 32}") {
                 continue;
             }
@@ -4403,9 +5013,19 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
             assert!(
                 QUALIFIERS.iter().any(|word| line.contains(word)),
                 "{doc}:{} states the {{1, 8, 32}} determinism claim without naming its \
-                 scope, while the corpus differential runs no thread matrix at all — one \
-                 pinned width, no comparison of stream digests across widths. A reader \
-                 takes this as covering the corpus (beads fln-8zsq, franken_lean-2ki4, \
+                 scope, while the per-commit matrix's input is the Prelude and the \
+                 corpus-scale matrix is an on-demand lane that gates nothing. A reader \
+                 takes this as covering the corpus per commit (beads fln-8zsq, \
+                 fln-corpus-thread-matrix-93te):\n  {line}",
+                index + 1
+            );
+            assert!(
+                CADENCE.iter().any(|word| line.contains(word)),
+                "{doc}:{} states the {{1, 8, 32}} claim without naming the corpus lane's \
+                 cadence. PG-5 asks for {{1, 8, 32}} PER COMMIT; the corpus lane runs on \
+                 demand, which is a DOCUMENTED SHORTFALL against that gate rather than \
+                 compliance with it, and a shortfall stated somewhere else in the file is \
+                 not stated where this claim is read (R4 of \
                  fln-corpus-thread-matrix-93te):\n  {line}",
                 index + 1
             );
