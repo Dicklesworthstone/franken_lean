@@ -297,6 +297,7 @@ E2E_STEP_ORDERS = {
     "env_snapshots": [
         "environment_suite",
         "environment_state",
+        "declaration_admission",
         "extension_merge_refusals",
         "set_union",
         "extension_state_mutant",
@@ -491,6 +492,207 @@ EXTENSION_DESCRIPTOR_MATRIX_TEST = (
 ENVIRONMENT_STATE_SCHEMA = "fln.e2e.environment-state"
 ENVIRONMENT_STATE_TEST = (
     "extensions::tests::environment_state_e2e_emits_detailed_real_path_evidence"
+)
+DECLARATION_ADMISSION_SCHEMA = "fln.e2e.declaration-admission"
+DECLARATION_ADMISSION_SUMMARY_SCHEMA = "fln.e2e.declaration-admission-summary"
+DECLARATION_ADMISSION_TEST = (
+    "environment::tests::"
+    "declaration_admission_e2e_emits_detailed_real_path_evidence"
+)
+DECLARATION_ADMISSION_ARGV = (
+    "cargo test --locked -q -p fln-env "
+    "environment::tests::"
+    "declaration_admission_e2e_emits_detailed_real_path_evidence "
+    "-- --exact --nocapture"
+)
+DECLARATION_ADMISSION_INPUT_ROOT = (
+    "2c9b97e5b882fa9495b69e462c8fbf2d"
+    "b35a1e4cb0ea3953a357a6549756e388"
+)
+DECLARATION_ADMISSION_BASE_ROOT = (
+    "36c2a8439e46a92cdd1ed0e0eebaa5ff"
+    "16728730342e5f13a4994eb199392b04"
+)
+DECLARATION_ADMISSION_UNBOUNDED_BUDGET = {
+    "max_level_params": (1 << 64) - 1,
+    "max_mutual_rows": (1 << 64) - 1,
+    "max_constructor_rows": (1 << 64) - 1,
+    "max_recursor_rules": (1 << 64) - 1,
+    "max_canonical_bytes": (1 << 64) - 1,
+    "max_expr_nodes": (1 << 64) - 1,
+    "max_expanded_weight": (1 << 64) - 1,
+}
+DECLARATION_ADMISSION_REFUSALS = (
+    (
+        "level_params",
+        True,
+        "declaration-preflight",
+        3,
+        "produced nodes",
+        "level_params",
+    ),
+    (
+        "mutual_rows",
+        True,
+        "declaration-preflight",
+        3,
+        "produced nodes",
+        "mutual_rows",
+    ),
+    (
+        "constructor_rows",
+        True,
+        "declaration-preflight",
+        3,
+        "produced nodes",
+        "constructor_rows",
+    ),
+    (
+        "recursor_rules",
+        True,
+        "declaration-preflight",
+        3,
+        "produced nodes",
+        "recursor_rules",
+    ),
+    (
+        "canonical_bytes",
+        True,
+        "declaration-preflight",
+        49,
+        "input bytes",
+        "canonical_bytes",
+    ),
+    (
+        "expr_nodes",
+        False,
+        "term-weight-preflight",
+        1,
+        "produced nodes",
+        "produced nodes",
+    ),
+    (
+        "expanded_weight",
+        False,
+        "term-weight-preflight",
+        1,
+        "expanded weight",
+        "expanded weight",
+    ),
+)
+DECLARATION_ADMISSION_RECOVERIES = (
+    (
+        "level_params",
+        {
+            "level_params": 3,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 108,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "e943a96e436d76198c42827054fb8cfe0330eb32b2d7a414e94c0e58f84b0610",
+        "7d7a4b653fc6472bd51122d6b0cbc61122290f6f445a55f2b0372e198f0de4a6",
+    ),
+    (
+        "mutual_rows",
+        {
+            "level_params": 0,
+            "mutual_rows": 3,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 119,
+            "expressions": 2,
+            "expr_nodes": 2,
+            "expanded_weight": 2,
+            "max_logical_depth": 1,
+        },
+        "72dc754d4e3c0b612fd6ba8f95ade80ca32218b25d1ff59826bffa311a9c52cb",
+        "9317645e979403f913e9a970aaed3267003d2caad9a12281c81464c9c0b5c720",
+    ),
+    (
+        "constructor_rows",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 3,
+            "recursor_rules": 0,
+            "canonical_bytes": 142,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "89625df1d9a219a607e34fd5d104dd2772a3b548a382e7d1b0fbb534c171bf58",
+        "b5a9f4ac94ec73b878077be1d6d8f056cf6ec73f5a07a7ee554975604dea1ac5",
+    ),
+    (
+        "recursor_rules",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 3,
+            "canonical_bytes": 162,
+            "expressions": 4,
+            "expr_nodes": 4,
+            "expanded_weight": 4,
+            "max_logical_depth": 1,
+        },
+        "fca53bc92f871456aae85b68feae2cda602bbed512bf85398782ebf1b0c10ecb",
+        "cc710f134162ab3a2b81dda84207de356e5951a41e9714284caa1f040fd613ef",
+    ),
+    (
+        "canonical_bytes",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 51,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "d5394a6026d58bbdab954a26875bc0d638d900b2684ce6577285c7d4207ba16f",
+        "87ecc4a3c635622312e76fe052d3fdddd1317b9f08d429f318140eaf7986562f",
+    ),
+    (
+        "expr_nodes",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 51,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "5be901abbb47830e0e9012425f3a884496396ad6f07e737f6e35c8ba3cf497cf",
+        "6571f8d9c64ec46adb0c37087013877154b93eed6119a95fc7e8a6f95e072680",
+    ),
+    (
+        "expanded_weight",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 51,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "bf7355fea0d48ce916cd0902653737891fa9679c7b6715bf35a7c9e6daf5129d",
+        "99eaf30ea59a11de8559ed638cfa14f3383546f2c450b2e841c5fd568967cbdb",
+    ),
 )
 ENVIRONMENT_IDENTITY_VERSION = 1
 DECLARATION_TAG_GOLDENS = {
@@ -6346,6 +6548,7 @@ def prepare_environment_identity_validation(
     expected_stdout_artifact: str,
     expected_stderr_artifact: str,
     expected_records: int,
+    additional_schemas: Sequence[str] = (),
 ) -> tuple[list[dict[str, Any]], str, str, str, str]:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", expected_run_id):
         raise EvidenceError("environment-identity run id is malformed")
@@ -6381,14 +6584,30 @@ def prepare_environment_identity_validation(
     if environment_identity_failure_material(stderr_text, test_name):
         raise EvidenceError("environment-identity stderr contains failure material")
 
-    marker = f'"schema":"{schema}"'.encode()
-    prefix = b'{"schema":"' + schema.encode() + b'"'
+    schemas = (schema, *additional_schemas)
+    if len(set(schemas)) != len(schemas) or any(not item for item in schemas):
+        raise EvidenceError("environment-identity schema inventory is malformed")
+    schema_markers = {
+        item: f'"schema":"{item}"'.encode() for item in schemas
+    }
+    schema_prefixes = {
+        item: b'{"schema":"' + item.encode() + b'"' for item in schemas
+    }
     records: list[dict[str, Any]] = []
     for stream_label, data in (("stdout", stdout_data), ("stderr", stderr_data)):
         for number, raw_line in enumerate(data.splitlines(), 1):
-            if marker not in raw_line:
+            matched = [
+                item for item in schemas if schema_markers[item] in raw_line
+            ]
+            if not matched:
                 continue
-            if not raw_line.startswith(prefix):
+            if len(matched) != 1:
+                raise EvidenceError(
+                    f"environment-identity {stream_label}:{number} "
+                    "record matches multiple schemas"
+                )
+            matched_schema = matched[0]
+            if not raw_line.startswith(schema_prefixes[matched_schema]):
                 raise EvidenceError(
                     f"environment-identity {stream_label}:{number} "
                     "record is not canonically positioned"
@@ -7639,6 +7858,482 @@ def validate_environment_state(
         ],
         "checkpoint_id": suffix["checkpoint_id"],
         "logical_root": persistent["actual_root"],
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def validate_declaration_admission(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    """Validate j8h's exact real declaration-admission evidence contract.
+
+    The producer deliberately reports seven budgeted limits while distinguishing
+    the five locally measured DeclarationDimensions from the two limits delegated
+    to term-weight preflight. This validator binds both sets, their order, typed
+    outcomes, publication authority, exact roots, and recovery identities.
+    """
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=DECLARATION_ADMISSION_SCHEMA,
+        additional_schemas=(DECLARATION_ADMISSION_SUMMARY_SCHEMA,),
+        test_name=DECLARATION_ADMISSION_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=19,
+    )
+    envelope = {
+        "schema",
+        "version",
+        "run_id",
+        "bead",
+        "claim_id",
+        "claim_type",
+        "invariant_id",
+        "invariant_relation",
+        "gate_id",
+        "gate_relation",
+        "parity_ledger_row",
+        "data_grade",
+        "epoch",
+        "mode",
+        "profile",
+        "platform",
+        "cache_state",
+        "canonical_input_root",
+        "cwd",
+        "argv",
+        "stdout_artifact",
+        "stderr_artifact",
+        "timing_used_as_gate",
+    }
+    detail = envelope | {
+        "scenario",
+        "step",
+        "step_index",
+        "declaration",
+        "status",
+        "cleanup_status",
+        "final_state",
+    }
+    publication = {
+        "base_root",
+        "published_root",
+        "authoritative",
+        "published",
+        "cacheable",
+        "expected_outcome",
+        "actual_outcome",
+        "first_divergence",
+    }
+    admitted_fields = detail | publication | {
+        "budget",
+        "usage",
+        "canonical_digest",
+        "limit_name",
+        "allowed",
+        "observed",
+        "structural_unit",
+    }
+    refusal_fields = admitted_fields | {
+        "is_declaration_dimension",
+        "measured_by",
+        "progress",
+    }
+    cancellation_fields = detail | publication | {"checkpoint"}
+    superseded_fields = detail | publication | {
+        "plan_base_root",
+        "commit_target_root",
+    }
+    recovery_fields = detail | publication | {
+        "budget",
+        "usage",
+        "canonical_digest",
+        "limit_name",
+    }
+    summary_fields = envelope | {
+        "scenario",
+        "steps",
+        "admitted_rows",
+        "refusal_rows",
+        "cancellation_rows",
+        "superseded_rows",
+        "recovery_rows",
+        "declaration_dimension_rows",
+        "delegated_limit_rows",
+        "status",
+        "cleanup_status",
+        "final_state",
+    }
+
+    def require_row(
+        record: dict[str, Any],
+        expected_fields: set[str],
+        *,
+        schema: str,
+        label: str,
+    ) -> None:
+        if set(record) != expected_fields:
+            missing = sorted(expected_fields - set(record))
+            extra = sorted(set(record) - expected_fields)
+            raise EvidenceError(
+                f"declaration-admission {label} field mismatch: "
+                f"missing={missing!r} extra={extra!r}"
+            )
+        cwd = record.get("cwd")
+        if (
+            not isinstance(cwd, str)
+            or not Path(cwd).is_absolute()
+            or Path(cwd).parts[-2:] != ("crates", "fln-env")
+        ):
+            raise EvidenceError(
+                f"declaration-admission {label} cwd is not the fln-env crate"
+            )
+        if (
+            record.get("schema") != schema
+            or record.get("version") != 1
+            or record.get("run_id") != expected_run_id
+            or record.get("bead") != "franken_lean-j8h"
+            or record.get("claim_id")
+            != "franken_lean-j8h-declaration-admission-resource-bounds"
+            or record.get("claim_type") != "bounded_model"
+            or record.get("invariant_id") != "FL-INV-07"
+            or record.get("invariant_relation")
+            != "inconclusive-is-not-rejected"
+            or record.get("gate_id") != "W2"
+            or record.get("gate_relation") != "partial-component-evidence"
+            or record.get("parity_ledger_row")
+            != "not_applicable_internal_declaration_admission"
+            or record.get("data_grade") != "verified"
+            or record.get("epoch") != "lean-v4.32.0"
+            or record.get("mode") != "sound"
+            or record.get("profile") != "e2e"
+            or record.get("platform") != "linux-x86_64"
+            or record.get("cache_state") != "uncontrolled"
+            or record.get("canonical_input_root")
+            != DECLARATION_ADMISSION_INPUT_ROOT
+            or record.get("argv") != [DECLARATION_ADMISSION_ARGV]
+            or record.get("stdout_artifact") != expected_stdout_artifact
+            or record.get("stderr_artifact") != expected_stderr_artifact
+            or record.get("timing_used_as_gate") is not False
+            or record.get("status") != "pass"
+        ):
+            raise EvidenceError(
+                f"declaration-admission {label} shared envelope differs"
+            )
+
+    expected_order = [
+        (0, "admitted-transaction", "admitted"),
+        *[
+            (index, "limit-refusal", f"refusal-{row[0]}")
+            for index, row in enumerate(DECLARATION_ADMISSION_REFUSALS, 1)
+        ],
+        (8, "cancellation", "cancel-before-expression"),
+        (9, "cancellation", "cancel-before-publication"),
+        (10, "superseded-plan", "superseded-nonpublication"),
+        *[
+            (index, "adequate-budget-recovery", f"recovery-{row[0]}")
+            for index, row in enumerate(DECLARATION_ADMISSION_RECOVERIES, 11)
+        ],
+        (None, "declaration-admission-real-path", None),
+    ]
+    actual_order = [
+        (record.get("step_index"), record.get("scenario"), record.get("step"))
+        for record in records
+    ]
+    if actual_order != expected_order:
+        raise EvidenceError(
+            "declaration-admission scenario or step order differs: "
+            f"{actual_order!r}"
+        )
+
+    admitted = records[0]
+    require_row(
+        admitted,
+        admitted_fields,
+        schema=DECLARATION_ADMISSION_SCHEMA,
+        label="admitted",
+    )
+    admitted_usage = {
+        "level_params": 2,
+        "mutual_rows": 0,
+        "constructor_rows": 0,
+        "recursor_rules": 0,
+        "canonical_bytes": 87,
+        "expressions": 1,
+        "expr_nodes": 1,
+        "expanded_weight": 1,
+        "max_logical_depth": 1,
+    }
+    if (
+        admitted.get("declaration") != "Admitted"
+        or admitted.get("budget") != DECLARATION_ADMISSION_UNBOUNDED_BUDGET
+        or admitted.get("usage") != admitted_usage
+        or admitted.get("canonical_digest")
+        != "8de3ad5e3cb6525929228ad73fea85aa71b4685d32a4b647599c7e9e31f80291"
+        or admitted.get("base_root") != DECLARATION_ADMISSION_BASE_ROOT
+        or admitted.get("published_root")
+        != "4b6ce45719dce319af9c2bf24b3c12bf012e194b49952173f35a9563690d6abf"
+        or admitted.get("authoritative") is not True
+        or admitted.get("published") is not True
+        or admitted.get("cacheable") is not True
+        or admitted.get("expected_outcome") != "admitted"
+        or admitted.get("actual_outcome") != "admitted"
+        or any(
+            admitted.get(field) is not None
+            for field in (
+                "limit_name",
+                "allowed",
+                "observed",
+                "structural_unit",
+                "first_divergence",
+            )
+        )
+        or admitted.get("cleanup_status") != "not_applicable"
+        or admitted.get("final_state")
+        != "declaration-published-and-base-unchanged"
+    ):
+        raise EvidenceError("declaration-admission admitted transaction differs")
+    for field in ("canonical_digest", "base_root", "published_root"):
+        require_environment_identity_hex(
+            admitted[field], label=f"declaration-admission admitted {field}"
+        )
+
+    refusals = records[1:8]
+    for offset, (record, expected) in enumerate(
+        zip(refusals, DECLARATION_ADMISSION_REFUSALS, strict=True)
+    ):
+        (
+            limit_name,
+            is_dimension,
+            measured_by,
+            observed,
+            structural_unit,
+            progress,
+        ) = expected
+        require_row(
+            record,
+            refusal_fields,
+            schema=DECLARATION_ADMISSION_SCHEMA,
+            label=f"refusal-{limit_name}",
+        )
+        budget = dict(DECLARATION_ADMISSION_UNBOUNDED_BUDGET)
+        budget[f"max_{limit_name}"] = 0
+        if (
+            record.get("declaration") != f"Refused{offset}"
+            or record.get("limit_name") != limit_name
+            or record.get("is_declaration_dimension") is not is_dimension
+            or record.get("measured_by") != measured_by
+            or record.get("allowed") != 0
+            or record.get("observed") != observed
+            or record.get("structural_unit") != structural_unit
+            or record.get("progress") != progress
+            or record.get("budget") != budget
+            or record.get("usage") is not None
+            or record.get("canonical_digest") is not None
+            or record.get("base_root") != DECLARATION_ADMISSION_BASE_ROOT
+            or record.get("published_root") is not None
+            or record.get("authoritative") is not False
+            or record.get("published") is not False
+            or record.get("cacheable") is not False
+            or record.get("expected_outcome")
+            != "inconclusive-resource-exhausted"
+            or record.get("actual_outcome")
+            != "inconclusive-resource-exhausted"
+            or record.get("first_divergence") is not None
+            or record.get("cleanup_status") != "not_applicable"
+            or record.get("final_state")
+            != "nothing-published-and-base-unchanged"
+        ):
+            raise EvidenceError(
+                f"declaration-admission refusal {limit_name} differs"
+            )
+        if not isinstance(record["observed"], int) or (
+            isinstance(record["observed"], bool)
+            or record["observed"] <= record["allowed"]
+        ):
+            raise EvidenceError(
+                f"declaration-admission refusal {limit_name} is not exhaustion"
+            )
+
+    cancellations = records[8:10]
+    for record, step, checkpoint in (
+        (
+            cancellations[0],
+            "cancel-before-expression",
+            "before-expression/0",
+        ),
+        (
+            cancellations[1],
+            "cancel-before-publication",
+            "before-publication",
+        ),
+    ):
+        require_row(
+            record,
+            cancellation_fields,
+            schema=DECLARATION_ADMISSION_SCHEMA,
+            label=step,
+        )
+        if (
+            record.get("declaration") != "Cancelled"
+            or record.get("checkpoint") != checkpoint
+            or record.get("base_root") != DECLARATION_ADMISSION_BASE_ROOT
+            or record.get("published_root") is not None
+            or record.get("authoritative") is not False
+            or record.get("published") is not False
+            or record.get("cacheable") is not False
+            or record.get("expected_outcome") != "inconclusive-cancelled"
+            or record.get("actual_outcome") != "inconclusive-cancelled"
+            or record.get("first_divergence") is not None
+            or record.get("cleanup_status") != "not_applicable"
+            or record.get("final_state")
+            != "nothing-published-and-base-unchanged"
+        ):
+            raise EvidenceError(
+                f"declaration-admission cancellation {step} differs"
+            )
+
+    superseded = records[10]
+    require_row(
+        superseded,
+        superseded_fields,
+        schema=DECLARATION_ADMISSION_SCHEMA,
+        label="superseded-plan",
+    )
+    if (
+        superseded.get("declaration") != "Stale"
+        or superseded.get("plan_base_root") != DECLARATION_ADMISSION_BASE_ROOT
+        or superseded.get("commit_target_root") != admitted["published_root"]
+        or superseded.get("base_root") != admitted["published_root"]
+        or superseded.get("published_root") is not None
+        or superseded.get("authoritative") is not False
+        or superseded.get("published") is not False
+        or superseded.get("cacheable") is not False
+        or superseded.get("expected_outcome")
+        != "inconclusive-authority-incomplete"
+        or superseded.get("actual_outcome")
+        != "inconclusive-authority-incomplete"
+        or superseded.get("first_divergence")
+        != "plan-base-differs-from-commit-target"
+        or superseded.get("cleanup_status") != "not_applicable"
+        or superseded.get("final_state")
+        != "nothing-published-and-target-unchanged"
+    ):
+        raise EvidenceError("declaration-admission superseded-plan row differs")
+
+    recoveries = records[11:18]
+    recovery_digests: set[str] = set()
+    recovery_roots: set[str] = set()
+    for offset, (record, expected) in enumerate(
+        zip(recoveries, DECLARATION_ADMISSION_RECOVERIES, strict=True)
+    ):
+        limit_name, usage, digest, published_root = expected
+        require_row(
+            record,
+            recovery_fields,
+            schema=DECLARATION_ADMISSION_SCHEMA,
+            label=f"recovery-{limit_name}",
+        )
+        if (
+            record.get("declaration") != f"Recovered{offset}"
+            or record.get("limit_name") != limit_name
+            or record.get("budget") != DECLARATION_ADMISSION_UNBOUNDED_BUDGET
+            or record.get("usage") != usage
+            or record.get("canonical_digest") != digest
+            or record.get("base_root") != DECLARATION_ADMISSION_BASE_ROOT
+            or record.get("published_root") != published_root
+            or record.get("authoritative") is not True
+            or record.get("published") is not True
+            or record.get("cacheable") is not True
+            or record.get("expected_outcome") != "admitted-after-refusal"
+            or record.get("actual_outcome") != "admitted-after-refusal"
+            or record.get("first_divergence") is not None
+            or record.get("cleanup_status") != "not_applicable"
+            or record.get("final_state")
+            != "declaration-published-after-earlier-refusal"
+        ):
+            raise EvidenceError(
+                f"declaration-admission recovery {limit_name} differs"
+            )
+        require_environment_identity_hex(
+            digest, label=f"declaration-admission recovery {limit_name} digest"
+        )
+        require_environment_identity_hex(
+            published_root,
+            label=f"declaration-admission recovery {limit_name} root",
+        )
+        recovery_digests.add(digest)
+        recovery_roots.add(published_root)
+    if len(recovery_digests) != 7 or len(recovery_roots) != 7:
+        raise EvidenceError(
+            "declaration-admission recoveries reuse a digest or published root"
+        )
+
+    summary = records[18]
+    require_row(
+        summary,
+        summary_fields,
+        schema=DECLARATION_ADMISSION_SUMMARY_SCHEMA,
+        label="summary",
+    )
+    if (
+        summary.get("scenario") != "declaration-admission-real-path"
+        or summary.get("steps") != 18
+        or summary.get("admitted_rows") != 1
+        or summary.get("refusal_rows") != 7
+        or summary.get("cancellation_rows") != 2
+        or summary.get("superseded_rows") != 1
+        or summary.get("recovery_rows") != 7
+        or summary.get("declaration_dimension_rows") != 5
+        or summary.get("delegated_limit_rows") != 2
+        or summary.get("cleanup_status") != "retained_by_policy"
+        or summary.get("final_state")
+        != "every-budgeted-limit-refused-typed-and-recovered"
+        or sum(
+            record["is_declaration_dimension"] is True for record in refusals
+        )
+        != 5
+        or sum(
+            record["is_declaration_dimension"] is False for record in refusals
+        )
+        != 2
+    ):
+        raise EvidenceError("declaration-admission summary or limit split differs")
+
+    return {
+        "schema": "fln.validation/1",
+        "validator": "declaration-admission/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "steps": 18,
+        "refusal_rows": len(refusals),
+        "declaration_dimension_rows": 5,
+        "delegated_limit_rows": 2,
+        "canonical_input_root": DECLARATION_ADMISSION_INPUT_ROOT,
+        "base_root": DECLARATION_ADMISSION_BASE_ROOT,
         "stdout_artifact": stdout_relative,
         "stderr_artifact": stderr_relative,
         "stdout_sha256": stdout_digest,
@@ -12676,6 +13371,14 @@ def cmd_validate_environment_state(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_validate_declaration_admission(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_declaration_admission,
+        label="declaration-admission",
+    )
+
+
 def cmd_validate_kernel_admission(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
     stdout_path = require_within(
@@ -16918,6 +17621,287 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         validate_environment_state,
         state_incomplete,
     )
+
+    def declaration_admission_fixture(
+        label: str,
+    ) -> list[dict[str, Any]]:
+        envelope = {
+            "version": 1,
+            "run_id": identity_run_id,
+            "bead": "franken_lean-j8h",
+            "claim_id": (
+                "franken_lean-j8h-declaration-admission-resource-bounds"
+            ),
+            "claim_type": "bounded_model",
+            "invariant_id": "FL-INV-07",
+            "invariant_relation": "inconclusive-is-not-rejected",
+            "gate_id": "W2",
+            "gate_relation": "partial-component-evidence",
+            "parity_ledger_row": (
+                "not_applicable_internal_declaration_admission"
+            ),
+            "data_grade": "verified",
+            "epoch": "lean-v4.32.0",
+            "mode": "sound",
+            "profile": "e2e",
+            "platform": "linux-x86_64",
+            "cache_state": "uncontrolled",
+            "canonical_input_root": DECLARATION_ADMISSION_INPUT_ROOT,
+            "cwd": "/tmp/self-test/crates/fln-env",
+            "argv": [DECLARATION_ADMISSION_ARGV],
+            "stdout_artifact": f"{label}.out",
+            "stderr_artifact": f"{label}.err",
+            "timing_used_as_gate": False,
+        }
+
+        def detail(
+            scenario: str,
+            step: str,
+            step_index: int,
+            declaration: str,
+            final_state: str,
+        ) -> dict[str, Any]:
+            return {
+                "schema": DECLARATION_ADMISSION_SCHEMA,
+                **envelope,
+                "scenario": scenario,
+                "step": step,
+                "step_index": step_index,
+                "declaration": declaration,
+                "status": "pass",
+                "cleanup_status": "not_applicable",
+                "final_state": final_state,
+            }
+
+        records: list[dict[str, Any]] = []
+        records.append(
+            {
+                **detail(
+                    "admitted-transaction",
+                    "admitted",
+                    0,
+                    "Admitted",
+                    "declaration-published-and-base-unchanged",
+                ),
+                "budget": dict(DECLARATION_ADMISSION_UNBOUNDED_BUDGET),
+                "usage": {
+                    "level_params": 2,
+                    "mutual_rows": 0,
+                    "constructor_rows": 0,
+                    "recursor_rules": 0,
+                    "canonical_bytes": 87,
+                    "expressions": 1,
+                    "expr_nodes": 1,
+                    "expanded_weight": 1,
+                    "max_logical_depth": 1,
+                },
+                "canonical_digest": (
+                    "8de3ad5e3cb6525929228ad73fea85aa7"
+                    "1b4685d32a4b647599c7e9e31f80291"
+                ),
+                "limit_name": None,
+                "allowed": None,
+                "observed": None,
+                "structural_unit": None,
+                "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                "published_root": (
+                    "4b6ce45719dce319af9c2bf24b3c12bf"
+                    "012e194b49952173f35a9563690d6abf"
+                ),
+                "authoritative": True,
+                "published": True,
+                "cacheable": True,
+                "expected_outcome": "admitted",
+                "actual_outcome": "admitted",
+                "first_divergence": None,
+            }
+        )
+        for offset, expected in enumerate(DECLARATION_ADMISSION_REFUSALS):
+            (
+                limit_name,
+                is_dimension,
+                measured_by,
+                observed,
+                structural_unit,
+                progress,
+            ) = expected
+            budget = dict(DECLARATION_ADMISSION_UNBOUNDED_BUDGET)
+            budget[f"max_{limit_name}"] = 0
+            records.append(
+                {
+                    **detail(
+                        "limit-refusal",
+                        f"refusal-{limit_name}",
+                        offset + 1,
+                        f"Refused{offset}",
+                        "nothing-published-and-base-unchanged",
+                    ),
+                    "budget": budget,
+                    "usage": None,
+                    "canonical_digest": None,
+                    "limit_name": limit_name,
+                    "is_declaration_dimension": is_dimension,
+                    "measured_by": measured_by,
+                    "allowed": 0,
+                    "observed": observed,
+                    "structural_unit": structural_unit,
+                    "progress": progress,
+                    "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                    "published_root": None,
+                    "authoritative": False,
+                    "published": False,
+                    "cacheable": False,
+                    "expected_outcome": "inconclusive-resource-exhausted",
+                    "actual_outcome": "inconclusive-resource-exhausted",
+                    "first_divergence": None,
+                }
+            )
+        for step_index, step, checkpoint in (
+            (8, "cancel-before-expression", "before-expression/0"),
+            (9, "cancel-before-publication", "before-publication"),
+        ):
+            records.append(
+                {
+                    **detail(
+                        "cancellation",
+                        step,
+                        step_index,
+                        "Cancelled",
+                        "nothing-published-and-base-unchanged",
+                    ),
+                    "checkpoint": checkpoint,
+                    "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                    "published_root": None,
+                    "authoritative": False,
+                    "published": False,
+                    "cacheable": False,
+                    "expected_outcome": "inconclusive-cancelled",
+                    "actual_outcome": "inconclusive-cancelled",
+                    "first_divergence": None,
+                }
+            )
+        admitted_root = records[0]["published_root"]
+        records.append(
+            {
+                **detail(
+                    "superseded-plan",
+                    "superseded-nonpublication",
+                    10,
+                    "Stale",
+                    "nothing-published-and-target-unchanged",
+                ),
+                "plan_base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                "commit_target_root": admitted_root,
+                "base_root": admitted_root,
+                "published_root": None,
+                "authoritative": False,
+                "published": False,
+                "cacheable": False,
+                "expected_outcome": "inconclusive-authority-incomplete",
+                "actual_outcome": "inconclusive-authority-incomplete",
+                "first_divergence": "plan-base-differs-from-commit-target",
+            }
+        )
+        for offset, expected in enumerate(DECLARATION_ADMISSION_RECOVERIES):
+            limit_name, usage, digest, published_root = expected
+            records.append(
+                {
+                    **detail(
+                        "adequate-budget-recovery",
+                        f"recovery-{limit_name}",
+                        offset + 11,
+                        f"Recovered{offset}",
+                        "declaration-published-after-earlier-refusal",
+                    ),
+                    "budget": dict(DECLARATION_ADMISSION_UNBOUNDED_BUDGET),
+                    "usage": usage,
+                    "canonical_digest": digest,
+                    "limit_name": limit_name,
+                    "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                    "published_root": published_root,
+                    "authoritative": True,
+                    "published": True,
+                    "cacheable": True,
+                    "expected_outcome": "admitted-after-refusal",
+                    "actual_outcome": "admitted-after-refusal",
+                    "first_divergence": None,
+                }
+            )
+        records.append(
+            {
+                "schema": DECLARATION_ADMISSION_SUMMARY_SCHEMA,
+                **envelope,
+                "scenario": "declaration-admission-real-path",
+                "steps": 18,
+                "admitted_rows": 1,
+                "refusal_rows": 7,
+                "cancellation_rows": 2,
+                "superseded_rows": 1,
+                "recovery_rows": 7,
+                "declaration_dimension_rows": 5,
+                "delegated_limit_rows": 2,
+                "status": "pass",
+                "cleanup_status": "retained_by_policy",
+                "final_state": (
+                    "every-budgeted-limit-refused-typed-and-recovered"
+                ),
+            }
+        )
+        return records
+
+    admission_valid = declaration_admission_fixture("admission_valid")
+    admission_stdout, admission_stderr = write_identity_fixture(
+        "admission_valid", admission_valid
+    )
+    require(
+        identity_validator_call(
+            validate_declaration_admission,
+            admission_stdout,
+            admission_stderr,
+        )["records"]
+        == 19,
+        "valid declaration-admission evidence was not accepted",
+    )
+    admission_mutants: list[
+        tuple[str, Callable[[list[dict[str, Any]]], None]]
+    ] = [
+        ("missing", lambda rows: rows.pop(17)),
+        ("extra", lambda rows: rows.append(dict(rows[-1]))),
+        ("duplicate", lambda rows: rows.__setitem__(2, dict(rows[1]))),
+        (
+            "reordered",
+            lambda rows: rows.__setitem__(
+                slice(1, 3), [dict(rows[2]), dict(rows[1])]
+            ),
+        ),
+        (
+            "stale",
+            lambda rows: rows[8].__setitem__(
+                "canonical_input_root", identity_hex(90_001)
+            ),
+        ),
+        (
+            "contradictory",
+            lambda rows: rows[1].__setitem__(
+                "actual_outcome", "rejected"
+            ),
+        ),
+        (
+            "summary_split",
+            lambda rows: rows[-1].__setitem__(
+                "declaration_dimension_rows", 7
+            ),
+        ),
+    ]
+    for mutant, mutate in admission_mutants:
+        label = f"admission_{mutant}"
+        mutant_records = declaration_admission_fixture(label)
+        mutate(mutant_records)
+        expect_identity_rejection(
+            label,
+            validate_declaration_admission,
+            mutant_records,
+        )
     expect_identity_rejection(
         "tag_stderr_leak",
         validate_declaration_tag_matrix,
@@ -16928,8 +17912,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         {
             "case": "environment_identity_matrix_validation",
             "ok": True,
-            "validators": 4,
-            "mutants_killed": 13,
+            "validators": 5,
+            "mutants_killed": 20,
         }
     )
 
@@ -20351,6 +21335,11 @@ def build_parser() -> argparse.ArgumentParser:
             "validate-environment-state",
             "strictly validate the 41s checkpoint/history identity evidence",
             cmd_validate_environment_state,
+        ),
+        (
+            "validate-declaration-admission",
+            "strictly validate the j8h declaration-admission evidence",
+            cmd_validate_declaration_admission,
         ),
     ):
         identity_parser = subparsers.add_parser(command, help=help_text)

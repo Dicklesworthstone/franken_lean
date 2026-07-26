@@ -845,6 +845,10 @@ run_structured_positive_step() {
   snapshot_before "$ROOT" crates/fln-env "$step"
   note "running structured producer step=$step"
   supervise "$step" env FLN_ENV_E2E_RUN_ID="$RUN_ID-$step" \
+    FLN_ENV_E2E_STDOUT_ARTIFACT="$step.out" \
+    FLN_ENV_E2E_STDERR_ARTIFACT="$step.err" \
+    FLN_ENV_E2E_ARGV="cargo test --locked -q -p fln-env $test_name -- --exact --nocapture" \
+    FLN_ENV_E2E_CACHE_STATE=uncontrolled \
     CARGO_TARGET_DIR=target_local cargo test --locked -q -p fln-env \
     "$test_name" -- --exact --nocapture
   inspect_supervisor "$step"
@@ -895,6 +899,10 @@ run_structured_positive_step environment_state \
   extensions::tests::environment_state_e2e_emits_detailed_real_path_evidence \
   '{"schema":"fln.e2e.environment-state","version":1' 4 \
   validate-environment-state
+run_structured_positive_step declaration_admission \
+  environment::tests::declaration_admission_e2e_emits_detailed_real_path_evidence \
+  '{"schema":"fln.e2e.declaration-admission","version":1' 19 \
+  validate-declaration-admission
 run_structured_positive_step extension_merge_refusals \
   extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence \
   '{"schema":"fln.e2e.extension-merge-refusal","version":1' 2
