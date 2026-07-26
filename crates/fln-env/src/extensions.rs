@@ -2078,13 +2078,7 @@ impl ExtensionState {
         theirs: &ExtensionState,
         set_union_limits: SetUnionLimits,
     ) -> Result<ExtensionMergeOutcome, MergeConflict> {
-        if base.descriptor != ours.descriptor || base.descriptor != theirs.descriptor {
-            return Err(MergeConflict::DescriptorMismatch {
-                base: base.descriptor.clone(),
-                ours: ours.descriptor.clone(),
-                theirs: theirs.descriptor.clone(),
-            });
-        }
+        validate_descriptor_admission(&base.descriptor, &ours.descriptor, &theirs.descriptor)?;
         let ours_common_prefix = base
             .entries()
             .zip(ours.entries())
@@ -2180,6 +2174,60 @@ impl ExtensionState {
         }
     }
 }
+
+/// Stage 1 of the merge pipeline: bounded descriptor admission.
+///
+/// # The signature is the enforcement
+///
+/// The stage law says a descriptor refusal must "inspect zero journal entries, clone
+/// zero payloads, select no policy, and expose no product or root". This function takes
+/// the three **descriptors** and nothing else, so none of those is reachable: there is
+/// no journal to walk, no payload to copy, and the success type is `()`, so no product
+/// or root can leave here even by accident.
+///
+/// That is deliberately a *structural* constraint rather than an assertion. The planted
+/// mutant `clone_payloads_during_refusal` — which deep-copied every `ours`/`theirs`
+/// payload on this path — survived the entire suite, because the returned conflict is
+/// byte-identical and nothing observed the copying. It is now not expressible here at
+/// all: `ours.entries()` does not compile when `ours` is an `ExtensionDescriptor`. A
+/// constraint cannot rot the way an assertion can be deleted or drift out of scope,
+/// which is the failure mode this whole bead is about.
+///
+/// # What this does NOT establish
+///
+/// It proves the refusal *cannot* touch a journal or a payload. It does **not** produce
+/// the operation/allocation *facts* the criteria separately demand — nothing here counts
+/// or reports anything, and the refusal does still clone the three descriptors, which is
+/// legitimate and is what the returned conflict is made of. Those are different claims
+/// and are tracked separately in `MERGE_VALIDATION_MUTANTS`.
+fn validate_descriptor_admission(
+    base: &ExtensionDescriptor,
+    ours: &ExtensionDescriptor,
+    theirs: &ExtensionDescriptor,
+) -> Result<(), MergeConflict> {
+    if base != ours || base != theirs {
+        return Err(MergeConflict::DescriptorMismatch {
+            base: base.clone(),
+            ours: ours.clone(),
+            theirs: theirs.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Pins the stage-1 signature, because the constraint above is only worth anything for
+/// as long as the parameters stay narrow.
+///
+/// Widening these to `&ExtensionState` — the single edit that would silently restore the
+/// ability to clone a payload during refusal, and the obvious "convenience" refactor for
+/// someone who wants the journal lengths in a diagnostic — fails to compile *here*, at a
+/// site that says why, rather than passing quietly and reopening the hole. Same device as
+/// `MERGE_VALIDATION_MUTANTS` holding each killer as a function item rather than a string.
+const _DESCRIPTOR_ADMISSION_STAYS_JOURNAL_FREE: fn(
+    &ExtensionDescriptor,
+    &ExtensionDescriptor,
+    &ExtensionDescriptor,
+) -> Result<(), MergeConflict> = validate_descriptor_admission;
 
 fn set_union_cached_limit_refusal(
     extension: &Name,
@@ -7258,12 +7306,32 @@ mod tests {
             /// The acceptance-criteria clause with no assertion behind it.
             obligation: &'static str,
         },
+        /// The mutation can no longer be **written**: the stage it targeted was narrowed
+        /// so the defect is not expressible there.
+        ///
+        /// Strictly stronger than a kill, and the difference is maintenance rather than
+        /// strength at one instant: a killed mutant stays dead only while some test keeps
+        /// failing for it, and this bead exists because nobody was watching that join. A
+        /// prevented one needs nothing to keep working — the compiler refuses.
+        ///
+        /// It carries `still_unproven` because prevention is narrow. Making a defect
+        /// inexpressible proves the code cannot do that thing; it does not discharge every
+        /// obligation the defect was standing in for, and a classification that omitted the
+        /// remainder would let a structural win read as a larger closure than it is.
+        StructurallyPrevented {
+            /// The constraint that makes the mutation inexpressible.
+            by: &'static str,
+            /// What that constraint does **not** establish.
+            still_unproven: &'static str,
+        },
     }
 
     /// The measured campaign, 2026-07-26: fourteen defects planted one at a time on the
     /// merge-validation plane, the `fln-env` suite run against each, source restored
-    /// byte-exactly between plants. Twelve killed, one equivalent, **one survivor that
-    /// is a real gap**.
+    /// byte-exactly between plants. Twelve killed, one equivalent, and one survivor that
+    /// was a real gap and is now **structurally prevented** rather than merely asserted
+    /// against — see `validate_descriptor_admission`, and note what that repair explicitly
+    /// does not establish.
     ///
     /// # The count was itself the defect
     ///
@@ -7349,17 +7417,22 @@ mod tests {
         ),
         (
             "clone_payloads_during_refusal",
-            MutantOutcome::SurvivedUncovered {
-                measured: "Deep-copying every ours/theirs journal payload on the \
-                           descriptor-refusal path leaves the returned MergeConflict \
-                           byte-identical, so the whole fln-env suite still passes \
-                           239/239. The path is reached — \
-                           mismatched_descriptors_are_typed_conflicts_on_either_branch \
-                           drives it — so this is neither unreachable nor equivalent: \
-                           the clone happens and nothing observes it.",
-                obligation: "Exact operation/allocation facts prove descriptor refusal \
-                             performs zero journal comparisons, payload clones, policy \
-                             dispatches, or product publications.",
+            MutantOutcome::StructurallyPrevented {
+                by: "validate_descriptor_admission takes three &ExtensionDescriptor and \
+                     returns Result<(), MergeConflict>, so stage 1 has no journal, no \
+                     payload and no product type in scope. The mutation body \
+                     ours.entries().map(|e| e.payload.to_vec()) no longer compiles there. \
+                     Measured first: as an inline guard it SURVIVED the full suite \
+                     239/239, because the returned conflict is byte-identical and nothing \
+                     observed the copying. _DESCRIPTOR_ADMISSION_STAYS_JOURNAL_FREE pins \
+                     the signature so widening it back is a compile error at a named site.",
+                still_unproven: "The operation/allocation FACTS the criteria separately \
+                                 demand. Nothing counts or reports journal comparisons, \
+                                 payload clones, policy dispatches or product \
+                                 publications, and the refusal does still clone the three \
+                                 descriptors — legitimately, since they are what the \
+                                 conflict is made of. Prevention bounds what stage 1 CAN \
+                                 do; it produces no facts about what it DID.",
             },
         ),
     ];
@@ -7444,59 +7517,134 @@ mod tests {
             .iter()
             .filter(|(_, outcome)| matches!(outcome, MutantOutcome::SurvivedUncovered { .. }))
             .count();
-        // Asserted FIRST, and the order is load-bearing rather than cosmetic. When these
-        // three counts sat in tally order, every way of falsely discharging the debt was
-        // caught by a bare `killed`/`equivalent` count mismatch that fired earlier — so
-        // this message, the only one that explains what the reader did wrong, could never
-        // run. Measured, not assumed: reclassifying the survivor to `KilledBy` failed with
-        // `left: 13 right: 12`. A diagnostic that cannot fire is the untruthful contract
-        // `environment.rs` names; the informative assertion has to be the reachable one.
-        assert_eq!(
-            uncovered, 1,
-            "an uncovered mutant is open debt: it must be repaired and reclassified, \
-             never dropped from the matrix, and never relabelled as killed or equivalent \
-             without an assertion that actually kills it"
+        let prevented = MERGE_VALIDATION_MUTANTS
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, MutantOutcome::StructurallyPrevented { .. }))
+            .count();
+        // Asserted BY NAME and FIRST, and both parts are load-bearing rather than cosmetic.
+        //
+        // First, by name: a tally says `left: 13 right: 12` and leaves the reader to work
+        // out which entry moved and why that is wrong. Naming the entry states the claim.
+        //
+        // Second, first: when the counts sat in tally order, every way of falsely
+        // discharging this entry was caught by an earlier bare count mismatch, so the one
+        // message that explains the mistake could never run. Measured, not assumed —
+        // reclassifying the survivor to `KilledBy` failed with `left: 13 right: 12`. A
+        // diagnostic that cannot fire is the untruthful contract `environment.rs` names.
+        let survivor = MERGE_VALIDATION_MUTANTS
+            .iter()
+            .find(|(name, _)| *name == "clone_payloads_during_refusal")
+            .map(|(_, outcome)| outcome)
+            .expect("the measured survivor must stay in the record under its own name");
+        assert!(
+            matches!(survivor, MutantOutcome::StructurallyPrevented { .. }),
+            "clone_payloads_during_refusal was MEASURED surviving the full suite and was \
+             repaired by narrowing stage 1 so it cannot be written. Relabelling it killed \
+             or equivalent without restoring an assertion, or dropping it, is how a \
+             structural repair gets read as a larger closure than it earned"
         );
+        // A wall on purpose. A survivor found by a later campaign is real debt and must
+        // redden the build until it is recorded here deliberately with its obligation
+        // named — an unwritten-down survivor is the exact state this bead was filed about.
+        assert_eq!(
+            uncovered, 0,
+            "an uncovered mutant is open debt: repair it and reclassify, never drop it \
+             from the matrix and never relabel it without an assertion that actually kills"
+        );
+        assert_eq!(prevented, 1);
         assert_eq!(killed, 12);
         assert_eq!(equivalent, 1);
         assert_eq!(
-            killed + equivalent + uncovered,
+            killed + equivalent + uncovered + prevented,
             CRITERIA_NAMED_MUTANTS.len()
         );
         for (name, outcome) in MERGE_VALIDATION_MUTANTS {
-            match outcome {
-                // Reading the item is what binds the record to the compiler. The
-                // reference in the table above is already a use, so renaming or deleting
-                // a killer fails the build rather than leaving a stale string behind —
-                // which is the entire exposure this table closes.
-                MutantOutcome::KilledBy(killer) => {
-                    let _killer: fn() = *killer;
-                }
-                // An equivalence must carry its argument. "It survived" is not a
-                // classification, and an unargued equivalence is how a real gap gets
-                // dismissed as a phantom.
-                MutantOutcome::EquivalentBecause(reason) => assert!(
-                    reason.len() > 80,
-                    "{name}: an equivalence claim must state why behaviour cannot change"
-                ),
-                // A survivor must carry both halves. "It survived" is not a finding, and
-                // a survivor without its unmet obligation is indistinguishable from an
-                // equivalence nobody argued.
-                MutantOutcome::SurvivedUncovered {
-                    measured,
-                    obligation,
-                } => {
-                    assert!(
-                        measured.len() > 80,
-                        "{name}: a survivor must state what the run showed"
-                    );
-                    assert!(
-                        obligation.len() > 40,
-                        "{name}: a survivor must name the obligation it leaves unmet"
-                    );
-                }
+            assert_classification_is_well_formed(name, outcome);
+        }
+    }
+
+    /// Every classification must carry the argument that makes it a classification rather
+    /// than a label. Extracted from the loop so it can be applied to *constructed*
+    /// variants too — the record currently contains no `SurvivedUncovered` entry, so
+    /// checking these rules only against the table would leave that arm's discipline
+    /// unexercised, and an unexercised rule is how the next survivor gets recorded as a
+    /// bare "it survived".
+    fn assert_classification_is_well_formed(name: &str, outcome: &MutantOutcome) {
+        match outcome {
+            // Reading the item is what binds the record to the compiler. The reference in
+            // the table above is already a use, so renaming or deleting a killer fails the
+            // build rather than leaving a stale string behind — the exposure this closes.
+            MutantOutcome::KilledBy(killer) => {
+                let _killer: fn() = *killer;
+            }
+            // An equivalence must carry its argument. "It survived" is not a
+            // classification, and an unargued equivalence is how a real gap gets dismissed
+            // as a phantom.
+            MutantOutcome::EquivalentBecause(reason) => assert!(
+                reason.len() > 80,
+                "{name}: an equivalence claim must state why behaviour cannot change"
+            ),
+            // A survivor must carry both halves. "It survived" is not a finding, and a
+            // survivor without its unmet obligation is indistinguishable from an
+            // equivalence nobody argued.
+            MutantOutcome::SurvivedUncovered {
+                measured,
+                obligation,
+            } => {
+                assert!(
+                    measured.len() > 80,
+                    "{name}: a survivor must state what the run showed"
+                );
+                assert!(
+                    obligation.len() > 40,
+                    "{name}: a survivor must name the obligation it leaves unmet"
+                );
+            }
+            // Prevention must carry BOTH halves. The constraint alone reads as a clean
+            // win; the remainder is what stops it being quoted as one.
+            MutantOutcome::StructurallyPrevented { by, still_unproven } => {
+                assert!(
+                    by.len() > 80,
+                    "{name}: prevention must name the constraint that makes the mutation \
+                     inexpressible, not merely assert that it is"
+                );
+                assert!(
+                    still_unproven.len() > 80,
+                    "{name}: prevention is narrow — it must state what it does NOT \
+                     establish, or a structural win reads as a larger closure"
+                );
             }
         }
+    }
+
+    /// The vocabulary for recording a *measured survivor* stays available and stays
+    /// checked, even though the record holds none today.
+    ///
+    /// `clone_payloads_during_refusal` was the only `SurvivedUncovered` entry and its
+    /// repair reclassified it, which would leave the variant unconstructed. Deleting it to
+    /// satisfy the dead-code lint is the wrong repair and worth naming: the next campaign
+    /// that finds a survivor would reach for the nearest surviving label, and the nearest
+    /// one is `EquivalentBecause` — turning a real gap into a dismissed phantom, which is
+    /// the precise error this bead's own criteria forbid in the other direction.
+    #[test]
+    fn a_measured_survivor_remains_recordable_and_must_argue_both_halves() {
+        let well_formed = MutantOutcome::SurvivedUncovered {
+            measured: "A planted defect compiled, ran, and no test failed, while the path \
+                       it sits on is demonstrably reached by an existing passing test.",
+            obligation: "The acceptance-criteria clause that has no assertion behind it.",
+        };
+        assert_classification_is_well_formed("exemplar", &well_formed);
+
+        // And the discipline actually bites: a bare survivor is rejected.
+        let bare = MutantOutcome::SurvivedUncovered {
+            measured: "it survived",
+            obligation: "",
+        };
+        assert!(
+            std::panic::catch_unwind(|| assert_classification_is_well_formed("bare", &bare))
+                .is_err(),
+            "a survivor recorded without its measurement and obligation must be refused"
+        );
     }
 
     /// The public projection refuses typed on every resource and exposes no view.
