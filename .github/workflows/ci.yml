@@ -519,6 +519,39 @@ jobs:
           fi
           exit "$command_rc"
 
+      - name: e2e smoke — bidirectional unsafe-note Clippy census
+        id: unsafe_note_clippy
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/unsafe-note-clippy"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/unsafe_note_clippy.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "unsafe-note Clippy lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
       # The census shards are governed outputs that the checkout carries, so this
       # proves them against the committed pins rather than fetching anything: the
       # per-shard bytes= in contracts/CONTRACT_HANDOFF.txt and the two sha256 group
@@ -722,6 +755,8 @@ jobs:
           STRUCTURE_EXIT: ${{ steps.structure_gate.outputs.command_exit }}
           CLOSURE_ARTIFACT: ${{ steps.closure_audit.outputs.artifact_path }}
           CLOSURE_EXIT: ${{ steps.closure_audit.outputs.command_exit }}
+          UNSAFE_NOTE_CLIPPY_ARTIFACT: ${{ steps.unsafe_note_clippy.outputs.artifact_path }}
+          UNSAFE_NOTE_CLIPPY_EXIT: ${{ steps.unsafe_note_clippy.outputs.command_exit }}
           CONTRACT_HANDOFF_ARTIFACT: ${{ steps.contract_handoff.outputs.artifact_path }}
           CONTRACT_HANDOFF_EXIT: ${{ steps.contract_handoff.outputs.command_exit }}
           ENV_SNAPSHOTS_ARTIFACT: ${{ steps.environment_collision.outputs.parent_artifact_path }}
@@ -759,6 +794,7 @@ jobs:
               e2e_root: {
                   "structure-gate",
                   "closure-audit",
+                  "unsafe-note-clippy",
                   "contract-handoff",
                   # env_snapshots is the sole parent bundle at this shared root;
                   # the two collision scenarios are its named children.
@@ -802,6 +838,13 @@ jobs:
                   os.environ.get("CLOSURE_ARTIFACT", ""),
                   os.environ.get("CLOSURE_EXIT", ""),
                   e2e_root / "closure-audit",
+                  True,
+              ),
+              (
+                  "unsafe_note_clippy",
+                  os.environ.get("UNSAFE_NOTE_CLIPPY_ARTIFACT", ""),
+                  os.environ.get("UNSAFE_NOTE_CLIPPY_EXIT", ""),
+                  e2e_root / "unsafe-note-clippy",
                   True,
               ),
               (

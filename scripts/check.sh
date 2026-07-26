@@ -163,14 +163,14 @@ INPUT_PATHS=(
   scripts/e2e/contract_drift.sh scripts/e2e/contract_handoff.sh
   scripts/e2e/olean_resurrection.sh
   scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh
-  scripts/e2e/verdict_schema.sh
+  scripts/e2e/verdict_schema.sh scripts/e2e/unsafe_note_clippy.sh
   scripts/tribunal/leanchecker_witness.sh
   contracts ABI_CONTRACT.md OLEAN_CONTRACT.md rustfmt.toml
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
   scripts/git-hooks/pre-commit scripts/git-hooks/install.sh
   scripts/git-hooks/test_projection_guard.sh
   tribunal
-  .github/workflows/ci.yml
+  .github/workflows/ci.yml .github/workflows/contract-drift.yml
 )
 # Every Cargo manifest below tribunal/ is outside the root workspace by
 # construction. Keep the registry exact so adding another nested Tribunal suite
@@ -1544,7 +1544,7 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/olean_resurrection.sh \
   scripts/extract/gen_extern_census.sh scripts/extract/census_materialize.sh \
   scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh \
-  scripts/e2e/verdict_schema.sh \
+  scripts/e2e/verdict_schema.sh scripts/e2e/unsafe_note_clippy.sh \
   scripts/tribunal/leanchecker_witness.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh \
   scripts/git-hooks/pre-commit scripts/git-hooks/install.sh \

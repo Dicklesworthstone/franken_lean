@@ -191,6 +191,14 @@ CHECK_STAGE_ORDER = [
 ]
 CHECK_SELF_TEST_ORDER = [*CHECK_STAGE_ORDER, "cancel-term"]
 E2E_STEP_ORDERS = {
+    "unsafe_note_clippy": [
+        "clippy_report",
+        "baseline_match",
+        "undeclared_site_mutant",
+        "undeclared_site_recovery",
+        "stale_declaration_mutant",
+        "stale_declaration_recovery",
+    ],
     "contract_handoff": [
         "cold_regeneration_a",
         "cold_regeneration_b",
@@ -13491,6 +13499,279 @@ def cmd_vendor_binding(args: argparse.Namespace) -> int:
     return PASS
 
 
+UNSAFE_NOTE_SITE_SCHEMA = "fln-unsafe-note-clippy-sites/1"
+UNSAFE_NOTE_LINT = "clippy::undocumented_unsafe_blocks"
+UNSAFE_NOTE_MAX_REPORT_BYTES = 64 * 1024 * 1024
+UNSAFE_NOTE_MAX_SOURCE_BYTES = 8 * 1024 * 1024
+UNSAFE_NOTE_MAX_REPORT_LINES = 100_000
+UNSAFE_NOTE_CONTEXT_LINES = 6
+UNSAFE_NOTE_MISMATCH = 101
+
+
+def render_unsafe_note_sites(rows: Iterable[tuple[str, str, str]]) -> bytes:
+    ordered = sorted(rows)
+    lines = [
+        f"schema {UNSAFE_NOTE_SITE_SCHEMA}",
+        f"lint {UNSAFE_NOTE_LINT}",
+        "columns\tpath\tfunction\tcontext_sha256",
+    ]
+    lines.extend(
+        f"site\t{path}\t{function}\t{digest}"
+        for path, function, digest in ordered
+    )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def parse_unsafe_note_sites(path: Path) -> set[tuple[str, str, str]]:
+    data, _size, _digest = stable_file_facts(
+        path, max_bytes=UNSAFE_NOTE_MAX_REPORT_BYTES
+    )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"{path}: unsafe-note site list is not UTF-8") from error
+    lines = text.splitlines()
+    expected_header = [
+        f"schema {UNSAFE_NOTE_SITE_SCHEMA}",
+        f"lint {UNSAFE_NOTE_LINT}",
+        "columns\tpath\tfunction\tcontext_sha256",
+    ]
+    if lines[:3] != expected_header:
+        raise EvidenceError(f"{path}: unsafe-note site-list header is invalid")
+    rows: set[tuple[str, str, str]] = set()
+    for index, line in enumerate(lines[3:], start=4):
+        columns = line.split("\t")
+        if len(columns) != 4 or columns[0] != "site":
+            raise EvidenceError(f"{path}:{index}: malformed unsafe-note site row")
+        relative, function, digest = columns[1:]
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.as_posix() != relative
+            or not relative.startswith("crates/fln-unsafe-")
+            or not relative.endswith(".rs")
+        ):
+            raise EvidenceError(f"{path}:{index}: invalid unsafe-note source path")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", function) is None:
+            raise EvidenceError(f"{path}:{index}: invalid enclosing function")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+            raise EvidenceError(f"{path}:{index}: invalid context digest")
+        row = (relative, function, digest)
+        if row in rows:
+            raise EvidenceError(f"{path}:{index}: duplicate unsafe-note site row")
+        rows.add(row)
+    if render_unsafe_note_sites(rows) != data:
+        raise EvidenceError(f"{path}: unsafe-note site list is not canonical")
+    return rows
+
+
+def extract_unsafe_note_sites(
+    root: Path, report_path: Path
+) -> set[tuple[str, str, str]]:
+    root = root.resolve(strict=True)
+    report, _size, _digest = stable_file_facts(
+        report_path, max_bytes=UNSAFE_NOTE_MAX_REPORT_BYTES
+    )
+    try:
+        report_text = report.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"{report_path}: Clippy report is not UTF-8") from error
+    report_lines = report_text.splitlines()
+    if len(report_lines) > UNSAFE_NOTE_MAX_REPORT_LINES:
+        raise EvidenceError(
+            f"{report_path}: Clippy report exceeds "
+            f"{UNSAFE_NOTE_MAX_REPORT_LINES} records"
+        )
+
+    diagnostic_spans: set[tuple[str, int, int]] = set()
+    rows: set[tuple[str, str, str]] = set()
+    function_pattern = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    for index, line in enumerate(report_lines, start=1):
+        if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
+            raise EvidenceError(f"{report_path}:{index}: JSON record is too large")
+        record = parse_json(line.encode("utf-8"), subject=f"{report_path}:{index}")
+        if not isinstance(record, dict):
+            raise EvidenceError(f"{report_path}:{index}: JSON record is not an object")
+        if record.get("reason") != "compiler-message":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            raise EvidenceError(
+                f"{report_path}:{index}: compiler-message payload is not an object"
+            )
+        code = message.get("code")
+        if not isinstance(code, dict) or code.get("code") != UNSAFE_NOTE_LINT:
+            continue
+        primary = [
+            span
+            for span in message.get("spans", [])
+            if isinstance(span, dict) and span.get("is_primary") is True
+        ]
+        if len(primary) != 1:
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note diagnostic needs one primary span"
+            )
+        span = primary[0]
+        relative = span.get("file_name")
+        byte_start = span.get("byte_start")
+        byte_end = span.get("byte_end")
+        if (
+            not isinstance(relative, str)
+            or not isinstance(byte_start, int)
+            or not isinstance(byte_end, int)
+            or byte_start < 0
+            or byte_end <= byte_start
+        ):
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note span facts are invalid"
+            )
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.as_posix() != relative
+            or not relative.startswith("crates/fln-unsafe-")
+            or not relative.endswith(".rs")
+        ):
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note span escapes boundary crates"
+            )
+        span_key = (relative, byte_start, byte_end)
+        if span_key in diagnostic_spans:
+            continue
+        diagnostic_spans.add(span_key)
+
+        source_path = require_within(
+            root / relative_path, root, label="unsafe-note Clippy source"
+        )
+        source, _source_size, _source_digest = stable_file_facts(
+            source_path, max_bytes=UNSAFE_NOTE_MAX_SOURCE_BYTES
+        )
+        if byte_end > len(source):
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note span exceeds {relative}"
+            )
+        try:
+            source_text = source.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise EvidenceError(f"{relative}: Rust source is not UTF-8") from error
+        line_index = source[:byte_start].count(b"\n")
+        source_lines = source_text.splitlines()
+        if line_index >= len(source_lines):
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note span line is absent"
+            )
+        function = None
+        for source_line in reversed(source_lines[: line_index + 1]):
+            match = function_pattern.search(source_line)
+            if match is not None:
+                function = match.group(1)
+                break
+        if function is None:
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note site has no enclosing function"
+            )
+        context = "\n".join(
+            source_line.strip()
+            for source_line in source_lines[
+                line_index : line_index + UNSAFE_NOTE_CONTEXT_LINES
+            ]
+        ).encode("utf-8")
+        context_digest = f"sha256:{hashlib.sha256(context).hexdigest()}"
+        row = (relative, function, context_digest)
+        if row in rows:
+            raise EvidenceError(
+                f"{report_path}:{index}: line-independent unsafe-note identity collided"
+            )
+        rows.add(row)
+    return rows
+
+
+def cmd_unsafe_note_clippy_sites(args: argparse.Namespace) -> int:
+    operation = args.operation
+    artifact_root = Path(args.artifact_root) if args.artifact_root else None
+    if operation == "extract":
+        if not args.root or not args.report or not args.output or artifact_root is None:
+            raise EvidenceError(
+                "unsafe-note extract requires --root, --report, --output, "
+                "and --artifact-root"
+            )
+        rows = extract_unsafe_note_sites(Path(args.root), Path(args.report))
+        output = require_within(
+            Path(args.output), artifact_root, label="unsafe-note observed sites"
+        )
+        write_new(output, render_unsafe_note_sites(rows))
+        print(f"unsafe-note clippy extract: {len(rows)} unique sites")
+        return PASS
+
+    if operation == "compare":
+        if not args.declared or not args.observed:
+            raise EvidenceError(
+                "unsafe-note compare requires --declared and --observed"
+            )
+        declared = parse_unsafe_note_sites(Path(args.declared))
+        observed = parse_unsafe_note_sites(Path(args.observed))
+        unexpected = sorted(observed - declared)
+        stale = sorted(declared - observed)
+        for row in unexpected:
+            print(
+                "undeclared clippy site: " + "\t".join(row),
+                file=sys.stderr,
+            )
+        for row in stale:
+            print(
+                "stale declared clippy site: " + "\t".join(row),
+                file=sys.stderr,
+            )
+        if unexpected or stale:
+            return UNSAFE_NOTE_MISMATCH
+        print(f"unsafe-note clippy match: {len(observed)} sites")
+        return PASS
+
+    if operation in {"drop-first", "add-observed", "add-stale"}:
+        if not args.declared or not args.output or artifact_root is None:
+            raise EvidenceError(
+                f"unsafe-note {operation} requires --declared, --output, "
+                "and --artifact-root"
+            )
+        rows = parse_unsafe_note_sites(Path(args.declared))
+        if operation == "drop-first":
+            if not rows:
+                raise EvidenceError("cannot drop a site from an empty declaration")
+            removed = sorted(rows)[0]
+            rows.remove(removed)
+            detail = "dropped " + "\t".join(removed)
+        elif operation == "add-observed":
+            planted = (
+                "crates/fln-unsafe-abi/src/__planted_undeclared__.rs",
+                "planted_undeclared_site",
+                "sha256:" + ("f" * 64),
+            )
+            if planted in rows:
+                raise EvidenceError("planted undeclared unsafe-note site already exists")
+            rows.add(planted)
+            detail = "added " + "\t".join(planted)
+        else:
+            planted = (
+                "crates/fln-unsafe-abi/src/__planted_stale__.rs",
+                "planted_stale_site",
+                "sha256:" + ("0" * 64),
+            )
+            if planted in rows:
+                raise EvidenceError("planted stale unsafe-note site already exists")
+            rows.add(planted)
+            detail = "added " + "\t".join(planted)
+        output = require_within(
+            Path(args.output), artifact_root, label="unsafe-note mutant declaration"
+        )
+        write_new(output, render_unsafe_note_sites(rows))
+        print(f"unsafe-note clippy mutant: {detail}")
+        return PASS
+
+    raise EvidenceError(f"unknown unsafe-note operation: {operation}")
+
+
 def cmd_ubs_inventory(args: argparse.Namespace) -> int:
     root = Path(args.root)
     inventory = collect_ubs_inventory(root, args.scope)
@@ -21437,6 +21718,23 @@ def build_parser() -> argparse.ArgumentParser:
     vendor_parser.add_argument("--output")
     vendor_parser.add_argument("--artifact-root")
     vendor_parser.set_defaults(func=cmd_vendor_binding)
+
+    unsafe_note_parser = subparsers.add_parser(
+        "unsafe-note-clippy-sites",
+        help="extract, compare, or mutate the Clippy unsafe-note site census",
+    )
+    unsafe_note_parser.add_argument(
+        "--operation",
+        required=True,
+        choices=("extract", "compare", "drop-first", "add-observed", "add-stale"),
+    )
+    unsafe_note_parser.add_argument("--root")
+    unsafe_note_parser.add_argument("--report")
+    unsafe_note_parser.add_argument("--declared")
+    unsafe_note_parser.add_argument("--observed")
+    unsafe_note_parser.add_argument("--output")
+    unsafe_note_parser.add_argument("--artifact-root")
+    unsafe_note_parser.set_defaults(func=cmd_unsafe_note_clippy_sites)
 
     inventory_parser = subparsers.add_parser(
         "ubs-inventory", help="publish an exact project-authored UBS file inventory"
