@@ -246,6 +246,78 @@ fn bead_status(tracker: &str, id: &str) -> Option<String> {
 /// the allowance shrinks only toward repair. The floor is that the bead must be FOUND —
 /// a lookup matching nothing is a broken scan, not a clean tree, and would otherwise let
 /// the whole check pass by silently referring to a bead that no longer exists.
+/// Whether the deferral on D18's product half still applies, decided from the two facts
+/// the production scan already publishes.
+///
+/// **Split out as a pure function, and that is the repair, not decoration.** On a clean
+/// tree the scan is vacuous, so a degeneracy clause written inline would sit behind a
+/// short-circuit and never execute in any real run — dead code that reads as coverage.
+/// Here every interesting input is reachable from a test.
+///
+/// Two states keep the deferral alive:
+///
+/// * **vacuous** — no crate declares a product root, so no closure was ever submitted.
+/// * **degenerate** — every declared product root reaches nothing but itself.
+///
+/// The second state is why this exists, and it was **measured, not hypothesised**
+/// (cc_3, 2026-07-26, at `08688c9a`). A product root is a *marker*: two comment lines,
+/// `# fln-product-root: sound` and `# fln-mode-provenance: sound`. Appending them to
+/// `crates/fln/Cargo.toml` — a **six-line charter stub with no dependencies**, whose own
+/// doc says "Implementation arrives with its workstream beads" — moves the live guard
+/// from `scan=vacuous product-roots=0 closure-nodes=0` to
+/// `scan=traversed product-roots=1 closures-scanned=1 closure-nodes=1`.
+///
+/// The old check tested `is_vacuous()` alone, so that flip **silenced it completely**.
+/// Measured as a 2×2 with the remainder bead marked closed in a scratch worktree: with
+/// the marker absent the guard exits 101 and refuses; with the marker present it exits 0
+/// and the whole gap books as done. Two comment lines on a stub defeated the one
+/// mechanism that exists to stop precisely that — and nothing anywhere would have said so.
+///
+/// A closure containing only its own root is not a product. `closure_nodes ==
+/// closures_scanned` forces that reading: every closure holds at least its root, so
+/// equality means every root is isolated. The first REAL product root carries a
+/// dependency cone, so this stops applying the moment the work is genuinely done —
+/// **one-way, no wall**, and whoever lands that product is not failed for doing the right
+/// thing.
+///
+/// **What it still does not earn.** A declared closure with a *fabricated* dependency
+/// would pass this. Making the product root itself underivable-by-assertion needs the
+/// canonical sidecar, which is the remainder bead's own content — so this narrows the
+/// hole from "two comments" to "a crate with real edges", it does not close it.
+fn deferral_still_applies(closures_scanned: usize, closure_nodes: usize) -> bool {
+    closures_scanned == 0 || closure_nodes == closures_scanned
+}
+
+#[test]
+fn a_vacuous_scan_keeps_the_deferral() {
+    assert!(deferral_still_applies(0, 0));
+}
+
+/// The measured stub case: one declared root, one node in its closure — itself.
+#[test]
+fn a_product_root_that_reaches_only_itself_keeps_the_deferral() {
+    assert!(
+        deferral_still_applies(1, 1),
+        "a marker on a dependency-free stub is not a product"
+    );
+}
+
+#[test]
+fn several_isolated_roots_still_keep_the_deferral() {
+    assert!(deferral_still_applies(3, 3));
+}
+
+/// The release condition. A root with a real cone ends the deferral, in both the
+/// single-product and multi-product shapes, so a correct repair is never walled.
+#[test]
+fn a_root_with_a_dependency_cone_releases_the_deferral() {
+    assert!(
+        !deferral_still_applies(1, 2),
+        "one root reaching one dependency"
+    );
+    assert!(!deferral_still_applies(2, 7), "two roots over a real cone");
+}
+
 #[test]
 fn the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous() {
     const REMAINDER: &str = "fln-d18-product-half-rgsg";
@@ -272,17 +344,26 @@ fn the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous() {
         )
     });
 
-    if outcome.mode_closure.is_vacuous() {
+    let scanned = outcome.mode_closure.closures_scanned;
+    let closure_nodes = outcome.mode_closure.closure_nodes;
+    if deferral_still_applies(scanned, closure_nodes) {
+        let shape = if scanned == 0 {
+            "still vacuous — no crate declares a product root, so no closure has ever \
+             been submitted to the core"
+        } else {
+            "traversed but DEGENERATE — every declared product root reaches nothing but \
+             itself, which is what a marker on a dependency-free stub produces. A \
+             `# fln-product-root:` comment is a declaration, not a product"
+        };
         assert!(
             !matches!(status.as_str(), "closed" | "tombstone"),
-            "the registered D18 scan is still vacuous — {} product roots, {} closures \
-             scanned, so no closure has ever been submitted to the core — while {REMAINDER}, \
-             which owns making it non-vacuous, is {status}. Closing the remainder in this \
-             state books the gap as done: franken_lean-r2st was split on the condition that \
-             this half stay open with its gap intact. Either reopen it, or land the product \
-             half so the scan traverses a real closure and this check stops applying.",
+            "the registered D18 scan is {shape} — {} product roots, {scanned} closures \
+             scanned, {closure_nodes} closure nodes — while {REMAINDER}, which owns making \
+             it real, is {status}. Closing the remainder in this state books the gap as \
+             done: franken_lean-r2st was split on the condition that this half stay open \
+             with its gap intact. Either reopen it, or land a product root with a real \
+             dependency cone so this check stops applying.",
             outcome.mode_closure.product_roots,
-            outcome.mode_closure.closures_scanned,
         );
     }
 }
