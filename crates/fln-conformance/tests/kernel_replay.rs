@@ -3002,6 +3002,173 @@ impl CorpusMatrixReceipt {
         }
         Ok(receipt)
     }
+
+    /// Everything the row must say to be evidence for the sentences that cite it.
+    ///
+    /// **Why this is a function and not assertions inside the guard.** It has two callers:
+    /// the retention guard, which runs it over the committed file, and
+    /// `a_receipt_that_compared_nothing_is_refused`, which runs it over forged rows. A
+    /// second copy of these rules written for the mutant test could drift from the one that
+    /// actually gates, and then the mutants would prove a check that no longer runs — the
+    /// join defect this file is otherwise careful about, one level up.
+    ///
+    /// **What the checks are for.** The first version of this guard tested the pin, the
+    /// widths, `diverging_modules == 0`, digest equality and the class token, and nothing
+    /// about *size*. That is `bkw6`'s empty-referent shape: a row recording
+    /// `modules: 0, decoded: 0, units_compared: 0, corpus_digests: []` satisfied every one
+    /// of those — zero divergences over zero comparisons — and stood as the retained
+    /// evidence for "2433 modules, every stream identical at {1, 8, 32}". Measured at
+    /// `2ebe03e0`: the vacuous row passed, a wrong-pin row failed, so the guard was reading
+    /// the file and simply had nothing to say about what the row claimed to have done.
+    ///
+    /// The producer cannot emit such a row — it asserts the same coverage floors before it
+    /// compares anything (`PINNED_PRESENT_OLEAN_FLOOR`, `PINNED_DECODED_DECL_FLOOR`) and
+    /// refuses a single unmatrixed module. But the producer is not what stands between the
+    /// documents and the file: this is. The receipt reaches the tree by an operator running
+    /// the lane and **committing the row by hand**, which is exactly the path a truncated or
+    /// invented row arrives on, and it is the path the expiry message invites when the pin
+    /// moves and the honest re-run costs 32 minutes.
+    ///
+    /// So the consumer re-derives the producer's own preconditions from the same constants
+    /// rather than trusting that the row came from the producer. The floors are `>=`: a
+    /// larger corpus is not a failure, a smaller one is.
+    fn validate(&self, pin: &str) -> Result<(), String> {
+        if self.pin != pin {
+            return Err(format!(
+                "row records pin {} but the file is the {pin} epoch's. The path IS the \
+                 binding; a row filed under the wrong epoch would make the guard check an \
+                 observation of another Reference",
+                self.pin
+            ));
+        }
+        let widths = CORPUS_MATRIX_WIDTHS
+            .iter()
+            .map(|w| *w as u64)
+            .collect::<Vec<_>>();
+        if self.widths != widths {
+            return Err(format!(
+                "row records widths {:?}, but the lane runs {CORPUS_MATRIX_WIDTHS:?}. An \
+                 observation at other widths is not evidence for the widths PG-5 names",
+                self.widths
+            ));
+        }
+
+        // CARDINALITY, and it comes before the content checks below on purpose. `all()` over
+        // an empty collection is vacuously true, so an absent digest list would satisfy
+        // "every width agreed" by having no widths to disagree. Counting first makes that
+        // unreachable instead of merely unlikely, and it is what lets the equality check
+        // index element zero at all.
+        if self.corpus_digests.len() != self.widths.len() {
+            return Err(format!(
+                "row claims widths {:?} but carries {} corpus digest(s). A width with no \
+                 digest was never folded, so the row cannot be evidence that it agreed",
+                self.widths,
+                self.corpus_digests.len()
+            ));
+        }
+        if self.per_width_ms.len() != self.widths.len() {
+            return Err(format!(
+                "row claims widths {:?} but carries {} per-width timing(s). A width with no \
+                 measured time was not run",
+                self.widths,
+                self.per_width_ms.len()
+            ));
+        }
+
+        // COVERAGE — the producer's own preconditions, re-derived from the producer's own
+        // constants so the two cannot drift apart.
+        if self.unmatrixed_modules != 0 {
+            return Err(format!(
+                "row records {} unmatrixed module(s). The lane refuses to publish an \
+                 observation with any module left out of the matrix, because the claim would \
+                 then be about a subset nobody named",
+                self.unmatrixed_modules
+            ));
+        }
+        if self.modules < PINNED_PRESENT_OLEAN_FLOOR {
+            return Err(format!(
+                "row records {} matrixed module(s), below the pinned present-module floor of \
+                 {PINNED_PRESENT_OLEAN_FLOOR} the lane asserts before it compares anything. \
+                 Zero divergences over a corpus this small is not the observation the \
+                 documents cite",
+                self.modules
+            ));
+        }
+        if self.decoded < PINNED_DECODED_DECL_FLOOR {
+            return Err(format!(
+                "row records {} decoded declaration(s) in matrixed modules, below the pinned \
+                 floor of {PINNED_DECODED_DECL_FLOOR}",
+                self.decoded
+            ));
+        }
+        if self.units_compared == 0 {
+            return Err(
+                "row records zero units compared. `diverging_modules: 0` over zero \
+                 comparisons is not agreement; it is the absence of a measurement wearing \
+                 the shape of one"
+                    .to_string(),
+            );
+        }
+        if self.units_compared > self.decoded {
+            return Err(format!(
+                "row records {} units compared but only {} decoded declaration(s) to compare; \
+                 the row contradicts itself",
+                self.units_compared, self.decoded
+            ));
+        }
+        if self.wall_ms == 0 {
+            return Err(
+                "row records wall_ms: 0. The whole corpus at three widths does not complete \
+                 in under a millisecond, and this number is the priced input to the cadence \
+                 decision the PG-5 waiver rests on"
+                    .to_string(),
+            );
+        }
+
+        // PROVENANCE. These two fields are what bind the row to a corpus revision and to the
+        // source that produced it. Empty strings are not weak provenance, they are none.
+        if self.corpus_fixture_hash.is_empty() {
+            return Err(
+                "row carries an empty corpus_fixture_hash, so it names no corpus revision"
+                    .to_string(),
+            );
+        }
+        if self.lane_source_digest_at_run.is_empty() {
+            return Err(
+                "row carries an empty lane_source_digest_at_run, so it names no producing \
+                 source"
+                    .to_string(),
+            );
+        }
+
+        // CONTENT.
+        if self.diverging_modules != 0 {
+            return Err(format!(
+                "row records {} diverging module(s). A refutation must not sit quietly in an \
+                 evidence file while the documents claim schedule-independence — this is \
+                 release-blocking, not a receipt",
+                self.diverging_modules
+            ));
+        }
+        if !self
+            .corpus_digests
+            .iter()
+            .all(|digest| *digest == self.corpus_digests[0])
+        {
+            return Err(
+                "per-width corpus digests differ while diverging_modules is 0; the row \
+                 contradicts itself"
+                    .to_string(),
+            );
+        }
+        if self.class != "observed_once_not_an_invariant" {
+            return Err(format!(
+                "row claims class {}, which this lane cannot earn",
+                self.class
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Where the retained receipts for a given Reference pin live, relative to this crate.
@@ -5400,52 +5567,9 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
         .collect::<Vec<_>>();
 
     for (index, receipt) in receipts.iter().enumerate() {
-        let number = index + 1;
-        assert_eq!(
-            receipt.pin,
-            pin,
-            "{}:{number}: row records pin {} but the file is the {pin} epoch's. The path IS \
-             the binding; a row filed under the wrong epoch would make the guard check an \
-             observation of another Reference",
-            path.display(),
-            receipt.pin
-        );
-        assert_eq!(
-            receipt.widths,
-            CORPUS_MATRIX_WIDTHS
-                .iter()
-                .map(|w| *w as u64)
-                .collect::<Vec<_>>(),
-            "{}:{number}: row records widths {:?}, but the lane runs {CORPUS_MATRIX_WIDTHS:?}. \
-             An observation at other widths is not evidence for the widths PG-5 names",
-            path.display(),
-            receipt.widths
-        );
-        assert_eq!(
-            receipt.diverging_modules,
-            0,
-            "{}:{number}: row records {} diverging module(s). A refutation must not sit \
-             quietly in an evidence file while the documents claim schedule-independence — \
-             this is release-blocking, not a receipt",
-            path.display(),
-            receipt.diverging_modules
-        );
-        assert!(
-            receipt
-                .corpus_digests
-                .iter()
-                .all(|digest| *digest == receipt.corpus_digests[0]),
-            "{}:{number}: per-width corpus digests differ while diverging_modules is 0; the \
-             row contradicts itself",
-            path.display()
-        );
-        assert_eq!(
-            receipt.class,
-            "observed_once_not_an_invariant",
-            "{}:{number}: row claims class {}, which this lane cannot earn",
-            path.display(),
-            receipt.class
-        );
+        if let Err(reason) = receipt.validate(&pin) {
+            panic!("{}:{}: {reason}", path.display(), index + 1);
+        }
     }
 
     // The claim must be re-derived when the evidence GROWS, not only when it decays. One
@@ -5522,6 +5646,195 @@ fn the_corpus_matrix_receipt_round_trips_through_its_own_serializer() {
             CorpusMatrixReceipt::from_row(&damaged).is_err(),
             "a receipt with `{mutation}` was accepted; the reader must refuse what it cannot \
              reproduce"
+        );
+    }
+}
+
+/// A row that compared nothing must not stand as the observation (bead `franken_lean-p6x1`).
+///
+/// **The mutant this exists for, and it was live.** Measured at `2ebe03e0`, with both
+/// controls: the committed receipt passed the retention guard, a wrong-pin row failed it,
+/// and a row recording `modules: 0, decoded: 0, units_compared: 0, corpus_digests: []`
+/// **passed**. Every check the guard had was satisfiable without comparing anything —
+/// `diverging_modules: 0` because nothing was compared, and "every width agreed" vacuously
+/// because `all()` over an empty list is true. That row would have been the standing
+/// evidence for the PG-5 waiver and for the corpus sentences in AGENTS.md and README.
+///
+/// It is `bkw6`'s empty-referent shape appearing inside a mechanism built to hold a claim to
+/// its evidence: the far end existed and was addressable, so every technique that compares a
+/// claim against its evidence was satisfied — while the evidence asserted nothing. The move
+/// that finds it is `bkw6`'s: bind the claim to the **cardinality** of what it asserts.
+///
+/// The mutants run against `validate`, the same function the retention guard runs, because a
+/// second copy of the rules written for this test could drift from the one that gates.
+#[test]
+fn a_receipt_that_compared_nothing_is_refused() {
+    let pin = suite_lock_reference_pin();
+    let path = corpus_matrix_receipt_path(&pin);
+    let text = fs::read_to_string(&path).expect("the retained receipt must be readable");
+    let real = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(CorpusMatrixReceipt::from_row)
+        .next()
+        .expect("the retained receipt must hold at least one row")
+        .expect("the committed row must parse");
+
+    // POSITIVE CONTROL, FIRST. A refusal test that refuses everything proves nothing, and
+    // this is the direction that actually breaks: a floor set one too high reddens the real
+    // receipt while every mutant below still dies, which reads as a clean campaign.
+    real.validate(&pin).unwrap_or_else(|reason| {
+        panic!("the committed receipt must satisfy its own guard, but: {reason}")
+    });
+
+    let below = |value: u64| value.saturating_sub(1);
+    let mutants: Vec<(&str, CorpusMatrixReceipt, &str)> = vec![
+        (
+            "compared nothing at all — the row measured to pass before this repair",
+            CorpusMatrixReceipt {
+                modules: 0,
+                decoded: 0,
+                units_compared: 0,
+                corpus_digests: Vec::new(),
+                per_width_ms: Vec::new(),
+                wall_ms: 0,
+                corpus_fixture_hash: String::new(),
+                lane_source_digest_at_run: String::new(),
+                ..real.clone()
+            },
+            "corpus digest(s)",
+        ),
+        (
+            "one digest for three widths",
+            CorpusMatrixReceipt {
+                corpus_digests: real.corpus_digests[..1].to_vec(),
+                ..real.clone()
+            },
+            "corpus digest(s)",
+        ),
+        (
+            "one timing for three widths",
+            CorpusMatrixReceipt {
+                per_width_ms: real.per_width_ms[..1].to_vec(),
+                ..real.clone()
+            },
+            "per-width timing(s)",
+        ),
+        (
+            "a module left out of the matrix",
+            CorpusMatrixReceipt {
+                unmatrixed_modules: 1,
+                ..real.clone()
+            },
+            "unmatrixed module(s)",
+        ),
+        (
+            "one module short of the pinned corpus",
+            CorpusMatrixReceipt {
+                modules: below(PINNED_PRESENT_OLEAN_FLOOR),
+                ..real.clone()
+            },
+            "present-module floor",
+        ),
+        (
+            "one declaration short of the pinned corpus",
+            CorpusMatrixReceipt {
+                decoded: below(PINNED_DECODED_DECL_FLOOR),
+                ..real.clone()
+            },
+            "decoded declaration(s) in matrixed modules",
+        ),
+        (
+            "a full corpus with no unit compared",
+            CorpusMatrixReceipt {
+                units_compared: 0,
+                ..real.clone()
+            },
+            "zero units compared",
+        ),
+        (
+            "more units compared than declarations to compare",
+            CorpusMatrixReceipt {
+                units_compared: real.decoded + 1,
+                ..real.clone()
+            },
+            "units compared but only",
+        ),
+        (
+            "the whole corpus at three widths in under a millisecond",
+            CorpusMatrixReceipt {
+                wall_ms: 0,
+                ..real.clone()
+            },
+            "wall_ms: 0",
+        ),
+        (
+            "no corpus revision named",
+            CorpusMatrixReceipt {
+                corpus_fixture_hash: String::new(),
+                ..real.clone()
+            },
+            "empty corpus_fixture_hash",
+        ),
+        (
+            "no producing source named",
+            CorpusMatrixReceipt {
+                lane_source_digest_at_run: String::new(),
+                ..real.clone()
+            },
+            "empty lane_source_digest_at_run",
+        ),
+        // The checks that existed before this repair. They are planted too, so a future
+        // rewrite of `validate` cannot quietly drop one while the new mutants keep dying.
+        (
+            "a refutation filed as a receipt",
+            CorpusMatrixReceipt {
+                diverging_modules: 1,
+                ..real.clone()
+            },
+            "diverging module(s)",
+        ),
+        (
+            "an observation of another Reference",
+            CorpusMatrixReceipt {
+                pin: format!("{pin}-not"),
+                ..real.clone()
+            },
+            "row records pin",
+        ),
+        (
+            "widths the lane does not run",
+            CorpusMatrixReceipt {
+                widths: vec![1, 8],
+                ..real.clone()
+            },
+            "row records widths",
+        ),
+        (
+            "a class this lane cannot earn",
+            CorpusMatrixReceipt {
+                class: "invariant".to_string(),
+                ..real.clone()
+            },
+            "which this lane cannot earn",
+        ),
+    ];
+
+    for (mutation, receipt, expected) in mutants {
+        // The reason is asserted, not merely the refusal. A rig that scored any `Err` as a
+        // kill would keep reporting a clean campaign after `validate` stopped checking the
+        // thing each mutant was planted against, and would credit the kill to a check that
+        // had been replaced by an unrelated one (the lesson `uagk` paid for).
+        let reason = receipt.validate(&pin).err().unwrap_or_else(|| {
+            panic!(
+                "SURVIVING MUTANT `{mutation}`: the guard accepted this row, so the retained \
+                 evidence for the PG-5 waiver does not have to describe a run that happened"
+            )
+        });
+        assert!(
+            reason.contains(expected),
+            "mutant `{mutation}` was refused for the wrong reason. Expected a message naming \
+             `{expected}`, got: {reason}"
         );
     }
 }
