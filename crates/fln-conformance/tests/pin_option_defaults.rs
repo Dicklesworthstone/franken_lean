@@ -37,9 +37,17 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
-use fln_conformance::pin;
+use fln_conformance::{ledger, pin};
 use fln_core::options::limits;
+
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+}
 
 /// What `fln-core` claims, and the exact ledger row each claim backs.
 ///
@@ -262,6 +270,169 @@ fn the_parse_is_anchored_on_the_marker_not_on_the_line_shape() {
 
     let (empty, no_size) = parse_table("nothing here\n");
     assert!(empty.is_empty() && no_size.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// This rig's scope, against the ledger
+// ---------------------------------------------------------------------------
+
+/// Every allowance entry naming an option row that this rig is supposed to back, and does
+/// not.
+///
+/// Kept as a function over its inputs so the planted cases below drive the *same* code the
+/// live check does — the discipline [`the_comparison_catches_a_moved_default_a_renamed_option_and_nothing_else`]
+/// already applies to `divergences`, applied here to the scope check.
+///
+/// The option rows are identified by the ledger's own `kind` field rather than by a name
+/// pattern over the symbol. Deriving the scope from the artifact is the point: a hand-listed
+/// or spelling-inferred scope is a second copy of the ledger that rots silently when the
+/// ledger moves, which is the defect class this whole rig exists to answer.
+fn unbacked_option_rows<'a>(
+    claimed: &[(&str, u64)],
+    allowance: &[&'a str],
+    ledger: &ledger::Ledger,
+) -> Vec<&'a str> {
+    allowance
+        .iter()
+        .filter(|symbol| {
+            ledger
+                .rows
+                .iter()
+                .any(|row| row.symbol == **symbol && row.kind == "option")
+        })
+        .filter(|symbol| !claimed.iter().any(|(name, _)| name == *symbol))
+        .copied()
+        .collect()
+}
+
+/// The join between the declared remainder and the oracle that is supposed to retire it
+/// (bead `fln-parity-ledger-l2-pinned-source-qydn`).
+///
+/// `SOURCE_READ_ALLOWANCE_REASON` states, as the reason eight rows may stay in the
+/// remainder, that *this file* asks the pinned binary for all eight of their defaults. That
+/// sentence was prose: dropping an entry from [`CLAIMED_DEFAULTS`] narrows the probe and the
+/// comparison **together**, so every other check in this file still passed while a published
+/// L2 row silently lost the evidence its exemption is justified by. Measured, not argued —
+/// with `maxErrors` removed, all sixteen tests across the three suites stayed green.
+///
+/// That is AGENTS.md item 7's shape (`a claim and the evidence that produces it, with the
+/// join unwatched`) occurring *inside* the repair for item 7's own instance. The sibling rig
+/// `pin_ctor_inventory.rs` already carries this guard for its four rows; the eight option
+/// rows had only the sentence.
+///
+/// The membership direction is deliberately one-way, for the reason that rig records:
+/// asserting that every backed row is still IN the allowance would turn `ci/PARITY_LEDGER.txt`
+/// being *repaired* into a red build, because a repaired row leaves the remainder. A row this
+/// rig still corroborates after its exemption is gone is the intended end state.
+///
+/// What this does **not** establish: once cod_2 repairs these rows and the remainder empties,
+/// this check goes vacuous and the eight rows keep their oracle by convention again. Closing
+/// that needs the repaired rows to cite this rig in their `fixtures`, which is an edit to
+/// their artifact and not mine to make.
+#[test]
+fn this_rig_backs_eight_ledger_rows_and_every_unrepaired_option_row_is_among_them() {
+    // Membership first, because it NAMES the row that lost its oracle, which is the
+    // actionable half. The count below catches what membership structurally cannot see —
+    // an entry added or duplicated rather than dropped.
+    let text = std::fs::read_to_string(workspace_root().join("ci/PARITY_LEDGER.txt"))
+        .expect("ledger exists");
+    let parsed = ledger::parse(&text).expect("ledger parses");
+    let unbacked = unbacked_option_rows(
+        &CLAIMED_DEFAULTS,
+        &ledger::SOURCE_READ_ABOVE_L1_ALLOWANCE,
+        &parsed,
+    );
+    assert!(
+        unbacked.is_empty(),
+        "{unbacked:?} are still in the declared remainder as source-read L2 option rows, and \
+         this rig does not ask the pinned binary about them — the remainder names rows this \
+         file was supposed to give a value-producing oracle.\n\nDeclared remainder:\n{}",
+        ledger::SOURCE_READ_ALLOWANCE_REASON
+    );
+
+    // The anti-vacuity floor, and it is a FLOOR rather than an equality on purpose.
+    //
+    // The membership check above is scoped to the declared remainder, so when cod_2 repairs
+    // these rows and the remainder empties it stops checking anything at all — quietly, and
+    // exactly when the rows have just become load-bearing published L2 claims. That is the
+    // `uagk` lesson in AGENTS.md item 7: a scan that returns empty is a broken scan, not a
+    // clean tree. This floor is what still holds when the remainder is gone.
+    //
+    // Not `== 8`: fln-core implementing a ninth option and this rig growing to cover it is a
+    // GOOD change, and an equality would turn it into a red build for no defect — the same
+    // wall-shaped mistake the membership direction above is careful to avoid.
+    let mut backed: Vec<&str> = CLAIMED_DEFAULTS.iter().map(|(name, _)| *name).collect();
+    backed.sort_unstable();
+    backed.dedup();
+    assert!(
+        backed.len() >= 8,
+        "this rig asks the pinned binary about {} distinct option(s), below the 8 option rows \
+         of bead fln-parity-ledger-l2-pinned-source-qydn that it exists to back: {backed:?}. \
+         An entry was dropped or duplicated — and once those rows leave the declared \
+         remainder, this floor is the only thing still checking that they kept their oracle",
+        backed.len()
+    );
+}
+
+/// The scope check must be shown to fail, and to stay quiet where it should.
+///
+/// Three planted cases over a synthetic ledger, so this runs with or without the pinned
+/// toolchain and so the one-way direction is a per-commit fact rather than something I
+/// verified once by hand.
+#[test]
+fn the_scope_check_catches_a_dropped_option_and_permits_a_repaired_row() {
+    let ledger_text = "\
+schema fln-parity-ledger/1
+row meta-api | maxErrors | option | native | L2 | faithful | pinned-source | exact | \
+crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | pin-census-v4.32.0
+row meta-api | maxRecDepth | option | native | L2 | faithful | pinned-source | exact | \
+crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | pin-census-v4.32.0
+row meta-api | Lean.Expr.ctorInventory | census | native | L2 | faithful | pinned-source | \
+exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | pin-census-v4.32.0
+";
+    let parsed = ledger::parse(ledger_text).expect("synthetic ledger parses");
+    let claimed: [(&str, u64); 2] = [("maxErrors", 100), ("maxRecDepth", 512)];
+
+    // 1. Everything the remainder names is backed. No finding.
+    assert!(
+        unbacked_option_rows(&claimed, &["maxErrors", "maxRecDepth"], &parsed).is_empty(),
+        "a rig that backs every remaining option row must produce no finding, or the guard \
+         is a wall"
+    );
+
+    // 2. THE MUTANT. An option dropped from the rig while its row stays in the remainder —
+    //    the exact edit that left all sixteen tests green before this guard existed.
+    let dropped: [(&str, u64); 1] = [("maxRecDepth", 512)];
+    assert_eq!(
+        unbacked_option_rows(&dropped, &["maxErrors", "maxRecDepth"], &parsed),
+        vec!["maxErrors"],
+        "dropping an option from the rig must be reported while its row is still exempt"
+    );
+
+    // 3. THE REPAIR. A row that has left the remainder is not this guard's business, so
+    //    shrinking the allowance cannot redden the build. This is the direction that makes
+    //    the guard survive the repair it is asking for.
+    assert!(
+        unbacked_option_rows(&dropped, &["maxRecDepth"], &parsed).is_empty(),
+        "a repaired row that left the remainder must not be reported as unbacked"
+    );
+
+    // 4. Non-option rows are out of scope: the ctorInventory rows are backed by
+    //    pin_ctor_inventory.rs, and claiming them here would report a false gap.
+    assert!(
+        unbacked_option_rows(&claimed, &["Lean.Expr.ctorInventory"], &parsed).is_empty(),
+        "a census row is not an option row and is not this rig's to back"
+    );
+
+    // 5. WHY THE FLOOR EXISTS. Once every row is repaired the remainder is empty, and this
+    //    check goes vacuous — a rig that had silently stopped asking about ANY option would
+    //    produce no finding here. Asserted rather than remarked, so the limitation is a
+    //    property of the code and not a comment somebody has to believe.
+    assert!(
+        unbacked_option_rows(&[], &[], &parsed).is_empty(),
+        "with an empty remainder this check cannot fail, which is what the >= 8 floor in \
+         the live test is for"
+    );
 }
 
 /// The pin this rig probes must be the pin the lock names. A rig that reads a toolchain
