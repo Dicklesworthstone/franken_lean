@@ -119,6 +119,10 @@ pub struct RunOutcome {
     pub authority_inventory: AuthorityInventory,
     pub compiler_identity: CompilerIdentity,
     pub admitted_environment: AdmittedEnvironment,
+    /// Scope the D18 mode-closure derivation achieved (bead `franken_lean-r2st`).
+    /// Carried so that "the D18 check ran" can never be read as "a product closure was
+    /// traversed": `ModeClosureFacts::is_vacuous` distinguishes the two.
+    pub mode_closure: crate::mode_closure::ModeClosureFacts,
 }
 
 /// Whether the run established authority over its complete governed input closure.
@@ -1627,12 +1631,18 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     discover(root, "crates", &mut discovered)?;
     discover(root, "tools", &mut discovered)?;
 
+    // Retained for the D18 derivation (bead franken_lean-r2st) so it reuses this read
+    // instead of re-opening every manifest: a second pass would add filesystem work
+    // between the two governed-root snapshots and perturb the concurrency authority
+    // tests that race a writer against the scan window.
+    let mut manifest_texts: BTreeMap<String, String> = BTreeMap::new();
     for c in &mut discovered {
         let manifest_rel = format!("{}/Cargo.toml", c.rel);
         let Some(text) = read_governed(&c.dir.join("Cargo.toml"), &manifest_rel, &mut findings)
         else {
             continue;
         };
+        manifest_texts.insert(c.name.clone(), text.clone());
         match manifest::parse(&text, &manifest_rel) {
             Ok(m) => c.manifest = Some(m),
             Err(e) => findings.push(Finding {
@@ -2451,6 +2461,13 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     let (handoff_findings, contract_handoff) = crate::contract_handoff::audit_with_snapshot(root);
     findings.extend(handoff_findings);
     findings.extend(crate::ownership_publication::audit(root));
+    // D18 mode closure (bead franken_lean-r2st). The closure is derived here from the
+    // reviewed graph and real manifests; `fln_core::mode::scan_mode_closure` remains the
+    // sole authority on the traversal and the mode algebra, and its FLN-D18-001..013
+    // codes are emitted unchanged.
+    let (mode_closure_findings, mode_closure) =
+        crate::mode_closure::audit_with_facts(&g, &manifest_texts);
+    findings.extend(mode_closure_findings);
 
     if compiler_identity.contract_declared && !compiler_identity.contract_match {
         findings.push(Finding {
@@ -2573,6 +2590,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         },
         compiler_identity,
         admitted_environment,
+        mode_closure,
     })
 }
 

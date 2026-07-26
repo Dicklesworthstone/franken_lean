@@ -31,6 +31,7 @@ pub mod graph;
 pub mod ledger;
 pub mod lockfile;
 pub mod manifest;
+pub mod mode_closure;
 pub mod ownership_publication;
 pub mod report;
 

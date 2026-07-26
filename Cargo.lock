@@ -184,3 +184,6 @@ version = "0.0.0"
 [[package]]
 name = "structure-guard"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]

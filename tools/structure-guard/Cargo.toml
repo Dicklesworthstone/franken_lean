@@ -6,3 +6,7 @@ license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 
 [dependencies]
+# Observes the authoritative D18 mode-closure scanner; never reimplements the
+# traversal or the mode algebra (bead franken_lean-r2st, edge acknowledged in
+# ci/WORKSPACE_GRAPH.txt).
+fln-core = { path = "../../crates/fln-core" }
