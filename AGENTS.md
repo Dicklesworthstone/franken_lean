@@ -328,6 +328,14 @@ The trade is deliberate: a red workspace blocks six panes immediately and visibl
 
 Practical notes: array fields must be sorted and duplicate-free or the validator refuses the row; and a row that records what the work did *not* establish is worth more than one that implies a win (`franken_lean-ext-observable-fixture-drift-gap-vqnu`'s row says the capture was never stale, only unchecked).
 
+**The row must judge *that* closure, and the validator checks it now** (bead `fln-judgement-row-not-bound-to-its-closure-iumd`). Non-empty arrays prove a row *exists*; they never proved it was authored for the close it is filed under, and at `b2ee77cd` a close landed carrying a row authored earlier for different work on the same bead, with `validate-verification-manifest` returning `valid=true`. So for any bead closed at or after `2026-07-26T20:50:06Z` — `fln-lyc8`'s close, the instance this was built from — a `complete` row must cite one bead comment on its own bead created at or after that bead's `closed_at`:
+
+```
+"artifacts": [..., "bead-comment:<bead-id>:<comment-id>", ...]
+```
+
+Which makes a close **three writes then one commit, in this order**: `br close`, `br comments add` recording the judgement, then the row citing that comment's id. The comment id exists before the commit does — that is the whole reason the citation is a comment and not the closing sha, since a row must be *inside* the commit that closes its bead and so can never name it. Closes before that instant are exempt **by their own `closed_at`**; there is no allowlist to maintain and the exempt set can only shrink. What this earns is **structural**: the row was authored after the close and names an immutable post-close record. It does not read the comment, so it does not establish that the row's prose describes the work. The refusal names the bead, the closure instant, and why each citation present cannot bind it — take the requirement from that message rather than from this paragraph.
+
 ---
 
 ## bv — Graph-Aware Triage

@@ -134,6 +134,50 @@ VERIFICATION_COVERAGE_REQUIRED_FIELDS = frozenset(
     }
 )
 
+# --- The judgement row must judge the closure it is filed for ----------------
+# (bead fln-judgement-row-not-bound-to-its-closure-iumd)
+#
+# Non-emptiness of the arrays above says a row EXISTS. It does not say the row
+# judges THIS closure: an identical row authored weeks earlier, for different
+# work on the same bead, satisfies every check in the `complete` branch. That is
+# not hypothetical — at b2ee77cd `fln-lyc8` went in_progress -> closed in a
+# commit that did not carry its updated row, and the validator returned
+# valid=true, exit 0, against that exact tree. cod_3 caught it by reading and
+# repaired it by hand in 6ad070b6, adding post-close bead comments and citing
+# them. This law mechanises that repair.
+#
+# THE FORM IS FORCED BY WHAT IS AUTHORABLE IN ONE PASS. A row must be IN the
+# commit that closes its bead, so it cannot cite that commit's own sha — a rule
+# nobody can satisfy is a rule people bypass with --no-verify (franken_lean-e5k7
+# on this very surface). What a closer CAN produce before writing the commit is a
+# bead comment: `br close` stamps `closed_at`, `br comments add` stamps a comment
+# after it, and the row cites that comment's id. The citation form already exists
+# in `artifacts` ("bead-comment:<bead>:<id>") and comments are immutable, so the
+# row points at a record that could not have preceded the closure.
+#
+# WHAT IT EARNS: structural, not behavioural. It proves the row was authored
+# after the close and names an immutable post-close record. It does not read the
+# comment, so it cannot prove the row's prose describes the work.
+#
+# THE BOUNDARY IS DERIVED, NOT HAND-LISTED, and it is pinned from both sides.
+# 107 complete rows predate this law and exactly one of them (`fln-lyc8`, by
+# cod_3's hand repair) satisfies it, so a law binding all of them would be a wall
+# and a hand-list of 106 exemptions would rot silently. Instead each row is
+# judged against its own `closed_at`: closes at or after the instant below are
+# bound, earlier ones are exempt by their own data, and the exempt set can only
+# shrink because `closed_at` is history. The instant IS `fln-lyc8`'s close — the
+# first close the law binds is the one that revealed the gap. Moving it earlier
+# binds `fln-env-merge-resource-envelope-9m74` (closed 2026-07-26T20:28:07Z, no
+# post-close citation) and reddens the real manifest; moving it later exempts the
+# self-test's planted historical case (closed 2026-07-26T21:00:00Z) and that
+# mutant survives, which the mutation matrix reports as a failure. Neither wall
+# is written down; both are measured.
+CLOSURE_BINDING_EFFECTIVE_FROM = "2026-07-26T20:50:06.900870108Z"
+CLOSURE_CITATION_PREFIX = "bead-comment"
+UTC_INSTANT_PATTERN = re.compile(
+    r"\A(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z\Z"
+)
+
 # --- Sealed compiler environment (bead fln-evidence-runner-bootstrap-btk) ----
 # Ambient channels that can alter what the pinned compiler does (cap-lints
 # injection, wrapper substitution, alternate-toolchain selection, rustflags in
@@ -4055,9 +4099,16 @@ def require_manifest_string_array(
     return value
 
 
-def bead_status_projection(path: Path) -> dict[str, str]:
+def bead_tracker_projection(path: Path) -> dict[str, dict[str, Any]]:
+    """Status, closure instant, and comment instants — the tracker facts a row is judged against.
+
+    Comment timestamps are carried raw and validated only where a row cites them:
+    a malformed instant on a comment nobody cites is not this validator's
+    question, and refusing on it would make an unrelated tracker anomaly block
+    every gate.
+    """
     records, _digest = load_ndjson_snapshot(path)
-    states: dict[str, str] = {}
+    beads: dict[str, dict[str, Any]] = {}
     for number, record in enumerate(records, 1):
         bead_id = record.get("id")
         status = record.get("status")
@@ -4067,10 +4118,107 @@ def bead_status_projection(path: Path) -> dict[str, str]:
             raise EvidenceError(
                 f"{path}:{number}: bead {bead_id!r} has unsupported status {status!r}"
             )
-        if bead_id in states:
+        if bead_id in beads:
             raise EvidenceError(f"{path}:{number}: duplicate bead id {bead_id!r}")
-        states[bead_id] = status
-    return states
+        raw_comments = record.get("comments")
+        if raw_comments is None:
+            raw_comments = []
+        if not isinstance(raw_comments, list):
+            raise EvidenceError(
+                f"{path}:{number}: bead {bead_id!r} has a non-list comments field"
+            )
+        comments: dict[int, Any] = {}
+        for comment in raw_comments:
+            if not isinstance(comment, dict):
+                raise EvidenceError(
+                    f"{path}:{number}: bead {bead_id!r} has a non-object comment"
+                )
+            comment_id = comment.get("id")
+            if not isinstance(comment_id, int) or isinstance(comment_id, bool):
+                raise EvidenceError(
+                    f"{path}:{number}: bead {bead_id!r} has a comment without an "
+                    f"integer id"
+                )
+            if comment_id in comments:
+                raise EvidenceError(
+                    f"{path}:{number}: bead {bead_id!r} has duplicate comment id "
+                    f"{comment_id}"
+                )
+            comments[comment_id] = comment.get("created_at")
+        beads[bead_id] = {
+            "status": status,
+            "closed_at": record.get("closed_at"),
+            "comments": comments,
+        }
+    return beads
+
+
+def utc_second_prefix(label: str, value: Any) -> str:
+    """The whole-second UTC prefix of an instant, which orders chronologically as a string.
+
+    Closures carry nanoseconds (`...T20:50:06.900870108Z`) and bead comments carry
+    whole seconds (`...T20:50:06Z`), so the two are comparable only at second
+    granularity. Comparing the raw strings is NOT chronological — `'Z' > '.'`, so a
+    coarse instant sorts after a finer one inside the same second — while comparing
+    fixed-width `YYYY-MM-DDTHH:MM:SS` prefixes is. Truncation also decides the
+    boundary case in the only direction that is not a wall: a comment written in
+    the same second as the close counts as after it, because refusing it would
+    redden a correct one-pass close on a one-second race.
+    """
+    if not isinstance(value, str):
+        raise EvidenceError(f"{label} is missing")
+    match = UTC_INSTANT_PATTERN.match(value)
+    if match is None:
+        raise EvidenceError(f"{label} is not a UTC instant: {value!r}")
+    return match.group(1)
+
+
+def closure_citation_diagnosis(
+    bead_id: str,
+    bead: Mapping[str, Any],
+    closed_second: str,
+    artifacts: Iterable[str],
+    label: str,
+) -> tuple[int | None, list[str]]:
+    """The cited comment that postdates this closure, else why each citation cannot bind it.
+
+    Comments are resolved inside the cited bead's own record, never against a
+    global id space: comment ids are globally monotonic here, so a lookup that
+    ignored the bead would let one bead's post-close comment certify another
+    bead's closure.
+    """
+    comments: Mapping[int, Any] = bead["comments"]
+    rejected: list[str] = []
+    for artifact in artifacts:
+        parts = artifact.split(":")
+        if len(parts) != 3 or parts[0] != CLOSURE_CITATION_PREFIX:
+            continue
+        _, cited_bead, cited_id = parts
+        if cited_bead != bead_id:
+            rejected.append(
+                f"{artifact} (cites bead {cited_bead!r}, not this row's bead)"
+            )
+            continue
+        if not re.fullmatch(r"[0-9]+", cited_id):
+            rejected.append(f"{artifact} (comment id is not an integer)")
+            continue
+        comment_id = int(cited_id)
+        if comment_id not in comments:
+            rejected.append(
+                f"{artifact} (no such comment on {bead_id} in the tracker)"
+            )
+            continue
+        created_second = utc_second_prefix(
+            f"{label}: bead {bead_id!r} comment {comment_id} created_at",
+            comments[comment_id],
+        )
+        if created_second < closed_second:
+            rejected.append(
+                f"{artifact} (created {created_second}Z, before the close)"
+            )
+            continue
+        return comment_id, rejected
+    return None, rejected
 
 
 def derived_verification_coverage_state(bead_status: str, skip: str) -> str:
@@ -4181,7 +4329,7 @@ def validate_verification_manifest(
         "artifact_kind",
         "artifact_name",
     }
-    bead_states = bead_status_projection(beads_path)
+    bead_states = bead_tracker_projection(beads_path)
     coverage: dict[str, dict[str, Any]] = {}
     coverage_numbers: dict[str, int] = {}
     scenarios: dict[str, dict[str, Any]] = {}
@@ -4373,13 +4521,23 @@ def validate_verification_manifest(
         "complete": 0,
         "blocked": 0,
     }
+    closure_bound_rows = 0
+    closure_exempt_rows = 0
+    # Validated here rather than trusted: a malformed boundary must refuse, not
+    # silently compare against garbage. There is deliberately no parameter to
+    # override it — the self-test's planted cases carry closure instants either
+    # side of this constant, so an edit that moves it is what makes a mutant
+    # survive, and the mutation matrix reports that as a failure.
+    closure_binding_effective_from = utc_second_prefix(
+        "CLOSURE_BINDING_EFFECTIVE_FROM", CLOSURE_BINDING_EFFECTIVE_FROM
+    )
     for bead_id, record in coverage.items():
         if bead_id not in bead_states:
             raise EvidenceError(
                 f"{manifest_path}: orphan coverage row for {bead_id!r}"
             )
         derived_state = derived_verification_coverage_state(
-            bead_states[bead_id], record["skip"]
+            bead_states[bead_id]["status"], record["skip"]
         )
         derived_state_counts[derived_state] += 1
         number = coverage_numbers[bead_id]
@@ -4402,11 +4560,50 @@ def validate_verification_manifest(
                     field,
                     nonempty=True,
                 )
+            # Non-emptiness above proves the row EXISTS. Bind it to the closure it
+            # claims to judge — see CLOSURE_BINDING_EFFECTIVE_FROM for why the form
+            # is a post-close comment citation and why the boundary is derived.
+            # A closed bead with no decidable `closed_at` is refused rather than
+            # exempted: exemption would make deleting the field the cheapest way
+            # to escape the law.
+            bead = bead_states[bead_id]
+            closed_second = utc_second_prefix(
+                f"{manifest_path}:{number}: bead {bead_id!r} is complete, so its "
+                f"closed_at",
+                bead["closed_at"],
+            )
+            if closed_second < closure_binding_effective_from:
+                closure_exempt_rows += 1
+            else:
+                closure_bound_rows += 1
+                citation, rejected = closure_citation_diagnosis(
+                    bead_id,
+                    bead,
+                    closed_second,
+                    record["artifacts"],
+                    f"{manifest_path}:{number}",
+                )
+                if citation is None:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: the judgement row for "
+                        f"{bead_id!r} does not judge the closure it is filed for: "
+                        f"the bead closed at {bead['closed_at']} and the row cites "
+                        f"no bead comment created at or after that instant, so a "
+                        f"row authored before the close — for different work on the "
+                        f"same bead — satisfies it identically. Record the "
+                        f"judgement as a bead comment AFTER `br close`, then cite "
+                        f"it: artifacts must contain "
+                        f'"{CLOSURE_CITATION_PREFIX}:{bead_id}:<comment-id>". '
+                        f"(The closing commit's own sha cannot be cited from "
+                        f"inside that commit, which is why the citation is a "
+                        f"comment.) Citations that cannot bind this closure: "
+                        f"{rejected!r}"
+                    )
     required_coverage = current_ids - adopted
     required_coverage.update(
         bead_id
         for bead_id in adoption_open_ids
-        if bead_states.get(bead_id) != "open"
+        if bead_states.get(bead_id, {}).get("status") != "open"
     )
     missing_coverage = sorted(required_coverage - set(coverage))
     if missing_coverage:
@@ -4451,6 +4648,9 @@ def validate_verification_manifest(
         "coverage_rows": len(coverage),
         "coverage_state_source": ".beads/issues.jsonl",
         "derived_state_counts": derived_state_counts,
+        "closure_binding_effective_from": CLOSURE_BINDING_EFFECTIVE_FROM,
+        "closure_bound_rows": closure_bound_rows,
+        "closure_exempt_rows": closure_exempt_rows,
         "scenario_rows": len(scenarios),
         "ci_scenarios": sorted(
             scenario
@@ -14937,10 +15137,29 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     # boundary. Exercise both the real transition law and discriminating
     # authority mutants before any repository stage can rely on it.
     verification_root = case_dir("verification-manifest")
+    # Comment instants straddle FIXTURE_CLOSE_BOUND, and that close is itself
+    # later than CLOSURE_BINDING_EFFECTIVE_FROM. Both relations are load-bearing:
+    # moving the production boundary past FIXTURE_CLOSE_BOUND exempts the planted
+    # historical case below and the mutant survives, which is how an edit to the
+    # constant is caught without a second copy of it.
+    fixture_close_exempt = "2026-07-25T00:00:00.000000000Z"
+    fixture_close_bound = "2026-07-26T21:00:00.000000000Z"
     verification_beads = [
         {"id": "baseline-closed", "status": "closed"},
-        {"id": "rur", "status": "in_progress"},
-        {"id": "rur-consumer", "status": "in_progress"},
+        {
+            "id": "rur",
+            "status": "in_progress",
+            "comments": [
+                {"id": 41, "created_at": "2026-07-26T20:59:59Z"},
+                {"id": 42, "created_at": "2026-07-26T21:00:00Z"},
+                {"id": 43, "created_at": "2026-07-26T21:05:00Z"},
+            ],
+        },
+        {
+            "id": "rur-consumer",
+            "status": "in_progress",
+            "comments": [{"id": 44, "created_at": "2026-07-26T21:06:00Z"}],
+        },
     ]
     verification_ids = sorted(record["id"] for record in verification_beads)
     verification_header = {
@@ -15071,9 +15290,13 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     # The exact same human-authored judgment row remains valid when its bead
     # closes: lifecycle is projected from the tracker, never edited into the
     # manifest. This is the regression that killed three full-gate attempts
-    # before fln.verification-manifest/2.
+    # before fln.verification-manifest/2. The close is dated before
+    # CLOSURE_BINDING_EFFECTIVE_FROM, so this case also carries the exempt side of
+    # the closure-binding law: a row for a pre-law closure passes on its own data,
+    # with no hand-listed exemption anywhere.
     closed_beads = clone_records(verification_beads)
     closed_beads[1]["status"] = "closed"
+    closed_beads[1]["closed_at"] = fixture_close_exempt
     derived_closed_manifest, derived_closed_tracker = write_verification_case(
         "derived-closed-lifecycle",
         clone_records(verification_records),
@@ -15089,6 +15312,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         and derived_closed_report["derived_state_counts"]["active"] == 1,
         "verification manifest did not derive closure from the tracker",
     )
+    require(
+        derived_closed_report["closure_exempt_rows"] == 1
+        and derived_closed_report["closure_bound_rows"] == 0,
+        "a pre-law closure was not exempted by its own closed_at",
+    )
     verification_mutants = 0
 
     def reject_verification_case(
@@ -15096,7 +15324,14 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         mutate: Callable[
             [list[dict[str, Any]], list[dict[str, Any]]], None
         ],
+        because: tuple[str, ...] = (),
     ) -> None:
+        """A mutant must be refused, and — where `because` is given — for the stated reason.
+
+        A rig that scores any refusal as a kill scores a test that has stopped
+        testing the property (the `uagk` lesson). Every closure-binding case below
+        names the words its refusal must carry.
+        """
         nonlocal verification_mutants
         records = clone_records(verification_records)
         beads = clone_records(verification_beads)
@@ -15108,12 +15343,40 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 tracker,
                 expected_adoption_authority_hash=verification_authority_hash,
             )
-        except EvidenceError:
+        except EvidenceError as error:
+            missing = [needle for needle in because if needle not in str(error)]
+            if missing:
+                raise EvidenceError(
+                    f"verification manifest mutant {name} was refused for the "
+                    f"wrong reason (missing {missing!r}): {error}"
+                ) from error
             verification_mutants += 1
         else:
             raise EvidenceError(
                 f"verification manifest mutant survived: {name}"
             )
+
+    def accept_verification_case(
+        name: str,
+        mutate: Callable[
+            [list[dict[str, Any]], list[dict[str, Any]]], None
+        ],
+    ) -> dict[str, Any]:
+        """A correct authoring must stay green — the control that catches a wall.
+
+        Plant the repair, not only the violation: a law that refuses the violation
+        AND the fix is indistinguishable from a working one until it reddens
+        somebody who did the work.
+        """
+        records = clone_records(verification_records)
+        beads = clone_records(verification_beads)
+        mutate(records, beads)
+        manifest, tracker = write_verification_case(name, records, beads)
+        return validate_verification_manifest(
+            manifest,
+            tracker,
+            expected_adoption_authority_hash=verification_authority_hash,
+        )
 
     reject_verification_case(
         "absent-coverage",
@@ -15194,11 +15457,150 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         records: list[dict[str, Any]], beads: list[dict[str, Any]]
     ) -> None:
         beads[1]["status"] = "closed"
+        beads[1]["closed_at"] = fixture_close_exempt
         records[1]["unit"] = []
 
     reject_verification_case(
         "closed-bead-without-complete-judgment",
         close_without_complete_judgment,
+        because=("unit must not be empty",),
+    )
+
+    # --- The judgement row must judge the closure it is filed for -------------
+    # (bead fln-judgement-row-not-bound-to-its-closure-iumd)
+    #
+    # The refusal case is `fln-lyc8` at b2ee77cd reduced to fixture scale: a bead
+    # closed inside a commit whose row was authored earlier and cites only
+    # comments predating the close, while a post-close comment (43) sits in the
+    # tracker uncited. The full historical replay against that commit's real
+    # blobs is recorded on the bead; this is the permanent case.
+    def close_bound_by_the_law(
+        beads: list[dict[str, Any]], artifacts: list[str]
+    ) -> None:
+        beads[1]["status"] = "closed"
+        beads[1]["closed_at"] = fixture_close_bound
+        artifacts.sort()
+
+    def close_citing_only_pre_close_evidence(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:41"]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    reject_verification_case(
+        "closed-row-predating-the-closure-it-judges",
+        close_citing_only_pre_close_evidence,
+        because=(
+            "'rur'",
+            "does not judge the closure it is filed for",
+            "bead-comment:rur:41 (created 2026-07-26T20:59:59Z, before the close)",
+        ),
+    )
+
+    def close_citing_an_absent_comment(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [
+            *records[1]["artifacts"],
+            "bead-comment:rur:9999",
+        ]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    reject_verification_case(
+        "closure-citation-with-no-referent",
+        close_citing_an_absent_comment,
+        because=("no such comment on rur in the tracker",),
+    )
+
+    def close_citing_another_beads_comment(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [
+            *records[1]["artifacts"],
+            "bead-comment:rur-consumer:44",
+        ]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    reject_verification_case(
+        "closure-citation-borrowed-from-another-bead",
+        close_citing_another_beads_comment,
+        because=("cites bead 'rur-consumer', not this row's bead",),
+    )
+
+    def close_without_a_decidable_instant(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:43"]
+        records[1]["artifacts"].sort()
+        beads[1]["status"] = "closed"
+
+    reject_verification_case(
+        "closed-row-without-a-decidable-closure-instant",
+        close_without_a_decidable_instant,
+        because=("is complete, so its closed_at is missing",),
+    )
+
+    def close_citing_a_malformed_instant(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:43"]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+        beads[1]["comments"][2]["created_at"] = "just after the close"
+
+    reject_verification_case(
+        "closure-citation-with-an-unparseable-instant",
+        close_citing_a_malformed_instant,
+        because=("comment 43 created_at is not a UTC instant",),
+    )
+
+    def close_citing_post_close_evidence(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:43"]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    bound_report = accept_verification_case(
+        "closure-bound-and-cited",
+        close_citing_post_close_evidence,
+    )
+    require(
+        bound_report["closure_bound_rows"] == 1
+        and bound_report["closure_exempt_rows"] == 0
+        and bound_report["derived_state_counts"]["complete"] == 1,
+        "a close whose row cites post-close evidence was not accepted as bound",
+    )
+
+    def close_cited_within_the_closing_second(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:42"]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    same_second_report = accept_verification_case(
+        "closure-cited-within-the-closing-second",
+        close_cited_within_the_closing_second,
+    )
+    require(
+        same_second_report["closure_bound_rows"] == 1,
+        "a comment written in the closing second was not accepted",
+    )
+    # The two fixture closes must stay either side of the production boundary, or
+    # the cases above stop testing the law they were written for: an exempt case
+    # that drifted past the boundary would demand a citation, and a bound case
+    # that drifted below it would be exempted and its mutant would survive. Said
+    # here as well as measured there, because a case that goes quiet is the
+    # failure this whole bead is about.
+    fixture_boundary = utc_second_prefix(
+        "CLOSURE_BINDING_EFFECTIVE_FROM", CLOSURE_BINDING_EFFECTIVE_FROM
+    )
+    require(
+        bound_report["closure_binding_effective_from"]
+        == CLOSURE_BINDING_EFFECTIVE_FROM
+        and utc_second_prefix("fixture_close_bound", fixture_close_bound)
+        >= fixture_boundary
+        and utc_second_prefix("fixture_close_exempt", fixture_close_exempt)
+        < fixture_boundary,
+        "the closure-binding fixtures stopped straddling the production boundary",
     )
     reject_verification_case(
         "hand-maintained-lifecycle-field",
@@ -15259,7 +15661,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     else:
         raise EvidenceError("truncated verification manifest was accepted")
     require(
-        verification_mutants == 17,
+        verification_mutants == 22,
         "verification manifest mutation matrix is incomplete",
     )
     cases.append(

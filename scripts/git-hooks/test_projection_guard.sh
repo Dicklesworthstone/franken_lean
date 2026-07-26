@@ -268,6 +268,30 @@ rewrite_tracker() {
     mv .beads/issues.jsonl.next .beads/issues.jsonl
 }
 
+# A close is `br close` plus the judgement comment that follows it: the validator
+# binds a complete row to a bead comment created at or after `closed_at`
+# (CLOSURE_BINDING_EFFECTIVE_FROM in scripts/evidence.py, bead
+# fln-judgement-row-not-bound-to-its-closure-iumd). A fixture that only flips
+# `status` cannot exercise that law, and — because a closed bead with no decidable
+# `closed_at` is refused rather than exempted — cannot reach an accepted close
+# either.
+close_tracker_bead() {
+    local bead_id=$1
+    jq -c --arg bead "$bead_id" \
+        'if .id == $bead then
+            .status = "closed"
+            | .closed_at = "2026-07-26T22:00:00.000000000Z"
+            | .comments = ((.comments // []) + [{
+                "id": 999999998,
+                "author": "guard-test",
+                "text": "prospective-tree closure judgement plant",
+                "created_at": "2026-07-26T22:00:30Z"
+            }])
+        else . end' \
+        .beads/issues.jsonl > .beads/issues.jsonl.next
+    mv .beads/issues.jsonl.next .beads/issues.jsonl
+}
+
 canonicalize_manifest_with() {
     local extra_row=$1
     {
@@ -379,7 +403,7 @@ mv ci/VERIFICATION_MANIFEST.jsonl.next ci/VERIFICATION_MANIFEST.jsonl
 # Closing derives `complete`, but lifecycle derivation must not launder a
 # sparse prospective row into terminal evidence. The close refuses until the
 # bead owner supplies the human judgment fields.
-rewrite_tracker franken_lean-hook-coverage-plant closed
+close_tracker_bead franken_lean-hook-coverage-plant
 coverage_republish
 out=$(run_commit -q -o \
     .beads/issues.jsonl \
@@ -410,7 +434,30 @@ out=$(run_commit -q -o \
     ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
     ci/VERIFICATION_MANIFEST.jsonl \
     -m 'close with complete judgment' 2>&1); code=$?
-check 'a close with complete human judgment is accepted' 0 '' "$code" "$out"
+check 'a complete row that does not judge its closure is refused' 1 \
+    'does not judge the closure it is filed for' "$code" "$out"
+note 'every required array is non-empty here; nothing tied the row to the close'
+
+# The same row, now citing the post-close judgement comment. This is the whole
+# law's satisfiability claim executed through the real hook on a prospective
+# tree: the citation is authorable BEFORE the commit that carries it, so a
+# correct close passes in one pass.
+jq -c '
+    if .kind == "coverage" and .bead == "franken_lean-hook-coverage-plant" then
+        .artifacts = [
+            "bead-comment:franken_lean-hook-coverage-plant:999999998",
+            "prospective-tree-complete-fixture"
+        ]
+    else .
+    end
+' ci/VERIFICATION_MANIFEST.jsonl > ci/VERIFICATION_MANIFEST.jsonl.next
+mv ci/VERIFICATION_MANIFEST.jsonl.next ci/VERIFICATION_MANIFEST.jsonl
+out=$(run_commit -q -o \
+    .beads/issues.jsonl \
+    ci/KERNEL_CONTRACT_OWNERSHIP.jsonl \
+    ci/VERIFICATION_MANIFEST.jsonl \
+    -m 'close with complete judgment' 2>&1); code=$?
+check 'a close whose row cites its post-close judgement is accepted' 0 '' "$code" "$out"
 
 # If the prospective validator itself cannot run, fail closed. The invalid
 # script is never committed; restoring the fixture makes the worktree clean.

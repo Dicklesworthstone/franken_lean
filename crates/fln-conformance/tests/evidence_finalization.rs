@@ -1078,3 +1078,85 @@ fn the_evidence_surface_refuses_a_gitdir_pointer_root() {
         );
     }
 }
+
+/// The closure-binding instant AGENTS.md publishes is the one the validator enforces.
+///
+/// `scripts/evidence.py` refuses a `complete` coverage row for a bead closed at or after
+/// `CLOSURE_BINDING_EFFECTIVE_FROM` unless the row cites a bead comment created at or after
+/// that bead's own `closed_at` (bead `fln-judgement-row-not-bound-to-its-closure-iumd`). The
+/// instruction that tells six panes how to close a bead lives in AGENTS.md and names that
+/// instant literally, so the two artifacts are a join: move the constant and the doctrine
+/// silently misstates the rule, in the direction where a pane authors a row it believes is
+/// compliant and the gate refuses it for a reason the doc does not mention.
+///
+/// This is deliberately the cheap half. The law's own behaviour — planted violation, planted
+/// correct repair, borrowed citation, absent referent, undecidable instant — is a mutation
+/// matrix inside `evidence.py self-test`, which is where the validator's other twenty-two
+/// mutants already live. What `cargo test` adds here is that deleting the refusal or moving
+/// its boundary cannot pass silently in a tree whose doctrine still promises them.
+#[test]
+fn the_closure_binding_instant_is_the_one_agents_md_publishes() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let validator = trusted_script("scripts/evidence.py");
+
+    let assignment = "CLOSURE_BINDING_EFFECTIVE_FROM = \"";
+    let start = validator.find(assignment).unwrap_or_else(|| {
+        panic!(
+            "scripts/evidence.py no longer assigns CLOSURE_BINDING_EFFECTIVE_FROM. Either the \
+             closure-binding law was removed — in which case AGENTS.md is still telling every \
+             pane to cite a post-close comment — or it was renamed and this join must follow it"
+        )
+    }) + assignment.len();
+    let instant: String = validator[start..]
+        .chars()
+        .take_while(|c| *c != '"')
+        .collect();
+    // A whole-second UTC instant, which is what the law compares at and what the doctrine
+    // quotes. Asserting the shape keeps the extraction from silently yielding an empty
+    // string and then "finding" it in a document that never mentioned it.
+    assert_eq!(
+        instant.len(),
+        30,
+        "CLOSURE_BINDING_EFFECTIVE_FROM is not a nanosecond UTC instant: {instant:?}"
+    );
+    let published = format!("{}Z", &instant[..19]);
+
+    // The refusal AGENTS.md promises, asserted against the validator that must produce it.
+    // Scoped to the sentence, not the file: a check that the words appear *somewhere* in a
+    // 23k-line script is satisfied by this test's own quotation of them if it ever moves.
+    for produced in ["does not judge the closure it is filed for", "bead-comment"] {
+        assert!(
+            validator.contains(produced),
+            "scripts/evidence.py no longer produces {produced:?}, which AGENTS.md tells \
+             closers to expect and to take the requirement from"
+        );
+    }
+
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let heading = "### Closing a bead: the judgement row";
+    let start = agents
+        .find(heading)
+        .expect("AGENTS.md must keep the section on closing a bead and its judgement row");
+    let section = &agents[start..];
+    let section = &section[..section.find("\n---").unwrap_or(section.len())];
+
+    assert!(
+        section.contains(&published),
+        "the AGENTS.md closing-a-bead section names an instant other than the validator's \
+         CLOSURE_BINDING_EFFECTIVE_FROM ({published}). A pane reading the doc would compute \
+         the wrong obligation from it, and the gate would refuse for a reason the doc denies"
+    );
+    for obligation in [
+        "bead-comment:<bead-id>:<comment-id>",
+        "br comments add",
+        "closed_at",
+        "structural",
+    ] {
+        assert!(
+            section.contains(obligation),
+            "the AGENTS.md closing-a-bead section no longer states {obligation:?}. The rule \
+             is enforced mechanically, so an unstated obligation surfaces as a refusal at \
+             commit time with no instruction anywhere for satisfying it"
+        );
+    }
+}
