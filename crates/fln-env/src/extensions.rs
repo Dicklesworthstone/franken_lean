@@ -2205,7 +2205,7 @@ fn validate_descriptor_admission(
     ours: &ExtensionDescriptor,
     theirs: &ExtensionDescriptor,
 ) -> Result<(), MergeConflict> {
-    if base != ours || base != theirs {
+    if !descriptors_agree(base, ours, theirs) {
         return Err(MergeConflict::DescriptorMismatch {
             base: base.clone(),
             ours: ours.clone(),
@@ -2213,6 +2213,34 @@ fn validate_descriptor_admission(
         });
     }
     Ok(())
+}
+
+/// The stage-1 **decision**, parametric in the descriptor type.
+///
+/// # Parametricity is the enforcement
+///
+/// The stage law also says a descriptor refusal must "select no policy", and narrowing
+/// stage 1 to `&ExtensionDescriptor` did **not** buy that: a descriptor carries `merge`,
+/// so `match base.merge { .. }` still type-checks there. That gap was recorded rather
+/// than glossed — `refusal_work_facts` reports `policy_selections: None`.
+///
+/// Here it is closed for the decision. With only `D: Eq` in scope the body cannot reach
+/// **any** field of a descriptor, `merge` included: there is no `.merge` to read, because
+/// `D` is opaque. Whether a refusal happens is therefore policy-blind by construction,
+/// not by inspection and not by an assertion someone can delete.
+///
+/// Sealing `ExtensionDescriptor::merge` itself would be the total fix, and it is
+/// deliberately not taken here: `merge` is a public field with 12 call sites across the
+/// crate, so that is a cross-cutting API change rather than a repair to this stage.
+///
+/// # What this leaves open, stated because the remainder is the point
+///
+/// The decision is policy-blind. The *conflict construction* in
+/// `validate_descriptor_admission` still holds concrete descriptors and could in
+/// principle branch on `merge` to build a different conflict. That is a narrower hole
+/// than the one this closes, and it is not closed.
+fn descriptors_agree<D: Eq>(base: &D, ours: &D, theirs: &D) -> bool {
+    base == ours && base == theirs
 }
 
 /// Pins the stage-1 signature, because the constraint above is only worth anything for
@@ -7389,10 +7417,14 @@ mod tests {
         );
         assert_eq!(
             facts.policy_selections, None,
-            "NOT discharged, and must not be recorded as zero: ExtensionDescriptor \
-             carries `merge`, so narrowing the stage to descriptors does not put policy \
-             selection out of reach. The criteria ask for zero policy dispatches on a \
-             descriptor refusal; this model does not establish it"
+            "STILL not discharged at this stage, and must not be recorded as zero: \
+             ExtensionDescriptor carries `merge`, so narrowing to descriptors does not \
+             put policy selection out of reach of the conflict construction. The \
+             *decision* half IS now closed, by parametricity rather than by this model — \
+             see descriptors_agree and \
+             the_stage_one_decision_cannot_see_a_policy_because_it_cannot_see_a_field. \
+             This fact stays None because it describes validate_descriptor_admission, \
+             which still holds concrete descriptors"
         );
     }
 
@@ -7421,6 +7453,77 @@ mod tests {
             refusal_work_facts(validate_descriptor_admission),
             "the facts must differ between a narrow and a wide stage, or they are not \
              derived from the signature at all"
+        );
+    }
+
+    /// The stage-1 decision is parametric, and stays that way.
+    ///
+    /// Instantiating `descriptors_agree` at a type that is *only* `Eq` — one with no
+    /// fields a descriptor has, and in particular no `merge` — is the compile-time join.
+    /// Specialising the function to `&ExtensionDescriptor`, which is the edit that would
+    /// silently restore the ability to branch on a policy inside the decision, stops this
+    /// from compiling. Same device as `_DESCRIPTOR_ADMISSION_STAYS_JOURNAL_FREE`, one
+    /// abstraction further in: that one pins *which* type, this pins *that there is none*.
+    #[test]
+    fn the_stage_one_decision_cannot_see_a_policy_because_it_cannot_see_a_field() {
+        #[derive(PartialEq, Eq)]
+        struct OpaqueToken(u8);
+
+        assert!(descriptors_agree(
+            &OpaqueToken(7),
+            &OpaqueToken(7),
+            &OpaqueToken(7)
+        ));
+        assert!(!descriptors_agree(
+            &OpaqueToken(7),
+            &OpaqueToken(7),
+            &OpaqueToken(9)
+        ));
+    }
+
+    /// Stage 1 privileges no merge policy — checked over **every** assignment, not a
+    /// sample.
+    ///
+    /// `MergeSemantics` has exactly three variants, so the 27 base/ours/theirs
+    /// assignments are exhaustible, and an exhaustive check is a different claim class
+    /// from a sampled one. The property: a refusal happens exactly when the three
+    /// descriptors disagree, and never because of *which* policy is present — so
+    /// `ConflictsRequireReview` gets no special early exit at stage 1, which is the
+    /// shape a premature dispatch would take.
+    #[test]
+    fn stage_one_admission_is_invariant_under_every_policy_assignment() {
+        const POLICIES: [MergeSemantics; 3] = [
+            MergeSemantics::AppendOrdered,
+            MergeSemantics::SetUnion,
+            MergeSemantics::ConflictsRequireReview,
+        ];
+        let with = |merge: MergeSemantics| ExtensionDescriptor {
+            merge,
+            ..descriptor(MergeSemantics::AppendOrdered, PayloadProvenance::Understood)
+        };
+
+        let mut assignments = 0;
+        for base in POLICIES {
+            for ours in POLICIES {
+                for theirs in POLICIES {
+                    assignments += 1;
+                    let refused =
+                        validate_descriptor_admission(&with(base), &with(ours), &with(theirs))
+                            .is_err();
+                    assert_eq!(
+                        refused,
+                        !(base == ours && base == theirs),
+                        "stage 1 must refuse on disagreement alone, never on which policy \
+                         is present: base={base:?} ours={ours:?} theirs={theirs:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            assignments,
+            POLICIES.len().pow(3),
+            "the sweep must be exhaustive over MergeSemantics, not a sample — if a \
+             variant is added, this count is what notices"
         );
     }
 
