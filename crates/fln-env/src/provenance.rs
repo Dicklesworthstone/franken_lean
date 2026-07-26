@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use fln_core::name::Name;
+use fln_core::outcome::{InconclusiveCause, Outcome};
 use fln_hash::canon::{CanonError, CanonReader, CanonWriter, Canonical, SchemaId};
 use fln_hash::domain::{Digest, Domain, DomainHasher, hash};
 
@@ -24,8 +25,8 @@ use crate::extensions::{
 };
 use crate::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, DirectImport, ModuleEpoch, ModuleGraph,
-    ModuleGraphAdmission, ModuleGraphError, ModuleGraphInconclusive, ModuleGraphLimits,
-    ModuleGraphOutcome, ModuleGraphResource, ModuleId, ModuleRecord, name_stats,
+    ModuleGraphError, ModuleGraphLimits, ModuleGraphResource, ModuleGraphStop, ModuleId,
+    ModuleRecord, name_stats,
 };
 
 // ---------------------------------------------------------------------------------
@@ -1606,26 +1607,36 @@ impl ModuleProvenanceManifest {
         // rejection, a bound payload budget is inconclusive. This path sets the
         // graph's payload budget to `u128::MAX`, so only the rejection arm is
         // reachable — but it is matched explicitly rather than assumed away.
-        let mut graph = match ModuleGraph::new(epoch.clone(), graph_limits) {
-            ModuleGraphOutcome::Complete(graph) => graph,
-            ModuleGraphOutcome::Rejected(error) => {
+        let (construction, construction_stop) =
+            ModuleGraph::new(epoch.clone(), graph_limits).into_parts();
+        let mut graph = match construction {
+            Outcome::Complete(Ok(graph)) => graph,
+            Outcome::Complete(Err(error)) => {
                 return Err(ModuleProvenanceError::InvalidModuleGraph(error));
             }
-            ModuleGraphOutcome::Inconclusive(reason) => {
+            // Our own invariant broke below us. Not a verdict about the manifest, and never
+            // a user diagnostic (FL-INV-07).
+            Outcome::InternalFault(_) => {
                 return Err(ModuleProvenanceError::GraphAdmissionFault {
-                    what: match reason {
-                        ModuleGraphInconclusive::ResourceLimitExceeded { .. } => {
+                    what: "module-graph construction reported an internal fault",
+                });
+            }
+            Outcome::Inconclusive(_) => {
+                return Err(ModuleProvenanceError::GraphAdmissionFault {
+                    what: match construction_stop {
+                        Some(ModuleGraphStop::Resource { .. }) => {
                             "module-graph construction bound a budget this path sets to u128::MAX"
                         }
-                        ModuleGraphInconclusive::Cancelled { .. } => {
+                        Some(ModuleGraphStop::Cancelled { .. }) => {
                             "module-graph construction reported cancellation without a request"
                         }
                         // Construction decides and publishes in one step; there is no
                         // plan to supersede. Reaching this is an invariant failure of
                         // the layer below, not a verdict about the manifest.
-                        ModuleGraphInconclusive::PlanSuperseded { .. } => {
+                        Some(ModuleGraphStop::PlanSuperseded { .. }) => {
                             "module-graph construction reported a superseded plan it never prepared"
                         }
+                        None => "module-graph construction stopped without naming a stop",
                     },
                 });
             }
@@ -1636,56 +1647,72 @@ impl ModuleProvenanceManifest {
             // it into `InvalidModuleGraph` would report "this graph is invalid" for
             // what is only "we ran out of room" (FL-INV-07, bead
             // franken_lean-module-graph-resource-outcomes-46b).
-            graph = match graph.register(record.module.clone()) {
-                ModuleGraphAdmission::Complete(registration) => registration.graph,
-                ModuleGraphAdmission::Rejected(error) => {
+            let (admission, stop) = graph.register(record.module.clone()).into_parts();
+            graph = match admission {
+                Outcome::Complete(Ok(registration)) => registration.graph,
+                Outcome::Complete(Err(error)) => {
                     return Err(ModuleProvenanceError::InvalidModuleGraph(error));
                 }
-                ModuleGraphAdmission::Inconclusive(
-                    ModuleGraphInconclusive::ResourceLimitExceeded {
-                        module,
-                        resource,
-                        limit,
-                        actual,
-                    },
-                ) => {
-                    return Err(ModuleProvenanceError::ResourceLimitExceeded {
-                        module,
-                        resource: match resource {
-                            ModuleGraphResource::Modules => ModuleProvenanceResource::Modules,
-                            ModuleGraphResource::DirectImportRows => {
-                                ModuleProvenanceResource::DirectImportRows
-                            }
-                            ModuleGraphResource::NameDepth => ModuleProvenanceResource::NameDepth,
-                            // Unreachable here: this path sets the graph's payload
-                            // budget to `u128::MAX`, so only the three above can bind.
-                            ModuleGraphResource::PayloadBytes => {
-                                ModuleProvenanceResource::EncodedBytes
-                            }
-                        },
-                        limit,
-                        actual,
-                    });
-                }
-                ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::Cancelled {
-                    ..
-                }) => {
-                    // This path requests no cancellation, so a cancelled outcome is an
-                    // invariant failure of the layer below — never a verdict about the
-                    // module, and never a user-facing diagnostic.
+                Outcome::InternalFault(_) => {
                     return Err(ModuleProvenanceError::GraphAdmissionFault {
-                        what: "module-graph registration reported cancellation without a request",
+                        what: "module-graph registration reported an internal fault",
                     });
                 }
-                ModuleGraphAdmission::Inconclusive(ModuleGraphInconclusive::PlanSuperseded {
-                    ..
-                }) => {
-                    // Same class: this path registers directly against a graph it
-                    // holds exclusively, so nothing can supersede a plan under it.
-                    return Err(ModuleProvenanceError::GraphAdmissionFault {
-                        what: "module-graph registration reported a superseded plan under exclusive ownership",
-                    });
-                }
+                Outcome::Inconclusive(inconclusive) => match stop {
+                    Some(ModuleGraphStop::Resource { module, resource }) => {
+                        // The numbers moved onto the shared usage when this seam folded
+                        // onto the FL-INV-07 algebra (bead `fln-um4a`): one fact, one
+                        // home. A resource stop whose authority is not a resource
+                        // exhaustion is our own inconsistency, not a verdict about the
+                        // manifest — so it is refused typed rather than assumed away.
+                        let InconclusiveCause::ResourceExhausted { usage } = inconclusive.cause
+                        else {
+                            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                                what: "module-graph registration reported a resource stop whose \
+                                       outcome was not a resource exhaustion",
+                            });
+                        };
+                        return Err(ModuleProvenanceError::ResourceLimitExceeded {
+                            module,
+                            resource: match resource {
+                                ModuleGraphResource::Modules => ModuleProvenanceResource::Modules,
+                                ModuleGraphResource::DirectImportRows => {
+                                    ModuleProvenanceResource::DirectImportRows
+                                }
+                                ModuleGraphResource::NameDepth => {
+                                    ModuleProvenanceResource::NameDepth
+                                }
+                                // Unreachable here: this path sets the graph's payload
+                                // budget to `u128::MAX`, so only the three above can bind.
+                                ModuleGraphResource::PayloadBytes => {
+                                    ModuleProvenanceResource::EncodedBytes
+                                }
+                            },
+                            limit: u128::from(usage.allowed),
+                            actual: u128::from(usage.observed),
+                        });
+                    }
+                    Some(ModuleGraphStop::Cancelled { .. }) => {
+                        // This path requests no cancellation, so a cancelled outcome is an
+                        // invariant failure of the layer below — never a verdict about the
+                        // module, and never a user-facing diagnostic.
+                        return Err(ModuleProvenanceError::GraphAdmissionFault {
+                            what: "module-graph registration reported cancellation without a request",
+                        });
+                    }
+                    Some(ModuleGraphStop::PlanSuperseded { .. }) => {
+                        // Same class: this path registers directly against a graph it
+                        // holds exclusively, so nothing can supersede a plan under it.
+                        return Err(ModuleProvenanceError::GraphAdmissionFault {
+                            what: "module-graph registration reported a superseded plan under exclusive ownership",
+                        });
+                    }
+                    None => {
+                        return Err(ModuleProvenanceError::GraphAdmissionFault {
+                            what: "module-graph registration stopped without naming a stop",
+                        });
+                    }
+                },
             };
         }
 

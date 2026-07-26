@@ -801,7 +801,7 @@ pub enum DeclAdmission {
 impl DeclAdmission {
     /// Stable evidence label for a whole budgeted-admission outcome, sharing the
     /// vocabulary [`DeclClosureStatus`](crate::decl_closure::DeclClosureStatus) and
-    /// [`ModuleGraphOutcome`](crate::modules::ModuleGraphOutcome) use.
+    /// [`ModuleGraphReport`](crate::modules::ModuleGraphReport) use.
     ///
     /// It takes the [`Outcome`] rather than `&self` because two of the four states it
     /// names are not verdicts about the declaration at all — which is precisely the fact
