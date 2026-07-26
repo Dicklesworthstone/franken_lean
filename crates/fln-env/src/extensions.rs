@@ -8765,4 +8765,497 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // The independent generated model of branch ancestry (bead dt5): "every invalid
+    // prefix class on either/both branches".
+    //
+    // Independent means what it says: everything below computes over `Vec<Vec<u8>>`
+    // sequences and never calls a production comparison. `ExtensionState::merge` uses a
+    // `zip`/`take_while` prefix walk; copying that into the model would make the two
+    // agree by construction and prove nothing.
+    // ---------------------------------------------------------------------------
+
+    /// The complete verdict on one branch's ancestry relative to a base.
+    ///
+    /// # Why three arms, and why that is exhaustive rather than convenient
+    ///
+    /// Let `c` be the length of the longest common prefix of base and branch, so
+    /// `c <= min(base.len(), branch.len())`. Exactly one of these holds:
+    ///
+    /// * `c == base.len()` — the branch carries the whole base. It descends.
+    /// * `c < base.len()` and `c == branch.len()` — the branch ran out first, agreeing on
+    ///   everything it had. Truncation.
+    /// * `c < base.len()` and `c < branch.len()` — index `c` exists on both sides, and the
+    ///   two entries there must differ, or `c` was not maximal. Divergence, at `c`.
+    ///
+    /// There is no fourth case, so this enum is the class space rather than a selection
+    /// from it. That matters because the criteria say "**every** invalid prefix class",
+    /// and a hand-picked list of interesting shapes can never establish "every".
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PrefixVerdict {
+        Descends,
+        Truncated { common_prefix: usize },
+        Diverges { at: usize },
+    }
+
+    /// The coarse kind of a verdict — the coverage key, without the index.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum PrefixKind {
+        Descends,
+        Truncated,
+        Diverges,
+    }
+
+    impl CaseDimension for PrefixKind {
+        const FIRST: Self = PrefixKind::Descends;
+        const COUNT: usize = 3;
+        fn succ(self) -> Option<Self> {
+            match self {
+                PrefixKind::Descends => Some(PrefixKind::Truncated),
+                PrefixKind::Truncated => Some(PrefixKind::Diverges),
+                PrefixKind::Diverges => None,
+            }
+        }
+    }
+
+    /// Where in the base a divergence sits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum DivergenceSite {
+        First,
+        Middle,
+        Last,
+    }
+
+    impl CaseDimension for DivergenceSite {
+        const FIRST: Self = DivergenceSite::First;
+        const COUNT: usize = 3;
+        fn succ(self) -> Option<Self> {
+            match self {
+                DivergenceSite::First => Some(DivergenceSite::Middle),
+                DivergenceSite::Middle => Some(DivergenceSite::Last),
+                DivergenceSite::Last => None,
+            }
+        }
+    }
+
+    /// The branch's length against the base's.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum LengthRelation {
+        Shorter,
+        Equal,
+        Longer,
+    }
+
+    impl CaseDimension for LengthRelation {
+        const FIRST: Self = LengthRelation::Shorter;
+        const COUNT: usize = 3;
+        fn succ(self) -> Option<Self> {
+            match self {
+                LengthRelation::Shorter => Some(LengthRelation::Equal),
+                LengthRelation::Equal => Some(LengthRelation::Longer),
+                LengthRelation::Longer => None,
+            }
+        }
+    }
+
+    /// One prefix class: the coverage key the criteria's "every ... class" ranges over.
+    type PrefixClass = (PrefixKind, Option<DivergenceSite>, LengthRelation);
+
+    fn model_common_prefix(base: &[Vec<u8>], branch: &[Vec<u8>]) -> usize {
+        let mut common = 0;
+        while common < base.len() && common < branch.len() && base[common] == branch[common] {
+            common += 1;
+        }
+        common
+    }
+
+    /// Classify a branch against a base, over sequences only.
+    fn model_prefix_verdict(base: &[Vec<u8>], branch: &[Vec<u8>]) -> PrefixVerdict {
+        let common = model_common_prefix(base, branch);
+        if common == base.len() {
+            PrefixVerdict::Descends
+        } else if common == branch.len() {
+            PrefixVerdict::Truncated {
+                common_prefix: common,
+            }
+        } else {
+            PrefixVerdict::Diverges { at: common }
+        }
+    }
+
+    fn model_length_relation(base_len: usize, branch_len: usize) -> LengthRelation {
+        match branch_len.cmp(&base_len) {
+            Ordering::Less => LengthRelation::Shorter,
+            Ordering::Equal => LengthRelation::Equal,
+            Ordering::Greater => LengthRelation::Longer,
+        }
+    }
+
+    fn prefix_class(verdict: PrefixVerdict, base_len: usize, branch_len: usize) -> PrefixClass {
+        let length = model_length_relation(base_len, branch_len);
+        match verdict {
+            PrefixVerdict::Descends => (PrefixKind::Descends, None, length),
+            PrefixVerdict::Truncated { common_prefix } => {
+                assert_eq!(
+                    common_prefix, branch_len,
+                    "truncation IS the branch running out, so its common prefix is its \
+                     whole length"
+                );
+                (PrefixKind::Truncated, None, length)
+            }
+            PrefixVerdict::Diverges { at } => {
+                let site = if at == 0 {
+                    DivergenceSite::First
+                } else if at == base_len - 1 {
+                    DivergenceSite::Last
+                } else {
+                    DivergenceSite::Middle
+                };
+                (PrefixKind::Diverges, Some(site), length)
+            }
+        }
+    }
+
+    /// The one base index a site names, or `None` when the base is too short for the site
+    /// to be distinct from another one.
+    ///
+    /// `Last` needs two entries or it *is* `First`; `Middle` needs three or there is no
+    /// interior. Returning `None` rather than a clamped index is what keeps the
+    /// realizability model from demanding a class the classifier can never emit.
+    fn divergence_index(site: DivergenceSite, base_len: usize) -> Option<usize> {
+        match site {
+            DivergenceSite::First => (base_len >= 1).then_some(0),
+            DivergenceSite::Middle => (base_len >= 3).then_some(1),
+            DivergenceSite::Last => (base_len >= 2).then_some(base_len - 1),
+        }
+    }
+
+    /// **The independent realizability model** — which prefix classes exist at all.
+    ///
+    /// This is what turns coverage into a claim instead of a tautology. Comparing the
+    /// classes a generator produced against the classes that generator produced proves
+    /// nothing; comparing them against a separately argued account of which classes *can*
+    /// exist fails in both directions — a class this says is realizable and the space
+    /// never reaches is a hole in the space, and a class the space reaches that this calls
+    /// impossible is a hole in the argument.
+    ///
+    /// The arguments, one per arm:
+    ///
+    /// * A **descendant** carries every base entry, so it is never shorter, and it has no
+    ///   differing position to site.
+    /// * **Truncation** *is* running out, so the branch is strictly shorter; likewise no
+    ///   site. It needs a non-empty base, since nothing can be shorter than nothing.
+    /// * A **divergence** at index `i` needs the branch to reach `i` (so `branch_len > i`)
+    ///   while `i < base_len`. Shorter therefore needs `i < base_len - 1`, which is why a
+    ///   `Last` divergence can never be Shorter: reaching the base's final index already
+    ///   makes the branch at least as long as the base. Longer needs the space to admit a
+    ///   branch longer than the base at all.
+    fn prefix_class_is_realizable(
+        class: PrefixClass,
+        base_len: usize,
+        max_branch_len: usize,
+    ) -> bool {
+        let (kind, site, length) = class;
+        match kind {
+            PrefixKind::Descends => {
+                site.is_none()
+                    && match length {
+                        LengthRelation::Shorter => false,
+                        LengthRelation::Equal => true,
+                        LengthRelation::Longer => max_branch_len > base_len,
+                    }
+            }
+            PrefixKind::Truncated => {
+                site.is_none() && length == LengthRelation::Shorter && base_len > 0
+            }
+            PrefixKind::Diverges => {
+                let Some(site) = site else {
+                    return false;
+                };
+                let Some(index) = divergence_index(site, base_len) else {
+                    return false;
+                };
+                match length {
+                    LengthRelation::Shorter => index < base_len.saturating_sub(1),
+                    LengthRelation::Equal => true,
+                    LengthRelation::Longer => max_branch_len > base_len,
+                }
+            }
+        }
+    }
+
+    /// Every class the realizability model admits, for one base length and space bound.
+    fn realizable_prefix_classes(base_len: usize, max_branch_len: usize) -> BTreeSet<PrefixClass> {
+        let mut classes = BTreeSet::new();
+        for kind in PrefixKind::all() {
+            let sites: Vec<Option<DivergenceSite>> = match kind {
+                PrefixKind::Diverges => DivergenceSite::all().into_iter().map(Some).collect(),
+                _ => vec![None],
+            };
+            for site in sites {
+                for length in LengthRelation::all() {
+                    let class = (kind, site, length);
+                    if prefix_class_is_realizable(class, base_len, max_branch_len) {
+                        classes.insert(class);
+                    }
+                }
+            }
+        }
+        classes
+    }
+
+    /// All sequences over `alphabet` of every length in `0..=max_len`.
+    fn model_sequence_space(alphabet: &[&[u8]], max_len: usize) -> Vec<Vec<Vec<u8>>> {
+        let mut space: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
+        let mut frontier: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next: Vec<Vec<Vec<u8>>> = Vec::new();
+            for sequence in &frontier {
+                for symbol in alphabet {
+                    let mut extended = sequence.clone();
+                    extended.push(symbol.to_vec());
+                    next.push(extended);
+                }
+            }
+            space.extend(next.iter().cloned());
+            frontier = next;
+        }
+        space
+    }
+
+    fn state_from_model(descriptor: &ExtensionDescriptor, model: &[Vec<u8>]) -> ExtensionState {
+        let mut state = ExtensionState::new(descriptor.clone());
+        for payload in model {
+            state = state.push_entry(bytes(payload));
+        }
+        state
+    }
+
+    /// The declared product of a merge whose branches both descend, per policy.
+    ///
+    /// `Err(())` models `ConcurrentChanges`, the only refusal the success path can still
+    /// produce. Written as a model rather than derived from the implementation, so that a
+    /// policy dispatching to another policy's product is a failure here.
+    #[allow(clippy::result_unit_err)]
+    fn model_merge_product(
+        policy: MergeSemantics,
+        base: &[Vec<u8>],
+        ours: &[Vec<u8>],
+        theirs: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, ()> {
+        match policy {
+            MergeSemantics::AppendOrdered => {
+                let mut product = ours.to_vec();
+                product.extend_from_slice(&theirs[base.len()..]);
+                Ok(product)
+            }
+            MergeSemantics::SetUnion => Ok(canonical_set_union_raw_model(
+                base,
+                &ours[base.len()..],
+                &theirs[base.len()..],
+            )),
+            MergeSemantics::ConflictsRequireReview => {
+                let ours_changed = ours.len() != base.len();
+                let theirs_changed = theirs.len() != base.len();
+                if ours_changed && theirs_changed {
+                    Err(())
+                } else if theirs_changed {
+                    Ok(theirs.to_vec())
+                } else {
+                    Ok(ours.to_vec())
+                }
+            }
+        }
+    }
+
+    /// **The prefix-class table**: every invalid prefix class, on either branch and on
+    /// both at once, cross-checked against an independent sequence model.
+    ///
+    /// # What it discharges
+    ///
+    /// The clause "every invalid prefix class on either/both branches", as a two-sided
+    /// claim rather than a sample. The generated space is every sequence over a
+    /// two-symbol alphabet of length 0..=4 against a three-entry base — 31 branches, so
+    /// 961 ordered branch pairs — run under all three merge policies. Three things are
+    /// asserted, and the third is the one that makes the first two mean something:
+    ///
+    /// 1. The implementation and the model agree on **every** pair: refusal exactly when
+    ///    the model says a branch does not descend, with the five reported facts equal to
+    ///    the model's, and the completed product equal to the policy model's otherwise.
+    /// 2. Every ordered pair of kinds is witnessed, so "both branches invalid" is covered
+    ///    rather than assumed to follow from two one-sided cases.
+    /// 3. The set of classes the space reaches equals the set
+    ///    [`prefix_class_is_realizable`] says exists — in both directions.
+    ///
+    /// # What it does not discharge
+    ///
+    /// The ancestry facts here are lengths and first divergences. The criteria elsewhere
+    /// also ask ancestry facts to identify compared *bytes*; `MergeConflict` carries no
+    /// byte count and nothing here adds one. Journal sizes and the SetUnion case list are
+    /// separate tables.
+    #[test]
+    fn the_prefix_class_model_covers_every_class_on_either_and_both_branches() {
+        const MAX_BRANCH_LEN: usize = 4;
+        let alphabet: [&[u8]; 2] = [b"a", b"b"];
+        let base_model: Vec<Vec<u8>> = vec![b"a".to_vec(), b"a".to_vec(), b"a".to_vec()];
+        let branches = model_sequence_space(&alphabet, MAX_BRANCH_LEN);
+        assert_eq!(
+            branches.len(),
+            (0..=MAX_BRANCH_LEN)
+                .map(|len| 2usize.pow(len as u32))
+                .sum::<usize>(),
+            "the branch space must be every sequence up to the bound, or `every class` is \
+             measured over an unknown space"
+        );
+
+        let mut classes_as_ours: BTreeSet<PrefixClass> = BTreeSet::new();
+        let mut classes_as_theirs: BTreeSet<PrefixClass> = BTreeSet::new();
+        let mut joint_kinds: BTreeSet<(PrefixKind, PrefixKind)> = BTreeSet::new();
+        let mut refusals = 0usize;
+        let mut completions = 0usize;
+        let mut concurrent_refusals = 0usize;
+
+        for policy in MergeSemantics::all() {
+            let contract = descriptor(policy, PayloadProvenance::Understood);
+            let base = state_from_model(&contract, &base_model);
+            let base_digest_before = base.content_digest();
+            let states: Vec<ExtensionState> = branches
+                .iter()
+                .map(|model| state_from_model(&contract, model))
+                .collect();
+
+            for (ours_index, ours_model) in branches.iter().enumerate() {
+                for (theirs_index, theirs_model) in branches.iter().enumerate() {
+                    let ours_verdict = model_prefix_verdict(&base_model, ours_model);
+                    let theirs_verdict = model_prefix_verdict(&base_model, theirs_model);
+                    let ours_class = prefix_class(ours_verdict, base_model.len(), ours_model.len());
+                    let theirs_class =
+                        prefix_class(theirs_verdict, base_model.len(), theirs_model.len());
+                    classes_as_ours.insert(ours_class);
+                    classes_as_theirs.insert(theirs_class);
+                    joint_kinds.insert((ours_class.0, theirs_class.0));
+
+                    let label = format!("{policy:?} ours={ours_model:?} theirs={theirs_model:?}");
+                    let outcome = ExtensionState::merge(
+                        &base,
+                        &states[ours_index],
+                        &states[theirs_index],
+                        TEST_SET_UNION_LIMITS,
+                    );
+
+                    let ours_descends = ours_verdict == PrefixVerdict::Descends;
+                    let theirs_descends = theirs_verdict == PrefixVerdict::Descends;
+                    if !(ours_descends && theirs_descends) {
+                        refusals += 1;
+                        assert_eq!(
+                            outcome.as_ref().expect_err(&label),
+                            &MergeConflict::HistoryMismatch {
+                                extension: contract.name.clone(),
+                                base_len: base_model.len(),
+                                ours_len: ours_model.len(),
+                                theirs_len: theirs_model.len(),
+                                ours_common_prefix: model_common_prefix(&base_model, ours_model),
+                                theirs_common_prefix: model_common_prefix(
+                                    &base_model,
+                                    theirs_model
+                                ),
+                            },
+                            "{label}: the ancestry stage must report both branches' lengths \
+                             and first divergences, in ours-then-theirs order"
+                        );
+                    } else {
+                        match model_merge_product(policy, &base_model, ours_model, theirs_model) {
+                            Ok(expected) => {
+                                completions += 1;
+                                let ExtensionMergeOutcome::Complete { state, .. } =
+                                    outcome.as_ref().expect(&label)
+                                else {
+                                    unreachable!("{label}: generous limits cannot be exhausted")
+                                };
+                                assert_eq!(
+                                    raw_payloads(state),
+                                    expected,
+                                    "{label}: the completed product must match the policy \
+                                     model exactly"
+                                );
+                            }
+                            Err(()) => {
+                                concurrent_refusals += 1;
+                                assert_eq!(
+                                    outcome.as_ref().expect_err(&label),
+                                    &MergeConflict::ConcurrentChanges {
+                                        extension: contract.name.clone(),
+                                    },
+                                    "{label}: two descendant branches that both changed are \
+                                     a review conflict, not a silent union"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                base.content_digest(),
+                base_digest_before,
+                "{policy:?}: no merge in the sweep may move the base"
+            );
+        }
+
+        // The classes the space actually reached, against the classes the model says
+        // exist. Equality, so a hole in either artifact fails.
+        let realizable = realizable_prefix_classes(base_model.len(), MAX_BRANCH_LEN);
+        assert_eq!(
+            classes_as_ours, realizable,
+            "the branch space must reach every realizable prefix class as `ours`, and no \
+             class the realizability model calls impossible"
+        );
+        assert_eq!(
+            classes_as_theirs, realizable,
+            "and the same set as `theirs` — `on either branch` is two claims, not one"
+        );
+        let invalid_classes = realizable
+            .iter()
+            .filter(|(kind, _, _)| *kind != PrefixKind::Descends)
+            .count();
+        assert!(
+            invalid_classes >= 2,
+            "a table over invalid prefix classes that reaches fewer than two of them is \
+             not covering a space"
+        );
+
+        // "on both branches" as its own claim: every ordered pair of kinds, including
+        // both-invalid, which is the case a pair of one-sided tests never reaches.
+        let expected_joint: BTreeSet<(PrefixKind, PrefixKind)> = PrefixKind::all()
+            .into_iter()
+            .flat_map(|ours| {
+                PrefixKind::all()
+                    .into_iter()
+                    .map(move |theirs| (ours, theirs))
+            })
+            .collect();
+        assert_eq!(
+            joint_kinds, expected_joint,
+            "every ordered pair of ancestry kinds must be witnessed, or `both branches` is \
+             inferred from two one-sided cases rather than measured"
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.extension-merge-validation-table\",\"version\":1,\
+             \"bead\":\"fln-extension-merge-validation-proof-debt-dt5\",\
+             \"claim_type\":\"bounded_model\",\"table\":\"prefix_class\",\
+             \"base_entries\":{},\"max_branch_entries\":{MAX_BRANCH_LEN},\
+             \"branch_space\":{},\"branch_pairs\":{},\"policies\":{},\
+             \"history_refusals\":{refusals},\"completions\":{completions},\
+             \"concurrent_change_refusals\":{concurrent_refusals},\
+             \"realizable_classes\":{},\"invalid_classes\":{invalid_classes},\
+             \"joint_kind_pairs\":{},\"status\":\"pass\"}}",
+            base_model.len(),
+            branches.len(),
+            branches.len() * branches.len(),
+            MergeSemantics::COUNT,
+            realizable.len(),
+            joint_kinds.len(),
+        );
+    }
 }
