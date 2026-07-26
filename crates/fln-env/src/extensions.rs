@@ -9258,4 +9258,288 @@ mod tests {
             joint_kinds.len(),
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Journal sizes (bead dt5): "empty/boundary/large journals".
+    // ---------------------------------------------------------------------------
+
+    /// How many journal sizes the table spans.
+    const JOURNAL_SIZE_TIER_COUNT: usize = 8;
+
+    /// The sizes, **derived from the production chunk capacity** rather than written out.
+    ///
+    /// The word in the criteria is "boundary", and a boundary is a property of the data
+    /// structure, not a number. `persistent_journal_boundaries_share_and_replay_exactly`
+    /// spells the same set as the literals `[0, 1, 31, 32, 33, 1_023, 1_024, 1_025]`,
+    /// which is correct today and becomes an arbitrary size sweep the moment
+    /// `JOURNAL_CHUNK_CAPACITY` moves — still green, no longer testing boundaries. These
+    /// move with the constant, and
+    /// [`the_journal_size_table_spans_empty_boundary_and_large_journals`] additionally
+    /// checks that the tiers really do straddle a structural transition, so a capacity
+    /// change that made them stop being boundaries fails rather than passes quietly.
+    const fn derive_journal_size_tiers() -> [usize; JOURNAL_SIZE_TIER_COUNT] {
+        let cap = JOURNAL_CHUNK_CAPACITY;
+        [
+            0,
+            1,
+            cap - 1,
+            cap,
+            cap + 1,
+            cap * cap - 1,
+            cap * cap,
+            cap * cap + 1,
+        ]
+    }
+
+    const JOURNAL_SIZE_TIERS: [usize; JOURNAL_SIZE_TIER_COUNT] = derive_journal_size_tiers();
+
+    fn sized_model(prefix: &str, count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|index| format!("{prefix}-{index}").into_bytes())
+            .collect()
+    }
+
+    /// **The journal-size table**: empty, both chunk boundaries, and large, under every
+    /// merge policy, on the completing path and on both refusal paths.
+    ///
+    /// # What it discharges
+    ///
+    /// The clause "empty/boundary/large journals", together with the repeated
+    /// refusal / restoration / recovery clause *at every size* rather than at one
+    /// convenient size.
+    ///
+    /// # The two facts worth having, beyond the sweep
+    ///
+    /// **An empty base admits every branch.** With `base.len() == 0` the common prefix is
+    /// trivially complete, so no branch can fail ancestry — the empty journal is not a
+    /// small case of the general one, it is a case where one whole refusal path is
+    /// unreachable. Asserted rather than left to be rediscovered.
+    ///
+    /// **A descriptor refusal is byte-identical at every size.** `MergeConflict::
+    /// DescriptorMismatch` carries three descriptors and no journal fact, so a diagnostic
+    /// that varied with journal size is not expressible — which is the observable half of
+    /// the same constraint `validate_descriptor_admission`'s signature makes structural.
+    /// Comparing the conflict across a 0-entry and a 1025-entry journal is what turns that
+    /// from an argument into a measurement.
+    ///
+    /// # What it does not discharge
+    ///
+    /// Not resource limits: every merge here runs under `TEST_SET_UNION_LIMITS`, which is
+    /// generous on all three axes, so "large" means large journals and not exhausted
+    /// budgets. Limit refusal and recovery are
+    /// `set_union_limits_are_independent_atomic_and_recoverable`'s.
+    #[test]
+    fn the_journal_size_table_spans_empty_boundary_and_large_journals() {
+        let cap = JOURNAL_CHUNK_CAPACITY;
+        assert_eq!(
+            JOURNAL_SIZE_TIERS,
+            [
+                0,
+                1,
+                cap - 1,
+                cap,
+                cap + 1,
+                cap * cap - 1,
+                cap * cap,
+                cap * cap + 1
+            ],
+            "the tiers are derived from the chunk capacity, and this states the shape they \
+             are derived into"
+        );
+
+        // The boundaries are real: the journal's node/leaf shape changes across each one.
+        // Without this the tiers are just eight numbers that happen to be green.
+        let shapes: Vec<(usize, usize)> = JOURNAL_SIZE_TIERS
+            .iter()
+            .map(|count| journal_shape(&numbered_state(*count).journal))
+            .collect();
+        assert_ne!(
+            shapes[3],
+            shapes[4],
+            "entry {cap} and entry {} must sit on opposite sides of a structural \
+             transition, or `boundary` names nothing",
+            cap + 1
+        );
+        assert_ne!(
+            shapes[6],
+            shapes[7],
+            "the depth-2 boundary at {} must be a structural transition too",
+            cap * cap
+        );
+
+        let mut descriptor_refusals: Vec<MergeConflict> = Vec::new();
+        let mut ancestry_refusals = 0usize;
+        let mut completions = 0usize;
+
+        for tier in JOURNAL_SIZE_TIERS {
+            let base_model = sized_model("base", tier);
+            for policy in MergeSemantics::all() {
+                let contract = descriptor(policy, PayloadProvenance::Understood);
+                let base = state_from_model(&contract, &base_model);
+                let base_digest_before = base.content_digest();
+
+                // Completion, both ways round: both branches extending, and one branch
+                // extending. The second is the only shape `ConflictsRequireReview`
+                // completes, so a table with only the first would never see it complete.
+                for (label, ours_model, theirs_model) in [
+                    (
+                        "both branches extend",
+                        [base_model.clone(), sized_model("ours", 2)].concat(),
+                        [base_model.clone(), sized_model("theirs", 3)].concat(),
+                    ),
+                    (
+                        "one branch extends",
+                        [base_model.clone(), sized_model("ours", 2)].concat(),
+                        base_model.clone(),
+                    ),
+                ] {
+                    let ours = state_from_model(&contract, &ours_model);
+                    let theirs = state_from_model(&contract, &theirs_model);
+                    let case = format!("tier={tier} {policy:?} {label}");
+                    let outcome =
+                        ExtensionState::merge(&base, &ours, &theirs, TEST_SET_UNION_LIMITS);
+                    match model_merge_product(policy, &base_model, &ours_model, &theirs_model) {
+                        Ok(expected) => {
+                            completions += 1;
+                            let ExtensionMergeOutcome::Complete { state, .. } =
+                                outcome.as_ref().expect(&case)
+                            else {
+                                unreachable!("{case}: generous limits cannot be exhausted")
+                            };
+                            assert_eq!(
+                                raw_payloads(state),
+                                expected,
+                                "{case}: the product must match the policy model at every \
+                                 journal size"
+                            );
+                        }
+                        Err(()) => {
+                            assert_eq!(
+                                outcome.as_ref().expect_err(&case),
+                                &MergeConflict::ConcurrentChanges {
+                                    extension: contract.name.clone(),
+                                },
+                                "{case}"
+                            );
+                        }
+                    }
+                }
+
+                // Descriptor refusal, at this size. Repeated three times: same answer.
+                let mismatched_contract = perturb_field(&contract, DescriptorField::Provenance, 0);
+                let mismatched = state_from_model(
+                    &mismatched_contract,
+                    &[base_model.clone(), sized_model("ours", 2)].concat(),
+                );
+                let mut previous: Option<MergeConflict> = None;
+                for repeat in 0..3 {
+                    let conflict =
+                        ExtensionState::merge(&base, &mismatched, &base, TEST_SET_UNION_LIMITS)
+                            .expect_err("a descriptor mismatch is refused at every size");
+                    if let Some(previous) = &previous {
+                        assert_eq!(
+                            &conflict, previous,
+                            "tier={tier} {policy:?}: repeat {repeat} must reproduce the \
+                             refusal exactly"
+                        );
+                    }
+                    previous = Some(conflict);
+                }
+                descriptor_refusals.push(previous.expect("three repeats always record a conflict"));
+
+                // Ancestry refusal, at this size — except that an EMPTY base has no
+                // invalid branch to offer, which is a property of the empty case rather
+                // than a gap in the table.
+                if tier == 0 {
+                    let anything = state_from_model(&contract, &sized_model("anything", 3));
+                    assert!(
+                        ExtensionState::merge(&base, &anything, &base, TEST_SET_UNION_LIMITS)
+                            .is_ok(),
+                        "every branch descends from an empty base, so the ancestry stage \
+                         cannot refuse there"
+                    );
+                } else {
+                    let mut divergent_model = base_model.clone();
+                    divergent_model[tier - 1] = b"divergent".to_vec();
+                    let divergent = state_from_model(&contract, &divergent_model);
+                    ancestry_refusals += 1;
+                    assert_eq!(
+                        ExtensionState::merge(&base, &divergent, &base, TEST_SET_UNION_LIMITS)
+                            .expect_err("a divergent final base entry is refused"),
+                        MergeConflict::HistoryMismatch {
+                            extension: contract.name.clone(),
+                            base_len: tier,
+                            ours_len: tier,
+                            theirs_len: tier,
+                            ours_common_prefix: tier - 1,
+                            theirs_common_prefix: tier,
+                        },
+                        "tier={tier} {policy:?}: the reported prefix must be the exact \
+                         divergence index at every journal size"
+                    );
+
+                    // Restoration and recovery at this size: repair the branch and the
+                    // same merge completes.
+                    let repaired = state_from_model(
+                        &contract,
+                        &[base_model.clone(), sized_model("ours", 1)].concat(),
+                    );
+                    assert!(
+                        ExtensionState::merge(&base, &repaired, &base, TEST_SET_UNION_LIMITS)
+                            .is_ok(),
+                        "tier={tier} {policy:?}: a refusal is a stop, so repairing the \
+                         branch must be enough to recover"
+                    );
+                }
+
+                assert_eq!(
+                    base.content_digest(),
+                    base_digest_before,
+                    "tier={tier} {policy:?}: no merge or refusal may move the base"
+                );
+                assert_eq!(base.len(), tier);
+            }
+        }
+
+        // A descriptor refusal carries no journal fact, so it cannot vary with journal
+        // size — the observable half of the stage-1 signature constraint.
+        // Compared across TIERS at one fixed policy. Across policies the descriptors
+        // legitimately differ — `descriptor(policy, ..)` puts the policy in the `merge`
+        // field, so those conflicts are supposed to differ, and comparing them would
+        // assert the opposite of the intended claim.
+        let first = descriptor_refusals
+            .first()
+            .expect("the sweep records a refusal per tier and policy");
+        let with_matching_policy: Vec<&MergeConflict> = descriptor_refusals
+            .iter()
+            .step_by(MergeSemantics::COUNT)
+            .collect();
+        assert_eq!(
+            with_matching_policy.len(),
+            JOURNAL_SIZE_TIER_COUNT,
+            "one descriptor refusal per tier at the first policy"
+        );
+        for conflict in &with_matching_policy {
+            assert_eq!(
+                *conflict,
+                first,
+                "the descriptor diagnostic must be identical for an empty journal and a \
+                 {}-entry one: it holds three descriptors and no journal fact, so a \
+                 size-dependent diagnostic is not expressible",
+                cap * cap + 1
+            );
+        }
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.extension-merge-validation-table\",\"version\":1,\
+             \"bead\":\"fln-extension-merge-validation-proof-debt-dt5\",\
+             \"claim_type\":\"bounded_model\",\"table\":\"journal_size\",\
+             \"chunk_capacity\":{cap},\"tiers\":{JOURNAL_SIZE_TIERS:?},\
+             \"journal_shapes\":{shapes:?},\"policies\":{},\
+             \"completions\":{completions},\"ancestry_refusals\":{ancestry_refusals},\
+             \"descriptor_refusals\":{},\"status\":\"pass\"}}",
+            MergeSemantics::COUNT,
+            descriptor_refusals.len(),
+        );
+    }
 }
