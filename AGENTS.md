@@ -173,7 +173,8 @@ The standing advice, correct and unchanged, is: when another pane's in-flight ed
 | runs in a linked worktree? | |
 |---|---|
 | `cargo test` / `clippy` / `fmt`, **one package or one target** | **yes** — this is the sanctioned escape hatch |
-| `cargo test --workspace` | **all but one suite** — `structure-guard`'s `contract_handoff_no_mock_e2e` fails there because `contracts/*.tsv` is **untracked** (53 MB, bead `fln-census-out-of-git-2ya9`), so a fresh checkout has no copy and the symlink shim people install to compensate is refused as `handoff_output_ambiguous`. Measured `80b3d38f`: 101 suites ok, that one red (bead `fln-census-empty-referent-no-mock-krb0`) |
+| `cargo test --workspace --no-fail-fast` | **two suites red, three tests** — all `structure-guard`, all reading `contracts/*.tsv`, which is **untracked** (53 MB, bead `fln-census-out-of-git-2ya9`): a fresh checkout has no copy, and the symlink shim people install to compensate is refused as `handoff_output_ambiguous`. Measured `7ebbddea`: **138 ok, 2 red** — `--lib`'s `contract_handoff_no_mock_e2e`, and `--test real_workspace`'s `real_workspace_is_structurally_clean` and `robot_real_workspace_binds_complete_authority_evidence` (bead `fln-census-empty-referent-no-mock-krb0`) |
+| `cargo test --workspace` **without** `--no-fail-fast` | **do not report a tally from it** — cargo stops at the first failing *target*. The same tree, same commit, reports "101 ok, 1 red": it hides 37 suites and the second failing suite entirely. A test name absent from that output means *did not run*, never *passed*. I published the 101/1 figure before re-running with the flag; this row is that correction |
 | `ubs <paths>` — the fourth mandated check | **no** — `✗ Failed to prepare files workspace`, exit 1. Same file, same command, main tree: exit 0 |
 | `evidence.py hash-tree --root R --path P` | yes, exit 0 |
 | `evidence.py hash-tree … **--vendor-path V**` | **no** — exit 2 |
