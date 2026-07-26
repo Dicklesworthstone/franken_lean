@@ -7244,11 +7244,36 @@ mod tests {
         /// none should be written. An equivalent mutant is not a coverage gap, and
         /// recording it as one manufactures permanent phantom debt.
         EquivalentBecause(&'static str),
+        /// Planted, compiled, run — and **nothing failed**, while the mutation is *not*
+        /// equivalent: it changes behaviour this bead's criteria name as load-bearing.
+        ///
+        /// The three explanations for a survivor — missing test, unreachable code,
+        /// equivalent mutant — demand opposite responses, so a survivor is only
+        /// classifiable once the reachability and equivalence questions are answered
+        /// rather than assumed. This variant is the answer "missing test", and it
+        /// carries the obligation it fails so the debt names its own discharge.
+        SurvivedUncovered {
+            /// What the run actually showed.
+            measured: &'static str,
+            /// The acceptance-criteria clause with no assertion behind it.
+            obligation: &'static str,
+        },
     }
 
-    /// The measured campaign, 2026-07-26: twelve defects planted one at a time on the
+    /// The measured campaign, 2026-07-26: fourteen defects planted one at a time on the
     /// merge-validation plane, the `fln-env` suite run against each, source restored
-    /// byte-exactly between plants.
+    /// byte-exactly between plants. Twelve killed, one equivalent, **one survivor that
+    /// is a real gap**.
+    ///
+    /// # The count was itself the defect
+    ///
+    /// The first pass planted **twelve** and this table asserted `len() == 12`. The
+    /// acceptance criteria name **fourteen**, so the record certified its own
+    /// completeness against a number rather than against the criteria that define it —
+    /// which is the exact failure `dt5` was filed to correct, reproduced inside the
+    /// correcting artifact. `policy_before_validation` and `clone_payloads_during_refusal`
+    /// were the two never planted; both have now been run, and they landed on opposite
+    /// sides: the first dies, the second survives uncovered.
     ///
     /// # Why this table exists at all
     ///
@@ -7318,6 +7343,57 @@ mod tests {
                  by semantic_projection_refuses_typed_on_every_resource_and_exposes_no_view.",
             ),
         ),
+        (
+            "policy_before_validation",
+            MutantOutcome::KilledBy(mismatched_descriptors_are_typed_conflicts_on_either_branch),
+        ),
+        (
+            "clone_payloads_during_refusal",
+            MutantOutcome::SurvivedUncovered {
+                measured: "Deep-copying every ours/theirs journal payload on the \
+                           descriptor-refusal path leaves the returned MergeConflict \
+                           byte-identical, so the whole fln-env suite still passes \
+                           239/239. The path is reached — \
+                           mismatched_descriptors_are_typed_conflicts_on_either_branch \
+                           drives it — so this is neither unreachable nor equivalent: \
+                           the clone happens and nothing observes it.",
+                obligation: "Exact operation/allocation facts prove descriptor refusal \
+                             performs zero journal comparisons, payload clones, policy \
+                             dispatches, or product publications.",
+            },
+        ),
+    ];
+
+    /// The mutant kinds `dt5`'s acceptance criteria name, transcribed from the bead.
+    ///
+    /// # What this does and does not buy
+    ///
+    /// It upgrades the completeness check from a **count** to a **set**: the previous
+    /// assertion was `len() == 12`, a number the author chose, which is satisfied by any
+    /// twelve entries and cannot report *which* criterion is unmet. Binding to names
+    /// makes a missing mutant say its own name.
+    ///
+    /// It does **not** close the join. This list is a transcription, so a criteria edit
+    /// on the bead still moves nothing here — the same shape as `AGENTS.md`'s item 7,
+    /// one artifact over. `mandated_mutants.rs` closes its version of this join by
+    /// deriving the names from `AGENTS.md` at test time; the equivalent move here would
+    /// derive from `.beads/issues.jsonl`, which is `fln-conformance`'s territory, not a
+    /// unit test's. Recorded as a known limit rather than implied to be a mechanism.
+    const CRITERIA_NAMED_MUTANTS: [&str; 14] = [
+        "descriptor_skip_name",
+        "descriptor_skip_merge",
+        "descriptor_skip_checkpoint",
+        "descriptor_skip_provenance",
+        "descriptor_validation_deferred",
+        "policy_before_validation",
+        "clone_payloads_during_refusal",
+        "expose_partial_product",
+        "ancestry_skipped",
+        "ancestry_only_length",
+        "ancestry_only_ours",
+        "ancestry_only_theirs",
+        "compare_entries_unordered",
+        "continue_after_refusal",
     ];
 
     /// The record covers the campaign and distinguishes a kill from an equivalence.
@@ -7328,15 +7404,33 @@ mod tests {
     /// that can never be discharged, because the test it asks for cannot exist.
     #[test]
     fn the_merge_validation_mutation_record_is_complete_and_classified() {
-        assert_eq!(MERGE_VALIDATION_MUTANTS.len(), 12);
         let names: BTreeSet<&str> = MERGE_VALIDATION_MUTANTS
             .iter()
             .map(|(name, _)| *name)
             .collect();
         assert_eq!(
             names.len(),
-            12,
+            MERGE_VALIDATION_MUTANTS.len(),
             "a duplicated mutant name hides a missing one"
+        );
+        // Set equality in *both* directions. One direction alone lets the matrix drift:
+        // subset-only would readmit the 12-of-14 state this test was measured out of,
+        // and superset-only would let an entry sit here under a name no criterion names.
+        let criteria: BTreeSet<&str> = CRITERIA_NAMED_MUTANTS.into_iter().collect();
+        assert_eq!(
+            criteria.len(),
+            CRITERIA_NAMED_MUTANTS.len(),
+            "the criteria transcription itself must not duplicate a name"
+        );
+        let missing: Vec<&&str> = criteria.difference(&names).collect();
+        assert!(
+            missing.is_empty(),
+            "acceptance criteria name mutants absent from the record: {missing:?}"
+        );
+        let unnamed: Vec<&&str> = names.difference(&criteria).collect();
+        assert!(
+            unnamed.is_empty(),
+            "record holds mutants no criterion names: {unnamed:?}"
         );
         let killed = MERGE_VALIDATION_MUTANTS
             .iter()
@@ -7346,8 +7440,24 @@ mod tests {
             .iter()
             .filter(|(_, outcome)| matches!(outcome, MutantOutcome::EquivalentBecause(_)))
             .count();
-        assert_eq!(killed, 11);
+        let uncovered = MERGE_VALIDATION_MUTANTS
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, MutantOutcome::SurvivedUncovered { .. }))
+            .count();
+        assert_eq!(killed, 12);
         assert_eq!(equivalent, 1);
+        // Deliberately asserted, not tolerated. `dt5` cannot close while this is nonzero,
+        // and a repair that adds the missing assertion must reclassify the entry here —
+        // so the debt cannot be discharged silently in either direction.
+        assert_eq!(
+            uncovered, 1,
+            "an uncovered mutant is open debt: it must be repaired and reclassified, \
+             never dropped from the matrix"
+        );
+        assert_eq!(
+            killed + equivalent + uncovered,
+            CRITERIA_NAMED_MUTANTS.len()
+        );
         for (name, outcome) in MERGE_VALIDATION_MUTANTS {
             match outcome {
                 // Reading the item is what binds the record to the compiler. The
@@ -7364,6 +7474,22 @@ mod tests {
                     reason.len() > 80,
                     "{name}: an equivalence claim must state why behaviour cannot change"
                 ),
+                // A survivor must carry both halves. "It survived" is not a finding, and
+                // a survivor without its unmet obligation is indistinguishable from an
+                // equivalence nobody argued.
+                MutantOutcome::SurvivedUncovered {
+                    measured,
+                    obligation,
+                } => {
+                    assert!(
+                        measured.len() > 80,
+                        "{name}: a survivor must state what the run showed"
+                    );
+                    assert!(
+                        obligation.len() > 40,
+                        "{name}: a survivor must name the obligation it leaves unmet"
+                    );
+                }
             }
         }
     }
