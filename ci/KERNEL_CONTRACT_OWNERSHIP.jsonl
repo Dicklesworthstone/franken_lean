@@ -1,4 +1,5 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":367,"projection_hash":"2ed0eb0689c18c1db89bc9603a5f8a139ff5b760e7ed096ca5088af7143d1d75"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":370,"projection_hash":"bc53da47f357de4a60f2081e27a80e9d7351de39d62548cb850c1c6e6efe09f2"}
+{"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -231,6 +232,7 @@
 {"id":"franken_lean-bc7"}
 {"id":"franken_lean-beads-workspace-doctor-health-fib"}
 {"id":"franken_lean-bp6x"}
+{"id":"franken_lean-brgt"}
 {"id":"franken_lean-c24a"}
 {"id":"franken_lean-canon-stack-safe-drop-6gy"}
 {"id":"franken_lean-cgt"}
@@ -326,6 +328,7 @@
 {"id":"franken_lean-r0xu"}
 {"id":"franken_lean-r2st"}
 {"id":"franken_lean-r4m8"}
+{"id":"franken_lean-rch-clean-overlay-has-no-git-dir-46pw"}
 {"id":"franken_lean-readme-install-oneliner-wao6"}
 {"id":"franken_lean-rps"}
 {"id":"franken_lean-rur"}
