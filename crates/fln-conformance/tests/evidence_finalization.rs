@@ -6,19 +6,17 @@ use std::fs;
 use std::path::Path;
 
 fn check_script() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check.sh");
+    let path = fln_conformance::checked_workspace_root!().join("scripts/check.sh");
     fs::read_to_string(path).expect("scripts/check.sh must be readable")
 }
 
 fn env_snapshots_script() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/e2e/env_snapshots.sh");
+    let path = fln_conformance::checked_workspace_root!().join("scripts/e2e/env_snapshots.sh");
     fs::read_to_string(path).expect("scripts/e2e/env_snapshots.sh must be readable")
 }
 
 fn trusted_script(relative: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative);
+    let path = fln_conformance::checked_workspace_root!().join(relative);
     fs::read_to_string(path).unwrap_or_else(|error| panic!("{relative} must be readable: {error}"))
 }
 
@@ -329,7 +327,7 @@ fn armed_finalizers_publish_only_after_their_process_wins_the_directory_claim() 
 /// of those twelve were missed even by the manual sweep that found the other ten.
 #[test]
 fn every_evidence_lane_claims_its_artifact_root_atomically() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = fln_conformance::checked_workspace_root!();
     let mut lanes: Vec<(String, String)> = Vec::new();
 
     for dir in ["scripts/e2e", "scripts/tribunal"] {
@@ -498,7 +496,7 @@ fn launches_python(line: &str) -> bool {
 /// is not evidence that `-I` works.
 #[test]
 fn every_python_launch_under_scripts_is_sealed() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = fln_conformance::checked_workspace_root!();
     let repo = repo
         .canonicalize()
         .expect("the repository root must resolve");
@@ -608,6 +606,281 @@ fn every_python_launch_under_scripts_is_sealed() {
     );
 }
 
+/// The interpreter-configuration channels `franken_lean-h40t` requires the evidence
+/// runner to classify. Transcribed once, from the bead's own scope paragraph, because
+/// there is no machine-readable list to derive them from — and used only as a FLOOR, so
+/// a runner that classifies more than these still passes.
+const REQUIRED_PYTHON_CONFIGURATION_CHANNELS: &[&str] = &[
+    "PYTHONEXECUTABLE",
+    "PYTHONHOME",
+    "PYTHONNOUSERSITE",
+    "PYTHONPATH",
+    "PYTHONSAFEPATH",
+    "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
+];
+
+/// Loads the real `scripts/evidence.py` and asks its real classifier to judge a
+/// synthetic environment. Sealed (`-I -S`) like every other trusted launch, and `-B` so
+/// a guard can never leave a `__pycache__` in a governed directory.
+const PYTHON_CLASSIFIER_PROBE: &str = r#"
+import importlib.util, sys
+
+spec = importlib.util.spec_from_file_location("fln_evidence_classifier_probe", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+declared = sorted(module.PYTHON_CONFIGURATION_ENV_EXACT)
+environ = {name: "hostile" for name in declared}
+# Matches the prefix rule and is deliberately NOT in the named set, so the prefix has to
+# be doing work of its own rather than restating the set.
+environ["PYTHONBREAKPOINT"] = "hostile"
+# Controls. A classifier that simply returned its whole input would satisfy every
+# positive assertion below while classifying nothing.
+environ.update({
+    "PATH": "/usr/bin",
+    "HOME": "/home/probe",
+    "RUSTFLAGS": "-C debuginfo=0",
+    "CARGO_HOME": "/cargo",
+})
+
+print("DECLARED " + " ".join(declared))
+print("CLASSIFIED " + " ".join(module.overridden_python_environment(environ)))
+print("PROBE-COMPLETE")
+"#;
+
+/// Ambient names that are not interpreter configuration. The probe plants these so a
+/// classifier that admits everything cannot pass by breadth.
+const PYTHON_CLASSIFIER_CONTROLS: &[&str] = &["PATH", "HOME", "RUSTFLAGS", "CARGO_HOME"];
+
+/// Load `path` as the evidence runner and return `(declared, classified)`.
+///
+/// A probe that did not complete is a broken probe, never a clean result: it panics here
+/// rather than returning empty vectors for the judgement below to quantify over.
+fn classify_python_configuration(path: &Path) -> (Vec<String>, Vec<String>) {
+    let run = std::process::Command::new("python3")
+        .args(["-I", "-S", "-B", "-c", PYTHON_CLASSIFIER_PROBE])
+        .arg(path)
+        .output()
+        .expect("the sealed interpreter must be able to load the evidence runner");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(
+        run.status.success() && stdout.contains("PROBE-COMPLETE"),
+        "the classifier probe did not complete against {}, so nothing was measured. This \
+         is a broken probe, not a clean result. status={:?} stderr={stderr}",
+        path.display(),
+        run.status.code()
+    );
+    let field = |tag: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(tag))
+            .unwrap_or_else(|| panic!("the probe must report {tag}; got: {stdout}"))
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    };
+    (field("DECLARED "), field("CLASSIFIED "))
+}
+
+/// The whole judgement, in one place that a forged caller can drive.
+///
+/// Kept separate from the call site deliberately: a guard that can only be exercised
+/// through its own producer cannot demonstrate that it discriminates, and this project
+/// has already shipped one coverage check that was satisfied by an empty referent. Each
+/// arm returns a distinct reason token, so a mutant can be required to die *for its
+/// stated reason* rather than merely to fail.
+fn judge_python_classification(declared: &[String], classified: &[String]) -> Result<(), String> {
+    // (1) Declaration-level: the runner still NAMES every channel the bead requires.
+    for channel in REQUIRED_PYTHON_CONFIGURATION_CHANNELS {
+        if !declared.iter().any(|name| name == channel) {
+            return Err(format!("undeclared-required-channel:{channel}"));
+        }
+    }
+    // (2) Behavioural: a declared channel that is not classified is decoration.
+    for channel in declared {
+        if !classified.contains(channel) {
+            return Err(format!("declared-but-unclassified:{channel}"));
+        }
+    }
+    // (3) Behavioural: the prefix rule classifies something the named set does not list,
+    // which is the only part of this family that carries behaviour at all.
+    if !classified.iter().any(|name| name == "PYTHONBREAKPOINT") {
+        return Err("prefix-rule-inert".to_owned());
+    }
+    // (4) The control: a classifier that returns its whole input classifies nothing.
+    for control in PYTHON_CLASSIFIER_CONTROLS {
+        if classified.iter().any(|name| name == control) {
+            return Err(format!("control-admitted:{control}"));
+        }
+    }
+    // (5) The one producer/validator join that IS bound today: the strict run-record
+    // validator refuses an `overridden_env` that is not sorted and duplicate-free.
+    let mut canonical = classified.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    if classified != canonical.as_slice() {
+        return Err("not-sorted-duplicate-free".to_owned());
+    }
+    Ok(())
+}
+
+/// The Python configuration channels the evidence runner refuses are verified by
+/// *running* its classifier, never by reading its constants — because reading them is
+/// precisely what would have missed the defect this guard was written from.
+///
+/// `scripts/evidence.py` declares the interpreter-configuration family twice:
+/// `PYTHON_CONFIGURATION_ENV_EXACT`, the seven named channels `franken_lean-h40t`
+/// requires, and `PYTHON_CONFIGURATION_ENV_PREFIXES = ("PYTHON",)`.
+/// `overridden_python_environment` admits a name that is in the set **or** matches a
+/// prefix. Every member of the set begins with `PYTHON`, so the set is wholly subsumed
+/// by the prefix and contributes nothing to the verdict. Measured at `5b6158ad` by
+/// loading the real module and emptying one constant at a time: emptying
+/// `PYTHON_CONFIGURATION_ENV_EXACT` returns a list **identical** to the baseline, while
+/// emptying the prefix tuple drops `PYTHONBREAKPOINT` (8 names to 7). Dropping only
+/// `PYTHONPATH` from the set is likewise identical.
+///
+/// That is worth stating because the bead asks for a mutant "that drops a `PYTHON*`
+/// classification, killed by a discriminating test". For the **named set** no such test
+/// can be written: the mutation is semantically a no-op, so a behavioural rig scores it
+/// SURVIVED and is right to. Only the prefix tuple carries behaviour. So the two halves
+/// below are deliberately different in kind, and the difference is the point:
+///
+/// * the floor over the declared set is a **declaration**-level check — it fails if the
+///   runner stops naming a channel the bead requires, and it earns nothing about what
+///   the runner does at runtime;
+/// * everything else is **behavioural** — it fails only if a channel stops actually
+///   being classified.
+///
+/// A guard that read the source and reported "seven channels classified" would have
+/// been green on an inert set, which is the same shape as reporting coverage from a
+/// list that no longer matches the tree.
+///
+/// **What this does not earn.** The classifier's output is recorded in evidence, and a
+/// strict NDJSON validator elsewhere in the same file independently re-derives the rule
+/// as a hardcoded `name.startswith("PYTHON")` rather than reading
+/// `PYTHON_CONFIGURATION_ENV_PREFIXES`. The two copies are unbound: measured the same
+/// way, widening the producer's tuple to `("PYTHON", "PY_", "PYVENV")` makes it emit
+/// `PY_HOSTILE` and `PYVENV_LAUNCHER`, which that validator then refuses as malformed —
+/// the runner rejecting a record it had just produced. This guard cannot close that; the
+/// repair is one line inside `scripts/evidence.py`. Filed, not fixed here.
+#[test]
+fn python_configuration_channels_are_classified_by_measurement_not_declaration() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let (declared, classified) = classify_python_configuration(&repo.join("scripts/evidence.py"));
+
+    if let Err(reason) = judge_python_classification(&declared, &classified) {
+        panic!(
+            "the evidence runner's interpreter-configuration classification is unsound \
+             ({reason}). A channel in this family that stops being classified is one an \
+             ambient environment can reopen under the process that computes the governed \
+             digests and decides the verdicts (franken_lean-h40t). \
+             declared={declared:?} classified={classified:?}"
+        );
+    }
+}
+
+/// Every arm of the judgement above kills a mutation, and each dies for its own reason.
+///
+/// The mutants are applied to **copies** of the runner, never to the file in the tree.
+/// That is not merely politeness toward whoever else is editing it: a campaign that
+/// mutates a shared file cannot be re-run by the next reader, so its verdicts age into
+/// a claim with nothing behind it. Appending a redefinition to the copy shadows the real
+/// one at import, so each mutant is anchored on nothing and cannot silently fail to
+/// apply — and the harness still checks that the copy really differs from the original,
+/// because a mutant that does not create the condition it claims is not evidence.
+///
+/// The last mutant is the one worth reading. It drops `PYTHONPATH` from the named set,
+/// which changes **no behaviour at all** — the prefix still classifies it — so every
+/// behavioural arm stays green and only the declaration-level floor kills it. That is
+/// the measurement from the doc comment above turned into a standing test: without arm
+/// (1) the runner could quietly stop naming the channels the bead requires.
+#[test]
+fn the_python_configuration_guard_kills_each_mutation_it_claims_to() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let original = fs::read_to_string(repo.join("scripts/evidence.py"))
+        .expect("scripts/evidence.py must be readable");
+    let scratch = std::env::var("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| repo.join("target"))
+        .join(format!("fln-python-classification-{}", std::process::id()));
+    fs::create_dir_all(&scratch).expect("the mutant scratch directory must be creatable");
+
+    // (name, appended override, the reason the guard must give)
+    let mutants: &[(&str, &str, &str)] = &[
+        (
+            "prefix-tuple-emptied",
+            "\ndef overridden_python_environment(environ):\n    \
+             return sorted(n for n in environ if n in PYTHON_CONFIGURATION_ENV_EXACT)\n",
+            "prefix-rule-inert",
+        ),
+        (
+            "one-declared-channel-not-classified",
+            "\ndef overridden_python_environment(environ):\n    \
+             return sorted(n for n in environ \
+             if n.startswith(\"PYTHON\") and n != \"PYTHONPATH\")\n",
+            "declared-but-unclassified:PYTHONPATH",
+        ),
+        (
+            "classifier-admits-everything",
+            "\ndef overridden_python_environment(environ):\n    return sorted(environ)\n",
+            "control-admitted:PATH",
+        ),
+        (
+            "classification-not-canonical",
+            "\ndef overridden_python_environment(environ):\n    \
+             return list(reversed(sorted(n for n in environ if n.startswith(\"PYTHON\"))))\n",
+            "not-sorted-duplicate-free",
+        ),
+        (
+            "required-channel-undeclared-behaviour-unchanged",
+            "\nPYTHON_CONFIGURATION_ENV_EXACT = frozenset({\"PYTHONHOME\", \"PYTHONSTARTUP\", \
+             \"PYTHONEXECUTABLE\", \"PYTHONUSERBASE\", \"PYTHONNOUSERSITE\", \"PYTHONSAFEPATH\"})\n",
+            "undeclared-required-channel:PYTHONPATH",
+        ),
+    ];
+
+    for (name, override_source, expected_reason) in mutants {
+        let mutated = format!("{original}{override_source}");
+        assert_ne!(
+            mutated, original,
+            "mutant {name} did not change the runner, so scoring it proves nothing"
+        );
+        let path = scratch.join(format!("{name}.py"));
+        fs::write(&path, &mutated).expect("a mutant copy must be writable");
+
+        let (declared, classified) = classify_python_configuration(&path);
+        let verdict = judge_python_classification(&declared, &classified);
+        assert_eq!(
+            verdict.as_ref().map_err(String::as_str),
+            Err(*expected_reason),
+            "mutant {name} was not killed for its stated reason. A rig that accepts any \
+             failure would score a mutant killed by a check that had stopped testing the \
+             property. declared={declared:?} classified={classified:?}"
+        );
+    }
+
+    // The harness's own control. If a broken probe returned empty vectors instead of
+    // panicking, every mutant above would "die" on the first arm and this whole test
+    // would be theatre. A file that loads but declares nothing must be refused as a
+    // broken probe, not judged.
+    let hollow = scratch.join("not-the-runner.py");
+    fs::write(&hollow, "# no classifier here\n").expect("the hollow probe must be writable");
+    let refused = std::panic::catch_unwind(|| classify_python_configuration(&hollow));
+    assert!(
+        refused.is_err(),
+        "a file with no classifier in it was judged instead of being refused, so this \
+         guard cannot tell a clean tree from a probe that measured nothing"
+    );
+}
+
 /// The evidence surface refuses a root whose `.git` is a gitdir pointer, and AGENTS.md
 /// still says which surfaces that takes down.
 ///
@@ -635,7 +908,7 @@ fn every_python_launch_under_scripts_is_sealed() {
 /// asserting a rule after the code changed underneath it.
 #[test]
 fn the_evidence_surface_refuses_a_gitdir_pointer_root() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = fln_conformance::checked_workspace_root!();
     let repo = repo
         .canonicalize()
         .expect("the repository root must resolve");
