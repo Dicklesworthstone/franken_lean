@@ -16,6 +16,7 @@
 //! 5 = raw write did not trap.
 
 #![deny(unsafe_code)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use fln_unsafe_region::mapping::{MapError, RegionMapping};
 
@@ -36,6 +37,13 @@ fn fact(kind: &str, body: &str) {
 // UNSAFE-LEDGER: FLN-UL-0063
 #[allow(unsafe_code)]
 fn raw_write(addr: usize) {
+    // SAFETY: none claimed, deliberately — this is the invariant violation the drill
+    // exists to punish, and the doc comment above states the full justification: the
+    // probe runs only in the trap lane's child process, whose expected fate is SIGSEGV,
+    // the store is volatile so it cannot be elided, and nothing after it is trusted.
+    // The note is repeated here because `clippy::undocumented_unsafe_blocks` reads the
+    // comment attached to the BLOCK, not the one attached to the function (bead
+    // `franken_lean-d3-safety-note-unenforced-cdbg`).
     unsafe { std::ptr::write_volatile(addr as *mut u8, 0xFF) }
 }
 

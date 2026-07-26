@@ -2182,23 +2182,53 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         // either TURNS THE LINT ON, or says out loud that it has not — with the bead
         // that tracks the outstanding sites. An unenforced rule is survivable; an
         // unenforced rule nobody can see is the defect.
-        let root_rel = format!("{}/src/lib.rs", c.rel);
-        if let Some(root_text) = read_governed(&c.dir.join("src/lib.rs"), &root_rel, &mut findings)
-        {
-            let enforced = root_text.lines().any(|line| {
-                let t = line.trim();
-                (t.starts_with("#![deny(") || t.starts_with("#![forbid("))
-                    && t.contains("clippy::undocumented_unsafe_blocks")
-            });
-            let waived = root_text
-                .lines()
-                .any(|line| safety_note_waiver(line).is_some());
-            if !enforced && !waived {
-                findings.push(Finding {
+        // EVERY target root, not just `src/lib.rs`. A cargo target is its own crate
+        // root, so `#![deny(...)]` in the library reaches neither `examples/` nor
+        // `tests/` nor `benches/` nor `src/bin/`. Checking the library alone reported
+        // `fln-unsafe-region` as ENFORCED while its one undocumented unsafe block sat in
+        // `examples/region_trap_probe.rs`, uncovered by any lint — the posture check
+        // itself producing a false clean (bead
+        // `franken_lean-d3-safety-note-unenforced-cdbg`).
+        let mut target_roots: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for rel in ["src/lib.rs", "src/main.rs"] {
+            let abs = c.dir.join(rel);
+            if abs.is_file() {
+                target_roots.push((format!("{}/{rel}", c.rel), abs));
+            }
+        }
+        for sub in ["examples", "tests", "benches", "src/bin"] {
+            let dir = c.dir.join(sub);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut found: Vec<std::path::PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+                .collect();
+            found.sort();
+            for abs in found {
+                let name = abs.file_name().unwrap_or_default().to_string_lossy();
+                target_roots.push((format!("{}/{sub}/{name}", c.rel), abs));
+            }
+        }
+
+        for (root_rel, root_abs) in target_roots {
+            if let Some(root_text) = read_governed(&root_abs, &root_rel, &mut findings) {
+                let enforced = root_text.lines().any(|line| {
+                    let t = line.trim();
+                    (t.starts_with("#![deny(") || t.starts_with("#![forbid("))
+                        && t.contains("clippy::undocumented_unsafe_blocks")
+                });
+                let waived = root_text
+                    .lines()
+                    .any(|line| safety_note_waiver(line).is_some());
+                if !enforced && !waived {
+                    findings.push(Finding {
                     code: "FLN-STRUCT-040",
                     path: root_rel,
                     detail: format!(
-                        "unsafe boundary `{}` neither enables the SAFETY-note lint nor \
+                        "target root of unsafe boundary `{}` neither enables the SAFETY-note lint nor \
                          declares that it has not. Add \
                          `#![deny(clippy::undocumented_unsafe_blocks)]` once the crate is \
                          clean, or, while sites remain, a crate-root comment \
@@ -2209,6 +2239,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                         c.name
                     ),
                 });
+                }
             }
         }
 
