@@ -4478,6 +4478,90 @@ def require_guard_name_list(path: Path, value: Any, *, label: str) -> list[str]:
     return value
 
 
+def validate_guard_mode_closure(
+    path: Path, terminal: Mapping[str, Any], crate_count: int, expected_verdict: str
+) -> None:
+    """Check the terminal record's D18 mode-closure scope (bead ``fln-q8qt``).
+
+    The guard computed these counts from the day D18 was registered and emitted none of
+    them, so a reader of a run saw ``verdict=pass`` with no way to learn whether the D18
+    check had traversed a product closure or nothing at all. Requiring them here is the
+    half that makes the emission load-bearing: ``require_guard_keys`` compares an EXACT
+    key set, so the guard dropping the object fails this validator, and this validator
+    dropping the requirement fails against a guard that still emits it. Neither side can
+    go quiet alone.
+
+    Presence is the cheap half. The laws below are the half that refuses a hand-written
+    or half-derived object, because they are relations the derivation cannot violate:
+
+    * ``scan_class`` is derived from ``closures_scanned`` at the source, so a scope word
+      that disagrees with its own count is a fabricated disclosure;
+    * a mode is scanned only when some product declares a root for it;
+    * a scanned closure contains at least its own root, and an unscanned one submits
+      nothing — this is what refuses a "traversed" claim carrying an empty closure;
+    * the derivation builds exactly one node per crate in the reviewed graph, and a
+      PASSING run is one where that graph is an exact snapshot of the workspace the rest
+      of this record describes — so the node count and the crate count are the same
+      number seen twice, and a scope computed over some other workspace is refused.
+
+    That last one is scoped to ``pass`` deliberately, and the reason is the whole content
+    of ``FLN-STRUCT-005``/``-006``: a failing run may be failing precisely BECAUSE the
+    reviewed graph and the discovered workspace disagree. Demanding the counts match
+    there would refuse the evidence stream of the very violation the guard exists to
+    report, so the join is asserted exactly where it is a law and nowhere else.
+    """
+    facts = terminal.get("mode_closure")
+    if not isinstance(facts, dict):
+        raise EvidenceError(f"{path}: D18 mode-closure scope is missing")
+    require_guard_keys(
+        path,
+        facts,
+        {
+            "scan_class",
+            "frontier_surfaces",
+            "product_roots",
+            "closures_scanned",
+            "closure_nodes",
+            "nodes",
+            "edges",
+        },
+        label="mode_closure",
+    )
+    scan_class = facts.get("scan_class")
+    if scan_class not in {"vacuous", "traversed"}:
+        raise EvidenceError(f"{path}: D18 scan class {scan_class!r} is unregistered")
+    counts = {
+        key: require_guard_nat(path, facts.get(key), label=f"mode_closure.{key}")
+        for key in (
+            "frontier_surfaces",
+            "product_roots",
+            "closures_scanned",
+            "closure_nodes",
+            "nodes",
+            "edges",
+        )
+    }
+    if (scan_class == "vacuous") != (counts["closures_scanned"] == 0):
+        raise EvidenceError(
+            f"{path}: D18 scan class {scan_class!r} disagrees with "
+            f"closures_scanned={counts['closures_scanned']}"
+        )
+    if counts["closures_scanned"] > counts["product_roots"]:
+        raise EvidenceError(f"{path}: D18 scanned more closures than declared roots")
+    if counts["closures_scanned"] == 0:
+        if counts["closure_nodes"] != 0:
+            raise EvidenceError(f"{path}: D18 submitted nodes without scanning a closure")
+    elif counts["closure_nodes"] < counts["closures_scanned"]:
+        raise EvidenceError(f"{path}: D18 closure is smaller than its own root set")
+    if counts["product_roots"] > counts["nodes"] or counts["frontier_surfaces"] > counts["nodes"]:
+        raise EvidenceError(f"{path}: D18 counted a crate more than once on one axis")
+    if expected_verdict == "pass" and counts["nodes"] != crate_count:
+        raise EvidenceError(
+            f"{path}: D18 scope covers {counts['nodes']} nodes but the passing run "
+            f"covers {crate_count} crates"
+        )
+
+
 def validate_guard(
     path: Path,
     expected_exit: int,
@@ -4489,7 +4573,7 @@ def validate_guard(
     path = lexical_absolute(path)
     records, digest = load_ndjson_snapshot(path)
     for index, record in enumerate(records):
-        if record.get("schema") != "structure-guard/3":
+        if record.get("schema") != "structure-guard/4":
             raise EvidenceError(f"{path}:{index + 1}: wrong schema")
     if records[0].get("event") != "run_start":
         raise EvidenceError(f"{path}: first record is not run_start")
@@ -4532,6 +4616,7 @@ def validate_guard(
         "authority",
         "contract_handoff_root",
         "traversal",
+        "mode_closure",
         "authority_count_rule",
         "authority_count_rule_holds",
         "governed_root_before",
@@ -4716,6 +4801,7 @@ def validate_guard(
         )
         if scanned + skipped != discovered:
             raise EvidenceError(f"{path}: authority count conservation failed")
+        validate_guard_mode_closure(path, terminal, crate_count, expected_verdict)
         authority_count_rule_holds = require_guard_bool(
             path,
             terminal.get("authority_count_rule_holds"),
@@ -4775,6 +4861,7 @@ def validate_guard(
             terminal.get("authority") != "not_established"
             or terminal.get("contract_handoff_root") is not None
             or terminal.get("traversal") is not None
+            or terminal.get("mode_closure") is not None
             or terminal.get("governed_root_before") is not None
             or terminal.get("governed_root_after") is not None
         ):
@@ -14840,12 +14927,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
 
     # The structure guard's robot stream is a versioned evidence contract, not a
-    # best-effort JSON bag. Exercise one complete /3 stream and discriminating
+    # best-effort JSON bag. Exercise one complete /4 stream and discriminating
     # mutations here so the validator cannot silently stop checking newly authoritative
     # fields while the E2E lanes continue to look green.
     guard_root = case_dir("structure-guard-contract")
     guard_start = {
-        "schema": "structure-guard/3",
+        "schema": "structure-guard/4",
         "event": "run_start",
         "root": str(guard_root),
         "root_identity": str(guard_root.resolve(strict=True)),
@@ -14879,7 +14966,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         },
     }
     guard_end = {
-        "schema": "structure-guard/3",
+        "schema": "structure-guard/4",
         "event": "run_end",
         "verdict": "pass",
         "exit_code": 0,
@@ -14891,6 +14978,15 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "files_discovered": 4,
             "files_scanned": 4,
             "files_skipped_unreadable": 0,
+        },
+        "mode_closure": {
+            "scan_class": "vacuous",
+            "frontier_surfaces": 0,
+            "product_roots": 0,
+            "closures_scanned": 0,
+            "closure_nodes": 0,
+            "nodes": 1,
+            "edges": 0,
         },
         "authority_count_rule": (
             "files_scanned+files_skipped_unreadable=files_discovered"
@@ -14916,8 +15012,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     validate_guard(guard_valid, PASS, "pass", [], str(guard_root), PASS)
 
     def old_guard_schema(records: list[dict[str, Any]]) -> None:
+        # The IMMEDIATELY preceding version, not an ancient one: `/3` differs from `/4`
+        # only by the D18 scope object, so this is the mutant that proves the version is
+        # rejected on its own account rather than because its shape happens to be wrong.
         for record in records:
-            record["schema"] = "structure-guard/2"
+            record["schema"] = "structure-guard/3"
 
     def missing_guard_field(records: list[dict[str, Any]]) -> None:
         records[0].pop("root_identity")
@@ -14943,6 +15042,40 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     def leaked_guard_environment_value(records: list[dict[str, Any]]) -> None:
         records[0]["admitted_environment"]["admitted_names"] = ["/secret/path"]
 
+    # The D18 scope mutants (bead `fln-q8qt`). The first is the defect the bead reports —
+    # the object simply not being there — and the rest are the ways an object CAN be
+    # there and still not qualify the verdict beside it. Each violates exactly one law,
+    # so a law that stops being checked is a mutant that stops dying.
+    def absent_guard_mode_closure(records: list[dict[str, Any]]) -> None:
+        records[1].pop("mode_closure")
+
+    def unregistered_guard_scan_class(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"]["scan_class"] = "clean"
+
+    def guard_vacuity_lie(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"]["scan_class"] = "traversed"
+
+    def guard_nodes_without_a_closure(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"]["closure_nodes"] = 3
+
+    def guard_closure_without_nodes(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"].update(
+            {
+                "scan_class": "traversed",
+                "product_roots": 1,
+                "closures_scanned": 1,
+                "closure_nodes": 0,
+            }
+        )
+
+    def guard_closure_without_a_root(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"].update(
+            {"scan_class": "traversed", "closures_scanned": 1, "closure_nodes": 1}
+        )
+
+    def guard_scope_over_a_foreign_workspace(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"]["nodes"] = 2
+
     guard_mutants = [
         ("old-schema", old_guard_schema),
         ("missing-field", missing_guard_field),
@@ -14953,6 +15086,13 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         ("false-root-equality", false_guard_root_equality),
         ("unbound-compiler", unbound_guard_compiler),
         ("environment-value", leaked_guard_environment_value),
+        ("mode-closure-absent", absent_guard_mode_closure),
+        ("mode-closure-unregistered-class", unregistered_guard_scan_class),
+        ("mode-closure-vacuity-lie", guard_vacuity_lie),
+        ("mode-closure-nodes-without-a-closure", guard_nodes_without_a_closure),
+        ("mode-closure-closure-without-nodes", guard_closure_without_nodes),
+        ("mode-closure-closure-without-a-root", guard_closure_without_a_root),
+        ("mode-closure-foreign-workspace", guard_scope_over_a_foreign_workspace),
     ]
     for mutant_name, mutate in guard_mutants:
         mutant = write_guard_stream(mutant_name, mutate)
@@ -14964,7 +15104,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             raise EvidenceError(f"structure-guard validator survived mutant {mutant_name}")
     cases.append(
         {
-            "case": "structure_guard_v3_contract",
+            "case": "structure_guard_v4_contract",
             "ok": True,
             "mutants_killed": [name for name, _mutate in guard_mutants],
         }

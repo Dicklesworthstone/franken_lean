@@ -4,6 +4,7 @@
 
 use crate::NDJSON_SCHEMA;
 use crate::checks::{AUTHORITY_COUNT_RULE, Finding, RunOutcome};
+use crate::mode_closure::ModeClosureFacts;
 
 /// FNV-1a 64-bit — a dependency-free content digest for run provenance. Labeled as
 /// `fnv1a64` in output; not a cryptographic hash (fln-hash owns those, later).
@@ -43,6 +44,19 @@ pub fn render_human(root_display: &str, outcome: &RunOutcome) -> String {
         outcome.contract_handoff_root.as_deref().unwrap_or("unavailable"),
         outcome.governed_root_after,
     ));
+    // The human reader has the same problem the robot reader had: a verdict with no
+    // scope beside it. Same facts, same derivation, one line up from the verdict.
+    let d18 = &outcome.mode_closure;
+    out.push_str(&format!(
+        "structure-guard: d18-mode-closure scan={} product-roots={} closures-scanned={} closure-nodes={} frontier-surfaces={} nodes={} edges={}\n",
+        d18.scan_class(),
+        d18.product_roots,
+        d18.closures_scanned,
+        d18.closure_nodes,
+        d18.frontier_surfaces,
+        d18.nodes,
+        d18.edges,
+    ));
     for f in &outcome.findings {
         out.push_str(&format!("{} {}: {}\n", f.code, f.path, f.detail));
     }
@@ -67,6 +81,28 @@ fn optional_json_string(value: Option<&str>) -> String {
     value.map_or_else(
         || "null".to_string(),
         |value| format!("\"{}\"", json_escape(value)),
+    )
+}
+
+/// The D18 mode-closure scope, rendered beside the verdict it qualifies (bead
+/// `fln-q8qt`).
+///
+/// The counts existed on `RunOutcome` from the day D18 was registered and only the test
+/// binary could read them, so a reader of a guard run saw `verdict=pass` with no way to
+/// learn that the D18 check had traversed nothing at all. Emitting them here puts the
+/// scope of the pass at the point the pass is read; `scan_class` is derived from
+/// `closures_scanned` rather than stored, and a consumer re-checks that law against these
+/// same numbers.
+fn mode_closure_json(facts: &ModeClosureFacts) -> String {
+    format!(
+        "{{\"scan_class\":\"{}\",\"frontier_surfaces\":{},\"product_roots\":{},\"closures_scanned\":{},\"closure_nodes\":{},\"nodes\":{},\"edges\":{}}}",
+        facts.scan_class(),
+        facts.frontier_surfaces,
+        facts.product_roots,
+        facts.closures_scanned,
+        facts.closure_nodes,
+        facts.nodes,
+        facts.edges,
     )
 }
 
@@ -108,7 +144,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
     ));
     lines.extend(outcome.findings.iter().map(finding_ndjson));
     lines.push(format!(
-        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"authority\":\"{}\",\"contract_handoff_root\":{},\"traversal\":{{\"directories_visited\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped_unreadable\":{}}},\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":{},\"governed_root_before\":\"fnv1a64:{:016x}\",\"governed_root_after\":\"fnv1a64:{:016x}\",\"governed_root_unchanged\":{},\"duration_ms\":{duration_ms}}}",
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"authority\":\"{}\",\"contract_handoff_root\":{},\"traversal\":{{\"directories_visited\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped_unreadable\":{}}},\"mode_closure\":{},\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":{},\"governed_root_before\":\"fnv1a64:{:016x}\",\"governed_root_after\":\"fnv1a64:{:016x}\",\"governed_root_unchanged\":{},\"duration_ms\":{duration_ms}}}",
         outcome.verdict(),
         outcome.exit_code(),
         outcome.findings.len(),
@@ -118,6 +154,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
         outcome.traversal.files_discovered,
         outcome.traversal.files_scanned,
         outcome.traversal.files_skipped_unreadable,
+        mode_closure_json(&outcome.mode_closure),
         outcome.traversal.count_rule_holds(),
         outcome.governed_root_before,
         outcome.governed_root_after,
@@ -131,7 +168,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
 pub fn render_setup_failure_ndjson(root_display: &str, error: &str, duration_ms: u128) -> String {
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"contract_handoff_root\":null,\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(root_display),
         json_escape(error)
     )
@@ -142,7 +179,7 @@ pub fn render_setup_failure_ndjson(root_display: &str, error: &str, duration_ms:
 pub fn render_cli_failure_ndjson(root_display: &str, error: &str, duration_ms: u128) -> String {
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"contract_handoff_root\":null,\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(root_display),
         json_escape(error)
     )
@@ -154,7 +191,7 @@ pub fn render_help_ndjson(usage: &str, duration_ms: u128) -> String {
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":null,\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
          {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"help\",\"usage\":\"{}\"}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"authority\":\"not_applicable\",\"contract_handoff_root\":null,\"traversal\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"authority\":\"not_applicable\",\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(usage)
     )
 }
@@ -172,6 +209,44 @@ mod tests {
     #[test]
     fn escaping() {
         assert_eq!(json_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    /// The D18 scope must be a function of the facts, not a constant.
+    ///
+    /// The live workspace scan is vacuous — no crate declares a mode-bound product root —
+    /// so every real run today renders `"scan_class":"vacuous"`. A renderer that
+    /// hardcoded that word, or that transcribed the wrong count into the wrong key, would
+    /// be indistinguishable from a correct one against the real workspace. These two
+    /// cases are the only place the traversed rendering exists at all, which is why they
+    /// carry distinct non-equal numbers in every field.
+    #[test]
+    fn the_rendered_d18_scope_tracks_the_facts_rather_than_a_constant() {
+        let vacuous = ModeClosureFacts {
+            frontier_surfaces: 1,
+            product_roots: 0,
+            closures_scanned: 0,
+            closure_nodes: 0,
+            nodes: 33,
+            edges: 28,
+        };
+        assert_eq!(
+            mode_closure_json(&vacuous),
+            "{\"scan_class\":\"vacuous\",\"frontier_surfaces\":1,\"product_roots\":0,\
+             \"closures_scanned\":0,\"closure_nodes\":0,\"nodes\":33,\"edges\":28}"
+        );
+        let traversed = ModeClosureFacts {
+            frontier_surfaces: 2,
+            product_roots: 3,
+            closures_scanned: 4,
+            closure_nodes: 5,
+            nodes: 6,
+            edges: 7,
+        };
+        assert_eq!(
+            mode_closure_json(&traversed),
+            "{\"scan_class\":\"traversed\",\"frontier_surfaces\":2,\"product_roots\":3,\
+             \"closures_scanned\":4,\"closure_nodes\":5,\"nodes\":6,\"edges\":7}"
+        );
     }
 
     #[test]

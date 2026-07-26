@@ -45,7 +45,11 @@ use crate::graph::GraphFile;
 /// read as "a frontier node was traversed".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModeClosureFacts {
-    /// Crates carrying a declared frontier surface, derived from real Cargo features.
+    /// Nodes whose SUBMITTED requirement is `FrontierOnly`, derived from real Cargo
+    /// features. Counted after the product-root override rather than before it: a crate
+    /// that declares both a frontier feature and a mode-bound product root is submitted
+    /// as `ModeBound`, so counting it as a frontier surface would publish a number that
+    /// does not describe the request the core actually received.
     pub frontier_surfaces: usize,
     /// Product roots that declare a mode binding. Zero means nothing was scanned.
     pub product_roots: usize,
@@ -65,6 +69,21 @@ impl ModeClosureFacts {
     /// distinguish this from a scan that traversed a closure and found it clean.
     pub const fn is_vacuous(&self) -> bool {
         self.closures_scanned == 0
+    }
+
+    /// The scope word carried into the robot artifact beside the counts (bead
+    /// `fln-q8qt`).
+    ///
+    /// It is derived from [`Self::is_vacuous`] rather than stored, so the word and the
+    /// counts cannot disagree at the source. A consumer re-checks the same law against
+    /// the emitted numbers, which is what makes a hand-edited artifact fail rather than
+    /// read as an enforced pass.
+    pub const fn scan_class(&self) -> &'static str {
+        if self.is_vacuous() {
+            "vacuous"
+        } else {
+            "traversed"
+        }
     }
 }
 
@@ -291,13 +310,17 @@ pub fn audit_with_facts(
         let features = declared_features(manifest);
 
         let mut requirement = derive_requirement(&features);
-        if matches!(requirement, StructuralModeRequirement::FrontierOnly(_)) {
-            facts.frontier_surfaces += 1;
-        }
         if let Some(mode) = declared_product_root(manifest) {
             facts.product_roots += 1;
             requirement = StructuralModeRequirement::ModeBound(mode);
             roots_by_mode.entry(mode.tag()).or_default().push(id);
+        }
+        // Counted from the FINAL requirement, after the override above. Counting the
+        // pre-override classification published a frontier surface for a node that was
+        // submitted as `ModeBound`, i.e. a disclosed number describing a request the
+        // core never received.
+        if matches!(requirement, StructuralModeRequirement::FrontierOnly(_)) {
+            facts.frontier_surfaces += 1;
         }
 
         nodes.push(ModeClosureNode {
@@ -600,6 +623,45 @@ mod tests {
             facts.closure_nodes, 1,
             "only the root itself is reachable, so only it is submitted"
         );
+    }
+
+    /// The disclosed frontier count must describe the request the core received, not an
+    /// intermediate classification the derivation then discarded. A crate declaring both
+    /// a frontier feature and a mode-bound product root is submitted as `ModeBound`.
+    #[test]
+    fn a_frontier_feature_on_a_product_root_is_not_counted_as_a_frontier_surface() {
+        let m = manifests(
+            "# fln-product-root: frontier\n# fln-mode-provenance: frontier\n[features]\niron = []\n",
+            "# fln-mode-provenance: neutral\n",
+        );
+        let graph = crate::graph::parse(GRAPH).expect("fixture graph parses");
+        let (_, facts) = audit_with_facts(&graph, &m);
+        assert_eq!(facts.product_roots, 1);
+        assert_eq!(
+            facts.frontier_surfaces, 0,
+            "the root was submitted as ModeBound, so publishing it as a frontier surface \
+             would disclose a count for a request the core never received"
+        );
+    }
+
+    /// The scope word and the counts are one fact, not two. A consumer re-checks this
+    /// law against the emitted numbers, so it must hold at the source in both directions.
+    #[test]
+    fn the_scan_class_agrees_with_the_closure_count_in_both_directions() {
+        let vacuous = ModeClosureFacts {
+            nodes: 33,
+            edges: 28,
+            ..ModeClosureFacts::default()
+        };
+        assert!(vacuous.is_vacuous());
+        assert_eq!(vacuous.scan_class(), "vacuous");
+        let traversed = ModeClosureFacts {
+            closures_scanned: 1,
+            closure_nodes: 2,
+            ..vacuous.clone()
+        };
+        assert!(!traversed.is_vacuous());
+        assert_eq!(traversed.scan_class(), "traversed");
     }
 
     #[test]

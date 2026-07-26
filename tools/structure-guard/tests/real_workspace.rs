@@ -25,7 +25,7 @@ fn assert_versioned_robot_lines(stdout: &str, expected_lines: usize) {
     assert!(
         lines
             .iter()
-            .all(|line| line.contains("\"schema\":\"structure-guard/3\"")),
+            .all(|line| line.contains("\"schema\":\"structure-guard/4\"")),
         "robot output used the wrong schema: {stdout}"
     );
 }
@@ -112,6 +112,91 @@ fn robot_real_workspace_binds_complete_authority_evidence() {
     assert!(stdout.contains("\"authority_count_rule_holds\":true"));
     assert!(stdout.contains("\"governed_root_unchanged\":true"));
     assert!(stdout.contains("\"verdict\":\"pass\""));
+}
+
+/// A `usize` field of a flat JSON object, without a JSON dependency (D1 applies to the
+/// apparatus). Returns `None` when the key is absent, so a missing field fails loudly at
+/// the assertion rather than defaulting to zero and satisfying the conservation laws.
+fn u64_field(object: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\":");
+    let rest = &object[object.find(&needle)? + needle.len()..];
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    rest[..end].parse().ok()
+}
+
+/// The D18 mode-closure scope must reach the artifact a reader actually reads, and the
+/// numbers in it must be mutually consistent (bead `fln-q8qt`).
+///
+/// The facts existed on `RunOutcome` from the day D18 was registered and only the test
+/// binary could observe them, so `verdict=pass` carried no way to learn that the D18
+/// check had traversed nothing at all. This asserts against the terminal `run_end`
+/// RECORD, not against the whole stream: an assertion scoped to the file would be
+/// satisfied by the object appearing in any line, which is the wrong-scope shape this
+/// repository has now produced several times.
+///
+/// The counts are deliberately not pinned. Today's live scan is vacuous — no crate
+/// declares a mode-bound product root — and pinning `"scan_class":"vacuous"` would turn
+/// red on whoever lands the first product binary, for doing exactly the right thing. The
+/// laws below hold in both scopes, so they survive that transition and still refuse an
+/// artifact whose scope word and counts disagree.
+#[test]
+fn the_terminal_record_discloses_the_d18_scope_of_the_verdict_it_carries() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let output = run_cli(&[
+        "--root",
+        root.to_str().expect("workspace root is UTF-8"),
+        "--robot",
+    ]);
+    let stdout = String::from_utf8(output.stdout).expect("robot stdout is UTF-8");
+    let terminal = stdout.lines().last().expect("robot stream is non-empty");
+    assert!(
+        terminal.contains("\"event\":\"run_end\""),
+        "last record is not the terminal one: {terminal}"
+    );
+    let start = terminal
+        .find("\"mode_closure\":{")
+        .unwrap_or_else(|| panic!("run_end carries no D18 scope: {terminal}"));
+    let object = &terminal[start..];
+    let object = &object[..object.find('}').expect("mode_closure object is closed") + 1];
+
+    let scanned = u64_field(object, "closures_scanned").expect("closures_scanned");
+    let closure_nodes = u64_field(object, "closure_nodes").expect("closure_nodes");
+    let product_roots = u64_field(object, "product_roots").expect("product_roots");
+    let frontier_surfaces = u64_field(object, "frontier_surfaces").expect("frontier_surfaces");
+    let nodes = u64_field(object, "nodes").expect("nodes");
+
+    let vacuous = object.contains("\"scan_class\":\"vacuous\"");
+    let traversed = object.contains("\"scan_class\":\"traversed\"");
+    assert!(
+        vacuous ^ traversed,
+        "scan class must be exactly one of the two registered words: {object}"
+    );
+    assert_eq!(
+        vacuous,
+        scanned == 0,
+        "the scope word and the closure count describe the same fact and disagree: \
+         {object}"
+    );
+    assert!(
+        scanned <= product_roots,
+        "a mode is only scanned when a product declares a root for it: {object}"
+    );
+    assert!(
+        if scanned == 0 {
+            closure_nodes == 0
+        } else {
+            closure_nodes >= scanned
+        },
+        "a scanned closure contains at least its own root, and an unscanned one \
+         submits nothing: {object}"
+    );
+    assert!(
+        product_roots <= nodes && frontier_surfaces <= nodes,
+        "a crate cannot be counted more than once per axis: {object}"
+    );
 }
 
 #[test]

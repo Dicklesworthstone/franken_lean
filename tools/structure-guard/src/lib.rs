@@ -99,4 +99,10 @@ pub const CONTRACT_HANDOFF_CANDIDATE_FILE: &str = "contracts/CONTRACT_HANDOFF.tx
 /// Interrupted kernel-ownership publication. Presence makes evidence authority inconclusive.
 pub const KERNEL_OWNERSHIP_CANDIDATE_FILE: &str = "ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate";
 /// NDJSON schema identifier for robot output.
-pub const NDJSON_SCHEMA: &str = "structure-guard/3";
+///
+/// `/4` adds the terminal `mode_closure` object (bead `fln-q8qt`). The version moves
+/// because the contract is an EXACT key set — `evidence.py:require_guard_keys` compares
+/// `set(record) != expected` — so a consumer pinned to `/3` is broken by an added key
+/// exactly as it is by a removed one. A schema id that stayed put while its exact key set
+/// moved would be a version claiming to describe a shape it no longer describes.
+pub const NDJSON_SCHEMA: &str = "structure-guard/4";
