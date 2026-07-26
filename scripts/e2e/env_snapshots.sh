@@ -901,7 +901,7 @@ run_structured_positive_step environment_state \
   validate-environment-state
 run_structured_positive_step declaration_admission \
   environment::tests::declaration_admission_e2e_emits_detailed_real_path_evidence \
-  '{"schema":"fln.e2e.declaration-admission","version":1' 19 \
+  '{"schema":"fln.e2e.declaration-admission' 19 \
   validate-declaration-admission
 run_structured_positive_step extension_merge_refusals \
   extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence \
