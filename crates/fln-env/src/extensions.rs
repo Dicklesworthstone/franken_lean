@@ -9542,4 +9542,452 @@ mod tests {
             descriptor_refusals.len(),
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // The SetUnion case table (bead dt5): the nine case shapes the criteria name, bound
+    // to COMPUTED PREDICATES over the fixtures rather than to fixture names.
+    //
+    // # Why predicates and not names
+    //
+    // Measured at bd13cd96 while baselining the next mutant: the file's existing
+    // hand-written table, `set_union_keeps_raw_replay_lossless_and_projects_exact_semantics`,
+    // does NOT kill a mutant that sorts entries inside a suffix block. Its five fixtures
+    // have suffix blocks that are single-element or already in order, so sorting them is
+    // the identity. The table names its cases in comments and every comment is true; no
+    // fixture exercises within-block order. That is a hand-listed scope one abstraction
+    // down from the one `AGENTS.md` records — a case list that names a class it does not
+    // reach.
+    //
+    // So each shape below is a predicate evaluated against the fixture data and the
+    // product, and coverage is set EQUALITY against the closed dimension. A fixture edit
+    // that destroys a property fails, and a shape nothing exhibits fails.
+    // ---------------------------------------------------------------------------
+
+    /// The SetUnion case shapes the criteria enumerate, plus one they do not.
+    ///
+    /// `UnsortedSuffixBlock` is the addition, and it is here because it was **measured**
+    /// missing rather than reasoned into the list: it is the property that discriminates
+    /// a within-block sort, and no existing fixture had it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum SetUnionCoverage {
+        OneSuffixPrefixesTheOther,
+        EqualSuffixBlocks,
+        EmptySuffixBlock,
+        DuplicatesInBase,
+        DuplicatesWithinASuffix,
+        DuplicatesAcrossSuffixes,
+        PayloadEqualEntriesWithDifferingProvenance,
+        BranchPermutation,
+        InjectedHashCollision,
+        UnsortedSuffixBlock,
+    }
+
+    impl CaseDimension for SetUnionCoverage {
+        const FIRST: Self = SetUnionCoverage::OneSuffixPrefixesTheOther;
+        const COUNT: usize = 10;
+        fn succ(self) -> Option<Self> {
+            match self {
+                SetUnionCoverage::OneSuffixPrefixesTheOther => {
+                    Some(SetUnionCoverage::EqualSuffixBlocks)
+                }
+                SetUnionCoverage::EqualSuffixBlocks => Some(SetUnionCoverage::EmptySuffixBlock),
+                SetUnionCoverage::EmptySuffixBlock => Some(SetUnionCoverage::DuplicatesInBase),
+                SetUnionCoverage::DuplicatesInBase => {
+                    Some(SetUnionCoverage::DuplicatesWithinASuffix)
+                }
+                SetUnionCoverage::DuplicatesWithinASuffix => {
+                    Some(SetUnionCoverage::DuplicatesAcrossSuffixes)
+                }
+                SetUnionCoverage::DuplicatesAcrossSuffixes => {
+                    Some(SetUnionCoverage::PayloadEqualEntriesWithDifferingProvenance)
+                }
+                SetUnionCoverage::PayloadEqualEntriesWithDifferingProvenance => {
+                    Some(SetUnionCoverage::BranchPermutation)
+                }
+                SetUnionCoverage::BranchPermutation => {
+                    Some(SetUnionCoverage::InjectedHashCollision)
+                }
+                SetUnionCoverage::InjectedHashCollision => {
+                    Some(SetUnionCoverage::UnsortedSuffixBlock)
+                }
+                SetUnionCoverage::UnsortedSuffixBlock => None,
+            }
+        }
+    }
+
+    /// One merge's `(raw, semantic)` payload views.
+    type SetUnionProduct = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    struct SetUnionCase {
+        name: &'static str,
+        base: Vec<Vec<u8>>,
+        ours_suffix: Vec<Vec<u8>>,
+        theirs_suffix: Vec<Vec<u8>>,
+        /// Two byte-distinct payloads in this case that collide under
+        /// [`colliding_test_hash`], as `(in_ours, in_theirs)`.
+        collision: Option<(Vec<u8>, Vec<u8>)>,
+    }
+
+    /// A deliberately terrible hash: every payload of the same length collides.
+    ///
+    /// The criteria say hashes "may accelerate comparison but may not decide equality or
+    /// ordering without an exact tie-break", which is a claim about what happens **when a
+    /// hash ties**. A real digest will not collide on demand, so the collision has to be
+    /// injected; this is the injection.
+    fn colliding_test_hash(payload: &[u8]) -> u64 {
+        payload.len() as u64
+    }
+
+    fn has_internal_duplicate(entries: &[Vec<u8>]) -> bool {
+        entries
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| entries[..index].contains(entry))
+    }
+
+    fn is_unsorted(entries: &[Vec<u8>]) -> bool {
+        entries.windows(2).any(|pair| pair[0] > pair[1])
+    }
+
+    fn is_proper_prefix(shorter: &[Vec<u8>], longer: &[Vec<u8>]) -> bool {
+        !shorter.is_empty() && shorter.len() < longer.len() && longer[..shorter.len()] == *shorter
+    }
+
+    /// Which named shapes this case actually exhibits, computed from the fixture and the
+    /// product it produced.
+    fn set_union_case_coverage(
+        case: &SetUnionCase,
+        raw: &[Vec<u8>],
+        semantic: &[Vec<u8>],
+        collision_verified: bool,
+    ) -> BTreeSet<SetUnionCoverage> {
+        let mut coverage = BTreeSet::new();
+        let ours = case.ours_suffix.as_slice();
+        let theirs = case.theirs_suffix.as_slice();
+
+        if is_proper_prefix(ours, theirs) || is_proper_prefix(theirs, ours) {
+            coverage.insert(SetUnionCoverage::OneSuffixPrefixesTheOther);
+        }
+        if !ours.is_empty() && ours == theirs {
+            coverage.insert(SetUnionCoverage::EqualSuffixBlocks);
+        }
+        if ours.is_empty() || theirs.is_empty() {
+            coverage.insert(SetUnionCoverage::EmptySuffixBlock);
+        }
+        if has_internal_duplicate(&case.base) {
+            coverage.insert(SetUnionCoverage::DuplicatesInBase);
+        }
+        if has_internal_duplicate(ours) || has_internal_duplicate(theirs) {
+            coverage.insert(SetUnionCoverage::DuplicatesWithinASuffix);
+        }
+        if ours.iter().any(|entry| theirs.contains(entry)) {
+            coverage.insert(SetUnionCoverage::DuplicatesAcrossSuffixes);
+        }
+        // Provenance in the raw sequence is POSITION: the criteria's "payload-equal
+        // entries with differing provenance" are entries whose bytes are equal and whose
+        // place in the replay is not. Computed over the PRODUCT rather than the inputs,
+        // which is what makes it a different claim from the cross-suffix one above — a
+        // within-suffix duplicate exhibits it too.
+        let payload_equal_at_distinct_positions = raw.iter().enumerate().any(|(index, entry)| {
+            raw[..index].contains(entry)
+                && semantic.iter().filter(|kept| *kept == entry).count() == 1
+        });
+        if payload_equal_at_distinct_positions {
+            coverage.insert(SetUnionCoverage::PayloadEqualEntriesWithDifferingProvenance);
+        }
+        // A permutation only tests anything when swapping the branches changes the input.
+        if ours != theirs {
+            coverage.insert(SetUnionCoverage::BranchPermutation);
+        }
+        if collision_verified {
+            coverage.insert(SetUnionCoverage::InjectedHashCollision);
+        }
+        if is_unsorted(ours) || is_unsorted(theirs) {
+            coverage.insert(SetUnionCoverage::UnsortedSuffixBlock);
+        }
+        coverage
+    }
+
+    fn set_union_cases() -> Vec<SetUnionCase> {
+        let payload = |text: &str| text.as_bytes().to_vec();
+        vec![
+            SetUnionCase {
+                name: "base duplicates, a cross-suffix duplicate, one suffix a proper prefix",
+                base: vec![payload("base"), payload("base")],
+                ours_suffix: vec![payload("x")],
+                theirs_suffix: vec![payload("x"), payload("y")],
+                collision: None,
+            },
+            SetUnionCase {
+                name: "duplicates inside one suffix block",
+                base: vec![payload("base")],
+                ours_suffix: vec![payload("a"), payload("a")],
+                theirs_suffix: vec![payload("z")],
+                collision: None,
+            },
+            SetUnionCase {
+                name: "equal suffix blocks, both retained",
+                base: vec![payload("base")],
+                ours_suffix: vec![payload("q"), payload("r")],
+                theirs_suffix: vec![payload("q"), payload("r")],
+                collision: None,
+            },
+            SetUnionCase {
+                name: "one branch did not move — an empty suffix block",
+                base: vec![payload("base")],
+                ours_suffix: vec![payload("only")],
+                theirs_suffix: vec![],
+                collision: None,
+            },
+            SetUnionCase {
+                name: "an unsorted suffix block keeps its recorded order",
+                base: vec![],
+                ours_suffix: vec![payload("z"), payload("a")],
+                theirs_suffix: vec![payload("m")],
+                collision: None,
+            },
+            SetUnionCase {
+                name: "a hash collision decides neither equality nor branch order",
+                base: vec![],
+                ours_suffix: vec![payload("bb")],
+                theirs_suffix: vec![payload("aa")],
+                collision: Some((payload("bb"), payload("aa"))),
+            },
+        ]
+    }
+
+    /// **The SetUnion case table**: the raw-order law over every named case shape, under
+    /// both provenance classes, with branch permutation checked on every case.
+    ///
+    /// # What it discharges
+    ///
+    /// The clause "SetUnion cases include one suffix prefixing the other, equal and empty
+    /// blocks, duplicates in base/each suffix/across suffixes, payload-equal entries with
+    /// differing provenance, branch permutation, and injected hash collisions" — as
+    /// computed coverage rather than as fixture names, so a case that stops exhibiting its
+    /// shape fails.
+    ///
+    /// # "differing provenance" is ambiguous, so both readings are covered
+    ///
+    /// The phrase can mean the entry's place in the replay, or the descriptor's
+    /// `PayloadProvenance`. The bead body's own sentence — "provenance remains
+    /// byte-exact" — is about the replay, so that is the reading the coverage predicate
+    /// takes. The other is not left out: the whole table runs under **both**
+    /// `PayloadProvenance` classes and the raw and semantic products must be identical
+    /// across them, while `supports_fine_invalidation` must differ. Provenance changes
+    /// what may be seen through, never what is kept.
+    ///
+    /// # What it does not discharge
+    ///
+    /// This is the completing path. SetUnion *refusal* under limits is
+    /// `set_union_limits_are_independent_atomic_and_recoverable`'s and
+    /// `merge_refuses_at_its_own_early_stage_not_inside_the_projection`'s. The productive
+    /// 1/8/32 matrix is separate.
+    #[test]
+    fn the_set_union_case_table_covers_every_named_shape_by_computed_predicate() {
+        let cases = set_union_cases();
+        let mut observed: BTreeSet<SetUnionCoverage> = BTreeSet::new();
+        let mut per_case: Vec<(&'static str, usize)> = Vec::new();
+
+        for case in &cases {
+            let mut products_by_provenance: Vec<SetUnionProduct> = Vec::new();
+
+            for provenance in PayloadProvenance::all() {
+                let contract = descriptor(MergeSemantics::SetUnion, provenance);
+                let base = state_from_model(&contract, &case.base);
+                let ours = state_from_model(
+                    &contract,
+                    &[case.base.clone(), case.ours_suffix.clone()].concat(),
+                );
+                let theirs = state_from_model(
+                    &contract,
+                    &[case.base.clone(), case.theirs_suffix.clone()].concat(),
+                );
+                let inputs_before = (base.clone(), ours.clone(), theirs.clone());
+                let label = format!("{} [{provenance:?}]", case.name);
+
+                let merged = merge_with_test_limits(&base, &ours, &theirs)
+                    .unwrap_or_else(|_| unreachable!("{label}: valid SetUnion histories merge"));
+                let swapped = merge_with_test_limits(&base, &theirs, &ours)
+                    .unwrap_or_else(|_| unreachable!("{label}: the permutation also merges"));
+
+                let raw = raw_payloads(&merged);
+                let semantic = semantic_payloads(&merged);
+
+                // The independent model of the raw-order law.
+                assert_eq!(
+                    raw,
+                    canonical_set_union_raw_model(
+                        &case.base,
+                        &case.ours_suffix,
+                        &case.theirs_suffix
+                    ),
+                    "{label}: raw order is base, then the lesser suffix block, then the \
+                     greater one"
+                );
+                assert_eq!(
+                    semantic,
+                    stable_unique_model(&raw),
+                    "{label}: the semantic view is first occurrence by exact payload bytes"
+                );
+
+                // Nothing is removed and nothing is reordered inside a block. Stated
+                // separately from the model because these are the bead's own words and a
+                // model equality alone does not say which law it encodes.
+                assert_eq!(
+                    raw.len(),
+                    case.base.len() + case.ours_suffix.len() + case.theirs_suffix.len(),
+                    "{label}: never remove raw duplicates — every admitted entry stays \
+                     replay evidence"
+                );
+                assert_eq!(
+                    &raw[..case.base.len()],
+                    case.base.as_slice(),
+                    "{label}: the validated common base is preserved verbatim and first"
+                );
+                let (first_block, second_block) = if case.ours_suffix <= case.theirs_suffix {
+                    (&case.ours_suffix, &case.theirs_suffix)
+                } else {
+                    (&case.theirs_suffix, &case.ours_suffix)
+                };
+                let split = case.base.len() + first_block.len();
+                assert_eq!(
+                    &raw[case.base.len()..split],
+                    first_block.as_slice(),
+                    "{label}: never sort or interleave entries inside a suffix block"
+                );
+                assert_eq!(
+                    &raw[split..],
+                    second_block.as_slice(),
+                    "{label}: the greater block follows intact"
+                );
+
+                // Branch permutation: the product is order-free.
+                assert_eq!(
+                    raw_payloads(&swapped),
+                    raw,
+                    "{label}: swapping the branches must not move a byte"
+                );
+                assert_eq!(
+                    merged.content_digest(),
+                    swapped.content_digest(),
+                    "{label}: and must not move the root"
+                );
+                assert_eq!(
+                    (base, ours, theirs),
+                    inputs_before,
+                    "{label}: a completed merge leaves every input unchanged"
+                );
+
+                // The injected collision, verified rather than asserted to exist.
+                let collision_verified = match &case.collision {
+                    None => false,
+                    Some((left, right)) => {
+                        assert_ne!(
+                            left, right,
+                            "{label}: a collision pair must be byte-DISTINCT, or it \
+                             demonstrates nothing"
+                        );
+                        assert_eq!(
+                            colliding_test_hash(left),
+                            colliding_test_hash(right),
+                            "{label}: the pair must actually collide under the injected \
+                             hash, or the case is not testing a tie"
+                        );
+                        assert!(
+                            semantic.contains(left) && semantic.contains(right),
+                            "{label}: equality is exact bytes — a hash tie may not merge \
+                             two distinct payloads into one"
+                        );
+                        // The tie has to land on the comparison that DECIDES branch order,
+                        // or it is a collision somewhere harmless.
+                        assert_eq!(
+                            case.ours_suffix.first(),
+                            Some(left),
+                            "{label}: the colliding pair must be the entries the branch-order \
+                             comparison starts on"
+                        );
+                        assert_eq!(case.theirs_suffix.first(), Some(right), "{label}");
+
+                        // The discriminating assertion, and it is stated as what must NOT
+                        // happen so it cannot be satisfied circularly. A comparator that
+                        // let the tied hash decide would report Equal, and `Equal` keeps
+                        // (ours, theirs) — so the product would be base ++ ours ++ theirs.
+                        // Byte order says otherwise, and byte order must win.
+                        let hash_tie_order: Vec<Vec<u8>> = [
+                            case.base.clone(),
+                            case.ours_suffix.clone(),
+                            case.theirs_suffix.clone(),
+                        ]
+                        .concat();
+                        assert_ne!(
+                            raw, hash_tie_order,
+                            "{label}: with the hash tied, an ordering that consulted it \
+                             would keep (ours, theirs); the exact byte tie-break must \
+                             override that"
+                        );
+                        true
+                    }
+                };
+
+                if let Some((previous_raw, previous_semantic)) = products_by_provenance.first() {
+                    assert_eq!(
+                        (&raw, &semantic),
+                        (previous_raw, previous_semantic),
+                        "{label}: provenance changes what may be seen THROUGH, never what \
+                         is kept"
+                    );
+                }
+                products_by_provenance.push((raw.clone(), semantic.clone()));
+
+                let coverage = set_union_case_coverage(case, &raw, &semantic, collision_verified);
+                assert!(
+                    coverage.len() < SetUnionCoverage::COUNT,
+                    "{label}: a case that exhibits every shape at once means a predicate \
+                     is trivially true"
+                );
+                per_case.push((case.name, coverage.len()));
+                observed.extend(coverage);
+            }
+
+            assert_eq!(
+                products_by_provenance.len(),
+                PayloadProvenance::COUNT,
+                "{}: every provenance class must be exercised",
+                case.name
+            );
+        }
+
+        // Provenance decides fine invalidation and nothing else about the product.
+        let understood = ExtensionState::new(descriptor(
+            MergeSemantics::SetUnion,
+            PayloadProvenance::Understood,
+        ));
+        let opaque = ExtensionState::new(descriptor(
+            MergeSemantics::SetUnion,
+            PayloadProvenance::Opaque,
+        ));
+        assert!(understood.supports_fine_invalidation());
+        assert!(!opaque.supports_fine_invalidation());
+
+        let declared: BTreeSet<SetUnionCoverage> = SetUnionCoverage::all().into_iter().collect();
+        assert_eq!(
+            observed, declared,
+            "every named SetUnion shape must be exhibited by some fixture, and no shape \
+             may sit in the dimension with nothing reaching it — checked as set equality, \
+             so both failures are visible"
+        );
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.extension-merge-validation-table\",\"version\":1,\
+             \"bead\":\"fln-extension-merge-validation-proof-debt-dt5\",\
+             \"claim_type\":\"bounded_model\",\"table\":\"set_union_shapes\",\
+             \"cases\":{},\"provenance_classes\":{},\"declared_shapes\":{},\
+             \"observed_shapes\":{},\"shapes_per_case\":{per_case:?},\"status\":\"pass\"}}",
+            cases.len(),
+            PayloadProvenance::COUNT,
+            declared.len(),
+            observed.len(),
+        );
+    }
 }
