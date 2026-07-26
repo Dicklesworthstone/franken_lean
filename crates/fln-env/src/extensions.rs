@@ -8095,4 +8095,674 @@ mod tests {
         );
         assert_eq!(facts.maximum_entry_bytes, 5);
     }
+
+    // ---------------------------------------------------------------------------
+    // UNIT AND MODEL TABLES for merge validation
+    // (bead `fln-extension-merge-validation-proof-debt-dt5`).
+    //
+    // These discharge the acceptance paragraph beginning "Unit tables and independent
+    // generated models cover ...". Each table names the clause it answers, and where it
+    // answers only part of one it says which part.
+    //
+    // # Why every dimension here is generated rather than listed
+    //
+    // The clause says "every invalid prefix class" and "all merge policies". A
+    // hand-written table satisfies wording like that at the instant it is written and
+    // stops satisfying it, silently, the moment a variant or a field is added — the
+    // hand-listed-scope defect `AGENTS.md` records, and the reason this bead exists at
+    // all. So every dimension below is either walked from a successor chain, so a new
+    // variant fails to compile until it joins, or recovered from the fixture data by a
+    // computed predicate, so a fixture that stops exhibiting its property fails.
+    // ---------------------------------------------------------------------------
+
+    /// A closed set of case values, walked from a successor chain.
+    ///
+    /// Factored from the `succ_merge_semantics` idiom already in this file rather than
+    /// re-rolled per dimension. `succ` forces a new variant to join the chain — the
+    /// exhaustive match stops compiling — and `COUNT` is checked in *both* directions by
+    /// [`CaseDimension::all`], because a chain that is too long and one that orphans a
+    /// variant are different mistakes and only the second is caught by an upper bound.
+    trait CaseDimension: Copy + PartialEq + std::fmt::Debug + Sized {
+        const FIRST: Self;
+        const COUNT: usize;
+
+        fn succ(self) -> Option<Self>;
+
+        fn all() -> Vec<Self> {
+            let mut values: Vec<Self> = Vec::with_capacity(Self::COUNT);
+            let mut next = Some(Self::FIRST);
+            while let Some(value) = next {
+                assert!(
+                    values.len() < Self::COUNT,
+                    "{}: the successor chain yields more values than COUNT — a variant is \
+                     double-counted or the chain cycles",
+                    std::any::type_name::<Self>()
+                );
+                values.push(value);
+                next = value.succ();
+            }
+            assert_eq!(
+                values.len(),
+                Self::COUNT,
+                "{}: the successor chain yields fewer values than COUNT — a variant is \
+                 orphaned, which is the one way to satisfy every exhaustive match and \
+                 still fall out of the tables",
+                std::any::type_name::<Self>()
+            );
+            values
+        }
+
+        /// A value **guaranteed different** from `self`, selected by `salt`.
+        ///
+        /// Named by position on the chain rather than by naming a second variant, so
+        /// adding a variant does not leave this reaching for a stale one.
+        ///
+        /// The step is `1 + salt % (COUNT - 1)`, which is never `0 mod COUNT`. The
+        /// obvious `1 + salt` is wrong and was written first: on a two-variant dimension
+        /// `rotate(2)` is the identity, so a `salt = 1` perturbation of `Checkpoint` or
+        /// `Provenance` changed nothing and the difference table quietly measured a
+        /// no-op. `every_descriptor_field_perturbation_changes_exactly_that_field` caught
+        /// it, which is the only reason that control exists.
+        fn other(self, salt: usize) -> Self {
+            let values = Self::all();
+            assert!(
+                values.len() >= 2,
+                "{}: a one-value dimension has no different value to offer",
+                std::any::type_name::<Self>()
+            );
+            let index = values
+                .iter()
+                .position(|value| *value == self)
+                .expect("every value of a closed dimension is on its own chain");
+            let step = 1 + salt % (values.len() - 1);
+            values[(index + step) % values.len()]
+        }
+    }
+
+    impl CaseDimension for MergeSemantics {
+        const FIRST: Self = FIRST_MERGE_SEMANTICS;
+        const COUNT: usize = MERGE_SEMANTICS_VARIANTS;
+        fn succ(self) -> Option<Self> {
+            succ_merge_semantics(self)
+        }
+    }
+
+    impl CaseDimension for CheckpointSemantics {
+        const FIRST: Self = FIRST_CHECKPOINT_SEMANTICS;
+        const COUNT: usize = CHECKPOINT_SEMANTICS_VARIANTS;
+        fn succ(self) -> Option<Self> {
+            succ_checkpoint_semantics(self)
+        }
+    }
+
+    impl CaseDimension for PayloadProvenance {
+        const FIRST: Self = FIRST_PAYLOAD_PROVENANCE;
+        const COUNT: usize = PAYLOAD_PROVENANCE_VARIANTS;
+        fn succ(self) -> Option<Self> {
+            succ_payload_provenance(self)
+        }
+    }
+
+    /// One field of [`ExtensionDescriptor`], as a value, in declaration order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum DescriptorField {
+        Name,
+        Merge,
+        Checkpoint,
+        Provenance,
+    }
+
+    const DESCRIPTOR_FIELD_COUNT: usize = 4;
+
+    impl CaseDimension for DescriptorField {
+        const FIRST: Self = DescriptorField::Name;
+        const COUNT: usize = DESCRIPTOR_FIELD_COUNT;
+        fn succ(self) -> Option<Self> {
+            match self {
+                DescriptorField::Name => Some(DescriptorField::Merge),
+                DescriptorField::Merge => Some(DescriptorField::Checkpoint),
+                DescriptorField::Checkpoint => Some(DescriptorField::Provenance),
+                DescriptorField::Provenance => None,
+            }
+        }
+    }
+
+    /// Which branch or branches carry a descriptor difference.
+    ///
+    /// The criteria say "on either/both branches", so this dimension is the "either/both"
+    /// — three assignments, not two, because a difference on *both* branches is a
+    /// distinct diagnostic (it must report both) and not the union of the one-sided ones.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DifferingBranches {
+        OursOnly,
+        TheirsOnly,
+        Both,
+    }
+
+    impl CaseDimension for DifferingBranches {
+        const FIRST: Self = DifferingBranches::OursOnly;
+        const COUNT: usize = 3;
+        fn succ(self) -> Option<Self> {
+            match self {
+                DifferingBranches::OursOnly => Some(DifferingBranches::TheirsOnly),
+                DifferingBranches::TheirsOnly => Some(DifferingBranches::Both),
+                DifferingBranches::Both => None,
+            }
+        }
+    }
+
+    /// A merge branch, in the **stable ours-then-theirs order** the criteria require
+    /// diagnostics to use.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum MergeBranch {
+        Ours,
+        Theirs,
+    }
+
+    impl CaseDimension for MergeBranch {
+        const FIRST: Self = MergeBranch::Ours;
+        const COUNT: usize = 2;
+        fn succ(self) -> Option<Self> {
+            match self {
+                MergeBranch::Ours => Some(MergeBranch::Theirs),
+                MergeBranch::Theirs => None,
+            }
+        }
+    }
+
+    /// Binds [`DescriptorField`]'s cardinality to the struct it claims to enumerate.
+    ///
+    /// This is the join that would otherwise rot. `DescriptorField` is a *transcription*
+    /// of `ExtensionDescriptor`'s fields, and nothing about an exhaustive `match
+    /// DescriptorField` notices a **fifth struct field** — the field would simply never
+    /// be perturbed, never be compared, and the difference table would keep passing while
+    /// covering three quarters of the descriptor.
+    ///
+    /// The total destructuring below has no `..`, so adding a field to
+    /// `ExtensionDescriptor` stops compiling **here**, at a site whose whole purpose is to
+    /// say the tables must grow with it. Nothing is computed from the bindings on purpose:
+    /// the pattern *is* the assertion.
+    fn descriptor_fields_of(
+        descriptor: &ExtensionDescriptor,
+    ) -> [DescriptorField; DESCRIPTOR_FIELD_COUNT] {
+        let ExtensionDescriptor {
+            name: _,
+            merge: _,
+            checkpoint: _,
+            provenance: _,
+        } = descriptor;
+        [
+            DescriptorField::Name,
+            DescriptorField::Merge,
+            DescriptorField::Checkpoint,
+            DescriptorField::Provenance,
+        ]
+    }
+
+    /// Does `left` differ from `right` in exactly this field?
+    fn field_differs(
+        field: DescriptorField,
+        left: &ExtensionDescriptor,
+        right: &ExtensionDescriptor,
+    ) -> bool {
+        match field {
+            DescriptorField::Name => left.name != right.name,
+            DescriptorField::Merge => left.merge != right.merge,
+            DescriptorField::Checkpoint => left.checkpoint != right.checkpoint,
+            DescriptorField::Provenance => left.provenance != right.provenance,
+        }
+    }
+
+    /// The fields in which two descriptors differ, in canonical field order.
+    fn differing_fields(
+        left: &ExtensionDescriptor,
+        right: &ExtensionDescriptor,
+    ) -> Vec<DescriptorField> {
+        descriptor_fields_of(left)
+            .into_iter()
+            .filter(|field| field_differs(*field, left, right))
+            .collect()
+    }
+
+    /// A descriptor differing from `descriptor` in exactly `field`.
+    ///
+    /// `salt` distinguishes the two branches so that a *both-branches* case has genuinely
+    /// different descriptors on each side wherever the dimension is wide enough to allow
+    /// it. `Checkpoint` and `Provenance` have two variants, so both salts land on the same
+    /// value there; that is fine and deliberately not worked around, because the expected
+    /// diagnostic is recomputed from the actual descriptors rather than assumed.
+    ///
+    /// The replacement is chosen by [`CaseDimension::other`] rather than by naming a
+    /// second variant, so adding a variant does not silently leave this reaching for a
+    /// stale one.
+    fn perturb_field(
+        descriptor: &ExtensionDescriptor,
+        field: DescriptorField,
+        salt: usize,
+    ) -> ExtensionDescriptor {
+        let mut perturbed = descriptor.clone();
+        match field {
+            DescriptorField::Name => {
+                perturbed.name = Name::str(
+                    Name::anonymous(),
+                    if salt.is_multiple_of(2) {
+                        "perturbedExtA"
+                    } else {
+                        "perturbedExtB"
+                    },
+                );
+            }
+            DescriptorField::Merge => perturbed.merge = descriptor.merge.other(salt),
+            DescriptorField::Checkpoint => {
+                perturbed.checkpoint = descriptor.checkpoint.other(salt);
+            }
+            DescriptorField::Provenance => {
+                perturbed.provenance = descriptor.provenance.other(salt);
+            }
+        }
+        perturbed
+    }
+
+    /// Apply a whole set of field perturbations at once — the "simultaneous differences"
+    /// half of the clause.
+    fn perturb_fields(
+        descriptor: &ExtensionDescriptor,
+        fields: &[DescriptorField],
+        salt: usize,
+    ) -> ExtensionDescriptor {
+        let mut perturbed = descriptor.clone();
+        for field in fields {
+            perturbed = perturb_field(&perturbed, *field, salt);
+        }
+        perturbed
+    }
+
+    fn table_descriptor(case: DescriptorIdentityCase) -> ExtensionDescriptor {
+        ExtensionDescriptor {
+            name: Name::str(Name::anonymous(), "tableExt"),
+            merge: case.merge,
+            checkpoint: case.checkpoint,
+            provenance: case.provenance,
+        }
+    }
+
+    /// Every closed dimension's chain agrees with its declared count.
+    ///
+    /// [`CaseDimension::all`] is where both directions are checked, so a dimension whose
+    /// `all()` is never called is a chain nobody walks. This calls every one.
+    #[test]
+    fn every_case_dimension_chain_matches_its_declared_count() {
+        assert_eq!(MergeSemantics::all().len(), MERGE_SEMANTICS_VARIANTS);
+        assert_eq!(
+            CheckpointSemantics::all().len(),
+            CHECKPOINT_SEMANTICS_VARIANTS
+        );
+        assert_eq!(PayloadProvenance::all().len(), PAYLOAD_PROVENANCE_VARIANTS);
+        assert_eq!(DescriptorField::all().len(), DESCRIPTOR_FIELD_COUNT);
+        assert_eq!(DifferingBranches::all().len(), 3);
+        assert_eq!(MergeBranch::all().len(), 2);
+        assert_eq!(
+            MergeBranch::all(),
+            vec![MergeBranch::Ours, MergeBranch::Theirs],
+            "diagnostics are required to report branch facts in stable ours-then-theirs \
+             order, so the chain that generates that order is itself pinned"
+        );
+        assert_eq!(
+            DescriptorField::all(),
+            descriptor_fields_of(&descriptor(
+                MergeSemantics::AppendOrdered,
+                PayloadProvenance::Understood
+            ))
+            .to_vec(),
+            "the chain order and the struct-bound order are the same canonical field \
+             order, or `canonical branch-then-field order` names two different things"
+        );
+    }
+
+    /// The perturbation is faithful, and the field comparison is complete.
+    ///
+    /// Both halves are load-bearing and neither is implied by the other:
+    ///
+    /// * If `perturb_field` did not actually change its field, every refusal in the
+    ///   difference table below would be produced by some *other* difference and the
+    ///   table would be measuring nothing. So each perturbation is asserted to change
+    ///   **exactly** its own field, over every base descriptor and both salts.
+    /// * If `field_differs` compared the wrong field — a copy-paste an exhaustive match
+    ///   cannot catch, because the arms are all well-typed — the recovered mismatch list
+    ///   would be wrong in the same direction as the expectation. So the field-wise view
+    ///   is cross-checked against the struct's own `PartialEq`: two descriptors are equal
+    ///   **iff** no field differs, over the full 12 x 12 matrix.
+    #[test]
+    fn every_descriptor_field_perturbation_changes_exactly_that_field() {
+        for case in DESCRIPTOR_IDENTITY_CASES {
+            let base = table_descriptor(case);
+            for field in DescriptorField::all() {
+                for salt in 0..2 {
+                    let perturbed = perturb_field(&base, field, salt);
+                    assert_eq!(
+                        differing_fields(&base, &perturbed),
+                        vec![field],
+                        "perturbing {field:?} (salt {salt}) must change that field and \
+                         nothing else, or the difference table proves nothing"
+                    );
+                }
+            }
+            // Simultaneous perturbation of an arbitrary subset changes exactly that subset.
+            for mask in 0u32..(1 << DESCRIPTOR_FIELD_COUNT) {
+                let subset: Vec<DescriptorField> = DescriptorField::all()
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, field)| (mask & (1 << index) != 0).then_some(field))
+                    .collect();
+                assert_eq!(
+                    differing_fields(&base, &perturb_fields(&base, &subset, 0)),
+                    subset,
+                    "a simultaneous perturbation must change exactly its subset"
+                );
+            }
+        }
+
+        for left_case in DESCRIPTOR_IDENTITY_CASES {
+            for right_case in DESCRIPTOR_IDENTITY_CASES {
+                let left = table_descriptor(left_case);
+                let right = table_descriptor(right_case);
+                assert_eq!(
+                    differing_fields(&left, &right).is_empty(),
+                    left == right,
+                    "the field-wise view and the struct's own equality must agree, or a \
+                     field is compared against the wrong one: {left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
+    /// **The descriptor-difference table**: single and simultaneous differences, on
+    /// either and on both branches, under every merge policy.
+    ///
+    /// # What it discharges
+    ///
+    /// The clause "unit tables ... cover single and simultaneous descriptor differences
+    /// on either/both branches", exhaustively rather than by sample: all 2^4 field
+    /// subsets x 3 branch assignments x the full 12-descriptor combination matrix, which
+    /// carries "all merge policies" for this table with it. The empty subset is the
+    /// control and must **not** refuse at stage 1.
+    ///
+    /// # And the stage order, which the same fixture proves for free
+    ///
+    /// Every case here is built so that all three refusal conditions hold at once: the
+    /// descriptors differ, *and* neither branch descends from the base, *and* both
+    /// branches changed (which `ConflictsRequireReview` would refuse). The bead freezes
+    /// the pipeline as admission, then ancestry, then policy — so the reported conflict
+    /// must be `DescriptorMismatch` whenever the subset is non-empty, and
+    /// `HistoryMismatch` when it is empty. A single fixture family therefore pins both
+    /// stage boundaries: reading a `HistoryMismatch` where a mismatch was planted means
+    /// stage 1 ran late, and reading a `ConcurrentChanges` means stage 3 ran early.
+    ///
+    /// # What it does not discharge
+    ///
+    /// Nothing here is about resource limits, and nothing here is a *generated* model:
+    /// the case space is exhaustive over the descriptor, which is a different and
+    /// stronger thing than sampling, but the journals are fixed. Prefix classes,
+    /// journal sizes and the SetUnion shapes are separate tables.
+    #[test]
+    fn the_descriptor_difference_table_is_exhaustive_over_fields_and_branches() {
+        let shared: Arc<[u8]> = Arc::from(&b"shared-table-payload"[..]);
+        let mut refusals = 0usize;
+        let mut controls = 0usize;
+
+        for case in DESCRIPTOR_IDENTITY_CASES {
+            let base_descriptor = table_descriptor(case);
+            for mask in 0u32..(1 << DESCRIPTOR_FIELD_COUNT) {
+                let subset: Vec<DescriptorField> = DescriptorField::all()
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, field)| (mask & (1 << index) != 0).then_some(field))
+                    .collect();
+                for branches in DifferingBranches::all() {
+                    let ours_descriptor = match branches {
+                        DifferingBranches::OursOnly | DifferingBranches::Both => {
+                            perturb_fields(&base_descriptor, &subset, 0)
+                        }
+                        DifferingBranches::TheirsOnly => base_descriptor.clone(),
+                    };
+                    let theirs_descriptor = match branches {
+                        DifferingBranches::TheirsOnly | DifferingBranches::Both => {
+                            perturb_fields(&base_descriptor, &subset, 1)
+                        }
+                        DifferingBranches::OursOnly => base_descriptor.clone(),
+                    };
+
+                    // Base [shared, b]; ours [x] diverges at 0 and is shorter; theirs
+                    // [shared, y, z] diverges at 1 and is longer. So ancestry is invalid on
+                    // BOTH branches and both branch lengths differ from the base's, which
+                    // is `ConflictsRequireReview`'s concurrent-change condition.
+                    let base = ExtensionState::new(base_descriptor.clone())
+                        .push_entry(Arc::clone(&shared))
+                        .push_entry(bytes(b"b"));
+                    let ours = ExtensionState::new(ours_descriptor.clone()).push_entry(bytes(b"x"));
+                    let theirs = ExtensionState::new(theirs_descriptor.clone())
+                        .push_entry(Arc::clone(&shared))
+                        .push_entry(bytes(b"y"))
+                        .push_entry(bytes(b"z"));
+
+                    let sharing_before = Arc::strong_count(&shared);
+                    let roots_before = (
+                        base.content_digest(),
+                        ours.content_digest(),
+                        theirs.content_digest(),
+                    );
+                    let inputs_before = (base.clone(), ours.clone(), theirs.clone());
+
+                    let label = format!("{case:?} subset={subset:?} branches={branches:?}");
+                    let outcome =
+                        ExtensionState::merge(&base, &ours, &theirs, TEST_SET_UNION_LIMITS);
+
+                    if subset.is_empty() {
+                        // The control. Descriptors agree, so stage 1 must let this through
+                        // and stage 2 must be the one that refuses.
+                        controls += 1;
+                        assert_eq!(
+                            outcome.as_ref().expect_err(&label),
+                            &MergeConflict::HistoryMismatch {
+                                extension: base_descriptor.name.clone(),
+                                base_len: 2,
+                                ours_len: 1,
+                                theirs_len: 3,
+                                ours_common_prefix: 0,
+                                theirs_common_prefix: 1,
+                            },
+                            "{label}: with agreeing descriptors the ancestry stage is the \
+                             authority, and a ConcurrentChanges here would mean policy \
+                             dispatch overtook it"
+                        );
+                    } else {
+                        refusals += 1;
+                        let conflict = outcome.as_ref().expect_err(&label);
+                        assert_eq!(
+                            conflict,
+                            &MergeConflict::DescriptorMismatch {
+                                base: base_descriptor.clone(),
+                                ours: ours_descriptor.clone(),
+                                theirs: theirs_descriptor.clone(),
+                            },
+                            "{label}: stage 1 refuses first and reports all three complete \
+                             descriptors"
+                        );
+
+                        // Every simultaneous mismatch is recoverable from the diagnostic,
+                        // in canonical branch-then-field order, checked in both directions.
+                        // The conflict carries the three *complete* descriptors, so a
+                        // partial mismatch report is not expressible — but a wrong one is,
+                        // and that is what this compares.
+                        let MergeConflict::DescriptorMismatch {
+                            base: reported_base,
+                            ours: reported_ours,
+                            theirs: reported_theirs,
+                        } = conflict
+                        else {
+                            unreachable!("asserted equal to a DescriptorMismatch just above")
+                        };
+                        let mut reported: Vec<(MergeBranch, DescriptorField)> = Vec::new();
+                        for branch in MergeBranch::all() {
+                            let side = match branch {
+                                MergeBranch::Ours => reported_ours,
+                                MergeBranch::Theirs => reported_theirs,
+                            };
+                            for field in differing_fields(reported_base, side) {
+                                reported.push((branch, field));
+                            }
+                        }
+                        let mut expected: Vec<(MergeBranch, DescriptorField)> = Vec::new();
+                        for branch in MergeBranch::all() {
+                            let differs = !matches!(
+                                (branch, branches),
+                                (MergeBranch::Ours, DifferingBranches::TheirsOnly)
+                                    | (MergeBranch::Theirs, DifferingBranches::OursOnly)
+                            );
+                            if differs {
+                                for field in subset.iter().copied() {
+                                    expected.push((branch, field));
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            reported, expected,
+                            "{label}: the diagnostic must expose every simultaneous \
+                             mismatch, and only those, in ours-then-theirs then canonical \
+                             field order"
+                        );
+
+                        // Repeated refusal: same inputs, same answer, no drift.
+                        for repeat in 0..2 {
+                            assert_eq!(
+                                ExtensionState::merge(&base, &ours, &theirs, TEST_SET_UNION_LIMITS)
+                                    .as_ref()
+                                    .expect_err(&label),
+                                conflict,
+                                "{label}: repeat {repeat} must reproduce the refusal exactly"
+                            );
+                        }
+                    }
+
+                    assert_eq!(
+                        Arc::strong_count(&shared),
+                        sharing_before,
+                        "{label}: a refusal that cloned a payload handle would move the \
+                         strong count"
+                    );
+                    assert_eq!(
+                        (
+                            base.content_digest(),
+                            ours.content_digest(),
+                            theirs.content_digest(),
+                        ),
+                        roots_before,
+                        "{label}: a refusal must expose no root movement"
+                    );
+                    assert_eq!(
+                        (base, ours, theirs),
+                        inputs_before,
+                        "{label}: a refusal must leave every input unchanged"
+                    );
+                }
+            }
+        }
+
+        let expected_cases = DESCRIPTOR_IDENTITY_CASES.len()
+            * (1 << DESCRIPTOR_FIELD_COUNT)
+            * DifferingBranches::COUNT;
+        assert_eq!(
+            refusals + controls,
+            expected_cases,
+            "the sweep must be exhaustive over descriptor x subset x branch assignment"
+        );
+        assert_eq!(
+            controls,
+            DESCRIPTOR_IDENTITY_CASES.len() * DifferingBranches::COUNT,
+            "exactly the empty subset is the control, on every branch assignment"
+        );
+        eprintln!(
+            "{{\"schema\":\"fln.unit.extension-merge-validation-table\",\"version\":1,\
+             \"bead\":\"fln-extension-merge-validation-proof-debt-dt5\",\
+             \"claim_type\":\"bounded_model\",\"table\":\"descriptor_difference\",\
+             \"descriptor_combinations\":{},\"field_subsets\":{},\"branch_assignments\":{},\
+             \"cases\":{expected_cases},\"stage_one_refusals\":{refusals},\
+             \"stage_two_controls\":{controls},\"status\":\"pass\"}}",
+            DESCRIPTOR_IDENTITY_CASES.len(),
+            1 << DESCRIPTOR_FIELD_COUNT,
+            DifferingBranches::COUNT,
+        );
+    }
+
+    /// Restoration and recovery for the descriptor stage.
+    ///
+    /// The clause names "repeated refusal, restoration, and recovery" together. Repeated
+    /// refusal is asserted inside the table above, where every case runs three times.
+    /// This is the other two: after a refusal, repairing the descriptor and then the
+    /// history restores the merge, and the product is exactly what the policy declares —
+    /// so a refusal is a stop, not a state change that has to be undone.
+    ///
+    /// Run under **every** merge policy, because the policies produce different products
+    /// and a recovery test on one of them would say nothing about the others.
+    #[test]
+    fn a_descriptor_refusal_is_recoverable_under_every_merge_policy() {
+        for policy in MergeSemantics::all() {
+            let agreed = ExtensionDescriptor {
+                merge: policy,
+                ..descriptor(policy, PayloadProvenance::Understood)
+            };
+            let mismatched = perturb_field(&agreed, DescriptorField::Provenance, 0);
+
+            let base = ExtensionState::new(agreed.clone()).push_entry(bytes(b"base"));
+            let bad_descriptor = ExtensionState::new(mismatched).push_entry(bytes(b"ours"));
+            let bad_history = ExtensionState::new(agreed.clone()).push_entry(bytes(b"other"));
+            let good_ours = base.push_entry(bytes(b"ours"));
+            let unchanged_theirs = base.clone();
+
+            assert!(
+                matches!(
+                    ExtensionState::merge(
+                        &base,
+                        &bad_descriptor,
+                        &unchanged_theirs,
+                        TEST_SET_UNION_LIMITS
+                    ),
+                    Err(MergeConflict::DescriptorMismatch { .. })
+                ),
+                "{policy:?}: the descriptor stage refuses first"
+            );
+            assert!(
+                matches!(
+                    ExtensionState::merge(
+                        &base,
+                        &bad_history,
+                        &unchanged_theirs,
+                        TEST_SET_UNION_LIMITS
+                    ),
+                    Err(MergeConflict::HistoryMismatch { .. })
+                ),
+                "{policy:?}: repairing only the descriptor leaves the ancestry stage to \
+                 refuse — a recovery that skipped a stage would pass here"
+            );
+
+            // Both repaired: the merge completes and the product is the declared one.
+            let recovery = merge_with_test_limits(&base, &good_ours, &unchanged_theirs);
+            assert!(
+                recovery.is_ok(),
+                "{policy:?}: recovery must complete: {recovery:?}"
+            );
+            let recovered = recovery.expect("asserted Ok immediately above");
+            assert_eq!(
+                raw_payloads(&recovered),
+                raw_payloads(&good_ours),
+                "{policy:?}: a one-sided change merges to that branch under every declared \
+                 policy"
+            );
+            assert_eq!(
+                base.len(),
+                1,
+                "{policy:?}: none of the refused attempts may have touched the base"
+            );
+        }
+    }
 }
