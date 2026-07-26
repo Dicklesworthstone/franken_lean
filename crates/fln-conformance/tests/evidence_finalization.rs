@@ -311,3 +311,72 @@ fn armed_finalizers_publish_only_after_their_process_wins_the_directory_claim() 
         );
     }
 }
+
+/// Every lane that allocates an evidence root must claim it atomically, so that a
+/// `RUN_ID` collision is a typed refusal rather than two lanes silently sharing one
+/// directory.
+///
+/// `RUN_ID` is `<lane>-<UTC second>-$$` in every lane, sealed and unsealed alike, so
+/// uniqueness rests entirely on a (second, PID) pair never repeating — an assumption
+/// nobody wrote down and nothing checks. `mkdir -p` converts that improbable collision
+/// into silent sharing instead of a fault, and two lanes take a caller-supplied root
+/// (`FLN_E2E_ARTIFACT_DIR`, `FLN_E2E_ART_ROOT`) and so have no uniqueness argument at all.
+///
+/// The scope is DERIVED from the filesystem rather than listed. The hand-list in
+/// `armed_finalizers_publish_only_after_their_process_wins_the_directory_claim` above
+/// is precisely why this was needed: it froze five scripts while the lane surface kept
+/// growing, and twelve other roots stayed unsealed behind it (`franken_lean-h40t`). Two
+/// of those twelve were missed even by the manual sweep that found the other ten.
+#[test]
+fn every_evidence_lane_claims_its_artifact_root_atomically() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut lanes: Vec<(String, String)> = Vec::new();
+
+    for dir in ["scripts/e2e", "scripts/tribunal"] {
+        let entries =
+            fs::read_dir(repo.join(dir)).unwrap_or_else(|e| panic!("{dir} must be readable: {e}"));
+        for entry in entries {
+            let path = entry.expect("directory entry must be readable").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sh") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .expect("a matched file has a name")
+                .to_string_lossy()
+                .into_owned();
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{dir}/{name} must be readable: {e}"));
+            // A lane is in scope exactly when it allocates its own evidence root.
+            if body.contains("ART_DIR=") {
+                lanes.push((format!("{dir}/{name}"), body));
+            }
+        }
+    }
+    // Directory order is not specified; the report must not depend on it (FL-INV-01).
+    lanes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // A moved directory or a broken filter must fail loudly rather than pass an empty
+    // scan. A derived scope that silently derives nothing is worse than a hand-list.
+    assert!(
+        lanes.len() >= 20,
+        "derived lane scan found only {} evidence lanes, so the scan scope is wrong; \
+         this guard must never report success over an empty or truncated set",
+        lanes.len()
+    );
+
+    for (relative, body) in &lanes {
+        let atomic = body.contains(r#"if ! mkdir "$ART_DIR" 2>/dev/null; then"#)
+            || body.contains(r#"if ! mkdir -- "$ART_DIR"; then"#);
+        assert!(
+            atomic,
+            "{relative} allocates an evidence root but never claims it atomically; \
+             on a RUN_ID collision two lanes would share one directory instead of one refusing"
+        );
+        assert!(
+            !body.contains(r#"mkdir -p "$ART_DIR""#),
+            "{relative} creates its evidence root with `mkdir -p`, which succeeds on an \
+             existing directory and therefore cannot detect a collision at all"
+        );
+    }
+}

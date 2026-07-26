@@ -24,7 +24,11 @@ SCHEMA="fln-e2e/1"
 START_NS="$(date +%s%N)"
 FINALIZED=0
 
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[canon_lifecycle] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 
 note() {
   printf '[canon_lifecycle] %s\n' "$*" | tee -a "$HUMAN" >&2

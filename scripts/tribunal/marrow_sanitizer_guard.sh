@@ -48,7 +48,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_ID="marrow-sanitizer-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_DIR="$ROOT/target/e2e/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[marrow_sanitizer_guard] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 
 TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$ROOT/rust-toolchain.toml")"
 TARGET="x86_64-unknown-linux-gnu"

@@ -15,7 +15,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_ID="diag-goldens-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_DIR="$ROOT/target/e2e/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[diag_goldens] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 
 BEAD="fln-rk6"
 SCHEMA="fln-e2e/1"
