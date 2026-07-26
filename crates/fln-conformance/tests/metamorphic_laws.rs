@@ -46,7 +46,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use fln_core::expr::Expr;
@@ -256,8 +256,8 @@ fn extension_payloads(environment: &Environment, extension: &Name) -> Vec<Vec<u8
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tribunal/fixtures/c3")
+    fln_conformance::checked_workspace_root!()
+        .join("tribunal/fixtures/c3")
         .join(name)
 }
 

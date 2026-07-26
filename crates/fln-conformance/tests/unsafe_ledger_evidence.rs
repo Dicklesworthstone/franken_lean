@@ -91,11 +91,7 @@ scripts/ change owned by another pane; this suite makes the gap visible and refu
 next one rather than reaching into their artifact.";
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .expect("workspace root is two levels above the crate manifest")
+    fln_conformance::checked_workspace_root!()
 }
 
 /// Parse the ledger keeping all six fields. Deliberately a second reader rather than a call

@@ -41,8 +41,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+    fln_conformance::checked_workspace_root!()
         .canonicalize()
         .expect("repo root")
 }

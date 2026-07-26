@@ -20,13 +20,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The workspace root, two levels above this crate's manifest.
+/// The workspace root, two levels above this crate's manifest — of the checkout this run
+/// was actually launched from.
+///
+/// The tree check is not decoration. This module's own doc comment above says a rig that
+/// consults the wrong Reference "would look **exactly** as green"; resolving the root
+/// from a manifest dir baked in by a *different checkout* is the same failure one level
+/// out, and it has been observed live (bead `fln-cross-tree-baked-root-k60n`).
 pub fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .expect("workspace root is two levels above the crate manifest")
+    crate::checked_workspace_root!()
 }
 
 /// The Reference tag `SUITE.lock` pins, e.g. `v4.32.0`.

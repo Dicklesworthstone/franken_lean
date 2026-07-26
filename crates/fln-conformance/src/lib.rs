@@ -27,6 +27,10 @@
 //!   to pass;
 //! * [`precedence`] — the oracle-precedence ladder as data; `Unclassified` blocks a
 //!   claim, never rounds up;
+//! * [`tree_identity`] — refusing a test binary compiled for a different checkout than
+//!   the one running it (bead `fln-cross-tree-baked-root-k60n`): the target directory is
+//!   shared across worktrees, so a rig can resolve, measure and report a whole verdict
+//!   about a repository that is not the one under test;
 //! * [`poison`] (feature `oracle-fallback-dev`, compiled out of releases) — the
 //!   `ORACLE_FALLBACK` tag that poisons every product of the development-only
 //!   lockstep harness: cache-inadmissible, gate-inert (§18.10).
@@ -46,4 +50,5 @@ pub mod pin;
 #[cfg(feature = "oracle-fallback-dev")]
 pub mod poison;
 pub mod precedence;
+pub mod tree_identity;
 pub mod witness;

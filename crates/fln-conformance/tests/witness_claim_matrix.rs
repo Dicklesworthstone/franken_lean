@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use fln_conformance::witness::{
     CLAIM_MATRIX, CONCEPT_CENSUS, ClaimRow, ClaimState, EVIDENCE_CITATIONS, Enforcement,
@@ -31,11 +31,7 @@ use fln_conformance::witness::{
 };
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .expect("workspace root is two levels above the crate manifest")
+    fln_conformance::checked_workspace_root!()
 }
 
 fn real_reader() -> impl FnMut(&str) -> Result<String, String> {

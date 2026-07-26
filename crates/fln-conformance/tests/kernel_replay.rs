@@ -3173,7 +3173,7 @@ impl CorpusMatrixReceipt {
 
 /// Where the retained receipts for a given Reference pin live, relative to this crate.
 fn corpus_matrix_receipt_path(pin: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    fln_conformance::checked_manifest_dir!()
         .join("evidence/corpus_thread_matrix")
         .join(format!("{pin}.jsonl"))
 }
@@ -5411,7 +5411,7 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
          fln-corpus-thread-matrix-93te)"
     );
 
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = fln_conformance::checked_workspace_root!();
     // Any of these makes the line honest: it names the per-commit matrix's scope, the class
     // one on-demand run earns, or the cadence gap. `unbuilt` and `inferred` used to be in
     // this set and were removed with R2 — they describe a world that no longer exists, and
@@ -5582,7 +5582,7 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
     // the thing the check meant to catch. Prose heuristics fail open. Both documents must
     // instead carry the literal count, so the only way to add a row without re-deriving the
     // claim is to edit two documents that will not agree with the file.
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = fln_conformance::checked_workspace_root!();
     let marker = format!("observations recorded: {}", receipts.len());
     for doc in ["AGENTS.md", "README.md"] {
         let doc_text = fs::read_to_string(repo.join(doc))

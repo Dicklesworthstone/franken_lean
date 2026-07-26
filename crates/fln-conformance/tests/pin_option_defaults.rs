@@ -43,10 +43,9 @@ use fln_conformance::{ledger, pin};
 use fln_core::options::limits;
 
 fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| fln_conformance::checked_workspace_root!())
+        .as_path()
 }
 
 /// What `fln-core` claims, and the exact ledger row each claim backs.

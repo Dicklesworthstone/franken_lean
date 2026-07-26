@@ -719,17 +719,14 @@ mod tests {
     #[test]
     fn fixture_validation_checks_the_filesystem() {
         let ledger = parse(OK).expect("parses");
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root");
-        validate_fixtures(&ledger, root).expect("fixture exists");
+        let root = crate::checked_workspace_root!();
+        validate_fixtures(&ledger, &root).expect("fixture exists");
         let ghost = OK.replace(
             "crates/fln-conformance/fixtures/core_observables.txt",
             "crates/fln-conformance/fixtures/ghost.txt",
         );
         let bad = parse(&ghost).expect("parses");
-        let err = validate_fixtures(&bad, root).expect_err("ghost fixture rejected");
+        let err = validate_fixtures(&bad, &root).expect_err("ghost fixture rejected");
         assert_eq!(err.line, 2, "reports the row's source line, not its index");
     }
 }

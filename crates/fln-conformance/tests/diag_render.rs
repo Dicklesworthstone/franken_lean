@@ -14,10 +14,9 @@ use fln_core::name::Name;
 use fln_core::pos::Position;
 
 fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| fln_conformance::checked_workspace_root!())
+        .as_path()
 }
 
 /// Parse one Reference CLI frame line: `{path}:{line}:{col}: error: {msg}` or

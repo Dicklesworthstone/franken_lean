@@ -908,9 +908,5 @@ pub fn scan_root() -> PathBuf {
     if let Ok(root) = std::env::var("FLN_NAMING_ROOT") {
         return PathBuf::from(root);
     }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf()
+    crate::checked_workspace_root!()
 }
