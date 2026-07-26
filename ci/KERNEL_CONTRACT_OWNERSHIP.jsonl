@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":351,"projection_hash":"66d7df7167930d5ae1e2fb0c4fd2d770a463a97660c151f9556af65d55fce7c3"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":352,"projection_hash":"460e40642aa0d025fef8c11acd021f24331225ec5d9d2bbfdc9773f1d56cd3ed"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -70,6 +70,7 @@
 {"id":"fln-bench-apparatus-empty-referent-bkw6"}
 {"id":"fln-bz4h"}
 {"id":"fln-c78c"}
+{"id":"fln-census-empty-referent-no-mock-krb0"}
 {"id":"fln-census-out-of-git-2ya9"}
 {"id":"fln-corpus-thread-matrix-93te"}
 {"id":"fln-d4x"}
