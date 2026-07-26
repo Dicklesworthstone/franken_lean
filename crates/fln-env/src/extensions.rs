@@ -2072,6 +2072,9 @@ impl ExtensionState {
     /// under the DECLARED semantics. Returns `Err` with the extension name when the
     /// contract says the merge needs review — a typed conflict, never a silent
     /// union.
+    // See `MergeConflict`'s size note: the Ok variant is the larger of the two, so
+    // boxing the error shrinks nothing and would put an allocation on the refusal path.
+    #[allow(clippy::result_large_err)]
     pub fn merge(
         base: &ExtensionState,
         ours: &ExtensionState,
@@ -2079,26 +2082,15 @@ impl ExtensionState {
         set_union_limits: SetUnionLimits,
     ) -> Result<ExtensionMergeOutcome, MergeConflict> {
         validate_descriptor_admission(&base.descriptor, &ours.descriptor, &theirs.descriptor)?;
-        let ours_common_prefix = base
-            .entries()
-            .zip(ours.entries())
-            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
-            .count();
-        let theirs_common_prefix = base
-            .entries()
-            .zip(theirs.entries())
-            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
-            .count();
-        if ours_common_prefix != base.len() || theirs_common_prefix != base.len() {
-            return Err(MergeConflict::HistoryMismatch {
-                extension: base.descriptor.name.clone(),
-                base_len: base.len(),
-                ours_len: ours.len(),
-                theirs_len: theirs.len(),
-                ours_common_prefix,
-                theirs_common_prefix,
-            });
-        }
+        validate_branch_ancestry(
+            base.entries(),
+            ours.entries(),
+            base.entries(),
+            theirs.entries(),
+        )
+        .map_err(|divergence| {
+            divergence.into_conflict(&base.descriptor.name, base.len(), ours.len(), theirs.len())
+        })?;
         match base.descriptor.merge {
             MergeSemantics::AppendOrdered => {
                 let mut merged = ours.clone();
@@ -2301,6 +2293,271 @@ const _DESCRIPTOR_ADMISSION_STAYS_JOURNAL_FREE: fn(
     &ExtensionDescriptor,
 ) -> Result<(), RefusedDescriptors> = validate_descriptor_admission;
 
+/// How one branch's history ended relative to the base it must descend from.
+///
+/// The three arms are the total classification of a prefix walk, argued from the
+/// definition rather than collected as interesting shapes: at every step either both
+/// sides have an entry (they agree, or they are the first divergence), or the branch has
+/// run out inside the base, or the base has run out — which is exactly descent.
+///
+/// `BranchEndedAt` exists because it was **measured indistinguishable** from
+/// `DivergedAt` before this type: a base `[a, b]` against a branch `[a]` and against a
+/// branch `[a, x]` both reported `common_prefix = 1`, and
+/// `invalid_branch_history_is_a_typed_conflict` asserted the same number for both. Two
+/// different ancestry failures with one diagnostic is the shape this bead's diagnostics
+/// clause forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchAncestry {
+    /// The base is an exact prefix of the branch.
+    Descends,
+    /// Both sides had an entry at this index and the entries disagreed.
+    DivergedAt(usize),
+    /// The branch ended at this length, inside the base. No entry disagreed.
+    BranchEndedAt(usize),
+}
+
+/// What the ancestry walk over one branch actually did, and what it concluded.
+///
+/// `compared_entries` is **not** `common_prefix + 1`, and the difference is the point:
+/// a divergence compares one entry more than it agrees on, a branch that ran out compares
+/// exactly as many as it agrees on. That is the fact the previous diagnostic could not
+/// express, and it is produced by the walk rather than reconstructed beside it.
+///
+/// `compared_payload_bytes` is charged from the **base** side, matching
+/// [`bounded_entry_divergence`]'s convention in this same file: the base is the side a
+/// caller can bound, so charging the branch would make the number depend on input the
+/// caller did not choose.
+///
+/// # Why the agreeing prefix is not a field
+///
+/// It is [`BranchAncestryFacts::common_prefix`], derived from the verdict. Storing it too
+/// would be a second source of truth for a quantity the verdict already fixes —
+/// `DivergedAt(i)` agrees on exactly `i`, `BranchEndedAt(n)` on exactly `n`, `Descends` on
+/// the whole base — and a defect that desynchronised them would leave both halves locally
+/// consistent, which is this project's recurring shape. It is also what keeps
+/// `MergeConflict` under clippy's `result_large_err` threshold; the design reason came
+/// first and the size is a consequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchAncestryFacts {
+    /// Entries this walk compared against a base entry.
+    pub compared_entries: usize,
+    /// Base-side payload bytes those comparisons covered.
+    pub compared_payload_bytes: u128,
+    /// How the walk ended.
+    pub verdict: BranchAncestry,
+}
+
+impl BranchAncestryFacts {
+    /// Entries that agreed, in order, before the walk stopped.
+    ///
+    /// `base_len` is needed only by the `Descends` arm, where the agreeing prefix IS the
+    /// base — the one case where the walk stops for a reason that carries no index.
+    pub fn common_prefix(&self, base_len: usize) -> usize {
+        match self.verdict {
+            BranchAncestry::Descends => base_len,
+            BranchAncestry::DivergedAt(index) => index,
+            BranchAncestry::BranchEndedAt(length) => length,
+        }
+    }
+
+    /// The diagnostic rendering, naming the ending as well as the counts.
+    ///
+    /// Written out rather than derived from `Debug` so that the two failure kinds a reader
+    /// could previously not tell apart are spelled differently in the message a human sees.
+    fn describe(&self, base_len: usize) -> String {
+        let ending = match self.verdict {
+            BranchAncestry::Descends => "descends".to_string(),
+            BranchAncestry::DivergedAt(index) => format!("diverged_at={index}"),
+            BranchAncestry::BranchEndedAt(length) => format!("branch_ended_at={length}"),
+        };
+        format!(
+            "{{{ending}, common_prefix={}, compared_entries={}, compared_payload_bytes={}}}",
+            self.common_prefix(base_len),
+            self.compared_entries,
+            self.compared_payload_bytes,
+        )
+    }
+}
+
+/// Stage 2's success value: the ancestry facts for both branches, in the criteria's
+/// stable ours-then-theirs order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AncestryFacts {
+    ours: BranchAncestryFacts,
+    theirs: BranchAncestryFacts,
+}
+
+/// Stage 2's error value: the same facts, and nothing else.
+///
+/// A distinct type rather than `Result<AncestryFacts, AncestryFacts>` so the refusal arm
+/// is nameable in the stage-output model, where "expose no product or root" has to be
+/// checked on the arm a refusal actually takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AncestryDivergence(AncestryFacts);
+
+impl AncestryDivergence {
+    /// The one concrete step on the ancestry-refusal path — the same residual shape as
+    /// stage 1's `From<RefusedDescriptors>` impl, and disclosed for the same reason.
+    ///
+    /// The three lengths are the caller's cached facts, not something the stage walked
+    /// for: counting a branch's total length would be work the criteria's "stop before
+    /// policy/output work" clause has no reason to buy.
+    fn into_conflict(
+        self,
+        extension: &Name,
+        base_len: usize,
+        ours_len: usize,
+        theirs_len: usize,
+    ) -> MergeConflict {
+        MergeConflict::HistoryMismatch {
+            extension: extension.clone(),
+            base_len,
+            ours_len,
+            theirs_len,
+            ours: self.0.ours,
+            theirs: self.0.theirs,
+        }
+    }
+}
+
+/// The single capability stage 2 needs beyond equality: how many payload bytes an entry
+/// carries.
+///
+/// Kept as a named one-method trait rather than a closure so that `Eq + AncestryWeight`
+/// is *the whole* of an entry's interface inside the walk. That is what makes the tally in
+/// `ancestry_refusal_compares_exactly_the_entries_it_reports` a complete account of the
+/// stage's work rather than a sample of the operations someone thought to instrument —
+/// the same argument `validate_descriptor_admission` rests on, one stage over.
+trait AncestryWeight {
+    fn payload_bytes(&self) -> u128;
+}
+
+impl AncestryWeight for ExtensionEntry {
+    fn payload_bytes(&self) -> u128 {
+        self.payload.len() as u128
+    }
+}
+
+impl<T: AncestryWeight + ?Sized> AncestryWeight for &T {
+    fn payload_bytes(&self) -> u128 {
+        (**self).payload_bytes()
+    }
+}
+
+/// Stage 2 of the merge pipeline: exact branch-ancestry validation.
+///
+/// # Parametricity is the enforcement
+///
+/// The stage law says ancestry validation must "stop before policy/output work". This
+/// function is generic in its entry type with only `Eq + AncestryWeight` in scope, so
+/// neither is expressible in its body: there is no `.merge` to read — `E` is opaque and a
+/// descriptor is not among its inputs at all — and neither arm of its return type can name
+/// an `ExtensionState` or an `ExtensionMergeOutcome`. `E` is deliberately **not** `Clone`,
+/// which is what makes "clones no payload" structural here rather than asserted: the
+/// facts types carry counts, so there is nothing an entry could be cloned *into*.
+///
+/// # Parametricity is also the measurement
+///
+/// Instantiating this very function at an instrumented entry counts every operation it
+/// performs, because a generic body can only do what its bounds permit. The counts
+/// transport to `&ExtensionEntry` because there is one body — see [`OpaqueSubject`] in the
+/// tests for the side condition, which applies unchanged here.
+///
+/// # Why the base iterator is passed twice
+///
+/// The two walks are independent traversals of the same base. Requiring the base iterator
+/// to be `Clone` would widen `ExtensionState::entries`' public return type, and buffering
+/// the base inside the stage would allocate on a path whose whole claim is that it does
+/// not. Two iterators from the caller costs nothing and keeps the bound at `Iterator`.
+///
+/// # No short-circuit, on purpose
+///
+/// Both branches are walked even when `ours` has already diverged. The criteria require a
+/// refusal to report "both branch-history facts in stable ours-then-theirs order", so a
+/// stage that stopped at the first bad branch could not produce the diagnostic it owes —
+/// which is exactly the `ancestry_only_ours`/`ancestry_only_theirs` mutant class.
+///
+/// # The facts the refusal reports are this stage's return value
+///
+/// Not a transcription of it. `MergeConflict::HistoryMismatch` carries the
+/// [`BranchAncestryFacts`] the walk produced, so a diagnostic cannot drift from the walk
+/// behind it — there is no join here for anyone to leave unwatched. The *success* facts
+/// are discarded at the call site: `ExtensionMergeOutcome` has nowhere to carry them and
+/// inventing somewhere is a wider change than this stage's clause asks for.
+///
+/// # What this does NOT establish
+///
+/// The walk is **unbounded**. Its sibling on the checkpoint path,
+/// [`bounded_entry_divergence`], charges a [`ProofBudget`] and can refuse; this one cannot,
+/// so a merge over a very long base pays for it. Making that a typed FL-INV-07
+/// inconclusive is available here — `ExtensionMergeOutcome::Inconclusive` already exists,
+/// unlike on the `restore` path — but it needs a limits parameter on
+/// [`ExtensionState::merge`] and is a wider change than this clause. Recorded rather than
+/// glossed; see `ancestry_walk_is_measured_unbounded_unlike_its_checkpoint_sibling`.
+fn validate_branch_ancestry<E: Eq + AncestryWeight>(
+    base_for_ours: impl Iterator<Item = E>,
+    ours: impl Iterator<Item = E>,
+    base_for_theirs: impl Iterator<Item = E>,
+    theirs: impl Iterator<Item = E>,
+) -> Result<AncestryFacts, AncestryDivergence> {
+    let facts = AncestryFacts {
+        ours: walk_branch_ancestry(base_for_ours, ours),
+        theirs: walk_branch_ancestry(base_for_theirs, theirs),
+    };
+    if facts.ours.verdict == BranchAncestry::Descends
+        && facts.theirs.verdict == BranchAncestry::Descends
+    {
+        Ok(facts)
+    } else {
+        Err(AncestryDivergence(facts))
+    }
+}
+
+/// One branch's exact prefix walk, reporting what it compared as well as what it decided.
+///
+/// Charging bytes before the comparison, not after, so the entry that is compared is the
+/// entry that is counted — the same ordering discipline as [`bounded_entry_divergence`],
+/// where a check applied after the work is a check that permits one unbounded step.
+fn walk_branch_ancestry<E: Eq + AncestryWeight>(
+    base: impl Iterator<Item = E>,
+    branch: impl Iterator<Item = E>,
+) -> BranchAncestryFacts {
+    let mut base = base;
+    let mut branch = branch;
+    let mut agreed = 0usize;
+    let mut facts = BranchAncestryFacts {
+        compared_entries: 0,
+        compared_payload_bytes: 0,
+        verdict: BranchAncestry::Descends,
+    };
+    loop {
+        match (base.next(), branch.next()) {
+            (Some(base_entry), Some(branch_entry)) => {
+                facts.compared_entries += 1;
+                facts.compared_payload_bytes = facts
+                    .compared_payload_bytes
+                    .saturating_add(base_entry.payload_bytes());
+                if base_entry != branch_entry {
+                    facts.verdict = BranchAncestry::DivergedAt(agreed);
+                    return facts;
+                }
+                agreed += 1;
+            }
+            // The branch ran out inside the base. Nothing disagreed, so this is not a
+            // divergence, and the base entry that had no counterpart was never compared —
+            // which is why it is not charged.
+            (Some(_), None) => {
+                facts.verdict = BranchAncestry::BranchEndedAt(agreed);
+                return facts;
+            }
+            // The base is exhausted: it is a prefix of the branch, which is descent.
+            // Whatever the branch carries beyond it is its own suffix, and this stage
+            // neither reads nor counts it.
+            (None, _) => return facts,
+        }
+    }
+}
+
 fn set_union_cached_limit_refusal(
     extension: &Name,
     facts: SetUnionFacts,
@@ -2485,6 +2742,17 @@ fn enforce_checkpoint_limits(
 
 /// A typed semantic-merge conflict (plan §15.3b: blocked and explained, the failure
 /// mode Git cannot even see).
+///
+/// # Size, and why it is not boxed
+///
+/// Carrying stage 2's measured facts for both branches puts this type over clippy's
+/// `result_large_err` threshold, so the functions returning it carry a scoped `allow`.
+/// The argument for the `allow` is checkable rather than a preference: `merge`'s success
+/// type owns an `ExtensionState`, so the `Ok` variant is the larger of the two and sets
+/// `Result`'s size on its own — boxing the error would shrink nothing while adding the
+/// only heap allocation on the ancestry-refusal path.
+/// `the_merge_error_is_not_the_dominant_term_in_its_own_result` pins exactly that, so if
+/// the error ever does dominate, the `allow` fails a test instead of quietly staying right.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeConflict {
     DescriptorMismatch {
@@ -2495,13 +2763,18 @@ pub enum MergeConflict {
     ConcurrentChanges {
         extension: Name,
     },
+    /// Both branch-history facts, in the criteria's stable ours-then-theirs order.
+    ///
+    /// `ours` and `theirs` hold stage 2's own return value rather than a transcription of
+    /// it, so the reported facts cannot drift from the walk that produced them — there is
+    /// no join between claim and evidence here to go unwatched.
     HistoryMismatch {
         extension: Name,
         base_len: usize,
         ours_len: usize,
         theirs_len: usize,
-        ours_common_prefix: usize,
-        theirs_common_prefix: usize,
+        ours: BranchAncestryFacts,
+        theirs: BranchAncestryFacts,
     },
 }
 
@@ -2534,12 +2807,14 @@ impl std::fmt::Display for MergeConflict {
                 base_len,
                 ours_len,
                 theirs_len,
-                ours_common_prefix,
-                theirs_common_prefix,
+                ours,
+                theirs,
             } => write!(
                 f,
-                "extension `{}` branches do not descend from the supplied base: base_len={base_len}, ours_len={ours_len}, theirs_len={theirs_len}, ours_common_prefix={ours_common_prefix}, theirs_common_prefix={theirs_common_prefix}",
-                extension.to_display_string()
+                "extension `{}` branches do not descend from the supplied base: base_len={base_len}, ours_len={ours_len}, theirs_len={theirs_len}, ours={}, theirs={}",
+                extension.to_display_string(),
+                ours.describe(*base_len),
+                theirs.describe(*base_len),
             ),
         }
     }
@@ -3004,6 +3279,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::result_large_err)] // see `MergeConflict`'s size note
     fn merge_with_test_limits(
         base: &ExtensionState,
         ours: &ExtensionState,
@@ -4901,18 +5177,27 @@ mod tests {
             base_len: reported_base_len,
             ours_len: reported_ours_len,
             theirs_len: reported_theirs_len,
-            ours_common_prefix: reported_ours_common_prefix,
-            theirs_common_prefix: reported_theirs_common_prefix,
+            ours: reported_ours,
+            theirs: reported_theirs,
             ..
         } = history_error
         else {
             return;
         };
+        let reported_ours_common_prefix = reported_ours.common_prefix(reported_base_len);
+        let reported_theirs_common_prefix = reported_theirs.common_prefix(reported_base_len);
         assert_eq!(reported_base_len, 2);
         assert_eq!(reported_ours_len, 3);
         assert_eq!(reported_theirs_len, 3);
         assert_eq!(reported_ours_common_prefix, 2);
         assert_eq!(reported_theirs_common_prefix, 0);
+        // The facts the previous diagnostic could not carry: `ours` agreed on the whole
+        // base and stopped there, `theirs` disagreed on its very first entry and paid for
+        // exactly one comparison.
+        assert_eq!(reported_ours.verdict, BranchAncestry::Descends);
+        assert_eq!(reported_ours.compared_entries, 2);
+        assert_eq!(reported_theirs.verdict, BranchAncestry::DivergedAt(0));
+        assert_eq!(reported_theirs.compared_entries, 1);
         assert_eq!(
             history_base.logical_root(&options),
             history_base_root_before
@@ -5040,25 +5325,60 @@ mod tests {
             .push_entry(bytes(b"a"))
             .push_entry(bytes(b"b"));
         let matching = base.push_entry(bytes(b"c"));
+        // The valid side's facts, asserted once and reused: it agrees on the whole base
+        // and stops there, having compared both base entries and their two bytes.
+        let descends = BranchAncestryFacts {
+            compared_entries: 2,
+            compared_payload_bytes: 2,
+            verdict: BranchAncestry::Descends,
+        };
+        // Each case now carries the FACTS it must report, not just the agreeing-prefix
+        // length. Rows `SHORT` and `LATE` are why: before these facts they were both
+        // `common_prefix = 1` and this table asserted the same number for a branch that
+        // ran out and a branch that disagreed. One diagnostic for two different failures
+        // is what the diagnostics clause forbids, and it was invisible while the only
+        // reported quantity was the one they share.
+        //
+        // The order matters and is not cosmetic. A branch that merely disagrees at index 0
+        // while matching the base's LENGTH is the one shape a length-only ancestry check
+        // cannot see at all, so it must be checked first: put anything else in front and a
+        // length-only implementation trips an equality assertion on a refusal it did make,
+        // instead of the `expect_err` on the refusal it failed to make. The lane's
+        // `ancestry_only_length` seed reads that `expect_err` literal as its kill signal.
+        const FIRST: usize = 0;
+        const SHORT: usize = 1;
+        const LATE: usize = 2;
         let invalid_histories = [
-            (
-                "shorter branch",
-                ExtensionState::new(expected.clone()).push_entry(bytes(b"a")),
-                1,
-            ),
             (
                 "first entry differs",
                 ExtensionState::new(expected.clone())
                     .push_entry(bytes(b"x"))
                     .push_entry(bytes(b"b")),
-                0,
+                BranchAncestryFacts {
+                    compared_entries: 1,
+                    compared_payload_bytes: 1,
+                    verdict: BranchAncestry::DivergedAt(0),
+                },
+            ),
+            (
+                "shorter branch",
+                ExtensionState::new(expected.clone()).push_entry(bytes(b"a")),
+                BranchAncestryFacts {
+                    compared_entries: 1,
+                    compared_payload_bytes: 1,
+                    verdict: BranchAncestry::BranchEndedAt(1),
+                },
             ),
             (
                 "same-length later entry differs",
                 ExtensionState::new(expected.clone())
                     .push_entry(bytes(b"a"))
                     .push_entry(bytes(b"x")),
-                1,
+                BranchAncestryFacts {
+                    compared_entries: 2,
+                    compared_payload_bytes: 2,
+                    verdict: BranchAncestry::DivergedAt(1),
+                },
             ),
             (
                 "longer history diverges before the base ends",
@@ -5066,11 +5386,31 @@ mod tests {
                     .push_entry(bytes(b"a"))
                     .push_entry(bytes(b"x"))
                     .push_entry(bytes(b"c")),
-                1,
+                BranchAncestryFacts {
+                    compared_entries: 2,
+                    compared_payload_bytes: 2,
+                    verdict: BranchAncestry::DivergedAt(1),
+                },
             ),
         ];
+        assert_eq!(
+            invalid_histories[FIRST].1.len(),
+            base.len(),
+            "the first row must MATCH the base's length, or it stops being the case a \
+             length-only check is blind to"
+        );
+        assert_eq!(
+            invalid_histories[SHORT].2.common_prefix(base.len()),
+            invalid_histories[LATE].2.common_prefix(base.len()),
+            "these two rows must keep agreeing on the one quantity the old diagnostic \
+             reported, or this table stops witnessing the collision it was written for"
+        );
+        assert_ne!(
+            invalid_histories[SHORT].2, invalid_histories[LATE].2,
+            "…and must differ on the facts, or the new ones discriminate nothing"
+        );
 
-        for (case, invalid, common_prefix) in invalid_histories {
+        for (case, invalid, facts) in invalid_histories {
             let before = (base.clone(), matching.clone(), invalid.clone());
             assert_eq!(
                 merge_with_test_limits(&base, &invalid, &matching)
@@ -5080,8 +5420,10 @@ mod tests {
                     base_len: 2,
                     ours_len: invalid.len(),
                     theirs_len: 3,
-                    ours_common_prefix: common_prefix,
-                    theirs_common_prefix: 2,
+                    ours: facts,
+                    // The valid branch is walked in full even though `ours` already
+                    // refused: a stage that short-circuited could not report this.
+                    theirs: descends,
                 },
                 "{case}"
             );
@@ -5093,8 +5435,8 @@ mod tests {
                     base_len: 2,
                     ours_len: 3,
                     theirs_len: invalid.len(),
-                    ours_common_prefix: 2,
-                    theirs_common_prefix: common_prefix,
+                    ours: descends,
+                    theirs: facts,
                 },
                 "{case}"
             );
@@ -5115,8 +5457,18 @@ mod tests {
                 base_len: 2,
                 ours_len: 0,
                 theirs_len: 1,
-                ours_common_prefix: 0,
-                theirs_common_prefix: 0,
+                ours: BranchAncestryFacts {
+                    // An empty branch compares nothing at all — the one case where the
+                    // stage reads a base entry and charges for neither it nor a comparison.
+                    compared_entries: 0,
+                    compared_payload_bytes: 0,
+                    verdict: BranchAncestry::BranchEndedAt(0),
+                },
+                theirs: BranchAncestryFacts {
+                    compared_entries: 1,
+                    compared_payload_bytes: 1,
+                    verdict: BranchAncestry::DivergedAt(0),
+                },
             }
         );
     }
@@ -7451,6 +7803,29 @@ mod tests {
         const CARRIES_PRODUCT: bool = false;
     }
 
+    /// Stage 2's two arms. The zero is **earned by `Copy`**, not promised: every product
+    /// in this module owns a journal, so none of them is `Copy`, and a field that made
+    /// either of these types own anything would fail its own `derive(Copy)` at the type
+    /// definition — before this impl is ever consulted.
+    ///
+    /// The pin below is what keeps that argument load-bearing: dropping the derive, which
+    /// is what someone adding an owned field would have to do, fails here at a named site
+    /// rather than quietly leaving a hand-written `false` behind.
+    const _ANCESTRY_FACTS_STAY_PLAIN: fn() = || {
+        fn only_plain_facts<T: Copy>() {}
+        only_plain_facts::<AncestryFacts>();
+        only_plain_facts::<AncestryDivergence>();
+        only_plain_facts::<BranchAncestryFacts>();
+    };
+
+    impl StageOutput for AncestryFacts {
+        const CARRIES_PRODUCT: bool = false;
+    }
+
+    impl StageOutput for AncestryDivergence {
+        const CARRIES_PRODUCT: bool = false;
+    }
+
     /// Operation facts for a refusal, as bounds rather than tallies.
     ///
     /// `Some(0)` means *provably zero* — the stage's signature puts the resource out of
@@ -7538,6 +7913,7 @@ mod tests {
     /// the next reader cannot tell which one earned the fact.
     #[test]
     fn the_same_model_at_a_concrete_descriptor_still_refuses_to_claim_policy_blindness() {
+        #[allow(clippy::result_large_err)] // see `MergeConflict`'s size note
         fn concrete_stage(
             _: &ExtensionDescriptor,
             _: &ExtensionDescriptor,
@@ -7564,6 +7940,7 @@ mod tests {
     /// is not a guard.
     #[test]
     fn the_refusal_work_model_reads_the_signature_it_is_given() {
+        #[allow(clippy::result_large_err)] // see `MergeConflict`'s size note
         fn stage_over_states(
             _: &ExtensionState,
             _: &ExtensionState,
@@ -7775,11 +8152,405 @@ mod tests {
         );
     }
 
-    /// The campaign behind the facts above, 2026-07-26, measured at `0f2dbc70`.
+    // ---------------------------------------------------------------------------
+    // Stage 2's own facts clause: "Ancestry facts identify exact compared
+    // entries/bytes, both side lengths and first divergences, and stop before
+    // policy/output work." Stage 1's repair explicitly did not touch this
+    // (`clone_payloads_during_refusal`'s `still_unproven`, item (c)).
+    // ---------------------------------------------------------------------------
+
+    /// Stage 2's entry, instrumented.
     ///
-    /// Six defects planted one at a time by exact byte-pair replacement with a
-    /// unique-anchor assertion, the `fln-env` lib suite run against each, the source
-    /// restored byte-exactly (`cmp`) between plants. Four semantic kills, two preventions.
+    /// `Eq + AncestryWeight` is the **whole** of `E`'s interface inside
+    /// [`walk_branch_ancestry`], so counting those two operations is a complete account of
+    /// what the walk did — not a sample of the calls someone thought to instrument. The
+    /// completeness degrades loudly: widening the bounds adds a method this type must
+    /// implement, and the tally stops being total at a compile error.
+    #[derive(Debug)]
+    struct CountedEntry {
+        tag: u8,
+        bytes: u128,
+        ops: Rc<Cell<EntryOps>>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct EntryOps {
+        comparisons: usize,
+        weighings: usize,
+    }
+
+    impl PartialEq for CountedEntry {
+        fn eq(&self, other: &Self) -> bool {
+            let mut ops = self.ops.get();
+            ops.comparisons += 1;
+            self.ops.set(ops);
+            self.tag == other.tag
+        }
+    }
+
+    impl Eq for CountedEntry {}
+
+    impl AncestryWeight for CountedEntry {
+        fn payload_bytes(&self) -> u128 {
+            let mut ops = self.ops.get();
+            ops.weighings += 1;
+            self.ops.set(ops);
+            self.bytes
+        }
+    }
+
+    /// The criteria's "exact compared entries/bytes", **counted on the production walk**.
+    ///
+    /// Same device as stage 1's tally and for the same reason: a counting allocator is
+    /// ruled out by D3, but a generic body can only perform the operations its bounds
+    /// permit, so instantiating the real walk at an instrumented entry observes all of
+    /// them. Merely compiling pins the genericity — a walk specialised back to
+    /// `&ExtensionEntry` cannot accept a `CountedEntry`.
+    ///
+    /// The three rows are the walk's three endings, and the middle two are the finding:
+    /// **a divergence and a branch that ran out report the same `common_prefix`**. That
+    /// was the only quantity the previous diagnostic carried, so those two failures were
+    /// indistinguishable to every consumer of a `HistoryMismatch`. `compared_entries` and
+    /// the verdict separate them, and this asserts the collision it repairs rather than
+    /// only the repair.
+    #[test]
+    fn ancestry_refusal_compares_exactly_the_entries_it_reports() {
+        let ops = Rc::new(Cell::new(EntryOps::default()));
+        let entry = |tag: u8, bytes: u128| CountedEntry {
+            tag,
+            bytes,
+            ops: Rc::clone(&ops),
+        };
+
+        let base = [entry(1, 10), entry(2, 20)];
+        let descending = [entry(1, 10), entry(2, 20), entry(3, 30)];
+        let diverging = [entry(1, 10), entry(9, 90)];
+        let ran_out = [entry(1, 10)];
+
+        ops.set(EntryOps::default());
+        assert_eq!(
+            walk_branch_ancestry(base.iter(), descending.iter()),
+            BranchAncestryFacts {
+                compared_entries: 2,
+                compared_payload_bytes: 30,
+                verdict: BranchAncestry::Descends,
+            },
+            "descent compares the whole base and charges its bytes, and stops there — the \
+             branch's own suffix is neither read nor counted"
+        );
+        assert_eq!(
+            ops.get(),
+            EntryOps {
+                comparisons: 2,
+                weighings: 2,
+            },
+            "the third branch entry must cost nothing: the walk ends when the base does"
+        );
+
+        ops.set(EntryOps::default());
+        let divergence = walk_branch_ancestry(base.iter(), diverging.iter());
+        assert_eq!(
+            divergence,
+            BranchAncestryFacts {
+                compared_entries: 2,
+                compared_payload_bytes: 30,
+                verdict: BranchAncestry::DivergedAt(1),
+            },
+            "a divergence compares one entry MORE than it agrees on, and pays for it"
+        );
+        assert_eq!(
+            ops.get(),
+            EntryOps {
+                comparisons: 2,
+                weighings: 2,
+            }
+        );
+
+        ops.set(EntryOps::default());
+        let truncation = walk_branch_ancestry(base.iter(), ran_out.iter());
+        assert_eq!(
+            truncation,
+            BranchAncestryFacts {
+                compared_entries: 1,
+                compared_payload_bytes: 10,
+                verdict: BranchAncestry::BranchEndedAt(1),
+            },
+            "a branch that ran out compares exactly as many entries as it agreed on: the \
+             base entry with no counterpart is read but never compared, so it is not charged"
+        );
+        assert_eq!(
+            ops.get(),
+            EntryOps {
+                comparisons: 1,
+                weighings: 1,
+            }
+        );
+
+        assert_eq!(
+            divergence.common_prefix(base.len()),
+            truncation.common_prefix(base.len()),
+            "the two failures agree on the one quantity the old diagnostic reported…"
+        );
+        assert_ne!(
+            (divergence.compared_entries, divergence.verdict),
+            (truncation.compared_entries, truncation.verdict),
+            "…and the facts this clause adds are what tells them apart"
+        );
+    }
+
+    /// The counter is not a constant — the negative control for the tally above.
+    ///
+    /// Without it, `weighings: 2` would be satisfied by an instrument that counted nothing
+    /// and a walk that weighed ten times. `wasteful` is the walk with one extra weighing in
+    /// front of it, and the count moves by exactly one.
+    #[test]
+    fn the_ancestry_tally_moves_when_the_walk_does_more_work() {
+        fn wasteful<E: Eq + AncestryWeight>(base: &[E], branch: &[E]) -> BranchAncestryFacts {
+            let _spare = base[0].payload_bytes();
+            walk_branch_ancestry(base.iter(), branch.iter())
+        }
+
+        let ops = Rc::new(Cell::new(EntryOps::default()));
+        let entry = |tag: u8| CountedEntry {
+            tag,
+            bytes: 1,
+            ops: Rc::clone(&ops),
+        };
+        let base = [entry(1), entry(2)];
+        let diverging = [entry(1), entry(9)];
+
+        wasteful(&base, &diverging);
+        assert_eq!(
+            ops.get(),
+            EntryOps {
+                comparisons: 2,
+                weighings: 3,
+            },
+            "one extra weighing must show as one extra weighing, or the tally proves nothing"
+        );
+    }
+
+    /// A refusal on one branch does **not** stop the other branch being walked.
+    ///
+    /// This is the structural counterpart of `ancestry_only_ours`/`ancestry_only_theirs`:
+    /// the criteria require a refusal to report "both branch-history facts in stable
+    /// ours-then-theirs order", so a stage that short-circuited could not produce the
+    /// diagnostic it owes. Stage 1 short-circuits and is *required* to; stage 2 must not,
+    /// and the difference is measured here rather than left to the reader.
+    #[test]
+    fn the_ancestry_stage_walks_both_branches_because_it_owes_both_facts() {
+        let ops = Rc::new(Cell::new(EntryOps::default()));
+        let entry = |tag: u8| CountedEntry {
+            tag,
+            bytes: 1,
+            ops: Rc::clone(&ops),
+        };
+        let base = [entry(1), entry(2)];
+        let ours = [entry(9), entry(9)];
+        let theirs = [entry(1), entry(2)];
+
+        ops.set(EntryOps::default());
+        let divergence =
+            validate_branch_ancestry(base.iter(), ours.iter(), base.iter(), theirs.iter())
+                .expect_err("a diverging `ours` is refused");
+        assert_eq!(divergence.0.ours.verdict, BranchAncestry::DivergedAt(0));
+        assert_eq!(divergence.0.theirs.verdict, BranchAncestry::Descends);
+        assert_eq!(
+            ops.get(),
+            EntryOps {
+                comparisons: 3,
+                weighings: 3,
+            },
+            "one comparison refuses `ours` and two more still walk `theirs`: a stage that \
+             stopped at the first bad branch would report 1 and could not fill the \
+             theirs-side facts the diagnostic must carry"
+        );
+    }
+
+    /// Stage 2 is parametric, and stays that way.
+    ///
+    /// Instantiating the walk at a type with **no fields a journal entry has** — in
+    /// particular no payload and no descriptor anywhere in reach — is the compile-time
+    /// join. Specialising it back to `&ExtensionEntry`, the edit that would restore the
+    /// ability to reach a payload or a policy from inside the stage, stops this compiling.
+    /// Same device as `the_stage_one_decision_cannot_see_a_policy_because_it_cannot_see_a_field`.
+    #[test]
+    fn the_ancestry_stage_cannot_see_a_policy_because_it_cannot_see_a_field() {
+        #[derive(PartialEq, Eq)]
+        struct OpaqueEntry(u8);
+
+        impl AncestryWeight for OpaqueEntry {
+            fn payload_bytes(&self) -> u128 {
+                0
+            }
+        }
+
+        let base = [OpaqueEntry(1)];
+        let descending = [OpaqueEntry(1), OpaqueEntry(2)];
+        let diverging = [OpaqueEntry(7)];
+
+        assert!(
+            validate_branch_ancestry(
+                base.iter(),
+                descending.iter(),
+                base.iter(),
+                descending.iter()
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_branch_ancestry(
+                base.iter(),
+                descending.iter(),
+                base.iter(),
+                diverging.iter()
+            )
+            .is_err()
+        );
+    }
+
+    /// Neither arm of stage 2 can carry a product or a root.
+    ///
+    /// Two mechanisms, and the first is the load-bearing one: `BranchAncestryFacts` and
+    /// `AncestryFacts` both `#[derive(Copy)]`, so a field of any owned type — an
+    /// `ExtensionState`, an `ExtensionMergeOutcome`, an `Arc<[u8]>` — fails the derive at
+    /// the type definition. The destructuring below is the second: no rest pattern, so a
+    /// new *`Copy`* field is `E0027` here rather than a fact quietly outside the account.
+    #[test]
+    fn ancestry_facts_carry_only_plain_counts_so_neither_arm_can_hold_a_product() {
+        fn is_a_plain_fact<T: Copy>(_: &T) {}
+
+        let refused = AncestryDivergence(AncestryFacts {
+            ours: BranchAncestryFacts {
+                compared_entries: 1,
+                compared_payload_bytes: 2,
+                verdict: BranchAncestry::DivergedAt(0),
+            },
+            theirs: BranchAncestryFacts {
+                compared_entries: 0,
+                compared_payload_bytes: 0,
+                verdict: BranchAncestry::BranchEndedAt(0),
+            },
+        });
+
+        let AncestryDivergence(AncestryFacts { ours, theirs }) = refused;
+        for facts in [ours, theirs] {
+            let BranchAncestryFacts {
+                compared_entries,
+                compared_payload_bytes,
+                verdict,
+            } = facts;
+            is_a_plain_fact(&compared_entries);
+            is_a_plain_fact(&compared_payload_bytes);
+            is_a_plain_fact(&verdict);
+        }
+
+        // The refusal arm is the one a refusal takes, so bounding only the success type
+        // would leave the publication claim resting on a path a refusal never reaches —
+        // the same reason `refusal_work_facts` reads both arms for stage 1.
+        assert_eq!(
+            refusal_work_facts(ancestry_stage_shape),
+            RefusalWorkFacts {
+                journal_comparisons: Some(0),
+                payload_clones: Some(0),
+                policy_selections: Some(0),
+                product_publications: Some(0),
+            },
+            "stage 2's subject is an opaque entry and neither arm of its result can name a \
+             product"
+        );
+    }
+
+    /// Stage 2's shape, as the stage-output model reads it.
+    ///
+    /// A separate function because the model takes a `fn(&I, &I, &I)` and stage 2 takes
+    /// four iterators; what the model is being asked here is about the *types* at the
+    /// boundary, which are the same ones. Never executed — the claim is about
+    /// reachability, not about one run.
+    fn ancestry_stage_shape(
+        _: &OpaqueSubject,
+        _: &OpaqueSubject,
+        _: &OpaqueSubject,
+    ) -> Result<AncestryFacts, AncestryDivergence> {
+        unreachable!("never executed: the model is about reachability, not a run")
+    }
+
+    /// The `result_large_err` allow's premise, checked rather than asserted.
+    ///
+    /// The lint's remedy is to box the error. That is only worth its cost if the error is
+    /// what makes the `Result` large, and here it is not: the success type owns an
+    /// `ExtensionState`. Boxing would therefore shrink nothing measurable while adding the
+    /// only heap allocation on the ancestry-refusal path — a path this bead's criteria ask
+    /// to be accounted for rather than casually enlarged. If a later change makes the error
+    /// the dominant term, this fails and the `allow` must be revisited.
+    #[test]
+    fn the_merge_error_is_not_the_dominant_term_in_its_own_result() {
+        let ok = std::mem::size_of::<ExtensionMergeOutcome>();
+        let err = std::mem::size_of::<MergeConflict>();
+        assert!(
+            err <= ok,
+            "boxing the error is only worth an allocation on the refusal path if the error \
+             is what makes Result big: Ok={ok} Err={err}"
+        );
+        assert_eq!(
+            std::mem::size_of::<Result<ExtensionMergeOutcome, MergeConflict>>(),
+            std::mem::size_of::<ExtensionMergeOutcome>(),
+            "…and the Result must actually be sized by the Ok variant, or the argument \
+             above is about two numbers that do not decide anything"
+        );
+    }
+
+    /// The disclosure in [`validate_branch_ancestry`]'s "what this does NOT establish",
+    /// measured rather than asserted in prose.
+    ///
+    /// The merge-path walk has no budget and cannot refuse for cost; its checkpoint-path
+    /// sibling over the same shape does. Recording the contrast as a test means the day
+    /// somebody bounds the merge walk, this fails and the disclosure has to be rewritten —
+    /// rather than a stale "unbounded" note surviving its own repair.
+    #[test]
+    fn the_ancestry_walk_is_unbounded_while_its_checkpoint_sibling_is_not() {
+        let ops = Rc::new(Cell::new(EntryOps::default()));
+        let long: Vec<CountedEntry> = (0..64u8)
+            .map(|tag| CountedEntry {
+                tag,
+                bytes: 1,
+                ops: Rc::clone(&ops),
+            })
+            .collect();
+        let facts = walk_branch_ancestry(long.iter(), long.iter());
+        assert_eq!(
+            facts.compared_entries, 64,
+            "the merge walk's cost scales with the base and nothing can stop it early"
+        );
+        assert_eq!(facts.verdict, BranchAncestry::Descends);
+
+        let contract = descriptor(MergeSemantics::AppendOrdered, PayloadProvenance::Understood);
+        let mut state = ExtensionState::new(contract);
+        for tag in 0..64u8 {
+            state = state.push_entry(bytes(&[tag]));
+        }
+        assert!(
+            bounded_entry_divergence(&state, &state, ProofBudget::new(4, u128::MAX)).is_err(),
+            "the checkpoint-path sibling refuses the same 64-entry comparison under a \
+             4-entry budget — the capability the merge path does not have"
+        );
+    }
+
+    /// The campaign behind the facts above, in two passes.
+    ///
+    /// Stage 1's six, 2026-07-26 at `0f2dbc70`; stage 2's five, 2026-07-26 at `9a6f7941`
+    /// plus this patch. Each defect planted one at a time by exact byte-pair replacement
+    /// with a unique-anchor assertion, the `fln-env` lib suite run against each, the source
+    /// restored byte-exactly (`cmp`) between plants. Eight semantic kills, three
+    /// preventions.
+    ///
+    /// The six criteria-named mutants that touch the ancestry stage —
+    /// `ancestry_skipped`, `ancestry_only_length`, `ancestry_only_ours`,
+    /// `ancestry_only_theirs`, `compare_entries_unordered` and
+    /// `descriptor_validation_deferred` — were **re-planted in their new form** in the same
+    /// run rather than inherited from the earlier measurement, because extracting stage 2
+    /// changed exactly the code they target. All six still die, and the killer recorded for
+    /// each in `MERGE_VALIDATION_MUTANTS` is still among the failures.
     ///
     /// # Why this is a second table and not four more rows in the first one
     ///
@@ -7849,6 +8620,46 @@ mod tests {
                                  the point; classifying it correctly is still a human step.",
             },
         ),
+        // Stage 2's half of the facts clause, measured in the same campaign shape at
+        // `9a6f7941` + this patch. The clause the first five rows above could not reach:
+        // "Ancestry facts identify exact compared entries/bytes, both side lengths and
+        // first divergences, and stop before policy/output work."
+        (
+            "ancestry_charges_bytes_from_the_branch_side",
+            MutantOutcome::KilledBy(ancestry_refusal_compares_exactly_the_entries_it_reports),
+        ),
+        (
+            "ancestry_counts_the_uncompared_base_entry",
+            MutantOutcome::KilledBy(ancestry_refusal_compares_exactly_the_entries_it_reports),
+        ),
+        (
+            "ancestry_conflates_a_short_branch_with_a_divergence",
+            MutantOutcome::KilledBy(ancestry_refusal_compares_exactly_the_entries_it_reports),
+        ),
+        (
+            "ancestry_short_circuits_after_ours_diverges",
+            MutantOutcome::KilledBy(
+                the_ancestry_stage_walks_both_branches_because_it_owes_both_facts,
+            ),
+        ),
+        (
+            "ancestry_stage_specialised_back_to_entries",
+            MutantOutcome::StructurallyPrevented {
+                by: "Narrowing walk_branch_ancestry to `impl Iterator<Item = &ExtensionEntry>` \
+                     — the edit that would put a payload back in reach of the walk's body — \
+                     stops compiling at two named sites. Measured: E0271 at \
+                     validate_branch_ancestry, whose generic parameter no longer matches, and \
+                     E0271 at ancestry_refusal_compares_exactly_the_entries_it_reports, which \
+                     instantiates the walk at CountedEntry precisely so that a specialised \
+                     version cannot accept it.",
+                still_unproven: "Nothing about behaviour, and this bead's criteria say a \
+                                 compile failure is not a kill — it is recorded as \
+                                 prevention for that reason. It also says nothing about the \
+                                 walk's COST: the stage is unbounded and its checkpoint-path \
+                                 sibling is not, which is measured separately in \
+                                 the_ancestry_walk_is_unbounded_while_its_checkpoint_sibling_is_not.",
+            },
+        ),
     ];
 
     /// The second record is complete, classified, and its kills are semantic.
@@ -7897,7 +8708,7 @@ mod tests {
             "a survivor in this campaign is open debt on the facts clause and must be \
              recorded with its obligation, never dropped"
         );
-        assert_eq!((killed, prevented), (4, 2));
+        assert_eq!((killed, prevented), (8, 3));
         assert_eq!(
             killed + prevented,
             REFUSAL_FACT_MUTANTS.len(),
@@ -8199,8 +9010,11 @@ mod tests {
                                  Name::clone sharing its component node, which is \
                                  fln-core's property — observed here with a two-directional \
                                  control, but no fln-core-side mutant was planted for it; \
-                                 (c) all of it bounds STAGE 1. The ancestry stage's own \
-                                 'exact compared entries and bytes' clause is untouched.",
+                                 (c) all of it bounds STAGE 1. Stage 2's own 'exact \
+                                 compared entries and bytes' clause is now carried by \
+                                 validate_branch_ancestry and the last five rows of \
+                                 REFUSAL_FACT_MUTANTS — what remains open there is the \
+                                 walk's COST, which is unbounded.",
             },
         ),
     ];
@@ -9033,8 +9847,16 @@ mod tests {
                                 base_len: 2,
                                 ours_len: 1,
                                 theirs_len: 3,
-                                ours_common_prefix: 0,
-                                theirs_common_prefix: 1,
+                                ours: BranchAncestryFacts {
+                                    compared_entries: 1,
+                                    compared_payload_bytes: shared.len() as u128,
+                                    verdict: BranchAncestry::DivergedAt(0),
+                                },
+                                theirs: BranchAncestryFacts {
+                                    compared_entries: 2,
+                                    compared_payload_bytes: shared.len() as u128 + 1,
+                                    verdict: BranchAncestry::DivergedAt(1),
+                                },
                             },
                             "{label}: with agreeing descriptors the ancestry stage is the \
                              authority, and a ConcurrentChanges here would mean policy \
@@ -9335,6 +10157,37 @@ mod tests {
         common
     }
 
+    /// The ancestry facts a branch must report, derived from the sequence model alone.
+    ///
+    /// A **second** account of the walk's arithmetic rather than a restatement of its
+    /// answer: `compared_entries` is recovered from the verdict's own shape — a divergence
+    /// costs one comparison more than it agrees on, a truncation costs exactly its agreeing
+    /// prefix, and descent costs the whole base — and the bytes are summed over the base
+    /// prefix those comparisons covered. If the production walk and this model ever
+    /// disagree, one of them is wrong and the 2883-merge sweep says which pair showed it.
+    fn model_ancestry_facts(base: &[Vec<u8>], branch: &[Vec<u8>]) -> BranchAncestryFacts {
+        let verdict = model_prefix_verdict(base, branch);
+        let compared_entries = match verdict {
+            PrefixVerdict::Descends => base.len(),
+            PrefixVerdict::Truncated { common_prefix } => common_prefix,
+            PrefixVerdict::Diverges { at } => at + 1,
+        };
+        BranchAncestryFacts {
+            compared_entries,
+            compared_payload_bytes: base[..compared_entries]
+                .iter()
+                .map(|entry| entry.len() as u128)
+                .sum(),
+            verdict: match verdict {
+                PrefixVerdict::Descends => BranchAncestry::Descends,
+                PrefixVerdict::Truncated { common_prefix } => {
+                    BranchAncestry::BranchEndedAt(common_prefix)
+                }
+                PrefixVerdict::Diverges { at } => BranchAncestry::DivergedAt(at),
+            },
+        }
+    }
+
     /// Classify a branch against a base, over sequences only.
     fn model_prefix_verdict(base: &[Vec<u8>], branch: &[Vec<u8>]) -> PrefixVerdict {
         let common = model_common_prefix(base, branch);
@@ -9553,12 +10406,20 @@ mod tests {
     /// 3. The set of classes the space reaches equals the set
     ///    [`prefix_class_is_realizable`] says exists — in both directions.
     ///
+    /// # The compared-bytes half, added after this table first shipped
+    ///
+    /// This doc comment used to record the gap it now closes: "the ancestry facts here are
+    /// lengths and first divergences … `MergeConflict` carries no byte count and nothing
+    /// here adds one". It does now, and the expectation is derived by
+    /// [`model_ancestry_facts`] from the sequence model alone — a second implementation of
+    /// the walk's accounting, not a copy of its result — so the 2883 merges here check the
+    /// compared entries and bytes on every refusing pair rather than at four fixtures.
+    ///
     /// # What it does not discharge
     ///
-    /// The ancestry facts here are lengths and first divergences. The criteria elsewhere
-    /// also ask ancestry facts to identify compared *bytes*; `MergeConflict` carries no
-    /// byte count and nothing here adds one. Journal sizes and the SetUnion case list are
-    /// separate tables.
+    /// Journal sizes and the SetUnion case list are separate tables. The walk's *cost* is
+    /// still unbounded — see [`validate_branch_ancestry`]; this table proves what it
+    /// reports, not that it can be stopped.
     #[test]
     fn the_prefix_class_model_covers_every_class_on_either_and_both_branches() {
         const MAX_BRANCH_LEN: usize = 4;
@@ -9620,14 +10481,12 @@ mod tests {
                                 base_len: base_model.len(),
                                 ours_len: ours_model.len(),
                                 theirs_len: theirs_model.len(),
-                                ours_common_prefix: model_common_prefix(&base_model, ours_model),
-                                theirs_common_prefix: model_common_prefix(
-                                    &base_model,
-                                    theirs_model
-                                ),
+                                ours: model_ancestry_facts(&base_model, ours_model),
+                                theirs: model_ancestry_facts(&base_model, theirs_model),
                             },
-                            "{label}: the ancestry stage must report both branches' lengths \
-                             and first divergences, in ours-then-theirs order"
+                            "{label}: the ancestry stage must report both branches' \
+                             lengths, first divergences, and the entries and bytes it \
+                             compared, in ours-then-theirs order"
                         );
                     } else {
                         match model_merge_product(policy, &base_model, ours_model, theirs_model) {
@@ -9936,11 +10795,12 @@ mod tests {
                             base_len: tier,
                             ours_len: tier,
                             theirs_len: tier,
-                            ours_common_prefix: tier - 1,
-                            theirs_common_prefix: tier,
+                            ours: model_ancestry_facts(&base_model, &divergent_model),
+                            theirs: model_ancestry_facts(&base_model, &base_model),
                         },
                         "tier={tier} {policy:?}: the reported prefix must be the exact \
-                         divergence index at every journal size"
+                         divergence index, and the compared entries and bytes must be the \
+                         exact cost of reaching it, at every journal size"
                     );
 
                     // Restoration and recovery at this size: repair the branch and the
@@ -10498,6 +11358,7 @@ mod tests {
     /// The three journals of a scenario, as models. Shrinking moves only these.
     type MatrixJournals = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
+    #[allow(clippy::result_large_err)] // see `MergeConflict`'s size note
     fn run_matrix_scenario(
         scenario: &MatrixScenario,
         journals: &MatrixJournals,
