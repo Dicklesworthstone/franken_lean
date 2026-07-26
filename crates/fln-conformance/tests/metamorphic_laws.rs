@@ -1,8 +1,38 @@
 //! Metamorphic laws over the implemented FrankenLean substrate.
 //!
-//! The parser and elaborator are not implemented yet, so this rig deliberately
-//! exercises only relations with a real public surface today. Every permutation is
-//! generated; no expected ordering is hand-enumerated.
+//! The ELABORATOR is not implemented (`fln-elab` is a charter stub), so this rig
+//! deliberately exercises only relations with a real public surface today. Every
+//! permutation is generated; no expected ordering is hand-enumerated.
+//!
+//! The parser IS implemented, and this sentence used to say it was not. Corrected
+//! 2026-07-26: `fln-parse` and `fln-syntax` carry ~9,900 lines and 157 public
+//! functions, and Vellum has its own metamorphic rig. The conclusion is unchanged —
+//! environment-level churn laws still need an elaborator — but the stated reason was
+//! half wrong, and a scope note whose justification has decayed is how a rig quietly
+//! stops being re-examined.
+//!
+//! ## Where plan §18's metamorphic laws actually live (read before concluding a gap)
+//!
+//! §18 names three churn classes and a Ledger clause. They are satisfied across TWO
+//! crates, and until this note neither rig referenced the other — so auditing §18 from
+//! here, which is §18's seat, produced "churn and alpha-renaming are untested". They
+//! are tested; they are just tested elsewhere, and completeness was establishable only
+//! by grepping the tree.
+//!
+//! | §18 law | where | at what level |
+//! |---|---|---|
+//! | comment/whitespace churn | `fln-syntax/tests/metamorphic_vellum.rs` MR1, MR2, MR5, MR6 | token stream, exact equality |
+//! | independent-decl reordering | MR3 there, **and** [`independent_declaration_insertions_commute_at_logical_root`] here | syntax **and** full `Environment` + logical root |
+//! | alpha-renaming | `metamorphic_vellum.rs` MR4, MR6 | token stream modulo names |
+//! | Ledger invalidates nothing | **nowhere** | `fln-ledger` is a 6-line charter stub, so there is no surface to test |
+//!
+//! §18 says these laws must "preserve environments". Only REORDERING reaches that
+//! level today — the Vellum rig references `Environment` zero times, necessarily, since
+//! elaboration does not exist. So the churn and alpha-renaming laws are real and exact
+//! but syntactic: they establish that the parser is stable under the transformation,
+//! not that an environment is. When `fln-elab` lands, the environment-level forms of
+//! MR1 and MR4 belong HERE, and nothing currently forces that — this table is prose,
+//! like every other scope note in this family.
 //!
 //! Relation strength (`fault sensitivity × independence ÷ cost`):
 //! - canonical set permutation invariance: `5 × 4 ÷ 1 = 20`;
