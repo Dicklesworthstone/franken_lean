@@ -3167,8 +3167,6 @@ fn walk_branch_ancestry<E: Eq + AncestryWeight>(
     loop {
         match (base.next(), branch.next()) {
             (Some(base_entry), Some(branch_entry)) => {
-                let entry_bytes = base_entry.payload_bytes();
-
                 let next_entries = spend.compared_entries.saturating_add(1);
                 if next_entries > budget.max_compared_entries {
                     return Err((
@@ -3177,6 +3175,14 @@ fn walk_branch_ancestry<E: Eq + AncestryWeight>(
                         u128::try_from(next_entries).unwrap_or(u128::MAX),
                     ));
                 }
+                // Learning an entry's cost is `payload.len()` — O(1), and not a look at the
+                // payload — but it happens *after* the entry check, so a stop on the entry
+                // dimension performs no operation whatsoever on the entry it refused. That
+                // is the order [`bounded_entry_divergence`] uses, and the two
+                // implementations of one idea now agree on it and not merely on their
+                // limits. A byte stop still costs one weighing, on both paths, because a
+                // cost that has not been read cannot be checked against an allowance.
+                let entry_bytes = base_entry.payload_bytes();
                 let next_bytes = spend.compared_payload_bytes.saturating_add(entry_bytes);
                 if next_bytes > budget.max_compared_payload_bytes {
                     return Err((
@@ -9230,11 +9236,11 @@ mod tests {
             ops.get(),
             EntryOps {
                 comparisons: 4,
-                weighings: 5,
+                weighings: 4,
             },
-            "counted on the entries themselves: four comparisons, and a fifth weighing \
-             because an entry's cost must be known before it can be charged — knowing a \
-             payload's length is not comparing it"
+            "counted on the entries themselves: the refused fifth entry is neither compared \
+             nor weighed, because the entry dimension is checked before its cost is even \
+             read — the same order bounded_entry_divergence uses"
         );
 
         let contract = descriptor(MergeSemantics::AppendOrdered, PayloadProvenance::Understood);
@@ -9371,6 +9377,65 @@ mod tests {
                 actual: 8,
             },
             "and one byte under it refuses on the byte dimension, not the entry one"
+        );
+    }
+
+    /// A stop outranks a divergence the walk had not yet reached.
+    ///
+    /// The ancestry analogue of
+    /// [`the_descriptor_budget_is_charged_before_the_comparison_it_bounds`], and the same
+    /// argument one stage over: a merge that ran out of budget at the second entry has not
+    /// established that the fourth diverges. Under an adequate budget the identical inputs
+    /// are a rejection, which is what makes this a precedence test rather than a restatement
+    /// of the boundary cases — the same three states, and only the allowance varies.
+    ///
+    /// It was missing from the first pass of this envelope. The descriptor stage had its
+    /// version and the ancestry stage did not, which is precisely the kind of asymmetry
+    /// between two implementations of one rule that this bead exists to remove.
+    #[test]
+    #[allow(clippy::result_large_err)] // see `MergeConflict`'s size note
+    fn an_ancestry_stop_outranks_a_divergence_it_never_reached() {
+        let contract = descriptor(MergeSemantics::AppendOrdered, PayloadProvenance::Understood);
+        let mut base = ExtensionState::new(contract);
+        for tag in 0..4u8 {
+            base = base.push_entry(bytes(&[tag]));
+        }
+        // `ours` agrees on the first three entries and disagrees on the fourth, so the
+        // divergence is at index 3 and a walk must reach entry four to find it.
+        let mut ours = ExtensionState::new(base.descriptor.clone());
+        for tag in [0u8, 1, 2, 9] {
+            ours = ours.push_entry(bytes(&[tag]));
+        }
+        let theirs = base.push_entry(bytes(b"t"));
+
+        let merge_with = |budget: ProofBudget| {
+            ExtensionState::merge(
+                &base,
+                &ours,
+                &theirs,
+                MergeLimits::new(DescriptorLimits::UNBOUNDED, budget, TEST_SET_UNION_LIMITS),
+                None,
+            )
+        };
+
+        assert!(
+            matches!(
+                merge_with(ProofBudget::UNBOUNDED),
+                Err(MergeConflict::HistoryMismatch { .. })
+            ),
+            "unbounded, the walk reaches the fourth entry and the merge is rejected"
+        );
+
+        assert_eq!(
+            expect_stop(merge_with(ProofBudget::new(2, u128::MAX))),
+            MergeStop::Ancestry {
+                extension: base.descriptor.name.clone(),
+                dimension: ProofDimension::ComparedEntries,
+                limit: 2,
+                actual: 3,
+            },
+            "under a budget that stops at the third comparison, the same inputs are a \
+             non-answer: the divergence is real and this merge did not establish it"
         );
     }
 
