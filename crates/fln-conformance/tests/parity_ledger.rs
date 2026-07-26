@@ -344,3 +344,155 @@ fn source_read_at_l1_and_value_produced_above_it_are_both_permitted() {
         "the law refused evidence it exists to permit: {errors:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The third field: freshness must name the run that produced the value
+// (bead fln-parity-ledger-freshness-names-the-run-igxr)
+// ---------------------------------------------------------------------------
+
+/// The live ledger obeys the freshness law, and every tag it denies is still live.
+///
+/// The second assertion is the one that shrinks: when the last row carrying
+/// `pin-census-v4.32.0` is repaired, this fails until the tag leaves the declared list.
+#[test]
+fn the_real_ledger_never_names_a_source_reading_run_for_a_produced_value() {
+    let text = std::fs::read_to_string(workspace_root().join("ci/PARITY_LEDGER.txt"))
+        .expect("ledger exists");
+    let parsed = ledger::parse(&text).expect("ledger parses");
+
+    let outcome = ledger::validate_freshness_names_the_oracle_it_claims(&parsed);
+    let rendered = outcome
+        .as_ref()
+        .err()
+        .map(|errors| {
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        })
+        .unwrap_or_default();
+    assert!(
+        outcome.is_ok(),
+        "a row claims a produced value on a source-reading evidence run:\n  {rendered}"
+    );
+
+    // NON-VACUITY, and it is the whole-file half. All three declared tags must still be
+    // carried by some row: a scan whose subject has vanished reports a clean tree because it
+    // looked for nothing, which is the `uagk` shape.
+    ledger::validate_source_reading_freshness_tags_are_live(&parsed)
+        .expect("every declared source-reading tag is still carried by a row");
+}
+
+/// THE TWO-FIELD REPAIR — the gap this law exists for, planted permanently rather than
+/// verified once by hand.
+///
+/// This row has had `oracle_kind` flipped to `pinned-binary` AND cites the rig that produces
+/// the value, so it satisfies the oracle law and cc_3's successor law completely. Only the
+/// evidence run is stale. Asserting that both prior laws PASS is the point: it measures the
+/// gap rather than describing it, and it is what keeps this test honest if either of them
+/// later grows to cover freshness itself.
+///
+/// This is also the FLOOR. Gutting the law, or emptying
+/// [`ledger::SOURCE_READING_FRESHNESS_TAGS`], turns this red.
+#[test]
+fn a_two_field_repair_that_leaves_its_freshness_tag_behind_is_refused() {
+    let two_field = synthetic(&[
+        "row meta-api | maxErrors | option | native | L2 | faithful | pinned-binary | exact \
+         | crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | \
+         pin-census-v4.32.0",
+    ]);
+
+    // The gap, measured: every check that existed before this law passes this row.
+    //
+    // Both preconditions are deliberately ALLOWANCE-INDEPENDENT, and that cost a rewrite.
+    // The first draft asserted the oracle law returns `Err` here — true today only because
+    // `maxErrors` is still declared, so the assertion would have gone red the instant cod_2
+    // landed the correct repair. A planted full repair caught it. `ORACLE_BACKING` outlives
+    // the repair by design, and "raises no unsupported-level finding" holds in both states,
+    // so neither assertion below turns on how far the repair has got.
+    assert!(
+        ledger::validate_repaired_rows_cite_their_oracle(&two_field).is_ok(),
+        "precondition: the successor law is satisfied — the row cites its rig"
+    );
+    let oracle_findings = ledger::validate_level_is_supported_by_its_oracle(&two_field)
+        .err()
+        .unwrap_or_default();
+    assert!(
+        !oracle_findings
+            .iter()
+            .any(|error| error.what.contains("produced no value to compare against")),
+        "precondition: on the oracle axis this row is already law-abiding — its oracle-kind \
+         IS value-producing, which is exactly why nothing else looks at it: {oracle_findings:?}"
+    );
+
+    let errors = ledger::validate_freshness_names_the_oracle_it_claims(&two_field)
+        .expect_err("a produced-value row on a source-reading evidence run must be refused");
+    assert!(
+        errors.iter().any(|error| error.what.contains("maxErrors")
+            && error.what.contains("pin-census-v4.32.0")
+            && error.what.contains("THREE fields")),
+        "the finding must name the row, the offending tag, and that the repair is three \
+         fields — or it cannot be acted on: {errors:?}"
+    );
+}
+
+/// THE PERMISSION HALF, in both directions, so the law is not a wall.
+///
+/// A three-field repair is admitted on a tag that exists nowhere in the real ledger, which is
+/// the case an allowlist would have refused: both pin rigs are deliberately fixture-less, so
+/// the run naming their evidence has no tag until cod_2 coins one.
+#[test]
+fn the_three_field_repair_is_admitted_and_an_unrepaired_row_is_untouched() {
+    let three_field = synthetic(&[
+        "row meta-api | maxErrors | option | native | L2 | faithful | pinned-binary | exact \
+         | crates/fln-conformance/tests/pin_option_defaults.rs | D0 | OBSERVED | \
+         pin-option-defaults-v4.32.0",
+    ]);
+    assert!(
+        ledger::validate_freshness_names_the_oracle_it_claims(&three_field).is_ok(),
+        "a row whose evidence run names the rig that produced its value is exactly what this \
+         law asks for — refusing it would make the repair unlandable"
+    );
+
+    // Still at pinned-source: the oracle law owns it, and this law must stay silent or it
+    // would redden the build today for twelve rows that are correctly declared.
+    let unrepaired = synthetic(&[
+        "row meta-api | maxRecDepth | option | native | L2 | faithful | pinned-source | exact \
+         | crates/fln-core/tests/pin_inventory_census.rs | D0 | OBSERVED | pin-census-v4.32.0",
+    ]);
+    assert!(
+        ledger::validate_freshness_names_the_oracle_it_claims(&unrepaired).is_ok(),
+        "a row still in the declared remainder is the oracle law's subject, not this one's"
+    );
+
+    // L1 source-read evidence on a source-reading run is what L1 MEANS.
+    let honest_l1 = synthetic(&[
+        "row meta-api | Lean.Read.fromSource | function | native | L1 | faithful | \
+         pinned-source | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | \
+         OBSERVED | unit-suite-v4.32.0",
+    ]);
+    assert!(
+        ledger::validate_freshness_names_the_oracle_it_claims(&honest_l1).is_ok(),
+        "the law refused evidence it exists to permit"
+    );
+}
+
+/// A declared tag that no row carries is refused, so the remainder cannot outlive its rows.
+#[test]
+fn a_declared_source_reading_tag_that_no_row_carries_is_refused() {
+    let none_carried = synthetic(&[
+        "row meta-api | Lean.Unrelated.symbol | function | native | L2 | faithful | \
+         pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | \
+         OBSERVED | core-observables-v4.32.0",
+    ]);
+    let errors = ledger::validate_source_reading_freshness_tags_are_live(&none_carried)
+        .expect_err("a declared tag no row carries must fail");
+    assert_eq!(errors.len(), ledger::SOURCE_READING_FRESHNESS_TAGS.len());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.what.contains("no row in this ledger")),
+        "{errors:?}"
+    );
+}

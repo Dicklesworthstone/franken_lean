@@ -242,6 +242,17 @@ pub const VALUE_PRODUCING_ORACLES: [&str; 4] = [
     "certified-matrix",
 ];
 
+/// A row asserts that somebody produced a value it compared against.
+///
+/// Extracted so the two laws that turn on this question cannot drift apart. Both
+/// [`validate_repaired_rows_cite_their_oracle`] and
+/// [`validate_freshness_names_the_oracle_it_claims`] fire exactly when a row has left the
+/// declared remainder, and two hand-written copies of that predicate would be a join between
+/// two rules with nothing watching it — this module's own defect class, one floor down.
+fn claims_a_produced_value(row: &Row) -> bool {
+    row.level > LLevel::L1 && VALUE_PRODUCING_ORACLES.contains(&row.oracle_kind.as_str())
+}
+
 /// The rows that break the law today, declared so that the FOURTEENTH cannot.
 ///
 /// A declared remainder, not a silent one — the same discipline the concept censuses use in
@@ -379,9 +390,7 @@ pub fn validate_repaired_rows_cite_their_oracle(ledger: &Ledger) -> Result<(), V
         // A row claims a produced value exactly when its level is above L1 AND its
         // oracle-kind is one that produced one. Until then the repair has not been asserted
         // and there is nothing to require; the allowance-scoped guards own it.
-        let claims_a_produced_value =
-            row.level > LLevel::L1 && VALUE_PRODUCING_ORACLES.contains(&row.oracle_kind.as_str());
-        if !claims_a_produced_value {
+        if !claims_a_produced_value(row) {
             continue;
         }
         if row.fixtures.iter().any(|fixture| fixture == rig) {
@@ -464,9 +473,7 @@ one-token row edit, and it is also cod_2's.";
 /// Two distinct failures, kept apart because they have opposite repairs: a row that breaks
 /// the law without being declared, and a declared row that no longer breaks it.
 pub fn validate_level_is_supported_by_its_oracle(ledger: &Ledger) -> Result<(), Vec<LedgerError>> {
-    let breaks_law = |row: &Row| {
-        row.level > LLevel::L1 && !VALUE_PRODUCING_ORACLES.contains(&row.oracle_kind.as_str())
-    };
+    let breaks_law = |row: &Row| row.level > LLevel::L1 && !claims_a_produced_value(row);
     let mut errors: Vec<LedgerError> = Vec::new();
 
     for row in &ledger.rows {
@@ -541,6 +548,112 @@ pub fn validate_allowance_has_no_orphans(ledger: &Ledger) -> Result<(), Vec<Ledg
     } else {
         Err(orphans)
     }
+}
+
+/// Freshness tags that name a run which only READ the pin, never asked it.
+///
+/// The ledger's header calls `freshness` "the evidence run", and the tags bear that out: each
+/// names a *run* by prefix and the pin epoch by suffix (`core-observables-` / `pin-census-` /
+/// `core-ext-observables-`, all at `v4.32.0`). So the tag encodes the same provenance fact
+/// that `oracle_kind` does — and until this law it was the one field of the twelve that was
+/// parsed into a typed field and never compared to anything, which is verbatim the defect
+/// this bead opened with about `level` and `oracle_kind`.
+///
+/// A DENYLIST, not an allowlist, and the direction is forced. An allowlist of value-producing
+/// tags is a WALL: repairing the twelve requires a tag that does not exist yet (both pin rigs
+/// are deliberately fixture-less, so their run has no tag today), and the permission test
+/// `source_read_at_l1_and_value_produced_above_it_are_both_permitted` already exercises a tag
+/// — `rfc-vectors` — that appears nowhere in the real ledger. A new honest tag must pass
+/// without asking anyone's permission; a known source-reading tag must not.
+///
+/// `unit-suite-v4.32.0` and `inventory-v4.32.0` sit on L1/L0 rows today, where the law never
+/// reaches them. They are declared anyway, so that raising one of those rows without moving
+/// its tag is caught at the moment it happens rather than becoming instance ten.
+pub const SOURCE_READING_FRESHNESS_TAGS: [&str; 3] = [
+    "inventory-v4.32.0",
+    "pin-census-v4.32.0",
+    "unit-suite-v4.32.0",
+];
+
+/// A row that claims a produced value may not name a source-reading run as its evidence.
+///
+/// THE GAP THIS CLOSES, which is a two-field repair passing every existing check. Repairing
+/// one of the twelve means moving three fields: `oracle_kind` to `pinned-binary`, `fixtures`
+/// to cite the rig, and `freshness` to name the rig's run. The oracle law watches the first,
+/// [`validate_repaired_rows_cite_their_oracle`] watches the second, and nothing watched the
+/// third. A row flipped to `pinned-binary` and citing `pin_option_defaults.rs` while still
+/// tagged `pin-census-v4.32.0` was fully green, with its stated evidence run naming the
+/// source-reading census as the provenance of a binary-produced level.
+///
+/// Read entirely off the ROW, for the reason cc_3 recorded when they made the successor law
+/// row-derived: keying it on a second constant would make the law depend on a join between
+/// two lists staying in step, and would make it untestable, because no synthetic ledger can
+/// shrink a compile-time const.
+///
+/// Scoped by exactly [`claims_a_produced_value`], so the coverage hands off cleanly rather
+/// than overlapping: while a row is still at `pinned-source` the oracle law owns it and this
+/// one is silent; the instant it claims a produced value this one takes over. The handoff is
+/// the transition the gap lived in.
+pub fn validate_freshness_names_the_oracle_it_claims(
+    ledger: &Ledger,
+) -> Result<(), Vec<LedgerError>> {
+    let mut errors: Vec<LedgerError> = Vec::new();
+    for row in &ledger.rows {
+        if !claims_a_produced_value(row) {
+            continue;
+        }
+        if !SOURCE_READING_FRESHNESS_TAGS.contains(&row.freshness.as_str()) {
+            continue;
+        }
+        errors.push(LedgerError {
+            line: row.line,
+            what: format!(
+                "`{}` claims {:?} on oracle-kind `{}`, but its freshness tag `{}` names a run \
+                 that only READ the pin. The ledger's header defines freshness as the evidence \
+                 run, so this row reports a binary-produced level whose evidence run is a \
+                 source reader — our READING of the oracle under the name of the oracle, which \
+                 is the substitution this bead exists to prevent. Repairing a row moves THREE \
+                 fields: oracle-kind, fixtures, and this one. Give it a tag naming the run that \
+                 produced the value.",
+                row.symbol, row.level, row.oracle_kind, row.freshness
+            ),
+        });
+    }
+    errors.sort_by_key(|error| error.line);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Every declared source-reading tag must still be carried by some row.
+///
+/// The other direction, so the remainder shrinks instead of rotting into a permanent hole
+/// wearing the costume of a shrinking debt. When the last row carrying `pin-census-v4.32.0`
+/// is repaired the tag becomes dead weight, and a dead entry is worse than none: it is a
+/// standing exemption that the next row to take that tag would inherit without anyone
+/// granting it — the same reasoning as [`validate_allowance_has_no_orphans`].
+///
+/// Deliberately scoped to the WHOLE ledger rather than to rows above L1, because a tag that
+/// has retreated to L0/L1 rows is still live and still worth denying above L1. It is dead
+/// only when no row carries it at all.
+pub fn validate_source_reading_freshness_tags_are_live(
+    ledger: &Ledger,
+) -> Result<(), Vec<LedgerError>> {
+    let stale: Vec<LedgerError> = SOURCE_READING_FRESHNESS_TAGS
+        .iter()
+        .filter(|tag| !ledger.rows.iter().any(|row| &row.freshness == *tag))
+        .map(|tag| LedgerError {
+            line: 0,
+            what: format!(
+                "SOURCE_READING_FRESHNESS_TAGS declares `{tag}`, which no row in this ledger \
+                 carries. Remove it in the change that retired the last row using it — a \
+                 remainder that does not shrink stops being a record of work outstanding."
+            ),
+        })
+        .collect();
+    if stale.is_empty() { Ok(()) } else { Err(stale) }
 }
 
 /// Validate fixture references against the workspace root: every cited fixture must
