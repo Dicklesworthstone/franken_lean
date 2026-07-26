@@ -7228,4 +7228,289 @@ mod tests {
             divergence_case_started.elapsed().as_micros()
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Merge-validation mutation record and the two facts it exposed
+    // (bead `fln-extension-merge-validation-proof-debt-dt5`).
+    // ---------------------------------------------------------------------------
+
+    /// What happened when one merge-validation defect was planted and the suite run.
+    enum MutantOutcome {
+        /// A named test failed for the intended divergence. The **function item** is
+        /// held, not its name as a string: renaming or deleting the killer is then a
+        /// compile error rather than a silently stale record.
+        KilledBy(fn()),
+        /// The mutation cannot change observable behaviour, so no test can kill it and
+        /// none should be written. An equivalent mutant is not a coverage gap, and
+        /// recording it as one manufactures permanent phantom debt.
+        EquivalentBecause(&'static str),
+    }
+
+    /// The measured campaign, 2026-07-26: twelve defects planted one at a time on the
+    /// merge-validation plane, the `fln-env` suite run against each, source restored
+    /// byte-exactly between plants.
+    ///
+    /// # Why this table exists at all
+    ///
+    /// `dt5` was filed because `fln-amv.3`/`.4` closed without demonstrating their named
+    /// mutation matrix, and the measurement showed the debt was **not** what it looked
+    /// like: eleven of the twelve already died, under ordinary behaviour-test names.
+    /// The killing assertions existed; nothing *named* them. That is the whole exposure
+    /// — a refactor that weakened `invalid_branch_history_is_a_typed_conflict` would
+    /// silently take four ancestry mutants and the unordered-comparison mutant with it,
+    /// and no artifact would record the loss.
+    ///
+    /// Holding function items binds the record to the compiler, in the same way
+    /// `franken_lean-oh1j` bound its variant count rather than maintaining a number.
+    const MERGE_VALIDATION_MUTANTS: &[(&str, MutantOutcome)] = &[
+        (
+            "descriptor_skip_name",
+            MutantOutcome::KilledBy(mismatched_descriptors_are_typed_conflicts_on_either_branch),
+        ),
+        (
+            "descriptor_skip_merge",
+            MutantOutcome::KilledBy(mismatched_descriptors_are_typed_conflicts_on_either_branch),
+        ),
+        (
+            "descriptor_skip_checkpoint",
+            MutantOutcome::KilledBy(mismatched_descriptors_are_typed_conflicts_on_either_branch),
+        ),
+        (
+            "descriptor_skip_provenance",
+            MutantOutcome::KilledBy(mismatched_descriptors_are_typed_conflicts_on_either_branch),
+        ),
+        (
+            "descriptor_validation_deferred",
+            MutantOutcome::KilledBy(mismatched_descriptors_are_typed_conflicts_on_either_branch),
+        ),
+        (
+            "ancestry_skipped",
+            MutantOutcome::KilledBy(invalid_branch_history_is_a_typed_conflict),
+        ),
+        (
+            "ancestry_only_length",
+            MutantOutcome::KilledBy(invalid_branch_history_is_a_typed_conflict),
+        ),
+        (
+            "ancestry_only_ours",
+            MutantOutcome::KilledBy(invalid_branch_history_is_a_typed_conflict),
+        ),
+        (
+            "ancestry_only_theirs",
+            MutantOutcome::KilledBy(invalid_branch_history_is_a_typed_conflict),
+        ),
+        (
+            "compare_entries_unordered",
+            MutantOutcome::KilledBy(invalid_branch_history_is_a_typed_conflict),
+        ),
+        (
+            "continue_after_refusal",
+            MutantOutcome::KilledBy(set_union_limits_are_independent_atomic_and_recoverable),
+        ),
+        (
+            "expose_partial_product",
+            MutantOutcome::EquivalentBecause(
+                "ExtensionState::merge pre-tests both of the projection's refusal \
+                 conditions over the same multiset before calling it, and both are \
+                 order-independent, so the projection's Inconclusive arm cannot fire on \
+                 the merge path; replacing it changes no observable behaviour there. The \
+                 arm IS live for the other caller, semantic_projection, which is covered \
+                 by semantic_projection_refuses_typed_on_every_resource_and_exposes_no_view.",
+            ),
+        ),
+    ];
+
+    /// The record covers the campaign and distinguishes a kill from an equivalence.
+    ///
+    /// The distinction is the point. A surviving mutant has three explanations — a
+    /// missing test, unreachable code, or a mutation that cannot change behaviour — and
+    /// they demand opposite responses. Filing an equivalent mutant as a gap creates debt
+    /// that can never be discharged, because the test it asks for cannot exist.
+    #[test]
+    fn the_merge_validation_mutation_record_is_complete_and_classified() {
+        assert_eq!(MERGE_VALIDATION_MUTANTS.len(), 12);
+        let names: BTreeSet<&str> = MERGE_VALIDATION_MUTANTS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            names.len(),
+            12,
+            "a duplicated mutant name hides a missing one"
+        );
+        let killed = MERGE_VALIDATION_MUTANTS
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, MutantOutcome::KilledBy(_)))
+            .count();
+        let equivalent = MERGE_VALIDATION_MUTANTS
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, MutantOutcome::EquivalentBecause(_)))
+            .count();
+        assert_eq!(killed, 11);
+        assert_eq!(equivalent, 1);
+        for (name, outcome) in MERGE_VALIDATION_MUTANTS {
+            match outcome {
+                // Reading the item is what binds the record to the compiler. The
+                // reference in the table above is already a use, so renaming or deleting
+                // a killer fails the build rather than leaving a stale string behind —
+                // which is the entire exposure this table closes.
+                MutantOutcome::KilledBy(killer) => {
+                    let _killer: fn() = *killer;
+                }
+                // An equivalence must carry its argument. "It survived" is not a
+                // classification, and an unargued equivalence is how a real gap gets
+                // dismissed as a phantom.
+                MutantOutcome::EquivalentBecause(reason) => assert!(
+                    reason.len() > 80,
+                    "{name}: an equivalence claim must state why behaviour cannot change"
+                ),
+            }
+        }
+    }
+
+    /// The public projection refuses typed on every resource and exposes no view.
+    ///
+    /// # The coverage hole the campaign found
+    ///
+    /// [`ExtensionState::semantic_projection`] is public and calls
+    /// `project_set_union_entries` with **no** pre-checks, so its refusal arm is live.
+    /// A reachability probe — planting a `panic!` in that arm and running the suite —
+    /// showed no test reached it by any route. The `expose_partial_product` mutant
+    /// survived on the merge path because it is equivalent there, and that equivalence
+    /// was masking a genuinely untested public path one caller over.
+    ///
+    /// FL-INV-07: a refusal is typed, carries the exact resource and both numbers, and
+    /// yields no product — the semantic view must not become observable on a path that
+    /// did not admit the complete projection, which is what that method's own doc
+    /// promises.
+    #[test]
+    fn semantic_projection_refuses_typed_on_every_resource_and_exposes_no_view() {
+        let mut state = ExtensionState::new(descriptor(
+            MergeSemantics::SetUnion,
+            PayloadProvenance::Understood,
+        ));
+        for payload in [b"aa".as_slice(), b"bbbb".as_slice(), b"cc".as_slice()] {
+            state = state.push_entry(bytes(payload));
+        }
+        let raw_entries = state.len();
+        let raw_payload_bytes = state.journal.payload_bytes;
+        assert_eq!(raw_entries, 3);
+        assert_eq!(raw_payload_bytes, 8);
+
+        // Generous on every axis: the complete projection is observable, which is the
+        // premise each refusal below is measured against.
+        let generous = SetUnionLimits::new(raw_entries, raw_payload_bytes, 4);
+        let SetUnionProjection::Complete { entries, facts } = state.semantic_projection(generous)
+        else {
+            unreachable!("an adequate budget must admit the complete projection")
+        };
+        assert_eq!(entries.len(), 3);
+        assert_eq!(facts.examined_entries, 3);
+
+        // One binding axis at a time, so a refusal names the resource under test rather
+        // than whichever the frozen order reached first.
+        for (resource, limits, allowed, observed) in [
+            (
+                SetUnionResource::Entries,
+                SetUnionLimits::new(raw_entries - 1, raw_payload_bytes, 4),
+                (raw_entries - 1) as u128,
+                raw_entries as u128,
+            ),
+            (
+                SetUnionResource::PayloadBytes,
+                SetUnionLimits::new(raw_entries, raw_payload_bytes - 1, 4),
+                raw_payload_bytes - 1,
+                raw_payload_bytes,
+            ),
+            (
+                SetUnionResource::EntryBytes,
+                SetUnionLimits::new(raw_entries, raw_payload_bytes, 3),
+                3,
+                4,
+            ),
+        ] {
+            let SetUnionProjection::Inconclusive { reason, .. } = state.semantic_projection(limits)
+            else {
+                unreachable!("{resource:?} must refuse rather than project")
+            };
+            assert_eq!(reason.resource, resource);
+            assert_eq!(reason.limit, allowed);
+            assert_eq!(reason.actual, observed);
+            assert!(
+                reason.actual > reason.limit,
+                "{resource:?}: a stop must report spending past its allowance"
+            );
+        }
+
+        // The state is a persistent value; refusing cannot have altered it.
+        assert_eq!(state.len(), raw_entries);
+        assert_eq!(state.journal.payload_bytes, raw_payload_bytes);
+    }
+
+    /// **The duplicated refusal authority, decided rather than tolerated.**
+    ///
+    /// `project_set_union_entries` has two callers with different preconditions:
+    /// [`ExtensionState::merge`], which pre-tests the same limits, and
+    /// [`ExtensionState::semantic_projection`], which does not. So the projection's own
+    /// checks are *redundant* for one caller and *load-bearing* for the other. That is a
+    /// legitimate shape, but nothing recorded which stage is the authority, and "a check
+    /// that cannot fire is not defence in depth, it is an untruthful contract"
+    /// (`environment::PreparedDeclarationAdmission::commit`) applies to whichever copy is
+    /// dead.
+    ///
+    /// **The decision: on the merge path the EARLY stages are the authority**, and they
+    /// stay. Merge refuses before computing the canonical branch order and before the
+    /// projection's O(n) walk, so the cheap refusal is the point. The projection's checks
+    /// stay too, because deleting them would leave `semantic_projection` unguarded.
+    ///
+    /// **What makes that a decision rather than a comment**: the two stages report
+    /// *different facts* for the same breach, and this pins which one a caller sees. The
+    /// entry-limit stage scans every entry, so it reports the true maximum and a full
+    /// `examined_entries`; the projection stops at the first oversized entry, so it would
+    /// report that entry's size and a partial count. Deleting merge's pre-check would
+    /// therefore still refuse — silently changing the reported evidence. This test fails
+    /// if that happens.
+    #[test]
+    fn merge_refuses_at_its_own_early_stage_not_inside_the_projection() {
+        fn set_state(payloads: &[&[u8]]) -> ExtensionState {
+            let mut state = ExtensionState::new(descriptor(
+                MergeSemantics::SetUnion,
+                PayloadProvenance::Understood,
+            ));
+            for payload in payloads {
+                state = state.push_entry(bytes(payload));
+            }
+            state
+        }
+
+        // The oversized entry is LAST and is not the first to breach, so the two stages
+        // are distinguishable: a first-breach reporter would name `bbb` (3 bytes), the
+        // scanning reporter names the true maximum `ccccc` (5 bytes).
+        let base = set_state(&[]);
+        let ours = set_state(&[b"a", b"bbb"]);
+        let theirs = set_state(&[b"ccccc"]);
+        let limits = SetUnionLimits::new(8, 64, 2);
+
+        let ExtensionMergeOutcome::Inconclusive { reason, facts } =
+            ExtensionState::merge(&base, &ours, &theirs, limits)
+                .expect("valid SetUnion histories do not conflict")
+        else {
+            unreachable!("an entry over the byte limit must refuse")
+        };
+        assert_eq!(reason.resource, SetUnionResource::EntryBytes);
+        // The authority: the true maximum across every entry, not the first breach.
+        assert_eq!(
+            reason.actual, 5,
+            "merge must report the scanned maximum; reporting 3 means the projection \
+             refused instead and merge's early stage was removed"
+        );
+        assert_eq!(reason.limit, 2);
+        // And it scanned all of them, which the projection's early return would not.
+        assert_eq!(
+            facts.examined_entries, 3,
+            "the entry-limit stage scans every entry; a partial count means a \
+             first-breach reporter answered"
+        );
+        assert_eq!(facts.maximum_entry_bytes, 5);
+    }
 }
