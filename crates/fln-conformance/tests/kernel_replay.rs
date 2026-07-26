@@ -4158,3 +4158,108 @@ fn admission_fault_matrix_is_typed_and_atomic() {
         );
     }
 }
+
+/// The corpus census must keep disclosing its own claim class, and must not
+/// strengthen that class without the evidence that would justify it.
+///
+/// **Why this is a source-level guard and not a log assertion.** The census is
+/// printed by `pinned_present_olean_kernel_differential`, which is `#[ignore]`d
+/// pending `fln-7odd`. It does not run under an ordinary `cargo test`, so a lane
+/// that greps stdout would observe nothing at all — not a missing disclosure, just
+/// silence. Reading the source is the only check that discriminates here.
+///
+/// **What it is for.** AGENTS.md's recurring-defect table records `fln-8zsq` as the
+/// one entry caught by *nothing*: the census disclosed its own limit in prose, and
+/// deleting that prose left every gate green. A disclosure protecting a claim, with
+/// nothing protecting the disclosure. This is the missing half.
+///
+/// **What it does NOT earn, stated because the whole bead is about not overclaiming.**
+/// Mechanising the disclosure does not make corpus schedule-independence *measured*.
+/// It remains INFERRED — from the Prelude matrix on different inputs, plus kernel
+/// purity and a deterministic merge. Closing that for real means running the corpus
+/// differential across {1, 8, 32} and comparing stream digests, which is a separate
+/// nightly lane and is deliberately not done here.
+#[test]
+fn corpus_census_keeps_disclosing_its_claim_class() {
+    const SOURCE: &str = include_str!("kernel_replay.rs");
+
+    // This guard must not be able to satisfy itself. Every needle below also occurs
+    // in this function's own body, so a whole-file search would match the assertion
+    // text and stay green after the census stopped disclosing anything — the exact
+    // vacuity this bead exists to prevent, one level up. The search region is
+    // therefore the file strictly BEFORE this guard.
+    let guard = SOURCE
+        .find("fn corpus_census_keeps_disclosing_its_claim_class")
+        .expect("the guard must be able to locate its own definition");
+    let census = &SOURCE[..guard];
+    assert!(
+        census.len() > 100_000,
+        "search region collapsed to {} bytes, so the self-exclusion split is wrong and \
+         these assertions would be checking almost nothing",
+        census.len()
+    );
+
+    // 1. The qualifier must travel WITH the numbers, because the numbers are what
+    //    gets quoted out of this file. This is deliberately scoped to the SUMMARY
+    //    row rather than to the file: a whole-file `contains` is satisfied by the
+    //    standalone CLAIM-CLASS row below, so it stays green while the SUMMARY is
+    //    gutted and the counts travel bare. That mutant survived the first version
+    //    of this guard, which is the same wrong-scope defect the bead is about.
+    let summary_start = census
+        .find("kernel_reference_corpus SUMMARY:")
+        .expect("the census SUMMARY row must exist");
+    let claim_start = census
+        .find("kernel_reference_corpus CLAIM-CLASS:")
+        .expect("the census CLAIM-CLASS row must exist");
+    assert!(
+        summary_start < claim_start,
+        "the CLAIM-CLASS row must follow the SUMMARY row; the region split below \
+         assumes it"
+    );
+    let summary = &census[summary_start..claim_start];
+    assert!(
+        summary.contains("schedule_independence=inferred_not_measured"),
+        "the census SUMMARY row no longer carries its claim class inline, so its \
+         compared/decoded counts can be quoted bare and would read as evidence of \
+         deterministic corpus checking; the standalone CLAIM-CLASS row does not travel \
+         with the numbers (bead fln-8zsq)"
+    );
+
+    // 2. The standalone CLAIM-CLASS row must keep naming its basis and its limit.
+    //    Losing `means=` is the worst case: the row would still look like evidence.
+    for needle in [
+        "kernel_reference_corpus CLAIM-CLASS:",
+        "basis=prelude_matrix_",
+        "means=these_counts_are_NOT_evidence_of_deterministic_corpus_checking",
+    ] {
+        assert!(
+            census.contains(needle),
+            "the census CLAIM-CLASS row lost `{needle}`, so it no longer states what the \
+             numbers are not evidence of (bead fln-8zsq)"
+        );
+    }
+
+    // 3. The module doc must keep scoping the Prelude matrix result. Before fln-8zsq
+    //    it said the matrix "PROVES it byte-equal at every width" with no input named,
+    //    sitting above both tests, which is how the corpus got read into it.
+    assert!(
+        census.contains("The matrix does not cover the corpus"),
+        "the module doc no longer scopes the {{1, 8, 32}} matrix to the Prelude, so it \
+         reads as covering the corpus differential too (bead fln-8zsq)"
+    );
+
+    // 4. The class may not silently strengthen. Claiming `measured` while the corpus
+    //    width is still the per-module size heuristic is false by construction: two
+    //    modules of different sizes run at different widths and nothing has ever
+    //    compared stream digests ACROSS widths. D7 forbids the weaker class standing
+    //    in for the stronger one, and this is that check in the direction nobody
+    //    watches — a strengthened claim, rather than a deleted one.
+    let strengthened = census.contains("schedule_independence=measured");
+    let size_heuristic = census.contains("if prep.items.len() < 64 { 1 } else { 8 }");
+    assert!(
+        !(strengthened && size_heuristic),
+        "the census claims schedule_independence=measured while the corpus width is still \
+         chosen by the per-module size heuristic; no run compares stream digests across \
+         widths, so the measured class is unearned (bead fln-8zsq, D7, PG-5)"
+    );
+}
