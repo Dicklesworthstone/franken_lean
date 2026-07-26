@@ -380,3 +380,230 @@ fn every_evidence_lane_claims_its_artifact_root_atomically() {
         );
     }
 }
+
+/// The one launcher that must start Python UNSEALED, and the marker that says why.
+///
+/// Checked in both directions. The entry is honoured only while the file still carries
+/// the negative-control assertion that *requires* an unsealed launch; sealing the probe,
+/// or deleting the control, makes this entry stale and fails the guard rather than
+/// leaving a permanent hole behind a name.
+const UNSEALED_LAUNCH_ALLOWANCE: &[(&str, &str)] = &[(
+    "scripts/tribunal/python_isolation_probe.sh",
+    r#"check "script_dir_vector_reproduces_while_unprotected" "HIJACKED""#,
+)];
+
+fn scripts_tree(dir: &Path, found: &mut Vec<(String, String)>, repo: &Path) {
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("{} must be readable: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("directory entry must be readable").path();
+        if path.is_dir() {
+            scripts_tree(&path, found, repo);
+            continue;
+        }
+        // Binary or non-UTF-8 files are not launchers; a read failure is not.
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(repo)
+            .expect("a scanned path lies under the repository")
+            .to_string_lossy()
+            .into_owned();
+        found.push((relative, body));
+    }
+}
+
+/// Fold backslash continuations into one logical command, keeping the physical line
+/// number the command started on. A launcher's flags routinely sit several continuation
+/// lines below the interpreter token, and a per-physical-line reading calls those sealed
+/// launches bare.
+fn logical_lines(body: &str) -> Vec<(usize, String)> {
+    let mut commands = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (index, line) in body.lines().enumerate() {
+        let continues = line.ends_with('\\');
+        let piece = line.strip_suffix('\\').unwrap_or(line);
+        match pending.as_mut() {
+            Some((_, buffer)) => {
+                buffer.push(' ');
+                buffer.push_str(piece.trim());
+            }
+            None => pending = Some((index + 1, piece.to_owned())),
+        }
+        if !continues {
+            commands.push(pending.take().expect("a command was started above"));
+        }
+    }
+    if let Some(tail) = pending {
+        commands.push(tail);
+    }
+    commands
+}
+
+/// Is this shell command an actual interpreter launch, as opposed to a mention?
+fn launches_python(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    // `command -v python3` resolves an interpreter without starting one; `-n`/`-z` test
+    // that the resolution succeeded; the remaining forms name it in a diagnostic
+    // message. None of them begins execution. The emptiness tests are matched on the
+    // operator rather than on `[[`, so a launch inside a command substitution in a test
+    // is still judged.
+    if line.contains("command -v python3")
+        || line.contains(r#"-n "$PYTHON_BIN""#)
+        || line.contains(r#"-z "$PYTHON_BIN""#)
+        || line.contains("python3 is required")
+        || line.contains("python3_")
+    {
+        return false;
+    }
+    line.contains("python3") || line.contains("$PYTHON_BIN") || line.contains("${PYTHON[@]}")
+}
+
+/// Every trusted Python launcher under `scripts/` starts its interpreter sealed, and the
+/// scope of "every" is derived from the tree rather than written down.
+///
+/// Python resolves imports from the launched script's own directory and from `PYTHONPATH`
+/// ahead of the standard library, so a `scripts/hashlib.py` or an ambient `PYTHONPATH`
+/// replaces the module that computes the governed digests and decides the verdicts
+/// (`franken_lean-h40t`; both vectors are reproduced then refused, live, by
+/// `scripts/tribunal/python_isolation_probe.sh`). `-I -S` closes both channels.
+///
+/// `every_supervisor_launcher_seals_python_configuration_before_imports` above asserts
+/// that, but over a hand-written list of ten shell scripts and five Python entry points.
+/// Measured at `4dc3e5fb`, that list had already gone stale in three places, and the
+/// mutants say so: dropping `-I -S` from `scripts/e2e/contract_handoff.sh`, from
+/// `scripts/e2e/unsafe_note_clippy.sh`, or the sealed shebang from
+/// `scripts/extract/validate_extern_builtin_census.py` each left the suite green, while
+/// the identical mutation in the listed `scripts/e2e/closure_audit.sh` exited 101. The
+/// rig could always kill the mutant; it could not see the file. All three were sealed —
+/// by their authors' care, and by nothing else.
+///
+/// The hand-list also could not have absorbed them as it stands: its "no bare `python3`
+/// token" rule panics on `python3 -I -S "$root/..."`, which is a *sealed* launch, so
+/// three correct files would have reddened the gate on being added. This guard judges
+/// each launch line instead, which is the property that actually matters.
+///
+/// **What it does not catch, stated so nobody has to rediscover it.** Judgement is per
+/// logical command, so a continued command carrying *two* interpreter starts passes on
+/// the sealed one and an unsealed sibling rides along. No such command exists in this
+/// tree — the shapes that do exist are a lone launch, or an interpreter path passed as
+/// an expected-executable argument beside a sealed launch — but the guard cannot tell
+/// those apart, and a future lane could introduce one. It is a *line* scanner over shell
+/// text, not a parser, and it does not observe a single interpreter actually start:
+/// that is `scripts/tribunal/python_isolation_probe.sh`'s job, and asserting `-I` is set
+/// is not evidence that `-I` works.
+#[test]
+fn every_python_launch_under_scripts_is_sealed() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let mut files = Vec::new();
+    scripts_tree(&repo.join("scripts"), &mut files, &repo);
+    // Directory order is not specified; the report must not depend on it (FL-INV-01).
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut python_entry_points = 0usize;
+    let mut shell_launchers = 0usize;
+    let mut allowance_used: Vec<&str> = Vec::new();
+
+    for (relative, body) in &files {
+        if relative.ends_with(".py") {
+            // A Python entry point is launched by its own shebang whenever it is run
+            // directly, so the shebang is the launch and must carry the flags.
+            python_entry_points += 1;
+            assert!(
+                body.starts_with("#!/usr/bin/env -S python3 -I -S\n"),
+                "{relative} is a trusted Python entry point whose shebang does not seal \
+                 startup; run directly, it resolves imports from its own directory first"
+            );
+            continue;
+        }
+
+        let allowed = UNSEALED_LAUNCH_ALLOWANCE
+            .iter()
+            .find(|(path, _)| path == relative);
+        let mut launches = false;
+        let mut unsealed: Vec<(usize, String)> = Vec::new();
+
+        for (first_line, command) in logical_lines(body) {
+            if !launches_python(&command) {
+                continue;
+            }
+            launches = true;
+            let sealed = command.contains("python3 -I")
+                || command.contains(r#""$PYTHON_BIN" -I -S"#)
+                || command.contains(r#"${PYTHON[@]}"#)
+                || command.contains(r#"PYTHON=("$PYTHON_BIN" -I -S)"#);
+            if !sealed {
+                unsealed.push((first_line, command.trim().to_owned()));
+            }
+        }
+
+        if !launches {
+            continue;
+        }
+        shell_launchers += 1;
+
+        // `${PYTHON[@]}` is an indirection, so a sealed-looking call site proves nothing
+        // unless the array it expands to is itself frozen with the flags. This is the
+        // mutation that survived: `PYTHON=("$PYTHON_BIN")` leaves every downstream
+        // `"${PYTHON[@]}"` reading as a sealed launch while sealing nothing.
+        if body.contains(r#"${PYTHON[@]}"#) {
+            assert!(
+                body.contains(r#"PYTHON=("$PYTHON_BIN" -I -S)"#),
+                "{relative} launches Python through the ${{PYTHON[@]}} array but never \
+                 freezes it as PYTHON=(\"$PYTHON_BIN\" -I -S), so every call site through \
+                 that array starts an unsealed interpreter"
+            );
+        }
+
+        if let Some((_, marker)) = allowed {
+            assert!(
+                body.contains(marker),
+                "{relative} holds an unsealed-launch allowance whose stated reason is \
+                 gone: the negative control {marker:?} is no longer in the file, so the \
+                 allowance names something that is not there"
+            );
+            assert!(
+                !unsealed.is_empty(),
+                "{relative} no longer launches Python unsealed, so its allowance is \
+                 stale and must be removed — this list may only shrink"
+            );
+            allowance_used.push(relative);
+        } else {
+            assert!(
+                unsealed.is_empty(),
+                "{relative} starts Python without -I -S at {unsealed:?}; an ambient \
+                 PYTHONPATH or a module beside the script would then replace the \
+                 stdlib under a trusted evidence producer"
+            );
+        }
+    }
+
+    // A moved directory or a broken filter must fail loudly rather than pass an empty
+    // scan. A derived scope that silently derives nothing is worse than a hand-list,
+    // because it reads as coverage. Floors, not equalities: a new sealed launcher must
+    // not redden a correct tree.
+    assert!(
+        shell_launchers >= 12 && python_entry_points >= 5,
+        "derived scan found {shell_launchers} shell launchers and {python_entry_points} \
+         Python entry points under scripts/, which is too few for this tree; the scan \
+         scope is wrong and this guard must never report success over a truncated set"
+    );
+    assert_eq!(
+        allowance_used.len(),
+        UNSEALED_LAUNCH_ALLOWANCE.len(),
+        "an unsealed-launch allowance entry never matched a scanned file: {:?} were used \
+         of {:?}. A dead entry is a hole with a name on it",
+        allowance_used,
+        UNSEALED_LAUNCH_ALLOWANCE
+            .iter()
+            .map(|(path, _)| *path)
+            .collect::<Vec<_>>()
+    );
+}
