@@ -790,6 +790,7 @@ mod tests {
     use fln_core::level::Level;
     use fln_core::name::Name;
     use fln_core::options::{DataValue, KVMap};
+    use std::collections::BTreeSet;
 
     fn name(text: &str) -> Name {
         Name::str(Name::anonymous(), text)
@@ -799,9 +800,9 @@ mod tests {
         Expr::bvar(idx).expect("a small index is representable")
     }
 
-    /// One `Expr` of **every** variant, so the invariant tests cover the whole enum rather than the
-    /// constructors that happened to come to mind. The count is asserted against `VARIANTS` below,
-    /// which is what keeps this list honest when the enum grows.
+    /// One `Expr` of **every** variant it can build, so the invariant tests cover the whole enum
+    /// rather than the constructors that happened to come to mind. Each entry's label is checked
+    /// against [`variant_label`], so a fixture cannot claim to cover a variant it does not build.
     fn one_of_each() -> Vec<(&'static str, Expr)> {
         vec![
             ("BVar", bvar(0)),
@@ -842,23 +843,67 @@ mod tests {
         ]
     }
 
+    /// Every variant's label, from a match with **no wildcard arm**.
+    ///
+    /// This replaces a hand-written `VARIANTS: usize = 12`, which was a claim ABOUT `ExprNode` that
+    /// nothing bound TO `ExprNode` (bead `franken_lean-oh1j`). A thirteenth variant broke the key
+    /// builder and the rebuilder, so the production paths were genuinely guarded — but this test's
+    /// coverage check was `one_of_each().len() + UNBUILT == 12`, which stays true forever while the
+    /// new variant goes untested. A count that cannot notice what it counts is the same shape as a
+    /// projection used as an identity without checking it is injective.
+    ///
+    /// Now a thirteenth variant fails to compile HERE, in the test module, next to the fixture that
+    /// would have to grow. **What this does and does not promise:** the compiler guarantees a new
+    /// variant is *noticed*; whether it then gets a fixture is a human decision. That is the honest
+    /// limit of what a type system can enforce about test coverage, and it is strictly more than a
+    /// constant that silently stays true.
+    fn variant_label(node: &ExprNode) -> &'static str {
+        match node {
+            ExprNode::BVar { .. } => "BVar",
+            ExprNode::FVar { .. } => "FVar",
+            ExprNode::MVar { .. } => "MVar",
+            ExprNode::Sort { .. } => "Sort",
+            ExprNode::Const { .. } => "Const",
+            ExprNode::App { .. } => "App",
+            ExprNode::Lam { .. } => "Lam",
+            ExprNode::ForallE { .. } => "ForallE",
+            ExprNode::LetE { .. } => "LetE",
+            ExprNode::Lit { .. } => "Lit",
+            ExprNode::MData { .. } => "MData",
+            ExprNode::Proj { .. } => "Proj",
+        }
+    }
+
     /// The variants `one_of_each` does not build, and why. `FVar` and `MVar` need id types this
-    /// module has no constructor for; they are covered by the exhaustive `match` arms rather than by
-    /// a fixture, and the compiler is the guard there.
-    const UNBUILT_VARIANTS: usize = 2;
-    const VARIANTS: usize = 12;
+    /// module has no constructor for; they are covered by the exhaustive `match` arms in the key
+    /// builder, the rebuilder and [`variant_label`], and the compiler is the guard there.
+    const UNBUILT_VARIANTS: [&str; 2] = ["FVar", "MVar"];
 
     /// **THE INTERNING INVARIANT: structural equality implies pointer equality.** Over every
     /// variant, and over every construction path — a term built twice independently must intern to
     /// the same stored node.
     #[test]
     fn structural_equality_implies_pointer_equality_for_every_variant() {
-        assert_eq!(
-            one_of_each().len() + UNBUILT_VARIANTS,
-            VARIANTS,
-            "the fixture must cover every ExprNode variant it can construct; if the enum grew, this \
-             count is the reminder"
-        );
+        // Each fixture's label must be the variant it actually builds — a label is otherwise a
+        // comment, and a wrong one makes the coverage set a fiction.
+        let mut covered = BTreeSet::new();
+        for (label, expr) in one_of_each() {
+            assert_eq!(
+                label,
+                variant_label(expr.node()),
+                "fixture {label} does not build the variant it names"
+            );
+            assert!(
+                covered.insert(label),
+                "two fixtures build the {label} variant"
+            );
+        }
+        for unbuilt in UNBUILT_VARIANTS {
+            assert!(
+                !covered.contains(unbuilt),
+                "{unbuilt} is listed as unbuildable but the fixture builds it"
+            );
+        }
 
         let mut interner = Interner::new();
         for (label, expr) in one_of_each() {
