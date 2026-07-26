@@ -4263,3 +4263,74 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
          widths, so the measured class is unearned (bead fln-8zsq, D7, PG-5)"
     );
 }
+
+/// The `{1, 8, 32}` determinism claim must name its scope everywhere it appears, for as
+/// long as the corpus differential still runs at one size-derived width.
+///
+/// `fln-8zsq` scoped the claim inside this file. It stayed unscoped in AGENTS.md, README
+/// and the plan, which is the same defect one level up: the claim is repository-wide and
+/// the enforcement is Prelude-only, and no reader of those documents could tell. This
+/// test is the join between the two artifacts, which is exactly where this project keeps
+/// finding the gap.
+///
+/// The probe for "does a corpus matrix exist" is read from the code rather than
+/// declared, so the day someone builds the corpus-scale matrix and deletes the size
+/// heuristic, this guard stops requiring the qualifier instead of demanding a stale one.
+#[test]
+fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
+    const SOURCE: &str = include_str!("kernel_replay.rs");
+    // The probe region must exclude EVERY guard body, not merely this one. The heuristic
+    // literal below also appears inside `corpus_census_keeps_disclosing_its_claim_class`'s
+    // strengthening assertion, so a region that stopped at this function still matched a
+    // *test's* text and reported the production heuristic present after it was removed —
+    // the same self-match that has now bitten three times in this session, here across two
+    // guards rather than inside one. Cutting at the FIRST guard leaves production code only.
+    let production_end = SOURCE
+        .find("fn corpus_census_keeps_disclosing_its_claim_class")
+        .expect("the first source-reading guard marks the end of production code");
+    let production = &SOURCE[..production_end];
+
+    // Derived, not declared: the corpus is single-width exactly while this heuristic
+    // stands. `prelude_replays_through_the_kernel` is the only real matrix.
+    let corpus_is_single_width = production.contains("if prep.items.len() < 64 { 1 } else { 8 }");
+    assert!(
+        production.contains("for threads in [1usize, 8, 32]"),
+        "the Prelude thread matrix disappeared; the claim would then have no support at \
+         any scope"
+    );
+    if !corpus_is_single_width {
+        // A corpus-scale matrix now exists. The documents may state the claim without a
+        // Prelude qualifier, and this guard must not demand a qualifier that has become
+        // false.
+        return;
+    }
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Any of these words makes the line honest: it either names the scope or names the
+    // gap. The set is deliberately generous — the failure this catches is a bare claim.
+    const QUALIFIERS: [&str; 6] = ["Prelude", "prelude", "unbuilt", "inferred", "2ki4", "8zsq"];
+    let mut checked = 0usize;
+    for doc in ["AGENTS.md", "README.md"] {
+        let text = fs::read_to_string(repo.join(doc))
+            .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
+        for (index, line) in text.lines().enumerate() {
+            if !line.contains("{1, 8, 32}") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                QUALIFIERS.iter().any(|word| line.contains(word)),
+                "{doc}:{} states the {{1, 8, 32}} determinism claim without naming its \
+                 scope, while the corpus differential still runs at a single size-derived \
+                 width and no run compares stream digests across widths. A reader takes \
+                 this as covering the corpus (beads fln-8zsq, franken_lean-2ki4):\n  {line}",
+                index + 1
+            );
+        }
+    }
+    assert!(
+        checked >= 4,
+        "only {checked} determinism claim lines found across AGENTS.md and README.md; the \
+         scan is looking in the wrong place and would pass over a bare claim"
+    );
+}

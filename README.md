@@ -31,7 +31,7 @@
 | Compatibility | Drop-in at six binary surfaces: source language, `.olean` (read *and* byte-compatible write), the `lean_object` C ABI (`lean.h` twin — existing native plugins load), `.ilean`/artifact chain, the `Lean.*` Meta API, and LSP + `$/lean/*` (vscode-lean4 connects unmodified). |
 | Kernel | ≤ 12 KLOC `forbid(unsafe)` dual-engine checker (certified small-step + NbE accelerator, cross-checked), plus an independent in-repo checker and foreign witnesses. Disagreement halts; it never outvotes. |
 | Receipts | Every checked declaration can emit a compressed proof certificate; attested checks append to a transparency log; `fln check-olean` re-checks all of mathlib in minutes on a kernel sharing no code with the thing it checks. |
-| Determinism | Same input closure ⇒ same environment, same diagnostics, same artifacts, at any thread count — an invariant, tested at {1, 8, 32} threads on every commit. `--reproducible` yields bit-identical artifacts across the certified platform matrix. |
+| Determinism | Same input closure ⇒ same environment, same diagnostics, same artifacts, at any thread count — an invariant, tested at {1, 8, 32} threads on every commit **over the Prelude**; the corpus-scale matrix is not built yet, so corpus schedule-independence is inferred rather than measured (beads `fln-8zsq`, `franken_lean-2ki4`). `--reproducible` yields bit-identical artifacts across the certified platform matrix. |
 | Incrementality | The environment is a Merkle DAG of content-addressed declarations. A leaf edit re-elaborates its *true dependency cone* (seconds), not its file cone (hours). Whitespace, comments, and reordering invalidate nothing. |
 | Server | One daemon, one shared immutable import heap. The ≈60 s × N workers × GBs × N multiplication becomes once-per-daemon; warm attach ≤ 2 s; thousands of O(1) proof-state forks per daemon. |
 | Metaprogramming | The entire tactic ecosystem (mathlib, aesop, downstream) runs unmodified on Golem, our register VM whose values *are* ABI objects — one calling convention across interpreted code, JIT'd code, Reference-built plugins, and native builtins. |
@@ -279,7 +279,7 @@ Numbers below are the provisional CI **gates** (§19 of the plan) — the target
 | PG-2 · Cold Corpus | Full mathlib elaboration wall-clock ≤ 0.5× Reference at G4, ≤ 0.35× at G6 |
 | PG-3 · The Cone | Leaf-edit incremental rebuild = true-cone only; representative leaf edits p50 ≤ 15 s, p95 ≤ 90 s from a warm Ledger |
 | PG-4 · Attach | Daemon warm attach of a mathlib file ≤ 2 s p50; cold first-attach ≤ 1.2× Reference worker import |
-| PG-5 · Determinism | Bit-identical environments/diagnostics/artifacts across {1, 8, 32} threads per commit; {96}+ weekly; certified matrix under `--reproducible` |
+| PG-5 · Determinism | Bit-identical environments/diagnostics/artifacts across {1, 8, 32} threads per commit — Prelude-scope today, corpus-scale matrix unbuilt (`franken_lean-2ki4`); {96}+ weekly; certified matrix under `--reproducible` |
 | PG-6 · Memory | Daemon steady RSS serving ≥ 8 open mathlib files ≤ 1.3× one Reference worker; zero leaks over a 4 h soak |
 | PG-7 · Golem | Interpreter ≥ 3× Reference interpreter on the tactic micro-corpus; Iron-JIT ≥ 0.5× Reference-precompiled |
 | PG-8 · Codec | olean read ≥ Reference load throughput; write round-trip bit-stable at 100% of the Corpus set |
