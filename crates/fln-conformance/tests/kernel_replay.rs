@@ -713,6 +713,69 @@ struct MatrixRun {
     duration_us: u128,
 }
 
+/// The first divergence across runs at different widths, or `None` when the
+/// authoritative streams and their consumption are identical (R3 of bead
+/// `fln-corpus-thread-matrix-93te`).
+///
+/// Extracted so the corpus matrix (R2) reuses this rather than growing a second
+/// comparison that could drift from the Prelude's.
+///
+/// Every run is compared against the first. Equality is transitive, so baseline-vs-rest
+/// reaches the same conclusion as all-pairs; the REPORT nonetheless names BOTH widths,
+/// because "threads=8 diverged" does not say what it diverged from, and a three-width
+/// matrix has three candidate baselines. That is the scope-the-evidence-to-the-site rule
+/// applied to a diagnostic.
+///
+/// Differing unit COUNTS are named explicitly. The inline version this replaces zipped
+/// the two streams, and `zip` stops at the shorter side — so a run that dropped units
+/// outright compared equal on every position it did have and was reported as "digest
+/// mismatch with equal prefixes", which describes the symptom and hides the cause.
+fn first_divergence_across_widths(runs: &[MatrixRun]) -> Option<String> {
+    let baseline = runs.first()?;
+    for run in &runs[1..] {
+        if run.stream_digest != baseline.stream_digest {
+            if run.outcomes.len() != baseline.outcomes.len() {
+                return Some(format!(
+                    "threads={} vs threads={}: unit count differs, {} vs {}",
+                    baseline.threads,
+                    run.threads,
+                    baseline.outcomes.len(),
+                    run.outcomes.len()
+                ));
+            }
+            for (index, (a, b)) in baseline
+                .outcomes
+                .iter()
+                .zip(run.outcomes.iter())
+                .enumerate()
+            {
+                if a != b {
+                    return Some(format!(
+                        "threads={} vs threads={}: unit={} lead={}: {} vs {}",
+                        baseline.threads, run.threads, index, a.lead, a.outcome, b.outcome
+                    ));
+                }
+            }
+            return Some(format!(
+                "threads={} vs threads={}: digest mismatch over identical unit streams",
+                baseline.threads, run.threads
+            ));
+        }
+        if run.steps_total != baseline.steps_total || run.depth_max != baseline.depth_max {
+            return Some(format!(
+                "threads={} vs threads={}: consumption differs, steps {} vs {}, depth {} vs {}",
+                baseline.threads,
+                run.threads,
+                baseline.steps_total,
+                run.steps_total,
+                baseline.depth_max,
+                run.depth_max
+            ));
+        }
+    }
+    None
+}
+
 // Rust's default spawned-thread stack is 2 MiB on this target. That is below
 // the depth at which `Budget::DEFAULT` can still permit the kernel to recurse,
 // so inheriting it lets a valid deep term abort the whole Tribunal before the
@@ -3252,35 +3315,11 @@ fn prelude_replays_through_the_kernel() {
     // emit the identity row carrying it, and only then assert — so a failure
     // leaves machine evidence behind, not just a panic message.
     let baseline = &runs[0];
-    let mut first_divergence: Option<String> = None;
-    'outer: for run in &runs[1..] {
-        if run.stream_digest == baseline.stream_digest {
-            continue;
-        }
-        for (i, (a, b)) in baseline
-            .outcomes
-            .iter()
-            .zip(run.outcomes.iter())
-            .enumerate()
-        {
-            if a != b {
-                first_divergence = Some(format!(
-                    "threads={} unit={} lead={}: {} vs {}",
-                    run.threads, i, a.lead, a.outcome, b.outcome
-                ));
-                break 'outer;
-            }
-        }
-        first_divergence = Some(format!(
-            "threads={}: digest mismatch with equal prefixes",
-            run.threads
-        ));
-        break;
-    }
-    let identical = first_divergence.is_none()
-        && runs
-            .iter()
-            .all(|r| r.steps_total == baseline.steps_total && r.depth_max == baseline.depth_max);
+    // Shared with the corpus matrix (R2 of `fln-corpus-thread-matrix-93te`) so the two
+    // scopes cannot drift apart in what they consider a divergence. Consumption equality
+    // is folded in, so `identical` is exactly "no divergence found".
+    let first_divergence = first_divergence_across_widths(&runs);
+    let identical = first_divergence.is_none();
     let start_us = emit.started.elapsed().as_micros();
     emit.matrix_row(
         &prep,
@@ -4376,5 +4415,88 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         checked >= 4,
         "only {checked} determinism claim lines found across AGENTS.md and README.md; the \
          scan is looking in the wrong place and would pass over a bare claim"
+    );
+}
+
+/// Planted divergences for `first_divergence_across_widths` (R3 of bead
+/// `fln-corpus-thread-matrix-93te`).
+///
+/// These run in milliseconds because the comparator is a pure function over recorded
+/// runs. That matters: the corpus matrix itself is expensive and will land on a cadence,
+/// so the part that decides whether a divergence is *detected and named* must be provable
+/// without paying for the run that produces the data.
+#[test]
+fn the_width_comparator_names_the_pair_and_the_unit_that_diverged() {
+    fn unit(lead: &str, outcome: &str) -> UnitOutcome {
+        UnitOutcome {
+            lead: lead.to_string(),
+            kind: "def",
+            members: 1,
+            outcome: outcome.to_string(),
+            message: String::new(),
+            steps_used: 1,
+            max_depth: 1,
+        }
+    }
+    fn run(threads: usize, digest: &str, outcomes: Vec<UnitOutcome>) -> MatrixRun {
+        MatrixRun {
+            threads,
+            outcomes,
+            stream_digest: digest.to_string(),
+            accepted: 1,
+            inconclusive: 0,
+            rejected: BTreeMap::new(),
+            steps_total: 10,
+            depth_max: 3,
+            duration_us: 0,
+        }
+    }
+    let base = vec![unit("A", "accepted"), unit("B", "accepted")];
+
+    // Negative control: without this the cases below could pass for the wrong reason.
+    let clean = vec![
+        run(1, "d", base.clone()),
+        run(8, "d", base.clone()),
+        run(32, "d", base.clone()),
+    ];
+    assert_eq!(first_divergence_across_widths(&clean), None);
+
+    // A unit-level divergence must name BOTH widths, the index, and the lead.
+    let mut drifted = base.clone();
+    drifted[1] = unit("B", "rejected");
+    let diverged = vec![
+        run(1, "d", base.clone()),
+        run(8, "other", drifted),
+        run(32, "d", base.clone()),
+    ];
+    let report = first_divergence_across_widths(&diverged).expect("divergence must be found");
+    assert!(
+        report.contains("threads=1 vs threads=8")
+            && report.contains("unit=1")
+            && report.contains("lead=B"),
+        "the report must name the pair and the site, not merely that something differed: {report}"
+    );
+
+    // A dropped unit must be named as a count difference. `zip` truncates, so the naive
+    // comparison reported "equal prefixes" here and hid the cause.
+    let truncated = vec![
+        run(1, "d", base.clone()),
+        run(8, "other", vec![unit("A", "accepted")]),
+    ];
+    let report = first_divergence_across_widths(&truncated).expect("divergence must be found");
+    assert!(
+        report.contains("unit count differs") && report.contains("2 vs 1"),
+        "a dropped unit must be reported as a count difference: {report}"
+    );
+
+    // Identical streams with differing consumption are still a divergence: FL-INV-01
+    // covers exact consumption, not just verdicts.
+    let mut greedy = run(8, "d", base.clone());
+    greedy.steps_total = 11;
+    let consumption = vec![run(1, "d", base.clone()), greedy];
+    let report = first_divergence_across_widths(&consumption).expect("divergence must be found");
+    assert!(
+        report.contains("consumption differs") && report.contains("steps 10 vs 11"),
+        "differing consumption at equal verdicts must still diverge: {report}"
     );
 }
