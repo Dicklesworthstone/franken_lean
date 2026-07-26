@@ -1,0 +1,100 @@
+# The dispatcher for the §18 mandated-mutant campaign.
+#
+# WHY THIS FILE IS SEPARATE FROM ci.yml. The campaign is `#[ignore]`d because it EDITS
+# TRACKED SOURCE — it plants each mandated mutant into the real production file, watches the
+# named killers die for the stated reason, and restores the file from a `Drop` impl. That is
+# correct on an ephemeral runner and wrong on a per-commit lane, so it gets its own cadence
+# rather than a step in the per-commit workflow.
+#
+# WHAT RUNS PER COMMIT IS NOT THIS. `the_recorded_kills_still_describe_this_tree` runs in
+# ordinary `cargo test` and proves the recorded kill still describes this tree; it does not
+# prove the mutant dies today. Those are different claims and stacking them does not make
+# one. This lane is what makes the second claim get re-measured when the code has NOT moved —
+# the retention check already forces it when the code has.
+#
+# THE JOIN BACK. `the_receipt_class_matches_what_actually_dispatches_the_campaign` reads this
+# directory and refuses if the receipt's `class` token and the dispatch state disagree in
+# either direction. Deleting this file is therefore not silent: it turns the recorded rows
+# into a claim with nothing producing it, and the per-commit suite goes red saying so.
+
+name: mandated mutant campaign
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # Weekly, offset from the contract-drift lane so the two never contend for a runner.
+    - cron: "23 4 * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: mandated-mutants-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  campaign:
+    name: plant the mandated mutants and watch their killers die
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: checkout FrankenLean
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: record the commit the campaign is measured at
+        shell: bash
+        run: |
+          # AGENTS.md's standing habit until `vdi4` closes: record the hash a measurement was
+          # re-derived at. The campaign records it into the receipt itself; this is for
+          # whoever reads the run log without the artifact.
+          git rev-parse HEAD
+
+      - name: confirm the tree is clean before anything plants into it
+        shell: bash
+        run: |
+          # The campaign refuses to start on a dirty tree so it can tell its own mutation
+          # from somebody else's edit. Failing here rather than inside the campaign makes the
+          # reason legible.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "working tree is not clean; the campaign cannot attribute its own edits" >&2
+            git status --porcelain >&2
+            exit 2
+          fi
+
+      - name: run the mandated mutant campaign
+        shell: bash
+        run: |
+          cargo test -p fln-conformance --test mandated_mutants \
+            the_mandated_mutants_are_planted_and_their_killers_die \
+            -- --ignored --exact --nocapture
+
+      - name: prove the production files were restored
+        shell: bash
+        run: |
+          # The campaign restores from `Drop`, including on panic. This asserts it, because a
+          # lane that leaves a kernel with its positivity check disabled must not report
+          # success — and because the next step's receipt would then describe mutated source.
+          if [[ -n "$(git status --porcelain -- crates/fln-kernel crates/fln-unsafe-abi)" ]]; then
+            echo "the campaign did not restore the production files it mutated" >&2
+            git status --porcelain -- crates/fln-kernel crates/fln-unsafe-abi >&2
+            exit 2
+          fi
+
+      - name: re-run the per-commit half against the freshly appended rows
+        shell: bash
+        run: |
+          # Closes the loop inside one lane: the campaign appended rows, and the retention and
+          # cadence guards must both accept them. A campaign that writes a receipt its own
+          # guards reject is a campaign nobody would notice was broken.
+          cargo test -p fln-conformance --test mandated_mutants
+
+      - name: archive the kill receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mandated-mutant-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: crates/fln-conformance/evidence/mandated_mutants/kills.jsonl
+          if-no-files-found: error
+          retention-days: 90
