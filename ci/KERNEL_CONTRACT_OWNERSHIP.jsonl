@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":359,"projection_hash":"ab82249d7aad08624b634b73209bad5991b3fa204757fff0f47418cfd9352bbd"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":360,"projection_hash":"0ce956f4ed5a921c6c0da95cde1d54d0c28da4d8054bbf34f90bf0cfaf171d9c"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -248,6 +248,7 @@
 {"id":"franken_lean-epoch-migration-autopilot-q9w"}
 {"id":"franken_lean-epx"}
 {"id":"franken_lean-etj"}
+{"id":"franken_lean-evidence-python-config-rule-drift-imuu"}
 {"id":"franken_lean-ex54"}
 {"id":"franken_lean-ext-observable-fixture-drift-gap-vqnu"}
 {"id":"franken_lean-f6br"}
