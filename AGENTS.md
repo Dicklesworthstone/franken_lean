@@ -338,14 +338,82 @@ Practical notes: array fields must be sorted and duplicate-free or the validator
 
 ## UBS — Ultimate Bug Scanner
 
-`ubs <changed-files>` before every commit. Exit 0 = safe; exit >0 = fix & re-run.
+Run `ubs <changed-files>` before every commit. **Its exit code is not a
+verdict.** A nonzero exit can mean completed findings or a staging/scanner
+failure; zero can mean a completed clean scan or that no scanner ran. The
+JSONL-only control on 2026-07-26 exited 0 while saying `no supported languages
+detected` and `nothing was checked (this is NOT a pass)`. A clean result
+requires positive message-text evidence that the intended scanner ran,
+accounted for every intended supported input, completed, and reported zero
+blocking findings.
 
 ```bash
 ubs file.rs file2.rs                    # specific files (< 1s)
 ubs $(git diff --name-only --cached)    # staged files — before commit
 ubs --only=rust,toml crates/            # language filter
 ```
-Parse `file:line:col` → location, 💡 → suggested fix. Fix root cause, not symptom. Critical (always fix): memory safety, UB, data races. Important: unwrap panics, resource leaks, overflow.
+
+Run from the checkout being assessed and pass relative paths. Do not invoke
+UBS from one checkout with absolute paths into another. Do not compare counts
+across trees unless cwd, relative path, and bytes are identical; hold cwd and
+path fixed and vary only content.
+
+Classify the terminal text before findings:
+
+- `completed_clean`: intended scanner ran, every supported input is accounted
+  for, totals are consistent, and there are zero blocking findings.
+- `completed_findings`: the same execution/accounting proof, with one or more
+  findings.
+- `not_applicable_no_supported_inputs`: the declared change set contains zero
+  files in languages UBS supports and the output confirms that fact. This
+  supplies no scanner evidence and is never called a pass, but it does not
+  block an unsupported-only documentation/JSONL commit; record it and use the
+  applicable validators.
+- `no_scanner_executed`: at least one supported input was intended, but its
+  scanner did not run or did not account for that input. This supplies no
+  safety evidence even when exit is 0.
+- `staging_or_scanner_failure`: shadow-workspace preparation, missing scanner,
+  timeout, or aborted/incomplete scan — supplies no safety evidence even
+  though it may share a nonzero exit with real findings.
+- `inconclusive`: execution, input accounting, completion, or totals cannot be
+  established or contradict one another.
+
+Only `completed_clean` is UBS-clean.
+`not_applicable_no_supported_inputs` is an explicit non-pass with zero scanner
+coverage; the last three modes block until corrected and rerun. A known-false
+exception starts only from `completed_findings`, never from a failed or
+vacuous run.
+
+For a known-false class, put a durable `UBS-TRIAGE/1` comment on the active
+change bead. Record: owning bead and exact class; absolute cwd; exact command;
+UBS version; HEAD and porcelain status; relative input paths plus SHA-256;
+exit code; expected/observed scanner and its positive execution evidence;
+intended/accounted supported-file counts; exact terminal mode and message
+excerpt; reported and enumerated distinct totals; and, for every site,
+file:line, both operands, both semantic roles, changed-hunk intersection, and
+classification. Counts must reconcile exactly. “Pre-existing” establishes
+attribution, not safety. Put a compact terminal-mode/class/count/bead-comment
+disclosure in the commit message; never call a nonzero known-false run
+“passed.” Any other critical, uncertain role, missing site, or count mismatch
+blocks.
+
+`fln-lyc8` owns the exact class `Secret, signature, or token compared with
+==/!=`. Its bounded UBS v5.3.7 measurement at
+`dbc3e998b19cc8eb31e8245efc9870c8107786b5` found 126 sites and zero true
+credential/signature comparisons. The implementable upstream narrowing
+inspects only the two operand ASTs; matches exact normalized credential
+components `secret`, `hmac`, `signature`, `api_key`, `csrf`, `bearer`, or
+`reset_token` rather than file/scope taint or bare `token`; and excludes a
+comparison when both operands are numeric or byte literals. It silences
+**124/126 measured criticals and 0 measured true positives**. The two retained
+semantic homonyms remain visible pending a sound type/role discriminator.
+This is a bounded proposal, not a suppression or a claim about future bytes.
+
+Parse `file:line:col` → location, 💡 → suggested fix. Fix root cause, not
+symptom. Critical (always fix): memory safety, UB, data races. Important:
+unwrap panics, resource leaks, overflow. Do not add `ubs:ignore`, broad
+`.ubsignore`, category skips, or correctness-neutral source contortions to make
+a known-false heuristic green.
 
 ---
 
