@@ -50,7 +50,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// A ledger row with **every** field retained — the thing the production parser drops.
@@ -317,4 +317,171 @@ fn the_reader_retains_every_field_the_production_parser_drops() {
     assert_eq!(row.evidence, "the evidence");
     assert_eq!(row.fallback, "the fallback");
     assert_eq!(row.no_claim, "the boundary");
+}
+
+// ---------------------------------------------------------------------------
+// The evidence remainder, counted (bead `franken_lean-d3-safety-note-unenforced-cdbg`)
+// ---------------------------------------------------------------------------
+
+/// Rows whose evidence resolves to an e2e lane. Enforced above: the lane must be RUN.
+const LANE_CITED_ROWS: usize = 1;
+
+/// Rows whose evidence names a function that exists in the boundary crates.
+///
+/// These are the machine-resolvable ones. They are held by a **ratchet**: a row that
+/// resolves today must keep resolving, because if the test it cites is renamed or deleted
+/// the row reclassifies as prose and the counts below move, which fails.
+const SYMBOL_RESOLVED_ROWS: usize = 59;
+
+/// Every citation token, across all rows, that resolves to a boundary-crate function.
+///
+/// Pinned SEPARATELY from the row count because the row count cannot see individual
+/// citation rot: `FLN-UL-0007` cites two symbols, so renaming one leaves the row
+/// symbol-resolved and the class totals unmoved. A planted rename survived exactly that way
+/// before this constant existed. Counting tokens makes each citation individually
+/// accountable — the difference between "this row still cites something real" and "every
+/// symbol this row names still exists".
+const RESOLVING_CITATION_TOKENS: usize = 71;
+
+/// Rows whose evidence is prose — the permanent, named remainder.
+///
+/// This is a NUMBER rather than a caveat, deliberately. A remainder nobody counts is the
+/// same defect one level up: it can grow without anyone noticing, which is precisely what
+/// "declared, not silent" is supposed to prevent. Pinned exactly and in both directions, so
+/// a new prose row fails and a prose row converted to a resolvable citation ALSO fails until
+/// the numbers move — the remainder shrinks deliberately or not at all.
+const PROSE_EVIDENCE_ROWS: usize = 120;
+
+/// Why prose stays prose, and what that costs.
+const EVIDENCE_REMAINDER_REASON: &str = "\
+Decided 2026-07-26 (option (b) on the parked question in \
+franken_lean-d3-safety-note-unenforced-cdbg). 180 rows: 1 cites an e2e lane, 59 name a \
+function that exists, 120 are prose. The 60 resolvable ones are enforced; the 120 are a \
+declared, COUNTED remainder rather than a rewrite.\n\
+The trade: a full rewrite of the TCB's paperwork into a citation grammar is a large cost \
+paid against a defect rate currently measured at ZERO — every resolvable row corroborates \
+its invariant. Option (a), the rewrite, stays available and is strictly easier once the \
+count is visible. What is bought here is that the remainder cannot GROW unnoticed.\n\
+What this does NOT establish: nothing verifies that a prose invariant is TRUE, or that a \
+resolvable citation's test actually exercises the invariant it is cited for. The ratchet \
+only says a citation that resolved still resolves.";
+
+/// Every evidence field's class, decided the same way on every run.
+///
+/// Resolution is deliberately a RATCHET rather than a predicate on shape. Bead
+/// `FLN-UL-0068`'s evidence reads `export_mk_string_lossy_vectors`, which looks exactly like
+/// an identifier and is prose — the vectors are real but unnamed. A check that demanded
+/// identifier-shaped citations resolve would have reported that row, a human would have
+/// found the vectors, and this suite would have taught everyone it cries wolf. So nothing
+/// here asserts that a prose citation OUGHT to resolve; it only counts, and holds the rows
+/// that already do.
+fn classify(
+    rows: &[Row],
+    lanes: &[String],
+    fn_names: &BTreeSet<String>,
+) -> (usize, usize, usize, usize) {
+    let (mut lane, mut symbol, mut prose, mut tokens) = (0, 0, 0, 0);
+    for row in rows {
+        let resolving: BTreeSet<&str> = row
+            .evidence
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|t| t.len() >= 7 && fn_names.contains(*t))
+            .collect();
+        tokens += resolving.len();
+        if lanes.iter().any(|l| row.evidence.contains(l.as_str())) {
+            lane += 1;
+        } else if !resolving.is_empty() {
+            symbol += 1;
+        } else {
+            prose += 1;
+        }
+    }
+    (lane, symbol, prose, tokens)
+}
+
+fn boundary_fn_names(root: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for krate in ["fln-unsafe-abi", "fln-unsafe-region", "fln-unsafe-jit"] {
+        let mut stack = vec![root.join("crates").join(krate)];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                {
+                    for (i, _) in text.match_indices("fn ") {
+                        let rest = &text[i + 3..];
+                        let end = rest
+                            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                            .unwrap_or(rest.len());
+                        if end > 0 {
+                            names.insert(rest[..end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The remainder is a number this run reports, and it cannot move without saying so.
+#[test]
+fn the_unsafe_ledger_evidence_remainder_is_counted_not_merely_disclosed() {
+    let root = workspace_root();
+    let ledger = std::fs::read_to_string(root.join("ci/UNSAFE_LEDGER.txt"))
+        .expect("the unsafe ledger exists");
+    let rows = parse(&ledger);
+    assert!(
+        rows.len() > 100,
+        "only {} rows parsed; counting an empty ledger proves nothing",
+        rows.len()
+    );
+
+    let fn_names = boundary_fn_names(&root);
+    assert!(
+        fn_names.len() > 100,
+        "only {} function names recovered from the boundary crates, so every citation would \
+         reclassify as prose and this count would be an artefact of a broken scan",
+        fn_names.len()
+    );
+
+    let (lane, symbol, prose, tokens) = classify(&rows, &lane_stems(&root), &fn_names);
+    assert_eq!(
+        tokens, RESOLVING_CITATION_TOKENS,
+        "{tokens} citation tokens resolve, against the declared \
+         {RESOLVING_CITATION_TOKENS}. Every named symbol is individually accountable: a \
+         renamed or deleted test drops this count even when its row still cites something \
+         else and the class totals below do not move.\n\n{EVIDENCE_REMAINDER_REASON}"
+    );
+    assert_eq!(
+        (lane, symbol, prose),
+        (LANE_CITED_ROWS, SYMBOL_RESOLVED_ROWS, PROSE_EVIDENCE_ROWS),
+        "the unsafe-ledger evidence classes moved: {lane} lane-cited, {symbol} \
+         symbol-resolved, {prose} prose, against the declared \
+         {LANE_CITED_ROWS}/{SYMBOL_RESOLVED_ROWS}/{PROSE_EVIDENCE_ROWS}. Movement in EITHER \
+         direction fails: a new prose row must be counted, and a row whose citation stopped \
+         resolving must not be able to slip into the remainder silently. Update the \
+         constants in the same change, and say which rows moved and why.\n\n{EVIDENCE_REMAINDER_REASON}"
+    );
+    assert_eq!(
+        lane + symbol + prose,
+        rows.len(),
+        "the classes must partition the ledger; {} rows went unclassified",
+        rows.len() - (lane + symbol + prose)
+    );
+
+    println!(
+        "unsafe_ledger_evidence: {} rows — {lane} lane-cited (enforced: the lane must run), \
+         {symbol} symbol-resolved (ratcheted: a citation that resolves must keep resolving), \
+         {prose} PROSE REMAINDER; {tokens} individual citation tokens resolve. The \
+         remainder is declared and counted, NOT verified: nothing here says a prose \
+         invariant is true.",
+        rows.len()
+    );
 }

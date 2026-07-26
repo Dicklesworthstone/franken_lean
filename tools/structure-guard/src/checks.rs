@@ -1477,6 +1477,14 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
         });
     }
 
+    // WHY THE FIRST TWO ARE NOT REDUNDANT WITH LAYERING, recorded here because the deletion
+    // that removes them will be proposed on exactly that ground, and for two of the three
+    // unsafe crates the argument is CORRECT. `fln-unsafe-abi` and `fln-unsafe-region` are
+    // rank 2, far below `fln-kernel` at rank 6, so FLN-STRUCT-007's strict-downward rule
+    // already forbids their edge. `fln-unsafe-jit` is rank 12 — ABOVE the kernel — so
+    // layering PERMITS a jit-to-kernel edge, and only these two lines forbid it. They look
+    // redundant because they are redundant for two crates out of three
+    // (bead `franken_lean-d3-safety-note-unenforced-cdbg`).
     for (source, destination) in [
         ("fln-unsafe-*", "fln-kernel"),
         ("fln-unsafe-*", "fln-checker"),
@@ -1495,7 +1503,10 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
                 code: "FLN-STRUCT-024",
                 path: GRAPH_FILE.to_string(),
                 detail: format!(
-                    "constitutional prohibition `{source} ->* {destination}` is missing"
+                    "constitutional prohibition `{source} ->* {destination}` is missing. If this was \
+                     removed as redundant with strict-downward layering, check the ranks \
+                     first: fln-unsafe-jit is rank 12 and fln-kernel is rank 6, so layering \
+                     permits that edge and only this line forbids it"
                 ),
             });
         }
