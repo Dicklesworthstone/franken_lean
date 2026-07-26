@@ -11260,7 +11260,33 @@ def run_git(
     except FileNotFoundError as error:
         raise EvidenceError(f"{subject} requires an explicit repository .git directory") from error
     if stat.S_ISLNK(git_mode) or not stat.S_ISDIR(git_mode):
-        raise EvidenceError(f"{subject} requires a real repository .git directory")
+        # Name the condition here, because every caller's own summary blames something
+        # else: check.sh reports that it cannot inventory UBS inputs, closure_audit that
+        # it cannot hash governed inputs, and seven lanes that they cannot verify the
+        # pinned Reference tree. Three wrong causes get asserted louder than this one
+        # correct line, so the reader goes looking for a missing tool, a dirty tree or an
+        # absent pin. A linked git worktree writes `.git` as a FILE holding `gitdir: …`,
+        # and that is by far the most common way to reach here
+        # (bead `franken_lean-worktree-gitdir-refusal-hugg`).
+        if stat.S_ISLNK(git_mode):
+            detail = "a symlink, not a directory"
+        elif stat.S_ISREG(git_mode):
+            try:
+                is_pointer = git_dir.read_bytes()[:7] == b"gitdir:"
+            except OSError:
+                is_pointer = False
+            if is_pointer:
+                detail = (
+                    "a gitdir pointer, so this is a LINKED GIT WORKTREE; the trusted "
+                    "evidence surface runs in the main tree only, under the gate lock"
+                )
+            else:
+                detail = "a file, not a directory"
+        else:
+            detail = "not a directory"
+        raise EvidenceError(
+            f"{subject} requires a real repository .git directory: {git_dir} is {detail}"
+        )
     git_environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }

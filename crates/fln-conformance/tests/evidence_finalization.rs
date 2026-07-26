@@ -645,19 +645,38 @@ fn the_evidence_surface_refuses_a_gitdir_pointer_root() {
         .unwrap_or_else(|_| repo.join("target"))
         .join(format!("fln-gitdir-refusal-{}", std::process::id()));
 
-    let probe = |name: &str, git_is_a_directory: bool| -> (Option<i32>, String) {
+    // Three shapes, because the refusal now has to DISCRIMINATE rather than merely fire.
+    // A plain regular file reaches the same refusal as a gitdir pointer, so a message that
+    // announced a linked worktree for any non-directory would be wrong exactly half the
+    // time — and wrong in the direction that sends the reader to look for a worktree they
+    // are not in.
+    enum GitShape {
+        Directory,
+        Pointer,
+        PlainFile,
+    }
+
+    let probe = |name: &str, shape: GitShape| -> (Option<i32>, String) {
         let root = scratch.join(name);
         fs::create_dir_all(&root).expect("probe root must be creatable");
         let git = root.join(".git");
-        if git_is_a_directory {
-            fs::create_dir_all(&git).expect("probe .git directory must be creatable");
-        } else {
+        match shape {
+            GitShape::Directory => {
+                fs::create_dir_all(&git).expect("probe .git directory must be creatable");
+            }
             // Exactly what `git worktree add` writes into a linked worktree.
-            fs::write(
-                &git,
-                "gitdir: /nonexistent/repository/.git/worktrees/probe\n",
-            )
-            .expect("probe .git pointer must be writable");
+            GitShape::Pointer => {
+                fs::write(
+                    &git,
+                    "gitdir: /nonexistent/repository/.git/worktrees/probe\n",
+                )
+                .expect("probe .git pointer must be writable");
+            }
+            // A regular file that is NOT a pointer. Same refusal, different cause.
+            GitShape::PlainFile => {
+                fs::write(&git, "this file is not a gitdir pointer\n")
+                    .expect("probe .git plain file must be writable");
+            }
         }
         let run = std::process::Command::new("python3")
             .args(["-I", "-S"])
@@ -679,8 +698,13 @@ fn the_evidence_surface_refuses_a_gitdir_pointer_root() {
     };
 
     const REFUSAL: &str = "requires a real repository .git directory";
+    // The half of the message that does the reader's diagnosis for them. Before this
+    // existed, the refusal fired correctly and named nothing, so `check.sh` saying "cannot
+    // inventory UBS inputs" was the loudest true-sounding thing on the screen and people
+    // spent a day looking for a missing tool (bead `franken_lean-worktree-gitdir-refusal-hugg`).
+    const NAMES_THE_WORKTREE: &str = "LINKED GIT WORKTREE";
 
-    let (pointer_code, pointer_stderr) = probe("gitdir-pointer", false);
+    let (pointer_code, pointer_stderr) = probe("gitdir-pointer", GitShape::Pointer);
     assert_eq!(
         pointer_code,
         Some(2),
@@ -691,14 +715,44 @@ fn the_evidence_surface_refuses_a_gitdir_pointer_root() {
         "a root whose .git is a gitdir pointer must be refused by name, so the reader is \
          not sent to diagnose a missing tool; got: {pointer_stderr}"
     );
+    assert!(
+        pointer_stderr.contains(NAMES_THE_WORKTREE),
+        "the refusal fired but did not SAY what it found. Firing is not the point: every \
+         caller prints a louder and wrong summary underneath this line, so a refusal that \
+         names no cause leaves the reader diagnosing a missing tool, a dirty tree or an \
+         absent pin. The message must name the linked worktree; got: {pointer_stderr}"
+    );
 
     // The control. A real .git directory must NOT produce this refusal -- git runs and
     // fails on its own terms. Same exit code, different reason, which is the whole point.
-    let (_, directory_stderr) = probe("gitdir-directory", true);
+    let (_, directory_stderr) = probe("gitdir-directory", GitShape::Directory);
     assert!(
         !directory_stderr.contains(REFUSAL),
         "the refusal fired for a root whose .git IS a real directory, so it is not keyed on \
          the worktree condition at all and the probe above proves nothing: {directory_stderr}"
+    );
+
+    // The second control, and the one that keeps the new sentence honest. A plain regular
+    // file hits the SAME refusal, so a message that announced a worktree for every
+    // non-directory would be wrong here -- and wrong in the direction that sends a reader
+    // hunting for a worktree they are not in. Refuse, but do not diagnose what you did not
+    // find.
+    let (plain_code, plain_stderr) = probe("gitdir-plain-file", GitShape::PlainFile);
+    assert_eq!(
+        plain_code,
+        Some(2),
+        "a .git that is a plain regular file must still be a typed setup failure: {plain_stderr}"
+    );
+    assert!(
+        plain_stderr.contains(REFUSAL),
+        "a .git that is a plain regular file must still be refused: {plain_stderr}"
+    );
+    assert!(
+        !plain_stderr.contains(NAMES_THE_WORKTREE),
+        "the refusal called a plain regular .git a linked worktree. It is not one, and this \
+         is the failure mode the new message introduces: a diagnosis confident enough to be \
+         wrong. Key it on the `gitdir:` pointer bytes, not on `not a directory`; \
+         got: {plain_stderr}"
     );
 
     // --- the doctrine half, scoped to the section that must carry it ------------------
