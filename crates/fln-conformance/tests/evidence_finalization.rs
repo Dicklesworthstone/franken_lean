@@ -623,12 +623,23 @@ const REQUIRED_PYTHON_CONFIGURATION_CHANNELS: &[&str] = &[
 /// Loads the real `scripts/evidence.py` and asks its real classifier to judge a
 /// synthetic environment. Sealed (`-I -S`) like every other trusted launch, and `-B` so
 /// a guard can never leave a `__pycache__` in a governed directory.
+///
+/// An optional second argument is source executed **in the loaded module's own
+/// namespace**, which is how the mutants below are planted. Injecting into the real
+/// namespace rather than copying the file is not a shortcut: rebound constants are seen
+/// by the module's own functions at call time, so a mutated constant behaves exactly as
+/// an edited one would — and nothing is written to disk. The first version of this guard
+/// wrote six 859 KB copies per run into a machine-wide shared target directory, an
+/// unbounded growth vector for a test that runs on every commit.
 const PYTHON_CLASSIFIER_PROBE: &str = r#"
 import importlib.util, sys
 
 spec = importlib.util.spec_from_file_location("fln_evidence_classifier_probe", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+if len(sys.argv) > 2:
+    exec(sys.argv[2], vars(module))
 
 declared = sorted(module.PYTHON_CONFIGURATION_ENV_EXACT)
 environ = {name: "hostile" for name in declared}
@@ -657,10 +668,18 @@ const PYTHON_CLASSIFIER_CONTROLS: &[&str] = &["PATH", "HOME", "RUSTFLAGS", "CARG
 ///
 /// A probe that did not complete is a broken probe, never a clean result: it panics here
 /// rather than returning empty vectors for the judgement below to quantify over.
-fn classify_python_configuration(path: &Path) -> (Vec<String>, Vec<String>) {
-    let run = std::process::Command::new("python3")
+fn classify_python_configuration(
+    path: &Path,
+    mutation: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut command = std::process::Command::new("python3");
+    command
         .args(["-I", "-S", "-B", "-c", PYTHON_CLASSIFIER_PROBE])
-        .arg(path)
+        .arg(path);
+    if let Some(mutation) = mutation {
+        command.arg(mutation);
+    }
+    let run = command
         .output()
         .expect("the sealed interpreter must be able to load the evidence runner");
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
@@ -771,7 +790,8 @@ fn python_configuration_channels_are_classified_by_measurement_not_declaration()
     let repo = repo
         .canonicalize()
         .expect("the repository root must resolve");
-    let (declared, classified) = classify_python_configuration(&repo.join("scripts/evidence.py"));
+    let (declared, classified) =
+        classify_python_configuration(&repo.join("scripts/evidence.py"), None);
 
     if let Err(reason) = judge_python_classification(&declared, &classified) {
         panic!(
@@ -786,13 +806,11 @@ fn python_configuration_channels_are_classified_by_measurement_not_declaration()
 
 /// Every arm of the judgement above kills a mutation, and each dies for its own reason.
 ///
-/// The mutants are applied to **copies** of the runner, never to the file in the tree.
-/// That is not merely politeness toward whoever else is editing it: a campaign that
-/// mutates a shared file cannot be re-run by the next reader, so its verdicts age into
-/// a claim with nothing behind it. Appending a redefinition to the copy shadows the real
-/// one at import, so each mutant is anchored on nothing and cannot silently fail to
-/// apply — and the harness still checks that the copy really differs from the original,
-/// because a mutant that does not create the condition it claims is not evidence.
+/// The mutants are injected into the loaded module's namespace, never into the file in
+/// the tree. That is not merely politeness toward whoever else is editing it: a campaign
+/// that mutates a shared file cannot be re-run by the next reader, so its verdicts age
+/// into a claim with nothing behind it. These re-run on every commit, write nothing, and
+/// are anchored on nothing, so no mutant can silently fail to apply for want of a match.
 ///
 /// The last mutant is the one worth reading. It drops `PYTHONPATH` from the named set,
 /// which changes **no behaviour at all** — the prefix still classifies it — so every
@@ -805,15 +823,9 @@ fn the_python_configuration_guard_kills_each_mutation_it_claims_to() {
     let repo = repo
         .canonicalize()
         .expect("the repository root must resolve");
-    let original = fs::read_to_string(repo.join("scripts/evidence.py"))
-        .expect("scripts/evidence.py must be readable");
-    let scratch = std::env::var("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| repo.join("target"))
-        .join(format!("fln-python-classification-{}", std::process::id()));
-    fs::create_dir_all(&scratch).expect("the mutant scratch directory must be creatable");
+    let evidence = repo.join("scripts/evidence.py");
 
-    // (name, appended override, the reason the guard must give)
+    // (name, source injected into the module namespace, the reason the guard must give)
     let mutants: &[(&str, &str, &str)] = &[
         (
             "prefix-tuple-emptied",
@@ -847,16 +859,26 @@ fn the_python_configuration_guard_kills_each_mutation_it_claims_to() {
         ),
     ];
 
-    for (name, override_source, expected_reason) in mutants {
-        let mutated = format!("{original}{override_source}");
-        assert_ne!(
-            mutated, original,
-            "mutant {name} did not change the runner, so scoring it proves nothing"
-        );
-        let path = scratch.join(format!("{name}.py"));
-        fs::write(&path, &mutated).expect("a mutant copy must be writable");
+    // The unmutated control. If the injection channel silently did nothing, every mutant
+    // below would report this same verdict, so it is measured rather than assumed.
+    let (clean_declared, clean_classified) = classify_python_configuration(&evidence, None);
+    assert_eq!(
+        judge_python_classification(&clean_declared, &clean_classified),
+        Ok(()),
+        "the unmutated runner must pass, or the mutants below prove nothing about the \
+         mutations and everything about a broken baseline"
+    );
 
-        let (declared, classified) = classify_python_configuration(&path);
+    for (name, mutation, expected_reason) in mutants {
+        let (declared, classified) = classify_python_configuration(&evidence, Some(mutation));
+        // A mutant that does not create the condition it claims is not evidence of a
+        // hole. Every one of these must move at least one of the two observations —
+        // including the last, which moves `declared` while leaving behaviour untouched.
+        assert!(
+            declared != clean_declared || classified != clean_classified,
+            "mutant {name} produced exactly the unmutated result, so it did not apply and \
+             scoring it proves nothing"
+        );
         let verdict = judge_python_classification(&declared, &classified);
         assert_eq!(
             verdict.as_ref().map_err(String::as_str),
@@ -869,14 +891,14 @@ fn the_python_configuration_guard_kills_each_mutation_it_claims_to() {
 
     // The harness's own control. If a broken probe returned empty vectors instead of
     // panicking, every mutant above would "die" on the first arm and this whole test
-    // would be theatre. A file that loads but declares nothing must be refused as a
-    // broken probe, not judged.
-    let hollow = scratch.join("not-the-runner.py");
-    fs::write(&hollow, "# no classifier here\n").expect("the hollow probe must be writable");
-    let refused = std::panic::catch_unwind(|| classify_python_configuration(&hollow));
+    // would be theatre. A module that no longer supplies a classification at all must be
+    // refused as a broken probe, not judged as a clean one.
+    let refused = std::panic::catch_unwind(|| {
+        classify_python_configuration(&evidence, Some("del PYTHON_CONFIGURATION_ENV_EXACT"))
+    });
     assert!(
         refused.is_err(),
-        "a file with no classifier in it was judged instead of being refused, so this \
+        "a module supplying no classification was judged instead of being refused, so this \
          guard cannot tell a clean tree from a probe that measured nothing"
     );
 }
