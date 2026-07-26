@@ -5314,4 +5314,677 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // The `fln.e2e.declaration-admission/1` producer (bead `franken_lean-j8h`).
+    // ---------------------------------------------------------------------------
+
+    /// Minimal JSON string escaping for the evidence envelope.
+    ///
+    /// Local rather than shared with `pmap`'s copy because that one is private to its
+    /// own test module; the two are not a drift risk in the way a shared *encoding*
+    /// would be, since each only quotes strings it is handed.
+    fn admission_json_string(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Which budget limit a refusal row is about.
+    ///
+    /// # The five-versus-seven question, answered rather than assumed
+    ///
+    /// [`DeclarationBudget`] bounds **seven** limits while [`DeclarationDimension`]
+    /// names **five**. `max_expr_nodes` and `max_expanded_weight` are budgeted without
+    /// being dimensions, because they are not measured here at all: they are delegated
+    /// to [`crate::terms::expanded_weight`], which refuses in the term store's own
+    /// vocabulary and therefore carries no `DeclarationDimension` in its `progress`.
+    ///
+    /// So "one refusal row for every frozen dimension" has two honest readings, and a
+    /// row that does not say which it took is the join this program keeps finding
+    /// unwatched. This producer emits **all seven** and labels each with the reading it
+    /// belongs to, so a consumer counting five and a consumer counting seven can both
+    /// be satisfied from the same evidence without either inferring the other's number.
+    #[derive(Debug, Clone, Copy)]
+    enum AdmissionLimit {
+        /// Named by [`DeclarationDimension`]; refuses inside `preflight_declaration_rows`
+        /// with the dimension's own name in `progress`.
+        Dimension(DeclarationDimension),
+        /// Budgeted but not a dimension; refuses inside the delegated term-weight
+        /// preflight, in the term store's unit vocabulary.
+        DelegatedToTermWeight(&'static str),
+    }
+
+    impl AdmissionLimit {
+        const ALL: [AdmissionLimit; 7] = [
+            AdmissionLimit::Dimension(DeclarationDimension::LevelParams),
+            AdmissionLimit::Dimension(DeclarationDimension::MutualRows),
+            AdmissionLimit::Dimension(DeclarationDimension::ConstructorRows),
+            AdmissionLimit::Dimension(DeclarationDimension::RecursorRules),
+            AdmissionLimit::Dimension(DeclarationDimension::CanonicalBytes),
+            AdmissionLimit::DelegatedToTermWeight("expr_nodes"),
+            AdmissionLimit::DelegatedToTermWeight("expanded_weight"),
+        ];
+
+        const fn wire_name(self) -> &'static str {
+            match self {
+                AdmissionLimit::Dimension(dimension) => dimension.as_str(),
+                AdmissionLimit::DelegatedToTermWeight(name) => name,
+            }
+        }
+
+        /// Whether this limit is one of the five `DeclarationDimension` names.
+        const fn is_declaration_dimension(self) -> bool {
+            matches!(self, AdmissionLimit::Dimension(_))
+        }
+
+        const fn measured_by(self) -> &'static str {
+            match self {
+                AdmissionLimit::Dimension(_) => "declaration-preflight",
+                AdmissionLimit::DelegatedToTermWeight(_) => "term-weight-preflight",
+            }
+        }
+    }
+
+    /// A declaration carrying exactly `count` rows of the family `limit` bounds.
+    ///
+    /// Each fixture varies **one** family and leaves the others minimal, so a refusal
+    /// names the dimension under test rather than whichever one the frozen `ORDER`
+    /// happened to reach first. A fixture that breached two would still produce a
+    /// green row while proving nothing about the second.
+    fn admission_fixture(limit: AdmissionLimit, name: &str, count: usize) -> ConstantInfo {
+        let base = |level_params: Vec<Name>| ConstantVal {
+            name: n(name),
+            level_params,
+            type_: Expr::sort(Level::zero()),
+        };
+        let rows = |prefix: &str| -> Vec<Name> {
+            (0..count).map(|i| n(&format!("{prefix}{i}"))).collect()
+        };
+        match limit {
+            AdmissionLimit::Dimension(DeclarationDimension::LevelParams) => {
+                ConstantInfo::Axiom(AxiomVal {
+                    base: base(rows("u")),
+                    is_unsafe: false,
+                })
+            }
+            AdmissionLimit::Dimension(DeclarationDimension::MutualRows) => {
+                ConstantInfo::Thm(TheoremVal {
+                    base: base(vec![]),
+                    value: Expr::sort(Level::zero()),
+                    all: rows("m"),
+                })
+            }
+            AdmissionLimit::Dimension(DeclarationDimension::ConstructorRows) => {
+                ConstantInfo::Induct(InductiveVal {
+                    base: base(vec![]),
+                    num_params: 0,
+                    num_indices: 0,
+                    all: vec![],
+                    ctors: rows("c"),
+                    num_nested: 0,
+                    is_rec: false,
+                    is_unsafe: false,
+                    is_reflexive: false,
+                })
+            }
+            AdmissionLimit::Dimension(DeclarationDimension::RecursorRules) => {
+                ConstantInfo::Rec(RecursorVal {
+                    base: base(vec![]),
+                    all: vec![],
+                    num_params: 0,
+                    num_indices: 0,
+                    num_motives: 0,
+                    num_minors: 0,
+                    rules: rows("c")
+                        .into_iter()
+                        .map(|ctor| RecursorRule {
+                            ctor,
+                            nfields: 0,
+                            rhs: Expr::sort(Level::zero()),
+                        })
+                        .collect(),
+                    k: false,
+                    is_unsafe: false,
+                })
+            }
+            // Bytes and both delegated limits ride on an ordinary axiom: every
+            // declaration emits canonical bytes and every declaration carries at least
+            // its signature expression, so no special shape is needed to breach them.
+            AdmissionLimit::Dimension(DeclarationDimension::CanonicalBytes)
+            | AdmissionLimit::DelegatedToTermWeight(_) => ConstantInfo::Axiom(AxiomVal {
+                base: base(vec![]),
+                is_unsafe: false,
+            }),
+        }
+    }
+
+    /// A budget that is unbounded everywhere except the one limit under test.
+    fn admission_budget_binding_only(limit: AdmissionLimit, allowed: u64) -> DeclarationBudget {
+        let mut budget = DeclarationBudget::UNBOUNDED;
+        match limit {
+            AdmissionLimit::Dimension(DeclarationDimension::LevelParams) => {
+                budget.max_level_params = allowed;
+            }
+            AdmissionLimit::Dimension(DeclarationDimension::MutualRows) => {
+                budget.max_mutual_rows = allowed;
+            }
+            AdmissionLimit::Dimension(DeclarationDimension::ConstructorRows) => {
+                budget.max_constructor_rows = allowed;
+            }
+            AdmissionLimit::Dimension(DeclarationDimension::RecursorRules) => {
+                budget.max_recursor_rules = allowed;
+            }
+            AdmissionLimit::Dimension(DeclarationDimension::CanonicalBytes) => {
+                budget.max_canonical_bytes = allowed;
+            }
+            AdmissionLimit::DelegatedToTermWeight("expr_nodes") => {
+                budget.max_expr_nodes = allowed;
+            }
+            AdmissionLimit::DelegatedToTermWeight(_) => {
+                budget.max_expanded_weight = allowed;
+            }
+        }
+        budget
+    }
+
+    /// Every budget field, as one JSON object. All seven, always — a budget row that
+    /// printed only the binding limit would leave a consumer unable to tell an
+    /// unbounded dimension from an omitted one.
+    fn admission_budget_json(budget: &DeclarationBudget) -> String {
+        format!(
+            "{{\"max_level_params\":{},\"max_mutual_rows\":{},\
+             \"max_constructor_rows\":{},\"max_recursor_rules\":{},\
+             \"max_canonical_bytes\":{},\"max_expr_nodes\":{},\
+             \"max_expanded_weight\":{}}}",
+            budget.max_level_params,
+            budget.max_mutual_rows,
+            budget.max_constructor_rows,
+            budget.max_recursor_rules,
+            budget.max_canonical_bytes,
+            budget.max_expr_nodes,
+            budget.max_expanded_weight
+        )
+    }
+
+    /// Every measured usage fact, as one JSON object.
+    ///
+    /// `max_logical_depth` is included and is deliberately **not** presented as a
+    /// budgeted dimension: it is an exact fact with no limit, for the reason
+    /// [`DeclarationUsage`] records. A row that listed it beside the seven limits
+    /// would imply a bound that does not exist.
+    fn admission_usage_json(usage: &DeclarationUsage) -> String {
+        format!(
+            "{{\"level_params\":{},\"mutual_rows\":{},\"constructor_rows\":{},\
+             \"recursor_rules\":{},\"canonical_bytes\":{},\"expressions\":{},\
+             \"expr_nodes\":{},\"expanded_weight\":{},\"max_logical_depth\":{}}}",
+            usage.level_params,
+            usage.mutual_rows,
+            usage.constructor_rows,
+            usage.recursor_rules,
+            usage.canonical_bytes,
+            usage.expressions,
+            usage.expr_nodes,
+            usage.expanded_weight,
+            usage.max_logical_depth
+        )
+    }
+
+    /// The real-path declaration-admission evidence producer (bead `franken_lean-j8h`).
+    ///
+    /// # Why this lives in `fln-env` and not in the lane script
+    ///
+    /// cod_2 established the boundary on `franken_lean-j8h-admission-lane-seeds-vss4`
+    /// and declined to synthesize these rows in shell: only this module holds the real
+    /// fixture values and the private [`DeclarationDimension`] vocabulary, so a
+    /// shell-side reconstruction would turn assertions about the production path into
+    /// hand-authored evidence — a lying-green lane. Every number below is **read back
+    /// from the production API**, never recomputed for the row: the digest comes from
+    /// [`DeclarationPublication::digest`], which exists only because publication made
+    /// it authoritative, and the usage facts come from the plan's own
+    /// [`PreparedDeclarationAdmission::usage`].
+    ///
+    /// # Assertions first, printing second
+    ///
+    /// Each scenario asserts its property and only then prints what it asserted. A
+    /// producer that printed unasserted values would be a log, and a lane validating a
+    /// log validates the formatter.
+    ///
+    /// Output is **stdout**, matching cod_2's spec and the sibling
+    /// `pmap::tests::environment_collision_e2e_emits_detailed_real_path_evidence`.
+    #[test]
+    fn declaration_admission_e2e_emits_detailed_real_path_evidence() {
+        let mut run_id = std::env::var("FLN_ENV_E2E_RUN_ID")
+            .unwrap_or_else(|_| "unit".to_string())
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            .collect::<String>();
+        if run_id.is_empty() {
+            run_id.push_str("unit");
+        }
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let artifact_fallback =
+            std::env::var("FLN_ENV_E2E_ARTIFACT").unwrap_or_else(|_| "stdout".to_string());
+        let stdout_artifact = std::env::var("FLN_ENV_E2E_STDOUT_ARTIFACT")
+            .unwrap_or_else(|_| artifact_fallback.clone());
+        let stderr_artifact =
+            std::env::var("FLN_ENV_E2E_STDERR_ARTIFACT").unwrap_or(artifact_fallback);
+        let argv = std::env::var("FLN_ENV_E2E_ARGV").unwrap_or_else(|_| {
+            "cargo test -p fln-env environment::tests::declaration_admission_e2e_emits_detailed_real_path_evidence -- --exact --nocapture".to_string()
+        });
+        let cache_state =
+            std::env::var("FLN_ENV_E2E_CACHE_STATE").unwrap_or_else(|_| "uncontrolled".to_string());
+
+        // The governed input root binds the fixture set this run measured. It is taken
+        // over the canonical declaration bytes of every fixture, so a fixture that
+        // changed shape moves the root and the lane can see that the evidence is about
+        // different inputs.
+        let mut input_bytes = Vec::new();
+        for (index, limit) in AdmissionLimit::ALL.iter().enumerate() {
+            input_bytes.extend_from_slice(&Environment::decl_content_bytes(&admission_fixture(
+                *limit,
+                &format!("Fixture{index}"),
+                3,
+            )));
+        }
+        let canonical_input_root = hash(Domain::Fixture, &input_bytes);
+
+        let envelope = format!(
+            "\"run_id\":{},\"bead\":\"franken_lean-j8h\",\
+             \"claim_id\":\"franken_lean-j8h-declaration-admission-resource-bounds\",\
+             \"claim_type\":\"bounded_model\",\"invariant_id\":\"FL-INV-07\",\
+             \"invariant_relation\":\"inconclusive-is-not-rejected\",\
+             \"gate_id\":\"W2\",\"gate_relation\":\"partial-component-evidence\",\
+             \"parity_ledger_row\":\"not_applicable_internal_declaration_admission\",\
+             \"data_grade\":\"verified\",\"epoch\":\"lean-v4.32.0\",\"mode\":\"sound\",\
+             \"profile\":\"e2e\",\"platform\":\"{}-{}\",\"cache_state\":{},\
+             \"canonical_input_root\":\"{canonical_input_root}\",\"cwd\":{},\"argv\":[{}],\
+             \"stdout_artifact\":{},\"stderr_artifact\":{},\"timing_used_as_gate\":false",
+            admission_json_string(&run_id),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            admission_json_string(&cache_state),
+            admission_json_string(&cwd),
+            admission_json_string(&argv),
+            admission_json_string(&stdout_artifact),
+            admission_json_string(&stderr_artifact),
+        );
+
+        let options = KVMap::new();
+        let mut steps = 0usize;
+
+        // ---- Scenario 1: one admitted transaction ----------------------------------
+        let base = Environment::new();
+        let base_root = base.logical_root(&options);
+        let admitted_info = admission_fixture(
+            AdmissionLimit::Dimension(DeclarationDimension::LevelParams),
+            "Admitted",
+            2,
+        );
+        let admitted_budget = DeclarationBudget::UNBOUNDED;
+        let Outcome::Complete(DeclarationPlan::Prepared(prepared)) = base.plan_add_decl(
+            admitted_info.clone(),
+            admitted_budget,
+            CollisionBudget::UNBOUNDED,
+            None,
+        ) else {
+            unreachable!("an unbounded budget must prepare a plan")
+        };
+        let admitted_usage = *prepared.usage();
+        // A plan holds material, never authority.
+        assert!(!prepared.is_cacheable());
+        let committed = prepared.commit(&base, None);
+        let Outcome::Complete(DeclarationCommitted::Published(publication)) = committed else {
+            unreachable!("a valid plan against its own base must publish")
+        };
+        let published_root = publication.environment.logical_root(&options);
+        assert!(publication.environment.contains(&n("Admitted")));
+        assert_ne!(published_root, base_root, "publication must move the root");
+        // The base is a persistent value: publishing cannot have touched it.
+        assert!(!base.contains(&n("Admitted")));
+        assert_eq!(base.logical_root(&options), base_root);
+        // The authoritative digest is the published one, and it is the digest of the
+        // declaration that was admitted.
+        assert_eq!(
+            publication.digest,
+            Environment::decl_content_digest(&admitted_info)
+        );
+        println!(
+            "{{\"schema\":\"fln.e2e.declaration-admission\",\"version\":1,{envelope},\
+             \"scenario\":\"admitted-transaction\",\"step\":\"admitted\",\"step_index\":{steps},\
+             \"declaration\":\"Admitted\",\"budget\":{},\"usage\":{},\
+             \"canonical_digest\":\"{}\",\"base_root\":\"{base_root}\",\
+             \"published_root\":\"{published_root}\",\"authoritative\":true,\"published\":true,\
+             \"cacheable\":true,\"expected_outcome\":\"admitted\",\"actual_outcome\":\"admitted\",\
+             \"limit_name\":null,\"allowed\":null,\"observed\":null,\"structural_unit\":null,\
+             \"first_divergence\":null,\"status\":\"pass\",\"cleanup_status\":\"not_applicable\",\
+             \"final_state\":\"declaration-published-and-base-unchanged\"}}",
+            admission_budget_json(&admitted_budget),
+            admission_usage_json(&admitted_usage),
+            publication.digest,
+        );
+        steps += 1;
+
+        // ---- Scenario 2: one typed refusal row per budgeted limit ------------------
+        for (index, limit) in AdmissionLimit::ALL.into_iter().enumerate() {
+            let info = admission_fixture(limit, &format!("Refused{index}"), 3);
+            // Zero allowed, so the limit binds on any declaration carrying the family
+            // at all — and the refusal cannot be an artifact of an off-by-one fixture.
+            let budget = admission_budget_binding_only(limit, 0);
+            let refused = base.plan_add_decl(info, budget, CollisionBudget::UNBOUNDED, None);
+
+            let Outcome::Inconclusive(inconclusive) = &refused else {
+                unreachable!(
+                    "{} must refuse as inconclusive, got {refused:?}",
+                    limit.wire_name()
+                )
+            };
+            let InconclusiveCause::ResourceExhausted { usage } = &inconclusive.cause else {
+                unreachable!(
+                    "{} must refuse as resource exhaustion, not cancellation",
+                    limit.wire_name()
+                )
+            };
+            // FL-INV-07: not a rejection, not an acceptance, not cacheable, nothing
+            // published, and the base is untouched.
+            assert_eq!(
+                refused.cache_admission(),
+                CacheAdmission::Refused {
+                    authority: Authority::NonAuthoritative
+                }
+            );
+            assert!(refused.as_complete().is_none());
+            assert_eq!(base.logical_root(&options), base_root);
+            assert!(!base.contains(&n(&format!("Refused{index}"))));
+            // A stop that did not report spending past its allowance is not a stop.
+            assert!(
+                usage.observed > usage.allowed,
+                "{}: observed {} must exceed allowed {}",
+                limit.wire_name(),
+                usage.observed,
+                usage.allowed
+            );
+            let ResourceReason::StructuralBudget { unit } = usage.reason else {
+                unreachable!("a budget stop reports a structural unit")
+            };
+            // The dimension-named limits carry their own name in `progress`; the two
+            // delegated ones do not, and this asserts that difference rather than
+            // papering over it.
+            if let AdmissionLimit::Dimension(dimension) = limit {
+                assert!(
+                    inconclusive
+                        .progress
+                        .as_ref()
+                        .is_some_and(|progress| progress.text().contains(dimension.as_str())),
+                    "{} must remain identifiable in progress: {:?}",
+                    limit.wire_name(),
+                    inconclusive.progress
+                );
+                assert_eq!(unit, dimension.unit(), "{}", limit.wire_name());
+            }
+            let progress = inconclusive
+                .progress
+                .as_ref()
+                .map(|progress| admission_json_string(progress.text()))
+                .unwrap_or_else(|| "null".to_string());
+            println!(
+                "{{\"schema\":\"fln.e2e.declaration-admission\",\"version\":1,{envelope},\
+                 \"scenario\":\"limit-refusal\",\"step\":\"refusal-{}\",\"step_index\":{steps},\
+                 \"declaration\":\"Refused{index}\",\"budget\":{},\"usage\":null,\
+                 \"canonical_digest\":null,\"base_root\":\"{base_root}\",\
+                 \"published_root\":null,\"authoritative\":false,\"published\":false,\
+                 \"cacheable\":false,\"expected_outcome\":\"inconclusive-resource-exhausted\",\
+                 \"actual_outcome\":\"inconclusive-resource-exhausted\",\
+                 \"limit_name\":\"{}\",\"is_declaration_dimension\":{},\"measured_by\":\"{}\",\
+                 \"allowed\":{},\"observed\":{},\"structural_unit\":\"{}\",\"progress\":{},\
+                 \"first_divergence\":null,\"status\":\"pass\",\
+                 \"cleanup_status\":\"not_applicable\",\
+                 \"final_state\":\"nothing-published-and-base-unchanged\"}}",
+                limit.wire_name(),
+                admission_budget_json(&budget),
+                limit.wire_name(),
+                limit.is_declaration_dimension(),
+                limit.measured_by(),
+                usage.allowed,
+                usage.observed,
+                unit.as_str(),
+                progress,
+            );
+            steps += 1;
+        }
+
+        // ---- Scenario 3: cancellation at each frozen checkpoint ---------------------
+        // BeforeExpression(0): the probe trips before any expression is measured.
+        let cancel_info = admission_fixture(
+            AdmissionLimit::Dimension(DeclarationDimension::LevelParams),
+            "Cancelled",
+            1,
+        );
+        let probe = TripAt::new(0);
+        let cancelled = base.plan_add_decl(
+            cancel_info.clone(),
+            DeclarationBudget::UNBOUNDED,
+            CollisionBudget::UNBOUNDED,
+            Some(&probe),
+        );
+        let Outcome::Inconclusive(inconclusive) = &cancelled else {
+            unreachable!("a tripped probe must stop preflight")
+        };
+        let InconclusiveCause::Cancelled { at } = &inconclusive.cause else {
+            unreachable!("cancellation must not be reported as exhaustion")
+        };
+        assert_eq!(
+            at.text(),
+            DeclarationCheckpoint::BeforeExpression(0).to_string()
+        );
+        assert!(cancelled.as_complete().is_none());
+        assert_eq!(base.logical_root(&options), base_root);
+        println!(
+            "{{\"schema\":\"fln.e2e.declaration-admission\",\"version\":1,{envelope},\
+             \"scenario\":\"cancellation\",\"step\":\"cancel-before-expression\",\
+             \"step_index\":{steps},\"declaration\":\"Cancelled\",\
+             \"checkpoint\":{},\"base_root\":\"{base_root}\",\"published_root\":null,\
+             \"authoritative\":false,\"published\":false,\"cacheable\":false,\
+             \"expected_outcome\":\"inconclusive-cancelled\",\
+             \"actual_outcome\":\"inconclusive-cancelled\",\"first_divergence\":null,\
+             \"status\":\"pass\",\"cleanup_status\":\"not_applicable\",\
+             \"final_state\":\"nothing-published-and-base-unchanged\"}}",
+            admission_json_string(at.text()),
+        );
+        steps += 1;
+
+        // BeforePublication: preflight completes, then the caller gives up. This is the
+        // last point at which a declaration can still be kept out of an environment on
+        // the caller's behalf.
+        let Outcome::Complete(DeclarationPlan::Prepared(late_plan)) = base.plan_add_decl(
+            cancel_info,
+            DeclarationBudget::UNBOUNDED,
+            CollisionBudget::UNBOUNDED,
+            None,
+        ) else {
+            unreachable!("an unbounded budget must prepare a plan")
+        };
+        let always = TripAt::new(0);
+        let late = late_plan.commit(&base, Some(&always));
+        let Outcome::Inconclusive(inconclusive) = &late else {
+            unreachable!("a cancelled commit must not publish")
+        };
+        let InconclusiveCause::Cancelled { at } = &inconclusive.cause else {
+            unreachable!("commit cancellation must be reported as cancellation")
+        };
+        assert_eq!(
+            at.text(),
+            DeclarationCheckpoint::BeforePublication.to_string()
+        );
+        assert!(!base.contains(&n("Cancelled")));
+        assert_eq!(base.logical_root(&options), base_root);
+        println!(
+            "{{\"schema\":\"fln.e2e.declaration-admission\",\"version\":1,{envelope},\
+             \"scenario\":\"cancellation\",\"step\":\"cancel-before-publication\",\
+             \"step_index\":{steps},\"declaration\":\"Cancelled\",\
+             \"checkpoint\":{},\"base_root\":\"{base_root}\",\"published_root\":null,\
+             \"authoritative\":false,\"published\":false,\"cacheable\":false,\
+             \"expected_outcome\":\"inconclusive-cancelled\",\
+             \"actual_outcome\":\"inconclusive-cancelled\",\"first_divergence\":null,\
+             \"status\":\"pass\",\"cleanup_status\":\"not_applicable\",\
+             \"final_state\":\"nothing-published-and-base-unchanged\"}}",
+            admission_json_string(at.text()),
+        );
+        steps += 1;
+
+        // ---- Scenario 4: a superseded plan publishes nothing ------------------------
+        // The plan is decided against `base`, then committed against an environment
+        // that has moved. Its measured insertion weight was taken against a different
+        // trie shape, so consuming it would publish a fact about the wrong structure.
+        let stale_info = admission_fixture(
+            AdmissionLimit::Dimension(DeclarationDimension::LevelParams),
+            "Stale",
+            1,
+        );
+        let Outcome::Complete(DeclarationPlan::Prepared(stale_plan)) = base.plan_add_decl(
+            stale_info,
+            DeclarationBudget::UNBOUNDED,
+            CollisionBudget::UNBOUNDED,
+            None,
+        ) else {
+            unreachable!("an unbounded budget must prepare a plan")
+        };
+        let moved = publication.environment.clone();
+        let moved_root = moved.logical_root(&options);
+        let superseded = stale_plan.commit(&moved, None);
+        let Outcome::Inconclusive(inconclusive) = &superseded else {
+            unreachable!("a superseded plan must not publish")
+        };
+        assert!(
+            matches!(
+                inconclusive.cause,
+                InconclusiveCause::AuthorityIncomplete { .. }
+            ),
+            "a moved base says nothing about admissibility: {inconclusive:?}"
+        );
+        assert!(superseded.as_complete().is_none());
+        assert!(!moved.contains(&n("Stale")));
+        assert_eq!(moved.logical_root(&options), moved_root);
+        println!(
+            "{{\"schema\":\"fln.e2e.declaration-admission\",\"version\":1,{envelope},\
+             \"scenario\":\"superseded-plan\",\"step\":\"superseded-nonpublication\",\
+             \"step_index\":{steps},\"declaration\":\"Stale\",\
+             \"plan_base_root\":\"{base_root}\",\"commit_target_root\":\"{moved_root}\",\
+             \"base_root\":\"{moved_root}\",\"published_root\":null,\"authoritative\":false,\
+             \"published\":false,\"cacheable\":false,\
+             \"expected_outcome\":\"inconclusive-authority-incomplete\",\
+             \"actual_outcome\":\"inconclusive-authority-incomplete\",\
+             \"first_divergence\":\"plan-base-differs-from-commit-target\",\"status\":\"pass\",\
+             \"cleanup_status\":\"not_applicable\",\
+             \"final_state\":\"nothing-published-and-target-unchanged\"}}"
+        );
+        steps += 1;
+
+        // ---- Scenario 5: adequate-budget recovery -----------------------------------
+        // The same declaration that every limit refused now admits, which is what
+        // proves the refusals were about the budget and not about the declaration.
+        let mut recovered_steps = 0usize;
+        for (index, limit) in AdmissionLimit::ALL.into_iter().enumerate() {
+            let name = format!("Recovered{index}");
+            let info = admission_fixture(limit, &name, 3);
+            let refused = base.plan_add_decl(
+                info.clone(),
+                admission_budget_binding_only(limit, 0),
+                CollisionBudget::UNBOUNDED,
+                None,
+            );
+            assert!(
+                matches!(refused, Outcome::Inconclusive(_)),
+                "{} must refuse under a zero budget",
+                limit.wire_name()
+            );
+
+            let Outcome::Complete(DeclarationPlan::Prepared(retry)) = base.plan_add_decl(
+                info.clone(),
+                DeclarationBudget::UNBOUNDED,
+                CollisionBudget::UNBOUNDED,
+                None,
+            ) else {
+                unreachable!("{}: an adequate budget must prepare", limit.wire_name())
+            };
+            let usage = *retry.usage();
+            let Outcome::Complete(DeclarationCommitted::Published(recovered)) =
+                retry.commit(&base, None)
+            else {
+                unreachable!("{}: the retry must publish", limit.wire_name())
+            };
+            let recovered_root = recovered.environment.logical_root(&options);
+            assert!(recovered.environment.contains(&n(&name)));
+            assert_ne!(recovered_root, base_root);
+            assert_eq!(
+                recovered.digest,
+                Environment::decl_content_digest(&info),
+                "{}: recovery must produce the declaration's own digest",
+                limit.wire_name()
+            );
+            // The refusal left nothing behind for the retry to inherit.
+            assert_eq!(base.logical_root(&options), base_root);
+            println!(
+                "{{\"schema\":\"fln.e2e.declaration-admission\",\"version\":1,{envelope},\
+                 \"scenario\":\"adequate-budget-recovery\",\"step\":\"recovery-{}\",\
+                 \"step_index\":{steps},\"declaration\":\"{name}\",\
+                 \"limit_name\":\"{}\",\"budget\":{},\"usage\":{},\
+                 \"canonical_digest\":\"{}\",\"base_root\":\"{base_root}\",\
+                 \"published_root\":\"{recovered_root}\",\"authoritative\":true,\
+                 \"published\":true,\"cacheable\":true,\
+                 \"expected_outcome\":\"admitted-after-refusal\",\
+                 \"actual_outcome\":\"admitted-after-refusal\",\"first_divergence\":null,\
+                 \"status\":\"pass\",\"cleanup_status\":\"not_applicable\",\
+                 \"final_state\":\"declaration-published-after-earlier-refusal\"}}",
+                limit.wire_name(),
+                limit.wire_name(),
+                admission_budget_json(&DeclarationBudget::UNBOUNDED),
+                admission_usage_json(&usage),
+                recovered.digest,
+            );
+            steps += 1;
+            recovered_steps += 1;
+        }
+
+        // ---- Summary ----------------------------------------------------------------
+        // Counts are asserted, not merely printed: a validator that trusts a summary it
+        // cannot cross-check against the rows is validating the summary.
+        assert_eq!(recovered_steps, AdmissionLimit::ALL.len());
+        assert_eq!(steps, 1 + AdmissionLimit::ALL.len() * 2 + 3);
+        let dimension_rows = AdmissionLimit::ALL
+            .iter()
+            .filter(|limit| limit.is_declaration_dimension())
+            .count();
+        assert_eq!(
+            dimension_rows,
+            DeclarationDimension::ORDER.len(),
+            "every DeclarationDimension must have a refusal row"
+        );
+        println!(
+            "{{\"schema\":\"fln.e2e.declaration-admission-summary\",\"version\":1,{envelope},\
+             \"scenario\":\"declaration-admission-real-path\",\"steps\":{steps},\
+             \"admitted_rows\":1,\"refusal_rows\":{},\"cancellation_rows\":2,\
+             \"superseded_rows\":1,\"recovery_rows\":{recovered_steps},\
+             \"declaration_dimension_rows\":{dimension_rows},\
+             \"delegated_limit_rows\":{},\"status\":\"pass\",\
+             \"cleanup_status\":\"retained_by_policy\",\
+             \"final_state\":\"every-budgeted-limit-refused-typed-and-recovered\"}}",
+            AdmissionLimit::ALL.len(),
+            AdmissionLimit::ALL.len() - dimension_rows,
+        );
+    }
 }
