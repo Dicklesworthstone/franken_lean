@@ -91,6 +91,7 @@ edge fln-conformance -> fln-kernel # kernel replay drives the one authority (fra
 edge fln-conformance -> fln-olean  # kernel replay decodes real Reference oleans (franken_lean-z6c)
 edge fln-conformance -> fln-hash   # kernel-replay evidence hashes fixture inputs canonically (evidence-runner lane)
 edge fln-conformance -> fln-verdict # corpus schema projection exercises the CNF/model/proof wire formats (franken_lean-dgxa)
+edge structure-guard -> fln-core   # observes the authoritative D18 scanner; never reimplements or controls product semantics (franken_lean-r2st)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.
