@@ -30,7 +30,7 @@
 //! inventory yields no scan and no finding, and [`ModeClosureFacts`] reports both
 //! counts so the vacuity is visible rather than presented as an enforced pass.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fln_core::mode::{
     FrontierFeature, FrontierSurface, Mode, ModeClosureEdge, ModeClosureEdgeKind, ModeClosureNode,
@@ -51,6 +51,11 @@ pub struct ModeClosureFacts {
     pub product_roots: usize,
     /// Consumer modes for which a closure was actually submitted to the scanner.
     pub closures_scanned: usize,
+    /// Nodes actually submitted, summed across closures — the reachable subset, which
+    /// is what the core validates. Distinct from `nodes`, which counts the whole
+    /// workspace: a run where these are equal has either one all-reaching product or a
+    /// derivation that has stopped selecting.
+    pub closure_nodes: usize,
     pub nodes: usize,
     pub edges: usize,
 }
@@ -322,14 +327,30 @@ pub fn audit_with_facts(
         let Some(roots) = roots_by_mode.get(&mode.tag()) else {
             continue;
         };
-        // Only the nodes this product actually reaches belong to its closure; the core
-        // refuses any listed node it cannot reach, which is the omission check.
+        // Only the nodes this product actually reaches belong to its closure. Submitting
+        // the whole workspace instead refuses every unrelated crate with FLN-D18-012 —
+        // which stayed invisible while no crate declared a product root, because a
+        // vacuous scan never exercises the request it would have built (bead
+        // franken_lean-r2st). Edges are filtered with the nodes: an edge leaving the
+        // closure would name an endpoint the closure omits.
         facts.closures_scanned += 1;
+        let reachable = reachable_from(roots, &edges);
+        let closure_nodes: Vec<ModeClosureNode> = nodes
+            .iter()
+            .filter(|node| reachable.contains(&node.id))
+            .copied()
+            .collect();
+        let closure_edges: Vec<ModeClosureEdge> = edges
+            .iter()
+            .filter(|edge| reachable.contains(&edge.from))
+            .copied()
+            .collect();
+        facts.closure_nodes += closure_nodes.len();
         let request = ModeClosureRequest {
             consumer: mode,
             roots,
-            nodes: &nodes,
-            edges: &edges,
+            nodes: &closure_nodes,
+            edges: &closure_edges,
         };
         if let Err(refusal) = scan_mode_closure(request) {
             findings.push(Finding {
@@ -346,6 +367,34 @@ pub fn audit_with_facts(
     }
 
     (findings, facts)
+}
+
+/// The nodes one product root set actually reaches, over the supplied edges.
+///
+/// The core requires `ModeClosureRequest::nodes` to be **exactly** the reachable closure
+/// of `roots`: `ValidatedModeClosure` is documented as proof that every supplied node is
+/// reachable, and `scan_mode_closure` refuses any node it cannot reach with
+/// `FLN-D18-012`. Selecting that subset is the caller's obligation under that contract,
+/// not a second copy of the scanner: no mode algebra happens here, and every admission
+/// decision still belongs to `fln_core::mode`.
+fn reachable_from(
+    roots: &[ModeClosureNodeId],
+    edges: &[ModeClosureEdge],
+) -> BTreeSet<ModeClosureNodeId> {
+    let mut outgoing: BTreeMap<ModeClosureNodeId, Vec<ModeClosureNodeId>> = BTreeMap::new();
+    for edge in edges {
+        outgoing.entry(edge.from).or_default().push(edge.to);
+    }
+    let mut seen: BTreeSet<ModeClosureNodeId> = roots.iter().copied().collect();
+    let mut queue: VecDeque<ModeClosureNodeId> = roots.iter().copied().collect();
+    while let Some(node) = queue.pop_front() {
+        for child in outgoing.get(&node).into_iter().flatten() {
+            if seen.insert(*child) {
+                queue.push_back(*child);
+            }
+        }
+    }
+    seen
 }
 
 /// Registration entry point, matching the other audit modules.
@@ -425,6 +474,51 @@ mod tests {
         assert!(!facts.is_vacuous(), "a scanned closure is not vacuous");
     }
 
+    /// Regression guard for the defect this module shipped with (bead
+    /// `franken_lean-r2st`): the derivation submitted the **whole workspace** as the
+    /// closure while its own comment said it submitted only what the product reaches.
+    /// The core refuses any node it cannot reach, so the first crate to declare a real
+    /// product root would have been met with `FLN-D18-012` naming an unrelated crate.
+    ///
+    /// It stayed invisible because no crate declares a product root, so the live scan is
+    /// vacuous and never builds the request it would have built. A vacuous check cannot
+    /// be trusted to be a correct one — that is the whole reason this test exists rather
+    /// than a note saying the derivation looks right.
+    #[test]
+    fn only_the_reachable_subset_is_submitted_not_the_whole_workspace() {
+        const GRAPH3: &str = "schema fln-workspace-graph/1\n\
+                              crate app rank=2 kind=ordinary\n\
+                              crate lib rank=1 kind=ordinary\n\
+                              crate unrelated rank=1 kind=ordinary\n\
+                              edge app -> lib\n";
+        let m = BTreeMap::from([
+            (
+                "app".to_string(),
+                "# fln-product-root: sound\n# fln-mode-provenance: sound\n".to_string(),
+            ),
+            (
+                "lib".to_string(),
+                "# fln-mode-provenance: neutral\n".to_string(),
+            ),
+            (
+                "unrelated".to_string(),
+                "# fln-mode-provenance: neutral\n".to_string(),
+            ),
+        ]);
+        let graph = crate::graph::parse(GRAPH3).expect("fixture graph parses");
+        let (findings, facts) = audit_with_facts(&graph, &m);
+        assert!(
+            findings.is_empty(),
+            "a crate the product does not reach must not refuse its closure: {findings:?}"
+        );
+        assert_eq!(facts.nodes, 3, "the workspace has three crates");
+        assert_eq!(
+            facts.closure_nodes, 2,
+            "the Sound closure is app+lib; submitting `unrelated` as well is what \
+             produced FLN-D18-012 on every unrelated crate"
+        );
+    }
+
     #[test]
     fn planted_frontier_contamination_of_a_sound_root_is_refused() {
         // `lib` declares a real frontier feature, carries provenance consistent with
@@ -469,9 +563,25 @@ mod tests {
         );
     }
 
+    /// **This test's assertion was inverted deliberately** (bead `franken_lean-r2st`);
+    /// recorded rather than quietly rewritten, because changing a test to match new
+    /// behaviour is how a regression gets blessed.
+    ///
+    /// It previously asserted that a crate the product root cannot reach refuses the
+    /// closure with `FLN-D18-012`. That was not a D18 property — it was the derivation
+    /// submitting the **whole workspace** as the closure instead of the reachable subset
+    /// its own comment described. Under it, the first crate to declare a real product
+    /// root would have been refused on account of the 32 unrelated crates beside it, so
+    /// the rule as written said no workspace may contain a crate outside the product.
+    ///
+    /// The omission check is not weakened, it moved to where it can still act: the core
+    /// refuses any supplied node it cannot reach, and this derivation can no longer
+    /// supply one. That is the point of deriving a closure rather than declaring it, and
+    /// it is why `only_the_reachable_subset_is_submitted_not_the_whole_workspace` above
+    /// pins the subset by count.
     #[test]
-    fn planted_closure_omission_is_refused_not_partially_passed() {
-        // `lib` is listed in the closure but no edge reaches it from the product root.
+    fn a_crate_the_product_does_not_reach_is_outside_its_closure_not_a_refusal() {
+        // `lib` is in the workspace and no edge reaches it from the product root.
         let disconnected = "schema fln-workspace-graph/1\n\
                             crate app rank=2 kind=ordinary\n\
                             crate lib rank=1 kind=ordinary\n";
@@ -479,10 +589,16 @@ mod tests {
             "# fln-product-root: sound\n# fln-mode-provenance: sound\n",
             "# fln-mode-provenance: neutral\n",
         );
+        assert!(
+            codes(disconnected, &m).is_empty(),
+            "a crate outside the product's reach is not part of that product, and a \
+             workspace does not become inadmissible by containing one"
+        );
+        let graph = crate::graph::parse(disconnected).expect("fixture graph parses");
+        let (_, facts) = audit_with_facts(&graph, &m);
         assert_eq!(
-            codes(disconnected, &m),
-            vec!["FLN-D18-012"],
-            "a node the product root cannot reach is a refusal, never a partial pass"
+            facts.closure_nodes, 1,
+            "only the root itself is reachable, so only it is submitted"
         );
     }
 

@@ -1612,3 +1612,91 @@ fn the_python_shadow_baseline_is_clean() {
         "a bootstrap with no shadow beside it must scan clean"
     );
 }
+
+// ---------------------------------------------------------------------------
+// D18 mode closure (bead franken_lean-r2st)
+//
+// The registration chain is real — ci.yml runs scripts/check.sh, whose
+// `structure-guard` stage runs the guard binary, whose `checks::run` calls
+// `mode_closure::audit_with_facts`, which calls `fln_core::mode::scan_mode_closure`.
+// The unit tests in `mode_closure.rs` already drive that extractor over synthetic
+// graph and manifest TEXT, and they are good tests.
+//
+// What none of them establish is the last link: that a planted D18 defect in a real
+// on-disk workspace makes the REGISTERED GUARD RUN go red, with the core's stable
+// code surviving translation and a non-zero exit code reaching check.sh. A check can
+// be wired in and still return findings nobody acts on. That is the `pnav` shape from
+// AGENTS.md item 7 one floor down — an assertion and the lane it delegates to — so it
+// gets the same treatment: plant it, prove the run fails, repair it, prove recovery.
+// ---------------------------------------------------------------------------
+
+/// A Sound product root reaching a crate that declares a real frontier feature.
+///
+/// The dependency is backed at all three layers the guard cross-checks — governed graph
+/// edge, manifest dependency, and `Cargo.lock` closure — so the only thing the plant
+/// varies is the frontier surface itself. An edge backed at fewer layers trips
+/// `FLN-STRUCT-006` or `FLN-STRUCT-018`, and a plant that trips two checks proves neither.
+fn plant_frontier_into_sound(ws: &TempWs, frontier_feature: &str, jit_provenance: &str) {
+    ws.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &graph_with_edges(&["fln-cli -> fln-unsafe-jit"]),
+    );
+    ws.write(
+        "Cargo.lock",
+        &fixture_cargo_lock_with_dependencies(&[("fln-cli", &["fln-unsafe-jit"])]),
+    );
+    ws.write(
+        "crates/fln-cli/Cargo.toml",
+        &format!(
+            "# fln-product-root: sound\n# fln-mode-provenance: sound\n{}",
+            manifest("fln-cli", &["fln-unsafe-jit"])
+        ),
+    );
+    ws.write(
+        "crates/fln-unsafe-jit/Cargo.toml",
+        &format!(
+            "# fln-mode-provenance: {jit_provenance}\n{}{frontier_feature}",
+            manifest("fln-unsafe-jit", &[])
+        ),
+    );
+}
+
+#[test]
+fn planted_frontier_reaching_a_sound_product_root_fails_the_guard_run() {
+    let ws = TempWs::new("d18-frontier-into-sound");
+    base(&ws);
+    plant_frontier_into_sound(&ws, "\n[features]\niron = []\n", "frontier");
+    let out = ws.run();
+    assert!(
+        codes(&out).contains(&"FLN-D18-001"),
+        "a frontier surface reachable from a Sound product root must be refused by the \
+         REGISTERED guard, with the core's stable code surviving translation: {:?}",
+        out.findings
+    );
+    assert_ne!(
+        out.exit_code(),
+        0,
+        "a D18 refusal must make the guard run fail; a finding the run does not act on \
+         is a check that is wired in and inert"
+    );
+}
+
+/// The repair half. Without it the plant above could be failing for a reason unrelated
+/// to the frontier feature — the edge, the product-root marker, or the manifest shape.
+#[test]
+fn removing_the_frontier_feature_recovers_the_sound_closure() {
+    let ws = TempWs::new("d18-frontier-repaired");
+    base(&ws);
+    // Identical to the planted fixture except that the frontier feature is gone and the
+    // marker no longer claims a frontier binding the structure does not support. Removing
+    // only the feature leaves ModeBound(Frontier) contradicting a Neutral requirement,
+    // which the scanner refuses as FLN-D18-004 — correctly, and it is a different defect
+    // than the one under repair.
+    plant_frontier_into_sound(&ws, "", "neutral");
+    let out = ws.run();
+    assert!(
+        !codes(&out).iter().any(|code| code.starts_with("FLN-D18-")),
+        "with the frontier feature removed the same closure must be admitted: {:?}",
+        out.findings
+    );
+}
