@@ -18,6 +18,7 @@
 //! `fln-parity-ledger-l2-pinned-source-qydn`).
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// The workspace root, two levels above this crate's manifest.
 pub fn workspace_root() -> PathBuf {
@@ -67,6 +68,53 @@ pub fn pinned_lean() -> Option<PathBuf> {
         .join(format!("leanprover--lean4---{tag}"))
         .join("bin/lean");
     p.is_file().then_some(p)
+}
+
+/// What the pinned binary said when it was asked a question.
+///
+/// `success` is kept alongside `code` because a probe killed by a signal has no exit code,
+/// and a rig that only inspected `code` would read that as "no failure reported".
+#[derive(Debug)]
+pub struct Answer {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: Option<i32>,
+    pub success: bool,
+}
+
+/// Ask the pinned binary a question, as a Lean file it elaborates and reports on.
+///
+/// This is the *oracle* capacity D8 reserves for the Reference: the binary is asked and its
+/// answer compared, never linked, patched, or executed as a component. Every rig that needs
+/// an answer rather than a reading should come through here — the duplication this module's
+/// header warns about is exactly the shape where one rig grows a scratch path, a cleanup or
+/// an exit-code reading that the others do not have.
+///
+/// `Err` is a broken oracle, never an absent one: callers decide absence with
+/// [`pinned_lean`] and emit [`skip_notice`]. A pin that was located but will not run has
+/// produced no evidence *and* is a defect, and those are different outcomes from a pin that
+/// is not installed.
+pub fn ask(lean: &Path, rig: &str, probe: &str) -> Result<Answer, String> {
+    let dir = std::env::temp_dir().join(format!("fln-probe-{rig}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|error| format!("probe scratch {dir:?}: {error}"))?;
+    let file = dir.join(format!("{rig}.lean"));
+    std::fs::write(&file, probe).map_err(|error| format!("writing {file:?}: {error}"))?;
+
+    let out = Command::new(lean)
+        .arg(&file)
+        .output()
+        .map_err(|error| format!("running {}: {error}", lean.display()));
+    // Best-effort: a scratch directory that outlives a failed probe is untidy, never wrong,
+    // and must not mask the probe's own error.
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = out?;
+
+    Ok(Answer {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code(),
+        success: out.status.success(),
+    })
 }
 
 /// A typed skip line naming what was NOT established, for rigs whose oracle is absent.

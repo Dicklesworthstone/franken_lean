@@ -37,7 +37,6 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::process::Command;
 
 use fln_conformance::pin;
 use fln_core::options::limits;
@@ -140,27 +139,16 @@ fn every_option_default_fln_core_claims_is_the_one_the_pinned_binary_reports() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("fln-pin-options-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("probe scratch directory");
-    let probe = dir.join("options_probe.lean");
-    std::fs::write(&probe, PROBE).expect("probe is writable");
-
     // A pin that is present but unrunnable fails the test rather than skipping it: the
     // toolchain was located, so this is a broken oracle, not an absent one.
-    let out = Command::new(&lean)
-        .arg(&probe)
-        .output()
-        .map_err(|error| format!("running {}: {error}", lean.display()))
+    let answer = pin::ask(&lean, "pin_option_defaults", PROBE)
         .expect("the located pinned binary is executable");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let _ = std::fs::remove_dir_all(&dir);
 
-    let (table, size) = parse_table(&stdout);
+    let (table, size) = parse_table(&answer.stdout);
     assert!(
-        out.status.success(),
-        "the pinned binary refused the probe (exit {:?}).\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        out.status.code()
+        answer.success,
+        "the pinned binary refused the probe (exit {:?}).\nstdout:\n{}\nstderr:\n{}",
+        answer.code, answer.stdout, answer.stderr
     );
 
     // A parse that quietly returned a handful of rows would make the comparison below
