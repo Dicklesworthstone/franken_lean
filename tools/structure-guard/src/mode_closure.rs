@@ -29,6 +29,16 @@
 //! module does NOT fabricate a closure when no product declares one: an empty product
 //! inventory yields no scan and no finding, and [`ModeClosureFacts`] reports both
 //! counts so the vacuity is visible rather than presented as an enforced pass.
+//!
+//! Today that product inventory is EMPTY — no crate declares a mode-bound product root —
+//! so the live scan traverses nothing and every real run renders `scan_class":"vacuous"`.
+//! That gap is owned rather than merely disclosed: the product half (the canonical
+//! sidecar, two certified builds compared for byte-identity, the no-mock E2E that BUILDS
+//! products, 1/8/32) is bead `fln-d18-product-half-rgsg`, which is OPEN. `franken_lean-r2st`
+//! closed on its registration half only, so a reader following that citation must not read
+//! it as the product half having been done. The two are bound by
+//! `the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous`, which refuses to
+//! let the remainder be closed while this module still reports a vacuous scan.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

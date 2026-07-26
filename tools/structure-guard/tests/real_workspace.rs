@@ -139,6 +139,10 @@ fn u64_field(object: &str, key: &str) -> Option<u64> {
 /// red on whoever lands the first product binary, for doing exactly the right thing. The
 /// laws below hold in both scopes, so they survive that transition and still refuse an
 /// artifact whose scope word and counts disagree.
+///
+/// The vacuity this test tolerates is owned by bead `fln-d18-product-half-rgsg` and bound
+/// by [`the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous`] below, so
+/// tolerating it here does not leave it unattended.
 #[test]
 fn the_terminal_record_discloses_the_d18_scope_of_the_verdict_it_carries() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -197,6 +201,90 @@ fn the_terminal_record_discloses_the_d18_scope_of_the_verdict_it_carries() {
         product_roots <= nodes && frontier_surfaces <= nodes,
         "a crate cannot be counted more than once per axis: {object}"
     );
+}
+
+/// The tracker status of one bead, without a JSON dependency (D1 applies to the
+/// apparatus).
+///
+/// The id is matched against the record's OWN `id` key at the start of its line, so a
+/// bead merely *cited* inside another bead's prose cannot answer for it — which matters
+/// here, because the ids below are cited in several bead bodies. `,"status":"` is matched
+/// unescaped, and that sequence can only occur structurally: a quote inside a JSON string
+/// is backslash-escaped, so embedded JSON in a description cannot forge a status.
+fn bead_status(tracker: &str, id: &str) -> Option<String> {
+    const STATUS: &str = ",\"status\":\"";
+    let prefix = format!("{{\"id\":\"{id}\",");
+    let line = tracker.lines().find(|line| line.starts_with(&prefix))?;
+    let rest = &line[line.find(STATUS)? + STATUS.len()..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+/// The deferred half of D18 stays owned for as long as the production scan is provably
+/// vacuous (beads `franken_lean-r2st`, split and closed; `fln-d18-product-half-rgsg`, the
+/// remainder, open).
+///
+/// `r2st` closed on its registration half: the check is wired, derives its closure from
+/// governed structure, hands it to the core authority, and a planted refusal reddens a
+/// real guard run with a non-zero exit. Its product half — the canonical sidecar, two
+/// certified builds compared for byte-identity, the no-mock E2E that BUILDS products,
+/// 1/8/32 — moved to the remainder bead intact.
+///
+/// A split is only legitimate if the remainder keeps its definition, and **a bead comment
+/// is not a mechanism**: nothing would stop that remainder being closed later while the
+/// gap it names sits here untouched, which is precisely how a split becomes a way to book
+/// a win by moving the unfinished part somewhere quieter. This binds the two so that
+/// cannot happen quietly.
+///
+/// The scan class is read from `checks::run` against the real workspace — the same
+/// derivation the guard publishes — rather than re-derived here, so this cannot pass by
+/// measuring something the production check does not.
+///
+/// **One-way, plus a floor.** Equality in both directions would be a wall that reddens a
+/// correct repair, a shape that has cost this repository before. So it does NOT pin the
+/// scan class: whoever lands the first product binary is not failed for doing the right
+/// thing. And it stops caring about the bead's status the moment the scan traverses, so
+/// the allowance shrinks only toward repair. The floor is that the bead must be FOUND —
+/// a lookup matching nothing is a broken scan, not a clean tree, and would otherwise let
+/// the whole check pass by silently referring to a bead that no longer exists.
+#[test]
+fn the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous() {
+    const REMAINDER: &str = "fln-d18-product-half-rgsg";
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let outcome = structure_guard::checks::run(root).expect("structure-guard setup");
+
+    let tracker_path = root.join(".beads/issues.jsonl");
+    let tracker = std::fs::read_to_string(&tracker_path).unwrap_or_else(|error| {
+        panic!(
+            "the tracker must be readable to decide whether the deferred D18 half is \
+             still owned: {}: {error}",
+            tracker_path.display()
+        )
+    });
+    // The floor, checked before the conditional below so that a vanished bead fails
+    // loudly instead of being skipped along with the branch that would have used it.
+    let status = bead_status(&tracker, REMAINDER).unwrap_or_else(|| {
+        panic!(
+            "bead {REMAINDER} owns the deferred D18 product half and is absent from the \
+             tracker; a lookup that matches nothing is a broken scan, not a clean tree"
+        )
+    });
+
+    if outcome.mode_closure.is_vacuous() {
+        assert!(
+            !matches!(status.as_str(), "closed" | "tombstone"),
+            "the registered D18 scan is still vacuous — {} product roots, {} closures \
+             scanned, so no closure has ever been submitted to the core — while {REMAINDER}, \
+             which owns making it non-vacuous, is {status}. Closing the remainder in this \
+             state books the gap as done: franken_lean-r2st was split on the condition that \
+             this half stay open with its gap intact. Either reopen it, or land the product \
+             half so the scan traverses a real closure and this check stops applying.",
+            outcome.mode_closure.product_roots,
+            outcome.mode_closure.closures_scanned,
+        );
+    }
 }
 
 #[test]
