@@ -607,3 +607,125 @@ fn every_python_launch_under_scripts_is_sealed() {
             .collect::<Vec<_>>()
     );
 }
+
+/// The evidence surface refuses a root whose `.git` is a gitdir pointer, and AGENTS.md
+/// still says which surfaces that takes down.
+///
+/// `run_git` lstats `ROOT/.git` and refuses unless it is a real directory. In a linked git
+/// worktree `.git` is a *file* holding a `gitdir:` pointer, so every trusted path reaching
+/// `run_git` refuses there — `scripts/check.sh`, the evidence self-test,
+/// `scripts/verify_vendor_tree.sh`, and every `fln.e2e/2` lane, whose first governed step
+/// is `hash-tree --vendor-path` (bead `franken_lean-worktree-gitdir-refusal-hugg`).
+///
+/// This cost real verification before anyone noticed, for a reason no amount of care
+/// prevents: each failure announces something else. `check.sh` reports that it cannot
+/// inventory UBS inputs, so the reader goes looking for a missing tool; a lane reports
+/// that it cannot hash governed inputs, or cannot verify the pinned Reference tree. The
+/// true line is printed once, above the lane's louder and wrong summary.
+///
+/// **The exit code is not the discriminator — the message is.** A root whose `.git` is a
+/// real directory also exits 2, because git then runs and reports "not a git repository".
+/// So the control here is the file/directory distinction itself: only the pointer form may
+/// produce the refusal. Without it, a mistyped invocation would exit 2 and this test would
+/// pass with no content.
+///
+/// The second half binds the doctrine to the behaviour. A guard that only checked the
+/// refusal would let AGENTS.md quietly stop naming the affected surfaces, which is the
+/// half that actually strands a reader; a guard that only read AGENTS.md would keep
+/// asserting a rule after the code changed underneath it.
+#[test]
+fn the_evidence_surface_refuses_a_gitdir_pointer_root() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let evidence = repo.join("scripts/evidence.py");
+    let scratch = std::env::var("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| repo.join("target"))
+        .join(format!("fln-gitdir-refusal-{}", std::process::id()));
+
+    let probe = |name: &str, git_is_a_directory: bool| -> (Option<i32>, String) {
+        let root = scratch.join(name);
+        fs::create_dir_all(&root).expect("probe root must be creatable");
+        let git = root.join(".git");
+        if git_is_a_directory {
+            fs::create_dir_all(&git).expect("probe .git directory must be creatable");
+        } else {
+            // Exactly what `git worktree add` writes into a linked worktree.
+            fs::write(
+                &git,
+                "gitdir: /nonexistent/repository/.git/worktrees/probe\n",
+            )
+            .expect("probe .git pointer must be writable");
+        }
+        let run = std::process::Command::new("python3")
+            .args(["-I", "-S"])
+            .arg(&evidence)
+            .arg("ubs-inventory")
+            .arg("--root")
+            .arg(&root)
+            .args(["--scope", "all-tracked"])
+            .arg("--output")
+            .arg(root.join("inventory.json"))
+            .arg("--artifact-root")
+            .arg(&root)
+            .output()
+            .expect("the sealed interpreter must be able to run the evidence runner");
+        (
+            run.status.code(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        )
+    };
+
+    const REFUSAL: &str = "requires a real repository .git directory";
+
+    let (pointer_code, pointer_stderr) = probe("gitdir-pointer", false);
+    assert_eq!(
+        pointer_code,
+        Some(2),
+        "a gitdir-pointer root must be a typed setup failure, not a crash or a pass: {pointer_stderr}"
+    );
+    assert!(
+        pointer_stderr.contains(REFUSAL),
+        "a root whose .git is a gitdir pointer must be refused by name, so the reader is \
+         not sent to diagnose a missing tool; got: {pointer_stderr}"
+    );
+
+    // The control. A real .git directory must NOT produce this refusal -- git runs and
+    // fails on its own terms. Same exit code, different reason, which is the whole point.
+    let (_, directory_stderr) = probe("gitdir-directory", true);
+    assert!(
+        !directory_stderr.contains(REFUSAL),
+        "the refusal fired for a root whose .git IS a real directory, so it is not keyed on \
+         the worktree condition at all and the probe above proves nothing: {directory_stderr}"
+    );
+
+    // --- the doctrine half, scoped to the section that must carry it ------------------
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let heading = "### Where a green bar may be taken from";
+    let start = agents
+        .find(heading)
+        .expect("AGENTS.md must keep the section stating where a green bar may be taken from");
+    let section = &agents[start..];
+    let section = &section[..section.find("\n---").unwrap_or(section.len())];
+
+    for surface in [
+        "scripts/check.sh",
+        "evidence self-test",
+        "scripts/verify_vendor_tree.sh",
+        "fln.e2e/2",
+        "ubs-inventory",
+        "vendor-binding",
+        "--vendor-path",
+        "main tree",
+        "the_evidence_surface_refuses_a_gitdir_pointer_root",
+    ] {
+        assert!(
+            section.contains(surface),
+            "the AGENTS.md green-bar section no longer names {surface:?}. A reader who \
+             verifies in a worktree is stranded by exactly this omission, and the omission \
+             is invisible at the point of failure"
+        );
+    }
+}
