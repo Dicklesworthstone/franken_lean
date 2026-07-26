@@ -1112,6 +1112,48 @@ mutations = {
     w.u8(payload_provenance_tag(descriptor.provenance));
 }""",
     ),
+    "descriptor_validation_deferred": (
+        b"""        if base.descriptor != ours.descriptor || base.descriptor != theirs.descriptor {
+            return Err(MergeConflict::DescriptorMismatch {
+                base: base.descriptor.clone(),
+                ours: ours.descriptor.clone(),
+                theirs: theirs.descriptor.clone(),
+            });
+        }""",
+        b"""        let deferred_ours_common_prefix = base
+            .entries()
+            .zip(ours.entries())
+            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
+            .count();
+        let deferred_theirs_common_prefix = base
+            .entries()
+            .zip(theirs.entries())
+            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
+            .count();
+        if deferred_ours_common_prefix != base.len()
+            || deferred_theirs_common_prefix != base.len()
+        {
+            return Err(MergeConflict::HistoryMismatch {
+                extension: base.descriptor.name.clone(),
+                base_len: base.len(),
+                ours_len: ours.len(),
+                theirs_len: theirs.len(),
+                ours_common_prefix: deferred_ours_common_prefix,
+                theirs_common_prefix: deferred_theirs_common_prefix,
+            });
+        }
+        if base.descriptor != ours.descriptor || base.descriptor != theirs.descriptor {
+            return Err(MergeConflict::DescriptorMismatch {
+                base: base.descriptor.clone(),
+                ours: ours.descriptor.clone(),
+                theirs: theirs.descriptor.clone(),
+            });
+        }""",
+    ),
+    "ancestry_only_length": (
+        b"""        if ours_common_prefix != base.len() || theirs_common_prefix != base.len() {""",
+        b"""        if ours.len() < base.len() || theirs.len() < base.len() {""",
+    ),
     "declaration_budget_check_omission": (
         b"""    const ORDER: [DeclarationDimension; 5] = [
         DeclarationDimension::LevelParams,
@@ -1263,6 +1305,16 @@ run_identity_path_mutant_recovery extension_descriptor \
   extensions::tests::descriptor_identity_matrix_matches_model_and_logical_roots \
   'extensions::tests::descriptor_identity_matrix_matches_model_and_logical_roots --- FAILED' \
   'descriptor identity diverged from the independent layout model'
+run_identity_path_mutant_recovery extension_descriptor_validation_deferred \
+  fln-env/src/extensions.rs descriptor_validation_deferred \
+  extensions::tests::mismatched_descriptors_are_typed_conflicts_on_either_branch \
+  'extensions::tests::mismatched_descriptors_are_typed_conflicts_on_either_branch --- FAILED' \
+  'HistoryMismatch'
+run_identity_path_mutant_recovery extension_ancestry_only_length \
+  fln-env/src/extensions.rs ancestry_only_length \
+  extensions::tests::invalid_branch_history_is_a_typed_conflict \
+  'extensions::tests::invalid_branch_history_is_a_typed_conflict --- FAILED' \
+  'invalid ours history is refused'
 run_identity_path_mutant_recovery declaration_budget_check_omission \
   fln-env/src/environment.rs declaration_budget_check_omission \
   environment::tests::declaration_row_preflight_admits_at_exact_and_refuses_one_over \
