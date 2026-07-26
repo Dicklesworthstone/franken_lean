@@ -1113,42 +1113,48 @@ mutations = {
 }""",
     ),
     "descriptor_validation_deferred": (
-        b"""        if base.descriptor != ours.descriptor || base.descriptor != theirs.descriptor {
-            return Err(MergeConflict::DescriptorMismatch {
-                base: base.descriptor.clone(),
-                ours: ours.descriptor.clone(),
-                theirs: theirs.descriptor.clone(),
-            });
-        }""",
-        b"""        let deferred_ours_common_prefix = base
+        b"""        validate_descriptor_admission(&base.descriptor, &ours.descriptor, &theirs.descriptor)?;
+        let ours_common_prefix = base
             .entries()
             .zip(ours.entries())
             .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
             .count();
-        let deferred_theirs_common_prefix = base
+        let theirs_common_prefix = base
             .entries()
             .zip(theirs.entries())
             .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
             .count();
-        if deferred_ours_common_prefix != base.len()
-            || deferred_theirs_common_prefix != base.len()
-        {
+        if ours_common_prefix != base.len() || theirs_common_prefix != base.len() {
             return Err(MergeConflict::HistoryMismatch {
                 extension: base.descriptor.name.clone(),
                 base_len: base.len(),
                 ours_len: ours.len(),
                 theirs_len: theirs.len(),
-                ours_common_prefix: deferred_ours_common_prefix,
-                theirs_common_prefix: deferred_theirs_common_prefix,
-            });
-        }
-        if base.descriptor != ours.descriptor || base.descriptor != theirs.descriptor {
-            return Err(MergeConflict::DescriptorMismatch {
-                base: base.descriptor.clone(),
-                ours: ours.descriptor.clone(),
-                theirs: theirs.descriptor.clone(),
+                ours_common_prefix,
+                theirs_common_prefix,
             });
         }""",
+        b"""        let ours_common_prefix = base
+            .entries()
+            .zip(ours.entries())
+            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
+            .count();
+        let theirs_common_prefix = base
+            .entries()
+            .zip(theirs.entries())
+            .take_while(|(base_entry, branch_entry)| base_entry == branch_entry)
+            .count();
+        if ours_common_prefix != base.len() || theirs_common_prefix != base.len() {
+            return Err(MergeConflict::HistoryMismatch {
+                extension: base.descriptor.name.clone(),
+                base_len: base.len(),
+                ours_len: ours.len(),
+                theirs_len: theirs.len(),
+                ours_common_prefix,
+                theirs_common_prefix,
+            });
+        }
+        validate_descriptor_admission(&base.descriptor, &ours.descriptor, &theirs.descriptor)?;""",
     ),
     "ancestry_only_length": (
         b"""        if ours_common_prefix != base.len() || theirs_common_prefix != base.len() {""",
