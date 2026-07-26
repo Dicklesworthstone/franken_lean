@@ -509,6 +509,15 @@ fn mt_object_dies_on_last_dec() {
 
 /// RC balance property: a seeded random object soup — builds, shares, and
 /// drops — must tear down completely with zero ownership faults.
+///
+/// MANDATED MUTANT (AGENTS testing policy: "dropped retain"): neutering
+/// `rc::inc_ref_n` fails this test at `rc.rs`'s ownership-fault check. Verified
+/// by planting it on 2026-07-26 (bead
+/// `fln-mandated-mutant-join-unwatched-uagk`), not by inspection —
+/// `mt_object_dies_on_last_dec` and `rc_clone_and_drop_balance` also die, the
+/// latter by SIGABRT rather than a clean assertion. The marker is what joins
+/// this test to §18's list; without it the kill was real but nothing recorded
+/// which obligation it discharged.
 #[test]
 fn rc_balance_property_random_graphs() {
     let _g = lock();
