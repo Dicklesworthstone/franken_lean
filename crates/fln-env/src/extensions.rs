@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::{LeafView, Name};
-use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
+use fln_core::outcome::{Inconclusive, InternalFault, NonAuthoritative, Outcome, ResourceUsage};
 use fln_hash::canon::{CanonWriter, Canonical};
 use fln_hash::domain::{Digest, Domain, hash};
 
@@ -527,6 +527,17 @@ impl SetUnionResource {
             SetUnionResource::EntryBytes => "entry_bytes",
         }
     }
+
+    /// The shared structural unit this resource is charged in. See
+    /// [`DescriptorResource::structural_unit`] for the non-injectivity note.
+    const fn structural_unit(self) -> StructuralUnit {
+        match self {
+            SetUnionResource::Entries => StructuralUnit::ProducedNodes,
+            SetUnionResource::PayloadBytes | SetUnionResource::EntryBytes => {
+                StructuralUnit::InputBytes
+            }
+        }
+    }
 }
 
 /// Deterministic accounting for one SetUnion projection attempt.
@@ -712,6 +723,23 @@ impl DescriptorResource {
             DescriptorResource::ExaminedComponentBytes => "examined_component_bytes",
         }
     }
+
+    /// The shared structural unit this resource is charged in.
+    ///
+    /// Two resources, two units, and the mapping is not injective across the merge
+    /// pipeline as a whole — `ExaminedComponents` and [`ProofDimension::ComparedEntries`]
+    /// both land on [`StructuralUnit::ProducedNodes`]. That collapse is deliberate and is
+    /// the question `franken_lean-pmap-refusal-outcome-taxonomy-i1z9` made every adopter
+    /// answer explicitly: the bar is "a caller has to react differently", not "it is a
+    /// different number". A caller retrying with a larger allowance reacts identically to
+    /// both — it raises a node budget — so the shared taxonomy stays closed and the finer
+    /// fact stays on [`MergeStop`], which keeps the resource itself.
+    const fn structural_unit(self) -> StructuralUnit {
+        match self {
+            DescriptorResource::ExaminedComponents => StructuralUnit::ProducedNodes,
+            DescriptorResource::ExaminedComponentBytes => StructuralUnit::InputBytes,
+        }
+    }
 }
 
 /// Exact work stage 1's bounded measurement consumed.
@@ -786,19 +814,22 @@ pub enum MergeStop {
     Descriptor {
         extension: Name,
         resource: DescriptorResource,
-        limit: u128,
-        actual: u128,
     },
     /// Stage 2: the branch-ancestry proof exceeded its budget.
     Ancestry {
         extension: Name,
         dimension: ProofDimension,
-        limit: u128,
-        actual: u128,
     },
     /// The `SetUnion` policy arm's resource stop, with its accounting.
+    ///
+    /// `facts` is the projection's own deterministic accounting and stays here: it is a
+    /// richer record than `allowed`/`observed` and `dt5`'s discharged tables assert
+    /// against it. The *limit and spend* do not — those are the paired
+    /// [`ResourceUsage`]'s, and the projection-layer [`SetUnionInconclusive`] that used to
+    /// carry them here is unwrapped at this boundary rather than nested inside the stop.
     SetUnion {
-        reason: SetUnionInconclusive,
+        extension: Name,
+        resource: SetUnionResource,
         facts: SetUnionFacts,
     },
     /// The caller cancelled at a fixed observation point.
@@ -828,8 +859,8 @@ impl MergeStop {
         match self {
             MergeStop::Descriptor { extension, .. }
             | MergeStop::Ancestry { extension, .. }
+            | MergeStop::SetUnion { extension, .. }
             | MergeStop::Cancelled { extension, .. } => extension,
-            MergeStop::SetUnion { reason, .. } => &reason.extension,
         }
     }
 
@@ -839,8 +870,44 @@ impl MergeStop {
         match self {
             MergeStop::Descriptor { resource, .. } => Some(resource.as_str()),
             MergeStop::Ancestry { dimension, .. } => Some(dimension.as_str()),
-            MergeStop::SetUnion { reason, .. } => Some(reason.resource.as_str()),
+            MergeStop::SetUnion { resource, .. } => Some(resource.as_str()),
             MergeStop::Cancelled { .. } => None,
+        }
+    }
+
+    /// Where the work had got to, as the diagnostic text the shared [`Inconclusive`]
+    /// carries.
+    ///
+    /// A **projection of this value**, computed at the one site that builds the pair, so
+    /// the text cannot drift from the structural fact it renders. Lossy by design —
+    /// nothing may recover identity from it, which is what the typed arms are for. The
+    /// extension is rendered here and only here: [`MergeStop::extension`] deliberately
+    /// hands back the `O(1)` handle because a stop that fired *because* a name was too
+    /// large to walk must not walk one to say so, and this projection runs once, after
+    /// the decision, on the caller's diagnostic path.
+    fn progress(&self) -> String {
+        match self {
+            MergeStop::Descriptor {
+                extension,
+                resource,
+            } => format!("{} at {}", resource.as_str(), extension.to_display_string()),
+            MergeStop::Ancestry {
+                extension,
+                dimension,
+            } => format!(
+                "{} at {}",
+                dimension.as_str(),
+                extension.to_display_string()
+            ),
+            MergeStop::SetUnion {
+                extension,
+                resource,
+                ..
+            } => format!("{} at {}", resource.as_str(), extension.to_display_string()),
+            MergeStop::Cancelled {
+                extension,
+                checkpoint,
+            } => format!("{checkpoint:?} at {}", extension.to_display_string()),
         }
     }
 
@@ -854,11 +921,182 @@ impl MergeStop {
     }
 }
 
-/// The merge result keeps resource exhaustion structurally distinct from both a
-/// semantic conflict and a completed product (FL-INV-07). The inconclusive
-/// variant contains no state, so a partial journal/root cannot be published.
+/// The two halves of one merge non-answer, built together so they cannot disagree.
+///
+/// The shared authority ([`Outcome`]'s non-answer arms) and this crate's finer fact are
+/// both derived from a single [`MergeStop`] at the point of the stop. Carrying both halves
+/// in one value is how "a stop must BE the return value, never a fact recorded beside it"
+/// stays true across the layers between [`ExtensionState::merge`] and the caller. Twinned
+/// deliberately with [`crate::modules`]'s `GraphNonAnswer`, because this bead exists to
+/// stop this crate growing a second local answer to a question it has already answered.
+struct MergeNonAnswer {
+    authority: NonAuthoritative,
+    stop: MergeStop,
+}
+
+impl MergeNonAnswer {
+    /// A bounded stage tripped. `limit` and `actual` are the pipeline's `u128` counters
+    /// and become the usage's `allowed` and `observed`.
+    ///
+    /// **The conversion refuses rather than clamps**, for the reason `GraphNonAnswer`
+    /// gives and `franken_lean-pmap-refusal-outcome-taxonomy-i1z9` paid for: the stage
+    /// counters are `u128` and [`ResourceUsage`] is `u64`, so the pair is not always
+    /// representable. A saturated pair would report `allowed == observed`, which
+    /// [`ResourceUsage::is_genuine_exhaustion`] reads as a *misreported* stop — a stop
+    /// claiming not to be one. The honest answer is that our own accounting produced a
+    /// number the shared type cannot carry, and that is an internal fault, not an
+    /// exhaustion.
+    fn resource(stop: MergeStop, unit: StructuralUnit, limit: u128, actual: u128) -> Self {
+        let (Ok(allowed), Ok(observed)) = (u64::try_from(limit), u64::try_from(actual)) else {
+            return MergeNonAnswer {
+                authority: NonAuthoritative::InternalFault(InternalFault::new(
+                    "FL-INV-07",
+                    format!(
+                        "merge {} budget is not representable as a resource usage \
+                         (allowed {limit}, observed {actual})",
+                        stop.dimension().unwrap_or("resource"),
+                    ),
+                )),
+                stop,
+            };
+        };
+        let inconclusive = Inconclusive::resource(ResourceUsage {
+            reason: ResourceReason::StructuralBudget { unit },
+            allowed,
+            observed,
+        })
+        .with_progress(stop.progress());
+        MergeNonAnswer {
+            authority: NonAuthoritative::Inconclusive(inconclusive),
+            stop,
+        }
+    }
+
+    /// The caller cancelled. Cancellation is not exhaustion — the core refuses
+    /// `ResourceReason::Cancelled` inside a usage for exactly that reason — so it takes
+    /// the outcome axis's own cause.
+    fn cancelled(stop: MergeStop) -> Self {
+        let inconclusive = Inconclusive::cancelled(stop.progress());
+        MergeNonAnswer {
+            authority: NonAuthoritative::Inconclusive(inconclusive),
+            stop,
+        }
+    }
+}
+
+/// A merge that ran to completion and produced a state.
+///
+/// # A struct, decided rather than left as a one-variant enum
+///
+/// This was `ExtensionMergeOutcome`, an enum whose second variant held a non-answer inside
+/// the success arm. That shape is now **unrepresentable**: there is no variant to put a
+/// stop in, so "a completed merge containing an inconclusive" cannot be constructed,
+/// cannot be matched, and cannot be cached as authoritative. That is the defect
+/// `fln-uuuz` names as WRONG in shape, removed by construction rather than asserted
+/// against — which is why no test is offered in its place. The authority now lives one
+/// level out, on [`MergeReport`], where [`Outcome`] already models it for the whole
+/// program.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExtensionMergeOutcome {
+pub struct ExtensionMergeProduct {
+    pub state: ExtensionState,
+    pub set_union_facts: Option<SetUnionFacts>,
+}
+
+/// The result of one merge: the FL-INV-07 authority, and the finer local fact about a stop.
+///
+/// Three things used to be one local enum — a product, a rejection, and a non-answer — and
+/// the third is not a verdict about the merge at all. Now the authority is [`Outcome`], the
+/// algebra `fln-hash`, `fln-kernel` and the rest of `fln-env` share, and what stays local
+/// is what only this seam knows.
+///
+/// The split the old enum existed for is still the point and the type still carries it. A
+/// [`MergeConflict`] is a merge the pipeline has *decided about* — mismatched descriptors,
+/// divergent history, concurrent changes under review semantics — and it lives INSIDE
+/// [`Outcome::Complete`], where a domain's own rejection belongs. A [`MergeStop`] is a
+/// merge that *did not finish deciding*: a stage budget, a cancellation. Collapsing the two
+/// would let "we ran out of room" be recorded, cached, and replayed as "this merge is
+/// invalid".
+///
+/// # The facts are unreachable without consulting the authority
+///
+/// `fln_core`'s [`Inconclusive`] docs require this of any caller keeping its own report:
+/// "a struct whose `work` field is readable while `status` says inconclusive has the same
+/// hazard as a payload here, only spelled differently". Both fields are private and the
+/// only way to the product is [`MergeReport::into_status`], which hands back an [`Outcome`]
+/// whose own `into_complete` is the single gate. There is no accessor that yields a state
+/// without passing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct MergeReport {
+    status: Outcome<Result<ExtensionMergeProduct, MergeConflict>>,
+    /// `Some` exactly when `status` is a non-answer. Structural rather than remembered:
+    /// the constructors below are private and [`MergeReport::stopped`] is the only one
+    /// that can produce either half.
+    stop: Option<MergeStop>,
+}
+
+impl MergeReport {
+    /// A merge that ran to completion, with the domain's own verdict inside.
+    fn decided(verdict: Result<ExtensionMergeProduct, MergeConflict>) -> Self {
+        MergeReport {
+            status: Outcome::Complete(verdict),
+            stop: None,
+        }
+    }
+
+    /// A merge that did not finish deciding. The only constructor that can produce a
+    /// non-answer, and it cannot produce one without a stop.
+    fn stopped(non_answer: MergeNonAnswer) -> Self {
+        let status = match non_answer.authority {
+            NonAuthoritative::Inconclusive(inconclusive) => Outcome::Inconclusive(inconclusive),
+            NonAuthoritative::InternalFault(fault) => Outcome::InternalFault(fault),
+        };
+        MergeReport {
+            status,
+            stop: Some(non_answer.stop),
+        }
+    }
+
+    /// The shared FL-INV-07 authority.
+    pub const fn status(&self) -> &Outcome<Result<ExtensionMergeProduct, MergeConflict>> {
+        &self.status
+    }
+
+    /// The shared authority, consumed. The only route to the product.
+    pub fn into_status(self) -> Outcome<Result<ExtensionMergeProduct, MergeConflict>> {
+        self.status
+    }
+
+    /// The finer local fact, present exactly when the authority is a non-answer.
+    pub const fn stop(&self) -> Option<&MergeStop> {
+        self.stop.as_ref()
+    }
+}
+
+/// The **fixture-only** flattened view of a [`MergeReport`], for the pre-envelope merge
+/// tests.
+///
+/// # Why this shape still exists, and why only here
+///
+/// This is the shape the production type had before `fln-uuuz`: a non-answer nested inside
+/// the success arm. It is deliberately *not* what [`ExtensionState::merge`] returns any
+/// more — production code cannot express it, cannot publish it, and cannot cache it — but
+/// the ~25 call sites that check merge *semantics* were written against it, and they were
+/// never about authority. Rewriting them all would restate evidence that has already
+/// closed while adding the one risk this migration is on record for:
+/// `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`'s first attempt was reverted when a
+/// bulk rewrite of 27 test sites went wrong.
+///
+/// `#[cfg(test)]` is what keeps that reasoning honest. No consumer of this crate can fold
+/// authority through this type, because outside the test build it does not exist.
+///
+/// **Authority evidence does not come through here.** The envelope and `dt5` tests that
+/// assert on a stop, a cause, or a [`ResourceUsage`] call [`ExtensionState::merge`] and
+/// read the [`MergeReport`] directly — a fixture that reconstitutes the old shape cannot
+/// witness the new one.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExtensionMergeOutcome {
     Complete {
         state: ExtensionState,
         set_union_facts: Option<SetUnionFacts>,
@@ -992,6 +1230,16 @@ impl ProofDimension {
         match self {
             ProofDimension::ComparedEntries => "compared_entries",
             ProofDimension::ComparedPayloadBytes => "compared_payload_bytes",
+        }
+    }
+
+    /// The shared structural unit this dimension is charged in. See
+    /// [`DescriptorResource::structural_unit`] for why the mapping onto the closed
+    /// taxonomy is allowed to collapse two dimensions onto one unit.
+    const fn structural_unit(self) -> StructuralUnit {
+        match self {
+            ProofDimension::ComparedEntries => StructuralUnit::ProducedNodes,
+            ProofDimension::ComparedPayloadBytes => StructuralUnit::InputBytes,
         }
     }
 }
@@ -2357,13 +2605,27 @@ impl ExtensionState {
         theirs: &ExtensionState,
         set_union_limits: SetUnionLimits,
     ) -> Result<ExtensionMergeOutcome, MergeConflict> {
-        ExtensionState::merge(
+        let report = ExtensionState::merge(
             base,
             ours,
             theirs,
             MergeLimits::unbounded_except_set_union(set_union_limits),
             None,
-        )
+        );
+        let stop = report.stop().cloned();
+        match report.into_status() {
+            Outcome::Complete(Ok(product)) => Ok(ExtensionMergeOutcome::Complete {
+                state: product.state,
+                set_union_facts: product.set_union_facts,
+            }),
+            Outcome::Complete(Err(conflict)) => Err(conflict),
+            Outcome::Inconclusive(_) => Ok(ExtensionMergeOutcome::Inconclusive(
+                stop.expect("an inconclusive merge report always carries its stop"),
+            )),
+            Outcome::InternalFault(fault) => {
+                panic!("the unbounded merge fixture cannot produce an internal fault: {fault:?}")
+            }
+        }
     }
 
     /// Merge `ours` and `theirs` (both derived from `base` as the common base)
@@ -2401,21 +2663,18 @@ impl ExtensionState {
     /// `theirs` exactly as they were — the pipeline reads them and builds its product last —
     /// so a later call under an adequate budget produces the same result as if the refused
     /// one had never been made.
-    // See `MergeConflict`'s size note: the Ok variant is the larger of the two, so
-    // boxing the error shrinks nothing and would put an allocation on the refusal path.
-    #[allow(clippy::result_large_err)]
     pub fn merge(
         base: &ExtensionState,
         ours: &ExtensionState,
         theirs: &ExtensionState,
         limits: MergeLimits,
         cancellation: Option<&dyn CancellationProbe>,
-    ) -> Result<ExtensionMergeOutcome, MergeConflict> {
+    ) -> MergeReport {
         let extension = &base.descriptor.name;
         let set_union_limits = limits.set_union;
 
         if let Some(stop) = cancelled_at(extension, MergeCheckpoint::Entry, cancellation) {
-            return Ok(ExtensionMergeOutcome::Inconclusive(stop));
+            return MergeReport::stopped(MergeNonAnswer::cancelled(stop));
         }
 
         match admit_descriptors_within(
@@ -2425,14 +2684,17 @@ impl ExtensionState {
             limits.descriptor,
         ) {
             Err((resource, limit, actual)) => {
-                return Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::Descriptor {
-                    extension: extension.clone(),
-                    resource,
+                return MergeReport::stopped(MergeNonAnswer::resource(
+                    MergeStop::Descriptor {
+                        extension: extension.clone(),
+                        resource,
+                    },
+                    resource.structural_unit(),
                     limit,
                     actual,
-                }));
+                ));
             }
-            Ok(Err(refused)) => return Err(refused.into()),
+            Ok(Err(refused)) => return MergeReport::decided(Err(refused.into())),
             Ok(Ok(_usage)) => {}
         }
 
@@ -2441,7 +2703,7 @@ impl ExtensionState {
             MergeCheckpoint::AfterDescriptorAdmission,
             cancellation,
         ) {
-            return Ok(ExtensionMergeOutcome::Inconclusive(stop));
+            return MergeReport::stopped(MergeNonAnswer::cancelled(stop));
         }
 
         match validate_branch_ancestry(
@@ -2452,20 +2714,23 @@ impl ExtensionState {
             limits.ancestry,
         ) {
             Err((dimension, limit, actual)) => {
-                return Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::Ancestry {
-                    extension: extension.clone(),
-                    dimension,
+                return MergeReport::stopped(MergeNonAnswer::resource(
+                    MergeStop::Ancestry {
+                        extension: extension.clone(),
+                        dimension,
+                    },
+                    dimension.structural_unit(),
                     limit,
                     actual,
-                }));
+                ));
             }
             Ok(Err(divergence)) => {
-                return Err(divergence.into_conflict(
+                return MergeReport::decided(Err(divergence.into_conflict(
                     extension,
                     base.len(),
                     ours.len(),
                     theirs.len(),
-                ));
+                )));
             }
             Ok(Ok(_facts)) => {}
         }
@@ -2475,45 +2740,46 @@ impl ExtensionState {
             MergeCheckpoint::AfterBranchAncestry,
             cancellation,
         ) {
-            return Ok(ExtensionMergeOutcome::Inconclusive(stop));
+            return MergeReport::stopped(MergeNonAnswer::cancelled(stop));
         }
 
-        let outcome = Self::merge_under_policy(base, ours, theirs, set_union_limits)?;
+        let report = Self::merge_under_policy(base, ours, theirs, set_union_limits);
 
         // Only over a product. A `SetUnion` stop was observed at an earlier point in the
         // pipeline than this checkpoint, so reporting a cancellation over it would move the
         // stop forward in time and lose the dimension that actually bound — the same
-        // ordering `try_checkpoint` keeps with its `captured.is_ok()` guard.
-        if matches!(outcome, ExtensionMergeOutcome::Complete { .. })
+        // ordering `try_checkpoint` keeps with its `captured.is_ok()` guard. A
+        // `ConflictsRequireReview` rejection is likewise already decided, and a decided
+        // merge is not re-opened by a later cancellation.
+        if matches!(report.status(), Outcome::Complete(Ok(_)))
             && let Some(stop) =
                 cancelled_at(extension, MergeCheckpoint::BeforePublication, cancellation)
         {
-            return Ok(ExtensionMergeOutcome::Inconclusive(stop));
+            return MergeReport::stopped(MergeNonAnswer::cancelled(stop));
         }
-        Ok(outcome)
+        report
     }
 
     /// The policy arms, after the pipeline's two validation stages have passed.
     ///
     /// Split out so the envelope above reads as the pipeline it is — four checkpoints and
     /// three stages in one fixed order — rather than burying the ordering inside a `match`.
-    #[allow(clippy::result_large_err)] // see `MergeConflict`'s size note
     fn merge_under_policy(
         base: &ExtensionState,
         ours: &ExtensionState,
         theirs: &ExtensionState,
         set_union_limits: SetUnionLimits,
-    ) -> Result<ExtensionMergeOutcome, MergeConflict> {
+    ) -> MergeReport {
         match base.descriptor.merge {
             MergeSemantics::AppendOrdered => {
                 let mut merged = ours.clone();
                 for entry in theirs.entries().skip(base.len()) {
                     merged = merged.push_entry(Arc::clone(&entry.payload));
                 }
-                Ok(ExtensionMergeOutcome::Complete {
+                MergeReport::decided(Ok(ExtensionMergeProduct {
                     state: merged,
                     set_union_facts: None,
-                })
+                }))
             }
             MergeSemantics::SetUnion => {
                 let raw_entries = ours.len() + (theirs.len() - base.len());
@@ -2524,20 +2790,14 @@ impl ExtensionState {
                 if let Some((reason, facts)) =
                     set_union_cached_limit_refusal(&base.descriptor.name, initial_facts)
                 {
-                    return Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::SetUnion {
-                        reason,
-                        facts,
-                    }));
+                    return set_union_stop(reason, facts);
                 }
                 if let Some((reason, facts)) = set_union_entry_limit_refusal(
                     &base.descriptor.name,
                     ours.entries().chain(theirs.entries().skip(base.len())),
                     initial_facts,
                 ) {
-                    return Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::SetUnion {
-                        reason,
-                        facts,
-                    }));
+                    return set_union_stop(reason, facts);
                 }
 
                 let (first, second) = canonical_set_union_branch_order(base, ours, theirs);
@@ -2551,42 +2811,62 @@ impl ExtensionState {
                 let facts = match projection {
                     SetUnionProjection::Complete { facts, .. } => facts,
                     SetUnionProjection::Inconclusive { reason, facts } => {
-                        return Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::SetUnion {
-                            reason,
-                            facts,
-                        }));
+                        return set_union_stop(reason, facts);
                     }
                 };
                 let mut merged = first.clone();
                 for entry in second.entries().skip(base.len()) {
                     merged = append_set_union_raw_entry(&merged, entry);
                 }
-                Ok(ExtensionMergeOutcome::Complete {
+                MergeReport::decided(Ok(ExtensionMergeProduct {
                     state: merged,
                     set_union_facts: Some(facts),
-                })
+                }))
             }
             MergeSemantics::ConflictsRequireReview => {
                 let ours_changed = ours.len() != base.len();
                 let theirs_changed = theirs.len() != base.len();
                 if ours_changed && theirs_changed {
-                    Err(MergeConflict::ConcurrentChanges {
+                    MergeReport::decided(Err(MergeConflict::ConcurrentChanges {
                         extension: base.descriptor.name.clone(),
-                    })
+                    }))
                 } else if theirs_changed {
-                    Ok(ExtensionMergeOutcome::Complete {
+                    MergeReport::decided(Ok(ExtensionMergeProduct {
                         state: theirs.clone(),
                         set_union_facts: None,
-                    })
+                    }))
                 } else {
-                    Ok(ExtensionMergeOutcome::Complete {
+                    MergeReport::decided(Ok(ExtensionMergeProduct {
                         state: ours.clone(),
                         set_union_facts: None,
-                    })
+                    }))
                 }
             }
         }
     }
+}
+
+/// Convert the `SetUnion` projection's own typed refusal into a merge non-answer.
+///
+/// This is the one place the projection layer's [`SetUnionInconclusive`] is unwrapped.
+/// `SetUnionProjection` keeps its own shape — it is a lower layer with its own callers and
+/// its own `dt5` evidence, and widening this bead to rewrite it would restate evidence that
+/// has already closed. What changes is that its `limit`/`actual` stop being carried
+/// *inside* the merge stop, where they would be a second home for the numbers now living
+/// in [`ResourceUsage`].
+fn set_union_stop(reason: SetUnionInconclusive, facts: SetUnionFacts) -> MergeReport {
+    let unit = reason.resource.structural_unit();
+    let stop = MergeStop::SetUnion {
+        extension: reason.extension,
+        resource: reason.resource,
+        facts,
+    };
+    MergeReport::stopped(MergeNonAnswer::resource(
+        stop,
+        unit,
+        reason.limit,
+        reason.actual,
+    ))
 }
 
 /// Sample the probe once at one fixed point, and build the stop if it has tripped.
@@ -5275,20 +5555,13 @@ mod tests {
             theirs: &ExtensionState,
             limits: SetUnionLimits,
         ) -> (SetUnionInconclusive, SetUnionFacts) {
-            match ExtensionState::merge_unbounded(base, ours, theirs, limits)
-                .expect("valid SetUnion histories do not conflict")
-            {
-                ExtensionMergeOutcome::Inconclusive(MergeStop::SetUnion { reason, facts }) => {
-                    Some((reason, facts))
-                }
-                ExtensionMergeOutcome::Inconclusive(stop) => {
-                    panic!(
-                        "this scenario bounds only the SetUnion arm, so no other stop is \
-                            reachable: {stop:?}"
-                    )
-                }
-                ExtensionMergeOutcome::Complete { .. } => None,
-            }
+            set_union_refusal(ExtensionState::merge(
+                base,
+                ours,
+                theirs,
+                MergeLimits::unbounded_except_set_union(limits),
+                None,
+            ))
             .expect("SetUnion merge must be inconclusive")
         }
 
@@ -5669,25 +5942,13 @@ mod tests {
         let ours_root_before_exhaustion = ours.logical_root(&options);
         let theirs_root_before_exhaustion = theirs.logical_root(&options);
         let exhaustion_limits = SetUnionLimits::new(9, 13, 3);
-        let (exhaustion_reason, exhaustion_facts) = match ExtensionState::merge_unbounded(
+        let (exhaustion_reason, exhaustion_facts) = set_union_refusal(ExtensionState::merge(
             base_state,
             ours_state,
             theirs_state,
-            exhaustion_limits,
-        )
-        .expect("resource exhaustion is not a semantic conflict")
-        {
-            ExtensionMergeOutcome::Inconclusive(MergeStop::SetUnion { reason, facts }) => {
-                Some((reason, facts))
-            }
-            ExtensionMergeOutcome::Inconclusive(stop) => {
-                panic!(
-                    "this scenario bounds only the SetUnion arm, so no other stop is \
-                            reachable: {stop:?}"
-                )
-            }
-            ExtensionMergeOutcome::Complete { .. } => None,
-        }
+            MergeLimits::unbounded_except_set_union(exhaustion_limits),
+            None,
+        ))
         .expect("over-limit SetUnion merge must be inconclusive");
         assert_eq!(exhaustion_reason.resource, SetUnionResource::EntryBytes);
         assert_eq!((exhaustion_reason.limit, exhaustion_reason.actual), (3, 4));
@@ -9284,10 +9545,75 @@ mod tests {
         (base, ours, theirs)
     }
 
-    fn expect_stop(outcome: Result<ExtensionMergeOutcome, MergeConflict>) -> MergeStop {
-        match outcome {
-            Ok(ExtensionMergeOutcome::Inconclusive(stop)) => stop,
-            other => panic!("expected a non-answer, got {other:?}"),
+    /// The stop from a non-answer, with the report's authority checked on the way past.
+    fn expect_stop(report: MergeReport) -> MergeStop {
+        let stop = report
+            .stop()
+            .cloned()
+            .unwrap_or_else(|| panic!("expected a non-answer, got {:?}", report.status()));
+        assert!(
+            !matches!(report.status(), Outcome::Complete(_)),
+            "a report carrying a stop must not also claim authority"
+        );
+        stop
+    }
+
+    /// A `SetUnion` refusal, re-packed into the projection layer's own vocabulary.
+    ///
+    /// The numbers come out of the shared [`ResourceUsage`] — after the fold that is where
+    /// they live — and are handed back in the [`SetUnionInconclusive`] shape the SetUnion
+    /// assertions already speak, so each of them keeps asserting the identical measured
+    /// value through the new authority rather than being rewritten around it. `None` when
+    /// the merge completed.
+    fn set_union_refusal(report: MergeReport) -> Option<(SetUnionInconclusive, SetUnionFacts)> {
+        if matches!(report.status(), Outcome::Complete(Ok(_))) {
+            return None;
+        }
+        let (stop, usage) = expect_resource_stop(report);
+        let MergeStop::SetUnion {
+            extension,
+            resource,
+            facts,
+        } = stop
+        else {
+            panic!(
+                "this scenario bounds only the SetUnion arm, so no other stop is \
+                 reachable: {stop:?}"
+            )
+        };
+        Some((
+            SetUnionInconclusive {
+                extension,
+                resource,
+                limit: u128::from(usage.allowed),
+                actual: u128::from(usage.observed),
+            },
+            facts,
+        ))
+    }
+
+    /// The stop **and** the shared usage from one resource non-answer.
+    ///
+    /// The pair is the point. `limit` and `actual` used to be fields on [`MergeStop`]
+    /// itself, and every assertion below used to read them there; after the fold they are
+    /// the [`ResourceUsage`]'s `allowed` and `observed`. Returning both halves lets each
+    /// test keep asserting the *same measured numbers* it always asserted — the
+    /// `fln-uuuz` constraint that this is a migration and not a rename — while the typed
+    /// dimension it also always asserted stays on the stop.
+    fn expect_resource_stop(report: MergeReport) -> (MergeStop, ResourceUsage) {
+        let stop = expect_stop(report.clone());
+        match report.into_status() {
+            Outcome::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::ResourceExhausted { usage },
+                ..
+            }) => {
+                assert!(
+                    usage.is_genuine_exhaustion(),
+                    "a resource stop must report spending past its allowance, got {usage:?}"
+                );
+                (stop, usage)
+            }
+            other => panic!("expected a resource exhaustion, got {other:?}"),
         }
     }
 
@@ -9314,35 +9640,39 @@ mod tests {
 
         assert!(
             matches!(
-                merge_with(ProofBudget::new(8, u128::MAX)),
-                Ok(ExtensionMergeOutcome::Complete { .. })
+                merge_with(ProofBudget::new(8, u128::MAX)).status(),
+                Outcome::Complete(Ok(_))
             ),
             "eight comparisons is the exact cost of both walks, so it must complete"
         );
 
+        let (stop, usage) = expect_resource_stop(merge_with(ProofBudget::new(7, u128::MAX)));
         assert_eq!(
-            expect_stop(merge_with(ProofBudget::new(7, u128::MAX))),
+            stop,
             MergeStop::Ancestry {
                 extension: base.descriptor.name.clone(),
                 dimension: ProofDimension::ComparedEntries,
-                limit: 7,
-                actual: 8,
             },
             "one under the exact cost stops on the eighth comparison — the boundary, and \
              the witnessed lower bound is that eighth entry rather than a total"
         );
-
         assert_eq!(
-            expect_stop(merge_with(ProofBudget::new(4, u128::MAX))),
+            (usage.allowed, usage.observed),
+            (7, 8),
+            "the allowance and the spend that tripped it, now on the shared usage"
+        );
+
+        let (stop, usage) = expect_resource_stop(merge_with(ProofBudget::new(4, u128::MAX)));
+        assert_eq!(
+            stop,
             MergeStop::Ancestry {
                 extension: base.descriptor.name.clone(),
                 dimension: ProofDimension::ComparedEntries,
-                limit: 4,
-                actual: 5,
             },
             "four is exactly one walk, so the stop lands on the first comparison of the \
              second: a budget scoped per walk would have completed here"
         );
+        assert_eq!((usage.allowed, usage.observed), (4, 5));
     }
 
     /// The other ancestry dimension, to the same boundary discipline.
@@ -9365,19 +9695,19 @@ mod tests {
         };
 
         assert!(
-            matches!(merge_with(8), Ok(ExtensionMergeOutcome::Complete { .. })),
+            matches!(merge_with(8).status(), Outcome::Complete(Ok(_))),
             "eight one-byte payloads over two walks is the exact cost"
         );
+        let (stop, usage) = expect_resource_stop(merge_with(7));
         assert_eq!(
-            expect_stop(merge_with(7)),
+            stop,
             MergeStop::Ancestry {
                 extension: base.descriptor.name.clone(),
                 dimension: ProofDimension::ComparedPayloadBytes,
-                limit: 7,
-                actual: 8,
             },
             "and one byte under it refuses on the byte dimension, not the entry one"
         );
+        assert_eq!((usage.allowed, usage.observed), (7, 8));
     }
 
     /// A stop outranks a divergence the walk had not yet reached.
@@ -9420,23 +9750,24 @@ mod tests {
 
         assert!(
             matches!(
-                merge_with(ProofBudget::UNBOUNDED),
-                Err(MergeConflict::HistoryMismatch { .. })
+                merge_with(ProofBudget::UNBOUNDED).status(),
+                Outcome::Complete(Err(MergeConflict::HistoryMismatch { .. }))
             ),
-            "unbounded, the walk reaches the fourth entry and the merge is rejected"
+            "unbounded, the walk reaches the fourth entry and the merge is rejected — and \
+             a rejection is a *completed* decision, so it rides inside `Outcome::Complete`"
         );
 
+        let (stop, usage) = expect_resource_stop(merge_with(ProofBudget::new(2, u128::MAX)));
         assert_eq!(
-            expect_stop(merge_with(ProofBudget::new(2, u128::MAX))),
+            stop,
             MergeStop::Ancestry {
                 extension: base.descriptor.name.clone(),
                 dimension: ProofDimension::ComparedEntries,
-                limit: 2,
-                actual: 3,
             },
             "under a budget that stops at the third comparison, the same inputs are a \
              non-answer: the divergence is real and this merge did not establish it"
         );
+        assert_eq!((usage.allowed, usage.observed), (2, 3));
     }
 
     /// A descriptor whose identity is `components` components of one byte each.
@@ -9476,40 +9807,40 @@ mod tests {
 
         assert!(
             matches!(
-                merge_with(DescriptorLimits::new(15, u128::MAX)),
-                Ok(ExtensionMergeOutcome::Complete { .. })
+                merge_with(DescriptorLimits::new(15, u128::MAX)).status(),
+                Outcome::Complete(Ok(_))
             ),
             "fifteen components is three five-component names exactly"
         );
+        let (stop, usage) = expect_resource_stop(merge_with(DescriptorLimits::new(14, u128::MAX)));
         assert_eq!(
-            expect_stop(merge_with(DescriptorLimits::new(14, u128::MAX))),
+            stop,
             MergeStop::Descriptor {
                 extension: contract.name.clone(),
                 resource: DescriptorResource::ExaminedComponents,
-                limit: 14,
-                actual: 15,
             },
             "one under refuses on the fifteenth component — inside `theirs`, which a \
              per-subject cap of five would have admitted"
         );
+        assert_eq!((usage.allowed, usage.observed), (14, 15));
 
         assert!(
             matches!(
-                merge_with(DescriptorLimits::new(usize::MAX, 15)),
-                Ok(ExtensionMergeOutcome::Complete { .. })
+                merge_with(DescriptorLimits::new(usize::MAX, 15)).status(),
+                Outcome::Complete(Ok(_))
             ),
             "fifteen one-byte components is the exact byte cost too"
         );
+        let (stop, usage) = expect_resource_stop(merge_with(DescriptorLimits::new(usize::MAX, 14)));
         assert_eq!(
-            expect_stop(merge_with(DescriptorLimits::new(usize::MAX, 14))),
+            stop,
             MergeStop::Descriptor {
                 extension: contract.name.clone(),
                 resource: DescriptorResource::ExaminedComponentBytes,
-                limit: 14,
-                actual: 15,
             },
             "and the byte dimension refuses independently of the component one"
         );
+        assert_eq!((usage.allowed, usage.observed), (14, 15));
     }
 
     /// The component budget bites before the comparison does, which is the whole point.
@@ -9532,34 +9863,35 @@ mod tests {
                     &ours,
                     MergeLimits::unbounded_except_set_union(TEST_SET_UNION_LIMITS),
                     None,
-                ),
-                Err(MergeConflict::DescriptorMismatch { .. })
+                )
+                .status(),
+                Outcome::Complete(Err(MergeConflict::DescriptorMismatch { .. }))
             ),
             "unbounded, these descriptors disagree and the merge is rejected"
         );
 
+        let (stop, usage) = expect_resource_stop(ExtensionState::merge(
+            &ours,
+            &mismatched,
+            &ours,
+            MergeLimits::new(
+                DescriptorLimits::new(3, u128::MAX),
+                ProofBudget::UNBOUNDED,
+                TEST_SET_UNION_LIMITS,
+            ),
+            None,
+        ));
         assert_eq!(
-            expect_stop(ExtensionState::merge(
-                &ours,
-                &mismatched,
-                &ours,
-                MergeLimits::new(
-                    DescriptorLimits::new(3, u128::MAX),
-                    ProofBudget::UNBOUNDED,
-                    TEST_SET_UNION_LIMITS,
-                ),
-                None,
-            )),
+            stop,
             MergeStop::Descriptor {
                 extension: ours.descriptor.name.clone(),
                 resource: DescriptorResource::ExaminedComponents,
-                limit: 3,
-                actual: 4,
             },
             "under a budget that cannot even measure the first name, the same inputs \
              produce a non-answer rather than the rejection: a merge that cannot afford to \
              look has not decided that the descriptors disagree"
         );
+        assert_eq!((usage.allowed, usage.observed), (3, 4));
     }
 
     /// A merge samples its probe at exactly four points, and each is reported as itself.
@@ -9594,7 +9926,7 @@ mod tests {
         }
 
         assert!(
-            matches!(cancel_on(4), Ok(ExtensionMergeOutcome::Complete { .. })),
+            matches!(cancel_on(4).status(), Outcome::Complete(Ok(_))),
             "there is no fifth sample: a probe that would trip on one never trips, and the \
              merge completes. Without this the loop above would pass for a pipeline that \
              sampled fifty times"
@@ -9721,9 +10053,9 @@ mod tests {
                 MergeLimits::unbounded_except_set_union(TEST_SET_UNION_LIMITS),
                 None,
             )
-            .expect("the retry sees the same valid inputs")
+            .into_status()
             {
-                ExtensionMergeOutcome::Complete { state, .. } => state.content_digest(),
+                Outcome::Complete(Ok(product)) => product.state.content_digest(),
                 other => panic!("the retry must complete: {other:?}"),
             };
             assert_eq!(
@@ -9758,17 +10090,13 @@ mod tests {
         // would defeat this pin. Spelling the signature out is the assertion: an alias
         // moves the thing being asserted to a definition that can be changed on its own,
         // and the pin would then agree with whatever `merge` became.
-        #[allow(clippy::type_complexity)]
         const _MERGE_TAKES_ITS_SUBJECTS_BY_SHARED_REFERENCE: fn(
             &ExtensionState,
             &ExtensionState,
             &ExtensionState,
             MergeLimits,
             Option<&dyn CancellationProbe>,
-        ) -> Result<
-            ExtensionMergeOutcome,
-            MergeConflict,
-        > = ExtensionState::merge;
+        ) -> MergeReport = ExtensionState::merge;
 
         let (base, ours, theirs) = descending_trio(4);
         let before = [
@@ -10930,10 +11258,13 @@ mod tests {
         let theirs = set_state(&[b"ccccc"]);
         let limits = SetUnionLimits::new(8, 64, 2);
 
-        let ExtensionMergeOutcome::Inconclusive(MergeStop::SetUnion { reason, facts }) =
-            ExtensionState::merge_unbounded(&base, &ours, &theirs, limits)
-                .expect("valid SetUnion histories do not conflict")
-        else {
+        let Some((reason, facts)) = set_union_refusal(ExtensionState::merge(
+            &base,
+            &ours,
+            &theirs,
+            MergeLimits::unbounded_except_set_union(limits),
+            None,
+        )) else {
             unreachable!("an entry over the byte limit must refuse")
         };
         assert_eq!(reason.resource, SetUnionResource::EntryBytes);
@@ -12953,18 +13284,27 @@ mod tests {
         },
     }
 
-    fn merge_discriminant(
-        outcome: &Result<ExtensionMergeOutcome, MergeConflict>,
-    ) -> MergeDiscriminant {
-        match outcome {
-            Ok(ExtensionMergeOutcome::Complete { .. }) => MergeDiscriminant::Complete,
-            Ok(ExtensionMergeOutcome::Inconclusive(stop)) => MergeDiscriminant::Inconclusive {
-                label: stop.label(),
-                dimension: stop.dimension(),
-            },
-            Err(MergeConflict::DescriptorMismatch { .. }) => MergeDiscriminant::DescriptorMismatch,
-            Err(MergeConflict::HistoryMismatch { .. }) => MergeDiscriminant::HistoryMismatch,
-            Err(MergeConflict::ConcurrentChanges { .. }) => MergeDiscriminant::ConcurrentChanges,
+    fn merge_discriminant(report: &MergeReport) -> MergeDiscriminant {
+        match report.status() {
+            Outcome::Complete(Ok(_)) => MergeDiscriminant::Complete,
+            Outcome::Complete(Err(MergeConflict::DescriptorMismatch { .. })) => {
+                MergeDiscriminant::DescriptorMismatch
+            }
+            Outcome::Complete(Err(MergeConflict::HistoryMismatch { .. })) => {
+                MergeDiscriminant::HistoryMismatch
+            }
+            Outcome::Complete(Err(MergeConflict::ConcurrentChanges { .. })) => {
+                MergeDiscriminant::ConcurrentChanges
+            }
+            // Both non-answer arms discriminate by the stop, which is present on exactly
+            // these arms. The label distinguishes an internal fault from an inconclusive,
+            // so the two do not collapse into one bucket.
+            Outcome::Inconclusive(_) | Outcome::InternalFault(_) => {
+                MergeDiscriminant::Inconclusive {
+                    label: report.stop().map_or("none", MergeStop::label),
+                    dimension: report.stop().and_then(MergeStop::dimension),
+                }
+            }
         }
     }
 
@@ -12982,17 +13322,14 @@ mod tests {
     /// The three journals of a scenario, as models. Shrinking moves only these.
     type MatrixJournals = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
-    #[allow(clippy::result_large_err)] // see `MergeConflict`'s size note
-    fn run_matrix_scenario(
-        scenario: &MatrixScenario,
-        journals: &MatrixJournals,
-    ) -> Result<ExtensionMergeOutcome, MergeConflict> {
+    fn run_matrix_scenario(scenario: &MatrixScenario, journals: &MatrixJournals) -> MergeReport {
         let (base, ours, theirs) = journals;
-        ExtensionState::merge_unbounded(
+        ExtensionState::merge(
             &state_from_model(&scenario.base_descriptor, base),
             &state_from_model(&scenario.ours_descriptor, ours),
             &state_from_model(&scenario.theirs_descriptor, theirs),
-            scenario.limits,
+            MergeLimits::unbounded_except_set_union(scenario.limits),
+            None,
         )
     }
 
@@ -13101,36 +13438,50 @@ mod tests {
         let base_state = state_from_model(&scenario.base_descriptor, base);
         let ours_state = state_from_model(&scenario.ours_descriptor, ours);
         let theirs_state = state_from_model(&scenario.theirs_descriptor, theirs);
-        let outcome = ExtensionState::merge_unbounded(
+        let report = ExtensionState::merge(
             &base_state,
             &ours_state,
             &theirs_state,
-            scenario.limits,
+            MergeLimits::unbounded_except_set_union(scenario.limits),
+            None,
         );
 
-        let diagnostic = match &outcome {
-            Ok(ExtensionMergeOutcome::Complete { .. }) => "complete".to_string(),
-            Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::SetUnion { reason, .. })) => format!(
-                "inconclusive resource={:?} limit={} actual={}",
-                reason.resource, reason.limit, reason.actual
+        // The numbers are read from the shared `ResourceUsage` rather than off the stop,
+        // which is where they live after `fln-uuuz`. The discriminant keeps naming both
+        // the dimension and the allowance/spend, so it still separates two stops that
+        // bound on the same dimension at different budgets.
+        let diagnostic = match report.status() {
+            Outcome::Complete(Ok(_)) => "complete".to_string(),
+            Outcome::Complete(Err(conflict)) => conflict.to_string(),
+            Outcome::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::ResourceExhausted { usage },
+                ..
+            }) => format!(
+                "inconclusive dimension={:?} allowed={} observed={}",
+                report.stop().and_then(MergeStop::dimension),
+                usage.allowed,
+                usage.observed
             ),
-            Ok(ExtensionMergeOutcome::Inconclusive(stop)) => format!(
-                "inconclusive label={} dimension={:?}",
-                stop.label(),
-                stop.dimension()
+            Outcome::Inconclusive(inconclusive) => format!(
+                "inconclusive label={} cause={:?}",
+                report.stop().map_or("none", MergeStop::label),
+                inconclusive.cause
             ),
-            Err(conflict) => conflict.to_string(),
+            Outcome::InternalFault(fault) => format!("internal-fault {fault:?}"),
         };
-        let product_root = match &outcome {
-            Ok(ExtensionMergeOutcome::Complete { state, .. }) => state.content_digest().to_string(),
+        let product_root = match report.status() {
+            Outcome::Complete(Ok(product)) => product.state.content_digest().to_string(),
             _ => "none".to_string(),
         };
-        let work_facts = match &outcome {
-            Ok(ExtensionMergeOutcome::Complete {
-                set_union_facts: Some(facts),
-                ..
-            })
-            | Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::SetUnion { facts, .. })) => {
+        let work_facts = match (report.status(), report.stop()) {
+            (
+                Outcome::Complete(Ok(ExtensionMergeProduct {
+                    set_union_facts: Some(facts),
+                    ..
+                })),
+                _,
+            )
+            | (_, Some(MergeStop::SetUnion { facts, .. })) => {
                 format!(
                     "raw_entries={} raw_payload_bytes={} examined_entries={} \
                  examined_payload_bytes={} maximum_entry_bytes={} semantic_entries={} \
@@ -13154,14 +13505,14 @@ mod tests {
             theirs_state.content_digest()
         );
 
-        let minimized = if matches!(merge_discriminant(&outcome), MergeDiscriminant::Complete) {
+        let minimized = if matches!(merge_discriminant(&report), MergeDiscriminant::Complete) {
             "none".to_string()
         } else {
             let minimal = minimize_matrix_scenario(scenario);
             // Replayable: rebuilt from the minimized journals alone, it answers the same.
             assert_eq!(
                 merge_discriminant(&run_matrix_scenario(scenario, &minimal)),
-                merge_discriminant(&outcome),
+                merge_discriminant(&report),
                 "{}: the minimized counterexample must replay to the same answer",
                 scenario.name
             );
@@ -13172,7 +13523,7 @@ mod tests {
                     .into_iter()
                     .all(|candidate| {
                         merge_discriminant(&run_matrix_scenario(scenario, &candidate))
-                            != merge_discriminant(&outcome)
+                            != merge_discriminant(&report)
                     }),
                 "{}: a further reduction still reproduces the answer, so this is not \
                  minimal for the declared steps",

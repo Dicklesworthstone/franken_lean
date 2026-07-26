@@ -1127,20 +1127,23 @@ mutations = {
             limits.ancestry,
         ) {
             Err((dimension, limit, actual)) => {
-                return Ok(ExtensionMergeOutcome::Inconclusive(MergeStop::Ancestry {
-                    extension: extension.clone(),
-                    dimension,
+                return MergeReport::stopped(MergeNonAnswer::resource(
+                    MergeStop::Ancestry {
+                        extension: extension.clone(),
+                        dimension,
+                    },
+                    dimension.structural_unit(),
                     limit,
                     actual,
-                }));
+                ));
             }
             Ok(Err(divergence)) => {
-                return Err(divergence.into_conflict(
+                return MergeReport::decided(Err(divergence.into_conflict(
                     extension,
                     base.len(),
                     ours.len(),
                     theirs.len(),
-                ));
+                )));
             }
             Ok(Ok(_facts)) => {}
         }
