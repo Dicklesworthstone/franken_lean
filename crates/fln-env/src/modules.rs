@@ -4347,6 +4347,289 @@ mod tests {
         }
     }
 
+    /// Every budget names the unit it is denominated in, and reports that unit when it
+    /// actually stops (bead `fln-um4a`).
+    ///
+    /// The join this pins is *a budget and the unit it claims*. `ResourceUsage` carries a
+    /// [`StructuralUnit`] that a scheduler reads to decide what to raise, so a wrong unit is
+    /// a wrong instruction rather than a cosmetic label. The map is asserted over
+    /// `ModuleGraphResource::ALL` — a resource added without choosing a unit does not
+    /// compile, and one that chooses wrongly fails here — and then every axis is DRIVEN to a
+    /// real stop and the unit it actually reported is compared against the map. A table
+    /// checked only against itself would stay green while `enforce_limit` reported something
+    /// else, which is this project's recurring evidence defect one floor down.
+    #[test]
+    fn every_resource_names_its_structural_unit_and_reports_it_on_a_real_stop() {
+        for resource in ModuleGraphResource::ALL {
+            let expected = match resource {
+                // The one byte axis: accounted serialized payload.
+                ModuleGraphResource::PayloadBytes => StructuralUnit::InputBytes,
+                // Counts of things the graph materializes.
+                ModuleGraphResource::Modules
+                | ModuleGraphResource::DirectImportRows
+                | ModuleGraphResource::NameDepth => StructuralUnit::ProducedNodes,
+            };
+            assert_eq!(resource.structural_unit(), expected, "{resource:?}");
+            assert!(!resource.label().is_empty(), "{resource:?} has no label");
+        }
+        // `ExpandedWeight` is the size of a tree a shared DAG DENOTES, measured without
+        // building it. Nothing in this seam denotes one, so no resource may claim it.
+        assert!(
+            ModuleGraphResource::ALL
+                .iter()
+                .all(|resource| resource.structural_unit() != StructuralUnit::ExpandedWeight),
+            "a module-graph budget claimed a denoted-size unit it does not measure"
+        );
+        // Three resources share `ProducedNodes`, so the label is what tells a reader which
+        // count stopped. Distinct, or that job is not done.
+        let labels: HashSet<&str> = ModuleGraphResource::ALL
+            .iter()
+            .map(|resource| resource.label())
+            .collect();
+        assert_eq!(labels.len(), ModuleGraphResource::ALL.len());
+
+        // Now drive each axis to a real stop. `payload_bytes` is driven through
+        // construction, which is the only place that budget binds without a fixture
+        // carrying artifact payload.
+        let roomy = u128::MAX;
+        let deep = ModuleId::new(Name::from_components(["a", "b", "c"]));
+        let observed: Vec<(ModuleGraphResource, ResourceUsage)> = vec![
+            {
+                let graph = ModuleGraph::new(epoch(), ModuleGraphLimits::new(0, 8, 8, roomy))
+                    .expect_complete("empty graph fits");
+                let (_, resource, usage) = graph
+                    .register(record("Any", vec![], 1))
+                    .expect_resource_stop("a zero module budget stops");
+                (resource, usage)
+            },
+            {
+                let graph = ModuleGraph::new(epoch(), ModuleGraphLimits::new(8, 0, 8, roomy))
+                    .expect_complete("empty graph fits");
+                let (_, resource, usage) = graph
+                    .register(record("Any", vec![direct("Dep", 0)], 2))
+                    .expect_resource_stop("a zero edge budget stops");
+                (resource, usage)
+            },
+            {
+                let graph = ModuleGraph::new(epoch(), ModuleGraphLimits::new(8, 8, 2, roomy))
+                    .expect_complete("empty graph fits");
+                let (_, resource, usage) = graph
+                    .register(ModuleRecord::new(deep, true, vec![], evidence(3)))
+                    .expect_resource_stop("a name past the depth budget stops");
+                (resource, usage)
+            },
+            {
+                let cost = epoch().payload_bytes();
+                let (_, resource, usage) =
+                    ModuleGraph::new(epoch(), ModuleGraphLimits::new(8, 8, 8, cost - 1))
+                        .expect_resource_stop("a payload budget under the epoch's cost stops");
+                (resource, usage)
+            },
+        ];
+        // Keyed on the label because it is `&'static str` and was just proved distinct;
+        // adding `Ord`/`Hash` to a public taxonomy for a test's bookkeeping would be the
+        // tail wagging the dog.
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (resource, usage) in observed {
+            assert_eq!(
+                usage.reason,
+                ResourceReason::StructuralBudget {
+                    unit: resource.structural_unit()
+                },
+                "{resource:?} reported a unit its own map does not name"
+            );
+            assert!(
+                usage.is_genuine_exhaustion(),
+                "{resource:?} reported a stop the shared type reads as misreported: {usage:?}"
+            );
+            seen.insert(resource.label());
+        }
+        assert_eq!(
+            seen.len(),
+            ModuleGraphResource::ALL.len(),
+            "an axis in the map was never driven to a real stop, so its unit is unverified"
+        );
+    }
+
+    /// An accounting number the shared usage cannot carry is an internal fault, never a
+    /// clamped exhaustion (bead `fln-um4a`).
+    ///
+    /// The graph counts in `u128` and [`ResourceUsage`] is `u64`, and the payload budget is
+    /// legitimately `u128::MAX` — `provenance.rs` sets exactly that. The tempting
+    /// conversion is a saturating one, and the mutant below is why it is wrong: it produces
+    /// `allowed == observed`, a pair the core's own `is_genuine_exhaustion` already
+    /// classifies as misreported. So the seam refuses instead, and says which axis and which
+    /// numbers it could not carry.
+    #[test]
+    fn an_unrepresentable_budget_is_an_internal_fault_not_a_clamped_exhaustion() {
+        let module = id("Wide");
+        let past_u64 = u128::from(u64::MAX) + 1;
+        let report: ModuleGraphAdmission = ModuleGraphReport::stopped(GraphNonAnswer::resource(
+            Some(&module),
+            ModuleGraphResource::PayloadBytes,
+            past_u64,
+            past_u64 + 1,
+        ));
+
+        assert_eq!(report.outcome_label(), "internal-fault");
+        assert!(
+            !report.is_inconclusive(),
+            "an invariant failure is not a budget stop"
+        );
+        assert_eq!(report.status().authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            report.status().cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
+        );
+        assert_eq!(report.graph(), None);
+        // The attribution survives the fault: which axis and which module stopped is still
+        // a typed fact, not a sentence.
+        assert!(matches!(
+            report.stop(),
+            Some(ModuleGraphStop::Resource {
+                module: Some(stopped),
+                resource: ModuleGraphResource::PayloadBytes,
+            }) if *stopped == module
+        ));
+        let Outcome::InternalFault(fault) = report.status() else {
+            unreachable!("asserted internal-fault above");
+        };
+        assert_eq!(fault.invariant, "FL-INV-07");
+        assert!(
+            fault
+                .detail
+                .text()
+                .contains(ModuleGraphResource::PayloadBytes.label()),
+            "the fault must name the axis it could not carry: {:?}",
+            fault.detail
+        );
+
+        // THE MUTANT: a saturating conversion. This is the exact pair it would report, and
+        // the shared type already refuses to call it a genuine stop — so clamping would
+        // produce a refusal that contradicts itself.
+        let clamped = ResourceUsage {
+            reason: ResourceReason::StructuralBudget {
+                unit: StructuralUnit::InputBytes,
+            },
+            allowed: u64::MAX,
+            observed: u64::MAX,
+        };
+        assert!(
+            !clamped.is_genuine_exhaustion(),
+            "a clamped pair must not read as a genuine exhaustion"
+        );
+
+        // One under the width boundary is representable and is an ordinary exhaustion, so
+        // the refusal is about the width and not about large budgets.
+        let representable: ModuleGraphAdmission =
+            ModuleGraphReport::stopped(GraphNonAnswer::resource(
+                Some(&module),
+                ModuleGraphResource::PayloadBytes,
+                u128::from(u64::MAX) - 1,
+                u128::from(u64::MAX),
+            ));
+        assert_eq!(representable.outcome_label(), "inconclusive-resource");
+        let (_, _, usage) =
+            representable.expect_resource_stop("one under the width boundary is a real stop");
+        assert!(usage.is_genuine_exhaustion());
+    }
+
+    /// A stop and its outcome are projections of one value, so they cannot disagree.
+    ///
+    /// The registration-seam analogue of `3ceb3711`'s pin on the closure seam. Every
+    /// non-answer here is built by one constructor from one [`ModuleGraphStop`], so the
+    /// stop arm, the cause family, the evidence label and the diagnostic text are four
+    /// projections of a single value rather than four facts kept in step by hand — which is
+    /// the shape that let a recorded stop and a returned value disagree in `fln-hash`.
+    #[test]
+    fn a_stop_and_its_outcome_are_projections_of_one_value() {
+        let module = id("Subject");
+        let cases: Vec<(GraphNonAnswer, &str)> = vec![
+            (
+                GraphNonAnswer::resource(Some(&module), ModuleGraphResource::Modules, 1, 2),
+                "inconclusive-resource",
+            ),
+            (
+                GraphNonAnswer::cancelled(&module, RegistrationCheckpoint::AfterValidation),
+                "inconclusive-cancelled",
+            ),
+            (
+                GraphNonAnswer::plan_superseded(&module, 3, 4),
+                "inconclusive-plan-superseded",
+            ),
+        ];
+
+        for (non_answer, expected_label) in cases {
+            let report: ModuleGraphAdmission = ModuleGraphReport::stopped(non_answer);
+            assert_eq!(report.outcome_label(), expected_label);
+            assert!(report.is_inconclusive());
+            assert_eq!(report.graph(), None);
+            let stop = report.stop().expect("a stop is always attributed").clone();
+            assert_eq!(stop.label(), expected_label, "the label is the stop's");
+            assert_eq!(stop.module(), Some(&module));
+
+            let (destructured, inconclusive) =
+                report.expect_inconclusive("every case here is a non-answer");
+            assert_eq!(destructured, stop, "the borrowed and owned stops differ");
+            assert!(
+                matches!(
+                    (&stop, &inconclusive.cause),
+                    (
+                        ModuleGraphStop::Resource { .. },
+                        InconclusiveCause::ResourceExhausted { .. }
+                    ) | (
+                        ModuleGraphStop::Cancelled { .. },
+                        InconclusiveCause::Cancelled { .. }
+                    ) | (
+                        ModuleGraphStop::PlanSuperseded { .. },
+                        InconclusiveCause::AuthorityIncomplete { .. }
+                    )
+                ),
+                "stop {stop:?} and cause {:?} disagree",
+                inconclusive.cause
+            );
+
+            // The diagnostic text is a projection of the same value, so it names the
+            // subject. It is a RENDERING: nothing may recover identity from it, which is
+            // what the typed arm above is for.
+            let text = match &inconclusive.cause {
+                InconclusiveCause::Cancelled { at } => at.text().to_string(),
+                _ => inconclusive
+                    .progress
+                    .as_ref()
+                    .expect("a stop records where it got to")
+                    .text()
+                    .to_string(),
+            };
+            assert!(
+                text.contains("Subject"),
+                "the derived text dropped the subject: {text}"
+            );
+        }
+
+        // The pairing holds in the other direction too: a decided outcome carries no stop,
+        // so a reader cannot find a stop beside an answer.
+        let base = graph();
+        assert_eq!(
+            base.register(record("Fine", vec![], 1)).stop(),
+            None,
+            "an admitted registration reported a stop"
+        );
+        assert_eq!(
+            base.register(ModuleRecord::new(
+                ModuleId::new(Name::anonymous()),
+                true,
+                vec![],
+                evidence(1),
+            ))
+            .stop(),
+            None,
+            "a rejection reported a stop"
+        );
+    }
+
     #[test]
     fn epoch_name_and_every_resource_boundary_fail_closed() {
         for malformed in [
