@@ -966,6 +966,12 @@ impl Dispatch {
 /// `schedule:`/`cron:` are matched file-wide, so a workflow carrying a cron for some *other*
 /// job would read as scheduled. That is visible in review and fails safe in the direction
 /// that matters least; a cron that is deleted still drops the state and fires this guard.
+///
+/// **The residue, stated because it is the same defect family:** a workflow whose YAML is
+/// *syntactically broken* still reads as dispatching here, while GitHub would refuse to run
+/// it. Text scanning cannot tell a valid lane from a malformed one, so this guard attests
+/// that a dispatcher is **declared**, never that it is **loadable** — and never, separately,
+/// that it ever **fired**. The receipt's token inherits exactly that strength and no more.
 fn dispatch_in_workflow(yaml: &str) -> Dispatch {
     let lines: Vec<&str> = yaml
         .lines()
