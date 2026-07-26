@@ -269,6 +269,171 @@ pub const SOURCE_READ_ABOVE_L1_ALLOWANCE: [&str; 13] = [
     "synthInstance.maxSize",
 ];
 
+/// The rig that gives each remainder row a value-producing oracle, so a REPAIRED row can be
+/// required to name it.
+///
+/// This is the successor to [`SOURCE_READ_ABOVE_L1_ALLOWANCE`], and it exists because the
+/// allowance-scoped guards have an end-of-life problem. `pin_option_defaults.rs` and
+/// `pin_ctor_inventory.rs` each assert that every UNREPAIRED row in the remainder is backed
+/// by them — correctly one-way, so that repairing a row cannot redden the build. But that
+/// makes both guards go quiet exactly as the remainder empties, which is the moment those
+/// rows stop being declared exceptions and become ordinary published L2 claims. A guard that
+/// switches off when its subject becomes load-bearing is the `uagk` shape in AGENTS.md item 7:
+/// a scan returning empty is a broken scan, not a clean tree.
+///
+/// So the two halves are complementary and the coverage is continuous:
+///
+/// | row state              | allowance guards       | this law                       |
+/// |------------------------|------------------------|--------------------------------|
+/// | in the remainder       | must be backed by rig  | silent (repair not yet claimed)|
+/// | repaired, left it      | silent (by design)     | must CITE the rig it claims    |
+///
+/// mixHash is deliberately absent: its oracle is not a rig but the fixture
+/// `core_observables.txt`, which it already cites, and which
+/// `scripts/extract/gen_core_fixtures.sh` generates by running the pinned binary. Its repair
+/// is a one-token `oracle_kind` edit with no fixture change, so this law has nothing to add.
+pub const ORACLE_BACKING: [(&str, &str); 12] = [
+    (
+        "Lean.DataValue.ctorInventory",
+        "crates/fln-conformance/tests/pin_ctor_inventory.rs",
+    ),
+    (
+        "Lean.Expr.ctorInventory",
+        "crates/fln-conformance/tests/pin_ctor_inventory.rs",
+    ),
+    (
+        "Lean.Level.ctorInventory",
+        "crates/fln-conformance/tests/pin_ctor_inventory.rs",
+    ),
+    (
+        "Lean.Name.ctorInventory",
+        "crates/fln-conformance/tests/pin_ctor_inventory.rs",
+    ),
+    (
+        "exponentiation.threshold",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
+    (
+        "maxErrors",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
+    (
+        "maxHeartbeats",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
+    (
+        "maxRecDepth",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
+    (
+        "maxSynthPendingDepth",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
+    (
+        "maxUniverseOffset",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
+    (
+        "synthInstance.maxHeartbeats",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
+    (
+        "synthInstance.maxSize",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
+];
+
+/// A repaired row must cite the oracle it now claims.
+///
+/// Vacuous today by construction — all twelve rows are still in the remainder — and that is
+/// the point rather than a weakness: this law GAINS force as the remainder shrinks, where the
+/// allowance-scoped guards lose it. The two together mean no row is ever unwatched, in either
+/// state or in the transition between them.
+///
+/// What it catches is the specific half-repair this bead makes easy. Every one of the twelve
+/// currently cites `crates/fln-core/tests/pin_inventory_census.rs`, which READS vendored
+/// upstream source. Flipping `oracle_kind` to `pinned-binary` while leaving that citation
+/// alone produces a row asserting the binary was asked, evidenced by a test that only ever
+/// read a file — the exact substitution of *our reading of the oracle* for *the oracle* that
+/// the whole bead is about, and it would otherwise pass every check in this module.
+///
+/// It is not a wall against a correct repair: citing the rig is one path added to a field
+/// that already lists evidence paths, which is the convention twelve of these rows already
+/// follow. The failure message names the exact path to add.
+pub fn validate_repaired_rows_cite_their_oracle(ledger: &Ledger) -> Result<(), Vec<LedgerError>> {
+    let mut errors: Vec<LedgerError> = Vec::new();
+    for (symbol, rig) in ORACLE_BACKING {
+        // Absent rows are the orphan question, which lives in
+        // `validate_allowance_has_no_orphans` and is a whole-file property.
+        let Some(row) = ledger.rows.iter().find(|row| row.symbol == symbol) else {
+            continue;
+        };
+        // "Repaired" is read off the ROW, not off the allowance const.
+        //
+        // Deriving it from the artifact rather than from a second list is the point: keying
+        // this on `SOURCE_READ_ABOVE_L1_ALLOWANCE` would make the law depend on a join
+        // between two constants staying in step, which is the defect class this bead is
+        // about — and it would also make the law untestable, because no synthetic ledger can
+        // shrink a compile-time const.
+        //
+        // A row claims a produced value exactly when its level is above L1 AND its
+        // oracle-kind is one that produced one. Until then the repair has not been asserted
+        // and there is nothing to require; the allowance-scoped guards own it.
+        let claims_a_produced_value =
+            row.level > LLevel::L1 && VALUE_PRODUCING_ORACLES.contains(&row.oracle_kind.as_str());
+        if !claims_a_produced_value {
+            continue;
+        }
+        if row.fixtures.iter().any(|fixture| fixture == rig) {
+            continue;
+        }
+        errors.push(LedgerError {
+            line: row.line,
+            what: format!(
+                "`{symbol}` has left the declared remainder — so it now claims {:?} on the \
+                 strength of oracle-kind `{}` — but it does not cite the rig that produces \
+                 that value. Add `{rig}` to its fixtures. Citing only a source-reading test \
+                 for a binary-produced level is the substitution this bead exists to prevent: \
+                 it reports our READING of the oracle under the name of the oracle.",
+                row.level, row.oracle_kind
+            ),
+        });
+    }
+    errors.sort_by_key(|error| error.line);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Every rig this law can require a citation to must exist.
+///
+/// Without this, renaming or deleting a rig turns [`ORACLE_BACKING`] into a demand that rows
+/// cite a file nobody can open — a guard that fails in a direction no repair can satisfy.
+/// Checked against the workspace root the same way [`validate_fixtures`] checks the ledger's
+/// own citations.
+pub fn validate_oracle_backing_paths_exist(root: &Path) -> Result<(), Vec<LedgerError>> {
+    let mut errors: Vec<LedgerError> = Vec::new();
+    for (symbol, rig) in ORACLE_BACKING {
+        if !root.join(rig).exists() {
+            errors.push(LedgerError {
+                line: 0,
+                what: format!(
+                    "ORACLE_BACKING names `{rig}` as the oracle for `{symbol}`, and no such \
+                     file exists. A repaired row cannot cite a rig that is not there — move \
+                     the entry in the change that moved the rig."
+                ),
+            });
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Why each group is still in the remainder, so the list is reviewable rather than a
 /// grandfather clause nobody can shrink.
 pub const SOURCE_READ_ALLOWANCE_REASON: &str = "\
