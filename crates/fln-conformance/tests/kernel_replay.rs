@@ -5448,34 +5448,30 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
         );
     }
 
-    // The claim must be re-derived when the evidence grows, not only when it decays. One
+    // The claim must be re-derived when the evidence GROWS, not only when it decays. One
     // row is one observation; several are repeated observations over one corpus revision,
-    // which is a different (still not invariant) class, and the documents would then be
-    // understating rather than overstating. Both directions are wrong.
+    // which is a different (still not invariant) class. Understating is a defect too.
+    //
+    // The join is an exact count, not a phrase. The first version of this check looked for
+    // wordings like "run once" and "one observation", and a planted mutant walked straight
+    // through it: "one recorded observation" contains neither string while saying exactly
+    // the thing the check meant to catch. Prose heuristics fail open. Both documents must
+    // instead carry the literal count, so the only way to add a row without re-deriving the
+    // claim is to edit two documents that will not agree with the file.
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let single_run_wording = ["run once", "one observation", "once at the pin"];
-    let mut says_once = false;
+    let marker = format!("observations recorded: {}", receipts.len());
     for doc in ["AGENTS.md", "README.md"] {
         let doc_text = fs::read_to_string(repo.join(doc))
             .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
-        says_once |= doc_text
-            .lines()
-            .any(|line| single_run_wording.iter().any(|w| line.contains(w)));
-    }
-    if receipts.len() == 1 {
         assert!(
-            says_once,
-            "the receipt holds exactly one observation but neither AGENTS.md nor README.md \
-             says so. A reader cannot tell one run from a kept cadence, which is the whole \
-             difference between bounded_model and statistical (bead franken_lean-p6x1)"
-        );
-    } else {
-        assert!(
-            !says_once,
-            "the receipt now holds {} observations, but AGENTS.md or README.md still \
-             describes a single run. Re-derive the class deliberately: repeated observations \
-             over the covered corpus buy a statistical claim, never the invariant PG-5 asks \
-             for (D7, bead franken_lean-p6x1)",
+            doc_text.contains(&marker),
+            "{doc} does not carry `{marker}`, but the retained receipt at {} holds {} \
+             observation(s). The documents and the evidence file disagree about how much \
+             evidence exists, which is the difference between one observation \
+             (bounded_model) and a kept cadence (statistical) — and neither is the invariant \
+             PG-5 asks for. Update the count where the claim is READ, not only here \
+             (D7, bead franken_lean-p6x1)",
+            path.display(),
             receipts.len()
         );
     }
