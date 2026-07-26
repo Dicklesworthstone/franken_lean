@@ -2177,57 +2177,95 @@ impl ExtensionState {
 
 /// Stage 1 of the merge pipeline: bounded descriptor admission.
 ///
-/// # The signature is the enforcement
+/// # Parametricity is the enforcement
 ///
 /// The stage law says a descriptor refusal must "inspect zero journal entries, clone
-/// zero payloads, select no policy, and expose no product or root". This function takes
-/// the three **descriptors** and nothing else, so none of those is reachable: there is
-/// no journal to walk, no payload to copy, and the success type is `()`, so no product
-/// or root can leave here even by accident.
+/// zero payloads, select no policy, and expose no product or root". This function is
+/// generic in its subject with only `Clone + Eq` in scope, so **none of the four is
+/// expressible in its body**: there is no journal type to walk, no payload to copy, no
+/// `.merge` to read — `D` is opaque — and the success type is `()`. The error carries the
+/// three refused subjects themselves rather than a `MergeConflict`, so the stage cannot
+/// name, let alone build, a product or a policy-dependent conflict; the concrete conflict
+/// is assembled by the `From` impl below, at the `?` in [`ExtensionState::merge`].
 ///
 /// That is deliberately a *structural* constraint rather than an assertion. The planted
 /// mutant `clone_payloads_during_refusal` — which deep-copied every `ours`/`theirs`
 /// payload on this path — survived the entire suite, because the returned conflict is
 /// byte-identical and nothing observed the copying. It is now not expressible here at
-/// all: `ours.entries()` does not compile when `ours` is an `ExtensionDescriptor`. A
-/// constraint cannot rot the way an assertion can be deleted or drift out of scope,
-/// which is the failure mode this whole bead is about.
+/// all: `ours.entries()` does not compile when `ours` is a `&D`. A constraint cannot rot
+/// the way an assertion can be deleted or drift out of scope, which is the failure mode
+/// this whole bead is about.
+///
+/// # Parametricity is also the *measurement*
+///
+/// Genericity is what makes the criteria's "exact operation/allocation facts" obtainable
+/// at all. A counting allocator is ruled out by D3, but a generic body can only perform
+/// the operations its bounds permit, so instantiating **this very function** at an
+/// instrumented subject counts every one of them — and the counts transport to
+/// `ExtensionDescriptor` because the body is the same source and cannot branch on which
+/// type it was given. Measured in
+/// `descriptor_refusal_performs_exactly_three_subject_clones_and_nothing_else`: three
+/// clones and one comparison on a refusal, zero clones on an admission.
 ///
 /// # What this does NOT establish
 ///
-/// It proves the refusal *cannot* touch a journal or a payload. It does **not** produce
-/// the operation/allocation *facts* the criteria separately demand — nothing here counts
-/// or reports anything, and the refusal does still clone the three descriptors, which is
-/// legitimate and is what the returned conflict is made of. Those are different claims
-/// and are tracked separately in `MERGE_VALIDATION_MUTANTS`.
-fn validate_descriptor_admission(
-    base: &ExtensionDescriptor,
-    ours: &ExtensionDescriptor,
-    theirs: &ExtensionDescriptor,
-) -> Result<(), MergeConflict> {
+/// It bounds stage 1 and nothing else. The ancestry stage keeps its own obligations, and
+/// the `From` impl below holds concrete descriptors — it is the one remaining site on the
+/// refusal path where a policy could in principle be read.
+fn validate_descriptor_admission<D: Clone + Eq>(
+    base: &D,
+    ours: &D,
+    theirs: &D,
+) -> Result<(), (D, D, D)> {
     if !descriptors_agree(base, ours, theirs) {
-        return Err(MergeConflict::DescriptorMismatch {
-            base: base.clone(),
-            ours: ours.clone(),
-            theirs: theirs.clone(),
-        });
+        return Err((base.clone(), ours.clone(), theirs.clone()));
     }
     Ok(())
 }
 
-/// The stage-1 **decision**, parametric in the descriptor type.
+/// Stage 1's error arm at its production instantiation: the three refused descriptors in
+/// canonical base-ours-theirs order, and the whole of what a descriptor refusal allocates.
+type RefusedDescriptors = (
+    ExtensionDescriptor,
+    ExtensionDescriptor,
+    ExtensionDescriptor,
+);
+
+/// The one concrete step on the descriptor-refusal path: the three refused descriptors
+/// become the typed conflict.
+///
+/// It lives here, as a conversion, rather than inside stage 1, so that stage 1 can stay
+/// generic — see [`validate_descriptor_admission`]. The `?` at the call site in
+/// [`ExtensionState::merge`] applies it, which is why that call site reads exactly as it
+/// did before the stage was generalised.
+///
+/// This is the residual, stated rather than glossed: it is the only place on this path
+/// holding an `ExtensionDescriptor`, so it is the only place that *could* read `merge`.
+/// It is three moves and no branch, and
+/// `stage_one_admission_is_invariant_under_every_policy_assignment` sweeps all 27 policy
+/// assignments through it — but that is a behavioural check, not a structural one.
+impl From<RefusedDescriptors> for MergeConflict {
+    fn from((base, ours, theirs): RefusedDescriptors) -> Self {
+        MergeConflict::DescriptorMismatch { base, ours, theirs }
+    }
+}
+
+/// The stage-1 **decision**, parametric in the subject type.
 ///
 /// # Parametricity is the enforcement
 ///
-/// The stage law also says a descriptor refusal must "select no policy", and narrowing
-/// stage 1 to `&ExtensionDescriptor` did **not** buy that: a descriptor carries `merge`,
-/// so `match base.merge { .. }` still type-checks there. That gap was recorded rather
-/// than glossed — `refusal_work_facts` reports `policy_selections: None`.
+/// The stage law also says a descriptor refusal must "select no policy". Narrowing stage 1
+/// to `&ExtensionDescriptor` did **not** buy that — a descriptor carries `merge`, so
+/// `match base.merge { .. }` still type-checked there, and the gap was recorded rather than
+/// glossed. This function closed it for the *decision*: with only `D: Eq` in scope the body
+/// cannot reach any field, `merge` included, because `D` is opaque.
 ///
-/// Here it is closed for the decision. With only `D: Eq` in scope the body cannot reach
-/// **any** field of a descriptor, `merge` included: there is no `.merge` to read, because
-/// `D` is opaque. Whether a refusal happens is therefore policy-blind by construction,
-/// not by inspection and not by an assertion someone can delete.
+/// The stage itself is now generic too, so the same argument covers the whole of stage 1
+/// and `refusal_work_facts` reports `policy_selections: Some(0)`. This function is
+/// therefore no longer the only thing standing between the decision and a policy — but it
+/// is kept, because the decision is a distinct claim from the stage that uses it, and
+/// `the_stage_one_decision_cannot_see_a_policy_because_it_cannot_see_a_field` pins it at a
+/// type with no fields at all.
 ///
 /// Sealing `ExtensionDescriptor::merge` itself would be the total fix, and it is
 /// deliberately not taken here: `merge` is a public field with 12 call sites across the
@@ -2235,27 +2273,33 @@ fn validate_descriptor_admission(
 ///
 /// # What this leaves open, stated because the remainder is the point
 ///
-/// The decision is policy-blind. The *conflict construction* in
-/// `validate_descriptor_admission` still holds concrete descriptors and could in
-/// principle branch on `merge` to build a different conflict. That is a narrower hole
-/// than the one this closes, and it is not closed.
+/// The `From<RefusedDescriptors>` impl holds concrete descriptors and could in principle
+/// branch on `merge` while building the conflict. That is a narrower hole than the one
+/// this closes — three moves rather than a whole stage — and it is not closed.
 fn descriptors_agree<D: Eq>(base: &D, ours: &D, theirs: &D) -> bool {
     base == ours && base == theirs
 }
 
-/// Pins the stage-1 signature, because the constraint above is only worth anything for
-/// as long as the parameters stay narrow.
+/// Pins the stage-1 signature at its production instantiation, because the constraint
+/// above is only worth anything for as long as the parameters stay narrow.
 ///
-/// Widening these to `&ExtensionState` — the single edit that would silently restore the
+/// Widening `D` to `ExtensionState` — the single edit that would silently restore the
 /// ability to clone a payload during refusal, and the obvious "convenience" refactor for
 /// someone who wants the journal lengths in a diagnostic — fails to compile *here*, at a
 /// site that says why, rather than passing quietly and reopening the hole. Same device as
 /// `MERGE_VALIDATION_MUTANTS` holding each killer as a function item rather than a string.
+/// The error type is pinned too: a stage that returned a `MergeConflict` again could
+/// build one that discriminates on a policy, and this is where that stops compiling.
+///
+/// This pins the *instantiation*. That the function is still **generic** — the property
+/// the operation facts actually rest on — is pinned separately, by
+/// `descriptor_refusal_performs_exactly_three_subject_clones_and_nothing_else`
+/// instantiating it at a type a descriptor-specialised version could not accept.
 const _DESCRIPTOR_ADMISSION_STAYS_JOURNAL_FREE: fn(
     &ExtensionDescriptor,
     &ExtensionDescriptor,
     &ExtensionDescriptor,
-) -> Result<(), MergeConflict> = validate_descriptor_admission;
+) -> Result<(), RefusedDescriptors> = validate_descriptor_admission;
 
 fn set_union_cached_limit_refusal(
     extension: &Name,
@@ -2505,9 +2549,12 @@ impl std::fmt::Display for MergeConflict {
 mod tests {
     use super::*;
     use crate::environment::Environment;
+    use fln_core::name::LeafView;
     use fln_core::options::KVMap;
     use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
+    use std::cell::Cell;
     use std::collections::HashSet;
+    use std::rc::Rc;
     use std::time::Instant;
 
     /// **The field-boundary law for entry identity**, pinned as a property rather than
@@ -7306,26 +7353,36 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Modelled refusal work facts (bead `fln-extension-merge-validation-proof-debt-dt5`).
+    // Refusal work and allocation facts (bead `fln-extension-merge-validation-proof-debt-dt5`).
     //
-    // Follows this file's existing `JournalAppendWork`/`next_append_work` idiom: the work
-    // is *modelled* rather than counted by instrumented production code. A counter in the
-    // hot path would also be the weaker artifact — it reports what one run did, where a
-    // model reports what the code can do at all.
+    // Two artifacts of two different claim classes, kept apart on purpose:
     //
-    // A counting allocator was never available as an alternative: no `#[global_allocator]`
-    // exists anywhere in the workspace and D3's `#![forbid(unsafe_code)]` rules one out.
-    // Recorded so the next reader does not rediscover that the obvious route is closed by
-    // doctrine.
+    //   * `RefusalWorkFacts` — BOUNDS. What stage 1 *can* reach, read off its type. Follows
+    //     this file's existing `JournalAppendWork`/`next_append_work` idiom.
+    //   * `SubjectOps` — EXACT TALLIES. What stage 1 *did*, counted on the production
+    //     function itself.
+    //
+    // The tallies exist because the bounds alone could not discharge the criteria's
+    // "exact operation/allocation facts", and the obvious instrument is closed by doctrine:
+    // no `#[global_allocator]` exists anywhere in the workspace and D3's
+    // `#![forbid(unsafe_code)]` rules one out. Recorded so the next reader does not
+    // rediscover that.
+    //
+    // What replaced it is parametricity. Stage 1 is generic with `Clone + Eq` in scope, so
+    // its body can only perform those two operations on its inputs — instantiating it at an
+    // instrumented subject therefore counts *everything*, and the tally is complete by
+    // construction rather than by whoever wrote the instrument having thought of every
+    // call. No production code is instrumented and nothing is counted in the hot path: the
+    // measurement lives entirely in the test's choice of type argument.
     // ---------------------------------------------------------------------------
 
     /// What a merge-stage *input* type puts within reach.
     trait StageInput {
         const REACHES_JOURNAL: bool;
         const REACHES_PAYLOAD: bool;
-        /// An `ExtensionDescriptor` carries `merge`, so narrowing a stage to descriptors
-        /// does **not** exclude policy *selection*. Recorded rather than glossed: this is
-        /// the one criterion of the four that the narrowing does not buy.
+        /// An `ExtensionDescriptor` carries `merge`, so narrowing a stage to *descriptors*
+        /// does not exclude policy selection — which is why the facts below are read at
+        /// [`OpaqueSubject`] instead, and why stage 1 is generic rather than merely narrow.
         const CARRIES_MERGE_POLICY: bool;
     }
 
@@ -7341,7 +7398,34 @@ mod tests {
         const CARRIES_MERGE_POLICY: bool = true;
     }
 
-    /// What a stage's success type can carry out of it.
+    /// The instantiation stage 1's facts are read at: a subject with `Clone + Eq` and no
+    /// other structure whatsoever.
+    ///
+    /// Reading the facts here rather than at `ExtensionDescriptor` is the upgrade this
+    /// bead's allocation clause needed. `validate_descriptor_admission` is generic, so its
+    /// body is one piece of source shared by every instantiation and cannot branch on
+    /// which type it received; an opaque subject is therefore not a weaker stand-in for
+    /// the real one, it is the instantiation at which the *bounds* are what is visible.
+    /// `CARRIES_MERGE_POLICY` is `false` here because there is no `.merge` to read, not
+    /// because anyone promised not to read it.
+    ///
+    /// The side condition, stated because it is the one thing that would break the
+    /// transport: this argument assumes monomorphisation is not *specialisation*. The
+    /// workspace enables no `specialization`/`min_specialization` feature (checked), and
+    /// D1 pins the toolchain, so a generic body cannot be swapped for a different one at
+    /// `ExtensionDescriptor`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct OpaqueSubject(u8);
+
+    impl StageInput for OpaqueSubject {
+        const REACHES_JOURNAL: bool = false;
+        const REACHES_PAYLOAD: bool = false;
+        const CARRIES_MERGE_POLICY: bool = false;
+    }
+
+    /// What a stage's success **or failure** type can carry out of it.
+    ///
+    /// Both arms, because "expose no product or root" is not a claim about the happy path.
     trait StageOutput {
         const CARRIES_PRODUCT: bool;
     }
@@ -7352,6 +7436,19 @@ mod tests {
 
     impl StageOutput for ExtensionMergeOutcome {
         const CARRIES_PRODUCT: bool = true;
+    }
+
+    /// A conflict is a diagnostic, not a product: it admits nothing to an environment.
+    impl StageOutput for MergeConflict {
+        const CARRIES_PRODUCT: bool = false;
+    }
+
+    /// Stage 1's error arm — three copies of the stage's own *input* type. A triple of
+    /// subjects is by construction not a product, and the bound is what says so: it is
+    /// written over `StageInput`, so this impl does not quietly cover
+    /// `(ExtensionMergeOutcome, ExtensionMergeOutcome, ExtensionMergeOutcome)`.
+    impl<D: StageInput> StageOutput for (D, D, D) {
+        const CARRIES_PRODUCT: bool = false;
     }
 
     /// Operation facts for a refusal, as bounds rather than tallies.
@@ -7379,52 +7476,83 @@ mod tests {
     ///
     /// The stage argument is unused at run time by design: nothing is executed, because
     /// the claim is about reachability, not about one observed run.
-    fn refusal_work_facts<I: StageInput, O: StageOutput>(
-        _stage: fn(&I, &I, &I) -> Result<O, MergeConflict>,
+    fn refusal_work_facts<I: StageInput, O: StageOutput, E: StageOutput>(
+        _stage: fn(&I, &I, &I) -> Result<O, E>,
     ) -> RefusalWorkFacts {
         let zero_unless = |unbounded: bool| if unbounded { None } else { Some(0) };
         RefusalWorkFacts {
             journal_comparisons: zero_unless(I::REACHES_JOURNAL),
             payload_clones: zero_unless(I::REACHES_PAYLOAD),
             policy_selections: zero_unless(I::CARRIES_MERGE_POLICY),
-            product_publications: zero_unless(O::CARRIES_PRODUCT),
+            // Both arms. A refusal returns through the *error* type, so bounding only the
+            // success type would leave the publication claim resting on the path a refusal
+            // never takes.
+            product_publications: zero_unless(O::CARRIES_PRODUCT || E::CARRIES_PRODUCT),
         }
     }
 
-    /// Stage 1's refusal work facts, derived from stage 1.
+    /// Stage 1's refusal work facts, derived from stage 1 at its opaque instantiation.
     ///
-    /// Three of the criteria's four operations are provably zero. The fourth is not, and
-    /// saying so is the point: `dt5` exists because closure evidence outran its own
-    /// criteria, so a fact set that rounded `policy_selections` up to zero would repeat
-    /// that on the correcting bead.
+    /// All four of the criteria's operations are now provably zero, and the fourth —
+    /// `policy_selections` — is the one this bead's earlier pass deliberately recorded as
+    /// `None` rather than rounding to zero. It moved because the *stage* moved: narrowing
+    /// it to `&ExtensionDescriptor` left `merge` in reach of the conflict construction, and
+    /// making it generic removes the field from the body's vocabulary entirely. The fact
+    /// changed because the code changed, which is the only honest way for a `None` to
+    /// become a `Some(0)`.
     #[test]
     fn descriptor_refusal_work_facts_are_zero_by_construction() {
-        let facts = refusal_work_facts(validate_descriptor_admission);
+        let facts = refusal_work_facts(validate_descriptor_admission::<OpaqueSubject>);
         assert_eq!(
             facts.journal_comparisons,
             Some(0),
-            "stage 1 takes descriptors, so no journal is in reach"
+            "stage 1's subject is opaque, so no journal is in reach"
         );
         assert_eq!(
             facts.payload_clones,
             Some(0),
-            "stage 1 takes descriptors, so no payload is in reach"
+            "stage 1's subject is opaque, so no payload is in reach"
         );
         assert_eq!(
             facts.product_publications,
             Some(0),
-            "stage 1 succeeds with (), so no product can leave it"
+            "stage 1 succeeds with () and fails with a triple of its own subject, so no \
+             product can leave it by either arm"
         );
         assert_eq!(
+            facts.policy_selections,
+            Some(0),
+            "stage 1 is generic in its subject, so `merge` is not a field its body can \
+             name — on the decision or on the conflict construction, which is the half \
+             that was still open while the stage took concrete descriptors"
+        );
+    }
+
+    /// The concrete instantiation still reports the weaker fact, and that is deliberate.
+    ///
+    /// Deleting this would let a reader take `Some(0)` above as a property of
+    /// `ExtensionDescriptor`. It is not: a descriptor carries `merge`, and a stage written
+    /// against descriptors could read it. The zero is bought by *genericity*, so the
+    /// model must keep saying so at the type where genericity is absent — otherwise the
+    /// distinction between the two versions of this stage disappears from the record and
+    /// the next reader cannot tell which one earned the fact.
+    #[test]
+    fn the_same_model_at_a_concrete_descriptor_still_refuses_to_claim_policy_blindness() {
+        fn concrete_stage(
+            _: &ExtensionDescriptor,
+            _: &ExtensionDescriptor,
+            _: &ExtensionDescriptor,
+        ) -> Result<(), MergeConflict> {
+            unreachable!("never executed: the model is about reachability, not a run")
+        }
+
+        let facts = refusal_work_facts(concrete_stage);
+        assert_eq!(facts.journal_comparisons, Some(0));
+        assert_eq!(facts.payload_clones, Some(0));
+        assert_eq!(
             facts.policy_selections, None,
-            "STILL not discharged at this stage, and must not be recorded as zero: \
-             ExtensionDescriptor carries `merge`, so narrowing to descriptors does not \
-             put policy selection out of reach of the conflict construction. The \
-             *decision* half IS now closed, by parametricity rather than by this model — \
-             see descriptors_agree and \
-             the_stage_one_decision_cannot_see_a_policy_because_it_cannot_see_a_field. \
-             This fact stays None because it describes validate_descriptor_admission, \
-             which still holds concrete descriptors"
+            "a descriptor-typed stage cannot claim policy blindness; only the generic one \
+             can, and that difference is exactly what this bead's repair bought"
         );
     }
 
@@ -7450,10 +7578,337 @@ mod tests {
         assert_eq!(wide.product_publications, None);
         assert_ne!(
             wide,
-            refusal_work_facts(validate_descriptor_admission),
+            refusal_work_facts(validate_descriptor_admission::<OpaqueSubject>),
             "the facts must differ between a narrow and a wide stage, or they are not \
              derived from the signature at all"
         );
+    }
+
+    /// Every operation stage 1 performs on its inputs, counted exactly.
+    ///
+    /// `Clone` and `Eq` are the *whole* of `D`'s interface inside
+    /// `validate_descriptor_admission`, so a tally of those two is a complete account of
+    /// what the stage did — not a sample of the operations someone thought to instrument.
+    /// That completeness is a property of the bounds and it degrades loudly: widening them
+    /// adds a method this type must implement, and the tally stops being total at a
+    /// compile error rather than by quietly missing a call.
+    #[derive(Debug)]
+    struct CountedSubject {
+        tag: u8,
+        ops: Rc<Cell<SubjectOps>>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct SubjectOps {
+        clones: usize,
+        comparisons: usize,
+    }
+
+    impl Clone for CountedSubject {
+        fn clone(&self) -> Self {
+            let mut ops = self.ops.get();
+            ops.clones += 1;
+            self.ops.set(ops);
+            CountedSubject {
+                tag: self.tag,
+                ops: Rc::clone(&self.ops),
+            }
+        }
+    }
+
+    impl PartialEq for CountedSubject {
+        fn eq(&self, other: &Self) -> bool {
+            let mut ops = self.ops.get();
+            ops.comparisons += 1;
+            self.ops.set(ops);
+            self.tag == other.tag
+        }
+    }
+
+    impl Eq for CountedSubject {}
+
+    /// The criteria's exact operation facts, **counted on the production function** rather
+    /// than modelled beside it.
+    ///
+    /// This is what a counting allocator would have been for, obtained without one: a
+    /// generic body can only do what its bounds permit, so instantiating stage 1 at an
+    /// instrumented subject observes every operation it performs. The counts are exact,
+    /// not bounds, and they transport to `ExtensionDescriptor` because there is one body
+    /// (see [`OpaqueSubject`] for the side condition).
+    ///
+    /// Merely compiling pins the property the facts rest on: a stage specialised back to
+    /// `&ExtensionDescriptor` cannot accept a `CountedSubject`, so the genericity cannot
+    /// be lost silently.
+    ///
+    /// The comparison counts are load-bearing too — they pin the short-circuit. A stage
+    /// that compared `theirs` after already refusing `ours` would still return the right
+    /// conflict and still clone three times.
+    #[test]
+    fn descriptor_refusal_performs_exactly_three_subject_clones_and_nothing_else() {
+        let ops = Rc::new(Cell::new(SubjectOps::default()));
+        let subject = |tag: u8| CountedSubject {
+            tag,
+            ops: Rc::clone(&ops),
+        };
+
+        ops.set(SubjectOps::default());
+        validate_descriptor_admission(&subject(1), &subject(1), &subject(1))
+            .expect("three agreeing subjects are admitted");
+        assert_eq!(
+            ops.get(),
+            SubjectOps {
+                clones: 0,
+                comparisons: 2,
+            },
+            "an admission must clone nothing at all: the three inputs stay borrowed"
+        );
+
+        ops.set(SubjectOps::default());
+        validate_descriptor_admission(&subject(1), &subject(2), &subject(1))
+            .expect_err("a disagreeing `ours` is refused");
+        assert_eq!(
+            ops.get(),
+            SubjectOps {
+                clones: 3,
+                comparisons: 1,
+            },
+            "a refusal clones exactly the three subjects the conflict is made of, and \
+             stops comparing at the first disagreement"
+        );
+
+        ops.set(SubjectOps::default());
+        validate_descriptor_admission(&subject(1), &subject(1), &subject(2))
+            .expect_err("a disagreeing `theirs` is refused");
+        assert_eq!(
+            ops.get(),
+            SubjectOps {
+                clones: 3,
+                comparisons: 2,
+            },
+            "a `theirs` disagreement costs the second comparison and the same three clones"
+        );
+    }
+
+    /// The counter is not a constant — the negative control for the tally above.
+    ///
+    /// Without it, `clones: 3` would be satisfied by an instrument that counted nothing
+    /// and a stage that cloned ten times. `wasteful` is stage 1 with one extra clone in
+    /// front of it — the exact shape of the defect the tally exists to catch — and the
+    /// count moves by exactly one.
+    #[test]
+    fn the_subject_tally_moves_when_the_stage_does_more_work() {
+        fn wasteful<D: Clone + Eq>(base: &D, ours: &D, theirs: &D) -> Result<(), (D, D, D)> {
+            let _spare = base.clone();
+            validate_descriptor_admission(base, ours, theirs)
+        }
+
+        let ops = Rc::new(Cell::new(SubjectOps::default()));
+        let subject = |tag: u8| CountedSubject {
+            tag,
+            ops: Rc::clone(&ops),
+        };
+
+        wasteful(&subject(1), &subject(2), &subject(1)).expect_err("refused");
+        assert_eq!(
+            ops.get(),
+            SubjectOps {
+                clones: 4,
+                comparisons: 1,
+            },
+            "one extra clone must show as one extra clone, or the tally proves nothing"
+        );
+    }
+
+    /// The allocation half: those three clones allocate **nothing**.
+    ///
+    /// The criteria ask for allocation facts and D3 rules out the instrument that would
+    /// normally give them, so the fact is assembled structurally instead. A descriptor's
+    /// four fields split into three `Copy` ones — which cannot allocate — and a `Name`,
+    /// whose clone shares its component node with the original. Composed with the exact
+    /// count above, descriptor refusal performs **three descriptor clones and zero heap
+    /// allocations**.
+    ///
+    /// The sharing is *observed*, through the one channel `Name`'s public API offers: the
+    /// address of the borrowed leaf component. Note the direction of the negative control
+    /// — two independently built equal names must NOT share. Without it this test would
+    /// pass against a `Name` that deep-copied on clone but interned its components, and
+    /// would be asserting something other than what it says.
+    #[test]
+    fn cloning_a_descriptor_allocates_nothing_because_its_one_owned_field_shares() {
+        // Total destructuring, no rest pattern: a fifth field stops this compiling rather
+        // than being silently left out of the account.
+        let ExtensionDescriptor {
+            name,
+            merge,
+            checkpoint,
+            provenance,
+        } = descriptor(MergeSemantics::AppendOrdered, PayloadProvenance::Understood);
+
+        fn cannot_allocate_on_clone<T: Copy>(_: &T) {}
+        cannot_allocate_on_clone(&merge);
+        cannot_allocate_on_clone(&checkpoint);
+        cannot_allocate_on_clone(&provenance);
+
+        let component_address = |name: &Name| match name.leaf_view() {
+            LeafView::Str(component) => component.as_ptr(),
+            other => panic!("the fixture descriptor is named by a string component: {other:?}"),
+        };
+
+        let cloned = name.clone();
+        assert_eq!(
+            component_address(&name),
+            component_address(&cloned),
+            "Name::clone must share the component node; a clone that copied it would \
+             allocate on every descriptor refusal"
+        );
+
+        let independent = Name::str(Name::anonymous(), "simpExt");
+        assert_eq!(
+            independent, name,
+            "the control is an equal name, not a different one"
+        );
+        assert_ne!(
+            component_address(&name),
+            component_address(&independent),
+            "two independently built equal names must not share, or the assertion above \
+             is satisfied by any two equal names and observes nothing"
+        );
+    }
+
+    /// The campaign behind the facts above, 2026-07-26, measured at `0f2dbc70`.
+    ///
+    /// Six defects planted one at a time by exact byte-pair replacement with a
+    /// unique-anchor assertion, the `fln-env` lib suite run against each, the source
+    /// restored byte-exactly (`cmp`) between plants. Four semantic kills, two preventions.
+    ///
+    /// # Why this is a second table and not four more rows in the first one
+    ///
+    /// `MERGE_VALIDATION_MUTANTS` is closed in both directions against
+    /// `CRITERIA_NAMED_MUTANTS`: it holds the fourteen mutant kinds `dt5`'s criteria name
+    /// and nothing else, and that closure is the thing keeping a 12-of-14 state from
+    /// recurring. These six are not among the fourteen — they target the *facts* clause
+    /// rather than the pipeline-stage clause — so folding them in would trade a checked
+    /// property for a longer list.
+    ///
+    /// # The finding
+    ///
+    /// `admission_clones_its_inputs` — three wasted clones on the path that *succeeds* —
+    /// was killed by exactly one test, the new tally, with the other 256 passing. That is
+    /// the same shape as the `clone_payloads_during_refusal` survivor that opened this
+    /// obligation: an allocation nobody observes is invisible to a suite that only checks
+    /// results. The tally is what makes that class visible, and this measures that it
+    /// does rather than assuming it.
+    const REFUSAL_FACT_MUTANTS: &[(&str, MutantOutcome)] = &[
+        (
+            "refusal_clones_a_fourth_time",
+            MutantOutcome::KilledBy(
+                descriptor_refusal_performs_exactly_three_subject_clones_and_nothing_else,
+            ),
+        ),
+        (
+            "admission_clones_its_inputs",
+            MutantOutcome::KilledBy(
+                descriptor_refusal_performs_exactly_three_subject_clones_and_nothing_else,
+            ),
+        ),
+        (
+            "refusal_compares_after_deciding",
+            MutantOutcome::KilledBy(
+                descriptor_refusal_performs_exactly_three_subject_clones_and_nothing_else,
+            ),
+        ),
+        (
+            "conflict_construction_swaps_branches",
+            MutantOutcome::KilledBy(mismatched_descriptors_are_typed_conflicts_on_either_branch),
+        ),
+        (
+            "stage_one_specialised_back_to_descriptors",
+            MutantOutcome::StructurallyPrevented {
+                by: "Reverting stage 1 to three &ExtensionDescriptor stops the tally test \
+                     compiling — it instantiates the stage at CountedSubject, which a \
+                     descriptor-typed stage cannot accept — and _DESCRIPTOR_ADMISSION_STAYS_\
+                     JOURNAL_FREE stops accepting the error type. Measured: E0107 and E0308 \
+                     at named sites, no test run.",
+                still_unproven: "Nothing about behaviour. This is the one edit that would \
+                                 silently retire the operation facts, so it is worth a \
+                                 compile error rather than a green suite — but a compile \
+                                 failure is NOT a kill and this bead's criteria say so \
+                                 explicitly. It is recorded as prevention for that reason.",
+            },
+        ),
+        (
+            "descriptor_grows_a_fifth_field",
+            MutantOutcome::StructurallyPrevented {
+                by: "The allocation test destructures ExtensionDescriptor totally with no \
+                     rest pattern, so a fifth field is E0027 `pattern does not mention \
+                     field` there rather than a field quietly left out of the allocation \
+                     account. Measured: E0027 at the destructuring plus E0063 at every \
+                     initializer.",
+                still_unproven: "That the new field would be *allocation-free*. The refusal \
+                                 would stop compiling until someone classified it, which is \
+                                 the point; classifying it correctly is still a human step.",
+            },
+        ),
+    ];
+
+    /// The second record is complete, classified, and its kills are semantic.
+    ///
+    /// The last part is the one worth asserting rather than assuming: `dt5`'s criteria say
+    /// "compile failures, unrelated failures, and generic nonzero results do not count as
+    /// kills", so a table that let a prevention sit under `KilledBy` would be counting the
+    /// wrong thing in this bead's own terms. Every `KilledBy` here names a test that ran
+    /// and failed with the intended assertion; the two compile-time entries are typed as
+    /// prevention and are excluded from the kill count by construction.
+    #[test]
+    fn the_refusal_fact_mutation_record_is_complete_and_classified() {
+        let names: BTreeSet<&str> = REFUSAL_FACT_MUTANTS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names.len(),
+            REFUSAL_FACT_MUTANTS.len(),
+            "a duplicated mutant name hides a missing one"
+        );
+
+        // Disjoint from the criteria-named matrix, in both directions. Overlap would let a
+        // criteria-named mutant be discharged by a row this table controls, which is the
+        // closure `the_merge_validation_mutation_record_is_complete_and_classified` exists
+        // to prevent, routed around one table over.
+        let criteria: BTreeSet<&str> = CRITERIA_NAMED_MUTANTS.into_iter().collect();
+        let overlap: Vec<&&str> = names.intersection(&criteria).collect();
+        assert!(
+            overlap.is_empty(),
+            "a criteria-named mutant must be recorded in MERGE_VALIDATION_MUTANTS, not \
+             here: {overlap:?}"
+        );
+
+        let killed = REFUSAL_FACT_MUTANTS
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, MutantOutcome::KilledBy(_)))
+            .count();
+        let prevented = REFUSAL_FACT_MUTANTS
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, MutantOutcome::StructurallyPrevented { .. }))
+            .count();
+        let uncovered = REFUSAL_FACT_MUTANTS
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, MutantOutcome::SurvivedUncovered { .. }))
+            .count();
+        assert_eq!(
+            uncovered, 0,
+            "a survivor in this campaign is open debt on the facts clause and must be \
+             recorded with its obligation, never dropped"
+        );
+        assert_eq!((killed, prevented), (4, 2));
+        assert_eq!(
+            killed + prevented,
+            REFUSAL_FACT_MUTANTS.len(),
+            "every entry must carry a measured outcome"
+        );
+        // The same well-formedness rules as the criteria-named matrix. A second table with
+        // its own weaker standard for what counts as a classification would be the easier
+        // place to record the next survivor as a bare "it survived".
+        for (name, outcome) in REFUSAL_FACT_MUTANTS {
+            assert_classification_is_well_formed(name, outcome);
+        }
     }
 
     /// The stage-1 decision is parametric, and stays that way.
@@ -7721,21 +8176,31 @@ mod tests {
         (
             "clone_payloads_during_refusal",
             MutantOutcome::StructurallyPrevented {
-                by: "validate_descriptor_admission takes three &ExtensionDescriptor and \
-                     returns Result<(), MergeConflict>, so stage 1 has no journal, no \
-                     payload and no product type in scope. The mutation body \
-                     ours.entries().map(|e| e.payload.to_vec()) no longer compiles there. \
-                     Measured first: as an inline guard it SURVIVED the full suite \
-                     239/239, because the returned conflict is byte-identical and nothing \
-                     observed the copying. _DESCRIPTOR_ADMISSION_STAYS_JOURNAL_FREE pins \
-                     the signature so widening it back is a compile error at a named site.",
-                still_unproven: "The operation/allocation FACTS the criteria separately \
-                                 demand. Nothing counts or reports journal comparisons, \
-                                 payload clones, policy dispatches or product \
-                                 publications, and the refusal does still clone the three \
-                                 descriptors — legitimately, since they are what the \
-                                 conflict is made of. Prevention bounds what stage 1 CAN \
-                                 do; it produces no facts about what it DID.",
+                by: "validate_descriptor_admission is generic in its subject with only \
+                     Clone + Eq in scope and fails with a triple of that subject, so stage \
+                     1 has no journal, no payload and no product type it can name. The \
+                     mutation body ours.entries().map(|e| e.payload.to_vec()) does not \
+                     compile against an opaque D. Measured first: as an inline guard it \
+                     SURVIVED the full suite 239/239, because the returned conflict is \
+                     byte-identical and nothing observed the copying. The repair was \
+                     narrowing to three &ExtensionDescriptor and was later widened to a \
+                     type parameter — same prevention, and it additionally makes the \
+                     operation facts measurable. _DESCRIPTOR_ADMISSION_STAYS_JOURNAL_FREE \
+                     pins the instantiation and the tally test pins the genericity, so \
+                     either regression is a compile error at a named site.",
+                still_unproven: "Not the operation/allocation facts any more — those are \
+                                 measured, see REFUSAL_FACT_MUTANTS. What is left is \
+                                 narrower and is stated so the repair is not read as \
+                                 larger than it is: (a) the From impl that builds the \
+                                 conflict still holds concrete descriptors, so the one \
+                                 site on this path that could read `merge` is covered by \
+                                 an exhaustive behavioural sweep rather than \
+                                 structurally; (b) the zero-allocation half rests on \
+                                 Name::clone sharing its component node, which is \
+                                 fln-core's property — observed here with a two-directional \
+                                 control, but no fln-core-side mutant was planted for it; \
+                                 (c) all of it bounds STAGE 1. The ancestry stage's own \
+                                 'exact compared entries and bytes' clause is untouched.",
             },
         ),
     ];
@@ -7842,8 +8307,8 @@ mod tests {
         assert!(
             matches!(survivor, MutantOutcome::StructurallyPrevented { .. }),
             "clone_payloads_during_refusal was MEASURED surviving the full suite and was \
-             repaired by narrowing stage 1 so it cannot be written. Relabelling it killed \
-             or equivalent without restoring an assertion, or dropping it, is how a \
+             repaired by making stage 1 generic so it cannot be written. Relabelling it \
+             killed or equivalent without restoring an assertion, or dropping it, is how a \
              structural repair gets read as a larger closure than it earned"
         );
         // A wall on purpose. A survivor found by a later campaign is real debt and must
