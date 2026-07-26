@@ -13,9 +13,11 @@
 //!
 //! Join (2) is checked on every run by `crates/fln-core/tests/pin_ext_observables.rs`.
 //! Join (1) was checked by nothing. The capture is produced by
-//! `crates/fln-core/fixtures/gen_core_ext.lean` run BY HAND — its own header documents the
-//! command line — and the only standing guard was that the fixture's header names a commit
-//! `SUITE.lock` pins, which is a string comparison the same edit could preserve.
+//! `scripts/extract/gen_core_ext_fixtures.lean` — since `franken_lean-eh0c`, through the
+//! wrapper `scripts/extract/gen_core_ext_fixtures.sh`, which verifies the binary's commit
+//! against `SUITE.lock` before generating; before that it was run by hand — and the only
+//! standing guard was that the fixture's header names a commit `SUITE.lock` pins, which is
+//! a string comparison the same edit could preserve.
 //!
 //! So the rows were not wrong; they were *unfalsifiable in one direction*. A stale capture,
 //! a hand edit, or a partial regeneration would have left all 28 rows reporting L2 against
@@ -41,7 +43,13 @@ use std::process::Command;
 
 use fln_conformance::pin;
 
-const GENERATOR: &str = "crates/fln-core/fixtures/gen_core_ext.lean";
+/// Moved out of `crates/fln-core/fixtures/` by `franken_lean-eh0c`. This constant is the
+/// third artifact that has to move with it — after the fixture's own header and the
+/// `pin_ext_observables` doc comment — and it is the one that fails loudest: a wrong path
+/// here makes the pinned binary refuse the generator, so join (1) is re-derived against
+/// nothing. Where the pin is absent that is a typed skip, so a stale path could sit green
+/// on every machine that lacks the toolchain.
+const GENERATOR: &str = "scripts/extract/gen_core_ext_fixtures.lean";
 const CAPTURE: &str = "crates/fln-core/fixtures/core_ext_observables.txt";
 
 /// The first place two texts differ, as a line number and both sides.
