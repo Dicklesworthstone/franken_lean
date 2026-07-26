@@ -385,3 +385,739 @@ fn the_names_come_from_agents_md_and_a_short_parse_is_refused() {
     let synthetic = mandated_names("Seeded defects (a, b, c) must each be killed");
     assert_eq!(synthetic, vec!["a", "b", "c"], "the split must be total");
 }
+
+// ---------------------------------------------------------------------------
+// From a marker to an actual KILL — the half the guard above cannot reach
+// ---------------------------------------------------------------------------
+//
+// Everything above joins §18's list to a *marker*. A marker is a comment: a test could be
+// gutted while keeping it and every check above stays green. That remaining gap was this
+// bead's own honest disclosure ("THE GUARD CHECKS MARKERS, NOT KILLS"), and closing it needs
+// two things that must land together, because either alone is the defect again:
+//
+//   * a **campaign** that actually plants each mutant and watches the named test die
+//     (`the_mandated_mutants_are_planted_and_their_killers_die`, `#[ignore]`d — it edits
+//     source, so it must never run by accident); and
+//   * a **receipt** binding that measurement to the exact text it was measured against, so
+//     the kill expires by itself when either half moves
+//     (`the_recorded_kills_still_describe_this_tree`, which runs in ordinary `cargo test`).
+//
+// The receipt is the load-bearing part, and it is `franken_lean-p6x1`'s shape reused: there,
+// the corpus-matrix receipt is keyed by the Reference pin, so advancing `SUITE.lock` expires
+// the observation *mechanically* rather than by anyone remembering. Here the key is a digest
+// over the mutated production site and the killer bodies, which is the same move against a
+// different clock — the thing that can silently invalidate a kill is not a pin, it is an edit
+// to either side of it.
+//
+// **What this still does not earn.** A campaign run is one measurement at one commit on one
+// host, class `bounded_model` — the same class AGENTS.md gives the corpus matrix, and for the
+// same reason. It is not a per-commit mutation gate: what runs per commit is the *retention*
+// check, which proves the recorded kill still describes this tree, not that the mutant dies
+// today. Those are different claims and stacking them does not make one.
+
+/// One killing test, named the way libtest names it.
+struct Killer {
+    /// The exact libtest path, which is what `--exact` matches. Not the bare fn name:
+    /// `fln-unsafe-abi`'s killers live in a `tests` module and answer to `tests::…`, and a
+    /// filter that matches nothing exits **0** — a vacuum this campaign would otherwise
+    /// report as a clean control run.
+    path: &'static str,
+    /// The bare fn name, used to extract the body the receipt is bound to.
+    func: &'static str,
+    /// The file defining it, which must also carry this mutant's marker.
+    file: &'static str,
+    /// A substring the failure must contain when the mutant is planted.
+    ///
+    /// Dying is not enough; dying *for the right reason* is the claim. Measured live on
+    /// 2026-07-26: with positivity skipped, the bad block is still **rejected** — for
+    /// "block declares 0 recursors" — and only the pinned-message assertion notices the
+    /// substitution. A campaign that accepted any non-zero exit would have scored that
+    /// mutant killed by a test that had stopped testing positivity at all.
+    expect: &'static str,
+}
+
+/// One mandated mutant, as a plantable edit plus the tests that must die under it.
+struct Plant {
+    /// Must equal one of §18's names, checked against the derived list rather than trusted.
+    name: &'static str,
+    /// Repo-relative production file.
+    file: &'static str,
+    /// The exact production text to replace. Required to occur **exactly once** in `file`
+    /// (`every_plant_still_targets_a_live_production_site`), so this is also the tripwire
+    /// that fires when the site moves, is duplicated, or is deleted.
+    find: &'static str,
+    /// The mutation.
+    replace: &'static str,
+    /// `cargo test -p <package>`.
+    package: &'static str,
+    /// The target selector, e.g. `["--test", "k1_judgments"]` or `["--lib"]`.
+    target: &'static [&'static str],
+    killers: &'static [Killer],
+}
+
+/// The three mandated mutants that can be planted today.
+///
+/// The two absent names are not omissions: `leaked transaction assignment` and
+/// `stale cache hit accepted` are in [`NOT_YET_SEEDED`] because their subsystems are
+/// charter-only stubs, and `no_plant_exists_for_a_name_that_cannot_be_seeded_yet` refuses a
+/// recipe for either — a plant against a stub could only ever be theatre.
+const PLANTS: &[Plant] = &[
+    Plant {
+        name: "skipped positivity check",
+        file: "crates/fln-kernel/src/admit.rs",
+        // Short-circuiting the recursive-occurrence test makes `check_positivity` return
+        // `Ok(())` for every argument, which is precisely "skipped".
+        find: "if !self.mentions_block(&t) {",
+        replace: "if true {",
+        package: "fln-kernel",
+        target: &["--test", "k1_judgments"],
+        killers: &[
+            Killer {
+                path: "kr606_negative_occurrences_are_rejected",
+                func: "kr606_negative_occurrences_are_rejected",
+                file: "crates/fln-kernel/tests/k1_judgments.rs",
+                expect: "the rejection must be the KR-606 positivity judgment",
+            },
+            Killer {
+                path: "kr608_positivity_is_enforced_through_the_translation",
+                func: "kr608_positivity_is_enforced_through_the_translation",
+                file: "crates/fln-kernel/tests/k1_judgments.rs",
+                expect: "the rejection must be the KR-606 positivity judgment on the \
+                         translated block",
+            },
+        ],
+    },
+    Plant {
+        name: "inverted universe condition",
+        file: "crates/fln-kernel/src/admit.rs",
+        // KR-604 with the sense of the universe fit reversed: exactly the "inverted
+        // condition" §18 names, not a deletion of the check.
+        find: "if !(self.result_level.is_geq(level) || self.result_level.is_zero()) {",
+        replace: "if self.result_level.is_geq(level) || self.result_level.is_zero() {",
+        package: "fln-kernel",
+        target: &["--test", "k1_judgments"],
+        killers: &[Killer {
+            path: "kr604_oversized_constructor_fields_are_rejected",
+            func: "kr604_oversized_constructor_fields_are_rejected",
+            file: "crates/fln-kernel/tests/k1_judgments.rs",
+            expect: "the rejection must be the KR-604 universe judgment",
+        }],
+    },
+    Plant {
+        name: "dropped retain",
+        file: "crates/fln-unsafe-abi/src/rc.rs",
+        // `inc_ref_n` returns before incrementing: the retain is dropped on every path.
+        find: "    if !shadow::check_rc_target(o as usize, \"inc_ref_n\") {",
+        replace: "    if true {",
+        package: "fln-unsafe-abi",
+        target: &["--lib"],
+        killers: &[Killer {
+            path: "tests::rc_balance_property_random_graphs",
+            func: "rc_balance_property_random_graphs",
+            file: "crates/fln-unsafe-abi/src/tests.rs",
+            expect: "del on reserved/poisoned tag",
+        }],
+    },
+];
+
+/// The receipt schema.
+///
+/// `head_commit` is the commit the campaign ran **against**, recorded because AGENTS.md's
+/// standing habit until `vdi4` closes is to record the hash a measurement was re-derived at.
+/// It is deliberately not the commit that *lands* the receipt — that hash cannot exist yet
+/// when the run happens — and the retention check does not read it. What binds a row to a
+/// tree is `site_digest` and `killer_digest`; `head_commit` is provenance, and it is only
+/// worth recording because the campaign refuses to run from a throwaway commit that `main`
+/// could never reach.
+const KILL_RECEIPT_SCHEMA: &str = "fln.mandated-mutant-kill-receipt/1";
+const KILL_RECEIPT_BEAD: &str = "fln-mandated-mutant-join-unwatched-uagk";
+
+fn kill_receipt_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("crates/fln-conformance/evidence/mandated_mutants/kills.jsonl")
+}
+
+// ---------------------------------------------------------------------------
+// The two digests a receipt is bound to
+// ---------------------------------------------------------------------------
+
+fn hex(bytes: &[u8]) -> String {
+    fln_hash::domain::hash(fln_hash::domain::Domain::Fixture, bytes).to_hex()
+}
+
+/// The mutated site: the file path and the exact text the plant replaces.
+///
+/// Binding the path as well as the text means moving the anchor to another file invalidates
+/// the kill even if the text is byte-identical there.
+fn site_digest(plant: &Plant) -> String {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(plant.file.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(plant.find.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(plant.replace.as_bytes());
+    hex(&preimage)
+}
+
+/// The body of a `fn`, from its signature line to the closing brace at the same indent.
+///
+/// Brace *counting* is wrong here: these bodies contain format strings like `{verdict:?}`,
+/// and a lone `{` inside a string literal would desynchronise a counter. Matching the
+/// closing brace by indentation needs no lexer and fails loudly rather than silently
+/// returning a truncated body — a short body would weaken the digest exactly where it is
+/// supposed to be strict.
+fn fn_body(source: &str, func: &str) -> Option<String> {
+    let needle = format!("fn {func}(");
+    let at = source.find(&needle)?;
+    let line_start = source[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let indent = &source[line_start..at];
+    if !indent.chars().all(|c| c == ' ' || c == '\t') {
+        // `pub fn`, `async fn`, a trailing comment — anything but plain indentation means
+        // the closing-brace rule below is not the right rule for this item.
+        return None;
+    }
+    let closing = format!("\n{indent}}}\n");
+    let end = source[at..].find(&closing)? + at + closing.len();
+    Some(source[line_start..end].to_string())
+}
+
+/// Every killer body for a plant, concatenated in declaration order.
+///
+/// This is what makes gutting a marked test fail: the marker survives an edit, the digest
+/// does not.
+fn killer_digest(root: &std::path::Path, plant: &Plant) -> String {
+    let mut preimage = Vec::new();
+    for killer in plant.killers {
+        let source = std::fs::read_to_string(root.join(killer.file))
+            .unwrap_or_else(|error| panic!("{} is readable: {error}", killer.file));
+        let body = fn_body(&source, killer.func).unwrap_or_else(|| {
+            panic!(
+                "`fn {}(` was not found in {} with a closing brace at its own indentation. \
+                 The killer this mutant is joined to cannot be located, so no digest can be \
+                 computed and the kill cannot be re-bound — find where it moved to and \
+                 update PLANTS rather than deleting the entry",
+                killer.func, killer.file
+            )
+        });
+        preimage.extend_from_slice(killer.path.as_bytes());
+        preimage.push(0);
+        preimage.extend_from_slice(body.as_bytes());
+        preimage.push(0);
+    }
+    hex(&preimage)
+}
+
+/// One field out of a receipt row.
+///
+/// A free function with its own test rather than a closure inside the retention check,
+/// because the first version was off by one — it skipped the value's opening quote and
+/// every row-match failed. That fault was *safe* (the guard refused rather than passed),
+/// but the same slip in the other direction would have made the retention check compare
+/// `None` against `None` and go green on any receipt at all. A parser this guard's verdict
+/// depends on is not allowed to be untested.
+fn receipt_field(row: &str, key: &str) -> Option<String> {
+    // `"key":` is a quote, the key, then a quote and a colon.
+    let at = row.find(&format!("\"{key}\":"))? + key.len() + 3;
+    let rest = &row[at..];
+    if let Some(stripped) = rest.strip_prefix('"') {
+        stripped.find('"').map(|end| stripped[..end].to_string())
+    } else {
+        rest.find([',', '}']).map(|end| rest[..end].to_string())
+    }
+}
+
+/// The receipt parser, pinned directly — see [`receipt_field`] for why.
+#[test]
+fn the_receipt_field_parser_reads_values_and_not_their_delimiters() {
+    let row = r#"{"schema":"s/1","name":"dropped retain","killed":1,"survivors":[],"last":"z"}"#;
+    assert_eq!(receipt_field(row, "schema").as_deref(), Some("s/1"));
+    assert_eq!(
+        receipt_field(row, "name").as_deref(),
+        Some("dropped retain"),
+        "a string value must come back without its quotes and without the following key"
+    );
+    assert_eq!(receipt_field(row, "killed").as_deref(), Some("1"));
+    assert_eq!(receipt_field(row, "survivors").as_deref(), Some("[]"));
+    assert_eq!(receipt_field(row, "last").as_deref(), Some("z"));
+    assert_eq!(
+        receipt_field(row, "absent"),
+        None,
+        "an absent key must be None, never a default that a comparison would accept"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The per-commit half: recipes stay joined, and recorded kills stay current
+// ---------------------------------------------------------------------------
+
+/// A plant whose anchor no longer exists is a recipe for a codebase that has moved on.
+///
+/// Checked as **exactly one** occurrence in both directions: zero means the site is gone,
+/// and more than one means the plant would mutate several places at once, so a kill could
+/// no longer be attributed to the defect §18 names.
+#[test]
+fn every_plant_still_targets_a_live_production_site() {
+    let root = workspace_root();
+    let mut failures = Vec::new();
+    for plant in PLANTS {
+        let path = root.join(plant.file);
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            failures.push(format!("`{}`: {} is unreadable", plant.name, plant.file));
+            continue;
+        };
+        let occurrences = source.matches(plant.find).count();
+        if occurrences != 1 {
+            failures.push(format!(
+                "`{}`: the anchor occurs {occurrences} times in {} (must be exactly 1). \
+                 The production site this mutant is defined against has moved, split or \
+                 vanished, so the recipe no longer plants what §18 names. Re-derive the \
+                 anchor and re-run the campaign; do not relax this count",
+                plant.name, plant.file
+            ));
+            continue;
+        }
+        if plant.find == plant.replace || source.contains(plant.replace) {
+            failures.push(format!(
+                "`{}`: the replacement is already present in {} (or equals the anchor), so \
+                 planting it would be a no-op and the campaign would score a mutant that \
+                 was never introduced",
+                plant.name, plant.file
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n  "));
+}
+
+/// Recipes and markers must account for each other, or one side can drift unnoticed.
+#[test]
+fn plants_and_markers_are_joined_in_both_directions() {
+    let root = workspace_root();
+    let names = mandated_names(&agents_md());
+    let found = markers(&root);
+    let mut failures = Vec::new();
+
+    for plant in PLANTS {
+        if !names.iter().any(|n| n == plant.name) {
+            failures.push(format!(
+                "PLANTS names `{}`, which is not one of §18's mandated names {names:?} — a \
+                 recipe for an obligation nobody asked for",
+                plant.name
+            ));
+        }
+        let marked_in: Vec<&str> = found
+            .iter()
+            .filter(|(name, _)| name == plant.name)
+            .map(|(_, file)| file.as_str())
+            .collect();
+        if marked_in.is_empty() {
+            failures.push(format!(
+                "`{}` has a plant but no test carries its marker",
+                plant.name
+            ));
+        }
+        for killer in plant.killers {
+            if !marked_in.contains(&killer.file) {
+                failures.push(format!(
+                    "`{}`: killer `{}` lives in {}, which carries no marker for this name \
+                     (marked in {marked_in:?}). The marker is what records which obligation \
+                     a test discharges, so a killer in an unmarked file is joined to §18 by \
+                     nothing again",
+                    plant.name, killer.path, killer.file
+                ));
+            }
+        }
+    }
+
+    // The other direction: a marked name with no recipe is a kill nobody can reproduce.
+    for (name, file) in &found {
+        if name == DECOY_SENTINEL {
+            continue;
+        }
+        if !PLANTS.iter().any(|p| p.name == name.as_str()) {
+            failures.push(format!(
+                "`{name}` is marked in {file} but has no plant, so nothing can re-establish \
+                 that the marked test still kills it"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n  "));
+}
+
+/// A name excused by a stub crate must not also carry a recipe.
+#[test]
+fn no_plant_exists_for_a_name_that_cannot_be_seeded_yet() {
+    for (name, krate) in NOT_YET_SEEDED {
+        assert!(
+            !PLANTS.iter().any(|p| p.name == name),
+            "`{name}` is declared not-yet-seeded against `{krate}` and yet has a plant. One \
+             of the two is false: either the subsystem landed (drop the declaration) or the \
+             recipe mutates something that is not the defect §18 names"
+        );
+    }
+}
+
+/// The extractor, tested directly — otherwise the retention digest could be silently
+/// computed over a truncated body and still look stable.
+#[test]
+fn the_body_extractor_finds_whole_bodies_and_refuses_rather_than_truncating() {
+    let top_level = "fn a() {\n    let s = \"}\";\n}\nfn b() {}\n";
+    let body = fn_body(top_level, "a").expect("top-level fn is extractable");
+    assert!(
+        body.contains("let s") && !body.contains("fn b"),
+        "the body must stop at its own closing brace: {body:?}"
+    );
+
+    // A brace inside a string literal must not end the body — the reason this is
+    // indentation-matched rather than brace-counted.
+    let indented = "mod t {\n    fn c() {\n        p(\"{x:?}\");\n    }\n    fn d() {}\n}\n";
+    let body = fn_body(indented, "c").expect("indented fn is extractable");
+    assert!(
+        body.contains("{x:?}") && !body.contains("fn d"),
+        "an indented body must match its own indent: {body:?}"
+    );
+
+    assert!(fn_body(top_level, "nonexistent").is_none());
+    // Refusing is the point: a `pub fn` is not covered by the indent rule, and returning a
+    // wrong body would be worse than returning none.
+    assert!(fn_body("pub fn e() {\n}\n", "e").is_none());
+}
+
+/// **The retention check.** A recorded kill must still describe the code it was measured on.
+///
+/// This is what makes the campaign worth running: without it, one hand-run measurement ages
+/// into a claim about a tree it no longer describes — which is `vdi4`'s shape, an evidence
+/// anchor that stays green while the thing underneath it moves.
+#[test]
+fn the_recorded_kills_still_describe_this_tree() {
+    let root = workspace_root();
+    let path = kill_receipt_path(&root);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "no mandated-mutant kill receipt at {} ({error}). Every marked test claims to \
+             kill a §18 mutant and nothing has measured that on this tree.\n\
+             Run the campaign and commit the rows it appends:\n\
+             \x20   cargo test -p fln-conformance --test mandated_mutants \\\n\
+             \x20     the_mandated_mutants_are_planted_and_their_killers_die \\\n\
+             \x20     -- --ignored --exact --nocapture\n\
+             Measured cost 9,393 ms — cheap because the dependency universe is closed \
+             (D1), so the campaign's own build directory is 56 MB from cold. \
+             Deleting this test is not the alternative: it is the \
+             only thing joining the markers to a measured kill (bead {KILL_RECEIPT_BEAD}).",
+            path.display()
+        )
+    });
+    let rows: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        !rows.is_empty(),
+        "{} exists but holds no rows. An empty receipt is not a weaker claim than a missing \
+         one; it is the same claim with the evidence taken out",
+        path.display()
+    );
+
+    let field = receipt_field;
+    let mut failures = Vec::new();
+    for plant in PLANTS {
+        let site = site_digest(plant);
+        let killers = killer_digest(&root, plant);
+        let matching = rows.iter().find(|row| {
+            field(row, "name").as_deref() == Some(plant.name)
+                && field(row, "site_digest").as_deref() == Some(site.as_str())
+                && field(row, "killer_digest").as_deref() == Some(killers.as_str())
+        });
+        let Some(row) = matching else {
+            failures.push(format!(
+                "`{}`: no receipt row matches this tree (site_digest {site}, killer_digest \
+                 {killers}). Either the mutated site in {} or one of the killer bodies \
+                 {:?} has changed since the kill was measured, so the recorded kill \
+                 describes code that is no longer here. Re-run the campaign (9,393 ms \
+                 measured) and commit the appended row:\n\
+                 \x20   cargo test -p fln-conformance --test mandated_mutants \\\n\
+                 \x20     the_mandated_mutants_are_planted_and_their_killers_die \\\n\
+                 \x20     -- --ignored --exact --nocapture",
+                plant.name,
+                plant.file,
+                plant.killers.iter().map(|k| k.path).collect::<Vec<_>>()
+            ));
+            continue;
+        };
+        let expected = plant.killers.len().to_string();
+        for (key, why) in [
+            (
+                "control_passed",
+                "the killers did not all pass BEFORE the mutation, so the \
+                                run proves nothing about the mutation",
+            ),
+            ("killed", "not every killer died under the mutant"),
+            (
+                "reasons_matched",
+                "a killer died for a reason other than the one the mutant \
+                                 introduces — the kill is coincidental",
+            ),
+        ] {
+            if field(row, key).as_deref() != Some(expected.as_str()) {
+                failures.push(format!(
+                    "`{}`: receipt records {key}={} against {} killer(s) — {why}",
+                    plant.name,
+                    field(row, key).unwrap_or_else(|| "<absent>".into()),
+                    plant.killers.len()
+                ));
+            }
+        }
+        if field(row, "survivors").as_deref() != Some("[]") {
+            failures.push(format!(
+                "`{}`: receipt records survivors {}. A surviving critical mutant blocks the \
+                 gate (§18) and must not sit quietly in an evidence file",
+                plant.name,
+                field(row, "survivors").unwrap_or_else(|| "<absent>".into())
+            ));
+        }
+        if field(row, "schema").as_deref() != Some(KILL_RECEIPT_SCHEMA) {
+            failures.push(format!("`{}`: unknown receipt schema", plant.name));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} mandated mutants have no current kill evidence:\n  {}",
+        failures.len(),
+        PLANTS.len(),
+        failures.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The campaign
+// ---------------------------------------------------------------------------
+
+/// A planted mutation that restores itself, including on panic.
+///
+/// `Drop` rather than a tidy-up at the end of the happy path: this test edits tracked source,
+/// and an assertion failure mid-campaign must not leave a kernel with its positivity check
+/// disabled sitting in somebody's working tree.
+struct Planted {
+    path: std::path::PathBuf,
+    original: String,
+}
+
+impl Drop for Planted {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.original);
+    }
+}
+
+/// Plant every mandated mutant, watch its named killers die for the stated reason, and
+/// record the measurement.
+///
+/// `#[ignore]`d because it **edits tracked source files**. It refuses to start unless the
+/// working tree is clean, so it can tell its own mutation from somebody else's edit — and so
+/// that it never runs while another pane has work in flight.
+#[test]
+#[ignore = "edits tracked source; run deliberately (see the_recorded_kills_still_describe_this_tree)"]
+fn the_mandated_mutants_are_planted_and_their_killers_die() {
+    let root = workspace_root();
+    let started = std::time::Instant::now();
+
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Only the files this campaign touches need to be pristine — the ones it mutates, and
+    // the ones whose bodies it digests. A whole-tree clean check looks safer and is worse
+    // twice over: it is unsatisfiable in a shared checkout where other panes always have
+    // work in flight, and forcing the run into a throwaway commit would make every receipt
+    // cite an anchor unreachable from `main`, which is precisely the defect
+    // `fln-history-rewrite-evidence-anchor-reachability-vdi4` records. The safety property
+    // that actually matters is narrower: this must not restore over somebody's edit, and it
+    // must not digest somebody's uncommitted work as if it were the committed tree.
+    let mut owned: Vec<&str> = PLANTS.iter().map(|p| p.file).collect();
+    owned.extend(PLANTS.iter().flat_map(|p| p.killers.iter().map(|k| k.file)));
+    owned.sort_unstable();
+    owned.dedup();
+    let status = git(&["status", "--porcelain"]);
+    let collisions: Vec<&str> = status
+        .lines()
+        .filter(|line| owned.iter().any(|file| line.contains(file)))
+        .collect();
+    assert!(
+        collisions.is_empty(),
+        "these files are modified and this campaign both mutates and digests them, so it \
+         cannot tell its own mutation from work in progress — and its restore would \
+         overwrite that work. Commit or stash them first:\n  {}\n\
+         (the rest of the tree may be dirty; only these {} files matter here)",
+        collisions.join("\n  "),
+        owned.len()
+    );
+    let commit = git(&["rev-parse", "HEAD"]);
+    assert_eq!(
+        commit.len(),
+        40,
+        "HEAD did not resolve to a commit: {commit}"
+    );
+
+    // A separate target directory: the outer `cargo test` holds the build lock on the
+    // ambient one for the whole invocation, so an inner cargo sharing it would wait for
+    // this test to finish and this test would wait for it. Cheap here because the
+    // dependency universe is closed (D1) — measured at 4.1 s and 56 MB from cold.
+    let inner_target = std::env::var("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| root.join("target"))
+        .join("mandated-mutants");
+
+    let run = |plant: &Plant| -> (bool, String) {
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.arg("test")
+            .arg("--locked")
+            .arg("-p")
+            .arg(plant.package)
+            .args(plant.target)
+            .arg("--")
+            .args(plant.killers.iter().map(|k| k.path))
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", &inner_target);
+        let out = cmd.output().expect("cargo runs");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out.status.success(), text)
+    };
+
+    let mut rows = Vec::new();
+    for plant in PLANTS {
+        let path = root.join(plant.file);
+        let original = std::fs::read_to_string(&path).expect("production file is readable");
+        assert_eq!(
+            original.matches(plant.find).count(),
+            1,
+            "`{}`: anchor is not unique in {}",
+            plant.name,
+            plant.file
+        );
+
+        // (a) Control. Every killer must PASS and must be SEEN to run: `--exact` against a
+        // name that no longer exists matches nothing and exits 0, which would otherwise be
+        // indistinguishable from a clean control.
+        let (ok, control) = run(plant);
+        assert!(
+            ok,
+            "`{}`: the killers do not pass on an unmutated tree, so nothing this campaign \
+             observes afterwards can be attributed to the mutant:\n{control}",
+            plant.name
+        );
+        let control_passed = plant
+            .killers
+            .iter()
+            .filter(|k| control.contains(&format!("test {} ... ok", k.path)))
+            .count();
+        assert_eq!(
+            control_passed,
+            plant.killers.len(),
+            "`{}`: only {control_passed} of {} killers were observed to RUN in the control. \
+             A libtest filter that matches nothing exits 0, so an unseen test is a vacuum, \
+             not a pass:\n{control}",
+            plant.name,
+            plant.killers.len()
+        );
+
+        // (b) Plant, restoring on every exit path including a panic below.
+        let planted = Planted {
+            path: path.clone(),
+            original: original.clone(),
+        };
+        std::fs::write(&path, original.replacen(plant.find, plant.replace, 1))
+            .expect("the mutation is writable");
+
+        // (c) The mutant must be killed, by the NAMED tests, for the STATED reason.
+        let (still_ok, mutated) = run(plant);
+        let mut survivors = Vec::new();
+        let mut killed = 0usize;
+        let mut reasons_matched = 0usize;
+        for killer in plant.killers {
+            if mutated.contains(&format!("test {} ... FAILED", killer.path)) {
+                killed += 1;
+                if mutated.contains(killer.expect) {
+                    reasons_matched += 1;
+                }
+            } else {
+                survivors.push(killer.path);
+            }
+        }
+
+        // (d) Restore, and prove it.
+        drop(planted);
+        let restored = std::fs::read_to_string(&path).expect("production file is readable");
+        assert_eq!(
+            restored, original,
+            "`{}`: {} was NOT restored to its original bytes",
+            plant.name, plant.file
+        );
+
+        assert!(
+            !still_ok && survivors.is_empty(),
+            "`{}`: SURVIVING MANDATED MUTANT. §18 makes this release-blocking. Survivors: \
+             {survivors:?}\n{mutated}",
+            plant.name
+        );
+        assert_eq!(
+            reasons_matched,
+            plant.killers.len(),
+            "`{}`: {reasons_matched} of {} killers died for the stated reason. A test that \
+             fails for an unrelated reason has stopped discharging this obligation even \
+             though it still fails:\n{mutated}",
+            plant.name,
+            plant.killers.len()
+        );
+
+        rows.push(format!(
+            "{{\"schema\":\"{KILL_RECEIPT_SCHEMA}\",\"bead\":\"{KILL_RECEIPT_BEAD}\",\
+             \"name\":\"{}\",\"head_commit\":\"{commit}\",\"observed_unix_s\":{},\
+             \"site_file\":\"{}\",\"site_digest\":\"{}\",\"killers\":[{}],\
+             \"killer_digest\":\"{}\",\"control_passed\":{},\"killed\":{killed},\
+             \"reasons_matched\":{reasons_matched},\"survivors\":[],\"class\":\
+             \"observed_once_not_a_per_commit_gate\"}}",
+            plant.name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the epoch")
+                .as_secs(),
+            plant.file,
+            site_digest(plant),
+            plant
+                .killers
+                .iter()
+                .map(|k| format!("\"{}\"", k.path))
+                .collect::<Vec<_>>()
+                .join(","),
+            killer_digest(&root, plant),
+            control_passed,
+        ));
+        println!("mandated_mutants: `{}` KILLED by {:?}", plant.name, {
+            plant.killers.iter().map(|k| k.path).collect::<Vec<_>>()
+        });
+    }
+
+    let out = std::env::var("FLN_MUTANT_CAMPAIGN_RECEIPT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| kill_receipt_path(&root));
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).expect("the evidence directory is creatable");
+    }
+    let mut text = std::fs::read_to_string(&out).unwrap_or_default();
+    for row in &rows {
+        text.push_str(row);
+        text.push('\n');
+    }
+    std::fs::write(&out, text).expect("the receipt is writable");
+    println!(
+        "mandated_mutants campaign: {} of {} mandated mutants planted and killed in {} ms; \
+         {} row(s) appended to {}. This is ONE measurement at {commit} on this host — class \
+         bounded_model, not a per-commit mutation gate.",
+        rows.len(),
+        PLANTS.len(),
+        started.elapsed().as_millis(),
+        rows.len(),
+        out.display()
+    );
+}
