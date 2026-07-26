@@ -11,8 +11,8 @@
 //! any of them matches its content. The binding against the pin lives in
 //! `scripts/e2e/contract_drift.sh`, which regenerates from the vendored header
 //! via `gen_abi_contract.py --check` and carries seeded mutants it must kill;
-//! it is registered in `scripts/check.sh`. Read the name literally: *present*,
-//! not *verified*.
+//! it runs weekly and on demand in `.github/workflows/contract-drift.yml`. Read
+//! the name literally: *present*, not *verified*.
 
 #![forbid(unsafe_code)]
 

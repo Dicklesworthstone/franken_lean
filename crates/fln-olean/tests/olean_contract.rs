@@ -7,7 +7,8 @@
 //! **What verifies `INVENTORY_DIGEST` is not here** (bead `franken_lean-pnav`).
 //! [`pin_binding_is_present`] asserts its *shape* (64 characters), never that it
 //! matches `contracts/olean_inventory.json`. That binding lives in
-//! `scripts/e2e/contract_drift.sh`, registered in `scripts/check.sh`.
+//! `scripts/e2e/contract_drift.sh`, which runs weekly and on demand in
+//! `.github/workflows/contract-drift.yml`.
 
 #![forbid(unsafe_code)]
 

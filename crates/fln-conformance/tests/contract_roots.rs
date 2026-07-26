@@ -27,19 +27,13 @@
 //! or unwired, this shape-only cluster becomes the only remaining check on
 //! the ABI and olean contracts, and nothing in these tests would change colour.
 //!
-//! ## The delegate is currently dormant (bead `franken_lean-0kpa`)
+//! ## Where the delegate runs (bead `franken_lean-0kpa`)
 //!
-//! Stated here rather than left to be discovered, because this header is what a reader
-//! consults to decide how much the cluster below is worth: **`contract_drift.sh` is
-//! invoked by no gate.** It is named in `scripts/check.sh` — in `INPUT_PATHS` and as an
-//! argument to the shellcheck stage — and executed by nothing, in `check.sh` or `ci.yml`.
-//! `ci.yml` defers Reference-drift detection to a scheduled job that was never created.
-//!
-//! So the digest verification these suites delegate is real, correct, and does not run.
-//! The tables were nonetheless verified by hand against the pin on 2026-07-26 and matched
-//! byte-for-byte: they are not stale, they are unguarded, and the risk is drift from here.
-//! The dormancy is declared in `UNWIRED_LANE_ALLOWANCE` so that a *second* lane going
-//! unwired fails immediately, and so that wiring this one forces the declaration out.
+//! The pin-dependent lane runs weekly and on demand in
+//! `.github/workflows/contract-drift.yml`. That workflow installs the exact Reference
+//! tag parsed from `SUITE.lock`, exposes the toolchain/vendor identity joins, and runs
+//! every extractor check plus the lane's seeded mutants. It deliberately does not run
+//! in the per-commit workflow, whose runner has no Reference toolchain.
 
 #![forbid(unsafe_code)]
 
@@ -96,12 +90,7 @@ fn assert_linked(md_rel: &str, rs_rel: &str, inv_rel: &str) {
 /// [`the_lane_this_suite_delegates_to_is_present_and_invoked`]: an undeclared unwired
 /// lane fails, and a declared lane that has since been wired ALSO fails. So the
 /// allowance shrinks as lanes land and cannot quietly outlive the defect it records.
-const UNWIRED_LANE_ALLOWANCE: &[(&str, &str)] = &[(
-    "scripts/e2e/contract_drift.sh",
-    "franken_lean-0kpa: the extractors' --check needs the SUITE.lock-pinned elan \
-     toolchain, which no runner installs, and ci.yml defers Reference-drift detection \
-     to a scheduled job that was never created",
-)];
+const UNWIRED_LANE_ALLOWANCE: &[(&str, &str)] = &[];
 
 /// Is `lane` EXECUTED by the gate, as opposed to merely NAMED in it?
 ///
@@ -118,12 +107,23 @@ const UNWIRED_LANE_ALLOWANCE: &[(&str, &str)] = &[(
 ///
 /// * in `scripts/check.sh`, the command of a `run_stage <name>` (optionally through
 ///   `bash`/`sh`), not any argument that follows it;
-/// * in `.github/workflows/ci.yml`, an executed `./<path>`.
+/// * in any `.github/workflows/*.yml` or `*.yaml`, an executed `./<path>`.
 fn lane_is_invoked(root: &Path, lane: &str) -> bool {
-    fs::read_to_string(root.join("scripts/check.sh"))
+    if fs::read_to_string(root.join("scripts/check.sh"))
         .is_ok_and(|gate| invoked_by_check_sh(&gate, lane))
-        || fs::read_to_string(root.join(".github/workflows/ci.yml"))
-            .is_ok_and(|ci| invoked_by_ci_yml(&ci, lane))
+    {
+        return true;
+    }
+
+    fs::read_dir(root.join(".github/workflows")).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            let path = entry.path();
+            matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("yml" | "yaml")
+            ) && fs::read_to_string(path).is_ok_and(|workflow| invoked_by_ci_yml(&workflow, lane))
+        })
+    })
 }
 
 /// Join backslash continuations, so a wrapped `run_stage` is one line to the scanner.
@@ -251,7 +251,7 @@ fn allowance_verdict(lane: &str, invoked: bool, declared: Option<&str>) -> Resul
 fn allowance_verdict_fails_in_both_directions() {
     // Wired and undeclared: the healthy end state.
     assert!(allowance_verdict("lane.sh", true, None).is_ok());
-    // Unwired and declared: the current, honest state of contract_drift.sh.
+    // Unwired and declared: an explicitly tracked temporary state.
     assert!(allowance_verdict("lane.sh", false, Some("bead-x")).is_ok());
 
     // Unwired and undeclared — a lane silently doing nothing.
@@ -318,7 +318,7 @@ fn the_lane_this_suite_delegates_to_is_present_and_invoked() {
     // `contains` check reported as registered.
     let gate = fs::read_to_string(root.join("scripts/check.sh")).expect("scripts/check.sh");
     assert!(
-        gate.contains(LANE) && !lane_is_invoked(&root, LANE),
+        gate.contains(LANE) && !invoked_by_check_sh(&gate, LANE),
         "the mention-versus-invocation control no longer holds: {LANE} must still be \
          NAMED in scripts/check.sh while not being invoked by it, or this test can no \
          longer demonstrate that it tells the two apart"

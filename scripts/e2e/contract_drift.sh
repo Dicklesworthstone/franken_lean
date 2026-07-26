@@ -55,6 +55,19 @@ note() { echo "[contract_drift] $*" >&2; }
 
 emit run_start started "\"cwd\":\"$ROOT\",\"argv\":\"$0\""
 
+# ---- lane 0: the staged Reference tree is exactly the pinned Git tree ------------------
+note "vendor tree binding check (SUITE.lock -> staged Reference Git tree)"
+set +e
+"$ROOT/scripts/verify_vendor_tree.sh" > "$ART_DIR/vendor_tree_check.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit vendor_tree failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"vendor_tree_check.log\""
+  note "FAIL: staged Reference tree does not match the pin"
+  exit 1
+fi
+emit vendor_tree passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"vendor_tree_check.log\""
+
 # ---- lane 1: ABI extraction is drift-free against the pin ------------------------------
 note "ABI contract drift check (lean.h -> inventory/MD/Rust)"
 set +e
@@ -197,23 +210,70 @@ fi
 emit mutant_b passed "\"suite_exit\":$suite_rc,\"restored_sha\":\"$sha_after\",\"artifact\":\"mutant_b_suite.log\""
 note "mutant B killed by the cross-artifact linkage test"
 
-# ---- lane 7: recovery — everything green again after restoration -----------------------
+# ---- lane 7: seeded mutation C — perturbed generated OLEAN header size -----------------
+OLEAN_RS="$ROOT/crates/fln-olean/src/format.rs"
+BACKUP_OLEAN="$ART_DIR/format.rs.orig"
+cp "$OLEAN_RS" "$BACKUP_OLEAN"
+sha_before="$(sha256sum "$OLEAN_RS" | cut -d' ' -f1)"
+note "seeding mutant C: OLEAN_HEADER_SIZE perturbed in the generated Rust module"
+if ! grep -q '^pub const OLEAN_HEADER_SIZE: usize = 88;$' "$OLEAN_RS"; then
+  emit mutant_c failed "\"reason\":\"seed_anchor_missing\""
+  note "FAIL: mutation seed anchor not found in format.rs"
+  exit 1
+fi
+"${PYTHON[@]}" - "$OLEAN_RS" <<'EOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+open(path, "w").write(text.replace(
+    "pub const OLEAN_HEADER_SIZE: usize = 88;",
+    "pub const OLEAN_HEADER_SIZE: usize = 89;", 1))
+EOF
+set +e
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_olean_contract.py" --check \
+  > "$ART_DIR/mutant_c_check.log" 2>&1
+check_rc=$?
+set -e
+cp "$BACKUP_OLEAN" "$OLEAN_RS"
+sha_after="$(sha256sum "$OLEAN_RS" | cut -d' ' -f1)"
+if [ "$sha_before" != "$sha_after" ]; then
+  emit mutant_c failed "\"reason\":\"restore_failed\""
+  note "FAIL: format.rs not restored byte-identically"
+  exit 1
+fi
+if [ "$check_rc" -eq 0 ] \
+    || ! grep -Fq 'gen_olean_contract: DRIFT: crates/fln-olean/src/format.rs:20' \
+      "$ART_DIR/mutant_c_check.log" \
+    || ! grep -Fq "checked-in: 'pub const OLEAN_HEADER_SIZE: usize = 89;'" \
+      "$ART_DIR/mutant_c_check.log" \
+    || ! grep -Fq "regenerated: 'pub const OLEAN_HEADER_SIZE: usize = 88;'" \
+      "$ART_DIR/mutant_c_check.log"; then
+  emit mutant_c failed "\"check_exit\":$check_rc,\"expected\":\"nonzero discriminator naming format.rs:20 and values 88/89\",\"artifact\":\"mutant_c_check.log\""
+  note "FAIL: mutant C was not killed by the exact OLEAN drift discriminator"
+  exit 1
+fi
+emit mutant_c passed "\"check_exit\":$check_rc,\"restored_sha\":\"$sha_after\",\"artifact\":\"mutant_c_check.log\""
+note "mutant C killed by the exact OLEAN drift discriminator"
+
+# ---- lane 8: recovery — everything green again after restoration -----------------------
 note "recovery: drift checks and linkage green after restoration"
 set +e
 "${PYTHON[@]}" "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/recovery_abi.log" 2>&1
 rc1=$?
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_olean_contract.py" --check > "$ART_DIR/recovery_olean.log" 2>&1
+rc2=$?
 ( cd "$ROOT" \
     && CARGO_TARGET_DIR=target_local cargo test -q -p fln-rt --test abi_contract \
     && CARGO_TARGET_DIR=target_local cargo test -q -p fln-conformance --test contract_roots ) \
   > "$ART_DIR/recovery_suite.log" 2>&1
-rc2=$?
+rc3=$?
 set -e
-if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ]; then
-  emit recovery failed "\"check_exit\":$rc1,\"suite_exit\":$rc2,\"artifacts\":\"recovery_abi.log,recovery_suite.log\""
-  note "FAIL: recovery lane not green (check=$rc1 suite=$rc2)"
+if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ] || [ "$rc3" -ne 0 ]; then
+  emit recovery failed "\"abi_check_exit\":$rc1,\"olean_check_exit\":$rc2,\"suite_exit\":$rc3,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_suite.log\""
+  note "FAIL: recovery lane not green (abi_check=$rc1 olean_check=$rc2 suite=$rc3)"
   exit 1
 fi
-emit recovery passed "\"check_exit\":0,\"suite_exit\":0,\"artifacts\":\"recovery_abi.log,recovery_suite.log\""
+emit recovery passed "\"abi_check_exit\":0,\"olean_check_exit\":0,\"suite_exit\":0,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_suite.log\""
 
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS: all lanes green (artifacts in target/e2e/$RUN_ID)"

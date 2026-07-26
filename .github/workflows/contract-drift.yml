@@ -1,0 +1,119 @@
+name: scheduled contract drift
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: contract-drift-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  contract-drift:
+    name: regenerate contracts against the pinned Reference
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: checkout FrankenLean
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: install pinned elan
+        shell: bash
+        run: |
+          tool_root="$RUNNER_TEMP/elan-bin"
+          archive="$RUNNER_TEMP/elan-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir "$tool_root"
+          python3 -I -S - "$archive" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          import urllib.request
+
+          url = (
+              "https://github.com/leanprover/elan/releases/download/"
+              "v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          expected = "4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c"
+          limit = 32 * 1024 * 1024
+          with urllib.request.urlopen(url, timeout=60) as response:
+              payload = response.read(limit + 1)
+          if len(payload) > limit:
+              raise SystemExit(f"elan archive exceeds {limit} bytes")
+          actual = hashlib.sha256(payload).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"elan archive digest mismatch: {actual} != {expected}")
+          pathlib.Path(sys.argv[1]).write_bytes(payload)
+          print(f"elan archive SHA-256: {actual}")
+          PY
+          tar -xzf "$archive" -C "$tool_root"
+          mv "$tool_root/elan-init" "$tool_root/elan"
+          chmod 0755 "$tool_root/elan"
+          printf 'ELAN_HOME=%s\n' "$HOME/.elan" >> "$GITHUB_ENV"
+          printf '%s\n' "$tool_root" >> "$GITHUB_PATH"
+
+      - name: read the Reference tag from SUITE.lock
+        id: reference
+        shell: bash
+        run: |
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          if (( ${#reference_rows[@]} != 1 )); then
+            echo "SUITE.lock must contain exactly one reference row" >&2
+            exit 2
+          fi
+          pin_tag="$(
+            sed -E 's/.*tag=([^ ]+).*/\1/' <<<"${reference_rows[0]}"
+          )"
+          if [[ ! "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "SUITE.lock Reference tag cannot name an elan toolchain: $pin_tag" >&2
+            exit 2
+          fi
+          printf 'pin_tag=%s\n' "$pin_tag" >> "$GITHUB_OUTPUT"
+          printf 'Reference tag from SUITE.lock: %s\n' "$pin_tag"
+
+      - name: install the SUITE.lock-pinned Reference toolchain
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          elan --version
+          elan toolchain install "leanprover/lean4:$PIN_TAG"
+          toolchain_root="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG"
+          test -x "$toolchain_root/bin/lean"
+          "$toolchain_root/bin/lean" --version
+
+      - name: expose the toolchain/vendor identity joins
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          toolchain_header="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/include/lean/lean.h"
+          vendor_header="vendor/lean4-src/src/include/lean/lean.h"
+          sha256sum "$toolchain_header" "$vendor_header"
+          cmp "$toolchain_header" "$vendor_header"
+          echo "toolchain/vendor lean.h join: byte-identical"
+          ./scripts/verify_vendor_tree.sh
+
+      - name: run the seeded contract drift lane
+        shell: bash
+        run: |
+          ./scripts/e2e/contract_drift.sh
+          git diff --exit-code -- \
+            ABI_CONTRACT.md \
+            crates/fln-rt/src/abi.rs \
+            crates/fln-olean/src/format.rs
+
+      - name: archive contract drift evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: contract-drift-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/e2e/contract-drift-*
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

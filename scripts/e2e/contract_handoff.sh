@@ -83,6 +83,7 @@ INPUT_PATHS=(
   scripts/extract/validate_extern_builtin_census.py
   scripts/extract/census_materialize.sh
   scripts/e2e/contract_handoff.sh scripts/evidence.py scripts/check.sh
+  scripts/verify_vendor_tree.sh
   tools/structure-guard .github/workflows/ci.yml vendor/NOTICE
 )
 HASH_ARGS=()
@@ -453,6 +454,7 @@ regeneration_command='
 set -euo pipefail
 root="$1"
 full="$2"
+"$root/scripts/verify_vendor_tree.sh"
 python3 -I -S "$root/scripts/extract/gen_abi_contract.py" --check
 python3 -I -S "$root/scripts/extract/gen_olean_contract.py" --check
 if [ "$full" = 1 ]; then
