@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,10 +33,78 @@ use structure_guard::{
 };
 
 /// An immutable workspace recipe. Every execution materializes a fresh, uniquely named
-/// root and retains it for inspection, as required by the repository's no-deletion rule.
+/// root; a root is **retained when its test fails** and reclaimed when it passes
+/// (bead `fln-fixture-retention-unbounded-evit`).
+///
+/// # Why this changed, stated because the previous behaviour was deliberate
+///
+/// This doc used to read "retains it for inspection, **as required by the repository's
+/// no-deletion rule**", and retention was unconditional. That reading of RULE 1 was
+/// careful but too broad: the rule forbids an *agent* deleting files, and it exists
+/// because agents have destroyed expensive work. A test harness reclaiming the scratch
+/// directory it created seconds earlier is ordinary hygiene, and the orchestrator ruled
+/// exactly that on 2026-07-26 when the pile was measured at **16,370 directories and
+/// 11 GB in `/data/tmp`, growing ~1.3 GB per hour with the disk at 95%**. Retention was
+/// costing more than the debugging value it bought, and it was buying that value on the
+/// ~99% of runs that pass and are never inspected.
+///
+/// The diagnostic value is kept where it is actually used: [`Drop`] checks
+/// [`std::thread::panicking`], so a **failing** test still leaves its workspace on disk
+/// with the same message as before. Only the passing path reclaims.
+///
+/// Nothing pre-existing is removed. This bounds future growth; the 16,370 directories
+/// already on disk are Jeffrey's call and are untouched by this change.
 pub struct TempWs {
     tag: String,
     files: RefCell<BTreeMap<String, Vec<u8>>>,
+    /// Every root this recipe materialized, reclaimed on drop unless the test is failing.
+    roots: RefCell<Vec<PathBuf>>,
+}
+
+/// Whether a path is one of ours and therefore safe to reclaim.
+///
+/// Belt and braces on a `remove_dir_all`: the parent must be exactly the temp dir this
+/// harness materializes into, and the final component must carry the fixture prefix. A
+/// bug that corrupted a stored root then cannot reach anything outside that namespace —
+/// the reclaimer refuses instead of guessing, and says so.
+fn is_reclaimable_fixture_root(root: &Path) -> bool {
+    root.parent() == Some(std::env::temp_dir().as_path())
+        && root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("structure-guard-test-"))
+}
+
+impl Drop for TempWs {
+    fn drop(&mut self) {
+        let roots = self.roots.borrow();
+        // A failing test is precisely the case the retention was for. `panicking()` is
+        // true for the whole unwind, so this covers an assertion failure anywhere in the
+        // test body, not merely one raised while the fixture is in scope.
+        if std::thread::panicking() {
+            for root in roots.iter() {
+                eprintln!("retained structure-guard fixture: {}", root.display());
+            }
+            return;
+        }
+        for root in roots.iter() {
+            if !is_reclaimable_fixture_root(root) {
+                eprintln!(
+                    "refusing to reclaim a fixture root outside this harness's namespace: {}",
+                    root.display()
+                );
+                continue;
+            }
+            // Never panic in Drop: on the success path that would convert a passing test
+            // into a confusing abort, and the disk is the lesser problem.
+            if let Err(error) = fs::remove_dir_all(root) {
+                eprintln!(
+                    "could not reclaim structure-guard fixture {}: {error}",
+                    root.display()
+                );
+            }
+        }
+    }
 }
 
 impl TempWs {
@@ -44,6 +112,7 @@ impl TempWs {
         TempWs {
             tag: tag.to_string(),
             files: RefCell::new(BTreeMap::new()),
+            roots: RefCell::new(Vec::new()),
         }
     }
 
@@ -160,7 +229,7 @@ impl TempWs {
             // divergence and the handoff adapter suppresses its dependent finding.
             let _ = structure_guard::contract_handoff::publish(&root);
         }
-        eprintln!("retained structure-guard fixture: {}", root.display());
+        self.roots.borrow_mut().push(root.clone());
         Ok(root)
     }
 
@@ -506,4 +575,70 @@ pub fn graph_with_edges(edges: &[&str]) -> String {
         g.push_str(&format!("edge {e}\n"));
     }
     g
+}
+
+/// The reclaimer's own proof, both directions (bead `fln-fixture-retention-unbounded-evit`).
+///
+/// A cleanup that silently never fires is indistinguishable from one that had nothing to
+/// do — the vacuous-success shape this repository keeps paying for — so the passing path
+/// asserts the directory is **gone** and the failing path asserts it is **still there**.
+/// Neither cell is inferred from the other.
+///
+/// The failure cell runs under [`std::panic::catch_unwind`] because the state that
+/// matters, [`std::thread::panicking`], is only true during an unwind: a test that merely
+/// *asks* whether retention would happen cannot observe it. This is the same distinction
+/// as "the command was issued" versus "the run happened".
+#[test]
+fn a_passing_fixture_is_reclaimed_and_a_failing_one_is_retained() {
+    let reclaimed = {
+        let ws = TempWs::new("reclaim-success-probe");
+        ws.write("marker.txt", "present");
+        ws.materialize().expect("materialize the success probe")
+    };
+    assert!(
+        !reclaimed.exists(),
+        "a PASSING test must reclaim its fixture, but {} survived",
+        reclaimed.display()
+    );
+
+    let mut observed = None;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ws = TempWs::new("reclaim-failure-probe");
+        ws.write("marker.txt", "present");
+        observed = Some(ws.materialize().expect("materialize the failure probe"));
+        panic!("deliberate failure: proving retention survives a failing test");
+    }));
+    assert!(outcome.is_err(), "the probe must actually have panicked");
+    let retained = observed.expect("the failure probe materialized before panicking");
+    assert!(
+        retained.exists(),
+        "a FAILING test must retain its fixture for diagnosis, but {} was reclaimed",
+        retained.display()
+    );
+    // This probe owns that directory and deliberately caused its retention, so it clears
+    // up after itself rather than leaving the proof as a new leak. Nothing pre-existing
+    // is touched: only the path this test just created.
+    fs::remove_dir_all(&retained).expect("the probe reclaims the fixture it retained");
+}
+
+/// The reclaimer refuses anything outside its own namespace, so a corrupted stored root
+/// cannot widen a `remove_dir_all` into someone else's directory.
+#[test]
+fn the_reclaimer_refuses_a_root_it_did_not_create() {
+    let temp = std::env::temp_dir();
+    assert!(is_reclaimable_fixture_root(
+        &temp.join("structure-guard-test-1-2-3-tag")
+    ));
+    assert!(
+        !is_reclaimable_fixture_root(&temp.join("someone-elses-scratch")),
+        "the prefix is what makes a directory ours"
+    );
+    assert!(
+        !is_reclaimable_fixture_root(&temp.join("nested").join("structure-guard-test-1-2-3-tag")),
+        "a matching name deeper in the tree is not one of ours"
+    );
+    assert!(
+        !is_reclaimable_fixture_root(Path::new("/")),
+        "a root with no parent is never reclaimable"
+    );
 }
