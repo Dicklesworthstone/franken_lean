@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":365,"projection_hash":"f62b993fe9f34d21010c5b97654eefeb48802db5b92e81fe6729a0ba821f9898"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":367,"projection_hash":"2ed0eb0689c18c1db89bc9603a5f8a139ff5b760e7ed096ca5088af7143d1d75"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -237,6 +237,7 @@
 {"id":"franken_lean-ci0"}
 {"id":"franken_lean-ckus"}
 {"id":"franken_lean-claim-matrix-doc-ci-mhew"}
+{"id":"franken_lean-closure-binding-exempt-rows-uninspected-3s8w"}
 {"id":"franken_lean-convergence-wip-governance-149"}
 {"id":"franken_lean-d17i"}
 {"id":"franken_lean-d2h5"}
@@ -250,6 +251,7 @@
 {"id":"franken_lean-eh0c"}
 {"id":"franken_lean-eikp"}
 {"id":"franken_lean-engine-backed-tactic-integration-c90"}
+{"id":"franken_lean-ephemeral-manifest-artifact-povo"}
 {"id":"franken_lean-epoch-migration-autopilot-q9w"}
 {"id":"franken_lean-epx"}
 {"id":"franken_lean-etj"}
