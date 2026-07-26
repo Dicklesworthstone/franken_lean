@@ -117,9 +117,10 @@ fn the_matrix_and_the_censuses_are_clean_against_the_real_tree() {
 
     assert_eq!(report.rows(), CLAIM_MATRIX.len(), "every row was decided");
     assert_eq!(
-        report.enforced, 2,
-        "two repairs are protected: the fln-olean header (86035037) and the README install \
-         one-liner (a368ea0b)"
+        report.enforced, 3,
+        "three repairs are protected: the fln-olean header (86035037), the README install \
+         one-liner (a368ea0b), and the README bench-apparatus inventory \
+         (fln-bench-apparatus-empty-referent-bkw6)"
     );
     assert_eq!(
         report.supported, 1,
@@ -668,6 +669,140 @@ fn every_row_carries_what_a_reviewer_needs() {
             Enforcement::Enforced => {}
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The empty-referent join: a claim bound to the cardinality of what it asserts
+// ---------------------------------------------------------------------------
+
+/// The workspace's own member manifests, resolved from the root manifest's `members` globs.
+///
+/// **Derived, never listed.** A hand-written scope rots silently, and a plain directory walk
+/// is worse than useless here: it picks up the twelve throwaway `Cargo.toml` fixtures under
+/// `scripts/e2e/artifacts/`, so a bench target planted in a *fixture* would read as a bench
+/// target in the *workspace*. The workspace defines its own membership; asking it is the only
+/// answer that stays correct when a crate is added tomorrow.
+fn workspace_member_manifests() -> Vec<PathBuf> {
+    let root = workspace_root();
+    let text = fs::read_to_string(root.join("Cargo.toml")).expect("root manifest is readable");
+    let members = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("members"))
+        .and_then(|line| line.split_once('['))
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(inner, _)| inner.to_string())
+        .expect("the root manifest declares a members array");
+
+    let mut manifests = vec![root.join("Cargo.toml")];
+    for entry in members.split(',') {
+        let entry = entry.trim().trim_matches('"');
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.strip_suffix("/*") {
+            Some(parent) => {
+                let dir = root.join(parent);
+                let read = fs::read_dir(&dir)
+                    .map_err(|e| format!("member glob {entry} names {dir:?}: {e}"))
+                    .expect("a members glob must name a readable directory");
+                for child in read.flatten() {
+                    let manifest = child.path().join("Cargo.toml");
+                    if manifest.is_file() {
+                        manifests.push(manifest);
+                    }
+                }
+            }
+            // A literal member path. Anything else — a `**`, a negation — is a form this
+            // resolver has not been taught, and guessing would silently narrow the scope.
+            None => {
+                assert!(
+                    !entry.contains('*'),
+                    "member entry {entry:?} uses a glob form this resolver does not \
+                     understand; teach it rather than letting the scope narrow silently"
+                );
+                manifests.push(root.join(entry).join("Cargo.toml"));
+            }
+        }
+    }
+    manifests
+}
+
+/// The number `README.md` discloses, read **out of the document** rather than transcribed
+/// here — an assertion that agrees with its own copy of the answer proves nothing.
+fn disclosed_bench_target_count(readme: &str) -> usize {
+    const MARKER: &str = " bench targets";
+    let at = readme.find(MARKER).expect(
+        "README.md must disclose the bench-target inventory beside the performance gates; \
+         the disclosure is absent, which is an unanswered question rather than a clean tree",
+    );
+    let digits: String = readme[..at]
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits
+        .parse()
+        .expect("the disclosed bench-target count must be a number")
+}
+
+/// **The empty-referent guard** (bead `fln-bench-apparatus-empty-referent-bkw6`).
+///
+/// Every instance in AGENTS.md item 7 is a claim whose evidence *exists* with the join to it
+/// unwatched — a bound and its configuration, a level and its oracle, a capture and its pin.
+/// `README.md` asserted that each of fifteen performance gates **has** a bench binary and a
+/// committed baseline while the workspace had none, and that shape has no join to watch: there
+/// is no evidence object to compare the claim against, so every technique item 7 recommends is
+/// structurally blind to it. What finds it is asking whether the thing a sentence says exists,
+/// exists.
+///
+/// So the claim is bound to the **cardinality** of what it asserts, and fails in both
+/// directions: a bench target appearing makes the disclosure stale, and editing the disclosed
+/// number without the tree moving makes it wrong.
+///
+/// Counting only `[[bench]]` sections would be a false clean of exactly the kind
+/// `FLN-STRUCT-040` was found producing — cargo auto-discovers `benches/*.rs` with no manifest
+/// section at all — so both signals are counted.
+#[test]
+fn the_bench_apparatus_disclosure_matches_the_measured_inventory() {
+    let manifests = workspace_member_manifests();
+    assert!(
+        manifests.len() >= 30,
+        "resolved only {} member manifests; a scan that cannot see the workspace reports a \
+         false clean rather than an empty inventory",
+        manifests.len()
+    );
+
+    let mut declared = 0usize;
+    let mut autodiscovered = 0usize;
+    for manifest in &manifests {
+        let text = fs::read_to_string(manifest)
+            .map_err(|e| format!("member manifest {manifest:?} is unreadable: {e}"))
+            .expect("a manifest the workspace declares as a member must be readable");
+        declared += text.matches("[[bench]]").count();
+        if manifest
+            .parent()
+            .is_some_and(|dir| dir.join("benches").is_dir())
+        {
+            autodiscovered += 1;
+        }
+    }
+    let measured = declared + autodiscovered;
+    let disclosed = disclosed_bench_target_count(&read_doc("README.md"));
+
+    assert_eq!(
+        measured,
+        disclosed,
+        "README.md discloses {disclosed} bench target(s); the workspace has {measured} \
+         ({declared} declared as [[bench]], {autodiscovered} auto-discovered from a benches/ \
+         directory) across {} member manifests.\n\
+         Re-read the whole paragraph under the performance table rather than only the number: \
+         if the apparatus has arrived, the sentence saying no gate has been measured is false \
+         too, and claim row PERF-GATE-BENCH-APPARATUS needs promoting rather than editing.",
+        manifests.len()
+    );
 }
 
 #[test]

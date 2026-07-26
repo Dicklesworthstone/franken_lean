@@ -250,7 +250,7 @@ pub struct ConceptCensus {
 /// What this matrix does and does not govern. Data, not a doc comment, so it is printable at
 /// failure time.
 pub const GOVERNED_SCOPE: &str = "\
-Seventeen rows over five documents (README.md, AGENTS.md, \
+Eighteen rows over five documents (README.md, AGENTS.md, \
 COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md, crates/fln-olean/src/lib.rs, \
 ci/PARITY_LEDGER.txt) plus \
 three concept censuses over README.md, AGENTS.md and \
@@ -262,7 +262,7 @@ class as one that overstates. NOT covered: the overwhelming majority of \
 README.md (~41 KB) and the plan (~195 KB), every claim in every other crate header, and all \
 generated contracts. Only three concepts have a conservation census; every other repeated \
 claim in these documents is unwatched. Every row now cites at least one checkable fact \
-(eighteen citations over seventeen rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
+(nineteen citations over eighteen rows) — but that is a FLOOR, NOT COVERAGE: a citation catches \
 only rot someone anticipated well enough to cite, and it protects one clause of a \
 multi-clause evidence paragraph. B3-CONSENSUS-HALTS has nine factual clauses and one is \
 cited, and it is not the clause its state depends on. Both rows that actually rotted on \
@@ -374,6 +374,11 @@ const SITES_WARM_ATTACH: [ClaimSite; 1] = [site(README, "warm attach ≤ 2 s")];
 const SITES_THREAD_MATRIX: [ClaimSite; 1] =
     [site(README, "tested at {1, 8, 32} threads on every commit")];
 const SITES_GOLEM: [ClaimSite; 1] = [site(README, "runs unmodified on Golem")];
+const SITES_BENCH_APPARATUS: [ClaimSite; 1] = [site(
+    README,
+    "Every gate has a bench binary, a committed baseline, a variance budget, and a flame \
+     artifact on regression",
+)];
 
 /// **The claim matrix.**
 ///
@@ -387,7 +392,7 @@ const SITES_GOLEM: [ClaimSite; 1] = [site(README, "runs unmodified on Golem")];
 /// (`scripts/tribunal/leanchecker_witness.sh`, wired into `scripts/check.sh`) — and it has no
 /// row here, so it is UNGOVERNED, not supported. A true clause with no row is exactly what a
 /// decomposition is supposed to make visible, and calling it supported hid it.
-pub const CLAIM_MATRIX: [ClaimRow; 17] = [
+pub const CLAIM_MATRIX: [ClaimRow; 18] = [
     // ---- the term itself, before any row that uses it -------------------------------
     ClaimRow {
         id: "PARITY-LEDGER-L2-MEANS-TWO-THINGS",
@@ -622,6 +627,34 @@ pub const CLAIM_MATRIX: [ClaimRow; 17] = [
                    right shape of evidence, and not tactic execution.",
         enforcement: Enforcement::Acknowledged,
     },
+    // ---- the empty-referent shape ---------------------------------------------------
+    ClaimRow {
+        id: "PERF-GATE-BENCH-APPARATUS",
+        sites: &SITES_BENCH_APPARATUS,
+        claim_type: ClaimType::Benchmark,
+        state: ClaimState::Targeted,
+        evidence: "REPAIRED 2026-07-26 (bead fln-bench-apparatus-empty-referent-bkw6). The \
+                   sentence under the fifteen-gate table asserted that every gate HAS a bench \
+                   binary, a committed baseline, a variance budget and a flame artifact. All \
+                   four conjuncts were false for all fifteen gates. Re-measured at HEAD \
+                   86b36e21: ZERO bench targets across the 33 workspace packages (from cargo \
+                   metadata, so a benches/ directory cargo auto-discovers without a [[bench]] \
+                   section could not hide in the count), zero benches/ directories, zero \
+                   criterion dependencies, and zero committed baseline artifacts outside \
+                   vendor/lean4-src, which is the Reference's own tree. The plan states the \
+                   rule correctly at §19.2 as a constraint on benchmark BUNDLES; only this \
+                   README restatement turned a rule about how to benchmark into an inventory \
+                   of containers that exist. THE SHAPE, which is why the row is worth reading: \
+                   every instance in AGENTS.md item 7 is a claim whose evidence EXISTS with \
+                   the join to it unwatched. This one had no join to watch, because the far \
+                   end was empty — so every technique item 7 recommends is structurally blind \
+                   to it, and the repair had to bind the claim to the CARDINALITY of the thing \
+                   it asserts instead. NOT a defect in crates/fln-bench: that crate is a \
+                   4281-line evidence substrate whose own module doc opens by saying it does \
+                   not run a product benchmark and owns no target threshold. It is correct and \
+                   unused, which is the right order to build one in.",
+        enforcement: Enforcement::Enforced,
+    },
 ];
 
 const CENSUS_DOCS: [&str; 3] = [README, AGENTS, PLAN];
@@ -685,7 +718,7 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 /// floor under it.
 ///
 /// [`every_row_cites_a_checkable_fact`]: ../../tests/witness_claim_matrix.rs
-pub const EVIDENCE_CITATIONS: [(&str, Citation); 18] = [
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
     // How many rows depend on the disputed definition. The sites pin the two definitions;
     // this pins the population, and it fires the moment ANY row's level moves — which is
     // exactly when "85 of 94, and zero under the plan's reading" stops being true.
@@ -846,6 +879,20 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 18] = [
         Citation::OccursExactly {
             path: "crates/fln-syntax/tests/lexer_thread_matrix.rs",
             needle: "const THREAD_COUNTS: [usize; 3] = [1, 8, 32];",
+            count: 1,
+        },
+    ),
+    // The repaired sentence must not merely stay repaired — the disclosure that replaced it
+    // must stay PRESENT. The site above fires if the overclaim returns; this fires if the
+    // replacement is quietly deleted, which would leave the fifteen gate numbers standing with
+    // nothing next to them saying none has been measured. The tree-side half of the join — the
+    // measured bench-target count actually matching the disclosed one — needs to enumerate the
+    // workspace and so lives in the suite, not here.
+    (
+        "PERF-GATE-BENCH-APPARATUS",
+        Citation::OccursExactly {
+            path: "README.md",
+            needle: "0 bench targets, 0 committed baselines and 0 flame artifacts",
             count: 1,
         },
     ),

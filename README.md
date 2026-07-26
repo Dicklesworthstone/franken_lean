@@ -290,7 +290,7 @@ Numbers below are the provisional CI **gates** (§19 of the plan) — the target
 | PG-1b · Consensus tax | Checker sampling ≤ 3% end-to-end overhead; full-closure release checking ≤ 10%; receipts ≤ 1 ms/decl amortized |
 | PG-M · The Mirror | The metaprogram corpus (real ecosystem tactic code) ≤ 1.25× Reference wall at G4, ≤ 0.9× at G6 |
 
-Every gate has a bench binary, a committed baseline, a variance budget, and a flame artifact on regression; regressions gate on tails as well as medians.
+**No gate above has been measured, and the apparatus that would measure one has no instances yet: 0 bench targets, 0 committed baselines and 0 flame artifacts across the workspace.** Every number in the table is therefore `TARGETED`, none is `OBSERVED`, and none has been produced by anything — quoting one as a result would be an overstatement this README cannot support. The rule those measurements will be held to is the plan's (§19.2), and it constrains *bundles* rather than asserting an inventory of them: every benchmark bundle records host facts, isolation checks, cache state, sample counts and raw samples, regressions gate on tails as well as medians, and a flame artifact identifies the bottleneck. `crates/fln-bench` is the substrate those bundles will be built from — host-profile capture, retained invalid attempts, exact regenerable statistics, and publication authority obtainable only from an independent validator — and it is finished and waiting for its first consumer. What is missing is the measurement, not the machinery that would record it (bead `fln-bench-apparatus-empty-referent-bkw6`).
 
 ## Determinism, trust & verification
 
