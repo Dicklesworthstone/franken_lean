@@ -7444,16 +7444,21 @@ mod tests {
             .iter()
             .filter(|(_, outcome)| matches!(outcome, MutantOutcome::SurvivedUncovered { .. }))
             .count();
-        assert_eq!(killed, 12);
-        assert_eq!(equivalent, 1);
-        // Deliberately asserted, not tolerated. `dt5` cannot close while this is nonzero,
-        // and a repair that adds the missing assertion must reclassify the entry here —
-        // so the debt cannot be discharged silently in either direction.
+        // Asserted FIRST, and the order is load-bearing rather than cosmetic. When these
+        // three counts sat in tally order, every way of falsely discharging the debt was
+        // caught by a bare `killed`/`equivalent` count mismatch that fired earlier — so
+        // this message, the only one that explains what the reader did wrong, could never
+        // run. Measured, not assumed: reclassifying the survivor to `KilledBy` failed with
+        // `left: 13 right: 12`. A diagnostic that cannot fire is the untruthful contract
+        // `environment.rs` names; the informative assertion has to be the reachable one.
         assert_eq!(
             uncovered, 1,
             "an uncovered mutant is open debt: it must be repaired and reclassified, \
-             never dropped from the matrix"
+             never dropped from the matrix, and never relabelled as killed or equivalent \
+             without an assertion that actually kills it"
         );
+        assert_eq!(killed, 12);
+        assert_eq!(equivalent, 1);
         assert_eq!(
             killed + equivalent + uncovered,
             CRITERIA_NAMED_MUTANTS.len()
