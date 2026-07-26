@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":353,"projection_hash":"85fc3f322444cc6eed48f1c8cfe82d0d7bf5d96aac1961ad3c165716cc83b05a"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":354,"projection_hash":"8f0eca7f917f4fd2a4a660710f1fefa6fad449f63367bf372d63b970a6b2251a"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
 {"id":"fln-1dxv"}
@@ -337,6 +337,7 @@
 {"id":"franken_lean-w75y"}
 {"id":"franken_lean-wasm-judge-packaging-contract-xte"}
 {"id":"franken_lean-wlan"}
+{"id":"franken_lean-worktree-gitdir-refusal-hugg"}
 {"id":"franken_lean-xk4c"}
 {"id":"franken_lean-xqb"}
 {"id":"franken_lean-xqc"}
