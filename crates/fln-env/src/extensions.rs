@@ -7278,6 +7278,206 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Modelled refusal work facts (bead `fln-extension-merge-validation-proof-debt-dt5`).
+    //
+    // Follows this file's existing `JournalAppendWork`/`next_append_work` idiom: the work
+    // is *modelled* rather than counted by instrumented production code. A counter in the
+    // hot path would also be the weaker artifact — it reports what one run did, where a
+    // model reports what the code can do at all.
+    //
+    // A counting allocator was never available as an alternative: no `#[global_allocator]`
+    // exists anywhere in the workspace and D3's `#![forbid(unsafe_code)]` rules one out.
+    // Recorded so the next reader does not rediscover that the obvious route is closed by
+    // doctrine.
+    // ---------------------------------------------------------------------------
+
+    /// What a merge-stage *input* type puts within reach.
+    trait StageInput {
+        const REACHES_JOURNAL: bool;
+        const REACHES_PAYLOAD: bool;
+        /// An `ExtensionDescriptor` carries `merge`, so narrowing a stage to descriptors
+        /// does **not** exclude policy *selection*. Recorded rather than glossed: this is
+        /// the one criterion of the four that the narrowing does not buy.
+        const CARRIES_MERGE_POLICY: bool;
+    }
+
+    impl StageInput for ExtensionDescriptor {
+        const REACHES_JOURNAL: bool = false;
+        const REACHES_PAYLOAD: bool = false;
+        const CARRIES_MERGE_POLICY: bool = true;
+    }
+
+    impl StageInput for ExtensionState {
+        const REACHES_JOURNAL: bool = true;
+        const REACHES_PAYLOAD: bool = true;
+        const CARRIES_MERGE_POLICY: bool = true;
+    }
+
+    /// What a stage's success type can carry out of it.
+    trait StageOutput {
+        const CARRIES_PRODUCT: bool;
+    }
+
+    impl StageOutput for () {
+        const CARRIES_PRODUCT: bool = false;
+    }
+
+    impl StageOutput for ExtensionMergeOutcome {
+        const CARRIES_PRODUCT: bool = true;
+    }
+
+    /// Operation facts for a refusal, as bounds rather than tallies.
+    ///
+    /// `Some(0)` means *provably zero* — the stage's signature puts the resource out of
+    /// reach. `None` means the signature does not bound it, and is deliberately not
+    /// spelled `Some(n)`: it records what is **not** proven instead of quietly reading as
+    /// a zero. Conflating those two is how a partial result gets quoted as a whole one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RefusalWorkFacts {
+        journal_comparisons: Option<usize>,
+        payload_clones: Option<usize>,
+        policy_selections: Option<usize>,
+        product_publications: Option<usize>,
+    }
+
+    /// Derives the facts **from the stage function itself**.
+    ///
+    /// This is the whole point of the shape. `I` and `O` are inferred from the real
+    /// function item that is passed in, so the facts are a function of the actual
+    /// signature and cannot be transcribed beside it and left to rot. Widen
+    /// `validate_descriptor_admission` to take `&ExtensionState` and `I` infers to
+    /// `ExtensionState`, the zeros become `None`, and the test asserting `Some(0)` fails —
+    /// in addition to `_DESCRIPTOR_ADMISSION_STAYS_JOURNAL_FREE` failing to compile.
+    ///
+    /// The stage argument is unused at run time by design: nothing is executed, because
+    /// the claim is about reachability, not about one observed run.
+    fn refusal_work_facts<I: StageInput, O: StageOutput>(
+        _stage: fn(&I, &I, &I) -> Result<O, MergeConflict>,
+    ) -> RefusalWorkFacts {
+        let zero_unless = |unbounded: bool| if unbounded { None } else { Some(0) };
+        RefusalWorkFacts {
+            journal_comparisons: zero_unless(I::REACHES_JOURNAL),
+            payload_clones: zero_unless(I::REACHES_PAYLOAD),
+            policy_selections: zero_unless(I::CARRIES_MERGE_POLICY),
+            product_publications: zero_unless(O::CARRIES_PRODUCT),
+        }
+    }
+
+    /// Stage 1's refusal work facts, derived from stage 1.
+    ///
+    /// Three of the criteria's four operations are provably zero. The fourth is not, and
+    /// saying so is the point: `dt5` exists because closure evidence outran its own
+    /// criteria, so a fact set that rounded `policy_selections` up to zero would repeat
+    /// that on the correcting bead.
+    #[test]
+    fn descriptor_refusal_work_facts_are_zero_by_construction() {
+        let facts = refusal_work_facts(validate_descriptor_admission);
+        assert_eq!(
+            facts.journal_comparisons,
+            Some(0),
+            "stage 1 takes descriptors, so no journal is in reach"
+        );
+        assert_eq!(
+            facts.payload_clones,
+            Some(0),
+            "stage 1 takes descriptors, so no payload is in reach"
+        );
+        assert_eq!(
+            facts.product_publications,
+            Some(0),
+            "stage 1 succeeds with (), so no product can leave it"
+        );
+        assert_eq!(
+            facts.policy_selections, None,
+            "NOT discharged, and must not be recorded as zero: ExtensionDescriptor \
+             carries `merge`, so narrowing the stage to descriptors does not put policy \
+             selection out of reach. The criteria ask for zero policy dispatches on a \
+             descriptor refusal; this model does not establish it"
+        );
+    }
+
+    /// The model is not a constant — the negative control.
+    ///
+    /// Without this, every zero above would be satisfied by a function that ignored its
+    /// type parameters and returned `Some(0)` four times, and the whole artifact would be
+    /// decoration. A guard whose passing state is reachable without the property holding
+    /// is not a guard.
+    #[test]
+    fn the_refusal_work_model_reads_the_signature_it_is_given() {
+        fn stage_over_states(
+            _: &ExtensionState,
+            _: &ExtensionState,
+            _: &ExtensionState,
+        ) -> Result<ExtensionMergeOutcome, MergeConflict> {
+            unreachable!("never executed: the model is about reachability, not a run")
+        }
+
+        let wide = refusal_work_facts(stage_over_states);
+        assert_eq!(wide.journal_comparisons, None);
+        assert_eq!(wide.payload_clones, None);
+        assert_eq!(wide.product_publications, None);
+        assert_ne!(
+            wide,
+            refusal_work_facts(validate_descriptor_admission),
+            "the facts must differ between a narrow and a wide stage, or they are not \
+             derived from the signature at all"
+        );
+    }
+
+    /// The cross-check the model cannot give: a real refusal leaves sharing and roots
+    /// alone.
+    ///
+    /// The model bounds what stage 1 *can* reach. This drives an actual descriptor
+    /// refusal and asserts the criteria's separate requirement that "inputs, roots,
+    /// sharing, and cache state remain unchanged after every refusal" — observed through
+    /// the one channel available without an allocator hook: `Arc::strong_count` over the
+    /// payloads, which a refusal that cloned a handle would move.
+    #[test]
+    fn a_real_descriptor_refusal_disturbs_no_sharing_and_no_root() {
+        let expected = descriptor(MergeSemantics::AppendOrdered, PayloadProvenance::Understood);
+        let shared: Arc<[u8]> = Arc::from(&b"shared-payload"[..]);
+        let base = ExtensionState::new(expected.clone()).push_entry(Arc::clone(&shared));
+        let ours = base.push_entry(Arc::clone(&shared));
+        let mismatched = ExtensionState::new(ExtensionDescriptor {
+            provenance: PayloadProvenance::Opaque,
+            ..expected.clone()
+        })
+        .push_entry(Arc::clone(&shared));
+
+        let sharing_before = Arc::strong_count(&shared);
+        let roots_before = (
+            base.content_digest(),
+            ours.content_digest(),
+            mismatched.content_digest(),
+        );
+        let inputs_before = (base.clone(), ours.clone(), mismatched.clone());
+
+        let refusal = ExtensionState::merge(&base, &ours, &mismatched, TEST_SET_UNION_LIMITS)
+            .expect_err("a descriptor mismatch is refused");
+        assert!(matches!(refusal, MergeConflict::DescriptorMismatch { .. }));
+
+        assert_eq!(
+            Arc::strong_count(&shared),
+            sharing_before,
+            "a refusal that cloned a payload handle would move the strong count"
+        );
+        assert_eq!(
+            (
+                base.content_digest(),
+                ours.content_digest(),
+                mismatched.content_digest(),
+            ),
+            roots_before,
+            "a refusal must expose no root movement"
+        );
+        assert_eq!(
+            (base, ours, mismatched),
+            inputs_before,
+            "a refusal must leave every input unchanged"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // Merge-validation mutation record and the two facts it exposed
     // (bead `fln-extension-merge-validation-proof-debt-dt5`).
     // ---------------------------------------------------------------------------
