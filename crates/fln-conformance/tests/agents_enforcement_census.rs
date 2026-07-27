@@ -33,19 +33,24 @@
 //! runs, or enforces what the sentence says. A claim citing a deleted test still counts as
 //! bound.
 //!
-//! Making the producer *denote* is pfei R2, and **one kind of referent is now walked**: line
-//! citations, below. That is the kind whose denotation is mechanical, and it was also the worst
-//! — eight of twelve were pointing at the wrong code. The other referent kinds the census
-//! recognises are **not** resolved here: a cited test function is not required to exist or to
-//! run, a cited lane is not required to be registered in `scripts/check.sh` and `ci.yml`, and a
-//! cited bead is not required to be in the tracker. Read the census's `bound` figure with that
-//! scope in mind — R2 is part walked, not done.
+//! Making the producer *denote* is pfei R2, and **two kinds of referent are now walked**. Line
+//! citations came first: the kind whose denotation is mechanical, and also the worst — eight of
+//! twelve were pointing at the wrong code. **Test-function names came second**, at `984a1555`,
+//! and are the kind whose denotation is load-bearing: a cited test is how a sentence claims to
+//! be enforced per commit, so a cited test that does not exist, is ambiguous, is `#[ignore]`d or
+//! sits outside every walked member is a claim with no producer. Both halves live below.
+//!
+//! The kinds still **not** resolved: a cited lane is not required to be registered in
+//! `scripts/check.sh` and `ci.yml`, and a cited bead is not required to be in the tracker. Read
+//! the census's `bound` figure with that scope in mind — R2 is part walked, not done.
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use fln_conformance::execution::{ignored_tests, test_functions, workspace_member_patterns};
 
 const CENSUS: &str = "scripts/agents_enforcement_census.py";
 
@@ -544,5 +549,564 @@ fn no_line_citation_in_agents_md_escapes_the_citation_registry() {
         "AGENTS.md's citation registry carries rows for {orphaned:?} that the prose no longer \
          cites. A row outliving its sentence overstates how much of this document is bound — \
          remove the row, or restore the citation it was written for.\nProse cites: {prose:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// pfei R2, second referent kind — the tests this document names must exist AND RUN.
+//
+// R2's first half bound the line citations, and its own closing note said what was still
+// open: "a cited test function is not required to exist or to RUN". This is that half.
+//
+// **Why this kind rots the same way the line citations did, measured rather than assumed.**
+// The population of test names AGENTS.md cites went 0 -> 20 over the three days to
+// `984a1555`, moving on 16 of the file's last 40 revisions — and every single movement was an
+// ADDITION. Twenty citations accreted in three days with nothing checking one. Because the
+// prose side only ever grows, the rot vector is never "the sentence drops the name"; it is
+// "the test is renamed, deleted, `#[ignore]`d or moved into a package `cargo test` does not
+// walk, while the sentence stays". So the population is derived from the PROSE and resolved
+// against the TREE. Deriving it from the tree instead is the trap this lineage already
+// recorded: two derived sets that both shrink agree perfectly, and a deleted test would
+// simply leave the population rather than fail it.
+//
+// **The predicates are borrowed, never re-implemented.** `execution::{test_functions,
+// ignored_tests, workspace_member_patterns}` already judge exactly these questions for
+// `ci/VERIFICATION_MANIFEST.jsonl` (bead `fln-rgha`). A second copy of "what is a test" here
+// would be free to drift from the one the manifest is judged by — the defect this bead's
+// whole family is about. It also inherits a trap paid for twice: `#[test]` and `#[ignore]`
+// appear in this workspace inside doc comments and guard assertions, so the construct is
+// recognised by the ATTRIBUTE at line start, never by the token. Writing that scan afresh
+// reproduces the bug — measured, while deriving this population: a window-based reading
+// reported `corpus_census_keeps_disclosing_its_claim_class` as `#[ignore]`d because a doc
+// comment six lines above it discusses `#[ignore]`d tests. It is not ignored.
+//
+// **Two tiers, because the shape rule is only needed in one direction.** Tier 1 takes EVERY
+// backticked snake_case token and, if it resolves to a real `#[test]`, requires that test to
+// run: no threshold, because demanding that an already-resolving test still run cannot
+// produce a false positive. Tier 2 requires a token that resolves to NOTHING to be declared,
+// and that is where a wrong guess reddens a peer's tree, so it is bounded to tokens with at
+// least four underscores. Measured at `984a1555`: all 17 cited tests clear that bar and only
+// three non-test tokens do, so the declared remainder is three rows rather than fifty-two.
+//
+// **The remainder is bound, the total deliberately is NOT.** Binding `cited=20` would redden
+// on precisely the commits that add a good citation — the cry-wolf failure this bead already
+// measured once, when a census counted item 7's catalogue and drifted 26 -> 27 -> 28 while
+// the live population stood still. What must be declared is what is NOT verified: the three
+// non-tests and the one cited test that does not run per commit.
+// ------------------------------------------------------------------------------------------
+
+/// Tokens AGENTS.md cites in the test-name shape that are **not** test functions.
+///
+/// Each row says what the token really is, so the next reader can tell a deliberate exclusion
+/// from a citation nobody repaired. Checked in both directions and under a ceiling: a row whose
+/// token has left AGENTS.md is stale and must be removed, so this list can only shrink without a
+/// deliberate, reviewable bump.
+const NON_TEST_TOKENS: &[(&str, &str)] = &[
+    (
+        "governed_input_mutation_during_initial_hash",
+        "a failure name `scripts/check.sh` prints for M4, not a Rust item",
+    ),
+    (
+        "not_applicable_no_supported_inputs",
+        "one of UBS's six terminal-mode classes",
+    ),
+    (
+        "validate_level_is_supported_by_its_oracle",
+        "a `pub fn` in crates/fln-conformance/src/ledger.rs — a producer the Parity Ledger guard \
+         calls, not a `#[test]`",
+    ),
+];
+
+/// The ceiling on that allowance. Growth is legitimate and must be deliberate, never silent.
+const NON_TEST_CEILING: usize = 4;
+
+/// Cited tests that do **not** run under plain `cargo test`, with the reason that is honest.
+///
+/// A cited test which is `#[ignore]`d is the hollow-green shape: the sentence reads as a
+/// per-commit mechanism and nothing executes. It is legitimate only when the document says so in
+/// the same breath, which for this one it does — the corpus matrix is an on-demand lane and
+/// AGENTS.md states the PG-5 shortfall and its waiver beside it.
+const IGNORED_CITATIONS: &[(&str, &str)] = &[(
+    "present_olean_corpus_thread_matrix_compares_stream_digests",
+    "the on-demand corpus thread-matrix lane; AGENTS.md declares the PG-5 per-commit shortfall \
+     and its expiring waiver in the same section",
+)];
+
+/// Every `#[test]` in the workspace, and where cargo would run it from.
+struct TestIndex {
+    /// name -> the walked files declaring it. A set, because a name is not an identity.
+    walked: BTreeMap<String, BTreeSet<String>>,
+    /// name -> files OUTSIDE any walked member target (nested workspaces, benches, examples).
+    unwalked: BTreeMap<String, BTreeSet<String>>,
+    /// Names carrying `#[ignore]`, by the attribute rather than the token.
+    ignored: BTreeSet<String>,
+    members: usize,
+    files: usize,
+    attributes: usize,
+}
+
+/// Resolve the root manifest's own `members` globs, then walk each member's `src` and `tests`.
+///
+/// `member/{src,tests}` is what cargo compiles for a workspace-root `cargo test`, and it excludes
+/// the two nested workspaces (`tools/structure-guard/kernel-ownership-publisher`,
+/// `tribunal/epoch-lab`) structurally rather than by name — the hand-listed-scope defect this
+/// session's own guard already reproduced once. Everything else under the repository is indexed
+/// separately as `unwalked`, so a citation to a test that exists but cannot run gets told which
+/// of the two it is instead of a misleading "no such test".
+fn index_tests(root: &Path) -> TestIndex {
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml");
+    let patterns = workspace_member_patterns(&manifest)
+        .expect("the root Cargo.toml must declare a non-empty [workspace] members array");
+    let mut member_dirs = BTreeSet::new();
+    for pattern in patterns {
+        match pattern.strip_suffix("/*") {
+            Some(prefix) => {
+                let Ok(entries) = std::fs::read_dir(root.join(prefix)) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        member_dirs.insert(format!("{prefix}/{name}"));
+                    }
+                }
+            }
+            None => {
+                if root.join(&pattern).is_dir() {
+                    member_dirs.insert(pattern);
+                }
+            }
+        }
+    }
+    let compiled: BTreeSet<String> = member_dirs
+        .iter()
+        .flat_map(|dir| [format!("{dir}/src/"), format!("{dir}/tests/")])
+        .collect();
+
+    let mut index = TestIndex {
+        walked: BTreeMap::new(),
+        unwalked: BTreeMap::new(),
+        ignored: BTreeSet::new(),
+        members: member_dirs.len(),
+        files: 0,
+        attributes: 0,
+    };
+    let mut sources = BTreeMap::new();
+    collect_rust_sources(root, root, &mut sources);
+    for (relative, text) in sources {
+        index.files += 1;
+        let is_compiled = compiled.iter().any(|prefix| relative.starts_with(prefix));
+        for name in test_functions(&text) {
+            index.attributes += 1;
+            let bucket = if is_compiled {
+                &mut index.walked
+            } else {
+                &mut index.unwalked
+            };
+            bucket.entry(name).or_default().insert(relative.clone());
+        }
+        for (name, _reason) in ignored_tests(&text) {
+            index.ignored.insert(name);
+        }
+    }
+    index
+}
+
+/// Collect every Rust source under the repository, skipping build and vendored trees.
+///
+/// A node this cannot read is a refusal, never a skip: a file dropped silently is exactly the
+/// one nobody is looking at. Symlinks are not descended — cargo does not compile through a
+/// directory symlink, and refusing removes the only way this walk fails to terminate.
+fn collect_rust_sources(dir: &Path, root: &Path, out: &mut BTreeMap<String, String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!(
+            "test-citation scan: {} is unreadable: {error}",
+            dir.display()
+        ),
+    };
+    for entry in entries {
+        let entry = entry.expect("a readable directory entry");
+        let kind = entry.file_type().expect("a readable file type");
+        if kind.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if kind.is_dir() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Neither is source this workspace compiles, and `vendor/` alone is 652 MB.
+            if matches!(name.as_str(), "target" | "vendor" | ".git" | "node_modules") {
+                continue;
+            }
+            collect_rust_sources(&path, root, out);
+            continue;
+        }
+        if !path.extension().is_some_and(|ext| ext == "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "test-citation scan: {} could not be read ({error}). A Rust file dropped here is \
+                 one this scan never judges — refuse rather than narrow the scope silently.",
+                path.display()
+            )
+        });
+        let relative = path
+            .strip_prefix(root)
+            .expect("a scanned path lies under the repository")
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.insert(relative, text);
+    }
+}
+
+/// Every backticked `snake_case` identifier AGENTS.md carries, with its underscore count.
+///
+/// A `path::to::name` citation is split, so `evidence_finalization.rs::the_evidence_surface_…`
+/// yields the function. The threshold is applied by the caller, not here, because the two tiers
+/// need different ones.
+fn backticked_identifiers(text: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    // Pairing is LINE-SCOPED, which is not a detail. Pairing across the whole file lets the three
+    // backticks of a ``` fence shift every subsequent pair by one, so a real citation after a
+    // fenced block silently stops being scanned — a narrower population that still clears the
+    // floor and reads as a clean document.
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('`') else { break };
+            let span = &after[..close];
+            for piece in span.split("::") {
+                let piece = piece.trim();
+                let shaped = !piece.is_empty()
+                    && piece.contains('_')
+                    && piece.starts_with(|c: char| c.is_ascii_lowercase())
+                    && piece
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if shaped {
+                    found.insert(piece.to_string());
+                }
+            }
+            rest = &after[close + 1..];
+        }
+    }
+    found
+}
+
+/// The tier-2 threshold, and the only place a wrong guess can redden a healthy tree.
+const DECLARATION_THRESHOLD: usize = 4;
+
+/// Judge AGENTS.md's test citations against the tree. Pure, so mutants are planted in the
+/// arguments rather than in the repository.
+fn judge_test_citations(text: &str, index: &TestIndex) -> Vec<String> {
+    let mut findings = Vec::new();
+    let candidates = backticked_identifiers(text);
+    let long: BTreeSet<&String> = candidates
+        .iter()
+        .filter(|token| token.matches('_').count() >= DECLARATION_THRESHOLD)
+        .collect();
+
+    // Anti-vacuity first. A scan that walked nothing and a document that cites nothing produce
+    // the identical empty finding list, and one of those is a broken scan.
+    if index.members < 20 {
+        findings.push(format!(
+            "scan floor: resolved only {} workspace members from the root manifest's globs; 33 \
+             were present when this binding landed. A collapsed member set silently empties the \
+             test index.",
+            index.members
+        ));
+    }
+    if index.attributes < 800 {
+        findings.push(format!(
+            "scan floor: found only {} `#[test]` attributes across {} Rust files; 1887 across 244 \
+             were present when this binding landed at `984a1555`. That is the WHOLE repository, \
+             not just the walked members — 1678 of them across 208 files sit under a member's \
+             `src/` or `tests/`, and the rest are what makes `cited-but-unreachable` reportable. \
+             A broken walk and a clean tree are the same green, so this refuses rather than \
+             reports nothing to check.",
+            index.attributes, index.files
+        ));
+    }
+    if long.len() < 12 {
+        findings.push(format!(
+            "scan floor: AGENTS.md yielded only {} test-shaped citations; 20 were live when this \
+             binding landed and the population has never once shrunk. An empty or thin scan is a \
+             broken scanner, never a clean document.",
+            long.len()
+        ));
+    }
+
+    for token in &candidates {
+        // Tier 1: it resolves, so it must actually run. No threshold — this cannot false-positive.
+        if let Some(paths) = index.walked.get(token) {
+            if paths.len() > 1 {
+                findings.push(format!(
+                    "ambiguous-citation: AGENTS.md cites `{token}`, and {} different files declare \
+                     a `#[test] fn {token}`: {paths:?}. The citation denotes two things, so the \
+                     reader cannot tell which sentence's evidence is which. Eight test names in \
+                     this workspace are already non-unique — a name is not an identity.",
+                    paths.len()
+                ));
+                continue;
+            }
+            let declared = IGNORED_CITATIONS.iter().any(|(name, _)| name == token);
+            if index.ignored.contains(token) && !declared {
+                findings.push(format!(
+                    "cited-but-not-run: AGENTS.md cites `{token}` ({}), and it is `#[ignore]`d, so \
+                     plain `cargo test` never runs it. The sentence reads as a per-commit \
+                     mechanism and nothing executes — the hollow-green shape. Either remove the \
+                     `#[ignore]`, or declare it in IGNORED_CITATIONS with the reason AGENTS.md \
+                     gives, and say in the prose that it does not run per commit.",
+                    paths.iter().next().map(String::as_str).unwrap_or("?")
+                ));
+            }
+            continue;
+        }
+        if !long.contains(token) {
+            continue;
+        }
+        // Tier 2: it resolves nowhere cargo walks, and it is shaped like a test name.
+        if NON_TEST_TOKENS.iter().any(|(name, _)| name == token) {
+            continue;
+        }
+        if let Some(paths) = index.unwalked.get(token) {
+            findings.push(format!(
+                "cited-but-unreachable: AGENTS.md cites `{token}`, which exists at {paths:?} — but \
+                 that path is not under any workspace member's `src/` or `tests/`, so a \
+                 workspace-root `cargo test` never compiles it. A libtest filter matching nothing \
+                 exits 0, which is why this is a finding and not a silence."
+            ));
+            continue;
+        }
+        findings.push(format!(
+            "citation-denotes-nothing: AGENTS.md cites `{token}` in the shape of a test name, and \
+             no `#[test] fn {token}` exists anywhere in this repository. Either the test was \
+             renamed or deleted and the prose was left behind — repair the sentence — or the token \
+             is not a test, in which case add it to NON_TEST_TOKENS saying what it actually is. \
+             Eight of twelve line citations in this file were already rot when they were measured, \
+             and every one had been correct on the day it was written."
+        ));
+    }
+
+    // The declared remainders, in the direction that makes them shrink with repair.
+    if NON_TEST_TOKENS.len() > NON_TEST_CEILING {
+        findings.push(format!(
+            "allowance ceiling: {} declared non-test tokens against a ceiling of \
+             {NON_TEST_CEILING}. Growth here is legitimate and must be deliberate — raise the \
+             ceiling in the same commit that adds the row, so it is reviewed rather than absorbed.",
+            NON_TEST_TOKENS.len()
+        ));
+    }
+    for (token, reason) in NON_TEST_TOKENS {
+        if !candidates.contains(*token) {
+            findings.push(format!(
+                "stale allowance: NON_TEST_TOKENS declares `{token}` ({reason}), which AGENTS.md no \
+                 longer cites. A row outliving its sentence overstates how much of this document \
+                 is bound — remove it."
+            ));
+        }
+    }
+    for (token, reason) in IGNORED_CITATIONS {
+        if !candidates.contains(*token) {
+            findings.push(format!(
+                "stale allowance: IGNORED_CITATIONS declares `{token}` ({reason}), which AGENTS.md \
+                 no longer cites. Remove the row."
+            ));
+        } else if !index.ignored.contains(*token) {
+            findings.push(format!(
+                "stale allowance: IGNORED_CITATIONS declares `{token}` as not running per commit, \
+                 but it is no longer `#[ignore]`d. The allowance must shrink when the thing it \
+                 excused is repaired — remove the row."
+            ));
+        }
+    }
+    findings
+}
+
+/// Every test AGENTS.md names must exist, be unambiguous, and actually run.
+#[test]
+fn every_agents_test_citation_names_a_test_that_runs() {
+    let root = workspace_root();
+    let index = index_tests(&root);
+    let findings = judge_test_citations(&agents_md(), &index);
+    assert!(
+        findings.is_empty(),
+        "AGENTS.md names tests that do not denote what the prose claims:\n\n{}\n\nThis is pfei R2's \
+         second referent kind. `bound` in the enforcement census means only that a producer is \
+         NAMED in the sentence; this is the check that it exists and runs.",
+        findings.join("\n\n")
+    );
+}
+
+// ---- controls (pfei R4): a decoy the scan must see, and its deletion it must notice ----
+
+fn index_for_controls() -> TestIndex {
+    index_tests(&workspace_root())
+}
+
+/// The decoy. A planted citation to a test that does not exist must be FOUND.
+///
+/// Without this the binding above passes identically against a scan that returns an empty finding
+/// list no matter what the document says — which is what a census that has lost its scope looks
+/// like, and is how this bead's R1 figure was wrong for a day.
+#[test]
+fn a_planted_citation_to_a_missing_test_is_caught() {
+    let index = index_for_controls();
+    let decoy = "`this_planted_test_name_denotes_absolutely_nothing`";
+    let doctored = format!("{}\n\nThe guard cites {decoy} here.\n", agents_md());
+    let findings = judge_test_citations(&doctored, &index);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("citation-denotes-nothing")
+                && f.contains("this_planted_test_name_denotes_absolutely_nothing")),
+        "a planted citation to a nonexistent test was not reported: {findings:?}"
+    );
+}
+
+/// The mutant that DELETES the decoy: with it gone the scan must go quiet again.
+///
+/// A guard that reports the decoy while also reporting the healthy document is not discriminating
+/// — it is failing. This is the half that proves the finding above came from the plant.
+#[test]
+fn removing_the_planted_citation_returns_the_scan_to_silence() {
+    let index = index_for_controls();
+    let findings = judge_test_citations(&agents_md(), &index);
+    assert!(
+        findings.is_empty(),
+        "with no decoy planted the real document must judge clean; got: {findings:?}"
+    );
+}
+
+/// A planted citation that RESOLVES must not be a finding.
+///
+/// The negative control that keeps this from being a blanket refusal of new tokens: 17 of the 20
+/// citations that accreted in three days were legitimate, and a guard that taxed each of them
+/// would be relaxed within a week.
+#[test]
+fn a_planted_citation_that_resolves_is_not_a_finding() {
+    let index = index_for_controls();
+    let real = "every_agents_test_citation_names_a_test_that_runs";
+    assert!(
+        index.walked.contains_key(real),
+        "this control needs a test that really exists"
+    );
+    let doctored = format!("{}\n\nA sentence citing `{real}`.\n", agents_md());
+    assert!(
+        judge_test_citations(&doctored, &index).is_empty(),
+        "a citation to a test that exists and runs must be silent, not taxed"
+    );
+}
+
+/// A cited test that stops running is caught — both ways it can stop.
+#[test]
+fn a_cited_test_that_stops_running_is_caught() {
+    let mut index = index_for_controls();
+    let cited = "the_evidence_surface_refuses_a_gitdir_pointer_root";
+    assert!(
+        index.walked.contains_key(cited),
+        "control needs a live citation"
+    );
+
+    let mut ignored_now = index_for_controls();
+    ignored_now.ignored.insert(cited.to_string());
+    let findings = judge_test_citations(&agents_md(), &ignored_now);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("cited-but-not-run") && f.contains(cited)),
+        "a cited test becoming `#[ignore]`d must be reported: {findings:?}"
+    );
+
+    let paths = index.walked.remove(cited).expect("the cited test");
+    index.unwalked.insert(cited.to_string(), paths);
+    let findings = judge_test_citations(&agents_md(), &index);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("cited-but-unreachable") && f.contains(cited)),
+        "a cited test moving out of every walked member must be reported: {findings:?}"
+    );
+}
+
+/// A cited name declared by two files is refused rather than silently resolved.
+///
+/// Eight names in this workspace are already non-unique. A citation keyed on one would be a key
+/// treated as an identity with nobody checking injectivity — the shape this lineage has paid for
+/// repeatedly.
+#[test]
+fn a_cited_test_declared_twice_is_refused_rather_than_resolved() {
+    let mut index = index_for_controls();
+    let cited = "the_build_gate_table_names_every_freeze_mechanism_in_the_code";
+    index
+        .walked
+        .get_mut(cited)
+        .expect("control needs a live citation")
+        .insert("crates/fln-somewhere-else/tests/twin.rs".to_string());
+    let findings = judge_test_citations(&agents_md(), &index);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("ambiguous-citation") && f.contains(cited)),
+        "a doubly-declared cited test must be refused: {findings:?}"
+    );
+}
+
+/// An empty or collapsed scan refuses instead of reporting a clean document.
+#[test]
+fn an_empty_scan_refuses_rather_than_reporting_a_clean_document() {
+    let index = index_for_controls();
+    let findings = judge_test_citations("AGENTS.md with no citations at all.\n", &index);
+    assert!(
+        findings.iter().any(|f| f.starts_with("scan floor")),
+        "a document yielding no citations must be refused as a broken scan: {findings:?}"
+    );
+
+    let collapsed = TestIndex {
+        walked: BTreeMap::new(),
+        unwalked: BTreeMap::new(),
+        ignored: BTreeSet::new(),
+        members: 0,
+        files: 0,
+        attributes: 0,
+    };
+    let findings = judge_test_citations(&agents_md(), &collapsed);
+    assert!(
+        findings
+            .iter()
+            .filter(|f| f.starts_with("scan floor"))
+            .count()
+            >= 2,
+        "an index that walked nothing must refuse on its own floors before judging citations: \
+         {findings:?}"
+    );
+}
+
+/// A declared allowance that has outlived its reason is refused.
+#[test]
+fn an_allowance_that_outlived_its_reason_is_refused() {
+    let index = index_for_controls();
+    // The document stops citing a declared non-test token: the row is now stale.
+    let without = agents_md().replace("governed_input_mutation_during_initial_hash", "M4");
+    let findings = judge_test_citations(&without, &index);
+    assert!(
+        findings.iter().any(|f| f.starts_with("stale allowance")
+            && f.contains("governed_input_mutation_during_initial_hash")),
+        "an allowance row whose token left the document must be refused: {findings:?}"
+    );
+
+    // The one cited test that does not run per commit starts running: the excuse must go.
+    let mut repaired = index_for_controls();
+    repaired
+        .ignored
+        .remove("present_olean_corpus_thread_matrix_compares_stream_digests");
+    let findings = judge_test_citations(&agents_md(), &repaired);
+    assert!(
+        findings.iter().any(|f| f.starts_with("stale allowance")
+            && f.contains("present_olean_corpus_thread_matrix_compares_stream_digests")),
+        "an ignored-citation allowance must shrink when the test starts running: {findings:?}"
     );
 }
