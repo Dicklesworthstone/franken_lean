@@ -31,6 +31,8 @@
 //! Class `bounded_model`: this is process behaviour on one host. What it earns per commit is that
 //! the discriminator still discriminates — not that the gate protects any lane.
 
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
