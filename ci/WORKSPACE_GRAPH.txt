@@ -93,6 +93,7 @@ edge fln-conformance -> fln-olean  # kernel replay decodes real Reference oleans
 edge fln-conformance -> fln-hash   # kernel-replay evidence hashes fixture inputs canonically (evidence-runner lane)
 edge fln-conformance -> fln-verdict # corpus schema projection exercises the CNF/model/proof wire formats (franken_lean-dgxa)
 edge structure-guard -> fln-core   # observes the authoritative D18 scanner; never reimplements or controls product semantics (franken_lean-r2st)
+edge structure-guard -> fln-conformance # dev-dependency only: its rigs resolve the repository through fln_conformance::checked_workspace_root!() so a cross-tree test binary refuses instead of reporting a verdict about the checkout that compiled it (fln-cross-tree-baked-root-k60n). FLN-STRUCT-007 exempts kind=tool from layering (checks.rs:1863); a second copy of the predicate in this crate is the defect that bead is an instance of
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.

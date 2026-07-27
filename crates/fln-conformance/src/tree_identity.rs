@@ -238,6 +238,10 @@ pub struct RootResolutionCensus {
     /// instead of as one number. See [`RAW_SITE_RESIDUE`] for why that distinction is
     /// the whole guard.
     pub raw_files: std::collections::BTreeMap<String, usize>,
+    /// `checked_sites`' sibling map. Needed because the disclosed coverage claim counts
+    /// the *crates* carrying invocations, not only the invocations, and a total cannot
+    /// answer that question.
+    pub checked_files: std::collections::BTreeMap<String, usize>,
 }
 
 /// Census a set of `(path, contents)` pairs.
@@ -263,8 +267,12 @@ pub fn census<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> RootRe
             census.raw_sites += raw;
             *census.raw_files.entry(path.to_string()).or_default() += raw;
         }
-        census.checked_sites +=
+        let checked =
             contents.matches(CHECKED_ROOT).count() + contents.matches(CHECKED_DIR).count();
+        if checked > 0 {
+            census.checked_sites += checked;
+            *census.checked_files.entry(path.to_string()).or_default() += checked;
+        }
     }
     census
 }
@@ -369,14 +377,10 @@ impl ResidueBreach {
 /// **What is still unconverted, by why.** `fln-conformance`'s own four sites are the two
 /// macro definitions and two unit tests that feed the compile-time value in as known-good
 /// input; they are counted rather than exempted, because a guard that excuses its own file
-/// cannot see a regression added to it. The rest divide three ways, and the division was
-/// re-measured at `017000f0` rather than inherited:
+/// cannot see a regression added to it. The rest divide **two** ways — it was three until
+/// the `tools/structure-guard` population was converted, and the division is re-measured
+/// on every run by [`coverage_populations`] rather than inherited from this comment:
 ///
-/// * **8 sites in `tools/structure-guard`** are blocked on *one line*. It is `kind=tool` in
-///   `ci/WORKSPACE_GRAPH.txt`, and `FLN-STRUCT-007` exempts tool crates from the layering
-///   law outright (`checks.rs:1863`, `(CrateKind::Tool, _) => {}`), so
-///   `edge structure-guard -> fln-conformance` is already legal and needs only to be
-///   declared alongside a dev-dependency.
 /// * **19 sites in nine product crates** are blocked on an *architectural* decision, not a
 ///   registration. `fln-conformance` is rank 22; every one of those crates ranks below it,
 ///   so a dev-dependency on it is an upward edge and `FLN-STRUCT-007` refuses it. Reaching
@@ -385,6 +389,16 @@ impl ResidueBreach {
 ///   never walks, so they are outside the graph entirely — the shape
 ///   `fln-bench-apparatus-empty-referent-bkw6` warns about, where the scope you measure and
 ///   the scope you meant are not the same set.
+///
+/// **`tools/structure-guard` is converted, and its rows are gone from this table rather
+/// than zeroed.** That was the population blocked on *one line*: the crate is `kind=tool`
+/// in `ci/WORKSPACE_GRAPH.txt`, `FLN-STRUCT-007` exempts tool crates from the layering law
+/// outright (`checks.rs:1863`, `(CrateKind::Tool, _) => {}`), and `DEP_SECTIONS`
+/// (`manifest.rs:45`) counts `dev-dependencies`, so the edge needed a dev-dependency plus
+/// one acknowledgement row and nothing else. Deleting the rows rather than setting them to
+/// zero is the repairer's obligation stated three paragraphs up: a retained row keeps its
+/// slot, and that one path could then regress up to its old count silently. With the rows
+/// gone, a raw site returning to either file is [`ResidueBreach::Undeclared`] and is named.
 pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
     ("crates/fln-checker/tests/charter_citations.rs", 1),
     ("crates/fln-conformance/src/tree_identity.rs", 4),
@@ -402,8 +416,6 @@ pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
     ("crates/fln-unsafe-region/src/tests.rs", 1),
     ("crates/fln-verdict/src/checker.rs", 1),
     ("crates/fln-verdict/tests/input_validation.rs", 1),
-    ("tools/structure-guard/src/contract_handoff.rs", 1),
-    ("tools/structure-guard/tests/real_workspace.rs", 7),
     ("tribunal/epoch-lab/examples/derive_report.rs", 1),
     ("tribunal/epoch-lab/src/main.rs", 1),
     ("tribunal/epoch-lab/tests/derived_input_provenance.rs", 6),
@@ -437,6 +449,242 @@ pub fn residue_breaches(
                 measured,
             }),
             Some(_) => None,
+        })
+        .collect()
+}
+
+/// The populations the k60n coverage disclosure in `AGENTS.md` names, re-derived from a
+/// census instead of transcribed.
+///
+/// Every number in that row was prose until this type existed, and the row went stale by
+/// the hand of the very commit that converted `tools/structure-guard`: it said "8 sites in
+/// `tools/structure-guard`" while the tree carried 10, then 0. That is item 7's shape —
+/// a claim and the population it counts, unjoined — sitting inside the section *about*
+/// claims and the evidence they count.
+///
+/// The partition is exhaustive on purpose. A raw site under a path none of the disclosed
+/// populations covers lands in [`Self::unclassified`], which the guard refuses: a
+/// disclosure that silently drops a member reads as coverage it does not have, which is
+/// `fln-bench-apparatus-empty-referent-bkw6`'s complaint about a scope measured differing
+/// from the scope meant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoveragePopulations {
+    /// Invocations of the checked macros **outside** the defining module. The module's own
+    /// occurrences are excluded because its two failure messages name
+    /// `checked_workspace_root!()` as the repair, so counting them would let the guard's
+    /// own advice satisfy a floor over real invocations — `fln-8zsq`'s lesson, and one this
+    /// module already paid for once.
+    pub checked_sites: usize,
+    /// Distinct workspace members carrying those invocations.
+    pub checked_members: usize,
+    /// Raw sites still in `tools/structure-guard` — the population this commit converted,
+    /// disclosed so that its return is a number moving rather than a silence.
+    pub structure_guard_raw: usize,
+    /// Raw sites in product crates under `crates/`, the defining module excluded.
+    pub product_raw: usize,
+    /// Distinct product crates carrying them — a count of *members*, never of files.
+    pub product_members: usize,
+    /// Raw sites in the nested `tribunal/epoch-lab` workspace.
+    pub epoch_lab_raw: usize,
+    /// Raw sites in the defining module itself: the two macro definitions and the two unit
+    /// tests that feed the compile-time value in as known-good input.
+    pub defining_module_raw: usize,
+    /// Raw sites no disclosed population covers. Non-empty is a refusal, not a bucket.
+    pub unclassified: std::collections::BTreeMap<String, usize>,
+}
+
+/// The workspace member a repository-relative path belongs to (`crates/fln-hash`,
+/// `tools/structure-guard`, `tribunal/epoch-lab`), or `None` for a top-level file.
+fn member_of(path: &str) -> Option<String> {
+    let mut parts = path.split('/');
+    let top = parts.next()?;
+    let name = parts.next()?;
+    (!name.is_empty() && parts.next().is_some()).then(|| format!("{top}/{name}"))
+}
+
+/// Partition a census into the populations the disclosure names.
+///
+/// Pure, so the interesting cases — an unclassified path, two files in one crate, a tools
+/// path that must not be scored as a product crate — are reachable without a repository.
+pub fn coverage_populations(
+    census: &RootResolutionCensus,
+    defining_module: &str,
+) -> CoveragePopulations {
+    let mut pops = CoveragePopulations::default();
+    let mut product_members = std::collections::BTreeSet::new();
+    for (path, &sites) in &census.raw_files {
+        if path == defining_module {
+            pops.defining_module_raw += sites;
+        } else if path.starts_with("tools/structure-guard/") {
+            pops.structure_guard_raw += sites;
+        } else if path.starts_with("tribunal/epoch-lab/") {
+            pops.epoch_lab_raw += sites;
+        } else if let Some(member) = member_of(path).filter(|m| m.starts_with("crates/")) {
+            pops.product_raw += sites;
+            product_members.insert(member);
+        } else {
+            *pops.unclassified.entry(path.clone()).or_default() += sites;
+        }
+    }
+    pops.product_members = product_members.len();
+
+    let mut checked_members = std::collections::BTreeSet::new();
+    for (path, &sites) in &census.checked_files {
+        if path == defining_module {
+            continue;
+        }
+        pops.checked_sites += sites;
+        if let Some(member) = member_of(path) {
+            checked_members.insert(member);
+        }
+    }
+    pops.checked_members = checked_members.len();
+    pops
+}
+
+/// A number a governed document declares, and the ways it can fail to bind to the tree.
+///
+/// There is deliberately no "close enough" outcome, and the three non-`Stale` variants
+/// matter as much as `Stale`: a marker that has been reworded, doubled, or stripped of its
+/// digits makes the comparison *vacuous*, and a vacuous comparison passes. `fln-8zsq`'s
+/// first repair asserted a qualifier appeared somewhere in a file and a planted mutant
+/// survived on a second copy of it; these three variants are that lesson turned into
+/// values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisclosureBreach {
+    /// The phrase that must carry the number is absent, so nothing was compared.
+    Missing {
+        /// The exact phrase looked for.
+        marker: String,
+    },
+    /// The phrase occurs more than once, so which number binds is undecidable.
+    Ambiguous {
+        /// The exact phrase looked for.
+        marker: String,
+        /// How many times it occurs.
+        occurrences: usize,
+    },
+    /// The phrase is present but no digits precede it.
+    Unparsed {
+        /// The exact phrase looked for.
+        marker: String,
+    },
+    /// The document declares a number the tree contradicts.
+    Stale {
+        /// The exact phrase looked for.
+        marker: String,
+        /// What the document says.
+        declared: usize,
+        /// What the tree measures.
+        measured: usize,
+    },
+}
+
+impl DisclosureBreach {
+    /// The operator-facing refusal, naming the phrase, both numbers, and the repair.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Missing { marker } => format!(
+                "the k60n coverage disclosure in AGENTS.md no longer contains the phrase \
+                 `…{marker}`, so that number was compared against nothing. Restore the \
+                 phrase with the measured count, or move the binding in \
+                 crates/fln-conformance/src/tree_identity.rs to whatever wording replaced \
+                 it. A reworded disclosure is a silent one. Bead \
+                 fln-cross-tree-baked-root-k60n."
+            ),
+            Self::Ambiguous {
+                marker,
+                occurrences,
+            } => format!(
+                "the phrase `…{marker}` occurs {occurrences} times in the k60n coverage \
+                 disclosure, so which number it binds is undecidable and no comparison was \
+                 made. Say each count once. Bead fln-cross-tree-baked-root-k60n."
+            ),
+            Self::Unparsed { marker } => format!(
+                "the phrase `…{marker}` in the k60n coverage disclosure is not preceded by \
+                 digits, so there is no declared number to compare. Write the count \
+                 immediately before the phrase. Bead fln-cross-tree-baked-root-k60n."
+            ),
+            Self::Stale {
+                marker,
+                declared,
+                measured,
+            } => format!(
+                "the k60n coverage disclosure in AGENTS.md declares {declared} for \
+                 `…{marker}` and the tree measures {measured}. Whichever moved, the other \
+                 must move with it in the same commit: this is the row that tells readers \
+                 how much of the workspace the tree check protects, and a stale one \
+                 overstates or understates it silently. Bead \
+                 fln-cross-tree-baked-root-k60n."
+            ),
+        }
+    }
+}
+
+/// Read the number written immediately before `marker`, refusing every way that can fail.
+fn declared_before(text: &str, marker: &str) -> Result<usize, DisclosureBreach> {
+    let occurrences = text.matches(marker).count();
+    if occurrences == 0 {
+        return Err(DisclosureBreach::Missing {
+            marker: marker.to_string(),
+        });
+    }
+    if occurrences > 1 {
+        return Err(DisclosureBreach::Ambiguous {
+            marker: marker.to_string(),
+            occurrences,
+        });
+    }
+    let head = &text[..text.find(marker).expect("exactly one occurrence")];
+    let mut digits: Vec<char> = head
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.reverse();
+    digits
+        .iter()
+        .collect::<String>()
+        .parse()
+        .map_err(|_| DisclosureBreach::Unparsed {
+            marker: marker.to_string(),
+        })
+}
+
+/// Judge the k60n coverage disclosure against the populations it claims to describe.
+///
+/// The phrase for each number is the *whole* binding, which is why they are long and
+/// specific: a marker of `" sites"` would match four places and bind none of them. Scope an
+/// assertion to the site that must carry the evidence, never to the document.
+pub fn disclosure_breaches(row: &str, pops: &CoveragePopulations) -> Vec<DisclosureBreach> {
+    let bindings: [(&str, usize); 7] = [
+        (" checked invocation sites", pops.checked_sites),
+        (" crates outside the defining module", pops.checked_members),
+        (
+            " raw sites in tools/structure-guard",
+            pops.structure_guard_raw,
+        ),
+        (" unprotected sites across", pops.product_raw),
+        (" product crates", pops.product_members),
+        (
+            " unprotected sites in tribunal/epoch-lab",
+            pops.epoch_lab_raw,
+        ),
+        (
+            " raw sites in the defining module",
+            pops.defining_module_raw,
+        ),
+    ];
+    bindings
+        .iter()
+        .filter_map(|(marker, measured)| match declared_before(row, marker) {
+            Err(breach) => Some(breach),
+            Ok(declared) if declared != *measured => Some(DisclosureBreach::Stale {
+                marker: (*marker).to_string(),
+                declared,
+                measured: *measured,
+            }),
+            Ok(_) => None,
         })
         .collect()
 }
@@ -753,36 +1001,16 @@ mod tests {
         );
     }
 
-    /// The coverage claim, re-derived every run and judged **per file**.
+    /// Every tracked Rust source in the tree this run was **launched from**, paired with
+    /// its contents, plus that tree's root.
     ///
-    /// Three assertions, each with a direction chosen deliberately and stated in
-    /// [`RAW_SITE_RESIDUE`]: the unprotected population may shrink freely and may not grow
-    /// *in any file*; the protected population may grow freely and may not shrink; and a
-    /// scan that reads almost nothing refuses rather than reporting a clean tree.
-    ///
-    /// The scope is **derived** from `git ls-files`, not listed: a hand-written root list
+    /// The scope is derived from `git ls-files`, never listed: a hand-written root list
     /// rots, and this repository has already paid for that twice
     /// (`franken_lean-ext-observable-fixture-drift-gap-vqnu`'s twelve evidence roots, and
-    /// `bkw6`'s twelve throwaway fixture manifests under `scripts/e2e/artifacts/`, which
-    /// a filesystem walk picks up and a tracked-file scan does not).
-    ///
-    /// **The checked floor excludes this file, and the raw ceiling does not.** The
-    /// asymmetry is not convenience, it is the direction of each error. Raw sites are
-    /// bounded from *above*, so counting this module's own occurrences is conservative and
-    /// a regression added here is still seen. Checked invocations are floored from
-    /// *below*, so this module's prose — the two failure messages naming
-    /// `checked_workspace_root!()` as the repair — would *inflate* the floor and let real
-    /// invocations disappear behind the guard's own advice. That is `fln-8zsq`'s lesson
-    /// exactly: the guard's own text is inside its search space, and the fix is to scope
-    /// the assertion to the site that must carry the evidence. Measured here: 35 raw
-    /// matches of the checked needles, of which **10 are in this file and only 25 are
-    /// invocations elsewhere**. The exclusion is derived from [`file!`] rather than
-    /// written down, and the derivation refuses if it fails to resolve.
-    #[test]
-    fn the_tree_check_coverage_claim_matches_the_measured_workspace() {
-        const CHECKED_FLOOR: usize = 25;
-        const FILES_FLOOR: usize = 200;
-
+    /// `bkw6`'s twelve throwaway fixture manifests under `scripts/e2e/artifacts/`, which a
+    /// filesystem walk picks up and a tracked-file scan does not). A failed `git` call is a
+    /// refusal, because an unknown scope supports no coverage claim at all.
+    fn tracked_sources() -> (PathBuf, Vec<(String, String)>) {
         let root = checked_workspace_root!();
         let listed = std::process::Command::new("git")
             .arg("-C")
@@ -797,7 +1025,7 @@ mod tests {
             String::from_utf8_lossy(&listed.stderr)
         );
         let paths = String::from_utf8(listed.stdout).expect("tracked paths are UTF-8");
-        let sources: Vec<(String, String)> = paths
+        let sources = paths
             .lines()
             .filter_map(|path| {
                 std::fs::read_to_string(root.join(path))
@@ -805,6 +1033,39 @@ mod tests {
                     .map(|text| (path.to_string(), text))
             })
             .collect();
+        (root, sources)
+    }
+
+    /// The floor on tracked sources read. A scan that reads almost nothing is a broken
+    /// scan, not a clean tree, so both live guards assert it rather than trusting the walk.
+    const FILES_FLOOR: usize = 200;
+
+    /// The coverage claim, re-derived every run and judged **per file**.
+    ///
+    /// Three assertions, each with a direction chosen deliberately and stated in
+    /// [`RAW_SITE_RESIDUE`]: the unprotected population may shrink freely and may not grow
+    /// *in any file*; the protected population may grow freely and may not shrink; and a
+    /// scan that reads almost nothing refuses rather than reporting a clean tree.
+    ///
+    /// **The checked floor excludes this file, and the raw ceiling does not.** The
+    /// asymmetry is not convenience, it is the direction of each error. Raw sites are
+    /// bounded from *above*, so counting this module's own occurrences is conservative and
+    /// a regression added here is still seen. Checked invocations are floored from
+    /// *below*, so this module's prose — the two failure messages naming
+    /// `checked_workspace_root!()` as the repair — would *inflate* the floor and let real
+    /// invocations disappear behind the guard's own advice. That is `fln-8zsq`'s lesson
+    /// exactly: the guard's own text is inside its search space, and the fix is to scope
+    /// the assertion to the site that must carry the evidence. Measured at `4e197f02` plus
+    /// this change: 49 raw matches of the checked needles, of which **10 are in this file
+    /// and 39 are invocations elsewhere** — 29 in `fln-conformance`'s other sources and 10
+    /// in `tools/structure-guard`, which this change converted. The exclusion is derived
+    /// from [`file!`] rather than written down, and the derivation refuses if it fails to
+    /// resolve.
+    #[test]
+    fn the_tree_check_coverage_claim_matches_the_measured_workspace() {
+        const CHECKED_FLOOR: usize = 39;
+
+        let (_root, sources) = tracked_sources();
         let measured = census(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
 
         assert!(
@@ -858,6 +1119,299 @@ mod tests {
             "only {} rigs outside {definition_site} route through the tree check, below the \
              floor of {CHECKED_FLOOR}: protection was removed rather than added",
             elsewhere.checked_sites
+        );
+    }
+
+    /// A row carrying every disclosed number in the exact wording the bindings look for.
+    ///
+    /// Built from a [`CoveragePopulations`] so the synthetic cases below vary **one** thing
+    /// — the row's text or one population — and never both at once.
+    fn sample_row(pops: &CoveragePopulations) -> String {
+        format!(
+            "| `fln-cross-tree-baked-root-k60n` | prose … {checked} checked invocation \
+             sites in {members} crates outside the defining module; {guard} raw sites in \
+             tools/structure-guard; {product} unprotected sites across {crates} product \
+             crates; {epoch} unprotected sites in tribunal/epoch-lab; {own} raw sites in \
+             the defining module itself. more prose … |",
+            checked = pops.checked_sites,
+            members = pops.checked_members,
+            guard = pops.structure_guard_raw,
+            product = pops.product_raw,
+            crates = pops.product_members,
+            epoch = pops.epoch_lab_raw,
+            own = pops.defining_module_raw,
+        )
+    }
+
+    fn sample_populations() -> CoveragePopulations {
+        CoveragePopulations {
+            checked_sites: 39,
+            checked_members: 2,
+            structure_guard_raw: 0,
+            product_raw: 19,
+            product_members: 9,
+            epoch_lab_raw: 11,
+            defining_module_raw: 4,
+            unclassified: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A row that agrees with the tree is clean. Without this the five refusal tests below
+    /// would be satisfied by a binding that refuses everything.
+    #[test]
+    fn a_disclosure_that_matches_the_tree_is_clean() {
+        let pops = sample_populations();
+        assert_eq!(disclosure_breaches(&sample_row(&pops), &pops), vec![]);
+    }
+
+    /// One number moved in the tree and not in the row: refused, with **both** values.
+    ///
+    /// Both are load-bearing. A refusal that named only the measured count would leave the
+    /// reader unable to tell a stale disclosure from a regression in the tree, which is the
+    /// whole complaint against the aggregate ceiling this module already replaced once.
+    #[test]
+    fn a_stale_disclosed_number_is_refused_with_both_values() {
+        let declared = sample_populations();
+        let row = sample_row(&declared);
+        let mut measured = declared.clone();
+        measured.product_raw = 20;
+
+        assert_eq!(
+            disclosure_breaches(&row, &measured),
+            vec![DisclosureBreach::Stale {
+                marker: " unprotected sites across".to_string(),
+                declared: 19,
+                measured: 20,
+            }],
+            "exactly the moved number must refuse, and only it"
+        );
+        let message = disclosure_breaches(&row, &measured)[0].message();
+        assert!(message.contains("19"), "{message}");
+        assert!(message.contains("20"), "{message}");
+        assert!(
+            message.contains("fln-cross-tree-baked-root-k60n"),
+            "{message}"
+        );
+    }
+
+    /// The two vacuity shapes, and they are the reason this is a typed breach rather than a
+    /// `bool`.
+    ///
+    /// Rewording a phrase makes the comparison silently disappear; saying a count twice
+    /// makes it undecidable. Either way a naive "does the row contain the measured number"
+    /// check passes while binding nothing — `fln-8zsq`'s planted mutant survived on exactly
+    /// that, a second copy of the qualifier elsewhere in the same file.
+    #[test]
+    fn a_reworded_or_doubled_marker_is_refused_rather_than_passing_vacuously() {
+        let pops = sample_populations();
+
+        let reworded = sample_row(&pops).replace("9 product crates", "9 product packages");
+        assert_eq!(
+            disclosure_breaches(&reworded, &pops),
+            vec![DisclosureBreach::Missing {
+                marker: " product crates".to_string(),
+            }],
+            "a reworded disclosure must refuse, not silently stop being checked"
+        );
+
+        let doubled = format!("{} and again 7 product crates", sample_row(&pops));
+        assert_eq!(
+            disclosure_breaches(&doubled, &pops),
+            vec![DisclosureBreach::Ambiguous {
+                marker: " product crates".to_string(),
+                occurrences: 2,
+            }],
+            "two counts for one population is undecidable, and the first must not win"
+        );
+    }
+
+    /// The phrase is present and the number is not. Refusing here is what stops a row from
+    /// reading as disclosed while carrying no figure at all.
+    #[test]
+    fn a_marker_with_no_digits_before_it_is_refused() {
+        let pops = sample_populations();
+        let stripped =
+            sample_row(&pops).replace("11 unprotected sites in", "several unprotected sites in");
+        assert_eq!(
+            disclosure_breaches(&stripped, &pops),
+            vec![DisclosureBreach::Unparsed {
+                marker: " unprotected sites in tribunal/epoch-lab".to_string(),
+            }]
+        );
+    }
+
+    /// The partition counts **members**, not files, and a tools path is never a product
+    /// crate.
+    ///
+    /// Both directions have bitten this bead already. Counting files would have reported
+    /// nine product crates as thirteen; folding `tools/` into `crates/` would have reported
+    /// the converted population as still unprotected and the product one as inflated, so the
+    /// row could go stale in two places while its total stayed put — a single aggregate's
+    /// exact failure mode, one level up.
+    #[test]
+    fn the_partition_separates_tools_from_product_crates_and_counts_members_not_files() {
+        let raw = "env!(\"CARGO_MANIFEST_DIR\")";
+        let measured = census([
+            ("crates/fln-hash/src/blake3.rs", raw),
+            ("crates/fln-hash/tests/schema_registry.rs", raw),
+            ("crates/fln-rt/tests/region_engine.rs", raw),
+            ("tools/structure-guard/tests/real_workspace.rs", raw),
+            ("tribunal/epoch-lab/src/main.rs", raw),
+        ]);
+        let pops = coverage_populations(&measured, "crates/fln-conformance/src/tree_identity.rs");
+
+        assert_eq!(pops.product_raw, 3, "three files carry product sites");
+        assert_eq!(
+            pops.product_members, 2,
+            "but they live in two crates — a file count would say three"
+        );
+        assert_eq!(
+            pops.structure_guard_raw, 1,
+            "a tools/ path is its own population, never a product crate"
+        );
+        assert_eq!(pops.epoch_lab_raw, 1);
+        assert!(pops.unclassified.is_empty());
+    }
+
+    /// A raw site in a directory no population covers is **named**, not dropped.
+    ///
+    /// This is the `bkw6` shape guarded directly: the disclosure would otherwise stay
+    /// arithmetically consistent while describing a smaller workspace than the one that
+    /// exists, and every number in it would still be true.
+    #[test]
+    fn a_raw_site_no_population_covers_is_unclassified_rather_than_dropped() {
+        let measured = census([
+            ("scripts/tribunal/rig.rs", "env!(\"CARGO_MANIFEST_DIR\")"),
+            ("build.rs", "env!(\"CARGO_MANIFEST_DIR\")"),
+        ]);
+        let pops = coverage_populations(&measured, "crates/fln-conformance/src/tree_identity.rs");
+
+        assert_eq!(pops.product_raw, 0);
+        assert_eq!(pops.epoch_lab_raw, 0, "scripts/tribunal is not tribunal/");
+        assert_eq!(
+            pops.unclassified
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["build.rs", "scripts/tribunal/rig.rs"],
+            "both must be named so the disclosure and the partition move together"
+        );
+    }
+
+    /// The defining module is counted in its **own** population and excluded from the
+    /// checked one.
+    ///
+    /// That asymmetry is the same one the coverage test carries, for the same reason: this
+    /// module's two failure messages name `checked_workspace_root!()` as the repair, so
+    /// including them would let the guard's own advice inflate a figure the row publishes as
+    /// real invocations. Trap already paid for once in `fln-8zsq`.
+    #[test]
+    fn the_defining_module_is_excluded_from_the_checked_population_and_counted_in_its_own() {
+        const DEFINING: &str = "crates/fln-conformance/src/tree_identity.rs";
+        let measured = census([
+            (
+                DEFINING,
+                "env!(\"CARGO_MANIFEST_DIR\") checked_workspace_root!() checked_manifest_dir!()",
+            ),
+            (
+                "tools/structure-guard/tests/real_workspace.rs",
+                "checked_workspace_root!()",
+            ),
+        ]);
+        let pops = coverage_populations(&measured, DEFINING);
+
+        assert_eq!(
+            pops.defining_module_raw, 1,
+            "the module's own raw site is disclosed, not exempted"
+        );
+        assert_eq!(
+            pops.product_raw, 0,
+            "and it is not double-counted as a product crate"
+        );
+        assert_eq!(
+            pops.checked_sites, 1,
+            "only the invocation outside the defining module counts toward the published \
+             figure — its own two occurrences are prose as far as this number is concerned"
+        );
+        assert_eq!(pops.checked_members, 1);
+    }
+
+    /// The disclosed coverage in `AGENTS.md` must equal the tree it describes, in **both**
+    /// directions.
+    ///
+    /// **This row went stale by the hand of the commit that repaired the population it
+    /// counts.** It said "8 sites in `tools/structure-guard`" while `2a96e7b9` had already
+    /// taken that file from 7 raw sites to 9, and the conversion then took it to 0 — a claim
+    /// and the population it counts, unjoined, inside the AGENTS.md section that exists to
+    /// name exactly that defect. Nothing would have said so; the number is prose in a table
+    /// cell and no reader recomputes it.
+    ///
+    /// Two properties are deliberate. The numbers are re-derived from `git ls-files` on
+    /// every run, so the row fails when the *tree* moves and equally when the *row* moves —
+    /// one-way would let a repair silently overstate coverage. And the row must be found
+    /// exactly once: a scan that locates no row is a broken scan, not a clean tree, and
+    /// would otherwise judge the disclosure against an empty string and pass.
+    #[test]
+    fn the_k60n_coverage_disclosure_matches_the_measured_populations() {
+        const ROW_PREFIX: &str = "| `fln-cross-tree-baked-root-k60n` |";
+
+        let (root, sources) = tracked_sources();
+        let measured = census(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
+        assert!(
+            measured.files >= FILES_FLOOR,
+            "the census read {} tracked source files, below the floor of {FILES_FLOOR}: a \
+             broken scan cannot judge a disclosure",
+            measured.files
+        );
+
+        let defining: Vec<&String> = measured
+            .raw_files
+            .keys()
+            .filter(|path| path.ends_with(file!()))
+            .collect();
+        assert_eq!(
+            defining.len(),
+            1,
+            "the defining module must be identifiable by {:?} and still carry the \
+             compile-time form; zero means the needle has stopped matching and every \
+             population below is a confident zero. Found: {defining:?}",
+            file!()
+        );
+        let defining = defining[0].clone();
+
+        let agents = std::fs::read_to_string(root.join("AGENTS.md"))
+            .expect("AGENTS.md must be readable: it carries the claim under test");
+        let rows: Vec<&str> = agents
+            .lines()
+            .filter(|line| line.trim_start().starts_with(ROW_PREFIX))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "AGENTS.md must carry exactly one item-7 row beginning {ROW_PREFIX:?}, and it \
+             carries {}. Zero is a broken scan rather than a clean tree — the disclosure \
+             would then be judged against nothing and pass",
+            rows.len()
+        );
+
+        let pops = coverage_populations(&measured, &defining);
+        assert!(
+            pops.unclassified.is_empty(),
+            "these raw sites belong to no population the k60n row discloses, so the row is \
+             silent about them while every number in it stays true: {:?}. Extend the \
+             disclosure and the partition in the same commit",
+            pops.unclassified
+        );
+
+        let breaches = disclosure_breaches(rows[0], &pops);
+        assert!(
+            breaches.is_empty(),
+            "{}",
+            breaches
+                .iter()
+                .map(DisclosureBreach::message)
+                .collect::<Vec<_>>()
+                .join("\n\n")
         );
     }
 }

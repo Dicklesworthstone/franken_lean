@@ -186,5 +186,6 @@ version = "0.0.0"
 name = "structure-guard"
 version = "0.0.0"
 dependencies = [
+ "fln-conformance",
  "fln-core",
 ]

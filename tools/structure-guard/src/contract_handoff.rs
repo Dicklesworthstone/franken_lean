@@ -1562,8 +1562,12 @@ mod tests {
 
     #[test]
     fn contract_handoff_no_mock_e2e() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
+        // Resolved through the tree check, not from this file's compile-time manifest
+        // dir: a binary compiled in another checkout would otherwise consume that
+        // tree's 53 MB untracked census and report the verdict here. The `canonicalize`
+        // is kept so the root is spelled exactly as it was before the conversion.
+        // Bead fln-cross-tree-baked-root-k60n.
+        let root = fln_conformance::checked_workspace_root!()
             .canonicalize()
             .expect("real repository root");
         let snapshot = consume(&root).expect("real checked-in handoff is consumable");

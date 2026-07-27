@@ -2,10 +2,23 @@
 //! structurally clean against its reviewed acknowledgment files. Any new crate or
 //! dependency edge fails this test until `ci/WORKSPACE_GRAPH.txt` is edited in the
 //! same change — that edit is the review surface.
+//!
+//! **Every rig here resolves the repository through
+//! [`fln_conformance::checked_workspace_root!`], never from its own compile-time
+//! manifest dir.** `CARGO_TARGET_DIR` is shared machine-wide, and cargo reuses a test
+//! binary built from an identical-bytes copy of this package in another checkout
+//! without rebuilding it — so the compile-time value names the tree that *built* this
+//! binary, which is not necessarily the tree that launched it. Measured live at
+//! `5c5ada4b`: this exact binary carried `/data/tmp/wt-cc_2/tools/structure-guard` and
+//! reported `INCONCLUSIVE` about that worktree while the main tree it was invoked from
+//! was clean, citing a symlink defect on a path that is a regular file here. Today that
+//! direction is a loud false red; swap which checkout is dirty and the identical
+//! mechanism reports **structurally clean about a repository nobody tested**. The macro
+//! compares the baked value against the one cargo puts in this process's environment and
+//! panics naming both paths. Bead `fln-cross-tree-baked-root-k60n`.
 
 #![forbid(unsafe_code)]
 
-use std::path::Path;
 use std::process::{Command, Output};
 
 fn run_cli(args: &[&str]) -> Output {
@@ -32,11 +45,8 @@ fn assert_versioned_robot_lines(stdout: &str, expected_lines: usize) {
 
 #[test]
 fn real_workspace_is_structurally_clean() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    let outcome = structure_guard::checks::run(root).expect("structure-guard setup");
+    let root = fln_conformance::checked_workspace_root!();
+    let outcome = structure_guard::checks::run(&root).expect("structure-guard setup");
     assert!(
         outcome.findings.is_empty(),
         "structural findings against the real workspace:\n{}",
@@ -50,10 +60,7 @@ fn real_workspace_is_structurally_clean() {
 
 #[test]
 fn real_verification_manifest_covers_the_live_tracker() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let root = fln_conformance::checked_workspace_root!();
     let output = Command::new("python3")
         .args(["-I", "-S"])
         .arg(root.join("scripts/evidence.py"))
@@ -84,10 +91,7 @@ fn real_verification_manifest_covers_the_live_tracker() {
 
 #[test]
 fn robot_real_workspace_binds_complete_authority_evidence() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let root = fln_conformance::checked_workspace_root!();
     let output = run_cli(&[
         "--root",
         root.to_str().expect("workspace root is UTF-8"),
@@ -145,10 +149,7 @@ fn u64_field(object: &str, key: &str) -> Option<u64> {
 /// tolerating it here does not leave it unattended.
 #[test]
 fn the_terminal_record_discloses_the_d18_scope_of_the_verdict_it_carries() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let root = fln_conformance::checked_workspace_root!();
     let output = run_cli(&[
         "--root",
         root.to_str().expect("workspace root is UTF-8"),
@@ -321,11 +322,8 @@ fn a_root_with_a_dependency_cone_releases_the_deferral() {
 #[test]
 fn the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous() {
     const REMAINDER: &str = "fln-d18-product-half-rgsg";
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    let outcome = structure_guard::checks::run(root).expect("structure-guard setup");
+    let root = fln_conformance::checked_workspace_root!();
+    let outcome = structure_guard::checks::run(&root).expect("structure-guard setup");
 
     let tracker_path = root.join(".beads/issues.jsonl");
     let tracker = std::fs::read_to_string(&tracker_path).unwrap_or_else(|error| {
@@ -370,10 +368,7 @@ fn the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous() {
 
 #[test]
 fn robot_rejects_an_unbound_rustc_override_without_executing_it() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let root = fln_conformance::checked_workspace_root!();
     let output = Command::new(env!("CARGO_BIN_EXE_structure-guard"))
         .args([
             "--root",
@@ -457,10 +452,7 @@ fn robot_help_remains_machine_only_in_either_argument_order() {
 /// direction can be satisfied by editing the needle list alone.
 #[test]
 fn the_admission_tripwire_names_what_the_kernel_actually_exports() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let root = fln_conformance::checked_workspace_root!();
 
     let capability = std::fs::read_to_string(root.join("crates/fln-kernel/src/capability.rs"))
         .expect("the kernel capability module must be readable");
@@ -635,11 +627,8 @@ fn judge_covenant_disclosure(
 /// `/5` bump blocked on another pane's uncommitted `scripts/evidence.py`.
 #[test]
 fn the_line_count_covenant_is_disclosed_by_the_walk_that_enforces_it() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    let outcome = structure_guard::checks::run(root).expect("structure-guard setup");
+    let root = fln_conformance::checked_workspace_root!();
+    let outcome = structure_guard::checks::run(&root).expect("structure-guard setup");
     let graph_text = std::fs::read_to_string(root.join("ci/WORKSPACE_GRAPH.txt"))
         .expect("ci/WORKSPACE_GRAPH.txt must be readable");
     let declared = structure_guard::graph::parse(&graph_text)
@@ -663,11 +652,8 @@ fn the_line_count_covenant_is_disclosed_by_the_walk_that_enforces_it() {
 /// cannot be planted is named rather than omitted.
 #[test]
 fn the_covenant_disclosure_guard_kills_each_mutation_it_claims_to() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    let outcome = structure_guard::checks::run(root).expect("structure-guard setup");
+    let root = fln_conformance::checked_workspace_root!();
+    let outcome = structure_guard::checks::run(&root).expect("structure-guard setup");
     let graph_text = std::fs::read_to_string(root.join("ci/WORKSPACE_GRAPH.txt"))
         .expect("ci/WORKSPACE_GRAPH.txt must be readable");
     let declared = structure_guard::graph::parse(&graph_text)
