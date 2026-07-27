@@ -767,6 +767,27 @@ def inspect_ilean_corpus(toolchain: Path, expected_epoch: int) -> dict:
     }
 
 
+def decode_ascii_field(data: bytes, field: dict, header: dict) -> str:
+    """Decode one ASCII header field, or refuse in a typed way.
+
+    A bare ``.decode("ascii")`` here raises ``UnicodeDecodeError`` as an unhandled traceback.
+    That is not a corrupt-file path: it is what a *revised upstream header* looks like, because
+    a layout whose offsets have moved reads real artifact bytes through the wrong window. The
+    doctrine is that malformed input must not panic and that a panic is never a user diagnostic
+    (FL-INV-07, "inconclusive is not rejected"), so this refuses through ``die`` — the same typed
+    idiom the truncation branch of ``decode_olean_header`` already uses.
+    """
+    try:
+        return data.decode("ascii")
+    except UnicodeDecodeError:
+        die(
+            f"OLEAN header field {field['name']!r} at offset {field['offset']} "
+            f"(field size {field['size']}, header size {header['size']}) is not ASCII: "
+            f"{data.hex()} — the checked-in layout does not describe these bytes, which is "
+            "what a revised upstream header looks like; re-extract against the pin"
+        )
+
+
 def decode_olean_header(payload: bytes, header: dict, target: dict) -> dict:
     if len(payload) < header["size"]:
         die(
@@ -779,11 +800,13 @@ def decode_olean_header(payload: bytes, header: dict, target: dict) -> dict:
         end = start + field["size"]
         data = payload[start:end]
         if field["name"] == "marker":
-            values["marker"] = data.decode("ascii")
+            values["marker"] = decode_ascii_field(data, field, header)
         elif field["name"] in ("version", "flags"):
             values[field["name"]] = data[0]
         elif field["name"] in ("lean_version", "githash"):
-            values[field["name"]] = data.rstrip(b"\0").decode("ascii")
+            values[field["name"]] = decode_ascii_field(
+                data.rstrip(b"\0"), field, header
+            )
         elif field["name"] == "base_addr":
             values["base_addr"] = int.from_bytes(data, byteorder=byteorder)
     return values
