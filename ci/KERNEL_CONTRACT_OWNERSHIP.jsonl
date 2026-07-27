@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":385,"projection_hash":"ecd497a51aeb2877cff7f486f69541fe58b8ebbb7c724506c014d6dc898ac65e"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":386,"projection_hash":"14655a3a98f52e99ba503f171bca55349aacbd475c552611ee1f68d7baf17e94"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -343,6 +343,7 @@
 {"id":"franken_lean-r4m8"}
 {"id":"franken_lean-rch-clean-overlay-has-no-git-dir-46pw"}
 {"id":"franken_lean-readme-install-oneliner-wao6"}
+{"id":"franken_lean-registered-lane-dispatched-by-nothing-glk0"}
 {"id":"franken_lean-rps"}
 {"id":"franken_lean-rur"}
 {"id":"franken_lean-sk0"}
