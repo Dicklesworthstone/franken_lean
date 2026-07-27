@@ -47,6 +47,38 @@ CANCELLED = 4
 RUN_SCHEMAS = {"fln.check/2", "fln.e2e/2"}
 VERIFICATION_MANIFEST_SCHEMA = "fln.verification-manifest/2"
 VERIFICATION_MANIFEST_PATH = "ci/VERIFICATION_MANIFEST.jsonl"
+VERIFICATION_EVIDENCE_REGISTRY_SCHEMA = "fln.verification-evidence-registry/1"
+VERIFICATION_EVIDENCE_RECEIPT_SCHEMA = "fln.verification-evidence-receipt/1"
+VERIFICATION_EVIDENCE_REGISTRY_PATH = (
+    "ci/VERIFICATION_EVIDENCE_RECEIPTS.jsonl"
+)
+VERIFICATION_RECEIPT_REFERENCE_PREFIX = "receipt:sha256:"
+# None means that the optional registry has not been adopted yet. A missing
+# registry is then a typed, visible absence when no manifest row cites a
+# receipt. If a registry appears before this authority is frozen, validation
+# refuses it rather than trusting a self-described migration boundary.
+VERIFICATION_LEGACY_ADOPTION_AUTHORITY_HASH: str | None = None
+VERIFICATION_LEGACY_TRACKING_BEAD = (
+    "franken_lean-ephemeral-manifest-artifact-povo"
+)
+VERIFICATION_LEGACY_CLASSIFICATIONS = frozenset(
+    {
+        "absolute_path",
+        "directory",
+        "glob",
+        "ignored",
+        "invalid_bead",
+        "invalid_comment",
+        "missing",
+        "short_commit",
+        "special",
+        "symlink",
+        "traversal_path",
+        "unknown_structured",
+        "unreachable_commit",
+        "untracked",
+    }
+)
 CHECK_HUMAN_SCHEMA = "fln.check-human/1"
 CHECK_HUMAN_LOG = "human.semantic.log"
 CENSUS_AVAILABILITY_SCHEMA = "fln.census-availability/1"
@@ -1181,6 +1213,10 @@ SECRET_KEY = re.compile(
 
 class EvidenceError(RuntimeError):
     """A fail-closed evidence production or validation error."""
+
+
+class VerificationEvidenceRegistryAbsent(EvidenceError):
+    """A manifest claim needs the optional receipt authority, but it is absent."""
 
 
 class SetupTimeoutError(EvidenceError):
@@ -4234,11 +4270,927 @@ def derived_verification_coverage_state(bead_status: str, skip: str) -> str:
     )
 
 
+def verification_legacy_pair_id(bead_id: str, artifact: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-evidence.legacy-pair/1")
+    digest.update(b"\0")
+    for value in (bead_id, artifact):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def verification_legacy_adoption_projection_hash(
+    pair_ids: Sequence[str],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-evidence.legacy-adoption.ids/1")
+    digest.update(b"\0")
+    for pair_id in pair_ids:
+        encoded = pair_id.encode("ascii")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def verification_legacy_adoption_authority_hash(
+    migration_commit: str, pair_ids: Sequence[str]
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-evidence.legacy-adoption-authority/1")
+    digest.update(b"\0")
+    commit_bytes = migration_commit.encode("ascii")
+    digest.update(len(commit_bytes).to_bytes(8, "little"))
+    digest.update(commit_bytes)
+    for pair_id in pair_ids:
+        encoded = pair_id.encode("ascii")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def verification_receipt_content_address(record: Mapping[str, Any]) -> str:
+    payload = dict(record)
+    payload.pop("receipt", None)
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-evidence.receipt/1")
+    digest.update(b"\0")
+    digest.update(canonical_json(payload))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def require_sha256_identity(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", value
+    ) is None:
+        raise EvidenceError(f"{label} is not a canonical SHA-256 identity")
+    return value
+
+
+def require_exact_object_keys(
+    path: Path,
+    number: int,
+    value: Any,
+    expected: set[str],
+    *,
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise EvidenceError(f"{path}:{number}: {label} must be an object")
+    if set(value) != expected:
+        raise EvidenceError(
+            f"{path}:{number}: {label} shape differs: "
+            f"missing={sorted(expected - set(value))!r} "
+            f"extra={sorted(set(value) - expected)!r}"
+        )
+    return value
+
+
+def validate_verification_receipt_record(
+    path: Path,
+    number: int,
+    record: Mapping[str, Any],
+    bead_states: Mapping[str, Mapping[str, Any]],
+) -> str:
+    expected_keys = {
+        "schema",
+        "kind",
+        "receipt",
+        "producer",
+        "outcome",
+        "source",
+        "execution",
+        "reference",
+    }
+    if set(record) != expected_keys:
+        raise EvidenceError(
+            f"{path}:{number}: receipt shape differs: "
+            f"missing={sorted(expected_keys - set(record))!r} "
+            f"extra={sorted(set(record) - expected_keys)!r}"
+        )
+    if (
+        record.get("schema") != VERIFICATION_EVIDENCE_RECEIPT_SCHEMA
+        or record.get("kind") != "receipt"
+    ):
+        raise EvidenceError(f"{path}:{number}: invalid receipt identity")
+    receipt_id = require_sha256_identity(
+        record.get("receipt"), label=f"{path}:{number}: receipt"
+    )
+
+    producer = require_exact_object_keys(
+        path,
+        number,
+        record.get("producer"),
+        {
+            "tool",
+            "run_schema",
+            "run_id",
+            "bead",
+            "scenario",
+            "producing_commit",
+            "commit_binding",
+        },
+        label="receipt producer",
+    )
+    if producer.get("tool") != (
+        "scripts/evidence.py:promote-verification-receipt/1"
+    ):
+        raise EvidenceError(f"{path}:{number}: receipt producer tool differs")
+    if producer.get("run_schema") not in RUN_SCHEMAS:
+        raise EvidenceError(f"{path}:{number}: receipt run schema is unsupported")
+    for field in ("run_id", "bead", "scenario"):
+        if not isinstance(producer.get(field), str) or not producer[field]:
+            raise EvidenceError(
+                f"{path}:{number}: receipt producer {field} is missing"
+            )
+    if producer["bead"] not in bead_states:
+        raise EvidenceError(
+            f"{path}:{number}: receipt has orphan bead {producer['bead']!r}"
+        )
+    commit_binding = producer.get("commit_binding")
+    producing_commit = producer.get("producing_commit")
+    if commit_binding not in {
+        "recorded",
+        "operator_attested_legacy",
+        "unbound",
+    }:
+        raise EvidenceError(
+            f"{path}:{number}: receipt commit binding is unsupported"
+        )
+    if commit_binding == "unbound":
+        if producing_commit != "unavailable":
+            raise EvidenceError(
+                f"{path}:{number}: unbound receipt claims a producing commit"
+            )
+    elif not isinstance(producing_commit, str) or re.fullmatch(
+        r"[0-9a-f]{40}", producing_commit
+    ) is None:
+        raise EvidenceError(
+            f"{path}:{number}: bound receipt lacks a full producing commit"
+        )
+
+    outcome = require_exact_object_keys(
+        path,
+        number,
+        record.get("outcome"),
+        {
+            "verdict",
+            "process_exit",
+            "reason_code",
+            "input_root",
+            "final_root",
+            "governed_state_static",
+            "governed_scope",
+            "governed_set",
+        },
+        label="receipt outcome",
+    )
+    if outcome.get("verdict") not in {
+        "pass",
+        "fail",
+        "inconclusive",
+        "internal_fault",
+        "cancelled",
+    }:
+        raise EvidenceError(f"{path}:{number}: receipt verdict is unsupported")
+    process_exit = outcome.get("process_exit")
+    if (
+        not isinstance(process_exit, int)
+        or isinstance(process_exit, bool)
+        or process_exit < 0
+        or process_exit > 255
+    ):
+        raise EvidenceError(
+            f"{path}:{number}: receipt process_exit must be an exit byte"
+        )
+    if not isinstance(outcome.get("reason_code"), str) or not outcome[
+        "reason_code"
+    ]:
+        raise EvidenceError(f"{path}:{number}: receipt reason_code is missing")
+    input_root = require_sha256_identity(
+        outcome.get("input_root"),
+        label=f"{path}:{number}: receipt input_root",
+    )
+    final_root = require_sha256_identity(
+        outcome.get("final_root"),
+        label=f"{path}:{number}: receipt final_root",
+    )
+    if not isinstance(outcome.get("governed_state_static"), bool):
+        raise EvidenceError(
+            f"{path}:{number}: receipt governed_state_static must be boolean"
+        )
+    if outcome["governed_state_static"] != hmac.compare_digest(
+        input_root, final_root
+    ):
+        raise EvidenceError(
+            f"{path}:{number}: receipt static-state claim disagrees with roots"
+        )
+    if outcome.get("governed_scope") not in {
+        "full_repository",
+        "lane_declared_subset",
+    }:
+        raise EvidenceError(
+            f"{path}:{number}: receipt governed scope is untyped"
+        )
+    governed_set = outcome.get("governed_set")
+    if commit_binding == "recorded":
+        require_sha256_identity(
+            governed_set,
+            label=f"{path}:{number}: recorded governed set",
+        )
+    elif governed_set != "unavailable":
+        require_sha256_identity(
+            governed_set,
+            label=f"{path}:{number}: legacy governed set",
+        )
+    if outcome["verdict"] == "pass":
+        if process_exit != PASS or not outcome["governed_state_static"]:
+            raise EvidenceError(
+                f"{path}:{number}: passing receipt lacks a static successful run"
+            )
+
+    source = require_exact_object_keys(
+        path,
+        number,
+        record.get("source"),
+        {
+            "bundle_commit_sha256",
+            "manifest_sha256",
+            "manifest_digest_sha256",
+            "run_log_sha256",
+        },
+        label="receipt source",
+    )
+    for field in source:
+        require_sha256_identity(
+            source[field], label=f"{path}:{number}: receipt source {field}"
+        )
+
+    execution = require_exact_object_keys(
+        path,
+        number,
+        record.get("execution"),
+        {
+            "authority",
+            "executed",
+            "expected_failure",
+            "typed_skip",
+            "not_run",
+        },
+        label="receipt execution",
+    )
+    if execution.get("authority") not in {
+        "structured_run_log",
+        "bundle_only",
+    }:
+        raise EvidenceError(
+            f"{path}:{number}: receipt execution authority is unsupported"
+        )
+    disposition_fields = (
+        "executed",
+        "expected_failure",
+        "typed_skip",
+        "not_run",
+    )
+    dispositions = {
+        field: require_manifest_string_array(
+            path, number, execution, field, nonempty=False
+        )
+        for field in disposition_fields
+    }
+    seen_dispositions: dict[str, str] = {}
+    for field, identities in dispositions.items():
+        for identity in identities:
+            prior = seen_dispositions.setdefault(identity, field)
+            if prior != field:
+                raise EvidenceError(
+                    f"{path}:{number}: execution identity {identity!r} has "
+                    f"both {prior} and {field} dispositions"
+                )
+    if not seen_dispositions:
+        raise EvidenceError(
+            f"{path}:{number}: receipt execution inventory is empty"
+        )
+    if execution["authority"] == "bundle_only" and (
+        execution["executed"] or execution["expected_failure"]
+    ):
+        raise EvidenceError(
+            f"{path}:{number}: bundle-only receipt claims per-unit execution"
+        )
+
+    reference = require_exact_object_keys(
+        path,
+        number,
+        record.get("reference"),
+        {"status", "binding_sha256"},
+        label="receipt reference",
+    )
+    if reference.get("status") not in {
+        "installed_and_bound",
+        "absent",
+        "not_applicable",
+        "unobserved",
+    }:
+        raise EvidenceError(
+            f"{path}:{number}: receipt Reference status is unsupported"
+        )
+    if reference["status"] == "installed_and_bound":
+        require_sha256_identity(
+            reference.get("binding_sha256"),
+            label=f"{path}:{number}: receipt Reference binding",
+        )
+    elif reference.get("binding_sha256") != "not_applicable":
+        raise EvidenceError(
+            f"{path}:{number}: unbound Reference status claims a binding"
+        )
+
+    expected_receipt = verification_receipt_content_address(record)
+    if not hmac.compare_digest(receipt_id, expected_receipt):
+        raise EvidenceError(
+            f"{path}:{number}: receipt content address differs"
+        )
+    return receipt_id
+
+
+def load_verification_evidence_registry(
+    path: Path,
+    bead_states: Mapping[str, Mapping[str, Any]],
+    *,
+    expected_legacy_authority_hash: str | None = (
+        VERIFICATION_LEGACY_ADOPTION_AUTHORITY_HASH
+    ),
+) -> dict[str, Any]:
+    path = lexical_absolute(path)
+    if expected_legacy_authority_hash is None:
+        raise EvidenceError(
+            f"{path}: verification evidence registry exists before its "
+            "legacy adoption authority is frozen"
+        )
+    records, digest = load_ndjson_snapshot(path)
+    header = records[0]
+    header_keys = {
+        "schema",
+        "kind",
+        "source",
+        "projection",
+        "hash_algorithm",
+        "hash_preimage",
+        "migration_commit",
+        "adoption_record_count",
+        "adoption_projection_hash",
+        "adoption_pair_ids",
+        "record_count",
+        "receipt_count",
+        "target_artifact_ceiling",
+    }
+    if set(header) != header_keys:
+        raise EvidenceError(
+            f"{path}: registry header shape differs: "
+            f"missing={sorted(header_keys - set(header))!r} "
+            f"extra={sorted(set(header) - header_keys)!r}"
+        )
+    if (
+        header.get("schema") != VERIFICATION_EVIDENCE_REGISTRY_SCHEMA
+        or header.get("kind") != "registry"
+        or header.get("source") != VERIFICATION_MANIFEST_PATH
+        or header.get("projection") != "exact-terminal-artifact-pairs-v1"
+        or header.get("hash_algorithm") != "sha256"
+        or header.get("hash_preimage")
+        != "fln.verification-evidence.legacy-pair/1+nul+"
+        "u64le-length-prefixed-bead+artifact"
+    ):
+        raise EvidenceError(f"{path}: invalid registry authority header")
+    migration_commit = header.get("migration_commit")
+    if not isinstance(migration_commit, str) or re.fullmatch(
+        r"[0-9a-f]{40}", migration_commit
+    ) is None:
+        raise EvidenceError(f"{path}: migration commit is not a full object id")
+    adoption_pair_ids = require_manifest_string_array(
+        path, 1, header, "adoption_pair_ids", nonempty=False
+    )
+    if any(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", pair_id) is None
+        for pair_id in adoption_pair_ids
+    ):
+        raise EvidenceError(f"{path}: adoption pair id is malformed")
+    if (
+        not isinstance(header.get("adoption_record_count"), int)
+        or isinstance(header["adoption_record_count"], bool)
+        or header["adoption_record_count"] != len(adoption_pair_ids)
+    ):
+        raise EvidenceError(f"{path}: adoption record count is stale")
+    expected_projection_hash = (
+        verification_legacy_adoption_projection_hash(adoption_pair_ids)
+    )
+    if not hmac.compare_digest(
+        str(header.get("adoption_projection_hash")),
+        expected_projection_hash,
+    ):
+        raise EvidenceError(f"{path}: adoption projection hash is stale")
+    authority_hash = verification_legacy_adoption_authority_hash(
+        migration_commit, adoption_pair_ids
+    )
+    if not hmac.compare_digest(
+        authority_hash, expected_legacy_authority_hash
+    ):
+        raise EvidenceError(
+            f"{path}: legacy adoption authority differs from the frozen migration"
+        )
+    if (
+        not isinstance(header.get("record_count"), int)
+        or isinstance(header["record_count"], bool)
+        or header["record_count"] != len(records) - 1
+    ):
+        raise EvidenceError(f"{path}: registry record count is stale")
+    if header.get("target_artifact_ceiling") != 0:
+        raise EvidenceError(f"{path}: target artifact ceiling must remain zero")
+
+    adopted = set(adoption_pair_ids)
+    legacy_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    legacy_pair_ids: set[str] = set()
+    receipts: dict[str, Mapping[str, Any]] = {}
+    order: list[tuple[int, str, str]] = []
+    receipt_count = 0
+    for number, record in enumerate(records[1:], 2):
+        kind = record.get("kind")
+        if kind == "legacy-artifact":
+            expected_keys = {
+                "schema",
+                "kind",
+                "pair_id",
+                "bead",
+                "artifact",
+                "classification",
+                "tracking_bead",
+            }
+            if set(record) != expected_keys:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy row shape differs"
+                )
+            if record.get("schema") != VERIFICATION_EVIDENCE_REGISTRY_SCHEMA:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy row schema differs"
+                )
+            bead_id = record.get("bead")
+            artifact = record.get("artifact")
+            if (
+                not isinstance(bead_id, str)
+                or not bead_id
+                or not isinstance(artifact, str)
+                or not artifact
+            ):
+                raise EvidenceError(
+                    f"{path}:{number}: legacy pair identity is missing"
+                )
+            pair_id = verification_legacy_pair_id(bead_id, artifact)
+            if not hmac.compare_digest(str(record.get("pair_id")), pair_id):
+                raise EvidenceError(
+                    f"{path}:{number}: legacy pair content address differs"
+                )
+            if pair_id not in adopted:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy pair was not present at migration"
+                )
+            classification = record.get("classification")
+            if classification not in VERIFICATION_LEGACY_CLASSIFICATIONS:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy classification is unsupported"
+                )
+            if record.get("tracking_bead") != VERIFICATION_LEGACY_TRACKING_BEAD:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy debt has the wrong tracking bead"
+                )
+            state = bead_states.get(bead_id)
+            if state is None:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy row has orphan bead {bead_id!r}"
+                )
+            if state["status"] not in {"closed", "tombstone"}:
+                raise EvidenceError(
+                    f"{path}:{number}: nonterminal bead consumes legacy debt"
+                )
+            pair = (bead_id, artifact)
+            if pair in legacy_by_pair or pair_id in legacy_pair_ids:
+                raise EvidenceError(
+                    f"{path}:{number}: duplicate legacy artifact pair"
+                )
+            legacy_by_pair[pair] = dict(record)
+            legacy_pair_ids.add(pair_id)
+            order.append((0, bead_id, artifact))
+        elif kind == "receipt":
+            receipt_id = validate_verification_receipt_record(
+                path, number, record, bead_states
+            )
+            if receipt_id in receipts:
+                raise EvidenceError(
+                    f"{path}:{number}: duplicate verification receipt"
+                )
+            receipts[receipt_id] = record
+            receipt_count += 1
+            order.append((1, receipt_id, ""))
+        else:
+            raise EvidenceError(
+                f"{path}:{number}: unknown registry row kind {kind!r}"
+            )
+    if order != sorted(order):
+        raise EvidenceError(
+            f"{path}: rows must be legacy-then-receipt canonical order"
+        )
+    if (
+        not isinstance(header.get("receipt_count"), int)
+        or isinstance(header["receipt_count"], bool)
+        or header["receipt_count"] != receipt_count
+    ):
+        raise EvidenceError(f"{path}: receipt count is stale")
+    return {
+        "path": path,
+        "sha256": digest,
+        "migration_commit": migration_commit,
+        "adoption_pair_ids": adopted,
+        "legacy_by_pair": legacy_by_pair,
+        "receipts": receipts,
+    }
+
+
+def verification_git_index_snapshot(
+    root: Path,
+) -> tuple[str, dict[str, str]]:
+    data = run_git(
+        root,
+        ["ls-files", "--stage", "-z"],
+        subject="verification artifact tracked-file inventory",
+    )
+    digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
+    entries = split_git_nul(
+        data, subject="verification artifact tracked-file inventory"
+    )
+    modes: dict[str, str] = {}
+    for entry in entries:
+        metadata, separator, path = entry.partition("\t")
+        parts = metadata.split(" ")
+        if separator != "\t" or len(parts) != 3 or not path:
+            raise EvidenceError(
+                "verification artifact tracked-file inventory is malformed"
+            )
+        mode, _object_id, stage = parts
+        if stage != "0":
+            raise EvidenceError(
+                f"verification artifact path {path!r} is unmerged"
+            )
+        if path in modes:
+            raise EvidenceError(
+                f"verification artifact inventory repeats {path!r}"
+            )
+        modes[path] = mode
+    return digest, modes
+
+
+def verification_git_path_is_ignored(root: Path, path: str) -> bool:
+    data = run_git(
+        root,
+        ["check-ignore", "--no-index", "--", path],
+        subject=f"verification artifact ignore classification for {path!r}",
+        accepted_exits={0, 1},
+    )
+    if not data:
+        return False
+    try:
+        ignored = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"verification artifact ignore classification for {path!r} "
+            "returned non-UTF-8 output"
+        ) from error
+    if ignored != f"{path}\n":
+        raise EvidenceError(
+            f"verification artifact ignore classification for {path!r} "
+            "returned a different path"
+        )
+    return True
+
+
+def verification_artifact_path_token(artifact: str) -> str | None:
+    if artifact.startswith("repo-file:"):
+        return artifact.removeprefix("repo-file:")
+    if ":" in artifact:
+        return None
+    return artifact
+
+
+def verification_path_lexical_classification(path: str) -> str | None:
+    if Path(path).is_absolute():
+        return "absolute_path"
+    if (
+        not path
+        or "\\" in path
+        or path.startswith("./")
+        or "//" in path
+        or any(component in {"", ".", ".."} for component in path.split("/"))
+    ):
+        return "traversal_path"
+    if any(character in path for character in "*?["):
+        return "glob"
+    if path == "target" or path.startswith("target/"):
+        return "target_path"
+    return None
+
+
+def verification_path_object_classification(
+    root: Path,
+    path: str,
+    *,
+    tracked_modes: Mapping[str, str],
+    ignored_paths: set[str],
+) -> str:
+    mode = tracked_modes.get(path)
+    current = root
+    components = path.split("/")
+    for index, component in enumerate(components):
+        current /= component
+        try:
+            object_mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return "ignored" if path in ignored_paths else "missing"
+        if stat.S_ISLNK(object_mode):
+            return "symlink"
+        if index != len(components) - 1:
+            if not stat.S_ISDIR(object_mode):
+                return "special"
+            continue
+        if stat.S_ISDIR(object_mode):
+            return "directory"
+        if not stat.S_ISREG(object_mode):
+            return "special"
+    if mode in {"100644", "100755"}:
+        return "tracked_file"
+    if mode == "120000":
+        return "symlink"
+    if mode is not None:
+        return "special"
+    if path in ignored_paths:
+        return "ignored"
+    return "untracked"
+
+
+def build_verification_artifact_authority(
+    manifest_path: Path, artifacts: Iterable[str]
+) -> dict[str, Any]:
+    if (
+        manifest_path.name != Path(VERIFICATION_MANIFEST_PATH).name
+        or manifest_path.parent.name != "ci"
+    ):
+        raise EvidenceError(
+            "production verification artifact authority requires the canonical "
+            "ci/VERIFICATION_MANIFEST.jsonl path"
+        )
+    root = manifest_path.parent.parent
+    head = git_text(
+        root,
+        ["rev-parse", "--verify", "HEAD"],
+        subject="verification artifact repository HEAD",
+    )
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        raise EvidenceError("verification artifact repository HEAD is malformed")
+    index_digest, tracked_modes = verification_git_index_snapshot(root)
+    ignored_paths: set[str] = set()
+    reachable_commits: set[str] = set()
+    for artifact in sorted(set(artifacts)):
+        path = verification_artifact_path_token(artifact)
+        if (
+            path is not None
+            and verification_path_lexical_classification(path) is None
+            and path not in tracked_modes
+            and verification_git_path_is_ignored(root, path)
+        ):
+            ignored_paths.add(path)
+        if artifact.startswith("commit:"):
+            commit = artifact.removeprefix("commit:")
+            if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                continue
+            object_type = run_git(
+                root,
+                ["cat-file", "-t", commit],
+                subject=f"verification artifact commit {commit}",
+                accepted_exits={0, 128},
+            ).decode("ascii", errors="strict").strip()
+            if object_type != "commit":
+                continue
+            merge_base = run_git(
+                root,
+                ["merge-base", commit, "HEAD"],
+                subject=f"verification artifact reachability for {commit}",
+                accepted_exits={0, 1},
+            ).decode("ascii", errors="strict").strip()
+            if hmac.compare_digest(merge_base, commit):
+                reachable_commits.add(commit)
+    repeated_head = git_text(
+        root,
+        ["rev-parse", "--verify", "HEAD"],
+        subject="repeated verification artifact repository HEAD",
+    )
+    repeated_index_digest, repeated_modes = (
+        verification_git_index_snapshot(root)
+    )
+    if (
+        not hmac.compare_digest(head, repeated_head)
+        or not hmac.compare_digest(index_digest, repeated_index_digest)
+        or tracked_modes != repeated_modes
+    ):
+        raise EvidenceError(
+            "verification artifact repository authority changed during census"
+        )
+    return {
+        "root": root,
+        "head": head,
+        "index_digest": index_digest,
+        "tracked_modes": tracked_modes,
+        "ignored_paths": ignored_paths,
+        "reachable_commits": reachable_commits,
+        "live_git": True,
+    }
+
+
+def verification_artifact_classification(
+    bead_id: str,
+    artifact: str,
+    *,
+    bead_states: Mapping[str, Mapping[str, Any]],
+    authority: Mapping[str, Any],
+    receipts: Mapping[str, Mapping[str, Any]],
+) -> str:
+    if artifact.startswith(VERIFICATION_RECEIPT_REFERENCE_PREFIX):
+        receipt_id = artifact.removeprefix("receipt:")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_id) is None:
+            return "unknown_receipt"
+        return "receipt" if receipt_id in receipts else "unknown_receipt"
+    if artifact.startswith("commit:"):
+        commit = artifact.removeprefix("commit:")
+        if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+            return "short_commit"
+        return (
+            "commit"
+            if commit in authority["reachable_commits"]
+            else "unreachable_commit"
+        )
+    if artifact.startswith(f"{CLOSURE_CITATION_PREFIX}:"):
+        parts = artifact.split(":")
+        if (
+            len(parts) != 3
+            or parts[1] != bead_id
+            or re.fullmatch(r"[0-9]+", parts[2]) is None
+            or int(parts[2]) not in bead_states[bead_id]["comments"]
+        ):
+            return "invalid_comment"
+        return "bead_comment"
+    if artifact.startswith("bead:"):
+        parts = artifact.split(":", 2)
+        if (
+            len(parts) != 3
+            or parts[1] != bead_id
+            or not parts[2]
+            or parts[1] not in bead_states
+        ):
+            return "invalid_bead"
+        return "bead"
+    path = verification_artifact_path_token(artifact)
+    if path is None:
+        return "unknown_structured"
+    lexical_classification = verification_path_lexical_classification(path)
+    if lexical_classification is not None:
+        return lexical_classification
+    return verification_path_object_classification(
+        authority["root"],
+        path,
+        tracked_modes=authority["tracked_modes"],
+        ignored_paths=authority["ignored_paths"],
+    )
+
+
+def validate_verification_artifact_references(
+    manifest_path: Path,
+    coverage: Mapping[str, Mapping[str, Any]],
+    coverage_numbers: Mapping[str, int],
+    derived_states: Mapping[str, str],
+    bead_states: Mapping[str, Mapping[str, Any]],
+    registry: Mapping[str, Any],
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    durable_classes = {
+        "tracked_file",
+        "bead_comment",
+        "bead",
+        "commit",
+        "receipt",
+    }
+    used_legacy: set[tuple[str, str]] = set()
+    artifact_pairs_scanned = 0
+    durable_pairs = 0
+    receipt_references = 0
+    for bead_id, record in coverage.items():
+        number = coverage_numbers[bead_id]
+        for artifact in record["artifacts"]:
+            artifact_pairs_scanned += 1
+            pair = (bead_id, artifact)
+            classification = verification_artifact_classification(
+                bead_id,
+                artifact,
+                bead_states=bead_states,
+                authority=authority,
+                receipts=registry["receipts"],
+            )
+            legacy = registry["legacy_by_pair"].get(pair)
+            if classification == "target_path":
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: {bead_id!r} cites transient "
+                    f"target artifact {artifact!r}; target evidence must be "
+                    "promoted before citation"
+                )
+            if classification in durable_classes:
+                if legacy is not None:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: repaired artifact {artifact!r} "
+                        "still has a stale legacy allowance"
+                    )
+                durable_pairs += 1
+                if classification == "receipt":
+                    receipt_references += 1
+                continue
+            if derived_states[bead_id] != "complete":
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: nonterminal coverage cannot "
+                    f"consume legacy artifact debt: {artifact!r} is "
+                    f"{classification}"
+                )
+            if classification == "unknown_receipt":
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: receipt reference {artifact!r} "
+                    "does not resolve through the tracked registry"
+                )
+            if legacy is None:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: non-durable artifact "
+                    f"{artifact!r} on {bead_id!r} has typed classification "
+                    f"{classification!r} and no exact migration allowance"
+                )
+            if legacy["classification"] != classification:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: legacy artifact {artifact!r} "
+                    f"changed class from {legacy['classification']!r} to "
+                    f"{classification!r}"
+                )
+            used_legacy.add(pair)
+    stale_legacy = sorted(set(registry["legacy_by_pair"]) - used_legacy)
+    if stale_legacy:
+        raise EvidenceError(
+            f"{registry['path']}: legacy allowances outlived their exact "
+            f"non-durable pairs: {stale_legacy!r}"
+        )
+    if artifact_pairs_scanned == 0:
+        raise EvidenceError(
+            f"{manifest_path}: artifact collector scanned zero pairs"
+        )
+    if authority.get("live_git"):
+        repeated_head = git_text(
+            authority["root"],
+            ["rev-parse", "--verify", "HEAD"],
+            subject="final verification artifact repository HEAD",
+        )
+        repeated_index_digest, _repeated_modes = (
+            verification_git_index_snapshot(authority["root"])
+        )
+        if (
+            not hmac.compare_digest(authority["head"], repeated_head)
+            or not hmac.compare_digest(
+                authority["index_digest"], repeated_index_digest
+            )
+        ):
+            raise EvidenceError(
+                "verification artifact repository authority changed during "
+                "validation"
+            )
+    return {
+        "artifact_pairs_scanned": artifact_pairs_scanned,
+        "durable_artifact_pairs": durable_pairs,
+        "legacy_artifact_pairs": len(used_legacy),
+        "receipt_references": receipt_references,
+        "legacy_pair_ids": sorted(
+            verification_legacy_pair_id(*pair) for pair in used_legacy
+        ),
+        "registry_sha256": registry["sha256"],
+    }
+
+
 def validate_verification_manifest(
     manifest_path: Path,
     beads_path: Path,
     *,
     expected_adoption_authority_hash: str = VERIFICATION_ADOPTION_AUTHORITY_HASH,
+    receipt_registry_path: Path | None = None,
+    artifact_authority: Mapping[str, Any] | None = None,
+    expected_legacy_authority_hash: str | None = (
+        VERIFICATION_LEGACY_ADOPTION_AUTHORITY_HASH
+    ),
 ) -> dict[str, Any]:
     manifest_path = lexical_absolute(manifest_path)
     beads_path = lexical_absolute(beads_path)
@@ -4521,6 +5473,7 @@ def validate_verification_manifest(
         "complete": 0,
         "blocked": 0,
     }
+    derived_states: dict[str, str] = {}
     closure_bound_rows = 0
     closure_exempt_rows = 0
     # Validated here rather than trusted: a malformed boundary must refuse, not
@@ -4539,6 +5492,7 @@ def validate_verification_manifest(
         derived_state = derived_verification_coverage_state(
             bead_states[bead_id]["status"], record["skip"]
         )
+        derived_states[bead_id] = derived_state
         derived_state_counts[derived_state] += 1
         number = coverage_numbers[bead_id]
         if derived_state in {"active", "complete"} and record["skip"] != "none":
@@ -4599,6 +5553,78 @@ def validate_verification_manifest(
                         f"comment.) Citations that cannot bind this closure: "
                         f"{rejected!r}"
                     )
+    registry_path = (
+        lexical_absolute(receipt_registry_path)
+        if receipt_registry_path is not None
+        else manifest_path.with_name(
+            Path(VERIFICATION_EVIDENCE_REGISTRY_PATH).name
+        )
+    )
+    receipt_references = sorted(
+        (bead_id, artifact)
+        for bead_id, record in coverage.items()
+        for artifact in record["artifacts"]
+        if artifact.startswith(VERIFICATION_RECEIPT_REFERENCE_PREFIX)
+    )
+    try:
+        registry_mode = registry_path.lstat().st_mode
+    except FileNotFoundError:
+        registry_mode = None
+    if registry_mode is None:
+        if receipt_references:
+            raise VerificationEvidenceRegistryAbsent(
+                f"{registry_path}: verification evidence registry is absent "
+                f"but manifest receipt claims require it: {receipt_references!r}"
+            )
+        registry_status = "absent_no_receipt_claims"
+        artifact_report = {
+            "artifact_reference_validation": "not_adopted_registry_absent",
+            "artifact_pairs_scanned": sum(
+                len(record["artifacts"]) for record in coverage.values()
+            ),
+            "durable_artifact_pairs": None,
+            "legacy_artifact_pairs": None,
+            "receipt_references": 0,
+            "legacy_pair_ids": None,
+            "registry_sha256": None,
+        }
+        receipt_rows = 0
+        target_artifact_ceiling: int | None = None
+    else:
+        if not stat.S_ISREG(registry_mode):
+            raise EvidenceError(
+                f"{registry_path}: verification evidence registry must be a "
+                "regular file"
+            )
+        registry = load_verification_evidence_registry(
+            registry_path,
+            bead_states,
+            expected_legacy_authority_hash=expected_legacy_authority_hash,
+        )
+        if artifact_authority is None:
+            artifact_authority = build_verification_artifact_authority(
+                manifest_path,
+                (
+                    artifact
+                    for record in coverage.values()
+                    for artifact in record["artifacts"]
+                ),
+            )
+        artifact_report = {
+            "artifact_reference_validation": "enforced",
+            **validate_verification_artifact_references(
+                manifest_path,
+                coverage,
+                coverage_numbers,
+                derived_states,
+                bead_states,
+                registry,
+                artifact_authority,
+            ),
+        }
+        registry_status = "present_and_validated"
+        receipt_rows = len(registry["receipts"])
+        target_artifact_ceiling = 0
     required_coverage = current_ids - adopted
     required_coverage.update(
         bead_id
@@ -4651,6 +5677,11 @@ def validate_verification_manifest(
         "closure_binding_effective_from": CLOSURE_BINDING_EFFECTIVE_FROM,
         "closure_bound_rows": closure_bound_rows,
         "closure_exempt_rows": closure_exempt_rows,
+        **artifact_report,
+        "receipt_registry": registry_path.name,
+        "receipt_registry_status": registry_status,
+        "receipt_rows": receipt_rows,
+        "target_artifact_ceiling": target_artifact_ceiling,
         "scenario_rows": len(scenarios),
         "ci_scenarios": sorted(
             scenario
@@ -13739,8 +14770,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_validate_verification_manifest(args: argparse.Namespace) -> int:
     try:
         report = validate_verification_manifest(
-            Path(args.manifest), Path(args.beads)
+            Path(args.manifest),
+            Path(args.beads),
+            receipt_registry_path=(
+                Path(args.receipt_registry)
+                if args.receipt_registry is not None
+                else None
+            ),
         )
+    except VerificationEvidenceRegistryAbsent as error:
+        print(f"verification-manifest: typed absence: {error}", file=sys.stderr)
+        return INCONCLUSIVE
     except (
         EvidenceError,
         OSError,
@@ -15286,6 +16326,14 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         and positive_report["derived_state_counts"]["active"] == 2,
         "verification manifest did not derive active lifecycle from the tracker",
     )
+    require(
+        positive_report["receipt_registry_status"]
+        == "absent_no_receipt_claims"
+        and positive_report["artifact_reference_validation"]
+        == "not_adopted_registry_absent"
+        and positive_report["receipt_rows"] == 0,
+        "an unadopted optional receipt registry was not reported as typed absence",
+    )
 
     # The exact same human-authored judgment row remains valid when its bead
     # closes: lifecycle is projected from the tracker, never edited into the
@@ -15433,6 +16481,36 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             {"id": "new-unregistered", "status": "open"}
         ),
     )
+    reject_verification_case(
+        "receipt-claim-with-absent-registry",
+        lambda records, _beads: records[1].update(
+            artifacts=[
+                "human.log",
+                f"{VERIFICATION_RECEIPT_REFERENCE_PREFIX}{'0' * 64}",
+                "run.ndjson",
+            ]
+        ),
+        because=("registry is absent", "manifest receipt claims require it"),
+    )
+
+    try:
+        validate_verification_manifest(
+            positive_manifest,
+            positive_beads,
+            expected_adoption_authority_hash=verification_authority_hash,
+            receipt_registry_path=positive_manifest,
+        )
+    except EvidenceError as error:
+        require(
+            "registry exists before its legacy adoption authority is frozen"
+            in str(error),
+            "a present unadopted registry was refused for the wrong reason",
+        )
+        verification_mutants += 1
+    else:
+        raise EvidenceError(
+            "a present registry was mistaken for optional absence"
+        )
 
     def expand_adoption_boundary(
         records: list[dict[str, Any]], beads: list[dict[str, Any]]
@@ -15661,7 +16739,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     else:
         raise EvidenceError("truncated verification manifest was accepted")
     require(
-        verification_mutants == 22,
+        verification_mutants == 24,
         "verification manifest mutation matrix is incomplete",
     )
     cases.append(
@@ -22593,6 +23671,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verification_manifest_parser.add_argument("--manifest", required=True)
     verification_manifest_parser.add_argument("--beads", required=True)
+    verification_manifest_parser.add_argument(
+        "--receipt-registry",
+        help="verification receipt registry (defaults beside the manifest)",
+    )
     verification_manifest_parser.add_argument("--output")
     verification_manifest_parser.set_defaults(
         func=cmd_validate_verification_manifest
