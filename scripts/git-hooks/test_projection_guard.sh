@@ -511,6 +511,36 @@ git add crates/fln-decoy/tests/multi.rs
 out=$(run_commit -q -m 'multi-lint forbid form' 2>&1); code=$?
 check 'a multi-lint forbid form is accepted, not walled' 0 '' "$code" "$out"
 
+# LARGER THAN THE PIPE BUFFER, which is the cell every small fixture above is blind to.
+# The first form of this guard piped printf into `grep -q`; grep exits on the first match, so
+# with the attribute near the top of a big blob printf died of SIGPIPE, pipefail promoted 141
+# to the pipeline, and the guard refused a CORRECT file purely on its size. 133 B and 5 082 B
+# passed; 202 032 B did not. Both directions are asserted, because a fix that simply stopped
+# refusing would also stop refusing real violations.
+{
+    printf '//! large fixture\n\n#![forbid(unsafe_code)]\n'
+    head -c 200000 /dev/zero | tr '\0' 'x' | fold -w 100
+    printf '\nfn t() {}\n'
+} > crates/fln-decoy/tests/large_ok.rs
+git add crates/fln-decoy/tests/large_ok.rs
+out=$(run_commit -q -m 'large root WITH the attribute' 2>&1); code=$?
+check 'a root larger than the pipe buffer WITH the attribute is accepted' 0 '' "$code" "$out"
+
+{
+    printf '//! large fixture, no attribute\n\n'
+    head -c 200000 /dev/zero | tr '\0' 'x' | fold -w 100
+    printf '\nfn t() {}\n'
+} > crates/fln-decoy/tests/large_bad.rs
+git add crates/fln-decoy/tests/large_bad.rs
+out=$(run_commit -q -m 'large root WITHOUT the attribute' 2>&1); code=$?
+check 'a root larger than the pipe buffer WITHOUT it is still refused' 1 \
+    'crates/fln-decoy/tests/large_bad.rs' "$code" "$out"
+printf '#![forbid(unsafe_code)]\n' | cat - crates/fln-decoy/tests/large_bad.rs \
+    > crates/fln-decoy/tests/large_bad.rs.fixed
+mv crates/fln-decoy/tests/large_bad.rs.fixed crates/fln-decoy/tests/large_bad.rs
+git add crates/fln-decoy/tests/large_bad.rs
+run_commit -q -m 'large root repaired' >/dev/null 2>&1
+
 # The guard must be invisible to every commit that adds no crate root.
 printf 'unrelated\n' >> README.md
 git add README.md

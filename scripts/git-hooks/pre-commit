@@ -212,7 +212,24 @@ if [ -n "$d3_candidates" ]; then
             d3_skipped="${d3_skipped}    ${d3_path} (prospective blob unreadable)"$'\n'
             continue
         fi
-        if ! printf '%s\n' "$d3_text" | grep -Eq "$D3_ATTR_PATTERN"; then
+        # A herestring, NOT a pipeline, and the difference is a wall. `grep -q` exits on
+        # the first match, so with the attribute near the top of a LARGE blob `printf` is
+        # still writing when the pipe closes, dies of SIGPIPE (141), and `pipefail`
+        # promotes that to the pipeline's status -- so `if !` fired and the guard reported
+        # the attribute MISSING on files that carry it, keyed on nothing but FILE SIZE.
+        # Found by cc_1 against a real 188 KB blob within an hour of the guard landing;
+        # every small fixture passed, which is exactly why it shipped.
+        #
+        # Reproduced under bash: 133 B and 5 082 B pass, 202 032 B and 404 032 B return
+        # 141. The threshold is the kernel pipe buffer, not a repository property. It is a
+        # WALL and never a hole -- with the attribute genuinely absent grep reads to EOF,
+        # printf completes, and the pipeline still exits 1, so a real D3 violation was
+        # always still refused.
+        #
+        # THE SHELL IS PART OF THE FINDING: this reproduces under bash, which the shebang
+        # pins, and NOT under zsh, which is the interactive shell on this host. A reader
+        # probing it by hand here gets zsh and concludes there is no defect.
+        if ! grep -Eq "$D3_ATTR_PATTERN" <<<"$d3_text"; then
             d3_missing="${d3_missing}    ${d3_path}"$'\n'
         fi
     done <<< "$d3_candidates"
