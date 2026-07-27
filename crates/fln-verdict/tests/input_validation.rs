@@ -7,9 +7,13 @@
 #![forbid(unsafe_code)]
 
 use fln_verdict::{
-    Clause, ClauseId, Cnf, InputClause, Literal, Polarity, ProofCheckLimits, ProofCheckOutcome,
-    ProofRefusal, ProofRule, ProofStep, ProofStream, SchemaError, SchemaLimits, SolverLimits,
-    SolverOutcome, UnsatProof, VariableId, check_unsat_streams, solve,
+    CNF_SCHEMA, Clause, ClauseId, Cnf, InputClause, Literal, Polarity, ProofCheckLimits,
+    ProofCheckOutcome, ProofRefusal, ProofRule, ProofStep, ProofStream, SchemaError, SchemaLimits,
+    SolverLimits, SolverOutcome, UNSAT_PROOF_SCHEMA, UnsatCertificateAttempt,
+    UnsatCertificateCandidate, UnsatCertificateFallbackFacts, UnsatCertificateInputRoot,
+    UnsatCertificateRefusal, UnsatCertificateSolve, UnsatCertificateVersionBoundary, UnsatProof,
+    VariableId, check_unsat_streams, solve, solve_with_unsat_certificate,
+    unsat_certificate_input_root,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -698,6 +702,489 @@ fn altered_proofs_are_refused_and_recomputed_from_checked_artifacts() {
         format_seeds(&wrongly_accepted_seeds),
         format_failures(&failed_cases)
     );
+}
+
+fn checked_unsat_candidate(cnf: &Cnf) -> UnsatCertificateCandidate {
+    match solve(cnf, SolverLimits::default()) {
+        SolverOutcome::Unsat { artifact, .. } => UnsatCertificateCandidate::from_checked(&artifact),
+        other => panic!("certificate fixture must solve to checked UNSAT: {other:?}"),
+    }
+}
+
+fn untrusted_candidate(
+    version: u16,
+    input_root: UnsatCertificateInputRoot,
+    cnf_schema_version: u16,
+    proof_schema_version: u16,
+    cnf_bytes: Vec<u8>,
+    proof_bytes: Vec<u8>,
+) -> UnsatCertificateCandidate {
+    UnsatCertificateCandidate::from_untrusted_parts(
+        version,
+        input_root,
+        cnf_schema_version,
+        proof_schema_version,
+        cnf_bytes,
+        proof_bytes,
+    )
+}
+
+fn assert_refused_recomputes(
+    cnf: &Cnf,
+    candidate: &UnsatCertificateCandidate,
+    limits: SolverLimits,
+    assert_refusal: impl FnOnce(&UnsatCertificateRefusal),
+) -> UnsatCertificateSolve {
+    let result = solve_with_unsat_certificate(cnf, candidate, limits);
+    let UnsatCertificateAttempt::Refused(refusal) = result.attempt() else {
+        panic!(
+            "certificate-failure arm did not run: attempt={:?}",
+            result.attempt()
+        );
+    };
+    assert_refusal(refusal);
+
+    let expected = solve(cnf, limits);
+    let has_artifact = expected.checked_artifact().is_some();
+    assert_eq!(
+        result.facts(),
+        UnsatCertificateFallbackFacts {
+            attempts: 1,
+            refusals: 1,
+            recomputations: 1,
+            rechecks: u64::from(has_artifact),
+            artifact_publications: u64::from(has_artifact),
+            artifact_nonpublications: u64::from(!has_artifact),
+        },
+        "certificate refusal must bind the exact recovery cardinalities"
+    );
+    assert_eq!(
+        result.outcome(),
+        &expected,
+        "certificate refusal must return the authoritative recomputation outcome"
+    );
+    result
+}
+
+#[test]
+fn production_certificate_wrapper_covers_every_reachable_refusal_branch() {
+    let seed = proof_seed(ProofCaseKind::WrongLiteralSign, 0);
+    let fixture = proof_fixture(seed);
+    let template = checked_unsat_candidate(&fixture.cnf);
+    let expected_root = unsat_certificate_input_root(&fixture.cnf);
+    assert_eq!(template.input_root(), expected_root);
+
+    let verified = solve_with_unsat_certificate(&fixture.cnf, &template, SolverLimits::default());
+    assert_eq!(verified.attempt(), &UnsatCertificateAttempt::Verified);
+    assert_eq!(
+        verified.facts(),
+        UnsatCertificateFallbackFacts {
+            attempts: 1,
+            refusals: 0,
+            recomputations: 0,
+            rechecks: 1,
+            artifact_publications: 1,
+            artifact_nonpublications: 0,
+        }
+    );
+    let SolverOutcome::Unsat {
+        artifact: verified_artifact,
+        ..
+    } = verified.outcome()
+    else {
+        panic!("verified current certificate must return checked UNSAT");
+    };
+    assert_eq!(verified_artifact.cnf_bytes(), template.cnf_bytes());
+    assert_eq!(verified_artifact.proof_bytes(), template.proof_bytes());
+
+    let future_envelope = untrusted_candidate(
+        3,
+        template.input_root(),
+        template.cnf_schema_version(),
+        template.proof_schema_version(),
+        template.cnf_bytes().to_vec(),
+        template.proof_bytes().to_vec(),
+    );
+    let future_result = assert_refused_recomputes(
+        &fixture.cnf,
+        &future_envelope,
+        SolverLimits::default(),
+        |refusal| {
+            assert_eq!(
+                refusal,
+                &UnsatCertificateRefusal::UnsupportedVersion {
+                    boundary: UnsatCertificateVersionBoundary::Envelope,
+                    found: 3,
+                    supported: template.version(),
+                },
+                "allow-version-3 mutant survived the envelope boundary"
+            );
+        },
+    );
+    assert_eq!(future_result.facts().recomputations, 1);
+
+    let mut drifted_root_bytes = expected_root.as_bytes();
+    drifted_root_bytes[0] ^= 0x80;
+    let drifted_root = UnsatCertificateInputRoot::from_untrusted_bytes(drifted_root_bytes);
+    let root_mismatch = untrusted_candidate(
+        template.version(),
+        drifted_root,
+        template.cnf_schema_version(),
+        template.proof_schema_version(),
+        template.cnf_bytes().to_vec(),
+        template.proof_bytes().to_vec(),
+    );
+    assert_refused_recomputes(
+        &fixture.cnf,
+        &root_mismatch,
+        SolverLimits::default(),
+        |refusal| {
+            assert_eq!(
+                refusal,
+                &UnsatCertificateRefusal::InputRootMismatch {
+                    expected: expected_root,
+                    found: drifted_root,
+                }
+            );
+        },
+    );
+
+    let declared_cnf_drift = untrusted_candidate(
+        template.version(),
+        template.input_root(),
+        3,
+        template.proof_schema_version(),
+        template.cnf_bytes().to_vec(),
+        template.proof_bytes().to_vec(),
+    );
+    assert_refused_recomputes(
+        &fixture.cnf,
+        &declared_cnf_drift,
+        SolverLimits::default(),
+        |refusal| {
+            assert_eq!(
+                refusal,
+                &UnsatCertificateRefusal::UnsupportedVersion {
+                    boundary: UnsatCertificateVersionBoundary::DeclaredCnfSchema,
+                    found: 3,
+                    supported: CNF_SCHEMA.version,
+                }
+            );
+        },
+    );
+
+    let declared_proof_drift = untrusted_candidate(
+        template.version(),
+        template.input_root(),
+        template.cnf_schema_version(),
+        3,
+        template.cnf_bytes().to_vec(),
+        template.proof_bytes().to_vec(),
+    );
+    assert_refused_recomputes(
+        &fixture.cnf,
+        &declared_proof_drift,
+        SolverLimits::default(),
+        |refusal| {
+            assert_eq!(
+                refusal,
+                &UnsatCertificateRefusal::UnsupportedVersion {
+                    boundary: UnsatCertificateVersionBoundary::DeclaredProofSchema,
+                    found: 3,
+                    supported: UNSAT_PROOF_SCHEMA.version,
+                }
+            );
+        },
+    );
+
+    let mut mismatched_cnf_bytes = template.cnf_bytes().to_vec();
+    mismatched_cnf_bytes.push(0);
+    let mismatched_cnf_len = mismatched_cnf_bytes.len() as u64;
+    let input_bytes_mismatch = untrusted_candidate(
+        template.version(),
+        template.input_root(),
+        template.cnf_schema_version(),
+        template.proof_schema_version(),
+        mismatched_cnf_bytes,
+        template.proof_bytes().to_vec(),
+    );
+    assert_refused_recomputes(
+        &fixture.cnf,
+        &input_bytes_mismatch,
+        SolverLimits::default(),
+        |refusal| {
+            assert_eq!(
+                refusal,
+                &UnsatCertificateRefusal::InputBytesMismatch {
+                    expected_len: template.cnf_bytes().len() as u64,
+                    found_len: mismatched_cnf_len,
+                }
+            );
+        },
+    );
+
+    let mut cnf_artifact_limit = SolverLimits {
+        max_artifact_bytes: template.cnf_bytes().len() as u64 - 1,
+        ..SolverLimits::default()
+    };
+    assert_refused_recomputes(&fixture.cnf, &template, cnf_artifact_limit, |refusal| {
+        assert_eq!(
+            refusal,
+            &UnsatCertificateRefusal::ArtifactBytesExceeded {
+                stream: ProofStream::Cnf,
+                limit: cnf_artifact_limit.max_artifact_bytes,
+                actual: template.cnf_bytes().len() as u64,
+            }
+        );
+    });
+
+    assert!(
+        template.proof_bytes().len() > template.cnf_bytes().len(),
+        "proof-limit fixture must cross only the proof byte boundary"
+    );
+    cnf_artifact_limit.max_artifact_bytes = template.cnf_bytes().len() as u64;
+    assert_refused_recomputes(&fixture.cnf, &template, cnf_artifact_limit, |refusal| {
+        assert_eq!(
+            refusal,
+            &UnsatCertificateRefusal::ArtifactBytesExceeded {
+                stream: ProofStream::Proof,
+                limit: cnf_artifact_limit.max_artifact_bytes,
+                actual: template.proof_bytes().len() as u64,
+            }
+        );
+    });
+
+    let mut malformed_proof = template.proof_bytes().to_vec();
+    malformed_proof.truncate(WIRE_HEADER_BYTES - 1);
+    let malformed_candidate = untrusted_candidate(
+        template.version(),
+        template.input_root(),
+        template.cnf_schema_version(),
+        template.proof_schema_version(),
+        template.cnf_bytes().to_vec(),
+        malformed_proof,
+    );
+    assert_refused_recomputes(
+        &fixture.cnf,
+        &malformed_candidate,
+        SolverLimits::default(),
+        |refusal| {
+            assert!(
+                matches!(
+                    refusal,
+                    UnsatCertificateRefusal::ProducerDecode(SchemaError::MalformedEncoding { .. })
+                ),
+                "malformed proof must be a typed producer refusal: {refusal:?}"
+            );
+        },
+    );
+
+    let mut future_proof = template.proof_bytes().to_vec();
+    future_proof[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&3_u16.to_le_bytes());
+    let future_proof_candidate = untrusted_candidate(
+        template.version(),
+        template.input_root(),
+        template.cnf_schema_version(),
+        template.proof_schema_version(),
+        template.cnf_bytes().to_vec(),
+        future_proof,
+    );
+    assert_refused_recomputes(
+        &fixture.cnf,
+        &future_proof_candidate,
+        SolverLimits::default(),
+        |refusal| {
+            assert_eq!(
+                refusal,
+                &UnsatCertificateRefusal::UnsupportedVersion {
+                    boundary: UnsatCertificateVersionBoundary::ProducerProofDecoder,
+                    found: 3,
+                    supported: UNSAT_PROOF_SCHEMA.version,
+                }
+            );
+        },
+    );
+
+    let refused_proof = mutate_proof(seed, &fixture);
+    let semantic_candidate = untrusted_candidate(
+        template.version(),
+        template.input_root(),
+        template.cnf_schema_version(),
+        template.proof_schema_version(),
+        template.cnf_bytes().to_vec(),
+        refused_proof.clone(),
+    );
+    let semantic_result = assert_refused_recomputes(
+        &fixture.cnf,
+        &semantic_candidate,
+        SolverLimits::default(),
+        |refusal| {
+            assert!(
+                matches!(
+                    refusal,
+                    UnsatCertificateRefusal::IndependentChecker(reason)
+                        if ProofCaseKind::WrongLiteralSign
+                            .accepts_refusal(reason, &fixture)
+                ),
+                "semantic proof mutant must reach the independent checker: {refusal:?}"
+            );
+        },
+    );
+    let refused_check = check_unsat_streams(
+        template.cnf_bytes(),
+        &refused_proof[..],
+        ProofCheckLimits::default(),
+    );
+    assert!(
+        matches!(refused_check, ProofCheckOutcome::Refused(_)) && refused_check.receipt().is_none(),
+        "accept-refused-candidate mutant survived without a receipt"
+    );
+    let SolverOutcome::Unsat {
+        artifact: recovered,
+        ..
+    } = semantic_result.outcome()
+    else {
+        panic!("semantic refusal must recompute checked UNSAT");
+    };
+    assert_ne!(
+        recovered.proof_bytes(),
+        refused_proof,
+        "reuse-refused-bytes mutant survived recovery"
+    );
+    assert_eq!(
+        semantic_result.facts().recomputations,
+        1,
+        "skip-recomputation mutant survived recovery accounting"
+    );
+
+    let mut checker_limited = SolverLimits::default();
+    checker_limited.checker.max_work_units = 0;
+    let checker_inconclusive =
+        assert_refused_recomputes(&fixture.cnf, &template, checker_limited, |refusal| {
+            assert!(
+                matches!(refusal, UnsatCertificateRefusal::CheckerInconclusive(_)),
+                "checker exhaustion must remain a typed accelerator refusal: {refusal:?}"
+            );
+        });
+    assert!(
+        matches!(
+            checker_inconclusive.outcome(),
+            SolverOutcome::Inconclusive { .. }
+        ) && checker_inconclusive.outcome().checked_artifact().is_none(),
+        "promote-Inconclusive mutant survived the production fallback"
+    );
+    assert_eq!(checker_inconclusive.facts().artifact_nonpublications, 1);
+
+    let sat = Cnf::new(
+        1,
+        vec![InputClause::new(
+            clause_id(1),
+            clause(&[(1, Polarity::Positive)]),
+        )],
+        SchemaLimits::default(),
+    )
+    .expect("different-input fixture is canonical SAT");
+    let sat_root = unsat_certificate_input_root(&sat);
+    let different_input =
+        assert_refused_recomputes(&sat, &template, SolverLimits::default(), |refusal| {
+            assert_eq!(
+                refusal,
+                &UnsatCertificateRefusal::InputRootMismatch {
+                    expected: sat_root,
+                    found: template.input_root(),
+                }
+            );
+        });
+    assert!(
+        matches!(different_input.outcome(), SolverOutcome::Sat { .. }),
+        "substitute-different-input mutant survived: fallback did not solve caller-owned SAT"
+    );
+}
+
+#[test]
+fn certificate_version_policy_exhausts_the_u16_domain() {
+    let fixture = proof_fixture(proof_seed(ProofCaseKind::WrongLiteralSign, 1));
+    let template = checked_unsat_candidate(&fixture.cnf);
+    assert_eq!(CNF_SCHEMA.version, SCHEMA_VERSION);
+    assert_eq!(UNSAT_PROOF_SCHEMA.version, SCHEMA_VERSION);
+
+    let mut cnf_bytes = template.cnf_bytes().to_vec();
+    let mut proof_bytes = template.proof_bytes().to_vec();
+    let mut producer_cnf = (0_u64, 0_u64);
+    let mut producer_proof = (0_u64, 0_u64);
+    let mut checker_cnf = (0_u64, 0_u64);
+    let mut checker_proof = (0_u64, 0_u64);
+
+    for version in u16::MIN..=u16::MAX {
+        cnf_bytes[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&version.to_le_bytes());
+        proof_bytes[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&version.to_le_bytes());
+
+        match Cnf::from_canonical_bytes(&cnf_bytes, SchemaLimits::default()) {
+            Ok(_) if version == CNF_SCHEMA.version => producer_cnf.0 += 1,
+            Err(SchemaError::UnsupportedVersion {
+                schema,
+                found,
+                supported,
+            }) if schema == CNF_SCHEMA && found == version && supported == CNF_SCHEMA.version => {
+                producer_cnf.1 += 1;
+            }
+            other => panic!("CNF producer version {version} had wrong outcome: {other:?}"),
+        }
+
+        match UnsatProof::from_canonical_bytes(&proof_bytes, &fixture.cnf, SchemaLimits::default())
+        {
+            Ok(_) if version == UNSAT_PROOF_SCHEMA.version => producer_proof.0 += 1,
+            Err(SchemaError::UnsupportedVersion {
+                schema,
+                found,
+                supported,
+            }) if schema == UNSAT_PROOF_SCHEMA
+                && found == version
+                && supported == UNSAT_PROOF_SCHEMA.version =>
+            {
+                producer_proof.1 += 1;
+            }
+            other => panic!("proof producer version {version} had wrong outcome: {other:?}"),
+        }
+
+        match check_unsat_streams(
+            &cnf_bytes[..],
+            template.proof_bytes(),
+            ProofCheckLimits::default(),
+        ) {
+            ProofCheckOutcome::Verified(_) if version == CNF_SCHEMA.version => checker_cnf.0 += 1,
+            ProofCheckOutcome::Refused(ProofRefusal::UnsupportedVersion {
+                stream: ProofStream::Cnf,
+                found,
+                supported,
+            }) if found == version && supported == CNF_SCHEMA.version => checker_cnf.1 += 1,
+            other => panic!("CNF checker version {version} had wrong outcome: {other:?}"),
+        }
+
+        match check_unsat_streams(
+            template.cnf_bytes(),
+            &proof_bytes[..],
+            ProofCheckLimits::default(),
+        ) {
+            ProofCheckOutcome::Verified(_) if version == UNSAT_PROOF_SCHEMA.version => {
+                checker_proof.0 += 1;
+            }
+            ProofCheckOutcome::Refused(ProofRefusal::UnsupportedVersion {
+                stream: ProofStream::Proof,
+                found,
+                supported,
+            }) if found == version && supported == UNSAT_PROOF_SCHEMA.version => {
+                checker_proof.1 += 1;
+            }
+            other => panic!("proof checker version {version} had wrong outcome: {other:?}"),
+        }
+    }
+
+    let expected = (1, u64::from(u16::MAX));
+    assert_eq!(producer_cnf, expected);
+    assert_eq!(producer_proof, expected);
+    assert_eq!(checker_cnf, expected);
+    assert_eq!(checker_proof, expected);
 }
 
 #[test]

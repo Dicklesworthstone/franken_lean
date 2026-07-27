@@ -388,6 +388,7 @@ pub struct UnsatCertificateFallbackFacts {
     pub attempts: u64,
     pub refusals: u64,
     pub recomputations: u64,
+    /// Successful candidate checks or authoritative artifact validations.
     pub rechecks: u64,
     /// Returned checked solver artifacts. This is not environment publication.
     pub artifact_publications: u64,
@@ -488,6 +489,56 @@ where
     engine.run(&mut cancelled)
 }
 
+fn producer_certificate_refusal(error: SchemaError) -> UnsatCertificateRefusal {
+    match error {
+        SchemaError::UnsupportedVersion {
+            found, supported, ..
+        } => UnsatCertificateRefusal::UnsupportedVersion {
+            boundary: UnsatCertificateVersionBoundary::ProducerProofDecoder,
+            found,
+            supported,
+        },
+        other => UnsatCertificateRefusal::ProducerDecode(other),
+    }
+}
+
+fn independent_certificate_refusal(reason: ProofRefusal) -> UnsatCertificateRefusal {
+    match reason {
+        ProofRefusal::UnsupportedVersion {
+            stream,
+            found,
+            supported,
+        } => UnsatCertificateRefusal::UnsupportedVersion {
+            boundary: match stream {
+                ProofStream::Cnf => UnsatCertificateVersionBoundary::IndependentCnfChecker,
+                ProofStream::Proof => UnsatCertificateVersionBoundary::IndependentProofChecker,
+            },
+            found,
+            supported,
+        },
+        other => UnsatCertificateRefusal::IndependentChecker(other),
+    }
+}
+
+fn refused_certificate_result(
+    outcome: SolverOutcome,
+    refusal: UnsatCertificateRefusal,
+) -> UnsatCertificateSolve {
+    let has_artifact = outcome.checked_artifact().is_some();
+    UnsatCertificateSolve {
+        outcome,
+        attempt: UnsatCertificateAttempt::Refused(refusal),
+        facts: UnsatCertificateFallbackFacts {
+            attempts: 1,
+            refusals: 1,
+            recomputations: 1,
+            rechecks: u64::from(has_artifact),
+            artifact_publications: u64::from(has_artifact),
+            artifact_nonpublications: u64::from(!has_artifact),
+        },
+    }
+}
+
 /// Verify an untrusted cached certificate, falling back to the authoritative
 /// solver on the exact caller-owned CNF whenever verification refuses it.
 // FLN-FL-INV-06-CERTIFICATE-BOUNDARY: cached-certificate-verify-or-recompute
@@ -532,8 +583,21 @@ pub fn solve_with_unsat_certificate(
                 found_len: candidate.cnf_bytes.len() as u64,
             });
         }
+        for (stream, bytes) in [
+            (ProofStream::Cnf, candidate.cnf_bytes.as_ref()),
+            (ProofStream::Proof, candidate.proof_bytes.as_ref()),
+        ] {
+            let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if actual > limits.max_artifact_bytes {
+                return Err(UnsatCertificateRefusal::ArtifactBytesExceeded {
+                    stream,
+                    limit: limits.max_artifact_bytes,
+                    actual,
+                });
+            }
+        }
         let proof = UnsatProof::from_canonical_bytes(&candidate.proof_bytes, cnf, limits.schema)
-            .map_err(UnsatCertificateRefusal::ProducerDecode)?;
+            .map_err(producer_certificate_refusal)?;
         let receipt = match check_unsat_streams(
             &candidate.cnf_bytes[..],
             &candidate.proof_bytes[..],
@@ -541,7 +605,7 @@ pub fn solve_with_unsat_certificate(
         ) {
             ProofCheckOutcome::Verified(receipt) => receipt,
             ProofCheckOutcome::Refused(reason) => {
-                return Err(UnsatCertificateRefusal::IndependentChecker(reason));
+                return Err(independent_certificate_refusal(reason));
             }
             ProofCheckOutcome::Inconclusive(reason) => {
                 return Err(UnsatCertificateRefusal::CheckerInconclusive(reason));
@@ -574,19 +638,7 @@ pub fn solve_with_unsat_certificate(
         },
         Err(refusal) => {
             let outcome = solve(cnf, limits);
-            let has_artifact = outcome.checked_artifact().is_some();
-            UnsatCertificateSolve {
-                outcome,
-                attempt: UnsatCertificateAttempt::Refused(refusal),
-                facts: UnsatCertificateFallbackFacts {
-                    attempts: 1,
-                    refusals: 1,
-                    recomputations: 1,
-                    artifact_publications: u64::from(has_artifact),
-                    artifact_nonpublications: u64::from(!has_artifact),
-                    ..Default::default()
-                },
-            }
+            refused_certificate_result(outcome, refusal)
         }
     }
 }
@@ -2267,6 +2319,95 @@ mod cdcl_state_model {
             ),
             ProofCheckOutcome::Verified(_)
         ));
+    }
+
+    #[test]
+    fn certificate_fallback_nonanswers_kill_the_promotion_mutant() {
+        let refusal = UnsatCertificateRefusal::UnsupportedVersion {
+            boundary: UnsatCertificateVersionBoundary::Envelope,
+            found: 3,
+            supported: UNSAT_CERTIFICATE_FALLBACK_VERSION,
+        };
+        let nonanswers = [
+            (
+                "Inconclusive",
+                SolverOutcome::Inconclusive {
+                    cause: SolverInconclusive::Cancelled,
+                    statistics: SolverStatistics::default(),
+                },
+            ),
+            (
+                "InternalFault",
+                SolverOutcome::InternalFault {
+                    fault: SolverInternalFault::StateInvariant,
+                    statistics: SolverStatistics::default(),
+                },
+            ),
+        ];
+
+        for (name, outcome) in nonanswers {
+            let result = refused_certificate_result(outcome, refusal.clone());
+            assert!(
+                result.outcome().checked_artifact().is_none(),
+                "promote-{name} mutant survived the checked-artifact boundary"
+            );
+            assert_eq!(
+                result.facts(),
+                UnsatCertificateFallbackFacts {
+                    attempts: 1,
+                    refusals: 1,
+                    recomputations: 1,
+                    rechecks: 0,
+                    artifact_publications: 0,
+                    artifact_nonpublications: 1,
+                },
+                "promote-{name} mutant survived fallback accounting"
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_version_refusals_name_every_decoder_boundary() {
+        assert_eq!(
+            producer_certificate_refusal(SchemaError::UnsupportedVersion {
+                schema: UNSAT_PROOF_SCHEMA,
+                found: 3,
+                supported: UNSAT_PROOF_SCHEMA.version,
+            }),
+            UnsatCertificateRefusal::UnsupportedVersion {
+                boundary: UnsatCertificateVersionBoundary::ProducerProofDecoder,
+                found: 3,
+                supported: UNSAT_PROOF_SCHEMA.version,
+            }
+        );
+
+        for (stream, boundary) in [
+            (
+                ProofStream::Cnf,
+                UnsatCertificateVersionBoundary::IndependentCnfChecker,
+            ),
+            (
+                ProofStream::Proof,
+                UnsatCertificateVersionBoundary::IndependentProofChecker,
+            ),
+        ] {
+            let supported = match stream {
+                ProofStream::Cnf => CNF_SCHEMA.version,
+                ProofStream::Proof => UNSAT_PROOF_SCHEMA.version,
+            };
+            assert_eq!(
+                independent_certificate_refusal(ProofRefusal::UnsupportedVersion {
+                    stream,
+                    found: 3,
+                    supported,
+                }),
+                UnsatCertificateRefusal::UnsupportedVersion {
+                    boundary,
+                    found: 3,
+                    supported,
+                }
+            );
+        }
     }
 
     #[test]

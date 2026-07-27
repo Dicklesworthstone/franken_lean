@@ -19,16 +19,14 @@ found while producing this census is tracked separately by open bug
 
 ## Measurement boundary
 
-- Public-API/source anchor:
-  `8aae792a9a99d522dd5e565f3acd86c369e79575`.
-- Discovery HEAD:
-  `77bfbbfd20814c24ac19702316298f816f7b880d`.
-- The anchor is reachable from that HEAD, and
-  `git diff 8aae792a..77bfbbfd -- crates/fln-verdict` is empty.
-- Implementation source tree:
-  `a04b7b43f8a0b91fab748166feab8a96272162ae`.
-- Test/evidence tree:
-  `4308b8c58abf9c4d786527b3630c8b8a456dd927`.
+- Implementation source tree over the exact closure content:
+  `bd30dc91e23e720373d5d82620a9855ee6560970`.
+- Test/evidence tree over the exact closure content:
+  `134844c9c3d4b18a8ac2c860d587ad99826014b5`.
+- `solver.rs` blob:
+  `1a37f15c78b3b8e9361032436a979723c85c3adf`.
+- `tests/input_validation.rs` blob:
+  `80a099aac74cd0f54cccfb5b00550aca747e2906`.
 - `Cargo.toml` blob:
   `02f5879da3ac3fd41a5d857edc81473b822cf980`.
 - Scope: every public or private callable that forms, decodes, semantically
@@ -57,7 +55,7 @@ would bind the claim to its scaffolding rather than to the production consumer.
 | 4 | `solve`, `solve_with_cancel`, and the incremental solve wrappers share `Engine::finish_unsat`, which submits the CDCL engine's exact CNF/proof bytes to row 3 before constructing `CheckedUnsat`. | The producer emits only the current schema. No caller can inject a version at this private join; any byte drift presented to row 3 is refused. | Checker refusal becomes `SolverInternalFault::ProofRefused`; checker faults remain `InternalFault`; checker cancellation or exhaustion remains `Inconclusive`. None carries a checked artifact. It does not retry because this path is the recomputation producer itself. | **No.** `CheckedUnsat` fields are private, and its only production construction occurs after `ProofCheckOutcome::Verified`. | **TYPE ARGUMENT** over the closed outcome and sealed constructor. **PLANTED MUTANTS:** the seeded solver/checker campaign and proof-logger corruption cases require every emitted proof to verify and every activated mutation to be refused. **READING** establishes the exhaustive terminal mapping. |
 | 5 | `ReflectedTheoremArtifact::from_bitblast_unsat` accepts a `BitblastArtifact` plus sealed `CheckedUnsat` and forms a non-authoritative reflection candidate. | There is no caller-supplied version field. Exact CNF-byte mismatch is `ReflectedArtifactError::CnfMismatch`; row 6 replays the retained bytes again. | Failure is `Err`, with neither recomputation nor candidate acceptance. | **No.** The candidate has private fields, is not `Clone`, is explicitly non-authoritative, and exposes no publication method. | **TYPE ARGUMENT** over the sealed input and candidate. **PLANTED MUTANT:** `reflected_artifact_refuses_a_certificate_from_another_bitblast` activates the join with a checked certificate for distinct CNF bytes and requires exact mismatch refusal. |
 | 6 | `publish_reflected_theorem` accepts the non-authoritative candidate, replays its exact certificate, compares the new and retained receipts, kernel-admits the exact owned theorem, names its council, and consumes Crucible's opaque checked capability to publish. | Unknown proof version and proof-byte or receipt drift are refused or typed internal fault before kernel admission/publication. | There is no automatic recomputation. Every proof, kernel, council, admission, cancellation, exhaustion, stale handoff, or duplicate failure returns without publishing; failure never becomes acceptance. | **No, at the bound source.** The only production environment mutation is `checked.publish(...)`, where `checked` is the exact capability returned by the kernel/council path. No raw kernel-check result or caller-owned declaration plan is publishable. | **TYPE ARGUMENT** over the opaque owned capability and exact-theorem handoff. **PLANTED MUTANTS:** unknown proof version, proof corruption, receipt drift, invalid reflected term, checker/kernel exhaustion, cancellation, and duplicate publication all assert an unchanged base; a positive control publishes the kernel-checked owner. **READING:** the positive source-string guard is not counted because `fln-h1k.1` proves it self-matches. |
-| 7 | `solve_with_unsat_certificate` accepts an untrusted cached/foreign `UnsatCertificateCandidate`, rebinds it to the caller's exact CNF and current schemas, producer-decodes the proof, and independently checks the retained streams. `UnsatCertificateCandidate::from_checked` is a projection into that untrusted envelope, not a separate accepting join. | Envelope, declared CNF, and declared proof versions are checked before decode. Producer-decoder and independent-checker version refusals remain typed and cannot form `CheckedUnsat`. | Every refusal branch calls the authoritative `solve(cnf, limits)` on the exact caller-owned CNF. A verified candidate returns a sealed checked solver artifact; the wrapper has no environment publication API. | **No.** The terminal value is a solver artifact, and theorem publication still requires rows 5–6 and Crucible's opaque exact-theorem capability. | **PRODUCTION-SITE CENSUS:** the guard binds the decoder call to this function, excludes every test/source-reading guard and document, and kills removal or relocation of the call. **READING:** the source has one exact-CNF recomputation join. Direct branch-by-branch behavioral tests remain required before this row can claim stronger evidence. |
+| 7 | `solve_with_unsat_certificate` accepts an untrusted cached/foreign `UnsatCertificateCandidate`, rebinds it to the caller's exact CNF and current schemas, bounds both retained streams, producer-decodes the proof, and independently checks those exact bytes. `UnsatCertificateCandidate::from_checked` is a projection into that untrusted envelope, not a separate accepting join. | Envelope, declared CNF, declared proof, producer-decoder, independent-CNF-checker, and independent-proof-checker version refusals map to distinct `UnsatCertificateVersionBoundary` values. The full `u16` model permits exactly one current value and returns 65,535 typed `UnsupportedVersion` outcomes at each producer/checker stream boundary. | Every refusal branch calls authoritative `solve(cnf, limits)` on the exact caller-owned CNF. Exact facts record one attempt, refusal, and recomputation; successful recomputation records one recheck/returned artifact, while `Inconclusive`/`InternalFault` records one nonpublication and no artifact. | **No.** A refused attempt has no receipt/artifact field; a nonanswer has no `CheckedSolverArtifact`; the terminal value is never environment authority. Theorem publication still requires rows 5–6 and Crucible's opaque exact-theorem capability. | **PRODUCTION-SITE CENSUS:** the guard binds the decoder call to this function and excludes test/document decoys. **BOUNDED MODEL:** `production_certificate_wrapper_covers_every_reachable_refusal_branch` activates the real join, every reachable refusal class, exact recomputation, input substitution, nonpublication, and the accept/skip/reuse/version/input/nonanswer mutants. `certificate_version_policy_exhausts_the_u16_domain` enumerates all 65,536 values at both producer and independent-checker stream boundaries. Unit tests bind unreachable version mapping arms and both nonanswer packaging arms. |
 
 ## Aliases and adjacent non-certificate outputs
 
@@ -81,8 +79,8 @@ values and are not additional acceptance joins.
 
 At the bound source tree:
 
-- the independent checker production prefix is 1,178 physical lines, versus
-  1,857 before the solver's first test module;
+- the independent checker production prefix is 1,180 physical lines, versus
+  2,226 before the solver's first test module;
 - `checker.rs` imports only `std` collections and `Read`/`ErrorKind`, owns its
   own wire reader, clause state, and rule semantics, and does not name the
   producer's `UnsatProof`, `ProofStep`, `ProofRule`, `SchemaError`, or
@@ -101,16 +99,37 @@ into an invariant over every future certificate.
 
 `solve_with_unsat_certificate` is now the production cached/foreign-certificate
 accelerator. It compares the envelope root and complete CNF bytes with the exact
-caller-owned formula, checks all declared versions, producer-decodes and
-independently replays the proof, and calls `solve` on that same formula after
-every refusal. It returns a checked solver artifact, not environment authority.
+caller-owned formula, checks all declared and embedded versions, enforces both
+artifact byte bounds, producer-decodes and independently replays the proof, and
+calls `solve` on that same formula after every refusal. It returns a checked
+solver artifact, not environment authority.
 
-The explicit recovery behavior is currently proved by
-`altered_proofs_are_refused_and_recomputed_from_checked_artifacts`: for all 512
-activated invalid/version-drifted inputs it solves the exact CNF again, proves
-the replacement bytes differ from the refused bytes, and independently replays
-the replacement receipt. That is a tested recovery consumer, not a type-level
-guarantee that every future caller recomputes.
+`production_certificate_wrapper_covers_every_reachable_refusal_branch` calls
+that public wrapper, first proving its verified control. Its refusal cells cover
+envelope/root/declared-schema/exact-byte/artifact-size/producer/checker/checker-
+exhaustion branches, compare every returned outcome with a fresh authoritative
+`solve(cnf, limits)`, and bind the attempt/refusal/recompute/recheck/publication/
+nonpublication facts. A semantic proof mutant proves the checker-refusal arm ran,
+has no receipt, and yields different replacement bytes. An UNSAT candidate
+presented with a SAT caller input is root-refused and returns checked SAT, killing
+candidate-input substitution. An exhausted checker remains `Inconclusive` with
+no artifact.
+
+`certificate_fallback_nonanswers_kill_the_promotion_mutant` feeds both
+`Inconclusive` and `InternalFault` through the production result-packaging helper
+and requires zero rechecks/publications plus one nonpublication.
+`certificate_version_refusals_name_every_decoder_boundary` binds the producer
+and both independent-checker stream mappings. The exhaustive `u16` test then
+requires one supported value and 65,535 exact typed refusals independently for
+CNF producer decode, proof producer decode, CNF checker decode, and proof checker
+decode.
+
+The older
+`altered_proofs_are_refused_and_recomputed_from_checked_artifacts` remains
+supporting bounded evidence: for all 512 activated invalid/version-drifted
+inputs it solves the exact CNF again, proves the replacement bytes differ from
+the refused bytes, and independently replays the replacement receipt. It is no
+longer cited as proof that a production wrapper exists.
 
 The executable census proves that this production join and its decoder/checker
 calls exist at the named site; it does not substitute for direct behavioral
@@ -142,8 +161,13 @@ Established for the bound Verdict implementation:
 - checker failure never produces a receipt, checked artifact, or publication;
 - solver-produced UNSAT output is independently checked before it can inhabit
   `CheckedUnsat`;
-- the cached/foreign-certificate wrapper has an exact production decoder/checker
-  site and a source-visible recomputation call on the caller-owned CNF;
+- the cached/foreign-certificate wrapper directly refuses every reachable
+  invalid/stale/mismatched/resource/version class and returns the exact
+  authoritative recomputation outcome on the caller-owned CNF;
+- the full `u16` domain has exactly one supported producer/checker stream
+  version and 65,535 typed refusals at each modeled boundary;
+- exact fallback cardinalities and nonpublication are tested for checked
+  artifacts, `Inconclusive`, and `InternalFault`;
 - publication replays the certificate and can mutate an environment only by
   consuming the kernel/council-owned exact-theorem capability;
 - the named planted failures leave the base environment unchanged.
@@ -152,8 +176,6 @@ Not established:
 
 - a universal proof that checker work is lower than recomputation for every
   input;
-- direct branch-by-branch behavioral evidence for the new cached/foreign
-  certificate wrapper;
 - FL-INV-06 enforcement for the stub `fln-anvil` crate or its future simp,
   arithmetic, grind, e-graph, index, or portfolio implementations;
 - that the self-matching publication source guard detects removal of the
