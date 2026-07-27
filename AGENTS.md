@@ -259,13 +259,39 @@ CLI robot surfaces must be: stable versioned schema, deterministic where possibl
 
 ---
 
+## Committing in a shared checkout — `git commit -o <paths>`, never the index
+
+The live panes all work in the **same** checkout, so there is exactly one `.git/index` and `git add` writes to all of it. Staging is **shared mutable state between agents**, and the ordinary two-step `git add … && git commit` is a read-modify-write on it with no lock — and, more to the point, with no verification that survives the gap between the two commands. (Linked worktrees each hold their own index, which is the one dimension in which a worktree is *safer*; the green-bar table above governs every other dimension and mostly says no.)
+
+**This file already carried the casualty and filed it under the wrong cause.** The projection-guard section below records four agents landing a stale projection on 2026-07-24/25, one of whom "had not touched beads at all: an incidental `git add` swept the JSONL into their commit." That is not a beads mistake, and reading it as one is why it kept happening. It is the index — and it is one event seen from one side only: the same `git add` swept that agent's own file into somebody else's commit.
+
+**Measured at `7c950ac6`, git 2.54.0, six purpose-built real repositories, one variable per cell:**
+
+| cell | measured |
+|---|---|
+| index-based commit; a peer stages between my verify and my commit | I verified my staged set was **exactly `[mine.txt]`**, and committed **`[mine.txt, peer.txt]`** |
+| the identical race, but `git commit -o mine.txt` | commit is `[mine.txt]`; the peer's staging **survives** and their worktree is untouched |
+| `-o` with nothing of mine staged at all | still commits the named path — `-o` reads the **worktree**, so staging is not a precondition for it |
+| `-o` on a path whose index and worktree differ | the **worktree** version lands, and the index is updated to match — `-o` does not read a peer's staging of your path |
+| `-o` with a directory pathspec (`-o sub/`) | commits every changed file beneath it; a peer's staged file outside it is untouched |
+
+> **`git commit -o <paths>` only. Then `git show --stat HEAD` and read what actually landed.**
+
+The first cell is [the block-expiry rule](#a-block-is-a-claim-and-it-expires--re-test-it-before-you-wait-on-it-and-before-you-act-on-it) one layer down, in the direction that section does not cover: a staged set is a measurement of **shared** state at an instant, true when you read it and false when you act on it. Verifying harder does not help, because no verification holds across the gap — which is why the repair is to stop depending on the index at all rather than to check it more carefully.
+
+**The residual, and it is live in this tree right now.** `-o` bounds a commit to the paths you **name**; it does not establish that you **authored** them. The fifth cell: `-o` on a path a peer had edited and I had not commits *their* uncommitted work under my name. Not hypothetical here — two orphaned working-tree files stand at HEAD, and this is exactly why the `9teu` patch was ruled accepted-on-the-merits but **not landable** on 2026-07-27, since landing it meant committing 543 uncommitted lines of a dead pane's under the committer's own authorship. Derive your path list from what you changed (`git status --porcelain`), and name nothing you did not write.
+
+**What this does not earn.** Nothing enforces any of it. `git add` still works; the pre-commit hooks judge the prospective *tree*, never how it was assembled; and commit authorship is not attributable in this shared checkout — the same limit the one-row manifest rule records below. This is a rule, not a guard. The cells are `bounded_model`: one host, one git version, one instant.
+
+---
+
 ## Session Completion ("Landing the Plane")
 
 Before finishing a work session you MUST:
 1. File beads issues for remaining work (anything needing follow-up).
 2. Run quality gates (if code changed) — tests, clippy, fmt, `ubs`.
 3. Update issue status — close finished work, update in-progress.
-4. `br sync --flush-only` to export beads to JSONL, then `git add .beads/`.
+4. `br sync --flush-only` to export beads to JSONL, then commit it **by path** — `git commit -o .beads/ …` per the section above, never `git add`.
 5. Hand off — summarize what changed, gates run + results, remaining risks/gaps, concrete next steps.
 
 ---
@@ -420,7 +446,7 @@ The table of **mechanisms** is still prose. Treat it the way you would treat any
 
 ## Beads (br) — Dependency-Aware Issue Tracking
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`). Issues live in `.beads/` and are tracked in git. **`br` is non-invasive — it NEVER runs git.** After `br sync --flush-only`, manually `git add .beads/ && git commit`.
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`). Issues live in `.beads/` and are tracked in git. **`br` is non-invasive — it NEVER runs git.** After `br sync --flush-only`, commit the export **by path**: `git commit -o .beads/ <your other paths>`. Never `git add` — the index is shared with every other pane, and [the section above](#committing-in-a-shared-checkout--git-commit--o-paths-never-the-index) measures what that costs.
 
 ```bash
 br ready                 # issues ready to work (no blockers)
