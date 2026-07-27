@@ -79,17 +79,32 @@
 //!    as reaching the workspace suite because they invoke the same script. Today the same
 //!    job also runs the plain gate, so the answer is unchanged; a job that ran *only* a
 //!    sub-mode would be over-credited.
-//! 4. **The five `#[ignore]`d tests.** A cited surface can be run by CI while the test
-//!    inside it that produces the evidence never executes. Artifact citations are
-//!    file-granular, so the manifest cannot express which test a row rests on and this
-//!    guard cannot check it. Measured at `974fcc5a`, all five are already compensated —
-//!    `fln-8zsq` went source-level *because* its producer is ignored, `93te` carries a
-//!    mechanically-expiring PG-5 waiver, `uagk` a retention receipt, `4o3n` the private
-//!    `Calibration` field — and `golden_vellum.rs`'s only prints for a human. **What is
-//!    unguarded is the class, not the instances:** nothing binds an ignored producer to a
-//!    compensating mechanism, so a sixth `#[ignore]` gets no scrutiny at all
-//!    (bead `franken_lean-ignored-producer-class-unguarded-t4u1`). Count the ATTRIBUTE, never the
-//!    token: this paragraph said "fifteen" until `974fcc5a` because `rg -c '#\[ignore'`
+//! 4. ~~**The five `#[ignore]`d tests.**~~ **This item's stated reason for being residue was
+//!    retired by this guard's own repair, and nobody re-read it.** It said: "Artifact
+//!    citations are file-granular, so the manifest cannot express which test a row rests on
+//!    and this guard cannot check it." True when written, false from `f24b6670`, which added
+//!    the `test:<pkg>::<target>::<path>` kind — the manifest can now name one function, and
+//!    the first thing it can name is a function CI never runs. Measured green at `5f7e44ad`:
+//!    a row citing an `#[ignore]`d function left `FILE_GRANULAR_EVIDENCE_ALLOWANCE` as a
+//!    **repair** and lowered the ceiling with it. Ten terminal rows cite one of the four
+//!    ignored-producer surfaces and all ten are declared in that allowance, so every one is
+//!    queued for the migration that opens it; for `fln-7odd` and `93te` the ignored function
+//!    is the only honest answer, because its `#[ignore]` reason names their bead. Now joined
+//!    in [`judge_granularity`] — `granularity-ignored` for either citation shape,
+//!    `granularity-hollow-surface` for a cited file whose every test is ignored, and
+//!    `granularity-ignored-scan` when the producing scan collapses. Four mutants, each
+//!    gutted independently at `5f7e44ad` and each killing exactly the one that names it.
+//!
+//!    **What is still residue.** A file-granular row citing a surface where *some* tests are
+//!    ignored still cannot say which test it rests on — that is the 67-row debt, not this
+//!    join. And `#[ignore]` is only one way a compiled test does not run: `#[cfg]` gating and
+//!    an early `return` are not modelled, and `--skip` is item 5. Measured at `974fcc5a`, all
+//!    five instances are compensated — `fln-8zsq` went source-level *because* its producer is
+//!    ignored, `93te` carries a mechanically-expiring PG-5 waiver, `uagk` a retention receipt,
+//!    `4o3n` the private `Calibration` field — and `golden_vellum.rs`'s only prints for a
+//!    human. **What was unguarded is the class, not the instances**
+//!    (bead `franken_lean-ignored-producer-class-unguarded-t4u1`). Count the ATTRIBUTE, never
+//!    the token: this paragraph said "fifteen" until `974fcc5a` because `rg -c '#\[ignore'`
 //!    returns 22 *mentions*, `kernel_replay.rs` being full of guards that discuss it —
 //!    the same mentions-vs-construct error `bkw6` paid for by counting `[[bench]]`
 //!    sections, committed here inside the guard written about that defect.
@@ -191,9 +206,20 @@ const PIN_REACH_SCAN_EXCLUSION_CEILING: usize = 2;
 ///
 /// This is the same defect as the population above, one granularity finer. A coverage row
 /// cites a **file**; cargo runs a **function**. Ten terminal rows cite one of these four
-/// surfaces and the manifest cannot say which test any of them rests on — so this guard
-/// does not claim those rows are hollow, and measurement says they are not: the ignored
-/// fraction is 2/14, 1/15, 1/10 and 1/9, and no surface has every test ignored.
+/// surfaces and a file-granular one cannot say which test it rests on — so this guard does
+/// not claim those rows are hollow, and measurement said they are not: the ignored fraction
+/// was 2/14, 1/15, 1/10 and 1/9 at `974fcc5a`, and no surface has every test ignored.
+///
+/// **That last clause is the load-bearing one, and it was a measurement transcribed into a
+/// doc comment with nothing rechecking it.** It is derived now — `granularity-hollow-surface`
+/// in [`judge_granularity`] fails the day a cited surface's last running test is `#[ignore]`d.
+/// The four fractions are deliberately *not* pinned: they move whenever a test is added, so
+/// pinning them buys churn, and the property that matters is the clause, not the arithmetic.
+///
+/// **And the sentence above no longer bounds the exposure**, because a row is no longer
+/// obliged to be file-granular. From `f24b6670` a row may cite one function, and all ten of
+/// these rows are declared debts in [`FILE_GRANULAR_EVIDENCE_ALLOWANCE`] whose sanctioned
+/// repair is exactly that migration. See residue item 4 in the module header.
 const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
     (
         "crates/fln-conformance/tests/kernel_replay.rs",
@@ -1109,6 +1135,28 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                 continue;
             }
             if target == "lib" {
+                // The lib half of the ignore join. No lib unit test is `#[ignore]`d today, so
+                // this branch has no live instance and is exercised by a planted one — an
+                // unfalsifiable half is `bkw6`'s empty referent, and a population with no
+                // members is exactly where the next instance lands.
+                let ignored_here = d.ignored.iter().any(|(surface, function)| {
+                    path.ends_with(function.as_str())
+                        && d.packages.iter().any(|(member, name)| {
+                            name == package && surface.starts_with(&format!("{member}/src/"))
+                        })
+                        && module_path_prefix(surface).is_some_and(|prefix| {
+                            prefix.is_empty() || path.starts_with(prefix.as_str())
+                        })
+                });
+                if ignored_here {
+                    findings.push(format!(
+                        "granularity-ignored: terminal row {} cites {artifact:?}, and that \
+                         function carries `#[ignore]`. Cargo compiles it; libtest never runs \
+                         it. The row now rests on ONE test, and that test is one CI does not \
+                         execute — see IGNORED_PRODUCER_ALLOWANCE, which declares it.",
+                        row.bead
+                    ));
+                }
                 let known = d.lib_tests.get(package);
                 // The module path prefix is a NECESSARY condition, not a sufficient one:
                 // inner `mod tests { … }` nesting appends components the file layout cannot
@@ -1159,6 +1207,78 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                 findings.push(format!(
                     "granularity-unbound: terminal row {} cites {artifact:?}, but {target:?} \
                      declares no `#[test] fn {path}`.",
+                    row.bead
+                ));
+            } else if d.ignored.contains(&(target_path.clone(), path.to_string())) {
+                findings.push(format!(
+                    "granularity-ignored: terminal row {} cites {artifact:?}, and that function \
+                     carries `#[ignore]`. Cargo compiles it; libtest never runs it. The row now \
+                     rests on ONE test, and that test is one CI does not execute — see \
+                     IGNORED_PRODUCER_ALLOWANCE, which declares it. Migrating a row to this \
+                     citation would delete it from FILE_GRANULAR_EVIDENCE_ALLOWANCE and lower \
+                     the ceiling, recording a REPAIR for a row that now rests on nothing that \
+                     runs. Cite a test CI executes, or leave the row file-granular and say why.",
+                    row.bead
+                ));
+            }
+        }
+    }
+
+    // --- the join to the ignored-producer set, in both citation shapes ------
+    //
+    // **The premise this guard's own residue item 4 rested on was retired by its own repair.**
+    // That item read: "Artifact citations are file-granular, so the manifest cannot express
+    // which test a row rests on and this guard cannot check it." True when written, and false
+    // from `f24b6670`, which added `test:<pkg>::<target>::<path>` — the manifest can now name
+    // one function, and the first thing it can name is an `#[ignore]`d one. The two facts sat
+    // in THIS FILE, forty lines apart: `IGNORED_PRODUCER_ALLOWANCE` names five tests CI
+    // compiles and never runs, `judge_granularity` resolved a citation against the function
+    // list without consulting it. That is item 7's join, inside one artifact, in the guard
+    // written about item 7 — `fln-history-rewrite-evidence-anchor-reachability-vdi4`'s row was
+    // caught by this same guard for the same shape.
+    //
+    // Measured green at `5f7e44ad`: all four mutants below failed and the other 44 tests
+    // passed, so a row citing an ignored function left the population as a REPAIR and lowered
+    // the ceiling. Ten terminal rows cite one of the four ignored-producer surfaces and **all
+    // ten** are declared in `FILE_GRANULAR_EVIDENCE_ALLOWANCE`, so every one is queued for the
+    // migration that opens this. For two the ignored function is the *only* honest answer:
+    // `pinned_present_olean_kernel_differential`'s `#[ignore]` reason names `fln-7odd`, and
+    // `present_olean_corpus_thread_matrix_compares_stream_digests`' names `93te` — both beads
+    // whose coverage rows cite the file.
+    if d.ignored.is_empty() {
+        findings.push(
+            "granularity-ignored-scan: the `#[ignore]` scan found nothing, so both checks below \
+             are vacuous and every citation resolves clean regardless of whether CI runs it. \
+             That is the attribute scan breaking, not a tree in which every test now runs."
+                .to_string(),
+        );
+    }
+
+    // The coarse half, and the reason it is not redundant with the population above. A row
+    // citing a FILE has always rested on that file's tests collectively, and
+    // `IGNORED_PRODUCER_ALLOWANCE`'s own defence is a fraction — "2/14, 1/15, 1/10 and 1/9,
+    // and no surface has every test ignored". That last clause is the load-bearing one and it
+    // was a measurement transcribed into a doc comment, checked by nobody. Derived here, so
+    // the day a surface's last running test is `#[ignore]`d the rows citing it say so.
+    for row in &d.rows {
+        for surface in &row.coarse {
+            let Some(text) = d.surfaces.get(surface) else {
+                continue;
+            };
+            let total = test_functions(text).len();
+            let ignored_here = d
+                .ignored
+                .iter()
+                .filter(|(where_, _)| where_ == surface)
+                .count();
+            if total > 0 && ignored_here >= total {
+                findings.push(format!(
+                    "granularity-hollow-surface: terminal row {} cites {surface}, whose \
+                     {total} `#[test]` functions are ALL `#[ignore]`d. A file-granular citation \
+                     rests on the surface's tests collectively; this surface has none that run, \
+                     so the row's evidence is compiled and never executed. The fraction defence \
+                     in IGNORED_PRODUCER_ALLOWANCE — no surface has every test ignored — has \
+                     stopped holding here.",
                     row.bead
                 ));
             }
@@ -2304,6 +2424,82 @@ fn granularity_mutant_a_malformed_citation_is_a_finding_not_a_shrug() {
     d.rows[0].fine.push("test:kernel_replay".to_string());
     let findings = granularity_findings(&d);
     assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+/// The name of an `#[ignore]`d test in `kernel_replay`, taken from the derivation rather than
+/// written down, so a rename moves this with it.
+fn an_ignored_function(d: &Derivation, surface: &str) -> String {
+    d.ignored
+        .iter()
+        .find(|(where_, _)| where_ == surface)
+        .map(|(_, function)| function.clone())
+        .unwrap_or_else(|| panic!("{surface} declares no `#[ignore]`d test"))
+}
+
+#[test]
+fn granularity_mutant_a_citation_naming_an_ignored_function_cannot_leave_the_population() {
+    let mut d = derive(&root());
+    let function = an_ignored_function(&d, "crates/fln-conformance/tests/kernel_replay.rs");
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine
+        .push(format!("test:fln-conformance::kernel_replay::{function}"));
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-ignored"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_lib_citation_naming_an_ignored_unit_test_is_caught() {
+    let mut d = derive(&root());
+    // No lib unit test is `#[ignore]`d today, so the lib half of the join has no live
+    // instance. Plant one: an unfalsifiable half is `bkw6`'s empty referent, and the whole
+    // point of this bead is that a population with no members is where the next one lands.
+    let surface = "crates/fln-env/src/extensions.rs".to_string();
+    assert!(
+        d.surfaces.contains_key(&surface),
+        "the planted surface must be real, or this mutant proves nothing"
+    );
+    let prefix = module_path_prefix(&surface).expect("a lib source file has a module path");
+    d.ignored
+        .insert((surface, "planted_ignored_unit_test".to_string()));
+    d.lib_tests
+        .entry("fln-env".to_string())
+        .or_default()
+        .insert((prefix.clone(), "planted_ignored_unit_test".to_string()));
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine.push(format!(
+        "test:fln-env::lib::{prefix}::planted_ignored_unit_test"
+    ));
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-ignored"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_surface_whose_every_test_is_ignored_is_not_evidence() {
+    let mut d = derive(&root());
+    let surface = "crates/fln-conformance/tests/kernel_replay.rs".to_string();
+    // Every `#[test]` in the file ignored: the file-granular defence — a row rests on the
+    // surface's *other* tests — has nothing left to rest on.
+    for function in test_functions(&d.surfaces[&surface]) {
+        d.ignored.insert((surface.clone(), function));
+    }
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.coarse.insert(surface);
+    let findings = granularity_findings(&d);
+    assert!(
+        fires(&findings, "granularity-hollow-surface"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn granularity_mutant_an_empty_ignore_scan_makes_the_join_refuse() {
+    let mut d = derive(&root());
+    d.ignored.clear();
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-ignored-scan"), "{findings:?}");
 }
 
 /// The positive control, and what stops every mutant above being vacuous: a **real** citation
