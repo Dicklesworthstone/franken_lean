@@ -99,6 +99,77 @@ jobs:
           echo "toolchain/vendor lean.h join: byte-identical"
           ./scripts/verify_vendor_tree.sh
 
+      - name: pin-dependent conformance suites (fln-rgha)
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          # The four test binaries carrying the typed-skip sites that NINE terminal coverage
+          # rows in ci/VERIFICATION_MANIFEST.jsonl cite as their evidence. Until this step
+          # those rows had never executed in any workflow: ci.yml installs no Lean pin and
+          # this workflow ran no cargo, so the intersection was empty (bead fln-rgha).
+          #
+          # They run HERE, not in ci.yml, deliberately. ci.yml installs no elan on purpose --
+          # see the comment above its contract-handoff step, where a prior attempt produced a
+          # setup failure that LOOKED LIKE A REAL VERIFICATION, which is this bead's own
+          # defect. The pinned toolchain is 2.8 GB; that is not a per-push cost. Rust comes
+          # from rust-toolchain.toml, which auto-selects the pinned nightly.
+          #
+          # THE FLOOR. Exit 0 cannot be the gate here. Measured by cc_3 at b45ff944 (comment
+          # 1484 on fln-rgha): with the pin present and with it masked, these binaries give
+          # BYTE-IDENTICAL results -- 3/5/6/14 passed, exit 0, in both cells -- because each
+          # skip is an early return inside a test that then passes. Reproduced by cc_2 at
+          # 9b6a7dfa: 28 passed / 4 result lines / cargo rc 0 in BOTH cells, 0 skip notices
+          # with the pin and 7 with HOME masked. (cc_3 recorded 4 notices for the same
+          # masking; the counts differ and neither has been reconciled -- what both cells
+          # agree on, and all this floor rests on, is 0-with-pin versus non-zero-without.)
+          #
+          # So four refusals are evaluated, NONE short-circuiting, because a floor that exits
+          # on the cheap path never exercises the expensive one.
+          log="$RUNNER_TEMP/rgha-suites.log"
+          set +e
+          cargo test --locked -p fln-conformance \
+            --test kernel_replay \
+            --test pin_option_defaults \
+            --test ext_observable_capture \
+            --test pin_ctor_inventory \
+            -- --nocapture > "$log" 2>&1
+          rc=$?
+          set -e
+          result_lines=$(grep -c '^test result:' "$log" || true)
+          passed=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" \
+            | paste -sd+ - | bc 2>/dev/null || echo 0)
+          [[ -z "$passed" ]] && passed=0
+          notices=$(grep -c '^SKIP ' "$log" || true)
+          printf 'rgha-floor: cargo_rc=%s result_lines=%s passed=%s skip_notices=%s\n' \
+            "$rc" "$result_lines" "$passed" "$notices"
+          fail=0
+          if (( rc != 0 )); then
+            echo "rgha-floor: REFUSED - cargo exited $rc; a real failure, not a skip question" >&2
+            fail=1
+          fi
+          # A libtest filter matching nothing exits 0 and emits no notices, which would pass
+          # the notice check vacuously. Floor the observed execution first.
+          if (( result_lines < 4 )); then
+            echo "rgha-floor: REFUSED - only $result_lines of 4 binaries reported a result" >&2
+            fail=1
+          fi
+          if (( passed < 20 )); then
+            echo "rgha-floor: REFUSED - only $passed tests ran (floor 20, measured 28); the ABSENCE of skip notices is not evidence when nothing executed" >&2
+            fail=1
+          fi
+          if (( notices > 0 )); then
+            echo "rgha-floor: REFUSED - $notices typed-skip notice(s), so these suites did NOT check their subject; this is the hollow green fln-rgha is about" >&2
+            grep '^SKIP ' "$log" | sed 's/^/  /' >&2
+            fail=1
+          fi
+          (( fail )) && exit 2
+          echo "rgha-floor: PASS - $passed tests across $result_lines binaries, zero typed skips"
+          # WHAT THIS DOES NOT ESTABLISH: that the suites checked their subject CORRECTLY.
+          # It proves only that they did not silently skip. Whether a rig's assertions are
+          # sound, and the structured per-rig execution record fln-rgha actually asks for,
+          # are the bead's own mechanism and are NOT delivered here.
+
       - name: run the seeded contract drift lane
         shell: bash
         run: |
