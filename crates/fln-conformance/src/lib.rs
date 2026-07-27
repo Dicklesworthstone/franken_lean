@@ -42,6 +42,7 @@
 #![forbid(unsafe_code)]
 
 pub mod corpus;
+pub mod execution;
 pub mod ledger;
 pub mod naming;
 pub mod normalize;
