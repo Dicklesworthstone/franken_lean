@@ -341,6 +341,39 @@ The failure it produces is silent in every channel a careful pane checks: no err
 
 **What this does not earn.** One instance at one commit on one host, class `bounded_model`. It is a property of a tool that lives **outside this repository**, so `br`'s flush accounting can change with a version and nothing here would notice — the same limit the rch and UBS sections record about their own figures. It does not establish that the report is ever *wrong*: it is accurate about what it measures, which is exactly why it misleads. And only the safe direction was observed — the record was already in the working copy, so the diff found it. Whether a flush can print that same sentence while the record is genuinely **absent** from the file is not excluded by this measurement, merely unobserved in it.
 
+### A NEW file cannot be committed by the mandated form at all — and the technique that can **never touches `.git/index`**
+
+**Read that heading as the whole claim, because this section otherwise says "never the index" and this is not the retraction.** The measured casualty above is a **shared-index** commit; what follows is not one, and the evidence is its own: across the run that landed `48c64a73`, `.git/index` was sha256 `b16392e5…` before and `b16392e5…` after — **byte-identical** — with `git diff --cached --name-only` empty before and **0** paths after the follow-up resync. Nothing here is permission to stage anything.
+
+**The trigger is narrow and is the whole scope of the exception.** `git commit -o` commits paths git already knows; against an untracked path it refuses outright, which this file has never stated:
+
+```text
+error: pathspec 'crates/fln-conformance/tests/artifact_referent_census.rs' did not match any file(s) known to git
+```
+
+So the mandated form cannot introduce a new file **at all**. Assemble that one commit in a **private** index built from `HEAD`:
+
+```bash
+IDX=/data/tmp/<yours>.index                              # OUTSIDE the repository
+GIT_INDEX_FILE=$IDX git read-tree HEAD                   # start from HEAD, never from the shared index
+GIT_INDEX_FILE=$IDX git add -- <exactly your paths>
+GIT_INDEX_FILE=$IDX git diff --cached --name-only HEAD   # must print EXACTLY your paths
+GIT_INDEX_FILE=$IDX git commit -F <msg>
+```
+
+`GIT_INDEX_FILE` redirects every git command in that environment, so the `git add` writes `$IDX` and nothing else.
+
+**It is stronger than `-o` rather than a fallback from it, which is why it is stated here instead of hidden as a workaround.** The second residual above measures that `-o` reads the **worktree**, so a copy older than `HEAD` — or a peer's edit to a path you name — lands under your authorship with no conflict and no warning. An index built from `HEAD` plus exactly your paths **cannot contain anything else by construction**: not a peer's staging, not a peer's worktree edit to any other path. It does not close the first residual, which is about paths you name but did not author.
+
+**The gate is part of the technique, not an optional extra.** Both assertions must hold *before* the commit runs, in one `&&` chain:
+
+- the prospective delta — `GIT_INDEX_FILE=$IDX git diff --cached --name-only HEAD` — is **exactly** the paths you intend; and
+- **nothing is staged in the shared index**, re-checked immediately before rather than earlier, because the resync below discards staged content and is safe only when there is none. That re-check is [the block-expiry rule](#a-block-is-a-claim-and-it-expires--re-test-it-before-you-wait-on-it-and-before-you-act-on-it) applied to shared state: an earlier look at a staged set has expired by the time you act on it.
+
+**The resync is mandatory, and skipping it hands the next pane a deletion to commit.** A private-index commit leaves the shared index with no entry for the new file while `HEAD` has one, which a later `git status` reads as a staged **deletion**. Repair it immediately with `git read-tree HEAD`, which is safe precisely because the gate refused unless nothing was staged.
+
+**What this does not earn.** Nothing enforces any of it: no hook can see how a commit was assembled, and the gate is a rule in a script one pane wrote. It says nothing about a peer's write landing between the gate and git's own read. One host, one git version, one instant, class `bounded_model`.
+
 **Which pane made a commit is not recoverable from git, and inferring it has already misfired.** Measured over the last 200 commits at `7e1765cd`: **one** author identity, **one** committer identity, **one** `Co-Authored-By` trailer — every field git offers is constant across all three panes. This file states that fact three times already, but always as a *limit on some other rule*; the two operational consequences have lived only in handoffs, which is why every handoff has had to re-teach them:
 
 - **Identify your own commits by subject line, never by author.** `git log --author` returns the whole repository.
