@@ -309,34 +309,31 @@ section is kept rather than deleted, because it may work again and a fresh pane 
 **both** facts. What it must not do is what it did four times: send a pane to the broken
 channel with no mention that a working one exists.
 
-**The channel in use is a plain file store**, outside the repository — so writing to it is
-safe even while the build gate is held, which is half the reason it won:
+**The channel in use is the routing store**, and its rules are stated once, above:
+[The routing store is the source of truth](#the-routing-store-is-the-source-of-truth-a-handoffs-routing-section-is-a-summary-of-it).
+That section and this one were written within minutes of each other by two panes who could not
+see each other's work, and the first version of this paragraph restated the store's convention
+rather than pointing at it — two copies of one fact in one file, which is the defect this file
+names most often. Deduplicated deliberately; what remains here is only what that section does
+not carry.
 
-```
-/data/tmp/claude-1000/route-<from>-to-<to>-<topic>.md
-```
+Two operational facts that belong at *this* vantage point, because they are what a pane
+reaching for mail actually needs:
 
-`<from>`/`<to>` are pane names (`cc_1`, `cc_2`, `cc_3`), `<topic>` is usually the bead's
-short id. Nothing polls it, so tell whoever sequences the swarm the path once the file is
-written.
+* **The store is outside the repository**, so writing a route is safe even while the build
+  gate is held — no mechanism in [The Build Gate](#the-build-gate--while-a-lane-runs-the-repository-is-frozen)
+  can see it. That is half of why it won. Nothing polls it either, so tell whoever sequences
+  the swarm the path once the file is written.
+* **On intake, enumerate the store yourself.** `ls` is aliased in this environment; use
+  `find /data/tmp/claude-1000 -maxdepth 1 -name 'route-*.md'` and sort by mtime. A route
+  written after your predecessor composed their handoff is precisely the one that handoff
+  cannot mention.
 
-**Write the LITERAL before/after — never a description of the change.** A described change is
-a claim with an expiry; the literal text is the thing itself, and producing it is what forces
-you to look. This is not a style preference, it is a measured one: on 2026-07-27 rendering a
-change literally caught a real error **four** times where the description of the same change
-had hidden it, including a filing that undercounted its own population by two. One instance
-from the same day, recorded because it cuts toward the reader rather than away: a routed patch
-proposing a trigger-reachability predicate read correctly in prose, and only writing its
-literal body out exposed that it rejected a spelling YAML permits — a wall that would have
-reddened a correct workflow. The prose was not wrong about intent. It simply could not be
-checked.
-
-**The store is the source of truth; a handoff's routing table is a summary, and summaries go
-stale.** On intake, **enumerate the store yourself** before trusting any ledger, your
-predecessor's included — a pane recorded "nothing was routed to me" on a day three routes were
-waiting for it. `ls` is aliased in this environment, so use `find /data/tmp/claude-1000
--maxdepth 1 -name 'route-*.md'` and sort by mtime; a route written after your handoff was
-composed is exactly the one the handoff cannot mention.
+One further instance of why the literal text is required, recorded because it cuts toward the
+reader rather than away: a routed patch proposing a trigger-reachability predicate read
+correctly in prose, and only writing its literal body out exposed that it rejected a spelling
+YAML permits — a wall that would have reddened a correct workflow. The prose was not wrong
+about intent; it simply could not be checked.
 
 ---
 
@@ -555,8 +552,40 @@ file:line, both operands, both semantic roles, changed-hunk intersection, and
 classification. Counts must reconcile exactly. “Pre-existing” establishes
 attribution, not safety. Put a compact terminal-mode/class/count/bead-comment
 disclosure in the commit message; never call a nonzero known-false run
-“passed.” Any other critical, uncertain role, missing site, or count mismatch
-blocks.
+“passed.” Any other critical, uncertain role, or count mismatch blocks, as does
+a missing site **wherever the tool emits per-site records at all**.
+
+**Where the tool has no per-site record, this is satisfied at CLASS granularity
+and must say so.** Measured for the rust module at UBS v5.3.7 (bead
+`fln-7vzi`): the findings model is per-**class**, so criticals emit one record
+carrying a class total plus a capped sample list, and no per-site object exists
+in any format — text, `-v`, json, jsonl, toon, sarif, `--beads-jsonl`, or the
+module's own emitter driven directly. The per-site clause is unsatisfiable
+there **by construction, not by effort**, and a triage comment that omits it is
+not thereby incomplete. Record instead: the tool version and the content hash
+it was measured at; the per-class totals and the capped sample list **as
+emitted**; that enumeration is unavailable at that version, named as such; and
+the class-level reconciliation. Type the result `class-level`, never
+`site-level`, and never write “every site reviewed” — a count taken from a
+capped list is a **floor, not a census**. This is a declared remainder of
+permitted shortfalls, so it is **one-way plus a floor**: a language/version
+pair joins it only with the measurement showing enumeration unavailable, and
+leaves when the tool grows a per-site record. Equality in both directions is
+wrong here — it would make the tool *acquiring* the capability redden a correct
+triage. Absent that measurement the per-site requirement stands unchanged; “the
+tool is awkward” is not a measurement.
+
+**That exemption is keyed to the ABSENCE of a capability, which is a shape this
+repository has already watched rot.** Nothing fails on the day UBS grows
+per-site records for rust: the allowance simply keeps excusing a clause the
+tool could now satisfy, and it reads exactly as it did when it was true. UBS
+lives outside this repository, so no check here can notice — which is why the
+version belongs in the triage comment and not only in this paragraph. **Treat
+any UBS version bump as expiring every `class-level` claim: re-measure the
+format matrix before reusing one, and record the version you measured at.**
+The recorded version is the only thing that makes staleness visible to the next
+reader, and a `class-level` claim citing a version older than the installed
+tool is inconclusive, not exempt.
 
 `fln-lyc8` owns the exact class `Secret, signature, or token compared with
 ==/!=`. Its bounded UBS v5.3.7 measurement at
