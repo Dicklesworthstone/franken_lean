@@ -1160,3 +1160,514 @@ fn the_closure_binding_instant_is_the_one_agents_md_publishes() {
         );
     }
 }
+
+/// The negative probe that every interpreter-isolation citation attributes its outcome to.
+const ISOLATION_PROBE: &str = "scripts/tribunal/python_isolation_probe.sh";
+
+/// One run of the probe, read back from the record it wrote rather than from its narration.
+struct ProbeRun {
+    exit: Option<i32>,
+    /// `(check name, passed)`, in emission order.
+    outcomes: Vec<(String, bool)>,
+    /// The `run_end` verdict token: `pass`, `fail`, or `inconclusive`.
+    verdict: String,
+    /// The `run_end` reason, carried only by a typed setup failure.
+    reason: String,
+    stderr: String,
+}
+
+/// Pull a compact-JSON string field out of one NDJSON line.
+fn ndjson_string(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = line.find(&needle)? + needle.len();
+    Some(line[start..].chars().take_while(|c| *c != '"').collect())
+}
+
+/// Run the probe and read back its run record.
+///
+/// A run that could not be addressed or read is returned as `inconclusive` rather than
+/// panicking, so the judgement below owns every reason token and the mutants can drive
+/// that arm too.
+fn run_isolation_probe(script: &Path) -> ProbeRun {
+    let run = std::process::Command::new("bash")
+        .arg(script)
+        .output()
+        .unwrap_or_else(|error| panic!("{} must be launchable: {error}", script.display()));
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    let mut probe = ProbeRun {
+        exit: run.status.code(),
+        outcomes: Vec::new(),
+        verdict: "inconclusive".to_owned(),
+        reason: String::new(),
+        stderr,
+    };
+
+    // stdout is data-only and carries exactly the artifact directory. Without it there is
+    // no run record to read, which is a probe that cannot be checked, not a clean one.
+    let Some(art_dir) = stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    else {
+        probe.reason = "artifact_directory_unclaimed".to_owned();
+        return probe;
+    };
+    let Ok(record) = fs::read_to_string(Path::new(art_dir).join("run.ndjson")) else {
+        probe.reason = "run_record_unreadable".to_owned();
+        return probe;
+    };
+
+    for line in record.lines() {
+        match ndjson_string(line, "event").as_deref() {
+            Some("probe") => {
+                let name = ndjson_string(line, "name").unwrap_or_default();
+                probe.outcomes.push((name, line.contains("\"pass\":true")));
+            }
+            Some("run_end") => {
+                probe.verdict = ndjson_string(line, "verdict").unwrap_or_default();
+                probe.reason = ndjson_string(line, "reason").unwrap_or_default();
+            }
+            _ => {}
+        }
+    }
+    probe
+}
+
+/// Every outcome the verification manifest attributes to the probe, derived from the file.
+///
+/// Scope comes from the manifest rather than from a list here, so a row that starts citing
+/// the probe is bound without anyone remembering to add it — the `fln-guard-scope-must-be-
+/// derived` rule. Citations carry an optional ` -> OBSERVATION` suffix; the outcome name is
+/// what the probe emits and what can be compared.
+fn cited_probe_outcomes(manifest: &str) -> Vec<String> {
+    let needle = format!("{ISOLATION_PROBE}: ");
+    let mut cited: Vec<String> = Vec::new();
+    let mut rest = manifest;
+    while let Some(at) = rest.find(&needle) {
+        rest = &rest[at + needle.len()..];
+        let citation: String = rest.chars().take_while(|c| *c != '"').collect();
+        let outcome = citation
+            .split(" -> ")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !outcome.is_empty() {
+            cited.push(outcome);
+        }
+    }
+    cited.sort();
+    cited.dedup();
+    cited
+}
+
+/// The probe exists to establish two directions, and only those two carry the claim.
+///
+/// `isolated_run_reports_the_flag` is deliberately outside this set: the probe's own header
+/// and the coverage row's behaviour note both say the flag is not the evidence, so binding
+/// the row to it would re-admit the thing the probe was written to replace.
+fn is_load_bearing_outcome(name: &str) -> bool {
+    name.ends_with("_reproduces_while_unprotected") || name.ends_with("_refused_under_isolation")
+}
+
+/// The whole judgement, in one place a forged caller can drive.
+///
+/// Each arm returns a distinct reason token so a mutant can be required to die *for its
+/// stated reason*, and the ordering is load-bearing: a per-check failure is reported before
+/// the run-level verdict, or a broken negative control and a broken refusal would be
+/// indistinguishable at `probe-verdict:fail`.
+fn judge_isolation_probe(cited: &[String], run: &ProbeRun) -> Result<(), String> {
+    // (0) The scan's own anti-vacuity. A manifest citing nothing makes every arm below
+    // quantify over the empty set and report a clean sweep.
+    if cited.is_empty() {
+        return Err("no-row-cites-the-probe".to_owned());
+    }
+    // (1) "We could not look" is not "we looked and found nothing" (FL-INV-07). This is
+    // refused, and refused as *inconclusive* — never rendered as a refutation of the
+    // isolation, which is a claim no failed setup can support.
+    if run.verdict == "inconclusive" || run.outcomes.is_empty() {
+        let reason = if run.reason.is_empty() {
+            "no_outcomes_recorded"
+        } else {
+            run.reason.as_str()
+        };
+        return Err(format!("probe-setup-inconclusive:{reason}"));
+    }
+    // (2) Every check the probe ran, including the two negative controls. A hijack that
+    // stopped reproducing dies here, which is the arm that keeps the isolated half from
+    // being a pass with no content.
+    for (name, passed) in &run.outcomes {
+        if !passed {
+            return Err(format!("probe-check-failed:{name}"));
+        }
+    }
+    let mut produced: Vec<String> = run
+        .outcomes
+        .iter()
+        .map(|(name, _)| name.clone())
+        .filter(|name| is_load_bearing_outcome(name))
+        .collect();
+    produced.sort();
+    produced.dedup();
+    // (3) Both directions must be present. A probe reduced to refusals alone never
+    // reproduces the attack, and one reduced to reproductions alone never refuses it;
+    // either reads as five green checks.
+    if !produced
+        .iter()
+        .any(|name| name.ends_with("_reproduces_while_unprotected"))
+    {
+        return Err("probe-has-no-negative-control".to_owned());
+    }
+    if !produced
+        .iter()
+        .any(|name| name.ends_with("_refused_under_isolation"))
+    {
+        return Err("probe-has-no-isolated-refusal".to_owned());
+    }
+    // (4)/(5) Equality, both directions. A citation the probe no longer produces is a
+    // claim with no producer; an outcome nothing cites is a direction the manifest stopped
+    // disclosing. Neither is a floor: this is a disclosure of a measured population, and
+    // one-way-plus-remainder would let it drift on the unwatched side.
+    for outcome in cited {
+        if !produced.contains(outcome) {
+            return Err(format!("cited-outcome-not-produced:{outcome}"));
+        }
+    }
+    for outcome in &produced {
+        if !cited.contains(outcome) {
+            return Err(format!("produced-outcome-not-cited:{outcome}"));
+        }
+    }
+    // (6) The run's own verdict and status, last, so they cannot mask a named check.
+    if run.verdict != "pass" {
+        return Err(format!("probe-verdict:{}", run.verdict));
+    }
+    if run.exit != Some(0) {
+        return Err(format!("probe-exit:{:?}", run.exit));
+    }
+    Ok(())
+}
+
+/// The interpreter-isolation probe **runs**, and every outcome the manifest attributes to
+/// it is one this run produced.
+///
+/// `every_python_launch_under_scripts_is_sealed` above ends by saying that it "does not
+/// observe a single interpreter actually start: that is
+/// `scripts/tribunal/python_isolation_probe.sh`'s job, and asserting `-I` is set is not
+/// evidence that `-I` works." Measured at `94fa9e7e`, that job was delegated to a script
+/// **nothing ran**: the probe appeared in `.beads/issues.jsonl`, in
+/// `ci/VERIFICATION_MANIFEST.jsonl`, and in this file's `UNSEALED_LAUNCH_ALLOWANCE` — which
+/// declares an exemption *for* it — and in no runnable surface at all. Not `scripts/check.sh`,
+/// not `.github/workflows/ci.yml`, not a lane. `franken_lean-h40t`'s coverage row cites four
+/// of its outcomes across `boundary` and `error`; all four were one hand-run, recorded.
+///
+/// That is `franken_lean-pnav`'s row in AGENTS.md item 7 — an assertion and the lane it
+/// delegates to — reproduced inside the guard whose own doc comment states the delegation,
+/// and `franken_lean-worktree-gitdir-refusal-hugg`'s lesson in its general form: where a
+/// claim rests on a run, check that the run *happened*.
+///
+/// So the flag half and the behaviour half now both execute per commit, and the join
+/// between the row and the probe is walked in **both** directions. A citation the probe
+/// stopped producing fails; an outcome no row cites fails; a negative control that stops
+/// reproducing the hijack fails; a run that could not be established is refused as
+/// inconclusive rather than counted clean.
+///
+/// **What this does not earn.** The probe is a bounded model — two vectors, one host, one
+/// CPython — and running it per commit does not widen it: an opaque `PYTHONHOME`, a
+/// `sitecustomize`, or a shadow module reached through some path neither vector plants are
+/// all outside it, and `-I` closing those is untested here. It says nothing about whether
+/// `scripts/evidence.py` is *launched* sealed; that is the scanner above. And the two
+/// halves share no code, so a future third vector must be added to both the probe and a
+/// citation or the equality refuses it — deliberately, since the alternative is a probe
+/// that grows silently.
+///
+/// Cost: 0.16 s and 5.1 KB per run, written under the gitignored `target/e2e/`. Disclosed
+/// because the last guard in this file to write per-run artifacts put 4.3 MB a run into a
+/// machine-wide shared target directory before anyone measured it.
+#[test]
+fn the_interpreter_isolation_probe_runs_and_produces_every_outcome_cited_for_it() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let manifest = fs::read_to_string(repo.join("ci/VERIFICATION_MANIFEST.jsonl"))
+        .expect("ci/VERIFICATION_MANIFEST.jsonl must be readable");
+    let cited = cited_probe_outcomes(&manifest);
+    let run = run_isolation_probe(&repo.join(ISOLATION_PROBE));
+
+    if let Err(reason) = judge_isolation_probe(&cited, &run) {
+        panic!(
+            "the interpreter-isolation evidence is not bound to a run that produced it \
+             ({reason}). `-I -S` is the only thing standing between an ambient PYTHONPATH \
+             and the module that computes the governed digests, and the flag being present \
+             in an argv is not evidence that it shuts the channel (franken_lean-h40t). \
+             cited={cited:?} produced={:?} verdict={:?} exit={:?}\n--- probe stderr ---\n{}",
+            run.outcomes, run.verdict, run.exit, run.stderr
+        );
+    }
+}
+
+/// Every arm of the judgement above kills a mutation, and each dies for its own reason.
+///
+/// The base run is **forged from the manifest's own citations** rather than written down,
+/// so it cannot drift away from the population the real test judges, and nothing is
+/// mutated on disk: a campaign that edits a shared file cannot be re-run by the next
+/// reader, and this one has to survive six panes editing the tree around it.
+///
+/// Two of the mutants are the same violation from opposite sides — a produced outcome
+/// nobody cites, and a citation removed from the row — and both are kept, because that is
+/// what "equality in both directions" means and a one-sided check would pass one of them.
+#[test]
+fn the_interpreter_isolation_binding_kills_each_mutation_it_claims_to() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let manifest = fs::read_to_string(repo.join("ci/VERIFICATION_MANIFEST.jsonl"))
+        .expect("ci/VERIFICATION_MANIFEST.jsonl must be readable");
+    let cited = cited_probe_outcomes(&manifest);
+
+    // The unmutated control, judged first. If the base were already refused, every mutant
+    // below would "die" on the same arm and this whole test would be theatre.
+    let base = ProbeRun {
+        exit: Some(0),
+        outcomes: cited.iter().map(|name| (name.clone(), true)).collect(),
+        verdict: "pass".to_owned(),
+        reason: String::new(),
+        stderr: String::new(),
+    };
+    assert_eq!(
+        judge_isolation_probe(&cited, &base),
+        Ok(()),
+        "the unmutated binding must hold, or the mutants below prove nothing about the \
+         mutations and everything about a broken baseline. cited={cited:?}"
+    );
+
+    let reproduces = cited
+        .iter()
+        .find(|name| name.ends_with("_reproduces_while_unprotected"))
+        .expect("the manifest must cite at least one negative control")
+        .clone();
+    let refuses = cited
+        .iter()
+        .find(|name| name.ends_with("_refused_under_isolation"))
+        .expect("the manifest must cite at least one isolated refusal")
+        .clone();
+
+    let flip = |target: &str| -> ProbeRun {
+        ProbeRun {
+            outcomes: base
+                .outcomes
+                .iter()
+                .map(|(name, passed)| (name.clone(), *passed && name != target))
+                .collect(),
+            verdict: "fail".to_owned(),
+            exit: Some(1),
+            reason: String::new(),
+            stderr: String::new(),
+        }
+    };
+    let without = |target: &str| -> ProbeRun {
+        ProbeRun {
+            outcomes: base
+                .outcomes
+                .iter()
+                .filter(|(name, _)| name != target)
+                .cloned()
+                .collect(),
+            verdict: "pass".to_owned(),
+            exit: Some(0),
+            reason: String::new(),
+            stderr: String::new(),
+        }
+    };
+    let with_extra = |extra: &str| -> ProbeRun {
+        let mut outcomes = base.outcomes.clone();
+        outcomes.push((extra.to_owned(), true));
+        ProbeRun {
+            outcomes,
+            verdict: "pass".to_owned(),
+            exit: Some(0),
+            reason: String::new(),
+            stderr: String::new(),
+        }
+    };
+
+    let renamed: Vec<(String, bool)> = base
+        .outcomes
+        .iter()
+        .map(|(name, passed)| (format!("{name}_note"), *passed))
+        .collect();
+
+    // (mutant, cited set, run, the reason the guard must give)
+    let mutants: Vec<(&str, Vec<String>, ProbeRun, String)> = vec![
+        (
+            "negative-control-did-not-reproduce",
+            cited.clone(),
+            flip(&reproduces),
+            format!("probe-check-failed:{reproduces}"),
+        ),
+        (
+            "isolation-did-not-refuse",
+            cited.clone(),
+            flip(&refuses),
+            format!("probe-check-failed:{refuses}"),
+        ),
+        (
+            "outcome-dropped-from-the-probe",
+            cited.clone(),
+            without(&refuses),
+            format!("cited-outcome-not-produced:{refuses}"),
+        ),
+        (
+            "outcome-added-without-a-citation",
+            cited.clone(),
+            with_extra("stdin_vector_refused_under_isolation"),
+            "produced-outcome-not-cited:stdin_vector_refused_under_isolation".to_owned(),
+        ),
+        (
+            "citation-removed-from-the-row",
+            cited
+                .iter()
+                .filter(|name| **name != refuses)
+                .cloned()
+                .collect(),
+            ProbeRun {
+                outcomes: base.outcomes.clone(),
+                verdict: "pass".to_owned(),
+                exit: Some(0),
+                reason: String::new(),
+                stderr: String::new(),
+            },
+            format!("produced-outcome-not-cited:{refuses}"),
+        ),
+        (
+            "probe-produced-nothing",
+            cited.clone(),
+            ProbeRun {
+                outcomes: Vec::new(),
+                verdict: "pass".to_owned(),
+                exit: Some(0),
+                reason: String::new(),
+                stderr: String::new(),
+            },
+            "probe-setup-inconclusive:no_outcomes_recorded".to_owned(),
+        ),
+        (
+            "probe-could-not-be-established",
+            cited.clone(),
+            ProbeRun {
+                outcomes: Vec::new(),
+                verdict: "inconclusive".to_owned(),
+                exit: Some(2),
+                reason: "python3_absent".to_owned(),
+                stderr: String::new(),
+            },
+            "probe-setup-inconclusive:python3_absent".to_owned(),
+        ),
+        (
+            "nothing-cites-the-probe",
+            Vec::new(),
+            ProbeRun {
+                outcomes: base.outcomes.clone(),
+                verdict: "pass".to_owned(),
+                exit: Some(0),
+                reason: String::new(),
+                stderr: String::new(),
+            },
+            "no-row-cites-the-probe".to_owned(),
+        ),
+        (
+            "no-outcome-carries-a-direction",
+            cited.clone(),
+            ProbeRun {
+                outcomes: renamed,
+                verdict: "pass".to_owned(),
+                exit: Some(0),
+                reason: String::new(),
+                stderr: String::new(),
+            },
+            "probe-has-no-negative-control".to_owned(),
+        ),
+        (
+            "run-failed-while-every-named-check-passed",
+            cited.clone(),
+            ProbeRun {
+                outcomes: base.outcomes.clone(),
+                verdict: "fail".to_owned(),
+                exit: Some(1),
+                reason: String::new(),
+                stderr: String::new(),
+            },
+            "probe-verdict:fail".to_owned(),
+        ),
+    ];
+
+    for (name, mutant_cited, mutant_run, expected_reason) in &mutants {
+        // A mutant that does not create the condition it claims is not evidence of a hole.
+        let moved = *mutant_cited != cited
+            || mutant_run.outcomes != base.outcomes
+            || mutant_run.verdict != base.verdict
+            || mutant_run.exit != base.exit;
+        assert!(
+            moved,
+            "mutant {name} is identical to the unmutated base, so it did not apply and \
+             scoring it proves nothing"
+        );
+        let verdict = judge_isolation_probe(mutant_cited, mutant_run);
+        assert_eq!(
+            verdict.as_ref().map_err(String::as_str),
+            Err(expected_reason.as_str()),
+            "mutant {name} was not killed for its stated reason. A rig that accepted any \
+             failure would score a mutant killed by an arm that had stopped testing the \
+             property"
+        );
+    }
+
+    // The citation side is PARSED, and driving the judgement over a forged vector proves
+    // only that the comparison discriminates — never that the scan reads the manifest. A
+    // scan whose needle had gone stale would return an empty set and be caught by
+    // `no-row-cites-the-probe`; a scan that silently dropped the ` -> OBSERVATION` suffix
+    // would return names that match nothing and read as a manifest problem. So the parser
+    // is mutated too, over an **in-memory copy**, because writing a tracked file while a
+    // lane runs can end it. Which mechanism it would trip is per-lane and not derivable
+    // from the path: `e8be303c` parsed all 21 lanes in `scripts/e2e/` and found eight
+    // declaring a governed set and thirteen declaring none — those thirteen cannot raise
+    // M2/M3/M4 under any write and rest on M1 alone — while `verdict_schema.sh` governs
+    // bare `scripts`, so any write anywhere beneath it voids that lane. Do not reason from
+    // a path to a mechanism without reading that lane's own `INPUT_PATHS`; the safe rule
+    // during a park is that the whole repository is frozen.
+    assert!(
+        cited.iter().all(|name| !name.contains(" -> ")),
+        "a citation's observation suffix survived into the outcome name, so no cited name \
+         can ever match one the probe emits: {cited:?}"
+    );
+    assert!(
+        manifest.contains(&format!("{ISOLATION_PROBE}: {reproduces} -> ")),
+        "the manifest no longer carries a suffixed citation, so the assertion above that \
+         suffixes are stripped is quantifying over a case that is not present"
+    );
+    let withdrawn = manifest.replace(
+        &format!("{ISOLATION_PROBE}: {refuses}"),
+        &format!("{ISOLATION_PROBE}: withdrawn"),
+    );
+    assert_ne!(
+        withdrawn, manifest,
+        "the citation mutation did not apply, so the parser was never exercised"
+    );
+    let reparsed = cited_probe_outcomes(&withdrawn);
+    assert!(
+        !reparsed.contains(&refuses) && reparsed.iter().any(|name| name == "withdrawn"),
+        "cited_probe_outcomes did not track a mutated manifest, so its result does not \
+         come from the file it claims to read: {reparsed:?}"
+    );
+    assert_eq!(
+        judge_isolation_probe(&reparsed, &base)
+            .as_ref()
+            .map_err(String::as_str),
+        Err("cited-outcome-not-produced:withdrawn"),
+        "a citation naming an outcome no probe emits was accepted"
+    );
+}

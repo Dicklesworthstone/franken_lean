@@ -28,6 +28,13 @@
 # before cleanup has manufactured the defect it was testing for.
 #
 # Usage:  scripts/tribunal/python_isolation_probe.sh
+#
+# stdout is data-only and carries exactly one line: the absolute path of this
+# run's artifact directory. A caller that cannot address the run record cannot
+# check that the run happened, and this probe's whole value is being run —
+# `crates/fln-conformance/tests/evidence_finalization.rs` reads the NDJSON
+# below through that line. Human narration goes to stderr.
+#
 # Exit 0 = both vectors reproduced while unprotected AND refused under -I.
 # Exit 1 = a vector was not refused under -I, or a negative control did not fire.
 # Exit 2 = setup could not be established. Typed separately because "we could
@@ -44,6 +51,9 @@ if ! mkdir "$ART_DIR" 2>/dev/null; then
   echo "[python_isolation_probe] setup failure: evidence directory already claimed: $ART_DIR" >&2
   exit 2
 fi
+# The sole stdout line, emitted the instant the claim succeeds so that a caller
+# holds the address even when the probe later fails or is interrupted.
+printf '%s\n' "$ART_DIR"
 
 SANDBOX="$(mktemp -d)"
 # Deterministic teardown, deliberately NOT a recursive force-removal. AGENTS.md
