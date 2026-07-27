@@ -90,11 +90,22 @@
 //! did not suffice is the transferable part.** `be14ee9b` proves the predicate refuses a pair
 //! the rewrite genuinely altered. It does not prove the predicate refuses two *unrelated*
 //! commits — so a predicate that accepted everything handed to it would still have failed
-//! `be14ee9b` for its own reasons while passing all seven. `cc_2` cross-paired `66e56721`
-//! with `419078c6`, both members of the accepted set and each with a twin that passes, and
-//! the wrong pairing is refused on every identity. **A negative control drawn from INSIDE
-//! the accepted set is what separates a discriminating predicate from a permissive one**; a
-//! control drawn only from known-bad material cannot.
+//! `be14ee9b` for its own reasons while passing all seven. `cc_2` cross-paired **`fln-8zsq`'s
+//! old anchor with `fln-kernel-bounded-decl-admission-ukzx`'s twin `419078c6`** — both rows
+//! members of the accepted set, each with a twin of its own that passes — and the wrong
+//! pairing is refused on every identity. **A negative control drawn from INSIDE the accepted
+//! set is what separates a discriminating predicate from a permissive one**; a control drawn
+//! only from known-bad material cannot.
+//!
+//! **That sentence names the rotted side by its ROW and not by its sha, and the reason is a
+//! defect this file committed and `commit_anchor_reachability` caught within the minute.**
+//! Writing the repaired sha into this prose *minted a fresh backup-only anchor* — the count
+//! for this file went 1 to 2 against a one-way allowance, reddening the workspace, because
+//! describing a rot repair in the obvious way reproduces the rot. The allowance may not be
+//! raised to accommodate it; the prose has to stop creating referents it has just finished
+//! proving unverifiable. **A rotted sha is not a safe thing to quote, even in a sentence
+//! whose subject is that it is rotted.** `be14ee9b` remains and is the declared 1: it is the
+//! one commit with no twin, so there is nothing to name it by instead.
 //!
 //! The class is at 0 and is not a permitted remainder: the census binds it by equality in
 //! both directions, so a new unreachable anchor must RAISE it and its author must say so.

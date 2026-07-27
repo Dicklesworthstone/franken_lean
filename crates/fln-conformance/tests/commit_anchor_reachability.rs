@@ -90,7 +90,7 @@ use std::process::{Command, Stdio};
 /// under a green aggregate guard.
 const BACKUP_ONLY_ALLOWANCE: &[(&str, usize)] = &[
     ("AGENTS.md", 2),
-    ("ci/VERIFICATION_MANIFEST.jsonl", 17),
+    ("ci/VERIFICATION_MANIFEST.jsonl", 12),
     ("ci/WORKSPACE_GRAPH.txt", 1),
     ("crates/fln-conformance/src/witness.rs", 3),
     (
