@@ -5537,6 +5537,14 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
 /// (the message prints the command and what it cost last time) or delete the observation
 /// sentences and let the claim fall back to inferred. The second is cheap and legitimate,
 /// which is what keeps the red from being extortion.
+///
+/// **The re-run is NOT a unilateral action, and until 2026-07-27 nothing in this repository
+/// said so** — the failure message handed a fresh pane a ready-to-paste command for a
+/// ~32-minute pin-dependent lane on a host every pane shares, and the only place the
+/// requirement existed was an orchestrator broadcast, which dies at the next rotation. The
+/// message now carries it. Recorded here because it is the second instance in one day of a
+/// rule living somewhere no fresh pane reads (the first was `f90ae35f`, a manifest rule that
+/// existed only in a broadcast; before that, `02da1b62`, a rule living in two bead comments).
 #[test]
 fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
     let pin = suite_lock_reference_pin();
@@ -5548,7 +5556,11 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
              file was of a different Reference, so the sentences in AGENTS.md and README \
              that describe it no longer describe this tree.\n\
              \n\
-             Two ways to clear this, both honest:\n\
+             Two ways to clear this, both honest — and (1) IS NOT YOURS TO LAUNCH \
+             UNILATERALLY. It is a ~32-minute run that requires the Reference pin, on a host \
+             every pane shares, so it goes through whoever sequences the swarm. Option (2) \
+             needs no permission and is the reason this red is never extortion.\n\
+             \n\
              (1) Re-run the lane at the new pin and commit the receipt it appends:\n\
              \x20   FLN_CORPUS_MATRIX_RECEIPT={} \\\n\
              \x20     cargo test --locked -p fln-conformance --test kernel_replay \\\n\
