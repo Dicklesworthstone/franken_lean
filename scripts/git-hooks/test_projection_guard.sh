@@ -468,5 +468,54 @@ check 'an invalid prospective validator refuses rather than passes' 1 \
     'planted validator failure' "$code" "$out"
 mv "$LAB/coverage-validator.saved" scripts/evidence.py
 
+# --- the D3 root-attribute guard ---------------------------------------------
+# Bead franken_lean-d3-root-attr-no-creation-affordance-sso4. The real tree has
+# zero non-compliant roots, so this guard's live population is EMPTY and a run
+# against a healthy tree cannot exercise it. Only a planted decoy shows it
+# works, and the refusal/accept pair below moves exactly one variable: the
+# presence of the attribute in the same path, in consecutive runs.
+mkdir -p crates/fln-decoy/tests/common crates/fln-unsafe-decoy/tests
+
+printf 'fn t() {}\n' > crates/fln-decoy/tests/plain.rs
+git add crates/fln-decoy/tests/plain.rs
+out=$(run_commit -q -m 'new test root, no D3 attribute' 2>&1); code=$?
+check 'a new tests/ root without the D3 attribute is refused' 1 \
+    'crates/fln-decoy/tests/plain.rs' "$code" "$out"
+
+printf '#![forbid(unsafe_code)]\nfn t() {}\n' > crates/fln-decoy/tests/plain.rs
+git add crates/fln-decoy/tests/plain.rs
+out=$(run_commit -q -m 'new test root, with D3 attribute' 2>&1); code=$?
+check 'the same root WITH the attribute is accepted' 0 '' "$code" "$out"
+
+# Nested, because structure-guard's crate_roots recurses into tests/. A depth-1
+# reading of the population misses this case entirely, which is why it is here.
+printf 'pub fn helper() {}\n' > crates/fln-decoy/tests/common/mod.rs
+git add crates/fln-decoy/tests/common/mod.rs
+out=$(run_commit -q -m 'nested test module, no D3 attribute' 2>&1); code=$?
+check 'a NESTED tests/ root without the attribute is refused' 1 \
+    'crates/fln-decoy/tests/common/mod.rs' "$code" "$out"
+printf '#![forbid(unsafe_code)]\npub fn helper() {}\n' > crates/fln-decoy/tests/common/mod.rs
+git add crates/fln-decoy/tests/common/mod.rs
+run_commit -q -m 'nested test module, repaired' >/dev/null 2>&1
+
+# Two walls this guard must NOT be. A boundary crate's posture is deny, not
+# forbid, so demanding forbid there would redden a correct commit...
+printf '#![deny(unsafe_code)]\nfn t() {}\n' > crates/fln-unsafe-decoy/tests/boundary.rs
+git add crates/fln-unsafe-decoy/tests/boundary.rs
+out=$(run_commit -q -m 'boundary-crate test root uses deny' 2>&1); code=$?
+check 'a boundary-crate root using deny is not walled by the forbid rule' 0 '' "$code" "$out"
+
+# ...and a multi-lint forbid satisfies D3 exactly as the bare form does.
+printf '#![forbid(clippy::all, unsafe_code)]\nfn t() {}\n' > crates/fln-decoy/tests/multi.rs
+git add crates/fln-decoy/tests/multi.rs
+out=$(run_commit -q -m 'multi-lint forbid form' 2>&1); code=$?
+check 'a multi-lint forbid form is accepted, not walled' 0 '' "$code" "$out"
+
+# The guard must be invisible to every commit that adds no crate root.
+printf 'unrelated\n' >> README.md
+git add README.md
+out=$(run_commit -q -m 'unrelated change' 2>&1); code=$?
+check 'a commit touching no crate root is unaffected' 0 '' "$code" "$out"
+
 printf '\n%s passed, %s failed\n' "$PASSES" "$FAILS"
 [ "$FAILS" -eq 0 ]
