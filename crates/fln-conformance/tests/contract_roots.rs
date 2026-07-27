@@ -37,6 +37,7 @@
 
 #![forbid(unsafe_code)]
 
+use fln_conformance::execution::{TriggerReachability, trigger_reachability};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -106,7 +107,17 @@ const UNWIRED_LANE_ALLOWANCE: &[(&str, &str)] = &[];
 ///
 /// * in `scripts/check.sh`, the command of a `run_stage <name>` (optionally through
 ///   `bash`/`sh`), not any argument that follows it;
-/// * in any `.github/workflows/*.yml` or `*.yaml`, an executed `./<path>`.
+/// * in any `.github/workflows/*.yml` or `*.yaml`, an executed `./<path>` **in a workflow
+///   that can actually fire**.
+///
+/// That last clause is bead `franken_lean-workflow-invocation-ignores-trigger-reachability-acm4`,
+/// and it is this bead's own defect one rung up. `0kpa` moved the check from *named in
+/// `check.sh`* to *appears as `./path` in a workflow*; appearing in a workflow is still not
+/// *reachable by a trigger*. A file with no `on:` block can never be dispatched, and until
+/// this conjunct it satisfied the check that exists to stop a dormant lane — restoring the
+/// exact state `0kpa` was filed for while every guard here stayed green. Reachability is
+/// decided by [`trigger_reachability`], which is shared with `mandated_mutants`' dispatch
+/// scan rather than written twice.
 fn lane_is_invoked(root: &Path, lane: &str) -> bool {
     if fs::read_to_string(root.join("scripts/check.sh"))
         .is_ok_and(|gate| invoked_by_check_sh(&gate, lane))
@@ -120,9 +131,24 @@ fn lane_is_invoked(root: &Path, lane: &str) -> bool {
             matches!(
                 path.extension().and_then(|extension| extension.to_str()),
                 Some("yml" | "yaml")
-            ) && fs::read_to_string(path).is_ok_and(|workflow| invoked_by_ci_yml(&workflow, lane))
+            ) && fs::read_to_string(path)
+                .is_ok_and(|workflow| workflow_invokes_lane(&workflow, lane))
         })
     })
+}
+
+/// Does one workflow both execute `lane` and stand a chance of running?
+///
+/// Lifted out of [`lane_is_invoked`] for the same reason [`allowance_verdict`] was, and the
+/// reason is worth stating because the first version of this repair did not do it: with the
+/// conjunction inlined above, **deleting the reachability half broke no test**. The controls
+/// exercised [`invoked_by_ci_yml`] and [`trigger_reachability`] individually, both of which
+/// kept passing, while the production decision quietly returned to what `acm4` reported. A
+/// guard whose fixtures pass either way is the defect this module exists to catch, one floor
+/// down — so the decision the real scan makes is the decision the control calls.
+fn workflow_invokes_lane(workflow: &str, lane: &str) -> bool {
+    invoked_by_ci_yml(workflow, lane)
+        && trigger_reachability(workflow) == TriggerReachability::Reachable
 }
 
 /// Join backslash continuations, so a wrapped `run_stage` is one line to the scanner.
@@ -167,6 +193,11 @@ fn invoked_by_check_sh(gate: &str, lane: &str) -> bool {
 }
 
 /// Does `ci` execute `lane` as `./<path>`?
+///
+/// **Execution position only — this deliberately says nothing about whether the workflow can
+/// fire.** Keeping the two questions apart is what lets [`the_scanner_distinguishes_command_position_from_mention`]
+/// and [`a_workflow_that_can_never_fire_does_not_count_as_invoking_a_lane`] each vary one
+/// axis; the caller conjoins them. Reading this as "the lane runs" is `acm4` exactly.
 fn invoked_by_ci_yml(ci: &str, lane: &str) -> bool {
     let executed = format!("./{lane}");
     ci.lines()
@@ -214,6 +245,132 @@ fn the_scanner_distinguishes_command_position_from_mention() {
         "          # see scripts/e2e/x.sh for details\n",
         "scripts/e2e/x.sh"
     ));
+}
+
+/// A workflow that can never fire is not a gate, however plainly it names the lane.
+///
+/// The control varies **reachability** and holds everything else fixed, which is the axis
+/// `0kpa`'s own negative control did not vary — it separated a never-written filename from a
+/// written one, and so earned confidence along an axis the claim did not rest on. Both texts
+/// below contain the executed command, so [`invoked_by_ci_yml`] cannot tell them apart; that
+/// is precisely the defect, and it is why the assertion is written against the pair rather
+/// than against either one.
+#[test]
+fn a_workflow_that_can_never_fire_does_not_count_as_invoking_a_lane() {
+    const LANE: &str = "scripts/e2e/contract_drift.sh";
+    let steps = "jobs:\n  c:\n    steps:\n      - run: |\n          ./scripts/e2e/contract_drift.sh --check\n";
+    let with_trigger = format!("on:\n  workflow_dispatch:\n{steps}");
+    let no_trigger = steps.to_string();
+
+    // The command is in execution position in BOTH, so the older half of the check is blind
+    // to the difference. Asserted, not assumed: if this stopped holding, the control below
+    // would be varying nothing.
+    assert!(
+        invoked_by_ci_yml(&with_trigger, LANE) && invoked_by_ci_yml(&no_trigger, LANE),
+        "both fixtures must execute the lane, or this control no longer isolates reachability"
+    );
+
+    assert_eq!(
+        trigger_reachability(&with_trigger),
+        TriggerReachability::Reachable
+    );
+    assert_eq!(
+        trigger_reachability(&no_trigger),
+        TriggerReachability::NeverFires,
+        "a workflow with no `on:` block can never be dispatched by GitHub, so it must not be \
+         allowed to satisfy the check that exists to stop a dormant lane (acm4)"
+    );
+
+    // The decision the real scan makes, not its ingredients. Asserting only the two lines
+    // above leaves the conjunction in `workflow_invokes_lane` untested, and a mutant deleting
+    // it passes every other assertion in this file — measured, not supposed.
+    assert!(workflow_invokes_lane(&with_trigger, LANE));
+    assert!(
+        !workflow_invokes_lane(&no_trigger, LANE),
+        "the lane is executed by this workflow and the workflow can never run, so the lane is \
+         not invoked by it — this is the assertion acm4's repair actually rests on"
+    );
+}
+
+/// Every workflow in the tree must be classifiable, or the reachability half is guessing.
+///
+/// [`lane_is_invoked`] admits only [`TriggerReachability::Reachable`], so an *unreadable*
+/// workflow silently reads as "does not invoke" — and a lane that is genuinely wired would
+/// then fail as dormant, with the message blaming the lane rather than the reader. FL-INV-07
+/// says an inconclusive outcome is neither verdict, so it is surfaced here as itself, named,
+/// before it can be mistaken for either.
+///
+/// The floor is the other half: a scan that walked no workflows is a broken scan, not a
+/// repository with no CI, and it would otherwise report this check as satisfied by nothing.
+#[test]
+fn every_workflow_can_be_classified_for_reachability() {
+    let root = root();
+    let dir = root.join(".github/workflows");
+    let mut seen = 0usize;
+    let mut reachable = 0usize;
+
+    let entries = fs::read_dir(&dir).unwrap_or_else(|error| {
+        panic!("{}: {error}", dir.display());
+    });
+    let mut files: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        seen += 1;
+        if trigger_reachability(&text) == TriggerReachability::Reachable {
+            reachable += 1;
+        }
+        files.push((path.display().to_string(), text));
+    }
+
+    assert!(
+        seen > 0,
+        "no workflow files were read from {}. An empty scan is a broken scan, not a \
+         repository with no CI: the reachability half of lane_is_invoked derives its whole \
+         answer from this directory, so it refuses rather than passing on no evidence",
+        dir.display()
+    );
+
+    // The real population plus ONE planted unclassifiable member, judged together. Asserting
+    // only that the real population is clean leaves the refusal unexecuted — a healthy tree
+    // has no unclassifiable workflow, so that assertion is decorative and a mutant gutting it
+    // survives, measured. Judging the union instead exercises the refusal per commit *and*
+    // pins the real tree: the verdict must name the plant and nothing else.
+    const PLANT: &str = "planted-unclassifiable.yml";
+    files.push((PLANT.to_string(), "{on: push, jobs: {}}\n".to_string()));
+    let refusal = fln_conformance::execution::classifiable_workflows(&files)
+        .expect_err("a planted unclassifiable workflow must be refused, or this guard is inert");
+    assert!(
+        refusal.contains(PLANT),
+        "the refusal must name the offending workflow: {refusal}"
+    );
+    let real_offenders: Vec<&(String, String)> = files
+        .iter()
+        .filter(|(name, _)| name != PLANT && refusal.contains(name.as_str()))
+        .collect();
+    assert!(
+        real_offenders.is_empty(),
+        "{refusal}\n\nthe plant is expected; these are not: {:?}",
+        real_offenders
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+    );
+
+    assert!(
+        reachable > 0,
+        "{seen} workflow(s) read and none declares a trigger. Either every workflow in this \
+         repository is dormant, or the reader has stopped recognising a live one — and the \
+         second would make lane_is_invoked's workflow branch answer `false` for everything, \
+         which is a wall rather than a finding"
+    );
 }
 
 /// Decide the allowance verdict for one lane: invoked-or-declared, in both directions.

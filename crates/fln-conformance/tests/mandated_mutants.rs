@@ -62,6 +62,12 @@
 // rule as every other, which is the `franken_lean-2ki4` correction.
 const SOURCE_READING: [&str; 2] = ["include_str!", "read_to_string"];
 
+// Placed after the constant above, never before it: the uniform cut is taken at the earliest
+// source-reading token, so anything above would join the scanned region. A `use` carries no
+// such token, and putting it here keeps that reasoning true by construction rather than by
+// nobody having tested it.
+use fln_conformance::execution::{TriggerReachability, trigger_reachability};
+
 /// The marker a killing test carries to claim one of §18's names.
 const MARKER: &str = "MANDATED MUTANT (AGENTS testing policy: \"";
 
@@ -987,6 +993,21 @@ fn dispatch_in_workflow(yaml: &str) -> Dispatch {
     if !runs_campaign {
         return Dispatch::Nothing;
     }
+    // A workflow that can never fire dispatches nothing, however completely it describes the
+    // campaign — bead `franken_lean-workflow-invocation-ignores-trigger-reachability-acm4`.
+    // Without this, a file with no `on:` block reached the `OnDemandOnly` arm below and the
+    // receipt earned `dispatched_on_demand_not_a_per_commit_gate`: a positive cadence claim,
+    // written into retained evidence, for a workflow GitHub can never run. Measured at
+    // `4e168918` on the real predicate with the `on:` block as the only variable.
+    //
+    // `Unreadable` lands here too, and that is the conservative half of a deliberate split:
+    // this pure function may not render an inconclusive as a verdict, so it declines to award
+    // a dispatch state, while [`measured_dispatch`] refuses the whole run by name when a real
+    // workflow cannot be classified. Silently mapping inconclusive to `Nothing` *without* that
+    // refusal would be FL-INV-07's exact prohibition.
+    if trigger_reachability(yaml) != TriggerReachability::Reachable {
+        return Dispatch::Nothing;
+    }
     let scheduled = lines
         .iter()
         .any(|l| l.trim_start().starts_with("schedule:"))
@@ -1042,6 +1063,31 @@ fn measured_dispatch(root: &std::path::Path) -> (Dispatch, Vec<String>) {
          rather than reporting the weakest state on no evidence",
         root.join(".github/workflows").display()
     );
+    // An unclassifiable workflow is inconclusive, and `dispatch_in_workflow` deliberately
+    // declines rather than guessing on it. Declining is only safe if somebody says so out
+    // loud: otherwise a workflow this reader stopped understanding would quietly drop the
+    // repository's dispatch state and read as "the cron was deleted" — a true-looking finding
+    // with a false cause, which is `hugg`'s misdirection in miniature.
+    // Judged as the real population plus ONE planted unclassifiable member, because a healthy
+    // tree contains none and an assertion over an empty population is decorative — a mutant
+    // gutting the plain `is_empty()` form survived. The verdict must name the plant and no
+    // real workflow, which exercises the refusal and pins the tree in one assertion.
+    const PLANT: &str = "planted-unclassifiable.yml";
+    let mut probe = files.clone();
+    probe.push((PLANT.to_string(), "{on: push, jobs: {}}\n".to_string()));
+    let refusal = fln_conformance::execution::classifiable_workflows(&probe)
+        .expect_err("a planted unclassifiable workflow must be refused, or this guard is inert");
+    let real_offenders: Vec<&String> = files
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| refusal.contains(name.as_str()))
+        .collect();
+    assert!(
+        real_offenders.is_empty(),
+        "{refusal}\n\nthe dispatch state of this repository is unknown rather than weak, so \
+         this refuses instead of reporting a cadence it cannot establish: {real_offenders:?}"
+    );
+
     let mut best = Dispatch::Nothing;
     let mut dispatchers = Vec::new();
     for (name, text) in &files {
@@ -1104,6 +1150,50 @@ fn the_dispatch_reader_separates_a_real_lane_from_the_three_near_misses() {
     );
 
     assert_eq!(dispatch_in_workflow(""), Dispatch::Nothing);
+}
+
+/// A fourth near-miss, and the only one that wrote a *positive* claim into retained evidence.
+///
+/// The three above are ways a workflow fails to run the campaign. This is a workflow that
+/// describes the campaign perfectly and can never run at all, and it is bead
+/// `franken_lean-workflow-invocation-ignores-trigger-reachability-acm4` reaching a second
+/// site: cc_2 measured the defect in `contract_roots`, where the cost is a dormant lane
+/// reading as wired; here the cost is worse, because the state is not merely believed but
+/// **serialized**. `Dispatch::OnDemandOnly.class()` is written into the kill receipt, so
+/// before this the receipt could assert `dispatched_on_demand_not_a_per_commit_gate` about a
+/// file GitHub cannot dispatch — a cadence claim with no producer, inside the very join
+/// AGENTS.md item 7 records as closed.
+///
+/// Both texts run the campaign with `--ignored` in the same `run:` block, so every other
+/// dimension the reader consults is held fixed and reachability is the only variable.
+#[test]
+fn a_workflow_that_can_never_fire_dispatches_nothing() {
+    let job = "jobs:\n  c:\n    steps:\n      - run: |\n          cargo test \
+               the_mandated_mutants_are_planted_and_their_killers_die -- --ignored --exact\n";
+    let reachable = format!("on:\n  workflow_dispatch:\n{job}");
+    let never_fires = job.to_string();
+
+    assert_eq!(
+        dispatch_in_workflow(&reachable),
+        Dispatch::OnDemandOnly,
+        "the control must still earn a dispatch state, or the pair below varies two things"
+    );
+    assert_eq!(
+        dispatch_in_workflow(&never_fires),
+        Dispatch::Nothing,
+        "a workflow with no `on:` block can never be dispatched, so it must earn no cadence \
+         at all — awarding it OnDemandOnly puts an unbacked claim in a retained receipt"
+    );
+
+    // A cron changes nothing while the file cannot fire: the schedule keys are matched
+    // file-wide, so without the reachability conjunct this is the strongest possible false
+    // claim the reader could make.
+    let cron_but_unreachable = format!("{job}schedule:\n  - cron: \"23 4 * * 2\"\n");
+    assert_ne!(
+        dispatch_in_workflow(&cron_but_unreachable),
+        Dispatch::Scheduled,
+        "a cron in a workflow that declares no trigger is not a cadence"
+    );
 }
 
 /// The class token every arm produces is distinct, and none of them claims a per-commit gate.

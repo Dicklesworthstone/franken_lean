@@ -547,6 +547,126 @@ pub fn ci_jobs(workflow: &str, text: &str) -> Vec<CiJob> {
     jobs
 }
 
+/// Can a workflow ever fire at all?
+///
+/// [`ci_jobs`] answers *what a workflow would run*; this answers *whether it ever gets the
+/// chance*. The two are independent, and until bead
+/// `franken_lean-workflow-invocation-ignores-trigger-reachability-acm4` nothing in this
+/// workspace asked the second one. Both guards that read workflows were deciding on the
+/// first alone, and a file with no `on:` block — which GitHub can never dispatch under any
+/// circumstance — satisfied both. Measured at `4e168918` against the two real predicates
+/// with the `on:` block as the only variable moved: `contract_roots`' dormant-lane check
+/// counted such a file as invoking a lane, and `mandated_mutants`' dispatch scan awarded it
+/// the token `dispatched_on_demand_not_a_per_commit_gate` — a positive cadence claim,
+/// retained in a receipt, for a workflow that cannot run.
+///
+/// Two copies of this question would be a join between two rules with nothing watching it —
+/// this module's own defect family, one floor down — so it is asked once, here, and borrowed
+/// by both callers rather than re-implemented in either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerReachability {
+    /// A top-level `on` key is present, so GitHub can dispatch this workflow.
+    Reachable,
+    /// Top-level keys were read and `on` was not among them: the file can never fire.
+    NeverFires,
+    /// No top-level key could be read at all, so the question is simply unanswered.
+    ///
+    /// FL-INV-07: this is the inconclusive outcome and it is never rendered as either of the
+    /// other two. A caller must refuse rather than guess, because both guesses are wrong in
+    /// a different direction — `Reachable` restores the defect this enum exists for, and
+    /// `NeverFires` is a wall that reddens a correct workflow nobody can repair.
+    Unreadable,
+}
+
+/// Does `text` declare a top-level `on` key?
+///
+/// An indentation reader, not a YAML parser (D1 forbids pulling one in), and the column-zero
+/// rule is what makes that *sound* rather than merely cheap: YAML requires a block scalar's
+/// content to be indented deeper than its own key, and every `run:` in a workflow is nested
+/// under `jobs:`, so no line of a `run:` body can reach column zero. A column-zero key is
+/// therefore a real top-level key, never script text that happens to look like one — which
+/// is the failure mode a naive file-wide `contains("on:")` would have.
+///
+/// Recognised as the same key: `on:`, `"on":`, `on :`, `on: push`, `on: [push]`. YAML permits
+/// the quotes and the space before the colon, so a reader that rejected them would report a
+/// live trigger as absent — a wall, and the more expensive direction to be wrong in. A
+/// leading `---`, a comment, and any indented line are not top-level keys; a flow-style
+/// document (`{on: …, jobs: …}`) yields no key at all and reports [`TriggerReachability::Unreadable`]
+/// rather than a guess.
+///
+/// **What this does not earn.** That a workflow is *declared* dispatchable — never that it is
+/// **loadable** (a syntactically broken file still reads as reachable here), and never that
+/// it ever **fired**. `uagk` records that a schedule GitHub silently disables is invisible
+/// from inside the repository; nothing here changes that, and a caller must not let a green
+/// imply otherwise.
+pub fn trigger_reachability(text: &str) -> TriggerReachability {
+    let mut saw_key = false;
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with([' ', '\t']) || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some(key) = top_level_key(line) else {
+            continue;
+        };
+        saw_key = true;
+        if key == "on" {
+            return TriggerReachability::Reachable;
+        }
+    }
+    if saw_key {
+        TriggerReachability::NeverFires
+    } else {
+        TriggerReachability::Unreadable
+    }
+}
+
+/// Refuse a workflow population containing one whose reachability cannot be decided.
+///
+/// The verdict is lifted out of both callers rather than asserted at each, for a reason that
+/// was measured rather than anticipated: with the refusal written inline as
+/// `assert!(unreadable.is_empty())`, **a mutant gutting it survived**. A healthy tree contains
+/// no unclassifiable workflow, so the population the assertion guards is empty and the
+/// assertion is decorative — the shape this repository has already paid for once, where a
+/// repaired population drives its own live guard to zero and only a *planted* member still
+/// catches the mutant. Callers therefore plant one, and the refusal they exercise is this
+/// function rather than a local `assert!`.
+///
+/// The error names every offender, because a refusal that says only *that* something is
+/// unclassifiable sends the reader looking through every workflow in the tree.
+pub fn classifiable_workflows(files: &[(String, String)]) -> Result<(), String> {
+    let unreadable: Vec<&str> = files
+        .iter()
+        .filter(|(_, text)| trigger_reachability(text) == TriggerReachability::Unreadable)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if unreadable.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "trigger_reachability cannot classify {unreadable:?}. That is inconclusive, not a \
+         verdict (FL-INV-07): reading it as reachable restores bead \
+         franken_lean-workflow-invocation-ignores-trigger-reachability-acm4, and reading it \
+         as never-firing fails a correct workflow while blaming the workflow. Write the \
+         `on:` block as a column-zero block-mapping key, or widen \
+         fln_conformance::execution::trigger_reachability deliberately"
+    ))
+}
+
+/// `name: value` at column zero → `name`; anything that is not a key line → `None`.
+///
+/// A line with no colon is not a key, which is what keeps `---` and a bare flow mapping out
+/// of the count; requiring the key to be a plain scalar keeps `{on` out of it too, so a flow
+/// document reports as unreadable instead of accidentally answering.
+fn top_level_key(line: &str) -> Option<&str> {
+    let (head, _) = line.split_once(':')?;
+    let key = head.trim().trim_matches(['"', '\'']).trim();
+    let ok = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    ok.then_some(key)
+}
+
 /// `  some-job:` and nothing else — two spaces, a key, a colon, end of line.
 ///
 /// Trailing whitespace is trimmed first. A job key written `"  gate:  "` would otherwise
@@ -1556,6 +1676,110 @@ fn discussion_only() {\n\
                 .iter()
                 .any(|attribute| attribute == "#[cfg(unix)]"),
             "{unmodelled:?}"
+        );
+    }
+
+    /// The reader separates a workflow that can fire from one that cannot, on the one axis
+    /// the callers depend on and nothing else.
+    ///
+    /// The first pair is the whole of `acm4`: two texts identical except for the `on:` block,
+    /// which every earlier reader in this workspace scored the same. The rest are the shapes
+    /// YAML permits for that same key — each of them, misread, reports a live trigger as
+    /// absent and reddens a workflow whose author did nothing wrong.
+    #[test]
+    fn a_workflow_with_no_trigger_block_can_never_fire() {
+        let job = "jobs:\n  c:\n    steps:\n      - run: |\n          ./scripts/e2e/x.sh\n";
+        let with_on = format!("on:\n  workflow_dispatch:\n{job}");
+        assert_eq!(
+            trigger_reachability(&with_on),
+            TriggerReachability::Reachable
+        );
+        assert_eq!(
+            trigger_reachability(job),
+            TriggerReachability::NeverFires,
+            "a workflow with no `on:` block can never be dispatched, so it must not read as \
+             reachable — this is the exact pair acm4 measured as indistinguishable"
+        );
+
+        // Every spelling YAML allows for the same top-level key.
+        for spelling in ["on:", "\"on\":", "'on':", "on :", "on: push", "on: [push]"] {
+            assert_eq!(
+                trigger_reachability(&format!("{spelling}\n{job}")),
+                TriggerReachability::Reachable,
+                "`{spelling}` is a top-level trigger key and must be read as one; rejecting it \
+                 is a wall that reddens a correct workflow"
+            );
+        }
+    }
+
+    /// A mention of the key that is not the key must not vouch for reachability, and a file
+    /// the reader cannot classify must say so instead of guessing.
+    #[test]
+    fn trigger_reachability_refuses_a_guess_and_ignores_a_mention() {
+        let job = "jobs:\n  c:\n    steps:\n      - run: |\n          ./x.sh\n";
+
+        // A comment, and an indented occurrence inside a `run:` body. Neither is a trigger.
+        assert_eq!(
+            trigger_reachability(&format!("# on: push\n{job}")),
+            TriggerReachability::NeverFires
+        );
+        assert_eq!(
+            trigger_reachability(
+                "jobs:\n  c:\n    steps:\n      - run: |\n          echo on: push\n"
+            ),
+            TriggerReachability::NeverFires,
+            "a `run:` body is indented deeper than its own key, so an `on:` inside one is \
+             script text and never a top-level trigger"
+        );
+
+        // The decoy the column-zero rule exists for, and it earns its place: the line above
+        // is already rejected by the key grammar (`echo on` is not a plain scalar), so it
+        // exercises nothing — a mutant deleting the indentation test survived it. This line
+        // parses as the key `on` the instant column zero stops being required.
+        assert_eq!(
+            trigger_reachability(
+                "jobs:\n  c:\n    steps:\n      - run: |\n          on: not-a-trigger\n"
+            ),
+            TriggerReachability::NeverFires,
+            "an indented line that would parse as the key `on` is still inside a `run:` body, \
+             and only its indentation says so"
+        );
+
+        // Nothing the reader recognises as a top-level key: it declines rather than deciding.
+        // Guessing either way is wrong in a different direction, so neither is permitted.
+        for opaque in ["{on: push, jobs: {}}\n", "---\n", "", "   \n"] {
+            assert_eq!(
+                trigger_reachability(opaque),
+                TriggerReachability::Unreadable,
+                "no top-level key is readable in {opaque:?}, so the answer is inconclusive \
+                 (FL-INV-07) and must not be rendered as either verdict"
+            );
+        }
+    }
+
+    /// The population verdict refuses exactly the members it cannot classify, and stays quiet
+    /// otherwise — the direction a healthy tree exercises, and the one it never can.
+    #[test]
+    fn classifiable_workflows_refuses_only_what_it_cannot_decide() {
+        let live = (
+            "ci.yml".to_string(),
+            "on:\n  push:\njobs:\n  c:\n".to_string(),
+        );
+        let dormant = ("dead.yml".to_string(), "jobs:\n  c:\n".to_string());
+        let opaque = ("flow.yml".to_string(), "{on: push, jobs: {}}\n".to_string());
+
+        assert!(classifiable_workflows(&[]).is_ok());
+        assert!(
+            classifiable_workflows(&[live.clone(), dormant.clone()]).is_ok(),
+            "a workflow that can never fire is decidable — it is a finding for the caller to \
+             act on, never a failure to classify"
+        );
+
+        let refusal = classifiable_workflows(&[live, dormant, opaque])
+            .expect_err("an undecidable workflow must be refused");
+        assert!(
+            refusal.contains("flow.yml") && !refusal.contains("dead.yml"),
+            "the refusal must name the undecidable member and only it: {refusal}"
         );
     }
 }
