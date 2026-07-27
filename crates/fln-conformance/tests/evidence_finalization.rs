@@ -1080,6 +1080,345 @@ fn the_evidence_surface_refuses_a_gitdir_pointer_root() {
     }
 }
 
+/// The fourth `.git` shape: **no `.git` at all**, which is the RCH worker's checkout
+/// (bead `fln-yihl`, the host half of `franken_lean-worktree-gitdir-refusal-hugg`).
+///
+/// The sibling above covers three shapes and every one of them is about the wrong **tree**. This
+/// is the wrong **host**, and it is the shape nobody chooses: RCH's PreToolUse hook offloads a
+/// bare `cargo test` with nothing in the command saying so, and the worker's checkout is synced
+/// without `.git` (bead `franken_lean-rch-clean-overlay-has-no-git-dir-46pw`). So an agent who
+/// runs the mandated gate exactly as AGENTS.md prescribes it can have the whole evidence surface
+/// refuse on a machine they never chose, and read a cause that names something else.
+///
+/// **The exit code discriminates nothing, which is why this is a message assertion.** Measured at
+/// `ef389785` against both the committed and the working-tree copy of `scripts/evidence.py` —
+/// they agree — a root with no `.git` exits **2**, and so does a root whose `.git` is a real
+/// directory, because there git runs and fails on its own terms. Only the text separates them.
+///
+/// **And the message must not over-diagnose.** The pointer refusal names a LINKED GIT WORKTREE.
+/// A worker is not a worktree, so borrowing that sentence here would be the same failure the
+/// sibling guards against one shape over: a diagnosis confident enough to be wrong, sending the
+/// reader to hunt for a worktree they are not in.
+/// The absent-`.git` refusal is its OWN sentence, not the non-directory one.
+const WORKER_ABSENT_REFUSAL: &str = "requires an explicit repository .git directory";
+const WORKER_NAMES_THE_WORKTREE: &str = "LINKED GIT WORKTREE";
+
+/// Run `ubs-inventory` against a purpose-built root, with or without a real `.git` directory.
+fn worker_probe(
+    evidence: &Path,
+    scratch: &Path,
+    name: &str,
+    with_git_dir: bool,
+) -> (Option<i32>, String) {
+    let root = scratch.join(name);
+    fs::create_dir_all(&root).expect("probe root must be creatable");
+    if with_git_dir {
+        fs::create_dir_all(root.join(".git")).expect("probe .git directory must be creatable");
+    }
+    let run = std::process::Command::new("python3")
+        .args(["-I", "-S"])
+        .arg(evidence)
+        .arg("ubs-inventory")
+        .arg("--root")
+        .arg(&root)
+        .args(["--scope", "all-tracked"])
+        .arg("--output")
+        .arg(root.join("inventory.json"))
+        .arg("--artifact-root")
+        .arg(&root)
+        .output()
+        .expect("the sealed interpreter must be able to run the evidence runner");
+    (
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr).into_owned(),
+    )
+}
+
+/// Judge one (evidence surface, doctrine text) pair, returning a finding per broken property.
+///
+/// Findings rather than assertions, so a mutant is planted in the ARGUMENTS and each property
+/// can be gutted alone. `scripts/evidence.py` is an orphaned working-tree file this session may
+/// not modify (bead `franken_lean-h4o1`), so every mutant below is a doctored COPY in scratch and
+/// the real file is never written.
+fn worker_refusal_findings(evidence: &Path, agents: &str, scratch: &Path) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    let (absent_code, absent_stderr) = worker_probe(evidence, scratch, "worker-no-git", false);
+    if absent_code != Some(2) {
+        findings.push(format!(
+            "absent-exit: a root with no .git must be a typed setup failure (exit 2), got \
+             {absent_code:?}. An RCH worker's checkout is exactly this root, so a pass here is a \
+             verdict about a machine the caller never chose: {absent_stderr}"
+        ));
+    }
+    if !absent_stderr.contains(WORKER_ABSENT_REFUSAL) {
+        findings.push(format!(
+            "absent-unnamed: a root with no .git must be refused BY NAME. Every caller prints a \
+             louder and wrong summary over this line — check.sh says it cannot inventory UBS \
+             inputs — so a refusal naming no cause sends the reader after a missing tool: \
+             {absent_stderr}"
+        ));
+    }
+    if absent_stderr.contains(WORKER_NAMES_THE_WORKTREE) {
+        findings.push(format!(
+            "absent-over-diagnosed: the refusal called a checkout with no .git a LINKED GIT \
+             WORKTREE. It is not one — this is the RCH worker shape — and announcing a worktree \
+             sends the reader to diagnose a checkout they are not in: {absent_stderr}"
+        ));
+    }
+
+    // The control that makes the three above mean anything: a real `.git` directory exits 2 as
+    // well, because there git runs and fails on its own terms. Nothing about the status
+    // separates a genuine refusal from a probe that merely failed, so a rig checking "non-zero"
+    // would pass with no content at all.
+    let (directory_code, directory_stderr) =
+        worker_probe(evidence, scratch, "worker-real-git", true);
+    if directory_code != Some(2) {
+        findings.push(format!(
+            "control-exit: the real-.git control must reach the same exit code, or this check is \
+             discriminating on the status rather than on the refusal: {directory_stderr}"
+        ));
+    }
+    if directory_stderr.contains(WORKER_ABSENT_REFUSAL) {
+        findings.push(format!(
+            "control-refused: the absent-.git refusal fired for a root whose .git IS a real \
+             directory, so it is not keyed on the missing-repository condition at all and the \
+             probes above prove nothing: {directory_stderr}"
+        ));
+    }
+
+    // --- the doctrine half. The rule this earns lives in the section readers consult ------
+    let heading = "### Where a green bar may be taken from";
+    let Some(start) = agents.find(heading) else {
+        findings.push(
+            "doctrine-missing-section: AGENTS.md no longer carries the section stating where a \
+             green bar may be taken from, so this check has nothing to hold and refuses rather \
+             than passing vacuously."
+                .to_string(),
+        );
+        return findings;
+    };
+    let section = &agents[start..];
+    let section = &section[..section.find("\n---").unwrap_or(section.len())];
+
+    // Each needle is a load-bearing half of the rule. The reason they are checked rather than
+    // trusted to prose is `hugg`: that correction was broadcast three times in one day and did
+    // not survive a pane restart. A rule nobody can read at session start is not a rule.
+    for needed in [
+        "RCH",
+        "unattributed",
+        "--clean-overlay",
+        "--overlay-path",
+        WORKER_ABSENT_REFUSAL,
+        "the_evidence_surface_refuses_a_worker_checkout_with_no_git_at_all",
+    ] {
+        if !section.contains(needed) {
+            findings.push(format!(
+                "doctrine-dropped: the AGENTS.md green-bar section no longer names {needed:?}. \
+                 That section is where an agent decides whether a green may be cited, and an RCH \
+                 default-mode green is about the worker's tree rather than theirs — an omission \
+                 here is invisible at the point of failure, which is a bead closed on somebody \
+                 else's build."
+            ));
+        }
+    }
+    findings
+}
+
+fn worker_scratch(tag: &str) -> PathBuf {
+    let dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("target"))
+        .join(format!("fln-worker-refusal-{}-{tag}", std::process::id()));
+    fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
+fn worker_repo() -> PathBuf {
+    fln_conformance::checked_workspace_root!()
+        .canonicalize()
+        .expect("the repository root must resolve")
+}
+
+/// Write a doctored copy of the evidence surface. The original is never touched.
+fn doctored_evidence(tag: &str, edit: impl Fn(String) -> String) -> (PathBuf, PathBuf) {
+    let repo = worker_repo();
+    let source = fs::read_to_string(repo.join("scripts/evidence.py")).expect("evidence.py");
+    let scratch = worker_scratch(tag);
+    let path = scratch.join("evidence_mutant.py");
+    let mutated = edit(source.clone());
+    assert_ne!(
+        mutated, source,
+        "mutant {tag} changed nothing, so the cell below would score a pass against the real \
+         surface and prove nothing. The needle it edits has moved."
+    );
+    fs::write(&path, mutated).expect("doctored evidence surface is writable");
+    (path, scratch)
+}
+
+#[test]
+fn the_evidence_surface_refuses_a_worker_checkout_with_no_git_at_all() {
+    let repo = worker_repo();
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let findings = worker_refusal_findings(
+        &repo.join("scripts/evidence.py"),
+        &agents,
+        &worker_scratch("live"),
+    );
+    assert!(
+        findings.is_empty(),
+        "the evidence surface no longer refuses an RCH worker's checkout as this repository's \
+         doctrine says it does:\n\n{}",
+        findings.join("\n\n")
+    );
+}
+
+/// Gut 1: the refusal stops naming the missing repository.
+#[test]
+fn a_worker_refusal_that_stops_naming_its_cause_is_caught() {
+    let (evidence, scratch) = doctored_evidence("unnamed", |text| {
+        text.replace(WORKER_ABSENT_REFUSAL, "cannot proceed")
+    });
+    let agents = fs::read_to_string(worker_repo().join("AGENTS.md")).expect("AGENTS.md");
+    let findings = worker_refusal_findings(&evidence, &agents, &scratch);
+    assert!(
+        findings.iter().any(|f| f.starts_with("absent-unnamed")),
+        "a refusal that fires without naming its cause must be caught — that is the whole \
+         `hugg` defect, one host over: {findings:?}"
+    );
+}
+
+/// Gut 2: the refusal over-diagnoses, calling a worker a linked worktree.
+#[test]
+fn a_worker_refusal_that_claims_a_linked_worktree_is_caught() {
+    let (evidence, scratch) = doctored_evidence("overdiagnosed", |text| {
+        text.replace(
+            WORKER_ABSENT_REFUSAL,
+            "requires an explicit repository .git directory (LINKED GIT WORKTREE)",
+        )
+    });
+    let agents = fs::read_to_string(worker_repo().join("AGENTS.md")).expect("AGENTS.md");
+    let findings = worker_refusal_findings(&evidence, &agents, &scratch);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("absent-over-diagnosed")),
+        "a diagnosis confident enough to be wrong must be caught: {findings:?}"
+    );
+}
+
+/// Gut 3: the surface stops refusing an absent `.git` and lets git fail on its own terms.
+///
+/// This is the mutant that proves the exit code is not the discriminator. The doctored surface
+/// still exits 2 — git simply fails for its own reason — so only the missing message catches it.
+#[test]
+fn a_surface_that_stops_refusing_a_worker_checkout_is_caught() {
+    let (evidence, scratch) = doctored_evidence("permissive", |text| {
+        text.replace(
+            "raise EvidenceError(f\"{subject} requires an explicit repository .git directory\") from error",
+            "git_mode = stat.S_IFDIR",
+        )
+    });
+    let agents = fs::read_to_string(worker_repo().join("AGENTS.md")).expect("AGENTS.md");
+    let findings = worker_refusal_findings(&evidence, &agents, &scratch);
+    assert!(
+        findings.iter().any(|f| f.starts_with("absent-unnamed")),
+        "a surface that stopped refusing a repository-less root must be caught: {findings:?}"
+    );
+}
+
+/// Gut 4: the refusal becomes unconditional and fires on a real repository too.
+///
+/// The direction a "does it fire?" rig cannot see. An always-refusing surface satisfies every
+/// positive cell above and is useless, which is why the control is not decoration.
+#[test]
+fn a_worker_refusal_that_fires_on_a_real_repository_is_caught() {
+    let (evidence, scratch) = doctored_evidence("overbroad", |text| {
+        text.replace(
+            "        git_mode = git_dir.lstat().st_mode",
+            "        raise FileNotFoundError(str(git_dir))",
+        )
+    });
+    let agents = fs::read_to_string(worker_repo().join("AGENTS.md")).expect("AGENTS.md");
+    let findings = worker_refusal_findings(&evidence, &agents, &scratch);
+    assert!(
+        findings.iter().any(|f| f.starts_with("control-refused")),
+        "a refusal that fires for a real repository must be caught by the control: {findings:?}"
+    );
+}
+
+/// Gut 7, and the one that matters most: the surface returns empty instead of refusing.
+///
+/// Measured — this mutant exits **0** and prints nothing, so a worker checkout produces a
+/// clean-looking inventory of a repository the surface could not read. Every other cell here is
+/// a refusal behaving wrongly; this is the *false clean*, which is the same "a broken walk and a
+/// clean tree are the same green" hazard one host over, and the only shape that would be quoted
+/// into a bead as evidence.
+///
+/// It is deliberately **not isolated**: it fires `absent-exit` and `absent-unnamed` together.
+/// That over-determination is reported rather than tuned away, because the alternative is
+/// contriving a mutant that changes the exit code while preserving the message, which no real
+/// regression looks like.
+#[test]
+fn a_surface_that_returns_empty_instead_of_refusing_is_caught() {
+    let (evidence, scratch) = doctored_evidence("silent", |text| {
+        text.replace(
+            "raise EvidenceError(f\"{subject} requires an explicit repository .git directory\") from error",
+            "return b\"\"",
+        )
+    });
+    let agents = fs::read_to_string(worker_repo().join("AGENTS.md")).expect("AGENTS.md");
+    let findings = worker_refusal_findings(&evidence, &agents, &scratch);
+    assert!(
+        findings.iter().any(|f| f.starts_with("absent-exit")),
+        "a surface that answers a repository-less root with exit 0 and an empty inventory must \
+         be caught: that is a green bar about a checkout nothing could read: {findings:?}"
+    );
+}
+
+/// Gut 5: the doctrine is softened — the attributable invocation stops being named.
+///
+/// `hugg`'s lesson is that the mechanism and the sentence must fail together. A reader who
+/// cannot find `--clean-overlay` has no way to obtain an attributable green and will take the
+/// default-mode one.
+#[test]
+fn a_doctrine_that_drops_the_attributable_invocation_is_caught() {
+    let repo = worker_repo();
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md");
+    let softened = agents.replace("--clean-overlay", "the attributable mode");
+    let findings = worker_refusal_findings(
+        &repo.join("scripts/evidence.py"),
+        &softened,
+        &worker_scratch("softened"),
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("doctrine-dropped") && f.contains("clean-overlay")),
+        "dropping the attributable invocation from the doctrine must be caught: {findings:?}"
+    );
+}
+
+/// Gut 6: the section itself disappears, which must refuse rather than pass vacuously.
+#[test]
+fn a_missing_green_bar_section_refuses_rather_than_passing_vacuously() {
+    let repo = worker_repo();
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md");
+    let gutted = agents.replace("### Where a green bar may be taken from", "### Removed");
+    let findings = worker_refusal_findings(
+        &repo.join("scripts/evidence.py"),
+        &gutted,
+        &worker_scratch("sectionless"),
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("doctrine-missing-section")),
+        "a doctrine section this check cannot locate is a broken scan, never a clean file: \
+         {findings:?}"
+    );
+}
+
 /// The closure-binding instant AGENTS.md publishes is the one the validator enforces.
 ///
 /// `scripts/evidence.py` refuses a `complete` coverage row for a bead closed at or after

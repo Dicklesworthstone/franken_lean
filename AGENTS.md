@@ -203,6 +203,22 @@ If you have reported a bead verified against `check.sh`, the evidence self-test,
 
 `crates/fln-conformance/tests/evidence_finalization.rs::the_evidence_surface_refuses_a_gitdir_pointer_root` holds this table to the code: it builds a root whose `.git` is a file and asserts the real refusal, and it fails if this section stops naming the surfaces that refuse. Neither half can drift silently without the other failing.
 
+#### The wrong **host** — an RCH green is about the worker's tree, and nothing in the command says so
+
+Everything above is about taking a green from the wrong **tree**, which you at least choose. This is the wrong **host**, and it is the one shape nobody chooses: RCH's PreToolUse hook offloads a bare `cargo test`/`clippy`/`build` to a remote worker automatically, with nothing in the command saying so (bead `fln-yihl`; the classifier numbers are in the RCH section below).
+
+**Measured by cc_1 on 2026-07-26 against worker hz2, and the first answer was wrong in the interesting direction.** A sentinel flipped mid-flight appeared in a job dispatched *before* the flip — which looks exactly like one job clobbering another's source. It is not: checking *when* each root synced refutes it, and a corrected protocol showed each job seeing exactly what it synced. **The clobber this bead is named for is not confirmed.** What did reproduce is sufficient on its own and changes the rule: RCH's default-mode sync is **not atomic**. One ordinary job's 34 roots were synced across a **22-second spread**, the full sequence took **~75 seconds** before execution began, and the remote path is the caller's own absolute path — `/data/projects/franken_lean`, the one directory all six panes work in. So a job does not compile a snapshot; it compiles whatever each root held when that root's turn came. A job was observed reporting **exit 0** over a mixture of two tree states that never existed locally at any single instant. You do not need a second RCH job to get a torn build — you need any pane to touch any file during your ~75-second window, which with six panes on one tree is the normal case.
+
+The default mode also reports **no content digest**: `rch exec -j` emitted zero JSON objects across 246 lines, and the one hash it prints is a project/path identity, constant across runs and identical for every pane. So the caller cannot tell which tree state produced their result.
+
+> **An RCH default-mode green is evidence about the worker's tree, not yours, and may never close a bead.** Treat a default-mode red as unattributed until reproduced locally, and a default-mode green as unattributed always.
+
+**The attributable form exists, was tested in both directions, and fails typed rather than silently.** `rch exec --base "$(git rev-parse HEAD)" --clean-overlay --overlay-path <every path you changed> -- cargo test -p <crate>` ships a git baseline plus your named paths (`1 root`, not 34), computes a sha256 over the overlay at admission, re-checks it before execution, and on a mid-flight edit refuses naming **both** digests — then declines to fall back locally, so nobody is handed an unattributed green by accident. The control matters as much: with the tree left quiet the same invocation returns exit 0, so it admits a still tree and refuses a moving one. Two footguns, both new rather than inherited: pass an explicit sha, never the literal `HEAD`, which is a moving target between dispatches; and name **every** changed path, because one you forget is simply *absent* from the build, giving you a green for the baseline rather than for your work — derive the list from `git status --porcelain`. What this buys beyond attribution is that five other panes' uncommitted edits are excluded **by construction**.
+
+**And the evidence surface refuses on a worker outright, for a fourth `.git` shape.** A worker checkout is synced without `.git` (bead `franken_lean-rch-clean-overlay-has-no-git-dir-46pw`), so `run_git` raises `requires an explicit repository .git directory` — a **different** sentence from the linked-worktree pointer above, and the distinction is load-bearing because a worker is not a worktree and a message that said so would send the reader hunting a checkout they are not in. Measured at `ef389785`, both the committed and the working-tree copy of `scripts/evidence.py` agreeing: absent `.git` exits **2**, and a real `.git` directory *also* exits 2 with no refusal, because there git runs and fails on its own terms. **The exit code discriminates nothing; only the message does.** `the_evidence_surface_refuses_a_worker_checkout_with_no_git_at_all` holds that shape to the code and this section to that rule, in both directions.
+
+**What none of this earns.** RCH lives outside this repository, so no test here can hold its classifier, its sync behaviour or its version — those figures are `bounded_model`, measured at one host at one instant, and the `--clean-overlay` result is one pair of runs on one worker. The original symptom this bead was filed for — the remote holding content *older* than the caller's tree both before and after dispatch — is **not** explained by non-atomic sync, which produces mixtures rather than staleness; a cached root rsync did not refresh is the obvious candidate and remains untested. The bead stays open on its own terms.
+
 ---
 
 ## Testing Policy — the Tribunal (plan §18)
@@ -589,7 +605,7 @@ Hard-won facts that will bite you if unknown:
    **This file's own enforcement claims are now counted, by a producer in the repository** (bead `franken_lean-pfei` R1). AGENTS.md is the densest source of unbound enforcement claims here, and four of its claims were measured false in two days — so the population is derived per commit rather than described:
 
    ```text
-   enforcement-census: live=25 bound=13 unbound=12 catalogued=7
+   enforcement-census: live=26 bound=13 unbound=13 catalogued=7
    ```
 
    `scripts/agents_enforcement_census.py --check` derives it and refuses any disagreement **in either direction**, so a new unbound claim raises the number and its author must say so, while a repair lowers it. `the_agents_enforcement_census_matches_the_file_it_describes` runs it under plain `cargo test`.
