@@ -423,10 +423,31 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         sites: &SITES_LOC_COVENANT,
         claim_type: ClaimType::Invariant,
         state: ClaimState::Observed,
-        evidence: "fln-kernel is 6,535 lines across 5 files, under the 12,000 bound declared \
-                   as `covenant fln-kernel max-loc=12000` in ci/WORKSPACE_GRAPH.txt and \
-                   enforced on every run by structure-guard FLN-STRUCT-015. This clause of B3 \
-                   is earned; it is Supported so the matrix does not imply otherwise.",
+        evidence: "The bound is real and enforced: `covenant fln-kernel max-loc=12000` in \
+                   ci/WORKSPACE_GRAPH.txt, checked on every structure-guard run as \
+                   FLN-STRUCT-015, with FLN-STRUCT-024 refusing a larger declared limit. This \
+                   clause of B3 is earned; it is Supported so the matrix does not imply \
+                   otherwise. The trusted closure is 6 files under crates/fln-kernel/src, and \
+                   that cardinality is bound in both directions by \
+                   `the_kernel_covenant_disclosure_matches_the_measured_closure` — a module \
+                   entering or leaving the TCB is precisely the growth D6 requires be \
+                   disclosed first, and it can no longer happen silently. CORRECTED at \
+                   fbb9de1b: from its authoring commit e1623223 this row read `6,535 lines \
+                   across 5 files', and that figure never came from the covenant's counter. \
+                   6,535 is every line of those files; count_loc \
+                   (tools/structure-guard/src/checks.rs) counts non-blank lines that do not \
+                   begin with a comment marker, and said 5,416 that day. The matrix's only \
+                   Supported row was therefore wrong by 1,119 lines on the day it was \
+                   written — in the safe direction for a ceiling, and invisible either way, \
+                   because nothing joined the disclosure to the counter that enforces the \
+                   covenant. The live line count is deliberately NOT transcribed here: it \
+                   moves on every kernel edit, so a figure in this row is either a nag or a \
+                   rot, and re-deriving it would plant the second copy of count_loc's \
+                   predicate that caused this. Measured once for the record at fbb9de1b with \
+                   that predicate: 6,112 lines, 50.9% of the bound, 5,888 of headroom. \
+                   Publishing the current value where it is measured, in the guard's own \
+                   robot line, is bead franken_lean-kernel-loc-covenant-not-disclosed-t0g7, \
+                   open.",
         enforcement: Enforcement::Supported,
     },
     ClaimRow {

@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":374,"projection_hash":"b5a82bd4e96b31c719e71dd1d15648f826d3fab6b9567aa02333445b8ec213a7"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":376,"projection_hash":"23a6c335f433ebe9b6007b519cd962094ff9afeb9adb0146cb7f4fe75ae72998"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -116,6 +116,7 @@
 {"id":"fln-k5rr"}
 {"id":"fln-k63"}
 {"id":"fln-kernel-bounded-decl-admission-ukzx"}
+{"id":"fln-kernel-loc-disclosure-foreign-counter-c118"}
 {"id":"fln-kok"}
 {"id":"fln-kpd"}
 {"id":"fln-kx3y"}
@@ -236,6 +237,7 @@
 {"id":"franken_lean-beads-workspace-doctor-health-fib"}
 {"id":"franken_lean-bp6x"}
 {"id":"franken_lean-brgt"}
+{"id":"franken_lean-build-gate-lane-governed-set-98np"}
 {"id":"franken_lean-c24a"}
 {"id":"franken_lean-canon-stack-safe-drop-6gy"}
 {"id":"franken_lean-cgt"}

@@ -725,6 +725,62 @@ fn workspace_member_manifests() -> Vec<PathBuf> {
 
 /// The number `README.md` discloses, read **out of the document** rather than transcribed
 /// here — an assertion that agrees with its own copy of the answer proves nothing.
+/// Every `.rs` file in the kernel's covenant closure, walked the way `count_loc` walks it:
+/// `crates/fln-kernel/src` recursively, symlinks skipped, `.rs` only. Files, never lines — the
+/// line predicate has exactly one implementation and this must not become a second.
+fn kernel_covenant_source_files() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![workspace_root().join("crates/fln-kernel/src")];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| format!("kernel source directory {dir:?} is unreadable: {e}"))
+            .expect("the covenanted crate's source directory must be readable");
+        for entry in entries {
+            let entry = entry.expect("an entry under the kernel source must be readable");
+            let file_type = entry
+                .file_type()
+                .expect("an entry under the kernel source must have a file type");
+            let path = entry.path();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The file cardinality `B3-KERNEL-LOC-COVENANT` discloses. Absent is an unanswered question,
+/// not a clean tree; twice is an editor who added a number instead of correcting the bound one.
+fn disclosed_kernel_file_count(evidence: &str) -> usize {
+    const MARKER: &str = " files under crates/fln-kernel/src";
+    let occurrences = evidence.matches(MARKER).count();
+    assert_eq!(
+        occurrences, 1,
+        "B3-KERNEL-LOC-COVENANT must disclose the kernel's file cardinality exactly once, as \
+         `<n>{MARKER}`; found {occurrences}"
+    );
+    let at = evidence
+        .find(MARKER)
+        .expect("asserted present immediately above");
+    let digits: String = evidence[..at]
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits
+        .parse()
+        .expect("the disclosed kernel file cardinality must be a number")
+}
+
 fn disclosed_bench_target_count(readme: &str) -> usize {
     const MARKER: &str = " bench targets";
     let at = readme.find(MARKER).expect(
@@ -799,6 +855,83 @@ fn the_bench_apparatus_disclosure_matches_the_measured_inventory() {
          too, and claim row PERF-GATE-BENCH-APPARATUS needs promoting rather than editing.",
         manifests.len()
     );
+}
+
+/// The kernel covenant's disclosed closure, bound to the measured one in both directions.
+///
+/// `fln-bench-apparatus-empty-referent-bkw6`'s move — bind a claim to the **cardinality** of
+/// what it asserts — applied to the one `Supported` row in this matrix. It is a test rather
+/// than a `Citation` because the far end is a directory, not a document.
+///
+/// **Only the file count is bound, and that is the design, not a shortfall.** The covenant's
+/// line count moves on every kernel edit, so pinning it would redden six panes' workspace on
+/// every legitimate change and be bypassed; and re-deriving it here would plant a second copy
+/// of `count_loc`'s predicate — which is the drift that produced the defect this test exists
+/// because of. Until `fbb9de1b` the row disclosed `6,535 lines across 5 files`, a figure
+/// produced by counting every line rather than by the covenant's counter: wrong by 1,119
+/// lines on the day it was written, and unseen for as long as nothing joined the two.
+///
+/// A file entering or leaving the TCB is the opposite kind of event: rare, and exactly the
+/// growth D6 requires be disclosed first. It has already happened once unnoticed — `council.rs`
+/// entered at `104bd8b1` and the row still said five files.
+///
+/// This walks the closure `count_loc` walks — `crates/fln-kernel/src/**/*.rs`, symlinks
+/// skipped — and counts **files, never lines**.
+#[test]
+fn the_kernel_covenant_disclosure_matches_the_measured_closure() {
+    let measured = kernel_covenant_source_files();
+    assert!(
+        measured.len() >= 3,
+        "resolved only {} source file(s) under crates/fln-kernel/src; a walk that cannot see \
+         the kernel reports a false clean rather than an empty TCB",
+        measured.len()
+    );
+
+    let row = CLAIM_MATRIX
+        .iter()
+        .find(|row| row.id == "B3-KERNEL-LOC-COVENANT")
+        .expect("the covenant row is this matrix's only Supported row and must exist");
+    let disclosed = disclosed_kernel_file_count(row.evidence);
+
+    let names = measured
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    assert_eq!(
+        measured.len(),
+        disclosed,
+        "B3-KERNEL-LOC-COVENANT discloses {disclosed} file(s) in fln-kernel's trusted closure; \
+         the tree has {} — {names}.\n\
+         A file entering or leaving fln-kernel changes what is trusted, which D6 says must be \
+         disclosed first rather than noticed later. Correct the row's disclosure, and read the \
+         rest of the row before you do: the headroom recorded there was measured at one commit \
+         and this test deliberately does not check it, because a second copy of count_loc's \
+         predicate is what made that number wrong the first time (bead t0g7).",
+        measured.len()
+    );
+}
+
+/// A doctored disclosure must parse as the doctored number — the negative control the
+/// assertion above cannot contain, proving the comparison reads the row and not a constant.
+#[test]
+fn the_covenant_cardinality_probe_reads_the_disclosure_not_a_constant() {
+    let doctored = "the trusted closure is 99 files under crates/fln-kernel/src, and that \
+                    cardinality is bound in both directions";
+    assert_eq!(disclosed_kernel_file_count(doctored), 99);
+}
+
+/// A row that has lost its disclosure must refuse. Returning zero, or quietly defaulting to
+/// the measured value, would make the probe pass on one of the states it exists to catch.
+#[test]
+#[should_panic(expected = "must disclose the kernel's file cardinality exactly once")]
+fn a_covenant_row_with_no_cardinality_disclosure_refuses_rather_than_passing() {
+    disclosed_kernel_file_count("a row that says nothing at all about the trusted closure");
 }
 
 #[test]
