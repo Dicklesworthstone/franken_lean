@@ -545,10 +545,20 @@ impl ResidueBreach {
 /// the `tools/structure-guard` population was converted, and the division is re-measured
 /// on every run by [`coverage_populations`] rather than inherited from this comment:
 ///
-/// * **19 sites in nine product crates** are blocked on an *architectural* decision, not a
-///   registration. `fln-conformance` is rank 22; every one of those crates ranks below it,
-///   so a dev-dependency on it is an upward edge and `FLN-STRUCT-007` refuses it. Reaching
-///   them means this check living in a low-rank crate.
+/// * **19 sites in nine product crates**, blocked by a **decision about where this check
+///   lives** rather than by an architectural impossibility — this bullet said
+///   "architecturally" until `839ff2ec`, which is an *overstatement* of a sound premise and
+///   the milder of the two directions the residue prose got wrong. The premise holds:
+///   `fln-conformance` is rank 22, `checks.rs`'s layering loop iterates `actual_edges`
+///   without consulting `dep.section`, so a dev-dependency from below is scored exactly like
+///   a normal one and `FLN-STRUCT-007` refuses it. The conclusion does not: **`fln-core` is
+///   rank 0**, every one of those crates sits at or above it, and **five of the eight
+///   already declare an edge to it** — `fln-hash`, `fln-olean`, `fln-parse`, `fln-verdict`,
+///   `fln-syntax` — so they are convertible with **no graph change at all**. Only `fln-rt`,
+///   `fln-unsafe-region` and `fln-checker` need a new edge, and only `fln-checker`'s also
+///   touches the §8 kernel/checker allowlist. The block is on this check's **address**, and
+///   moving it into the rank-0 foundation crate grows that crate's exported surface, which
+///   is the graph owner's call and plan §21's — routed, not taken.
 /// * **1 site in `tribunal/epoch-lab`**, down from 11, and what the other ten cost is the
 ///   point: **nothing**. That population read as blocked because it sits in a nested
 ///   workspace the members glob never walks — `fln-bench-apparatus-empty-referent-bkw6`'s
