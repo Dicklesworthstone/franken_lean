@@ -293,6 +293,14 @@ This is [the block-expiry rule](#a-block-is-a-claim-and-it-expires--re-test-it-b
 
 When it is not, regenerate or re-export rather than reconciling by hand: the shared producer usually already holds the peer's write, which is why the near miss above resolved in one command. **What this does not earn:** it is a rule and not a mechanism, nothing runs it for you, and it is one near miss at one commit on one host, class `bounded_model`. It also says nothing about a peer's *uncommitted* work, which is the first residual's question, one paragraph up.
 
+**The third residual is the one the instruction directly above creates, and it was measured against a pane while they were obeying it.** The second residual says your copy may be **stale**. This one says your **verification of that copy expires before the commit does** — and what lands may be *newer* than what you checked, carrying a peer's record you never inspected. The check prescribed above is right, and it does not **gate** anything: it prints an answer, and the commit is a separate command. Measured on 2026-07-27 at `23f80f44` — the record-by-record diff ran, printed its refusal, and the commit executed anyway, because the two sat in one shell block. What it had refused was real: a peer's `franken_lean-6tqy` had moved `open` to `in_progress` and gained a comment about a minute earlier, and that record landed under a commit message asserting that zero existing records had changed.
+
+**The mechanism is the index race one layer over, and everything above covers the index half only.** `.beads/issues.jsonl` is a **shared file in a shared worktree**, and a peer's ordinary `br` command auto-flushes the tracker into *your* working copy without either of you deciding anything. `git commit -o` reads the worktree. So the window between verifying and committing is exactly as unsafe as staging is, for the same reason, with no `git add` anywhere in it — and unlike the index there is no second place to look afterwards that would say so. Note which direction was observed: the peer's write was carried **forward** and nothing was lost, which is the safe half. The reverting direction is not excluded by this measurement, merely unobserved in it.
+
+> **Gate the commit on the check — `verify && commit`, never `verify; commit`. A verification that does not gate the action it verifies is decoration.**
+
+**What this does not earn.** Still a rule and not a mechanism: nothing runs the diff, and making it gate is a shell habit rather than a guard. One instance at one commit on one host, class `bounded_model`. It gives no bound on the window either — the observed gap was about a minute, which is one sample — and a peer's write landing between a gated check and git's own read of the worktree is narrowed by none of this.
+
 **Which pane made a commit is not recoverable from git, and inferring it has already misfired.** Measured over the last 200 commits at `7e1765cd`: **one** author identity, **one** committer identity, **one** `Co-Authored-By` trailer — every field git offers is constant across all three panes. This file states that fact three times already, but always as a *limit on some other rule*; the two operational consequences have lived only in handoffs, which is why every handoff has had to re-teach them:
 
 - **Identify your own commits by subject line, never by author.** `git log --author` returns the whole repository.
@@ -508,6 +516,20 @@ What to know when it fires:
 ### Closing a bead: the judgement row, and the one sanctioned exception to `ci/` ownership
 
 A closed bead derives verification state `complete`, and a `complete` coverage row whose evidence arrays are empty fails `validate-verification-manifest`. So the close and its judgement row **must be one commit**: closing first reddens the workspace for every pane in the gap between two commits.
+
+**This section is written entirely about closes, and the obligation is wider: FILING a bead owes a row too.** That cost a refused commit to learn, by a pane who had read this section and reasoned from it. A merely *created* bead has crossed what the validator calls the **adoption boundary**, and the verification-coverage-guard in `scripts/git-hooks/pre-commit` refuses the commit that files it when no row accompanies it. Its own words, refusing the first attempt at `23f80f44` on 2026-07-27:
+
+```text
+verification-coverage-guard: REFUSED — prospective verification coverage is invalid (exit 1):
+  beads crossed the adoption boundary without coverage rows:
+  ['franken_lean-d3-root-attr-no-creation-affordance-sso4']
+verification-coverage-guard: New beads need judgment rows, and closed beads need
+verification-coverage-guard: complete human-authored evidence in the same commit.
+```
+
+**So filing a bead is three artifacts in one commit, not one** — the bead, the regenerated ownership projection (gotcha 1 below, since any new bead stales it), and a coverage row. The row for an open bead is legitimately **sparse**: every evidence array empty, the notes carrying the measurement and what it does not establish, because no repair is being claimed yet. `franken_lean-evidence-fields-never-resolved-bs5o`'s row is the model and says so in its own text.
+
+**The reasoning that fails here is worth stating, because it reads as sound and is half true**: *a judgement row binds a close; my bead is open and derives no `complete` state; therefore no row is owed.* Both premises hold. The conclusion does not follow, because the guard keys on the **boundary crossing**, not on the terminal state — and the paragraphs below, which are all about `complete` rows and `closed_at`, are exactly what makes the wrong inference available. Take the obligation from the refusal message, not from this section's title.
 
 That collides with `ci/` being cod_2's. **Standing rule, decided 2026-07-25: atomicity wins, with disclosure.**
 
@@ -789,12 +811,14 @@ Hard-won facts that will bite you if unknown:
    **This file's own enforcement claims are now counted, by a producer in the repository** (bead `franken_lean-pfei` R1). AGENTS.md is the densest source of unbound enforcement claims here, and four of its claims were measured false in two days — so the population is derived per commit rather than described:
 
    ```text
-   enforcement-census: live=27 bound=13 unbound=14 catalogued=7
+   enforcement-census: live=28 bound=13 unbound=15 catalogued=7
    ```
 
    `scripts/agents_enforcement_census.py --check` derives it and refuses any disagreement **in either direction**, so a new unbound claim raises the number and its author must say so, while a repair lowers it. `the_agents_enforcement_census_matches_the_file_it_describes` runs it under plain `cargo test`.
 
    **Read `bound` as "names a candidate referent in the same sentence" — never as "verified".** A sentence citing a deleted test still counts as bound; making the producer *denote* is pfei R2 and is not built.
+
+   **The 27 → 28 movement on 2026-07-27 is disclosed here with its reason, because the reason is a limit of the scan rather than of the sentence.** The new member is the coverage-row obligation added to the judgement-row section, and it *does* name its producer in plain English — the verification-coverage-guard living in the pre-commit hook. The scan cannot see it: `test-fn` requires a closing backtick immediately after the token, so a backticked **path** never matches, and `source-file` requires one of seven file **extensions**, which an extensionless executable hook does not have. So the member is genuinely unbound *by this scan's definition* while naming its producer to any reader, and the number was raised rather than the sentence reworded — softening the sentence to go green is pfei R5 and is the one move this census exists to make expensive. Two consequences worth keeping: the unbound figure is an **upper bound** on real unboundedness, not a count of unnamed producers; and extending the pattern set to recognise extensionless hook paths would move this member without any prose changing, which is a repair someone should make deliberately rather than discover as drift.
 
    **The number that governs is the one with item 7's own table excluded, and that distinction inverted the answer once.** The catalogue above quotes every phrase the scan searches for, because quoting them is what the rows are *for*. The first version of this census declared that exclusion in a constant and never applied it, and the resulting figure moved 26 → 27 → 28 across three commits — re-anchored each time as evidence that a count of claims is itself a claim — while **the live population never moved from 22**. Every one of those movements was a catalogue row. A count bound to the unfiltered figure would have reddened on exactly the commits that record good work, and been ignored within a week. The scan now **fails** if it cannot locate the region, or if the region excludes nothing.
 
