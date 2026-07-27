@@ -220,11 +220,34 @@ if [ -n "$d3_candidates" ]; then
         # Found by cc_1 against a real 188 KB blob within an hour of the guard landing;
         # every small fixture passed, which is exactly why it shipped.
         #
-        # Reproduced under bash: 133 B and 5 082 B pass, 202 032 B and 404 032 B return
-        # 141. The threshold is the kernel pipe buffer, not a repository property. It is a
-        # WALL and never a hole -- with the attribute genuinely absent grep reads to EOF,
-        # printf completes, and the pipeline still exits 1, so a real D3 violation was
-        # always still refused.
+        # IT IS A RACE WITH A PROBABILISTIC BAND, NOT A THRESHOLD, and the sentence that
+        # stood here said "the threshold is the kernel pipe buffer" -- measured wrong by
+        # its own author at 60b2e176, in the direction that manufactures a false
+        # refutation. Re-measured under bash 5.2.37, 40-100 trials per cell, one variable
+        # per cell; the refusal RATE against real tracked blobs:
+        #
+        #     45 824 B   0/40      48 580 B   0/40      49 919 B   3/40  ( 7%)
+        #     50 627 B   5/100     72 725 B  37/40      76 834 B  39/40  (97%)
+        #     79 774 B  40/40     169 783 B  40/40     261 554 B  40/40  (100%)
+        #
+        # So retry is a FALSE REFUTATION: in the band a re-run passes 5-95% of the time,
+        # and a pane that hits the wall, retries, and sees green concludes there is no
+        # defect. Only above ~80 KB is it deterministic.
+        #
+        # AND THE TRIGGER IS NOT SIZE -- size only correlates. `grep -q` exits as soon as
+        # it holds a complete MATCHING LINE, so what decides the race is how many bytes
+        # `printf` still has unwritten at that instant. Isolated at ~50.6 KB, 100 trials,
+        # newlines the only variable: synthetic one-long-line 0/100; synthetic many short
+        # lines 14/100; the real blob 5/100; THE REAL BLOB'S OWN BYTES WITH NEWLINES
+        # REMOVED 0/100. Same bytes, same size, opposite verdict. Consequence for anyone
+        # writing a cell here: a synthetic size sweep UNDER-REPORTS this defect and is not
+        # a valid control -- use real blobs, or filler with realistic line structure.
+        #
+        # It is a WALL and never a hole -- with the attribute genuinely absent grep reads
+        # to EOF, printf completes, and the pipeline still exits 1, so a real D3 violation
+        # was always still refused. Blast radius of the form that shipped, measured across
+        # all 88 tracked roots this guard governs: 8 disagreed with the fixed form, all 8
+        # false refusals of correct files, 0 real violations let through.
         #
         # THE SHELL IS PART OF THE FINDING: this reproduces under bash, which the shebang
         # pins, and NOT under zsh, which is the interactive shell on this host. A reader

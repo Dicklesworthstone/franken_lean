@@ -514,14 +514,31 @@ check 'a multi-lint forbid form is accepted, not walled' 0 '' "$code" "$out"
 # LARGER THAN THE PIPE BUFFER, which is the cell every small fixture above is blind to.
 # The first form of this guard piped printf into `grep -q`; grep exits on the first match, so
 # with the attribute near the top of a big blob printf died of SIGPIPE, pipefail promoted 141
-# to the pipeline, and the guard refused a CORRECT file purely on its size. 133 B and 5 082 B
-# passed; 202 032 B did not. Both directions are asserted, because a fix that simply stopped
-# refusing would also stop refusing real violations.
+# to the pipeline, and the guard refused a CORRECT file. Both directions are asserted, because
+# a fix that simply stopped refusing would also stop refusing real violations.
+#
+# THE SIZE OF THIS FIXTURE IS LOAD-BEARING AND IS NOW ASSERTED, because the defect is a RACE
+# and not a threshold -- see the measurement in scripts/git-hooks/pre-commit. Re-measured under
+# bash 5.2.37, 40-100 trials per cell: the broken form refuses 5% of the time at 50 627 B, 92%
+# at 72 725 B, and only 100% from ~98 KB up. So a fixture shrunk into that band would make THIS
+# CELL FLAKY -- it would intermittently pass against a hook reverted to the pipeline form, which
+# is the one failure a regression cell must never have. A cell that passes sometimes against the
+# defect it exists for reads exactly like a cell that passes.
+D3_LARGE_FIXTURE_FLOOR=131072   # measured deterministic at 131 096 B: 40/40 refusals
 {
     printf '//! large fixture\n\n#![forbid(unsafe_code)]\n'
     head -c 200000 /dev/zero | tr '\0' 'x' | fold -w 100
     printf '\nfn t() {}\n'
 } > crates/fln-decoy/tests/large_ok.rs
+d3_fixture_bytes=$(wc -c < crates/fln-decoy/tests/large_ok.rs)
+if [ "$d3_fixture_bytes" -lt "$D3_LARGE_FIXTURE_FLOOR" ]; then
+    printf 'FAIL the large D3 fixture is %s B, below the %s B floor: this cell would be FLAKY\n' \
+        "$d3_fixture_bytes" "$D3_LARGE_FIXTURE_FLOOR"
+    FAILS=$((FAILS + 1))
+else
+    PASSES=$((PASSES + 1))
+    note "large D3 fixture is ${d3_fixture_bytes} B, above the ${D3_LARGE_FIXTURE_FLOOR} B non-flaky floor"
+fi
 git add crates/fln-decoy/tests/large_ok.rs
 out=$(run_commit -q -m 'large root WITH the attribute' 2>&1); code=$?
 check 'a root larger than the pipe buffer WITH the attribute is accepted' 0 '' "$code" "$out"
