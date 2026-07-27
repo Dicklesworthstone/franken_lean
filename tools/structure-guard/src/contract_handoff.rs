@@ -1669,9 +1669,12 @@ mod tests {
     fn contract_handoff_no_mock_e2e() {
         // Resolved through the tree check, not from this file's compile-time manifest
         // dir: a binary compiled in another checkout would otherwise consume that
-        // tree's 53 MB untracked census and report the verdict here. The `canonicalize`
-        // is kept so the root is spelled exactly as it was before the conversion.
-        // Bead fln-cross-tree-baked-root-k60n.
+        // tree's untracked census — 242,966,844 bytes across four shards, measured at
+        // `9d86aac2` — and report the verdict here. This comment read "53 MB" until then,
+        // which is `builtin_environment.tsv` ALONE, one shard of the four; the same figure
+        // was wrong in AGENTS.md's green-bar row and right in `fln-census-out-of-git-2ya9`.
+        // The `canonicalize` is kept so the root is spelled exactly as it was before the
+        // conversion. Bead fln-cross-tree-baked-root-k60n.
         let root = fln_conformance::checked_workspace_root!()
             .canonicalize()
             .expect("real repository root");
