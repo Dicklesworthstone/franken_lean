@@ -1560,6 +1560,111 @@ mod tests {
         assert_eq!(consume(&root).unwrap(), receipt.snapshot);
     }
 
+    /// Whether a failed `consume` is the fresh-checkout census absence this rig may skip on.
+    ///
+    /// **Exactly one reason, and the exclusions are the whole content of this predicate.**
+    ///
+    /// - `handoff_output_unavailable` — the required output is not there at all. This is the
+    ///   fresh clone of `origin/main`, where the four census shards are gitignored and
+    ///   unreachable from history (`fln-census-out-of-git-2ya9`). A typed skip is the honest
+    ///   answer, and the `.expect()` this replaced turned it into a panic — collapsing an
+    ///   FL-INV-07 `Inconclusive` into a failure, which AGENTS.md rule 8 forbids outright.
+    /// - `handoff_output_ambiguous` — **deliberately NOT skippable.** That is what a symlink
+    ///   shim into another checkout produces, which is precisely the workaround people install
+    ///   to make this lane pass without the shards. Absorbing it as "no census here" would
+    ///   convert a refusal of a bad workaround into a silent pass, and the refusal is the point.
+    /// - Any `Violation`, and every other `Inconclusive` reason (`stale_candidate` among them),
+    ///   stay loud. A skip predicate that widens is a free exit from the whole no-mock lane.
+    ///
+    /// **What a skip here does not earn.** It reports that nothing was established; it does not
+    /// make the no-mock obligation discharged. The notice goes to stderr, which cargo captures
+    /// and discards for a *passing* test — so a skipped run is still not distinguishable from a
+    /// real one by reading the terminal, which is `fln-rgha`'s subject and is NOT closed by this
+    /// change. Making the skip visible needs the artifact stating the claim to name the artifact
+    /// supplying its evidence, and that artifact is `ci/VERIFICATION_MANIFEST.jsonl`.
+    fn is_absent_census(error: &HandoffError) -> bool {
+        error.class == ErrorClass::Inconclusive && error.reason == "handoff_output_unavailable"
+    }
+
+    #[test]
+    fn the_census_skip_admits_absence_and_refuses_every_neighbouring_failure() {
+        let absent = HandoffError::new(
+            ErrorClass::Inconclusive,
+            "handoff_output_unavailable",
+            "contracts/builtin_environment.tsv",
+            "cannot inspect required output: No such file or directory",
+        );
+        assert!(is_absent_census(&absent));
+
+        // The symlink shim. If this ever becomes skippable, the lane starts passing on trees
+        // that borrowed another checkout's census.
+        let shim = HandoffError::new(
+            ErrorClass::Inconclusive,
+            "handoff_output_ambiguous",
+            "contracts/builtin_environment.tsv",
+            "required output is a symlink",
+        );
+        assert!(!is_absent_census(&shim));
+
+        // A different Inconclusive reason is a real refusal, not a missing file.
+        let stale = HandoffError::new(
+            ErrorClass::Inconclusive,
+            "stale_candidate",
+            "contracts/CONTRACT_HANDOFF.txt",
+            "interrupted candidate",
+        );
+        assert!(!is_absent_census(&stale));
+
+        // Class is checked as well as reason: a Violation carrying the same reason string must
+        // not be skipped, or the predicate keys on text alone.
+        let violation = HandoffError::new(
+            ErrorClass::Violation,
+            "handoff_output_unavailable",
+            "contracts/builtin_environment.tsv",
+            "declared present and absent",
+        );
+        assert!(!is_absent_census(&violation));
+    }
+
+    /// The join the skip rests on: a genuinely missing required output really does produce the
+    /// one reason [`is_absent_census`] keys on.
+    ///
+    /// Without this the predicate is a claim about a string nothing produces. If `observe_output`
+    /// ever classified absence differently, the skip would never fire and a fresh clone would go
+    /// back to failing the gate — the exact condition
+    /// `fln-census-empty-referent-no-mock-krb0` exists to remove — while every unit test above
+    /// stayed green, because they construct their inputs by hand.
+    ///
+    /// The shard is **moved aside, never deleted**, and it is asserted to be a required output
+    /// first: a test that removed a path no policy row names would prove nothing.
+    #[test]
+    fn a_missing_required_output_produces_the_reason_the_skip_keys_on() {
+        let root = fixture_root("absent-census");
+        publish(&root).expect("complete fixture publishes");
+        consume(&root).expect("the complete fixture is consumable before the shard moves");
+
+        let shard = "contracts/builtin_environment.tsv";
+        assert!(
+            REQUIRED_OUTPUTS.iter().any(|output| output.path == shard),
+            "{shard} must be a required output, or moving it aside proves nothing"
+        );
+        fs::rename(
+            root.join(shard),
+            root.join("builtin_environment.tsv.moved-aside"),
+        )
+        .expect("move the shard aside");
+
+        let error = consume(&root).expect_err("a missing required output must refuse");
+        assert_eq!(error.class, ErrorClass::Inconclusive);
+        assert_eq!(error.reason, "handoff_output_unavailable");
+        assert_eq!(error.path, shard);
+        assert!(
+            is_absent_census(&error),
+            "the real refusal must be the one the skip admits, or the skip is unreachable \
+             in the condition it was written for: {error}"
+        );
+    }
+
     #[test]
     fn contract_handoff_no_mock_e2e() {
         // Resolved through the tree check, not from this file's compile-time manifest
@@ -1570,7 +1675,39 @@ mod tests {
         let root = fln_conformance::checked_workspace_root!()
             .canonicalize()
             .expect("real repository root");
-        let snapshot = consume(&root).expect("real checked-in handoff is consumable");
+        let snapshot = match consume(&root) {
+            Ok(snapshot) => snapshot,
+            Err(error) if is_absent_census(&error) => {
+                // The reason is CHECKED against the filesystem at the root we probed, never
+                // trusted from the string. An absent census and a misdirected root produce the
+                // identical `handoff_output_unavailable`, and a skip that cannot tell them apart
+                // is correct about what it saw and wrong about what it claims — recorded on
+                // `fln-census-empty-referent-no-mock-krb0` after a cached binary consumed
+                // another worktree's census. `checked_workspace_root!()` closes the baked-root
+                // half (`fln-cross-tree-baked-root-k60n`); this closes the reported-reason half.
+                let missing = root.join(&error.path);
+                assert!(
+                    !missing.exists(),
+                    "typed skip claims {} is unavailable, but it EXISTS at the probed root {}. \
+                     The skip's stated reason is false for this checkout, so this is a \
+                     misdirected probe rather than a fresh clone with no census.",
+                    error.path,
+                    root.display()
+                );
+                eprintln!(
+                    "SKIP contract_handoff_no_mock_e2e: required handoff output {} is absent at \
+                     {}. This is a typed skip: NOTHING this no-mock rig checks has been \
+                     established by this run. The census shards are gitignored and unreachable \
+                     from main (bead `fln-census-out-of-git-2ya9`); regenerate them with \
+                     `scripts/extract/census_materialize.sh`, which proves the result against \
+                     tracked pins and exits 3 when the Reference toolchain is absent.",
+                    error.path,
+                    root.display()
+                );
+                return;
+            }
+            Err(error) => panic!("real checked-in handoff is not consumable: {error}"),
+        };
         assert_eq!(snapshot.row_count, REQUIRED_OUTPUTS.len());
         assert_eq!(snapshot.domain_count, 4);
         assert!(snapshot.output_bytes > 200_000_000);
