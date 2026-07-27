@@ -221,6 +221,20 @@ The default mode also reports **no content digest**: `rch exec -j` emitted zero 
 
 ---
 
+## A block is a claim, and it expires — re-test it before you wait on it, and before you act on it
+
+Everything above concerns a **green** taken from the wrong tree, the wrong host, or from a run that never happened. The mirror image is unwritten and has cost more: a **red** — a block, a refusal, a price — measured once and then carried by everyone who reads it afterwards. A block is a measurement of the world at an instant, so it decays exactly as a green does. It decays *invisibly*, though, because the run that would falsify it is the one run nobody has a reason to make: the usual reward for re-testing a block is learning that the block is still there.
+
+> **Re-test a block before you wait on it, and before you act on it — and say what you tested.**
+
+**Apply it to instructions and not only to your own reports, which is the half that costs.** On 2026-07-27 cc_1 was twice told to commit pending items, re-tested first, and twice found none — a peer's commit had already carried the work, and the second attempt printed `no changes added to commit`. Acting on the unverified premise would have produced a confusing empty commit against a state that had already lapsed. Verify the premise, then act, whoever handed it to you.
+
+**The sharpest form is a cost cited as a reason to decline a measurement, because a decline leaves no artifact behind for anyone to check.** Recorded on bead `franken_lean-j8h`: a clean-checkout production run was declined on the ground that a separate `CARGO_TARGET_DIR` is "multi-GB against 63G free at 94 percent". Both halves were false and re-measuring cost one command. 94% is *used of a 906 G disk*; the scratch target directories that measurement needed run 13 M – 3.8 G, and the scoped ones — one package or one target, which is the shape it wanted — 116 M – 648 M, a worst case of about 6% of free space and a typical scoped one under 1%. **The abstention itself still stands; only its stated reason was false**, and that is exactly why the shape survives review: the decision reads as sound, so nobody re-derives the number underneath it. Note the free figure at each telling — 63 G when the reason was written, 60 G when `0f2ae0ba` corrected it, **58 G at `4e168918`** when this section was. A quantity that moves every session may never be cited from memory. **Never offer a percentage-used as scarcity; give the absolute cost of the thing you are declining against the absolute headroom, and re-measure both.**
+
+**What this does not earn.** It is a practice and not a mechanism: nothing here re-runs a block for you, and that gap is measured rather than assumed — `fln-ysvo` priced four candidate joins between a bead's mutable summary and the immutable comment log beneath it and found every one of them fails, because the predicate that matters is semantic while the lexical proxy is saturated at 87% by this project's own house style of writing corrections into comments. Whether a recorded block still holds is a predicate of that same kind. The instances above are `bounded_model`, one host and one commit each; what is durable in the disk figures is the range and the fraction of free space, never the three numbers.
+
+---
+
 ## Testing Policy — the Tribunal (plan §18)
 
 This is the second-largest subsystem in the program, not a QA appendix. The Reference runs *inside the harness*, as the differential oracle, forever. From cheapest to strongest:
