@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":376,"projection_hash":"23a6c335f433ebe9b6007b519cd962094ff9afeb9adb0146cb7f4fe75ae72998"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":377,"projection_hash":"8f53426240d38f3f877b8261e6d995ee0fa333e1ad797bce27d0b92c88b46ffd"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -228,6 +228,7 @@
 {"id":"franken_lean-9pg"}
 {"id":"franken_lean-9pnc"}
 {"id":"franken_lean-a2e"}
+{"id":"franken_lean-admission-tripwire-needles-unbound-en9q"}
 {"id":"franken_lean-ap6"}
 {"id":"franken_lean-apgi"}
 {"id":"franken_lean-artifact-incomplete-private-refs-sgt"}
