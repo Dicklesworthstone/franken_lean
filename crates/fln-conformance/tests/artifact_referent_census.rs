@@ -73,10 +73,31 @@
 //! rewrite stripped. The one commit whose content the rewrite genuinely altered is the one
 //! the content check declined.
 //!
-//! **Two of the nine were `cc_3`'s rows and are repaired here, which is why the class reads
-//! 7. The remaining seven are `cc_2`'s and are routed, not repaired** — this module's own
-//! ruling is that an individual row belongs to its owner, and that binds repair exactly as it
-//! binds withdrawal. The class is expected to reach 0; it is not a permitted remainder.
+//! **The class now reads 0, and the seven anchors that took it there were accepted on TWO
+//! INDEPENDENT DERIVATIONS BY DIFFERENT PANES — which is strictly stronger than either
+//! alone, and is recorded here as two rather than absorbed into one verdict.** Two of the
+//! nine were `cc_3`'s own rows and were repaired at `c291fd91`. The remaining seven are
+//! `cc_2`'s, and this module's ruling that an individual row belongs to its owner binds
+//! repair exactly as it binds withdrawal — so `cc_3` routed them instead of taking them.
+//! **`cc_2` re-derived all seven at `86d87486`**, and deliberately not by re-running
+//! `cc_3`'s script: its own predicate written from the four content identities, its own
+//! shell, and a control this file did not have. It then handed the result over as *evidence
+//! rather than a decision*, because this file is `fln-conformance` and crossing into it to
+//! move the constant would be the row-ownership violation one layer over. Both derivations
+//! report 7 of 7 accepting on all four identities, with identical stable patch-ids.
+//!
+//! **`cc_2`'s added control is what makes "7 of 7" mean anything, and why the first control
+//! did not suffice is the transferable part.** `be14ee9b` proves the predicate refuses a pair
+//! the rewrite genuinely altered. It does not prove the predicate refuses two *unrelated*
+//! commits — so a predicate that accepted everything handed to it would still have failed
+//! `be14ee9b` for its own reasons while passing all seven. `cc_2` cross-paired `66e56721`
+//! with `419078c6`, both members of the accepted set and each with a twin that passes, and
+//! the wrong pairing is refused on every identity. **A negative control drawn from INSIDE
+//! the accepted set is what separates a discriminating predicate from a permissive one**; a
+//! control drawn only from known-bad material cannot.
+//!
+//! The class is at 0 and is not a permitted remainder: the census binds it by equality in
+//! both directions, so a new unreachable anchor must RAISE it and its author must say so.
 //!
 //! **What this does not earn.** It classifies referents; it never establishes that a
 //! *resolvable* citation supports the claim citing it, which is the harder join and is
@@ -91,6 +112,16 @@
 //! coverage rows**, against 180 of 584 across 190. The manifest gained one coverage row and
 //! seven citations from a peer in between, none of the seven unresolvable, so the entire
 //! movement in the unresolvable figure is the two anchors repaired here.
+//!
+//! Re-derived again at `86d87486`, after the three `fln-amv` citations and these seven
+//! twins: **171 unresolvable of 594 citations across 191 coverage rows**. The seven anchors
+//! were repaired rather than withdrawn, so they moved from `commit_unreachable` to
+//! `commit_reachable` and the citation total is unmoved by them — only the unresolvable
+//! figure falls. [`FULLY_UNRESOLVABLE_ROWS`] and [`THIRD_STATE_ROWS`] stay at 14 and the
+//! decomposition stays 7/4/3, because none of the five rows carrying a rotted anchor was
+//! fully unresolvable: `cc_2` said so from its own reading and it is confirmed by
+//! measurement here, which is the direction that matters — a claim about someone else's
+//! arithmetic is worth re-deriving before it is landed on.
 
 #![forbid(unsafe_code)]
 
@@ -111,7 +142,7 @@ const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
     ("rootless_leaf", 120),
     ("glob", 20),
     ("never_existed", 15),
-    ("commit_unreachable", 7),
+    ("commit_unreachable", 0),
     ("present_but_untracked", 9),
     ("under_target_ephemeral", 7),
     ("existed_then_removed", 0),
