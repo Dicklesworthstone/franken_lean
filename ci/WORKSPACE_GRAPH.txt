@@ -75,6 +75,7 @@ edge fln-kernel -> fln-env         # check consults the environment read-only (f
 edge fln-kernel -> fln-bignum      # owned kernel-grade bignum for literal reduction (§8; already in the allow-direct covenant)
 edge fln-verdict -> fln-core       # reflected theorem expressions use the canonical term plane (franken_lean-08lb)
 edge fln-verdict -> fln-env        # checked reflected theorems publish through bounded environment admission (franken_lean-08lb)
+edge fln-verdict -> fln-hash       # certificate-fallback identities use the canonical domain hasher (franken_lean-workspace-graph-producer-edge-drift-8o3o)
 edge fln-verdict -> fln-kernel     # reflected theorem artifacts cross the sole kernel check authority (franken_lean-08lb)
 edge fln-olean -> fln-rt           # region reader consumes the generated ABI object model (franken_lean-y24)
 edge fln-olean -> fln-unsafe-region # mmap-backed codec load over the shared region machinery, sealed (fln-20n/fln-wgp seam)

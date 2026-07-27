@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":384,"projection_hash":"75721fb5294dac174f5435bf0709d54ef5c892a292fbe91c97322290439c25e9"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":385,"projection_hash":"ecd497a51aeb2877cff7f486f69541fe58b8ebbb7c724506c014d6dc898ac65e"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -367,6 +367,7 @@
 {"id":"franken_lean-w75y"}
 {"id":"franken_lean-wasm-judge-packaging-contract-xte"}
 {"id":"franken_lean-wlan"}
+{"id":"franken_lean-workspace-graph-producer-edge-drift-8o3o"}
 {"id":"franken_lean-worktree-gitdir-refusal-hugg"}
 {"id":"franken_lean-xk4c"}
 {"id":"franken_lean-xqb"}
