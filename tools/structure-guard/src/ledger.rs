@@ -1023,13 +1023,47 @@ pub fn expanded_public_items(expanded: &str) -> Vec<PubItem> {
 /// identifiers appearing anywhere in boundary source or expanded output is
 /// unconditionally a finding — cheap string-level insurance against a
 /// laundering surface being prepared before the dependency edge exists.
+/// The identifiers [`admission_token_sites`] trips on, sorted.
+///
+/// **Every entry must name something that exists** — a needle naming nothing can never fire,
+/// and a tripwire that cannot fire reports healthy for the same reason a working one does.
+/// Until bead `franken_lean-admission-tripwire-needles-unbound-en9q` this list carried
+/// `CheckedExpr`, the *expression* typestate of plan §8.2b, which is unimplemented and exists
+/// nowhere in the workspace; meanwhile the capability types that DO exist were unnamed. So the
+/// only bare needle here could not match, and the ones that could were absent.
+///
+/// `the_admission_tripwire_names_what_the_kernel_actually_exports`
+/// (`tests/real_workspace.rs`) binds this list to `crates/fln-kernel/src/capability.rs` in
+/// both directions: a needle naming nothing fails, and a capability type named by no needle
+/// fails. Neither direction can be satisfied by editing this list alone.
+///
+/// `Published` is deliberately absent — see [`ADMISSION_TOKEN_EXCLUSIONS`].
+pub const ADMISSION_TOKENS: &[&str] = &[
+    "Admitted",
+    "CheckedDecl",
+    "Reviewable",
+    "fln_checker",
+    "fln_kernel",
+];
+
+/// Capability-module types deliberately NOT tripwired, each with the reason it is safe.
+///
+/// A declared, shrinking allowance rather than a silent omission: the binding test requires
+/// every `pub` type in the capability module to be either tripwired or listed here, so a new
+/// type forces a decision instead of defaulting to uncovered, and a row naming a type that no
+/// longer exists fails rather than accumulating.
+pub const ADMISSION_TOKEN_EXCLUSIONS: &[(&str, &str)] = &[(
+    "Published",
+    "an outcome REPORT of a publication that already happened, not a right to perform one: \
+     its arms are Committed/DuplicateName/BlockHandoffUnavailable and none can be laundered \
+     into admitting anything. It is also a generic identifier, so tripwiring it would buy no \
+     admission coverage while adding real false-positive risk in boundary code.",
+)];
+
 pub fn admission_token_sites(text: &str) -> Vec<ExportSite> {
     let mut sites = Vec::new();
     for lexeme in rust_lexemes(text) {
-        if matches!(
-            lexeme.text.as_str(),
-            "fln_kernel" | "fln_checker" | "CheckedExpr"
-        ) {
+        if ADMISSION_TOKENS.contains(&lexeme.text.as_str()) {
             sites.push(ExportSite {
                 line: lexeme.line,
                 detail: "kernel-admission token in boundary code",
@@ -1437,7 +1471,19 @@ fn two() {}
             admission_token_sites("fn f() { let x = fln_kernel::check; }\n").len(),
             1
         );
-        assert_eq!(admission_token_sites("type T = CheckedExpr;\n").len(), 1);
+        // A LIVE capability type, not a planned one: `CheckedDecl` is declared in
+        // crates/fln-kernel/src/capability.rs, so this needle can actually fire on real
+        // boundary source. The previous version of this assertion used `CheckedExpr`, which
+        // exists nowhere in the workspace — a self-consistent test of a needle that could
+        // never match anything (bead franken_lean-admission-tripwire-needles-unbound-en9q).
+        assert_eq!(admission_token_sites("type T = CheckedDecl;\n").len(), 1);
+        assert_eq!(admission_token_sites("fn f(r: Reviewable) {}\n").len(), 1);
+        assert_eq!(
+            admission_token_sites("fn f() -> Admitted { todo!() }\n").len(),
+            1
+        );
+        // The excluded type stays untripwired, and this fails if someone adds it silently.
+        assert!(admission_token_sites("fn f() -> Published { todo!() }\n").is_empty());
         assert!(admission_token_sites("fn clean() {}\n").is_empty());
         // Macro-generated symbol exports.
         let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

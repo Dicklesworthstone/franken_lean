@@ -430,3 +430,107 @@ fn robot_help_remains_machine_only_in_either_argument_order() {
         assert!(stdout.contains("\"exit_code\":0"));
     }
 }
+
+/// The admission tripwire's needle set, bound to what the kernel actually exports.
+///
+/// **The defect this exists because of** (bead
+/// `franken_lean-admission-tripwire-needles-unbound-en9q`): the tripwire's only bare needle was
+/// `CheckedExpr`, the *expression* typestate of plan §8.2b — unimplemented, and present nowhere
+/// in the workspace except the plan and the needle itself. Meanwhile `CheckedDecl`, the real
+/// publication right, and the two types that carry it were unnamed. A needle that matches
+/// nothing reports healthy for exactly the same reason a working one does, which is the sharpest
+/// form of hollow green: the guard cannot fail, so its silence is uninformative.
+///
+/// **Why this is not "a needle matching zero sites is an error".** The tripwire scans BOUNDARY
+/// crate source, where zero matches is the *healthy* state — `fln_kernel` occurring zero times
+/// in `fln-unsafe-abi` is the whole point. Erroring on that would make the guard red on a clean
+/// tree, which is a gate people learn to bypass (the `franken_lean-e5k7` lesson). The real
+/// property is narrower and has two directions:
+///
+/// * **liveness** — every needle must NAME something that exists in the workspace, so it is
+///   capable of matching. This is the direction that fails on `CheckedExpr`.
+/// * **coverage** — every capability type the kernel exports must be named by a needle, or
+///   listed in `ADMISSION_TOKEN_EXCLUSIONS` with its reason.
+///
+/// Both are derived from `crates/fln-kernel/src/capability.rs` at test time rather than
+/// transcribed here, so this test cannot drift from the module it guards — and neither
+/// direction can be satisfied by editing the needle list alone.
+#[test]
+fn the_admission_tripwire_names_what_the_kernel_actually_exports() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+
+    let capability = std::fs::read_to_string(root.join("crates/fln-kernel/src/capability.rs"))
+        .expect("the kernel capability module must be readable");
+
+    // Derived, never transcribed: every `pub struct`/`pub enum` the capability module declares.
+    let declared: Vec<String> = capability
+        .lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("pub struct ")
+                .or_else(|| line.strip_prefix("pub enum "))?;
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect();
+    assert!(
+        declared.len() >= 3,
+        "found only {} pub type(s) in the capability module; a scan that cannot see it reports \
+         a false clean rather than a kernel with no capabilities: {declared:?}",
+        declared.len()
+    );
+
+    let needles = structure_guard::ledger::ADMISSION_TOKENS;
+    let excluded: Vec<&str> = structure_guard::ledger::ADMISSION_TOKEN_EXCLUSIONS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+
+    // ---- direction 1: coverage — nothing the kernel exports may be silently untripwired ----
+    for name in &declared {
+        assert!(
+            needles.contains(&name.as_str()) || excluded.contains(&name.as_str()),
+            "crates/fln-kernel/src/capability.rs declares `{name}`, which is neither tripwired \
+             nor declared excluded. A new capability type must be a decision, not a default: \
+             add it to ADMISSION_TOKENS, or to ADMISSION_TOKEN_EXCLUSIONS with the reason it \
+             cannot be laundered into an admission."
+        );
+    }
+
+    // ---- direction 2: liveness — a needle must be able to match something ----
+    for needle in needles {
+        let names_a_crate = root.join("crates").join(needle.replace('_', "-")).is_dir();
+        let names_a_capability = declared.iter().any(|d| d == needle);
+        assert!(
+            names_a_crate || names_a_capability,
+            "the admission tripwire trips on `{needle}`, which names neither a crate under \
+             crates/ nor a pub type in crates/fln-kernel/src/capability.rs. A needle that can \
+             never match reports healthy for the same reason a working one does — this is the \
+             state bead franken_lean-admission-tripwire-needles-unbound-en9q was filed for, \
+             when the list carried `CheckedExpr` from the plan's unimplemented expression \
+             typestate. Remove it, or name the thing that now carries that role."
+        );
+    }
+
+    // ---- the exclusions are a SHRINKING allowance, not a parking lot ----
+    for (name, reason) in structure_guard::ledger::ADMISSION_TOKEN_EXCLUSIONS {
+        assert!(
+            declared.iter().any(|d| d == name),
+            "`{name}` is declared excluded from the admission tripwire but no longer exists in \
+             the capability module — a stale exclusion is an allowance that grew for free. \
+             Remove the row."
+        );
+        assert!(
+            reason.len() > 60,
+            "the exclusion for `{name}` must state why it cannot be laundered into an \
+             admission; an undeclared remainder is the silent gap this whole binding exists to \
+             prevent"
+        );
+    }
+}
