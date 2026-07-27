@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Write a bead comment so it CANNOT be corrupted, and refuse the write if it was.
 
 Bead `fln-qpkj`. A comment body passed as an inline shell word is expanded before `br` ever
