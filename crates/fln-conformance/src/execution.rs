@@ -89,6 +89,50 @@ pub fn reaches_the_pinned_reference(source: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Tests CI compiles and never runs
+// ---------------------------------------------------------------------------
+
+/// Every `#[ignore]`d test in one source file, as `(function, reason)`.
+///
+/// **Counts the attribute, never the token, and the difference is not pedantry.** Measured
+/// at `974fcc5a` the same construct yields three different answers depending on how it is
+/// counted: `rg -c '#\[ignore'` returns **22** because guard bodies and module docs discuss
+/// the attribute at length; a `#[test]`-with-`#[ignore]`-nearby window returns **6** because
+/// a doc-comment mention sits within six lines of an unrelated test; the attribute itself
+/// returns **5**. `kernel_replay.rs` is the trap in every version — one of its own guards
+/// asserts on the literal `#[ignore` as a *needle*.
+///
+/// This is the mentions-versus-construct error `fln-bench-apparatus-empty-referent-bkw6`
+/// already paid for by counting `[[bench]]` sections, and the guard that reports this
+/// carried "fifteen" in its own documentation until `974fcc5a`. Requiring the line to
+/// *begin* with the attribute is what separates a declaration from a discussion of one.
+pub fn ignored_tests(source: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("#[ignore") {
+            continue;
+        }
+        let reason = line
+            .split_once('"')
+            .and_then(|(_, rest)| rest.rsplit_once('"').map(|(body, _)| body.to_string()))
+            .unwrap_or_else(|| "<bare #[ignore], no reason given>".to_string());
+        // The attribute may sit above further attributes before the item itself.
+        let name = lines[index + 1..lines.len().min(index + 9)]
+            .iter()
+            .find_map(|candidate| {
+                let trimmed = candidate.trim_start();
+                let rest = trimmed.strip_prefix("fn ")?;
+                let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len());
+                Some(rest[..end].to_string())
+            })
+            .unwrap_or_else(|| "<no function beneath the attribute>".to_string());
+        found.push((name, reason));
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
 // The workspace's own member globs
 // ---------------------------------------------------------------------------
 
@@ -565,6 +609,55 @@ mod tests {
         assert!(reaches_the_pinned_reference(
             "std::env::var(\"FLN_REFERENCE_LIB\")\n"
         ));
+    }
+
+    /// The decisive control, and the one that would have caught the wrong number this
+    /// module's own documentation carried: a file that *discusses* `#[ignore]` — in a module
+    /// doc, in a doc comment, in a string literal, and as a scanner's own needle, which is
+    /// every shape `kernel_replay.rs` actually contains — must contribute **nothing**.
+    #[test]
+    fn discussing_the_attribute_is_not_declaring_it() {
+        let source = "\
+//! The corpus lane is `#[ignore]`d for cost, so a green run proves nothing.\n\
+/// `#[ignore]`d because it edits tracked source.\n\
+fn discussion_only() {\n\
+    let gated = body.contains(\"#[ignore\");\n\
+    assert!(gated, \"the campaign is #[ignore]d, so the filter matches nothing\");\n\
+}\n";
+        assert_eq!(ignored_tests(source), Vec::new());
+
+        // The same file, plus ONE real attribute.
+        let with_one =
+            format!("{source}#[ignore = \"cost: the whole corpus\"]\nfn real_lane() {{}}\n");
+        assert_eq!(
+            ignored_tests(&with_one),
+            vec![(
+                "real_lane".to_string(),
+                "cost: the whole corpus".to_string()
+            )]
+        );
+    }
+
+    /// A bare `#[ignore]` names no reason, and an attribute above further attributes still
+    /// finds its function. Both are refusals-by-naming rather than silent drops.
+    #[test]
+    fn an_ignore_reports_its_function_and_says_when_no_reason_was_given() {
+        let source = "#[ignore]\n#[should_panic]\nfn bare_one() {}\n";
+        assert_eq!(
+            ignored_tests(source),
+            vec![(
+                "bare_one".to_string(),
+                "<bare #[ignore], no reason given>".to_string()
+            )]
+        );
+        let orphan = "#[ignore = \"why\"]\n// nothing follows\n";
+        assert_eq!(
+            ignored_tests(orphan),
+            vec![(
+                "<no function beneath the attribute>".to_string(),
+                "why".to_string()
+            )]
+        );
     }
 
     #[test]

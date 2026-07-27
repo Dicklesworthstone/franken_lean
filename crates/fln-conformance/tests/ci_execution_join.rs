@@ -69,10 +69,20 @@
 //!    as reaching the workspace suite because they invoke the same script. Today the same
 //!    job also runs the plain gate, so the answer is unchanged; a job that ran *only* a
 //!    sub-mode would be over-credited.
-//! 4. **The fifteen `#[ignore]`d tests.** A cited surface can be run by CI while the test
-//!    inside it that actually produces the evidence never executes. Artifact citations are
+//! 4. **The five `#[ignore]`d tests.** A cited surface can be run by CI while the test
+//!    inside it that produces the evidence never executes. Artifact citations are
 //!    file-granular, so the manifest cannot express which test a row rests on and this
-//!    guard cannot check it. **This is the next instance of item 7 in this area.**
+//!    guard cannot check it. Measured at `974fcc5a`, all five are already compensated —
+//!    `fln-8zsq` went source-level *because* its producer is ignored, `93te` carries a
+//!    mechanically-expiring PG-5 waiver, `uagk` a retention receipt, `4o3n` the private
+//!    `Calibration` field — and `golden_vellum.rs`'s only prints for a human. **What is
+//!    unguarded is the class, not the instances:** nothing binds an ignored producer to a
+//!    compensating mechanism, so a sixth `#[ignore]` gets no scrutiny at all
+//!    (bead `franken_lean-ignored-producer-class-unguarded-t4u1`). Count the ATTRIBUTE, never the
+//!    token: this paragraph said "fifteen" until `974fcc5a` because `rg -c '#\[ignore'`
+//!    returns 22 *mentions*, `kernel_replay.rs` being full of guards that discuss it —
+//!    the same mentions-vs-construct error `bkw6` paid for by counting `[[bench]]`
+//!    sections, committed here inside the guard written about that defect.
 //! 5. **`--skip` at `scripts/check.sh:1586-1590`.** Treated as workspace-wide because
 //!    `--skip` filters test *names*, not targets — true today, and a libtest filter that
 //!    matches nothing exits 0 (`uagk`).
@@ -85,8 +95,8 @@ use std::path::{Path, PathBuf};
 
 use fln_conformance::execution::{
     CiJob, Field, PIN_COORDINATES, check_sh_reaches_workspace, ci_jobs, e2e_scenario_keys,
-    installs_reference_pin, is_terminal, reach_covers, reaches_the_pinned_reference, record_field,
-    test_reach, workspace_member_patterns,
+    ignored_tests, installs_reference_pin, is_terminal, reach_covers, reaches_the_pinned_reference,
+    record_field, test_reach, workspace_member_patterns,
 };
 
 // ---------------------------------------------------------------------------
@@ -156,6 +166,59 @@ const PIN_REACH_SCAN_EXCLUSIONS: &[(&str, &str)] = &[
 
 const PIN_REACH_SCAN_EXCLUSION_CEILING: usize = 2;
 
+/// Every `#[ignore]`d test in the workspace, each with the mechanism that compensates for
+/// CI compiling it and never running it (bead `franken_lean-ignored-producer-class-unguarded-t4u1`).
+///
+/// **The instances are fine; the class is what is unguarded.** Measured at `974fcc5a`, all
+/// five ignored tests are already compensated — but by five bespoke mechanisms, written by
+/// four different people, each invisible from the ignore site. Nothing binds an ignored
+/// producer to a compensating mechanism, so a sixth `#[ignore]` added tomorrow gets no
+/// scrutiny at all. That is AGENTS.md's own sentence about item 7: instances found by
+/// attentive reading are not a mechanism, they are luck with good people, and luck does not
+/// survive a context restart.
+///
+/// This is the same defect as the population above, one granularity finer. A coverage row
+/// cites a **file**; cargo runs a **function**. Ten terminal rows cite one of these four
+/// surfaces and the manifest cannot say which test any of them rests on — so this guard
+/// does not claim those rows are hollow, and measurement says they are not: the ignored
+/// fraction is 2/14, 1/15, 1/10 and 1/9, and no surface has every test ignored.
+const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "pinned_present_olean_kernel_differential",
+        "fln-8zsq made its census guard SOURCE-level precisely because this producer is \
+         ignored: a lane grepping stdout observes silence rather than a missing disclosure",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "present_olean_corpus_thread_matrix_compares_stream_digests",
+        "AGENTS.md's public PG-5 waiver, which expires MECHANICALLY — the receipt path is \
+         keyed by pin, so advancing SUITE.lock fails the retention check (fln-corpus-thread-matrix-93te)",
+    ),
+    (
+        "crates/fln-conformance/tests/mandated_mutants.rs",
+        "the_mandated_mutants_are_planted_and_their_killers_die",
+        "fln-mandated-mutant-join-unwatched-uagk's per-commit retention receipt, weekly \
+         dispatcher, and a class token DERIVED from what dispatches it",
+    ),
+    (
+        "crates/fln-kernel/tests/depth_stack_calibration.rs",
+        "calibrate_stack_bytes_per_depth",
+        "franken_lean-4o3n's private Calibration field: no bound can exist without the \
+         provenance of the configuration it was measured in",
+    ),
+    (
+        "crates/fln-syntax/tests/golden_vellum.rs",
+        "emit_corpus_for_review",
+        "not evidence for any claim — a regeneration ceremony that only PRINTS rows for a \
+         human to review, and never writes the corpus",
+    ),
+];
+
+/// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
+/// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
+const IGNORED_PRODUCER_CEILING: usize = 5;
+
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
 
@@ -186,6 +249,8 @@ struct Derivation {
     e2e_keys: BTreeSet<String>,
     /// `crates/fln-conformance/src/pin.rs`, raw — the coordinate set's positive control.
     pin_module: String,
+    /// `(surface, function)` for every `#[ignore]`d test cargo compiles and never runs.
+    ignored: BTreeSet<(String, String)>,
 }
 
 fn read(root: &Path, relative: &str) -> String {
@@ -367,6 +432,16 @@ fn derive(root: &Path) -> Derivation {
         "scan: the tracker reader resolved no issues at all — a broken reader, not an empty tracker"
     );
 
+    // Every test cargo compiles and never runs, keyed by the attribute rather than the token.
+    let ignored: BTreeSet<(String, String)> = surfaces
+        .iter()
+        .flat_map(|(path, text)| {
+            ignored_tests(text)
+                .into_iter()
+                .map(|(name, _reason)| (path.clone(), name))
+        })
+        .collect();
+
     // `cargo-test:<stem>` names an integration target; cargo binds a target's name to its
     // file stem under `tests/`, so unlike the e2e scenario convention this binding is the
     // build system's, not a local habit.
@@ -435,7 +510,70 @@ fn derive(root: &Path) -> Derivation {
         rows,
         e2e_keys,
         pin_module: read(root, "crates/fln-conformance/src/pin.rs"),
+        ignored,
     }
+}
+
+/// Every `#[ignore]`d test is declared with the mechanism that compensates for it, and the
+/// declaration can only shrink. Findings are prefixed so a mutant can assert *which* fired.
+fn judge_ignored(d: &Derivation, allowance: &[(&str, &str, &str)], ceiling: usize) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    // Zero is a broken scan, not a repaired tree: the attribute cannot stop existing while
+    // the corpus lane, the mutant campaign and the calibration runs all still carry it.
+    if d.ignored.is_empty() {
+        findings.push(
+            "ignored-scan: no `#[ignore]`d test was found anywhere in the workspace. That is \
+             the attribute scan breaking, not a tree in which every lane now runs per commit."
+                .to_string(),
+        );
+    }
+
+    let declared: BTreeSet<(String, String)> = allowance
+        .iter()
+        .map(|(surface, name, _)| ((*surface).to_string(), (*name).to_string()))
+        .collect();
+
+    let undeclared: Vec<&(String, String)> = d.ignored.difference(&declared).collect();
+    if !undeclared.is_empty() {
+        findings.push(format!(
+            "ignored-undeclared: {undeclared:?} are `#[ignore]`d, so CI compiles them and \
+             never runs them. Declare each in IGNORED_PRODUCER_ALLOWANCE with the mechanism \
+             that compensates — what still fails if the thing this test would have proved \
+             stops being true. If the honest answer is `nothing`, the test is not evidence \
+             and no coverage row may cite its surface for that claim."
+        ));
+    }
+
+    let stale: Vec<&(String, String)> = declared.difference(&d.ignored).collect();
+    if !stale.is_empty() {
+        findings.push(format!(
+            "ignored-stale: {stale:?} are declared in IGNORED_PRODUCER_ALLOWANCE but are no \
+             longer `#[ignore]`d (or were renamed). This is the good direction: delete those \
+             entries and lower IGNORED_PRODUCER_CEILING to {} in the same commit.",
+            d.ignored.len()
+        ));
+    }
+
+    if allowance.len() != ceiling {
+        findings.push(format!(
+            "ignored-ceiling: IGNORED_PRODUCER_ALLOWANCE holds {} entries against a ceiling \
+             of {ceiling}. Equality, so a shrink must lower it and the headroom a repair \
+             earns cannot be spent admitting the next unexamined `#[ignore]`.",
+            allowance.len()
+        ));
+    }
+
+    for (surface, name, mechanism) in allowance {
+        if mechanism.trim().is_empty() {
+            findings.push(format!(
+                "ignored-vacuous: {surface}::{name} is declared with an empty compensating \
+                 mechanism, which is a declaration that says nothing."
+            ));
+        }
+    }
+
+    findings
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1115,171 @@ fn mutant_members_hardcoded_to_crates_resurrects_the_tools_false_positive() {
             .iter()
             .any(|finding| finding.contains("tools/structure-guard")),
         "the finding must name the surfaces that dropped out; got {findings:?}"
+    );
+}
+
+/// Every test CI compiles and never runs is declared with what compensates for it.
+#[test]
+fn every_ignored_producer_is_declared_with_its_compensating_mechanism() {
+    let d = derive(&root());
+    eprintln!(
+        "ci-execution-join: ignored_tests={} (attribute-counted, not token-counted)",
+        d.ignored.len()
+    );
+    let findings = judge_ignored(&d, IGNORED_PRODUCER_ALLOWANCE, IGNORED_PRODUCER_CEILING);
+    assert!(
+        findings.is_empty(),
+        "the ignored-producer class (bead franken_lean-ignored-producer-class-unguarded-t4u1):\n  - {}",
+        findings.join("\n  - ")
+    );
+}
+
+/// **The mutant that would have caught this guard's own wrong number.**
+///
+/// Until `974fcc5a` the module doc above said "fifteen `#[ignore]`d tests". There are five.
+/// The number came from counting the token, which `kernel_replay.rs` alone mentions many
+/// times in module docs, doc comments, an assertion message, and one guard's own *needle*.
+/// So the control is not "does the count look right" — it is: **inject every shape of
+/// mention and require the count not to move.**
+#[test]
+fn mutant_discussing_the_attribute_must_not_change_the_count() {
+    let mut d = baseline_ignored();
+    let before = d.ignored.len();
+
+    let discussion = "\
+//! The corpus lane is `#[ignore]`d for cost.\n\
+/// `#[ignore]`d because it edits tracked source.\n\
+fn talks_about_it() {\n\
+    let gated = body.contains(\"#[ignore\");\n\
+    assert!(gated, \"the campaign is #[ignore]d, so the filter matches nothing\");\n\
+}\n";
+    d.surfaces.insert(
+        "crates/fln-planted/tests/discussion.rs".to_string(),
+        discussion.to_string(),
+    );
+    let recounted: BTreeSet<(String, String)> = d
+        .surfaces
+        .iter()
+        .flat_map(|(path, text)| {
+            ignored_tests(text)
+                .into_iter()
+                .map(|(name, _)| (path.clone(), name))
+        })
+        .collect();
+    assert_eq!(
+        recounted.len(),
+        before,
+        "five shapes of MENTION were injected and the count moved. Counting the token \
+         rather than the attribute is exactly how this guard's own documentation came to \
+         claim fifteen; recounted {recounted:?}"
+    );
+
+    // And the positive half: one real attribute must move it by exactly one.
+    d.surfaces.insert(
+        "crates/fln-planted/tests/real.rs".to_string(),
+        format!("{discussion}#[ignore = \"cost\"]\nfn real_lane() {{}}\n"),
+    );
+    let recounted: BTreeSet<(String, String)> = d
+        .surfaces
+        .iter()
+        .flat_map(|(path, text)| {
+            ignored_tests(text)
+                .into_iter()
+                .map(|(name, _)| (path.clone(), name))
+        })
+        .collect();
+    assert_eq!(
+        recounted.len(),
+        before + 1,
+        "a real attribute must be counted, or the scan is blind rather than precise"
+    );
+}
+
+fn baseline_ignored() -> Derivation {
+    let d = derive(&root());
+    assert!(
+        judge_ignored(&d, IGNORED_PRODUCER_ALLOWANCE, IGNORED_PRODUCER_CEILING).is_empty(),
+        "the campaign's control must start clean, or every kill below is unattributable"
+    );
+    d
+}
+
+/// A sixth `#[ignore]` reddens until its author says what compensates it, and declaring it
+/// costs a visible edit to the ceiling.
+#[test]
+fn mutant_a_new_ignore_reddens_and_resists_silent_declaration() {
+    let mut d = baseline_ignored();
+    d.ignored.insert((
+        "crates/fln-planted/tests/new_lane.rs".to_string(),
+        "an_expensive_new_lane".to_string(),
+    ));
+    let findings = judge_ignored(&d, IGNORED_PRODUCER_ALLOWANCE, IGNORED_PRODUCER_CEILING);
+    assert!(
+        has(&findings, "ignored-undeclared:"),
+        "a sixth ignored test must redden; got {findings:?}"
+    );
+
+    let mut grown: Vec<(&str, &str, &str)> = IGNORED_PRODUCER_ALLOWANCE.to_vec();
+    grown.push((
+        "crates/fln-planted/tests/new_lane.rs",
+        "an_expensive_new_lane",
+        "nothing yet",
+    ));
+    let findings = judge_ignored(&d, &grown, IGNORED_PRODUCER_CEILING);
+    assert!(
+        !has(&findings, "ignored-undeclared:"),
+        "declaring it must satisfy membership, or the ceiling is not what refuses"
+    );
+    assert!(
+        has(&findings, "ignored-ceiling:"),
+        "growing the declaration must trip the ceiling; got {findings:?}"
+    );
+}
+
+/// Un-ignoring a test forces the declaration to shrink with it.
+#[test]
+fn mutant_un_ignoring_a_test_forces_the_declaration_to_shrink() {
+    let mut d = baseline_ignored();
+    let removed = d
+        .ignored
+        .iter()
+        .next()
+        .cloned()
+        .expect("the ignored set is non-empty");
+    d.ignored.remove(&removed);
+    let findings = judge_ignored(&d, IGNORED_PRODUCER_ALLOWANCE, IGNORED_PRODUCER_CEILING);
+    assert!(
+        has(&findings, "ignored-stale:"),
+        "a declaration that outlived its ignore must redden; got {findings:?}"
+    );
+    assert!(
+        findings.iter().any(|f| f.contains(&removed.1)),
+        "the finding must NAME the entry to delete; got {findings:?}"
+    );
+}
+
+/// An empty scan refuses rather than agreeing with every declaration.
+#[test]
+fn mutant_an_empty_ignore_scan_refuses_instead_of_reporting_clean() {
+    let mut d = baseline_ignored();
+    d.ignored.clear();
+    let findings = judge_ignored(&d, IGNORED_PRODUCER_ALLOWANCE, IGNORED_PRODUCER_CEILING);
+    assert!(
+        has(&findings, "ignored-scan:"),
+        "a scan finding nothing is broken, not clean; got {findings:?}"
+    );
+}
+
+/// A declaration whose mechanism is blank declares nothing.
+#[test]
+fn mutant_a_blank_compensating_mechanism_is_refused() {
+    let d = baseline_ignored();
+    let mut blank: Vec<(&str, &str, &str)> = IGNORED_PRODUCER_ALLOWANCE.to_vec();
+    blank[0].2 = "   ";
+    let findings = judge_ignored(&d, &blank, IGNORED_PRODUCER_CEILING);
+    assert!(
+        has(&findings, "ignored-vacuous:"),
+        "an empty mechanism must be refused; got {findings:?}"
     );
 }
 
