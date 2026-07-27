@@ -2980,8 +2980,35 @@ fn unsealed_rust_launches(files: &[(String, String)]) -> Vec<(String, usize, Str
     found
 }
 
+/// Repository-relative directories the repo itself declares as generated output.
+///
+/// Derived from `.gitignore`'s own rooted-directory entries (`/scripts/e2e/artifacts/`,
+/// `/target`, …) rather than named here. Walking from the repository root without this picked up
+/// **twelve** untracked `.rs` files under `scripts/e2e/artifacts/` — generated structural-gate
+/// fixtures — which is `fln-bench-apparatus-empty-referent-bkw6`'s documented trap reproduced to
+/// the exact count. A generated fixture is not this repository's source, and reddening the build
+/// over one is the cry-wolf failure. Deriving the exclusion keeps it honest in the safe
+/// direction: if `.gitignore` stops declaring a directory the scan WIDENS, which can only make
+/// this guard noisier, never blind.
+fn declared_generated_directories(repo: &Path) -> BTreeSet<String> {
+    let Ok(text) = fs::read_to_string(repo.join(".gitignore")) else {
+        return BTreeSet::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('/') && !line.starts_with("/*"))
+        .map(|line| {
+            line.trim_start_matches('/')
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|line| !line.is_empty() && !line.contains('*'))
+        .collect()
+}
+
 /// Collect `*.rs` under `dir`, skipping build and vendor output.
 fn rust_tree(dir: &Path, found: &mut Vec<(String, String)>, repo: &Path) {
+    let generated = declared_generated_directories(repo);
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -2991,6 +3018,13 @@ fn rust_tree(dir: &Path, found: &mut Vec<(String, String)>, repo: &Path) {
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
             if name == "target" || name == "vendor" || name == ".git" {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(repo)
+                .map(|rel| rel.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if generated.contains(&relative) {
                 continue;
             }
             rust_tree(&path, found, repo);
@@ -3017,9 +3051,34 @@ fn every_rust_side_launch_of_a_trusted_script_is_sealed() {
     let repo = repo
         .canonicalize()
         .expect("the repository root must resolve");
+    // The scan roots are NOT named. The first version of this guard walked `crates/` and
+    // `tools/`, which is a hand-listed scope — the defect this repository keeps producing, and
+    // the one the guard itself was written about. Measured immediately after it landed: 214 of
+    // 232 tracked `.rs` files were scanned and **18 were invisible**, the whole of
+    // `tribunal/epoch-lab/`, which `k60n`'s row already records as a nested workspace the
+    // members glob never walks. No launch lived there, so it was an unwatched population rather
+    // than a live hole — which is exactly what the five `crates/`+`tools/` launches were. A
+    // named root cannot drift if there is no named root, so the walk starts at the repository.
+    // The exclusion must not be INERT. A `.gitignore` that failed to parse would return an empty
+    // set, the walk would silently widen to include generated fixtures, and nothing would say so
+    // — `fln-inert-declaration-shape`: a declaration that reads as behaviour and does nothing.
+    // Checked in both halves: the repo must declare generated directories, and at least one of
+    // them must actually be on disk, or the declaration is naming only absent paths.
+    let generated = declared_generated_directories(&repo);
+    assert!(
+        !generated.is_empty(),
+        "no generated-output directories were derived from .gitignore, so the exclusion this \
+         walk depends on is inert and the scan has silently widened to include build products"
+    );
+    assert!(
+        generated.iter().any(|dir| repo.join(dir).is_dir()),
+        "every directory .gitignore declares as generated output is absent from disk ({generated:?}); \
+         the derivation is parsing something, but not paths this tree has, so the exclusion \
+         cannot be shown to exclude anything"
+    );
+
     let mut files = Vec::new();
-    rust_tree(&repo.join("crates"), &mut files, &repo);
-    rust_tree(&repo.join("tools"), &mut files, &repo);
+    rust_tree(&repo, &mut files, &repo);
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let launches: usize = files
@@ -3034,11 +3093,12 @@ fn every_rust_side_launch_of_a_trusted_script_is_sealed() {
     // Five were measured at `b6e6b732`; this is a FLOOR, so removing one is allowed and only a
     // scan that has lost its scope reddens.
     assert!(
-        launches >= 5 && files.len() >= 50,
-        "derived scan found {launches} Rust-side interpreter launch(es) across {} files under \
-         crates/ and tools/, which is too few for this tree. Five launches were measured when \
-         this guard was written, so an empty or truncated scan is a broken scan and is refused \
-         rather than reported as a clean tree.",
+        launches >= 5 && files.len() >= 200,
+        "derived scan found {launches} Rust-side interpreter launch(es) across {} Rust files in \
+         the repository, which is too few for this tree. Five launches over 232 files were \
+         measured at 887db274, so an empty or truncated scan is a BROKEN SCAN and is refused \
+         rather than reported as a clean tree. Both figures are floors: a launch removed or a \
+         file deleted is allowed, a collapsed scope is not.",
         files.len()
     );
 
