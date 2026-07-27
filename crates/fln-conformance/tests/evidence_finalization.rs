@@ -1080,6 +1080,162 @@ fn the_evidence_surface_refuses_a_gitdir_pointer_root() {
     }
 }
 
+/// The same refusal, in a **real** linked worktree rather than a hand-built one — the half
+/// `franken_lean-worktree-gitdir-refusal-hugg` asks for in its own words: *"No claim that
+/// reading the source substitutes for running the trusted path in a real worktree."*
+///
+/// **What this adds over the sibling above is exactly one property, and naming it is the whole
+/// justification for a second test.** The sibling writes `gitdir: /nonexistent/repository/…`,
+/// so its pointer **never resolves**. `run_git` does not resolve the pointer today, so both
+/// roots refuse identically and the sibling is correct — but that equivalence is a property of
+/// the *current* implementation, not of the shapes. The bead's candidate 2 is precisely the
+/// change that breaks it: *"if [a linked worktree] is [admissible], resolve the gitdir pointer
+/// and bind the run to the resolved repository identity."* On the day anyone implements that,
+/// the sibling keeps passing while describing a root no worktree resembles, because a
+/// dangling pointer would refuse for a reason that has nothing to do with worktrees.
+///
+/// So this test asserts the resolution **as a precondition** before it asserts anything else.
+/// Without that assertion it degenerates into a slower copy of the sibling, and a duplicated
+/// test that has silently stopped testing anything extra is worse than no test at all.
+///
+/// **It builds its own repository rather than using this one.** `git worktree add` against the
+/// real checkout would write into the shared `.git/worktrees/`, from a test, in a tree six
+/// panes share — and would leave an entry behind that nobody owns. A purpose-built repo in the
+/// scratch target gives a pointer written by **git itself**, pointing at a gitdir that **exists**,
+/// for 240 KB and about 0.6 s measured.
+///
+/// **The exit code discriminates nothing here either**: the worktree cell and the control both
+/// exit 2 in the sibling's world, and the control below exits **0** only because a real `.git`
+/// directory lets the run succeed outright. The message is the discriminator, as everywhere in
+/// this family.
+#[test]
+fn the_evidence_surface_refuses_a_real_linked_worktree_whose_pointer_resolves() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let evidence = repo.join("scripts/evidence.py");
+    let scratch = std::env::var("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| repo.join("target"))
+        .join(format!("fln-real-worktree-{}", std::process::id()));
+    let source = scratch.join("source-repo");
+    let worktree = scratch.join("linked-worktree");
+    fs::create_dir_all(&source).expect("the purpose-built repository root must be creatable");
+
+    let git = |args: &[&str], cwd: &Path| -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    };
+
+    // Setup failures must be LOUD. A silent skip here would leave the suite green while the
+    // only cell that exercises a resolving pointer never ran.
+    assert!(git(&["init", "-q", "."], &source), "git init must succeed");
+    assert!(
+        git(&["config", "user.email", "probe@example.invalid"], &source)
+            && git(&["config", "user.name", "probe"], &source),
+        "git identity must be configurable in the purpose-built repository"
+    );
+    fs::write(source.join("f.txt"), "x\n").expect("a file must be writable in the probe repo");
+    assert!(git(&["add", "f.txt"], &source), "git add must succeed");
+    assert!(
+        git(&["commit", "-qm", "base"], &source),
+        "the probe repository needs one commit before a worktree can be added"
+    );
+    assert!(
+        git(
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                "--detach",
+                worktree.to_str().expect("scratch path must be UTF-8"),
+                "HEAD",
+            ],
+            &source,
+        ),
+        "git worktree add must succeed; without a REAL worktree this test is the sibling"
+    );
+
+    // --- the precondition that makes this test different from the sibling above ----------
+    let pointer_path = worktree.join(".git");
+    let pointer = fs::read_to_string(&pointer_path).expect("git must write a .git pointer file");
+    assert!(
+        pointer.starts_with("gitdir: "),
+        "git did not write a gitdir pointer into the linked worktree: {pointer:?}"
+    );
+    let target = Path::new(pointer.trim_start_matches("gitdir: ").trim());
+    assert!(
+        target.exists(),
+        "the pointer target {target:?} does not exist, so this root is the sibling's \
+         dangling-pointer fixture wearing a real worktree's name and it tests nothing extra"
+    );
+
+    let probe = |root: &Path, name: &str| -> (Option<i32>, String) {
+        let out_dir = scratch.join(name);
+        fs::create_dir_all(&out_dir).expect("probe output root must be creatable");
+        let run = std::process::Command::new("python3")
+            .args(["-I", "-S"])
+            .arg(&evidence)
+            .arg("ubs-inventory")
+            .arg("--root")
+            .arg(root)
+            .args(["--scope", "all-tracked"])
+            .arg("--output")
+            .arg(out_dir.join("inventory.json"))
+            .arg("--artifact-root")
+            .arg(&out_dir)
+            .output()
+            .expect("the sealed interpreter must be able to run the evidence runner");
+        (
+            run.status.code(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        )
+    };
+
+    const REFUSAL: &str = "requires a real repository .git directory";
+    const NAMES_THE_WORKTREE: &str = "LINKED GIT WORKTREE";
+
+    let (code, stderr) = probe(&worktree, "cell-worktree");
+    assert_eq!(
+        code,
+        Some(2),
+        "a real linked worktree must be a typed setup failure, not a crash or a pass: {stderr}"
+    );
+    assert!(
+        stderr.contains(REFUSAL),
+        "a real linked worktree must be refused by name: {stderr}"
+    );
+    assert!(
+        stderr.contains(NAMES_THE_WORKTREE),
+        "the refusal fired in a REAL linked worktree and did not say so. Every caller prints a \
+         louder and wrong summary underneath this line, so a refusal naming no cause leaves the \
+         reader diagnosing a missing tool; got: {stderr}"
+    );
+
+    // The control, and it is not the same control as the sibling's. There, a `.git` directory
+    // was empty and git failed on its own terms at exit 2. Here the source repo is REAL, so a
+    // correct implementation SUCCEEDS — which separates "refuses everything it is pointed at"
+    // from "refuses the worktree condition specifically".
+    let (source_code, source_stderr) = probe(&source, "cell-source");
+    assert!(
+        !source_stderr.contains(REFUSAL),
+        "the refusal fired against a genuine repository with a real .git directory, so it is \
+         not keyed on the worktree condition and the cell above proves nothing: {source_stderr}"
+    );
+    assert_eq!(
+        source_code,
+        Some(0),
+        "the same command against the worktree's own source repository must SUCCEED. If it \
+         does not, the cell above may be refusing for an unrelated reason and this test is \
+         vacuous: {source_stderr}"
+    );
+}
+
 /// The fourth `.git` shape: **no `.git` at all**, which is the RCH worker's checkout
 /// (bead `fln-yihl`, the host half of `franken_lean-worktree-gitdir-refusal-hugg`).
 ///
