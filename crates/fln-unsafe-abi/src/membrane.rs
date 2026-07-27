@@ -196,6 +196,9 @@ pub(crate) unsafe fn alloc_big(sz: usize) -> *mut LeanObject {
 #[allow(unsafe_code)]
 pub(crate) unsafe fn alloc_ctor_memory(sz: usize) -> *mut LeanObject {
     let aligned = align_obj_size(sz);
+    // SAFETY: delegated, exactly as this function's own `# Safety` clause says
+    // ("As `alloc_small`"): the caller has already discharged `alloc_small`'s
+    // obligation, so calling it here adds none.
     let o = unsafe { alloc_small(sz) };
     if aligned > sz {
         // SAFETY: the block is `aligned` bytes; the final word is in-bounds.

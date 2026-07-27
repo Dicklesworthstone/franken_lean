@@ -839,6 +839,9 @@ fn export_alloc_object_marks_big_path_and_frees() {
     assert!(!o.is_null());
     // Header init through the internal twin, then release through the
     // exported category dispatch.
+    // SAFETY: `o` was minted by this crate's own exported allocator and
+    // asserted non-null above; the test owns it exclusively until it frees it
+    // below, and `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0103
     #[allow(unsafe_code)]
     unsafe {
@@ -863,6 +866,10 @@ fn export_string_constructors_match_pin_semantics() {
         export_lean_mk_string_from_bytes, export_lean_object_byte_size,
         export_lean_object_data_byte_size, export_lean_string_eq_cold,
     };
+    // SAFETY: every object here is minted by this crate's own constructors from
+    // literals that satisfy their contracts, is owned exclusively by this test,
+    // and is released through the exported cold path before the block ends;
+    // `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0104
     #[allow(unsafe_code)]
     unsafe {
@@ -945,6 +952,10 @@ fn export_panic_fn_balances_ownership_and_returns_default() {
     // Quiet: the message plane is exercised by the gauntlet lane with real
     // process boundaries; here we assert the ownership contract only.
     export_lean_set_panic_messages(false);
+    // SAFETY: both objects are minted by this crate's own constructors and owned
+    // exclusively by this test; the ownership contract under assertion is
+    // exactly which of them the exported panic path consumes, and each is
+    // released once. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0105
     #[allow(unsafe_code)]
     unsafe {
@@ -988,6 +999,10 @@ fn export_heartbeat_is_thread_local_counting() {
 fn export_dec_ref_cold_tears_down_graphs() {
     let _g = lock();
     use crate::export::export_lean_dec_ref_cold;
+    // SAFETY: the whole object graph is built here by this crate's own
+    // constructors and is owned exclusively by this test; the single
+    // `dec_ref_cold` at the root is the only release, which is the property
+    // under test. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0106
     #[allow(unsafe_code)]
     unsafe {
@@ -1007,6 +1022,10 @@ fn export_dec_ref_cold_tears_down_graphs() {
 fn export_mark_persistent_via_c_surface() {
     let _g = lock();
     use crate::export::export_lean_mark_persistent;
+    // SAFETY: the string and ctor are minted by this crate's own constructors
+    // and owned exclusively by this test; marking them persistent is the
+    // operation under test and is applied to objects this block created.
+    // `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0107
     #[allow(unsafe_code)]
     unsafe {
@@ -1032,6 +1051,10 @@ fn export_platform_and_byte_array_roundtrip() {
         tagged::unbox(export_lean_system_platform_nbits(tagged::boxi(0))),
         64
     );
+    // SAFETY: the string is minted from a NUL-terminated literal through this
+    // crate's own exported constructor and is owned exclusively by this test;
+    // each conversion in the roundtrip consumes or borrows exactly as its
+    // contract states. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0112
     #[allow(unsafe_code)]
     unsafe {
@@ -1058,6 +1081,10 @@ fn export_array_list_roundtrip_and_push_laws() {
         export_lean_array_mk, export_lean_array_push, export_lean_array_to_list,
         export_lean_dec_ref_cold,
     };
+    // SAFETY: the list is built here from boxed scalars, so every node is this
+    // test's own and exclusively owned; the Array/List conversions consume and
+    // produce objects of the shapes their contracts require, and the result is
+    // released once. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0131
     #[allow(unsafe_code)]
     unsafe {
@@ -1110,6 +1137,10 @@ fn export_byte_array_families_match_pin_laws() {
         export_lean_byte_array_data, export_lean_byte_array_mk, export_lean_byte_array_push,
         export_lean_dec_ref_cold,
     };
+    // SAFETY: the array is allocated here with matching size and capacity and
+    // every slot is written before it is read; the ByteArray conversions
+    // consume and produce objects of the shapes their contracts require.
+    // `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0132
     #[allow(unsafe_code)]
     unsafe {
@@ -1150,6 +1181,10 @@ fn export_string_list_roundtrip_and_hash() {
         export_lean_dec_ref_cold, export_lean_mk_string, export_lean_string_data,
         export_lean_string_eq_cold, export_lean_string_hash, export_lean_string_mk,
     };
+    // SAFETY: the string is minted from a NUL-terminated literal through this
+    // crate's own exported constructor; the extra reference this test takes is
+    // matched by the releases below, so every borrow is live for its use.
+    // `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0133
     #[allow(unsafe_code)]
     unsafe {
@@ -1189,6 +1224,10 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
         export_lean_nat_overflow_mul, export_lean_string_of_usize, export_lean_uint8_of_big_nat,
         export_lean_uint64_of_big_nat, export_lean_usize_of_big_nat,
     };
+    // SAFETY: every value here is either a boxed scalar, which carries no
+    // pointer, or an mpz minted by this crate's own constructor and owned
+    // exclusively by this test; each arithmetic entry point is handed operands
+    // of the shape it documents. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0160
     #[allow(unsafe_code)]
     unsafe {
@@ -1287,6 +1326,10 @@ fn export_name_eq_walks_prefixes_exactly() {
     use crate::export::{
         export_lean_big_uint64_to_nat, export_lean_dec_ref_cold, export_lean_name_eq,
     };
+    // SAFETY: the Name node is built here with the field and scalar counts the
+    // ctor layout requires, so the cached-hash slot this test reads is inside
+    // the allocation, and the graph is owned exclusively by this test and
+    // released once. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0161
     #[allow(unsafe_code)]
     unsafe {
@@ -1351,6 +1394,10 @@ mod apply_targets {
     }
     /// arity-1 returning a NEW closure (for the over-application arm).
     pub(crate) extern "C" fn make_adder(a: *mut LeanObject) -> *mut LeanObject {
+        // SAFETY: reached only as a closure target invoked by the apply arms in
+        // this module, which pass `a` as an owned argument. The closure is
+        // allocated here with the arity and fixed-argument count `add2`
+        // declares, and takes ownership of `a` in slot 0.
         // UNSAFE-LEDGER: FLN-UL-0176
         #[allow(unsafe_code)]
         unsafe {
@@ -1365,6 +1412,10 @@ mod apply_targets {
 fn export_apply_arms_match_generated_semantics() {
     let _g = lock();
     use crate::export::{export_lean_apply_1, export_lean_apply_2, export_lean_apply_3};
+    // SAFETY: each closure is allocated here with an arity and fixed-argument
+    // count matching the `extern "C"` target it wraps, which is what makes the
+    // apply arms well-formed; every closure and result is owned exclusively by
+    // this test. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0177
     #[allow(unsafe_code)]
     unsafe {
@@ -1432,12 +1483,20 @@ fn export_once_cells_initialize_exactly_once() {
         0xFEED
     }
     extern "C" fn init_obj() -> *mut LeanObject {
+        // SAFETY: reached only as the once-initialisation target invoked by the
+        // test below. It takes no arguments and mints a fresh string from a
+        // static literal whose length it states correctly, so the constructor's
+        // contract is satisfied by construction.
         // UNSAFE-LEDGER: FLN-UL-0178
         #[allow(unsafe_code)]
         unsafe {
             crate::object::mk_string_unchecked(b"once", 4)
         }
     }
+    // SAFETY: `cell` is a local array owned by this test, so the pointer handed
+    // to the once-initialisation entry point is valid, aligned and exclusively
+    // borrowed for the call; it stands in for the C-side static and outlives
+    // every use here. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0179
     #[allow(unsafe_code)]
     unsafe {

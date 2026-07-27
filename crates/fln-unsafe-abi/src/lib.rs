@@ -37,13 +37,17 @@
 //!   mpz arithmetic — the fln-bignum shim (Crucible workstream).
 
 #![deny(unsafe_code)]
-// D3's SAFETY-note half is NOT enforced in this crate yet: 28 unsafe blocks across the
-// library and its tests carry no safety comment. Enabling the lint today would fail the
-// gate, and a gate that must be routed around is one people learn to route around, so the
-// state is declared here rather than hidden. The sites are listed on the bead; when they
-// are written, replace this line with
-// `#![deny(clippy::undocumented_unsafe_blocks)]`.
-// UNSAFE-NOTE-WAIVER: franken_lean-d3-safety-note-unenforced-cdbg
+// D3's SAFETY-note half, now enforced here as it already was in the other two boundary
+// crates (bead franken_lean-d3-safety-note-unenforced-cdbg). The 28 sites this crate
+// carried are written; the waiver that stood here is discharged rather than moved.
+//
+// There is no declared allowance and that is the point. The sibling bead
+// franken_lean-d3-safety-note-clippy-diff-lane-5dkw showed a per-site allowance cannot
+// shrink — `#[expect(clippy::undocumented_unsafe_blocks)]` is not reported as unfulfilled
+// for clippy's own lints in this toolchain, so a note written without removing its
+// attribute would rot silently. At zero sites that question does not arise: the count can
+// only go up, and going up is what this denies.
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 // The layout mirrors are exact only under the certified target shape: 64-bit,
 // little-endian (C bitfield unit `m_cs_sz:16|m_other:8|m_tag:8` byte-splits

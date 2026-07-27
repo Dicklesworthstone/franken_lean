@@ -40,6 +40,10 @@ pub(crate) unsafe fn alloc_ctor(tag: u8, num_objs: usize, scalar_sz: usize) -> *
     // SAFETY: sz is bounded by the contract maxima (< 8 + 256*8 + 1024), well
     // inside the small-object range; header initialized before return.
     let o = unsafe { membrane::alloc_ctor_memory(sz) };
+    // SAFETY: this is the "header initialized before return" the note above
+    // promises. `alloc_ctor_memory` diverges through `handle_alloc_error` on
+    // exhaustion rather than returning null, so `o` is a live, exclusively
+    // owned block of at least `sz` bytes and the header write is in bounds.
     unsafe { init_st_header(o, tag, num_objs as u8) };
     membrane::note_alloc(o, membrane::align_obj_size(sz), tag);
     o
@@ -181,6 +185,10 @@ pub(crate) unsafe fn alloc_array(size: usize, capacity: usize) -> *mut LeanObjec
     // SAFETY: overflow-checked size; header + salient fields initialized
     // before return.
     let o = unsafe { membrane::alloc_big(bytes) };
+    // SAFETY: the "header + salient fields initialized before return" the note
+    // above defers to. `alloc_big` diverges through `handle_alloc_error` on
+    // exhaustion rather than returning null, so `o` is a live, exclusively
+    // owned block of `bytes`, and every write below lies inside it.
     unsafe {
         init_st_header(o, TAG_ARRAY, 0);
         let a = o.cast::<LeanArrayObject>();
@@ -263,6 +271,10 @@ pub(crate) unsafe fn alloc_sarray(elem_size: u8, size: usize, capacity: usize) -
         .expect("sarray size overflow");
     // SAFETY: overflow-checked; header + salient fields initialized here.
     let o = unsafe { membrane::alloc_big(bytes) };
+    // SAFETY: the "header + salient fields initialized here" the note above
+    // defers to. `alloc_big` diverges through `handle_alloc_error` rather than
+    // returning null, so `o` is a live, exclusively owned block of `bytes`,
+    // and every write below lies inside it.
     unsafe {
         init_st_header(o, TAG_SCALAR_ARRAY, elem_size);
         let a = o.cast::<LeanSarrayObject>();
@@ -310,6 +322,10 @@ pub(crate) unsafe fn mk_string_unchecked(bytes: &[u8], len: usize) -> *mut LeanO
         .expect("string size overflow");
     // SAFETY: overflow-checked; all salient bytes (data + NUL) written below.
     let o = unsafe { membrane::alloc_big(total) };
+    // SAFETY: the "all salient bytes (data + NUL) written below" the note above
+    // defers to. `alloc_big` diverges through `handle_alloc_error` rather than
+    // returning null, so `o` is a live, exclusively owned block of `total`
+    // bytes, and every write below lies inside it.
     unsafe {
         init_st_header(o, TAG_STRING, 0);
         let s = o.cast::<LeanStringObject>();
@@ -363,6 +379,10 @@ pub(crate) unsafe fn alloc_closure(
         size_of::<LeanClosureObject>() + size_of::<*mut LeanObject>() * usize::from(num_fixed);
     // SAFETY: bounded by CLOSURE_MAX_ARGS * 8 + fixed part; fields set below.
     let o = unsafe { membrane::alloc_big(bytes) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_big`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `bytes`, and every write below lies
+    // inside it.
     unsafe {
         init_st_header(o, TAG_CLOSURE, 0);
         let c = o.cast::<LeanClosureObject>();
@@ -424,6 +444,10 @@ pub(crate) unsafe fn alloc_ref(value: *mut LeanObject) -> *mut LeanObject {
     let sz = size_of::<LeanRefObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it.
     unsafe {
         init_st_header(o, TAG_REF, 0);
         (&raw mut (*o.cast::<LeanRefObject>()).m_value).write(value);
@@ -456,6 +480,10 @@ pub(crate) unsafe fn alloc_thunk_value(v: *mut LeanObject) -> *mut LeanObject {
     let sz = size_of::<LeanThunkObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it.
     unsafe {
         init_st_header(o, TAG_THUNK, 0);
         let t = o.cast::<LeanThunkObject>();
@@ -478,6 +506,10 @@ pub(crate) unsafe fn alloc_task_pure(v: *mut LeanObject) -> *mut LeanObject {
     let sz = size_of::<LeanTaskObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it.
     unsafe {
         init_st_header(o, TAG_TASK, 0);
         let t = o.cast::<LeanTaskObject>();
@@ -554,6 +586,11 @@ pub(crate) unsafe fn alloc_external(
     let sz = size_of::<LeanExternalObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it. `class` and `data` are stored verbatim; their validity is
+    // the caller's obligation, recorded in this function's `# Safety` clause.
     unsafe {
         init_st_header(o, TAG_EXTERNAL, 0);
         let e = o.cast::<LeanExternalObject>();
@@ -608,12 +645,21 @@ pub(crate) unsafe fn alloc_mpz(limbs: &[u64], negative: bool) -> *mut LeanObject
         if p.is_null() {
             handle_alloc_error(limb_layout(n));
         }
+        // SAFETY: the "buffer fully initialized by the copy" the note above
+        // promises. `p` is non-null (null aborts two lines up) and was laid out
+        // for exactly `n` u64s, `limbs` holds `n` initialized u64s, and a fresh
+        // allocation cannot overlap the caller's slice.
         unsafe { core::ptr::copy_nonoverlapping(limbs.as_ptr(), p, n) };
         p
     };
     let sz = size_of::<LeanMpzObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it. `buf` is either null (n == 0) or the limb buffer this
+    // function allocated and fully initialized above; the object owns it now.
     unsafe {
         init_st_header(o, TAG_MPZ, 0);
         let m = o.cast::<LeanMpzObject>();

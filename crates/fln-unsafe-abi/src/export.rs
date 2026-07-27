@@ -243,6 +243,9 @@ unsafe fn mk_string_from_bytes_impl(s: *const c_char, sz: usize) -> *mut LeanObj
     let bytes = if sz == 0 {
         &[][..]
     } else {
+        // SAFETY: the note above, stated where a mechanical reader looks for
+        // it. `sz > 0` in this arm and the caller's C contract vouches for `sz`
+        // readable bytes at `s`; the slice only borrows them for this call.
         unsafe { core::slice::from_raw_parts(s.cast::<u8>(), sz) }
     };
     let mut pos = 0usize;
