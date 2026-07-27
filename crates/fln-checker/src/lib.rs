@@ -131,7 +131,7 @@
 //!
 //! This section previously said two prohibitions were missing. **One of them has
 //! landed**, and the paragraph outlived it — which is the defect this crate's own
-//! matrix row was corrected for once already (`witness.rs:479`, where
+//! matrix row was corrected for once already (`witness.rs:496`, where
 //! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
 //! throughout). So the state is measured here rather than remembered, at
 //! `53a5e3ec`:
@@ -174,4 +174,45 @@
 //!
 //! Nobody should read the existence of this section as evidence that the whole
 //! boundary holds; read the two bullets above for which half does.
+//!
+//! ## Citation registry — every line number above, bound to what it points at
+//!
+//! **Why this exists** (bead `franken_lean-checker-charter-line-citations-unbound-68ob`). This
+//! charter's authority rests on line numbers in code it does not control: 33 lines across six
+//! files in five crates. A line number is a claim that rots the moment anyone inserts a line
+//! above it, and nothing noticed when that happened — `witness.rs:479 (historical)` was
+//! `B3-INDEPENDENT-CHECKER`'s evidence line until commit `f39eaa2c` added 25 lines above it,
+//! after which 479 pointed at a *different* row whose text looked just as plausible. This crate
+//! had no tests at all, so nothing could have caught it.
+//!
+//! Each row below names the construct the citation is *for*. The line number is then checkable
+//! rather than merely asserted, and `charter_citations.rs` fails in both directions: if a cited
+//! line stops containing its construct, and if the prose cites a location this registry does
+//! not cover. **Fix the registry, not the test** — the registry is the source.
+//!
+//! ```text
+//! cite crates/fln-kernel/src/tc.rs:949 :: lt.is_equiv(ls)
+//! cite crates/fln-kernel/src/tc.rs:896 :: ExprNode::Sort { level }
+//! cite crates/fln-kernel/src/tc.rs:1224 :: ExprNode::Sort { level }
+//! cite crates/fln-kernel/src/tc.rs:1889 :: ExprNode::Sort { level }
+//! cite crates/fln-kernel/src/tc.rs:176 :: e.loose_bvar_range() <= k
+//! cite crates/fln-kernel/src/tc.rs:1645 :: !e.has_fvar()
+//! cite crates/fln-kernel/src/tc.rs:1707 :: !e.has_fvar()
+//! cite crates/fln-kernel/src/tc.rs:1779 :: !e.has_fvar()
+//! cite crates/fln-hash/src/canon.rs:1044 :: impl Canonical for Expr
+//! cite crates/fln-hash/src/canon.rs:542 :: pub trait Canonical: Sized
+//! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
+//! cite crates/fln-conformance/src/witness.rs:496 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite tools/structure-guard/src/checks.rs:983 :: code: "FLN-STRUCT-037"
+//! cite tools/structure-guard/tests/seeded.rs:1279 :: fn the_checker_boundary_baseline_is_clean
+//! cite tools/structure-guard/tests/seeded.rs:1289 :: fn every_semantic_item_is_refused_inside_fln_checker
+//! cite tools/structure-guard/tests/seeded.rs:1321 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
+//! ```
+//!
+//! **What this does not earn.** A bound citation proves the line still holds the construct
+//! named; it does not prove the surrounding prose is a correct reading of that construct. And
+//! the registry covers this file only — `tools/structure-guard/src/checks.rs:904 (foreign)`/`:931`/`:936`
+//! transcribe the same `tc.rs` line numbers into `FLN-STRUCT-037`'s finding text, so a violator
+//! is still sent to a line by a guard that cannot know whether it moved. That half belongs to
+//! structure-guard's owner.
 #![forbid(unsafe_code)]
