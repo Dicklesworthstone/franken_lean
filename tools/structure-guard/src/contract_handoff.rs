@@ -1724,6 +1724,66 @@ mod tests {
         );
     }
 
+    /// Whether a typed skip's stated reason is **true of the tree it was taken at**.
+    ///
+    /// An absent census and a misdirected root produce the identical `handoff_output_unavailable`,
+    /// so a skip that trusts the string is correct about what it saw and wrong about what it
+    /// claims.
+    ///
+    /// Lifted out of [`contract_handoff_no_mock_e2e`], where it was an inline `assert!` no test
+    /// could reach: an independent-gut campaign for `fln-census-empty-referent-no-mock-krb0`
+    /// disabled it and **no test failed**, because in every tree the campaign could reach the
+    /// shard was either genuinely absent — where the assertion holds vacuously — or present,
+    /// where the skip never fires at all. A check unreachable from a test is carried by review,
+    /// and review does not survive a context restart.
+    ///
+    /// It lives in this module rather than beside [`is_absent_census`] because the rig is its
+    /// only caller: at module scope it is dead code in a non-test build, which `-D warnings`
+    /// refuses. `is_absent_census` is module-scope for the opposite reason — `audit_with_snapshot`
+    /// needs it too, and a second copy of that answer is `franken_lean-m5bl`'s defect.
+    fn skip_reason_holds_at(root: &Path, error: &HandoffError) -> bool {
+        !root.join(&error.path).exists()
+    }
+
+    /// The no-mock skip's stated reason is checked against the tree, and BOTH directions matter.
+    ///
+    /// This is `krb0`'s reported-reason half, which had no test until an independent-gut campaign
+    /// disabled the check and nothing went red. The fixture carries the shard, so the identical
+    /// `handoff_output_unavailable` that is truthful on a fresh clone is **false here** — a
+    /// misdirected probe wearing a fresh-clone reason. Without the negative control below, a
+    /// predicate hardwired to `false` would satisfy this cell and refuse every real skip.
+    #[test]
+    fn a_skip_reason_is_false_when_the_named_output_exists_at_the_probed_root() {
+        let root = fixture_root("skip-reason");
+        publish(&root).expect("complete fixture publishes");
+        let error = HandoffError::new(
+            ErrorClass::Inconclusive,
+            "handoff_output_unavailable",
+            "contracts/builtin_environment.tsv",
+            "cannot inspect required output: No such file or directory",
+        );
+        assert!(
+            root.join(&error.path).exists(),
+            "the fixture must carry the shard, or this cell proves nothing"
+        );
+        assert!(
+            !skip_reason_holds_at(&root, &error),
+            "a skip claiming an output is unavailable while it EXISTS at the probed root must \
+             not be admitted: that is a misdirected probe, not a fresh clone"
+        );
+
+        // The negative control: move it aside and the identical error becomes truthful.
+        fs::rename(
+            root.join(&error.path),
+            root.join("builtin_environment.tsv.moved-aside"),
+        )
+        .expect("move the shard aside");
+        assert!(
+            skip_reason_holds_at(&root, &error),
+            "a genuinely absent output must still be admitted, or the rig can never skip"
+        );
+    }
+
     /// The symlink shim must survive the change above as a finding.
     ///
     /// This is the cell that stops the repair widening: the shim and the absence differ only by
@@ -1772,9 +1832,8 @@ mod tests {
                 // `fln-census-empty-referent-no-mock-krb0` after a cached binary consumed
                 // another worktree's census. `checked_workspace_root!()` closes the baked-root
                 // half (`fln-cross-tree-baked-root-k60n`); this closes the reported-reason half.
-                let missing = root.join(&error.path);
                 assert!(
-                    !missing.exists(),
+                    skip_reason_holds_at(&root, &error),
                     "typed skip claims {} is unavailable, but it EXISTS at the probed root {}. \
                      The skip's stated reason is false for this checkout, so this is a \
                      misdirected probe rather than a fresh clone with no census.",

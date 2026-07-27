@@ -1426,4 +1426,136 @@ fn discussion_only() {\n\
         assert_eq!(module_path_prefix("crates/x/src/main.rs"), None);
         assert_eq!(module_path_prefix("crates/x/tests/foo.rs"), None);
     }
+
+    /// The off-by-default set is the **closure** over `default`, not one level of it.
+    ///
+    /// Added because an independent-gut campaign for `f2t9` found all three parsers below
+    /// uncovered: disabling each one's call site in `ci_execution_join.rs` killed no test, since
+    /// this tree's gated population is a single module behind a single off feature and every
+    /// other shape is absent. A check whose population is uniform is unkillable by the live
+    /// tree, and only a planted member still catches the mutant.
+    #[test]
+    fn features_off_by_default_walks_the_closure_and_skips_foreign_entries() {
+        let manifest = concat!(
+            "[package]\nname = \"x\"\n\n",
+            "[features]\n",
+            "default = [\"on-direct\"]\n",
+            "on-direct = [\"on-transitive\", \"dep:serde\", \"other/feat\"]\n",
+            "on-transitive = []\n",
+            "off-one = []\n",
+            "off-two = [\"off-one\"]\n\n",
+            "[dependencies]\nnot-a-feature = \"1\"\n",
+        );
+        let off = features_off_by_default(manifest);
+        assert!(off.contains("off-one"), "{off:?}");
+        assert!(off.contains("off-two"), "{off:?}");
+        // Reachable from `default` only THROUGH another feature. A one-level read calls this
+        // off, and calling a live feature off names every test inside its modules dead.
+        assert!(!off.contains("on-transitive"), "{off:?}");
+        assert!(!off.contains("on-direct"), "{off:?}");
+        assert!(!off.contains("default"), "{off:?}");
+        // Equality, not membership — and note which mutant that buys. Any other table header
+        // must close `[features]`, or a dependency name becomes a feature.
+        assert_eq!(
+            off.iter().cloned().collect::<Vec<_>>(),
+            vec!["off-one", "off-two"],
+            "exactly the declared features unreachable from `default`"
+        );
+
+        // WHAT NO CELL HERE CAN CATCH, stated so nobody adds an assertion that only looks like
+        // one. The `dep:foo` / `pkg/feat` skip inside the closure walk is **unobservable through
+        // this function's output**: the reported set is `declared - on`, and neither shape is
+        // ever a *declared* feature name, so admitting them into `on` cannot move the answer.
+        // Measured — a mutant deleting that skip survived this test, and the two membership
+        // assertions that stood here asserted something which cannot be false. The skip is
+        // defensive, and it is unkillable by construction rather than merely untested.
+
+        // A feature list may span lines; the accumulator must close the array before deciding.
+        let wrapped =
+            "[features]\ndefault = [\n  \"wrapped-on\",\n]\nwrapped-on = []\nwrapped-off = []\n";
+        let off = features_off_by_default(wrapped);
+        assert_eq!(off.iter().cloned().collect::<Vec<_>>(), vec!["wrapped-off"]);
+
+        // The empty answer is the safe one: a manifest with no `[features]` refuses nothing.
+        assert!(features_off_by_default("[package]\nname = \"x\"\n").is_empty());
+    }
+
+    /// Only the literal one-feature form, only on a `mod`, and only when the attribute **begins**
+    /// the trimmed line.
+    #[test]
+    fn feature_gated_modules_decides_the_literal_form_and_never_a_mention() {
+        let source = concat!(
+            "#[cfg(feature = \"dev-only\")]\npub mod poison;\n\n",
+            "#[cfg(feature = \"dev-only\")]\n#[allow(dead_code)]\npub(crate) mod behind_attr;\n\n",
+            "#[cfg(feature = \"dev-only\")]\npub fn not_a_module() {}\n\n",
+            "// #[cfg(feature = \"commented\")]\n// pub mod commented_out;\n\n",
+            // The literal and a REAL `mod` on the line beneath it. A parser matching the
+            // attribute anywhere in the line rather than at its start gates the module below,
+            // so this cell kills that mutant; a literal with nothing under it would not.
+            "const PLANTED: &str = \"#[cfg(feature = \\\"planted\\\")]\";\n",
+            "pub mod actually_compiled;\n",
+        );
+        let gated = feature_gated_modules(source);
+        let module = |name: &str| gated.iter().any(|(_, found)| found == name);
+        assert!(module("poison"), "{gated:?}");
+        // The attribute may sit above further attributes before the item itself.
+        assert!(module("behind_attr"), "{gated:?}");
+        // A `fn` is not a module: gating one removes no test from the lib target's namespace.
+        assert!(!module("not_a_module"), "{gated:?}");
+        // Both of these are *mentions*. Counting them instead of constructs is the error
+        // `fln-bench-apparatus-empty-referent-bkw6` paid for, and the identical string-literal
+        // shape is real planted fixture source in `tools/structure-guard/tests/authority.rs`.
+        assert!(!module("actually_compiled"), "{gated:?}");
+        assert!(!module("commented_out"), "{gated:?}");
+        // Equality in both directions, because membership is not enough here and that was
+        // measured rather than assumed: a mutant that stops requiring the item to be a `mod`
+        // extracts `fn` as the module name from `pub fn not_a_module()`, which every membership
+        // assertion above misses and only an exact set catches. It survived the membership form.
+        assert_eq!(
+            gated,
+            vec![
+                ("dev-only".to_string(), "poison".to_string()),
+                ("dev-only".to_string(), "behind_attr".to_string()),
+            ],
+            "the literal one-feature form on a `mod`, and nothing else"
+        );
+    }
+
+    /// Every feature `#[cfg]` shape the simple parser cannot decide, and nothing else.
+    ///
+    /// Both directions are asserted. Reporting the decided form would raise a precondition for
+    /// every gated module in the workspace; failing to report an undecided one lets a gated
+    /// module look live, which is the false clean the pairing exists to refuse.
+    #[test]
+    fn unmodelled_feature_cfgs_reports_only_the_shapes_the_simple_parser_cannot_decide() {
+        let source = concat!(
+            "#[cfg(feature = \"plain\")]\npub mod plain;\n",
+            "#[cfg(all(feature = \"combined\", unix))]\npub mod combined;\n",
+            "#[cfg(not(feature = \"inverted\"))]\npub mod inverted;\n",
+            "#[cfg(any(feature = \"either\", feature = \"or\"))]\npub mod either;\n",
+            "#[cfg(unix)]\npub mod host_only;\n",
+        );
+        let unmodelled = unmodelled_feature_cfgs(source);
+        for shape in ["combined", "inverted", "either"] {
+            assert!(
+                unmodelled.iter().any(|attribute| attribute.contains(shape)),
+                "{shape} must be refused rather than guessed: {unmodelled:?}"
+            );
+        }
+        // The decided form is decided elsewhere and must not also raise a precondition.
+        assert!(
+            !unmodelled
+                .iter()
+                .any(|attribute| attribute.contains("\"plain\"")),
+            "{unmodelled:?}"
+        );
+        // A host `#[cfg]` names no feature at all. It IS a property of a run rather than of the
+        // source layout — the half of residue item 4 that stays undecidable.
+        assert!(
+            !unmodelled
+                .iter()
+                .any(|attribute| attribute == "#[cfg(unix)]"),
+            "{unmodelled:?}"
+        );
+    }
 }
