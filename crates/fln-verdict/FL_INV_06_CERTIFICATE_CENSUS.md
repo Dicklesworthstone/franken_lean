@@ -37,8 +37,15 @@ found while producing this census is tracked separately by open bug
   one.
 
 Aliases that share one implementation join are grouped in one row. The
-certificate-accepting join count in this boundary is exactly **six**.
-Certificate-accepting path cardinality: `6`.
+certificate-accepting join count in this boundary is exactly **seven**.
+Certificate-accepting path cardinality: `7`.
+
+The seventh row was added only after the executable census derived the new
+production call at `solve_with_unsat_certificate`: one producer decode, one
+independent check, and an exact-CNF `solve` fallback at that site. Test bodies,
+source-reading guard assertions, marker prose, and this document are outside
+the call counter. Counting those mutable surfaces and then moving this pin
+would bind the claim to its scaffolding rather than to the production consumer.
 
 ## Census
 
@@ -50,6 +57,7 @@ Certificate-accepting path cardinality: `6`.
 | 4 | `solve`, `solve_with_cancel`, and the incremental solve wrappers share `Engine::finish_unsat`, which submits the CDCL engine's exact CNF/proof bytes to row 3 before constructing `CheckedUnsat`. | The producer emits only the current schema. No caller can inject a version at this private join; any byte drift presented to row 3 is refused. | Checker refusal becomes `SolverInternalFault::ProofRefused`; checker faults remain `InternalFault`; checker cancellation or exhaustion remains `Inconclusive`. None carries a checked artifact. It does not retry because this path is the recomputation producer itself. | **No.** `CheckedUnsat` fields are private, and its only production construction occurs after `ProofCheckOutcome::Verified`. | **TYPE ARGUMENT** over the closed outcome and sealed constructor. **PLANTED MUTANTS:** the seeded solver/checker campaign and proof-logger corruption cases require every emitted proof to verify and every activated mutation to be refused. **READING** establishes the exhaustive terminal mapping. |
 | 5 | `ReflectedTheoremArtifact::from_bitblast_unsat` accepts a `BitblastArtifact` plus sealed `CheckedUnsat` and forms a non-authoritative reflection candidate. | There is no caller-supplied version field. Exact CNF-byte mismatch is `ReflectedArtifactError::CnfMismatch`; row 6 replays the retained bytes again. | Failure is `Err`, with neither recomputation nor candidate acceptance. | **No.** The candidate has private fields, is not `Clone`, is explicitly non-authoritative, and exposes no publication method. | **TYPE ARGUMENT** over the sealed input and candidate. **PLANTED MUTANT:** `reflected_artifact_refuses_a_certificate_from_another_bitblast` activates the join with a checked certificate for distinct CNF bytes and requires exact mismatch refusal. |
 | 6 | `publish_reflected_theorem` accepts the non-authoritative candidate, replays its exact certificate, compares the new and retained receipts, kernel-admits the exact owned theorem, names its council, and consumes Crucible's opaque checked capability to publish. | Unknown proof version and proof-byte or receipt drift are refused or typed internal fault before kernel admission/publication. | There is no automatic recomputation. Every proof, kernel, council, admission, cancellation, exhaustion, stale handoff, or duplicate failure returns without publishing; failure never becomes acceptance. | **No, at the bound source.** The only production environment mutation is `checked.publish(...)`, where `checked` is the exact capability returned by the kernel/council path. No raw kernel-check result or caller-owned declaration plan is publishable. | **TYPE ARGUMENT** over the opaque owned capability and exact-theorem handoff. **PLANTED MUTANTS:** unknown proof version, proof corruption, receipt drift, invalid reflected term, checker/kernel exhaustion, cancellation, and duplicate publication all assert an unchanged base; a positive control publishes the kernel-checked owner. **READING:** the positive source-string guard is not counted because `fln-h1k.1` proves it self-matches. |
+| 7 | `solve_with_unsat_certificate` accepts an untrusted cached/foreign `UnsatCertificateCandidate`, rebinds it to the caller's exact CNF and current schemas, producer-decodes the proof, and independently checks the retained streams. `UnsatCertificateCandidate::from_checked` is a projection into that untrusted envelope, not a separate accepting join. | Envelope, declared CNF, and declared proof versions are checked before decode. Producer-decoder and independent-checker version refusals remain typed and cannot form `CheckedUnsat`. | Every refusal branch calls the authoritative `solve(cnf, limits)` on the exact caller-owned CNF. A verified candidate returns a sealed checked solver artifact; the wrapper has no environment publication API. | **No.** The terminal value is a solver artifact, and theorem publication still requires rows 5–6 and Crucible's opaque exact-theorem capability. | **PRODUCTION-SITE CENSUS:** the guard binds the decoder call to this function, excludes every test/source-reading guard and document, and kills removal or relocation of the call. **READING:** the source has one exact-CNF recomputation join. Direct branch-by-branch behavioral tests remain required before this row can claim stronger evidence. |
 
 ## Aliases and adjacent non-certificate outputs
 
@@ -91,9 +99,11 @@ into an invariant over every future certificate.
 
 ## Recovery boundary
 
-No current production path loads a cached or foreign Verdict certificate as an
-accelerator for theorem admission. The direct checker is a validation API; on
-failure it returns a typed non-acceptance and cannot silently fall through.
+`solve_with_unsat_certificate` is now the production cached/foreign-certificate
+accelerator. It compares the envelope root and complete CNF bytes with the exact
+caller-owned formula, checks all declared versions, producer-decodes and
+independently replays the proof, and calls `solve` on that same formula after
+every refusal. It returns a checked solver artifact, not environment authority.
 
 The explicit recovery behavior is currently proved by
 `altered_proofs_are_refused_and_recomputed_from_checked_artifacts`: for all 512
@@ -102,9 +112,11 @@ the replacement bytes differ from the refused bytes, and independently replays
 the replacement receipt. That is a tested recovery consumer, not a type-level
 guarantee that every future caller recomputes.
 
-Therefore a future cached-certificate or index fast path must add its own
-production recomputation wrapper and planted bypass mutant. Citing the direct
-checker or this test without that production join would be the
+The executable census proves that this production join and its decoder/checker
+calls exist at the named site; it does not substitute for direct behavioral
+coverage of every refusal branch. A future index or theorem-admission fast path
+must still add its own production wrapper and planted bypass mutant. Citing the
+direct checker or the 512-case harness for such a path would remain the
 claim-without-producer defect described in `AGENTS.md`.
 
 ## Publication-guard finding
@@ -130,6 +142,8 @@ Established for the bound Verdict implementation:
 - checker failure never produces a receipt, checked artifact, or publication;
 - solver-produced UNSAT output is independently checked before it can inhabit
   `CheckedUnsat`;
+- the cached/foreign-certificate wrapper has an exact production decoder/checker
+  site and a source-visible recomputation call on the caller-owned CNF;
 - publication replays the certificate and can mutate an environment only by
   consuming the kernel/council-owned exact-theorem capability;
 - the named planted failures leave the base environment unchanged.
@@ -138,8 +152,8 @@ Not established:
 
 - a universal proof that checker work is lower than recomputation for every
   input;
-- an automatic production recomputation fallback for a future cached or
-  foreign certificate path;
+- direct branch-by-branch behavioral evidence for the new cached/foreign
+  certificate wrapper;
 - FL-INV-06 enforcement for the stub `fln-anvil` crate or its future simp,
   arithmetic, grind, e-graph, index, or portfolio implementations;
 - that the self-matching publication source guard detects removal of the
@@ -156,8 +170,7 @@ Re-run this census when any of the following changes:
    constructor, or environment consumer is added;
 2. `CheckedUnsat`, `ReflectedTheoremArtifact`, or the kernel publication
    capability changes visibility or construction;
-3. a cached/foreign certificate fast path introduces a real recomputation
-   fallback;
+3. the cached/foreign certificate fast path or its recomputation policy changes;
 4. the certificate schema, checker policy, solver policy, or bitblast manifest
    version moves;
 5. `fln-h1k.1` repairs the publication source guard.

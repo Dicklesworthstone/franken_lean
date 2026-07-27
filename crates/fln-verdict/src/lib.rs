@@ -57,7 +57,10 @@ pub use solver::{
     CdclDeterminismPolicy, CheckedSat, CheckedSolverArtifact, CheckedUnsat,
     DETERMINISTIC_CDCL_POLICY, IncrementalError, IncrementalSolver, PreparedSolve,
     SolverInconclusive, SolverInternalFault, SolverLimits, SolverOutcome, SolverResource,
-    SolverStatistics, solve, solve_with_cancel,
+    SolverStatistics, UnsatCertificateAttempt, UnsatCertificateCandidate,
+    UnsatCertificateFallbackFacts, UnsatCertificateInputRoot, UnsatCertificateRefusal,
+    UnsatCertificateSolve, UnsatCertificateVersionBoundary, solve, solve_with_cancel,
+    solve_with_unsat_certificate, unsat_certificate_input_root,
 };
 
 const WIRE_MAGIC: [u8; 8] = *b"FLNVRDCT";

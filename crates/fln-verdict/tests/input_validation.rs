@@ -885,6 +885,12 @@ const CERTIFICATE_BOUNDARY_MARKER: &str = "FLN-FL-INV-06-CERTIFICATE-BOUNDARY:";
 const CERTIFICATE_ALIAS_MARKER: &str = "FLN-FL-INV-06-CERTIFICATE-ALIAS:";
 const ANVIL_CENSUS: &str = "crates/fln-anvil/FL_INV_06_CERTIFICATE_CENSUS.md";
 const VERDICT_CENSUS: &str = "crates/fln-verdict/FL_INV_06_CERTIFICATE_CENSUS.md";
+const SENSITIVE_CERTIFICATE_CALLS: [&str; 4] = [
+    "check_unsat_streams_with_cancel(",
+    "UnsatProof::new(",
+    "UnsatProof::from_canonical_bytes(",
+    "ReflectedTheoremArtifact::from_bitblast_unsat(",
+];
 
 #[derive(Debug, Clone)]
 struct CensusTree {
@@ -1199,6 +1205,7 @@ struct FunctionSite {
     line: usize,
     name: String,
     header: String,
+    region: String,
     marker: Option<(bool, String)>,
 }
 
@@ -1254,11 +1261,16 @@ fn function_sites(path: &str, source: &str) -> Vec<FunctionSite> {
             header.push(' ');
             header.push_str(lines[index].trim());
         }
+        let mut region_end = index + 1;
+        while region_end < lines.len() && function_name(lines[region_end]).is_none() {
+            region_end += 1;
+        }
         sites.push(FunctionSite {
             path: path.to_owned(),
             line: start + 1,
             name,
             header,
+            region: lines[start..region_end].join("\n"),
             marker: pending_marker.take(),
         });
         index += 1;
@@ -1273,7 +1285,15 @@ struct ExpectedBoundary {
     function: &'static str,
 }
 
-const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 6] = [
+#[derive(Debug, Clone, Copy)]
+struct ExpectedCall {
+    needle: &'static str,
+    path: &'static str,
+    function: &'static str,
+    count: usize,
+}
+
+const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 7] = [
     ExpectedBoundary {
         id: "structured-proof-construction",
         path: "crates/fln-verdict/src/lib.rs",
@@ -1304,6 +1324,11 @@ const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 6] = [
         path: "crates/fln-verdict/src/reflection.rs",
         function: "publish_reflected_theorem",
     },
+    ExpectedBoundary {
+        id: "cached-certificate-verify-or-recompute",
+        path: "crates/fln-verdict/src/solver.rs",
+        function: "solve_with_unsat_certificate",
+    },
 ];
 
 const EXPECTED_VERDICT_ALIASES: [ExpectedBoundary; 1] = [ExpectedBoundary {
@@ -1312,14 +1337,64 @@ const EXPECTED_VERDICT_ALIASES: [ExpectedBoundary; 1] = [ExpectedBoundary {
     function: "check_unsat_streams_with_cancel",
 }];
 
+const EXPECTED_VERDICT_CALLS: [ExpectedCall; 6] = [
+    ExpectedCall {
+        needle: "check_unsat_streams_with_cancel(",
+        path: "crates/fln-verdict/src/checker.rs",
+        function: "check_unsat_streams",
+        count: 1,
+    },
+    ExpectedCall {
+        needle: "check_unsat_streams_with_cancel(",
+        path: "crates/fln-verdict/src/reflection.rs",
+        function: "publish_reflected_theorem",
+        count: 1,
+    },
+    ExpectedCall {
+        needle: "check_unsat_streams_with_cancel(",
+        path: "crates/fln-verdict/src/solver.rs",
+        function: "finish_unsat",
+        count: 1,
+    },
+    ExpectedCall {
+        needle: "UnsatProof::new(",
+        path: "crates/fln-verdict/src/solver.rs",
+        function: "finish_unsat",
+        count: 1,
+    },
+    ExpectedCall {
+        needle: "UnsatProof::from_canonical_bytes(",
+        path: "crates/fln-verdict/src/solver.rs",
+        function: "solve_with_unsat_certificate",
+        count: 1,
+    },
+    ExpectedCall {
+        needle: "ReflectedTheoremArtifact::from_bitblast_unsat(",
+        path: "crates/fln-verdict/src/bv_decide.rs",
+        function: "bv_decide_with_cancel",
+        count: 1,
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VerdictInventory {
     source_files: BTreeSet<String>,
     boundaries: BTreeMap<String, (String, String)>,
     aliases: BTreeMap<String, (String, String)>,
     unmarked_sensitive_functions: BTreeSet<String>,
-    sensitive_call_counts: BTreeMap<&'static str, usize>,
+    sensitive_call_sites: BTreeMap<&'static str, BTreeMap<String, usize>>,
     marker_faults: Vec<String>,
+}
+
+fn code_occurrences(region: &str, needle: &str) -> usize {
+    region
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            (!trimmed.starts_with("//")).then(|| line.split("//").next().unwrap_or_default())
+        })
+        .map(|line| line.matches(needle).count())
+        .sum()
 }
 
 fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
@@ -1327,12 +1402,10 @@ fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
     let mut boundaries = BTreeMap::new();
     let mut aliases = BTreeMap::new();
     let mut unmarked_sensitive_functions = BTreeSet::new();
-    let mut sensitive_call_counts = BTreeMap::from([
-        ("check_unsat_streams_with_cancel(", 0usize),
-        ("UnsatProof::new(", 0usize),
-        ("UnsatProof::from_canonical_bytes(", 0usize),
-        ("ReflectedTheoremArtifact::from_bitblast_unsat(", 0usize),
-    ]);
+    let mut sensitive_call_sites = SENSITIVE_CERTIFICATE_CALLS
+        .into_iter()
+        .map(|needle| (needle, BTreeMap::new()))
+        .collect::<BTreeMap<_, _>>();
     let mut marker_faults = Vec::new();
 
     for (path, source) in &tree.files {
@@ -1340,16 +1413,6 @@ fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
             continue;
         }
         source_files.insert(path.clone());
-        let production = production_prefix(source);
-        for line in production.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            for (needle, count) in &mut sensitive_call_counts {
-                *count += line.matches(*needle).count();
-            }
-        }
 
         for site in function_sites(path, source) {
             match &site.marker {
@@ -1373,14 +1436,29 @@ fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
                 None => {}
             }
 
+            let site_key = format!("{}:{}", site.path, site.name);
+            let mut has_sensitive_call = false;
+            for needle in SENSITIVE_CERTIFICATE_CALLS {
+                let count = code_occurrences(&site.region, needle);
+                if count == 0 {
+                    continue;
+                }
+                has_sensitive_call = true;
+                sensitive_call_sites
+                    .get_mut(needle)
+                    .expect("every sensitive call has an initialized site map")
+                    .insert(site_key.clone(), count);
+            }
             let sensitive = [
                 "UnsatProof",
                 "CheckedUnsat",
                 "ReflectedTheoremArtifact",
                 "ProofCheckOutcome",
+                "UnsatCertificateCandidate",
             ]
             .iter()
             .any(|needle| site.header.contains(needle))
+                || has_sensitive_call
                 || matches!(
                     site.name.as_str(),
                     "check_unsat_streams"
@@ -1389,9 +1467,15 @@ fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
                         | "publish_reflected_theorem"
                         | "from_bitblast_unsat"
                 );
-            let allowed_projection =
-                site.path == "crates/fln-verdict/src/solver.rs" && site.name == "proof";
-            if sensitive && site.marker.is_none() && !allowed_projection {
+            let allowed_projection = site.path == "crates/fln-verdict/src/solver.rs"
+                && matches!(site.name.as_str(), "proof" | "from_checked");
+            let allowed_orchestration_alias = site.path == "crates/fln-verdict/src/bv_decide.rs"
+                && site.name == "bv_decide_with_cancel";
+            if sensitive
+                && site.marker.is_none()
+                && !allowed_projection
+                && !allowed_orchestration_alias
+            {
                 unmarked_sensitive_functions
                     .insert(format!("{}:{}:{}", site.path, site.line, site.name));
             }
@@ -1403,7 +1487,7 @@ fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
         boundaries,
         aliases,
         unmarked_sensitive_functions,
-        sensitive_call_counts,
+        sensitive_call_sites,
         marker_faults,
     }
 }
@@ -1508,16 +1592,23 @@ fn census_findings(tree: &CensusTree) -> Vec<String> {
             verdict.unmarked_sensitive_functions
         ));
     }
-    let expected_calls = BTreeMap::from([
-        ("check_unsat_streams_with_cancel(", 3usize),
-        ("UnsatProof::new(", 1usize),
-        ("UnsatProof::from_canonical_bytes(", 0usize),
-        ("ReflectedTheoremArtifact::from_bitblast_unsat(", 1usize),
-    ]);
-    if verdict.sensitive_call_counts != expected_calls {
+    let mut expected_calls = SENSITIVE_CERTIFICATE_CALLS
+        .into_iter()
+        .map(|needle| (needle, BTreeMap::new()))
+        .collect::<BTreeMap<_, _>>();
+    for expected in EXPECTED_VERDICT_CALLS {
+        expected_calls
+            .get_mut(expected.needle)
+            .expect("every expected call uses a governed needle")
+            .insert(
+                format!("{}:{}", expected.path, expected.function),
+                expected.count,
+            );
+    }
+    if verdict.sensitive_call_sites != expected_calls {
         findings.push(format!(
             "verdict-calls: expected {expected_calls:?}, derived {:?}",
-            verdict.sensitive_call_counts
+            verdict.sensitive_call_sites
         ));
     }
     match disclosed_cardinality(tree, VERDICT_CENSUS) {
@@ -1608,8 +1699,8 @@ fn fl_inv_06_census_mutants_change_the_referent_and_die() {
     );
     assert_mutant_finding(&consumer, "workspace consumers");
 
-    let mut seventh = baseline.clone();
-    seventh.edit("crates/fln-verdict/src/checker.rs", |source| {
+    let mut additional = baseline.clone();
+    additional.edit("crates/fln-verdict/src/checker.rs", |source| {
         let injected = "\n// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: foreign-proof-consumer\n\
                         pub fn accept_foreign_proof(proof: UnsatProof) -> ProofCheckOutcome {\n\
                             check_unsat_streams_with_cancel(&[][..], proof.to_canonical_bytes().as_slice(), \
@@ -1621,11 +1712,11 @@ fn fl_inv_06_census_mutants_change_the_referent_and_die() {
         }
     });
     assert_eq!(
-        verdict_inventory(&seventh).boundaries.len(),
+        verdict_inventory(&additional).boundaries.len(),
         base_verdict.boundaries.len() + 1,
-        "seventh Verdict consumer mutant did not enter the derived referent"
+        "additional Verdict consumer mutant did not enter the derived referent"
     );
-    assert_mutant_finding(&seventh, "verdict-boundaries");
+    assert_mutant_finding(&additional, "verdict-boundaries");
 
     let mut removed = baseline.clone();
     removed.edit("crates/fln-verdict/src/reflection.rs", |source| {
@@ -1642,6 +1733,43 @@ fn fl_inv_06_census_mutants_change_the_referent_and_die() {
     );
     assert_mutant_finding(&removed, "verdict-boundaries");
 
+    let mut decoder_call_removed = baseline.clone();
+    decoder_call_removed.edit("crates/fln-verdict/src/solver.rs", |source| {
+        source.replacen(
+            "UnsatProof::from_canonical_bytes(",
+            "UnsatProof::decode_candidate_bytes(",
+            1,
+        )
+    });
+    assert_ne!(
+        verdict_inventory(&decoder_call_removed).sensitive_call_sites,
+        base_verdict.sensitive_call_sites,
+        "removing the production decoder call did not change the site-scoped referent"
+    );
+    assert_mutant_finding(&decoder_call_removed, "verdict-calls");
+
+    let mut nonproduction_decoys = baseline.clone();
+    nonproduction_decoys.edit("crates/fln-verdict/src/solver.rs", |source| {
+        format!(
+            "{source}\n\n#[cfg(test)]\nmod census_counter_decoy {{\n    \
+             const DECODER_CALL: &str = \"UnsatProof::from_canonical_bytes(\";\n}}\n"
+        )
+    });
+    nonproduction_decoys.edit(VERDICT_CENSUS, |document| {
+        format!(
+            "{document}\nGuard-decoy text: `UnsatProof::from_canonical_bytes(` is not production.\n"
+        )
+    });
+    assert_eq!(
+        verdict_inventory(&nonproduction_decoys).sensitive_call_sites,
+        base_verdict.sensitive_call_sites,
+        "test-guard or documentation text leaked into the production-only call counter"
+    );
+    assert!(
+        census_findings(&nonproduction_decoys).is_empty(),
+        "non-production decoys must not perturb the census referent"
+    );
+
     let mut anvil_count = baseline.clone();
     anvil_count.edit(ANVIL_CENSUS, |document| {
         document.replacen(
@@ -1655,8 +1783,8 @@ fn fl_inv_06_census_mutants_change_the_referent_and_die() {
     let mut verdict_count = baseline;
     verdict_count.edit(VERDICT_CENSUS, |document| {
         document.replacen(
+            "Certificate-accepting path cardinality: `7`.",
             "Certificate-accepting path cardinality: `6`.",
-            "Certificate-accepting path cardinality: `5`.",
             1,
         )
     });

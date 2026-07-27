@@ -6,12 +6,20 @@
 //! checked against the original CNF before publication.
 
 use crate::{
-    Assignment, Clause, ClauseId, Cnf, InputClause, Literal, Polarity, ProofCheckInconclusive,
-    ProofCheckInternalFault, ProofCheckLimits, ProofCheckOutcome, ProofCheckReceipt,
-    ProofCheckResource, ProofRefusal, ProofRule, ProofStep, ResourceKind, SatModel, SchemaError,
-    SchemaLimits, UnsatProof, VariableId, check_unsat_streams_with_cancel,
+    Assignment, CNF_SCHEMA, Clause, ClauseId, Cnf, InputClause, Literal, Polarity,
+    ProofCheckInconclusive, ProofCheckInternalFault, ProofCheckLimits, ProofCheckOutcome,
+    ProofCheckReceipt, ProofCheckResource, ProofRefusal, ProofRule, ProofStep, ProofStream,
+    ResourceKind, SatModel, SchemaError, SchemaLimits, UNSAT_PROOF_SCHEMA, UnsatProof, VariableId,
+    check_unsat_streams, check_unsat_streams_with_cancel,
 };
+use fln_hash::domain::{Domain, DomainHasher};
 use std::collections::BTreeSet;
+
+/// The governed verify-or-recompute policy shared with W3's certificate law.
+pub const UNSAT_CERTIFICATE_FALLBACK_POLICY_ID: &str = "fln.verdict.unsat-certificate-fallback/1";
+
+/// The one supported in-memory accelerator envelope version.
+pub const UNSAT_CERTIFICATE_FALLBACK_VERSION: u16 = 1;
 
 /// Registered choices for every semantically free CDCL order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +221,179 @@ impl CheckedUnsat {
     }
 }
 
+/// Content root for the exact CNF and schema policy an untrusted accelerator
+/// candidate claims to cover.
+///
+/// The root is not authority: the consumer also compares the complete canonical
+/// CNF bytes and independently checks the proof. It prevents a stale cache entry
+/// from being mistaken for a candidate for another exact input before parsing its
+/// proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnsatCertificateInputRoot([u8; 32]);
+
+impl UnsatCertificateInputRoot {
+    /// Construct an untrusted root received from storage or another process.
+    pub const fn from_untrusted_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Compute the governed input root for the current certificate policy.
+pub fn unsat_certificate_input_root(cnf: &Cnf) -> UnsatCertificateInputRoot {
+    unsat_certificate_input_root_from_bytes(&cnf.to_canonical_bytes())
+}
+
+fn unsat_certificate_input_root_from_bytes(cnf_bytes: &[u8]) -> UnsatCertificateInputRoot {
+    let mut hasher = DomainHasher::new(Domain::Receipt);
+    hasher
+        .update(UNSAT_CERTIFICATE_FALLBACK_POLICY_ID.as_bytes())
+        .update(&UNSAT_CERTIFICATE_FALLBACK_VERSION.to_le_bytes())
+        .update(&CNF_SCHEMA.version.to_le_bytes())
+        .update(&UNSAT_PROOF_SCHEMA.version.to_le_bytes())
+        .update(
+            &u64::try_from(cnf_bytes.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        )
+        .update(cnf_bytes);
+    UnsatCertificateInputRoot(hasher.finalize().0)
+}
+
+/// Raw cached or foreign UNSAT certificate input. Possessing this value conveys
+/// no authority; all fields are re-bound by [`solve_with_unsat_certificate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsatCertificateCandidate {
+    version: u16,
+    input_root: UnsatCertificateInputRoot,
+    cnf_schema_version: u16,
+    proof_schema_version: u16,
+    cnf_bytes: Box<[u8]>,
+    proof_bytes: Box<[u8]>,
+}
+
+impl UnsatCertificateCandidate {
+    /// Form a cache candidate from an already checked artifact.
+    pub fn from_checked(artifact: &CheckedUnsat) -> Self {
+        Self {
+            version: UNSAT_CERTIFICATE_FALLBACK_VERSION,
+            input_root: unsat_certificate_input_root_from_bytes(artifact.cnf_bytes()),
+            cnf_schema_version: CNF_SCHEMA.version,
+            proof_schema_version: UNSAT_PROOF_SCHEMA.version,
+            cnf_bytes: artifact.cnf_bytes().into(),
+            proof_bytes: artifact.proof_bytes().into(),
+        }
+    }
+
+    /// Form an explicitly untrusted envelope received from a cache or foreign
+    /// producer. The constructor performs no validation by design.
+    pub fn from_untrusted_parts(
+        version: u16,
+        input_root: UnsatCertificateInputRoot,
+        cnf_schema_version: u16,
+        proof_schema_version: u16,
+        cnf_bytes: Vec<u8>,
+        proof_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            version,
+            input_root,
+            cnf_schema_version,
+            proof_schema_version,
+            cnf_bytes: cnf_bytes.into_boxed_slice(),
+            proof_bytes: proof_bytes.into_boxed_slice(),
+        }
+    }
+
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
+    pub const fn input_root(&self) -> UnsatCertificateInputRoot {
+        self.input_root
+    }
+
+    pub const fn cnf_schema_version(&self) -> u16 {
+        self.cnf_schema_version
+    }
+
+    pub const fn proof_schema_version(&self) -> u16 {
+        self.proof_schema_version
+    }
+
+    pub const fn cnf_bytes(&self) -> &[u8] {
+        &self.cnf_bytes
+    }
+
+    pub const fn proof_bytes(&self) -> &[u8] {
+        &self.proof_bytes
+    }
+}
+
+/// Which version join refused an untrusted certificate candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsatCertificateVersionBoundary {
+    Envelope,
+    DeclaredCnfSchema,
+    DeclaredProofSchema,
+    ProducerProofDecoder,
+    IndependentCnfChecker,
+    IndependentProofChecker,
+}
+
+/// A typed refusal of the accelerator only. Every variant falls back to the
+/// authoritative non-certificate solver on the exact caller-owned CNF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsatCertificateRefusal {
+    UnsupportedVersion {
+        boundary: UnsatCertificateVersionBoundary,
+        found: u16,
+        supported: u16,
+    },
+    InputRootMismatch {
+        expected: UnsatCertificateInputRoot,
+        found: UnsatCertificateInputRoot,
+    },
+    InputBytesMismatch {
+        expected_len: u64,
+        found_len: u64,
+    },
+    ArtifactBytesExceeded {
+        stream: ProofStream,
+        limit: u64,
+        actual: u64,
+    },
+    ProducerDecode(SchemaError),
+    IndependentChecker(ProofRefusal),
+    CheckerInconclusive(ProofCheckInconclusive),
+    CheckerInternalFault(ProofCheckInternalFault),
+}
+
+/// The certificate branch taken before the terminal solver outcome.
+///
+/// A refused attempt has no receipt or artifact field by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsatCertificateAttempt {
+    NotAttempted,
+    Verified,
+    Refused(UnsatCertificateRefusal),
+}
+
+/// Exact one-request cardinalities for the verify-or-recompute join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnsatCertificateFallbackFacts {
+    pub attempts: u64,
+    pub refusals: u64,
+    pub recomputations: u64,
+    pub rechecks: u64,
+    /// Returned checked solver artifacts. This is not environment publication.
+    pub artifact_publications: u64,
+    pub artifact_nonpublications: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverOutcome {
     Sat {
@@ -231,6 +412,38 @@ pub enum SolverOutcome {
         fault: SolverInternalFault,
         statistics: SolverStatistics,
     },
+}
+
+/// Terminal result of the governed certificate accelerator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsatCertificateSolve {
+    outcome: SolverOutcome,
+    attempt: UnsatCertificateAttempt,
+    facts: UnsatCertificateFallbackFacts,
+}
+
+impl UnsatCertificateSolve {
+    pub const fn outcome(&self) -> &SolverOutcome {
+        &self.outcome
+    }
+
+    pub const fn attempt(&self) -> &UnsatCertificateAttempt {
+        &self.attempt
+    }
+
+    pub const fn facts(&self) -> UnsatCertificateFallbackFacts {
+        self.facts
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        SolverOutcome,
+        UnsatCertificateAttempt,
+        UnsatCertificateFallbackFacts,
+    ) {
+        (self.outcome, self.attempt, self.facts)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +486,109 @@ where
         Err(stop) => return stop.into_outcome(SolverStatistics::default()),
     };
     engine.run(&mut cancelled)
+}
+
+/// Verify an untrusted cached certificate, falling back to the authoritative
+/// solver on the exact caller-owned CNF whenever verification refuses it.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: cached-certificate-verify-or-recompute
+pub fn solve_with_unsat_certificate(
+    cnf: &Cnf,
+    candidate: &UnsatCertificateCandidate,
+    limits: SolverLimits,
+) -> UnsatCertificateSolve {
+    let expected_root = unsat_certificate_input_root(cnf);
+    let expected_cnf = cnf.to_canonical_bytes();
+    let verification = (|| {
+        if candidate.version != UNSAT_CERTIFICATE_FALLBACK_VERSION {
+            return Err(UnsatCertificateRefusal::UnsupportedVersion {
+                boundary: UnsatCertificateVersionBoundary::Envelope,
+                found: candidate.version,
+                supported: UNSAT_CERTIFICATE_FALLBACK_VERSION,
+            });
+        }
+        if candidate.input_root != expected_root {
+            return Err(UnsatCertificateRefusal::InputRootMismatch {
+                expected: expected_root,
+                found: candidate.input_root,
+            });
+        }
+        if candidate.cnf_schema_version != CNF_SCHEMA.version {
+            return Err(UnsatCertificateRefusal::UnsupportedVersion {
+                boundary: UnsatCertificateVersionBoundary::DeclaredCnfSchema,
+                found: candidate.cnf_schema_version,
+                supported: CNF_SCHEMA.version,
+            });
+        }
+        if candidate.proof_schema_version != UNSAT_PROOF_SCHEMA.version {
+            return Err(UnsatCertificateRefusal::UnsupportedVersion {
+                boundary: UnsatCertificateVersionBoundary::DeclaredProofSchema,
+                found: candidate.proof_schema_version,
+                supported: UNSAT_PROOF_SCHEMA.version,
+            });
+        }
+        if candidate.cnf_bytes.as_ref() != expected_cnf.as_slice() {
+            return Err(UnsatCertificateRefusal::InputBytesMismatch {
+                expected_len: expected_cnf.len() as u64,
+                found_len: candidate.cnf_bytes.len() as u64,
+            });
+        }
+        let proof = UnsatProof::from_canonical_bytes(&candidate.proof_bytes, cnf, limits.schema)
+            .map_err(UnsatCertificateRefusal::ProducerDecode)?;
+        let receipt = match check_unsat_streams(
+            &candidate.cnf_bytes[..],
+            &candidate.proof_bytes[..],
+            limits.checker,
+        ) {
+            ProofCheckOutcome::Verified(receipt) => receipt,
+            ProofCheckOutcome::Refused(reason) => {
+                return Err(UnsatCertificateRefusal::IndependentChecker(reason));
+            }
+            ProofCheckOutcome::Inconclusive(reason) => {
+                return Err(UnsatCertificateRefusal::CheckerInconclusive(reason));
+            }
+            ProofCheckOutcome::InternalFault(fault) => {
+                return Err(UnsatCertificateRefusal::CheckerInternalFault(fault));
+            }
+        };
+        Ok((proof, receipt))
+    })();
+
+    match verification {
+        Ok((proof, receipt)) => UnsatCertificateSolve {
+            outcome: SolverOutcome::Unsat {
+                artifact: CheckedUnsat {
+                    proof,
+                    receipt,
+                    cnf_bytes: candidate.cnf_bytes.clone(),
+                    proof_bytes: candidate.proof_bytes.clone(),
+                },
+                statistics: SolverStatistics::default(),
+            },
+            attempt: UnsatCertificateAttempt::Verified,
+            facts: UnsatCertificateFallbackFacts {
+                attempts: 1,
+                rechecks: 1,
+                artifact_publications: 1,
+                ..Default::default()
+            },
+        },
+        Err(refusal) => {
+            let outcome = solve(cnf, limits);
+            let has_artifact = outcome.checked_artifact().is_some();
+            UnsatCertificateSolve {
+                outcome,
+                attempt: UnsatCertificateAttempt::Refused(refusal),
+                facts: UnsatCertificateFallbackFacts {
+                    attempts: 1,
+                    refusals: 1,
+                    recomputations: 1,
+                    artifact_publications: u64::from(has_artifact),
+                    artifact_nonpublications: u64::from(!has_artifact),
+                    ..Default::default()
+                },
+            }
+        }
+    }
 }
 
 /// Failure to materialize a canonical incremental/assumption input.
