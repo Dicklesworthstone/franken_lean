@@ -618,6 +618,7 @@ emit_event --new-log --string event run_start \
   --string seed deterministic-fixture-v1 --string cache_state "${FLN_E2E_CACHE_STATE:-uncontrolled}" \
   --string input_root "$INPUT_ROOT" \
   --string vendor_binding vendor-binding.json \
+  --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"readiness_wait_ms\":$READY_WAIT_MS}" \
   || early_fault early_run_start_emission_failure "cannot emit run_start"
 

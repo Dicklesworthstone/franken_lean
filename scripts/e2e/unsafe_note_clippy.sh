@@ -220,6 +220,7 @@ emit_event --new-log --string event run_start \
   --string seed "$DECLARED_ROOT" \
   --string cache_state "${FLN_E2E_CACHE_STATE:-unspecified}" \
   --string input_root "$INPUT_ROOT" \
+  --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS}"
 
 run_step() {

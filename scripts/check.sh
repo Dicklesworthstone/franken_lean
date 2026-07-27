@@ -982,6 +982,7 @@ emit_event \
   --string seed "$SEED" \
   --string cache_state "$CACHE_STATE" \
   --string input_root "$INPUT_ROOT" \
+  --producer-binding-root "$REPO" "${GOVERNED_ARGS[@]}" \
   --string ubs_inventory "$UBS_INVENTORY_BINDING" \
   --string vendor_binding "$VENDOR_BINDING_BINDING" \
   --string verification_manifest "$VERIFICATION_MANIFEST_REL" \

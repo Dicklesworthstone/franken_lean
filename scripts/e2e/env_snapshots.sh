@@ -586,6 +586,7 @@ emit_event --new-log --string event run_start \
   --integer thread_count 32 --json-value thread_matrix '[1,8,32]' \
   --string seed environment-identity-v1 --string cache_state "$CACHE_STATE" \
   --string input_root "$INPUT_ROOT" --string vendor_binding vendor-binding.json \
+  --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"readiness_wait_ms\":$READY_WAIT_MS}"
 : > "$HUMAN"
 RUN_STARTED=1
@@ -1468,6 +1469,7 @@ run_identity_child() {
     --string seed "$scenario-v1" --string cache_state "$CACHE_STATE" \
     --string input_root "$child_input_root" \
     --string vendor_binding vendor-binding.json \
+    --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
     --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS}"
   : > "$IDENTITY_ART_DIR/human.log"
 
@@ -1774,6 +1776,7 @@ collision_emit_event --new-log --string event run_start \
   --string cache_state "$COLLISION_CACHE_STATE" \
   --string input_root "$COLLISION_INPUT_ROOT" \
   --string vendor_binding vendor-binding.json \
+  --producer-binding-root "$ROOT" "${COLLISION_GOVERNED_ARGS[@]}" \
   --string live_head "$COLLISION_LIVE_HEAD" \
   --string live_subject_sha256 "$COLLISION_LIVE_SUBJECT_SHA" \
   --json-value budgets "{\"capture_bytes_per_stream\":$COLLISION_CAPTURE_BYTES,\"output_budget_bytes\":$COLLISION_OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$COLLISION_TIMEOUT_MS,\"kill_grace_ms\":$COLLISION_GRACE_MS,\"max_collision_cardinality\":96}"
@@ -2022,6 +2025,7 @@ collision_emit_event --new-log --string event run_start \
   --string cache_state "$COLLISION_CACHE_STATE" \
   --string input_root "$COLLISION_INPUT_ROOT" \
   --string vendor_binding vendor-binding.json \
+  --producer-binding-root "$ROOT" "${COLLISION_GOVERNED_ARGS[@]}" \
   --string live_head "$COLLISION_LIVE_HEAD" \
   --string live_subject_sha256 "$COLLISION_LIVE_SUBJECT_SHA" \
   --json-value budgets "{\"capture_bytes_per_stream\":$COLLISION_CAPTURE_BYTES,\"output_budget_bytes\":$COLLISION_OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$COLLISION_TIMEOUT_MS,\"kill_grace_ms\":$COLLISION_GRACE_MS,\"max_collision_cardinality\":1000,\"max_construction_comparisons\":18000,\"max_append_fresh_nodes\":18}"

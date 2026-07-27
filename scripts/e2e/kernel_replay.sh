@@ -323,6 +323,7 @@ else
     --string cache_state "$AP6_CACHE_STATE" \
     --string input_root "$AP6_INPUT_ROOT" \
     --string vendor_binding vendor-binding.json \
+    --producer-binding-root "$ROOT" "${AP6_GOVERNED_ARGS[@]}" \
     --string live_head "$AP6_LIVE_HEAD" \
     --json-value budgets "{\"capture_bytes_per_stream\":$AP6_CAPTURE_BYTES,\"output_budget_bytes\":$AP6_OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$AP6_TIMEOUT_MS,\"kill_grace_ms\":$AP6_GRACE_MS,\"kernel_step_budget\":10000000,\"kernel_depth_budget\":4096}"
   : > "$AP6_HUMAN"

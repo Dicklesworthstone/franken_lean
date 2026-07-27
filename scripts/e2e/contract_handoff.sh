@@ -337,6 +337,7 @@ emit_event --new-log --string event run_start \
   --json-value host_facts "$HOST_FACTS_JSON" \
   --string seed "$SOURCE_COMMIT" --string cache_state cold-archived-checkouts \
   --string input_root "$INPUT_ROOT" --string vendor_binding vendor-binding.json \
+  --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS}"
 
 note "materializing two retained cold checkouts from commit $SOURCE_COMMIT"

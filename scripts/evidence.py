@@ -45,6 +45,11 @@ INCONCLUSIVE = 3
 CANCELLED = 4
 
 RUN_SCHEMAS = {"fln.check/2", "fln.e2e/2"}
+PRODUCER_BINDING_SCHEMA = "fln.producer-binding/1"
+EVIDENCE_MANIFEST_SCHEMA = "fln.evidence-manifest/2"
+LEGACY_EVIDENCE_MANIFEST_SCHEMA = "fln.evidence-manifest/1"
+EVIDENCE_BUNDLE_COMMIT_SCHEMA = "fln.evidence-bundle-commit/2"
+LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA = "fln.evidence-bundle-commit/1"
 VERIFICATION_MANIFEST_SCHEMA = "fln.verification-manifest/2"
 VERIFICATION_MANIFEST_PATH = "ci/VERIFICATION_MANIFEST.jsonl"
 VERIFICATION_EVIDENCE_REGISTRY_SCHEMA = "fln.verification-evidence-registry/1"
@@ -10615,6 +10620,13 @@ def validate_run(
         raise EvidenceError(f"{path}: argv must be a string array")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(records[0]["input_root"])):
         raise EvidenceError(f"{path}: input_root is not a canonical SHA-256 tree root")
+    if "producer_binding" in records[0]:
+        validate_producer_binding(
+            records[0]["producer_binding"],
+            live_repository_root=(
+                Path(records[0]["cwd"]) if live_context else None
+            ),
+        )
     budgets = records[0]["budgets"]
     if (
         not isinstance(budgets, dict)
@@ -12615,9 +12627,158 @@ def sha256_file(path: Path) -> str:
     return digest
 
 
+def canonical_governed_paths(requested: Sequence[str]) -> list[str]:
+    if not requested:
+        raise EvidenceError("governed path set must not be empty")
+    observed: set[str] = set()
+    canonical: list[str] = []
+    for raw in requested:
+        if (
+            not isinstance(raw, str)
+            or not raw
+            or "\0" in raw
+            or "\\" in raw
+            or raw.startswith("./")
+            or "//" in raw
+        ):
+            raise EvidenceError(f"governed path is not canonical: {raw!r}")
+        parsed = Path(raw)
+        if (
+            parsed.is_absolute()
+            or parsed.as_posix() != raw
+            or any(part == ".." for part in parsed.parts)
+        ):
+            raise EvidenceError(f"governed path is not canonical: {raw!r}")
+        if raw in observed:
+            raise EvidenceError(f"duplicate governed path: {raw!r}")
+        observed.add(raw)
+        canonical.append(raw)
+    return sorted(canonical, key=lambda value: value.encode("utf-8"))
+
+
+def governed_path_set_identity(requested: Sequence[str]) -> str:
+    canonical = canonical_governed_paths(requested)
+    digest = hashlib.sha256(b"fln.governed-path-set/1\0")
+    for value in canonical:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def governed_scope(requested: Sequence[str]) -> str:
+    canonical = canonical_governed_paths(requested)
+    return (
+        "full_repository"
+        if canonical == ["."]
+        else "lane_declared_subset"
+    )
+
+
+def repository_head(root: Path, *, subject: str) -> str:
+    root = lexical_absolute(root)
+    top_level = git_text(
+        root,
+        ["rev-parse", "--show-toplevel"],
+        subject=f"{subject} repository top level",
+    )
+    if lexical_absolute(Path(top_level)) != root:
+        raise EvidenceError(
+            f"{subject} repository top level mismatch: "
+            f"expected={root} actual={top_level}"
+        )
+    head = git_text(
+        root,
+        ["rev-parse", "--verify", "HEAD"],
+        subject=f"{subject} repository HEAD",
+    )
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        raise EvidenceError(f"{subject} repository HEAD is malformed")
+    repeated = git_text(
+        root,
+        ["rev-parse", "--verify", "HEAD"],
+        subject=f"{subject} repeated repository HEAD",
+    )
+    if not hmac.compare_digest(head, repeated):
+        raise EvidenceError(f"{subject} repository HEAD changed during capture")
+    return head
+
+
+def build_producer_binding(
+    repository_root: Path, governed_paths: Sequence[str]
+) -> dict[str, Any]:
+    canonical = canonical_governed_paths(governed_paths)
+    return {
+        "schema": PRODUCER_BINDING_SCHEMA,
+        "repository_head": repository_head(
+            repository_root, subject="producer binding"
+        ),
+        "governed_scope": governed_scope(canonical),
+        "governed_set": governed_path_set_identity(canonical),
+        "governed_paths": canonical,
+    }
+
+
+def validate_producer_binding(
+    value: Any,
+    *,
+    live_repository_root: Path | None = None,
+    expected_governed_paths: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema",
+        "repository_head",
+        "governed_scope",
+        "governed_set",
+        "governed_paths",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise EvidenceError("producer binding has unknown or missing fields")
+    if value.get("schema") != PRODUCER_BINDING_SCHEMA:
+        raise EvidenceError("producer binding schema is unsupported")
+    recorded_head = value.get("repository_head")
+    if not isinstance(recorded_head, str) or re.fullmatch(
+        r"[0-9a-f]{40}", recorded_head
+    ) is None:
+        raise EvidenceError(
+            "producer binding repository HEAD is not full lowercase hexadecimal"
+        )
+    recorded_paths = value.get("governed_paths")
+    if not isinstance(recorded_paths, list) or not all(
+        isinstance(path, str) for path in recorded_paths
+    ):
+        raise EvidenceError("producer binding governed paths must be an array")
+    canonical = canonical_governed_paths(recorded_paths)
+    if recorded_paths != canonical:
+        raise EvidenceError(
+            "producer binding governed paths are not canonically ordered"
+        )
+    if expected_governed_paths is not None:
+        expected = canonical_governed_paths(expected_governed_paths)
+        if recorded_paths != expected:
+            raise EvidenceError(
+                "producer binding governed paths differ from completion inputs"
+            )
+    expected_scope = governed_scope(canonical)
+    if value.get("governed_scope") != expected_scope:
+        raise EvidenceError("producer binding governed scope is inconsistent")
+    expected_set = governed_path_set_identity(canonical)
+    if not hmac.compare_digest(str(value.get("governed_set")), expected_set):
+        raise EvidenceError("producer binding governed set identity differs")
+    if live_repository_root is not None:
+        live_head = repository_head(
+            live_repository_root, subject="live producer binding"
+        )
+        if not hmac.compare_digest(recorded_head, live_head):
+            raise EvidenceError(
+                "producer binding repository HEAD changed after run start"
+            )
+    return dict(value)
+
+
 def iter_tree_files(root: Path, requested: Sequence[str]) -> Iterable[tuple[str, Path]]:
     seen: set[str] = set()
-    for raw in sorted(requested):
+    for raw in canonical_governed_paths(requested):
         raw_path = Path(raw)
         if raw_path.is_absolute() or ".." in raw_path.parts:
             raise EvidenceError(f"hash input escapes root: {raw}")
@@ -13572,6 +13733,28 @@ def artifact_inventory(art_dir: Path, *, excluded: set[Path]) -> list[dict[str, 
     )
 
 
+def validate_manifest_producer_binding(
+    manifest_schema: Any,
+    start: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    live_context: bool,
+) -> None:
+    if manifest_schema == EVIDENCE_MANIFEST_SCHEMA:
+        producer_binding = validate_producer_binding(
+            manifest.get("producer_binding"),
+            live_repository_root=(
+                Path(start["cwd"]) if live_context else None
+            ),
+        )
+        if start.get("producer_binding") != producer_binding:
+            raise EvidenceError("manifest/run producer binding mismatch")
+    elif "producer_binding" in start:
+        raise EvidenceError(
+            "legacy evidence manifest dropped the run producer binding"
+        )
+
+
 def generate_manifest(
     art_dir: Path,
     output: Path,
@@ -13602,6 +13785,11 @@ def generate_manifest(
         validate_check_human(run_log, art_dir / CHECK_HUMAN_LOG)
     start = run_records[0]
     terminal = run_records[-1]
+    if "producer_binding" not in start:
+        raise EvidenceError(
+            "new evidence manifests require a producer binding at run start"
+        )
+    producer_binding = validate_producer_binding(start["producer_binding"])
     expected_identity = {
         "run_id": run_id,
         "bead": bead,
@@ -13643,7 +13831,7 @@ def generate_manifest(
             f"manifest is missing required artifacts: {sorted(required - present)!r}"
         )
     manifest = {
-        "schema": "fln.evidence-manifest/1",
+        "schema": EVIDENCE_MANIFEST_SCHEMA,
         "run_schema": run_schema,
         "run_id": run_id,
         "bead": bead,
@@ -13653,6 +13841,7 @@ def generate_manifest(
         "input_root": input_root,
         "final_root": final_root,
         "final_state_matches_input": input_root == final_root,
+        "producer_binding": producer_binding,
         "artifacts": entries,
     }
     data = canonical_json(manifest)
@@ -13680,8 +13869,32 @@ def validate_manifest(
         digest_path, art_dir, "manifest.digest", label="manifest digest"
     )
     manifest = read_json_object(manifest_path)
-    if manifest.get("schema") != "fln.evidence-manifest/1":
+    manifest_schema = manifest.get("schema")
+    if manifest_schema not in {
+        LEGACY_EVIDENCE_MANIFEST_SCHEMA,
+        EVIDENCE_MANIFEST_SCHEMA,
+    }:
         raise EvidenceError("wrong evidence manifest schema")
+    common_keys = {
+        "schema",
+        "run_schema",
+        "run_id",
+        "bead",
+        "scenario",
+        "verdict",
+        "created_utc",
+        "input_root",
+        "final_root",
+        "final_state_matches_input",
+        "artifacts",
+    }
+    expected_manifest_keys = (
+        common_keys | {"producer_binding"}
+        if manifest_schema == EVIDENCE_MANIFEST_SCHEMA
+        else common_keys
+    )
+    if set(manifest) != expected_manifest_keys:
+        raise EvidenceError("evidence manifest has unknown or missing fields")
     if manifest.get("run_schema") not in RUN_SCHEMAS:
         raise EvidenceError("manifest run schema is unsupported")
     if manifest.get("verdict") not in {
@@ -13783,6 +13996,12 @@ def validate_manifest(
         raise EvidenceError("manifested run validation report is stale or forged")
     terminal = load_ndjson(run_log)[-1]
     start = load_ndjson(run_log)[0]
+    validate_manifest_producer_binding(
+        manifest_schema,
+        start,
+        manifest,
+        live_context=live_context,
+    )
     for key, manifest_key in (
         ("run_id", "run_id"),
         ("bead", "bead"),
@@ -13911,16 +14130,27 @@ def complete_bundle(
     validate_manifest(art_dir, manifest_path, digest_path)
     manifest = read_json_object(manifest_path)
     run_log = art_dir / "run.ndjson"
-    terminal = load_ndjson(run_log)[-1]
+    run_records = load_ndjson(run_log)
+    start = run_records[0]
+    terminal = run_records[-1]
     if terminal.get("bundle_commit") != output.name:
         raise EvidenceError("run terminal names a different bundle commit marker")
+    if manifest.get("schema") != EVIDENCE_MANIFEST_SCHEMA:
+        raise EvidenceError(
+            "new complete bundles require the producer-bound evidence manifest"
+        )
+    producer_binding = validate_producer_binding(
+        manifest.get("producer_binding"),
+        live_repository_root=Path(start["cwd"]),
+        expected_governed_paths=governed_paths,
+    )
     initial_bindings = (
         sha256_file(run_log),
         sha256_file(manifest_path),
         sha256_file(digest_path),
     )
     marker: dict[str, Any] = {
-        "schema": "fln.evidence-bundle-commit/1",
+        "schema": EVIDENCE_BUNDLE_COMMIT_SCHEMA,
         "status": "committed",
         "run_id": manifest["run_id"],
         "bead": manifest["bead"],
@@ -13934,6 +14164,7 @@ def complete_bundle(
             "path": digest_path.name,
             "sha256": initial_bindings[2],
         },
+        "producer_binding": producer_binding,
     }
     validate_marker_bindings(marker, manifest, terminal, initial_bindings)
     marker_data = canonical_json(marker)
@@ -13945,6 +14176,11 @@ def complete_bundle(
     )
     if current_root != expected_root or current_root != manifest.get("final_root"):
         raise EvidenceError("governed inputs changed before bundle commit")
+    validate_producer_binding(
+        producer_binding,
+        live_repository_root=Path(start["cwd"]),
+        expected_governed_paths=governed_paths,
+    )
     # The governed hash can be long. Revalidate every artifact after it, then prove
     # both sides stable across another full pass before publishing the marker.
     validate_manifest(art_dir, manifest_path, digest_path)
@@ -13969,6 +14205,11 @@ def complete_bundle(
     )
     if repeated_root != current_root:
         raise EvidenceError("governed inputs changed during prospective validation")
+    validate_producer_binding(
+        producer_binding,
+        live_repository_root=Path(start["cwd"]),
+        expected_governed_paths=governed_paths,
+    )
     durably_sync_manifested_bundle(art_dir, manifest_path, digest_path)
     validate_manifest(art_dir, manifest_path, digest_path)
     durable_bindings = (
@@ -13986,6 +14227,11 @@ def complete_bundle(
     )
     if final_root != current_root:
         raise EvidenceError("governed inputs changed before durable bundle commit")
+    validate_producer_binding(
+        producer_binding,
+        live_repository_root=Path(start["cwd"]),
+        expected_governed_paths=governed_paths,
+    )
     validate_manifest(art_dir, manifest_path, digest_path)
     final_bindings = (
         sha256_file(run_log),
@@ -14018,7 +14264,7 @@ def validate_marker_bindings(
     terminal: dict[str, Any],
     bindings: tuple[str, str, str],
 ) -> None:
-    if set(marker) != {
+    common_keys = {
         "schema",
         "status",
         "run_id",
@@ -14030,13 +14276,33 @@ def validate_marker_bindings(
         "run_log",
         "manifest",
         "manifest_digest",
-    }:
+    }
+    marker_schema = marker.get("schema")
+    expected_marker_keys = (
+        common_keys | {"producer_binding"}
+        if marker_schema == EVIDENCE_BUNDLE_COMMIT_SCHEMA
+        else common_keys
+    )
+    if set(marker) != expected_marker_keys:
         raise EvidenceError("bundle marker has unknown or missing fields")
-    if (
-        marker.get("schema") != "fln.evidence-bundle-commit/1"
-        or marker.get("status") != "committed"
-    ):
+    if marker_schema not in {
+        LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA,
+        EVIDENCE_BUNDLE_COMMIT_SCHEMA,
+    } or marker.get("status") != "committed":
         raise EvidenceError("invalid evidence bundle commit marker")
+    expected_manifest_schema = (
+        EVIDENCE_MANIFEST_SCHEMA
+        if marker_schema == EVIDENCE_BUNDLE_COMMIT_SCHEMA
+        else LEGACY_EVIDENCE_MANIFEST_SCHEMA
+    )
+    if manifest.get("schema") != expected_manifest_schema:
+        raise EvidenceError("bundle marker and evidence manifest schemas disagree")
+    if marker_schema == EVIDENCE_BUNDLE_COMMIT_SCHEMA:
+        marker_binding = validate_producer_binding(
+            marker.get("producer_binding")
+        )
+        if manifest.get("producer_binding") != marker_binding:
+            raise EvidenceError("bundle marker producer binding mismatch")
     for key in ("run_id", "bead", "scenario", "verdict"):
         if marker.get(key) != manifest.get(key):
             raise EvidenceError(f"bundle marker identity mismatch for {key}")
@@ -14187,6 +14453,271 @@ def adopt_bundle(
         art_dir, manifest_path, digest_path, commit_path=commit_path
     )
     return validate_bundle(art_dir, manifest_path, digest_path, commit_path)
+
+
+def sha256_file_identity(path: Path) -> str:
+    return f"sha256:{sha256_file(path)}"
+
+
+def verification_receipt_execution(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    dispositions: dict[str, list[str]] = {
+        "executed": [],
+        "expected_failure": [],
+        "typed_skip": [],
+        "not_run": [],
+    }
+    for record in records[1:-1]:
+        event = record.get("event")
+        if event == "stage":
+            identity = f"stage:{record['stage']}"
+            outcome = record.get("outcome")
+            if outcome == "skipped":
+                disposition = "typed_skip"
+            elif outcome == "not_run":
+                disposition = "not_run"
+            elif outcome in {
+                "pass",
+                "fail",
+                "inconclusive",
+                "internal_fault",
+                "cancelled",
+            }:
+                disposition = "executed"
+            else:
+                raise EvidenceError(
+                    f"receipt promotion cannot classify stage outcome {outcome!r}"
+                )
+        elif event == "step":
+            identity = f"step:{record['step_id']}"
+            if record.get("assertion") not in {"pass", "fail"}:
+                raise EvidenceError(
+                    "receipt promotion cannot classify an unknown step assertion"
+                )
+            is_expected_failure = (
+                record.get("assertion") == "pass"
+                and (
+                    record.get("expected_child_exit") != PASS
+                    or record.get("expected_wrapper_exit") != PASS
+                    or record.get("expected_supervisor_classification")
+                    not in {"pass", "skipped"}
+                )
+            )
+            disposition = (
+                "expected_failure" if is_expected_failure else "executed"
+            )
+        elif event == "self_test":
+            identity = f"self_test:{record['stage']}"
+            disposition = (
+                "expected_failure"
+                if record.get("ok") is True
+                and record.get("planted_exit") != PASS
+                else "executed"
+            )
+        else:
+            raise EvidenceError(
+                f"receipt promotion cannot classify event {event!r}"
+            )
+        dispositions[disposition].append(identity)
+    for identities in dispositions.values():
+        if len(identities) != len(set(identities)):
+            raise EvidenceError(
+                "receipt execution identities are duplicated"
+            )
+        identities.sort()
+    if not any(dispositions.values()):
+        raise EvidenceError("receipt execution inventory is empty")
+    return {
+        "authority": "structured_run_log",
+        **dispositions,
+    }
+
+
+def validate_verification_receipt_source(
+    record: Mapping[str, Any],
+    *,
+    run_path: Path,
+    manifest_path: Path,
+    digest_path: Path,
+    commit_path: Path,
+) -> None:
+    source = record.get("source")
+    if not isinstance(source, dict):
+        raise EvidenceError("verification receipt source binding is missing")
+    expected = {
+        "bundle_commit_sha256": sha256_file_identity(commit_path),
+        "manifest_sha256": sha256_file_identity(manifest_path),
+        "manifest_digest_sha256": sha256_file_identity(digest_path),
+        "run_log_sha256": sha256_file_identity(run_path),
+    }
+    for field, expected_identity in expected.items():
+        if not hmac.compare_digest(
+            str(source.get(field)), expected_identity
+        ):
+            raise EvidenceError(
+                f"verification receipt source digest differs for {field}"
+            )
+
+
+def verification_receipt_producer_binding(
+    marker: Mapping[str, Any],
+    *,
+    legacy_producing_commit: str | None,
+    legacy_governed_scope: str | None,
+) -> tuple[str, str, str, str]:
+    marker_schema = marker.get("schema")
+    if marker_schema == EVIDENCE_BUNDLE_COMMIT_SCHEMA:
+        if (
+            legacy_producing_commit is not None
+            or legacy_governed_scope is not None
+        ):
+            raise EvidenceError(
+                "recorded producer binding cannot be replaced by legacy "
+                "operator arguments"
+            )
+        binding = validate_producer_binding(marker.get("producer_binding"))
+        return (
+            binding["repository_head"],
+            "recorded",
+            binding["governed_scope"],
+            binding["governed_set"],
+        )
+    if marker_schema != LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA:
+        raise EvidenceError("receipt source has an unsupported bundle schema")
+    if legacy_governed_scope not in {
+        "full_repository",
+        "lane_declared_subset",
+    }:
+        raise EvidenceError(
+            "historical bundle promotion requires a typed "
+            "--legacy-governed-scope"
+        )
+    if legacy_producing_commit is None:
+        producing_commit = "unavailable"
+        commit_binding = "unbound"
+    else:
+        if re.fullmatch(r"[0-9a-f]{40}", legacy_producing_commit) is None:
+            raise EvidenceError(
+                "legacy producing commit must be full lowercase hexadecimal"
+            )
+        producing_commit = legacy_producing_commit
+        commit_binding = "operator_attested_legacy"
+    return (
+        producing_commit,
+        commit_binding,
+        legacy_governed_scope,
+        "unavailable",
+    )
+
+
+def promote_verification_receipt(
+    art_dir: Path,
+    manifest_path: Path,
+    digest_path: Path,
+    commit_path: Path,
+    *,
+    legacy_producing_commit: str | None = None,
+    legacy_governed_scope: str | None = None,
+) -> dict[str, Any]:
+    """Project one validated bundle into a compact, content-addressed receipt."""
+    art_dir = lexical_absolute(art_dir)
+    manifest_path = require_exact_artifact_path(
+        manifest_path, art_dir, "manifest.json", label="manifest"
+    )
+    digest_path = require_exact_artifact_path(
+        digest_path, art_dir, "manifest.digest", label="manifest digest"
+    )
+    commit_path = require_exact_artifact_path(
+        commit_path, art_dir, "bundle.complete.json", label="bundle commit"
+    )
+    validate_bundle(art_dir, manifest_path, digest_path, commit_path)
+    run_path = art_dir / "run.ndjson"
+    records = load_ndjson(run_path)
+    start = records[0]
+    terminal = records[-1]
+    manifest = read_json_object(manifest_path)
+    marker = read_json_object(commit_path)
+    (
+        producing_commit,
+        commit_binding,
+        receipt_governed_scope,
+        receipt_governed_set,
+    ) = verification_receipt_producer_binding(
+        marker,
+        legacy_producing_commit=legacy_producing_commit,
+        legacy_governed_scope=legacy_governed_scope,
+    )
+
+    vendor_binding = start.get("vendor_binding")
+    if vendor_binding == "vendor-binding.json":
+        reference = {
+            "status": "installed_and_bound",
+            "binding_sha256": sha256_file_identity(
+                art_dir / "vendor-binding.json"
+            ),
+        }
+    elif isinstance(vendor_binding, str) and vendor_binding.startswith(
+        "not_applicable"
+    ):
+        reference = {
+            "status": "not_applicable",
+            "binding_sha256": "not_applicable",
+        }
+    else:
+        reference = {
+            "status": "unobserved",
+            "binding_sha256": "not_applicable",
+        }
+
+    record: dict[str, Any] = {
+        "schema": VERIFICATION_EVIDENCE_RECEIPT_SCHEMA,
+        "kind": "receipt",
+        "producer": {
+            "tool": "scripts/evidence.py:promote-verification-receipt/1",
+            "run_schema": start["schema"],
+            "run_id": start["run_id"],
+            "bead": start["bead"],
+            "scenario": start["scenario"],
+            "producing_commit": producing_commit,
+            "commit_binding": commit_binding,
+        },
+        "outcome": {
+            "verdict": terminal["verdict"],
+            "process_exit": terminal["process_exit"],
+            "reason_code": terminal["reason_code"],
+            "input_root": manifest["input_root"],
+            "final_root": manifest["final_root"],
+            "governed_state_static": hmac.compare_digest(
+                manifest["input_root"], manifest["final_root"]
+            ),
+            "governed_scope": receipt_governed_scope,
+            "governed_set": receipt_governed_set,
+        },
+        "source": {
+            "bundle_commit_sha256": sha256_file_identity(commit_path),
+            "manifest_sha256": sha256_file_identity(manifest_path),
+            "manifest_digest_sha256": sha256_file_identity(digest_path),
+            "run_log_sha256": sha256_file_identity(run_path),
+        },
+        "execution": verification_receipt_execution(records),
+        "reference": reference,
+    }
+    record["receipt"] = verification_receipt_content_address(record)
+    validate_verification_receipt_source(
+        record,
+        run_path=run_path,
+        manifest_path=manifest_path,
+        digest_path=digest_path,
+        commit_path=commit_path,
+    )
+    validate_verification_receipt_record(
+        Path(VERIFICATION_EVIDENCE_REGISTRY_PATH),
+        1,
+        record,
+        {str(start["bead"]): {}},
+    )
+    return record
 
 
 PARTIAL_BUNDLE_CLASSIFICATIONS = {"internal_fault", "inconclusive", "cancelled"}
@@ -14448,6 +14979,17 @@ def cmd_emit(args: argparse.Namespace) -> int:
     require_within(Path(args.file), Path(args.artifact_root), label="NDJSON log")
     record: dict[str, Any] = {}
     add_fields(record, args)
+    if bool(args.producer_binding_root) != bool(args.governed_path):
+        raise EvidenceError(
+            "producer binding requires both --producer-binding-root and "
+            "--governed-path"
+        )
+    if args.producer_binding_root:
+        if "producer_binding" in record:
+            raise EvidenceError("duplicate field: producer_binding")
+        record["producer_binding"] = build_producer_binding(
+            Path(args.producer_binding_root), args.governed_path
+        )
     append_record(Path(args.file), record, must_be_new=args.new_log)
     return PASS
 
@@ -15882,6 +16424,19 @@ def cmd_validate_bundle(args: argparse.Namespace) -> int:
         write_new(Path(args.output), canonical_json(report))
     else:
         sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_promote_verification_receipt(args: argparse.Namespace) -> int:
+    receipt = promote_verification_receipt(
+        Path(args.art_dir),
+        Path(args.manifest),
+        Path(args.digest),
+        Path(args.commit),
+        legacy_producing_commit=args.legacy_producing_commit,
+        legacy_governed_scope=args.legacy_governed_scope,
+    )
+    sys.stdout.buffer.write(canonical_json(receipt))
     return PASS
 
 
@@ -21860,8 +22415,166 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     require(first_hash == second_hash, "canonical tree hash depends on argument order")
     cases.append({"case": "canonical_hash", "ok": True, "root": first_hash})
 
+    producer_repository_root = lexical_absolute(Path(__file__).parent.parent)
+    producer_binding = build_producer_binding(
+        producer_repository_root, ["b", "a"]
+    )
+    validate_producer_binding(
+        producer_binding,
+        live_repository_root=producer_repository_root,
+        expected_governed_paths=["a", "b"],
+    )
+
+    def expect_producer_binding_rejection(
+        label: str,
+        mutate: Callable[[dict[str, Any]], None],
+        expected_message: str,
+        *,
+        live: bool = False,
+    ) -> None:
+        mutant = parse_json(
+            canonical_json(producer_binding),
+            subject=f"producer binding mutant {label}",
+        )
+        mutate(mutant)
+        try:
+            validate_producer_binding(
+                mutant,
+                live_repository_root=(
+                    producer_repository_root if live else None
+                ),
+            )
+        except EvidenceError as error:
+            require(
+                expected_message in str(error),
+                f"producer binding mutant {label!r} produced the wrong failure: "
+                f"{error}",
+            )
+        else:
+            raise EvidenceError(
+                f"producer binding mutant {label!r} was accepted"
+            )
+
+    different_head = (
+        "0" * 40
+        if producer_binding["repository_head"] != "0" * 40
+        else "1" * 40
+    )
+    producer_binding_mutants: list[
+        tuple[
+            str,
+            Callable[[dict[str, Any]], None],
+            str,
+            bool,
+        ]
+    ] = [
+        (
+            "missing_repository_head",
+            lambda binding: binding.pop("repository_head"),
+            "unknown or missing",
+            False,
+        ),
+        (
+            "short_repository_head",
+            lambda binding: binding.__setitem__("repository_head", "deadbeef"),
+            "not full lowercase hexadecimal",
+            False,
+        ),
+        (
+            "substituted_repository_head",
+            lambda binding: binding.__setitem__(
+                "repository_head", different_head
+            ),
+            "changed after run start",
+            True,
+        ),
+        (
+            "reordered_governed_paths",
+            lambda binding: binding.__setitem__(
+                "governed_paths",
+                list(reversed(binding["governed_paths"])),
+            ),
+            "not canonically ordered",
+            False,
+        ),
+        (
+            "duplicated_governed_path",
+            lambda binding: binding["governed_paths"].append(
+                binding["governed_paths"][0]
+            ),
+            "duplicate governed path",
+            False,
+        ),
+        (
+            "substituted_governed_set",
+            lambda binding: binding.__setitem__(
+                "governed_set", f"sha256:{'0' * 64}"
+            ),
+            "identity differs",
+            False,
+        ),
+        (
+            "subset_upgraded_to_full_repository",
+            lambda binding: binding.__setitem__(
+                "governed_scope", "full_repository"
+            ),
+            "scope is inconsistent",
+            False,
+        ),
+    ]
+    for (
+        mutant_label,
+        mutant_transform,
+        mutant_message,
+        mutant_live,
+    ) in producer_binding_mutants:
+        expect_producer_binding_rejection(
+            mutant_label,
+            mutant_transform,
+            mutant_message,
+            live=mutant_live,
+        )
+    full_repository_binding = build_producer_binding(
+        producer_repository_root, ["."]
+    )
+    require(
+        full_repository_binding["governed_scope"] == "full_repository",
+        "the exact full-repository governed set was typed as a subset",
+    )
+    try:
+        validate_manifest_producer_binding(
+            EVIDENCE_MANIFEST_SCHEMA,
+            {
+                "cwd": str(producer_repository_root),
+                "producer_binding": producer_binding,
+            },
+            {"schema": EVIDENCE_MANIFEST_SCHEMA},
+            live_context=False,
+        )
+    except EvidenceError as error:
+        require(
+            "unknown or missing fields" in str(error),
+            "missing manifest producer binding produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("missing manifest producer binding was accepted")
+    cases.append(
+        {
+            "case": "producer_binding",
+            "ok": True,
+            "mutants_killed": len(producer_binding_mutants) + 1,
+            "repository_head": producer_binding["repository_head"],
+            "governed_set": producer_binding["governed_set"],
+            "governed_scope": producer_binding["governed_scope"],
+        }
+    )
+
     manifest_root = case_dir("write_once_manifest")
     manifest_run_id = "manifest-self-test"
+    manifest_repository_root = producer_repository_root
+    manifest_producer_binding = build_producer_binding(
+        manifest_repository_root, ["a", "b"]
+    )
     manifest_meta = manifest_root / "manifest-stage.meta.json"
     manifest_rc = run_supervised(
         argv=[sys.executable, "-c", "print('manifest-stage')"],
@@ -21891,7 +22604,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "monotonic_ns": 1,
             "wall_time_utc": utc_now(),
             "argv": ["evidence.py", "self-test"],
-            "cwd": str(art_dir),
+            "cwd": str(manifest_repository_root),
             "claim_ids": ["FLN-EVIDENCE-SELF-TEST"],
             "invariant_ids": ["FL-INV-07"],
             "gate_ids": ["G0-10"],
@@ -21909,6 +22622,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "seed": "deterministic",
             "cache_state": "not_applicable",
             "input_root": first_hash,
+            "producer_binding": manifest_producer_binding,
             "budgets": {"timeout_ms": 5000},
             "parity_ledger_row": "not_applicable_evidence_self_test",
             "planted": "",
@@ -22099,6 +22813,208 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         relative_manifest_root / "manifest.json",
         relative_manifest_root / "manifest.digest",
         relative_manifest_root / "bundle.complete.json",
+    )
+    receipt_source_paths = (
+        manifest_root / "run.ndjson",
+        manifest_root / "manifest.json",
+        manifest_root / "manifest.digest",
+        manifest_root / "bundle.decision",
+        manifest_root / "bundle.complete.json",
+    )
+    receipt_source_before = {
+        path.name: stable_file_facts(path) for path in receipt_source_paths
+    }
+    promoted_receipt = promote_verification_receipt(
+        manifest_root,
+        manifest_root / "manifest.json",
+        manifest_root / "manifest.digest",
+        manifest_root / "bundle.complete.json",
+    )
+    receipt_source_after = {
+        path.name: stable_file_facts(path) for path in receipt_source_paths
+    }
+    require(
+        receipt_source_before == receipt_source_after,
+        "receipt promotion mutated its source bundle",
+    )
+    require(
+        promoted_receipt["producer"]["commit_binding"] == "recorded"
+        and promoted_receipt["producer"]["producing_commit"]
+        == manifest_producer_binding["repository_head"]
+        and promoted_receipt["outcome"]["governed_scope"]
+        == "lane_declared_subset"
+        and promoted_receipt["outcome"]["governed_set"]
+        == manifest_producer_binding["governed_set"],
+        "receipt promotion lost its recorded producer binding",
+    )
+    require(
+        promoted_receipt["execution"]
+        == {
+            "authority": "structured_run_log",
+            "executed": ["stage:manifest-stage"],
+            "expected_failure": [],
+            "typed_skip": [],
+            "not_run": [],
+        },
+        "receipt promotion misclassified its structured execution",
+    )
+    receipt_source_mutant = parse_json(
+        canonical_json(promoted_receipt),
+        subject="receipt source digest mutant",
+    )
+    receipt_source_mutant["source"]["manifest_sha256"] = (
+        f"sha256:{'0' * 64}"
+    )
+    receipt_source_mutant["receipt"] = verification_receipt_content_address(
+        receipt_source_mutant
+    )
+    validate_verification_receipt_record(
+        Path(VERIFICATION_EVIDENCE_REGISTRY_PATH),
+        1,
+        receipt_source_mutant,
+        {"fln-8mj": {}},
+    )
+    try:
+        validate_verification_receipt_source(
+            receipt_source_mutant,
+            run_path=manifest_root / "run.ndjson",
+            manifest_path=manifest_root / "manifest.json",
+            digest_path=manifest_root / "manifest.digest",
+            commit_path=manifest_root / "bundle.complete.json",
+        )
+    except EvidenceError as error:
+        require(
+            "manifest_sha256" in str(error),
+            "receipt source digest mutant produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("receipt source digest mutant was accepted")
+
+    disposition_projection = verification_receipt_execution(
+        [
+            {"event": "run_start"},
+            {"event": "stage", "stage": "executed", "outcome": "pass"},
+            {"event": "stage", "stage": "typed-skip", "outcome": "skipped"},
+            {"event": "stage", "stage": "not-run", "outcome": "not_run"},
+            {"event": "run_end"},
+        ]
+    )
+    require(
+        disposition_projection["executed"] == ["stage:executed"]
+        and disposition_projection["typed_skip"] == ["stage:typed-skip"]
+        and disposition_projection["not_run"] == ["stage:not-run"]
+        and disposition_projection["expected_failure"] == [],
+        "receipt projection collapsed typed skip, not-run, or execution",
+    )
+
+    legacy_marker = {"schema": LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA}
+    legacy_unbound = verification_receipt_producer_binding(
+        legacy_marker,
+        legacy_producing_commit=None,
+        legacy_governed_scope="lane_declared_subset",
+    )
+    legacy_attested = verification_receipt_producer_binding(
+        legacy_marker,
+        legacy_producing_commit=manifest_producer_binding[
+            "repository_head"
+        ],
+        legacy_governed_scope="lane_declared_subset",
+    )
+    require(
+        legacy_unbound
+        == (
+            "unavailable",
+            "unbound",
+            "lane_declared_subset",
+            "unavailable",
+        )
+        and legacy_attested
+        == (
+            manifest_producer_binding["repository_head"],
+            "operator_attested_legacy",
+            "lane_declared_subset",
+            "unavailable",
+        ),
+        "legacy receipt promotion upgraded or lost its provenance grade",
+    )
+    try:
+        verification_receipt_producer_binding(
+            read_json_object(manifest_root / "bundle.complete.json"),
+            legacy_producing_commit=manifest_producer_binding[
+                "repository_head"
+            ],
+            legacy_governed_scope="lane_declared_subset",
+        )
+    except EvidenceError as error:
+        require(
+            "cannot be replaced by legacy" in str(error),
+            "recorded-binding override produced the wrong failure",
+        )
+    else:
+        raise EvidenceError(
+            "recorded producer binding accepted a legacy override"
+        )
+
+    manifest_binding_mutant = parse_json(
+        canonical_json(read_json_object(manifest_root / "manifest.json")),
+        subject="manifest producer binding mutant",
+    )
+    manifest_binding_mutant["producer_binding"]["repository_head"] = (
+        different_head
+    )
+    try:
+        validate_manifest_producer_binding(
+            EVIDENCE_MANIFEST_SCHEMA,
+            manifest_records[0],
+            manifest_binding_mutant,
+            live_context=False,
+        )
+    except EvidenceError as error:
+        require(
+            "manifest/run producer binding mismatch" in str(error),
+            "manifest producer substitution produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("manifest producer substitution was accepted")
+
+    marker_binding_mutant = parse_json(
+        canonical_json(
+            read_json_object(manifest_root / "bundle.complete.json")
+        ),
+        subject="bundle marker producer binding mutant",
+    )
+    marker_binding_mutant["producer_binding"]["repository_head"] = (
+        different_head
+    )
+    manifest_object = read_json_object(manifest_root / "manifest.json")
+    manifest_terminal = load_ndjson(manifest_root / "run.ndjson")[-1]
+    manifest_bindings = (
+        sha256_file(manifest_root / "run.ndjson"),
+        sha256_file(manifest_root / "manifest.json"),
+        sha256_file(manifest_root / "manifest.digest"),
+    )
+    try:
+        validate_marker_bindings(
+            marker_binding_mutant,
+            manifest_object,
+            manifest_terminal,
+            manifest_bindings,
+        )
+    except EvidenceError as error:
+        require(
+            "bundle marker producer binding mismatch" in str(error),
+            "bundle marker producer substitution produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("bundle marker producer substitution was accepted")
+    cases.append(
+        {
+            "case": "verification_receipt_promotion",
+            "ok": True,
+            "receipt": promoted_receipt["receipt"],
+            "mutants_killed": 4,
+            "source_bundle_preserved": True,
+        }
     )
     try:
         validate_bundle(
@@ -23596,6 +24512,8 @@ def build_parser() -> argparse.ArgumentParser:
     emit_parser.add_argument("--json-value", nargs=2, action="append")
     emit_parser.add_argument("--append-string", nargs=2, action="append")
     emit_parser.add_argument("--json-file", nargs=2, action="append")
+    emit_parser.add_argument("--producer-binding-root")
+    emit_parser.add_argument("--governed-path", action="append")
     emit_parser.set_defaults(func=cmd_emit)
 
     run_parser = subparsers.add_parser(
@@ -24092,6 +25010,21 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_validation.add_argument("--artifact-root", required=True)
     bundle_validation.add_argument("--output")
     bundle_validation.set_defaults(func=cmd_validate_bundle)
+
+    receipt_promotion = subparsers.add_parser(
+        "promote-verification-receipt",
+        help="project one validated bundle into a compact tracked receipt",
+    )
+    receipt_promotion.add_argument("--art-dir", required=True)
+    receipt_promotion.add_argument("--manifest", required=True)
+    receipt_promotion.add_argument("--digest", required=True)
+    receipt_promotion.add_argument("--commit", required=True)
+    receipt_promotion.add_argument("--legacy-producing-commit")
+    receipt_promotion.add_argument(
+        "--legacy-governed-scope",
+        choices=("full_repository", "lane_declared_subset"),
+    )
+    receipt_promotion.set_defaults(func=cmd_promote_verification_receipt)
 
     partial_publication = subparsers.add_parser(
         "publish-partial-bundle",
