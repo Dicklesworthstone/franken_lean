@@ -23,35 +23,110 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The code portion of a line: everything before the first `//` that is NOT inside a
-/// string literal. A naive `line.find("//")` would truncate at a `//` *inside a
-/// string* (e.g. a URL literal), hiding a later raw-hasher reference on the same line
-/// — the evasion RubyForest flagged. `//` can only appear in a string or a comment
-/// (a char literal holds one char), so tracking double-quoted strings suffices; we do
-/// not track char literals or lifetimes (both use `'` and would otherwise mislead).
-fn code_before_comment(line: &str) -> &str {
+/// Whether a byte can be part of a Rust identifier.
+fn is_word_byte(b: &u8) -> bool {
+    b.is_ascii_alphanumeric() || *b == b'_'
+}
+
+/// The *scannable* portion of a line: everything before the first `//` that is not inside
+/// a string literal, with the **contents of every string literal blanked out**.
+///
+/// Two evasions pull in opposite directions and this function has to survive both.
+///
+/// **Truncating too early.** A naive `line.find("//")` truncates at a `//` inside a
+/// string — a URL literal — and hides a raw-hasher reference later on the same line. That
+/// is the evasion RubyForest flagged, and it is why this walks the line instead of
+/// searching it.
+///
+/// **Reading a mention as a use.** A string literal is *data*. No `blake3` inside one can
+/// resolve to the module, because Rust has no path from a string to a symbol. The guard
+/// used to scan string contents anyway, and it turned the workspace red for a table of
+/// file paths in another crate — `("crates/fln-hash/src/blake3.rs", 1)` — where the needle
+/// sits between `/` and `.`, so it is a whole word by every test this file applies and
+/// still not a reference to anything. That is the second time this class has fired here.
+/// The first was `convert_blake3_vectors.py`, repaired by requiring a whole identifier;
+/// the repair was right and incomplete, because it distinguished an identifier from a
+/// fragment and never asked whether the text was code. **A filesystem path segment is not
+/// a Rust path segment.** Scoping the search region to the code is the narrow repair, and
+/// the same one AGENTS.md prescribes for `fln-8zsq`: scope the assertion to the site that
+/// must carry the evidence. An exemption list would have been the wide one — it would let
+/// any file that says the word off, rather than letting no file be judged on its data.
+///
+/// Blanking preserves byte length, so a blanked span reads as spaces and the
+/// word-boundary test in [`names_raw_hasher`] behaves exactly as it does on real code.
+/// Raw strings (`r"…"`, `r#"…"#`) are matched with their own hash count rather than by
+/// quote counting: a naive toggle on `r#"say "hi""#` re-enters a string at the embedded
+/// quote and blanks the *rest of the line*, which would hide a genuine reference after it.
+/// That is the first evasion arriving through the second repair, and
+/// `a_raw_string_with_embedded_quotes_does_not_hide_a_later_reference` is the control.
+/// Char literals and lifetimes are deliberately not tracked — both spell `'` and a char
+/// literal cannot hold `blake3`.
+fn scannable_code(line: &str) -> String {
     let bytes = line.as_bytes();
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut i = 0;
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_str = false;
+
+        // A raw-string opener: `r`, `r#`, `r##`, … then `"`, and not preceded by a word
+        // byte (so a raw identifier `r#foo` and any identifier ending in `r` are not it).
+        if b == b'r'
+            && !i
+                .checked_sub(1)
+                .and_then(|p| bytes.get(p))
+                .is_some_and(is_word_byte)
+        {
+            let mut j = i + 1;
+            while bytes.get(j) == Some(&b'#') {
+                j += 1;
             }
-        } else if b == b'"' {
-            in_str = true;
-        } else if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            return &line[..i];
+            if bytes.get(j) == Some(&b'"') {
+                let hashes = j - (i + 1);
+                out.extend(std::iter::repeat_n(b' ', j - i + 1));
+                let mut k = j + 1;
+                while k < bytes.len() {
+                    if bytes[k] == b'"' && (0..hashes).all(|h| bytes.get(k + 1 + h) == Some(&b'#'))
+                    {
+                        out.extend(std::iter::repeat_n(b' ', hashes + 1));
+                        k += hashes + 1;
+                        break;
+                    }
+                    out.push(b' ');
+                    k += 1;
+                }
+                i = k;
+                continue;
+            }
         }
+
+        if b == b'"' {
+            out.push(b' ');
+            let mut k = i + 1;
+            let mut escaped = false;
+            while k < bytes.len() {
+                let c = bytes[k];
+                out.push(b' ');
+                k += 1;
+                if escaped {
+                    escaped = false;
+                } else if c == b'\\' {
+                    escaped = true;
+                } else if c == b'"' {
+                    break;
+                }
+            }
+            i = k;
+            continue;
+        }
+
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            break;
+        }
+
+        out.push(b);
         i += 1;
     }
-    line
+    String::from_utf8(out).expect("blanking ASCII spans of valid UTF-8 leaves it valid")
 }
 
 /// Whether `code` names the raw hasher as a Rust identifier rather than as part of a longer
@@ -100,7 +175,7 @@ fn raw_hash_references(source: &str) -> Vec<(usize, String)> {
         // to an exemption list would have been the wrong repair: the reference we are
         // hunting is always a path segment, so requiring a path segment is both narrower
         // and strictly more accurate than listing the files allowed to say the word.
-        if names_raw_hasher(code_before_comment(line)) {
+        if names_raw_hasher(&scannable_code(line)) {
             findings.push((idx + 1, line.trim().to_string()));
         }
     }
@@ -293,6 +368,72 @@ fn the_scanner_detects_a_planted_violation() {
     assert!(raw_hash_references("let _u = \"ok\"; // blake3 note\n").is_empty());
 }
 
+/// A file path inside a string literal is data, not a reference.
+///
+/// The live instance: `crates/fln-conformance/src/tree_identity.rs` declares its
+/// per-file residue as a table of `(path, count)` pairs, one of which names
+/// `crates/fln-hash/src/blake3.rs`. The needle sits between `/` and `.`, so it is a
+/// whole identifier by every test this file applies — and it is still a filesystem
+/// path in a data table, reachable from nothing. It failed `check.sh` at stage 8 on
+/// 2026-07-27 (`target/check/check-20260727T044815Z-2738056`).
+#[test]
+fn a_path_in_a_string_literal_is_not_a_raw_hasher_reference() {
+    assert!(raw_hash_references("    (\"crates/fln-hash/src/blake3.rs\", 1),\n").is_empty());
+    assert!(raw_hash_references("let p = \"src/blake3.rs\";\n").is_empty());
+    assert!(raw_hash_references("expect(\"blake3 fixture missing\")\n").is_empty());
+    // A raw string is data too.
+    assert!(raw_hash_references("let p = r\"crates/fln-hash/src/blake3.rs\";\n").is_empty());
+}
+
+/// **The anti-widening control.** Every assertion above removes findings, so on its own
+/// it cannot tell a narrowed guard from a broken one. A genuine reference must still be
+/// refused *while sharing its line with a string that mentions the needle* — which is
+/// only true if string CONTENTS are blanked rather than lines containing strings skipped.
+#[test]
+fn a_real_reference_is_still_refused_when_a_string_on_the_same_line_mentions_it() {
+    let mixed = "let _ = fln_hash::blake3::hash(\"crates/fln-hash/src/blake3.rs\");\n";
+    assert_eq!(
+        raw_hash_references(mixed).len(),
+        1,
+        "blanking a string must not blank the code beside it"
+    );
+    let after = "let _p = \"blake3.rs\"; use fln_hash::blake3::Hasher;\n";
+    assert_eq!(raw_hash_references(after).len(), 1);
+    let before = "use fln_hash::blake3::Hasher; let _p = \"blake3.rs\";\n";
+    assert_eq!(raw_hash_references(before).len(), 1);
+}
+
+/// The first evasion arriving through the second repair.
+///
+/// Quote-counting re-enters a string at the embedded `"` of `r#"say "hi""#`, and from
+/// there blanks the rest of the line — hiding a real reference behind a raw string. The
+/// hash count is what distinguishes the terminator from a quote inside the body.
+#[test]
+fn a_raw_string_with_embedded_quotes_does_not_hide_a_later_reference() {
+    let evasion = "let _a = r#\"say \"hi\"\"#; use fln_hash::blake3::Hasher;\n";
+    assert_eq!(
+        raw_hash_references(evasion).len(),
+        1,
+        "a raw string's embedded quote must not swallow the code after it"
+    );
+    // And the raw string's own body is still data.
+    assert!(raw_hash_references("let _a = r#\"blake3 \"x\"\"#;\n").is_empty());
+    // An escaped quote inside an ordinary string must not end it early either.
+    assert!(raw_hash_references("let _a = \"say \\\"blake3\\\"\";\n").is_empty());
+}
+
+/// Blanking preserves byte length, so the word-boundary test sees the same shape it
+/// would see on code. A span that collapsed would let two identifiers become adjacent
+/// and change a verdict.
+#[test]
+fn blanking_a_string_preserves_the_length_of_the_line() {
+    let line = "let p = \"crates/fln-hash/src/blake3.rs\"; // note";
+    let code = scannable_code(line);
+    assert_eq!(code.len(), line.find("//").expect("has a comment"));
+    assert!(!code.contains("blake3"), "{code:?}");
+    assert!(code.starts_with("let p = "), "{code:?}");
+}
+
 // ---------------------------------------------------------------------------
 // The public-API proof — the half the workspace scan structurally cannot do.
 // ---------------------------------------------------------------------------
@@ -308,7 +449,8 @@ const PUBLIC_MODULES: [&str; 3] = ["canon", "domain", "root"];
 fn declared_modules(lib_source: &str) -> Vec<(String, bool)> {
     let mut modules = Vec::new();
     for line in lib_source.lines() {
-        let code = code_before_comment(line).trim();
+        let code = scannable_code(line);
+        let code = code.trim();
         // Only plain `… mod name;` declarations. An inline `mod name { … }` block and
         // a `pub use` re-export are not the crate's module-surface statement.
         let Some(head) = code.strip_suffix(';') else {
