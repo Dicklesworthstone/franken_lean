@@ -164,18 +164,10 @@ use fln_conformance::execution::{
 /// **The only legitimate edit is a deletion**, and the equality check below forces one the
 /// moment a row leaves the population — see [`judge`].
 const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
-    "fln-7odd",
-    "fln-8zsq",
-    "fln-c78c",
-    "fln-corpus-thread-matrix-93te",
     "fln-ffam",
     "franken_lean-2jht",
-    "franken_lean-2ki4",
     "franken_lean-c24a",
-    "franken_lean-eh0c",
     "franken_lean-ext-observable-fixture-drift-gap-vqnu",
-    "franken_lean-kxbj",
-    "franken_lean-sxsk",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -184,7 +176,7 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// by growing back to twelve with no visible change to a literal. Equality makes the
 /// ceiling a ratchet whose only legitimate edit is downward, and makes any upward edit a
 /// deliberate, reviewable change to a constant that says what it is.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 12;
+const UNEXECUTED_EVIDENCE_CEILING: usize = 4;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
@@ -2336,11 +2328,25 @@ fn mutant_ci_installs_the_pin_forces_the_declaration_to_shrink() {
 #[test]
 fn mutant_a_new_row_on_a_pin_reaching_surface_reddens_and_resists_silencing() {
     let mut d = baseline();
+    // The plant target is DERIVED, not positional. This used to take the first
+    // pin-reaching test surface, which was sound only while CI ran none of them: once
+    // `fe9198dd` wired the four pin-dependent suites into a job that installs the pin,
+    // that first surface became CI-executed and the plant stopped being a finding — the
+    // mutant passed nothing and asserted `[]`. A guard whose population is repaired out
+    // from under it goes decorative, and only re-deriving the target keeps it live.
+    //
+    // The `expect` is the anti-vacuity floor: when the last unrun pin-reaching surface is
+    // wired, this refuses loudly instead of silently testing nothing, which forces the
+    // deliberate decision about what this mutant should plant on next.
     let surface = d
         .pin_reaching
         .iter()
-        .find(|path| path.contains("/tests/"))
-        .expect("at least one pin-reaching test surface")
+        .find(|path| path.contains("/tests/") && !run_by_ci_with_the_pin(&d, path))
+        .expect(
+            "at least one pin-reaching test surface that CI does not run with the pin — if \
+             none remains, this mutant has nothing to plant on and must be re-aimed rather \
+             than deleted",
+        )
         .clone();
     d.rows.push(TerminalRow {
         bead: "fln-planted-mutant".to_string(),
@@ -2357,7 +2363,7 @@ fn mutant_a_new_row_on_a_pin_reaching_surface_reddens_and_resists_silencing() {
     );
     assert!(
         has(&findings, "population-grew:"),
-        "a thirteenth row must redden; got {findings:?}"
+        "a new row on an unrun pin-reaching surface must redden; got {findings:?}"
     );
 
     // The silencing move: declare it. The ceiling must refuse.
