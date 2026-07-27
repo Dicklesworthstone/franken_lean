@@ -278,15 +278,15 @@ fn scan_evidence_file(path: &Path) -> Result<Vec<String>, std::io::ErrorKind> {
         .map_err(|error| error.kind())
 }
 
-fn unique_temp_workspace(label: &str) -> PathBuf {
+fn unique_temp_workspace(label: &str) -> Result<PathBuf, std::io::Error> {
     loop {
         let id = TEMP_REPO_ID.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("fln-vdi4-{label}-{}-{id}", std::process::id()));
         match fs::create_dir(&path) {
-            Ok(()) => return path,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => panic!("cannot create temporary Git workspace {path:?}: {error}"),
+            Ok(()) => return Ok(path),
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::AlreadyExists) => {}
+            Err(error) => return Err(error),
         }
     }
 }
@@ -306,7 +306,7 @@ fn must_git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> String {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|error| panic!("cannot run git {args:?} in {repo:?}: {error}"));
+        .expect("temporary Git command starts");
     child
         .stdin
         .take()
@@ -781,7 +781,8 @@ fn the_checked_in_producer_anchor_is_reachable_from_main() {
 /// transport clone then proves that current validity does not depend on either backup ref.
 #[test]
 fn rewritten_history_separates_current_backup_only_and_unresolved_anchors() {
-    let workspace = unique_temp_workspace("rewritten-history");
+    let workspace =
+        unique_temp_workspace("rewritten-history").expect("create rewritten-history workspace");
     let origin = workspace.join("origin");
     fs::create_dir(&origin).expect("temporary origin directory");
     must_git(
@@ -938,7 +939,8 @@ fn ambiguous_or_inconclusive_anchor_probes_never_turn_green() {
         AnchorReachability::Unresolved(AnchorRefusal::RepositoryChanged { .. })
     ));
 
-    let not_a_repo = unique_temp_workspace("not-a-repository");
+    let not_a_repo =
+        unique_temp_workspace("not-a-repository").expect("create non-repository workspace");
     assert!(matches!(
         classify_anchor(&not_a_repo, "6666666666666666666666666666666666666666"),
         AnchorReachability::Unresolved(AnchorRefusal::GitRefusal {
