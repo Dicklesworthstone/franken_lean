@@ -57,6 +57,32 @@
 //! healthy tree can never exercise it and the guard would be decorative on live data alone;
 //! the mutant test plants a synthetic multi-kind row rather than trusting the population.
 //!
+//! **`rootless_leaf` moved 121 -> 99 because the CLASSIFIER was wrong, not because anything
+//! was repaired, and this is the one movement in this file that is neither.** `classify`
+//! tested the *shape* rule — no `/`, therefore no root, therefore nothing to resolve against
+//! — **before** it tested tracked-ness. So a citation naming a tracked file at the
+//! repository root scored as never-denoted: `AGENTS.md` fourteen times, `README.md` four,
+//! plus `Cargo.lock`, `rust-toolchain.toml`, `ABI_CONTRACT.md` and `OLEAN_CONTRACT.md` —
+//! **22 citations across 14 rows**, every one of them denoting exactly one file. The shape
+//! rule's own rationale is that supplying a root would make the *checker* pick one; nothing
+//! is picked here, because `git ls-files` already contains the string verbatim.
+//!
+//! **What located it was two implementations disagreeing.** The `povo` population script,
+//! written independently against the same manifest, tests `a in tracked` first and has been
+//! reporting `rootless_leaf 99` for as long as this file reported 120. Neither number was
+//! ever checked against the other, because the two scans report different totals and nobody
+//! had reason to line up a sub-class. The gap is exactly the 22. A second implementation is
+//! worth its cost precisely for the case where the first one is confidently wrong, and the
+//! comparison that finds it is a *class*, not a total.
+//!
+//! Note which direction the error ran: the census **over-stated** its own defect population
+//! by 22 and was never at risk of hiding one, and the constant moved DOWN as the definition
+//! sharpened. That is not a repair and must not be read as one — no citation improved. It is
+//! also not a class boundary softened to go green, the move this file's own failure message
+//! warns about: it landed while the guard was RED for an unrelated reason, it lowers a number
+//! the guard had just successfully raised, and the reclassified members are enumerable and
+//! enumerated above.
+//!
 //! **`commit_unreachable` is ROT, not an empty referent, and the recovery method is now
 //! measured rather than assumed** (bead `fln-history-rewrite-evidence-anchor-reachability-vdi4`).
 //! The 2026-07-25 `filter-branch` did not make these anchors wrong; it made them unverifiable
@@ -150,7 +176,7 @@ use fln_conformance::execution::{Field, record_field};
 /// already measured once when an enforcement census drifted 26 → 27 → 28 while the live
 /// population stood still.
 const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
-    ("rootless_leaf", 120),
+    ("rootless_leaf", 99),
     ("glob", 20),
     ("never_existed", 15),
     ("commit_unreachable", 0),
@@ -262,14 +288,23 @@ fn classify(root: &Path, entry: &str, tracked: &BTreeSet<String>) -> &'static st
         // rests on. Unresolvable regardless of what it happens to match today.
         return "glob";
     }
+    if tracked.contains(entry) {
+        // Tested BEFORE the shape rule below, and the order is the whole point. A citation
+        // that is EXACTLY a tracked path denotes exactly one file whether or not it carries a
+        // slash — `AGENTS.md`, `README.md`, `Cargo.lock`, `rust-toolchain.toml`. The rootless
+        // rule's own rationale is that supplying a root would make the CHECKER pick one; here
+        // no root is supplied and none is picked, because `git ls-files` already contains the
+        // string verbatim. Shape-first misclassified 22 citations across 14 rows as
+        // never-denoted, which is why this class read 121 while the independently written
+        // povo population script read 99 over the same manifest. Two implementations
+        // disagreeing by exactly the tracked repo-root files is what located it.
+        return "tracked_exists";
+    }
     if !entry.contains('/') {
         // A rootless leaf states no root, so there is nothing to resolve it against. The
         // root must be stated in the ROW; supplying one in the checker would resolve all 120
         // against a directory the checker picked and prove nothing.
         return "rootless_leaf";
-    }
-    if tracked.contains(entry) {
-        return "tracked_exists";
     }
     if entry.starts_with("target/") {
         return "under_target_ephemeral";
