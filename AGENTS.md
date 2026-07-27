@@ -270,9 +270,27 @@ Before finishing a work session you MUST:
 
 ---
 
+## The routing store is the source of truth; a handoff's routing section is a summary of it
+
+Panes hand work to each other by writing `/data/tmp/claude-1000/route-<from>-to-<to>-<topic>.md` carrying the **literal before/after text** of the change proposed, because Agent Mail has repeatedly failed as a delivery channel here and a *described* change is a claim with an expiry. Each handoff then carries a routing ledger summarising what arrived and what was sent, and step 5 above is where that ledger is written.
+
+**That ledger is a summary, and it can be false at the moment it is written.** On 2026-07-27 a cc_2 handoff recorded "Nothing was routed TO me this session" while **three** files addressed to cc_2 already sat in the store: an h4o1 adoption route relaying a sequencer decision that assigned work to that very pane, a proposed UBS-TRIAGE/1 amendment, and a revised robot-schema change. All three predate the handoff — the earliest by **54 minutes** — so "they arrived afterwards" does not explain it. Nobody was careless. A ledger records what a pane *acted on*; a store holds what it *received*, and the two diverge silently in exactly the direction that strands the successor, because unacted-on items are the ones a summary has least reason to mention and most reason to be read for.
+
+> **On intake, list the routing store and read every file whose name targets you. Do not take the predecessor's ledger as the population.**
+
+```bash
+ls -t /data/tmp/claude-1000/route-*.md      # the listing IS the population; the ledger is not
+```
+
+It costs one command, and it is the section above applied to the one artifact a fresh pane has no other way to check: a status recorded at time T is a claim with an expiry, and a handoff's routing section is a status recorded by someone who has since stopped running. The filenames carry both endpoints, so the directory listing answers "what was sent to me" without trusting anyone's account of it.
+
+**What this does not earn.** It is a practice and not a mechanism: nothing reconciles a handoff's routing section against the store, nothing enforces the filename convention, and a file addressed to you in its body but not in its name is invisible to that listing. The store lives outside the repository, so nothing here can hold its contents, its retention or its path — and reading a route is not acting on one, which stays a judgement about ownership.
+
+---
+
 ## MCP Agent Mail — Multi-Agent Coordination
 
-A mail-like layer for agents to coordinate via MCP tools/resources: identities, inbox/outbox, searchable threads, advisory file reservations with human-auditable Git artifacts.
+A mail-like layer for agents to coordinate via MCP tools/resources: identities, inbox/outbox, searchable threads, advisory file reservations with human-auditable Git artifacts. **Measured unreliable for delivery in this swarm on 2026-07-27** (three failures in one day); use the routing store above and tell the sequencer the path.
 
 - **Register identity:** `ensure_project(project_key=<abs-path>)` → `register_agent(project_key, program, model)`.
 - **Reserve files before editing:** `file_reservation_paths(project_key, agent_name, ["crates/fln-kernel/**"], ttl_seconds=3600, exclusive=true, reason="br-###")`.
@@ -302,7 +320,7 @@ Two consequences you must hold together, because either alone yields a wrong rul
 flock -n /data/tmp/fln-gate.lockfile -c true    # exit 0 = free, exit 1 = HELD
 ```
 
-> **HELD means the repository is frozen. Make no change of any kind inside it.** No commits. No edits. No file creation. No `br` command that writes. Not `crates/`, not `ci/`, not `scripts/` — and **not `AGENTS.md`, `README.md` or the plan either.**
+> **HELD means something holds the gate lock — not that a lane is running. Treat the repository as frozen anyway: make no change of any kind inside it.** No commits. No edits. No file creation. No `br` command that writes. Not `crates/`, not `ci/`, not `scripts/` — and **not `AGENTS.md`, `README.md` or the plan either.** Holding still is cheap and the conservative behaviour is unchanged; what you may **not** do is report that freeze to anyone else without naming its holder, for the reason two paragraphs below.
 
 **Why three people derived three wrong rules.** `INPUT_PATHS` in `scripts/check.sh` is real, and it *looks* like the boundary — it is an explicit, short, authoritative-looking list, so everyone reads it as "these are the files that matter". It governs M2/M3 (`governed_inputs_changed`, `final_workspace_changed`) and nothing else. But the freeze is not simply "separate and stricter", which is what this paragraph used to say and what the measurement disproves: it is stricter in one direction and **blind** in the other. If you remember one thing, remember the union: **any commit kills any lane; any write to that lane's governed set kills that lane; and "my file is not on the list" is an argument about M2/M3 that says nothing about M1.**
 
@@ -318,9 +336,13 @@ The three attempts, recorded because each was made in good faith by someone foll
 
 **A failed probe is an answer, not an obstacle.** If `flock -n … && git commit …` exits 1 with no commit, the plumbing worked: the gate said *held*. Do not re-run without the guard. Written from a real one — on 2026-07-25 cc_3 diagnosed the short-circuit correctly, read it as shell friction, committed directly 16 seconds into a running lane (`bb561892`), and cost the rerun before this one.
 
-**Do not use `pgrep -f` to decide whether a lane is running.** It matches its own command line and will report a lane that is your own grep. Use `ps -eo pid,ppid,args` with your own process tree excluded — or just trust the lock, which is what it is for.
+**Do not use `pgrep -f` to decide whether a lane is running.** It matches its own command line and will report a lane that is your own grep. Use `ps -eo pid,ppid,args` with your own process tree excluded. **This sentence used to end "or just trust the lock, which is what it is for", and that clause is now measured false in both directions** — it sent readers away from the one thing that answers the question and towards the one thing that does not.
 
 **A probe that says FREE can also be wrong, and that is the harder case.** `flock -n` answers "is it held *right now*", and the answer is stale the instant it returns. The lane acquires with `flock -w 2400` — a *waiting* acquire — so it can be dispatched and queued while the lock still reads free. On 2026-07-25 three panes probed correctly, got free, and wrote; `.beads/issues.jsonl` was written at 21:23:35Z against a lane dispatched at 21:23:06Z. **Do not "fix" this by wrapping the write in `flock -w …`**: that queues your write to fire the moment the lock frees, which is precisely when the next lane takes it. There is no safe way to *gate* a write on a probe. Write when the tree is confirmed quiet, not when a probe happens to return zero.
+
+**A probe that says HELD is wrong in the mirror direction, and that is the half this file was asserting rather than doubting.** Bead `franken_lean-gate-lock-producer-optional-o2vz` records why FREE carries no information: the gate lock engages only if the caller volunteers, so an unwrapped lane leaves nothing for any probe to observe. Derived at `8c13c543`, the population is sharper than "no lane acquires it" — `fln-gate.lockfile` is named in exactly **three tracked files**, `.beads/issues.jsonl`, this file, and `ci/VERIFICATION_MANIFEST.jsonl`, every one of them prose or record. **Zero executable surfaces name it at all.** The one `flock` in `scripts/evidence.py` is an unrelated `fcntl` lock on its own descriptor, identical in the committed blob and the working copy. HELD then fails for the mirror reason: *anything* may take that path. Measured by the sequencer at 2026-07-27T08:25:56Z — a pane's `flock -n /data/tmp/fln-gate.lockfile zsh -f` (pid 2719272, state `S<s`, WCHAN `do_wait`) held the gate for nearly three minutes with **no lane running**. That form is not a probe: it runs a shell under the lock for that shell's entire life, and the probe form is the `-c true` one in the box above. Reproduced by cc_1 on a scratch lockfile at `8c13c543`, same state signature, with a planted non-lane holder: two consecutive `-c true` probes both exit 0, so the probe never holds; under the plant the prescribed probe exits 1.
+
+**So neither answer is load-bearing, and the common cause is that nothing joins this lock to lanes in either direction** — `fln-bench-apparatus-empty-referent-bkw6`'s empty referent at the process layer, where the far end of the claim is not stale but absent. It has already cost a phantom freeze: a tick printed `static since lane start`, skipped its own bead queries, and told six panes the repository was frozen for a lane that did not exist. **The repair needs no new machinery and is available in one command: name the holder before you believe it, and never publish a freeze you have not attributed.** `fuser -v <lockfile>`, `lsof <lockfile>`, or `ps -eo pid,ppid,stat,wchan,args` each yield the holding pid and its argv; classify that argv against `scripts/check.sh` and the 21 scripts in `scripts/e2e/`, and a holder matching none of them is not a lane. Note what you cannot recover afterwards: on release the lockfile is **0 bytes**, so nothing anywhere records that it was ever held, by what, or when — which is why this must be observed live and why a run's own self-report would be the wrong repair. And because a HELD probe is a block, the block-expiry section above applies to it exactly: re-test it before you wait on it, and now also name what is holding it.
 
 **A lane can kill itself.** Its own script and `scripts/evidence.py` are both tracked, so the pane running the lane must finish editing them **before** launching, not merely refrain during. A save 30 seconds in looks identical to an outsider's edit and ends the run the same way.
 
