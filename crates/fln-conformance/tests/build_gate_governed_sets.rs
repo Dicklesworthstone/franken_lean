@@ -37,6 +37,8 @@
 //! disagree" because it parsed no rows goes green forever the day its anchor moves, which is why
 //! the anchor is `expect`ed and the row count floored.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
