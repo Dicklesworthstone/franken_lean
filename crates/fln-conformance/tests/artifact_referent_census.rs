@@ -32,13 +32,30 @@
 //! say so, and a repair must **lower** it. Both directions fail the build.
 //!
 //! **The third state, said loudly because a reader will assume it does not exist.** Of the
-//! rows whose every citation is unresolvable, **17 can neither be repaired nor withdrawn**:
+//! rows whose every citation is unresolvable, **14 can neither be repaired nor withdrawn**:
 //! repaired because no recovery method exists for a citation that never denoted anything,
 //! and withdrawn because `artifacts` is required non-empty for a `complete` row, so emptying
-//! them makes them *invalid* rather than honest. Every one of the 17 is blocked by a
-//! **single** kind — 10 rootless-leaf-only, 4 glob-only, 3 never-existed-only — because they
+//! them makes them *invalid* rather than honest. Every one of the 14 is blocked by a
+//! **single** kind — 7 rootless-leaf-only, 4 glob-only, 3 never-existed-only — because they
 //! are lane-evidence rows whose entire evidence set is the lane's own output namespace,
 //! cited by name in a namespace that is unrooted and ephemeral by construction.
+//!
+//! **That decomposition was prose, and landing the repair above without it would have made
+//! it false — which is this module's own defect arriving inside this module.** Measured at
+//! `60b2e176`: it read 10/4/3 against a total of 17, and the three `fln-amv` rows that
+//! gained a checkable referent were *all* rootless-leaf-only, so moving only the headline
+//! leaves `10 rootless-leaf-only` describing a population of 7, still summing to a total
+//! that has changed. Nothing would have said so. [`THIRD_STATE_ROWS`] binds the cardinality
+//! of the **population**; a decomposition is a claim about each **member**, and
+//! `fln-cross-tree-baked-root-k60n` already measured what the difference costs — an
+//! aggregate is a budget its own repairs refill, so three rootless-leaf rows repaired here
+//! would silently fund three new glob-only ones with the total never moving.
+//! [`THIRD_STATE_BY_BLOCKING_KIND`] binds it per member, in both directions.
+//!
+//! The sentence's *other* claim — that every third-state row is blocked by a **single** kind
+//! — is bound too, by [`THIRD_STATE_MULTI_KIND_ROWS`]. It is a declared **zero**, so a
+//! healthy tree can never exercise it and the guard would be decorative on live data alone;
+//! the mutant test plants a synthetic multi-kind row rather than trusting the population.
 //!
 //! **`commit_unreachable` is ROT, not an empty referent, and the recovery method is now
 //! measured rather than assumed** (bead `fln-history-rewrite-evidence-anchor-reachability-vdi4`).
@@ -102,7 +119,23 @@ const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
 
 /// Rows whose every citation is unresolvable **and** whose blocking kinds are all
 /// never-denoted, so neither repair nor withdrawal is available. See the module header.
-const THIRD_STATE_ROWS: usize = 17;
+const THIRD_STATE_ROWS: usize = 14;
+
+/// The third state decomposed by the **sole** blocking kind of each row — the same
+/// disclosure as [`THIRD_STATE_ROWS`] at member granularity rather than population
+/// granularity, and equality is required in both directions for the same reason it is there.
+///
+/// Binding only the total is a **budget**: a repair frees a slot the whole population can
+/// refill, so a row moving between kinds is invisible and a new glob-only row lands green
+/// the moment a rootless-leaf one is repaired. Measured, not reasoned — the mutant test
+/// below moves one row between kinds and confirms the total does not budge.
+const THIRD_STATE_BY_BLOCKING_KIND: &[(&str, usize)] =
+    &[("rootless_leaf", 7), ("glob", 4), ("never_existed", 3)];
+
+/// Third-state rows blocked by **more than one** never-denoted kind, which the module header
+/// claims are none. Declared rather than asserted-away so that the first such row raises a
+/// number its author must explain, instead of reddening as if it were a defect.
+const THIRD_STATE_MULTI_KIND_ROWS: usize = 0;
 
 /// Rows whose every citation is unresolvable.
 ///
@@ -115,7 +148,7 @@ const THIRD_STATE_ROWS: usize = 17;
 /// they are equal. They measure different predicates, and merging them would make the next
 /// recoverable-class row join a population this module declares *unrepairable* instead of
 /// re-opening the gap and saying so.
-const FULLY_UNRESOLVABLE_ROWS: usize = 17;
+const FULLY_UNRESOLVABLE_ROWS: usize = 14;
 
 /// Classes that resolve to something this repository can check.
 const RESOLVABLE: &[&str] = &["tracked_exists", "bead_comment_checked", "commit_reachable"];
@@ -259,15 +292,29 @@ fn scan() -> Vec<Row> {
     rows
 }
 
-fn measure(rows: &[Row]) -> (BTreeMap<&'static str, usize>, usize, usize, usize) {
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut total = 0usize;
-    let mut fully_unresolvable = 0usize;
-    let mut third_state = 0usize;
+/// One pass over the classified rows. Named fields rather than a tuple because the
+/// decomposition below makes six of them, and a positional `_` is how a reader stops seeing
+/// which quantity a test is actually asserting on.
+#[derive(Default)]
+struct Measured {
+    counts: BTreeMap<&'static str, usize>,
+    total: usize,
+    fully_unresolvable: usize,
+    third_state: usize,
+    /// Third-state rows keyed by their **sole** blocking kind. A row blocked by more than one
+    /// kind is deliberately absent here and counted in `third_state_multi_kind` instead, so
+    /// the decomposition sums to the population only together with that count — which is what
+    /// makes dropping a row from one bucket a conservation failure rather than a smaller sum.
+    third_state_by_kind: BTreeMap<&'static str, usize>,
+    third_state_multi_kind: usize,
+}
+
+fn measure(rows: &[Row]) -> Measured {
+    let mut m = Measured::default();
     for row in rows {
         for kind in &row.kinds {
-            *counts.entry(*kind).or_default() += 1;
-            total += 1;
+            *m.counts.entry(*kind).or_default() += 1;
+            m.total += 1;
         }
         let unresolvable: Vec<&&str> = row
             .kinds
@@ -277,12 +324,25 @@ fn measure(rows: &[Row]) -> (BTreeMap<&'static str, usize>, usize, usize, usize)
         if unresolvable.is_empty() || unresolvable.len() != row.kinds.len() {
             continue;
         }
-        fully_unresolvable += 1;
+        m.fully_unresolvable += 1;
         if unresolvable.iter().all(|kind| NEVER_DENOTED.contains(kind)) {
-            third_state += 1;
+            m.third_state += 1;
+            let blocking: Vec<&'static str> = unresolvable
+                .iter()
+                .map(|kind| **kind)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            // A slice pattern rather than a length test plus an unwrap: `[sole]` *is* the
+            // single-kind case, so the exactly-one guarantee is carried by the type instead
+            // of by a panic that the branch above has already made unreachable.
+            match blocking.as_slice() {
+                [sole] => *m.third_state_by_kind.entry(*sole).or_default() += 1,
+                _ => m.third_state_multi_kind += 1,
+            }
         }
     }
-    (counts, total, fully_unresolvable, third_state)
+    m
 }
 
 /// The declared population must equal the measured one, class by class, in **both**
@@ -291,7 +351,7 @@ fn measure(rows: &[Row]) -> (BTreeMap<&'static str, usize>, usize, usize, usize)
 #[test]
 fn the_unresolvable_citation_census_matches_the_measured_population() {
     let rows = scan();
-    let (counts, total, _, _) = measure(&rows);
+    let Measured { counts, total, .. } = measure(&rows);
     assert!(
         total >= 400,
         "{total} artifact citations is implausibly few — refusing a broken scan"
@@ -363,7 +423,11 @@ fn the_unresolvable_citation_census_matches_the_measured_population() {
 #[test]
 fn the_third_state_row_count_matches_the_measured_population() {
     let rows = scan();
-    let (_, _, fully_unresolvable, third_state) = measure(&rows);
+    let Measured {
+        fully_unresolvable,
+        third_state,
+        ..
+    } = measure(&rows);
     assert_eq!(
         fully_unresolvable, FULLY_UNRESOLVABLE_ROWS,
         "rows whose every citation is unresolvable moved from {FULLY_UNRESOLVABLE_ROWS} to \
@@ -383,6 +447,175 @@ fn the_third_state_row_count_matches_the_measured_population() {
     );
 }
 
+/// The third state's **decomposition**, bound per member so a row moving between blocking
+/// kinds cannot hide inside an unchanged total.
+///
+/// The test above binds a population's cardinality. This binds each member's, which is a
+/// different guarantee and the one `fln-cross-tree-baked-root-k60n` paid to learn: an
+/// aggregate is refilled by its own repairs. It is also the guard the header sentence needed
+/// and did not have — that sentence read `10 rootless-leaf-only` while the total moved to 14,
+/// and no grep for the total could ever have found it.
+#[test]
+fn the_third_state_decomposition_matches_the_measured_population() {
+    let rows = scan();
+    let m = measure(&rows);
+
+    let mut disagreements = Vec::new();
+    let mut declared_total = 0usize;
+    for (kind, declared) in THIRD_STATE_BY_BLOCKING_KIND {
+        assert!(
+            NEVER_DENOTED.contains(kind),
+            "the decomposition declares {kind:?}, which is not a never-denoted class — a \
+             third-state row is blocked only by never-denoted kinds, so this row can never be \
+             measured and would sit here permanently unfalsifiable"
+        );
+        declared_total += declared;
+        let measured = m.third_state_by_kind.get(kind).copied().unwrap_or(0);
+        if measured != *declared {
+            disagreements.push(format!(
+                "  {kind}: disclosed {declared}, measured {measured} ({:+})",
+                measured as isize - *declared as isize
+            ));
+        }
+    }
+    for kind in m.third_state_by_kind.keys() {
+        assert!(
+            THIRD_STATE_BY_BLOCKING_KIND
+                .iter()
+                .any(|(declared, _)| declared == kind),
+            "third-state rows are blocked by {kind:?} and the decomposition never mentions it \
+             — an undeclared bucket is invisible to the equality above and to the conservation \
+             identity below at the same time"
+        );
+    }
+
+    assert!(
+        disagreements.is_empty(),
+        "the disclosed third-state decomposition no longer describes this manifest:\n{}\n\
+         Equality is required in BOTH directions, exactly as for the census above. Note what \
+         a passing TOTAL does not tell you: repairing a row of one kind frees a slot any \
+         other kind can fill, so {} rows can be right while every bucket is wrong.",
+        disagreements.join("\n"),
+        m.third_state
+    );
+    assert_eq!(
+        m.third_state_multi_kind, THIRD_STATE_MULTI_KIND_ROWS,
+        "third-state rows blocked by more than one kind moved from \
+         {THIRD_STATE_MULTI_KIND_ROWS} to {}. The module header claims every third-state row \
+         is blocked by a SINGLE kind; raise this number and say so rather than softening the \
+         sentence",
+        m.third_state_multi_kind
+    );
+    assert_eq!(
+        declared_total + m.third_state_multi_kind,
+        m.third_state,
+        "the decomposition sums to {declared_total} single-kind rows plus {} multi-kind, \
+         against a third state of {} — conservation failed, so a row is double-counted or \
+         dropped",
+        m.third_state_multi_kind,
+        m.third_state
+    );
+}
+
+/// **The planted mutant for the decomposition, and the one that matters is the mutant an
+/// aggregate-only guard cannot see.**
+///
+/// Two plants, because the two declarations fail for different reasons and a shared
+/// assertion would let one ride the other:
+///
+/// 1. A third-state row **moved between blocking kinds**. The total is provably unmoved —
+///    this test asserts that, so the claim that the old guard would have stayed green is
+///    measured here rather than argued in the header.
+/// 2. A **multi-kind** third-state row. [`THIRD_STATE_MULTI_KIND_ROWS`] is a declared zero,
+///    so live data can never exercise it; a guard over a population driven to zero is
+///    decorative, and only a synthetic member still kills the mutant.
+#[test]
+fn a_third_state_row_moving_between_blocking_kinds_is_caught_though_the_total_is_unmoved() {
+    let rows = scan();
+    let baseline = measure(&rows);
+    assert!(
+        baseline.third_state_by_kind.len() >= 2,
+        "this plant needs at least two occupied buckets to move a row between; measured {:?} \
+         — refusing a vacuous mutant rather than reporting a kill",
+        baseline.third_state_by_kind
+    );
+
+    let clone = |rows: &[Row]| -> Vec<Row> {
+        rows.iter()
+            .map(|row| Row {
+                bead: row.bead.clone(),
+                kinds: row.kinds.clone(),
+            })
+            .collect()
+    };
+    let third_state_row = |rows: &[Row], kind: &str| -> usize {
+        rows.iter()
+            .position(|row| !row.kinds.is_empty() && row.kinds.iter().all(|k| *k == kind))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no third-state row is blocked solely by {kind:?} — the plant has no subject"
+                )
+            })
+    };
+
+    // 1. Move one rootless-leaf-only row to glob-only. Same row count, same total.
+    let mut moved = clone(&rows);
+    let subject = third_state_row(&moved, "rootless_leaf");
+    moved[subject].kinds = vec!["glob"; moved[subject].kinds.len()];
+    let mutant = measure(&moved);
+    assert_eq!(
+        mutant.third_state, baseline.third_state,
+        "the plant was supposed to leave the TOTAL unmoved; if it moves the total then this \
+         mutant is killed by the aggregate guard and proves nothing about this one"
+    );
+    assert_ne!(
+        mutant.third_state_by_kind, baseline.third_state_by_kind,
+        "moving a row between blocking kinds did not move the decomposition, so this guard \
+         cannot see the one thing the aggregate guard is blind to"
+    );
+    // Asserted against the BASELINE MEASUREMENT, never against the declared constant. This
+    // test's subject is the production predicate; coupling it to the declaration makes a
+    // mutated constant kill it as well, and a mutant that dies at two cells has not told you
+    // which one was load-bearing. Measured: doing exactly that made m2 and m4 die here too.
+    let bucket = |m: &Measured, kind: &str| m.third_state_by_kind.get(kind).copied().unwrap_or(0);
+    assert_eq!(
+        bucket(&mutant, "rootless_leaf"),
+        bucket(&baseline, "rootless_leaf") - 1,
+        "the moved row did not leave the rootless_leaf bucket"
+    );
+    assert_eq!(
+        bucket(&mutant, "glob"),
+        bucket(&baseline, "glob") + 1,
+        "the moved row did not arrive in the glob bucket, so the decomposition tracks the \
+         row's identity rather than its blocking kind"
+    );
+
+    // 2. A synthetic multi-kind third-state row, since the declared population is zero.
+    let mut multi = clone(&rows);
+    multi.push(Row {
+        bead: "planted-multi-kind-decoy".to_owned(),
+        kinds: vec!["rootless_leaf", "glob"],
+    });
+    let mutant = measure(&multi);
+    assert_eq!(
+        mutant.third_state_multi_kind,
+        baseline.third_state_multi_kind + 1,
+        "a planted row blocked by two never-denoted kinds was not counted as multi-kind, so \
+         the single-kind claim in the module header rests on nothing"
+    );
+    assert_eq!(
+        mutant.third_state,
+        baseline.third_state + 1,
+        "the planted multi-kind row must still be a third-state row; if it is not, the decoy \
+         lands outside the population it was built to probe"
+    );
+    assert_eq!(
+        mutant.third_state_by_kind, baseline.third_state_by_kind,
+        "a multi-kind row must be absent from the per-kind buckets, or it is counted twice \
+         and the conservation identity is satisfied by an accident"
+    );
+}
+
 /// **The planted mutant.** An undeclared unresolvable citation must RAISE the census and be
 /// caught, rather than joining the population silently.
 ///
@@ -393,7 +626,7 @@ fn the_third_state_row_count_matches_the_measured_population() {
 #[test]
 fn an_undeclared_unresolvable_citation_is_caught_rather_than_joining_silently() {
     let rows = scan();
-    let (baseline, _, _, _) = measure(&rows);
+    let baseline = measure(&rows).counts;
 
     for (kind, planted) in [
         ("rootless_leaf", "planted_decoy_artifact.ndjson"),
@@ -417,7 +650,7 @@ fn an_undeclared_unresolvable_citation_is_caught_rather_than_joining_silently() 
         );
         mutated[0].kinds.push(observed);
 
-        let (mutant, _, _, _) = measure(&mutated);
+        let mutant = measure(&mutated).counts;
         let declared = UNRESOLVABLE_CENSUS
             .iter()
             .find(|(class, _)| *class == kind)
@@ -444,8 +677,12 @@ fn an_undeclared_unresolvable_citation_is_caught_rather_than_joining_silently() 
 #[test]
 fn an_empty_or_shallow_scan_is_refused_rather_than_reported_clean() {
     let empty: Vec<Row> = Vec::new();
-    let (counts, total, fully, third) = measure(&empty);
-    assert!(counts.is_empty() && total == 0 && fully == 0 && third == 0);
+    let m = measure(&empty);
+    assert!(m.counts.is_empty() && m.total == 0 && m.fully_unresolvable == 0);
+    assert!(
+        m.third_state == 0 && m.third_state_by_kind.is_empty() && m.third_state_multi_kind == 0,
+        "an empty scan must produce an empty decomposition, not a partial one"
+    );
     // The floors live in `scan`, so this asserts the SHAPE the floors defend: a zero
     // measurement is indistinguishable from a clean manifest, and every equality assertion
     // above would report a large disagreement rather than a pass. That direction — loud
@@ -455,5 +692,10 @@ fn an_empty_or_shallow_scan_is_refused_rather_than_reported_clean() {
         declared > 0,
         "an all-zero disclosure would make an empty scan agree with it, which is the vacuous \
          green this floor exists to prevent"
+    );
+    let declared_third: usize = THIRD_STATE_BY_BLOCKING_KIND.iter().map(|(_, n)| n).sum();
+    assert!(
+        declared_third > 0,
+        "an all-zero decomposition would agree with an empty scan for the same reason"
     );
 }
