@@ -116,6 +116,48 @@ fn robot_real_workspace_binds_complete_authority_evidence() {
     assert!(stdout.contains("\"authority_count_rule_holds\":true"));
     assert!(stdout.contains("\"governed_root_unchanged\":true"));
     assert!(stdout.contains("\"verdict\":\"pass\""));
+
+    // THE JOIN THIS TEST IS NAMED FOR, and until now it did not make it — which is why this
+    // test could not tell a fresh clone from a complete checkout.
+    //
+    // `authority:"complete"` is a fact about the governed **traversal** closure (`Authority`'s
+    // own doc-comment). The contract-handoff audit is a *different* audit, and on a tree with no
+    // census it establishes nothing and returns no snapshot — deliberately, since withholding it
+    // is what stops an absent census reading as "audited and clean"
+    // (`fln-census-empty-referent-no-mock-krb0`, commit `66bfb488`).
+    //
+    // Measured in a REAL fresh clone at `a0c9b1c8`, one variable — the same binary against the
+    // same clone, the four census shards absent then present: `verdict:"pass"` and
+    // `authority:"complete"` were **byte-identical in both**, and `contract_handoff_root` was the
+    // only field that moved, `null` to a digest. So the snapshot's absence reaches the artifact
+    // and reaches nothing else: a claim and its evidence in one artifact with no join between
+    // them, which is item 7's shape, and a reader taking `verdict` or `authority` is told
+    // "pass"/"complete" about a tree where this audit never ran.
+    //
+    // The null is bound to the filesystem rather than trusted from the string, for the same
+    // reason the no-mock rig's skip is: an absent census and a misdirected root are
+    // indistinguishable in the artifact alone.
+    if stdout.contains("\"contract_handoff_root\":null") {
+        assert!(
+            !root.join("contracts/builtin_environment.tsv").exists(),
+            "the artifact withheld a contract-handoff root while the census EXISTS at {}; that \
+             is a misdirected probe, not a fresh clone",
+            root.display()
+        );
+        eprintln!(
+            "PARTIAL robot_real_workspace_binds_complete_authority_evidence at {}: the census is \
+             absent, so NOTHING about contract-handoff authority is established by this run. The \
+             artifact's `authority`:`complete` covers the governed traversal ONLY. Every other \
+             assertion in this test did run. Shards are gitignored and unreachable from main \
+             (bead `fln-census-out-of-git-2ya9`).",
+            root.display()
+        );
+    } else {
+        assert!(
+            stdout.contains("\"contract_handoff_root\":\"fnv1a64:"),
+            "a contract-handoff root must be a digest or an explicit null, never absent: {stdout}"
+        );
+    }
 }
 
 /// A `usize` field of a flat JSON object, without a JSON dependency (D1 applies to the
