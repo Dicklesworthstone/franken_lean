@@ -593,8 +593,15 @@ jobs:
           # --validate, not --check. --check re-walks the Reference and needs an elan
           # toolchain pinned to SUITE.lock, which this runner does not install; asking
           # for it here only produced a setup failure (exit 2) that looked like a real
-          # verification. Reference-drift detection belongs in a scheduled job that
-          # actually installs the toolchain.
+          # verification. Reference-drift detection therefore runs in
+          # .github/workflows/contract-drift.yml, which installs the SUITE.lock-pinned
+          # toolchain and runs scripts/e2e/contract_drift.sh with its seeded mutants.
+          # This comment used to defer to "a scheduled job that actually installs the
+          # toolchain" and name none, because none existed; the deferral then outlived
+          # its own missing referent, which is what bead franken_lean-0kpa was filed
+          # for. Do not re-word it back into a promise: what holds the delegation is
+          # contract_roots.rs, which fails if no gate INVOKES that lane, and being
+          # named in check.sh's INPUT_PATHS or shellcheck arguments is not invocation.
           FLN_E2E_ART_ROOT="$step_root" \
             FLN_CONTRACT_HANDOFF_FULL_CENSUS=0 \
             ./scripts/e2e/contract_handoff.sh
