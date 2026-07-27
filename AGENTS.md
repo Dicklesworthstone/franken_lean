@@ -286,6 +286,8 @@ It costs one command, and it is the section above applied to the one artifact a 
 
 **What this does not earn.** It is a practice and not a mechanism: nothing reconciles a handoff's routing section against the store, nothing enforces the filename convention, and a file addressed to you in its body but not in its name is invisible to that listing. The store lives outside the repository, so nothing here can hold its contents, its retention or its path — and reading a route is not acting on one, which stays a judgement about ownership.
 
+**Writing a rule down and telling people are two different acts, and this file states only one of them.** The lesson everywhere above — a broadcast dies at the next rotation, so put it here — is one direction. Its converse is equally true and is the one that gets skipped: **landing a rule in this file reaches every *future* pane and no *current* one**, because a pane already running has read this file and has no reason to read it again. On 2026-07-27 seven rules that existed only in sequencer broadcasts were written into this repository by panes that noticed they lived nowhere durable; every one of them still needed a broadcast *as well*, because the panes that most needed them were mid-rotation and would not see the commit. Publication is for your successors, notification is for your peers, and neither substitutes for the other. **When you land a durable rule, say so to whoever sequences the swarm and ask for it to be broadcast, and record in your handoff which of the two you did** — a rule that is committed but unannounced looks identical, from inside the repository, to one that is both.
+
 ---
 
 ## MCP Agent Mail — Multi-Agent Coordination
