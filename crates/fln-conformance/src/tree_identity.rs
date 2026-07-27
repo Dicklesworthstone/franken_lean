@@ -483,6 +483,58 @@ mod tests {
         );
     }
 
+    /// The refusal must be SYMMETRIC, and the sibling above tests only one direction.
+    ///
+    /// **This is the direction that is not currently firing, which is why it needs a test
+    /// rather than an argument.** Today the bake tree is the dirtier one, so a cross-tree
+    /// artifact yields a loud false RED — a suite reporting a defect that is real about the
+    /// other checkout. Swap which tree is dirty and the identical mechanism yields a false
+    /// GREEN: a suite reporting *structurally clean* about a repository that is not the one
+    /// under test. Nobody investigates a green, so that direction is strictly worse, and it
+    /// is the one the observed instance at `5c5ada4b` did not happen to produce.
+    ///
+    /// Symmetry follows from `!=` being symmetric, and that is an argument, not a
+    /// measurement. What it does not survive is a plausible future edit: any special case of
+    /// the form "if the bake tree IS the canonical repository root, trust it" passes every
+    /// other test in this module and opens the false green alone. Measured at `ee59d283`:
+    /// `if compiled_in.starts_with("/data/projects/") { return None }` was planted in
+    /// [`cross_tree_fault`] and killed by **this test alone** — all fourteen others, including
+    /// `a_foreign_bake_tree_is_refused_and_the_message_names_both`, stayed green.
+    #[test]
+    fn the_refusal_is_symmetric_so_a_clean_bake_tree_is_refused_too() {
+        const MAIN: &str = "/data/projects/fl/tools/g";
+        const WORKTREE: &str = "/data/tmp/wt-cc_2/tools/g";
+
+        // Direction B: compiled in the MAIN tree, invoked from the worktree. The bake tree is
+        // the clean one, so an unprotected site here would report main's verdict as the
+        // worktree's — clean about a repository nobody tested.
+        let fault = cross_tree_fault(MAIN, Some(WORKTREE)).expect("the swap is still a fault");
+        assert_eq!(
+            fault,
+            CrossTreeFault::Mismatch {
+                compiled_in: MAIN.to_string(),
+                invoked_from: WORKTREE.to_string(),
+            },
+            "the fields must follow the swap rather than being normalised into one order — a \
+             message that always names the worktree as `compiled_in` is wrong half the time"
+        );
+        let message = fault.message();
+        assert!(message.contains(MAIN), "{message}");
+        assert!(message.contains(WORKTREE), "{message}");
+        assert!(
+            message.contains("COMPILED FOR A DIFFERENT CHECKOUT"),
+            "the headline may not weaken in the direction nobody investigates: {message}"
+        );
+
+        // And the pair is genuinely a swap, not two spellings of one case.
+        let forward = cross_tree_fault(WORKTREE, Some(MAIN)).expect("the sibling case");
+        assert_ne!(
+            fault, forward,
+            "if both orders produced the same value the mechanism would be normalising, and \
+             the message could not name which checkout compiled the binary"
+        );
+    }
+
     #[test]
     fn an_absent_invoking_tree_refuses_rather_than_assuming_it_matches() {
         let fault =
