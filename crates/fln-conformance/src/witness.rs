@@ -406,15 +406,46 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    (gated corpus passes; exclusions explicit)'. ci/PARITY_LEDGER.txt's header \
                    says L2 is `the pinned Reference binary produced the expected value, and \
                    ... compares ours to it on every run', with L1 for source-read evidence. \
-                   All 94 rows were earned against the SECOND; under the first, zero rows are \
-                   at L2, because no row in that file was compared on a corpus pass of any \
-                   kind. Readers resolve the first: README.md:42 and :94 advertise L0-L4 with \
+                   RE-MEASURED AT HEAD BY cc_2 ON 2026-07-27 AND CORRECTED. This sentence read \
+                   `All 94 rows were earned against the SECOND'. It conflated the row count \
+                   with the L2 population: the file holds 94 rows of which 85 are L2, and this \
+                   row's OWN citation has asserted 85 since it was written — the prose and the \
+                   tripwire beneath it disagreed from day one and nothing compares the two, \
+                   which is this matrix's own defect arriving inside a row about that defect. \
+                   Of those 85, SEVENTY-NINE were earned against the SECOND definition; under \
+                   the first, ZERO are, because no row in the file was compared on a corpus \
+                   pass of any kind — the ledger's whole fixture evidence is 687 lines, while \
+                   the one corpus-scale rig (kernel_replay.rs, 157,183 declarations against \
+                   the pin's own oleans) is cited by no row at all. SIX MEET NEITHER \
+                   DEFINITION, named here because a declared population with no members is the \
+                   empty-referent shape: BLAKE3.hash, BLAKE3.keyed_hash, BLAKE3.derive_key and \
+                   BLAKE3.finalize_xof (oracle `spec-vectors'), plus \
+                   Domain.vectors.multi-host-identity and LogicalRoot.multi-host-identity \
+                   (oracle `multi-host-attestation'). All six sit on the `hash' surface, which \
+                   is FrankenLean's own hashing rather than a Lean compatibility surface, so \
+                   the pinned Reference — having no BLAKE3 — CANNOT have produced their values \
+                   even in principle, and no gated corpus pass applies to them either. For \
+                   those six the ladder has no rung at all, which is a CATEGORY ERROR IN THE \
+                   LADDER rather than a collision between two definitions of one rung, and is \
+                   a strictly larger claim than the bead states. DELIBERATELY NOT RESOLVED: \
+                   inventing a third classification for rows whose author cannot be asked is \
+                   choosing the answer. The population is declared and its members named; the \
+                   axis is NOT built. Readers resolve the first: README.md:42 and :94 advertise L0-L4 with \
                    no local gloss, and the plan gates releases on it (R4 requires `all \
                    mandatory rows L4'). THIS ROW DOES NOT DECIDE WHICH DEFINITION WINS — that \
                    is a doctrine call above this matrix, and the bead states the cost of each \
                    direction. What it does is make the split impossible to carry silently: \
                    both definitions are governed sites, so editing either one — including to \
-                   resolve the split — fails this row until someone answers it.",
+                   resolve the split — fails this row until someone answers it. WHAT THE \
+                   2026-07-27 CORRECTION DOES NOT CHANGE, stated because it is the load-bearing \
+                   half: this edits the row's DESCRIPTION, never its enforcement. The state \
+                   stays Acknowledged, so the row still CANNOT redden while the contradiction \
+                   stands — deliberately, per the `franken_lean-e5k7' lesson that a gate which \
+                   cannot go green is one people learn to bypass. Movement is watched and the \
+                   standing contradiction is not, and making the description true does not make \
+                   it reddenable. A contradiction that can never fail the build remains the \
+                   actual defect here; nothing in this correction is a substitute for deciding \
+                   it.",
         enforcement: Enforcement::Acknowledged,
     },
     // ---- B3, decomposed -------------------------------------------------------------
