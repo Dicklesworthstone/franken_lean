@@ -11,7 +11,10 @@ use fln_verdict::{
     ProofRefusal, ProofRule, ProofStep, ProofStream, SchemaError, SchemaLimits, SolverLimits,
     SolverOutcome, UnsatProof, VariableId, check_unsat_streams, solve,
 };
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 
 const WIRE_MAGIC: &[u8; 8] = b"FLNVRDCT";
 const CNF_KIND: u8 = 1;
@@ -871,4 +874,791 @@ fn campaign_accounting_is_stable() {
     assert_eq!(PROOF_INPUTS, 512);
     assert_eq!(TOTAL_SEEDS, 5_120);
     assert_eq!(TOTAL_INPUTS, 5_120);
+}
+
+// ---------------------------------------------------------------------------
+// FL-INV-06 census cardinality join (bead fln-h1k.2)
+// ---------------------------------------------------------------------------
+
+const CENSUS_DISCLOSURE_PREFIX: &str = "Certificate-accepting path cardinality: `";
+const CERTIFICATE_BOUNDARY_MARKER: &str = "FLN-FL-INV-06-CERTIFICATE-BOUNDARY:";
+const CERTIFICATE_ALIAS_MARKER: &str = "FLN-FL-INV-06-CERTIFICATE-ALIAS:";
+const ANVIL_CENSUS: &str = "crates/fln-anvil/FL_INV_06_CERTIFICATE_CENSUS.md";
+const VERDICT_CENSUS: &str = "crates/fln-verdict/FL_INV_06_CERTIFICATE_CENSUS.md";
+
+#[derive(Debug, Clone)]
+struct CensusTree {
+    files: BTreeMap<String, String>,
+}
+
+impl CensusTree {
+    fn read(&self, path: &str) -> Result<&str, String> {
+        self.files
+            .get(path)
+            .map(String::as_str)
+            .ok_or_else(|| format!("census input {path} was not found"))
+    }
+
+    fn insert(&mut self, path: &str, contents: impl Into<String>) {
+        self.files.insert(path.to_owned(), contents.into());
+    }
+
+    fn edit(&mut self, path: &str, edit: impl FnOnce(&str) -> String) {
+        let prior = self
+            .files
+            .get(path)
+            .unwrap_or_else(|| panic!("mutant input {path} must exist"))
+            .clone();
+        self.files.insert(path.to_owned(), edit(&prior));
+    }
+}
+
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("fln-verdict must remain a direct member of the workspace crates directory")
+        .to_path_buf()
+}
+
+fn collect_census_inputs(
+    directory: &Path,
+    root: &Path,
+    files: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "census directory {} is unreadable: {error}",
+            directory.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "an entry under census directory {} is unreadable: {error}",
+                directory.display()
+            )
+        })?;
+        let kind = entry.file_type().map_err(|error| {
+            format!(
+                "census path {} has no readable file type: {error}",
+                entry.path().display()
+            )
+        })?;
+        if kind.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if kind.is_dir() {
+            collect_census_inputs(&path, root, files)?;
+            continue;
+        }
+        let name = path.file_name().and_then(|name| name.to_str());
+        let relevant = name == Some("Cargo.toml")
+            || path.extension().is_some_and(|extension| extension == "rs")
+            || name == Some("FL_INV_06_CERTIFICATE_CENSUS.md");
+        if !relevant {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("census path {} escaped the root: {error}", path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let contents = fs::read_to_string(&path)
+            .map_err(|error| format!("census input {relative} is unreadable: {error}"))?;
+        files.insert(relative, contents);
+    }
+    Ok(())
+}
+
+fn real_census_tree() -> Result<CensusTree, String> {
+    let root = repository_root();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "Cargo.toml".to_owned(),
+        fs::read_to_string(root.join("Cargo.toml"))
+            .map_err(|error| format!("workspace Cargo.toml is unreadable: {error}"))?,
+    );
+    collect_census_inputs(&root.join("crates"), &root, &mut files)?;
+    Ok(CensusTree { files })
+}
+
+fn disclosed_cardinality(tree: &CensusTree, path: &str) -> Result<usize, String> {
+    let document = tree.read(path)?;
+    let rows: Vec<&str> = document
+        .lines()
+        .filter_map(|line| line.strip_prefix(CENSUS_DISCLOSURE_PREFIX))
+        .collect();
+    if rows.len() != 1 {
+        return Err(format!(
+            "{path} must carry exactly one machine-readable `{CENSUS_DISCLOSURE_PREFIX}<n>`.` \
+             row; found {}",
+            rows.len()
+        ));
+    }
+    let encoded = rows[0]
+        .strip_suffix("`.")
+        .ok_or_else(|| format!("{path} has a malformed cardinality disclosure"))?;
+    encoded
+        .parse()
+        .map_err(|error| format!("{path} has a non-numeric cardinality {encoded:?}: {error}"))
+}
+
+fn production_prefix(source: &str) -> &str {
+    ["\n#[cfg(test)]\nmod ", "\n#[cfg(test)]\npub mod "]
+        .iter()
+        .filter_map(|marker| source.find(marker))
+        .min()
+        .map_or(source, |at| &source[..at])
+}
+
+fn manifest_facts(manifest: &str) -> (usize, usize) {
+    let mut dependency_rows = 0usize;
+    let mut target_rows = 0usize;
+    let mut section = "";
+    for line in manifest.lines() {
+        let trimmed = line.split('#').next().unwrap_or_default().trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            section = trimmed;
+            if matches!(
+                section,
+                "[lib]" | "[[bin]]" | "[[test]]" | "[[bench]]" | "[[example]]"
+            ) {
+                target_rows += 1;
+            }
+            if section.starts_with("[dependencies.")
+                || section.starts_with("[dev-dependencies.")
+                || section.starts_with("[build-dependencies.")
+                || section.contains(".dependencies.")
+            {
+                dependency_rows += 1;
+            }
+            continue;
+        }
+        if trimmed.is_empty() || !trimmed.contains('=') {
+            continue;
+        }
+        if matches!(
+            section,
+            "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
+        ) || section.ends_with(".dependencies]")
+        {
+            dependency_rows += 1;
+        }
+    }
+    (dependency_rows, target_rows)
+}
+
+fn rust_item_line(line: &str) -> bool {
+    let mut text = line.split("//").next().unwrap_or_default().trim();
+    if text.is_empty() || text.starts_with("#!") || text.starts_with("#[") {
+        return false;
+    }
+    if let Some(rest) = text.strip_prefix("pub ") {
+        text = rest.trim_start();
+    } else if text.starts_with("pub(")
+        && let Some((_, rest)) = text.split_once(") ")
+    {
+        text = rest.trim_start();
+    }
+    for qualifier in ["const ", "async ", "default "] {
+        if let Some(rest) = text.strip_prefix(qualifier) {
+            text = rest.trim_start();
+        }
+    }
+    [
+        "fn ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "impl ",
+        "mod ",
+        "type ",
+        "const ",
+        "static ",
+        "use ",
+        "extern crate ",
+        "macro_rules!",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
+fn auto_target_kind(path: &str) -> Option<&'static str> {
+    if path == "crates/fln-anvil/src/main.rs" {
+        Some("src/main.rs")
+    } else if path == "crates/fln-anvil/build.rs" {
+        Some("build.rs")
+    } else if path.starts_with("crates/fln-anvil/src/bin/") && path.ends_with(".rs") {
+        Some("src/bin")
+    } else if path.starts_with("crates/fln-anvil/tests/") && path.ends_with(".rs") {
+        Some("tests")
+    } else if path.starts_with("crates/fln-anvil/benches/") && path.ends_with(".rs") {
+        Some("benches")
+    } else if path.starts_with("crates/fln-anvil/examples/") && path.ends_with(".rs") {
+        Some("examples")
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnvilInventory {
+    package_found: bool,
+    implicit_lib_found: bool,
+    boundary_ids: BTreeSet<String>,
+    extra_rust_sources: BTreeSet<String>,
+    rust_items: BTreeSet<String>,
+    auto_targets: BTreeSet<String>,
+    dependency_rows: usize,
+    manifest_target_rows: usize,
+    workspace_consumers: BTreeSet<String>,
+}
+
+fn anvil_inventory(tree: &CensusTree) -> AnvilInventory {
+    let manifest = tree
+        .files
+        .get("crates/fln-anvil/Cargo.toml")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let (dependency_rows, manifest_target_rows) = manifest_facts(manifest);
+    let package_found = manifest
+        .lines()
+        .any(|line| line.trim() == "name = \"fln-anvil\"");
+    let implicit_lib_found = tree.files.contains_key("crates/fln-anvil/src/lib.rs");
+
+    let mut boundary_ids = BTreeSet::new();
+    let mut extra_rust_sources = BTreeSet::new();
+    let mut rust_items = BTreeSet::new();
+    let mut auto_targets = BTreeSet::new();
+    let mut workspace_consumers = BTreeSet::new();
+
+    for (path, contents) in &tree.files {
+        if path.starts_with("crates/fln-anvil/") && path.ends_with(".rs") {
+            if path != "crates/fln-anvil/src/lib.rs" {
+                extra_rust_sources.insert(path.clone());
+            }
+            if let Some(kind) = auto_target_kind(path) {
+                auto_targets.insert(format!("{kind}:{path}"));
+            }
+            for (line_number, line) in production_prefix(contents).lines().enumerate() {
+                if let Some((_, id)) = line.split_once(CERTIFICATE_BOUNDARY_MARKER) {
+                    boundary_ids.insert(id.trim().to_owned());
+                }
+                if rust_item_line(line) {
+                    rust_items.insert(format!("{path}:{}", line_number + 1));
+                }
+            }
+            continue;
+        }
+
+        if !path.starts_with("crates/") || path.starts_with("crates/fln-anvil/") {
+            continue;
+        }
+        if path.ends_with("/Cargo.toml") {
+            let mut section = "";
+            for line in contents.lines() {
+                let trimmed = line.split('#').next().unwrap_or_default().trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    section = trimmed;
+                    continue;
+                }
+                let dependency_section = matches!(
+                    section,
+                    "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
+                ) || section.ends_with(".dependencies]");
+                if dependency_section && trimmed.contains("fln-anvil") {
+                    workspace_consumers.insert(path.clone());
+                }
+            }
+        } else if path.contains("/src/")
+            && path.ends_with(".rs")
+            && production_prefix(contents).contains("fln_anvil")
+        {
+            workspace_consumers.insert(path.clone());
+        }
+    }
+
+    AnvilInventory {
+        package_found,
+        implicit_lib_found,
+        boundary_ids,
+        extra_rust_sources,
+        rust_items,
+        auto_targets,
+        dependency_rows,
+        manifest_target_rows,
+        workspace_consumers,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FunctionSite {
+    path: String,
+    line: usize,
+    name: String,
+    header: String,
+    marker: Option<(bool, String)>,
+}
+
+fn function_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") || trimmed.starts_with('#') {
+        return None;
+    }
+    let at = trimmed.find("fn ")?;
+    let prefix = &trimmed[..at];
+    if !prefix.trim().is_empty()
+        && !prefix
+            .split_whitespace()
+            .all(|word| matches!(word, "pub" | "const" | "async" | "default"))
+        && !prefix.starts_with("pub(")
+    {
+        return None;
+    }
+    let after = &trimmed[at + 3..];
+    let name: String = after
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn function_sites(path: &str, source: &str) -> Vec<FunctionSite> {
+    let production = production_prefix(source);
+    let lines: Vec<&str> = production.lines().collect();
+    let mut pending_marker: Option<(bool, String)> = None;
+    let mut sites = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some((_, id)) = line.split_once(CERTIFICATE_BOUNDARY_MARKER) {
+            pending_marker = Some((true, id.trim().to_owned()));
+            index += 1;
+            continue;
+        }
+        if let Some((_, id)) = line.split_once(CERTIFICATE_ALIAS_MARKER) {
+            pending_marker = Some((false, id.trim().to_owned()));
+            index += 1;
+            continue;
+        }
+        let Some(name) = function_name(line) else {
+            index += 1;
+            continue;
+        };
+        let start = index;
+        let mut header = line.trim().to_owned();
+        while !header.contains('{') && !header.ends_with(';') && index + 1 < lines.len() {
+            index += 1;
+            header.push(' ');
+            header.push_str(lines[index].trim());
+        }
+        sites.push(FunctionSite {
+            path: path.to_owned(),
+            line: start + 1,
+            name,
+            header,
+            marker: pending_marker.take(),
+        });
+        index += 1;
+    }
+    sites
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedBoundary {
+    id: &'static str,
+    path: &'static str,
+    function: &'static str,
+}
+
+const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 6] = [
+    ExpectedBoundary {
+        id: "structured-proof-construction",
+        path: "crates/fln-verdict/src/lib.rs",
+        function: "new",
+    },
+    ExpectedBoundary {
+        id: "canonical-proof-decode",
+        path: "crates/fln-verdict/src/lib.rs",
+        function: "from_canonical_bytes",
+    },
+    ExpectedBoundary {
+        id: "streaming-semantic-checker",
+        path: "crates/fln-verdict/src/checker.rs",
+        function: "check_unsat_streams",
+    },
+    ExpectedBoundary {
+        id: "solver-finish-unsat",
+        path: "crates/fln-verdict/src/solver.rs",
+        function: "finish_unsat",
+    },
+    ExpectedBoundary {
+        id: "reflected-artifact-construction",
+        path: "crates/fln-verdict/src/reflection.rs",
+        function: "from_bitblast_unsat",
+    },
+    ExpectedBoundary {
+        id: "kernel-capability-publication",
+        path: "crates/fln-verdict/src/reflection.rs",
+        function: "publish_reflected_theorem",
+    },
+];
+
+const EXPECTED_VERDICT_ALIASES: [ExpectedBoundary; 1] = [ExpectedBoundary {
+    id: "streaming-semantic-checker",
+    path: "crates/fln-verdict/src/checker.rs",
+    function: "check_unsat_streams_with_cancel",
+}];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerdictInventory {
+    source_files: BTreeSet<String>,
+    boundaries: BTreeMap<String, (String, String)>,
+    aliases: BTreeMap<String, (String, String)>,
+    unmarked_sensitive_functions: BTreeSet<String>,
+    sensitive_call_counts: BTreeMap<&'static str, usize>,
+    marker_faults: Vec<String>,
+}
+
+fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
+    let mut source_files = BTreeSet::new();
+    let mut boundaries = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    let mut unmarked_sensitive_functions = BTreeSet::new();
+    let mut sensitive_call_counts = BTreeMap::from([
+        ("check_unsat_streams_with_cancel(", 0usize),
+        ("UnsatProof::new(", 0usize),
+        ("UnsatProof::from_canonical_bytes(", 0usize),
+        ("ReflectedTheoremArtifact::from_bitblast_unsat(", 0usize),
+    ]);
+    let mut marker_faults = Vec::new();
+
+    for (path, source) in &tree.files {
+        if !path.starts_with("crates/fln-verdict/src/") || !path.ends_with(".rs") {
+            continue;
+        }
+        source_files.insert(path.clone());
+        let production = production_prefix(source);
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            for (needle, count) in &mut sensitive_call_counts {
+                *count += line.matches(*needle).count();
+            }
+        }
+
+        for site in function_sites(path, source) {
+            match &site.marker {
+                Some((true, id)) => {
+                    if boundaries
+                        .insert(id.clone(), (site.path.clone(), site.name.clone()))
+                        .is_some()
+                    {
+                        marker_faults.push(format!("duplicate-boundary:{id}"));
+                    }
+                }
+                Some((false, id)) => {
+                    let key = format!("{id}:{}", site.name);
+                    if aliases
+                        .insert(key.clone(), (site.path.clone(), site.name.clone()))
+                        .is_some()
+                    {
+                        marker_faults.push(format!("duplicate-alias:{key}"));
+                    }
+                }
+                None => {}
+            }
+
+            let sensitive = [
+                "UnsatProof",
+                "CheckedUnsat",
+                "ReflectedTheoremArtifact",
+                "ProofCheckOutcome",
+            ]
+            .iter()
+            .any(|needle| site.header.contains(needle))
+                || matches!(
+                    site.name.as_str(),
+                    "check_unsat_streams"
+                        | "check_unsat_streams_with_cancel"
+                        | "finish_unsat"
+                        | "publish_reflected_theorem"
+                        | "from_bitblast_unsat"
+                );
+            let allowed_projection =
+                site.path == "crates/fln-verdict/src/solver.rs" && site.name == "proof";
+            if sensitive && site.marker.is_none() && !allowed_projection {
+                unmarked_sensitive_functions
+                    .insert(format!("{}:{}:{}", site.path, site.line, site.name));
+            }
+        }
+    }
+
+    VerdictInventory {
+        source_files,
+        boundaries,
+        aliases,
+        unmarked_sensitive_functions,
+        sensitive_call_counts,
+        marker_faults,
+    }
+}
+
+fn census_findings(tree: &CensusTree) -> Vec<String> {
+    let mut findings = Vec::new();
+    let anvil = anvil_inventory(tree);
+    if !anvil.package_found {
+        findings.push("anvil-sentinel: package manifest was not resolved".to_owned());
+    }
+    if !anvil.implicit_lib_found {
+        findings.push("anvil-sentinel: implicit library root was not resolved".to_owned());
+    }
+    match disclosed_cardinality(tree, ANVIL_CENSUS) {
+        Ok(disclosed) if disclosed != anvil.boundary_ids.len() => findings.push(format!(
+            "anvil-cardinality: census discloses {disclosed}, production markers derive {}",
+            anvil.boundary_ids.len()
+        )),
+        Err(error) => findings.push(format!("anvil-cardinality: {error}")),
+        Ok(_) => {}
+    }
+    if !anvil.extra_rust_sources.is_empty() {
+        findings.push(format!(
+            "anvil-footprint: extra Rust sources {:?}",
+            anvil.extra_rust_sources
+        ));
+    }
+    if !anvil.rust_items.is_empty() {
+        findings.push(format!(
+            "anvil-footprint: Rust items/modules {:?}",
+            anvil.rust_items
+        ));
+    }
+    if !anvil.auto_targets.is_empty() {
+        findings.push(format!(
+            "anvil-footprint: Cargo auto-discovery targets {:?}",
+            anvil.auto_targets
+        ));
+    }
+    if anvil.dependency_rows != 0 {
+        findings.push(format!(
+            "anvil-footprint: {} dependency rows",
+            anvil.dependency_rows
+        ));
+    }
+    if anvil.manifest_target_rows != 0 {
+        findings.push(format!(
+            "anvil-footprint: {} explicit manifest target rows",
+            anvil.manifest_target_rows
+        ));
+    }
+    if !anvil.workspace_consumers.is_empty() {
+        findings.push(format!(
+            "anvil-footprint: workspace consumers {:?}",
+            anvil.workspace_consumers
+        ));
+    }
+
+    let verdict = verdict_inventory(tree);
+    if verdict.source_files.len() < 6 {
+        findings.push(format!(
+            "verdict-sentinel: only {} production source files were resolved",
+            verdict.source_files.len()
+        ));
+    }
+    if !verdict.marker_faults.is_empty() {
+        findings.push(format!("verdict-markers: {:?}", verdict.marker_faults));
+    }
+    let expected: BTreeMap<String, (String, String)> = EXPECTED_VERDICT_BOUNDARIES
+        .iter()
+        .map(|site| {
+            (
+                site.id.to_owned(),
+                (site.path.to_owned(), site.function.to_owned()),
+            )
+        })
+        .collect();
+    if verdict.boundaries != expected {
+        findings.push(format!(
+            "verdict-boundaries: expected {expected:?}, derived {:?}",
+            verdict.boundaries
+        ));
+    }
+    let expected_aliases: BTreeMap<String, (String, String)> = EXPECTED_VERDICT_ALIASES
+        .iter()
+        .map(|site| {
+            (
+                format!("{}:{}", site.id, site.function),
+                (site.path.to_owned(), site.function.to_owned()),
+            )
+        })
+        .collect();
+    if verdict.aliases != expected_aliases {
+        findings.push(format!(
+            "verdict-aliases: expected {expected_aliases:?}, derived {:?}",
+            verdict.aliases
+        ));
+    }
+    if !verdict.unmarked_sensitive_functions.is_empty() {
+        findings.push(format!(
+            "verdict-unmarked: certificate-sensitive functions {:?}",
+            verdict.unmarked_sensitive_functions
+        ));
+    }
+    let expected_calls = BTreeMap::from([
+        ("check_unsat_streams_with_cancel(", 3usize),
+        ("UnsatProof::new(", 1usize),
+        ("UnsatProof::from_canonical_bytes(", 0usize),
+        ("ReflectedTheoremArtifact::from_bitblast_unsat(", 1usize),
+    ]);
+    if verdict.sensitive_call_counts != expected_calls {
+        findings.push(format!(
+            "verdict-calls: expected {expected_calls:?}, derived {:?}",
+            verdict.sensitive_call_counts
+        ));
+    }
+    match disclosed_cardinality(tree, VERDICT_CENSUS) {
+        Ok(disclosed) if disclosed != verdict.boundaries.len() => findings.push(format!(
+            "verdict-cardinality: census discloses {disclosed}, production sites derive {}",
+            verdict.boundaries.len()
+        )),
+        Err(error) => findings.push(format!("verdict-cardinality: {error}")),
+        Ok(_) => {}
+    }
+    findings
+}
+
+fn assert_mutant_finding(tree: &CensusTree, needle: &str) {
+    let findings = census_findings(tree);
+    assert!(
+        findings.iter().any(|finding| finding.contains(needle)),
+        "mutant survived without its intended {needle:?} finding: {findings:?}"
+    );
+}
+
+#[test]
+fn fl_inv_06_certificate_censuses_match_the_derived_production_cardinalities() {
+    let tree = real_census_tree().expect("FL-INV-06 census inputs must be readable");
+    let findings = census_findings(&tree);
+    assert!(
+        findings.is_empty(),
+        "FL-INV-06 census cardinality join failed: {findings:#?}"
+    );
+}
+
+#[test]
+fn fl_inv_06_census_mutants_change_the_referent_and_die() {
+    let baseline = real_census_tree().expect("FL-INV-06 census inputs must be readable");
+    assert!(
+        census_findings(&baseline).is_empty(),
+        "mutation campaign requires a clean positive control"
+    );
+    let base_anvil = anvil_inventory(&baseline);
+    let base_verdict = verdict_inventory(&baseline);
+
+    let mut auto_bench = baseline.clone();
+    auto_bench.insert(
+        "crates/fln-anvil/benches/probe.rs",
+        "#![forbid(unsafe_code)]\nfn main() {}\n",
+    );
+    assert_eq!(
+        anvil_inventory(&auto_bench).auto_targets.len(),
+        base_anvil.auto_targets.len() + 1,
+        "auto-discovered benches/*.rs mutant did not enter the derived inventory"
+    );
+    assert_mutant_finding(&auto_bench, "Cargo auto-discovery targets");
+
+    let mut inline_item = baseline.clone();
+    inline_item.edit("crates/fln-anvil/src/lib.rs", |source| {
+        format!("{source}\n\npub fn probe_engine() {{}}\n")
+    });
+    assert_eq!(
+        anvil_inventory(&inline_item).rust_items.len(),
+        base_anvil.rust_items.len() + 1,
+        "inline Anvil item mutant did not enter the derived inventory"
+    );
+    assert_mutant_finding(&inline_item, "Rust items/modules");
+
+    let mut dependency = baseline.clone();
+    dependency.edit("crates/fln-anvil/Cargo.toml", |manifest| {
+        manifest.replacen(
+            "[dependencies]",
+            "[dependencies]\nfln-core = { path = \"../fln-core\" }",
+            1,
+        )
+    });
+    assert_eq!(
+        anvil_inventory(&dependency).dependency_rows,
+        base_anvil.dependency_rows + 1,
+        "Anvil dependency mutant did not enter the derived inventory"
+    );
+    assert_mutant_finding(&dependency, "dependency rows");
+
+    let mut consumer = baseline.clone();
+    consumer.edit("crates/fln-core/src/lib.rs", |source| {
+        format!("{source}\n\npub fn probe_anvil(_: fln_anvil::Probe) {{}}\n")
+    });
+    assert_eq!(
+        anvil_inventory(&consumer).workspace_consumers.len(),
+        base_anvil.workspace_consumers.len() + 1,
+        "external Anvil consumer mutant did not enter the derived inventory"
+    );
+    assert_mutant_finding(&consumer, "workspace consumers");
+
+    let mut seventh = baseline.clone();
+    seventh.edit("crates/fln-verdict/src/checker.rs", |source| {
+        let injected = "\n// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: foreign-proof-consumer\n\
+                        pub fn accept_foreign_proof(proof: UnsatProof) -> ProofCheckOutcome {\n\
+                            check_unsat_streams_with_cancel(&[][..], proof.to_canonical_bytes().as_slice(), \
+                                                           ProofCheckLimits::default(), || false)\n\
+                        }\n";
+        match source.split_once("\n#[cfg(test)]") {
+            Some((production, tests)) => format!("{production}{injected}\n#[cfg(test)]{tests}"),
+            None => format!("{source}{injected}"),
+        }
+    });
+    assert_eq!(
+        verdict_inventory(&seventh).boundaries.len(),
+        base_verdict.boundaries.len() + 1,
+        "seventh Verdict consumer mutant did not enter the derived referent"
+    );
+    assert_mutant_finding(&seventh, "verdict-boundaries");
+
+    let mut removed = baseline.clone();
+    removed.edit("crates/fln-verdict/src/reflection.rs", |source| {
+        source.replacen(
+            "// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: reflected-artifact-construction\n",
+            "",
+            1,
+        )
+    });
+    assert_eq!(
+        verdict_inventory(&removed).boundaries.len() + 1,
+        base_verdict.boundaries.len(),
+        "removed Verdict join mutant did not leave the derived referent"
+    );
+    assert_mutant_finding(&removed, "verdict-boundaries");
+
+    let mut anvil_count = baseline.clone();
+    anvil_count.edit(ANVIL_CENSUS, |document| {
+        document.replacen(
+            "Certificate-accepting path cardinality: `0`.",
+            "Certificate-accepting path cardinality: `1`.",
+            1,
+        )
+    });
+    assert_mutant_finding(&anvil_count, "anvil-cardinality");
+
+    let mut verdict_count = baseline;
+    verdict_count.edit(VERDICT_CENSUS, |document| {
+        document.replacen(
+            "Certificate-accepting path cardinality: `6`.",
+            "Certificate-accepting path cardinality: `5`.",
+            1,
+        )
+    });
+    assert_mutant_finding(&verdict_count, "verdict-cardinality");
 }

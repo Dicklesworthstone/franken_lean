@@ -270,6 +270,7 @@ impl ProofCheckOutcome {
 }
 
 /// Check canonical CNF and UNSAT-proof byte streams without materializing the proof.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: streaming-semantic-checker
 pub fn check_unsat_streams<C, P>(cnf: C, proof: P, limits: ProofCheckLimits) -> ProofCheckOutcome
 where
     C: Read,
@@ -279,6 +280,7 @@ where
 }
 
 /// As [`check_unsat_streams`], with a deterministic cancellation observation hook.
+// FLN-FL-INV-06-CERTIFICATE-ALIAS: streaming-semantic-checker
 pub fn check_unsat_streams_with_cancel<C, P, F>(
     cnf: C,
     proof: P,

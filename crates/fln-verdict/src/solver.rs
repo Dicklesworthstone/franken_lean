@@ -1382,6 +1382,7 @@ impl<'a> Engine<'a> {
         Ok(current_id)
     }
 
+    // FLN-FL-INV-06-CERTIFICATE-BOUNDARY: solver-finish-unsat
     fn finish_unsat<F>(&mut self, conflict: usize, cancelled: &mut F) -> EngineResult<SolverOutcome>
     where
         F: FnMut() -> bool,

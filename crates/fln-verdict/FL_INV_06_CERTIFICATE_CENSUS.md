@@ -38,6 +38,7 @@ found while producing this census is tracked separately by open bug
 
 Aliases that share one implementation join are grouped in one row. The
 certificate-accepting join count in this boundary is exactly **six**.
+Certificate-accepting path cardinality: `6`.
 
 ## Census
 

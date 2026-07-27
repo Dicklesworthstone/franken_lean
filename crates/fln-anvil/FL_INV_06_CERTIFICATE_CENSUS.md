@@ -25,6 +25,7 @@ in its comments 1313 and 1328. Future implementation obligations remain on
   and every public re-export or workspace consumer of such a route.
 
 The certificate-accepting path count in that boundary is exactly **zero**.
+Certificate-accepting path cardinality: `0`.
 
 ## Census
 

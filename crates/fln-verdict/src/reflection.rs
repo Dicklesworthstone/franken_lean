@@ -139,6 +139,7 @@ impl ReflectedTheoremArtifact {
     /// already-assembled declaration with a different type or membership list.
     /// Crucible still validates the resulting proof term before the opaque
     /// capability can exist.
+    // FLN-FL-INV-06-CERTIFICATE-BOUNDARY: reflected-artifact-construction
     pub fn from_bitblast_unsat(
         bitblast: BitblastArtifact,
         certificate: CheckedUnsat,
@@ -324,6 +325,7 @@ fn cancelled(checkpoint: ReflectedTheoremCheckpoint) -> ReflectedTheoremOutcome 
 /// No intermediate authority token is public. Every refusal, cancellation,
 /// exhaustion, internal fault, stale plan, or duplicate name returns without an
 /// environment containing the candidate theorem.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: kernel-capability-publication
 pub fn publish_reflected_theorem(
     environment: &Environment,
     artifact: ReflectedTheoremArtifact,

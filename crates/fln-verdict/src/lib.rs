@@ -887,6 +887,7 @@ pub struct UnsatProof {
 }
 
 impl UnsatProof {
+    // FLN-FL-INV-06-CERTIFICATE-BOUNDARY: structured-proof-construction
     pub fn new(
         cnf: &Cnf,
         mut steps: Vec<ProofStep>,
@@ -956,6 +957,7 @@ impl UnsatProof {
         writer.finish()
     }
 
+    // FLN-FL-INV-06-CERTIFICATE-BOUNDARY: canonical-proof-decode
     pub fn from_canonical_bytes(
         bytes: &[u8],
         cnf: &Cnf,
