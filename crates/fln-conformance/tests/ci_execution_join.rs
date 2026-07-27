@@ -94,9 +94,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fln_conformance::execution::{
-    CiJob, Field, PIN_COORDINATES, check_sh_reaches_workspace, ci_jobs, e2e_scenario_keys,
-    ignored_tests, installs_reference_pin, is_terminal, reach_covers, reaches_the_pinned_reference,
-    record_field, test_reach, workspace_member_patterns,
+    CiJob, Field, PIN_COORDINATES, autodiscovery_overrides, check_sh_reaches_workspace, ci_jobs,
+    e2e_scenario_keys, ignored_tests, installs_reference_pin, is_terminal, module_path_prefix,
+    reach_covers, reaches_the_pinned_reference, record_field, test_function_citation,
+    test_functions, test_reach, workspace_member_patterns,
 };
 
 // ---------------------------------------------------------------------------
@@ -222,6 +223,126 @@ const IGNORED_PRODUCER_CEILING: usize = 5;
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
 
+/// Terminal rows whose evidence is stated at a granularity **coarser than the unit that runs**.
+///
+/// A coverage row cites a *file*; cargo compiles a *target*; libtest runs a *function*. Two
+/// shapes, and the second is the worse one:
+///
+/// - **A** — the row cites an integration target (`tests/*.rs`, or `cargo-test:<stem>`). That
+///   names one real cargo target, but the target holds many functions and the row names none.
+/// - **B** — the row cites a `src/*.rs` carrying `#[cfg(test)]` tests. There is **no cargo
+///   invocation at all** that runs that file's tests: the narrowest selectable unit is
+///   `-p <pkg> --lib`, which is every sibling source file's tests too.
+///
+/// Measured at `29852ec1` over the 166 coverage rows: A is 53 rows (47 terminal), B is 45 (37),
+/// and the union is **80 rows, 70 of them terminal**, with **1733 test functions** behind the
+/// terminal citations. `crates/fln-env/src/extensions.rs` alone carries 87 functions in a lib
+/// target shared with 11 sibling files, and three rows cite it.
+///
+/// **A and B are one mechanism, and the check that says so is the one that says povo and ywmq
+/// are not.** Same producer (the test binary), same repair (name a runnable libtest unit), same
+/// change site, one law preventing both recurrences. The first draft of this guard scoped the
+/// population to A and would have left 27 terminal B rows outside a guard written to catch
+/// them — `franken_lean-worktree-gitdir-refusal-hugg`'s criticism, committed here, caught by
+/// re-reading the question rather than by the derivation.
+///
+/// **What this is not.** No row here is claimed false; several are separately compensated, as
+/// [`IGNORED_PRODUCER_ALLOWANCE`] records. This is
+/// `fln-bench-apparatus-empty-referent-bkw6`'s move applied to *granularity* — bind the claim
+/// to the **cardinality** of what it asserts and let the number fail in both directions — and
+/// the fact it binds is exact: **the manifest cannot say which test 70 terminal rows rest on.**
+///
+/// **The shrink direction is reachable, which is what makes equality honest rather than a
+/// wall.** `fln-shrinking-allowance-guard-direction` is this lineage's own finding that an
+/// equality check is a wall when a correct repair cannot satisfy it. Not so here: the migration
+/// ships with the ratchet — replace the citation with `test:<pkg>::<target>::<path>`, which
+/// [`test_function_citation`] parses and [`judge_granularity`] resolves against the target's
+/// real function list. Every entry is a debt, not a budget.
+const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
+    "fln-22i1",
+    "fln-23cz",
+    "fln-2bn5",
+    "fln-46mw",
+    "fln-49c",
+    "fln-4yos",
+    "fln-7odd",
+    "fln-8138",
+    "fln-8gz3",
+    "fln-8zsq",
+    "fln-9wya",
+    "fln-amv.14",
+    "fln-bench-apparatus-empty-referent-bkw6",
+    "fln-c78c",
+    "fln-corpus-thread-matrix-93te",
+    "fln-env-merge-resource-envelope-9m74",
+    "fln-ffam",
+    "fln-glml",
+    "fln-judgement-row-not-bound-to-its-closure-iumd",
+    "fln-kernel-loc-disclosure-foreign-counter-c118",
+    "fln-kx3y",
+    "fln-laxj",
+    "fln-mandated-mutant-join-unwatched-uagk",
+    "fln-okfb",
+    "fln-pu6i",
+    "fln-q8qt",
+    "fln-q944",
+    "fln-rwz",
+    "fln-sn0w",
+    "fln-sr2z",
+    "fln-stc1",
+    "fln-sv7x",
+    "fln-uc44",
+    "fln-um4a",
+    "fln-uuuz",
+    "fln-yswb",
+    "fln-zti3",
+    "franken_lean-008q",
+    "franken_lean-0sv9",
+    "franken_lean-2jht",
+    "franken_lean-2ki4",
+    "franken_lean-4o3n",
+    "franken_lean-81oq",
+    "franken_lean-admission-tripwire-needles-unbound-en9q",
+    "franken_lean-c24a",
+    "franken_lean-checker-charter-line-citations-unbound-68ob",
+    "franken_lean-claim-matrix-doc-ci-mhew",
+    "franken_lean-dgxa",
+    "franken_lean-e5k7",
+    "franken_lean-eh0c",
+    "franken_lean-ex54",
+    "franken_lean-ext-observable-fixture-drift-gap-vqnu",
+    "franken_lean-h5z1",
+    "franken_lean-hv9m",
+    "franken_lean-kxbj",
+    "franken_lean-l84f",
+    "franken_lean-lu5",
+    "franken_lean-mrlo",
+    "franken_lean-mvak",
+    "franken_lean-oh1j",
+    "franken_lean-ome7",
+    "franken_lean-oof9",
+    "franken_lean-pmap-refusal-outcome-taxonomy-i1z9",
+    "franken_lean-pnav",
+    "franken_lean-r0xu",
+    "franken_lean-r2st",
+    "franken_lean-r4m8",
+    "franken_lean-sxsk",
+    "franken_lean-tkr2",
+    "franken_lean-vui8",
+];
+
+/// The ratchet for [`FILE_GRANULAR_EVIDENCE_ALLOWANCE`], by equality, for the reason
+/// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
+const FILE_GRANULAR_EVIDENCE_CEILING: usize = 70;
+
+/// The floor beneath [`judge_granularity`]'s vacuity check.
+///
+/// A population whose cited surfaces each held **one** test function would be a distinction
+/// without a difference — file granularity and function granularity would name the same thing,
+/// and the finding would be measuring nothing. 1733 at `29852ec1`; the floor sits an order of
+/// magnitude below so ordinary churn never trips it and a collapsed scan always does.
+const FILE_GRANULAR_FANOUT_FLOOR: usize = 150;
+
 // ---------------------------------------------------------------------------
 // The derivation, gathered from disk
 // ---------------------------------------------------------------------------
@@ -232,6 +353,12 @@ struct TerminalRow {
     bead: String,
     surfaces: BTreeSet<String>,
     scenarios: Vec<String>,
+    /// Surfaces this row names at a granularity coarser than the unit that runs: an
+    /// integration target (shape A) or a `src/*.rs` with unit tests (shape B).
+    coarse: BTreeSet<String>,
+    /// Raw `test:`-prefixed artifacts, resolved by [`judge_granularity`] rather than here, so
+    /// an unresolvable one is a **finding** and not a silently dropped artifact.
+    fine: Vec<String>,
 }
 
 /// Everything the guard measures, in one value, so [`judge`] is a pure function of it and
@@ -251,6 +378,21 @@ struct Derivation {
     pin_module: String,
     /// `(surface, function)` for every `#[ignore]`d test cargo compiles and never runs.
     ignored: BTreeSet<(String, String)>,
+    /// `<stem>` → path, for every integration target cargo auto-discovers. Replaces the old
+    /// stem map, which was **not injective**: it ingested every `.rs` under a `tests/` tree, so
+    /// the three `tests/common/mod.rs` modules all claimed the stem `mod` and two vanished
+    /// silently — a key used as an identity with nobody checking, live at `29852ec1`.
+    targets: BTreeMap<String, String>,
+    /// `<stem>` → the `#[test]` functions inside that integration target.
+    target_tests: BTreeMap<String, BTreeSet<String>>,
+    /// `<package>` → `(module path prefix, function)` for every lib unit test.
+    lib_tests: BTreeMap<String, BTreeSet<(String, String)>>,
+    /// member directory → the package name its manifest **declares**. Read, never inferred
+    /// from the directory name, which merely happens to match for all 33 members today.
+    packages: BTreeMap<String, String>,
+    /// `(where, reason)` for everything that makes the layout-derived target set incomplete:
+    /// a manifest override, a directory-style target, a stem collision, a `#[path]` attribute.
+    granularity_preconditions: Vec<(String, String)>,
 }
 
 fn read(root: &Path, relative: &str) -> String {
@@ -445,15 +587,114 @@ fn derive(root: &Path) -> Derivation {
     // `cargo-test:<stem>` names an integration target; cargo binds a target's name to its
     // file stem under `tests/`, so unlike the e2e scenario convention this binding is the
     // build system's, not a local habit.
-    let mut by_stem: BTreeMap<String, String> = BTreeMap::new();
+    //
+    // **Only what cargo auto-discovers.** The previous version of this map took every `.rs`
+    // whose path contained `/tests/`, which ingested the three `tests/common/mod.rs` modules
+    // as well — all three claiming the stem `mod`, last insert winning, the other two gone in
+    // silence. That key denoted no cargo target at all and collided three ways, at
+    // `29852ec1`; no row cited it, so it produced no wrong answer *yet*. Restricting to
+    // top-level `tests/*.rs` under a declared member drops exactly that key and moves no
+    // terminal row's resolved surface set — measured before the change, not assumed.
+    let mut targets: BTreeMap<String, String> = BTreeMap::new();
+    let mut preconditions: Vec<(String, String)> = Vec::new();
     for path in surfaces.keys() {
-        if !path.contains("/tests/") {
+        let Some((member, file)) = path.rsplit_once("/tests/") else {
+            continue;
+        };
+        if file.contains('/') || !members.iter().any(|m| m == member) {
             continue;
         }
-        if let Some(stem) = path.rsplit('/').next().and_then(|n| n.strip_suffix(".rs")) {
-            by_stem.insert(stem.to_string(), path.clone());
+        let Some(stem) = file.strip_suffix(".rs") else {
+            continue;
+        };
+        if let Some(previous) = targets.insert(stem.to_string(), path.clone()) {
+            preconditions.push((
+                path.clone(),
+                format!(
+                    "shares its file stem with {previous}, so `cargo-test:<stem>` has stopped \
+                     denoting one target — a key used as an identity without injectivity"
+                ),
+            ));
         }
     }
+    let target_tests: BTreeMap<String, BTreeSet<String>> = targets
+        .iter()
+        .map(|(stem, path)| {
+            (
+                stem.clone(),
+                test_functions(&surfaces[path]).into_iter().collect(),
+            )
+        })
+        .collect();
+    let by_stem = targets.clone();
+
+    // The lib half: a `src/*.rs`'s unit tests compile into the crate's ONE lib target, so the
+    // file is not a selectable unit at all. Keyed by package because that is what `-p` takes.
+    let mut packages: BTreeMap<String, String> = BTreeMap::new();
+    let mut lib_tests: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    for member in &members {
+        let manifest = read(root, &format!("{member}/Cargo.toml"));
+        let name = manifest
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix("name")?.trim_start();
+                let value = rest.strip_prefix('=')?.trim();
+                value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                panic!("scan: {member}/Cargo.toml declares no package name this reader can find")
+            });
+        for reason in autodiscovery_overrides(&manifest) {
+            preconditions.push((format!("{member}/Cargo.toml"), reason.to_string()));
+        }
+        if let Ok(entries) = fs::read_dir(root.join(member).join("tests")) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() && entry.path().join("main.rs").is_file() {
+                    preconditions.push((
+                        format!(
+                            "{member}/tests/{}/main.rs",
+                            entry.file_name().to_string_lossy()
+                        ),
+                        "is a directory-style integration target this layout rule does not model"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        packages.insert(member.clone(), name.clone());
+        for (path, text) in &surfaces {
+            if !path.starts_with(&format!("{member}/src/")) {
+                continue;
+            }
+            // A `#[path]` attribute decouples a module's name from its file, which is the one
+            // thing that makes `module_path_prefix` wrong rather than merely partial.
+            if text
+                .lines()
+                .any(|line| line.trim_start().starts_with("#[path"))
+            {
+                preconditions.push((
+                    path.clone(),
+                    "carries a #[path] attribute, so a module path can no longer be derived \
+                     from the file layout"
+                        .to_string(),
+                ));
+            }
+            let Some(prefix) = module_path_prefix(path) else {
+                continue;
+            };
+            for function in test_functions(text) {
+                lib_tests
+                    .entry(name.clone())
+                    .or_default()
+                    .insert((prefix.clone(), function));
+            }
+        }
+    }
+    preconditions.sort();
+    preconditions.dedup();
 
     let mut rows = Vec::new();
     for (number, line) in read(root, "ci/VERIFICATION_MANIFEST.jsonl")
@@ -484,19 +725,38 @@ fn derive(root: &Path) -> Derivation {
             continue;
         }
         let mut cited = BTreeSet::new();
+        let mut coarse = BTreeSet::new();
+        let mut fine = Vec::new();
         for artifact in &artifacts {
+            if artifact.starts_with("test:") {
+                fine.push(artifact.clone());
+                continue;
+            }
             if surfaces.contains_key(artifact) {
                 cited.insert(artifact.clone());
+                // Shape A: the cited file IS an integration target. Shape B: it is a
+                // `src/*.rs` whose unit tests are a fraction of a shared lib target. Shape C —
+                // a source file with no tests at all — is an implementation reference, a
+                // different claim, and is deliberately NOT folded in.
+                let is_target = targets.values().any(|path| path == artifact);
+                let has_unit_tests =
+                    artifact.contains("/src/") && !test_functions(&surfaces[artifact]).is_empty();
+                if is_target || has_unit_tests {
+                    coarse.insert(artifact.clone());
+                }
             } else if let Some(stem) = artifact.strip_prefix("cargo-test:")
                 && let Some(path) = by_stem.get(stem)
             {
                 cited.insert(path.clone());
+                coarse.insert(path.clone());
             }
         }
         rows.push(TerminalRow {
             bead,
             surfaces: cited,
             scenarios,
+            coarse,
+            fine,
         });
     }
 
@@ -511,6 +771,11 @@ fn derive(root: &Path) -> Derivation {
         e2e_keys,
         pin_module: read(root, "crates/fln-conformance/src/pin.rs"),
         ignored,
+        targets,
+        target_tests,
+        lib_tests,
+        packages,
+        granularity_preconditions: preconditions,
     }
 }
 
@@ -570,6 +835,216 @@ fn judge_ignored(d: &Derivation, allowance: &[(&str, &str, &str)], ceiling: usiz
                 "ignored-vacuous: {surface}::{name} is declared with an empty compensating \
                  mechanism, which is a declaration that says nothing."
             ));
+        }
+    }
+
+    findings
+}
+
+/// Every terminal row states its evidence at the granularity that runs, or is declared — and
+/// the declaration can only shrink.
+///
+/// Findings are prefixed `granularity-…` so the campaign asserts *which* one fired. A campaign
+/// scoring "something went red" credits a mutant to an assertion that had stopped testing what
+/// it names (`fln-mandated-mutant-join-unwatched-uagk`).
+fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    // --- the scan must refuse rather than report a clean tree ---------------
+    if d.targets.is_empty() {
+        findings.push(
+            "granularity-scan: no integration-test target was found in any member. Cargo \
+             auto-discovers one per top-level `tests/*.rs` and this workspace has 75 — zero is \
+             the layout rule breaking, not a workspace that stopped testing."
+                .to_string(),
+        );
+    }
+    if d.lib_tests.is_empty() {
+        findings.push(
+            "granularity-scan: no package declares a single lib unit test. That is the \
+             `#[test]` attribute scan breaking, not a workspace whose crates test nothing."
+                .to_string(),
+        );
+    }
+
+    // --- the derivation's own preconditions, in the loud direction ----------
+    //
+    // The mirror of `bkw6`. It counted `[[bench]]` sections and reported a false clean because
+    // cargo auto-discovered the rest; here auto-discovery IS the whole rule, so what silently
+    // breaks this scan is an override APPEARING. Refuse rather than under-count.
+    for (where_, reason) in &d.granularity_preconditions {
+        findings.push(format!(
+            "granularity-derivation: {where_} {reason}. The population below is derived from \
+             the LAYOUT, which is exact only while nothing overrides it. Model the override or \
+             the count is low — and a low count reads as a repair."
+        ));
+    }
+
+    // --- the finding must not be vacuous ------------------------------------
+    let fanout: usize = d
+        .rows
+        .iter()
+        .flat_map(|row| row.coarse.iter())
+        .map(|surface| match surface.rsplit_once("/tests/") {
+            Some((_, file)) => file
+                .strip_suffix(".rs")
+                .and_then(|stem| d.target_tests.get(stem))
+                .map_or(0, BTreeSet::len),
+            None => d
+                .packages
+                .iter()
+                .find(|(member, _)| surface.starts_with(&format!("{member}/src/")))
+                .and_then(|(member, package)| {
+                    let prefix = module_path_prefix(surface)?;
+                    let _ = member;
+                    Some(
+                        d.lib_tests
+                            .get(package)?
+                            .iter()
+                            .filter(|(p, _)| *p == prefix)
+                            .count(),
+                    )
+                })
+                .unwrap_or(0),
+        })
+        .sum();
+    if fanout < FILE_GRANULAR_FANOUT_FLOOR {
+        findings.push(format!(
+            "granularity-fanout: {fanout} test functions live behind the cited surfaces, below \
+             the floor of {FILE_GRANULAR_FANOUT_FLOOR}. Either the `#[test]` scan has broken, \
+             or the population has become one where naming a file and naming a function mean \
+             the same thing — in which case this check measures nothing and should be retired \
+             deliberately, not passed silently."
+        ));
+    }
+
+    // --- the population, bound by cardinality in both directions ------------
+    //
+    // A row stays in while it carries ANY coarse citation, even beside a precise one. Letting
+    // one `test:` citation excuse a row that still cites a bare file is an exit that costs
+    // nothing and proves nothing. Migration means REPLACING the coarse citation.
+    let measured: BTreeSet<String> = d
+        .rows
+        .iter()
+        .filter(|row| !row.coarse.is_empty())
+        .map(|row| row.bead.clone())
+        .collect();
+    let declared: BTreeSet<String> = allowance.iter().map(|id| (*id).to_string()).collect();
+
+    let grew: Vec<&String> = measured.difference(&declared).collect();
+    if !grew.is_empty() {
+        findings.push(format!(
+            "granularity-grew: {grew:?} are terminal `complete` rows whose evidence names a \
+             FILE. Cargo compiles a target; libtest runs a FUNCTION. So the row cannot say \
+             which test carries its claim, and a run in which that test was `#[ignore]`d, \
+             filtered out by `--skip`, or returned early is indistinguishable from one in which \
+             it ran. A `src/*.rs` citation is worse still: no cargo invocation runs one source \
+             file's tests, the narrowest unit being `-p <pkg> --lib`. Cite the function — \
+             `test:<pkg>::<target>::<path>` or `test:<pkg>::lib::<module::path::fn>`, which is \
+             exactly what a `cargo test … -- --exact` invocation runs. Declaring it here needs \
+             FILE_GRANULAR_EVIDENCE_CEILING raised, which is a debt, not a fix."
+        ));
+    }
+
+    let shrank: Vec<&String> = declared.difference(&measured).collect();
+    if !shrank.is_empty() {
+        findings.push(format!(
+            "granularity-shrank: {shrank:?} are declared in FILE_GRANULAR_EVIDENCE_ALLOWANCE \
+             but are no longer measured. This is the good direction and the edit is mechanical: \
+             delete exactly those ids and lower FILE_GRANULAR_EVIDENCE_CEILING to {} in the \
+             same commit.",
+            measured.len()
+        ));
+    }
+
+    if allowance.len() != ceiling {
+        findings.push(format!(
+            "granularity-ceiling: FILE_GRANULAR_EVIDENCE_ALLOWANCE holds {} ids against a \
+             ceiling of {ceiling}. Equality, so the headroom a migration earns cannot be spent \
+             admitting the next file-granular row.",
+            allowance.len()
+        ));
+    }
+
+    // --- the migration path must DENOTE -------------------------------------
+    //
+    // Without this the new kind is a free exit: write `test:a::b::c` naming a function that
+    // does not exist and the row leaves the count while proving strictly LESS than the file
+    // path it replaced. That is `fln-0rxm`'s shape — a citation that denotes nothing —
+    // reproduced inside the repair for its neighbour.
+    for row in &d.rows {
+        for artifact in &row.fine {
+            let Some((package, target, path)) = test_function_citation(artifact) else {
+                findings.push(format!(
+                    "granularity-unbound: terminal row {} cites {artifact:?}, which is not a \
+                     well-formed `test:<pkg>::<target>::<path>` citation. A malformed one is a \
+                     finding, never an artifact of another kind — or a typo is a way out.",
+                    row.bead
+                ));
+                continue;
+            };
+            if !d.packages.values().any(|name| name == package) {
+                findings.push(format!(
+                    "granularity-unbound: terminal row {} cites {artifact:?}, but no workspace \
+                     member declares the package name {package:?}.",
+                    row.bead
+                ));
+                continue;
+            }
+            if target == "lib" {
+                let known = d.lib_tests.get(package);
+                // The module path prefix is a NECESSARY condition, not a sufficient one:
+                // inner `mod tests { … }` nesting appends components the file layout cannot
+                // give. Resolving by function name alone would be unsound — measured, two of
+                // 33 packages have ambiguous unit-test names — so both halves are required.
+                let resolves = known.is_some_and(|tests| {
+                    tests.iter().any(|(prefix, function)| {
+                        path.ends_with(function)
+                            && (prefix.is_empty() || path.starts_with(prefix.as_str()))
+                    })
+                });
+                if !resolves {
+                    findings.push(format!(
+                        "granularity-unbound: terminal row {} cites {artifact:?}, but package \
+                         {package:?} declares no `#[test]` function whose name ends {path:?} at \
+                         a module path the file layout can produce. The citation names a \
+                         `--exact` filter that would match nothing, and a libtest filter \
+                         matching nothing exits 0 (`fln-mandated-mutant-join-unwatched-uagk`).",
+                        row.bead
+                    ));
+                }
+                continue;
+            }
+            let Some(target_path) = d.targets.get(target) else {
+                findings.push(format!(
+                    "granularity-unbound: terminal row {} cites {artifact:?}, but no \
+                     integration-test target named {target:?} exists in this workspace.",
+                    row.bead
+                ));
+                continue;
+            };
+            let owner = target_path
+                .rsplit_once("/tests/")
+                .map(|(member, _)| member)
+                .unwrap_or_default();
+            if d.packages.get(owner).map(String::as_str) != Some(package) {
+                findings.push(format!(
+                    "granularity-unbound: terminal row {} cites {artifact:?}, but target \
+                     {target:?} lives in {target_path}, whose package is {:?}. The package \
+                     qualifier is what makes this kind survive two members sharing a stem — it \
+                     may not be wrong.",
+                    row.bead,
+                    d.packages.get(owner)
+                ));
+                continue;
+            }
+            if !d.target_tests[target].contains(path) {
+                findings.push(format!(
+                    "granularity-unbound: terminal row {} cites {artifact:?}, but {target:?} \
+                     declares no `#[test] fn {path}`.",
+                    row.bead
+                ));
+            }
         }
     }
 
@@ -939,6 +1414,8 @@ fn mutant_a_new_row_on_a_pin_reaching_surface_reddens_and_resists_silencing() {
         bead: "fln-planted-mutant".to_string(),
         surfaces: [surface].into(),
         scenarios: vec!["quality_gate".to_string()],
+        coarse: BTreeSet::new(),
+        fine: Vec::new(),
     });
 
     let findings = judge(
@@ -1291,6 +1768,8 @@ fn mutant_an_unregistered_e2e_scenario_reddens() {
         bead: "fln-planted-scenario".to_string(),
         surfaces: BTreeSet::new(),
         scenarios: vec!["a_lane_nobody_registered".to_string()],
+        coarse: BTreeSet::new(),
+        fine: Vec::new(),
     });
     let findings = judge(
         &d,
@@ -1301,4 +1780,247 @@ fn mutant_an_unregistered_e2e_scenario_reddens() {
         has(&findings, "e2e:"),
         "citing an unregistered scenario must redden; got {findings:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Granularity: the guard, and the campaign against it
+// ---------------------------------------------------------------------------
+
+/// Terminal rows state their evidence at the granularity that runs, or are declared.
+#[test]
+fn terminal_rows_do_not_state_evidence_coarser_than_the_unit_that_runs() {
+    let d = derive(&root());
+    let findings = judge_granularity(
+        &d,
+        FILE_GRANULAR_EVIDENCE_ALLOWANCE,
+        FILE_GRANULAR_EVIDENCE_CEILING,
+    );
+    assert!(findings.is_empty(), "{}", findings.join("\n\n"));
+}
+
+/// The stem the legacy `cargo-test:<stem>` kind is keyed by is still an identity.
+///
+/// The map this asserts over is the *repaired* one. Its predecessor took every `.rs` beneath a
+/// `tests/` tree and so carried the stem `mod` three times over, last insert winning — a key
+/// denoting no cargo target and colliding three ways, live and unnoticed at `29852ec1`.
+#[test]
+fn the_cargo_test_stem_is_still_an_identity() {
+    let d = derive(&root());
+    let collisions: Vec<&(String, String)> = d
+        .granularity_preconditions
+        .iter()
+        .filter(|(_, reason)| reason.contains("shares its file stem"))
+        .collect();
+    assert!(
+        collisions.is_empty(),
+        "`cargo-test:<stem>` is keyed by file stem and these targets now share one, so the key \
+         has stopped being an identity: {collisions:?}"
+    );
+    assert!(
+        d.targets.len() >= 70,
+        "the target scan resolved only {} targets against 75 at 29852ec1 — a collapsed map \
+         makes the assertion above vacuous",
+        d.targets.len()
+    );
+    assert!(
+        !d.targets.contains_key("mod"),
+        "`mod` is back in the target map, so the scan is ingesting `tests/common/mod.rs` \
+         modules again — that key denotes no cargo target and collides three ways"
+    );
+}
+
+fn granularity_findings(d: &Derivation) -> Vec<String> {
+    judge_granularity(
+        d,
+        FILE_GRANULAR_EVIDENCE_ALLOWANCE,
+        FILE_GRANULAR_EVIDENCE_CEILING,
+    )
+}
+
+fn fires(findings: &[String], prefix: &str) -> bool {
+    findings.iter().any(|finding| finding.starts_with(prefix))
+}
+
+fn a_coarse_row(d: &mut Derivation) -> &mut TerminalRow {
+    d.rows
+        .iter_mut()
+        .find(|row| !row.coarse.is_empty())
+        .expect("at least one terminal row cites a surface coarsely")
+}
+
+#[test]
+fn granularity_mutant_a_new_file_granular_row_is_caught() {
+    let mut d = derive(&root());
+    let stem = d.targets.values().next().expect("targets").clone();
+    d.rows.push(TerminalRow {
+        bead: "planted-row-citing-a-file".to_string(),
+        surfaces: BTreeSet::new(),
+        scenarios: Vec::new(),
+        coarse: BTreeSet::from([stem]),
+        fine: Vec::new(),
+    });
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-grew"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_migration_that_did_not_shrink_the_declaration_is_caught() {
+    let mut d = derive(&root());
+    a_coarse_row(&mut d).coarse.clear();
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-shrank"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_grown_declaration_is_caught_by_the_ceiling() {
+    let d = derive(&root());
+    let mut grown: Vec<&str> = FILE_GRANULAR_EVIDENCE_ALLOWANCE.to_vec();
+    grown.push("planted-extra-id");
+    let findings = judge_granularity(&d, &grown, FILE_GRANULAR_EVIDENCE_CEILING);
+    assert!(fires(&findings, "granularity-ceiling"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_an_empty_target_scan_refuses_instead_of_passing() {
+    let mut d = derive(&root());
+    d.targets.clear();
+    d.target_tests.clear();
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-scan"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_manifest_that_defeats_autodiscovery_is_caught() {
+    let mut d = derive(&root());
+    d.granularity_preconditions.push((
+        "crates/fln-planted/Cargo.toml".to_string(),
+        "declares an explicit [[test]] target section".to_string(),
+    ));
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-derivation"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_collapsed_fanout_refuses_instead_of_reporting_a_repair() {
+    let mut d = derive(&root());
+    for names in d.target_tests.values_mut() {
+        names.clear();
+    }
+    d.lib_tests.clear();
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-fanout"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_citation_naming_no_such_function_cannot_leave_the_population() {
+    let mut d = derive(&root());
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine
+        .push("test:fln-conformance::kernel_replay::no_such_function".to_string());
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_lib_citation_naming_no_such_function_is_caught() {
+    let mut d = derive(&root());
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine
+        .push("test:fln-env::lib::extensions::tests::no_such_unit_test".to_string());
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_lib_citation_at_the_wrong_module_path_is_caught() {
+    let d0 = derive(&root());
+    // A real function, deliberately cited under a module prefix that is not its file's.
+    let (prefix, function) = d0
+        .lib_tests
+        .get("fln-env")
+        .expect("fln-env declares lib unit tests")
+        .iter()
+        .find(|(prefix, _)| !prefix.is_empty())
+        .expect("a non-root module carries a unit test")
+        .clone();
+    let mut d = derive(&root());
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine.push(format!(
+        "test:fln-env::lib::not_{prefix}::tests::{function}"
+    ));
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_citation_naming_no_such_target_is_caught() {
+    let mut d = derive(&root());
+    d.rows[0]
+        .fine
+        .push("test:fln-conformance::no_such_target::f".to_string());
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_citation_with_the_wrong_package_is_caught() {
+    let mut d = derive(&root());
+    d.rows[0]
+        .fine
+        .push("test:fln-kernel::kernel_replay::prelude_replays_through_the_kernel".to_string());
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+#[test]
+fn granularity_mutant_a_malformed_citation_is_a_finding_not_a_shrug() {
+    let mut d = derive(&root());
+    d.rows[0].fine.push("test:kernel_replay".to_string());
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+/// The positive control, and what stops every mutant above being vacuous: a **real** citation
+/// of each flavour resolves, produces no finding, and forces its own declaration edit.
+#[test]
+fn granularity_control_real_citations_resolve_and_force_their_own_shrink() {
+    for (package, target, path_of) in [
+        ("fln-conformance", "kernel_replay", true),
+        ("fln-env", "lib", false),
+    ] {
+        let mut d = derive(&root());
+        let citation = if path_of {
+            let function = d.target_tests[target]
+                .iter()
+                .next()
+                .expect("the target declares tests")
+                .clone();
+            format!("test:{package}::{target}::{function}")
+        } else {
+            let (prefix, function) = d.lib_tests[package]
+                .iter()
+                .find(|(prefix, _)| !prefix.is_empty())
+                .expect("a non-root module carries a unit test")
+                .clone();
+            format!("test:{package}::lib::{prefix}::tests::{function}")
+        };
+        let row = a_coarse_row(&mut d);
+        let bead = row.bead.clone();
+        row.coarse.clear();
+        row.fine.push(citation.clone());
+        let findings = granularity_findings(&d);
+        assert!(
+            !fires(&findings, "granularity-unbound"),
+            "{citation} must resolve: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.starts_with("granularity-shrank") && f.contains(&bead)),
+            "a migration must force its own declaration edit: {findings:?}"
+        );
+    }
 }

@@ -133,6 +133,180 @@ pub fn ignored_tests(source: &str) -> Vec<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Granularity: the unit a row names versus the unit that runs
+// ---------------------------------------------------------------------------
+
+/// Every `#[test]`/`#[tokio::test]` function in a source file, by the **attribute**.
+///
+/// The sibling of [`ignored_tests`], subject to the identical trap and answering it more
+/// strictly. `#[test]` appears in this workspace inside doc comments, inside doctests, inside
+/// guard assertions and inside the string literals a mutation campaign plants; counting the
+/// token instead of the construct is the mentions-versus-construct error
+/// `fln-bench-apparatus-empty-referent-bkw6` paid for, and the guard reporting *this* number
+/// carried a wrong one for exactly that reason until `974fcc5a`.
+///
+/// So the attribute must be the **entire** trimmed line, where [`ignored_tests`] accepts a
+/// prefix. That is deliberate, because this function has a second caller with the opposite
+/// risk profile: `test:<pkg>::<target>::<path>` citations are resolved against it, and there a
+/// false *positive* would let a citation naming a function that does not exist resolve anyway
+/// — a label that denotes nothing, which is `fln-0rxm`'s shape reproduced inside the repair
+/// for its neighbour. Under-reading a `#[test]` that shares its line with something else costs
+/// a spurious refusal, which is loud; over-reading one buys a silent pass.
+///
+/// A `#[test]` with no `fn` beneath it yields the sentinel rather than vanishing, for
+/// [`ignored_tests`]'s reason: a construct this cannot resolve is a refusal, never an absence.
+pub fn test_functions(source: &str) -> Vec<String> {
+    const NO_FUNCTION: &str = "<no function beneath the attribute>";
+    let lines: Vec<&str> = source.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed != "#[test]" && trimmed != "#[tokio::test]" {
+            continue;
+        }
+        // The attribute may sit above further attributes before the item itself. The scan
+        // stops at the *next* test attribute: without that bound a `#[test]` whose item this
+        // cannot parse silently captures the following test's name, which is a wrong answer
+        // wearing a right one's shape — measured, by this module's own unit test, which
+        // caught `async fn` slipping through and returning the next function's name.
+        let name = lines[index + 1..lines.len().min(index + 9)]
+            .iter()
+            .take_while(|candidate| {
+                let t = candidate.trim();
+                t != "#[test]" && t != "#[tokio::test]"
+            })
+            .find_map(|candidate| {
+                let mut rest = candidate.trim_start();
+                // `async fn`, `pub fn`, `pub(crate) async fn`, `unsafe fn` — the item may
+                // carry modifiers, and `#[tokio::test]` guarantees at least one of them.
+                loop {
+                    let stripped = ["pub(crate) ", "pub ", "async ", "unsafe ", "const "]
+                        .iter()
+                        .find_map(|modifier| rest.strip_prefix(modifier));
+                    match stripped {
+                        Some(next) => rest = next.trim_start(),
+                        None => break,
+                    }
+                }
+                let rest = rest.strip_prefix("fn ")?;
+                let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len());
+                Some(rest[..end].to_string())
+            })
+            .unwrap_or_else(|| NO_FUNCTION.to_string());
+        found.push(name);
+    }
+    found
+}
+
+/// Every reason a member manifest defeats cargo's integration-test **auto-discovery**.
+///
+/// The target set is derived from the *layout* — one target per top-level `tests/*.rs` — and
+/// that is complete only while nothing overrides it. Two manifest keys can: an explicit
+/// `[[test]]` section, whose `path` may point anywhere, and `autotests`, which switches
+/// discovery off outright.
+///
+/// **The direction is the mirror of `bkw6`'s.** `bkw6` counted `[[bench]]` sections and
+/// reported a false clean because cargo auto-discovered the rest; here auto-discovery *is* the
+/// whole rule, so what would silently break this derivation is one of those keys appearing.
+/// Measured at `29852ec1`: zero members declare either, and no `tests/<dir>/main.rs` exists, so
+/// the layout rule is exact at 75 targets. The guard asserts that precondition rather than
+/// assuming it, so the day a `[[test]]` section lands the scan says its answer has stopped
+/// being complete instead of quietly under-counting.
+pub fn autodiscovery_overrides(manifest: &str) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "[[test]]" {
+            reasons.push("declares an explicit [[test]] target section");
+        }
+        if trimmed
+            .strip_prefix("autotests")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            reasons.push("sets `autotests`, which turns integration-test auto-discovery off");
+        }
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    reasons
+}
+
+/// A `test:<pkg>::<target>::<path>` citation — the **function-granular** evidence kind.
+///
+/// A coverage row cites a file; cargo compiles a *target*; libtest runs a *function*. The
+/// existing `cargo-test:<stem>` token closes half that gap and a bare path closes none of it:
+/// both name something cargo can build, neither names something libtest can run. This kind
+/// names exactly what a `cargo test` invocation runs, in both target flavours:
+///
+/// ```text
+/// test:fln-conformance::kernel_replay::prelude_replays_through_the_kernel
+///   -> cargo test -p fln-conformance --test kernel_replay -- --exact prelude_replays_…
+/// test:fln-env::lib::extensions::tests::merge_rejects_conflicting_extensions
+///   -> cargo test -p fln-env --lib -- --exact extensions::tests::merge_rejects_…
+/// ```
+///
+/// So it is a **runnable command rather than a label**, which is the property a rig-emitted
+/// execution record can later be joined to (`fln-log-derived-disposition-not-execution-xes2`).
+///
+/// **The split is `::` with maxsplit 2, and the third segment keeps its own `::`.** A lib unit
+/// test's libtest name *is* a module path, so a fixed three-segment parse could express the
+/// integration half and not the lib half — and the lib half is the worse shape: there is no
+/// cargo invocation at all that runs the tests of one `src/*.rs`, the narrowest selectable unit
+/// being the whole crate's lib target.
+///
+/// **It is package-qualified where `cargo-test:<stem>` is not**, and that is not decoration. A
+/// stem is unique across this workspace today and nothing makes it stay unique; two crates may
+/// each hold `tests/model.rs`. That is the non-injective-projection shape this lineage has paid
+/// for repeatedly — a key treated as an identity with nobody checking — so this kind never
+/// depends on the stem being unique.
+///
+/// Returns `None` for anything that is not three non-empty `::`-separated parts after the
+/// prefix. A caller must treat a `test:`-prefixed artifact that returns `None` as a **finding**,
+/// never as an artifact of some other kind: silently ignoring a malformed citation is how a
+/// typo becomes a free exit from the population.
+pub fn test_function_citation(artifact: &str) -> Option<(&str, &str, &str)> {
+    let rest = artifact.strip_prefix("test:")?;
+    let mut parts = rest.splitn(3, "::");
+    let package = parts.next()?;
+    let target = parts.next()?;
+    let path = parts.next()?;
+    (!package.is_empty() && !target.is_empty() && !path.is_empty() && !path.starts_with("::"))
+        .then_some((package, target, path))
+}
+
+/// The module path prefix cargo gives a package source file, from the file layout alone.
+///
+/// `src/lib.rs` → `""`; `src/foo.rs` → `"foo"`; `src/foo/mod.rs` → `"foo"`;
+/// `src/foo/bar.rs` → `"foo::bar"`. `src/main.rs` is a binary target and yields `None`.
+///
+/// **Sound here because nothing overrides the layout**: measured at `29852ec1`, no source file
+/// in the workspace carries a `#[path` attribute, so a file's module path is its directory
+/// path. That precondition is checked by the caller, in the loud direction — a `#[path`
+/// appearing makes this incomplete and must refuse rather than mis-resolve.
+///
+/// This is a **prefix**, not the whole libtest name: inner `mod tests { … }` nesting appends
+/// further components this does not model. Callers must therefore treat it as a *necessary*
+/// condition — the cited path must begin with it — never a sufficient one.
+pub fn module_path_prefix(relative_path: &str) -> Option<String> {
+    let (_, tail) = relative_path.rsplit_once("/src/")?;
+    let tail = tail.strip_suffix(".rs")?;
+    if tail == "main" {
+        return None;
+    }
+    let mut parts: Vec<&str> = tail.split('/').collect();
+    match parts.last() {
+        Some(&"lib") | Some(&"mod") => {
+            parts.pop();
+        }
+        _ => {}
+    }
+    Some(parts.join("::"))
+}
+
+// ---------------------------------------------------------------------------
 // The workspace's own member globs
 // ---------------------------------------------------------------------------
 
@@ -870,5 +1044,111 @@ fn discussion_only() {\n\
             ["closure_audit".to_string(), "env_snapshots".to_string()].into()
         );
         assert!(e2e_scenario_keys("nothing here").is_empty());
+    }
+
+    #[test]
+    fn test_functions_counts_the_attribute_and_never_the_token() {
+        // Every shape that actually occurs in this workspace, in one fixture: a module doc
+        // that discusses the attribute, a doctest that contains it, and a mutation campaign's
+        // planted string literal. All three are mentions; none is a test.
+        let source = concat!(
+            "//! A module doc that discusses `#[test]` at length.\n",
+            "/// ```\n",
+            "/// #[test]\n",
+            "/// fn documented_but_not_compiled() {}\n",
+            "/// ```\n",
+            "const PLANTED: &str = \"#[test]\\nfn inside_a_string_literal() {}\";\n",
+            "\n",
+            "#[test]\n",
+            "fn a_real_one() {}\n",
+            "\n",
+            "#[tokio::test]\n",
+            "async fn an_async_one() {}\n",
+            "\n",
+            "#[test]\n",
+            "#[ignore = \"cost\"]\n",
+            "fn behind_another_attribute() {}\n",
+        );
+        assert_eq!(
+            test_functions(source),
+            vec!["a_real_one", "an_async_one", "behind_another_attribute"],
+            "the doc comment, the doctest and the planted literal are mentions of the \
+             attribute, not declarations of one — counting them is the error `bkw6` paid for"
+        );
+    }
+
+    #[test]
+    fn a_test_attribute_with_no_function_beneath_it_refuses_rather_than_vanishing() {
+        assert_eq!(
+            test_functions("#[test]\n"),
+            vec!["<no function beneath the attribute>"]
+        );
+    }
+
+    #[test]
+    fn autodiscovery_overrides_names_both_keys_and_ignores_commented_ones() {
+        assert!(autodiscovery_overrides("[package]\nname = \"x\"\n").is_empty());
+        assert!(
+            autodiscovery_overrides("# [[test]]\n# autotests = false\n").is_empty(),
+            "a commented-out override does not defeat auto-discovery"
+        );
+        assert_eq!(autodiscovery_overrides("[[test]]\nname = \"t\"\n").len(), 1);
+        assert_eq!(autodiscovery_overrides("autotests = false\n").len(), 1);
+        assert_eq!(
+            autodiscovery_overrides("autotests=false\n[[test]]\n").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_function_citation_takes_both_target_flavours_and_refuses_the_rest() {
+        assert_eq!(
+            test_function_citation("test:fln-conformance::kernel_replay::prelude_replays"),
+            Some(("fln-conformance", "kernel_replay", "prelude_replays"))
+        );
+        // The lib flavour keeps its module path intact in the third part — a fixed
+        // three-segment split could not express it.
+        assert_eq!(
+            test_function_citation("test:fln-env::lib::extensions::tests::merges"),
+            Some(("fln-env", "lib", "extensions::tests::merges"))
+        );
+        for malformed in [
+            "test:fln-conformance::kernel_replay",
+            "test:::",
+            "test:",
+            "test:pkg::target::",
+            "test:pkg::::path",
+            "cargo-test:kernel_replay",
+            "crates/fln-conformance/tests/kernel_replay.rs",
+        ] {
+            assert_eq!(
+                test_function_citation(malformed),
+                None,
+                "{malformed:?} must not parse as a function-granular citation"
+            );
+        }
+    }
+
+    #[test]
+    fn module_path_prefix_follows_the_file_layout() {
+        assert_eq!(
+            module_path_prefix("crates/x/src/lib.rs").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            module_path_prefix("crates/x/src/foo.rs").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            module_path_prefix("crates/x/src/foo/mod.rs").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            module_path_prefix("crates/x/src/foo/bar.rs").as_deref(),
+            Some("foo::bar")
+        );
+        // A binary target is not part of the lib target's test namespace.
+        assert_eq!(module_path_prefix("crates/x/src/main.rs"), None);
+        assert_eq!(module_path_prefix("crates/x/tests/foo.rs"), None);
     }
 }
