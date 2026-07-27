@@ -1103,7 +1103,7 @@ run_stage() {
   else
     case "$name" in
       verification-manifest|shellcheck|fmt|contract-handoff-no-mock|\
-        tribunal-manifest-inventory|\
+        tribunal-manifest-inventory|projection-guard-harness|\
         epoch-lab-live-verify|structure-guard|vendor-tree|ubs)
         semantic_args=(--semantic-failure-exit 1)
         ;;
@@ -1601,6 +1601,47 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/lib/gate_lock.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh \
   scripts/git-hooks/pre-commit scripts/git-hooks/install.sh \
   scripts/git-hooks/test_projection_guard.sh
+# The projection, verification-coverage and D3 root-attribute guards in
+# scripts/git-hooks/pre-commit are proved by scripts/git-hooks/test_projection_guard.sh,
+# which until now was shellchecked directly above and EXECUTED BY NOTHING — named in
+# INPUT_PATHS and in that shellcheck list, invoked nowhere in this repository. That is the
+# documented-command-nobody-invokes shape sitting inside the feedback-loop closer it exists
+# to prove (beads franken_lean-projection-republish-mechanical-voz4 and
+# franken_lean-d3-root-attr-no-creation-affordance-sso4). Registration is the part that
+# matters: a script can sit in the tree unrun for months, which this one did.
+#
+# A stage rather than an fln.e2e/2 lane, deliberately: the harness takes no gate lock and
+# runs in about a second, so cheap-and-always-on beats correct-and-quarterly.
+#
+# The publisher is a deliberately NESTED workspace, so `cargo build -p` cannot reach it and
+# the hook's own candidate search is repeated here. That is binary-path resolution, not a
+# second copy of the projection predicate — that stays in the publisher, which is the whole
+# reason the guard shells out to it instead of recomputing the hash.
+PROJECTION_PUBLISHER=""
+for publisher_candidate in \
+  "${CARGO_TARGET_DIR:-$REPO/target}/debug/kernel-ownership-publisher" \
+  "${CARGO_TARGET_DIR:-$REPO/target}/release/kernel-ownership-publisher" \
+  "$REPO/tools/structure-guard/kernel-ownership-publisher/target/debug/kernel-ownership-publisher"; do
+  if [ -x "$publisher_candidate" ]; then PROJECTION_PUBLISHER="$publisher_candidate"; break; fi
+done
+if [ -z "$PROJECTION_PUBLISHER" ]; then
+  note "building kernel-ownership-publisher once for the projection-guard harness"
+  (cd "$REPO/tools/structure-guard/kernel-ownership-publisher" && cargo build --quiet) || true
+  for publisher_candidate in \
+    "${CARGO_TARGET_DIR:-$REPO/target}/debug/kernel-ownership-publisher" \
+    "$REPO/tools/structure-guard/kernel-ownership-publisher/target/debug/kernel-ownership-publisher"; do
+    if [ -x "$publisher_candidate" ]; then PROJECTION_PUBLISHER="$publisher_candidate"; break; fi
+  done
+fi
+# An absent publisher leaves this empty, the harness refuses with exit 2, and run_stage types
+# that as an internal_fault rather than a semantic failure — an environment fault is not a
+# finding about the code (FL-INV-07).
+run_stage projection-guard-harness bash "$REPO/scripts/git-hooks/test_projection_guard.sh" \
+  "$REPO/scripts/git-hooks/pre-commit" \
+  "$PROJECTION_PUBLISHER" \
+  "$EVIDENCE" \
+  "$VERIFICATION_MANIFEST" \
+  "$REPO/.beads/issues.jsonl"
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets
 run_stage clippy cargo clippy --locked --all-targets -- -D warnings
