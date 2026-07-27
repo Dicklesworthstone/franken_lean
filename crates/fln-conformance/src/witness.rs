@@ -517,9 +517,16 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         sites: &SITES_RECEIPTS,
         claim_type: ClaimType::BoundedModel,
         state: ClaimState::Targeted,
-        evidence: "crates/fln-kernel/src/verdict.rs:10 states receipts are a follow-up slice, \
-                   and :273 repeats it at the admission site. There is no transparency log \
-                   anywhere in the workspace.",
+        evidence: "`crates/fln-kernel/src/verdict.rs`'s module header states receipts are a \
+                   follow-up slice — \"Bootstrap slice: receipts and the full typestate \
+                   envelope (§8.2b) are follow-up slices recorded on the bead\" — and the \
+                   admitted variant repeats it as \"(Receipts: follow-up slice.)\". There is no \
+                   transparency log anywhere in the workspace. QUOTED, NOT LINE-CITED, and \
+                   re-derived at `a025c3cb`: this row said `verdict.rs:10` and `:273`, and both \
+                   had drifted onto unrelated code — :10 onto a blank `//!` (the sentence moved \
+                   to 11) and :273 onto `StackMeasurement`'s fields (the admission-site repeat \
+                   moved to 974), each by an insertion above it. A line number is a claim with \
+                   an expiry; a quoted construct is one a reader can still find.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
