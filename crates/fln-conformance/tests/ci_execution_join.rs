@@ -97,8 +97,25 @@
 //!
 //!    **What is still residue.** A file-granular row citing a surface where *some* tests are
 //!    ignored still cannot say which test it rests on — that is the 67-row debt, not this
-//!    join. And `#[ignore]` is only one way a compiled test does not run: `#[cfg]` gating and
-//!    an early `return` are not modelled, and `--skip` is item 5. Measured at `974fcc5a`, all
+//!    join. And `#[ignore]` is only one way a compiled test does not run.
+//!
+//!    **This item's own repair then rotted the same way the item did, which is the lesson
+//!    twice over.** It closed saying "`#[cfg]` gating and an early `return` are not modelled"
+//!    and bound that to a premise reading *properties of a run, not of the source layout*.
+//!    False for the half that matters, and false in the direction that keeps a debt: a
+//!    `#[cfg(feature = "…")]` on a `mod` declaration is resolved at **compile** time from the
+//!    manifest's `[features]` table and the attribute, both of which are source. Measured at
+//!    `c0f2ace5` — one such gate exists, `fln-conformance`'s `oracle-fallback-dev` over
+//!    `poison`, and nothing in `scripts/check.sh`, `.github/workflows/ci.yml` or the 21 lane
+//!    scripts passes `--features` or `--all-features`, so its one `#[test]` is never compiled.
+//!    A row citing it resolved **clean**: not `#[ignore]`d, so `granularity-ignored` was
+//!    silent, and present in `lib_tests`, so the existence check passed. Now joined by
+//!    `granularity-cfg-gated`, with the gate population bound by `judge_cfg_gated`. What stays
+//!    undecidable is an early `return` and a `#[cfg]` on a property of the **host** — `unix`,
+//!    `target_arch` — which genuinely is a fact about a run. The lib half of this join no
+//!    longer rests on a planted instance; it has a real one.
+//!
+//!    `--skip` is item 5. Measured at `974fcc5a`, all
 //!    five instances are compensated — `fln-8zsq` went source-level *because* its producer is
 //!    ignored, `93te` carries a mechanically-expiring PG-5 waiver, `uagk` a retention receipt,
 //!    `4o3n` the private `Calibration` field — and `golden_vellum.rs`'s only prints for a
@@ -120,10 +137,11 @@ use std::path::{Path, PathBuf};
 
 use fln_conformance::execution::{
     CiJob, Field, GOVERNED_E2E_SCHEMA, PIN_COORDINATES, autodiscovery_overrides,
-    check_sh_reaches_workspace, ci_jobs, e2e_scenario_keys, ignored_tests, installs_reference_pin,
-    invokes_check_sh, is_terminal, module_path_prefix, names_scenario_in_code, reach_covers,
-    reaches_the_pinned_reference, record_field, scenario_assignments, shell_code_only,
-    test_function_citation, test_functions, test_reach, workspace_member_patterns,
+    check_sh_reaches_workspace, ci_jobs, e2e_scenario_keys, feature_gated_modules,
+    features_off_by_default, ignored_tests, installs_reference_pin, invokes_check_sh, is_terminal,
+    module_path_prefix, names_scenario_in_code, reach_covers, reaches_the_pinned_reference,
+    record_field, scenario_assignments, shell_code_only, test_function_citation, test_functions,
+    test_reach, unmodelled_feature_cfgs, workspace_member_patterns,
 };
 
 // ---------------------------------------------------------------------------
@@ -457,9 +475,10 @@ const RESIDUE_PREMISES: &[(usize, Premise)] = &[
     (
         4,
         Premise::Undecidable(
-            "the remaining reasons a compiled test does not run — `#[cfg]` gating and an early \
-             `return` — are properties of a run, not of the source layout; the `#[ignore]` half \
-             is now derived and joined by `judge_granularity`",
+            "the remaining reasons a test does not run — an early `return`, and a `#[cfg]` on a \
+             property of the HOST such as `unix` or `target_arch` — are properties of a run, not \
+             of the source layout; the `#[ignore]` half and the `#[cfg(feature = …)]` half are \
+             both derived now and joined by `judge_granularity`",
         ),
     ),
     (5, Premise::Derived("skip-filters-names-not-targets")),
@@ -480,6 +499,24 @@ const RESIDUE_UNDECIDABLE_CEILING: usize = 2;
 /// and the finding would be measuring nothing. 1733 at `29852ec1`; the floor sits an order of
 /// magnitude below so ordinary churn never trips it and a collapsed scan always does.
 const FILE_GRANULAR_FANOUT_FLOOR: usize = 150;
+
+/// Every module this workspace compiles **out** of a default `cargo test`, as
+/// `(package, feature, module path)` — checked by equality in both directions.
+///
+/// **Why a declared set and not a count.** The live population is one, so a guard that only
+/// consulted it would go decorative the day `poison` is deleted, and a broken scan returning
+/// empty would look identical to a clean tree — `bkw6`'s empty referent and
+/// `fln-cross-tree-baked-root-k60n`'s confident zero, in the same place. Equality both ways
+/// separates the two: a scan that collapses no longer matches this list and refuses loudly,
+/// while a legitimate removal forces a deliberate edit here in the commit that earns it.
+///
+/// Equality is the right direction because this is a disclosure of a **measured population**,
+/// not a remainder of permitted violations that shrinks as people repair it
+/// (`franken_lean-closure-binding-exempt-rows-uninspected-3s8w`). A new gated module must be
+/// declared here, and declaring it is what makes someone ask whether a coverage row cites into
+/// it.
+const FEATURE_GATED_MODULES: &[(&str, &str, &str)] =
+    &[("fln-conformance", "oracle-fallback-dev", "poison")];
 
 // ---------------------------------------------------------------------------
 // The derivation, gathered from disk
@@ -528,6 +565,17 @@ struct Derivation {
     pin_module: String,
     /// `(surface, function)` for every `#[ignore]`d test cargo compiles and never runs.
     ignored: BTreeSet<(String, String)>,
+    /// `(package, module path prefix, function)` for every lib unit test cargo does not
+    /// **compile** at all under default features, because its module is gated behind a feature
+    /// nothing turns on. `ignored`'s harsher sibling: an `#[ignore]`d test is in the binary and
+    /// `--ignored` runs it, where one of these is absent from the binary entirely, so the
+    /// `--exact` filter a citation names matches nothing and libtest exits 0 (`uagk`).
+    cfg_gated: BTreeSet<(String, String, String)>,
+    /// `(package, feature, module path)` for every module gated out of a default build — the
+    /// *declaration* the set above is a consequence of. Held separately because
+    /// [`FEATURE_GATED_MODULES`] discloses modules while the finding names functions, and a
+    /// module whose tests are all deleted must still be visible to the equality check.
+    cfg_gated_modules: BTreeSet<(String, String, String)>,
     /// `<stem>` → path, for every integration target cargo auto-discovers. Replaces the old
     /// stem map, which was **not injective**: it ingested every `.rs` under a `tests/` tree, so
     /// the three `tests/common/mod.rs` modules all claimed the stem `mod` and two vanished
@@ -809,6 +857,8 @@ fn derive(root: &Path) -> Derivation {
     // file is not a selectable unit at all. Keyed by package because that is what `-p` takes.
     let mut packages: BTreeMap<String, String> = BTreeMap::new();
     let mut lib_tests: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut cfg_gated: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut cfg_gated_modules: BTreeSet<(String, String, String)> = BTreeSet::new();
     for member in &members {
         let manifest = read(root, &format!("{member}/Cargo.toml"));
         let name = manifest
@@ -842,6 +892,43 @@ fn derive(root: &Path) -> Derivation {
             }
         }
         packages.insert(member.clone(), name.clone());
+
+        // A `#[cfg(feature = "…")]` on a `mod` declaration removes that module — and every
+        // `#[test]` inside it — from a default `cargo test`, with no `#[ignore]` anywhere.
+        // Gathered in its own pass because the gate is declared in the **parent** file:
+        // `lib.rs` carries the attribute, `poison.rs` carries the tests.
+        let features_off = features_off_by_default(&manifest);
+        let mut gated_roots: BTreeSet<String> = BTreeSet::new();
+        for (path, text) in &surfaces {
+            if !path.starts_with(&format!("{member}/src/")) {
+                continue;
+            }
+            for attribute in unmodelled_feature_cfgs(text) {
+                preconditions.push((
+                    path.clone(),
+                    format!(
+                        "carries {attribute:?}, a feature `#[cfg]` shape this scan does not \
+                         decide, so a module it gates would look live"
+                    ),
+                ));
+            }
+            for (feature, module) in feature_gated_modules(text) {
+                if !features_off.contains(&feature) {
+                    continue;
+                }
+                let Some(prefix) = module_path_prefix(path) else {
+                    continue;
+                };
+                let path = if prefix.is_empty() {
+                    module
+                } else {
+                    format!("{prefix}::{module}")
+                };
+                cfg_gated_modules.insert((name.clone(), feature, path.clone()));
+                gated_roots.insert(path);
+            }
+        }
+
         for (path, text) in &surfaces {
             if !path.starts_with(&format!("{member}/src/")) {
                 continue;
@@ -862,7 +949,13 @@ fn derive(root: &Path) -> Derivation {
             let Some(prefix) = module_path_prefix(path) else {
                 continue;
             };
+            let gated = gated_roots
+                .iter()
+                .any(|root| prefix == *root || prefix.starts_with(&format!("{root}::")));
             for function in test_functions(text) {
+                if gated {
+                    cfg_gated.insert((name.clone(), prefix.clone(), function.clone()));
+                }
                 lib_tests
                     .entry(name.clone())
                     .or_default()
@@ -990,6 +1083,8 @@ fn derive(root: &Path) -> Derivation {
         workflow_text,
         pin_module: read(root, "crates/fln-conformance/src/pin.rs"),
         ignored,
+        cfg_gated,
+        cfg_gated_modules,
         targets,
         target_tests,
         lib_tests,
@@ -1233,6 +1328,26 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                         row.bead
                     ));
                 }
+                // `#[ignore]`'s harsher sibling, and the half residue item 4 called undecidable.
+                // A gated function is not in the binary at all, so the `--exact` filter this
+                // citation names matches nothing and libtest exits 0 — the row rests on a
+                // command that cannot fail.
+                let cfg_gated_here = d.cfg_gated.iter().any(|(owner, prefix, function)| {
+                    owner == package
+                        && path.ends_with(function.as_str())
+                        && (prefix.is_empty() || path.starts_with(prefix.as_str()))
+                });
+                if cfg_gated_here {
+                    findings.push(format!(
+                        "granularity-cfg-gated: terminal row {} cites {artifact:?}, and that \
+                         function lives in a module gated behind a feature no default \
+                         `cargo test` turns on. Cargo does not compile it, so unlike an \
+                         `#[ignore]`d test it cannot even be reached with `--ignored`; the \
+                         citation names a filter that matches nothing and exits 0. See \
+                         FEATURE_GATED_MODULES, which declares the gate.",
+                        row.bead
+                    ));
+                }
                 let known = d.lib_tests.get(package);
                 // The module path prefix is a NECESSARY condition, not a sufficient one:
                 // inner `mod tests { … }` nesting appends components the file layout cannot
@@ -1361,6 +1476,45 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
         }
     }
 
+    findings
+}
+
+/// The feature-gated module population matches [`FEATURE_GATED_MODULES`], in both directions.
+///
+/// The citation check in [`judge_granularity`] consults a **derived** set, and a derived set
+/// that silently empties is the confident zero this lineage has already paid for twice
+/// (`fln-cross-tree-baked-root-k60n`, `fln-bench-apparatus-empty-referent-bkw6`): every
+/// citation would resolve clean and the guard would read as a tree in which nothing is gated,
+/// which is indistinguishable from the truth today. Equality against a written-down list is
+/// what makes a collapsed scan loud instead of reassuring.
+///
+/// **What this does not earn.** It binds the set of *gates*, never whether a gate should exist.
+/// `poison` is gated deliberately — D8 requires the lockstep harness be compiled out of
+/// releases — so the finding is never "remove the gate", only "no coverage row may rest on a
+/// test inside one".
+fn judge_cfg_gated(d: &Derivation, declared: &[(&str, &str, &str)]) -> Vec<String> {
+    let mut findings = Vec::new();
+    let declared: BTreeSet<(String, String, String)> = declared
+        .iter()
+        .map(|(package, feature, module)| {
+            (package.to_string(), feature.to_string(), module.to_string())
+        })
+        .collect();
+    for gate in declared.difference(&d.cfg_gated_modules) {
+        findings.push(format!(
+            "cfg-gated-stale: FEATURE_GATED_MODULES declares {gate:?}, which this tree no longer \
+             has. Either the gate was removed — delete the row in the same commit — or the scan \
+             that finds it has broken, and a broken scan is what makes every `test:` citation \
+             resolve clean."
+        ));
+    }
+    for gate in d.cfg_gated_modules.difference(&declared) {
+        findings.push(format!(
+            "cfg-gated-undeclared: {gate:?} is a module this workspace compiles out of a default \
+             `cargo test`, and FEATURE_GATED_MODULES does not declare it. Declare it, and while \
+             doing so establish that no terminal coverage row cites a test inside it."
+        ));
+    }
     findings
 }
 
@@ -2874,6 +3028,95 @@ fn granularity_mutant_a_lib_citation_naming_an_ignored_unit_test_is_caught() {
     ));
     let findings = granularity_findings(&d);
     assert!(fires(&findings, "granularity-ignored"), "{findings:?}");
+}
+
+/// The one lib unit test this workspace compiles **out** of a default `cargo test`.
+///
+/// Unlike the `#[ignore]` half above, this needs no planted instance: `poison.rs`'s test is
+/// real and live at `c0f2ace5`. Read from the derivation rather than written down, so the day
+/// the module moves this helper panics instead of silently testing nothing.
+fn a_cfg_gated_unit_test(d: &Derivation, package: &str) -> (String, String) {
+    d.cfg_gated
+        .iter()
+        .find(|(owner, prefix, _)| owner == package && !prefix.is_empty())
+        .map(|(_, prefix, function)| (prefix.clone(), function.clone()))
+        .unwrap_or_else(|| panic!("{package} declares no feature-gated unit test"))
+}
+
+fn cfg_gated_findings(d: &Derivation) -> Vec<String> {
+    judge_cfg_gated(d, FEATURE_GATED_MODULES)
+}
+
+#[test]
+fn granularity_mutant_a_lib_citation_naming_a_cfg_gated_unit_test_is_caught() {
+    let mut d = derive(&root());
+    let (prefix, function) = a_cfg_gated_unit_test(&d, "fln-conformance");
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine
+        .push(format!("test:fln-conformance::lib::{prefix}::{function}"));
+    let findings = granularity_findings(&d);
+    assert!(fires(&findings, "granularity-cfg-gated"), "{findings:?}");
+}
+
+#[test]
+fn granularity_control_a_citation_into_a_compiled_module_is_not_cfg_gated() {
+    let mut d = derive(&root());
+    // Without this cell the mutant above passes equally well against a check that fires on
+    // every lib citation, which would prove nothing about gating.
+    let (prefix, function) = d.lib_tests["fln-conformance"]
+        .iter()
+        .find(|(prefix, function)| {
+            !prefix.is_empty()
+                && !d
+                    .cfg_gated
+                    .iter()
+                    .any(|(_, gated_prefix, gated)| gated_prefix == prefix && gated == function)
+        })
+        .cloned()
+        .expect("fln-conformance has a unit test outside any gated module");
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine
+        .push(format!("test:fln-conformance::lib::{prefix}::{function}"));
+    let findings = granularity_findings(&d);
+    assert!(!fires(&findings, "granularity-cfg-gated"), "{findings:?}");
+}
+
+#[test]
+fn the_feature_gated_module_population_matches_the_declaration() {
+    let d = derive(&root());
+    let findings = cfg_gated_findings(&d);
+    assert!(findings.is_empty(), "{findings:?}");
+    // The anti-vacuity floor, and the reason this test is not just the equality above: an
+    // empty derived set would make the citation check pass for EVERY citation while matching
+    // an emptied declaration without a word. Assert the population is non-empty at the site
+    // that would otherwise go quiet.
+    assert!(
+        !d.cfg_gated_modules.is_empty(),
+        "the feature-gate scan found nothing, which is a collapsed scan and not a tree with \
+         no gated modules"
+    );
+}
+
+#[test]
+fn cfg_gated_mutant_an_undeclared_gate_is_caught() {
+    let mut d = derive(&root());
+    d.cfg_gated_modules.insert((
+        "fln-conformance".to_string(),
+        "planted-feature".to_string(),
+        "planted_module".to_string(),
+    ));
+    let findings = cfg_gated_findings(&d);
+    assert!(fires(&findings, "cfg-gated-undeclared"), "{findings:?}");
+}
+
+#[test]
+fn cfg_gated_mutant_a_collapsed_scan_refuses_instead_of_reporting_no_gates() {
+    let mut d = derive(&root());
+    d.cfg_gated_modules.clear();
+    let findings = cfg_gated_findings(&d);
+    assert!(fires(&findings, "cfg-gated-stale"), "{findings:?}");
 }
 
 #[test]

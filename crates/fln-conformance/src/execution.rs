@@ -234,6 +234,160 @@ pub fn autodiscovery_overrides(manifest: &str) -> Vec<&'static str> {
     reasons
 }
 
+/// Every feature a default `cargo test` leaves **off**, from a member manifest's `[features]`.
+///
+/// A `#[cfg(feature = "…")]` item is compiled only when its feature is on, and this repository
+/// turns none on explicitly: measured at `c0f2ace5`, neither `scripts/check.sh`,
+/// `.github/workflows/ci.yml` nor any of the 21 scripts in `scripts/e2e/` passes `--features` or
+/// `--all-features`, so "on" means "reachable from `default`" and nothing else.
+///
+/// The closure over `default` is **walked**, because a feature named only as another feature's
+/// dependency is still on and a one-level read would call it off. `dep:foo` and `pkg/feat`
+/// entries are skipped: neither names a feature of this member.
+///
+/// **The empty answer is the safe one.** A manifest this cannot parse yields no off-features, so
+/// the caller refuses nothing. The opposite default would name *live* tests as dead — a wrong
+/// answer that reddens a healthy tree, where this one merely fails to catch.
+pub fn features_off_by_default(manifest: &str) -> BTreeSet<String> {
+    let mut declared: Vec<(String, Vec<String>)> = Vec::new();
+    let mut in_features = false;
+    let mut pending: Option<(String, String)> = None;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if pending.is_none() && trimmed.starts_with('[') {
+            // Any other table header closes `[features]`; only the exact header opens it.
+            in_features = trimmed == "[features]";
+            continue;
+        }
+        if !in_features || trimmed.is_empty() {
+            continue;
+        }
+        let (name, mut body) = match pending.take() {
+            Some((name, accumulated)) => (name, format!("{accumulated} {trimmed}")),
+            None => match trimmed.split_once('=') {
+                Some((name, rest)) => (name.trim().to_string(), rest.trim().to_string()),
+                None => continue,
+            },
+        };
+        // A feature list may span lines; accumulate until the array closes.
+        if body.contains('[') && !body.contains(']') {
+            pending = Some((name, body));
+            continue;
+        }
+        body = body
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        let dependencies = body
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim().trim_matches('"').trim();
+                (!entry.is_empty()).then(|| entry.to_string())
+            })
+            .collect();
+        declared.push((name, dependencies));
+    }
+
+    let mut on: BTreeSet<String> = BTreeSet::new();
+    let mut frontier = vec!["default".to_string()];
+    while let Some(feature) = frontier.pop() {
+        if !on.insert(feature.clone()) {
+            continue;
+        }
+        let Some((_, dependencies)) = declared.iter().find(|(name, _)| *name == feature) else {
+            continue;
+        };
+        for dependency in dependencies {
+            if dependency.starts_with("dep:") || dependency.contains('/') {
+                continue;
+            }
+            frontier.push(dependency.clone());
+        }
+    }
+
+    declared
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !on.contains(name))
+        .collect()
+}
+
+/// Every `mod` declaration gated by a plain `#[cfg(feature = "…")]`, as `(feature, module)`.
+///
+/// Paired with [`unmodelled_feature_cfgs`], and the pairing is not optional: this decides only
+/// the literal one-feature form, so a shape it cannot decide must become a **precondition
+/// failure** at the caller rather than an absence here. A gated module silently skipped leaves
+/// every test inside it looking live, which is the exact false clean this join exists to refuse.
+///
+/// The attribute must **begin** the trimmed line, for [`test_functions`]'s reason: this identical
+/// text appears inside a string literal in `tools/structure-guard/tests/authority.rs` as planted
+/// fixture source, and counting mentions instead of constructs is the error
+/// `fln-bench-apparatus-empty-referent-bkw6` paid for.
+pub fn feature_gated_modules(source: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim().strip_prefix("#[cfg(feature") else {
+            continue;
+        };
+        let Some(feature) = rest
+            .split_once('"')
+            .and_then(|(_, tail)| tail.split_once('"'))
+            .map(|(name, _)| name.to_string())
+        else {
+            continue;
+        };
+        // The attribute may sit above further attributes before the item itself.
+        let mut cursor = index + 1;
+        while cursor < lines.len() && lines[cursor].trim_start().starts_with("#[") {
+            cursor += 1;
+        }
+        let Some(item) = lines.get(cursor) else {
+            continue;
+        };
+        let mut item = item.trim_start();
+        loop {
+            let stripped = ["pub(crate) ", "pub ", "unsafe "]
+                .iter()
+                .find_map(|modifier| item.strip_prefix(modifier));
+            match stripped {
+                Some(next) => item = next.trim_start(),
+                None => break,
+            }
+        }
+        let Some(rest) = item.strip_prefix("mod ") else {
+            continue;
+        };
+        let end = rest.find([';', ' ', '{']).unwrap_or(rest.len());
+        found.push((feature, rest[..end].to_string()));
+    }
+    found
+}
+
+/// Every `#[cfg(…)]` attribute naming a feature that [`feature_gated_modules`] does **not**
+/// decide — `all(…)`, `any(…)`, `not(…)`, or any nesting.
+///
+/// Measured at `c0f2ace5`: zero in member `src/` trees, so the simple form is exact today. The
+/// one `not(feature = …)` in this workspace sits in an integration test and carries the opposite
+/// polarity — the item is present *by default* — so a parser that read it as a gate would report
+/// a running test as dead. That is why an undecided shape refuses instead of guessing which way
+/// it points.
+pub fn unmodelled_feature_cfgs(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("#[cfg(")
+                && line.contains("feature")
+                && !line.starts_with("#[cfg(feature")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// A `test:<pkg>::<target>::<path>` citation — the **function-granular** evidence kind.
 ///
 /// A coverage row cites a file; cargo compiles a *target*; libtest runs a *function*. The
