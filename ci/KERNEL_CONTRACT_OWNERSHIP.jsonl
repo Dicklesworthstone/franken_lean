@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":397,"projection_hash":"d4c5f2b1140381d59968ecd33b78de040ec596ba6fa37a4b62a41e855362881a"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":398,"projection_hash":"a584be5d983b6005bc456b596f530c6c92010a55b46eb1e7bf787e376ccd8724"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -278,6 +278,7 @@
 {"id":"franken_lean-ext-observable-fixture-drift-gap-vqnu"}
 {"id":"franken_lean-f6br"}
 {"id":"franken_lean-feo"}
+{"id":"franken_lean-fmt-gate-env-fault-as-finding-u4j7"}
 {"id":"franken_lean-fnj"}
 {"id":"franken_lean-foo"}
 {"id":"franken_lean-fy2x"}
