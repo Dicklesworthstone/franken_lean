@@ -80,8 +80,13 @@
 //! * **SCHEMA — the wire format.** `SchemaId`, the domain tags
 //!   ([`fln_hash::domain`]), the byte grammar itself. Both sides must agree on
 //!   what the bytes *mean* or a disagreement cannot be stated.
-//! * **SEMANTIC — the readers.** `Canonical::read_body` and
-//!   `from_canonical_bytes` for `Expr`, `Level` and `Name`. Decoding is where
+//! * **SEMANTIC — the readers.** `Canonical::read_body`, `from_canonical_bytes`
+//!   and `from_canonical_bytes_budgeted` for `Expr`, `Level` and `Name`. The
+//!   budgeted entry point is the one `canon.rs` steers callers to for untrusted
+//!   input, so naming only the unbudgeted one would send a checker author who
+//!   followed the documentation straight past the rule. It was in the inventory
+//!   and absent from this list until the registry below bound the two together.
+//!   Decoding is where
 //!   `franken_lean-d17i` measured 37 real defects (24 missing private
 //!   equation-compiler auxiliaries, 8 sharing that root cause, 5 definitions
 //!   decoded as `Axiom` with their values stripped). A second decoder is the
@@ -143,11 +148,17 @@
 //!    text cited `WORKSPACE_GRAPH.txt:110`, which is now *fln-kernel's*
 //!    allowlist: a line-number citation moved under the claim, so cite the
 //!    declaration by content.
-//! 2. **STILL OPEN, and it cannot be a crate-level rule.**
-//!    `fln-checker -> fln-hash` must stay permitted — the wire format and the
-//!    domain tags have to be shared — so the split runs through the middle of
-//!    one crate. The `Canonical` *readers* need an item-level rule and do not
-//!    have one yet.
+//! 2. **DONE, and this entry was wrong about it for two days.** It read "STILL
+//!    OPEN … the `Canonical` *readers* need an item-level rule and do not have one
+//!    yet". They had one. `read_body` and `from_canonical_bytes` entered
+//!    `FLN-STRUCT-037`'s inventory at `18b6d14b`, which is an **ancestor** of
+//!    `a22c64f2` — the commit that wrote this entry, whose subject is "re-measure
+//!    the two doctrine claims in its charter, both of which outlived the work that
+//!    satisfied them". The re-measurement itself outlived nothing; it was false the
+//!    day it was written, and `franken_lean-r0xu`'s own closing judgement already
+//!    said so. `fln-checker -> fln-hash` does still stay permitted, so the split
+//!    genuinely runs through the middle of one crate — that half was correct, which
+//!    is exactly why the wrong half survived review.
 //!
 //! ## What is machine-checked, and what is not
 //!
@@ -157,16 +168,26 @@
 //!
 //! * **ENFORCED at item granularity.** `FLN-STRUCT-037` refuses `fln-checker`
 //!   *reaching* a SEMANTIC item across this boundary
-//!   (`tools/structure-guard/src/checks.rs:1014`). It is planted three ways:
-//!   `seeded.rs:1295` proves the baseline clean, `seeded.rs:1305`
+//!   (`tools/structure-guard/src/checks.rs:1023`). It is planted three ways:
+//!   `seeded.rs:1296` proves the baseline clean, `seeded.rs:1306`
 //!   `every_semantic_item_is_refused_inside_fln_checker` plants one violation per
 //!   inventory item and asserts each fires **alone** so an over-broad matcher
-//!   cannot fake green, and `seeded.rs:1337` proves that *naming* a semantic item
+//!   cannot fake green, and `seeded.rs:1341` proves that *naming* a semantic item
 //!   in prose is not a violation — which is why this document may keep citing
 //!   `Level::is_equiv` and `from_canonical_bytes` by name.
-//! * **NOT ENFORCED.** The `fln-hash` reader split of item 2 above. A rule
-//!   refusing `Canonical::read_body` / `from_canonical_bytes` for `Expr`, `Level`
-//!   and `Name` inside this crate does not exist, so that half remains a document.
+//! * **DECLARED AND NOT WALKED — three items, and the number is bound.** Not every
+//!   name this charter calls SEMANTIC is in the inventory. `normalize` and `is_zero`
+//!   are method names the checker's *own required reimplementation* legitimately
+//!   wants, and the rule matches lexemes — including definitions — so enforcing them
+//!   would forbid exactly what this document demands. `lean_hash` is a module path
+//!   and looks enforceable on the same terms as `fln_bignum`; it is unenforced for
+//!   no recorded reason, which is a candidate for repair rather than a decision.
+//!   The registry below marks each `walked` or `reviewed`, and
+//!   `the_charter_and_the_rule_declare_the_same_semantic_inventory` fails if a
+//!   `reviewed` item is in the rule, if a `walked` item is not, or if the reviewed
+//!   remainder is any size but three. **A remainder that is counted is a remainder
+//!   somebody has to argue for; this bullet used to be the sentence "that half
+//!   remains a document", and it was false.**
 //! * **VACUOUS TODAY, deliberately.** There is no checking code here, so
 //!   `FLN-STRUCT-037` currently refuses nothing. It was installed before the
 //!   implementation on purpose: the boundary is cheapest to hold before the first
@@ -174,6 +195,50 @@
 //!
 //! Nobody should read the existence of this section as evidence that the whole
 //! boundary holds; read the two bullets above for which half does.
+//!
+//! ## Semantic registry — every name above, bound to the rule that refuses it
+//!
+//! **Why this exists.** Everything above is prose, and prose about enforcement rots
+//! in the one direction nobody checks: *toward claiming less than the build does*, so
+//! it never fails and never gets read again. The `NOT ENFORCED` bullet this section
+//! replaced was false the day it was written and stayed false through two later edits
+//! to this file, including one whose stated purpose was re-measuring these very claims.
+//!
+//! The rule is `structure_guard::checks::CHECKER_SEMANTIC`, and it is the **single**
+//! producer: the seeded campaign that plants one violation per item reads that array
+//! directly, and so does the test behind this registry. Nothing transcribes it any
+//! more. Each row below marks a name `walked` — in the rule, refused inside this
+//! crate — or `reviewed`, declared SEMANTIC here and deliberately not in the rule.
+//!
+//! `reviewed` is a **counted remainder, not an escape hatch**: the test pins it at
+//! three, so a fourth unwalked declaration cannot be added quietly and a repaired one
+//! cannot be left claiming to be unrepaired. Equality both ways, because this is a
+//! measured population rather than a shrinking allowance.
+//!
+//! ```text
+//! semantic is_equiv                     :: walked
+//! semantic normalize_fixpoint           :: walked
+//! semantic loose_bvar_range             :: walked
+//! semantic has_fvar                     :: walked
+//! semantic has_expr_mvar                :: walked
+//! semantic has_level_mvar               :: walked
+//! semantic has_level_param              :: walked
+//! semantic approx_depth                 :: walked
+//! semantic read_body                    :: walked
+//! semantic from_canonical_bytes         :: walked
+//! semantic from_canonical_bytes_budgeted :: walked
+//! semantic fln_bignum                   :: walked
+//! semantic normalize                    :: reviewed the checker's own eager normalization wants this name
+//! semantic is_zero                      :: reviewed the checker's own Level reimplementation wants this name
+//! semantic lean_hash                    :: reviewed no recorded reason; enforceable like fln_bignum, so a repair candidate
+//! ```
+//!
+//! **What this does not earn.** A `walked` row proves the name is in the rule's
+//! inventory. It does not prove the rule *fires* against this crate — that is the
+//! seeded campaign's job, and it is vacuous against the real tree while there is no
+//! checking code here. Nor does a `reviewed` row make its reason true: two of the
+//! three reasons are arguments about name collision that nobody has tested, and the
+//! third says plainly that there is no reason at all.
 //!
 //! ## Citation registry — every line number above, bound to what it points at
 //!
@@ -203,10 +268,10 @@
 //! cite crates/fln-hash/src/canon.rs:542 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
 //! cite crates/fln-conformance/src/witness.rs:496 :: id: "B3-INDEPENDENT-CHECKER"
-//! cite tools/structure-guard/src/checks.rs:1014 :: code: "FLN-STRUCT-037"
-//! cite tools/structure-guard/tests/seeded.rs:1295 :: fn the_checker_boundary_baseline_is_clean
-//! cite tools/structure-guard/tests/seeded.rs:1305 :: fn every_semantic_item_is_refused_inside_fln_checker
-//! cite tools/structure-guard/tests/seeded.rs:1337 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
+//! cite tools/structure-guard/src/checks.rs:1023 :: code: "FLN-STRUCT-037"
+//! cite tools/structure-guard/tests/seeded.rs:1296 :: fn the_checker_boundary_baseline_is_clean
+//! cite tools/structure-guard/tests/seeded.rs:1306 :: fn every_semantic_item_is_refused_inside_fln_checker
+//! cite tools/structure-guard/tests/seeded.rs:1341 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
 //! ```
 //!
 //! **What this does not earn.** A bound citation proves the line still holds the construct

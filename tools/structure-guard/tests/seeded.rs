@@ -1276,20 +1276,21 @@ fn a_waiver_inside_a_string_literal_does_not_waive_the_crate() {
 /// passing is an unenforced claim, which is the failure class this suite exists
 /// to prevent — so every entry in the semantic inventory is planted here and
 /// asserted to fire.
-const CHECKER_SEMANTIC_INVENTORY: [&str; 12] = [
-    "is_equiv",
-    "normalize_fixpoint",
-    "loose_bvar_range",
-    "has_fvar",
-    "has_expr_mvar",
-    "has_level_mvar",
-    "has_level_param",
-    "approx_depth",
-    "read_body",
-    "from_canonical_bytes",
-    "from_canonical_bytes_budgeted",
-    "fln_bignum",
-];
+/// Read from the rule itself, never transcribed beside it.
+///
+/// This was a hand-written `[&str; 12]` until the inventory was made `pub`. The copy
+/// agreed with `checks::CHECKER_SEMANTIC` on the day it was written and nothing joined
+/// them, so a thirteenth item added to the rule would have left this campaign planting
+/// twelve: the new item's violation would never have been attempted, and the suite
+/// would have stayed green while covering less than it claims. The copy had already
+/// begun to rot in the direction nothing checks — the doc comment above it called the
+/// inventory "eleven items" after it had grown to twelve.
+fn checker_semantic_inventory() -> Vec<&'static str> {
+    checks::CHECKER_SEMANTIC
+        .iter()
+        .map(|(name, _)| *name)
+        .collect()
+}
 
 #[test]
 fn the_checker_boundary_baseline_is_clean() {
@@ -1303,7 +1304,7 @@ fn the_checker_boundary_baseline_is_clean() {
 /// single over-broad matcher cannot make the suite look green.
 #[test]
 fn every_semantic_item_is_refused_inside_fln_checker() {
-    for item in CHECKER_SEMANTIC_INVENTORY {
+    for item in checker_semantic_inventory() {
         let ws = TempWs::new(&format!("checker-boundary-{item}"));
         base(&ws);
         ws.write(
@@ -1332,13 +1333,16 @@ fn every_semantic_item_is_refused_inside_fln_checker() {
 /// line comments, block comments and string literals.
 ///
 /// Without this the rule would have been self-defeating — the real
-/// `crates/fln-checker/src/lib.rs` names all eleven items in its doc comments.
+/// `crates/fln-checker/src/lib.rs` names every item in the inventory in its doc
+/// comments, and now carries a machine-readable registry of them besides. The count
+/// is deliberately not written here: this comment said "eleven" for as long as the
+/// inventory had twelve entries, which is the same rot in miniature.
 #[test]
 fn naming_a_semantic_item_in_prose_is_not_a_violation() {
     let ws = TempWs::new("checker-boundary-prose");
     base(&ws);
     let mut src = String::from("//! stub\n#![forbid(unsafe_code)]\n");
-    for item in CHECKER_SEMANTIC_INVENTORY {
+    for item in checker_semantic_inventory() {
         src.push_str(&format!("//! never call `{item}` from this crate.\n"));
         src.push_str(&format!("/* block: {item} is SEMANTIC */\n"));
     }

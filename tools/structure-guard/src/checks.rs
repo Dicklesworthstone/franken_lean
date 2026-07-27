@@ -946,66 +946,75 @@ fn count_loc(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<usi
 /// deliberately **absent**: the checker's own eager normalization legitimately
 /// wants that name, while `normalize_fixpoint` is the distinctive `fln-core`
 /// entry point and is refused.
-fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
-    const SEMANTIC: [(&str, &str); 12] = [
-        (
-            "is_equiv",
-            "universe equivalence is a judgment fln-kernel returns as its verdict (KR-303); \
+pub const CHECKER_SEMANTIC: [(&str, &str); 12] = [
+    (
+        "is_equiv",
+        "universe equivalence is a judgment fln-kernel returns as its verdict (KR-303); \
              the checker must decide it independently",
-        ),
-        (
-            "normalize_fixpoint",
-            "universe normalization is a judgment; imax/max fixpoint is where unsoundness hides",
-        ),
-        (
-            "loose_bvar_range",
-            "a precomputed answer `instantiate` prunes traversal on (tc.rs:176); \
+    ),
+    (
+        "normalize_fixpoint",
+        "universe normalization is a judgment; imax/max fixpoint is where unsoundness hides",
+    ),
+    (
+        "loose_bvar_range",
+        "a precomputed answer `instantiate` prunes traversal on (tc.rs:176); \
              a shared wrong range makes both engines skip the same subterm",
-        ),
-        (
-            "has_fvar",
-            "a precomputed answer the `abstract_*` walks prune on (tc.rs:1645/1707/1779)",
-        ),
-        (
-            "has_expr_mvar",
-            "a precomputed data-word answer, not a schema",
-        ),
-        (
-            "has_level_mvar",
-            "a precomputed data-word answer, not a schema",
-        ),
-        (
-            "has_level_param",
-            "a precomputed data-word answer, not a schema",
-        ),
-        (
-            "approx_depth",
-            "a precomputed data-word answer, not a schema",
-        ),
-        (
-            "read_body",
-            "the Canonical reader: share the wire FORMAT, never the PARSER — decoding is \
+    ),
+    (
+        "has_fvar",
+        "a precomputed answer the `abstract_*` walks prune on (tc.rs:1645/1707/1779)",
+    ),
+    (
+        "has_expr_mvar",
+        "a precomputed data-word answer, not a schema",
+    ),
+    (
+        "has_level_mvar",
+        "a precomputed data-word answer, not a schema",
+    ),
+    (
+        "has_level_param",
+        "a precomputed data-word answer, not a schema",
+    ),
+    (
+        "approx_depth",
+        "a precomputed data-word answer, not a schema",
+    ),
+    (
+        "read_body",
+        "the Canonical reader: share the wire FORMAT, never the PARSER — decoding is \
              where franken_lean-d17i measured 37 real defects",
-        ),
-        (
-            "from_canonical_bytes",
-            "the Canonical reader; fln-checker must bring its own decoder (gii)",
-        ),
-        (
-            "from_canonical_bytes_budgeted",
-            "the Canonical reader canon.rs itself steers callers to for untrusted input, \
+    ),
+    (
+        "from_canonical_bytes",
+        "the Canonical reader; fln-checker must bring its own decoder (gii)",
+    ),
+    (
+        "from_canonical_bytes_budgeted",
+        "the Canonical reader canon.rs itself steers callers to for untrusted input, \
              so a checker author following the documentation would slip past a guard \
              that named only the unbudgeted entry point",
-        ),
-        (
-            "fln_bignum",
-            "kernel arithmetic is judgment: KR-313 decides definitional equality by computing, \
+    ),
+    (
+        "fln_bignum",
+        "kernel arithmetic is judgment: KR-313 decides definitional equality by computing, \
              so a shared sum is a shared verdict",
-        ),
-    ];
-    let wanted: Vec<&str> = SEMANTIC.iter().map(|(name, _)| *name).collect();
+    ),
+];
+
+/// Refuse every [`CHECKER_SEMANTIC`] identifier appearing anywhere in `fln-checker`.
+///
+/// The inventory is `pub` and sits above this function rather than inside it so that
+/// the seeded campaign and `fln-checker`'s own charter test read the **same array**.
+/// Both previously held transcriptions of it, and a transcription is free to drift
+/// from the rule it claims to describe: `seeded.rs`'s copy still called the inventory
+/// "eleven items" after it grew to twelve, and the charter declared a prohibition
+/// enforced here as "NOT ENFORCED" for two days.
+fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
+    let wanted: Vec<&str> = CHECKER_SEMANTIC.iter().map(|(name, _)| *name).collect();
     for site in ledger::identifier_sites(text, &wanted) {
-        let why = SEMANTIC
+        let why = CHECKER_SEMANTIC
             .iter()
             .find(|(name, _)| *name == site.name)
             .map(|(_, why)| *why)
