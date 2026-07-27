@@ -40,11 +40,40 @@
 //! are lane-evidence rows whose entire evidence set is the lane's own output namespace,
 //! cited by name in a namespace that is unrooted and ephemeral by construction.
 //!
+//! **`commit_unreachable` is ROT, not an empty referent, and the recovery method is now
+//! measured rather than assumed** (bead `fln-history-rewrite-evidence-anchor-reachability-vdi4`).
+//! The 2026-07-25 `filter-branch` did not make these anchors wrong; it made them unverifiable
+//! from `main`, while `refs/original` keeps every pre-rewrite commit alive in this clone so a
+//! naive existence check still passes. Re-derived at `84e15401`: **9 of the 9** unreachable
+//! `commit:` citations recover to a content-identical twin on `main`. A twin is accepted only
+//! on identical patch-id, byte-identical diff text, identical touched-path list and identical
+//! resulting blob for every path — never on subject and author date, which agree here for
+//! reasons that prove nothing on their own.
+//!
+//! The negative control came from the tree rather than from the probe, which is why the
+//! method is believable: swept repository-wide the same predicate refuses `be14ee9b`, whose
+//! same-subject candidate on `main` is missing exactly the four `contracts/*.tsv` shards the
+//! rewrite stripped. The one commit whose content the rewrite genuinely altered is the one
+//! the content check declined.
+//!
+//! **Two of the nine were `cc_3`'s rows and are repaired here, which is why the class reads
+//! 7. The remaining seven are `cc_2`'s and are routed, not repaired** — this module's own
+//! ruling is that an individual row belongs to its owner, and that binds repair exactly as it
+//! binds withdrawal. The class is expected to reach 0; it is not a permitted remainder.
+//!
 //! **What this does not earn.** It classifies referents; it never establishes that a
 //! *resolvable* citation supports the claim citing it, which is the harder join and is
-//! untouched. `never_existed` rests on `git log --all`, so a path that lived only on a
-//! dropped branch misclassifies. The census is a measurement of this tree at this commit,
-//! re-derived per run; the *ruling* above is `bounded_model` at one host.
+//! untouched. A twin proves two commits carry the same *content*; it never proves the
+//! sentence citing the anchor was sound. `never_existed` rests on `git log --all`, so a path
+//! that lived only on a dropped branch misclassifies. The census is a measurement of this
+//! tree at this commit, re-derived per run; the *ruling* above is `bounded_model` at one host.
+//!
+//! The header's `2eb09ba6` figures are left as measured **at that commit** rather than
+//! silently refreshed, since a measurement carries the hash it was taken at. Re-derived at
+//! `84e15401` after the two repairs above: **178 unresolvable of 591 citations across 191
+//! coverage rows**, against 180 of 584 across 190. The manifest gained one coverage row and
+//! seven citations from a peer in between, none of the seven unresolvable, so the entire
+//! movement in the unresolvable figure is the two anchors repaired here.
 
 #![forbid(unsafe_code)]
 
@@ -65,7 +94,7 @@ const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
     ("rootless_leaf", 120),
     ("glob", 20),
     ("never_existed", 15),
-    ("commit_unreachable", 9),
+    ("commit_unreachable", 7),
     ("present_but_untracked", 9),
     ("under_target_ephemeral", 7),
     ("existed_then_removed", 0),
@@ -75,11 +104,18 @@ const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
 /// never-denoted, so neither repair nor withdrawal is available. See the module header.
 const THIRD_STATE_ROWS: usize = 17;
 
-/// Rows whose every citation is unresolvable. Larger than [`THIRD_STATE_ROWS`] by exactly
-/// the rows carrying a *recoverable* class — rot, which has a known recovery method — and
-/// the gap is disclosed rather than smoothed away, because a row that can be rescued by
-/// repairing an anchor is not in the third state.
-const FULLY_UNRESOLVABLE_ROWS: usize = 18;
+/// Rows whose every citation is unresolvable.
+///
+/// This stood at 18 — one more than [`THIRD_STATE_ROWS`] — for as long as exactly one such
+/// row carried a *recoverable* class alongside its never-denoted one: `wao6`, whose rotted
+/// commit anchor sat beside a rootless leaf. That anchor is repaired, so **the gap is now
+/// zero and every fully-unresolvable row is third-state**.
+///
+/// The two constants are deliberately kept separate rather than collapsed into one now that
+/// they are equal. They measure different predicates, and merging them would make the next
+/// recoverable-class row join a population this module declares *unrepairable* instead of
+/// re-opening the gap and saying so.
+const FULLY_UNRESOLVABLE_ROWS: usize = 17;
 
 /// Classes that resolve to something this repository can check.
 const RESOLVABLE: &[&str] = &["tracked_exists", "bead_comment_checked", "commit_reachable"];
