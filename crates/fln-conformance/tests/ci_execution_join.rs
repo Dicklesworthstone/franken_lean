@@ -350,6 +350,40 @@ const UNDISPATCHED_GOVERNED_LANES: &[(&str, &str)] = &[(
 /// ships with the ratchet — replace the citation with `test:<pkg>::<target>::<path>`, which
 /// [`test_function_citation`] parses and [`judge_granularity`] resolves against the target's
 /// real function list. Every entry is a debt, not a budget.
+///
+/// # Who may narrow a row, and how far — two sequencer rulings of 2026-07-27
+///
+/// Both were made in messages and lived nowhere durable for most of a day. They are recorded here
+/// rather than in a handoff because a handoff reaches one successor, while this is the text a pane
+/// reads *before* moving the ceiling.
+///
+/// **The narrow exception.** Every bead in this list is CLOSED, so AGENTS.md's one sanctioned
+/// exception — edit your own row in the same commit as your close — cannot reach any of them, and
+/// 22 of the 30 repairable rows have no living owner. So **any** pane may narrow a row to the
+/// functions **that row's own `unit` field already declares**, under four binding constraints:
+///
+/// 1. narrow only where the row's own `unit` already names the function — never invent one;
+/// 2. verify each function exists and is not `#[ignore]`d, **borrowing** `execution.rs`'s
+///    predicate per `fln-rgha` rather than planting a second copy free to drift from it;
+/// 3. disclose the exception in every commit message that uses it;
+/// 4. rows whose `unit` holds shell commands are a **separate finding** — do not fold them in.
+///
+/// **The widening is REFUSED.** Copying a citation out of `mutation`, `boundary`, or any of the
+/// other eleven evidence fields into `artifacts` is not permitted: it manufactures a *checked*
+/// citation resting on an *unchecked* field. Bead `franken_lean-evidence-fields-never-resolved-bs5o`
+/// measures that nothing anywhere resolves those twelve fields against a real function, and
+/// `franken_lean-tkr2` is the recorded row whose entire evidence set names functions that do not
+/// exist while validating clean. `unit` is inside the exception **only** because constraint 2
+/// independently re-verifies it against the tree; no other field earns that, and widening the
+/// exception to one would be this repository's own defect family arriving inside its repair.
+///
+/// **So 57 is a debt, not a clean number.** 25 repairable rows remain, plus 18 whose `unit` covers
+/// some cited coarse artifacts and not all, and 14 whose `unit` covers none of them.
+///
+/// A coupled population, recorded because it is invisible from this list. A row leaving here
+/// **also** leaves the ignored-producer citation census whenever the surface it cited coarsely
+/// carries an `#[ignore]`d producer. Migrating five rows moved that census by three, and the guard
+/// refused until both moved; no reader had noticed the coupling. Expect two ratchets, not one.
 const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-22i1",
     "fln-23cz",
