@@ -3,7 +3,17 @@
 > **@generated** by `scripts/extract/gen_olean_contract.py` (Rule D5/D9, plan Appendix B). DO NOT EDIT.
 > Format constants are derived, never remembered; regenerate with the script.
 >
-> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35` tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
+> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35`
+> — tag and commit are **established here**: cross-checked against the pinned
+>   Reference binary's `lean --version` and against every pinned `.olean`
+>   artifact's `lean_version` and `githash` fields.
+> — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91` is **transcribed from `SUITE.lock` and NOT
+>   established by this extractor**. What is bound here is *content*: a
+>   sha256 is recorded below for each source read, so any change to those
+>   files is caught — while a staged tree differing from the pin in a file
+>   this extractor does not read is not. Tree identity is verified by
+>   `scripts/verify_vendor_tree.sh`, which the contract lanes run before
+>   extraction; this line records the pin, it does not attest to it.
 > inventory: `contracts/olean_inventory.json` sha256 `901a2970a31a945a05bbf5e6f3bcb13fe01016a16930bcd654879403076437f8`
 > rust: `crates/fln-olean/src/format.rs` (rendered from the same inventory)
 >

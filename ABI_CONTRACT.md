@@ -3,7 +3,15 @@
 > **@generated** by `scripts/extract/gen_abi_contract.py` (Rule D5/D9, plan Appendix B). DO NOT EDIT.
 > Layout constants are derived, never remembered; regenerate with the script.
 >
-> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35` tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
+> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35`
+> — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
+> — all three pin fields above are **transcribed from `SUITE.lock` and NOT
+>   established by this extractor**: it verifies neither the tag, the commit,
+>   nor the tree. Tree identity is verified by `scripts/verify_vendor_tree.sh`,
+>   which the contract lanes run before extraction.
+> — what this extractor **does** establish: the vendored source below is
+>   byte-identical to the installed pinned toolchain's own copy of it, and the
+>   extraction fails if they differ.
 > source: `vendor/lean4-src/src/include/lean/lean.h` (3352 lines, sha256 `22eed50aa703c4403010fabc12a7231ffa34dc979bd59ca1bfbac13c29a1dad2`)
 > inventory: `contracts/abi_inventory.json` sha256 `f61654c61c404f3c34bfefbe695269dafaffadd146643083ffca3e73340e2254`
 > rust: `crates/fln-rt/src/abi.rs` (rendered from the same inventory)

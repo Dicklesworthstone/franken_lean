@@ -1224,7 +1224,22 @@ def render_markdown(inv: dict, digest: str) -> str:
     w.append("> **@generated** by `scripts/extract/gen_abi_contract.py` (Rule D5/D9, plan Appendix B). DO NOT EDIT.")
     w.append("> Layout constants are derived, never remembered; regenerate with the script.")
     w.append(">")
-    w.append(f"> pin: `{pin['repo']}` `{pin['tag']}` commit `{pin['commit']}`" + (f" tree `{pin['tree']}`" if pin["tree"] else ""))
+    # D5/D9: an artifact may not assert provenance its producer did not establish. Measured
+    # for bead `franken_lean-6tqy`: this extractor verifies NONE of the three pin fields —
+    # no tree identity is computed, and unlike its OLEAN sibling it never compares the tag or
+    # the commit against the pinned toolchain. What it does establish is byte-identity between
+    # the vendored `lean.h` and the installed pinned toolchain's own copy, which is a real
+    # independent oracle and is stated as such rather than left to be inferred from the pin.
+    w.append(f"> pin: `{pin['repo']}` `{pin['tag']}` commit `{pin['commit']}`")
+    if pin["tree"]:
+        w.append(f"> — tree `{pin['tree']}`")
+    w.append("> — all three pin fields above are **transcribed from `SUITE.lock` and NOT")
+    w.append(">   established by this extractor**: it verifies neither the tag, the commit,")
+    w.append(">   nor the tree. Tree identity is verified by `scripts/verify_vendor_tree.sh`,")
+    w.append(">   which the contract lanes run before extraction.")
+    w.append("> — what this extractor **does** establish: the vendored source below is")
+    w.append(">   byte-identical to the installed pinned toolchain's own copy of it, and the")
+    w.append(">   extraction fails if they differ.")
     w.append(f"> source: `{src['path']}` ({src['lines']} lines, sha256 `{src['sha256']}`)")
     w.append(f"> inventory: `contracts/abi_inventory.json` sha256 `{digest}`")
     w.append(f"> rust: `crates/fln-rt/src/abi.rs` (rendered from the same inventory)")

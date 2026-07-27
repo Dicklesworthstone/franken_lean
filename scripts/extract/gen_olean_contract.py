@@ -1693,7 +1693,24 @@ def render_markdown(inv: dict, digest: str) -> str:
     w.append("> **@generated** by `scripts/extract/gen_olean_contract.py` (Rule D5/D9, plan Appendix B). DO NOT EDIT.")
     w.append("> Format constants are derived, never remembered; regenerate with the script.")
     w.append(">")
-    w.append(f"> pin: `{pin['repo']}` `{pin['tag']}` commit `{pin['commit']}`" + (f" tree `{pin['tree']}`" if pin["tree"] else ""))
+    # D5/D9: an artifact may not assert provenance its producer did not establish. This
+    # extractor DOES establish the tag and the commit — they are cross-checked against the
+    # pinned Reference binary's own `lean --version` and against every pinned `.olean`
+    # artifact's `lean_version` and `githash` fields. It does NOT establish the tree: no tree
+    # identity is computed anywhere in this file (bead `franken_lean-6tqy`). Rendering all
+    # three in one voice let a transcribed field read as a verified one.
+    w.append(f"> pin: `{pin['repo']}` `{pin['tag']}` commit `{pin['commit']}`")
+    w.append("> — tag and commit are **established here**: cross-checked against the pinned")
+    w.append(">   Reference binary's `lean --version` and against every pinned `.olean`")
+    w.append(">   artifact's `lean_version` and `githash` fields.")
+    if pin["tree"]:
+        w.append(f"> — tree `{pin['tree']}` is **transcribed from `SUITE.lock` and NOT")
+        w.append(">   established by this extractor**. What is bound here is *content*: a")
+        w.append(">   sha256 is recorded below for each source read, so any change to those")
+        w.append(">   files is caught — while a staged tree differing from the pin in a file")
+        w.append(">   this extractor does not read is not. Tree identity is verified by")
+        w.append(">   `scripts/verify_vendor_tree.sh`, which the contract lanes run before")
+        w.append(">   extraction; this line records the pin, it does not attest to it.")
     w.append(f"> inventory: `contracts/olean_inventory.json` sha256 `{digest}`")
     w.append("> rust: `crates/fln-olean/src/format.rs` (rendered from the same inventory)")
     w.append(">")
