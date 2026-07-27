@@ -2900,3 +2900,235 @@ fn rch_mutant_a_missing_disclosure_line_refuses() {
 fn rch_mutant_deleting_the_doctrine_section_refuses() {
     let _ = rch_section_of("# AGENTS.md\n\nEverything except the section that must exist.\n");
 }
+
+// ---------------------------------------------------------------------------------------------
+// franken_lean-h40t: the OTHER half of the launch population — Rust-side launches
+//
+// `every_python_launch_under_scripts_is_sealed` derives its scope from `scripts/`, and the `.py`
+// half of it enforces a sealed **shebang**. Neither reaches a launch written in Rust, and the
+// shebang rule is not merely out of scope there — it is INAPPLICABLE. A shebang is consulted only
+// when a script is executed directly; `Command::new("python3").arg(script)` names the interpreter
+// itself, so the sealed `#!/usr/bin/env -S python3 -I -S` line is never read and buys nothing.
+//
+// The two guards therefore look complementary and leave a population between them: measured at
+// `b6e6b732`, five Rust-side launches of trusted scripts live under `crates/` and `tools/`, every
+// one of them sealed by hand, held by nothing. A sixth written without `-I` would restore exactly
+// the channel this bead exists to shut — an ambient `PYTHONPATH`, or a `hashlib.py` beside the
+// script, replacing the stdlib under the process that computes governed digests and decides
+// verdicts — and no check in this tree would notice.
+//
+// The judgement is a PURE FUNCTION over (path, body) pairs so the decoy can be INJECTED. A guard
+// whose only input is a healthy tree cannot demonstrate that it finds anything: with five sealed
+// call sites present, "no unsealed launch" is what a scan returning nothing at all also reports.
+// ---------------------------------------------------------------------------------------------
+
+/// The file with full-line `//` comments blanked, line numbering preserved.
+///
+/// **The first run of this guard failed on its own doc comment**, which explains the defect in
+/// English and so contains the pattern it searches for. That is `fln-8zsq`'s lesson reproduced
+/// inside the fix for a different bead, and the direction it failed in was the correct one: a
+/// scanner that cannot separate prose from code should redden, not quietly widen. Blanking rather
+/// than deleting keeps every reported line number equal to the line in the real file. Only
+/// whole-line comments are removed — a trailing `//` is left alone, because cutting at one risks
+/// truncating a line whose string literal merely contains `//`.
+fn code_only(body: &str) -> String {
+    body.lines()
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every Rust-side interpreter launch that does not seal startup, as (path, line, command).
+///
+/// `-I` is the load-bearing flag: isolated mode ignores `PYTHONPATH` and refuses to put the
+/// script's own directory on `sys.path`. `-S` is required with it because that is the standard
+/// the `.py` entry points in this tree already hold, and a launch sealed against the environment
+/// but still importing `site` is a weaker guarantee wearing the same name.
+fn unsealed_rust_launches(files: &[(String, String)]) -> Vec<(String, usize, String)> {
+    const LAUNCH: &str = concat!("Command::new(\"", "python3\")");
+    let mut found = Vec::new();
+    for (path, raw) in files {
+        let body = code_only(raw);
+        let body = &body;
+        let mut cursor = 0usize;
+        while let Some(offset) = body[cursor..].find(LAUNCH) {
+            let start = cursor + offset;
+            let line = body[..start].matches('\n').count() + 1;
+            // The builder chain ends where the process is actually started; flags added after
+            // that would belong to a different command.
+            let tail = &body[start..];
+            let end = ["\n    ;", ".output()", ".status()", ".spawn()"]
+                .iter()
+                .filter_map(|marker| tail.find(marker))
+                .min()
+                .unwrap_or(tail.len().min(800));
+            let chain = &tail[..end];
+            let sealed = chain.contains("\"-I\"") && chain.contains("\"-S\"");
+            if !sealed {
+                let shown: String = chain.split_whitespace().collect::<Vec<_>>().join(" ");
+                found.push((path.clone(), line, shown.chars().take(120).collect()));
+            }
+            cursor = start + LAUNCH.len();
+        }
+    }
+    found
+}
+
+/// Collect `*.rs` under `dir`, skipping build and vendor output.
+fn rust_tree(dir: &Path, found: &mut Vec<(String, String)>, repo: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            if name == "target" || name == "vendor" || name == ".git" {
+                continue;
+            }
+            rust_tree(&path, found, repo);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(repo)
+            .expect("a scanned path lies under the repository")
+            .to_string_lossy()
+            .into_owned();
+        found.push((relative, body));
+    }
+}
+
+#[test]
+fn every_rust_side_launch_of_a_trusted_script_is_sealed() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let mut files = Vec::new();
+    rust_tree(&repo.join("crates"), &mut files, &repo);
+    rust_tree(&repo.join("tools"), &mut files, &repo);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let launches: usize = files
+        .iter()
+        .map(|(_, body)| {
+            code_only(body)
+                .matches(concat!("Command::new(\"", "python3\")"))
+                .count()
+        })
+        .sum();
+    // A moved directory or a broken filter must fail loudly rather than report a clean tree.
+    // Five were measured at `b6e6b732`; this is a FLOOR, so removing one is allowed and only a
+    // scan that has lost its scope reddens.
+    assert!(
+        launches >= 5 && files.len() >= 50,
+        "derived scan found {launches} Rust-side interpreter launch(es) across {} files under \
+         crates/ and tools/, which is too few for this tree. Five launches were measured when \
+         this guard was written, so an empty or truncated scan is a broken scan and is refused \
+         rather than reported as a clean tree.",
+        files.len()
+    );
+
+    let unsealed = unsealed_rust_launches(&files);
+    assert!(
+        unsealed.is_empty(),
+        "these Rust-side launches start Python without `-I -S`: {unsealed:#?}\n\n\
+         A shebang does NOT protect them: `Command::new(\"python3\").arg(script)` names the \
+         interpreter, so the script's sealed `#!` line is never read. Without `-I` an ambient \
+         PYTHONPATH, or a module beside the script, replaces the stdlib under a trusted evidence \
+         producer. Add `.args([\"-I\", \"-S\"])` before the script path."
+    );
+}
+
+/// The decoy, and the mutant that deletes it.
+///
+/// With five sealed call sites in the tree, the test above cannot distinguish "found nothing
+/// wrong" from "found nothing". These feed the judgement synthetic bodies, so the finding and
+/// its absence are both demonstrated (`franken_lean-pfei` R4's shape).
+#[test]
+fn the_rust_launch_scan_finds_a_planted_unsealed_launch_and_clears_a_sealed_one() {
+    let sealed = (
+        "crates/decoy/tests/sealed.rs".to_string(),
+        "let out = Command::new(\"python3\")\n.args([\"-I\", \"-S\"])\n.arg(script)\n.output();"
+            .to_string(),
+    );
+    assert!(
+        unsealed_rust_launches(std::slice::from_ref(&sealed)).is_empty(),
+        "a launch carrying -I and -S must be judged sealed, or the guard reddens a correct tree"
+    );
+
+    let decoy = (
+        "crates/decoy/tests/unsealed.rs".to_string(),
+        "let out = Command::new(\"python3\")\n.arg(script)\n.arg(\"validate\")\n.output();"
+            .to_string(),
+    );
+    let found = unsealed_rust_launches(std::slice::from_ref(&decoy));
+    assert_eq!(
+        found.len(),
+        1,
+        "the planted unsealed launch was not found; the scan is not reading what it claims to"
+    );
+    assert_eq!(
+        found[0].1, 1,
+        "the finding must carry the line it was found at"
+    );
+
+    // -S alone is not isolation: this is the mutation that would otherwise read as sealed.
+    let site_only = (
+        "crates/decoy/tests/site_only.rs".to_string(),
+        "Command::new(\"python3\").args([\"-S\"]).arg(script).output();".to_string(),
+    );
+    assert_eq!(
+        unsealed_rust_launches(std::slice::from_ref(&site_only)).len(),
+        1,
+        "`-S` without `-I` leaves PYTHONPATH and the script directory live and must not pass"
+    );
+
+    // The prose/code split, in BOTH directions. Blanking comments is what stopped this guard
+    // reporting its own doc comment as a finding, and a stripper that swallowed real code would
+    // hide launches instead — the failure that looks identical to a clean tree.
+    let commented = (
+        "crates/decoy/tests/commented.rs".to_string(),
+        "// explains that Command::new(\"python3\").arg(script) skips the shebang\n".to_string(),
+    );
+    assert!(
+        unsealed_rust_launches(std::slice::from_ref(&commented)).is_empty(),
+        "a launch pattern inside a whole-line comment is prose, not a launch; counting it is what \
+         made the first run of this guard redden on its own explanation"
+    );
+    let same_line_in_code = (
+        "crates/decoy/tests/code.rs".to_string(),
+        "    let out = Command::new(\"python3\").arg(script).output();\n".to_string(),
+    );
+    assert_eq!(
+        unsealed_rust_launches(std::slice::from_ref(&same_line_in_code)).len(),
+        1,
+        "the identical text in CODE must still be found; a comment stripper that swallows real \
+         launches reports a clean tree for the same reason a broken scan does"
+    );
+
+    // Flags added AFTER the process starts belong to a different command and must not seal it.
+    let after = (
+        "crates/decoy/tests/after.rs".to_string(),
+        "Command::new(\"python3\").arg(script).output();\nlet other = [\"-I\", \"-S\"];"
+            .to_string(),
+    );
+    assert_eq!(
+        unsealed_rust_launches(std::slice::from_ref(&after)).len(),
+        1,
+        "flags appearing after .output() are not part of the launch and must not seal it"
+    );
+}
