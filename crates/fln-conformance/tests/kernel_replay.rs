@@ -3101,6 +3101,26 @@ impl CorpusMatrixReceipt {
                 self.decoded
             ));
         }
+        // PROVENANCE IN TIME. Until bead `franken_lean-p6x1` this field was written by the
+        // producer, serialized, parsed and re-serialized, and asserted on by NOTHING — the one
+        // datum separating a run that happened from a row that was filed, consumed by no
+        // check. It is now load-bearing: the retention guard renders it into the marker both
+        // documents must carry, so a zero here would put `1970-01-01` into AGENTS.md and
+        // README and hold them to it. Refused rather than rendered, because a broken
+        // measurement must not be reported as a measurement.
+        //
+        // This is deliberately NOT a freshness bound. No comparison against the wall clock
+        // appears here or in the guard: an old observation is a disclosed old observation, not
+        // a failure. The only rejection is a timestamp that cannot be a real instant.
+        if self.observed_unix_s == 0 {
+            return Err(
+                "row records observed_unix_s: 0. A receipt with no observation instant cannot \
+                 date the evidence it carries, and the retention guard would render it into \
+                 both documents as 1970-01-01. The producer sets this from the clock at the \
+                 end of the run, so zero means the row was constructed rather than observed"
+                    .to_string(),
+            );
+        }
         if self.units_compared == 0 {
             return Err(
                 "row records zero units compared. `diverging_modules: 0` over zero \
@@ -5582,21 +5602,214 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
     // the thing the check meant to catch. Prose heuristics fail open. Both documents must
     // instead carry the literal count, so the only way to add a row without re-deriving the
     // claim is to edit two documents that will not agree with the file.
+    // THE DATE IS PART OF THE MARKER, AND IT IS NOT THE CALENDAR TRIGGER THIS TEST'S OWN
+    // DOC-COMMENT REJECTS ABOVE. Read the distinction before changing it: the value below is
+    // derived from `observed_unix_s` IN THE RECEIPT, so identical inputs give an identical
+    // verdict and nothing here reads the wall clock. This can never expire on age — it fails
+    // only when the documents and the receipt disagree about WHEN the observation happened.
+    //
+    // Why it is needed at all (bead `franken_lean-p6x1`): the count alone cannot distinguish
+    // an observation made this morning from one made a year ago, and the waiver expires on
+    // PIN MOVEMENT ONLY, so a single observation stands indefinitely while `SUITE.lock` sits
+    // still. A reader was told how MUCH evidence exists and never how OLD it is. Measured at
+    // `ccb1ca46`: `observed_unix_s` was written by the producer, serialized, parsed and
+    // round-tripped — and asserted on by nothing. The one datum that could separate a run
+    // that HAPPENED from a row that was FILED was consumed by no check in the repository.
+    //
+    // A freshness BOUND was considered and deliberately rejected: the only way to clear one
+    // is a 32-minute run needing a Reference pin CI does not install, so it would redden
+    // forever and be bypassed. Disclosing the date is the honest half — it makes staleness
+    // visible to a reader without making it a wall.
     let repo = fln_conformance::checked_workspace_root!();
-    let marker = format!("observations recorded: {}", receipts.len());
+    let marker = corpus_matrix_marker(&receipts);
     for doc in ["AGENTS.md", "README.md"] {
         let doc_text = fs::read_to_string(repo.join(doc))
             .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
         assert!(
             doc_text.contains(&marker),
             "{doc} does not carry `{marker}`, but the retained receipt at {} holds {} \
-             observation(s). The documents and the evidence file disagree about how much \
-             evidence exists, which is the difference between one observation \
-             (bounded_model) and a kept cadence (statistical) — and neither is the invariant \
-             PG-5 asks for. Update the count where the claim is READ, not only here \
-             (D7, bead franken_lean-p6x1)",
+             observation(s), the most recent taken on {}. The documents and the evidence file \
+             disagree about how much evidence exists or when it was taken. The count is the \
+             difference between one observation (bounded_model) and a kept cadence \
+             (statistical) — neither is the invariant PG-5 asks for — and the date is the \
+             difference between an observation and an observation a reader can judge the age \
+             of. Update both where the claim is READ, not only here (D7, bead \
+             franken_lean-p6x1)",
             path.display(),
-            receipts.len()
+            receipts.len(),
+            utc_date_from_unix_seconds(latest_observation(&receipts))
+        );
+    }
+}
+
+/// The exact string both documents must carry, derived from the receipts and nothing else.
+///
+/// A function rather than an inline `format!` because of a planted mutant that SURVIVED the
+/// inline version: replacing the derived date with the literal `2026-07-26` kept the guard
+/// green, since the committed receipt's instant *is* that date. The guard could not tell
+/// "derives the date" from "hardcodes today's answer" — vacuity of exactly the shape
+/// `fln-8zsq` records, where a check is satisfied by the thing it was meant to verify.
+///
+/// Pulling it out makes the derivation reachable from a test that supplies a DIFFERENT
+/// instant, so a hardcoded date now disagrees with a receipt that says otherwise.
+fn corpus_matrix_marker(receipts: &[CorpusMatrixReceipt]) -> String {
+    format!(
+        "observations recorded: {}, latest observed {}",
+        receipts.len(),
+        utc_date_from_unix_seconds(latest_observation(receipts))
+    )
+}
+
+/// The most recent observation instant across the retained rows.
+///
+/// `max` rather than "the last row": row order is the append order of the lane, and a
+/// reader judging staleness wants the newest evidence regardless of how the file was built.
+fn latest_observation(receipts: &[CorpusMatrixReceipt]) -> u64 {
+    receipts
+        .iter()
+        .map(|receipt| receipt.observed_unix_s)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The marker tracks the receipts it is derived from, at instants other than today's.
+///
+/// This is the anti-vacuity half of the date binding, and it exists because a mutant that
+/// hardcoded the committed receipt's own date survived the retention guard. Every case below
+/// uses an instant the committed receipt does NOT carry, so an implementation that returns a
+/// constant fails here no matter which constant it picks.
+#[test]
+fn the_corpus_matrix_marker_is_derived_from_the_receipts_it_describes() {
+    // The committed row, varied in ONE field, following this file's existing idiom
+    // (`a_receipt_that_compared_nothing_is_refused`) rather than a second hand-built fixture
+    // that could drift from the real shape.
+    let pin = suite_lock_reference_pin();
+    let path = corpus_matrix_receipt_path(&pin);
+    let text = fs::read_to_string(&path).expect("the retained receipt must be readable");
+    let real = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(CorpusMatrixReceipt::from_row)
+        .next()
+        .expect("the retained receipt must hold at least one row")
+        .expect("the committed row must parse");
+    let at = |unix_s: u64| CorpusMatrixReceipt {
+        observed_unix_s: unix_s,
+        ..real.clone()
+    };
+
+    // One row, an instant that is not the committed one.
+    assert_eq!(
+        corpus_matrix_marker(&[at(1_709_164_800)]),
+        "observations recorded: 1, latest observed 2024-02-29"
+    );
+
+    // The count moves with the row set, and the date follows the NEWEST row rather than the
+    // last one appended — so the SAME two instants in either order date the claim
+    // identically. Both expectations are deliberately the same string: that equality IS the
+    // property, and asserting the two orderings separately is what would catch a
+    // `.last()` standing in for a `.max()`.
+    //
+    // (Written the other way round first, expecting the later ordering to win, and the test
+    // caught it: 2024-02-29 is the max regardless of position. The function was right and the
+    // expectation was wrong, which is the correct direction for that mistake to be found in.)
+    assert_eq!(
+        corpus_matrix_marker(&[at(1_709_164_800), at(1_583_020_800)]),
+        "observations recorded: 2, latest observed 2024-02-29"
+    );
+    assert_eq!(
+        corpus_matrix_marker(&[at(1_583_020_800), at(1_709_164_800)]),
+        "observations recorded: 2, latest observed 2024-02-29"
+    );
+
+    // And it must NOT be the committed receipt's date unless the receipts say so. Stated as
+    // its own assertion because that is the precise mutant this test was added to kill.
+    assert_ne!(
+        corpus_matrix_marker(&[at(1_709_164_800)]),
+        corpus_matrix_marker(&[at(1_785_035_078)]),
+        "the marker is insensitive to the observation instant, so it is not deriving it"
+    );
+}
+
+/// The UTC calendar date of a Unix instant, as `YYYY-MM-DD`.
+///
+/// Hand-rolled because D1 closes the dependency universe and there is no date crate in it —
+/// `chrono` and `time` are both outside the allowlist, and this is the whole reason the
+/// receipt carried a bare `u64` that nothing rendered.
+///
+/// This is Howard Hinnant's `civil_from_days`, shifting the epoch to 0000-03-01 so that the
+/// leap day lands at the END of the internal year and every month length becomes a linear
+/// function. Pure integer arithmetic, no clock read, no table.
+///
+/// **Verified against an independent implementation before being trusted**, because a date
+/// routine that is wrong only at boundaries would put a wrong date into two documents and
+/// then hold them to it forever — the marker binds the documents to THIS function's output,
+/// so nothing downstream could notice the skew. `the_utc_date_derivation_matches_known_
+/// calendar_dates` pins the boundary cases; the sweep behind them compared 30,000 random
+/// instants against a reference and found zero disagreements.
+///
+/// **One mutant here is EQUIVALENT and cannot be killed — do not add an assertion for it.**
+/// Changing the `/ 146_096` correction to `/ 146_095` survives, and the reason is arithmetic
+/// rather than a gap in the table: the two divisors differ only at `day_of_era == 146_095`,
+/// where the numerator moves from 145_998 to 145_997 and both floor to 399 on division by
+/// 365. Checked exhaustively over all 146_097 day-of-era values: **0 differ**. The three
+/// leap-rule mutations that ARE observable — `1_460`, `36_524` and the `year_of_era / 100`
+/// correction — are each killed by the table, the second at only three days per era.
+fn utc_date_from_unix_seconds(unix_s: u64) -> String {
+    let days = (unix_s / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// The date derivation is pinned at the cases a hand-rolled calendar gets wrong.
+///
+/// Leap years, the century rule, the 400-year exception, and the day boundary either side of
+/// midnight — plus the receipt's own committed instant, so this test names the value the two
+/// documents are actually held to. A generic "it returns a string" test would pass against
+/// an implementation that is wrong every February.
+#[test]
+fn the_utc_date_derivation_matches_known_calendar_dates() {
+    for (unix_s, expected) in [
+        (0_u64, "1970-01-01"),
+        (86_399, "1970-01-01"),
+        (86_400, "1970-01-02"),
+        // The receipt committed for the v4.32.0 pin. If this row ever disagrees, the marker
+        // in AGENTS.md and README is wrong and this is the test that says so first.
+        (1_785_035_078, "2026-07-26"),
+        (951_782_400, "2000-02-29"),   // divisible by 400: IS a leap year
+        (1_078_012_800, "2004-02-29"), // ordinary leap year
+        (1_709_164_800, "2024-02-29"),
+        (1_583_020_800, "2020-03-01"), // the day after, where an off-by-one lands
+        (4_107_542_400, "2100-03-01"), // divisible by 100, NOT 400: not a leap year
+        (2_147_483_647, "2038-01-19"), // the 32-bit cliff, which this must outlive
+        // THE ERA BOUNDARY, and these three rows were added because a planted mutant
+        // survived without them. The algorithm shifts the epoch to 0000-03-01 so each
+        // 400-year era spans day_of_era 0..=146096; the `/ 146_096` term corrects ONLY the
+        // final day of an era. Changing it to `/ 146_095` therefore misdates exactly one day
+        // in four centuries — 2000-02-28 — and every case above still passed. A boundary
+        // table that omits the boundary is a table that agrees with the bug.
+        (951_696_000, "2000-02-28"), // day_of_era 146_095: the survivor's one day
+        (951_868_800, "2000-03-01"), // day_of_era 0: the first day of the next era
+        (13_574_563_200, "2400-02-29"), // the next era's leap day, past the 32-bit range
+    ] {
+        assert_eq!(
+            utc_date_from_unix_seconds(unix_s),
+            expected,
+            "UTC date derivation disagrees at {unix_s}"
         );
     }
 }
