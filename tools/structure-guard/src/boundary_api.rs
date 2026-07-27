@@ -23,6 +23,40 @@ pub struct ApiRow {
     pub kind: String,
     /// The item's name (for `use` re-exports: the exported name).
     pub name: String,
+    /// Field 4, the declared surface type, retained since bead
+    /// `fln-boundary-api-no-admission-argument-discarded-ez07`.
+    ///
+    /// It used to be checked non-empty and then dropped, which made every
+    /// no-admission argument resting on it ("value copy", "plain-int
+    /// snapshot") unfalsifiable: a row could declare any type at all. For
+    /// `fn` rows it is now compared against the real signature.
+    pub surface: String,
+}
+
+/// The return type a row's surface type declares, normalized like
+/// [`crate::ledger::PubItem::ret`] — whitespace removed — or `None` when the
+/// row declares no `->`.
+///
+/// The arrow is taken at paren depth 0 so a function-typed *parameter*
+/// (`(fn(u8) -> u8) -> bool`) cannot be mistaken for the item's own return.
+pub fn declared_return_type(surface: &str) -> Option<String> {
+    let bytes = surface.as_bytes();
+    let mut depth = 0_i32;
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'-' if depth == 0 && bytes.get(index + 1) == Some(&b'>') => {
+                let rest: String = surface[index + 2..]
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                return (!rest.is_empty()).then_some(rest);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[derive(Debug, Default)]
@@ -99,6 +133,7 @@ pub fn parse(text: &str) -> Result<BoundaryApi, String> {
             path: fields[1].to_string(),
             kind: kind.to_string(),
             name: name.to_string(),
+            surface: fields[3].to_string(),
         });
     }
     if !saw_schema {

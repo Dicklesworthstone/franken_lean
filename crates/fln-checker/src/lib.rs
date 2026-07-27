@@ -158,10 +158,10 @@
 //! * **ENFORCED at item granularity.** `FLN-STRUCT-037` refuses `fln-checker`
 //!   *reaching* a SEMANTIC item across this boundary
 //!   (`tools/structure-guard/src/checks.rs:983`). It is planted three ways:
-//!   `seeded.rs:1279` proves the baseline clean, `seeded.rs:1289`
+//!   `seeded.rs:1295` proves the baseline clean, `seeded.rs:1305`
 //!   `every_semantic_item_is_refused_inside_fln_checker` plants one violation per
 //!   inventory item and asserts each fires **alone** so an over-broad matcher
-//!   cannot fake green, and `seeded.rs:1321` proves that *naming* a semantic item
+//!   cannot fake green, and `seeded.rs:1337` proves that *naming* a semantic item
 //!   in prose is not a violation — which is why this document may keep citing
 //!   `Level::is_equiv` and `from_canonical_bytes` by name.
 //! * **NOT ENFORCED.** The `fln-hash` reader split of item 2 above. A rule
@@ -204,9 +204,9 @@
 //! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
 //! cite crates/fln-conformance/src/witness.rs:496 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:983 :: code: "FLN-STRUCT-037"
-//! cite tools/structure-guard/tests/seeded.rs:1279 :: fn the_checker_boundary_baseline_is_clean
-//! cite tools/structure-guard/tests/seeded.rs:1289 :: fn every_semantic_item_is_refused_inside_fln_checker
-//! cite tools/structure-guard/tests/seeded.rs:1321 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
+//! cite tools/structure-guard/tests/seeded.rs:1295 :: fn the_checker_boundary_baseline_is_clean
+//! cite tools/structure-guard/tests/seeded.rs:1305 :: fn every_semantic_item_is_refused_inside_fln_checker
+//! cite tools/structure-guard/tests/seeded.rs:1337 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
 //! ```
 //!
 //! **What this does not earn.** A bound citation proves the line still holds the construct

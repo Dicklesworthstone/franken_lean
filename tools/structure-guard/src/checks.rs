@@ -2341,12 +2341,64 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                     });
                     continue;
                 }
+                // A return type the CALLER chooses is the one laundering vector
+                // the dependency law cannot carry, and no reviewed row can
+                // argue it away — so this fires whether or not the item has a
+                // row (bead `fln-boundary-api-no-admission-argument-discarded-ez07`).
+                // `pub fn forge<T>() -> T` names no kernel type, so
+                // FLN-STRUCT-008 permits it and the admission-token tripwire
+                // sees nothing; the caller instantiates `T` at a checked
+                // declaration and receives one from a crate that cannot name
+                // it. Before this, giving that export a row declaring `() -> T`
+                // made the covenant pass it clean.
+                if let Some(param) = &item.ret_type_param {
+                    findings.push(Finding {
+                        code: "FLN-STRUCT-022",
+                        path: format!("{rel}:{}", item.line),
+                        detail: format!(
+                            "`fn {}` in unsafe boundary `{}` returns `{}`, which names the caller-chosen type parameter `{param}`; the caller may instantiate it at a checked declaration, so the return launders admission out of a crate that never names a kernel type (D3 law b). No {BOUNDARY_API_FILE} row can argue this away",
+                            item.name,
+                            c.name,
+                            item.ret.as_deref().unwrap_or("?"),
+                        ),
+                    });
+                }
                 match boundary_rows
                     .iter()
                     .find(|row| row.path == rel && row.name == item.name && row.kind == item.kind)
                 {
                     Some(row) => {
                         used_api_rows.insert(row.id.as_str());
+                        // D3 law (b)'s no-admission argument is a claim about the
+                        // item's TYPE, so the declared type has to be the real one
+                        // (bead `fln-boundary-api-no-admission-argument-discarded-ez07`).
+                        // Before this, field 4 was checked non-empty and discarded, so a
+                        // row could declare `() -> bool` for a function returning
+                        // anything at all and every argument resting on that type —
+                        // "value copy", "plain-int snapshot" — was unfalsifiable.
+                        // Scoped to `fn` because only those rows are written as a
+                        // signature; the other kinds carry prose and are still unbound.
+                        if item.kind == "fn" {
+                            let declared = boundary_api::declared_return_type(&row.surface);
+                            if declared != item.ret {
+                                let observed = item.ret.as_deref().map_or_else(
+                                    || "no return type".to_string(),
+                                    |found| format!("`{found}`"),
+                                );
+                                let claimed = declared.as_deref().map_or_else(
+                                    || "no return type".to_string(),
+                                    |found| format!("`{found}`"),
+                                );
+                                findings.push(Finding {
+                                    code: "FLN-STRUCT-022",
+                                    path: format!("{rel}:{}", item.line),
+                                    detail: format!(
+                                        "row `{}` declares surface type `{}` for `fn {}` in unsafe boundary `{}` — that is {claimed}, but the signature has {observed}; the row's no-admission argument is a claim about this type, so it must match the source (D3 law b)",
+                                        row.id, row.surface, item.name, c.name
+                                    ),
+                                });
+                            }
+                        }
                         source_pub.insert((item.kind.clone(), item.name.clone()));
                     }
                     None => findings.push(Finding {

@@ -631,15 +631,31 @@ fn inner_unsafe_allow_is_never_narrowly_ledgerable() {
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-013"]);
 }
 
+// Renamed at the ez07 repair: the classification is no longer deferred, so a name saying
+// "until type-aware classification" would now be the false half of its own assertion. The
+// planted `forge<T>` used to fire for ONE reason — it had no row — which ez07's coverage row
+// recorded as the suite conceding the gap. It now fires for BOTH, and this asserts both,
+// because a single-code assertion cannot tell the two apart.
 #[test]
-fn unsafe_boundary_exports_fail_closed_until_type_aware_classification() {
+fn unsafe_boundary_exports_fail_closed_by_shape_and_by_caller_chosen_return() {
     let ws = TempWs::new("unsafe-export");
     base(&ws);
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
         "#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\npub fn forge<T>() -> T { loop {} }\n",
     );
-    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-022"]);
+    let out = ws.run();
+    assert_eq!(codes(&out), vec!["FLN-STRUCT-022", "FLN-STRUCT-022"]);
+    assert!(
+        out.findings[0].detail.contains("caller-chosen"),
+        "{:?}",
+        out.findings[0]
+    );
+    assert!(
+        out.findings[1].detail.contains("undeclared public item"),
+        "{:?}",
+        out.findings[1]
+    );
 
     let local = TempWs::new("restricted-export");
     base(&local);
@@ -1698,5 +1714,213 @@ fn removing_the_frontier_feature_recovers_the_sound_closure() {
         !codes(&out).iter().any(|code| code.starts_with("FLN-D18-")),
         "with the frontier feature removed the same closure must be admitted: {:?}",
         out.findings
+    );
+}
+
+// ---- D3 law (b): the declared surface type is bound to the real signature --------------
+// (bead `fln-boundary-api-no-admission-argument-discarded-ez07`)
+//
+// Field 4 of `ci/BOUNDARY_API.txt` — the surface type every no-admission argument of the
+// form "value copy" or "plain-int snapshot" is a claim ABOUT — used to be checked non-empty
+// and then discarded, so a row could declare `() -> bool` for a function returning anything
+// at all. Measured before the repair, with a matching row so the inventory check passed:
+// a laundering return hidden behind a private alias produced ZERO findings, while the same
+// export naming an admission token was already refused by the tripwire. So the covenant
+// refused laundering by NAMING and accepted a declared type that was simply false.
+#[test]
+fn boundary_api_surface_type_is_bound_to_the_signature() {
+    let api = |surface: &str| {
+        format!(
+            "schema fln-boundary-api/1\n\
+             row FLN-BX-0001 | crates/fln-unsafe-abi/src/lib.rs | fn mint | {surface} \
+             | fixture | fixture\n"
+        )
+    };
+    let stub = "//! boundary stub\n#![deny(unsafe_code)]\n\
+                #![deny(clippy::undocumented_unsafe_blocks)]\n";
+    let plant = |name: &str, surface: &str, body: &str| {
+        let ws = TempWs::new(name);
+        base(&ws);
+        ws.write("ci/BOUNDARY_API.txt", &api(surface));
+        ws.write("crates/fln-unsafe-abi/src/lib.rs", &format!("{stub}{body}"));
+        ws.run()
+    };
+
+    // A — the defect itself: the row declares a plain-data surface, the signature does not.
+    let a = plant(
+        "ez07-lie",
+        "() -> bool",
+        "type Decl = u64;\npub fn mint() -> Decl { 0 }\n",
+    );
+    assert_eq!(codes(&a), vec!["FLN-STRUCT-022"]);
+    // The refusal must name BOTH types. One side alone cannot be acted on.
+    assert!(
+        a.findings[0].detail.contains("`bool`"),
+        "{:?}",
+        a.findings[0]
+    );
+    assert!(
+        a.findings[0].detail.contains("`Decl`"),
+        "{:?}",
+        a.findings[0]
+    );
+
+    // B — THE CORRECT REPAIR MUST STAY GREEN. This is the wall detector, and the only cell
+    // that fails if `fn_return_type` silently stops recovering anything: the refusal cells
+    // below would all still pass against an extractor that always returned `None`.
+    let b = plant(
+        "ez07-repaired",
+        "() -> Decl",
+        "type Decl = u64;\npub fn mint() -> Decl { 0 }\n",
+    );
+    assert!(
+        b.findings.is_empty(),
+        "a correct repair must not redden: {:?}",
+        b.findings
+    );
+
+    // C — the row declares a return the signature does not have.
+    let c = plant("ez07-phantom", "() -> bool", "pub fn mint() {}\n");
+    assert_eq!(codes(&c), vec!["FLN-STRUCT-022"]);
+    assert!(
+        c.findings[0].detail.contains("no return type"),
+        "{:?}",
+        c.findings[0]
+    );
+
+    // D — the row understates: a real return, none declared.
+    let d = plant("ez07-understated", "()", "pub fn mint() -> u64 { 0 }\n");
+    assert_eq!(codes(&d), vec!["FLN-STRUCT-022"]);
+    assert!(
+        d.findings[0].detail.contains("`u64`"),
+        "{:?}",
+        d.findings[0]
+    );
+
+    // E — SCOPE. Non-`fn` rows carry prose rather than a signature and must stay unbound;
+    // without this the 66 real rows redden, since `mod`/`struct`/`field` field-4 values are
+    // descriptions. The bound half is field 4 of `fn` rows and nothing wider.
+    let e = TempWs::new("ez07-prose-scope");
+    base(&e);
+    e.write(
+        "ci/BOUNDARY_API.txt",
+        "schema fln-boundary-api/1\n\
+         row FLN-BX-0001 | crates/fln-unsafe-abi/src/lib.rs | struct Handle \
+         | opaque owned reference, prose not a signature | fixture | fixture\n",
+    );
+    e.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        &format!("{stub}pub struct Handle(u8);\n"),
+    );
+    assert!(
+        e.run().findings.is_empty(),
+        "non-fn rows carry prose and must stay unbound"
+    );
+}
+
+// ---- D3 law (b): a caller-chosen return type is refused, row or no row ------------------
+// (bead `fln-boundary-api-no-admission-argument-discarded-ez07`)
+//
+// This is the negative control for the law as WRITTEN — "no unsafe crate exports any
+// function whose return type can be laundered into a checked declaration". Binding the
+// declared surface type to the signature (above) closes the ROT hole: the row can no
+// longer lie. It does nothing about a declared type that is itself launderable, and
+// `-> T` is the purest such signature, because the CALLER picks the type.
+//
+// It is also the one vector the dependency law cannot carry. AGENTS.md's D3 paragraph
+// argued that FLN-STRUCT-008 does law (b)'s work "since a boundary crate that cannot
+// depend on the kernel cannot name a kernel type" — true, and irrelevant here: a generic
+// return names nothing. Measured before this check, with a matching row so the inventory
+// dimension passed: ZERO findings.
+#[test]
+fn a_caller_chosen_return_type_is_refused_even_with_a_reviewed_row() {
+    let stub = "//! boundary stub\n#![deny(unsafe_code)]\n\
+                #![deny(clippy::undocumented_unsafe_blocks)]\n";
+    let plant = |name: &str, rows: &str, body: &str| {
+        let ws = TempWs::new(name);
+        base(&ws);
+        ws.write(
+            "ci/BOUNDARY_API.txt",
+            &format!("schema fln-boundary-api/1\n{rows}"),
+        );
+        ws.write("crates/fln-unsafe-abi/src/lib.rs", &format!("{stub}{body}"));
+        ws.run()
+    };
+    let mint = |surface: &str| {
+        format!(
+            "row FLN-BX-0001 | crates/fln-unsafe-abi/src/lib.rs | fn mint | {surface} \
+             | fixture | fixture\n"
+        )
+    };
+
+    // A — THE CONTROL. A truthful row for a laundering export. Field 4 says exactly what
+    // the signature says, so the surface-type binding is satisfied and cannot fire; only a
+    // check that reads the type as launderable refuses this.
+    let a = plant(
+        "ez07-generic-return",
+        &mint("() -> T"),
+        "pub fn mint<T>() -> T { loop {} }\n",
+    );
+    assert_eq!(codes(&a), vec!["FLN-STRUCT-022"]);
+    assert!(a.findings[0].detail.contains("`T`"), "{:?}", a.findings[0]);
+    assert!(
+        a.findings[0].detail.contains("caller-chosen"),
+        "the refusal must say WHY, or the next author will add a row and move on: {:?}",
+        a.findings[0]
+    );
+
+    // B — a wrapper launders too: the caller indexes the `Vec` and holds a `T`. Mention,
+    // not equality, is the property.
+    let b = plant(
+        "ez07-generic-wrapper",
+        &mint("() -> Vec<T>"),
+        "pub fn mint<T>() -> Vec<T> { Vec::new() }\n",
+    );
+    assert_eq!(codes(&b), vec!["FLN-STRUCT-022"]);
+    assert!(b.findings[0].detail.contains("`T`"), "{:?}", b.findings[0]);
+
+    // C — the same signature written one level up. An enclosing `impl<T>` binds the
+    // parameter for every method inside it, so scoping the rule to the fn's OWN generic
+    // list would leave a one-line bypass.
+    let c = plant(
+        "ez07-impl-scope",
+        "row FLN-BX-0001 | crates/fln-unsafe-abi/src/lib.rs | struct Holder \
+         | opaque owned handle | fixture | fixture\n\
+         row FLN-BX-0002 | crates/fln-unsafe-abi/src/lib.rs | fn get | (&self) -> T \
+         | fixture | fixture\n",
+        "pub struct Holder<T>(T);\nimpl<T> Holder<T> { pub fn get(self) -> T { self.0 } }\n",
+    );
+    assert_eq!(codes(&c), vec!["FLN-STRUCT-022"]);
+    assert!(c.findings[0].detail.contains("`T`"), "{:?}", c.findings[0]);
+
+    // D — THE WALL DETECTOR, and the cell that keeps the rule honest about what it
+    // forbids. A generic export is not per se a violation: what is refused is a return
+    // the caller chooses. `Tally` also CONTAINS `T`, so a substring test reddens here
+    // while a token test does not.
+    let d = plant(
+        "ez07-concrete-return",
+        &mint("(T) -> Tally"),
+        "type Tally = u64;\npub fn mint<T>(seed: T) -> Tally { 0 }\n",
+    );
+    assert!(
+        d.findings.is_empty(),
+        "a generic fn with a concrete return must stay green: {:?}",
+        d.findings
+    );
+
+    // E — `impl Holder<u8>` is a USE of `u8`, not a binder. Reading it as one would put
+    // every concrete type argument in scope and redden the matching return.
+    let e = plant(
+        "ez07-impl-use-not-binder",
+        "row FLN-BX-0001 | crates/fln-unsafe-abi/src/lib.rs | struct Holder \
+         | opaque owned handle | fixture | fixture\n\
+         row FLN-BX-0002 | crates/fln-unsafe-abi/src/lib.rs | fn get | (&self) -> u8 \
+         | fixture | fixture\n",
+        "pub struct Holder<T>(T);\nimpl Holder<u8> { pub fn get(&self) -> u8 { self.0 } }\n",
+    );
+    assert!(
+        e.findings.is_empty(),
+        "a concrete type argument is not a bound parameter: {:?}",
+        e.findings
     );
 }

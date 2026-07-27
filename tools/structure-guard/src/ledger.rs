@@ -905,6 +905,167 @@ pub struct PubItem {
     /// recognized (fail closed: the caller reports it).
     pub kind: String,
     pub name: String,
+    /// For `fn` items: the return type recovered from the item's own lexemes,
+    /// whitespace removed. `None` means the signature declares no `->`.
+    ///
+    /// This exists so `ci/BOUNDARY_API.txt`'s declared surface type can be
+    /// compared against the real signature. Every no-admission argument in
+    /// that file of the form "value copy" or "plain-int snapshot" is a claim
+    /// about *this* type, and until bead
+    /// `fln-boundary-api-no-admission-argument-discarded-ez07` the declared
+    /// type was parsed and thrown away, so a row could declare anything.
+    pub ret: Option<String>,
+    /// For `fn` items: a type parameter **in scope at the item** — its own or
+    /// an enclosing `impl`/`trait` block's — that the return type names.
+    ///
+    /// This is the laundering signature D3 law (b) is about, and it is the one
+    /// case the *dependency* law cannot carry. `pub fn forge<T>() -> T` names
+    /// no kernel type, so `FLN-STRUCT-008` permits it and the admission-token
+    /// tripwire sees nothing; the **caller** picks `T`, and can pick a checked
+    /// declaration. What is laundered is the caller's own choice, from a crate
+    /// that never has to name it.
+    pub ret_type_param: Option<String>,
+}
+
+/// The pieces of a `pub fn` signature that D3 law (b) reasons about, recovered
+/// from lexemes. Whitespace is dropped (the lexer already drops comments and
+/// string literals) so [`Self::ret`] compares against a `ci/BOUNDARY_API.txt`
+/// surface type written in source form.
+#[derive(Debug, Default)]
+struct FnSignature {
+    /// The declared return type, or `None` when the signature has no `->`.
+    ret: Option<String>,
+    /// The identifier lexemes of the return type. Membership is tested against
+    /// these rather than against [`Self::ret`] as a substring, because `Tally`
+    /// contains `T` and is not a type parameter.
+    ret_idents: Vec<String>,
+    /// The type-parameter names the `fn` itself binds.
+    type_params: Vec<String>,
+}
+
+/// The type-parameter names bound by the generic list opening at `open`, plus
+/// the index just past its closing `>`.
+///
+/// Lifetimes and const parameters are excluded: neither can name a declaration,
+/// so neither is a laundering vector. `None` when `open` is not a `<` or the
+/// list never closes — the callers treat that as "recovered nothing", which
+/// leaves the return type unrecoverable too and so fails closed downstream.
+fn generic_type_params(lexemes: &[Lexeme], open: usize) -> Option<(Vec<String>, usize)> {
+    if lexemes.get(open)?.text != "<" {
+        return None;
+    }
+    let mut names = Vec::new();
+    let mut angle = 0_usize;
+    let mut at_group_start = false;
+    let mut k = open;
+    loop {
+        let l = lexemes.get(k)?;
+        match l.text.as_str() {
+            // `->` inside a bound (`F: Fn(u8) -> u8`) is two lexemes, and its
+            // `>` must not be read as closing the generic list.
+            "-" if lexemes.get(k + 1).is_some_and(|n| n.text == ">") => {
+                at_group_start = false;
+                k += 2;
+                continue;
+            }
+            "<" => {
+                angle += 1;
+                at_group_start = angle == 1;
+            }
+            ">" => {
+                angle -= 1;
+                if angle == 0 {
+                    return Some((names, k + 1));
+                }
+                at_group_start = false;
+            }
+            "," if angle == 1 => at_group_start = true,
+            text => {
+                if at_group_start {
+                    at_group_start = false;
+                    // A lifetime is `'` + identifier, so the `'` lands here and
+                    // consumes the group; `const N: usize` is consumed by its
+                    // `const`. Only a type parameter's own name is recorded.
+                    if text != "const"
+                        && text
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    {
+                        names.push(text.to_string());
+                    }
+                }
+            }
+        }
+        k += 1;
+    }
+}
+
+/// The type parameters an `impl`/`trait` header binds at `open`, or none when
+/// that position holds no generic list.
+fn scope_params(lexemes: &[Lexeme], open: usize) -> Vec<String> {
+    generic_type_params(lexemes, open).map_or_else(Vec::new, |(names, _)| names)
+}
+
+/// Recover a `fn`'s signature from the lexeme at `name_idx` (the item's name).
+///
+/// `base_depth` is the delimiter depth of the item's own `pub`, so methods
+/// inside an `impl` block work unchanged. Anything unrecoverable — unbalanced
+/// generics, a parameter list that never closes — yields an empty return,
+/// which the covenant treats as a mismatch against any declared return and
+/// refuses. Failing closed is deliberate: an unparseable signature must not
+/// read as "declares nothing".
+fn fn_signature(lexemes: &[Lexeme], name_idx: usize, base_depth: usize) -> FnSignature {
+    let mut signature = FnSignature::default();
+    let mut k = name_idx + 1;
+    // Generic parameters. `->` cannot precede the parameter list, so the list
+    // is walked before the arrow is looked for.
+    if lexemes.get(k).is_some_and(|l| l.text == "<") {
+        let Some((params, next)) = generic_type_params(lexemes, k) else {
+            return signature;
+        };
+        signature.type_params = params;
+        k = next;
+    }
+    // The parameter list, matched by depth rather than by counting, because
+    // the lexer already tracks `()[]{}`.
+    if lexemes.get(k).map(|l| (l.text.as_str(), l.delimiter_depth)) != Some(("(", base_depth)) {
+        return signature;
+    }
+    k += 1;
+    loop {
+        let Some(l) = lexemes.get(k) else {
+            return signature;
+        };
+        k += 1;
+        if l.text == ")" && l.delimiter_depth == base_depth + 1 {
+            break;
+        }
+    }
+    // `->` is two lexemes: the lexer emits punctuation one byte at a time.
+    if !(lexemes.get(k).is_some_and(|l| l.text == "-")
+        && lexemes.get(k + 1).is_some_and(|l| l.text == ">"))
+    {
+        return signature;
+    }
+    k += 2;
+    let mut out = String::new();
+    while let Some(l) = lexemes.get(k) {
+        if l.delimiter_depth == base_depth && matches!(l.text.as_str(), "{" | ";" | "where") {
+            break;
+        }
+        if l.text
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            signature.ret_idents.push(l.text.clone());
+        }
+        out.push_str(&l.text);
+        k += 1;
+    }
+    signature.ret = (!out.is_empty()).then_some(out);
+    signature
 }
 
 /// Extract every bare-`pub` item declaration. Deliberately strict: modifiers
@@ -921,10 +1082,43 @@ pub fn public_item_sites(text: &str) -> Vec<PubItem> {
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
     };
+    // Type parameters bound by an enclosing `impl` or `trait` block are in
+    // scope for the `pub fn`s inside it, and a caller chooses them exactly as
+    // it chooses a function's own: `impl<T> Abi<T> { pub fn get(&self) -> T }`
+    // is `pub fn get<T>() -> T` written one level up. Tracked as a stack keyed
+    // by the block's interior delimiter depth.
+    let mut scopes: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut pending_scope: Option<Vec<String>> = None;
     for (idx, lexeme) in lexemes.iter().enumerate() {
+        while scopes
+            .last()
+            .is_some_and(|(interior, _)| *interior > lexeme.delimiter_depth)
+        {
+            scopes.pop();
+        }
+        match lexeme.text.as_str() {
+            // Only the BINDER position counts. `impl<T> Foo<T>` binds at
+            // `impl`+1 and `trait Name<T>` at `trait`+2; the `<T>` of
+            // `impl Foo<T>` is a *use* of a type already in scope, and reading
+            // it as a binder would make `impl Foo<u8>` put `u8` in scope and
+            // redden every `-> u8` inside.
+            "impl" => pending_scope = Some(scope_params(&lexemes, idx + 1)),
+            "trait" => pending_scope = Some(scope_params(&lexemes, idx + 2)),
+            "{" => {
+                if let Some(params) = pending_scope.take() {
+                    scopes.push((lexeme.delimiter_depth + 1, params));
+                }
+            }
+            ";" => pending_scope = None,
+            _ => {}
+        }
         if lexeme.text != "pub" || lexemes.get(idx + 1).is_some_and(|next| next.text == "(") {
             continue;
         }
+        let in_scope: Vec<&str> = scopes
+            .iter()
+            .flat_map(|(_, params)| params.iter().map(String::as_str))
+            .collect();
         let mut j = idx + 1;
         // Skip declaration modifiers. String literals (the ABI string in
         // `extern "C"`) are not lexemes, so `extern` is directly followed by
@@ -939,6 +1133,24 @@ pub fn public_item_sites(text: &str) -> Vec<PubItem> {
             line,
             kind: "unknown".to_string(),
             name: "?".to_string(),
+            ret: None,
+            ret_type_param: None,
+        };
+        let fn_item = |name: &Lexeme, name_idx: usize| {
+            let signature = fn_signature(&lexemes, name_idx, lexeme.delimiter_depth);
+            PubItem {
+                line: lexeme.line,
+                kind: "fn".to_string(),
+                name: name.text.clone(),
+                ret_type_param: signature
+                    .type_params
+                    .iter()
+                    .map(String::as_str)
+                    .chain(in_scope.iter().copied())
+                    .find(|param| signature.ret_idents.iter().any(|ident| ident == param))
+                    .map(str::to_string),
+                ret: signature.ret,
+            }
         };
         let Some(head) = lexemes.get(j) else {
             items.push(unknown(lexeme.line));
@@ -948,26 +1160,32 @@ pub fn public_item_sites(text: &str) -> Vec<PubItem> {
             "const" => {
                 // `pub const fn name` vs `pub const NAME: T`.
                 match (lexemes.get(j + 1), lexemes.get(j + 2)) {
-                    (Some(next), _) if next.text == "fn" => lexemes.get(j + 2).map(|n| PubItem {
-                        line: lexeme.line,
-                        kind: "fn".to_string(),
-                        name: n.text.clone(),
-                    }),
+                    (Some(next), _) if next.text == "fn" => {
+                        lexemes.get(j + 2).map(|n| fn_item(n, j + 2))
+                    }
                     (Some(name), _) if is_ident(&name.text) => Some(PubItem {
                         line: lexeme.line,
                         kind: "const".to_string(),
                         name: name.text.clone(),
+                        ret: None,
+                        ret_type_param: None,
                     }),
                     _ => None,
                 }
             }
-            "fn" | "struct" | "enum" | "union" | "trait" | "type" | "mod" | "static" => lexemes
+            "fn" => lexemes
+                .get(j + 1)
+                .filter(|n| is_ident(&n.text))
+                .map(|n| fn_item(n, j + 1)),
+            "struct" | "enum" | "union" | "trait" | "type" | "mod" | "static" => lexemes
                 .get(j + 1)
                 .filter(|n| is_ident(&n.text))
                 .map(|n| PubItem {
                     line: lexeme.line,
                     kind: head.text.clone(),
                     name: n.text.clone(),
+                    ret: None,
+                    ret_type_param: None,
                 }),
             "use" => {
                 // Walk to the terminating `;`, rejecting grouped/glob forms.
@@ -992,6 +1210,8 @@ pub fn public_item_sites(text: &str) -> Vec<PubItem> {
                         line: lexeme.line,
                         kind: "use".to_string(),
                         name,
+                        ret: None,
+                        ret_type_param: None,
                     })
                 } else {
                     None
@@ -1002,6 +1222,8 @@ pub fn public_item_sites(text: &str) -> Vec<PubItem> {
                     line: lexeme.line,
                     kind: "field".to_string(),
                     name: name.to_string(),
+                    ret: None,
+                    ret_type_param: None,
                 })
             }
             _ => None,
@@ -1395,15 +1617,21 @@ fn two() {}
             vec![PubItem {
                 line: 1,
                 kind: "fn".into(),
-                name: "launder".into()
+                name: "launder".into(),
+                ret: None,
+                ret_type_param: None
             }]
         );
+        // An associated type of a caller-chosen parameter is still the caller's
+        // choice: it can pick `T` so that `T::Out` is a checked declaration.
         assert_eq!(
             public_item_sites("pub fn generic<T: Trait>(x: T) -> T::Out { x.out() }\n"),
             vec![PubItem {
                 line: 1,
                 kind: "fn".into(),
-                name: "generic".into()
+                name: "generic".into(),
+                ret: Some("T::Out".into()),
+                ret_type_param: Some("T".into())
             }]
         );
         assert_eq!(
@@ -1411,7 +1639,9 @@ fn two() {}
             vec![PubItem {
                 line: 1,
                 kind: "struct".into(),
-                name: "Laundered".into()
+                name: "Laundered".into(),
+                ret: None,
+                ret_type_param: None
             }]
         );
         // Modifier chains, consts, fields, and single-leaf re-exports.
@@ -1420,7 +1650,9 @@ fn two() {}
             vec![PubItem {
                 line: 1,
                 kind: "fn".into(),
-                name: "s".into()
+                name: "s".into(),
+                ret: None,
+                ret_type_param: None
             }]
         );
         assert_eq!(
@@ -1429,12 +1661,16 @@ fn two() {}
                 PubItem {
                     line: 1,
                     kind: "fn".into(),
-                    name: "cf".into()
+                    name: "cf".into(),
+                    ret: None,
+                    ret_type_param: None
                 },
                 PubItem {
                     line: 2,
                     kind: "const".into(),
-                    name: "K".into()
+                    name: "K".into(),
+                    ret: None,
+                    ret_type_param: None
                 }
             ]
         );
@@ -1443,7 +1679,9 @@ fn two() {}
             vec![PubItem {
                 line: 1,
                 kind: "field".into(),
-                name: "rc".into()
+                name: "rc".into(),
+                ret: None,
+                ret_type_param: None
             }]
         );
         assert_eq!(
@@ -1452,14 +1690,39 @@ fn two() {}
                 PubItem {
                     line: 1,
                     kind: "use".into(),
-                    name: "Header".into()
+                    name: "Header".into(),
+                    ret: None,
+                    ret_type_param: None
                 },
                 PubItem {
                     line: 2,
                     kind: "use".into(),
-                    name: "shadow_enable".into()
+                    name: "shadow_enable".into(),
+                    ret: None,
+                    ret_type_param: None
                 }
             ]
+        );
+        // Scope. A lifetime and a const parameter bind nothing launderable; an
+        // enclosing `impl<T>` binds exactly as the fn's own list does; and
+        // `impl Foo<u8>` is a USE of `u8`, not a binder, so `-> u8` stays clean.
+        let param = |src: &str| public_item_sites(src)[0].ret_type_param.clone();
+        assert_eq!(
+            param("pub fn f<'a, const N: usize>(x: &'a [u8; N]) -> u8 { 0 }\n"),
+            None
+        );
+        assert_eq!(param("pub fn f<T>(x: T) -> Tally { 0 }\n"), None);
+        assert_eq!(
+            param("pub fn f<T>(x: T) -> Vec<T> { vec![x] }\n"),
+            Some("T".into())
+        );
+        assert_eq!(
+            param("impl<T> Holder<T> { pub fn get(&self) -> T { todo!() } }\n"),
+            Some("T".into())
+        );
+        assert_eq!(
+            param("impl Holder<u8> { pub fn get(&self) -> u8 { 0 } }\n"),
+            None
         );
         // Grouped/glob re-exports cannot be classified — fail closed.
         assert_eq!(public_item_sites("pub use m::{a, b};\n")[0].kind, "unknown");
