@@ -905,7 +905,7 @@ run_structured_positive_step declaration_admission \
   validate-declaration-admission
 run_structured_positive_step extension_merge_refusals \
   extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence \
-  '{"schema":"fln.e2e.extension-merge-refusal","version":1' 2
+  '{"schema":"fln.e2e.extension-merge-refusal","version":1' 5
 run_structured_positive_step set_union \
   extensions::tests::set_union_e2e_emits_detailed_real_path_evidence \
   '{"schema":"fln.e2e.set-union","version":1' 4

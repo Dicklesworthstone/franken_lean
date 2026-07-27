@@ -6178,6 +6178,231 @@ mod tests {
             evidence_order_hash(recovered_raw.iter().map(Vec::as_slice)),
             history_recovered.content_digest(),
         );
+
+        // franken_lean-2tcr: the three stop kinds the envelope added in 9m74, on the real
+        // Environment path. Until now this step reached `merge` only through
+        // `merge_with_test_limits`, whose limits are unbounded and whose probe is `None`, so
+        // the lane proved the enveloped merge still behaves and proved nothing about any
+        // stop. `SetUnion` is already covered by the `set_union` step.
+        //
+        // Every label, dimension and checkpoint below is read off `MergeStop`'s own `const
+        // fn` projections rather than written beside it, so the record cannot drift from the
+        // type: deleting an arm is a compile error here, not a stale string in a lane.
+        let stop_base = replay_environment(&descriptor, &[b"stop-0", b"stop-1"]);
+        let stop_ours = replay_environment(&descriptor, &[b"stop-0", b"stop-1", b"ours"]);
+        let stop_theirs = replay_environment(&descriptor, &[b"stop-0", b"stop-1", b"theirs"]);
+        let stop_base_state = stop_base
+            .extension(&extension_name)
+            .expect("stop base extension exists");
+        let stop_ours_state = stop_ours
+            .extension(&extension_name)
+            .expect("stop ours extension exists");
+        let stop_theirs_state = stop_theirs
+            .extension(&extension_name)
+            .expect("stop theirs extension exists");
+        let stop_base_root_before = stop_base.logical_root(&options).to_string();
+        let stop_ours_root_before = stop_ours.logical_root(&options).to_string();
+        let stop_theirs_root_before = stop_theirs.logical_root(&options).to_string();
+
+        // The answer every stop below withholds. Taken once, under an adequate envelope, so
+        // each recovery can be compared against it by content digest: a refusal that
+        // withheld nothing recoverable would be indistinguishable from one that lost work.
+        let adequate = MergeLimits::new(
+            DescriptorLimits::new(64, 4096),
+            ProofBudget::new(64, 4096),
+            TEST_SET_UNION_LIMITS,
+        );
+        let withheld = match ExtensionState::merge(
+            stop_base_state,
+            stop_ours_state,
+            stop_theirs_state,
+            adequate,
+            None,
+        )
+        .into_status()
+        {
+            Outcome::Complete(Ok(product)) => product.state,
+            other => panic!("an adequate envelope must complete, got {other:?}"),
+        };
+
+        for (scenario, limits, probe) in [
+            (
+                "descriptor-resource-stop",
+                MergeLimits::new(
+                    DescriptorLimits::new(1, u128::MAX),
+                    ProofBudget::UNBOUNDED,
+                    TEST_SET_UNION_LIMITS,
+                ),
+                None::<&TripAt>,
+            ),
+            (
+                "ancestry-resource-stop",
+                MergeLimits::new(
+                    DescriptorLimits::UNBOUNDED,
+                    ProofBudget::new(1, u128::MAX),
+                    TEST_SET_UNION_LIMITS,
+                ),
+                None,
+            ),
+        ] {
+            let report = ExtensionState::merge(
+                stop_base_state,
+                stop_ours_state,
+                stop_theirs_state,
+                limits,
+                probe.map(|p| p as &dyn CancellationProbe),
+            );
+            let (stop, usage) = expect_resource_stop(report);
+            emit_merge_stop_record(
+                &run_id,
+                scenario,
+                &stop,
+                Some(&usage),
+                [
+                    (
+                        stop_base_root_before.clone(),
+                        stop_base.logical_root(&options).to_string(),
+                    ),
+                    (
+                        stop_ours_root_before.clone(),
+                        stop_ours.logical_root(&options).to_string(),
+                    ),
+                    (
+                        stop_theirs_root_before.clone(),
+                        stop_theirs.logical_root(&options).to_string(),
+                    ),
+                ],
+                &withheld,
+                (
+                    stop_base_state,
+                    stop_ours_state,
+                    stop_theirs_state,
+                    adequate,
+                ),
+            );
+        }
+
+        // A cancellation is the one stop that spends nothing it can name: `dimension()` is
+        // `None` and `checkpoint()` is `Some`, exactly inverting every resource stop above.
+        // Sampling at 2 lands on `AfterBranchAncestry`, which is past both earlier
+        // checkpoints and before publication — so this record also witnesses that a stop
+        // taken *after* real work still exposes no product.
+        let cancel_probe = TripAt::new(2);
+        let cancel_report = ExtensionState::merge(
+            stop_base_state,
+            stop_ours_state,
+            stop_theirs_state,
+            adequate,
+            Some(&cancel_probe),
+        );
+        let cancel_stop = expect_stop(cancel_report);
+        emit_merge_stop_record(
+            &run_id,
+            "cancellation-stop",
+            &cancel_stop,
+            None,
+            [
+                (
+                    stop_base_root_before,
+                    stop_base.logical_root(&options).to_string(),
+                ),
+                (
+                    stop_ours_root_before,
+                    stop_ours.logical_root(&options).to_string(),
+                ),
+                (
+                    stop_theirs_root_before,
+                    stop_theirs.logical_root(&options).to_string(),
+                ),
+            ],
+            &withheld,
+            (
+                stop_base_state,
+                stop_ours_state,
+                stop_theirs_state,
+                adequate,
+            ),
+        );
+    }
+
+    /// Emit one `fln.e2e.extension-merge-refusal` record for a [`MergeStop`], for
+    /// `franken_lean-2tcr`.
+    ///
+    /// Every field that names the stop is a projection **of the stop value** — `label()`,
+    /// `dimension()`, `checkpoint()` — so a lane record cannot describe a stop the type no
+    /// longer produces. The roots are passed as before/after pairs and asserted equal here
+    /// rather than by the caller, because "the inputs did not move" is the claim this
+    /// record exists to make and a caller that forgot to assert it would still emit a
+    /// well-formed line.
+    fn emit_merge_stop_record(
+        run_id: &str,
+        scenario: &str,
+        stop: &MergeStop,
+        usage: Option<&ResourceUsage>,
+        roots: [(String, String); 3],
+        withheld: &ExtensionState,
+        retry: (
+            &ExtensionState,
+            &ExtensionState,
+            &ExtensionState,
+            MergeLimits,
+        ),
+    ) {
+        for (label, (before, after)) in ["base", "ours", "theirs"].iter().zip(roots.iter()) {
+            assert_eq!(
+                before, after,
+                "{scenario}: a stop must leave the {label} input exactly as it was"
+            );
+        }
+
+        // FL-INV-07: the stop is a typed non-answer, so there is no product to expose. That
+        // is structural here — the non-answer arms carry no domain payload — and this
+        // assertion witnesses it on the real path rather than restating it.
+        let (base, ours, theirs, limits) = retry;
+        let recovered = match ExtensionState::merge(base, ours, theirs, limits, None).into_status()
+        {
+            Outcome::Complete(Ok(product)) => product.state,
+            other => panic!("{scenario}: an adequate-budget retry must complete, got {other:?}"),
+        };
+        assert_eq!(
+            recovered.content_digest(),
+            withheld.content_digest(),
+            "{scenario}: the retry must produce exactly what the refusal withheld"
+        );
+
+        let dimension = stop
+            .dimension()
+            .map_or_else(|| "null".to_owned(), |d| format!("\"{d}\""));
+        let checkpoint = stop
+            .checkpoint()
+            .map_or_else(|| "null".to_owned(), |c| format!("\"{c:?}\""));
+        let (allowed, observed) = usage.map_or_else(
+            || ("null".to_owned(), "null".to_owned()),
+            |u| (u.allowed.to_string(), u.observed.to_string()),
+        );
+        println!(
+            "{{\"schema\":\"fln.e2e.extension-merge-refusal\",\"version\":1,\
+             \"run_id\":\"{run_id}\",\"bead\":\"franken_lean-2tcr\",\
+             \"scenario\":\"{scenario}\",\"status\":\"pass\",\
+             \"invariant\":\"FL-INV-07\",\"outcome_class\":\"inconclusive\",\
+             \"stop_label\":\"{}\",\"stop_dimension\":{dimension},\
+             \"stop_checkpoint\":{checkpoint},\"allowed\":{allowed},\"observed\":{observed},\
+             \"authoritative\":false,\"product_exposed\":false,\"cacheable\":false,\
+             \"rendered_as_accept\":false,\"rendered_as_reject\":false,\
+             \"base_root_before\":\"{}\",\"base_root_after\":\"{}\",\
+             \"ours_root_before\":\"{}\",\"ours_root_after\":\"{}\",\
+             \"theirs_root_before\":\"{}\",\"theirs_root_after\":\"{}\",\
+             \"input_mutation\":false,\"recovery_outcome\":\"adequate_budget_retry_merged\",\
+             \"recovered_digest\":\"{}\",\"final_state\":\"clean_recovery\"}}",
+            stop.label(),
+            roots[0].0,
+            roots[0].1,
+            roots[1].0,
+            roots[1].1,
+            roots[2].0,
+            roots[2].1,
+            recovered.content_digest(),
+        );
     }
 
     #[test]
