@@ -104,9 +104,40 @@ pub struct Finding {
     pub detail: String,
 }
 
+/// One line-count covenant, as measured — not as re-derived.
+///
+/// `loc` is the value `count_loc` returned inside the enforcing walk, carried out rather than
+/// recomputed. That is the whole design: the covenant was *walked* and its number *discarded*
+/// unless it exceeded the limit, so anyone who needed "how big is the kernel" had exactly one
+/// counter they could actually invoke and it was `wc -l`. Two of the three kernel-size figures
+/// ever written down in this repository were that raw count — 6,535 in
+/// `fln-conformance/src/witness.rs` against a covenant of 5,416, and 6,382 in the `ukzx` row
+/// against 5,379 — authored independently by different people, neither aware of the other.
+/// The substitution was not carelessness; it was the only available move
+/// (bead `franken_lean-kernel-loc-covenant-not-disclosed-t0g7`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovenantFact {
+    pub crate_name: String,
+    pub loc: usize,
+    pub limit: usize,
+}
+
+impl CovenantFact {
+    /// Lines still available under the cap. Saturating: a crate already over its limit has no
+    /// negative headroom, it has none, and `FLN-STRUCT-015` is the thing that says so.
+    pub fn headroom(&self) -> usize {
+        self.limit.saturating_sub(self.loc)
+    }
+}
+
 #[derive(Debug)]
 pub struct RunOutcome {
     pub findings: Vec<Finding>,
+    /// Every line-count covenant the run measured, in declaration order. Scope is inherited
+    /// from the enforcing walk's own `g.covenants`, never listed here — a hand-listed scope
+    /// rots silently and this repository has paid for that more than once
+    /// (`fln-guard-scope-must-be-derived`).
+    pub covenants: Vec<CovenantFact>,
     pub crate_count: usize,
     pub edge_count: usize,
     pub graph_digest: u64,
@@ -2504,6 +2535,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     audit_python_import_shadowing(root, &mut findings);
 
     // ---- line-count covenants ----------------------------------------------------------
+    let mut covenants: Vec<CovenantFact> = Vec::new();
     for (crate_name, limit) in &g.covenants {
         let Some(c) = on_disk.get(crate_name.as_str()) else {
             continue;
@@ -2536,6 +2568,16 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             }
         }
         let loc = count_loc(root, &src, &mut findings)?;
+        // The disclosure and the enforcement are the SAME value, used twice. Not a second
+        // implementation agreeing with the first — there is nothing here that could disagree.
+        // A mutant that moves the real count without moving the disclosure is therefore
+        // unplantable by construction, which is the strongest available outcome and is stated
+        // in the guard below rather than quietly scored as a kill.
+        covenants.push(CovenantFact {
+            crate_name: crate_name.clone(),
+            loc,
+            limit: *limit,
+        });
         if loc > *limit {
             findings.push(Finding {
                 code: "FLN-STRUCT-015",
@@ -2667,6 +2709,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     findings.sort_by(|a, b| (a.code, &a.path, &a.detail).cmp(&(b.code, &b.path, &b.detail)));
     Ok(RunOutcome {
         findings,
+        covenants,
         crate_count: discovered.len(),
         edge_count: actual_edges.len(),
         graph_digest,

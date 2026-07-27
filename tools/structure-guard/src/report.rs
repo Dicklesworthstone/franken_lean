@@ -57,6 +57,11 @@ pub fn render_human(root_display: &str, outcome: &RunOutcome) -> String {
         d18.nodes,
         d18.edges,
     ));
+    // The covenant was walked on every run and its number thrown away unless it exceeded the
+    // limit, so the only counter anyone could actually invoke was `wc -l` — and two of the
+    // three kernel-size figures ever written down in this repository were that raw count
+    // (bead `franken_lean-kernel-loc-covenant-not-disclosed-t0g7`). A wall, printed as a gauge.
+    out.push_str(&covenant_human_line(&outcome.covenants));
     for f in &outcome.findings {
         out.push_str(&format!("{} {}: {}\n", f.code, f.path, f.detail));
     }
@@ -113,6 +118,48 @@ fn json_string_array(values: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{values}]")
+}
+
+/// Render the measured line-count covenants for the human record.
+///
+/// Every field is carried from the enforcing walk: `loc` is the value `count_loc` returned,
+/// `limit` the declared cap, `headroom` their difference. Nothing here recomputes anything, so
+/// there is no second copy that could drift from the first — which is the whole point of the
+/// bead (`franken_lean-kernel-loc-covenant-not-disclosed-t0g7`). Tenths of a percent, so a
+/// trend is readable without putting a float in an evidence record.
+///
+/// **This belongs in the robot `run_end` line and is not there yet.** Measured at `2f9112f7`:
+/// `scripts/evidence.py`'s `require_guard_keys` compares the terminal record's key set for
+/// EXACT equality, so adding `line_count_covenants` to `structure-guard/4` is refused with
+/// `extra=['line_count_covenants']` — it is a schema bump to `/5`, moving the producer, the
+/// validator's schema check and its fixtures together, and that file is currently carrying
+/// another pane's uncommitted work. The human log is sealed into every bundle
+/// (`terminal_human_log_is_sealed_before_manifest_generation`), so the number is disclosed and
+/// citable today; it is not yet machine-parseable, and no row may claim that it is.
+fn covenant_human_line(covenants: &[crate::checks::CovenantFact]) -> String {
+    if covenants.is_empty() {
+        // Not "no covenants" — this walk declares at least fln-kernel, so an empty set is a
+        // counter that stopped counting. Said out loud rather than rendered as a blank, because
+        // a disclosure that silently vanishes is worse than one that was never written.
+        return "structure-guard: line-count-covenants NONE MEASURED — the covenant walk \
+                produced no facts; this is a broken measurement, not a clean crate\n"
+            .to_string();
+    }
+    let mut out = String::new();
+    for c in covenants {
+        // A zero limit is not a covenant; reporting it beats dividing by it.
+        let permille = (c.loc * 1000).checked_div(c.limit).unwrap_or(0);
+        out.push_str(&format!(
+            "structure-guard: line-count-covenant {} loc={} max-loc={} headroom={} used={}.{}%\n",
+            c.crate_name,
+            c.loc,
+            c.limit,
+            c.headroom(),
+            permille / 10,
+            permille % 10
+        ));
+    }
+    out
 }
 
 pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128) -> String {

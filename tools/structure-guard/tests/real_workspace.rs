@@ -534,3 +534,278 @@ fn the_admission_tripwire_names_what_the_kernel_actually_exports() {
         );
     }
 }
+
+/// The judgement, in one place a forged caller can drive, so the mutants below can
+/// demonstrate it discriminates without editing the tree.
+///
+/// Each arm returns a distinct reason token. **Direction is deliberate everywhere**: every
+/// arm treats absence and zero as FAILURE, never as agreement. A floor-only or
+/// presence-only reading of a counter goes green forever the day the counter breaks and
+/// returns nothing, which is the failure mode a disclosure is least able to survive — the
+/// number would simply stop appearing and every check that asked "is it under the limit"
+/// would keep saying yes.
+fn judge_covenant_disclosure(
+    declared: &std::collections::BTreeMap<String, usize>,
+    measured: &[structure_guard::checks::CovenantFact],
+    human: &str,
+) -> Result<(), String> {
+    // (0) An empty measurement is a counter that stopped counting, not a crate with no
+    // covenant: the walk declares at least `fln-kernel`.
+    if measured.is_empty() {
+        return Err("no-covenant-measured".to_owned());
+    }
+    if declared.is_empty() {
+        return Err("no-covenant-declared".to_owned());
+    }
+    // (1)/(2) Equality both ways between what the graph DECLARES and what the walk MEASURED.
+    // A declared covenant the walk skipped is a cap nobody is enforcing; a measured one
+    // nobody declared is a cap nobody reviewed.
+    for name in declared.keys() {
+        if !measured.iter().any(|c| &c.crate_name == name) {
+            return Err(format!("declared-covenant-not-measured:{name}"));
+        }
+    }
+    for fact in measured {
+        let Some(limit) = declared.get(&fact.crate_name) else {
+            return Err(format!(
+                "measured-covenant-not-declared:{}",
+                fact.crate_name
+            ));
+        };
+        // (3) The limit carried out must be the limit declared, or the headroom is fiction.
+        if *limit != fact.limit {
+            return Err(format!(
+                "limit-disagrees-with-declaration:{}:{}-vs-{limit}",
+                fact.crate_name, fact.limit
+            ));
+        }
+        // (4) Zero is refused, both sides. A zero count is a broken counter reported as
+        // maximal headroom — the single most dangerous value this field can carry.
+        if fact.loc == 0 {
+            return Err(format!("covenant-counted-zero:{}", fact.crate_name));
+        }
+        if fact.limit == 0 {
+            return Err(format!("covenant-limit-zero:{}", fact.crate_name));
+        }
+        // (5) The disclosure must carry the measured number. This is the join the bead is
+        // about: the value is walked on every run, and until now it was thrown away unless
+        // it exceeded the limit.
+        if !human.contains(&format!(
+            "line-count-covenant {} loc={} max-loc={} headroom={}",
+            fact.crate_name,
+            fact.loc,
+            fact.limit,
+            fact.headroom()
+        )) {
+            return Err(format!("disclosure-omits-measurement:{}", fact.crate_name));
+        }
+    }
+    Ok(())
+}
+
+/// The kernel line-count covenant is DISCLOSED by the same walk that ENFORCES it.
+///
+/// `<= 12 KLOC` (D6 / FL-INV-02) is genuinely walked — `FLN-STRUCT-015` fails the build over
+/// it and `FLN-STRUCT-024` refuses to let the declared limit be raised. But `count_loc`'s
+/// result was **discarded unless it exceeded the limit**, so the covenant was a wall and
+/// never a gauge: nobody could see headroom or its trend, and the first signal would have
+/// been a refused commit.
+///
+/// That absence had already caused two false disclosures, authored independently: 6,535 in
+/// `fln-conformance/src/witness.rs` against a covenant of 5,416, and 6,382 in the `ukzx`
+/// coverage row against 5,379. Both are the raw `wc -l` count. **That is a cause, not a
+/// coincidence** — a person who needed the number had exactly one counter they could invoke,
+/// and it was the wrong one (`franken_lean-kernel-loc-covenant-not-disclosed-t0g7`).
+///
+/// **One producer, not two agreeing.** The disclosed `loc` is the value `count_loc` returned
+/// inside the enforcing walk, carried out on `RunOutcome`. There is no second implementation
+/// that could drift, which is why the mutant the bead asks for — *move the real count without
+/// moving the disclosure* — is **unplantable at this level, by construction**: they are one
+/// binding used twice, and no forged input can separate them. Stated rather than quietly
+/// dropped, and then made plantable one level up, at the source: the guard below refuses a
+/// second `count_loc` call site, which is the only way that mutant could ever exist again.
+///
+/// **What this does not earn.** Disclosing a number does not make the covenant stronger, and
+/// this test must not be read as evidence about kernel size — `fln-8zsq` and
+/// `franken_lean-2ki4` both closed on a disclosure and bought nothing about the thing
+/// disclosed. It buys exactly two things: the correct number is now reachable, and its
+/// movement is now visible. The value is in the sealed human log and **not** in the robot
+/// NDJSON, because `require_guard_keys` compares the terminal key set for exact equality —
+/// measured, `extra=['line_count_covenants']` — so that half is a `structure-guard/4` to
+/// `/5` bump blocked on another pane's uncommitted `scripts/evidence.py`.
+#[test]
+fn the_line_count_covenant_is_disclosed_by_the_walk_that_enforces_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let outcome = structure_guard::checks::run(root).expect("structure-guard setup");
+    let graph_text = std::fs::read_to_string(root.join("ci/WORKSPACE_GRAPH.txt"))
+        .expect("ci/WORKSPACE_GRAPH.txt must be readable");
+    let declared = structure_guard::graph::parse(&graph_text)
+        .expect("the reviewed workspace graph must parse")
+        .covenants;
+    let human = structure_guard::report::render_human(&root.display().to_string(), &outcome);
+
+    if let Err(reason) = judge_covenant_disclosure(&declared, &outcome.covenants, &human) {
+        panic!(
+            "the line-count covenant is not disclosed by the walk that enforces it ({reason}). \
+             A covenant whose number is invisible is a wall, not a gauge, and the last time it \
+             was invisible two people independently published the raw `wc -l` count instead \
+             (franken_lean-kernel-loc-covenant-not-disclosed-t0g7). declared={declared:?} \
+             measured={:?}",
+            outcome.covenants
+        );
+    }
+}
+
+/// Every arm above kills a mutation, each gutted independently, and the one mutant that
+/// cannot be planted is named rather than omitted.
+#[test]
+fn the_covenant_disclosure_guard_kills_each_mutation_it_claims_to() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let outcome = structure_guard::checks::run(root).expect("structure-guard setup");
+    let graph_text = std::fs::read_to_string(root.join("ci/WORKSPACE_GRAPH.txt"))
+        .expect("ci/WORKSPACE_GRAPH.txt must be readable");
+    let declared = structure_guard::graph::parse(&graph_text)
+        .expect("the reviewed workspace graph must parse")
+        .covenants;
+    let human = structure_guard::report::render_human(&root.display().to_string(), &outcome);
+    let measured = outcome.covenants.clone();
+
+    // The unmutated control, judged first, or every mutant below dies on a broken baseline.
+    assert_eq!(
+        judge_covenant_disclosure(&declared, &measured, &human),
+        Ok(()),
+        "the unmutated covenant disclosure must hold. declared={declared:?} measured={measured:?}"
+    );
+    let first = measured.first().expect("at least one covenant").clone();
+
+    let with = |f: fn(&mut structure_guard::checks::CovenantFact)| {
+        let mut m = measured.clone();
+        f(&mut m[0]);
+        m
+    };
+
+    // (mutant, declared, measured, human, expected reason) — one gut each.
+    let cases: Vec<(
+        &str,
+        _,
+        Vec<structure_guard::checks::CovenantFact>,
+        String,
+        String,
+    )> = vec![
+        (
+            "counter-returned-nothing",
+            declared.clone(),
+            Vec::new(),
+            human.clone(),
+            "no-covenant-measured".to_owned(),
+        ),
+        (
+            "counter-returned-zero-lines",
+            declared.clone(),
+            with(|c| c.loc = 0),
+            human.clone(),
+            format!("covenant-counted-zero:{}", first.crate_name),
+        ),
+        (
+            "declared-limit-vanished",
+            declared.clone(),
+            with(|c| c.limit = 0),
+            human.clone(),
+            format!(
+                "limit-disagrees-with-declaration:{}:0-vs-{}",
+                first.crate_name, first.limit
+            ),
+        ),
+        (
+            "a-declared-covenant-was-never-walked",
+            {
+                let mut d = declared.clone();
+                d.insert("fln-checker".to_owned(), 4000);
+                d
+            },
+            measured.clone(),
+            human.clone(),
+            "declared-covenant-not-measured:fln-checker".to_owned(),
+        ),
+        (
+            "a-cap-nobody-reviewed",
+            std::collections::BTreeMap::new(),
+            measured.clone(),
+            human.clone(),
+            "no-covenant-declared".to_owned(),
+        ),
+        (
+            "disclosure-dropped-the-number",
+            declared.clone(),
+            measured.clone(),
+            human.replace("line-count-covenant", "line-count-covenant-suppressed"),
+            format!("disclosure-omits-measurement:{}", first.crate_name),
+        ),
+        (
+            "disclosure-shows-a-different-number",
+            declared.clone(),
+            measured.clone(),
+            human.replace(
+                &format!("loc={}", first.loc),
+                &format!("loc={}", first.loc + 1),
+            ),
+            format!("disclosure-omits-measurement:{}", first.crate_name),
+        ),
+    ];
+
+    for (name, m_declared, m_measured, m_human, expected) in &cases {
+        let moved = *m_declared != declared || *m_measured != measured || *m_human != human;
+        assert!(
+            moved,
+            "mutant {name} is identical to the unmutated base, so it did not apply and \
+             scoring it proves nothing"
+        );
+        let verdict = judge_covenant_disclosure(m_declared, m_measured, m_human);
+        assert_eq!(
+            verdict.as_ref().map_err(String::as_str),
+            Err(expected.as_str()),
+            "mutant {name} was not killed for its stated reason. A rig accepting any failure \
+             would score a mutant killed by an arm that had stopped testing the property"
+        );
+    }
+
+    // THE MUTANT THAT CANNOT BE PLANTED AT THIS LEVEL, made plantable one level up.
+    //
+    // The bead asks for a mutant that moves the real count without moving the disclosure.
+    // It does not exist here: `loc` is one binding, produced once by `count_loc` inside the
+    // enforcing walk and read twice. No forged `CovenantFact` can separate them, because
+    // separating them would require a SECOND counter — which is precisely the defect this
+    // repository keeps filing (a re-implementation of a predicate beside the original) and
+    // precisely what AGENTS.md refuses for the closure-exempt guard.
+    //
+    // So the mutant is planted where it could actually reappear: the source. Exactly one
+    // call site may exist. A second one is the moment two numbers become possible.
+    let checks_src = std::fs::read_to_string(root.join("tools/structure-guard/src/checks.rs"))
+        .expect("checks.rs must be readable");
+    let call_sites = checks_src
+        .lines()
+        .filter(|line| line.contains("count_loc(") && !line.trim_start().starts_with("fn "))
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .count();
+    assert_eq!(
+        call_sites, 1,
+        "there must be exactly one `count_loc` call site, so the enforced number and the \
+         disclosed number cannot be two numbers. Found {call_sites}. A second counter is the \
+         only way the bead's 'move the count without moving the disclosure' mutant could ever \
+         be planted again, and it is how 6,535 and 6,382 were published against covenants of \
+         5,416 and 5,379"
+    );
+    // And the scan must not be vacuous: a renamed counter would make the count 0 and read as
+    // "no second producer" rather than "the producer is gone".
+    assert!(
+        checks_src.contains("fn count_loc("),
+        "the counter's definition is gone, so the call-site scan above measured nothing and \
+         reported agreement"
+    );
+}
