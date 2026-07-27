@@ -2,8 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn check_script() -> String {
     let path = fln_conformance::checked_workspace_root!().join("scripts/check.sh");
@@ -2387,4 +2388,515 @@ fn the_worktree_refusal_scope_is_derived_from_the_lane_population() {
         "these lanes are now PROVEN to run in a linked worktree, which is new and makes a \
          verification path available that the section still denies. Say so there: {running:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The rch tracker exclusion, and the population a worker would answer for
+// ---------------------------------------------------------------------------
+
+/// The floor beneath the tracker walk.
+///
+/// 214 Rust files under `crates/` and `tools/` at `c0f2ace5`. The floor sits far enough below
+/// that ordinary churn never reaches it and a walk that has stopped descending always does. A
+/// collapsed scan finds no mentions, which is indistinguishable from a tree in which nobody
+/// reads the tracker — and the second one is a clean bill of health.
+const RCH_WALK_FLOOR: usize = 150;
+
+/// The rch tracker section of AGENTS.md, sliced to its own heading.
+///
+/// Scoped to the section rather than the file for `fln-8zsq`'s reason: a check satisfied by the
+/// words appearing *somewhere* in a 600-line document is satisfied by this test's own quotation
+/// of them the moment either moves.
+fn rch_section_of(agents: &str) -> &str {
+    let heading = "### The worker does not have the tracker";
+    let start = agents.find(heading).unwrap_or_else(|| {
+        panic!(
+            "AGENTS.md no longer carries the section warning that an rch worker lacks the beads \
+             tracker. A pane that offloads a beads-reading suite gets exit 101 — libtest's own \
+             failure code — and nothing left in the tree tells them why"
+        )
+    });
+    let section = &agents[start..];
+    &section[..section.find("\n---").unwrap_or(section.len())]
+}
+
+/// The single disclosure line beginning with `key`.
+///
+/// Refuses a missing line and a doubled one alike. Two producers for one population is the
+/// defect this block exists to remove, so finding two is a refusal and never a preference.
+fn rch_disclosure_line<'a>(section: &'a str, key: &str) -> &'a str {
+    let mut found: Option<&str> = None;
+    for line in section.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix(key) {
+            assert!(
+                found.is_none(),
+                "the rch tracker section states {key:?} twice, so the population has two \
+                 producers and nothing stops them disagreeing"
+            );
+            found = Some(rest.trim());
+        }
+    }
+    found.unwrap_or_else(|| {
+        panic!(
+            "the rch tracker section no longer carries a {key:?} line. That block is the single \
+             producer for this section's figures; without it the doctrine states counts that \
+             nothing rechecks, which is item 7's shape"
+        )
+    })
+}
+
+/// One `key=value` count, matched on whole tokens.
+///
+/// Whole-token matching is load-bearing rather than tidy: `reads=` is a substring of
+/// `non-reads=`, so a `contains` search silently reads the wrong field and still parses a
+/// number — agreement reached by measuring the wrong thing.
+fn rch_count(line: &str, key: &str) -> usize {
+    let mut found: Option<usize> = None;
+    for token in line.split_whitespace() {
+        let Some(rest) = token.strip_prefix(key) else {
+            continue;
+        };
+        assert!(found.is_none(), "{key:?} appears twice in {line:?}");
+        found = Some(
+            rest.parse()
+                .unwrap_or_else(|_| panic!("{key:?} is not a count in {line:?}")),
+        );
+    }
+    found.unwrap_or_else(|| panic!("the rch disclosure has no {key:?} field: {line:?}"))
+}
+
+/// One `key=value` string field, matched on whole tokens.
+fn rch_field<'a>(line: &'a str, key: &str) -> &'a str {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(key))
+        .unwrap_or_else(|| panic!("the rch provenance line has no {key:?}: {line:?}"))
+}
+
+/// The declared member list on `key`, refusing a repeated path.
+///
+/// A duplicate would make a declared cardinality meet a strictly smaller set, so the count
+/// could agree with the tree while the membership did not.
+fn rch_paths(section: &str, key: &str) -> BTreeSet<String> {
+    let listed: Vec<&str> = rch_disclosure_line(section, key)
+        .split_whitespace()
+        .collect();
+    let set: BTreeSet<String> = listed.iter().map(|path| (*path).to_string()).collect();
+    assert_eq!(
+        set.len(),
+        listed.len(),
+        "{key:?} lists a path twice, so its declared count meets a smaller set than it appears to"
+    );
+    set
+}
+
+/// Every Rust file under `crates/` and `tools/` naming the tracker, plus the number walked.
+///
+/// Takes the root so the campaign can drive the real walker over a staged tree. The walk count
+/// comes back with the set because an empty result and a clean tree are otherwise the same
+/// green — the defect `c0f2ace5` had to repair one section down.
+fn rch_tracker_mentions(root: &Path) -> (BTreeSet<String>, usize) {
+    const NEEDLE: &str = ".beads/issues.jsonl";
+    let mut mentions = BTreeSet::new();
+    let mut walked = 0usize;
+    let mut stack: Vec<PathBuf> = vec![root.join("crates"), root.join("tools")];
+    while let Some(directory) = stack.pop() {
+        let entries = fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", directory.display()));
+        for entry in entries {
+            let entry = entry.expect("a directory entry must be readable");
+            let file_type = entry.file_type().expect("a file type must be readable");
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if name != "target" && !name.starts_with('.') {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            walked += 1;
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+            if text.contains(NEEDLE) {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                mentions.insert(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    (mentions, walked)
+}
+
+/// Compare a disclosed population against a measured one, both directions.
+///
+/// Findings are returned rather than asserted so the campaign can drive this at a staged root
+/// and read what fired. Broken *scans* and broken *parses* panic instead, because they are
+/// refusals: yielding "no findings" for a walk that found nothing would report a clean tree on
+/// the strength of a scan that never ran.
+fn judge_rch_population(
+    section: &str,
+    measured: &BTreeSet<String>,
+    walked: usize,
+    floor: usize,
+) -> Vec<String> {
+    assert!(
+        walked >= floor,
+        "the walk found only {walked} Rust files under crates/ and tools/ against a floor of \
+         {floor}. That is a broken scan, not a small tree, and it is refused rather than \
+         reported as agreement"
+    );
+    assert!(
+        !measured.is_empty(),
+        "no file under crates/ or tools/ names the beads tracker at all. The needle has moved or \
+         the walk is broken; either way this is a refusal and never a clean tree"
+    );
+
+    let mut findings = Vec::new();
+
+    // The cells nothing in this tree can hold must at least still carry their provenance, and
+    // must not contradict the interception the prose claims.
+    let provenance = rch_disclosure_line(section, "rch-measured-at:");
+    for field in ["head=", "rch="] {
+        if rch_field(provenance, field).is_empty() {
+            findings.push(format!(
+                "provenance: {field:?} is empty, so the unmechanised rch cells claim a \
+                 provenance they do not have"
+            ));
+        }
+    }
+    let number = |field: &str| -> f64 {
+        rch_field(provenance, field)
+            .parse()
+            .unwrap_or_else(|_| panic!("{field:?} is not a number in {provenance:?}"))
+    };
+    let (confidence, threshold) = (number("confidence="), number("threshold="));
+    if confidence < threshold {
+        findings.push(format!(
+            "coherence: the section says a plain `cargo test` WOULD INTERCEPT while disclosing \
+             confidence {confidence} BELOW threshold {threshold}. One of the two is wrong, and \
+             the reader who trusts the prose offloads a beads-reading suite to a worker that has \
+             no tracker"
+        ));
+    }
+
+    let counts = rch_disclosure_line(section, "rch-tracker-population:");
+    let mentions = rch_count(counts, "mentions=");
+    let non_reads = rch_count(counts, "non-reads=");
+    let reads = rch_count(counts, "reads=");
+    let declared_reads = rch_paths(section, "rch-tracker-reads:");
+    let declared_non_reads = rch_paths(section, "rch-tracker-non-reads:");
+
+    if declared_reads.len() != reads {
+        findings.push(format!(
+            "counts: rch-tracker-population says reads={reads} while rch-tracker-reads lists {} \
+             paths",
+            declared_reads.len()
+        ));
+    }
+    if declared_non_reads.len() != non_reads {
+        findings.push(format!(
+            "counts: rch-tracker-population says non-reads={non_reads} while \
+             rch-tracker-non-reads lists {} paths",
+            declared_non_reads.len()
+        ));
+    }
+    if reads + non_reads != mentions {
+        findings.push(format!(
+            "conservation: reads={reads} + non-reads={non_reads} != mentions={mentions}. Every \
+             file naming the tracker is one or the other"
+        ));
+    }
+
+    let declared: BTreeSet<String> = declared_reads.union(&declared_non_reads).cloned().collect();
+    if declared.len() != declared_reads.len() + declared_non_reads.len() {
+        let both: Vec<&String> = declared_reads.intersection(&declared_non_reads).collect();
+        findings.push(format!(
+            "overlap: {both:?} are listed as BOTH a read and a non-read, so the classification \
+             says two things about one file"
+        ));
+    }
+
+    let arrived: Vec<&String> = measured.difference(&declared).collect();
+    if !arrived.is_empty() {
+        findings.push(format!(
+            "arrived: these files now name the beads tracker and are in neither list: \
+             {arrived:?}. If one READS it, it breaks under rch and joins rch-tracker-reads; if it \
+             only mentions the path, it joins rch-tracker-non-reads. Then move mentions= and the \
+             matching count. Growing silently is what strands the next reader"
+        ));
+    }
+    let departed: Vec<&String> = declared.difference(measured).collect();
+    if !departed.is_empty() {
+        findings.push(format!(
+            "departed: these paths are listed in the rch tracker population but no longer name \
+             the tracker — moved, renamed, or the mention was deleted: {departed:?}. Drop them \
+             and lower the counts; a list that denotes nothing reads as maintained and is not"
+        ));
+    }
+
+    findings
+}
+
+/// The rch tracker-exclusion row describes the population this tree actually has.
+///
+/// `~/.config/rch/config.toml` drops `.beads/` from the worker sync while the tracker is a
+/// tracked file, so an offloaded suite that reads it dies on the worker at exit 101 — the code
+/// libtest also uses for a real assertion failure. One command produced both in one session.
+/// The doctrine section is the only place that says so, and `hugg` is the standing proof that a
+/// correction delivered by broadcast does not survive a pane restart.
+///
+/// **What this binds.** The in-repo population a worker would answer for: membership and
+/// cardinality, in both directions and per member, so a file that starts naming the tracker
+/// cannot arrive silently and a listed member cannot rot away. Both directions matter for
+/// opposite reasons — silent growth strands the next reader with a number that was true once,
+/// and a stale member makes the list look maintained while denoting nothing.
+///
+/// **What it cannot.** `~/.config/rch/config.toml` is outside the repository, so no test here
+/// can hold the exclusion, the threshold or the confidence; a version bump moves all three and
+/// this tree would not notice. Those cells are disclosed with the version they were measured at
+/// so a reader can tell whether they still describe their machine, and the only mechanical claim
+/// made about them is internal: a section asserting interception while disclosing a confidence
+/// *below* its own threshold is incoherent, and that is refused. The read/non-read
+/// classification is likewise reviewed prose — this refuses a member appearing or vanishing,
+/// never a member filed under the wrong heading.
+#[test]
+fn the_rch_tracker_exclusion_row_matches_the_measured_population() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let section = rch_section_of(&agents);
+    let (measured, walked) = rch_tracker_mentions(&repo);
+    let findings = judge_rch_population(section, &measured, walked, RCH_WALK_FLOOR);
+    assert!(findings.is_empty(), "{}", findings.join("\n\n"));
+}
+
+// --- the campaign, at a staged root -----------------------------------------------------
+//
+// The floors above exist for the day the scan breaks, and a healthy tree can never exercise
+// them: with 214 real files present, `walked >= 150` cannot fire. `build_gate_governed_sets`
+// paid for that lesson — inject the inputs or the check is decorative.
+
+/// A staged root with `crates/` and `tools/`, uniquely named so no run inherits another's files.
+fn rch_staged_root(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock must be after the epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("fln-rch-{}-{tag}-{nanos}", std::process::id()));
+    fs::create_dir_all(root.join("crates")).expect("the staged crates dir must be creatable");
+    fs::create_dir_all(root.join("tools")).expect("the staged tools dir must be creatable");
+    root
+}
+
+/// Write `relative` under the staged root, naming the tracker or not.
+fn rch_stage_file(root: &Path, relative: &str, names_the_tracker: bool) {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().expect("a staged file must have a parent"))
+        .expect("the staged parent must be creatable");
+    let body = if names_the_tracker {
+        "fn probe() { let _ = \".beads/issues.jsonl\"; }\n"
+    } else {
+        "fn probe() { let _ = \"nothing of interest\"; }\n"
+    };
+    fs::write(path, body).expect("the staged file must be writable");
+}
+
+/// The baseline section: one read, one non-read, agreeing with the baseline root.
+fn rch_baseline_section() -> String {
+    rch_section(
+        "head=abcd1234 rch=1.0.52 confidence=0.95 threshold=0.85",
+        "mentions=2 non-reads=1 reads=1",
+        "crates/alpha/src/reader.rs",
+        "tools/beta/src/mentioner.rs",
+    )
+}
+
+fn rch_section(provenance: &str, population: &str, reads: &str, non_reads: &str) -> String {
+    format!(
+        "### The worker does not have the tracker — staged\n\n```text\n\
+         rch-measured-at: {provenance}\n\
+         rch-tracker-population: {population}\n\
+         rch-tracker-reads: {reads}\n\
+         rch-tracker-non-reads: {non_reads}\n```\n"
+    )
+}
+
+/// The baseline root the whole campaign varies one thing against.
+fn rch_baseline_root(tag: &str) -> PathBuf {
+    let root = rch_staged_root(tag);
+    rch_stage_file(&root, "crates/alpha/src/reader.rs", true);
+    rch_stage_file(&root, "tools/beta/src/mentioner.rs", true);
+    rch_stage_file(&root, "crates/alpha/src/quiet.rs", false);
+    root
+}
+
+/// The control. Every mutant below must be shown against a baseline that is genuinely clean,
+/// or a red proves nothing about the change that produced it.
+#[test]
+fn rch_control_a_disclosure_that_matches_its_root_yields_no_findings() {
+    let root = rch_baseline_root("control");
+    let (measured, walked) = rch_tracker_mentions(&root);
+    assert_eq!(walked, 3, "the staged walk must see all three staged files");
+    let findings = judge_rch_population(&rch_baseline_section(), &measured, walked, 2);
+    assert!(
+        findings.is_empty(),
+        "the baseline must be clean: {findings:?}"
+    );
+}
+
+#[test]
+fn rch_mutant_a_new_file_naming_the_tracker_is_caught() {
+    let root = rch_baseline_root("arrived");
+    rch_stage_file(&root, "crates/gamma/tests/newcomer.rs", true);
+    let (measured, walked) = rch_tracker_mentions(&root);
+    let findings = judge_rch_population(&rch_baseline_section(), &measured, walked, 2);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("arrived:")
+                && finding.contains("crates/gamma/tests/newcomer.rs")),
+        "a file that starts naming the tracker must be caught and NAMED: {findings:?}"
+    );
+}
+
+#[test]
+fn rch_mutant_a_listed_path_that_stopped_naming_it_is_caught() {
+    let root = rch_baseline_root("departed");
+    // The one variable: the listed read stops naming the tracker. Nothing else moves.
+    rch_stage_file(&root, "crates/alpha/src/reader.rs", false);
+    let (measured, walked) = rch_tracker_mentions(&root);
+    let findings = judge_rch_population(&rch_baseline_section(), &measured, walked, 2);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("departed:")
+                && finding.contains("crates/alpha/src/reader.rs")),
+        "a listed member that has rotted away must be caught and NAMED: {findings:?}"
+    );
+}
+
+#[test]
+fn rch_mutant_a_count_that_does_not_conserve_is_caught() {
+    let root = rch_baseline_root("conservation");
+    let (measured, walked) = rch_tracker_mentions(&root);
+    let section = rch_section(
+        "head=abcd1234 rch=1.0.52 confidence=0.95 threshold=0.85",
+        "mentions=3 non-reads=1 reads=1",
+        "crates/alpha/src/reader.rs",
+        "tools/beta/src/mentioner.rs",
+    );
+    let findings = judge_rch_population(&section, &measured, walked, 2);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("conservation:")),
+        "reads + non-reads must equal mentions: {findings:?}"
+    );
+}
+
+#[test]
+fn rch_mutant_a_list_shorter_than_its_count_is_caught() {
+    let root = rch_baseline_root("shortlist");
+    let (measured, walked) = rch_tracker_mentions(&root);
+    let section = rch_section(
+        "head=abcd1234 rch=1.0.52 confidence=0.95 threshold=0.85",
+        "mentions=2 non-reads=1 reads=1",
+        "",
+        "tools/beta/src/mentioner.rs",
+    );
+    let findings = judge_rch_population(&section, &measured, walked, 2);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("counts:")),
+        "a declared count that its own list cannot meet must be caught: {findings:?}"
+    );
+}
+
+#[test]
+fn rch_mutant_a_path_in_both_lists_is_caught() {
+    let root = rch_baseline_root("overlap");
+    let (measured, walked) = rch_tracker_mentions(&root);
+    let section = rch_section(
+        "head=abcd1234 rch=1.0.52 confidence=0.95 threshold=0.85",
+        "mentions=2 non-reads=1 reads=1",
+        "crates/alpha/src/reader.rs",
+        "crates/alpha/src/reader.rs",
+    );
+    let findings = judge_rch_population(&section, &measured, walked, 2);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("overlap:")),
+        "one file classified two ways must be caught: {findings:?}"
+    );
+}
+
+#[test]
+fn rch_mutant_interception_claimed_below_its_own_threshold_is_caught() {
+    let root = rch_baseline_root("coherence");
+    let (measured, walked) = rch_tracker_mentions(&root);
+    let section = rch_section(
+        "head=abcd1234 rch=1.0.52 confidence=0.50 threshold=0.85",
+        "mentions=2 non-reads=1 reads=1",
+        "crates/alpha/src/reader.rs",
+        "tools/beta/src/mentioner.rs",
+    );
+    let findings = judge_rch_population(&section, &measured, walked, 2);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("coherence:")),
+        "a section claiming interception below its own threshold must be caught: {findings:?}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "broken scan")]
+fn rch_mutant_a_collapsed_walk_refuses_instead_of_agreeing() {
+    let root = rch_baseline_root("collapsed");
+    let (measured, walked) = rch_tracker_mentions(&root);
+    // The floor is what a healthy tree can never exercise, so it is exercised here.
+    let _ = judge_rch_population(&rch_baseline_section(), &measured, walked, 4);
+}
+
+#[test]
+#[should_panic(expected = "never a clean tree")]
+fn rch_mutant_an_empty_scan_refuses_instead_of_reporting_clean() {
+    let root = rch_staged_root("empty");
+    rch_stage_file(&root, "crates/alpha/src/quiet.rs", false);
+    rch_stage_file(&root, "tools/beta/src/quiet.rs", false);
+    let (measured, walked) = rch_tracker_mentions(&root);
+    assert!(measured.is_empty(), "the staged root must name nothing");
+    let _ = judge_rch_population(&rch_baseline_section(), &measured, walked, 2);
+}
+
+#[test]
+#[should_panic(expected = "twice")]
+fn rch_mutant_a_doubled_disclosure_line_refuses() {
+    let root = rch_baseline_root("doubled");
+    let (measured, walked) = rch_tracker_mentions(&root);
+    let doubled = format!(
+        "{}\nrch-tracker-population: mentions=9 non-reads=9 reads=9\n",
+        rch_baseline_section()
+    );
+    let _ = judge_rch_population(&doubled, &measured, walked, 2);
+}
+
+#[test]
+#[should_panic(expected = "no longer carries")]
+fn rch_mutant_a_missing_disclosure_line_refuses() {
+    let root = rch_baseline_root("missing");
+    let (measured, walked) = rch_tracker_mentions(&root);
+    let section = rch_baseline_section().replace("rch-tracker-population:", "rch-tracker-absent:");
+    let _ = judge_rch_population(&section, &measured, walked, 2);
+}
+
+#[test]
+#[should_panic(expected = "no longer carries the section")]
+fn rch_mutant_deleting_the_doctrine_section_refuses() {
+    let _ = rch_section_of("# AGENTS.md\n\nEverything except the section that must exist.\n");
 }

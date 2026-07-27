@@ -484,6 +484,30 @@ a known-false heuristic green.
 
 RCH offloads `cargo build/test/clippy` to remote workers to avoid local compilation storms. Installed at `~/.local/bin/rch`, hooked into Claude Code's PreToolUse — usually transparent. Manual: `rch exec -- cargo build --release`. Health: `rch doctor`, `rch status`. Fails open (builds run locally if workers unavailable). **Codex/GPT users:** no auto-hook — manually `rch exec -- <cmd>` for heavy builds.
 
+### The worker does not have the tracker — a beads-reading suite answers for a checkout that lacks it
+
+The green-bar table above says where evidence may be taken from when the *tree* is wrong. This is the same defect one layer out: the **host** is wrong, the suite still runs, and the exit code is the one a real finding uses. Measured for bead `fln-y0f7`; the head, the rch version and the classifier numbers are in the block below, which is the single producer for every figure in this section:
+
+- `~/.config/rch/config.toml`'s `exclude_patterns` holds **`.beads/` and `.beads/**`**, while `.beads/issues.jsonl` is **tracked** (`git ls-files .beads/` returns four paths). The worker's checkout is therefore missing a file the repository contains — not stale, absent.
+- A suite that reads the tracker dies there with `No such file or directory` and **exits 101 — the same code libtest uses for a genuine assertion failure.** Both were hit on one command. **Judge from the message text; the exit status cannot separate them.**
+- **It is not opt-in.** `rch diagnose -- cargo test -p fln-conformance --test ci_execution_join` classifies it `CargoTest` at a confidence at or above the interception threshold — both are in the block below — and prints `✓ WOULD INTERCEPT`. With the PreToolUse hook installed a plain `cargo test` is offloaded with nothing in the command saying so.
+- **The dodge is the command line, not a flag** — the classifier matches the text it is given. A one-line wrapper (`exec cargo "$@"`) is not matched and runs locally. Bead `fln-y0f7` and the pin row in the gotchas list below both rely on this.
+
+**The population, derived per commit and disclosed here because that is the half a broadcast cannot keep.** Every Rust file under `crates/` and `tools/` naming the tracker is counted, classified, and listed — the numbers and the members have one producer, this block, so prose can never drift from a count:
+
+```text
+rch-measured-at: head=c0f2ace5 rch=1.0.52 confidence=0.95 threshold=0.85
+rch-tracker-population: mentions=8 non-reads=3 reads=5
+rch-tracker-reads: crates/fln-conformance/src/naming.rs crates/fln-conformance/src/ownership.rs crates/fln-conformance/tests/ci_execution_join.rs tools/structure-guard/kernel-ownership-publisher/src/main.rs tools/structure-guard/tests/real_workspace.rs
+rch-tracker-non-reads: crates/fln-conformance/tests/evidence_finalization.rs crates/fln-conformance/tests/vellum_surface_inventory.rs crates/fln-env/src/extensions.rs
+```
+
+**Discriminate on the read, never on the mention.** `vellum_surface_inventory.rs` compares a finding's path string and never opens the file; `evidence_finalization.rs` and `extensions.rs` name it only in prose. A count taken from a bare grep is the `mentions` figure, and that wrong one was published to this swarm once already.
+
+`the_rch_tracker_exclusion_row_matches_the_measured_population` re-derives the population per commit and **fails the build** in both directions — a file that starts naming the tracker and is in neither list, and a listed member that has stopped naming it — and it also **refuses a scan** that came back empty or that walked implausibly few files, because a broken walk and a clean tree are the same green (`c0f2ace5`'s lesson, one section down).
+
+**What this does not earn, stated because it is the load-bearing half.** `~/.config/rch/config.toml` is **outside the repository**, so no test here can hold the exclusion, the threshold, or the confidence — a version bump changes all three silently and nothing in this tree would notice. Those four cells are a measurement at one host at one instant, class `bounded_model`, and the version is recorded above precisely so the next reader can tell whether it still describes their machine. What *is* held per commit is the in-repo population that would be answered for by a worker without the file. Re-measure the rch half before relying on it, and record the version you measured at.
+
 ---
 
 ## ast-grep vs ripgrep vs warp_grep
@@ -565,7 +589,7 @@ Hard-won facts that will bite you if unknown:
    **This file's own enforcement claims are now counted, by a producer in the repository** (bead `franken_lean-pfei` R1). AGENTS.md is the densest source of unbound enforcement claims here, and four of its claims were measured false in two days — so the population is derived per commit rather than described:
 
    ```text
-   enforcement-census: live=22 bound=10 unbound=12 catalogued=7
+   enforcement-census: live=23 bound=11 unbound=12 catalogued=7
    ```
 
    `scripts/agents_enforcement_census.py --check` derives it and refuses any disagreement **in either direction**, so a new unbound claim raises the number and its author must say so, while a repair lowers it. `the_agents_enforcement_census_matches_the_file_it_describes` runs it under plain `cargo test`.
