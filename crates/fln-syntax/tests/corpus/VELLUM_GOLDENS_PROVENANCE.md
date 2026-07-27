@@ -8,9 +8,16 @@ can regenerate its own expectation is a mirror, not a golden. A tree-shape chang
 `golden_vellum` and stays failed until a human reads the diff and edits `vellum_goldens.hex` by
 hand.
 
-The producer is `fln-syntax@0.0.0` at commit
-`d64218a954f8447b3f29c4ca230ae5d158d56dc9`, with the token stream at schema
-`fln.vellum.token-stream/1` and the green tree at `fln.vellum.green-tree/1`.
+The current producer authority is `fln-syntax@0.0.0` at commit
+`d5ecb96659c5830449c5f000d9d9a4b9cb320dc8`, with the token stream at schema
+`fln.vellum.token-stream/1` and the green tree at `fln.vellum.green-tree/1`. Re-derived on
+2026-07-26 at repository commit `b241943dec5c22c81d7bd51ab6e622ad8715fa86`, this producer
+commit resolves uniquely and is an ancestor of `refs/heads/main`.
+
+The superseded producer anchor `d64218a954f8447b3f29c4ca230ae5d158d56dc9` remains a real
+commit object in this local repository only because the pre-filter-branch history is retained by
+backup refs. It is **local-backup-only**, not an ancestor of `refs/heads/main`, and therefore
+historical context rather than current evidence authority.
 
 The token table is frozen in the test source, not here, because the table is a **parameter** of the
 lexer: the same source lexes differently under a different table, so a golden without its table is
