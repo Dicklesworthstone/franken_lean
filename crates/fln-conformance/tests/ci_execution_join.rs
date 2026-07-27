@@ -351,11 +351,11 @@ const UNDISPATCHED_GOVERNED_LANES: &[(&str, &str)] = &[(
 /// [`test_function_citation`] parses and [`judge_granularity`] resolves against the target's
 /// real function list. Every entry is a debt, not a budget.
 ///
-/// # Who may narrow a row, and how far — two sequencer rulings of 2026-07-27
+/// # Who may repair a citation, and how far — three sequencer rulings of 2026-07-27
 ///
-/// Both were made in messages and lived nowhere durable for most of a day. They are recorded here
-/// rather than in a handoff because a handoff reaches one successor, while this is the text a pane
-/// reads *before* moving the ceiling.
+/// All three were made in messages and lived nowhere durable for most of a day. They are recorded
+/// here rather than in a handoff because a handoff reaches one successor, while this is the text a
+/// pane reads *before* moving the ceiling.
 ///
 /// **The narrow exception.** Every bead in this list is CLOSED, so AGENTS.md's one sanctioned
 /// exception — edit your own row in the same commit as your close — cannot reach any of them, and
@@ -379,6 +379,43 @@ const UNDISPATCHED_GOVERNED_LANES: &[(&str, &str)] = &[(
 ///
 /// **So 57 is a debt, not a clean number.** 25 repairable rows remain, plus 18 whose `unit` covers
 /// some cited coarse artifacts and not all, and 14 whose `unit` covers none of them.
+///
+/// **The third ruling: a guard that DISCOVERS rot declares all of it and repairs none of it.** It
+/// governs the guard `franken_lean-evidence-fields-never-resolved-bs5o` proposes over the twelve
+/// *unchecked* evidence fields — the same twelve the widening refusal above will not let anyone
+/// launder into `artifacts`. That guard is not built. The ruling is recorded here anyway, because
+/// the two rulings above are the text anyone building it reads first, and because for one rotation
+/// it lived only in the doc comment of an **untracked** file, which is to say nowhere.
+///
+/// Repairing one of those citations means choosing which function a closed bead's author meant.
+/// The rows span several panes, three of which are dead until 2026-08-01. A guard that silently
+/// corrects rot while discovering it converts every schedulable item into an invisible judgement
+/// by whoever happened to write the guard — **unattributable**, since commit authorship is not
+/// recoverable in this shared checkout, and **unreviewable**, since the guard's own green is then
+/// the only artifact left. Declared-and-unrepaired makes the same rot a queue with owners.
+///
+/// **It binds hardest on your own rows, which is the only reason it holds.**
+/// `franken_lean-claim-matrix-doc-ci-mhew` is this pane's row and its two citations are
+/// near-certain renames. Being more confident about a row you own is not a licence: if you would
+/// not accept another pane silently repairing your row, do not do it to theirs.
+///
+/// **The ruling names no count, and re-deriving it is exactly why.** It was made against "eight
+/// rotted rows", measured at `8d7c2caf`. Re-derived at `f5359c22` against the same producer it is
+/// **21 citations across 9 rows**, of 786 citation-shaped entries with 765 resolving. One of those
+/// nine — `fln-env-merge-resource-envelope-9m74` — is the lone `.rs`-path citation no kind in the
+/// grammar models, so whether it is *rot* or an *unmodelled subject* is a property of the
+/// classifier and not of the tree. The population moved before the ruling reached a file, and the
+/// figure that moved it was this repository's ordinary churn. So the ruling is stated over
+/// whatever the guard finds rather than over a number, and the guard must model the citation
+/// **kinds** — at least five are in use — and build the classifier's negative controls, before it
+/// calls anything rot. Every kind it mis-parses is a false accusation against another pane's row.
+///
+/// **Unenforced, deliberately, and it must land WITH the rig.** Nothing here checks any of this:
+/// there is no guard to green and no population to bind in both directions, so this is prose of
+/// the kind item 7 of the module header exists to distrust. It is
+/// `fln-term-plane-population-differential-wv4u`'s shape on purpose — constraints recorded ahead
+/// of a rig nobody has started — and that bead's own R4 is the rule that governs the discharge:
+/// the enforcement law lands in the same commit as the rig, never after it.
 ///
 /// A coupled population, recorded because it is invisible from this list. A row leaving here
 /// **also** leaves the ignored-producer citation census whenever the surface it cited coarsely
