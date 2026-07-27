@@ -35,11 +35,15 @@ fn assert_versioned_robot_lines(stdout: &str, expected_lines: usize) {
         lines.iter().all(|line| line.starts_with('{')),
         "robot mode emitted human output: {stdout}"
     );
+    // Bound to the const the producer actually emits, never transcribed. A transcribed
+    // version is a second copy of the answer, and the pending `/5` bump (bead
+    // `fln-census-empty-referent-no-mock-krb0` for `data_grade`, `t0g7` for
+    // `line_count_covenants`) would have had to remember this line to stay green — which is
+    // how a test starts asserting a version the tool stopped emitting.
+    let needle = format!("\"schema\":\"{}\"", structure_guard::NDJSON_SCHEMA);
     assert!(
-        lines
-            .iter()
-            .all(|line| line.contains("\"schema\":\"structure-guard/4\"")),
-        "robot output used the wrong schema: {stdout}"
+        lines.iter().all(|line| line.contains(&needle)),
+        "robot output used the wrong schema, expected {needle}: {stdout}"
     );
 }
 
@@ -465,7 +469,52 @@ fn robot_help_remains_machine_only_in_either_argument_order() {
         assert!(stdout.contains("\"event\":\"help\""));
         assert!(stdout.contains("\"reason_code\":\"help_requested\""));
         assert!(stdout.contains("\"exit_code\":0"));
+
+        // The usage text names the robot schema to a HUMAN reader, and `main.rs` spells that
+        // version out as a literal because `USAGE` is a `const` and `concat!` cannot take one.
+        // So the two can drift, and the drift is invisible: the help record would carry the new
+        // schema in its envelope while the prose inside it advertised the old one.
+        //
+        // Scoped to the `usage` VALUE, not to the record, because the envelope's own
+        // `"schema":"…"` field would satisfy a whole-line search and make this vacuous — the
+        // `fln-8zsq` lesson, where a guard's needle was matched by the guard's own text.
+        let usage = help_usage_field(&stdout);
+        assert!(
+            usage.contains("usage: structure-guard"),
+            "could not extract the usage field; this assertion is not measuring what it names: \
+             {stdout}"
+        );
+        assert!(
+            usage.contains(structure_guard::NDJSON_SCHEMA),
+            "the usage text advertises a different robot schema than the tool emits (expected \
+             {}): {usage}",
+            structure_guard::NDJSON_SCHEMA
+        );
     }
+}
+
+/// The `usage` string of the help record, unescaped only as far as this assertion needs.
+///
+/// No JSON dependency: D1 applies to the apparatus as much as to the product. `USAGE`
+/// contains no `"`, so scanning to the first unescaped quote is exact here rather than
+/// merely adequate — and if that ever stops being true the caller's own anti-vacuity
+/// assertion fails rather than silently comparing a truncated slice.
+fn help_usage_field(stdout: &str) -> &str {
+    let needle = "\"usage\":\"";
+    let Some(start) = stdout.find(needle).map(|at| at + needle.len()) else {
+        return "";
+    };
+    let rest = &stdout[start..];
+    let mut escaped = false;
+    for (offset, ch) in rest.char_indices() {
+        match ch {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return &rest[..offset],
+            _ => {}
+        }
+    }
+    ""
 }
 
 /// The admission tripwire's needle set, bound to what the kernel actually exports.
