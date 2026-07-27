@@ -298,6 +298,46 @@ A mail-like layer for agents to coordinate via MCP tools/resources: identities, 
 - **Prefer macros:** `macro_start_session`, `macro_prepare_thread`, `macro_file_reservation_cycle`, `macro_contact_handshake`.
 - Common pitfalls: `"from_agent not registered"` → `register_agent` in the right `project_key` first; `"FILE_RESERVATION_CONFLICT"` → adjust patterns / wait / use non-exclusive.
 
+### Everything above is documented and is not the channel in use — read this before reaching for it
+
+**The section above describes a producer that, today, does not produce.** Observed on
+2026-07-27, four separate failures in one day: one pane's inbox fetch timed out at 30 s
+**three times**; a routing request sat undelivered for **fourteen minutes**; a second pane
+waited on a request that never arrived; and a third pane's own handoff ledger recorded
+"nothing was routed to me" while **three** routes addressed to it sat in the store. The mail
+section is kept rather than deleted, because it may work again and a fresh pane should know
+**both** facts. What it must not do is what it did four times: send a pane to the broken
+channel with no mention that a working one exists.
+
+**The channel in use is a plain file store**, outside the repository — so writing to it is
+safe even while the build gate is held, which is half the reason it won:
+
+```
+/data/tmp/claude-1000/route-<from>-to-<to>-<topic>.md
+```
+
+`<from>`/`<to>` are pane names (`cc_1`, `cc_2`, `cc_3`), `<topic>` is usually the bead's
+short id. Nothing polls it, so tell whoever sequences the swarm the path once the file is
+written.
+
+**Write the LITERAL before/after — never a description of the change.** A described change is
+a claim with an expiry; the literal text is the thing itself, and producing it is what forces
+you to look. This is not a style preference, it is a measured one: on 2026-07-27 rendering a
+change literally caught a real error **four** times where the description of the same change
+had hidden it, including a filing that undercounted its own population by two. One instance
+from the same day, recorded because it cuts toward the reader rather than away: a routed patch
+proposing a trigger-reachability predicate read correctly in prose, and only writing its
+literal body out exposed that it rejected a spelling YAML permits — a wall that would have
+reddened a correct workflow. The prose was not wrong about intent. It simply could not be
+checked.
+
+**The store is the source of truth; a handoff's routing table is a summary, and summaries go
+stale.** On intake, **enumerate the store yourself** before trusting any ledger, your
+predecessor's included — a pane recorded "nothing was routed to me" on a day three routes were
+waiting for it. `ls` is aliased in this environment, so use `find /data/tmp/claude-1000
+-maxdepth 1 -name 'route-*.md'` and sort by mtime; a route written after your handoff was
+composed is exactly the one the handoff cannot mention.
+
 ---
 
 ## The Build Gate — while a lane runs, the repository is frozen
