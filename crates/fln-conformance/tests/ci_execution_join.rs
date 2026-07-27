@@ -356,7 +356,6 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-2bn5",
     "fln-46mw",
     "fln-49c",
-    "fln-4yos",
     "fln-7odd",
     "fln-8138",
     "fln-8gz3",
@@ -372,7 +371,6 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-judgement-row-not-bound-to-its-closure-iumd",
     "fln-kernel-loc-disclosure-foreign-counter-c118",
     "fln-kx3y",
-    "fln-laxj",
     "fln-mandated-mutant-join-unwatched-uagk",
     "fln-okfb",
     "fln-pu6i",
@@ -387,15 +385,12 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-uuuz",
     "fln-yswb",
     "fln-zti3",
-    "franken_lean-0sv9",
     "franken_lean-2ki4",
     "franken_lean-4o3n",
     "franken_lean-81oq",
     "franken_lean-admission-tripwire-needles-unbound-en9q",
     "franken_lean-c24a",
     "franken_lean-checker-charter-line-citations-unbound-68ob",
-    "franken_lean-claim-matrix-doc-ci-mhew",
-    "franken_lean-dgxa",
     "franken_lean-e5k7",
     "franken_lean-eh0c",
     "franken_lean-ex54",
@@ -422,7 +417,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
 
 /// The ratchet for [`FILE_GRANULAR_EVIDENCE_ALLOWANCE`], by equality, for the reason
 /// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
-const FILE_GRANULAR_EVIDENCE_CEILING: usize = 67;
+const FILE_GRANULAR_EVIDENCE_CEILING: usize = 62;
 
 // ---------------------------------------------------------------------------
 // The residue list, bound to the premises it rests on
