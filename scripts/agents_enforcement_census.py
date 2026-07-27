@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Derive the population of ENFORCEMENT CLAIMS in AGENTS.md (bead `franken_lean-pfei`, R1).
 
 An ENFORCEMENT CLAIM is a sentence asserting that some mechanism enforces something. A PRODUCER
