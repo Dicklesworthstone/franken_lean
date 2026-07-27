@@ -356,7 +356,6 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-2bn5",
     "fln-46mw",
     "fln-49c",
-    "fln-7odd",
     "fln-8138",
     "fln-8gz3",
     "fln-8zsq",
@@ -364,13 +363,11 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-amv.14",
     "fln-bench-apparatus-empty-referent-bkw6",
     "fln-c78c",
-    "fln-corpus-thread-matrix-93te",
     "fln-env-merge-resource-envelope-9m74",
     "fln-ffam",
     "fln-glml",
     "fln-judgement-row-not-bound-to-its-closure-iumd",
     "fln-kernel-loc-disclosure-foreign-counter-c118",
-    "fln-kx3y",
     "fln-mandated-mutant-join-unwatched-uagk",
     "fln-okfb",
     "fln-pu6i",
@@ -386,7 +383,6 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-yswb",
     "fln-zti3",
     "franken_lean-2ki4",
-    "franken_lean-4o3n",
     "franken_lean-81oq",
     "franken_lean-admission-tripwire-needles-unbound-en9q",
     "franken_lean-c24a",
@@ -407,7 +403,6 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "franken_lean-oof9",
     "franken_lean-pmap-refusal-outcome-taxonomy-i1z9",
     "franken_lean-pnav",
-    "franken_lean-r0xu",
     "franken_lean-r2st",
     "franken_lean-r4m8",
     "franken_lean-sxsk",
@@ -417,7 +412,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
 
 /// The ratchet for [`FILE_GRANULAR_EVIDENCE_ALLOWANCE`], by equality, for the reason
 /// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
-const FILE_GRANULAR_EVIDENCE_CEILING: usize = 62;
+const FILE_GRANULAR_EVIDENCE_CEILING: usize = 57;
 
 // ---------------------------------------------------------------------------
 // The residue list, bound to the premises it rests on
@@ -1455,12 +1450,20 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=4 rows=10 citations=11 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=4 rows=7 citations=8 all-rows-declared=true
     //
-    // For two of those rows the ignored function is the *only* honest answer:
-    // `pinned_present_olean_kernel_differential`'s `#[ignore]` reason names `fln-7odd`, and
-    // `present_olean_corpus_thread_matrix_compares_stream_digests`' names `93te` — both beads
-    // whose coverage rows cite the file.
+    // `rows` and `citations` fell 10 -> 7 and 11 -> 8 when `fln-7odd`, `fln-corpus-thread-matrix-93te`
+    // and `fln-kx3y` were migrated off file-granular citations; `surfaces` is unmoved because
+    // IGNORED_PRODUCER_ALLOWANCE was not touched. That coupling is not obvious from the
+    // granularity population alone — a row leaving FILE_GRANULAR_EVIDENCE_ALLOWANCE also leaves
+    // this census whenever the surface it cited carries an ignored producer — and it was found
+    // by this guard refusing, not by reading. Both figures move together or not at all.
+    //
+    // The `#[ignore]` reasons of `pinned_present_olean_kernel_differential` and
+    // `present_olean_corpus_thread_matrix_compares_stream_digests` still name `fln-7odd` and
+    // `93te` respectively, and those justifications are unchanged. What is no longer true, and
+    // used to be stated here, is that either bead's coverage row cites the FILE: both now cite
+    // named tests, which is why they left the population above.
     if d.ignored.is_empty() {
         findings.push(
             "granularity-ignored-scan: the `#[ignore]` scan found nothing, so both checks below \
