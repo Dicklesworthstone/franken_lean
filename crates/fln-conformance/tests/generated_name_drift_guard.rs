@@ -13,11 +13,20 @@ fn contract_registry() -> naming::Registry {
     naming::load_registry(&naming::scan_root()).expect("real registry loads")
 }
 
+/// Scan, refusing an unreadable governed surface rather than censusing what is left.
+///
+/// One site per suite: `scan_tree` reports the condition typed (`fln-y0f7` R2), and the
+/// panic belongs at the test boundary, not in `src/`.
+fn scan(root: &std::path::Path, registry: &naming::Registry) -> naming::ScanReport {
+    naming::scan_tree(root, registry)
+        .unwrap_or_else(|error| panic!("the governed surfaces must all be readable: {error}"))
+}
+
 #[test]
 fn real_ci_artifacts_are_drift_free() {
     let root = naming::scan_root();
     let registry = contract_registry();
-    let report = naming::scan_tree(&root, &registry);
+    let report = scan(&root, &registry);
     let ci_findings: Vec<_> = report
         .stale
         .iter()
@@ -37,7 +46,7 @@ fn real_ci_artifacts_are_drift_free() {
 fn real_contract_inventories_are_drift_free() {
     let root = naming::scan_root();
     let registry = contract_registry();
-    let report = naming::scan_tree(&root, &registry);
+    let report = scan(&root, &registry);
     let contract_findings: Vec<_> = report
         .stale
         .iter()

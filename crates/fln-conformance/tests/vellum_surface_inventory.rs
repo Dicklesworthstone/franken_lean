@@ -12,6 +12,17 @@
 
 use fln_conformance::naming::{self, SurfaceClass};
 
+/// Scan, refusing an unreadable governed surface rather than censusing what is left.
+///
+/// One site per suite: `scan_tree` reports the condition typed (`fln-y0f7` R2), and the
+/// panic belongs at the test boundary, not in `src/`. Before that repair an absent tracker
+/// was skipped in silence — `the_scan_is_deterministic` below then compared two scans that
+/// had read no beads and PASSED, which the BeadsCurrent floor never covered.
+fn scan(root: &std::path::Path, registry: &naming::Registry) -> naming::ScanReport {
+    naming::scan_tree(root, registry)
+        .unwrap_or_else(|error| panic!("the governed surfaces must all be readable: {error}"))
+}
+
 #[test]
 fn the_real_tree_has_no_stale_reserved_names() {
     let root = naming::scan_root();
@@ -21,7 +32,7 @@ fn the_real_tree_has_no_stale_reserved_names() {
     let registry = naming::load_registry(&root).unwrap_or_else(|error| {
         panic!("registry gate failed: {error}");
     });
-    let report = naming::scan_tree(&root, &registry);
+    let report = scan(&root, &registry);
     assert!(
         !report.scanned.is_empty(),
         "the scan saw files (an empty census is not a clean tree)"
@@ -99,8 +110,8 @@ fn the_scan_is_deterministic() {
     let registry = naming::load_registry(&root).unwrap_or_else(|error| {
         panic!("registry gate failed: {error}");
     });
-    let first = naming::scan_tree(&root, &registry);
-    let second = naming::scan_tree(&root, &registry);
+    let first = scan(&root, &registry);
+    let second = scan(&root, &registry);
     assert_eq!(first, second, "two scans of one tree disagree");
     let rendered_first = naming::render_report_ndjson(&first, &naming::missing_anchors(&root));
     let rendered_second = naming::render_report_ndjson(&second, &naming::missing_anchors(&root));

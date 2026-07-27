@@ -378,6 +378,43 @@ pub struct ScanReport {
     pub scanned: Vec<(SurfaceClass, String)>,
 }
 
+/// A governed surface could not be read, so the census is INCONCLUSIVE rather than clean.
+///
+/// Typed rather than a panic, for FL-INV-07 and for this module's neighbours: `ownership.rs`
+/// returns `Unreadable` and the ownership publisher returns a typed `Inconclusive` for the same
+/// condition, both in `src/`. A missing surface is an environmental fact, not an invariant
+/// failure, so it is reported — the *callers* are tests, and a test is where a panic belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanError {
+    UnreadableSurface {
+        class: SurfaceClass,
+        path: String,
+        detail: String,
+    },
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // The hint rides on the error, not on one caller, because this refusal's most
+            // common cause names something else entirely and that is how `hugg` cost a day.
+            ScanError::UnreadableSurface {
+                class,
+                path,
+                detail,
+            } => write!(
+                f,
+                "unreadable-surface: {}: {path}: {detail}. A census that cannot read a governed \
+                 surface is inconclusive, never a clean tree. If this fired under `rch`: \
+                 `.beads/` is in its `exclude_patterns`, so the worker has no copy and the \
+                 PreToolUse hook intercepts a plain `cargo test` — run this suite locally \
+                 (bead `fln-y0f7`).",
+                class.label()
+            ),
+        }
+    }
+}
+
 fn is_word_boundary(byte: Option<u8>) -> bool {
     match byte {
         None => true,
@@ -653,7 +690,7 @@ fn rel(root: &Path, path: &Path) -> String {
 
 /// Scan every governed surface class under `root`. Missing directories are
 /// skipped (scratch fixtures carry subsets); the census records what WAS seen.
-pub fn scan_tree(root: &Path, registry: &Registry) -> ScanReport {
+pub fn scan_tree(root: &Path, registry: &Registry) -> Result<ScanReport, ScanError> {
     let exempt: Vec<String> = CONTRACT_DEFINITION_PATHS
         .iter()
         .map(|path| (*path).to_string())
@@ -716,23 +753,35 @@ pub fn scan_tree(root: &Path, registry: &Registry) -> ScanReport {
         }
     }
 
+    // An absent tracker is INCONCLUSIVE, never a clean surface. This read used to be
+    // `if let Ok(..)`, which skipped the whole mutable-bead-field census in silence and did
+    // not even record the surface as scanned — so the scan reported a clean tree having read
+    // no beads. It was compensated only by `vellum_surface_inventory`'s BeadsCurrent floor, in
+    // a different file with nothing binding the two, so weakening that floor reopened the
+    // vacuum here without this file changing a byte (bead `fln-y0f7` R1/R2).
+    //
+    // The message names the cause it is most often going to have, because a refusal that
+    // blames the wrong thing is this repository's most expensive recurring failure.
     let beads = root.join(".beads/issues.jsonl");
-    if let Ok(text) = std::fs::read_to_string(&beads) {
-        scanned.push((
-            SurfaceClass::BeadsCurrent,
-            ".beads/issues.jsonl".to_string(),
-        ));
-        for (index, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            stale.extend(scan_beads_line(index + 1, line, registry));
+    let text = std::fs::read_to_string(&beads).map_err(|error| ScanError::UnreadableSurface {
+        class: SurfaceClass::BeadsCurrent,
+        path: ".beads/issues.jsonl".to_string(),
+        detail: error.to_string(),
+    })?;
+    scanned.push((
+        SurfaceClass::BeadsCurrent,
+        ".beads/issues.jsonl".to_string(),
+    ));
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
         }
+        stale.extend(scan_beads_line(index + 1, line, registry));
     }
 
     stale.sort();
     scanned.sort();
-    ScanReport { stale, scanned }
+    Ok(ScanReport { stale, scanned })
 }
 
 /// Every contract-definition exemption must exist under `root`: a dangling
