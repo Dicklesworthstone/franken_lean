@@ -175,13 +175,35 @@ fn an_allowance_entry_naming_no_row_is_refused() {
 
 /// The live ledger obeys the successor law, and every rig it can demand a citation to exists.
 ///
-/// The first assertion is VACUOUS today — all twelve rows are still in the remainder — and
-/// that is by construction, not an oversight. The allowance-scoped guards in
-/// `pin_option_defaults.rs` and `pin_ctor_inventory.rs` check exactly the rows this one
-/// skips, and go quiet exactly as this one takes over. Neither alone covers both states.
+/// THE ASSERTION IS ON THE SPECIFIC OUTCOME, NOT ON `is_ok()`. This test's doc used to say
+/// the first assertion was "VACUOUS today — all twelve rows are still in the remainder". That
+/// was true when written and is false now: all twelve have left the remainder, so the law
+/// examines every one and admits it on merit. The stale wording is the smaller half of the
+/// defect. The larger half is that `is_ok()` could not have told the difference.
 ///
-/// The second assertion is NOT vacuous and is what stops the first from rotting into a
-/// demand nobody can satisfy.
+/// `validate_repaired_rows_cite_their_oracle` returns `Ok` in two different worlds — one
+/// where it examined twelve rows and admitted them all, and one where it examined NONE
+/// because every row had left its scope. A bare `is_ok()` is satisfied identically by both,
+/// so the law could be switched off in silence with this suite green.
+///
+/// That the vacuous world returns `Ok` is NOT an inference. The sibling test
+/// `the_successor_law_admits_a_full_repair_and_ignores_an_undeclared_repair` asserts exactly
+/// that verdict for an unrepaired row, and the permission half of
+/// `the_three_field_repair_is_admitted_and_an_unrepaired_row_is_untouched` requires it too.
+/// The vacuous world is a state this suite already pins as passing.
+///
+/// TWO MUTANTS, planted against the real `ci/PARITY_LEDGER.txt` at `efc5e730` and restored by
+/// sha256, because a guard nobody attacked is decorative by default:
+///
+/// * reverting all twelve rows to `pinned-source` left THIS test reporting `ok`. It was
+///   caught — by a NEIGHBOUR, `the_real_ledger_never_earns_a_level_its_oracle_did_not_produce`
+///   — so the mutant rode another law's assertion rather than this one's.
+/// * demoting all twelve from `L2` to `L1` was caught by NOTHING: 15 passed, 0 failed, exit 0.
+///   Both laws turn on `level > L1`, so a demotion leaves both scopes at the same instant. A
+///   one-token edit per row silently withdraws twelve published L2 claims and empties this
+///   law's entire population, with the whole suite green.
+///
+/// The floor below kills both, and the second is the one no other check covers.
 #[test]
 fn the_real_ledger_obeys_the_successor_law_and_its_rigs_exist() {
     let root = workspace_root();
@@ -203,6 +225,25 @@ fn the_real_ledger_obeys_the_successor_law_and_its_rigs_exist() {
         );
     }
 
+    // ANTI-VACUITY FLOOR — the half `is_ok()` cannot express. A scan that examined nothing is
+    // a broken scan, not a clean tree, and this population can be emptied without any
+    // neighbouring law noticing (see this test's doc comment for the measured mutant).
+    let bound = ledger::rows_bound_by_the_successor_law(&parsed);
+    assert!(
+        bound.len() >= ledger::SUCCESSOR_LAW_LIVE_FLOOR,
+        "the successor law now reaches {} of ORACLE_BACKING's {} symbols, against a floor of \
+         {}. It would pass here because it examined almost nothing, not because the ledger is \
+         clean. Every way of shrinking this population withdraws a published claim or reverts \
+         a repair — demoting a row below L2, or moving its oracle-kind off a value-producing \
+         one — and a demotion leaves the oracle law's scope at the same instant, so no \
+         neighbouring check reports it. Reached: {bound:?}",
+        bound.len(),
+        ledger::ORACLE_BACKING.len(),
+        ledger::SUCCESSOR_LAW_LIVE_FLOOR,
+    );
+
+    // ...and the merit half. Together these two say the law examined at least the floor and
+    // admitted every row it examined; `is_ok()` alone is satisfied by the empty population.
     let outcome = ledger::validate_repaired_rows_cite_their_oracle(&parsed);
     let rendered = outcome
         .as_ref()

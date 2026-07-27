@@ -342,10 +342,19 @@ pub const ORACLE_BACKING: [(&str, &str); 12] = [
 
 /// A repaired row must cite the oracle it now claims.
 ///
-/// Vacuous today by construction — all twelve rows are still in the remainder — and that is
-/// the point rather than a weakness: this law GAINS force as the remainder shrinks, where the
-/// allowance-scoped guards lose it. The two together mean no row is ever unwatched, in either
-/// state or in the transition between them.
+/// LIVE, and the sentence that stood here said the opposite. It read "vacuous today by
+/// construction — all twelve rows are still in the remainder", which was true when written
+/// and was falsified by the qydn repair: measured at `efc5e730`, all twelve have LEFT the
+/// remainder — every one is `L2` on `pinned-binary` — so this law examines all twelve and
+/// admits them on merit, 12/12 citing their rig. It is not vacuous and has not been since
+/// `8eb2f892`.
+///
+/// The design claim underneath survives and is why the correction matters: this law GAINS
+/// force as the remainder shrinks, where the allowance-scoped guards lose it, so the two
+/// together mean no row is unwatched in either state or in the transition. What nothing
+/// watched was the transition ITSELF — a stale "vacuous" invites a reader to treat this law
+/// as dead code, and the assertion in the suite could not tell the two worlds apart either.
+/// [`SUCCESSOR_LAW_LIVE_FLOOR`] is the repair.
 ///
 /// What it catches is the specific half-repair this bead makes easy. Every one of the twelve
 /// currently cites `crates/fln-core/tests/pin_inventory_census.rs`, which READS vendored
@@ -400,6 +409,41 @@ pub fn validate_repaired_rows_cite_their_oracle(ledger: &Ledger) -> Result<(), V
     } else {
         Err(errors)
     }
+}
+
+/// How many of [`ORACLE_BACKING`]'s symbols [`validate_repaired_rows_cite_their_oracle`]
+/// actually REACHES rather than skips.
+///
+/// A FLOOR, deliberately not an equality, and the direction is forced. The population grows
+/// only when a row is repaired out of the remainder — the event this module exists to
+/// encourage — and equality would redden the build for a correct addition to
+/// [`ORACLE_BACKING`]: a thirteenth symbol whose row is still unrepaired. It may never
+/// shrink, because every way of shrinking it is a published claim being withdrawn or a repair
+/// being reverted, and both must be deliberate rather than silent. That is the
+/// shrinking-allowance direction this repository has already paid for twice.
+///
+/// Measured at `efc5e730`: 12 of 12.
+pub const SUCCESSOR_LAW_LIVE_FLOOR: usize = 12;
+
+/// The [`ORACLE_BACKING`] symbols the successor law examines rather than skips.
+///
+/// Exposed because the anti-vacuity floor cannot be written in the integration suite without
+/// it, and re-deriving it there is the one repair that is not available.
+/// [`claims_a_produced_value`] is private on purpose — the two laws that turn on it must not
+/// drift apart — so a suite that answered "is this row under the law" for itself would plant
+/// exactly the second copy that predicate was extracted to prevent. The module that owns the
+/// predicate reports the population; the suite asserts against it and re-implements nothing.
+pub fn rows_bound_by_the_successor_law(ledger: &Ledger) -> Vec<&'static str> {
+    ORACLE_BACKING
+        .iter()
+        .filter(|(symbol, _rig)| {
+            ledger
+                .rows
+                .iter()
+                .any(|row| row.symbol == *symbol && claims_a_produced_value(row))
+        })
+        .map(|(symbol, _rig)| *symbol)
+        .collect()
 }
 
 /// Every rig this law can require a citation to must exist.
@@ -553,12 +597,30 @@ pub fn validate_allowance_has_no_orphans_against(
 /// parsed into a typed field and never compared to anything, which is verbatim the defect
 /// this bead opened with about `level` and `oracle_kind`.
 ///
-/// A DENYLIST, not an allowlist, and the direction is forced. An allowlist of value-producing
-/// tags is a WALL: repairing the twelve requires a tag that does not exist yet (both pin rigs
-/// are deliberately fixture-less, so their run has no tag today), and the permission test
-/// `source_read_at_l1_and_value_produced_above_it_are_both_permitted` already exercises a tag
-/// — `rfc-vectors` — that appears nowhere in the real ledger. A new honest tag must pass
-/// without asking anyone's permission; a known source-reading tag must not.
+/// A DENYLIST, not an allowlist. TWO reasons were given for that direction and only the
+/// SECOND still holds; both are named because a reader cannot otherwise tell which one is
+/// load-bearing, and a justification resting on a false premise is worse than one resting on
+/// a narrow premise.
+///
+/// EXPIRED — "repairing the twelve requires a tag that does not exist yet (both pin rigs are
+/// deliberately fixture-less, so their run has no tag today)". True when written at
+/// `3208f099` (2026-07-26 12:27:40) and falsified 31 minutes later by `8eb2f892`, which
+/// repaired the thirteen rows and created exactly those tags: measured at `efc5e730`,
+/// `pin-option-defaults-v4.32.0` sits on 8 rows and `pin-ctor-inventory-v4.32.0` on 4. That
+/// commit edited THIS doc block — it rewrote the `pin-census-v4.32.0` paragraph below for the
+/// new state — and left this paragraph asserting the old one.
+///
+/// STANDS — a new honest tag must pass without asking anyone's permission, and a known
+/// source-reading tag must not. The permission test
+/// `source_read_at_l1_and_value_produced_above_it_are_both_permitted` exercises `rfc-vectors`,
+/// which still appears nowhere in the real ledger: re-measured at `efc5e730`, 0 occurrences.
+///
+/// So the conclusion survives and one of its two supports does not. This is NOT the repair
+/// bead `fln-parity-freshness-denylist-direction-dy22` asks for — that bead's finding is that
+/// this denylist classifies 0 of 85 produced-value rows, and its proposed repair is a DERIVED
+/// tag-to-rig binding rather than a hand-maintained allowlist, which the now-existing tags
+/// make cheaper than when it was filed. Correcting a justification does not perform a repair;
+/// dy22 stays open.
 ///
 /// `unit-suite-v4.32.0` and `inventory-v4.32.0` sit on L1/L0 rows today, where the law never
 /// reaches them. They are declared anyway, so that raising one of those rows without moving
