@@ -749,8 +749,8 @@ pub fn is_terminal(bead_status: &str, skip: &str) -> bool {
 ///
 /// This binding *is* declared — `validate_e2e` refuses a scenario absent from
 /// `E2E_STEP_ORDERS` — which is why the guard checks citations against it. The binding
-/// from a key to the shell script that dispatches it is **not** declared anywhere; see
-/// the guard's own notes for what that costs.
+/// from a key to the shell script that dispatches it is declared nowhere either; the
+/// functions below derive it from the lane scripts' own text rather than from their names.
 pub fn e2e_scenario_keys(evidence_py: &str) -> BTreeSet<String> {
     let Some(block) = evidence_py.split_once("E2E_STEP_ORDERS = {") else {
         return BTreeSet::new();
@@ -765,6 +765,89 @@ pub fn e2e_scenario_keys(evidence_py: &str) -> BTreeSet<String> {
             rest.trim_start().starts_with(':').then(|| key.to_string())
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// A registered scenario and the lane script that runs it
+// ---------------------------------------------------------------------------
+
+/// The schema token every `fln.e2e/2` lane script carries.
+///
+/// A **compiled contract**, not a needle: `scripts/evidence.py` refuses a run whose records
+/// do not declare it, so a lane cannot quietly stop being governed by rewording something.
+pub const GOVERNED_E2E_SCHEMA: &str = "fln.e2e/2";
+
+/// Drop whole-line shell comments, for the reason [`code_only`] drops Rust ones.
+///
+/// It matters more here than there. Every lane script opens with a prose header naming the
+/// sibling lanes it was modelled on and the beads it serves, so a scan that read comments
+/// would find `closure_audit` inside `structure_gate.sh` and conclude the two are bound.
+pub fn shell_code_only(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every scenario name a lane script **assigns**, from any variable whose name ends in
+/// `SCENARIO`.
+///
+/// **The variable name is not fixed and assuming it was cost a false measurement.** Six of
+/// the eight governed lanes use plain `SCENARIO=`; `kernel_replay.sh` uses `AP6_SCENARIO=`
+/// for its nested child bundle. A first pass anchored on a word boundary before `SCENARIO`
+/// missed it and reported the lane as declaring no scenario at all — the guard's own
+/// spelling-keyed-scan defect, in the guard written about derivation.
+///
+/// Only `[a-z0-9_]` literals are collected, which is exactly the shape of an
+/// `E2E_STEP_ORDERS` key. `IDENTITY_SCENARIO="$scenario"` is a parameter expansion, not a
+/// name, and is correctly not one.
+pub fn scenario_assignments(shell_source: &str) -> BTreeSet<String> {
+    let code = shell_code_only(shell_source);
+    let mut found = BTreeSet::new();
+    for (index, _) in code.match_indices("SCENARIO=\"") {
+        let rest = &code[index + "SCENARIO=\"".len()..];
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        let literal = &rest[..end];
+        if !literal.is_empty()
+            && literal
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            found.insert(literal.to_string());
+        }
+    }
+    found
+}
+
+/// Does this lane script's **code** name `key` as a standalone word?
+///
+/// The weaker of the two bindings, and the guard declares which keys rest on it. Three
+/// scenarios reach their lane as the first argument of a dispatch helper
+/// (`run_identity_child declaration_tag_matrix …`) rather than through an assignment, so an
+/// assignment-only rule reports them as orphans.
+///
+/// **Modelling the helper by name is the alternative, and it is a hand-list** — the exact
+/// defect `franken_lean-worktree-gitdir-refusal-hugg` is criticised for, and one this
+/// codebase has already paid for twice: a scan keyed to one *spelling* is a hand-list
+/// wearing a derived scan's clothes (`franken_lean-build-gate-lane-governed-set-98np`).
+/// A word scan cannot be defeated by renaming a helper.
+///
+/// It over-credits an incidental code mention, and that direction never yields a false red:
+/// it can only fail to flag an orphan, never invent one. The population resting on it is
+/// declared and checked by set equality, so it cannot grow unnoticed.
+pub fn names_scenario_in_code(shell_source: &str, key: &str) -> bool {
+    fn word_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+    let code = shell_code_only(shell_source);
+    code.match_indices(key).any(|(index, _)| {
+        let before = code[..index].chars().next_back();
+        let after = code[index + key.len()..].chars().next();
+        !before.is_some_and(word_char) && !after.is_some_and(word_char)
+    })
 }
 
 #[cfg(test)]
@@ -1044,6 +1127,38 @@ fn discussion_only() {\n\
             ["closure_audit".to_string(), "env_snapshots".to_string()].into()
         );
         assert!(e2e_scenario_keys("nothing here").is_empty());
+    }
+
+    #[test]
+    fn a_scenario_assignment_is_found_under_any_variable_prefix_and_never_in_a_comment() {
+        // Both spellings this tree actually uses, plus the parameter expansion that is not a
+        // name, plus the header comment that names a sibling lane and must not bind it.
+        let source = concat!(
+            "# Modelled on scripts/e2e/closure_audit.sh; SCENARIO=\"from_a_comment\"\n",
+            "SCENARIO=\"env_snapshots\"\n",
+            "AP6_SCENARIO=\"kernel_replay\"\n",
+            "IDENTITY_SCENARIO=\"$scenario\"\n",
+        );
+        assert_eq!(
+            scenario_assignments(source),
+            ["env_snapshots".to_string(), "kernel_replay".to_string()].into()
+        );
+    }
+
+    #[test]
+    fn a_word_binding_excludes_comments_and_longer_identifiers() {
+        // The dispatch-helper form three scenarios reach their lane through, the step id that
+        // merely extends the key, and the provenance header that names a sibling lane.
+        let source = concat!(
+            "# see scripts/e2e/structure_gate.sh for the closure_audit pattern\n",
+            "run_identity_child declaration_tag_matrix fln-amv.12 \\\n",
+            "emit declaration_membership_mutant started\n",
+        );
+        assert!(names_scenario_in_code(source, "declaration_tag_matrix"));
+        // Only as a prefix of a longer step id — not a binding.
+        assert!(!names_scenario_in_code(source, "declaration_membership"));
+        // Present, but only in the header comment.
+        assert!(!names_scenario_in_code(source, "closure_audit"));
     }
 
     #[test]

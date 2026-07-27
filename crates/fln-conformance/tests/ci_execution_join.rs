@@ -56,11 +56,21 @@
 //! Stated here rather than discovered again, because item 7's whole complaint is claims
 //! whose limits live somewhere other than the claim.
 //!
-//! 1. **The `E2E_STEP_ORDERS` key → shell script binding is nowhere declared.** Keys match
-//!    `scripts/e2e/<key>.sh` by shared filename and nothing ties them; diverge them and any
-//!    dispatch derivation silently misses the lane. That is hugg's criticism reproduced
-//!    inside the method built to answer it, so this guard checks only *registration* —
-//!    which `scripts/evidence.py` does enforce — and makes no dispatch claim at all.
+//! 1. ~~**The `E2E_STEP_ORDERS` key → shell script binding is nowhere declared.**~~ Still
+//!    undeclared, now **derived** — see [`judge_lane_binding`]. The sentence this residue
+//!    item used to carry was measured false at `ad2b9207`: it said keys match
+//!    `scripts/e2e/<key>.sh` "by shared filename", which holds for eight of thirteen and
+//!    for none of the interesting ones. `env_snapshots.sh` alone hosts **six** registered
+//!    scenarios, five of them named nothing like it, so renaming that one file orphans five
+//!    registrations at once. Of 21 lane scripts only **8** carry the `fln.e2e/2` schema, and
+//!    one of those eight — `kernel_replay.sh` — is dispatched by **no workflow at all**,
+//!    while sitting in `E2E_STEP_ORDERS` and `check.sh`'s shellcheck stage looking exactly
+//!    as authoritative as the twelve that run. That is this bead's own thesis one floor up:
+//!    the guard was written because *rows* rest on suites CI never runs, and a *lane* CI
+//!    never runs was sitting inside the registry the guard was reading from.
+//!
+//!    What remains underived is **dispatch at runtime**: a workflow naming a script is not
+//!    a run of it, exactly as `uagk` records for its cron.
 //! 2. **Cargo's real target set.** Text cannot yield it; `bkw6` already paid for the
 //!    text-only version by counting `[[bench]]` sections while cargo auto-discovered the
 //!    rest. Member globs and directory layout are resolved here; `[[test]]` sections,
@@ -94,10 +104,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fln_conformance::execution::{
-    CiJob, Field, PIN_COORDINATES, autodiscovery_overrides, check_sh_reaches_workspace, ci_jobs,
-    e2e_scenario_keys, ignored_tests, installs_reference_pin, is_terminal, module_path_prefix,
-    reach_covers, reaches_the_pinned_reference, record_field, test_function_citation,
-    test_functions, test_reach, workspace_member_patterns,
+    CiJob, Field, GOVERNED_E2E_SCHEMA, PIN_COORDINATES, autodiscovery_overrides,
+    check_sh_reaches_workspace, ci_jobs, e2e_scenario_keys, ignored_tests, installs_reference_pin,
+    is_terminal, module_path_prefix, names_scenario_in_code, reach_covers,
+    reaches_the_pinned_reference, record_field, scenario_assignments, shell_code_only,
+    test_function_citation, test_functions, test_reach, workspace_member_patterns,
 };
 
 // ---------------------------------------------------------------------------
@@ -222,6 +233,43 @@ const IGNORED_PRODUCER_CEILING: usize = 5;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
+
+/// Registered scenarios bound to their lane only by a **bare word in code**, because they
+/// reach it as a dispatch helper's argument rather than through a `…SCENARIO=` assignment.
+///
+/// **Declared as a set, never as a count, and that is `k60n`'s finding applied here.** A
+/// count over a population is a budget its own repairs refill: convert one of these to an
+/// assignment and the number frees a slot the next weakly-bound scenario spends silently.
+/// Set equality in both directions means a repair must name what it repaired and an
+/// addition must name what it added.
+///
+/// All three are `env_snapshots.sh`'s children, dispatched by `run_identity_child <key> …`.
+/// The alternative to the word scan is matching that helper by name, which is a hand-list —
+/// see [`names_scenario_in_code`] for why this codebase does not get to make that trade
+/// again.
+const WEAKLY_BOUND_SCENARIOS: &[&str] = &[
+    "declaration_membership",
+    "declaration_tag_matrix",
+    "extension_descriptor_matrix",
+];
+
+/// Governed `fln.e2e/2` lanes that **no workflow dispatches**, each with the reason —
+/// and the reason is re-derived, not read.
+///
+/// `kernel_replay.sh` reaches the pinned Reference (`FLN_REFERENCE_LIB`, its own elan path
+/// at line 94) and CI installs no Reference toolchain, so it could not run there if it were
+/// dispatched. That is the honest state, and it is this bead's subject rather than an
+/// exception to it: a lane nothing runs is the same hollow green as a row whose suite
+/// nothing runs, one level up.
+///
+/// **Both halves are live bindings.** Adding a dispatch makes the entry stale and fails;
+/// the lane ceasing to reach the pin falsifies the recorded reason and fails. Neither can
+/// rot into a bare exemption, which is what `qydn`'s thirteen declared violations earn by
+/// being checked in both directions.
+const UNDISPATCHED_GOVERNED_LANES: &[(&str, &str)] = &[(
+    "scripts/e2e/kernel_replay.sh",
+    "reaches the pinned Reference, which CI does not install",
+)];
 
 /// Terminal rows whose evidence is stated at a granularity **coarser than the unit that runs**.
 ///
@@ -371,6 +419,12 @@ struct Derivation {
     check_sh_workspace: bool,
     rows: Vec<TerminalRow>,
     e2e_keys: BTreeSet<String>,
+    /// Every `scripts/e2e/*.sh`, workspace-relative, mapped to its raw text. All of them,
+    /// governed or not: which are governed is derived from the text, never from the name.
+    lanes: BTreeMap<String, String>,
+    /// The concatenated `.github/workflows/*.yml` text, for the dispatch scan. A workflow
+    /// naming a script is not a run of it — see [`judge_lane_binding`] for what that costs.
+    workflow_text: String,
     /// `crates/fln-conformance/src/pin.rs`, raw — the coordinate set's positive control.
     pin_module: String,
     /// `(surface, function)` for every `#[ignore]`d test cargo compiles and never runs.
@@ -506,7 +560,31 @@ fn derive(root: &Path) -> Derivation {
         .map(|(path, _)| path.clone())
         .collect();
 
+    // Every lane script, read by directory listing rather than by any list of names. A file
+    // this cannot read is a refusal: a dropped lane is exactly the lane nobody is looking at.
+    let mut lanes = BTreeMap::new();
+    let lane_dir = root.join("scripts/e2e");
+    let mut lane_paths: Vec<PathBuf> = fs::read_dir(&lane_dir)
+        .expect("scripts/e2e must be readable")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sh"))
+        .collect();
+    lane_paths.sort();
+    for path in lane_paths {
+        let text = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("scan: lane {} could not be read: {error}", path.display())
+        });
+        let relative = path
+            .strip_prefix(root)
+            .expect("a lane script lies under the repository")
+            .to_string_lossy()
+            .replace('\\', "/");
+        lanes.insert(relative, text);
+    }
+
     let mut jobs = Vec::new();
+    let mut workflow_text = String::new();
     let workflows = root.join(".github/workflows");
     let mut names: Vec<PathBuf> = fs::read_dir(&workflows)
         .expect(".github/workflows must be readable")
@@ -533,6 +611,8 @@ fn derive(root: &Path) -> Derivation {
                 path.display()
             )
         });
+        workflow_text.push_str(&text);
+        workflow_text.push('\n');
         jobs.extend(ci_jobs(&name, &text));
     }
 
@@ -804,6 +884,8 @@ fn derive(root: &Path) -> Derivation {
         check_sh_workspace,
         rows,
         e2e_keys,
+        lanes,
+        workflow_text,
         pin_module: read(root, "crates/fln-conformance/src/pin.rs"),
         ignored,
         targets,
@@ -1086,6 +1168,199 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     findings
 }
 
+/// Every registered `fln.e2e/2` scenario is bound to a lane script that exists, every lane
+/// script's scenario is registered, and every governed lane is dispatched by a workflow —
+/// or declared, by set equality in both directions.
+///
+/// **Residue item 1 of this module's own list, closed as far as text can close it.** The
+/// binding this derives was previously asserted in prose as "keys match `scripts/e2e/<key>.sh`
+/// by shared filename", which is false for five of thirteen keys — `env_snapshots.sh` hosts
+/// six scenarios and is named after one. A rename of that file would have orphaned five
+/// registrations with nothing to say so.
+///
+/// Findings are prefixed `lane-…` so the campaign asserts *which* one fired. A campaign
+/// scoring "something went red" credits a mutant to an assertion that had stopped testing
+/// what it names (`fln-mandated-mutant-join-unwatched-uagk`).
+///
+/// **What it does not earn.** A workflow *naming* a script is not a run of it — the same
+/// limit `uagk`'s cron token carries, stated here so nobody re-derives it as observation.
+/// And a lane dispatched only from `scripts/check.sh` would read as undispatched: measured
+/// at `ad2b9207` no lane is, `check.sh` names two only to shellcheck them, and the loud
+/// direction is the correct one for a check that cannot decide.
+fn judge_lane_binding(
+    d: &Derivation,
+    weak_allowance: &[&str],
+    undispatched_allowance: &[(&str, &str)],
+) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    // Which lanes are governed is read off their text, never their name or a list.
+    let governed: BTreeMap<&str, &str> = d
+        .lanes
+        .iter()
+        .filter(|(_, text)| text.contains(GOVERNED_E2E_SCHEMA))
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+
+    // --- A collapsed scan is a broken scan, never a clean tree ---------------
+    if d.lanes.is_empty() {
+        findings.push(
+            "lane-scan: scripts/e2e yielded no lane scripts at all. That is a broken walk, \
+             not a repository without lanes."
+                .to_string(),
+        );
+    }
+    if governed.is_empty() {
+        findings.push(format!(
+            "lane-scan: none of the {} lane scripts carries the {GOVERNED_E2E_SCHEMA} schema \
+             token. Either the schema was renamed — in which case this guard, \
+             scripts/evidence.py and every lane moved apart — or the read returned nothing.",
+            d.lanes.len()
+        ));
+    }
+    if d.e2e_keys.is_empty() {
+        findings.push(
+            "lane-scan: E2E_STEP_ORDERS yielded no registered scenarios. The registry moved \
+             or the reader broke; an empty registry is not a state this guard may assume."
+                .to_string(),
+        );
+    }
+    if !findings.is_empty() {
+        return findings;
+    }
+
+    // --- How each registered scenario reaches a lane ------------------------
+    let mut assigned_by: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (path, text) in &governed {
+        for literal in scenario_assignments(text) {
+            if !d.e2e_keys.contains(&literal) {
+                findings.push(format!(
+                    "lane-unregistered: {path} assigns scenario {literal:?}, which is absent \
+                     from E2E_STEP_ORDERS. scripts/evidence.py refuses to validate a run \
+                     under an unregistered scenario, so this lane cannot produce evidence \
+                     until the step order is registered."
+                ));
+                continue;
+            }
+            assigned_by
+                .entry(
+                    d.e2e_keys
+                        .get(&literal)
+                        .expect("membership was just checked")
+                        .as_str(),
+                )
+                .or_default()
+                .insert(path);
+        }
+    }
+
+    let mut weakly_bound: BTreeSet<&str> = BTreeSet::new();
+    for key in &d.e2e_keys {
+        if assigned_by.contains_key(key.as_str()) {
+            continue;
+        }
+        let worded: Vec<&str> = governed
+            .iter()
+            .filter(|(_, text)| names_scenario_in_code(text, key))
+            .map(|(path, _)| *path)
+            .collect();
+        if worded.is_empty() {
+            findings.push(format!(
+                "lane-orphan: scenario {key:?} is registered in E2E_STEP_ORDERS and no \
+                 governed lane script assigns or names it. A registered scenario no lane \
+                 runs is a step order nothing can ever satisfy, and a coverage row citing \
+                 it passes the registration check in this same file as though a lane existed."
+            ));
+        } else {
+            weakly_bound.insert(key.as_str());
+        }
+    }
+
+    // --- The weakly-bound population, by set equality in both directions ----
+    let declared_weak: BTreeSet<&str> = weak_allowance.iter().copied().collect();
+    let grew: Vec<&&str> = weakly_bound.difference(&declared_weak).collect();
+    if !grew.is_empty() {
+        findings.push(format!(
+            "lane-weak-grew: {grew:?} reach their lane only as a bare word in code, and are \
+             not in WEAKLY_BOUND_SCENARIOS. Either bind the scenario with a `…SCENARIO=` \
+             assignment in its lane — the repair — or add it here, which is a deliberate \
+             edit naming exactly what is now resting on the weaker binding."
+        ));
+    }
+    let shrank: Vec<&&str> = declared_weak.difference(&weakly_bound).collect();
+    if !shrank.is_empty() {
+        findings.push(format!(
+            "lane-weak-shrank: {shrank:?} are declared in WEAKLY_BOUND_SCENARIOS but now \
+             carry a real assignment. This is the good direction: delete exactly those \
+             entries. A set, not a count, so the slot a repair frees cannot be spent on the \
+             next weakly-bound scenario without naming it (fln-cross-tree-baked-root-k60n)."
+        ));
+    }
+
+    // --- Governed lanes no workflow dispatches ------------------------------
+    let measured_undispatched: BTreeSet<&str> = governed
+        .keys()
+        .copied()
+        .filter(|path| !d.workflow_text.contains(*path))
+        .collect();
+    let declared_undispatched: BTreeSet<&str> = undispatched_allowance
+        .iter()
+        .map(|(path, _)| *path)
+        .collect();
+
+    let newly: Vec<&&str> = measured_undispatched
+        .difference(&declared_undispatched)
+        .collect();
+    if !newly.is_empty() {
+        findings.push(format!(
+            "lane-undispatched: {newly:?} carry the {GOVERNED_E2E_SCHEMA} schema and are \
+             named by no workflow. A governed lane nothing dispatches is this bead's own \
+             defect one level up from the rows it judges: registered, linted, and never run."
+        ));
+    }
+    let now_dispatched: Vec<&&str> = declared_undispatched
+        .difference(&measured_undispatched)
+        .collect();
+    if !now_dispatched.is_empty() {
+        findings.push(format!(
+            "lane-dispatch-stale: {now_dispatched:?} are declared undispatched and a \
+             workflow now names them. Delete those entries from \
+             UNDISPATCHED_GOVERNED_LANES."
+        ));
+    }
+
+    // Each declared entry's stated reason is re-derived, so it cannot rot into a bare
+    // exemption whose argument nobody reads — AGENTS.md's own complaint about the
+    // BOUNDARY_API rows whose fields 5 and 6 are checked non-empty and discarded.
+    for (path, reason) in undispatched_allowance {
+        let Some(text) = d.lanes.get(*path) else {
+            findings.push(format!(
+                "lane-dispatch-stale: UNDISPATCHED_GOVERNED_LANES names {path}, which is not \
+                 a lane script in scripts/e2e. A declaration outliving its subject is the \
+                 shape this guard exists to refuse."
+            ));
+            continue;
+        };
+        if !governed.contains_key(path) {
+            findings.push(format!(
+                "lane-dispatch-stale: {path} is declared undispatched but no longer carries \
+                 the {GOVERNED_E2E_SCHEMA} schema, so this guard does not govern it."
+            ));
+            continue;
+        }
+        if !reaches_the_pinned_reference(&shell_code_only(text)) {
+            findings.push(format!(
+                "lane-reason-falsified: {path} is exempted because it {reason}, and its code \
+                 no longer names any pin coordinate. The exemption's stated reason is the \
+                 thing that earns it; when the reason stops holding the exemption goes, \
+                 rather than surviving as a path in a list."
+            ));
+        }
+    }
+
+    findings
+}
+
 // ---------------------------------------------------------------------------
 // The judgement
 // ---------------------------------------------------------------------------
@@ -1313,6 +1588,19 @@ fn terminal_rows_do_not_rest_on_evidence_ci_never_executed() {
     assert!(
         findings.is_empty(),
         "the CI-execution join (bead fln-rgha):\n  - {}",
+        findings.join("\n  - ")
+    );
+}
+
+/// Every registered scenario reaches a lane that exists, and every governed lane is
+/// dispatched — or declared, by set equality in both directions.
+#[test]
+fn every_registered_e2e_scenario_is_bound_to_a_lane_and_every_governed_lane_is_dispatched() {
+    let d = derive(&root());
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        findings.is_empty(),
+        "the registered-scenario/lane join (bead fln-rgha, residue item 1):\n  - {}",
         findings.join("\n  - ")
     );
 }
@@ -2111,5 +2399,192 @@ fn a_function_granular_citation_still_resolves_to_its_surface() {
         "a `test:<pkg>::lib::<module::path::fn>` citation must resolve to the source file whose \
          layout prefix it begins with, longest prefix winning. Resolved: {:?}",
         lib_cited.surfaces
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The lane-binding campaign (residue item 1)
+// ---------------------------------------------------------------------------
+//
+// Each mutant perturbs ONE derived fact and asserts the `lane-…` finding that names it.
+// The last one is a NEGATIVE control in the good direction: it renames the dispatch helper
+// three scenarios reach their lane through, and requires the guard to stay GREEN. A
+// helper-keyed scan — the hand-list this derivation exists to avoid — dies there, and a
+// campaign made only of kills would never notice.
+
+fn baseline_lane() -> Derivation {
+    let d = derive(&root());
+    assert!(
+        judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES).is_empty(),
+        "the campaign's control must start clean, or every kill below is unattributable"
+    );
+    d
+}
+
+fn lane_mut<'a>(d: &'a mut Derivation, path: &str) -> &'a mut String {
+    d.lanes
+        .get_mut(path)
+        .unwrap_or_else(|| panic!("{path} must be a lane script this scan read"))
+}
+
+/// A step order registered for a scenario no lane runs.
+#[test]
+fn lane_mutant_a_registered_scenario_with_no_lane_is_an_orphan() {
+    let mut d = baseline_lane();
+    d.e2e_keys
+        .insert("a_lane_that_was_renamed_away".to_string());
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        has(&findings, "lane-orphan:"),
+        "a registered scenario no lane assigns or names must redden as an orphan; got {findings:?}"
+    );
+}
+
+/// A lane whose scenario `scripts/evidence.py` would refuse to validate.
+#[test]
+fn lane_mutant_a_lane_assigning_an_unregistered_scenario_reddens() {
+    let mut d = baseline_lane();
+    lane_mut(&mut d, "scripts/e2e/verdict_schema.sh").push_str("\nSCENARIO=\"never_registered\"\n");
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        has(&findings, "lane-unregistered:"),
+        "a governed lane assigning a scenario absent from E2E_STEP_ORDERS must redden; got {findings:?}"
+    );
+}
+
+/// A fourth scenario dropping to the weaker binding cannot arrive silently.
+#[test]
+fn lane_mutant_a_fourth_weakly_bound_scenario_cannot_arrive_silently() {
+    let mut d = baseline_lane();
+    let lane = lane_mut(&mut d, "scripts/e2e/verdict_schema.sh");
+    *lane = lane.replace(
+        "SCENARIO=\"verdict_schema\"",
+        "SCENARIO=\"$held_elsewhere\"",
+    );
+    lane.push_str("\nrun_identity_child verdict_schema fln-planted\n");
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        has(&findings, "lane-weak-grew:"),
+        "a scenario losing its assignment and resting on a bare word must redden; got {findings:?}"
+    );
+    assert!(
+        !has(&findings, "lane-orphan:"),
+        "it is still bound, just weakly — reporting it as an orphan would name the wrong \
+         repair: {findings:?}"
+    );
+}
+
+/// Binding a weakly-bound scenario properly is the repair, and the declaration must shrink
+/// with it in the same commit.
+#[test]
+fn lane_mutant_repairing_a_weak_binding_forces_the_declaration_to_shrink() {
+    let mut d = baseline_lane();
+    lane_mut(&mut d, "scripts/e2e/env_snapshots.sh")
+        .push_str("\nSCENARIO=\"declaration_tag_matrix\"\n");
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        has(&findings, "lane-weak-shrank:"),
+        "a repaired binding must demand its entry be deleted, so the freed slot cannot be \
+         spent on the next one; got {findings:?}"
+    );
+    assert!(
+        !has(&findings, "lane-weak-grew:"),
+        "a repair must not read as a new instance: {findings:?}"
+    );
+}
+
+/// A governed lane that no workflow dispatches — the defect this residue item found live.
+#[test]
+fn lane_mutant_a_governed_lane_no_workflow_dispatches_reddens() {
+    let mut d = baseline_lane();
+    d.workflow_text = d.workflow_text.replace(
+        "scripts/e2e/verdict_schema.sh",
+        "scripts/e2e/renamed_away.sh",
+    );
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        has(&findings, "lane-undispatched:"),
+        "a governed lane dropping out of every workflow must redden; got {findings:?}"
+    );
+}
+
+/// Dispatching the exempt lane is the repair, and its entry must go in the same commit.
+#[test]
+fn lane_mutant_dispatching_the_exempt_lane_forces_the_declaration_to_shrink() {
+    let mut d = baseline_lane();
+    d.workflow_text
+        .push_str("\n            ./scripts/e2e/kernel_replay.sh\n");
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        has(&findings, "lane-dispatch-stale:"),
+        "an exemption whose lane is now dispatched must demand deletion; got {findings:?}"
+    );
+}
+
+/// The exemption's stated reason is re-derived, never read.
+///
+/// The sharpest mutant here, and the one that separates this from AGENTS.md's own complaint
+/// about `ci/BOUNDARY_API.txt`: 24 of its 66 rows argue nothing at all, because the field
+/// carrying the argument is checked non-empty and then discarded. A reason that is only
+/// prose survives its own falsification.
+#[test]
+fn lane_mutant_the_exempt_lanes_reason_is_re_derived_not_read() {
+    let mut d = baseline_lane();
+    let lane = lane_mut(&mut d, "scripts/e2e/kernel_replay.sh");
+    for coordinate in PIN_COORDINATES {
+        *lane = lane.replace(coordinate, "A_LOCAL_FIXTURE");
+    }
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        has(&findings, "lane-reason-falsified:"),
+        "a lane exempted for reaching the pin, that no longer reaches it, must lose the \
+         exemption rather than keep it as a path in a list; got {findings:?}"
+    );
+}
+
+/// A scan that returns nothing is a broken scan, never a repository without lanes.
+#[test]
+fn lane_mutant_an_empty_scan_refuses_instead_of_reporting_clean() {
+    let mut d = baseline_lane();
+    d.lanes.clear();
+    assert!(
+        has(
+            &judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES),
+            "lane-scan:"
+        ),
+        "an empty lane walk must refuse"
+    );
+
+    let mut d = baseline_lane();
+    for text in d.lanes.values_mut() {
+        *text = text.replace(GOVERNED_E2E_SCHEMA, "fln.e2e/superseded");
+    }
+    assert!(
+        has(
+            &judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES),
+            "lane-scan:"
+        ),
+        "every lane losing the governed schema token must refuse, not report a clean tree"
+    );
+}
+
+/// **The negative control.** Renaming the dispatch helper must change nothing.
+///
+/// Three scenarios reach their lane as `run_identity_child <key> …`. The obvious derivation
+/// matches that helper by name — and is a hand-list, the defect
+/// `franken_lean-worktree-gitdir-refusal-hugg` is criticised for and the one
+/// `franken_lean-build-gate-lane-governed-set-98np` measured itself committing: a scan keyed
+/// to one spelling is a hand-list wearing a derived scan's clothes. This mutant is what tells
+/// the two apart, and it is the only test here that requires GREEN.
+#[test]
+fn lane_control_renaming_the_dispatch_helper_does_not_break_the_binding() {
+    let mut d = baseline_lane();
+    let lane = lane_mut(&mut d, "scripts/e2e/env_snapshots.sh");
+    *lane = lane.replace("run_identity_child", "dispatch_child_scenario");
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        findings.is_empty(),
+        "the binding must survive renaming the helper it travels through — a scan that dies \
+         here is keyed to a spelling, not derived from the artefacts; got {findings:?}"
     );
 }
