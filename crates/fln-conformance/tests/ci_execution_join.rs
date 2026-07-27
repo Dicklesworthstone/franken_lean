@@ -285,7 +285,6 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-okfb",
     "fln-pu6i",
     "fln-q8qt",
-    "fln-q944",
     "fln-rwz",
     "fln-sn0w",
     "fln-sr2z",
@@ -296,9 +295,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-uuuz",
     "fln-yswb",
     "fln-zti3",
-    "franken_lean-008q",
     "franken_lean-0sv9",
-    "franken_lean-2jht",
     "franken_lean-2ki4",
     "franken_lean-4o3n",
     "franken_lean-81oq",
@@ -333,7 +330,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
 
 /// The ratchet for [`FILE_GRANULAR_EVIDENCE_ALLOWANCE`], by equality, for the reason
 /// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
-const FILE_GRANULAR_EVIDENCE_CEILING: usize = 70;
+const FILE_GRANULAR_EVIDENCE_CEILING: usize = 67;
 
 /// The floor beneath [`judge_granularity`]'s vacuity check.
 ///
@@ -730,6 +727,44 @@ fn derive(root: &Path) -> Derivation {
         for artifact in &artifacts {
             if artifact.starts_with("test:") {
                 fine.push(artifact.clone());
+                // **A function-granular citation still names a surface, and every OTHER
+                // population resolves surfaces.** Migrating a row off a file citation must not
+                // make it vanish from a neighbouring guard: `franken_lean-2jht` rests on a
+                // pin-dependent rig, and when its `reference_differential.rs` citation was
+                // replaced by a `test:` one the CI-execution join reported the row as REPAIRED
+                // — a granularity fix silently shrinking the pin-dependence population by
+                // making its referent unresolvable. Measured, by that guard, on this change.
+                // So resolve the citation back to the file it names and feed `cited` too.
+                if let Some((package, target, path)) = test_function_citation(artifact) {
+                    if target == "lib" {
+                        // The lib flavour names a module path; map it back to the source file
+                        // whose layout prefix it begins with, longest prefix winning so
+                        // `foo::bar` prefers `foo/bar.rs` over `foo.rs`.
+                        let mut best: Option<(usize, String)> = None;
+                        for candidate in surfaces.keys() {
+                            let Some(member) = candidate.split("/src/").next() else {
+                                continue;
+                            };
+                            if packages.get(member).map(String::as_str) != Some(package) {
+                                continue;
+                            }
+                            let Some(prefix) = module_path_prefix(candidate) else {
+                                continue;
+                            };
+                            if prefix.is_empty() || path.starts_with(prefix.as_str()) {
+                                let score = prefix.len();
+                                if best.as_ref().is_none_or(|(best, _)| *best < score) {
+                                    best = Some((score, candidate.clone()));
+                                }
+                            }
+                        }
+                        if let Some((_, path)) = best {
+                            cited.insert(path);
+                        }
+                    } else if let Some(path) = targets.get(target) {
+                        cited.insert(path.clone());
+                    }
+                }
                 continue;
             }
             if surfaces.contains_key(artifact) {
@@ -2023,4 +2058,58 @@ fn granularity_control_real_citations_resolve_and_force_their_own_shrink() {
             "a migration must force its own declaration edit: {findings:?}"
         );
     }
+}
+
+/// A function-granular citation still resolves to the surface it names.
+///
+/// **This test exists because the migration that introduced the kind broke this, and the other
+/// guard caught it.** `franken_lean-2jht` rests on a pin-dependent rig. When its
+/// `crates/fln-kernel/tests/reference_differential.rs` citation was replaced by
+/// `test:fln-kernel::reference_differential::kernel_verdicts_agree_with_the_pinned_reference`,
+/// the row stopped resolving to any surface — so
+/// `terminal_rows_do_not_rest_on_evidence_ci_never_executed` reported it as **repaired** and
+/// demanded the pin-dependence allowance shrink. A granularity fix had silently shrunk a
+/// neighbouring population by making its referent unresolvable.
+///
+/// The shape generalises past this instance: every population here is computed over resolved
+/// surfaces, so a new citation kind that does not resolve does not merely fail to help — it
+/// *removes* rows from every other guard at once, in the direction that reads as progress.
+#[test]
+fn a_function_granular_citation_still_resolves_to_its_surface() {
+    let d = derive(&root());
+
+    let migrated = d
+        .rows
+        .iter()
+        .find(|row| row.bead == "franken_lean-2jht")
+        .expect("franken_lean-2jht is terminal and carries a function-granular citation");
+    assert!(
+        !migrated.fine.is_empty(),
+        "2jht is the live example this test is written from; if its citation stopped being \
+         function-granular, point this test at another migrated row rather than deleting it"
+    );
+    assert!(
+        migrated
+            .surfaces
+            .contains("crates/fln-kernel/tests/reference_differential.rs"),
+        "a `test:` citation must resolve back to the surface it names, or every population \
+         computed over surfaces silently loses this row. Resolved: {:?}",
+        migrated.surfaces
+    );
+
+    // The lib flavour resolves too, and by LONGEST module prefix — `execution::tests::f` must
+    // pick `src/execution.rs`, never `src/lib.rs`, whose empty prefix also matches.
+    let lib_cited = d
+        .rows
+        .iter()
+        .find(|row| row.bead == "franken_lean-ignored-producer-class-unguarded-t4u1")
+        .expect("t4u1 is terminal and carries a lib-flavour citation");
+    assert!(
+        lib_cited
+            .surfaces
+            .contains("crates/fln-conformance/src/execution.rs"),
+        "a `test:<pkg>::lib::<module::path::fn>` citation must resolve to the source file whose \
+         layout prefix it begins with, longest prefix winning. Resolved: {:?}",
+        lib_cited.surfaces
+    );
 }
