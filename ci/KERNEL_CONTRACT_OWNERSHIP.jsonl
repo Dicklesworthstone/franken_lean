@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":398,"projection_hash":"a584be5d983b6005bc456b596f530c6c92010a55b46eb1e7bf787e376ccd8724"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":400,"projection_hash":"999e9e176b80c3c6dee03a7c07e61efb7318044b6bf51c86fdbacd9fbae462e4"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -178,6 +178,7 @@
 {"id":"fln-yihl"}
 {"id":"fln-yk3t"}
 {"id":"fln-yo2w"}
+{"id":"fln-ysvo"}
 {"id":"fln-yswb"}
 {"id":"fln-zddn"}
 {"id":"fln-zfyt"}
@@ -380,6 +381,7 @@
 {"id":"franken_lean-w75y"}
 {"id":"franken_lean-wasm-judge-packaging-contract-xte"}
 {"id":"franken_lean-wlan"}
+{"id":"franken_lean-workflow-invocation-ignores-trigger-reachability-acm4"}
 {"id":"franken_lean-workspace-graph-producer-edge-drift-8o3o"}
 {"id":"franken_lean-worktree-gitdir-refusal-hugg"}
 {"id":"franken_lean-xk4c"}
