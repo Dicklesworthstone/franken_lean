@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":400,"projection_hash":"999e9e176b80c3c6dee03a7c07e61efb7318044b6bf51c86fdbacd9fbae462e4"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":401,"projection_hash":"a0c2984c2df5642773391c29806ee85077c822223b90ca7b94572787f53b555d"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -384,6 +384,7 @@
 {"id":"franken_lean-workflow-invocation-ignores-trigger-reachability-acm4"}
 {"id":"franken_lean-workspace-graph-producer-edge-drift-8o3o"}
 {"id":"franken_lean-worktree-gitdir-refusal-hugg"}
+{"id":"franken_lean-xjjr"}
 {"id":"franken_lean-xk4c"}
 {"id":"franken_lean-xqb"}
 {"id":"franken_lean-xqc"}
