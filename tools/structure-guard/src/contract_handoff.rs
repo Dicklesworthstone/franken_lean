@@ -1229,6 +1229,27 @@ pub fn recover(root: &Path) -> Result<PublicationReceipt, HandoffError> {
     })
 }
 
+/// Whether a failed [`consume`] is the fresh-checkout census absence, which is a typed
+/// inconclusive rather than a structural defect.
+///
+/// **Exactly one reason, and the exclusions are the content of this predicate.**
+///
+/// - `handoff_output_unavailable` — the required output is not there at all: a fresh clone of
+///   `origin/main`, where the four census shards are gitignored and unreachable from history
+///   (`fln-census-out-of-git-2ya9`, 242,966,844 bytes measured at `9d86aac2`).
+/// - `handoff_output_ambiguous` — **deliberately NOT admitted.** That is what a symlink shim
+///   into another checkout produces, which is the workaround people install to fake the shards.
+///   Admitting it would convert the refusal of a bad workaround into a clean tree.
+/// - Every `Violation`, and every other `Inconclusive` reason (`stale_candidate` among them),
+///   stay findings. A predicate that widens silences the whole handoff audit.
+///
+/// **One producer, deliberately.** The no-mock rig's skip and this audit ask the same question,
+/// and a second copy of the answer is the defect `franken_lean-m5bl` was filed for — a guard
+/// over a transcription is weaker than not having the transcription.
+fn is_absent_census(error: &HandoffError) -> bool {
+    error.class == ErrorClass::Inconclusive && error.reason == "handoff_output_unavailable"
+}
+
 pub fn audit_with_snapshot(root: &Path) -> (Vec<Finding>, Option<HandoffSnapshot>) {
     // The lower-level inventory audit owns its own authority failures. Reporting a
     // second terminal-handoff error when that prerequisite is invalid obscures the
@@ -1238,6 +1259,18 @@ pub fn audit_with_snapshot(root: &Path) -> (Vec<Finding>, Option<HandoffSnapshot
     }
     match consume(root) {
         Ok(snapshot) => (Vec::new(), Some(snapshot)),
+        // An absent materialised artifact is NOT a structural defect. FL-INV-07: resource
+        // absence yields a typed `Inconclusive` that is never rendered as rejection, and a
+        // `FLN-STRUCT-036` finding asserts this tree is structurally unclean — which is a
+        // rejection with a code on it. On a fresh clone the shards are simply not there, and
+        // the repository is not thereby malformed (`fln-census-empty-referent-no-mock-krb0`).
+        //
+        // **It returns `None`, and that is what keeps this from being a hollow green.** The
+        // snapshot is how a caller records complete authority evidence; withholding it is the
+        // difference between "audited and clean" and "not audited", so an absent census reports
+        // as unestablished rather than as success. Emitting no finding AND a snapshot would be
+        // `hugg`'s shape — a verdict whose subject never ran, wearing a pass.
+        Err(error) if is_absent_census(&error) => (Vec::new(), None),
         Err(error) => {
             let code = match error.class {
                 ErrorClass::Violation => "FLN-STRUCT-035",
@@ -1560,31 +1593,21 @@ mod tests {
         assert_eq!(consume(&root).unwrap(), receipt.snapshot);
     }
 
-    /// Whether a failed `consume` is the fresh-checkout census absence this rig may skip on.
+    // `is_absent_census` is the module-level predicate above, used by BOTH the no-mock rig's
+    // skip and `audit_with_snapshot`. It had a second copy here for one commit; a guard over a
+    // transcription is weaker than not having the transcription (`franken_lean-m5bl` R1), and
+    // the two copies would have been free to drift in exactly the direction that silences the
+    // audit while the rig still refuses.
+
+    /// What a typed skip here does NOT earn, kept next to the tests that exercise it.
     ///
-    /// **Exactly one reason, and the exclusions are the whole content of this predicate.**
-    ///
-    /// - `handoff_output_unavailable` — the required output is not there at all. This is the
-    ///   fresh clone of `origin/main`, where the four census shards are gitignored and
-    ///   unreachable from history (`fln-census-out-of-git-2ya9`). A typed skip is the honest
-    ///   answer, and the `.expect()` this replaced turned it into a panic — collapsing an
-    ///   FL-INV-07 `Inconclusive` into a failure, which AGENTS.md rule 8 forbids outright.
-    /// - `handoff_output_ambiguous` — **deliberately NOT skippable.** That is what a symlink
-    ///   shim into another checkout produces, which is precisely the workaround people install
-    ///   to make this lane pass without the shards. Absorbing it as "no census here" would
-    ///   convert a refusal of a bad workaround into a silent pass, and the refusal is the point.
-    /// - Any `Violation`, and every other `Inconclusive` reason (`stale_candidate` among them),
-    ///   stay loud. A skip predicate that widens is a free exit from the whole no-mock lane.
-    ///
-    /// **What a skip here does not earn.** It reports that nothing was established; it does not
-    /// make the no-mock obligation discharged. The notice goes to stderr, which cargo captures
-    /// and discards for a *passing* test — so a skipped run is still not distinguishable from a
-    /// real one by reading the terminal, which is `fln-rgha`'s subject and is NOT closed by this
-    /// change. Making the skip visible needs the artifact stating the claim to name the artifact
-    /// supplying its evidence, and that artifact is `ci/VERIFICATION_MANIFEST.jsonl`.
-    fn is_absent_census(error: &HandoffError) -> bool {
-        error.class == ErrorClass::Inconclusive && error.reason == "handoff_output_unavailable"
-    }
+    /// It reports that nothing was established; it does not discharge the no-mock obligation.
+    /// The notice goes to stderr, which cargo captures and discards for a *passing* test — so a
+    /// skipped run is still not distinguishable from a real one by reading the terminal. That is
+    /// `fln-rgha`'s subject and is NOT closed by this change. Making the skip visible needs the
+    /// artifact stating the claim to name the artifact supplying its evidence, and that artifact
+    /// is `ci/VERIFICATION_MANIFEST.jsonl`.
+    const _SKIP_VISIBILITY_IS_NOT_EARNED: () = ();
 
     #[test]
     fn the_census_skip_admits_absence_and_refuses_every_neighbouring_failure() {
@@ -1663,6 +1686,67 @@ mod tests {
             "the real refusal must be the one the skip admits, or the skip is unreachable \
              in the condition it was written for: {error}"
         );
+    }
+
+    /// An absent shard is inconclusive, and inconclusive is neither a finding nor a pass.
+    ///
+    /// Both halves are asserted because either alone is a different defect. No finding with a
+    /// snapshot would be `hugg`'s hollow green — a tree reported clean by an audit that never
+    /// ran. A finding would be the FL-INV-07 violation this commit removes, rendering resource
+    /// absence as a structural rejection.
+    #[test]
+    fn an_absent_shard_is_inconclusive_and_neither_a_finding_nor_authority_evidence() {
+        let root = fixture_root("absent-census-audit");
+        publish(&root).expect("complete fixture publishes");
+
+        let (findings, snapshot) = audit_with_snapshot(&root);
+        assert!(findings.is_empty(), "complete tree: {findings:?}");
+        assert!(
+            snapshot.is_some(),
+            "a complete tree must yield authority evidence, or the control proves nothing"
+        );
+
+        fs::rename(
+            root.join("contracts/builtin_environment.tsv"),
+            root.join("builtin_environment.tsv.moved-aside"),
+        )
+        .expect("move the shard aside");
+
+        let (findings, snapshot) = audit_with_snapshot(&root);
+        assert!(
+            findings.is_empty(),
+            "an absent materialised artifact must not assert the tree is structurally \
+             unclean: {findings:?}"
+        );
+        assert!(
+            snapshot.is_none(),
+            "...and it must not report authority evidence either, or the skip is a hollow green"
+        );
+    }
+
+    /// The symlink shim must survive the change above as a finding.
+    ///
+    /// This is the cell that stops the repair widening: the shim and the absence differ only by
+    /// `handoff_output_ambiguous` vs `handoff_output_unavailable`, and absorbing the former would
+    /// let a tree that borrowed another checkout's census audit clean.
+    #[cfg(unix)]
+    #[test]
+    fn the_symlink_shim_is_still_a_finding_after_absence_stops_being_one() {
+        let root = fixture_root("shim-audit");
+        publish(&root).expect("complete fixture publishes");
+
+        let shard = root.join("contracts/builtin_environment.tsv");
+        let moved = root.join("builtin_environment.tsv.moved-aside");
+        fs::rename(&shard, &moved).expect("move the shard aside");
+        std::os::unix::fs::symlink(&moved, &shard).expect("install the shim");
+
+        let (findings, snapshot) = audit_with_snapshot(&root);
+        assert!(
+            !findings.is_empty(),
+            "the symlink shim must not be absorbed as an absent census"
+        );
+        assert_eq!(findings[0].code, "FLN-STRUCT-036");
+        assert!(snapshot.is_none());
     }
 
     #[test]
