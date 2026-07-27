@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":402,"projection_hash":"dfd3b25f65811dfe4b590d05355f16a8637890406b284bff8feb9f7988c8da30"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":403,"projection_hash":"9bcd0bb506e8ca152a129936e754c072e428752e0b19e4451814adade6e82aa6"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -82,6 +82,7 @@
 {"id":"fln-dcv"}
 {"id":"fln-eae"}
 {"id":"fln-eeyn"}
+{"id":"fln-ehb5"}
 {"id":"fln-env-merge-resource-envelope-9m74"}
 {"id":"fln-euo"}
 {"id":"fln-evidence-runner-bootstrap-btk"}
