@@ -121,7 +121,7 @@ use std::path::{Path, PathBuf};
 use fln_conformance::execution::{
     CiJob, Field, GOVERNED_E2E_SCHEMA, PIN_COORDINATES, autodiscovery_overrides,
     check_sh_reaches_workspace, ci_jobs, e2e_scenario_keys, ignored_tests, installs_reference_pin,
-    is_terminal, module_path_prefix, names_scenario_in_code, reach_covers,
+    invokes_check_sh, is_terminal, module_path_prefix, names_scenario_in_code, reach_covers,
     reaches_the_pinned_reference, record_field, scenario_assignments, shell_code_only,
     test_function_citation, test_functions, test_reach, workspace_member_patterns,
 };
@@ -406,6 +406,73 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
 const FILE_GRANULAR_EVIDENCE_CEILING: usize = 67;
 
+// ---------------------------------------------------------------------------
+// The residue list, bound to the premises it rests on
+// ---------------------------------------------------------------------------
+
+/// What a disclosed limitation rests on — the thing that must stay true for its stated
+/// reason to keep holding.
+#[derive(Debug, Clone, Copy)]
+enum Premise {
+    /// A fact about this tree, re-derived every run. When it flips, the residue item's
+    /// stated reason has stopped holding and the item must be re-read.
+    Derived(&'static str),
+    /// No cheap derivation exists. Declared with why, ceiling-bound below so the set of
+    /// unwatched disclosures can only shrink.
+    Undecidable(&'static str),
+}
+
+/// Every residue item in this module's header, bound to its premise.
+///
+/// **Why this exists, and it is the twelfth instance's whole lesson.** Item 4 of that list
+/// read "artifact citations are file-granular, so … this guard cannot check it". True when
+/// written and false from `f24b6670`, which added the `test:` citation kind — *in this file,
+/// four commits later, from this pane*. The obstacle a residue item gives as its reason for
+/// BEING residue is a claim like any other, and item 7's law applies to it: it must name the
+/// thing that produces it and fail when that thing changes. A residue item's producer is the
+/// **absence of a capability**, and nothing failed when the capability arrived
+/// (`franken_lean-ignored-citation-scored-a-repair-f2t9`).
+///
+/// So each item names a premise here, the derived ones are evaluated every run, and the
+/// cardinality is bound in both directions — a residue item added without a premise fails,
+/// and a premise whose item is deleted fails.
+///
+/// **What this does not earn.** A premise is a *necessary* condition for the item's reason,
+/// never a sufficient one: item 2's derivation can be exact and its prose still wrong about
+/// something else. This catches the reason evaporating, not the item being badly written.
+const RESIDUE_PREMISES: &[(usize, Premise)] = &[
+    (
+        1,
+        Premise::Undecidable(
+            "runtime dispatch cannot be observed from inside the repository at all — a \
+             workflow naming a script is not a run of it, and a cron GitHub silently disables \
+             is invisible here (`fln-mandated-mutant-join-unwatched-uagk`'s cadence limit)",
+        ),
+    ),
+    (2, Premise::Derived("layout-derived-target-set-is-exact")),
+    (
+        3,
+        Premise::Derived("submode-jobs-also-invoke-the-plain-gate"),
+    ),
+    (
+        4,
+        Premise::Undecidable(
+            "the remaining reasons a compiled test does not run — `#[cfg]` gating and an early \
+             `return` — are properties of a run, not of the source layout; the `#[ignore]` half \
+             is now derived and joined by `judge_granularity`",
+        ),
+    ),
+    (5, Premise::Derived("skip-filters-names-not-targets")),
+];
+
+/// The ratchet for the **undecidable** half of [`RESIDUE_PREMISES`], by equality.
+///
+/// One-way-plus-floor is wrong here for [`FILE_GRANULAR_EVIDENCE_CEILING`]'s reason inverted:
+/// this is a count of disclosures nothing watches, so it is a debt, and a debt that can grow
+/// silently is the shape `0ad34e9c` measured — a single ceiling is a budget every repair
+/// refills. Equality forces the edit into the commit that earns it.
+const RESIDUE_UNDECIDABLE_CEILING: usize = 2;
+
 /// The floor beneath [`judge_granularity`]'s vacuity check.
 ///
 /// A population whose cited surfaces each held **one** test function would be a distinction
@@ -443,6 +510,12 @@ struct Derivation {
     pin_reaching: BTreeSet<String>,
     jobs: Vec<CiJob>,
     check_sh_workspace: bool,
+    /// `scripts/check.sh`, raw. Held so residue premises are pure functions of this value and
+    /// the campaign can perturb one without touching the repository.
+    check_sh: String,
+    /// This test file's own source, for the residue-list scan. Read once here rather than in
+    /// the judge for the same reason.
+    own_source: String,
     rows: Vec<TerminalRow>,
     e2e_keys: BTreeSet<String>,
     /// Every `scripts/e2e/*.sh`, workspace-relative, mapped to its raw text. All of them,
@@ -642,7 +715,8 @@ fn derive(root: &Path) -> Derivation {
         jobs.extend(ci_jobs(&name, &text));
     }
 
-    let check_sh_workspace = check_sh_reaches_workspace(&read(root, "scripts/check.sh"));
+    let check_sh = read(root, "scripts/check.sh");
+    let check_sh_workspace = check_sh_reaches_workspace(&check_sh);
     let e2e_keys = e2e_scenario_keys(&read(root, "scripts/evidence.py"));
 
     // The tracker decides terminal state; coverage rows never declare it.
@@ -908,6 +982,8 @@ fn derive(root: &Path) -> Derivation {
         pin_reaching,
         jobs,
         check_sh_workspace,
+        check_sh,
+        own_source: read(root, "crates/fln-conformance/tests/ci_execution_join.rs"),
         rows,
         e2e_keys,
         lanes,
@@ -1282,6 +1358,166 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                     row.bead
                 ));
             }
+        }
+    }
+
+    findings
+}
+
+/// The numbered residue items in this module's own header, as they appear on the page.
+///
+/// **The scan region is the doc header, not the file**, and that bound is load-bearing rather
+/// than tidy. `fln-8zsq` planted a mutant that gutted the site it cared about and survived,
+/// because the needle also appeared elsewhere in the same file; the correction is to scope an
+/// assertion to the **site** that must carry the evidence. Here the site is the module doc
+/// between the residue heading and `#![forbid(unsafe_code)]`, so every guard body below —
+/// including this function, which necessarily spells the marker it looks for — is outside the
+/// search space by construction rather than by an exclusion someone must maintain.
+fn residue_items(source: &str) -> Vec<usize> {
+    let header = match source.split_once("\n#![forbid(unsafe_code)]") {
+        Some((header, _)) => header,
+        None => return Vec::new(),
+    };
+    let Some((_, list)) = header.split_once("# What could not be derived") else {
+        return Vec::new();
+    };
+    list.lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("//!")?.trim_start();
+            let (number, tail) = rest.split_once('.')?;
+            if !tail.starts_with(' ') {
+                return None;
+            }
+            number.parse::<usize>().ok()
+        })
+        .collect()
+}
+
+/// Is the named premise still true of this tree? `None` for an id nothing evaluates.
+fn premise_holds(d: &Derivation, id: &str) -> Option<bool> {
+    match id {
+        // Item 2. The target set is derived from the LAYOUT, exact only while nothing
+        // overrides it. `derive` already collects every override it can see; a non-empty
+        // list means the derivation has stopped being exact and the item's "not modelled"
+        // has become "silently under-counted".
+        "layout-derived-target-set-is-exact" => Some(d.granularity_preconditions.is_empty()),
+        // Item 3. A sub-mode invocation is credited with the workspace suite because the job
+        // running it also runs the plain gate. A job that ran ONLY a sub-mode would be
+        // over-credited — which is precisely what the item discloses, and it is derivable.
+        "submode-jobs-also-invoke-the-plain-gate" => Some(d.jobs.iter().all(|job| {
+            let submode = job.body.lines().any(|line| {
+                line.contains("--self-test") || line.contains("--tribunal-manifest-inventory")
+            });
+            !submode
+                || job.body.lines().any(|line| {
+                    invokes_check_sh(line)
+                        && !line.contains("--self-test")
+                        && !line.contains("--tribunal-manifest-inventory")
+                })
+        })),
+        // Item 5. `--skip` is read as leaving the target set whole. True while every `--skip`
+        // sits on an invocation that narrows by nothing else. A `--skip` that never appears
+        // is NOT a pass: the item would then name a site that no longer exists, which is the
+        // transcribed-anchor rot the item's own line number is already an instance of.
+        "skip-filters-names-not-targets" => {
+            let sites: Vec<&str> = d
+                .check_sh
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.contains("--skip"))
+                .collect();
+            Some(
+                !sites.is_empty() && {
+                    let narrowed = d.check_sh.lines().map(str::trim).any(|line| {
+                        line.contains("--skip")
+                            && (line.contains(" -p ")
+                                || line.contains("--test ")
+                                || line.contains("--manifest-path"))
+                    });
+                    !narrowed
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Every residue item names a premise, every premise still holds, and neither set can move
+/// without the other.
+///
+/// Takes the registry and ceiling as parameters, like [`judge`] and [`judge_ignored`], so the
+/// campaign can perturb a declaration without editing a `const` — and so a premise id nothing
+/// evaluates is reachable as a mutant rather than only as a direct assertion.
+fn judge_residue(d: &Derivation, premises: &[(usize, Premise)], ceiling: usize) -> Vec<String> {
+    let mut findings = Vec::new();
+    let items = residue_items(&d.own_source);
+
+    if items.is_empty() {
+        findings.push(
+            "residue-scan: this module's residue list yielded no numbered items. That is the \
+             doc-header reader breaking — the heading moved, or `#![forbid(unsafe_code)]` did \
+             — not a guard with nothing left undisclosed. Every premise below is vacuous \
+             until it is repaired."
+                .to_string(),
+        );
+        return findings;
+    }
+
+    let declared: BTreeSet<usize> = premises.iter().map(|(item, _)| *item).collect();
+    let measured: BTreeSet<usize> = items.iter().copied().collect();
+
+    for item in measured.difference(&declared) {
+        findings.push(format!(
+            "residue-unbound: residue item {item} is on the page with no entry in \
+             RESIDUE_PREMISES. A disclosed limitation states a reason it cannot be checked, \
+             and that reason is a claim: name what must stay true for it to hold, or declare \
+             it Undecidable and raise RESIDUE_UNDECIDABLE_CEILING. Item 4 is why this exists \
+             — its reason was retired by a repair in this same file and nothing said so."
+        ));
+    }
+    for item in declared.difference(&measured) {
+        findings.push(format!(
+            "residue-stale: RESIDUE_PREMISES binds item {item}, which is no longer on the \
+             page. Delete the entry in the commit that deleted the item — a premise for a \
+             disclosure that no longer exists watches nothing."
+        ));
+    }
+
+    let undecidable = premises
+        .iter()
+        .filter(|(_, premise)| matches!(premise, Premise::Undecidable(_)))
+        .count();
+    if undecidable != ceiling {
+        findings.push(format!(
+            "residue-ceiling: {undecidable} residue items are declared Undecidable against a \
+             ceiling of {ceiling}. Equality, so converting one to a \
+             derived premise lowers the number in the same commit and the headroom cannot be \
+             spent admitting the next unwatched disclosure."
+        ));
+    }
+
+    for (item, premise) in premises {
+        match premise {
+            Premise::Undecidable(why) if why.trim().is_empty() => findings.push(format!(
+                "residue-vacuous: residue item {item} is declared Undecidable with an empty \
+                 reason. A blank declaration is an exit that costs nothing."
+            )),
+            Premise::Undecidable(_) => {}
+            Premise::Derived(id) => match premise_holds(d, id) {
+                None => findings.push(format!(
+                    "residue-unknown-premise: residue item {item} names premise {id:?}, which \
+                     `premise_holds` does not evaluate. A premise nothing computes is prose \
+                     wearing a mechanism's shape."
+                )),
+                Some(false) => findings.push(format!(
+                    "residue-premise-flipped: residue item {item}'s premise {id:?} NO LONGER \
+                     HOLDS. The item's stated reason for being residue has evaporated, so the \
+                     limitation it discloses is either now checkable or now wrong. Re-read the \
+                     item and either close it or restate why. This is the failure that did not \
+                     happen when `f24b6670` retired item 4's premise."
+                )),
+                Some(true) => {}
+            },
         }
     }
 
@@ -2424,6 +2660,171 @@ fn granularity_mutant_a_malformed_citation_is_a_finding_not_a_shrug() {
     d.rows[0].fine.push("test:kernel_replay".to_string());
     let findings = granularity_findings(&d);
     assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+/// Every disclosed limitation names what must stay true for it, and that thing still is.
+#[test]
+fn every_residue_item_names_a_premise_and_every_premise_still_holds() {
+    let d = derive(&root());
+    println!(
+        "ci-execution-join: residue_items={:?} declared={} undecidable={}",
+        residue_items(&d.own_source),
+        RESIDUE_PREMISES.len(),
+        RESIDUE_UNDECIDABLE_CEILING
+    );
+    let findings = judge_residue(&d, RESIDUE_PREMISES, RESIDUE_UNDECIDABLE_CEILING);
+    assert!(
+        findings.is_empty(),
+        "a disclosed unknown is a claim and it rots like one \
+         (franken_lean-ignored-citation-scored-a-repair-f2t9):\n  - {}",
+        findings.join("\n  - ")
+    );
+}
+
+fn residue_findings(d: &Derivation) -> Vec<String> {
+    judge_residue(d, RESIDUE_PREMISES, RESIDUE_UNDECIDABLE_CEILING)
+}
+
+#[test]
+fn residue_mutant_a_grown_declaration_is_caught_by_the_ceiling() {
+    let d = derive(&root());
+    let mut grown: Vec<(usize, Premise)> = RESIDUE_PREMISES.to_vec();
+    grown.push((2, Premise::Undecidable("a third unwatched disclosure")));
+    let findings = judge_residue(&d, &grown, RESIDUE_UNDECIDABLE_CEILING);
+    assert!(fires(&findings, "residue-ceiling"), "{findings:?}");
+}
+
+#[test]
+fn residue_mutant_a_blank_undecidable_reason_is_refused() {
+    let d = derive(&root());
+    let blanked: Vec<(usize, Premise)> = RESIDUE_PREMISES
+        .iter()
+        .map(|(item, premise)| match premise {
+            Premise::Undecidable(_) => (*item, Premise::Undecidable("   ")),
+            other => (*item, *other),
+        })
+        .collect();
+    let findings = judge_residue(&d, &blanked, RESIDUE_UNDECIDABLE_CEILING);
+    assert!(fires(&findings, "residue-vacuous"), "{findings:?}");
+}
+
+/// The judge-level form of the unknown-premise refusal. The direct assertion on
+/// [`premise_holds`] below is not enough: gutting the judge's own arm leaves it passing, which
+/// is the independent-gut protocol's whole point.
+#[test]
+fn residue_mutant_a_premise_id_nothing_evaluates_is_caught_by_the_judge() {
+    let d = derive(&root());
+    let swapped: Vec<(usize, Premise)> = RESIDUE_PREMISES
+        .iter()
+        .map(|(item, premise)| match premise {
+            Premise::Derived(_) => (*item, Premise::Derived("a-premise-nobody-computes")),
+            other => (*item, *other),
+        })
+        .collect();
+    let findings = judge_residue(&d, &swapped, RESIDUE_UNDECIDABLE_CEILING);
+    assert!(fires(&findings, "residue-unknown-premise"), "{findings:?}");
+}
+
+#[test]
+fn residue_mutant_a_new_item_with_no_premise_is_caught() {
+    let mut d = derive(&root());
+    d.own_source = d.own_source.replace(
+        "//! 5. **`--skip`",
+        "//! 6. **A limitation nobody bound.** Stated and unwatched.\n//! 5. **`--skip`",
+    );
+    let findings = residue_findings(&d);
+    assert!(fires(&findings, "residue-unbound"), "{findings:?}");
+}
+
+#[test]
+fn residue_mutant_a_premise_for_a_deleted_item_is_caught() {
+    let mut d = derive(&root());
+    d.own_source = d.own_source.replace("//! 5. **`--skip`", "//! **`--skip`");
+    let findings = residue_findings(&d);
+    assert!(fires(&findings, "residue-stale"), "{findings:?}");
+}
+
+#[test]
+fn residue_mutant_an_override_landing_flips_item_2s_premise() {
+    let mut d = derive(&root());
+    d.granularity_preconditions.push((
+        "crates/fln-planted/Cargo.toml".to_string(),
+        "declares an explicit [[test]] target section".to_string(),
+    ));
+    let findings = residue_findings(&d);
+    assert!(fires(&findings, "residue-premise-flipped"), "{findings:?}");
+}
+
+#[test]
+fn residue_mutant_a_job_running_only_a_submode_flips_item_3s_premise() {
+    let mut d = derive(&root());
+    d.jobs.push(CiJob {
+        workflow: ".github/workflows/planted.yml".to_string(),
+        id: "submode-only".to_string(),
+        body: "    - run: ./scripts/check.sh --self-test\n".to_string(),
+    });
+    let findings = residue_findings(&d);
+    assert!(fires(&findings, "residue-premise-flipped"), "{findings:?}");
+}
+
+#[test]
+fn residue_mutant_a_narrowed_skip_flips_item_5s_premise() {
+    let mut d = derive(&root());
+    d.check_sh
+        .push_str("\n  run_stage test cargo test --locked -p fln-kernel -- --skip planted\n");
+    let findings = residue_findings(&d);
+    assert!(fires(&findings, "residue-premise-flipped"), "{findings:?}");
+}
+
+/// The other direction on item 5, and the one a "does a `--skip` exist" check would miss:
+/// the site VANISHING is also a flip, because the item then names something that is not there.
+#[test]
+fn residue_mutant_the_skip_site_vanishing_is_also_a_flip() {
+    let mut d = derive(&root());
+    d.check_sh = d.check_sh.replace("--skip", "--planted-was-skip");
+    let findings = residue_findings(&d);
+    assert!(fires(&findings, "residue-premise-flipped"), "{findings:?}");
+}
+
+#[test]
+fn residue_mutant_an_unevaluated_premise_id_is_refused() {
+    let d = derive(&root());
+    assert!(
+        premise_holds(&d, "a-premise-nobody-computes").is_none(),
+        "an unknown id must be unevaluated, not silently true"
+    );
+}
+
+#[test]
+fn residue_mutant_a_collapsed_doc_scan_refuses_instead_of_reporting_clean() {
+    let mut d = derive(&root());
+    d.own_source = d
+        .own_source
+        .replace("# What could not be derived", "# Something else");
+    let findings = residue_findings(&d);
+    assert!(fires(&findings, "residue-scan"), "{findings:?}");
+}
+
+/// The positive control: the real tree satisfies every premise, so none of the mutants above
+/// is riding on a guard that reddens regardless.
+#[test]
+fn residue_control_the_real_tree_holds_every_derived_premise() {
+    let d = derive(&root());
+    for (item, premise) in RESIDUE_PREMISES {
+        if let Premise::Derived(id) = premise {
+            assert_eq!(
+                premise_holds(&d, id),
+                Some(true),
+                "residue item {item}'s premise {id:?} must hold on the real tree"
+            );
+        }
+    }
+    assert!(
+        residue_items(&d.own_source).len() >= 5,
+        "the residue scan found {} items; the header carries five and a collapsed scan makes \
+         every assertion above vacuous",
+        residue_items(&d.own_source).len()
+    );
 }
 
 /// The name of an `#[ignore]`d test in `kernel_replay`, taken from the derivation rather than

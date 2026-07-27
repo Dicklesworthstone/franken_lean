@@ -513,7 +513,13 @@ pub fn test_reach(job: &CiJob, check_sh_reaches_workspace: bool) -> Vec<TestReac
     reach
 }
 
-fn invokes_check_sh(line: &str) -> bool {
+/// Does this line invoke `scripts/check.sh`, under any spelling?
+///
+/// Public so a caller asking a *different* question about the same construct — such as
+/// whether a job invoking a `check.sh` sub-mode also invokes the plain gate — reuses this
+/// predicate rather than planting a second copy. A second copy that drifts from the original
+/// is the defect family this crate exists to catch.
+pub fn invokes_check_sh(line: &str) -> bool {
     line.split_whitespace()
         .any(|token| token.ends_with("check.sh") || token.ends_with("check.sh\""))
 }
