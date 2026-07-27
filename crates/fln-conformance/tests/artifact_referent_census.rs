@@ -46,6 +46,8 @@
 //! dropped branch misclassifies. The census is a measurement of this tree at this commit,
 //! re-derived per run; the *ruling* above is `bounded_model` at one host.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
