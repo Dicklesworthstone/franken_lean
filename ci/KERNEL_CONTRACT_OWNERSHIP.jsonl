@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":378,"projection_hash":"bfa9b2718bb6d604b22fe34264e64432cc25d28ab54d5f6d9eeb7d1ff7d92bed"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":379,"projection_hash":"fea96c4305d809579a228914c93427b9f4933ea4c3a00b20d4004d7c46c6cc12"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -354,6 +354,7 @@
 {"id":"franken_lean-uv6"}
 {"id":"franken_lean-v2p"}
 {"id":"franken_lean-v2z"}
+{"id":"franken_lean-verification-receipt-producer-binding-ywmq"}
 {"id":"franken_lean-vrmi"}
 {"id":"franken_lean-vugo"}
 {"id":"franken_lean-vui8"}
