@@ -1671,3 +1671,371 @@ fn the_interpreter_isolation_binding_kills_each_mutation_it_claims_to() {
         "a citation naming an outcome no probe emits was accepted"
     );
 }
+
+/// The file-stability family in the evidence runner, derived from its own definitions.
+///
+/// This is the family that actually grew. `stable_file_facts` `fstat`s a governed file before
+/// and after reading it; `stable_symlink_facts` is its sibling for a governed symlink and
+/// `lstat`s instead, hashing the link *target string* — so retargeting a symlink moves the
+/// governed root with no content edited anywhere. A future `stable_dir_facts` would be a sixth
+/// mechanism arriving the same way this fifth one did: as a new sibling, silently.
+fn stability_family(evidence: &str) -> Vec<String> {
+    let mut family: Vec<String> = evidence
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("def "))
+        .filter_map(|rest| rest.split('(').next())
+        .filter(|name| name.starts_with("stable_") && name.ends_with("_facts"))
+        .map(str::to_owned)
+        .collect();
+    family.sort();
+    family.dedup();
+    family
+}
+
+/// The Build Gate section, cut at the next top-level heading.
+fn build_gate_section(agents: &str) -> &str {
+    let start = agents
+        .find("## The Build Gate")
+        .expect("AGENTS.md must keep the Build Gate section");
+    let section = &agents[start..];
+    match section[3..].find("\n## ") {
+        Some(end) => &section[..end + 3],
+        None => section,
+    }
+}
+
+/// The mechanism rows, as `(id, row text)`.
+fn mechanism_rows(section: &str) -> Vec<(String, String)> {
+    section
+        .lines()
+        .filter(|line| line.trim_start().starts_with("| **M"))
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("| **")?;
+            let id = rest.split("**").next()?.to_owned();
+            Some((id, line.to_owned()))
+        })
+        .collect()
+}
+
+/// The headline's spelled-out count. A lexicon, not a scope: it maps words to numbers and has
+/// nothing to derive.
+fn headline_mechanism_count(section: &str) -> Option<usize> {
+    let marker = "** checks can end a lane";
+    let at = section.find(marker)?;
+    let word = section[..at]
+        .rsplit("**")
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    ]
+    .iter()
+    .position(|spelled| *spelled == word)
+}
+
+/// Backticked snake_case tokens in a table row that could name a producer.
+fn cited_symbols(row: &str) -> Vec<String> {
+    row.split('`')
+        .skip(1)
+        .step_by(2)
+        .map(|token| token.trim_end_matches("()").trim())
+        .filter(|token| {
+            token.len() > 3
+                && !token.contains(' ')
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One forged Build Gate reading, so the mutant table below is a list of named cases rather
+/// than a tuple nobody can read.
+struct BuildGateMutant {
+    name: &'static str,
+    family: Vec<String>,
+    rows: Vec<(String, String)>,
+    headline: Option<usize>,
+    expected: &'static str,
+}
+
+/// The whole judgement, in one place a forged caller can drive.
+fn judge_build_gate(
+    family: &[String],
+    rows: &[(String, String)],
+    headline: Option<usize>,
+    producers: &str,
+) -> Result<(), String> {
+    // (0)/(1) A scan that finds nothing is a broken scan, never a clean tree. Both sides are
+    // derived, so both can silently derive nothing when a definition style or a table format
+    // moves — and an empty set makes every arm below quantify over nothing.
+    if family.is_empty() {
+        return Err("stability-family-scan-empty".to_owned());
+    }
+    // A scan that narrows from two members to one is NOT caught by anything above: arm 4
+    // quantifies over the family, so a shorter family satisfies it trivially, and the vanished
+    // member's row still cites a symbol that is still in the corpus. Measured — planted as a
+    // mutant and it was ACCEPTED. So a floor, in the same shape and for the same reason as
+    // `every_python_launch_under_scripts_is_sealed`'s: a truncated derived scope reads as
+    // coverage. If the family legitimately shrinks, this reddens and its author lowers the
+    // floor deliberately, which is the disclosure the number exists to force.
+    if family.len() < 2 {
+        return Err(format!("stability-family-scan-truncated:{}", family.len()));
+    }
+    if rows.len() < 2 {
+        return Err("mechanism-table-scan-empty".to_owned());
+    }
+    // (2)/(3) The headline count is the sentence that has now been wrong twice. Binding it to
+    // the number of rows is what stops a third hand-transcription: a row added without moving
+    // the word, or a word moved without adding the row, both fail.
+    let Some(headline) = headline else {
+        return Err("headline-count-unreadable".to_owned());
+    };
+    if headline != rows.len() {
+        return Err(format!(
+            "headline-count-disagrees-with-table:{headline}-vs-{}",
+            rows.len()
+        ));
+    }
+    // (4) code -> table. A new sibling in the stability family that no row names is exactly how
+    // the fifth mechanism arrived, and exactly what nothing noticed.
+    for member in family {
+        if !rows.iter().any(|(_, row)| row.contains(member.as_str())) {
+            return Err(format!("mechanism-not-in-table:{member}"));
+        }
+    }
+    // (5) table -> code. A row whose every cited producer has been renamed away is a claim with
+    // nothing behind it, which is the shape this whole section is about.
+    for (id, row) in rows {
+        let symbols = cited_symbols(row);
+        if symbols.is_empty() {
+            return Err(format!("row-cites-no-symbol:{id}"));
+        }
+        if !symbols
+            .iter()
+            .any(|symbol| producers.contains(symbol.as_str()))
+        {
+            return Err(format!("row-cites-no-live-symbol:{id}"));
+        }
+    }
+    Ok(())
+}
+
+/// AGENTS.md's Build Gate table names every freeze mechanism the code actually has.
+///
+/// **This sentence has been wrong twice, and the second time was the repair of the first.**
+/// It first said the freeze "asserts that the whole repository held still" (false: M1's content
+/// check is scoped to the pinned Reference tree). The correction replaced it with "**Four**
+/// checks can end a lane" — a hand-transcribed count, which rotted on exactly the schedule the
+/// claim it replaced did, because `stable_symlink_facts` was added as a sibling of
+/// `stable_file_facts` and nothing anywhere compared the table against the code
+/// (`franken_lean-pfei` instance six; measured by cc_1 in `76298969`).
+///
+/// So the count is no longer transcribed: it is bound to the number of rows, and the rows are
+/// bound to the code in **both** directions. A sixth mechanism arriving as another
+/// `stable_*_facts` sibling now reddens the build until the table names it; a row whose
+/// producer was renamed away reddens too; and either side deriving *nothing* is refused as a
+/// broken scan rather than reported as agreement.
+///
+/// **What it does not earn, and this is the honest limit.** The derived family is the
+/// `stable_*_facts` one only — the family that grew. M1, M2 and M3 are still recognised by the
+/// symbols their rows cite, so a genuinely new mechanism of a *different* shape (a fresh
+/// `repository_state` sampler, a new `require_unchanged` call site in a lane) is not derived
+/// and would not be caught. That is a narrower claim than "the table is complete", and it is
+/// the claim this test makes. Widening it is `98np` R4's job, not this guard's.
+///
+/// Unlike `fln-8zsq`'s guard, this one's own text is **not** in its search space: it scans
+/// `scripts/evidence.py` and AGENTS.md, never this file. No self-exclusion is needed, and none
+/// is present — a reader checking for one should stop here rather than conclude it was missed.
+#[test]
+fn the_build_gate_table_names_every_freeze_mechanism_in_the_code() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let evidence = trusted_script("scripts/evidence.py");
+    // The producer corpus is the whole of `scripts/`, walked, not a list of the two files that
+    // happen to hold M1 and M2. Written as a hand-list first and it was already wrong: M3's
+    // `require_unchanged` lives in the lane scripts, so the guard refused a correct table with
+    // `row-cites-no-live-symbol:M3`. That is `fln-guard-scope-must-be-derived` reproduced inside
+    // a guard written to stop claims drifting from their producers, caught only because the
+    // wrong scope happened to fail loudly rather than quietly agreeing.
+    let producers = {
+        let root = repo
+            .canonicalize()
+            .expect("the repository root must resolve");
+        let mut files = Vec::new();
+        scripts_tree(&root.join("scripts"), &mut files, &root);
+        files
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let section = build_gate_section(&agents);
+
+    let family = stability_family(&evidence);
+    let rows = mechanism_rows(section);
+    let headline = headline_mechanism_count(section);
+
+    if let Err(reason) = judge_build_gate(&family, &rows, headline, &producers) {
+        panic!(
+            "the Build Gate table no longer matches the code it describes ({reason}). Six panes \
+             read this section at session start to decide what is safe to do mid-lane, and a \
+             mechanism it omits is one nobody defends against — the last omission cost two \
+             lanes (franken_lean-pfei, franken_lean-build-gate-lane-governed-set-98np). \
+             derived_family={family:?} table_rows={:?} headline={headline:?}",
+            rows.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Every arm above kills a mutation, including a planted decoy proving the scan is not vacuous.
+///
+/// The decoy is the arm that matters. Arms 4 and 5 compare two derived sets, and two scans that
+/// both silently return nothing agree perfectly — so a guard built only from the real tree can
+/// pass while measuring neither side. A sixth mechanism is therefore *planted* into an in-memory
+/// copy of the runner, and the guard is required to notice it is absent from the table.
+#[test]
+fn the_build_gate_guard_kills_each_mutation_it_claims_to() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let evidence = trusted_script("scripts/evidence.py");
+    // The producer corpus is the whole of `scripts/`, walked, not a list of the two files that
+    // happen to hold M1 and M2. Written as a hand-list first and it was already wrong: M3's
+    // `require_unchanged` lives in the lane scripts, so the guard refused a correct table with
+    // `row-cites-no-live-symbol:M3`. That is `fln-guard-scope-must-be-derived` reproduced inside
+    // a guard written to stop claims drifting from their producers, caught only because the
+    // wrong scope happened to fail loudly rather than quietly agreeing.
+    let producers = {
+        let root = repo
+            .canonicalize()
+            .expect("the repository root must resolve");
+        let mut files = Vec::new();
+        scripts_tree(&root.join("scripts"), &mut files, &root);
+        files
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let section = build_gate_section(&agents).to_owned();
+
+    let family = stability_family(&evidence);
+    let rows = mechanism_rows(&section);
+    let headline = headline_mechanism_count(&section);
+
+    // The unmutated control, judged first, or every mutant below dies on a broken baseline.
+    assert_eq!(
+        judge_build_gate(&family, &rows, headline, &producers),
+        Ok(()),
+        "the unmutated Build Gate binding must hold. family={family:?} rows={} headline={headline:?}",
+        rows.len()
+    );
+
+    // THE DECOY. A sixth mechanism planted in the runner, absent from the table.
+    let decoyed = format!("{evidence}\ndef stable_decoy_facts(path):\n    return ()\n");
+    let grown = stability_family(&decoyed);
+    assert!(
+        grown.len() == family.len() + 1 && grown.iter().any(|n| n == "stable_decoy_facts"),
+        "the planted decoy did not enter the derived family, so this scan does not read \
+         definitions and every agreement it reports is between two empty sets: {grown:?}"
+    );
+    assert_eq!(
+        judge_build_gate(&grown, &rows, headline, &producers)
+            .as_ref()
+            .map_err(String::as_str),
+        Err("mechanism-not-in-table:stable_decoy_facts"),
+        "a mechanism present in the code and absent from the table was accepted — which is \
+         precisely the state this section was in for two days"
+    );
+
+    let dropped: Vec<String> = family.iter().skip(1).cloned().collect();
+    let extra_row = {
+        let mut grown_rows = rows.clone();
+        grown_rows.push((
+            "M9".to_owned(),
+            "| **M9** | `repository_state` |".to_owned(),
+        ));
+        grown_rows
+    };
+    let dead_row = {
+        let mut bad = rows.clone();
+        bad.push((
+            "M9".to_owned(),
+            "| **M9** | `a_producer_that_was_renamed_away` |".to_owned(),
+        ));
+        bad
+    };
+
+    let mutants: Vec<BuildGateMutant> = vec![
+        BuildGateMutant {
+            name: "family-scan-returns-nothing",
+            family: Vec::new(),
+            rows: rows.clone(),
+            headline,
+            expected: "stability-family-scan-empty",
+        },
+        BuildGateMutant {
+            name: "table-scan-returns-nothing",
+            family: family.clone(),
+            rows: Vec::new(),
+            headline,
+            expected: "mechanism-table-scan-empty",
+        },
+        BuildGateMutant {
+            name: "headline-word-unreadable",
+            family: family.clone(),
+            rows: rows.clone(),
+            headline: None,
+            expected: "headline-count-unreadable",
+        },
+        BuildGateMutant {
+            name: "row-added-without-moving-the-headline",
+            family: family.clone(),
+            rows: extra_row,
+            headline,
+            expected: "headline-count-disagrees-with-table",
+        },
+        // This one was ACCEPTED before the truncation floor existed, and it is the mutant worth
+        // reading: it models the family scan silently narrowing, which every other arm agrees
+        // with perfectly because both sides shrink together.
+        BuildGateMutant {
+            name: "mechanism-dropped-from-the-derived-family",
+            family: dropped,
+            rows: rows.clone(),
+            headline,
+            expected: "stability-family-scan-truncated:1",
+        },
+        BuildGateMutant {
+            name: "row-whose-producer-was-renamed-away",
+            family: family.clone(),
+            rows: dead_row,
+            headline: headline.map(|n| n + 1),
+            expected: "row-cites-no-live-symbol:M9",
+        },
+    ];
+
+    for mutant in &mutants {
+        let moved = mutant.family != family || mutant.rows != rows || mutant.headline != headline;
+        assert!(
+            moved,
+            "mutant {} is identical to the unmutated base, so it did not apply",
+            mutant.name
+        );
+        let verdict = judge_build_gate(&mutant.family, &mutant.rows, mutant.headline, &producers);
+        let reason = verdict
+            .as_ref()
+            .err()
+            .map(String::as_str)
+            .unwrap_or("<accepted>");
+        assert!(
+            reason.starts_with(mutant.expected),
+            "mutant {} was not killed for its stated reason: expected {:?}, got {reason:?}. A \
+             rig accepting any failure would score a mutant killed by an arm that had stopped \
+             testing the property",
+            mutant.name,
+            mutant.expected
+        );
+    }
+}
