@@ -1928,3 +1928,78 @@ fn a_caller_chosen_return_type_is_refused_even_with_a_reviewed_row() {
         e.findings
     );
 }
+
+/// `data_grade` must be `verified` EXACTLY when a contract-handoff root was established,
+/// in both directions — and the fixture that supplies the negative direction is the krb0
+/// defect itself, reproduced by moving one variable (bead
+/// `fln-census-empty-referent-no-mock-krb0`; schema change routed to cc_2 and judged in
+/// `/data/tmp/claude-1000/route-cc_2-to-cc_3-krb0-schema-verdict.md`).
+///
+/// The control is the whole point and it is asserted rather than described: the two runs
+/// agree on `verdict`, on `authority` and on the finding count, so every field a reader
+/// currently has to judge a tree by is byte-identical across an audited tree and an
+/// unaudited one. Measured at `a0c9b1c8` in a real fresh clone; reproduced here in 0.2 s.
+/// Without that equality this test would pass just as well against a grade wired to
+/// `verdict`, which would carry no new information at all.
+///
+/// **This asserts the DERIVATION, not the artifact.** Neither field is rendered into the
+/// `structure-guard/4` robot stream yet: `scripts/evidence.py`'s `require_guard_keys`
+/// compares the terminal key set for exact equality, so emitting them is a `/5` bump that
+/// must move the producer, the validator and its fixtures together, and two of those live
+/// in another pane's uncommitted file. No record claims this grade today.
+#[test]
+fn the_data_grade_is_the_only_field_that_separates_an_unaudited_tree() {
+    let audited = TempWs::new("krb0-grade-audited");
+    base(&audited);
+    let audited = audited.run();
+
+    // One variable: a single census shard absent, exactly as on a fresh clone where the
+    // shards are gitignored and unreachable from main (bead `fln-census-out-of-git-2ya9`).
+    let unaudited = TempWs::new("krb0-grade-unaudited");
+    base(&unaudited);
+    unaudited.retain_paths(|rel| rel != "contracts/builtin_environment.tsv");
+    let unaudited = unaudited.run();
+
+    // THE CONTROL. If these three ever diverge, the fixture has stopped isolating the one
+    // variable and the directions below prove nothing about this field's information.
+    assert_eq!(
+        audited.verdict(),
+        unaudited.verdict(),
+        "fixture no longer isolates one variable: the verdicts differ"
+    );
+    assert_eq!(
+        audited.authority, unaudited.authority,
+        "fixture no longer isolates one variable: the authorities differ"
+    );
+    assert_eq!(
+        codes(&audited),
+        codes(&unaudited),
+        "fixture no longer isolates one variable: the findings differ"
+    );
+    assert_eq!(audited.verdict(), "pass");
+    assert_eq!(audited.authority, Authority::Complete);
+    assert!(codes(&audited).is_empty());
+
+    // Direction 1 — a root was established, so the grade is `verified` and nothing is owed.
+    assert!(
+        audited.contract_handoff_root.is_some(),
+        "the audited fixture established no handoff root; the positive direction is vacuous"
+    );
+    assert_eq!(audited.data_grade(), "verified");
+    assert!(audited.unestablished().is_empty());
+
+    // Direction 2 — no root, so the grade is `provisional` and it names what is owed. This
+    // is the record a reader gets from a tree whose verdict says `pass`.
+    assert!(
+        unaudited.contract_handoff_root.is_none(),
+        "the unaudited fixture established a handoff root; the negative direction is vacuous"
+    );
+    assert_eq!(unaudited.data_grade(), "provisional");
+    assert_eq!(
+        unaudited.unestablished(),
+        vec!["contract_handoff".to_string()]
+    );
+
+    // `provisional` is not a failure, and a caller must never render it as one.
+    assert_eq!(unaudited.exit_code(), 0);
+}

@@ -247,6 +247,51 @@ impl RunOutcome {
             _ => 2,
         }
     }
+
+    /// Which audits contributing to this verdict established no evidence.
+    ///
+    /// DERIVED from the same `Option` the root is rendered from, never set by a caller. A
+    /// second source for this answer is the defect the bead is about: a hand-set grade is
+    /// exactly what lets a stale "verified" outlive the audit it describes
+    /// (`fln-census-empty-referent-no-mock-krb0`).
+    ///
+    /// **The population is one, and that is a fact about today's tree rather than a law.**
+    /// `contract_handoff_root` is the only field in `RunOutcome` carrying an audit that can
+    /// establish nothing without saying so in the verdict, so this list has at most one
+    /// member by construction. A second such audit must move this function; nothing here
+    /// would notice on its own, and no caller may read a one-member list as a complete
+    /// inventory of what went unestablished.
+    pub fn unestablished(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.contract_handoff_root.is_none() {
+            out.push("contract_handoff".to_string());
+        }
+        out
+    }
+
+    /// The FL-INV-07 data grade AGENTS.md's Agent Ergonomics section already requires of a
+    /// robot surface, and which this record does not carry.
+    ///
+    /// `provisional` is NOT a failure and must never be rendered as one. It is the difference
+    /// between "audited and clean" and "not audited" — which, measured in a real fresh clone
+    /// at `a0c9b1c8` and reproduced as a one-variable fixture by
+    /// `the_data_grade_is_the_only_field_that_separates_an_unaudited_tree`, only a `null` in
+    /// one field carried, while `verdict`, `authority` and the finding count stayed identical.
+    ///
+    /// **What this does NOT distinguish, measured at `d560560c`.** `contract_handoff_root` is
+    /// `None` in three different situations, and this grade collapses them: an invalid
+    /// inventory prerequisite (`contract_handoff::audit_with_snapshot` returns early), an
+    /// absent census (typed `Inconclusive`, no finding — the krb0 shape), and an audit that
+    /// ran and failed (`FLN-STRUCT-035`/`036`, which DOES emit a finding). Only the middle
+    /// case is "not audited"; the third established a rejection and is still graded
+    /// `provisional` here. A reader who needs those separated must read `findings`, not this.
+    pub fn data_grade(&self) -> &'static str {
+        if self.unestablished().is_empty() {
+            "verified"
+        } else {
+            "provisional"
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
