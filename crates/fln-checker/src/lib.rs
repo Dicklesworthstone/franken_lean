@@ -127,23 +127,51 @@
 //! that matters. It still inherits the flag correctness above, which is why
 //! the flags themselves are SEMANTIC.
 //!
-//! ## What the graph must be tightened to, and why it cannot be done here
+//! ## Where the graph stands, re-measured
 //!
-//! Two prohibitions are missing, and both are `ci/WORKSPACE_GRAPH.txt` edits
-//! owned elsewhere. Recorded here so the checker's author knows the graph is
-//! **weaker than this document** until they land:
+//! This section previously said two prohibitions were missing. **One of them has
+//! landed**, and the paragraph outlived it — which is the defect this crate's own
+//! matrix row was corrected for once already (`witness.rs:479`, where
+//! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
+//! throughout). So the state is measured here rather than remembered, at
+//! `53a5e3ec`:
 //!
-//! 1. `fln-checker -> fln-bignum` is permitted (`WORKSPACE_GRAPH.txt:110`) and
-//!    should not be, per the reasoning above and `gii`'s REVIEW AMENDMENT.
-//! 2. `fln-checker -> fln-hash` must stay permitted — the wire format and the
-//!    domain tags have to be shared — so a crate-level prohibition cannot
-//!    express the split. The `Canonical` *readers* need an item-level rule.
+//! 1. **DONE.** `fln-checker -> fln-bignum` is no longer permitted.
+//!    `WORKSPACE_GRAPH.txt:113` reads
+//!    `allow-direct fln-checker = fln-core, fln-hash`. `gii`'s REVIEW AMENDMENT
+//!    is satisfied, so the checker must bring its own arithmetic. Note the old
+//!    text cited `WORKSPACE_GRAPH.txt:110`, which is now *fln-kernel's*
+//!    allowlist: a line-number citation moved under the claim, so cite the
+//!    declaration by content.
+//! 2. **STILL OPEN, and it cannot be a crate-level rule.**
+//!    `fln-checker -> fln-hash` must stay permitted — the wire format and the
+//!    domain tags have to be shared — so the split runs through the middle of
+//!    one crate. The `Canonical` *readers* need an item-level rule and do not
+//!    have one yet.
 //!
-//! ## The standing limitation
+//! ## What is machine-checked, and what is not
 //!
-//! **This classification is not yet machine-checked.** Until a structure-guard
-//! rule enforces it at item granularity, it is a document, and a document is
-//! not a boundary — it constrains an author who reads it and nothing else.
-//! That rule is the remaining work on `franken_lean-r0xu`; nobody should read
-//! the existence of this section as evidence that the boundary holds.
+//! This section previously said the classification was "not yet machine-checked"
+//! and that "a document is not a boundary". **That is now half wrong**, and in
+//! the direction that understates the build:
+//!
+//! * **ENFORCED at item granularity.** `FLN-STRUCT-037` refuses `fln-checker`
+//!   *reaching* a SEMANTIC item across this boundary
+//!   (`tools/structure-guard/src/checks.rs:983`). It is planted three ways:
+//!   `seeded.rs:1279` proves the baseline clean, `seeded.rs:1289`
+//!   `every_semantic_item_is_refused_inside_fln_checker` plants one violation per
+//!   inventory item and asserts each fires **alone** so an over-broad matcher
+//!   cannot fake green, and `seeded.rs:1321` proves that *naming* a semantic item
+//!   in prose is not a violation — which is why this document may keep citing
+//!   `Level::is_equiv` and `from_canonical_bytes` by name.
+//! * **NOT ENFORCED.** The `fln-hash` reader split of item 2 above. A rule
+//!   refusing `Canonical::read_body` / `from_canonical_bytes` for `Expr`, `Level`
+//!   and `Name` inside this crate does not exist, so that half remains a document.
+//! * **VACUOUS TODAY, deliberately.** There is no checking code here, so
+//!   `FLN-STRUCT-037` currently refuses nothing. It was installed before the
+//!   implementation on purpose: the boundary is cheapest to hold before the first
+//!   line that would cross it exists.
+//!
+//! Nobody should read the existence of this section as evidence that the whole
+//! boundary holds; read the two bullets above for which half does.
 #![forbid(unsafe_code)]
