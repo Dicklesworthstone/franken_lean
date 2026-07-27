@@ -3192,3 +3192,175 @@ fn the_rust_launch_scan_finds_a_planted_unsealed_launch_and_clears_a_sealed_one(
         "flags appearing after .output() are not part of the launch and must not seal it"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// franken_lean-h40t: the THIRD launch surface — the workflows, where the bootstrap runs
+//
+// The sealing family now has three members and they were found one at a time, each by asking
+// where the previous one's scope ended:
+//
+//   1. `scripts/**` — shebangs and shell launches         (pre-existing)
+//   2. `crates/**`, `tools/**` — Rust launches            (887db274, then 83f851af for its scope)
+//   3. `.github/workflows/*.yml` — THIS                   (nothing watched it per commit)
+//
+// The third is the one that matters most and was guarded least. `ci.yml` bootstraps the
+// toolchain: it parses `rust-toolchain.toml` under Python to decide which compiler the whole
+// build uses. A shadowed `tomllib` there chooses the compiler — the exact vector this bead was
+// filed for, proven live under `fln-8mj`.
+//
+// **`ci.yml` does carry a self-check, and it has three defects, each from a family this
+// repository has recorded before.** `ci.yml:149` greps for unsealed bootstrap snippets, but
+//   (a) it greps the literal path `.github/workflows/ci.yml`, so `contract-drift.yml` is outside
+//       it — a hand-listed scope, in the guard for this very property;
+//   (b) it is a workflow step, so it runs only in CI and never under `cargo test` — `pnav`'s
+//       shape, a producer that exists but is registered nowhere a commit reaches;
+//   (c) its pattern matches only the bare-stdin `python3 - ` form, so `-c`, a script path, and
+//       the `subprocess` list form are all invisible to it.
+//
+// Measured at 83f851af: every launch in both workflows is sealed. So this is an UNWATCHED
+// POPULATION, not a live defect — the same thing the five Rust launches were, one layer out.
+// ---------------------------------------------------------------------------------------------
+
+/// Lines in a workflow that start Python **without** `-I`, and the reason each is permitted.
+///
+/// Every entry carries a marker that must still be present in the same file, so an allowance
+/// cannot outlive the reason it was granted for. Two are the isolation probe's negative-control
+/// arms — they must run *unprotected* to prove the hijack reproduces, exactly like
+/// `python_isolation_probe.sh`'s entry in `UNSEALED_LAUNCH_ALLOWANCE`. The third is not a launch
+/// at all but a grep PATTERN, and declaring it buys something: this guard now fails if `ci.yml`'s
+/// own self-check is deleted, which closes defect (b) above from the outside.
+const WORKFLOW_UNSEALED_ALLOWANCE: &[(&str, &str, &str)] = &[
+    (
+        ".github/workflows/ci.yml",
+        "vulnerable=\"$(cd \"$shadow\"",
+        "isolated=\"$(cd \"$shadow\"",
+    ),
+    (
+        ".github/workflows/ci.yml",
+        "vulnerable_env=\"$(PYTHONPATH=",
+        "isolated_env=\"$(PYTHONPATH=",
+    ),
+    (
+        ".github/workflows/ci.yml",
+        "if grep -nE",
+        "a bootstrap snippet invokes python3 without -I",
+    ),
+];
+
+/// `.github/workflows/*.{yml,yaml}`, workspace-relative, with their text.
+///
+/// An unreadable workflow FAILS rather than contributing the empty string: a workflow read as
+/// empty launches nothing and would look exactly like a clean one, which is `ci_execution_join`'s
+/// recorded reason for the same refusal.
+fn workflow_files(repo: &Path) -> Vec<(String, String)> {
+    let dir = repo.join(".github/workflows");
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+        .expect(".github/workflows must be readable")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == "yml" || ext == "yaml")
+        })
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(repo)
+                .expect("a workflow lies under the repository")
+                .to_string_lossy()
+                .into_owned();
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{relative} must be readable to be judged: {e}"));
+            (relative, body)
+        })
+        .collect()
+}
+
+/// Is this workflow line a Python *launch*, as opposed to prose about one?
+///
+/// `echo` lines and comments talk about interpreters; they do not start them. This is the same
+/// prose/code split that made the Rust guard redden on its own doc comment, met deliberately
+/// here rather than discovered — and it is why the remaining grep PATTERN is declared in the
+/// allowance instead of filtered, since a filter for it would also hide a real launch.
+fn workflow_launches_python(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.starts_with('#') || trimmed.starts_with("echo ") || trimmed.starts_with("echo\"") {
+        return false;
+    }
+    launches_python(trimmed)
+}
+
+#[test]
+fn every_workflow_python_launch_is_sealed_or_declared() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let repo = repo
+        .canonicalize()
+        .expect("the repository root must resolve");
+    let workflows = workflow_files(&repo);
+    assert!(
+        workflows.len() >= 2,
+        "derived {} workflow file(s); two were measured at 83f851af, so a scan that has lost \
+         the directory is refused rather than reported as a clean tree",
+        workflows.len()
+    );
+
+    let mut launches = 0usize;
+    let mut unsealed: Vec<String> = Vec::new();
+    let mut allowance_used: Vec<(&str, &str)> = Vec::new();
+
+    for (relative, body) in &workflows {
+        for (line_no, command) in logical_lines(body) {
+            if !workflow_launches_python(&command) {
+                continue;
+            }
+            launches += 1;
+            // The subprocess list form spells the flag as its own quoted argument.
+            if command.contains("python3 -I") || command.contains(r#""python3","#) {
+                continue;
+            }
+            match WORKFLOW_UNSEALED_ALLOWANCE
+                .iter()
+                .find(|(path, needle, _)| path == relative && command.contains(needle))
+            {
+                Some((_, needle, marker)) => {
+                    assert!(
+                        body.contains(marker),
+                        "{relative}:{line_no} holds an unsealed-launch allowance whose stated \
+                         reason is gone: the marker {marker:?} is no longer in the file, so the \
+                         allowance names something that is not there"
+                    );
+                    allowance_used.push((relative, needle));
+                }
+                None => unsealed.push(format!("{relative}:{line_no}: {}", command.trim())),
+            }
+        }
+    }
+
+    assert!(
+        launches >= 8,
+        "derived only {launches} Python launch(es) across the workflows; fourteen were measured \
+         at 83f851af. A pattern that has stopped matching is a BROKEN SCAN and is refused rather \
+         than reported as a workflow set that starts no interpreters."
+    );
+    assert!(
+        unsealed.is_empty(),
+        "these workflow lines start Python without `-I`: {unsealed:#?}\n\n\
+         `ci.yml` bootstraps the toolchain by parsing rust-toolchain.toml under Python, so a \
+         shadowed module here chooses the compiler for the whole build. Add `-I`, or declare the \
+         line in WORKFLOW_UNSEALED_ALLOWANCE with the marker that states why it must run \
+         unprotected."
+    );
+    assert_eq!(
+        allowance_used.len(),
+        WORKFLOW_UNSEALED_ALLOWANCE.len(),
+        "an allowance entry never matched a scanned line: {allowance_used:?} of {:?}. A dead \
+         entry is a hole with a name on it, and this list may only shrink.",
+        WORKFLOW_UNSEALED_ALLOWANCE
+            .iter()
+            .map(|(path, needle, _)| (*path, *needle))
+            .collect::<Vec<_>>()
+    );
+}
