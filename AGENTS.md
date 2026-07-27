@@ -192,7 +192,7 @@ The standing advice, correct and unchanged, is: when another pane's in-flight ed
 | `evidence.py hash-tree … **--vendor-path V**` | **no** — exit 2 |
 | `evidence.py ubs-inventory`, `evidence.py vendor-binding` | **no** — exit 2 |
 | `scripts/check.sh`, the evidence self-test, `scripts/verify_vendor_tree.sh` | **no** — exit 2 |
-| any `fln.e2e/2` lane | **no** — `hash-tree --vendor-path` is its first governed step |
+| any `fln.e2e/2` lane — **8 declared fln.e2e/2 lanes**, of which **7 refuse on a measured invocation shape** and **1 whose verdict is unmeasured** | **no**, and this row's *scope* is now derived per commit rather than listed (`the_worktree_refusal_scope_is_derived_from_the_lane_population`), which is the half this table left open. The verdict survives measurement; the reason this row used to give does not. It said `hash-tree --vendor-path` is the first governed step of any such lane. Seven lanes do refuse, and the witness for all seven is `vendor-binding`, measured to refuse unconditionally. The eighth, `unsafe_note_clippy.sh`, carries no `--vendor-path` anywhere; it would reach `run_git`, if it does, through `emit --governed-path` / `--producer-binding-root` and `manifest --input-root` — six subcommands in shapes nobody has measured — so it is typed **indeterminate and named here**, not counted as refusing. Note also that the 21 scripts in `scripts/e2e/` and the 8 declared lanes are different sets. Static reachability cannot settle the eighth and is used only to prove a *negative*: 15 of the 42 subcommands reach `run_git`, yet `hash-tree` is one of them and exits 0 without `--vendor-path`, so a handler that never reaches it cannot refuse, while one that does may still succeed |
 
 So the evidence surface runs in the **main tree only**. Two consequences worth stating separately, because each has already cost something:
 
@@ -561,6 +561,18 @@ Hard-won facts that will bite you if unknown:
    **What this does not earn:** mechanising a disclosure does not upgrade the claim it discloses. That real evidence — a `{1, 8, 32}` corpus run comparing stream digests at an explicitly pinned width — was built and run separately (`fln-corpus-thread-matrix-93te`), and it moved corpus schedule-independence from *inferred* to **one observation, still not a measured invariant**: the lane runs on demand, so PG-5's per-commit gate stays a documented shortfall. Note which half each bead earned. `fln-8zsq` and `franken_lean-2ki4` closed on the disclosure and bought nothing about the corpus; `93te` bought a bounded observation about the corpus and nothing about cadence. Neither is the invariant, and stacking them does not make one.
 
    A twelfth is already filed and deliberately unmechanised: `fln-term-plane-population-differential-wv4u` carries constraints R1–R4 as *prose in a bead*, on a rig nobody has started. Its own R4 says the enforcement law must land **with** the rig rather than after it — which is this rule applied to a claim that does not exist yet.
+
+   **This file's own enforcement claims are now counted, by a producer in the repository** (bead `franken_lean-pfei` R1). AGENTS.md is the densest source of unbound enforcement claims here, and four of its claims were measured false in two days — so the population is derived per commit rather than described:
+
+   ```text
+   enforcement-census: live=22 bound=10 unbound=12 catalogued=7
+   ```
+
+   `scripts/agents_enforcement_census.py --check` derives it and refuses any disagreement **in either direction**, so a new unbound claim raises the number and its author must say so, while a repair lowers it. `the_agents_enforcement_census_matches_the_file_it_describes` runs it under plain `cargo test`.
+
+   **Read `bound` as "names a candidate referent in the same sentence" — never as "verified".** A sentence citing a deleted test still counts as bound; making the producer *denote* is pfei R2 and is not built.
+
+   **The number that governs is the one with item 7's own table excluded, and that distinction inverted the answer once.** The catalogue above quotes every phrase the scan searches for, because quoting them is what the rows are *for*. The first version of this census declared that exclusion in a constant and never applied it, and the resulting figure moved 26 → 27 → 28 across three commits — re-anchored each time as evidence that a count of claims is itself a claim — while **the live population never moved from 22**. Every one of those movements was a catalogue row. A count bound to the unfiltered figure would have reddened on exactly the commits that record good work, and been ignored within a week. The scan now **fails** if it cannot locate the region, or if the region excludes nothing.
 
 ---
 

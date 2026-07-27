@@ -2039,3 +2039,352 @@ fn the_build_gate_guard_kills_each_mutation_it_claims_to() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The worktree-refusal SCOPE, derived rather than listed
+// (bead `franken_lean-worktree-gitdir-refusal-hugg`).
+//
+// The sibling guard above proves the refusal FIRES and that AGENTS.md still names the
+// surfaces it takes down. AGENTS.md's own "what it does not earn" says what that leaves
+// open, in its own words: "the affected-surface list is written down, not derived — so a
+// *new* lane that starts refusing would go unnamed and nothing would notice."
+//
+// **Static reachability is provably wrong for deriving the affected set, and is used here
+// only to prove a NEGATIVE.** Fifteen of `evidence.py`'s 42 subcommands have handlers that
+// reach `run_git`, and `hash-tree` is one of them yet exits 0 without `--vendor-path`
+// (cc_2, measured at `115ef2fd` against a main-tree positive control). So reachability
+// cannot say a lane dies. What it CAN say soundly is the contrapositive: a handler that
+// never reaches `run_git` cannot possibly raise the refusal. That asymmetry is the whole
+// design — a positive verdict needs a MEASURED invocation shape, a negative verdict may
+// rest on the walk, and anything else is `Indeterminate` and named.
+// ---------------------------------------------------------------------------------------
+
+/// Whether the evidence surface refuses inside a linked worktree, for one lane script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaneWorktreeVerdict {
+    /// A measured refusing invocation shape is present. The witness is named, because
+    /// "this lane refuses" and "this lane refuses BECAUSE of X" are different claims and
+    /// AGENTS.md was asserting the second while only the first had been measured.
+    Refuses(&'static str),
+    /// Every subcommand it invokes is proven unable to reach `run_git`.
+    Runs,
+    /// It invokes subcommands that CAN reach `run_git` in shapes nobody has measured.
+    /// **Not "clean" — unknown.** Reported with the names, so the next reader measures
+    /// those instead of re-deriving the question.
+    Indeterminate(Vec<String>),
+}
+
+/// The invocation shapes measured to refuse, each with the anchor it was measured at.
+///
+/// Declared as data rather than derived, because the refusal is ARGUMENT-gated and no call
+/// graph can see that: `hash-tree` refuses with `--vendor-path` and succeeds without it.
+/// A shape may be added here only with a measurement, never with an argument.
+const MEASURED_REFUSING_SHAPES: &[(&str, &str)] = &[
+    // Unconditional: the handler hashes the pinned Reference tree through git.
+    // cc_2 at `115ef2fd`, worktree vs main-tree control.
+    ("vendor-binding", "vendor-binding"),
+    // Unconditional: enumerates tracked inputs via `git ls-files`. Same measurement, and
+    // it is the invocation the sibling guard above probes directly.
+    ("ubs-inventory", "ubs-inventory"),
+];
+
+/// `hash-tree` is the counterexample that makes static derivation unsafe, so it is named
+/// once, here, and keyed on its flag rather than on the subcommand.
+const VENDOR_PATH_FLAG: &str = "--vendor-path";
+
+/// Top-level `def` blocks of a Python source, in file order.
+fn python_def_blocks(source: &str) -> std::collections::BTreeMap<String, String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let starts: Vec<(usize, String)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let rest = line.strip_prefix("def ")?;
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty() && rest[name.len()..].starts_with('(')).then_some((index, name))
+        })
+        .collect();
+    let mut blocks = std::collections::BTreeMap::new();
+    for (position, (index, name)) in starts.iter().enumerate() {
+        let end = starts
+            .get(position + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(lines.len());
+        blocks.insert(name.clone(), lines[*index..end].join("\n"));
+    }
+    blocks
+}
+
+/// Every top-level function that can reach `run_git`, transitively.
+///
+/// Over-approximating is the correct direction: a false "reaches" only makes a lane
+/// `Indeterminate`, which asks for a measurement. A false "cannot reach" would silently
+/// call a refusing lane clean, so the walk closes to a fixpoint rather than one hop.
+fn defs_reaching_run_git(source: &str) -> std::collections::BTreeSet<String> {
+    let blocks = python_def_blocks(source);
+    let mut reaching: std::collections::BTreeSet<String> = blocks
+        .iter()
+        .filter(|(_, body)| body.contains("run_git("))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let calls: std::collections::BTreeMap<&String, std::collections::BTreeSet<&String>> = blocks
+        .iter()
+        .map(|(name, body)| {
+            let called = blocks
+                .keys()
+                .filter(|candidate| *candidate != name && body.contains(&format!("{candidate}(")))
+                .collect();
+            (name, called)
+        })
+        .collect();
+    loop {
+        let mut grew = false;
+        for (name, called) in &calls {
+            if !reaching.contains(*name) && called.iter().any(|c| reaching.contains(*c)) {
+                reaching.insert((*name).clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            return reaching;
+        }
+    }
+}
+
+/// Classify one lane script.
+fn classify_lane(
+    text: &str,
+    subcommands: &std::collections::BTreeSet<String>,
+    reaching: &std::collections::BTreeSet<String>,
+) -> LaneWorktreeVerdict {
+    for (needle, witness) in MEASURED_REFUSING_SHAPES {
+        if text.contains(needle) {
+            return LaneWorktreeVerdict::Refuses(witness);
+        }
+    }
+    let invoked: std::collections::BTreeSet<&String> = subcommands
+        .iter()
+        .filter(|name| text.contains(name.as_str()))
+        .collect();
+    if invoked.iter().any(|name| *name == "hash-tree") && text.contains(VENDOR_PATH_FLAG) {
+        return LaneWorktreeVerdict::Refuses("hash-tree --vendor-path");
+    }
+    let unresolved: Vec<String> = invoked
+        .iter()
+        // `hash-tree` without `--vendor-path` is MEASURED to exit 0, so it is resolved
+        // rather than unknown — the one place a reaching subcommand is excused, and it is
+        // excused by a measurement.
+        .filter(|name| reaching.contains(**name) && name.as_str() != "hash-tree")
+        .map(|name| (*name).clone())
+        .collect();
+    if unresolved.is_empty() {
+        LaneWorktreeVerdict::Runs
+    } else {
+        LaneWorktreeVerdict::Indeterminate(unresolved)
+    }
+}
+
+/// The set of surfaces a linked worktree takes down is DERIVED, and AGENTS.md's counts
+/// match it in both directions.
+///
+/// **What this changes about the row it binds.** AGENTS.md said `any fln.e2e/2 lane —
+/// **no** — hash-tree --vendor-path is its first governed step`: a universal verdict with a
+/// single stated producer. The verdict survives measurement; the producer does not. Of the
+/// eight declared `fln.e2e/2` lanes, seven carry `vendor-binding`, and the eighth —
+/// `unsafe_note_clippy.sh` — carries no `--vendor-path` anywhere and reaches `run_git`, if
+/// it does, through `emit --governed-path` / `--producer-binding-root` and
+/// `manifest --input-root` instead. So the row was right for a reason that is wrong for at
+/// least one member, which is item 7's shape: a claim whose stated producer is not the
+/// thing producing it.
+///
+/// **I did not resolve that eighth lane and this guard says so rather than guessing.** Its
+/// distinctive subcommand IS measured — `unsafe-note-clippy-sites --operation extract`
+/// exits 0 on a gitdir-pointer root with an empty report, against a real-`.git` control —
+/// but six other subcommands it invokes reach `run_git` statically in unmeasured shapes.
+/// A first pass here classified it `Runs` off a three-needle scan, and that was wrong in
+/// exactly the way this bead's own row warns about; `Indeterminate` is the honest verdict
+/// and it names the six.
+#[test]
+fn the_worktree_refusal_scope_is_derived_from_the_lane_population() {
+    const LANE_FLOOR: usize = 20;
+    const SUBCOMMAND_FLOOR: usize = 30;
+
+    let repo = fln_conformance::checked_workspace_root!();
+    let evidence = trusted_script("scripts/evidence.py");
+
+    // --- the subcommand population, from the PARSER rather than from a regex ------------
+    // `add_parser` calls span lines and one is registered from a loop variable, so a scan
+    // of the source undercounts. The parser is the authority on what exists.
+    let help = std::process::Command::new("python3")
+        .args(["-I", "-S"])
+        .arg(repo.join("scripts/evidence.py"))
+        .arg("--help")
+        .output()
+        .expect("the evidence runner must be able to print its own help");
+    let help = String::from_utf8_lossy(&help.stdout);
+    let listing = help
+        .split_once('{')
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(names, _)| names)
+        .expect("evidence.py --help must list its subcommands in {a,b,c} form");
+    let subcommands: std::collections::BTreeSet<String> =
+        listing.split(',').map(str::to_string).collect();
+    assert!(
+        subcommands.len() >= SUBCOMMAND_FLOOR,
+        "the parser listed only {} subcommands, below the floor of {SUBCOMMAND_FLOOR}. A \
+         short list is a broken extraction, not a small program — and it would make every \
+         lane below classify as Runs",
+        subcommands.len()
+    );
+
+    // --- subcommand -> handler, by the convention, refusing an exception ----------------
+    let defs = python_def_blocks(&evidence);
+    let unmapped: Vec<&String> = subcommands
+        .iter()
+        .filter(|name| !defs.contains_key(&format!("cmd_{}", name.replace('-', "_"))))
+        .collect();
+    assert!(
+        unmapped.is_empty(),
+        "these subcommands have no `cmd_<name>` handler, so their reachability cannot be \
+         decided and they must not be silently treated as unable to reach git: {unmapped:?}"
+    );
+
+    let reaching_defs = defs_reaching_run_git(&evidence);
+    let reaching: std::collections::BTreeSet<String> = subcommands
+        .iter()
+        .filter(|name| reaching_defs.contains(&format!("cmd_{}", name.replace('-', "_"))))
+        .cloned()
+        .collect();
+    // Anti-vacuity, and it is the assertion that matters most. If the walk broke and
+    // returned nothing, every lane would classify as `Runs`, the counts would agree with a
+    // row saying nothing refuses, and this guard would be a confident false clean.
+    assert!(
+        reaching.contains("vendor-binding"),
+        "the call walk did not find `vendor-binding` able to reach run_git, which is the \
+         one invocation measured to refuse unconditionally. The walk is broken, and a \
+         broken walk classifies every lane as running: {} subcommands judged reaching",
+        reaching.len()
+    );
+
+    // --- the lane population, derived from git ------------------------------------------
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["ls-files", "scripts/e2e/*.sh"])
+        .output()
+        .expect("git ls-files must run: the lane population is derived from it");
+    assert!(
+        listed.status.success(),
+        "git ls-files failed, so the lane population is unknown and no scope claim can be \
+         made: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let lane_paths: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lane_paths.len() >= LANE_FLOOR,
+        "only {} lane scripts were found, below the floor of {LANE_FLOOR}. A scan that \
+         reads almost nothing is a broken scan, not a repository with no lanes — the \
+         derivation for AGENTS.md's build-gate table already produced a wrong zero once \
+         because a character class excluded a digit",
+        lane_paths.len()
+    );
+
+    let mut declared_lanes: Vec<(String, LaneWorktreeVerdict)> = Vec::new();
+    for path in &lane_paths {
+        let text = fs::read_to_string(repo.join(path))
+            .unwrap_or_else(|error| panic!("{path} must be readable: {error}"));
+        // The row speaks of `fln.e2e/2` lanes, not of every script in the directory. Those
+        // are different sets — 21 scripts, 8 declared lanes — and conflating them is
+        // `bkw6`'s shape, the scope measured differing from the scope meant.
+        if !text.contains("fln.e2e/2") {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        declared_lanes.push((name, classify_lane(&text, &subcommands, &reaching)));
+    }
+    assert!(
+        !declared_lanes.is_empty(),
+        "no script declares the fln.e2e/2 schema, so the row's population is empty and \
+         every count below would be a vacuous zero"
+    );
+
+    let refusing = declared_lanes
+        .iter()
+        .filter(|(_, verdict)| matches!(verdict, LaneWorktreeVerdict::Refuses(_)))
+        .count();
+    let unmeasured: Vec<&String> = declared_lanes
+        .iter()
+        .filter(|(_, verdict)| matches!(verdict, LaneWorktreeVerdict::Indeterminate(_)))
+        .map(|(name, _)| name)
+        .collect();
+    let running: Vec<&String> = declared_lanes
+        .iter()
+        .filter(|(_, verdict)| *verdict == LaneWorktreeVerdict::Runs)
+        .map(|(name, _)| name)
+        .collect();
+
+    // --- bind AGENTS.md's row to the derived counts, both directions --------------------
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let heading = "### Where a green bar may be taken from";
+    let start = agents
+        .find(heading)
+        .expect("AGENTS.md must keep the section stating where a green bar may be taken from");
+    let section = &agents[start..];
+    let section = &section[..section.find("\n---").unwrap_or(section.len())];
+
+    for (marker, measured) in [
+        (" declared fln.e2e/2 lanes", declared_lanes.len()),
+        (" refuse on a measured invocation shape", refusing),
+        (" whose verdict is unmeasured", unmeasured.len()),
+    ] {
+        let occurrences = section.matches(marker).count();
+        assert_eq!(
+            occurrences, 1,
+            "the green-bar section must state `…{marker}` exactly once and states it \
+             {occurrences} times; zero means the count is compared against nothing and \
+             more than one makes it undecidable"
+        );
+        let head = &section[..section.find(marker).expect("one occurrence")];
+        let digits: String = {
+            let mut d: Vec<char> = head
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            d.reverse();
+            d.into_iter().collect()
+        };
+        let declared: usize = digits.parse().unwrap_or_else(|_| {
+            panic!("`…{marker}` in the green-bar section is not preceded by a count")
+        });
+        assert_eq!(
+            declared, measured,
+            "the green-bar section declares {declared} for `…{marker}` and the lane \
+             population measures {measured}. A new lane, a renamed subcommand or a \
+             measured shape moves this number, and the row must move with it — that is the \
+             half this bead left open: an affected-surface list nobody re-derives"
+        );
+    }
+
+    // Every unresolved lane must be NAMED where a reader looks, not folded into a count.
+    for name in &unmeasured {
+        assert!(
+            section.contains(name.as_str()),
+            "lane {name} has an unmeasured worktree verdict and the green-bar section does \
+             not name it. A reader is told the class refuses and would take a green from a \
+             lane nobody has measured: {:?}",
+            declared_lanes
+        );
+    }
+    assert!(
+        running.is_empty(),
+        "these lanes are now PROVEN to run in a linked worktree, which is new and makes a \
+         verification path available that the section still denies. Say so there: {running:?}"
+    );
+}
