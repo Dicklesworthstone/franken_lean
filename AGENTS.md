@@ -528,6 +528,29 @@ rch-tracker-non-reads: crates/fln-conformance/tests/evidence_finalization.rs cra
 
 **What this does not earn, stated because it is the load-bearing half.** `~/.config/rch/config.toml` is **outside the repository**, so no test here can hold the exclusion, the threshold, or the confidence — a version bump changes all three silently and nothing in this tree would notice. Those four cells are a measurement at one host at one instant, class `bounded_model`, and the version is recorded above precisely so the next reader can tell whether it still describes their machine. What *is* held per commit is the in-repo population that would be answered for by a worker without the file. Re-measure the rch half before relying on it, and record the version you measured at.
 
+### The worker may lack a component of the pin — and for one gate that is indistinguishable from a finding
+
+The tracker case above is the worker missing a **file**. This is the worker missing a **component of the toolchain**, and it reaches further, because one of the two gates it breaks reports the breakage in the shape of a code defect (bead `franken_lean-m3fq`).
+
+`rust-toolchain.toml` declares `components = ["rustfmt", "clippy", "miri", "rust-src"]`. Those are components **of the pin**, not a second pin — a machine holding `nightly-2026-07-13` without `clippy` does not have this repository's toolchain. **Nothing verifies them.** `parse_rust_lock` in `scripts/evidence.py` is the sealed-cargo path's toolchain check and it reads `rust-toolchain.toml` for `channel` only, asserting it equals `SUITE.lock`'s `rust-nightly`; the `components` array is never read by anything. Locally rustup installs them from the same file, which is why this has never been felt on a developer machine — and is exactly why the remote case went four reproductions without a rule.
+
+**Re-measured at rch 1.0.52 on 2026-07-27, and the exposure has grown.** `rch workers capabilities` reports `Rust : 1.99.0-nightly` per worker and inventories Bun, Node and npm — it does not inventory `clippy`, and it reports a *version* rather than the pinned *toolchain*, so it cannot distinguish a worker that lacks the component from one that has it, nor one on the pin from one on some other nightly. The fleet is **11 workers**; when this bead was filed there were 2. cod_1 reproduced the selection of a worker without `cargo-clippy` four times on 2026-07-25, each time after the full ~68-second sync had already been paid.
+
+**The measured 2×2, which is the part that matters and was not in the bead.** A component-absent failure and a real finding are separable for one gate and not the other:
+
+| gate | real code finding | component absent | `check.sh` registers | separable? |
+|---|---|---|---|---|
+| `cargo clippy --all-targets -- -D warnings` | **101** | **1** | `--semantic-failure-exit 101` | **yes** — an absent component is outside the semantic set, so it types `internal_fault`, never a stage failure |
+| `cargo fmt --check` | **1** | **1** | `--semantic-failure-exit 1` | **no** — the environment fault and the finding are the same exit |
+
+So the clippy gate already satisfies FL-INV-07 here, by a margin nobody had written down: **do not "simplify" that 101 to 1**, because that single edit would convert every environment fault on the clippy stage into a reported code defect. The fmt gate does not satisfy it, and that is an open defect of this repository rather than of RCH — recorded as such rather than repaired here, because repairing it changes the gate's control flow and no full-gate `check.sh` verdict is obtainable while the two orphaned working-tree files stand (bead `franken_lean-h4o1`).
+
+> **A gate failure whose text says a component `is not installed` is an environment fault — FL-INV-07 `Inconclusive`, never a finding about the code.** Do not diagnose the repository, and do not retry until a worker answers, which is how an unattributed green gets adopted. Re-run pinned locally, or under `--base <sha> --clean-overlay`.
+
+`the_pin_declares_components_and_the_gates_that_cannot_separate_them_are_disclosed` derives the component list from `rust-toolchain.toml` rather than transcribing it, and fails if the pin's components move without this section, if the clippy stage stops registering an exit outside the environment-fault code, or if the disclosure of the non-separable gate disappears.
+
+**What this does not earn.** The RCH figures are one host at one instant, class `bounded_model`, and the capability surface is outside this repository — a version bump changes it silently. Nothing here verifies that a component is *present* before a gate consumes its verdict; what is held per commit is that the pin's declared components are disclosed and that the separable gate stays separable.
+
 ---
 
 ## ast-grep vs ripgrep vs warp_grep

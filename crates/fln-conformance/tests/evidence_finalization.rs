@@ -3703,3 +3703,264 @@ fn every_workflow_python_launch_is_sealed_or_declared() {
             .collect::<Vec<_>>()
     );
 }
+
+// ------------------------------------------------------------------------------------------
+// franken_lean-m3fq — the pin declares components, and nothing verifies them.
+//
+// `fln-y0f7` above is a worker missing a FILE. This is a worker missing a COMPONENT of the
+// toolchain, and it reaches further because one of the two gates it breaks reports the
+// breakage in the shape of a code defect.
+//
+// `rust-toolchain.toml` declares four components of the pin. `parse_rust_lock` in
+// `scripts/evidence.py` — the sealed-cargo path's toolchain check — reads that file for
+// `channel` only and never reads `components`, so a machine holding the pinned nightly
+// WITHOUT `clippy` passes every identity check this repository performs. Locally rustup
+// installs them from the same file, which is why it has never been felt on a developer
+// machine and why the remote case went four reproductions without a rule.
+//
+// Measured at `925e6604` in a scratch crate, one variable per cell: `cargo clippy
+// --all-targets -- -D warnings` exits **101** on a real finding and **1** when the component
+// is absent, so `check.sh`'s registration of 101 puts an absent component OUTSIDE the
+// semantic set, where it types `internal_fault` rather than a stage failure. `cargo fmt
+// --check` exits **1** for BOTH. The clippy separation is load-bearing and undocumented
+// until now — changing that 101 to a 1 would convert every environment fault on the stage
+// into a reported code defect, which is FL-INV-07 exactly.
+// ------------------------------------------------------------------------------------------
+
+/// The exit code a cargo gate returns when its component is absent, measured rather than assumed.
+const COMPONENT_ABSENT_EXIT: &str = "1";
+
+/// Derive the pin's declared components from `rust-toolchain.toml`.
+///
+/// Derived, never transcribed: a second copy of this list here would be free to drift from the
+/// pin, which is the defect this whole family is about. An unparseable manifest is a refusal.
+fn declared_pin_components(manifest: &str) -> Vec<String> {
+    let Some(rest) = manifest.split_once("components") else {
+        return Vec::new();
+    };
+    let Some((_, body)) = rest.1.split_once('[') else {
+        return Vec::new();
+    };
+    let Some((body, _)) = body.split_once(']') else {
+        return Vec::new();
+    };
+    body.split(',')
+        .map(|raw| raw.trim().trim_matches('"').trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// The `--semantic-failure-exit` a `check.sh` stage registers, read from the case arm naming it.
+///
+/// Returns `None` when the arm or its registration cannot be located, so a restructured
+/// `check.sh` refuses here instead of silently reporting whatever it found last.
+fn registered_semantic_exit(check_sh: &str, stage: &str) -> Option<String> {
+    let arm = check_sh.find(&format!("|{stage}|"))?;
+    let tail = &check_sh[arm..];
+    let at = tail.find("--semantic-failure-exit ")?;
+    let value = tail[at + "--semantic-failure-exit ".len()..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?;
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Judge the pin/gate/doctrine triple, returning a finding per broken property.
+///
+/// Findings rather than assertions so each property can be gutted alone and every mutant is
+/// planted in the ARGUMENTS. All three inputs are plain text, so the campaign below costs no
+/// process spawns and never writes a governed file.
+fn pin_component_findings(manifest: &str, check_sh: &str, agents: &str) -> Vec<String> {
+    let mut findings = Vec::new();
+    let components = declared_pin_components(manifest);
+    if components.len() < 4 {
+        findings.push(format!(
+            "pin-floor: rust-toolchain.toml declared only {} pin component(s): {components:?}. \
+             Four were declared when this binding landed, and a scan that cannot read the array \
+             looks exactly like a pin that declares nothing — refuse rather than report a clean \
+             pin.",
+            components.len()
+        ));
+    }
+
+    let heading = "### The worker may lack a component of the pin";
+    let Some(start) = agents.find(heading) else {
+        findings.push(
+            "doctrine-missing: AGENTS.md no longer carries the section stating that the pin's \
+             components are unverified. That section is what stops an agent diagnosing this \
+             repository when a worker answers without `clippy`, and it is the only place the \
+             measured exit-code separation is written down."
+                .to_string(),
+        );
+        return findings;
+    };
+    let section = &agents[start..];
+    let section = &section[..section.find("\n---").unwrap_or(section.len())];
+
+    // Every declared component must be named where the rule is stated. Derived from the pin, so
+    // adding a fifth component obliges its author to say whether its absence is separable.
+    for component in &components {
+        if !section.contains(component.as_str()) {
+            findings.push(format!(
+                "component-unclassified: the pin declares {component:?} and the AGENTS.md \
+                 section on unverified components does not name it. A component nobody has \
+                 classified is one whose absence will be diagnosed as a defect of this \
+                 repository."
+            ));
+        }
+    }
+
+    // The load-bearing half: the clippy stage must register an exit OUTSIDE the code an absent
+    // component returns. This is the single edit that would convert every environment fault on
+    // that stage into a reported code defect.
+    let Some(clippy_exit) = registered_semantic_exit(check_sh, "clippy") else {
+        findings.push(
+            "gate-unreadable: could not locate the clippy stage's `--semantic-failure-exit` \
+             registration in scripts/check.sh. A restructured gate refuses here rather than \
+             passing on a registration this can no longer see."
+                .to_string(),
+        );
+        return findings;
+    };
+    if clippy_exit == COMPONENT_ABSENT_EXIT {
+        findings.push(format!(
+            "gate-conflates: scripts/check.sh registers exit {clippy_exit} as the clippy stage's \
+             SEMANTIC failure, and {COMPONENT_ABSENT_EXIT} is the exit a cargo gate returns when \
+             its component is absent. Registering it means an environment fault — a worker or a \
+             fresh clone without the `clippy` component of the pin — is reported as a code \
+             defect, which is FL-INV-07's prohibition: an inconclusive outcome rendered as a \
+             rejection. Measured at `925e6604`: a real clippy finding exits 101, an absent \
+             component exits 1."
+        ));
+    }
+    // A check that the SECTION still quotes the live registration stood here and was DELETED,
+    // because the mutation campaign proved it could not fail. Two reasons compound: the section
+    // legitimately quotes both registrations (101 for clippy, 1 for fmt) since the whole point
+    // is the contrast, and `"--semantic-failure-exit 101"` contains `"--semantic-failure-exit 1"`
+    // as a substring anyway. So no change to the gate could make it fire. An assertion that
+    // cannot fail reads exactly like coverage, which is the one thing worse than an absent
+    // check — `f2t9`'s two deleted `dep:`/`pkg/feat` assertions, same reasoning.
+
+    // And the gate that is NOT separable must stay disclosed. It is an open defect of this
+    // repository rather than of RCH, and a disclosure that quietly vanishes is worse than the
+    // defect, because the next reader will trust the gate.
+    if !(section.contains("cargo fmt --check") && section.contains("**no**")) {
+        findings.push(
+            "disclosure-dropped: the AGENTS.md section no longer discloses that `cargo fmt \
+             --check` cannot separate a component-absent failure from a real finding — both exit \
+             1. That disclosure is the only thing standing between a missing `rustfmt` and a \
+             reader diagnosing their own formatting."
+                .to_string(),
+        );
+    }
+    findings
+}
+
+fn pin_inputs() -> (String, String, String) {
+    let repo = worker_repo();
+    (
+        fs::read_to_string(repo.join("rust-toolchain.toml")).expect("rust-toolchain.toml"),
+        fs::read_to_string(repo.join("scripts/check.sh")).expect("scripts/check.sh"),
+        fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md"),
+    )
+}
+
+#[test]
+fn the_pin_declares_components_and_the_gates_that_cannot_separate_them_are_disclosed() {
+    let (manifest, check_sh, agents) = pin_inputs();
+    let findings = pin_component_findings(&manifest, &check_sh, &agents);
+    assert!(
+        findings.is_empty(),
+        "the pin's declared components, the gate that consumes them, and the doctrine that \
+         classifies their absence have come apart:\n\n{}",
+        findings.join("\n\n")
+    );
+}
+
+/// Gut 1: the clippy stage starts registering the environment-fault exit as semantic.
+#[test]
+fn a_clippy_stage_that_registers_the_component_absent_exit_is_caught() {
+    let (manifest, check_sh, agents) = pin_inputs();
+    let mutated = check_sh.replace("--semantic-failure-exit 101", "--semantic-failure-exit 1");
+    assert_ne!(mutated, check_sh, "the registration needle has moved");
+    let findings = pin_component_findings(&manifest, &mutated, &agents);
+    assert!(
+        findings.iter().any(|f| f.starts_with("gate-conflates")),
+        "registering the component-absent exit as a semantic failure must be caught — that one \
+         edit turns every environment fault into a code defect: {findings:?}"
+    );
+}
+
+/// Gut 2: a component is added to the pin and nobody classifies it.
+#[test]
+fn a_new_pin_component_that_nobody_classifies_is_caught() {
+    let (manifest, check_sh, agents) = pin_inputs();
+    let mutated = manifest.replace(
+        "components = [\"rustfmt\"",
+        "components = [\"llvm-tools-preview\", \"rustfmt\"",
+    );
+    assert_ne!(mutated, manifest, "the components needle has moved");
+    let findings = pin_component_findings(&mutated, &check_sh, &agents);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("component-unclassified") && f.contains("llvm-tools-preview")),
+        "a component added to the pin without being classified must be caught: {findings:?}"
+    );
+}
+
+/// Gut 3: the pin's component array becomes unreadable — a refusal, never a clean pin.
+#[test]
+fn a_pin_whose_components_cannot_be_read_refuses() {
+    let (manifest, check_sh, agents) = pin_inputs();
+    let mutated = manifest.replace("components = [", "components_disabled = (");
+    assert_ne!(mutated, manifest, "the components needle has moved");
+    let findings = pin_component_findings(&mutated, &check_sh, &agents);
+    assert!(
+        findings.iter().any(|f| f.starts_with("pin-floor")),
+        "a pin whose component array cannot be read must refuse, because that is \
+         indistinguishable from a pin declaring nothing: {findings:?}"
+    );
+}
+
+/// Gut 4: the doctrine section disappears.
+#[test]
+fn a_missing_component_doctrine_section_refuses() {
+    let (manifest, check_sh, agents) = pin_inputs();
+    let mutated = agents.replace(
+        "### The worker may lack a component of the pin",
+        "### Removed",
+    );
+    assert_ne!(mutated, agents, "the heading needle has moved");
+    let findings = pin_component_findings(&manifest, &check_sh, &mutated);
+    assert!(
+        findings.iter().any(|f| f.starts_with("doctrine-missing")),
+        "losing the section that classifies a component-absent failure must refuse: {findings:?}"
+    );
+}
+
+/// Gut 5: the disclosure of the gate that CANNOT separate is quietly dropped.
+#[test]
+fn dropping_the_non_separable_gate_disclosure_is_caught() {
+    let (manifest, check_sh, agents) = pin_inputs();
+    let mutated = agents.replace("| `cargo fmt --check` | **1** | **1** |", "| (removed) |");
+    assert_ne!(mutated, agents, "the disclosure needle has moved");
+    let findings = pin_component_findings(&manifest, &check_sh, &mutated);
+    assert!(
+        findings.iter().any(|f| f.starts_with("disclosure-dropped")),
+        "dropping the disclosure that fmt cannot separate must be caught: {findings:?}"
+    );
+}
+
+/// Gut 6: `check.sh` is restructured so the registration cannot be found.
+#[test]
+fn a_gate_whose_registration_cannot_be_located_refuses() {
+    let (manifest, check_sh, agents) = pin_inputs();
+    let mutated = check_sh.replace("|clippy|", "|clippy-stage|");
+    assert_ne!(mutated, check_sh, "the case-arm needle has moved");
+    let findings = pin_component_findings(&manifest, &mutated, &agents);
+    assert!(
+        findings.iter().any(|f| f.starts_with("gate-unreadable")),
+        "a gate whose registration this can no longer read must refuse rather than pass on a \
+         stale reading: {findings:?}"
+    );
+}
