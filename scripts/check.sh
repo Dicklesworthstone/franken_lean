@@ -200,6 +200,7 @@ INPUT_PATHS=(
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
   scripts/git-hooks/pre-commit scripts/git-hooks/install.sh
   scripts/git-hooks/test_projection_guard.sh
+  scripts/ubs_gate_classifier.sh scripts/test_ubs_gate_classifier.sh
   tribunal
   .github/workflows/ci.yml .github/workflows/contract-drift.yml
 )
@@ -1104,6 +1105,7 @@ run_stage() {
     case "$name" in
       verification-manifest|shellcheck|fmt|contract-handoff-no-mock|\
         tribunal-manifest-inventory|projection-guard-harness|\
+        ubs-gate-classifier|\
         epoch-lab-live-verify|structure-guard|vendor-tree|ubs)
         semantic_args=(--semantic-failure-exit 1)
         ;;
@@ -1600,7 +1602,8 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/lib/gate_lock.sh \
   scripts/tribunal/leanchecker_witness.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh \
   scripts/git-hooks/pre-commit scripts/git-hooks/install.sh \
-  scripts/git-hooks/test_projection_guard.sh
+  scripts/git-hooks/test_projection_guard.sh \
+  scripts/ubs_gate_classifier.sh scripts/test_ubs_gate_classifier.sh
 # The projection, verification-coverage and D3 root-attribute guards in
 # scripts/git-hooks/pre-commit are proved by scripts/git-hooks/test_projection_guard.sh,
 # which until now was shellchecked directly above and EXECUTED BY NOTHING — named in
@@ -1636,6 +1639,13 @@ fi
 # An absent publisher leaves this empty, the harness refuses with exit 2, and run_stage types
 # that as an internal_fault rather than a semantic failure — an environment fault is not a
 # finding about the code (FL-INV-07).
+# The UBS terminal classifier is proved here for the same reason the projection guard is: a
+# guard that is shellchecked and executed by nothing is the documented-command-nobody-invokes
+# shape. Its two-way control is the load-bearing one — a timeout must type as a non-answer AND
+# a genuine critical must still type as a rejection — because a classifier that stopped blocking
+# on everything would satisfy the first half and silence every real finding.
+run_stage ubs-gate-classifier bash "$REPO/scripts/test_ubs_gate_classifier.sh" \
+  "$REPO/scripts/ubs_gate_classifier.sh"
 run_stage projection-guard-harness bash "$REPO/scripts/git-hooks/test_projection_guard.sh" \
   "$REPO/scripts/git-hooks/pre-commit" \
   "$PROJECTION_PUBLISHER" \
@@ -1695,8 +1705,18 @@ if [ "$PLANT" = ubs ]; then
   run_stage ubs ubs --version
 elif command -v ubs >/dev/null 2>&1; then
   if [ "$UBS_COUNT" -gt 0 ]; then
+    # The `--` target is the CLASSIFIER, not `ubs` itself, and that indirection is the whole
+    # repair (bead fln-ubs-timeout-promoted-to-rejection-pekl). `ubs --ci` exits 1 for BOTH a
+    # genuine critical finding and a scanner MODULE_TIMEOUT, so registering it directly against
+    # --semantic-failure-exit 1 renders resource exhaustion as a REJECTION — an FL-INV-07
+    # violation in a lane whose own run_start declares FL-INV-07. exec-ubs-inventory execs its
+    # target with the validated paths appended, so the classifier receives exactly the same argv
+    # `ubs` would have, runs it, reads the terminal MESSAGE TEXT that carries the distinction,
+    # and exits 1 ONLY for completed_findings. Every non-answer exits 2, which is outside this
+    # stage's semantic set and therefore types internal_fault rather than fail.
     run_stage ubs "${PYTHON[@]}" "$EVIDENCE" exec-ubs-inventory \
-      --root "$REPO" --inventory "$UBS_INVENTORY" -- ubs --ci
+      --root "$REPO" --inventory "$UBS_INVENTORY" -- \
+      bash "$REPO/scripts/ubs_gate_classifier.sh"
     "${PYTHON[@]}" "$EVIDENCE" validate-ubs-inventory --root "$REPO" \
       --inventory "$UBS_INVENTORY" >/dev/null
   else
