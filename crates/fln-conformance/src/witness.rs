@@ -412,7 +412,7 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    row's OWN citation has asserted 85 since it was written — the prose and the \
                    tripwire beneath it disagreed from day one and nothing compares the two, \
                    which is this matrix's own defect arriving inside a row about that defect. \
-                   Of those 85, SEVENTY-NINE were earned against the SECOND definition; under \
+                   Of those 85, seventy-nine were earned against the SECOND definition; under \
                    the first, ZERO are, because no row in the file was compared on a corpus \
                    pass of any kind — the ledger's whole fixture evidence is 687 lines, while \
                    the one corpus-scale rig (kernel_replay.rs, 157,183 declarations against \
@@ -430,7 +430,15 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    a strictly larger claim than the bead states. DELIBERATELY NOT RESOLVED: \
                    inventing a third classification for rows whose author cannot be asked is \
                    choosing the answer. The population is declared and its members named; the \
-                   axis is NOT built. Readers resolve the first: README.md:42 and :94 advertise L0-L4 with \
+                   axis is NOT built. The three figures above are re-derived from \
+                   ci/PARITY_LEDGER.txt on every run and compared against this sentence in \
+                   both directions by \
+                   `the_l2_split_disclosure_matches_the_measured_ledger', so neither the file \
+                   nor this prose can move without the other — the join that was missing when \
+                   the description said 94 and the citation beneath it said 85. The canonical \
+                   form it parses, which is why these are digits and not words: \
+                   MEASURED-SPLIT l2=85 ledger-earned=79 neither=6 END-MEASURED-SPLIT. \
+                   Readers resolve the first: README.md:42 and :94 advertise L0-L4 with \
                    no local gloss, and the plan gates releases on it (R4 requires `all \
                    mandatory rows L4'). THIS ROW DOES NOT DECIDE WHICH DEFINITION WINS — that \
                    is a doctrine call above this matrix, and the bead states the cost of each \

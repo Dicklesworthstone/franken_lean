@@ -955,3 +955,139 @@ fn every_census_declares_why_its_remainder_is_ungoverned() {
         );
     }
 }
+
+/// Parse the canonical disclosure out of the L2-split row's evidence.
+///
+/// Refuses a missing, reworded, or non-numeric block by panicking rather than returning a
+/// default. A guard that silently accepts a disclosure it could not find would pass
+/// vacuously on exactly the edit it exists to catch — someone softening the sentence — which
+/// is `k60n`'s recorded failure and pfei R5's cheapest escape.
+fn parse_measured_split(evidence: &str) -> (usize, usize, usize) {
+    const OPEN: &str = "MEASURED-SPLIT ";
+    const CLOSE: &str = " END-MEASURED-SPLIT";
+    let start = evidence.find(OPEN).unwrap_or_else(|| {
+        panic!(
+            "the L2-split row's evidence carries no MEASURED-SPLIT block. A reworded or \
+             digit-less disclosure is refused as a VACUOUS comparison rather than passed: \
+             the point of this row is that the prose and ci/PARITY_LEDGER.txt cannot move \
+             independently, and deleting the block would otherwise be the way to go green."
+        )
+    });
+    let rest = &evidence[start + OPEN.len()..];
+    let end = rest
+        .find(CLOSE)
+        .unwrap_or_else(|| panic!("the MEASURED-SPLIT block is not terminated by {CLOSE:?}"));
+
+    let (mut l2, mut earned, mut neither) = (None, None, None);
+    for token in rest[..end].split_whitespace() {
+        let (key, value) = token
+            .split_once('=')
+            .unwrap_or_else(|| panic!("malformed MEASURED-SPLIT token {token:?}"));
+        let parsed: usize = value
+            .parse()
+            .unwrap_or_else(|_| panic!("non-numeric MEASURED-SPLIT token {token:?}"));
+        match key {
+            "l2" => l2 = Some(parsed),
+            "ledger-earned" => earned = Some(parsed),
+            "neither" => neither = Some(parsed),
+            other => panic!("unknown MEASURED-SPLIT key {other:?}"),
+        }
+    }
+    (
+        l2.expect("MEASURED-SPLIT must carry l2="),
+        earned.expect("MEASURED-SPLIT must carry ledger-earned="),
+        neither.expect("MEASURED-SPLIT must carry neither="),
+    )
+}
+
+/// The L2-split row's figures are re-derived from the ledger and compared in BOTH directions.
+///
+/// **This is the join that was missing, and its absence is measured rather than supposed.**
+/// Until 2026-07-27 the row's prose said "all 94 rows were earned against the second
+/// definition" while its own [`EVIDENCE_CITATIONS`] entry asserted `85`. Both sat in this
+/// file, neither was wrong about what it counted, and nothing compared them — so the
+/// description of the contradiction was itself false for two days while every anchor matched
+/// and every test was green. `evidence_that_has_gone_stale_is_caught_...` catches the tree
+/// moving under a citation; nothing caught the *prose* disagreeing with the citation.
+///
+/// **Equality in both directions, deliberately, and the direction that looks wrong is the
+/// point.** A new L2 row reddens this test until someone states which definition earned it —
+/// which is the whole question the bead exists to keep open. The one-way-plus-floor shape is
+/// for a declared remainder of permitted violations, which shrinks as people repair it; this
+/// is a disclosure of a *measured population*, which does not (the `3s8w` ruling).
+///
+/// **What this does not earn.** It binds the numbers, never the argument: it cannot tell
+/// whether "earned under the ledger's definition" is the right reading of any row, only that
+/// the count in the prose is the count in the file. It does not decide which definition wins,
+/// and it does not make the standing contradiction reddenable — the row stays
+/// [`Enforcement::Acknowledged`] and green by design.
+#[test]
+fn the_l2_split_disclosure_matches_the_measured_ledger() {
+    let ledger = fs::read_to_string(workspace_root().join("ci/PARITY_LEDGER.txt"))
+        .expect("ci/PARITY_LEDGER.txt must be readable");
+
+    let records: Vec<Vec<&str>> = ledger
+        .lines()
+        .filter(|line| line.starts_with("row "))
+        .map(|line| line.split('|').map(str::trim).collect())
+        .collect();
+
+    // A scan that cannot see the ledger must report a broken scan, never a clean tree. The
+    // floor sits far below the live 94 so it separates "parsed the file" from "parsed
+    // nothing" without reddening whenever a row is added.
+    assert!(
+        records.len() >= 50,
+        "parsed only {} row records from ci/PARITY_LEDGER.txt; a scan that cannot see the \
+         ledger reports a false clean rather than an empty population",
+        records.len()
+    );
+    assert!(
+        records.iter().all(|fields| fields.len() >= 7),
+        "a row record with fewer than 7 fields means the ledger's column shape moved, and \
+         every count derived below would be fiction rather than a finding"
+    );
+
+    let l2: Vec<&Vec<&str>> = records.iter().filter(|fields| fields[4] == "L2").collect();
+    // Derived from the ORACLE column rather than from a list of oracle kinds, so a new kind
+    // that is not the pinned binary joins the "meets neither" population automatically.
+    let neither = l2
+        .iter()
+        .filter(|fields| fields[6] != "pinned-binary")
+        .count();
+    let ledger_earned = l2.len() - neither;
+
+    assert!(
+        neither > 0 && ledger_earned > 0,
+        "measured {ledger_earned} earned / {neither} neither: a split with an empty half is \
+         not the split this row describes, and would pass vacuously in one direction"
+    );
+
+    let (disclosed_l2, disclosed_earned, disclosed_neither) =
+        parse_measured_split(row("PARITY-LEDGER-L2-MEANS-TWO-THINGS").evidence);
+
+    assert_eq!(
+        disclosed_l2,
+        l2.len(),
+        "the row discloses l2={disclosed_l2}; ci/PARITY_LEDGER.txt holds {} L2 rows. Either \
+         the ledger moved without the disclosure or the disclosure moved without the ledger.",
+        l2.len()
+    );
+    assert_eq!(
+        disclosed_earned, ledger_earned,
+        "the row discloses ledger-earned={disclosed_earned}; {ledger_earned} L2 rows carry \
+         oracle=pinned-binary, which is what the ledger's own L2 tier requires"
+    );
+    assert_eq!(
+        disclosed_neither, neither,
+        "the row discloses neither={disclosed_neither}; {neither} L2 rows carry an oracle \
+         that is not the pinned binary and so meet neither definition"
+    );
+    // A conservation assertion stood here and was REMOVED as unkillable, recorded where it
+    // stood rather than deleted silently (`k60n`'s tenth mutant, same resolution). Because
+    // `ledger_earned` is *derived* as `l2.len() - neither`, the three equalities above entail
+    // `disclosed_earned + disclosed_neither == disclosed_l2`: any triple that breaks
+    // conservation must already disagree with a measured value, so no mutation can reach the
+    // conservation check first. Measured, not reasoned — the planted mutant intended for it
+    // died at the `ledger-earned` equality instead. A check that cannot fail is decoration,
+    // and decoration in a guard is worse than absence because it reads as coverage.
+}
