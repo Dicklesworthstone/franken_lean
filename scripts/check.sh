@@ -57,6 +57,29 @@ EVIDENCE="$REPO/scripts/evidence.py"
 SCHEMA="fln.check/2"
 SCENARIO="quality_gate"
 BEAD="franken_lean-rur"
+
+# The build gate, taken by the lane instead of by its caller — bead
+# franken_lean-gate-lock-producer-optional-o2vz. The library landed VERIFIED AND DELIBERATELY
+# UNWIRED at 5a94b48e, at core scope, so that this wiring could be judged on the core's measured
+# behaviour rather than on a prediction of it; this is that wiring. Before it, the gate lockfile
+# was named in zero executable surfaces, which left a FREE probe uninformative (an unwrapped lane
+# takes no lock) and a HELD probe uninformative (anything at all may take the path).
+#
+# Placement is load-bearing in both directions and is stated as constructs, not line numbers,
+# because a line number is a claim that rots: this sits AFTER the argument `case` closes, so
+# `--help` exits without ever reaching the gate, and BEFORE the EXIT finalizer is installed, so a
+# contention `exit 3` runs no finalizer and leaves no partial evidence behind.
+#
+# Rolling this out to the remaining sites is a SEPARATE decision, deliberately not taken here.
+#
+# SC1091 is disabled rather than followed: the library is named as its own input to the shellcheck
+# stage below, so it is checked directly (exit 0) rather than through this `.`. Following it here
+# would need `-x` on the whole stage, which changes the verdict for 25 other scripts at once.
+# shellcheck source=scripts/lib/gate_lock.sh
+# shellcheck disable=SC1091
+. "$REPO/scripts/lib/gate_lock.sh"
+fln_gate_acquire "$SCENARIO"
+
 VERIFICATION_MANIFEST_REL="ci/VERIFICATION_MANIFEST.jsonl"
 VERIFICATION_MANIFEST="$REPO/$VERIFICATION_MANIFEST_REL"
 CHECK_STAGE_ORDER=(
@@ -158,6 +181,7 @@ INPUT_PATHS=(
   ci crates tools
   vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
+  scripts/lib/gate_lock.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh scripts/e2e/core_observables.sh
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh
@@ -699,6 +723,10 @@ abort_if_finalizer_signalled() {
 on_exit() {
   local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0
   local -a MARKER_PAUSE_ARGS=()
+  # Recorded FIRST, so it survives every later early-exit path in this finalizer. `|| true`
+  # because `set -e` is in force and a journal write is never worth killing a finalizer over;
+  # the kernel releases the gate when fd 9 closes regardless of whether this line ran.
+  fln_gate_release_note "$SCENARIO" || true
   if [ "$RUN_STARTED" -eq 0 ]; then
     trap - EXIT
     finalize_early_envelope "$observed_rc"
@@ -1557,7 +1585,8 @@ run_stage evidence-self-test "${PYTHON[@]}" scripts/evidence.py self-test \
 run_stage verification-manifest "${PYTHON[@]}" scripts/evidence.py \
   validate-verification-manifest --manifest "$VERIFICATION_MANIFEST" \
   --beads "$REPO/.beads/issues.jsonl"
-run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
+run_stage shellcheck shellcheck scripts/check.sh scripts/lib/gate_lock.sh \
+  scripts/verify_vendor_tree.sh \
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh \
   scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \
   scripts/extract/gen_core_ext_fixtures.sh \

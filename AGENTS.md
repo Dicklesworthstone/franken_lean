@@ -422,7 +422,7 @@ The three attempts, recorded because each was made in good faith by someone foll
 
 **Narrowness is a property of the lane you are running, never of lanes.** Derived at `5f7e44ad` from all 21 scripts in `scripts/e2e/` rather than read off one — 98np R1. **Eight lanes declare a governed set; thirteen declare none at all** and so cannot raise M2/M3/M4 under any write:
 
-| governed paths | lane | relative to `check.sh`'s 50 |
+| governed paths | lane | relative to `check.sh`'s 51 |
 |---|---|---|
 | 40 | `contract_handoff.sh` | 2 outside: `scripts/extract/census_materialize.sh`, `…/validate_extern_builtin_census.py` |
 | 19 | `vellum_naming_no_mock_e2e.sh` | 3 outside: **`AGENTS.md`**, `README.md`, the plan |
