@@ -3,13 +3,41 @@
 version = 4
 
 [[package]]
+name = "fln-bignum"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
+
+[[package]]
+name = "fln-conformance"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-env",
+ "fln-hash",
+ "fln-kernel",
+ "fln-olean",
+ "fln-verdict",
+]
+
+[[package]]
 name = "fln-core"
 version = "0.0.0"
+
+[[package]]
+name = "fln-env"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-hash",
+]
 
 [[package]]
 name = "fln-epoch-lab"
 version = "0.0.0"
 dependencies = [
+ "fln-conformance",
  "fln-hash",
 ]
 
@@ -18,4 +46,52 @@ name = "fln-hash"
 version = "0.0.0"
 dependencies = [
  "fln-core",
+]
+
+[[package]]
+name = "fln-kernel"
+version = "0.0.0"
+dependencies = [
+ "fln-bignum",
+ "fln-core",
+ "fln-env",
+]
+
+[[package]]
+name = "fln-olean"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-env",
+ "fln-rt",
+ "fln-unsafe-region",
+]
+
+[[package]]
+name = "fln-rt"
+version = "0.0.0"
+dependencies = [
+ "fln-unsafe-abi",
+ "fln-unsafe-region",
+]
+
+[[package]]
+name = "fln-unsafe-abi"
+version = "0.0.0"
+dependencies = [
+ "fln-bignum",
+]
+
+[[package]]
+name = "fln-unsafe-region"
+version = "0.0.0"
+
+[[package]]
+name = "fln-verdict"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-env",
+ "fln-hash",
+ "fln-kernel",
 ]

@@ -34,7 +34,7 @@ use fln_epoch_lab::derive::{
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    fln_conformance::checked_manifest_dir!().join("../..")
 }
 
 fn plan() -> PathBuf {
@@ -42,8 +42,8 @@ fn plan() -> PathBuf {
 }
 
 fn committed_module_artifact() -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../derived/v4.32.0/C1_MODULE_INVENTORY.txt");
+    let p =
+        fln_conformance::checked_manifest_dir!().join("../derived/v4.32.0/C1_MODULE_INVENTORY.txt");
     match std::fs::read_to_string(&p) {
         Ok(s) => s,
         Err(e) => panic!("the committed module artifact is missing at {p:?}: {e}"),
@@ -544,11 +544,11 @@ fn derivations_are_deterministic_across_repeated_runs() {
 // ---------------------------------------------------------------------------
 
 fn epoch_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../epochs/v4.32.0")
+    fln_conformance::checked_manifest_dir!().join("../epochs/v4.32.0")
 }
 
 fn committed_epoch_tree() -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../derived/v4.32.0/EPOCH_TREE.txt");
+    let p = fln_conformance::checked_manifest_dir!().join("../derived/v4.32.0/EPOCH_TREE.txt");
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("epoch tree missing at {p:?}: {e}"))
 }
 
@@ -630,7 +630,7 @@ fn an_edited_added_or_removed_epoch_file_is_detected() {
     // point a valid tree at the derived/ directory instead of the epoch.
     let drifts = fln_epoch_lab::derive::verify_epoch_tree(
         &committed_epoch_tree(),
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../derived/v4.32.0"),
+        &fln_conformance::checked_manifest_dir!().join("../derived/v4.32.0"),
         HEAD_ROOT,
     )
     .expect("parses");
@@ -669,7 +669,7 @@ fn a_tree_bound_to_a_different_head_is_refused() {
 // ---------------------------------------------------------------------------
 
 fn policy() -> Vec<(String, fln_epoch_lab::poison::Shippability)> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../derived/SHIPPABILITY_POLICY.txt");
+    let p = fln_conformance::checked_manifest_dir!().join("../derived/SHIPPABILITY_POLICY.txt");
     fln_epoch_lab::derive::read_shippability_policy(&p).expect("the policy file is readable")
 }
 

@@ -57,7 +57,6 @@ use fln_epoch_lab::g0::{
     Amendment, Block, BlockedReason, Decision, NoGo, Outcome, Resolution, Resources, RosterSpike,
     Scope, Witness, WitnessRoot, report, verify,
 };
-use std::path::PathBuf;
 
 /// The roster, DERIVED from the plan rather than transcribed.
 ///
@@ -66,7 +65,7 @@ use std::path::PathBuf;
 /// was enforcing a paraphrase. Every test below now measures against what the
 /// plan actually says.
 fn roster() -> Vec<RosterSpike> {
-    let plan = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let plan = fln_conformance::checked_manifest_dir!()
         .join("../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md");
     match derive_g0_roster(&plan) {
         Ok(d) => d.into_parts().0,

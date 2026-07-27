@@ -304,7 +304,7 @@ fn a_chain_from_another_epoch_is_refused() {
 /// pass.
 #[test]
 fn the_real_v4_32_0_epoch_lab_verifies() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../epochs/v4.32.0");
+    let dir = fln_conformance::checked_manifest_dir!().join("../epochs/v4.32.0");
     if !dir.join(CHAIN_FILE).exists() {
         eprintln!("SKIP (typed limitation): {EPOCH} chain not published yet");
         return;

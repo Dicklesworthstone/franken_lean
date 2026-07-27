@@ -698,7 +698,7 @@ fn evidence_state_and_claim_type_survive_a_round_trip_unconflated() {
 // ---------------------------------------------------------------------------
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    fln_conformance::checked_manifest_dir!().join("../..")
 }
 
 #[test]

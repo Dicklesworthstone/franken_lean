@@ -24,7 +24,7 @@ use fln_epoch_lab::poison::Shippability;
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    fln_conformance::checked_manifest_dir!().join("../..")
 }
 
 fn main() -> std::process::ExitCode {

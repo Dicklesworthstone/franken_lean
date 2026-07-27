@@ -549,10 +549,22 @@ impl ResidueBreach {
 ///   registration. `fln-conformance` is rank 22; every one of those crates ranks below it,
 ///   so a dev-dependency on it is an upward edge and `FLN-STRUCT-007` refuses it. Reaching
 ///   them means this check living in a low-rank crate.
-/// * **11 sites in `tribunal/epoch-lab`** are in a nested workspace that the members glob
-///   never walks, so they are outside the graph entirely — the shape
-///   `fln-bench-apparatus-empty-referent-bkw6` warns about, where the scope you measure and
-///   the scope you meant are not the same set.
+/// * **1 site in `tribunal/epoch-lab`**, down from 11, and what the other ten cost is the
+///   point: **nothing**. That population read as blocked because it sits in a nested
+///   workspace the members glob never walks — `fln-bench-apparatus-empty-referent-bkw6`'s
+///   shape, where the scope you measure and the scope you meant are different sets. But
+///   being outside the graph is the *reason it is reachable*, not a reason it is not: the
+///   lab is governed by no layering law, already path-depends into the product workspace
+///   (`fln-hash`), and owns its own `Cargo.lock`. A `dev-dependency` on `fln-conformance`
+///   therefore adds **no governance row and does not touch the root lock**, which is exactly
+///   the pair of concerns that crate's own manifest comment records. Measured, not assumed:
+///   `cargo check --tests --examples` there is clean and only `tribunal/epoch-lab/Cargo.lock`
+///   moves.
+///
+///   The one that remains is `src/main.rs`, and it is a **different** blocker rather than a
+///   leftover: a `dev-dependency` reaches `tests/` and `examples/` and not a `bin` target, so
+///   converting it means a *normal* dependency putting a rank-22 crate into the lab binary's
+///   runtime closure. That is a trade worth stating rather than making silently.
 ///
 /// **`tools/structure-guard` is converted, and its rows are gone from this table rather
 /// than zeroed.** That was the population blocked on *one line*: the crate is `kind=tool`
@@ -580,12 +592,7 @@ pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
     ("crates/fln-unsafe-region/src/tests.rs", 1),
     ("crates/fln-verdict/src/checker.rs", 1),
     ("crates/fln-verdict/tests/input_validation.rs", 1),
-    ("tribunal/epoch-lab/examples/derive_report.rs", 1),
     ("tribunal/epoch-lab/src/main.rs", 1),
-    ("tribunal/epoch-lab/tests/derived_input_provenance.rs", 6),
-    ("tribunal/epoch-lab/tests/epoch_lab_hash_chain.rs", 1),
-    ("tribunal/epoch-lab/tests/g0_spike_decision_model.rs", 1),
-    ("tribunal/epoch-lab/tests/parity_row_authority.rs", 1),
 ];
 
 /// Judge a census against a declared residue.
@@ -787,8 +794,35 @@ impl DisclosureBreach {
 }
 
 /// Read the number written immediately before `marker`, refusing every way that can fail.
-fn declared_before(text: &str, marker: &str) -> Result<usize, DisclosureBreach> {
-    let occurrences = text.matches(marker).count();
+/// The singular spelling of a `… sites …` marker, or `None` when the marker has no plural
+/// noun to fold.
+///
+/// **Why this exists, since accommodating a check is usually the wrong move.** A population
+/// that shrinks to exactly one forces a choice between ungrammatical prose in a
+/// constitutional document — "1 unprotected sites" — and softening the number. Neither is
+/// acceptable, and the number is the part that must not move: this folds only the NOUN, and
+/// the count is still compared exactly. The alternative anyone reaches for first is to widen
+/// the marker to a prefix like `" unprotected site"`, which silently starts matching
+/// `" unprotected sites across"` as well and makes two bindings read the same clause.
+fn singular_marker(marker: &str) -> Option<String> {
+    marker
+        .find("sites ")
+        .map(|at| format!("{}site {}", &marker[..at], &marker[at + "sites ".len()..]))
+}
+
+/// Returns the declared count **and the marker actually matched**, which differ whenever the
+/// singular fallback fires.
+fn declared_before(text: &str, marker: &str) -> Result<(usize, String), DisclosureBreach> {
+    let mut occurrences = text.matches(marker).count();
+    let mut marker = marker.to_string();
+    if occurrences == 0
+        && let Some(singular) = singular_marker(&marker)
+        && text.matches(singular.as_str()).count() == 1
+    {
+        occurrences = 1;
+        marker = singular;
+    }
+    let marker = marker.as_str();
     if occurrences == 0 {
         return Err(DisclosureBreach::Missing {
             marker: marker.to_string(),
@@ -811,6 +845,7 @@ fn declared_before(text: &str, marker: &str) -> Result<usize, DisclosureBreach> 
         .iter()
         .collect::<String>()
         .parse()
+        .map(|declared| (declared, marker.to_string()))
         .map_err(|_| DisclosureBreach::Unparsed {
             marker: marker.to_string(),
         })
@@ -882,13 +917,17 @@ pub fn disclosure_breaches(row: &str, pops: &CoveragePopulations) -> Vec<Disclos
         .filter_map(
             |(marker, measured, direction)| match declared_before(row, marker) {
                 Err(breach) => Some(breach),
-                Ok(declared) => {
+                Ok((declared, matched)) => {
                     let violated = match direction {
                         Direction::Exact => declared != *measured,
                         Direction::AtLeast => *measured < declared,
                     };
-                    violated.then(|| DisclosureBreach::Stale {
-                        marker: (*marker).to_string(),
+                    // `matched`, not `marker`: where the singular fallback fired, naming the
+                    // plural would send the reader grepping for a clause that is not in the
+                    // file. This repository's recorded cost of a refusal that names the wrong
+                    // thing is three panes chasing three wrong causes.
+                    violated.then_some(DisclosureBreach::Stale {
+                        marker: matched,
                         declared,
                         measured: *measured,
                     })
@@ -1648,6 +1687,91 @@ mod tests {
             vec![DisclosureBreach::Unparsed {
                 marker: " unprotected sites in tribunal/epoch-lab".to_string(),
             }]
+        );
+    }
+
+    /// A population that shrinks to exactly one may be disclosed in the **singular**, and the
+    /// count stays exact.
+    ///
+    /// Driven by injected input rather than by the live row, because the live row carries a
+    /// singular clause only while `tribunal/epoch-lab` sits at 1 — the moment it reaches 0 or
+    /// returns to 2 this path stops being exercised by the tree and becomes decorative, which
+    /// is precisely how a refusal survives a mutation campaign while doing nothing.
+    #[test]
+    fn a_population_of_one_may_be_disclosed_in_the_singular() {
+        let mut pops = sample_populations();
+        pops.epoch_lab_raw = 1;
+        let row = sample_row(&pops).replace(
+            "1 unprotected sites in tribunal/epoch-lab",
+            "1 unprotected site in tribunal/epoch-lab",
+        );
+        assert!(
+            row.contains("1 unprotected site in tribunal/epoch-lab"),
+            "the plant did not apply"
+        );
+        assert_eq!(
+            disclosure_breaches(&row, &pops),
+            vec![],
+            "a grammatical singular disclosure must be accepted"
+        );
+    }
+
+    /// Folding the noun must not fold the **number**: a singular clause carrying the wrong
+    /// count still fails. Without this cell the accommodation above would be indistinguishable
+    /// from softening the check to go green.
+    #[test]
+    fn a_singular_disclosure_with_the_wrong_count_still_fails() {
+        let mut pops = sample_populations();
+        pops.epoch_lab_raw = 1;
+        let row = sample_row(&pops).replace(
+            "1 unprotected sites in tribunal/epoch-lab",
+            "7 unprotected site in tribunal/epoch-lab",
+        );
+        assert_eq!(
+            disclosure_breaches(&row, &pops),
+            vec![DisclosureBreach::Stale {
+                marker: " unprotected site in tribunal/epoch-lab".to_string(),
+                declared: 7,
+                measured: 1,
+            }],
+            "the singular fallback must report the SINGULAR marker it actually matched, or the \
+             refusal sends the reader looking for a clause that is not in the file"
+        );
+    }
+
+    /// The fallback folds only a marker whose plural noun is followed by a word, so it can
+    /// never turn `" unprotected sites in tribunal/epoch-lab"` into a prefix that also matches
+    /// `" unprotected sites across"` — two bindings reading one clause would make the census
+    /// agree with itself while measuring the wrong population.
+    #[test]
+    fn the_singular_fold_cannot_collide_two_bindings() {
+        assert_eq!(
+            singular_marker(" unprotected sites in tribunal/epoch-lab").as_deref(),
+            Some(" unprotected site in tribunal/epoch-lab")
+        );
+        // My first version of this cell asserted None here and was WRONG: the fold applies
+        // to any marker with a plural noun followed by a word, so this yields
+        // `" unprotected site across"`. That is harmless and the reason is the guard, not the
+        // fold - the fallback fires ONLY when the plural has zero occurrences, so a live
+        // plural clause is never displaced. What must hold is that no folded marker collides
+        // with another binding's, in either direction.
+        assert_eq!(
+            singular_marker(" unprotected sites across").as_deref(),
+            Some(" unprotected site across")
+        );
+        assert_eq!(
+            singular_marker(" product crates"),
+            None,
+            "no trailing word to fold"
+        );
+        let folded = [
+            singular_marker(" unprotected sites in tribunal/epoch-lab").unwrap(),
+            singular_marker(" unprotected sites across").unwrap(),
+        ];
+        assert!(
+            !folded[0].starts_with(&folded[1]) && !folded[1].starts_with(&folded[0]),
+            "a folded marker that prefixes another binding's would make two bindings read one \
+             clause and agree while measuring different populations: {folded:?}"
         );
     }
 
