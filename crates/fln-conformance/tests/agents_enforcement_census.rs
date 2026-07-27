@@ -243,7 +243,7 @@ fn a_planted_live_claim_moves_the_derived_population() {
 /// figure drifted 26 → 27 → 28 while nothing about enforcement changed.
 #[test]
 fn a_claim_planted_inside_the_catalogue_does_not_move_the_live_population() {
-    let anchor = "   A twelfth is already filed and deliberately unmechanised:";
+    let anchor = "   A thirteenth is already filed and deliberately unmechanised:";
     let (_guard, path) = doctored(|text| {
         assert!(
             text.contains(anchor),
@@ -253,7 +253,7 @@ fn a_claim_planted_inside_the_catalogue_does_not_move_the_live_population() {
         text.replace(
             anchor,
             "   A planted decoy inside the catalogue: CI refuses every catalogued decoy.\n\n\
-             \x20  A twelfth is already filed and deliberately unmechanised:",
+             \x20  A thirteenth is already filed and deliberately unmechanised:",
         )
     });
     let (code, output) = run(Some(&path));
