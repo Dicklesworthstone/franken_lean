@@ -107,6 +107,62 @@ def src_meta(path: Path) -> dict:
     }
 
 
+# Fewer than this many vendored sources means the DERIVATION below is broken, not that the
+# extractor legitimately reads fewer: the six sources this file cannot render a contract without
+# are module.cpp (the olean_header struct, every layout row, the packing static_assert),
+# compact.cpp and compact.h (the compactor anchors), Environment.lean (ModuleData), Setup.lean
+# (Import) and References.lean (Ilean). The floor is deliberately NOT set at the current
+# population: a floor at today's count is a wall that reddens a correct repair the day a source
+# stops being read, which is this repository's recorded shrinking-allowance defect.
+VENDOR_SOURCE_FLOOR = 6
+
+
+def vendor_sources() -> list[tuple[str, Path]]:
+    """Every vendored Reference source this extractor reads, DERIVED from this module's own path
+    constants rather than listed.
+
+    Two hand-written lists of this population used to live in this file and they DISAGREED:
+    `build_inventory` named six and `render_exact_format` named nine. The contract's own sentence
+    -- "a sha256 is recorded below for each source read" -- was therefore false for
+    CompactedRegion.lean, Elab/Frontend.lean and Data/Lsp/Internal.lean, all three genuinely read
+    (bead `franken_lean-contract-pin-tree-unestablished-monc`). A listed scope rots silently the
+    day a tenth source is added; a derived one cannot. The key is the constant's own name
+    lowercased with underscores hyphenated, which reproduces every previously published key
+    byte-for-byte, so this is a derivation of the convention already in use rather than a new one.
+    """
+    found: dict[Path, str] = {}
+    for name, value in globals().items():
+        if not name.isupper() or not isinstance(value, Path):
+            continue
+        # The VENDOR root is itself trivially relative to VENDOR. Excluded BY NAME rather than by
+        # a quiet is_file() filter: a scan that silently skips what it cannot handle redefines its
+        # own denominator, which is the very defect this function exists to remove.
+        if value == VENDOR:
+            continue
+        try:
+            value.relative_to(VENDOR)
+        except ValueError:
+            continue
+        if not value.is_file():
+            die(
+                f"vendored source constant {name} does not name a readable file ({value}): "
+                "refusing rather than dropping it from the recorded set"
+            )
+        found[value] = name.lower().replace("_", "-")
+    if len(found) < VENDOR_SOURCE_FLOOR:
+        die(
+            f"vendored source derivation found {len(found)} sources, below the floor of "
+            f"{VENDOR_SOURCE_FLOOR}: refusing a broken walk rather than recording a silently "
+            "shrunken source set"
+        )
+    if MODULE_CPP not in found:
+        die(
+            "vendored source derivation did not find module.cpp, from which every field this "
+            "contract states is derived: refusing a broken walk"
+        )
+    return sorted((key, path) for path, key in found.items())
+
+
 C_FIELD_RX = re.compile(
     r"^\s*(char|uint8_t|size_t)\s+(\w+)\s*(\[\s*(\d*)\s*\])?\s*(?:=[^;]*)?(;|=\s*$)"
 )
@@ -570,13 +626,9 @@ def build_inventory() -> dict:
     return {
         "schema": SCHEMA,
         "pin": read_pin(),
-        "sources": [
-            src_meta(p)
-            for p in (
-                MODULE_CPP, COMPACT_CPP, COMPACT_H,
-                ENVIRONMENT_LEAN, SETUP_LEAN, REFERENCES_LEAN,
-            )
-        ],
+        # DERIVED, never listed -- see vendor_sources(). This list used to name six of the nine
+        # sources actually read, which made the rendered contract's own coverage sentence false.
+        "sources": [src_meta(path) for _key, path in vendor_sources()],
         "sizeof_size_t": sizeof_size_t,
         "header": parse_olean_header(module_text, sizeof_size_t),
         "versions": parse_versions(module_text),
@@ -1467,17 +1519,11 @@ def render_exact_format(inv: dict) -> str:
     abi_targets = parse_abi_targets()
     toolchain = reference_toolchain(pin)
     host_target_index = verify_toolchain_identity(toolchain, pin, targets)
-    sources = [
-        ("abi-target-layout", ABI_TARGET_LAYOUT_PATH, "derived-target-layout"),
-        ("compact-cpp", COMPACT_CPP, "SUITE.lock:reference"),
-        ("compact-h", COMPACT_H, "SUITE.lock:reference"),
-        ("compacted-region-lean", COMPACTED_REGION_LEAN, "SUITE.lock:reference"),
-        ("environment-lean", ENVIRONMENT_LEAN, "SUITE.lock:reference"),
-        ("frontend-lean", FRONTEND_LEAN, "SUITE.lock:reference"),
-        ("lsp-internal-lean", LSP_INTERNAL_LEAN, "SUITE.lock:reference"),
-        ("module-cpp", MODULE_CPP, "SUITE.lock:reference"),
-        ("references-lean", REFERENCES_LEAN, "SUITE.lock:reference"),
-        ("setup-lean", SETUP_LEAN, "SUITE.lock:reference"),
+    # The vendored rows are DERIVED from the same producer the Markdown block uses, so the two
+    # can no longer disagree; only the non-vendored row stays explicit, since it is not under
+    # VENDOR and carries a different authority.
+    sources = [("abi-target-layout", ABI_TARGET_LAYOUT_PATH, "derived-target-layout")] + [
+        (key, path, "SUITE.lock:reference") for key, path in vendor_sources()
     ]
     output = [
         f"schema {EXACT_FORMAT_SCHEMA}",
@@ -1705,12 +1751,18 @@ def render_markdown(inv: dict, digest: str) -> str:
     w.append(">   artifact's `lean_version` and `githash` fields.")
     if pin["tree"]:
         w.append(f"> — tree `{pin['tree']}` is **transcribed from `SUITE.lock` and NOT")
-        w.append(">   established by this extractor**. What is bound here is *content*: a")
-        w.append(">   sha256 is recorded below for each source read, so any change to those")
-        w.append(">   files is caught — while a staged tree differing from the pin in a file")
-        w.append(">   this extractor does not read is not. Tree identity is verified by")
-        w.append(">   `scripts/verify_vendor_tree.sh`, which the contract lanes run before")
-        w.append(">   extraction; this line records the pin, it does not attest to it.")
+        w.append(">   established by this extractor**. The D5/D9 producer-side obligation to")
+        w.append(">   establish it is **UNMET** — not deferred, and not handled elsewhere: no")
+        w.append(">   producer in this repository computes a tree identity at all. Coverage is")
+        w.append(">   LANE-SIDE only, by `scripts/verify_vendor_tree.sh`, which the contract")
+        w.append(">   lanes run before extraction — so an extraction performed outside those")
+        w.append(">   lanes establishes no tree identity whatever. Tracked as bead")
+        w.append(">   `franken_lean-contract-pin-tree-producer-side-f8zo`.")
+        w.append("> — what IS bound here is *content*: a sha256 is recorded below for **every**")
+        w.append(">   vendored source this extractor reads, and that set is DERIVED from the")
+        w.append(">   extractor's own path constants rather than listed, so it cannot fall")
+        w.append(">   behind the reads. A change to any of them is caught; a staged tree")
+        w.append(">   differing from the pin in a file this extractor does not read is not.")
     w.append(f"> inventory: `contracts/olean_inventory.json` sha256 `{digest}`")
     w.append("> rust: `crates/fln-olean/src/format.rs` (rendered from the same inventory)")
     w.append(">")

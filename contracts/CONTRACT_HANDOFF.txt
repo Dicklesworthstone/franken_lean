@@ -3,11 +3,11 @@ definition-root fnv1a64:bbeefd58635fa819
 inventory-root fnv1a64:cfb48a1ce52db39f
 suite-lock-root fnv1a64:54c4ae5afb0b3bbb
 policy-root fnv1a64:316fff3ad9eb14bc
-output-root fnv1a64:d8a750f4d97eb62b
+output-root fnv1a64:f0b422a94738945e
 row-count 17
 domain-count 4
-output-bytes 243784789
-row abi-contract-markdown path=ABI_CONTRACT.md domain=abi role=markdown bytes=69692 content-root=fnv1a64:b9e88685c8a40b62 identity=fnv1a64:a59cd4f3c16f3501 authority=observed support=required
+output-bytes 243786842
+row abi-contract-markdown path=ABI_CONTRACT.md domain=abi role=markdown bytes=70382 content-root=fnv1a64:b8a61e82db07618c identity=fnv1a64:81afab131dae9c6a authority=observed support=required
 row abi-inventory path=contracts/abi_inventory.json domain=abi role=canonical-intermediate bytes=258225 content-root=fnv1a64:f03e8eb84a119e68 identity=fnv1a64:e12e083671aeea40 authority=observed support=required
 row abi-layout path=contracts/ABI_TARGET_LAYOUT.txt domain=abi role=target-contract bytes=9975 content-root=fnv1a64:43b0e49c3089f94c identity=fnv1a64:88cec0decc9808d7 authority=observed support=required
 row abi-rust-boundary path=crates/fln-unsafe-abi/src/contract.rs domain=abi role=rust-boundary bytes=13162 content-root=fnv1a64:35727c893937709c identity=fnv1a64:5dc3fbcc8d5ddf5a authority=observed support=required
@@ -19,9 +19,9 @@ row builtin-partition path=contracts/builtin_partition.tsv domain=environment ro
 row contract-inventory path=contracts/PIN_TARGET_INVENTORY.txt domain=inventory role=canonical-join bytes=5500 content-root=fnv1a64:bbd4c486ab83994c identity=fnv1a64:e6f5096f3b8baf2f authority=observed support=required
 row extern-census path=contracts/extern_census.tsv domain=environment role=extern-census bytes=185758 content-root=fnv1a64:582aa13244796778 identity=fnv1a64:199013e84f39f05b authority=observed support=required
 row extern-environment-envelope path=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt domain=environment role=publication-envelope bytes=774 content-root=fnv1a64:3978c4e7669fcfb7 identity=fnv1a64:be36f0c89d98869f authority=observed support=required
-row format-contract-markdown path=OLEAN_CONTRACT.md domain=format role=markdown bytes=7061 content-root=fnv1a64:00b676ca3032adaa identity=fnv1a64:2a0bbe4c7891b65c authority=observed support=required
-row format-inventory path=contracts/olean_inventory.json domain=format role=canonical-intermediate bytes=5781 content-root=fnv1a64:1dc6e85e6f017fb9 identity=fnv1a64:9530c8afb83b9de0 authority=observed support=required
-row format-rust-public path=crates/fln-olean/src/format.rs domain=format role=rust-public bytes=4962 content-root=fnv1a64:79c8552904a503d0 identity=fnv1a64:a687715179e4d3cf authority=observed support=required
-row format-rust-region path=crates/fln-rt/src/region_contract.rs domain=format role=rust-region bytes=2682 content-root=fnv1a64:a288fa2b273b5044 identity=fnv1a64:8ff1e4c1d6df3a91 authority=observed support=required
+row format-contract-markdown path=OLEAN_CONTRACT.md domain=format role=markdown bytes=7923 content-root=fnv1a64:b81a84b91ae215b4 identity=fnv1a64:3777659e296a76dd authority=observed support=required
+row format-inventory path=contracts/olean_inventory.json domain=format role=canonical-intermediate bytes=6282 content-root=fnv1a64:5887eefa7c3dc8c9 identity=fnv1a64:c925d80d63ddd870 authority=observed support=required
+row format-rust-public path=crates/fln-olean/src/format.rs domain=format role=rust-public bytes=4962 content-root=fnv1a64:2a794d71716121a4 identity=fnv1a64:dc1cb5c0008e3ad4 authority=observed support=required
+row format-rust-region path=crates/fln-rt/src/region_contract.rs domain=format role=rust-region bytes=2682 content-root=fnv1a64:8e3a6cb63eb45800 identity=fnv1a64:b0bdfb977966d0a3 authority=observed support=required
 row olean-ilean-format path=contracts/OLEAN_ILEAN_FORMAT.txt domain=format role=exact-format-contract bytes=17787 content-root=fnv1a64:45181f2ea91fa218 identity=fnv1a64:fa0ea9909a6b59bc authority=observed support=required
-handoff-root fnv1a64:6e7d9c998c01b7e5
+handoff-root fnv1a64:8fac6576b81850be

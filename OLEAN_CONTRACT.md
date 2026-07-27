@@ -8,22 +8,31 @@
 >   Reference binary's `lean --version` and against every pinned `.olean`
 >   artifact's `lean_version` and `githash` fields.
 > — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91` is **transcribed from `SUITE.lock` and NOT
->   established by this extractor**. What is bound here is *content*: a
->   sha256 is recorded below for each source read, so any change to those
->   files is caught — while a staged tree differing from the pin in a file
->   this extractor does not read is not. Tree identity is verified by
->   `scripts/verify_vendor_tree.sh`, which the contract lanes run before
->   extraction; this line records the pin, it does not attest to it.
-> inventory: `contracts/olean_inventory.json` sha256 `901a2970a31a945a05bbf5e6f3bcb13fe01016a16930bcd654879403076437f8`
+>   established by this extractor**. The D5/D9 producer-side obligation to
+>   establish it is **UNMET** — not deferred, and not handled elsewhere: no
+>   producer in this repository computes a tree identity at all. Coverage is
+>   LANE-SIDE only, by `scripts/verify_vendor_tree.sh`, which the contract
+>   lanes run before extraction — so an extraction performed outside those
+>   lanes establishes no tree identity whatever. Tracked as bead
+>   `franken_lean-contract-pin-tree-producer-side-f8zo`.
+> — what IS bound here is *content*: a sha256 is recorded below for **every**
+>   vendored source this extractor reads, and that set is DERIVED from the
+>   extractor's own path constants rather than listed, so it cannot fall
+>   behind the reads. A change to any of them is caught; a staged tree
+>   differing from the pin in a file this extractor does not read is not.
+> inventory: `contracts/olean_inventory.json` sha256 `ecd0f18e64358bb69d1ce3e2880d08f5553d2f3789df46d531988cbfe7b577dc`
 > rust: `crates/fln-olean/src/format.rs` (rendered from the same inventory)
 >
 > sources:
-> - `vendor/lean4-src/src/library/module.cpp` (632 lines, sha256 `7343bfc1691a72d8550e4159e03f22ba528edb1942963f4cf04bb2bfda0b9469`)
 > - `vendor/lean4-src/src/runtime/compact.cpp` (736 lines, sha256 `490928b63b781f43956463bc418e3ab1cd218a4f438b72320a463f8dd12cde2c`)
 > - `vendor/lean4-src/src/runtime/compact.h` (145 lines, sha256 `89c7868a99e9f494313a5ce6286cf41194e60fea0e0c7178947a0f8ad3673ab6`)
+> - `vendor/lean4-src/src/Lean/CompactedRegion.lean` (111 lines, sha256 `56ef2a63c2394faefe590b58a5e3bd239589ddb6657a8523e5b0385800043f94`)
 > - `vendor/lean4-src/src/Lean/Environment.lean` (2835 lines, sha256 `100b207523d1005ae87f62f4e1693806854a35c59cd9b3210dfeeaa875d0ff98`)
-> - `vendor/lean4-src/src/Lean/Setup.lean` (204 lines, sha256 `7f085003e696df5c29af1dc1342ef3dfaaca70b6eaa5d357ce832abd49e9554c`)
+> - `vendor/lean4-src/src/Lean/Elab/Frontend.lean` (383 lines, sha256 `2616fef6e97c0a898d4b0c0e2207675c23396233748e5bf94b38fd72cf76733d`)
+> - `vendor/lean4-src/src/Lean/Data/Lsp/Internal.lean` (426 lines, sha256 `ebcd1850babf4c78f50d03f76d7d1b15b0bd1f3506a8fb8b29db39682a53f6c2`)
+> - `vendor/lean4-src/src/library/module.cpp` (632 lines, sha256 `7343bfc1691a72d8550e4159e03f22ba528edb1942963f4cf04bb2bfda0b9469`)
 > - `vendor/lean4-src/src/Lean/Server/References.lean` (858 lines, sha256 `b7022ed1a659d5181735d9ef0cd2f13cc2e3f96b11f5ece3e6e5defe8363ee88`)
+> - `vendor/lean4-src/src/Lean/Setup.lean` (204 lines, sha256 `7f085003e696df5c29af1dc1342ef3dfaaca70b6eaa5d357ce832abd49e9554c`)
 
 ## 1. The fixed header
 

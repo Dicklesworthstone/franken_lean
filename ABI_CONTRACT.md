@@ -7,11 +7,20 @@
 > — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
 > — all three pin fields above are **transcribed from `SUITE.lock` and NOT
 >   established by this extractor**: it verifies neither the tag, the commit,
->   nor the tree. Tree identity is verified by `scripts/verify_vendor_tree.sh`,
->   which the contract lanes run before extraction.
+>   nor the tree. The D5/D9 producer-side obligation to establish the tree is
+>   **UNMET** — not deferred, and not handled elsewhere: no producer in this
+>   repository computes a tree identity at all, and this gap is symmetric
+>   across both contract extractors. Coverage is LANE-SIDE only, by
+>   `scripts/verify_vendor_tree.sh`, which the contract lanes run before
+>   extraction — so an extraction performed outside those lanes establishes no
+>   tree identity whatever. Tracked as bead
+>   `franken_lean-contract-pin-tree-producer-side-f8zo`.
 > — what this extractor **does** establish: the vendored source below is
 >   byte-identical to the installed pinned toolchain's own copy of it, and the
->   extraction fails if they differ.
+>   extraction fails if they differ. That source set is complete — this
+>   extractor reads exactly one vendored file and records exactly one sha256,
+>   which is the one dimension in which it is NOT short where the `.olean`
+>   extractor was (bead `franken_lean-contract-pin-tree-unestablished-monc`).
 > source: `vendor/lean4-src/src/include/lean/lean.h` (3352 lines, sha256 `22eed50aa703c4403010fabc12a7231ffa34dc979bd59ca1bfbac13c29a1dad2`)
 > inventory: `contracts/abi_inventory.json` sha256 `f61654c61c404f3c34bfefbe695269dafaffadd146643083ffca3e73340e2254`
 > rust: `crates/fln-rt/src/abi.rs` (rendered from the same inventory)

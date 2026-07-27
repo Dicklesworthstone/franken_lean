@@ -574,3 +574,129 @@ fn extern_census_is_coherent() {
         );
     }
 }
+
+/// Every vendored source the `.olean` extractor READS must be recorded in the contract it
+/// renders (bead `franken_lean-contract-pin-tree-unestablished-monc`).
+///
+/// This exists because the extractor carried **two** hand-written lists of that population and
+/// they disagreed: `build_inventory` named six, `render_exact_format` named nine, and the
+/// contract's own sentence — "a sha256 is recorded below for each source read" — was therefore
+/// false for `CompactedRegion.lean`, `Elab/Frontend.lean` and `Data/Lsp/Internal.lean`, all
+/// three genuinely read.
+///
+/// **Why `--check` cannot replace this.** `--check` compares the artifact against what the
+/// producer renders *today*, so it is green whenever the two agree — including when the producer
+/// has silently gone back to naming a subset. This test derives the population from the
+/// extractor's own path constants and requires the artifact to match it, so replacing the
+/// derivation with a hand list fails here even though every artifact regenerates cleanly. That
+/// is precisely the state this repository was in before the repair.
+#[test]
+fn every_vendored_source_the_olean_extractor_reads_is_recorded_in_its_contract() {
+    let root = root();
+    let producer = fs::read_to_string(root.join("scripts/extract/gen_olean_contract.py"))
+        .expect("olean extractor");
+    let contract = fs::read_to_string(root.join("OLEAN_CONTRACT.md")).expect("olean contract");
+
+    // Derived from the producer's own constants. A line that looks like a vendored constant and
+    // does not parse is a REFUSAL, never a skip: a scan that quietly drops what it cannot read
+    // redefines its own denominator, which is the defect family this guard belongs to.
+    let mut declared: Vec<String> = Vec::new();
+    for line in producer.lines() {
+        let Some((name, rest)) = line.split_once(" = VENDOR / ") else {
+            continue;
+        };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+            continue;
+        }
+        let mut parts = vec!["vendor/lean4-src".to_string()];
+        for segment in rest.trim().split(" / ") {
+            let literal = segment
+                .trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or_else(|| {
+                    panic!("vendored constant {name} has an unparsable segment {segment:?}")
+                });
+            parts.push(literal.to_string());
+        }
+        declared.push(parts.join("/"));
+    }
+    declared.sort();
+    declared.dedup();
+
+    let mut recorded: Vec<String> = Vec::new();
+    for line in contract.lines() {
+        if let Some(rest) = line.strip_prefix("> - `vendor/lean4-src/") {
+            let (path, _) = rest
+                .split_once('`')
+                .unwrap_or_else(|| panic!("unterminated source row: {line:?}"));
+            recorded.push(format!("vendor/lean4-src/{path}"));
+        }
+    }
+    recorded.sort();
+    recorded.dedup();
+
+    // Anti-vacuity floors on BOTH sides. Two empty sets compare equal, so without these a broken
+    // scan on either side is indistinguishable from a clean tree. Six is the number of sources
+    // this contract cannot be rendered without; it is deliberately not the current population,
+    // because a floor pinned at today's count is a wall that reddens a correct removal.
+    assert!(
+        declared.len() >= 6,
+        "derived only {} vendored constants from the extractor — refusing a broken scan",
+        declared.len()
+    );
+    assert!(
+        recorded.len() >= 6,
+        "found only {} source rows in OLEAN_CONTRACT.md — refusing a broken scan",
+        recorded.len()
+    );
+
+    // Equality in BOTH directions. This is a measured population that must match exactly, not a
+    // declared remainder that shrinks with repair, so equality is correct here and one-way
+    // membership would let the artifact fall behind the reads again.
+    assert_eq!(
+        declared, recorded,
+        "the sources OLEAN_CONTRACT.md records and the sources the extractor reads disagree; \
+         the contract states a sha256 is recorded for every source read, so this makes that \
+         sentence false (bead franken_lean-contract-pin-tree-unestablished-monc)"
+    );
+}
+
+/// Both contracts must disclose the D5/D9 producer-side tree obligation as **UNMET**
+/// (bead `franken_lean-contract-pin-tree-producer-side-f8zo`).
+///
+/// The obligation is real and unmet: `rev-parse`, `ls-tree` and `hash_object` occur zero times
+/// in either extractor, so no producer computes a tree identity. It is covered lane-side only.
+/// Without this test, an edit restoring a single-voice pin line — or softening "UNMET" to
+/// "verified by the lanes" — is caught only by the byte-compare and goes green again on the next
+/// regeneration, which is exactly the unwatched join the bead was split off for.
+#[test]
+fn both_contracts_disclose_the_producer_side_tree_obligation_as_unmet() {
+    let root = root();
+    for name in ["OLEAN_CONTRACT.md", "ABI_CONTRACT.md"] {
+        let raw = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // Strip blockquote prefixes and collapse whitespace before matching. These blocks are
+        // hard-wrapped by the renderer, so a needle that spans a wrap point tests the wrapping
+        // rather than the claim: `is **UNMET**` matched the `.olean` contract and missed the ABI
+        // one purely because the line broke between the two words.
+        let text = raw
+            .lines()
+            .map(|l| l.trim_start().trim_start_matches('>').trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("**UNMET**"),
+            "{name} must state the producer-side tree obligation is UNMET, not deferred or handled"
+        );
+        assert!(
+            text.contains("LANE-SIDE only"),
+            "{name} must state the coverage is lane-side ONLY — a lane that covers it is not a \
+             producer that establishes it"
+        );
+        assert!(
+            text.contains("franken_lean-contract-pin-tree-producer-side-f8zo"),
+            "{name} must cite the bead tracking the unmet obligation, so the disclosure has a \
+             producer and cannot outlive the work"
+        );
+    }
+}

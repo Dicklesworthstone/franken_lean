@@ -231,11 +231,6 @@
  "sizeof_size_t": 8,
  "sources": [
   {
-   "lines": 632,
-   "path": "vendor/lean4-src/src/library/module.cpp",
-   "sha256": "7343bfc1691a72d8550e4159e03f22ba528edb1942963f4cf04bb2bfda0b9469"
-  },
-  {
    "lines": 736,
    "path": "vendor/lean4-src/src/runtime/compact.cpp",
    "sha256": "490928b63b781f43956463bc418e3ab1cd218a4f438b72320a463f8dd12cde2c"
@@ -246,19 +241,39 @@
    "sha256": "89c7868a99e9f494313a5ce6286cf41194e60fea0e0c7178947a0f8ad3673ab6"
   },
   {
+   "lines": 111,
+   "path": "vendor/lean4-src/src/Lean/CompactedRegion.lean",
+   "sha256": "56ef2a63c2394faefe590b58a5e3bd239589ddb6657a8523e5b0385800043f94"
+  },
+  {
    "lines": 2835,
    "path": "vendor/lean4-src/src/Lean/Environment.lean",
    "sha256": "100b207523d1005ae87f62f4e1693806854a35c59cd9b3210dfeeaa875d0ff98"
   },
   {
-   "lines": 204,
-   "path": "vendor/lean4-src/src/Lean/Setup.lean",
-   "sha256": "7f085003e696df5c29af1dc1342ef3dfaaca70b6eaa5d357ce832abd49e9554c"
+   "lines": 383,
+   "path": "vendor/lean4-src/src/Lean/Elab/Frontend.lean",
+   "sha256": "2616fef6e97c0a898d4b0c0e2207675c23396233748e5bf94b38fd72cf76733d"
+  },
+  {
+   "lines": 426,
+   "path": "vendor/lean4-src/src/Lean/Data/Lsp/Internal.lean",
+   "sha256": "ebcd1850babf4c78f50d03f76d7d1b15b0bd1f3506a8fb8b29db39682a53f6c2"
+  },
+  {
+   "lines": 632,
+   "path": "vendor/lean4-src/src/library/module.cpp",
+   "sha256": "7343bfc1691a72d8550e4159e03f22ba528edb1942963f4cf04bb2bfda0b9469"
   },
   {
    "lines": 858,
    "path": "vendor/lean4-src/src/Lean/Server/References.lean",
    "sha256": "b7022ed1a659d5181735d9ef0cd2f13cc2e3f96b11f5ece3e6e5defe8363ee88"
+  },
+  {
+   "lines": 204,
+   "path": "vendor/lean4-src/src/Lean/Setup.lean",
+   "sha256": "7f085003e696df5c29af1dc1342ef3dfaaca70b6eaa5d357ce832abd49e9554c"
   }
  ],
  "versions": {
