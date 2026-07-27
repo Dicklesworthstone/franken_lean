@@ -576,6 +576,47 @@ br sync --flush-only     # export to JSONL (NO git ops)
 
 Conventions: use the bead ID (e.g. `br-123`) as the Agent-Mail `thread_id` and prefix subjects with `[br-123]`; put the issue ID in the file-reservation `reason`; include `br-###` in commit messages. Map beads to workstreams (W1 Substrate & Contracts … W12 Distribution & Epochs) and gates (G0–G6) from §22 of the plan.
 
+### A comment body is a shell word before it is a record — pass it with `-f`, never `-m` (bead `fln-qpkj`)
+
+**The write reports success and the record is already damaged.** A body passed as an inline
+double-quoted argument is expanded *before* `br` ever sees it, so a markdown backtick pair is a
+**command substitution**: the shell runs the enclosed word and splices its output in. Observed on
+`fln-171x` — a backticked field name vanished and the stored text reads `carries , the byte
+offset`, a grammatical sentence with the identifier silently removed. It was caught only because
+the word happened to name a binary that is not installed; `date`, `id` or `w` would have injected
+their **output** into the durable record with no signal at all. **Bead comments are immutable, so
+this cannot be repaired — only annotated.** The same hazard covers `$(…)`, bare `$VAR` and `!`.
+
+```bash
+br comments add <id> -f body.md          # correct: no expansion is possible
+git commit -F msg.txt                    # the second surface: `-m` globbing eats backticked tokens
+```
+
+**Post-hoc detection does not work here and the measurement is the reason, not an excuse.** Over
+407 beads and 1502 stored comments, the two signatures with real recall are saturated by this
+project's own house style — call syntax quoted in comments (169) and column-aligned tables inside
+comments (162) — so 19.4% of comments carry a signature and **that figure is not a damage count.**
+Hand-adjudicating the seven low-saturation hits gave 1 confirmed, 1 correction quoting it, 1
+previously-unrecorded candidate, 1 ambiguous, and 3 false positives all from `--root .`. This is
+[`fln-ysvo`'s shape](#evidence--census-pins--operational-gotchas): **a detector saturates on good
+practice.** Refusing the write instead has no such problem, so the tool is a write-path one.
+
+`scripts/br_comment.py` (`write <id> <body-file>`) hands the body to `br` through an **argv list**,
+so no expansion is possible at all. On read-back `scripts/br_comment.py` refuses any mismatch it
+finds, which is exact rather than heuristic: it compares what landed against what was meant rather
+than reasoning about the path between them. (The producer is named twice on purpose — the census
+that counts these claims segments by **physical line**, so a hard wrap falling between a claim and
+its producer is by itself enough to make a bound claim read as unbound.) Demonstrated in both directions against a scratch database:
+a body carrying a backtick *and* a `$(…)` is **accepted** byte-identically, the same body written
+the corrupting way is **refused** naming the first differing character, and two controls separate
+those from a verifier that always refuses.
+
+**What this does not earn.** Nothing forces the tool's use: plain `br` still works and a corrupting
+write still succeeds. The read-back proves *this* write landed intact and says nothing about any
+other. The saturation figures are one corpus at one commit, class `bounded_model`, and the
+adjudicated count is a **floor** — damage whose lost token left no whitespace scar is invisible to
+any scan.
+
 ### The projection guard (bead `franken_lean-projection-republish-mechanical-voz4`)
 
 `ci/KERNEL_CONTRACT_OWNERSHIP.jsonl` is a canonical projection over the sorted id set of `.beads/issues.jsonl`. A commit carrying the JSONL with a stale projection turns `cargo test` red **workspace-wide**, for every agent — and four separate agents produced that state on 2026-07-24/25 alone, each of whom knew the rule. One of them had not touched beads at all: an incidental `git add` swept the JSONL into their commit.
@@ -897,12 +938,14 @@ Hard-won facts that will bite you if unknown:
    **This file's own enforcement claims are now counted, by a producer in the repository** (bead `franken_lean-pfei` R1). AGENTS.md is the densest source of unbound enforcement claims here, and four of its claims were measured false in two days — so the population is derived per commit rather than described:
 
    ```text
-   enforcement-census: live=29 bound=14 unbound=15 catalogued=8
+   enforcement-census: live=30 bound=15 unbound=15 catalogued=10
    ```
 
    `scripts/agents_enforcement_census.py --check` derives it and refuses any disagreement **in either direction**, so a new unbound claim raises the number and its author must say so, while a repair lowers it. `the_agents_enforcement_census_matches_the_file_it_describes` runs it under plain `cargo test`.
 
    **Read `bound` as "names a candidate referent in the same sentence" — never as "verified".** A sentence citing a deleted test still counts as bound; making the producer *denote* is pfei R2 and is not built.
+
+   **The 29 → 30 movement is the `fln-qpkj` write-path guard, disclosed here as its author, and getting it counted took four attempts that are themselves the finding.** "Same sentence" is implemented as **same physical line**, and this file is hard-wrapped, so the same claim in the same words was scored three different ways by nothing but typography: `is **refused**` does not match while `is refused` does, because markdown emphasis breaks the verb; `refuses on any mismatch` does not match while `refuses any mismatch` does; and a wrap falling between `refuses any` and `mismatch`, or between a claim and its producer, silently converts counted→uncounted and bound→unbound. So `live` under-counts wherever this file's own emphasis habit meets an enforcement verb, and `bound` under-counts wherever a paragraph wraps in the wrong place — **both in addition to the over-count** the burstiness row above records, where a disclaimer matched on a positive verb phrase inside a negative sentence. Read the pair as **upper bounds with unstable margins in both directions**, not as a conservative estimate. Narrowing the verb set to exclude negated subjects would move the over-counted member but also delete the three deliberate `nothing holds|watches|binds` members, so it is not a pure narrowing and needs a decision rather than a patch (measured by cc_3 at `7b5dd549`; routed to the census's owner rather than repaired here, since the scan is not this pane's file).
 
    **The 27 → 28 movement on 2026-07-27 is disclosed here with its reason, because the reason is a limit of the scan rather than of the sentence.** The new member is the coverage-row obligation added to the judgement-row section, and it *does* name its producer in plain English — the verification-coverage-guard living in the pre-commit hook. The scan cannot see it: `test-fn` requires a closing backtick immediately after the token, so a backticked **path** never matches, and `source-file` requires one of seven file **extensions**, which an extensionless executable hook does not have. So the member is genuinely unbound *by this scan's definition* while naming its producer to any reader, and the number was raised rather than the sentence reworded — softening the sentence to go green is pfei R5 and is the one move this census exists to make expensive. Two consequences worth keeping: the unbound figure is an **upper bound** on real unboundedness, not a count of unnamed producers; and extending the pattern set to recognise extensionless hook paths would move this member without any prose changing, which is a repair someone should make deliberately rather than discover as drift.
 
