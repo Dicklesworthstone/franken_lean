@@ -59,6 +59,15 @@ use std::path::{Path, PathBuf};
 /// environment of the process it launches.
 pub const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
 
+/// The precise compile-time form the census counts, assembled from fragments so this
+/// module's own source does not contain it.
+///
+/// **One copy, deliberately.** [`census`] and [`needle_drifts`] must count the *same* needle
+/// or the reconciliation between them compares two different questions and can agree while
+/// both are wrong. The decoy in [`needle_decoy`] is the part that must stay independent, and
+/// it derives from [`MANIFEST_DIR_VAR`] instead.
+const RAW_NEEDLE: &str = concat!("env!(\"CARGO_", "MANIFEST_DIR\")");
+
 /// Why a run cannot be trusted to describe the tree it was launched from.
 ///
 /// Both variants are refusals. There is deliberately no "probably fine" outcome: a check
@@ -255,7 +264,7 @@ pub struct RootResolutionCensus {
 /// below still count, and a raw site added to this module would still be found. It only
 /// keeps the scanner's own needle literals out of the population it measures.
 pub fn census<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> RootResolutionCensus {
-    const RAW: &str = concat!("env!(\"CARGO_", "MANIFEST_DIR\")");
+    const RAW: &str = RAW_NEEDLE;
     const CHECKED_ROOT: &str = concat!("checked_workspace_", "root!(");
     const CHECKED_DIR: &str = concat!("checked_manifest_", "dir!(");
 
@@ -275,6 +284,161 @@ pub fn census<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> RootRe
         }
     }
     census
+}
+
+/// A deliberately planted occurrence of the raw form, whose only job is to be **found**.
+///
+/// **An empty scan must be a failure, not a clean tree.** If the needle in [`census`] stops
+/// matching, `raw_sites` becomes 0, [`residue_breaches`] returns nothing, and every
+/// judgement built on it passes — a green that means nothing. AGENTS.md records that exact
+/// shape three times: `fln-8zsq`'s guard, where a planted mutant survived because a second
+/// copy of the qualifier satisfied the check; `franken_lean-2ki4`'s probe, which reported a
+/// production heuristic present *after it had been deleted*; and the mandated-mutants lane,
+/// where dropping `--ignored` makes the libtest filter match nothing and **exit 0**, green
+/// forever while running no campaign.
+///
+/// **It is built from [`MANIFEST_DIR_VAR`], deliberately NOT from the needle's own
+/// fragments.** A decoy assembled from the same fragments as the thing it validates moves
+/// with it: break the needle, the decoy breaks identically, and the liveness check passes on
+/// a matcher that matches nothing. That is the vacuity trap re-entered *inside* the fix for
+/// it, so the decoy derives from the authoritative variable name instead. If
+/// `MANIFEST_DIR_VAR` itself changes, both move together — which is correct, because then
+/// the variable really did change.
+///
+/// It returns a `String` rather than being a `const` so this module's own source never
+/// contains the literal, which is what keeps the scanner's text out of its own search space.
+pub fn needle_decoy() -> String {
+    format!("fn decoy() -> &'static str {{ env!(\"{MANIFEST_DIR_VAR}\") }}")
+}
+
+/// A file where the coarse and precise matchers disagree about the same source.
+///
+/// The precise needle is `env!("…")`; the coarse one is the bare variable name, which any
+/// occurrence of the precise form must also contain. So `precise <= coarse` always, and
+/// **equality is the invariant** everywhere except the files that discuss the needle in
+/// prose. That reconciliation is what catches the failure a decoy cannot: production code
+/// adopting a spelling the precise needle misses. The counts then diverge per file and are
+/// named, instead of the population silently shrinking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NeedleDrift {
+    /// A file mentions the variable more often than the precise form matches, and is not a
+    /// declared divergence. Either a new spelling or a runtime read — both need review.
+    Spelling {
+        /// Repository-relative path.
+        path: String,
+        /// Occurrences of the bare variable name.
+        coarse: usize,
+        /// Occurrences of the precise compile-time form.
+        precise: usize,
+    },
+    /// A declared divergence that no longer diverges. Left standing it would excuse a real
+    /// drift in that file forever, so it is refused rather than tolerated — the same
+    /// direction as deleting a repaired residue row.
+    StaleDivergence {
+        /// Repository-relative path.
+        path: String,
+    },
+    /// The precise matcher found more than the coarse one, which is arithmetically
+    /// impossible for a substring. The matchers are inconsistent and nothing below them can
+    /// be trusted.
+    Impossible {
+        /// Repository-relative path.
+        path: String,
+        /// Occurrences of the bare variable name.
+        coarse: usize,
+        /// Occurrences of the precise compile-time form.
+        precise: usize,
+    },
+}
+
+impl NeedleDrift {
+    /// The operator-facing refusal, naming the file, both counts and the repair.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Spelling {
+                path,
+                coarse,
+                precise,
+            } => format!(
+                "{path} mentions the manifest-dir variable {coarse} time(s) but the \
+                 compile-time needle matches only {precise}. Either this file uses a \
+                 spelling the census cannot see — in which case the census is silently \
+                 under-counting the unprotected population and its zero is not a clean tree \
+                 — or it reads the variable at run time, which is legitimate and must be \
+                 declared in DECLARED_NEEDLE_DIVERGENCE with a reason. Bead \
+                 fln-cross-tree-baked-root-k60n."
+            ),
+            Self::StaleDivergence { path } => format!(
+                "{path} is declared in DECLARED_NEEDLE_DIVERGENCE but its coarse and precise \
+                 counts now agree, so the declaration excuses nothing and would hide a real \
+                 drift in that file forever. Delete the row. Bead \
+                 fln-cross-tree-baked-root-k60n."
+            ),
+            Self::Impossible {
+                path,
+                coarse,
+                precise,
+            } => format!(
+                "{path} matched the precise needle {precise} time(s) and the bare variable \
+                 name only {coarse}. The precise form contains the bare name, so this is \
+                 impossible and the two matchers are inconsistent: no count in this module \
+                 means anything until that is resolved. Bead \
+                 fln-cross-tree-baked-root-k60n."
+            ),
+        }
+    }
+}
+
+/// Files whose own text discusses the needle, and so must be cut out of the reconciliation.
+///
+/// **Cut the region at the first source-reading guard, so only production code is in
+/// scope.** `franken_lean-2ki4` is the standing argument: its probe looked for a
+/// size-heuristic literal that also appeared inside the `fln-8zsq` guard's *assertion*, so
+/// it reported the production heuristic present after it had been deleted. Self-exclusion
+/// alone is not enough — every guard body must be out of scope, not merely one's own.
+///
+/// Checked in **both** directions: an entry that no longer diverges is refused as stale.
+pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[(
+    "crates/fln-conformance/src/tree_identity.rs",
+    "this module: needle fragments, the run-time read in manifest_dir_of, the failure prose \
+     naming the repair, and the decoy's own format string",
+)];
+
+/// Reconcile the precise needle against a coarser, independent one, per file.
+///
+/// Pure, so a broken needle, a new spelling, a stale declaration and an impossible pair are
+/// all reachable from a test without staging a repository.
+pub fn needle_drifts<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    declared: &[(&str, &str)],
+) -> Vec<NeedleDrift> {
+    let declared: std::collections::BTreeSet<&str> =
+        declared.iter().map(|(path, _)| *path).collect();
+    let mut drifts = Vec::new();
+    for (path, contents) in files {
+        let coarse = contents.matches(MANIFEST_DIR_VAR).count();
+        let precise = contents.matches(RAW_NEEDLE).count();
+        if precise > coarse {
+            drifts.push(NeedleDrift::Impossible {
+                path: path.to_string(),
+                coarse,
+                precise,
+            });
+        } else if declared.contains(path) {
+            if coarse == precise {
+                drifts.push(NeedleDrift::StaleDivergence {
+                    path: path.to_string(),
+                });
+            }
+        } else if coarse != precise {
+            drifts.push(NeedleDrift::Spelling {
+                path: path.to_string(),
+                coarse,
+                precise,
+            });
+        }
+    }
+    drifts
 }
 
 /// A file resolving paths against its bake tree that the declared residue does not
@@ -569,7 +733,8 @@ pub enum DisclosureBreach {
         /// The exact phrase looked for.
         marker: String,
     },
-    /// The document declares a number the tree contradicts.
+    /// The document declares a number the tree contradicts, in the direction that binding
+    /// forbids.
     Stale {
         /// The exact phrase looked for.
         marker: String,
@@ -651,41 +816,85 @@ fn declared_before(text: &str, marker: &str) -> Result<usize, DisclosureBreach> 
         })
 }
 
+/// Which way a disclosed number is allowed to move.
+///
+/// **The first version of this binding made every number `Exact`, and that was wrong in the
+/// direction that taxes a repair.** Within one hour it reddened the workspace twice — once by
+/// my own hand and once by a peer — for the *good* event: a rig being converted to
+/// `checked_workspace_root!()`, which grows the protected count. `RAW_SITE_RESIDUE`'s own
+/// docs already state the rule this violated: "reverse membership is a wall that reddens a
+/// correct repair". So the populations divide by which direction is the defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// A measured population that must not move either way without the row moving: the
+    /// **unprotected** counts. Silent growth is the defect this bead exists for, and silent
+    /// shrinkage would let a repair go unrecorded.
+    Exact,
+    /// A **floor**. The protected counts may grow freely — that is the repair — and may not
+    /// shrink. The cost is stated rather than hidden: a floor left un-raised understates
+    /// coverage, so the number is a lower bound and the prose must say so.
+    AtLeast,
+}
+
 /// Judge the k60n coverage disclosure against the populations it claims to describe.
 ///
 /// The phrase for each number is the *whole* binding, which is why they are long and
 /// specific: a marker of `" sites"` would match four places and bind none of them. Scope an
 /// assertion to the site that must carry the evidence, never to the document.
 pub fn disclosure_breaches(row: &str, pops: &CoveragePopulations) -> Vec<DisclosureBreach> {
-    let bindings: [(&str, usize); 7] = [
-        (" checked invocation sites", pops.checked_sites),
-        (" crates outside the defining module", pops.checked_members),
+    let bindings: [(&str, usize, Direction); 7] = [
+        // Protected: growing these is the whole point of the bead.
+        (
+            " checked invocation sites",
+            pops.checked_sites,
+            Direction::AtLeast,
+        ),
+        (
+            " crates outside the defining module",
+            pops.checked_members,
+            Direction::AtLeast,
+        ),
+        // Unprotected: these may not move in either direction unattended.
         (
             " raw sites in tools/structure-guard",
             pops.structure_guard_raw,
+            Direction::Exact,
         ),
-        (" unprotected sites across", pops.product_raw),
-        (" product crates", pops.product_members),
+        (
+            " unprotected sites across",
+            pops.product_raw,
+            Direction::Exact,
+        ),
+        (" product crates", pops.product_members, Direction::Exact),
         (
             " unprotected sites in tribunal/epoch-lab",
             pops.epoch_lab_raw,
+            Direction::Exact,
         ),
         (
             " raw sites in the defining module",
             pops.defining_module_raw,
+            Direction::Exact,
         ),
     ];
     bindings
         .iter()
-        .filter_map(|(marker, measured)| match declared_before(row, marker) {
-            Err(breach) => Some(breach),
-            Ok(declared) if declared != *measured => Some(DisclosureBreach::Stale {
-                marker: (*marker).to_string(),
-                declared,
-                measured: *measured,
-            }),
-            Ok(_) => None,
-        })
+        .filter_map(
+            |(marker, measured, direction)| match declared_before(row, marker) {
+                Err(breach) => Some(breach),
+                Ok(declared) => {
+                    let violated = match direction {
+                        Direction::Exact => declared != *measured,
+                        Direction::AtLeast => *measured < declared,
+                    };
+                    violated.then(|| DisclosureBreach::Stale {
+                        marker: (*marker).to_string(),
+                        declared,
+                        measured: *measured,
+                    })
+                }
+            },
+        )
         .collect()
 }
 
@@ -1068,6 +1277,57 @@ mod tests {
         let (_root, sources) = tracked_sources();
         let measured = census(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
 
+        // --- THE DECOY, before any count below is believed --------------------------------
+        // An empty scan must be a failure, not a clean tree. A planted occurrence built from
+        // MANIFEST_DIR_VAR — not from the needle's own fragments — must be found on every
+        // run, so a needle that has stopped matching says so here instead of reporting a
+        // confident zero through every judgement in this test.
+        const DECOY_PATH: &str = "<planted>/needle_liveness.rs";
+        let decoy = needle_decoy();
+        let liveness = census([(DECOY_PATH, decoy.as_str())]);
+        assert_eq!(
+            liveness.raw_files.get(DECOY_PATH),
+            Some(&1),
+            "the census did not find its own planted decoy, so the compile-time needle has \
+             stopped matching. Every count in this guard would then be a confident ZERO and \
+             the residue would be judged clean against an empty population — the exact shape \
+             fln-8zsq, franken_lean-2ki4 and the mandated-mutants lane each produced. Decoy \
+             text: {decoy:?}"
+        );
+
+        // --- the independent, coarser signal, reconciled PER FILE -------------------------
+        // The decoy proves the matcher is alive; it cannot prove production code still spells
+        // the form the matcher looks for. Every precise match contains the bare variable
+        // name, so equality is the invariant outside the files that discuss the needle, and a
+        // file that mentions it more often than the needle matches is named rather than
+        // silently dropped from the population.
+        let drifts = needle_drifts(
+            sources.iter().map(|(p, t)| (p.as_str(), t.as_str())),
+            DECLARED_NEEDLE_DIVERGENCE,
+        );
+        assert!(
+            drifts.is_empty(),
+            "{}",
+            drifts
+                .iter()
+                .map(NeedleDrift::message)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+        // And the reconciliation must have had something to reconcile. If the region were
+        // empty — every file excluded, or the coarse matcher broken too — the equality above
+        // holds vacuously over zero files.
+        let carrying = sources
+            .iter()
+            .filter(|(_, text)| text.contains(MANIFEST_DIR_VAR))
+            .count();
+        assert!(
+            carrying >= 15,
+            "only {carrying} tracked sources mention the manifest-dir variable at all, so the \
+             per-file reconciliation ran over almost nothing and proves nothing. A scan that \
+             reads almost nothing is a broken scan, not a clean tree"
+        );
+
         assert!(
             measured.files >= FILES_FLOOR,
             "the census read {} tracked source files, below the floor of {FILES_FLOOR}. A \
@@ -1122,6 +1382,111 @@ mod tests {
         );
     }
 
+    /// The decoy is found, and it is spelled INDEPENDENTLY of the needle it validates.
+    ///
+    /// The second half is the one that matters. A decoy assembled from the same fragments as
+    /// the needle moves with it: break the needle and the decoy breaks identically, so the
+    /// liveness check passes on a matcher that matches nothing — the vacuity trap re-entered
+    /// inside the fix for it. Here the decoy derives from [`MANIFEST_DIR_VAR`], so the two can
+    /// only move together when the variable itself changes.
+    #[test]
+    fn the_planted_decoy_is_found_and_does_not_share_the_needles_spelling() {
+        let decoy = needle_decoy();
+        let found = census([("decoy.rs", decoy.as_str())]);
+        assert_eq!(
+            found.raw_sites, 1,
+            "the decoy must match the census needle: {decoy:?}"
+        );
+
+        // Independence, asserted rather than argued: the decoy is reproducible from the
+        // authoritative variable name alone, with no reference to the needle's fragments.
+        assert_eq!(
+            decoy,
+            format!("fn decoy() -> &'static str {{ env!(\"{MANIFEST_DIR_VAR}\") }}"),
+            "the decoy must be derivable from MANIFEST_DIR_VAR alone; if it is ever built from \
+             the needle's own fragments it stops being able to detect a broken needle"
+        );
+    }
+
+    /// A production file that adopts a spelling the needle misses is NAMED, not dropped.
+    ///
+    /// This is the failure a decoy cannot see: the matcher is alive, and the population it
+    /// measures has quietly shrunk. `env! ("CARGO_MANIFEST_DIR")` with a space is a real
+    /// rustfmt-stable spelling and the census counts it as zero.
+    #[test]
+    fn a_spelling_the_needle_misses_is_refused_with_both_counts() {
+        let drifted = "fn r() { Path::new(env! (\"CARGO_MANIFEST_DIR\")).join(\"..\") }";
+        assert_eq!(
+            census([("a.rs", drifted)]).raw_sites,
+            0,
+            "premise: the needle misses it"
+        );
+        assert_eq!(
+            needle_drifts([("a.rs", drifted)], &[]),
+            vec![NeedleDrift::Spelling {
+                path: "a.rs".to_string(),
+                coarse: 1,
+                precise: 0,
+            }],
+            "an unprotected site the census cannot see must be named"
+        );
+    }
+
+    /// A broken needle is caught by the reconciliation across the whole population, not only
+    /// by the decoy — the two failures are independent and both are live.
+    #[test]
+    fn a_needle_matching_nothing_makes_every_real_file_drift() {
+        let real = "fn r() { Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"..\") }";
+        // The population as it really is: coarse and precise agree.
+        assert!(needle_drifts([("a.rs", real)], &[]).is_empty());
+        // Now the same file judged as if the needle no longer matched it. `needle_drifts`
+        // takes the text, so the equivalent of a dead needle is a file whose precise form is
+        // absent while the variable is still named — which is the drift above, per file. Over
+        // a real population that is one refusal per file rather than a silent zero.
+        let dead = real.replace("env!(", "env_broken!(");
+        assert_eq!(needle_drifts([("a.rs", dead.as_str())], &[]).len(), 1);
+    }
+
+    /// A declared divergence that no longer diverges is refused as stale.
+    ///
+    /// Same direction as deleting a repaired residue row: left standing, the declaration
+    /// would excuse a real drift in that file forever.
+    #[test]
+    fn a_declared_divergence_that_no_longer_diverges_is_refused() {
+        let agreeing = "fn r() { env!(\"CARGO_MANIFEST_DIR\") }";
+        assert_eq!(
+            needle_drifts([("a.rs", agreeing)], &[("a.rs", "reason")]),
+            vec![NeedleDrift::StaleDivergence {
+                path: "a.rs".to_string()
+            }]
+        );
+        // And a genuine divergence under the same declaration is clean.
+        let diverging =
+            "const V: &str = \"CARGO_MANIFEST_DIR\"; fn r() { env!(\"CARGO_MANIFEST_DIR\") }";
+        assert!(needle_drifts([("a.rs", diverging)], &[("a.rs", "reason")]).is_empty());
+    }
+
+    /// Two matchers that disagree in the impossible direction refuse rather than being
+    /// reconciled. The precise form contains the bare name, so `precise > coarse` means the
+    /// matchers are inconsistent and no count downstream means anything.
+    #[test]
+    fn an_impossible_matcher_pair_is_refused_rather_than_explained() {
+        // Reachable only by construction, which is the point of the function being pure.
+        let text = "env!(\"CARGO_MANIFEST_DIR\")";
+        let drifts = needle_drifts([("a.rs", text)], &[]);
+        assert!(drifts.is_empty(), "the honest pair is 1 and 1: {drifts:?}");
+        assert!(
+            NeedleDrift::Impossible {
+                path: "a.rs".to_string(),
+                coarse: 0,
+                precise: 1,
+            }
+            .message()
+            .contains("impossible"),
+            "the refusal must say the matchers are inconsistent"
+        );
+    }
+
     /// A row carrying every disclosed number in the exact wording the bindings look for.
     ///
     /// Built from a [`CoveragePopulations`] so the synthetic cases below vary **one** thing
@@ -1162,6 +1527,52 @@ mod tests {
     fn a_disclosure_that_matches_the_tree_is_clean() {
         let pops = sample_populations();
         assert_eq!(disclosure_breaches(&sample_row(&pops), &pops), vec![]);
+    }
+
+    /// A floor accepts growth and refuses shrinkage; an exact binding refuses both.
+    ///
+    /// **This is the test whose absence cost two reds in one hour.** The first version of
+    /// `disclosure_breaches` compared every number with `!=`, so converting one rig — the
+    /// repair this whole bead exists to encourage — moved `checked_sites` up and reddened the
+    /// workspace for every pane until AGENTS.md was edited. A guard that taxes the correct
+    /// direction gets worked around, which is the `franken_lean-e5k7` shape.
+    #[test]
+    fn a_floor_accepts_growth_and_refuses_shrinkage_while_exact_refuses_both() {
+        let declared = sample_populations();
+        let row = sample_row(&declared);
+
+        // Protected count GREW: a repair. Must be clean.
+        let mut grown = declared.clone();
+        grown.checked_sites = declared.checked_sites + 7;
+        grown.checked_members = declared.checked_members + 1;
+        assert_eq!(
+            disclosure_breaches(&row, &grown),
+            vec![],
+            "growing the protected population is a repair and must not redden the tree"
+        );
+
+        // Protected count SHRANK: protection was removed. Must refuse.
+        let mut shrunk = declared.clone();
+        shrunk.checked_sites = declared.checked_sites - 1;
+        assert_eq!(
+            disclosure_breaches(&row, &shrunk),
+            vec![DisclosureBreach::Stale {
+                marker: " checked invocation sites".to_string(),
+                declared: declared.checked_sites,
+                measured: declared.checked_sites - 1,
+            }],
+            "losing protection must refuse: the floor is the whole point of it being a floor"
+        );
+
+        // Unprotected count SHRANK: a repair too, but it must still be recorded, because the
+        // disclosure is of a measured population and a stale low number understates the debt.
+        let mut repaired = declared.clone();
+        repaired.product_raw = declared.product_raw - 1;
+        assert_eq!(
+            disclosure_breaches(&row, &repaired).len(),
+            1,
+            "an unprotected count is exact in BOTH directions, so even a repair moves the row"
+        );
     }
 
     /// One number moved in the tree and not in the row: refused, with **both** values.
