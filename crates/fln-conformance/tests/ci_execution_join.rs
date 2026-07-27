@@ -1430,9 +1430,39 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     //
     // Measured green at `5f7e44ad`: all four mutants below failed and the other 44 tests
     // passed, so a row citing an ignored function left the population as a REPAIR and lowered
-    // the ceiling. Ten terminal rows cite one of the four ignored-producer surfaces and **all
-    // ten** are declared in `FILE_GRANULAR_EVIDENCE_ALLOWANCE`, so every one is queued for the
-    // migration that opens this. For two the ignored function is the *only* honest answer:
+    // the ceiling.
+    //
+    // Ten terminal rows cite one of the four ignored-producer surfaces and **all ten** are
+    // declared in `FILE_GRANULAR_EVIDENCE_ALLOWANCE`, so every one is queued for the migration
+    // that opens this.
+    //
+    // THAT SENTENCE IS TRUE, AND THIS COMMENT ONCE SAID IT WAS NOT. The retraction is worth more
+    // than the census, so it is recorded here rather than in a commit message nobody re-reads.
+    // Deriving the population by matching artifact strings against the four surface PATHS gives
+    // NINE, and on that basis the sentence was rewritten to say it had counted citations and
+    // called them rows. It had not. The tenth row is `franken_lean-sxsk`, which cites
+    // `cargo-test:kernel_replay` — the legacy stem kind, resolved to a surface path by the same
+    // `else if` in the derivation that handles the direct form. A scan that matches only the
+    // direct form cannot see it, so the scan returned less and the shortfall read as a defect in
+    // the prose. **A search returning fewer is evidence about the search until the search is
+    // known to be capable of finding the thing** — the same rule that inverted the governed-set
+    // answer in AGENTS.md's Build Gate section, arriving here as a near-miss correction of a
+    // correct sentence.
+    //
+    // What caught it was not re-reading: it was this census being bound to a DERIVATION that
+    // models the stem kind. The guard failed on its first run naming `franken_lean-sxsk`, which
+    // is exactly what a bound number is for and exactly what careful prose had not done.
+    //
+    // The two units are genuinely different and both are kept, because that difference is what
+    // made the wrong reading plausible: `franken_lean-kxbj` cites two surfaces, so eleven
+    // (row, surface) citations sit across ten rows. `all-rows-declared` is stated over ROWS
+    // because the allowance holds bead ids and can hold at most one entry per row.
+    // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
+    // directions when any field moves without the population, or the population without it:
+    //
+    // ignored-producer-citation-census: surfaces=4 rows=10 citations=11 all-rows-declared=true
+    //
+    // For two of those rows the ignored function is the *only* honest answer:
     // `pinned_present_olean_kernel_differential`'s `#[ignore]` reason names `fln-7odd`, and
     // `present_olean_corpus_thread_matrix_compares_stream_digests`' names `93te` — both beads
     // whose coverage rows cite the file.
@@ -2629,6 +2659,112 @@ fn terminal_rows_do_not_state_evidence_coarser_than_the_unit_that_runs() {
         FILE_GRANULAR_EVIDENCE_CEILING,
     );
     assert!(findings.is_empty(), "{}", findings.join("\n\n"));
+}
+
+/// One field of the ignored-producer census line, e.g. `rows=9`.
+///
+/// Panics rather than defaulting: a missing field must fail loudly, not read as zero and satisfy
+/// whatever comparison it feeds.
+fn census_field(line: &str, key: &str) -> String {
+    line.split_whitespace()
+        .find_map(|token| {
+            token
+                .strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix('='))
+        })
+        .unwrap_or_else(|| panic!("census line carries no `{key}=` field: {line}"))
+        .to_string()
+}
+
+/// The ignored-producer citation census is derived, not transcribed.
+///
+/// The sentence this replaces said "ten terminal rows" where ten was the count of
+/// **(row, surface) citations** and the rows were nine — `franken_lean-kxbj` cites two surfaces.
+/// Re-derived at `5f7e44ad`, the commit that sentence cites as its measurement: nine there too,
+/// so it was never true rather than having drifted. Both units are checked here so neither can be
+/// stated without the other.
+///
+/// **The marker is assembled with `concat!` so this function's own body does not contain it.**
+/// `fln-8zsq` planted a mutant that gutted the site it cared about and survived because the needle
+/// also appeared inside the guard; requiring exactly one occurrence is only meaningful when the
+/// scanner's own text is outside its search space.
+#[test]
+fn the_ignored_producer_citation_census_matches_the_measured_population() {
+    let d = derive(&root());
+    let marker = concat!("ignored-producer-citation", "-census: ");
+
+    let occurrences = d.own_source.matches(marker).count();
+    assert_eq!(
+        occurrences, 1,
+        "the census line must appear exactly once in this file; found {occurrences}. Two copies \
+         are a transcription, which is the defect this census exists to remove."
+    );
+    let line = d
+        .own_source
+        .lines()
+        .find(|line| line.contains(marker))
+        .expect("the occurrence count above proves the line is present");
+
+    let surfaces: BTreeSet<&str> = IGNORED_PRODUCER_ALLOWANCE
+        .iter()
+        .map(|(surface, _, _)| *surface)
+        .collect();
+    let mut rows_citing: BTreeSet<&str> = BTreeSet::new();
+    let mut citations = 0usize;
+    for row in &d.rows {
+        for surface in &row.coarse {
+            if surfaces.contains(surface.as_str()) {
+                citations += 1;
+                rows_citing.insert(row.bead.as_str());
+            }
+        }
+    }
+
+    // Anti-vacuity, and it is reachable rather than decorative: if the terminal-row derivation
+    // or the `coarse` classification breaks, every count below collapses to zero and every
+    // comparison would pass against a census line edited to match. A broken scan is not a tree
+    // in which no row cites an ignored producer.
+    assert!(
+        !surfaces.is_empty(),
+        "IGNORED_PRODUCER_ALLOWANCE names no surfaces; the census cannot be derived"
+    );
+    assert!(
+        !d.rows.is_empty(),
+        "the terminal-row derivation returned nothing, which is a broken scan"
+    );
+    assert!(
+        citations > 0,
+        "no terminal row cites any of the {} ignored-producer surfaces. That is the scan \
+         breaking, not a repaired population — a genuine repair empties the ALLOWANCE too, and \
+         this assertion is what forces that to be a deliberate edit.",
+        surfaces.len()
+    );
+
+    let declared: BTreeSet<&str> = FILE_GRANULAR_EVIDENCE_ALLOWANCE.iter().copied().collect();
+    let undeclared: Vec<&&str> = rows_citing.difference(&declared).collect();
+
+    assert_eq!(
+        census_field(line, "surfaces"),
+        surfaces.len().to_string(),
+        "census `surfaces` disagrees with IGNORED_PRODUCER_ALLOWANCE"
+    );
+    assert_eq!(
+        census_field(line, "rows"),
+        rows_citing.len().to_string(),
+        "census `rows` disagrees with the measured terminal rows: {rows_citing:?}"
+    );
+    assert_eq!(
+        census_field(line, "citations"),
+        citations.to_string(),
+        "census `citations` disagrees with the measured (row, surface) pairs. These two numbers \
+         differ whenever one row cites two surfaces, and confusing them is what put the wrong \
+         figure in this file."
+    );
+    assert_eq!(
+        census_field(line, "all-rows-declared"),
+        undeclared.is_empty().to_string(),
+        "census `all-rows-declared` disagrees; undeclared rows: {undeclared:?}"
+    );
 }
 
 /// The stem the legacy `cargo-test:<stem>` kind is keyed by is still an identity.
