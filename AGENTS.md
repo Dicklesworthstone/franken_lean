@@ -609,7 +609,7 @@ br sync --flush-only     # export to JSONL (NO git ops)
 
 Conventions: use the bead ID (e.g. `br-123`) as the Agent-Mail `thread_id` and prefix subjects with `[br-123]`; put the issue ID in the file-reservation `reason`; include `br-###` in commit messages. Map beads to workstreams (W1 Substrate & Contracts … W12 Distribution & Epochs) and gates (G0–G6) from §22 of the plan.
 
-### A comment body is a shell word before it is a record — pass it with `-f`, never `-m` (bead `fln-qpkj`)
+### A comment or description body is a shell word before it is a record — use a file path (bead `fln-qpkj`)
 
 **The write reports success and the record is already damaged.** A body passed as an inline
 double-quoted argument is expanded *before* `br` ever sees it, so a markdown backtick pair is a
@@ -622,8 +622,14 @@ this cannot be repaired — only annotated.** The same hazard covers `$(…)`, b
 
 ```bash
 br comments add <id> -f body.md          # correct: no expansion is possible
+scripts/br_comment.py description <id> body.md  # mutable description, exact read-back
 git commit -F msg.txt                    # the second surface: `-m` globbing eats backticked tokens
 ```
+
+For a new bead with a long description, create its short metadata first and then use the
+`description` command above with the returned ID. `br create --description="…"` has the same shell
+hazard and has no file option; the two-step form keeps the body out of the shell and verifies the
+stored description.
 
 **Post-hoc detection does not work here and the measurement is the reason, not an excuse.** Over
 407 beads and 1502 stored comments, the two signatures with real recall are saturated by this
@@ -634,7 +640,7 @@ previously-unrecorded candidate, 1 ambiguous, and 3 false positives all from `--
 [`fln-ysvo`'s shape](#evidence--census-pins--operational-gotchas): **a detector saturates on good
 practice.** Refusing the write instead has no such problem, so the tool is a write-path one.
 
-`scripts/br_comment.py` (`write <id> <body-file>`) hands the body to `br` through an **argv list**,
+`scripts/br_comment.py` (`write <id> <body-file>` or `description <id> <body-file>`) hands the body to `br` through an **argv list**,
 so no expansion is possible at all. On read-back `scripts/br_comment.py` refuses any mismatch it
 finds, which is exact rather than heuristic: it compares what landed against what was meant rather
 than reasoning about the path between them. (The producer is named twice on purpose — the census

@@ -274,6 +274,68 @@ fn every_supervisor_launcher_seals_python_configuration_before_imports() {
     );
 }
 
+/// The bead-text write guard must compare complete payloads and bind comment read-back to the
+/// immutable record created by this process.
+///
+/// The first implementation stripped trailing newlines while claiming byte identity, even though
+/// the installed `br` preserves them. It also discovered its write with a before/after set
+/// difference. A concurrent peer comment therefore made the guard refuse only after its own
+/// immutable comment had landed, inviting a duplicate on retry. The script's hermetic self-test
+/// plants both failures: one missing trailing newline, and a later peer comment whose id is newer
+/// than the id returned by `br comments add --json`. Launching the script directly also binds the
+/// documented CLI to its executable bit and isolated shebang rather than bypassing both. The same
+/// matrix drives the mutable-description path named separately by the bead's acceptance criteria.
+#[test]
+fn bead_text_guard_binds_the_created_id_and_complete_utf8_payload() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let heading = "### A comment or description body is a shell word before it is a record";
+    let section = agents
+        .split_once(heading)
+        .unwrap_or_else(|| panic!("AGENTS.md must retain the fln-qpkj write-path section"))
+        .1;
+    let section = section
+        .split_once("\n### ")
+        .map_or(section, |(body, _)| body);
+    for obligation in [
+        "br comments add <id> -f body.md",
+        "scripts/br_comment.py description <id> body.md",
+        "br create --description",
+    ] {
+        assert!(
+            section.contains(obligation),
+            "AGENTS.md's fln-qpkj section no longer states {obligation:?}"
+        );
+    }
+
+    let script = repo.join("scripts/br_comment.py");
+    let output = std::process::Command::new(&script)
+        .arg("self-test")
+        .output()
+        .unwrap_or_else(|error| panic!("{} self-test must launch: {error}", script.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{} self-test failed\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        script.display()
+    );
+    for proof in [
+        "exact-payload",
+        "trailing-newline-drift",
+        "returned-write-id",
+        "description-payload",
+        "malformed-schema",
+        "typed-diagnostic",
+    ] {
+        assert!(
+            stdout.contains(proof),
+            "{} self-test did not report the {proof} cell\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            script.display()
+        );
+    }
+}
+
 #[test]
 fn armed_finalizers_publish_only_after_their_process_wins_the_directory_claim() {
     for relative in [
