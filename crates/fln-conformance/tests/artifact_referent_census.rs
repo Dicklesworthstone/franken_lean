@@ -171,6 +171,13 @@
 //! swap and permits the total to fall. They are stated together here because a reader who
 //! finds one will assume it is the whole law.
 //!
+//! **And that second law is itself a SECOND declaration of a population the validator already
+//! knows how to judge.** `scripts/evidence.py` implements `povo`'s repair decision today, in
+//! the place the bead asks for it, and validates nothing because its registry file has never
+//! been minted — so the Rust law is the only one that fires, and the day the registry appears
+//! there are two. [`povo_validator_is_unadopted`] carries that whole measurement and fails on
+//! the event; do not re-derive it from this paragraph.
+//!
 //! Note what sharing the file buys and what it costs. The classifier is written once, so the
 //! two laws can never disagree about what "untracked" means — the disagreement that cost this
 //! census 22 citations was between two *implementations*, and there is only one here. The cost
@@ -622,6 +629,73 @@ const UNTRACKED_PATH_CITATION_DEBT: &[(&str, &[&str])] = &[
 /// of that exclusion is asserted rather than assumed by the test below.
 fn is_untracked_path_kind(kind: &str) -> bool {
     UNRESOLVABLE_CENSUS.iter().any(|(class, _)| *class == kind) && !kind.starts_with("commit_")
+}
+
+/// **This law's whole justification is that a capability is ABSENT, and that shape rots
+/// silently** — the defect family `fln-disclosed-unknowns-rot` is named for.
+///
+/// `scripts/evidence.py` **already implements `povo`'s repair decision**, committed, in the
+/// place the bead asks for it: `verification_artifact_classification` types every citation,
+/// `target_path` raises unconditionally rather than on an existence probe, a legacy allowance
+/// is keyed per `(bead, artifact)` with a content-addressed `pair_id`, and
+/// `receipt:sha256:<64hex>` is criterion 3's durable reference. That is not this file's
+/// discovery to claim; it is another pane's work.
+///
+/// It does **nothing today**. `ci/VERIFICATION_EVIDENCE_RECEIPTS.jsonl` does not exist, so
+/// `validate-verification-manifest` reports `artifact_reference_validation:
+/// not_adopted_registry_absent`, scans every artifact pair, validates none of them, and exits
+/// **0** — measured at `cf9ac40f` from the committed copy and from the `h4o1` working copy
+/// separately, both identical, so the orphan is not the reason either.
+///
+/// **So the debt is declared TWICE the moment that registry is minted** — once here, once as
+/// `legacy-artifact` rows carrying `tracking_bead: povo`. Two declarations of one population,
+/// free to drift, is the defect this whole module exists inside. Nothing would say so, because
+/// the event that makes the duplication live is a *file appearing* rather than a line changing.
+/// [`povo_validator_is_unadopted`] is that join, and it fails on exactly that event.
+fn povo_validator_is_unadopted<'src>(
+    root: &Path,
+    evidence_source: &'src str,
+) -> Result<&'src str, String> {
+    // Derived from the validator's own source, never transcribed: renaming either constant
+    // fails here rather than leaving this guard probing a path nobody writes any more.
+    let registry = evidence_source
+        .split_once("VERIFICATION_EVIDENCE_REGISTRY_PATH = (")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(path, _)| path)
+        .ok_or_else(|| {
+            "VERIFICATION_EVIDENCE_REGISTRY_PATH is no longer readable out of \
+             scripts/evidence.py, so this guard cannot name the file whose appearance it is \
+             watching for — a broken scan, not an unadopted validator"
+                .to_owned()
+        })?;
+    let tracking = evidence_source
+        .split_once("VERIFICATION_LEGACY_TRACKING_BEAD = (")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(bead, _)| bead)
+        .ok_or_else(|| {
+            "VERIFICATION_LEGACY_TRACKING_BEAD is no longer readable out of \
+             scripts/evidence.py"
+                .to_owned()
+        })?;
+    if tracking != POVO_BEAD {
+        return Err(format!(
+            "the validator's legacy debt is tracked by {tracking:?}, not by {POVO_BEAD:?}. The \
+             two declarations of this population are no longer even pointed at the same bead"
+        ));
+    }
+    if root.join(registry).exists() {
+        return Err(format!(
+            "{registry} EXISTS, so the validator's artifact-reference validation is ADOPTED and \
+             this file's UNTRACKED_PATH_CITATION_DEBT is now a SECOND declaration of the same \
+             population, keyed differently and free to drift from it. Reconcile them in one \
+             commit: either bind this table to the registry's `legacy-artifact` rows, or delete \
+             it and say in the module header that the validator carries the law. Do not raise \
+             a number to go green — there is no number here to raise."
+        ));
+    }
+    Ok(registry)
 }
 
 /// The verdict of `povo`'s law over a population: how many measured untracked citations the
@@ -1232,6 +1306,68 @@ fn an_empty_or_shallow_scan_is_refused_rather_than_reported_clean() {
     assert!(
         declared_third > 0,
         "an all-zero decomposition would agree with an empty scan for the same reason"
+    );
+}
+
+/// The bead this file's second law serves, and the bead the validator's own legacy-debt design
+/// names as its tracking bead. Written once so the two uses cannot drift apart.
+const POVO_BEAD: &str = "franken_lean-ephemeral-manifest-artifact-povo";
+
+/// **The join between this file's debt and the validator's, which fails the day the second one
+/// goes live.** See [`povo_validator_is_unadopted`] for why that day is the hazard.
+///
+/// Three cells through the **same** decision the production path makes, because a live
+/// assertion that the registry is absent is unkillable while it is absent — deleting it changes
+/// no verdict. Cell 2 is the positive control for the probe itself: a path that certainly
+/// exists must come back ADOPTED, so hardcoding the existence test to `false` fails here rather
+/// than passing quietly until the real file lands.
+#[test]
+fn this_files_debt_is_the_second_declaration_and_says_so_the_day_the_validator_is_adopted() {
+    let root = fln_conformance::checked_workspace_root!();
+    let source = std::fs::read_to_string(root.join("scripts/evidence.py"))
+        .expect("the validator's source must be readable; this guard is derived from it");
+
+    let registry = povo_validator_is_unadopted(&root, &source).unwrap_or_else(|why| {
+        panic!("povo (bead {POVO_BEAD}): {why}");
+    });
+    assert_eq!(
+        registry, "ci/VERIFICATION_EVIDENCE_RECEIPTS.jsonl",
+        "the registry path derived from scripts/evidence.py is not the one this module's header \
+         describes, so the header's measurement no longer describes the file it was taken from"
+    );
+
+    // The probe reads the filesystem — proved against a path that certainly exists rather than
+    // asserted. Without this cell the existence test can be gutted and nothing fails until the
+    // real registry appears, which is exactly the moment this guard exists for.
+    let control = source.replace(
+        "VERIFICATION_EVIDENCE_REGISTRY_PATH = (\n    \"ci/VERIFICATION_EVIDENCE_RECEIPTS.jsonl\"",
+        "VERIFICATION_EVIDENCE_REGISTRY_PATH = (\n    \"ci/VERIFICATION_MANIFEST.jsonl\"",
+    );
+    assert_ne!(
+        control, source,
+        "the positive control did not plant anything — the constant's spelling moved, so this \
+         cell would pass vacuously"
+    );
+    let adopted = povo_validator_is_unadopted(&root, &control).expect_err(
+        "a registry path that EXISTS must read as adopted, or this guard is not \
+                     reading the filesystem at all",
+    );
+    assert!(
+        adopted.contains("EXISTS") && adopted.contains("SECOND declaration"),
+        "the adopted refusal must name the duplication rather than merely fail: {adopted}"
+    );
+
+    // A tracking bead that stops naming povo is the other way the join dies.
+    let renamed = source.replace(POVO_BEAD, "franken_lean-some-other-bead");
+    assert_ne!(
+        renamed, source,
+        "the tracking-bead plant did not plant anything"
+    );
+    let mismatch = povo_validator_is_unadopted(&root, &renamed)
+        .expect_err("a tracking bead that is not povo must be refused");
+    assert!(
+        mismatch.contains("tracked by"),
+        "the mismatch refusal must name the bead it found: {mismatch}"
     );
 }
 
