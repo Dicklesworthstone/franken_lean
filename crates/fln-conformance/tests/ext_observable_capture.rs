@@ -89,6 +89,7 @@ fn first_difference(checked_in: &str, rederived: &str) -> Option<String> {
 
 #[test]
 fn the_checked_in_capture_is_what_the_pinned_binary_produces_today() {
+    let rig = pin::RigRun::new(pin::PinRig::ExtObservableCapture);
     let root = pin::workspace_root();
     let checked_in = std::fs::read_to_string(root.join(CAPTURE)).expect("the capture exists");
 
@@ -102,7 +103,11 @@ fn the_checked_in_capture_is_what_the_pinned_binary_produces_today() {
     );
 
     let Some(lean) = pin::pinned_lean() else {
-        eprintln!("{}", pin::skip_notice("ext_observable_capture"));
+        eprintln!(
+            "{}",
+            rig.typed_skip()
+                .expect("record the typed ext-observable skip")
+        );
         eprintln!(
             "  In particular: the 28 Parity Ledger rows citing {CAPTURE} are NOT shown to \
              rest on anything the pin produced by this run."
@@ -146,6 +151,8 @@ fn the_checked_in_capture_is_what_the_pinned_binary_produces_today() {
         checked_in.contains(&commit),
         "the capture's header does not name the commit SUITE.lock pins ({commit})"
     );
+    rig.executed()
+        .expect("record the executed ext-observable differential");
 }
 
 /// The comparison must be shown to catch a moved record, or a green run means only that

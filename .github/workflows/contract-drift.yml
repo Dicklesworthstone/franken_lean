@@ -115,17 +115,23 @@ jobs:
           # defect. The pinned toolchain is 2.8 GB; that is not a per-push cost. Rust comes
           # from rust-toolchain.toml, which auto-selects the pinned nightly.
           #
-          # THE FLOOR. Exit 0 cannot be the gate here. Measured by cc_3 at b45ff944 (comment
-          # 1484 on fln-rgha): with the pin present and with it masked, these binaries give
-          # BYTE-IDENTICAL results -- 3/5/6/14 passed, exit 0, in both cells -- because each
-          # skip is an early return inside a test that then passes. Reproduced by cc_2 at
-          # 9b6a7dfa: 28 passed / 4 result lines / cargo rc 0 in BOTH cells, 0 skip notices
-          # with the pin and 7 with HOME masked. (cc_3 recorded 4 notices for the same
-          # masking; the counts differ and neither has been reconciled -- what both cells
-          # agree on, and all this floor rests on, is 0-with-pin versus non-zero-without.)
+          # THE EXECUTION JOIN. Exit 0 and libtest's per-test `ok` cannot be the gate here.
+          # Measured by cc_3 at b45ff944 and independently by cc_2 at 9b6a7dfa: with the pin
+          # present and masked, cargo's externally visible dispositions are identical because
+          # each typed skip is an early return inside a test that then passes. Grepping the log
+          # merely changes cargo's capture policy and still cannot prove which assertions ran.
           #
-          # So four refusals are evaluated, NONE short-circuiting, because a floor that exits
-          # on the cheap path never exercises the expensive one.
+          # Each registered pin rig therefore owns one structured record file. The record is
+          # written only after the assertion-bearing body completes, or as typed_skip_no_pin
+          # from the declining branch. The verifier below derives the expected set from the
+          # compiled PinRig registry and the live #[ignore] attributes, binds every record to
+          # SUITE.lock's tag and full commit, writes a first-class tally, and refuses missing,
+          # duplicate, stale, unexpected or skipped records. The directory is unique to this
+          # workflow attempt so a prior green cannot satisfy a later run.
+          artifact_root="target/e2e/contract-drift-rgha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export FLN_RIG_EXECUTION_DIR="$PWD/$artifact_root/records"
+          export FLN_RIG_EXECUTION_SUMMARY="$PWD/$artifact_root/rig-execution-summary.txt"
+          mkdir -p "$FLN_RIG_EXECUTION_DIR"
           log="$RUNNER_TEMP/rgha-suites.log"
           set +e
           cargo test --locked -p fln-conformance \
@@ -135,40 +141,43 @@ jobs:
             --test pin_ctor_inventory \
             -- --nocapture > "$log" 2>&1
           rc=$?
+          cargo test --locked -p fln-conformance \
+            --test ci_execution_join \
+            configured_pin_rig_records_prove_each_scheduled_rig_executed \
+            -- --exact --nocapture
+          collector_rc=$?
           set -e
           result_lines=$(grep -c '^test result:' "$log" || true)
           passed=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" \
             | paste -sd+ - | bc 2>/dev/null || echo 0)
           [[ -z "$passed" ]] && passed=0
-          notices=$(grep -c '^SKIP ' "$log" || true)
-          printf 'rgha-floor: cargo_rc=%s result_lines=%s passed=%s skip_notices=%s\n' \
-            "$rc" "$result_lines" "$passed" "$notices"
+          printf 'rgha-join: cargo_rc=%s collector_rc=%s result_lines=%s passed=%s\n' \
+            "$rc" "$collector_rc" "$result_lines" "$passed"
           fail=0
           if (( rc != 0 )); then
-            echo "rgha-floor: REFUSED - cargo exited $rc; a real failure, not a skip question" >&2
+            echo "rgha-join: REFUSED - cargo exited $rc; a real failure, not a skip question" >&2
             fail=1
           fi
-          # A libtest filter matching nothing exits 0 and emits no notices, which would pass
-          # the notice check vacuously. Floor the observed execution first.
+          if (( collector_rc != 0 )); then
+            echo "rgha-join: REFUSED - the structured per-rig execution join failed" >&2
+            fail=1
+          fi
+          # These two floors answer only whether the command shape collapsed. They do not
+          # carry execution evidence; the structured records above do.
           if (( result_lines < 4 )); then
-            echo "rgha-floor: REFUSED - only $result_lines of 4 binaries reported a result" >&2
+            echo "rgha-join: REFUSED - only $result_lines of 4 binaries reported a result" >&2
             fail=1
           fi
           if (( passed < 20 )); then
-            echo "rgha-floor: REFUSED - only $passed tests ran (floor 20, measured 28); the ABSENCE of skip notices is not evidence when nothing executed" >&2
-            fail=1
-          fi
-          if (( notices > 0 )); then
-            echo "rgha-floor: REFUSED - $notices typed-skip notice(s), so these suites did NOT check their subject; this is the hollow green fln-rgha is about" >&2
-            grep '^SKIP ' "$log" | sed 's/^/  /' >&2
+            echo "rgha-join: REFUSED - only $passed tests ran (floor 20, measured 28); a zero-test cargo success is not a run" >&2
             fail=1
           fi
           (( fail )) && exit 2
-          echo "rgha-floor: PASS - $passed tests across $result_lines binaries, zero typed skips"
+          cat "$FLN_RIG_EXECUTION_SUMMARY"
+          echo "rgha-join: PASS - exact structured record for every scheduled pin rig"
           # WHAT THIS DOES NOT ESTABLISH: that the suites checked their subject CORRECTLY.
-          # It proves only that they did not silently skip. Whether a rig's assertions are
-          # sound, and the structured per-rig execution record fln-rgha actually asks for,
-          # are the bead's own mechanism and are NOT delivered here.
+          # It proves that the registered assertion-bearing bodies executed and did not
+          # silently skip; the soundness of the assertions remains their own obligation.
 
       - name: run the seeded contract drift lane
         shell: bash

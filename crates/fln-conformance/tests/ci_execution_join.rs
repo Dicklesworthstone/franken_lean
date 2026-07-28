@@ -2,32 +2,30 @@
 //! (bead `fln-rgha`; AGENTS.md "Evidence & Census Pins" item 7).
 //!
 //! Item 7's law is that every level, digest, capture and delegation must name the thing
-//! that produces it and must fail when that thing changes. Twelve terminal `complete` rows
-//! in `ci/VERIFICATION_MANIFEST.jsonl` cite conformance suites as their evidence; CI runs
-//! those suites **without the pinned Reference toolchain installed**, so each pin-dependent
-//! rig inside them takes an early return and reports `ok`.
+//! that produces it and must fail when that thing changes. The original census found
+//! terminal `complete` rows citing conformance suites that CI ran **without the pinned
+//! Reference toolchain installed**, so each pin-dependent rig inside them took an early
+//! return and reported `ok`.
 //!
 //! This is a harder instance than `franken_lean-worktree-gitdir-refusal-hugg`, and the
 //! reason is worth stating before the code. hugg shouted three wrong causes over one
 //! correct line, so there was something to notice. Here the message is *right* —
-//! `pin::skip_notice` says outright that nothing was established — and it goes to stderr,
-//! which cargo captures and discards for a **passing** test. There is no misleading text
-//! and no failure to investigate. A green run looks identical whether the rig ran or not.
+//! `pin::RigRun::typed_skip` says outright that nothing was established — and its human
+//! line goes to stderr, which cargo captures and discards for a **passing** test. There is
+//! no misleading text and no failure to investigate. A green run looks identical whether
+//! the rig ran or not.
 //!
 //! # What this guard is, and what it is not
 //!
-//! It is a **join** check: it does not read a rig's output, and it makes no claim that any
-//! row is false. Every one of the twelve may have been verified on a pin-bearing host by
-//! the agent who closed it, and several bead bodies say exactly that. The defect is that
-//! **the repository cannot tell**, and each CI run silently re-asserts the green. So the
-//! guard binds the *population* of such rows to a declared allowance, in both directions,
-//! and makes any change to it fail.
+//! It is a **join** check and makes no claim that any row is false. The source half binds
+//! the population of pin-reaching evidence to a shrink-only allowance. The runtime half
+//! reads exact-unit records emitted by the compiled [`PinRig`] registry and refuses unless
+//! every non-ignored rig in the pin-bearing workflow reached its assertion-bearing end.
 //!
-//! It measures **reach**, not decline: whether a cited surface's code can consult the
-//! pinned Reference, not whether it skips or hard-fails without it. That is deliberate —
-//! both mean the row's evidence was not established by the CI run — but it is not the
-//! bead's eventual mechanism, which is a structured execution record each rig emits and
-//! the gate collects. Nothing here observes a run happening.
+//! The static derivation measures **reach**, not decline: whether a cited surface's code
+//! can consult the pinned Reference. The structured record measures decline versus
+//! execution separately. Neither substitutes for the other: one prevents a new surface
+//! from escaping the population, and the other proves what happened in one concrete run.
 //!
 //! # Why the scope is derived
 //!
@@ -133,6 +131,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fln_conformance::execution::{
@@ -143,6 +142,12 @@ use fln_conformance::execution::{
     record_field, scenario_assignments, shell_code_only, test_function_citation, test_functions,
     test_reach, unmodelled_feature_cfgs, workspace_member_patterns,
 };
+use fln_conformance::pin::{
+    self, PinRig, RIG_EXECUTION_DIR_ENV, RigDisposition, RigExecutionRecord,
+};
+
+const RIG_EXECUTION_SUMMARY_ENV: &str = "FLN_RIG_EXECUTION_SUMMARY";
+const RIG_EXECUTION_SUMMARY_SCHEMA: &str = "fln.rig-execution-summary/1";
 
 // ---------------------------------------------------------------------------
 // The two declarations
@@ -2168,6 +2173,434 @@ fn judge(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<String> {
     findings
 }
 
+// ---------------------------------------------------------------------------
+// The runtime half: exact per-rig records from the pin-bearing workflow
+// ---------------------------------------------------------------------------
+
+fn rig_source_path(root: &Path, rig: PinRig) -> Result<(PathBuf, String), String> {
+    let (package, target, function) = test_function_citation(rig.identity())
+        .ok_or_else(|| format!("registered rig {} is not a test citation", rig.identity()))?;
+    if package != "fln-conformance" {
+        return Err(format!(
+            "registered rig {} belongs to package {package}, not fln-conformance",
+            rig.identity()
+        ));
+    }
+    Ok((
+        root.join("crates/fln-conformance/tests")
+            .join(format!("{target}.rs")),
+        function.to_string(),
+    ))
+}
+
+fn rig_call_marker(rig: PinRig) -> String {
+    format!("pin::RigRun::new(pin::PinRig::{})", rig.variant_name())
+}
+
+/// The source region from one test function through the next test attribute.
+///
+/// This is intentionally a loud over-approximation rather than a pretend Rust parser. The
+/// exact marker is still required once in the whole source file, and the function name is
+/// independently resolved through [`test_functions`]. If attributes or item layout move so
+/// this cannot decide, it returns `None` and the guard refuses.
+fn test_region<'a>(source: &'a str, function: &str) -> Option<&'a str> {
+    let needle = format!("fn {function}(");
+    let mut starts = source.match_indices(&needle).map(|(at, _)| at);
+    let start = starts.next()?;
+    if starts.next().is_some() {
+        return None;
+    }
+    let tail = &source[start..];
+    let end = tail[needle.len()..]
+        .find("\n#[test]")
+        .map_or(tail.len(), |offset| needle.len() + offset);
+    Some(&tail[..end])
+}
+
+fn rig_registry_source_findings(root: &Path) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut sources = BTreeMap::<PathBuf, String>::new();
+    for rig in PinRig::ALL {
+        let (path, _) = match rig_source_path(root, *rig) {
+            Ok(value) => value,
+            Err(error) => {
+                findings.push(format!("registry-citation: {error}"));
+                continue;
+            }
+        };
+        if sources.contains_key(&path) {
+            continue;
+        }
+        match fs::read_to_string(&path) {
+            Ok(source) => {
+                sources.insert(path, source);
+            }
+            Err(error) => findings.push(format!(
+                "registry-source: cannot read {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    if sources.is_empty() {
+        findings.push(
+            "registry-scan: no pin-rig source files were read; an empty scan is not a \
+             closed registry"
+                .to_string(),
+        );
+        return findings;
+    }
+
+    for (path, source) in &sources {
+        if source.contains("\"SKIP ") || source.contains("pin::skip_notice(") {
+            findings.push(format!(
+                "registry-legacy-skip: {} still carries a free-form skip site. Every \
+                 pin-dependent decline must consume RigRun::typed_skip so it cannot keep \
+                 the message while losing the structured record.",
+                path.display()
+            ));
+        }
+    }
+
+    for rig in PinRig::ALL {
+        let (path, function) = match rig_source_path(root, *rig) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(source) = sources.get(&path) else {
+            continue;
+        };
+        let marker = rig_call_marker(*rig);
+        let occurrences = sources
+            .values()
+            .map(|candidate| candidate.matches(&marker).count())
+            .sum::<usize>();
+        if occurrences != 1 {
+            findings.push(format!(
+                "registry-cardinality: {marker} occurs {occurrences} times across the \
+                 governed rig sources, expected exactly once"
+            ));
+        }
+        let functions = test_functions(source);
+        if !functions.iter().any(|name| name == &function) {
+            findings.push(format!(
+                "registry-function: {} names {function}, which is not a runnable #[test] in {}",
+                rig.identity(),
+                path.display()
+            ));
+            continue;
+        }
+        match test_region(source, &function) {
+            Some(region) if region.contains(&marker) => {}
+            Some(_) => findings.push(format!(
+                "registry-join: {marker} is not in the source region for {}",
+                rig.identity()
+            )),
+            None => findings.push(format!(
+                "registry-region: could not isolate the unique source region for {}",
+                rig.identity()
+            )),
+        }
+    }
+
+    findings
+}
+
+fn contract_drift_expected_rigs(
+    root: &Path,
+) -> Result<(BTreeSet<PinRig>, BTreeSet<PinRig>), Vec<String>> {
+    let mut executed = BTreeSet::new();
+    let mut not_run = BTreeSet::new();
+    let mut errors = Vec::new();
+    let mut ignored_by_path = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+    for rig in PinRig::ALL {
+        let (path, function) = match rig_source_path(root, *rig) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        if !ignored_by_path.contains_key(&path) {
+            match fs::read_to_string(&path) {
+                Ok(source) => {
+                    ignored_by_path.insert(
+                        path.clone(),
+                        ignored_tests(&source)
+                            .into_iter()
+                            .map(|(name, _reason)| name)
+                            .collect(),
+                    );
+                }
+                Err(error) => {
+                    errors.push(format!("cannot read {}: {error}", path.display()));
+                    continue;
+                }
+            }
+        }
+        if ignored_by_path[&path].contains(&function) {
+            not_run.insert(*rig);
+        } else {
+            executed.insert(*rig);
+        }
+    }
+    if executed.is_empty() {
+        errors.push(
+            "the derived contract-drift execution set is empty; a broken derivation is not \
+             a clean run"
+                .to_string(),
+        );
+    }
+    if executed.len() + not_run.len() != PinRig::ALL.len() {
+        errors.push(format!(
+            "the expected execution partition covers {} of {} registered rigs",
+            executed.len() + not_run.len(),
+            PinRig::ALL.len()
+        ));
+    }
+    if errors.is_empty() {
+        Ok((executed, not_run))
+    } else {
+        Err(errors)
+    }
+}
+
+fn load_rig_execution_records(directory: &Path) -> (Vec<RigExecutionRecord>, Vec<String>) {
+    let mut records = Vec::new();
+    let mut findings = Vec::new();
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            findings.push(format!(
+                "record-directory: cannot inspect {}: {error}",
+                directory.display()
+            ));
+            return (records, findings);
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        findings.push(format!(
+            "record-directory: {} is not a real directory",
+            directory.display()
+        ));
+        return (records, findings);
+    }
+
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>(),
+        Err(error) => {
+            findings.push(format!(
+                "record-directory: cannot enumerate {}: {error}",
+                directory.display()
+            ));
+            return (records, findings);
+        }
+    };
+    let mut entries = match entries {
+        Ok(entries) => entries,
+        Err(error) => {
+            findings.push(format!(
+                "record-directory: an entry in {} is unreadable: {error}",
+                directory.display()
+            ));
+            return (records, findings);
+        }
+    };
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                findings.push(format!(
+                    "record-entry: cannot classify {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            findings.push(format!(
+                "record-entry: {} is not a real regular file",
+                path.display()
+            ));
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("record") {
+            findings.push(format!(
+                "record-entry: {} has an unrecognised extension",
+                path.display()
+            ));
+            continue;
+        }
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                findings.push(format!(
+                    "record-entry: cannot read {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        match RigExecutionRecord::parse(&text) {
+            Ok(record) => records.push(record),
+            Err(error) => findings.push(format!(
+                "record-entry: {} is invalid: {error}",
+                path.display()
+            )),
+        }
+    }
+    if records.is_empty() {
+        findings.push(
+            "record-scan: zero valid rig records were collected. A clean run and a broken \
+             collector must never have the same representation."
+                .to_string(),
+        );
+    }
+    (records, findings)
+}
+
+fn judge_rig_execution_records(
+    records: &[RigExecutionRecord],
+    expected_executed: &BTreeSet<PinRig>,
+    expected_not_run: &BTreeSet<PinRig>,
+    reference_tag: &str,
+    reference_commit: &str,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut by_rig = BTreeMap::<PinRig, RigDisposition>::new();
+    for record in records {
+        if record.reference_tag() != reference_tag || record.reference_commit() != reference_commit
+        {
+            findings.push(format!(
+                "record-pin: {} binds {} at {}, expected {} at {}",
+                record.rig().identity(),
+                record.reference_tag(),
+                record.reference_commit(),
+                reference_tag,
+                reference_commit
+            ));
+        }
+        if let Some(prior) = by_rig.insert(record.rig(), record.disposition()) {
+            findings.push(format!(
+                "record-duplicate: {} has both {} and {} records",
+                record.rig().identity(),
+                prior.as_str(),
+                record.disposition().as_str()
+            ));
+        }
+    }
+
+    for rig in expected_executed {
+        match by_rig.get(rig) {
+            Some(RigDisposition::Executed) => {}
+            Some(RigDisposition::TypedSkipNoPin) => findings.push(format!(
+                "record-skip: {} was scheduled but took the typed no-pin branch",
+                rig.identity()
+            )),
+            None => findings.push(format!(
+                "record-missing: {} was scheduled but emitted no disposition",
+                rig.identity()
+            )),
+        }
+    }
+    for rig in expected_not_run {
+        if let Some(disposition) = by_rig.get(rig) {
+            findings.push(format!(
+                "record-unexpected: {} is derived #[ignore]d for this command but emitted {}",
+                rig.identity(),
+                disposition.as_str()
+            ));
+        }
+    }
+    for rig in by_rig.keys() {
+        if !expected_executed.contains(rig) && !expected_not_run.contains(rig) {
+            findings.push(format!(
+                "record-outside-partition: {} belongs to neither expected set",
+                rig.identity()
+            ));
+        }
+    }
+    findings
+}
+
+fn rig_execution_summary(
+    records: &[RigExecutionRecord],
+    expected_executed: &BTreeSet<PinRig>,
+    expected_not_run: &BTreeSet<PinRig>,
+    reference_tag: &str,
+    reference_commit: &str,
+    findings: &[String],
+) -> String {
+    let mut by_rig = BTreeMap::<PinRig, RigDisposition>::new();
+    for record in records {
+        by_rig.entry(record.rig()).or_insert(record.disposition());
+    }
+    let executed_count = by_rig
+        .values()
+        .filter(|disposition| **disposition == RigDisposition::Executed)
+        .count();
+    let typed_skip_count = by_rig
+        .values()
+        .filter(|disposition| **disposition == RigDisposition::TypedSkipNoPin)
+        .count();
+    let not_run_count = expected_not_run
+        .iter()
+        .filter(|rig| !by_rig.contains_key(rig))
+        .count();
+    let missing_count = expected_executed
+        .iter()
+        .filter(|rig| !by_rig.contains_key(rig))
+        .count();
+    let mut out = format!(
+        "schema={RIG_EXECUTION_SUMMARY_SCHEMA}\nreference_tag={reference_tag}\n\
+         reference_commit={reference_commit}\nregistry_count={}\nexecuted_count={executed_count}\n\
+         typed_skip_count={typed_skip_count}\nnot_run_count={not_run_count}\n\
+         missing_count={missing_count}\nfinding_count={}\n",
+        PinRig::ALL.len(),
+        findings.len()
+    );
+    for rig in PinRig::ALL {
+        let disposition = match by_rig.get(rig) {
+            Some(disposition) => disposition.as_str(),
+            None if expected_not_run.contains(rig) => "not_run_ignored",
+            None => "missing_record",
+        };
+        out.push_str(&format!("rig={disposition}|{}\n", rig.identity()));
+    }
+    for finding in findings {
+        out.push_str(&format!("finding={}\n", finding.replace('\n', "\\n")));
+    }
+    out
+}
+
+fn write_rig_execution_summary(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("summary path {} has no parent", path.display()))?;
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("inspect summary parent {}: {error}", parent.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "summary parent {} is not a real directory",
+            parent.display()
+        ));
+    }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("create summary {}: {error}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| format!("write summary {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("sync summary {}: {error}", path.display()))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync summary parent {}: {error}", parent.display()))
+}
+
 fn root() -> PathBuf {
     fln_conformance::checked_workspace_root!()
 }
@@ -2191,6 +2624,217 @@ fn terminal_rows_do_not_rest_on_evidence_ci_never_executed() {
         "the CI-execution join (bead fln-rgha):\n  - {}",
         findings.join("\n  - ")
     );
+}
+
+/// The compiled registry, the exact test functions, and the pin-bearing workflow are one
+/// closed contract. A free-form skip string or a registry variant living in the wrong test
+/// would restore the hollow green while leaving the runtime collector apparently healthy.
+#[test]
+fn every_pin_dependent_skip_is_typed_and_joined_to_its_exact_function() {
+    let root = root();
+    let mut findings = rig_registry_source_findings(&root);
+    let derivation = derive(&root);
+    let mut governed_surfaces = BTreeSet::new();
+    for rig in PinRig::ALL {
+        let (path, _) = match rig_source_path(&root, *rig) {
+            Ok(value) => value,
+            Err(error) => {
+                findings.push(format!("registry-citation: {error}"));
+                continue;
+            }
+        };
+        let relative = match path.strip_prefix(&root) {
+            Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+            Err(error) => {
+                findings.push(format!(
+                    "registry-path: {} is outside {}: {error}",
+                    path.display(),
+                    root.display()
+                ));
+                continue;
+            }
+        };
+        governed_surfaces.insert(relative);
+    }
+    for surface in governed_surfaces {
+        if !run_by_ci_with_the_pin(&derivation, &surface) {
+            findings.push(format!(
+                "registry-workflow: {surface} is not run by a CI job that installs the \
+                 Reference pin"
+            ));
+        }
+    }
+
+    let workflow_path = root.join(".github/workflows/contract-drift.yml");
+    match fs::read_to_string(&workflow_path) {
+        Ok(workflow) => {
+            for needle in [
+                RIG_EXECUTION_DIR_ENV,
+                RIG_EXECUTION_SUMMARY_ENV,
+                "configured_pin_rig_records_prove_each_scheduled_rig_executed",
+                "GITHUB_RUN_ID",
+                "GITHUB_RUN_ATTEMPT",
+                "target/e2e/contract-drift-*",
+            ] {
+                if !workflow.contains(needle) {
+                    findings.push(format!(
+                        "registry-workflow: {} does not bind {needle:?}",
+                        workflow_path.display()
+                    ));
+                }
+            }
+        }
+        Err(error) => findings.push(format!(
+            "registry-workflow: cannot read {}: {error}",
+            workflow_path.display()
+        )),
+    }
+
+    assert!(
+        findings.is_empty(),
+        "the typed pin-rig registry (bead fln-rgha):\n  - {}",
+        findings.join("\n  - ")
+    );
+}
+
+/// Runtime verifier invoked by the pin-bearing workflow after the four governed test
+/// binaries. Ordinary developer runs do not configure a collector and therefore exercise
+/// the pure registry and mutant tests around this function instead. In the workflow, a
+/// missing summary path is itself a refusal: evidence that cannot be archived cannot
+/// discharge a row.
+#[test]
+fn configured_pin_rig_records_prove_each_scheduled_rig_executed() {
+    let Some(directory) = std::env::var_os(RIG_EXECUTION_DIR_ENV) else {
+        return;
+    };
+    let summary_path = std::env::var_os(RIG_EXECUTION_SUMMARY_ENV)
+        .map(PathBuf::from)
+        .expect("a configured rig collector must name its citable summary path");
+    let root = root();
+    let (expected_executed, expected_not_run) =
+        contract_drift_expected_rigs(&root).unwrap_or_else(|findings| {
+            panic!(
+                "cannot derive the contract-drift pin-rig partition:\n  - {}",
+                findings.join("\n  - ")
+            )
+        });
+    let reference_tag = pin::pinned_tag().expect("SUITE.lock names the Reference tag");
+    let reference_commit = pin::pinned_commit().expect("SUITE.lock names the Reference commit");
+    let (records, mut findings) = load_rig_execution_records(&PathBuf::from(directory));
+    findings.extend(judge_rig_execution_records(
+        &records,
+        &expected_executed,
+        &expected_not_run,
+        &reference_tag,
+        &reference_commit,
+    ));
+    let summary = rig_execution_summary(
+        &records,
+        &expected_executed,
+        &expected_not_run,
+        &reference_tag,
+        &reference_commit,
+        &findings,
+    );
+    if let Err(error) = write_rig_execution_summary(&summary_path, &summary) {
+        findings.push(format!("summary-write: {error}"));
+    }
+    assert!(
+        findings.is_empty(),
+        "the collected pin-rig execution record (bead fln-rgha):\n  - {}",
+        findings.join("\n  - ")
+    );
+}
+
+fn synthetic_rig_record(
+    rig: PinRig,
+    disposition: RigDisposition,
+    reference_tag: &str,
+    reference_commit: &str,
+) -> RigExecutionRecord {
+    RigExecutionRecord::parse(&format!(
+        "schema=fln.rig-execution/1\nrig={}\ndisposition={}\nreference_tag={reference_tag}\n\
+         reference_commit={reference_commit}\n",
+        rig.identity(),
+        disposition.as_str()
+    ))
+    .expect("the synthetic record uses the production parser")
+}
+
+fn synthetic_execution_partition() -> (BTreeSet<PinRig>, BTreeSet<PinRig>) {
+    let mut executed = PinRig::ALL.iter().copied().collect::<BTreeSet<_>>();
+    assert!(executed.remove(&PinRig::PresentOleanCorpusThreadMatrix));
+    (executed, [PinRig::PresentOleanCorpusThreadMatrix].into())
+}
+
+#[test]
+fn a_complete_structured_rig_record_is_accepted() {
+    const TAG: &str = "v4.32.0";
+    const COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
+    let (expected_executed, expected_not_run) = synthetic_execution_partition();
+    let records = expected_executed
+        .iter()
+        .map(|rig| synthetic_rig_record(*rig, RigDisposition::Executed, TAG, COMMIT))
+        .collect::<Vec<_>>();
+    assert!(
+        judge_rig_execution_records(&records, &expected_executed, &expected_not_run, TAG, COMMIT)
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_typed_skip_and_a_missing_record_are_distinct_refusals() {
+    const TAG: &str = "v4.32.0";
+    const COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
+    let (expected_executed, expected_not_run) = synthetic_execution_partition();
+    let mut records = expected_executed
+        .iter()
+        .map(|rig| synthetic_rig_record(*rig, RigDisposition::Executed, TAG, COMMIT))
+        .collect::<Vec<_>>();
+    let skipped = PinRig::PreludeKernelReplay;
+    let missing = PinRig::AdmissionFaultMatrix;
+    records.retain(|record| record.rig() != skipped && record.rig() != missing);
+    records.push(synthetic_rig_record(
+        skipped,
+        RigDisposition::TypedSkipNoPin,
+        TAG,
+        COMMIT,
+    ));
+    let findings =
+        judge_rig_execution_records(&records, &expected_executed, &expected_not_run, TAG, COMMIT);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("record-skip:")
+                && finding.contains(skipped.identity()))
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("record-missing:")
+                && finding.contains(missing.identity()))
+    );
+}
+
+#[test]
+fn duplicate_and_wrong_pin_records_cannot_discharge_a_rig() {
+    const TAG: &str = "v4.32.0";
+    const COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
+    let (expected_executed, expected_not_run) = synthetic_execution_partition();
+    let rig = PinRig::PreludeKernelReplay;
+    let records = vec![
+        synthetic_rig_record(rig, RigDisposition::Executed, TAG, COMMIT),
+        synthetic_rig_record(
+            rig,
+            RigDisposition::TypedSkipNoPin,
+            "v4.31.0",
+            "1111111111111111111111111111111111111111",
+        ),
+    ];
+    let findings =
+        judge_rig_execution_records(&records, &expected_executed, &expected_not_run, TAG, COMMIT);
+    assert!(has(&findings, "record-duplicate:"));
+    assert!(has(&findings, "record-pin:"));
 }
 
 /// Every registered scenario reaches a lane that exists, and every governed lane is

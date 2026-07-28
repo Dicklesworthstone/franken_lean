@@ -4,10 +4,10 @@
 //! Nine terminal `complete` rows in `ci/VERIFICATION_MANIFEST.jsonl` were found by hand to
 //! cite conformance suites that CI executes **without the pinned Reference toolchain
 //! installed**, so the pin-dependent half of each suite takes a typed skip and the run
-//! reports `ok`. The skip notice is correct — `pin::skip_notice` says outright that
-//! nothing was established — and it goes to stderr, which cargo captures and discards for
-//! a *passing* test. There is no misleading text to notice and no failure to investigate:
-//! a green run looks identical whether the rig ran or not.
+//! reports `ok`. The skip notice is correct — `pin::RigRun::typed_skip` says outright that
+//! nothing was established — and the human line goes to stderr, which cargo captures and
+//! discards for a *passing* test. There is no misleading text to notice and no failure to
+//! investigate: a green run looks identical whether the rig ran or not.
 //!
 //! This module is the derivation half of the guard that fails on recurrence. It is
 //! deliberately **pure**: every function takes text and returns a judgement, so the guard
@@ -26,9 +26,9 @@
 //! **What this module does not attempt.** It measures *reach* — whether a surface's code
 //! can consult the pinned Reference — not *decline*. A surface that hard-failed without
 //! the pin would also be reported, and that is deliberate: it is still a surface whose CI
-//! behaviour differs from the host its row was verified on. Distinguishing skip from
-//! failure requires observing a run, which is the bead's eventual mechanism (a structured
-//! execution record the gate collects) and is not this.
+//! behaviour differs from the host its row was verified on. The runtime half now lives in
+//! [`crate::pin::RigRun`]: exact-unit structured records distinguish `executed` from
+//! `typed_skip_no_pin`, and `tests/ci_execution_join.rs` joins them back to this derivation.
 
 use std::collections::BTreeSet;
 

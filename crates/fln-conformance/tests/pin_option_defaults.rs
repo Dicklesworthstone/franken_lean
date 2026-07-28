@@ -141,8 +141,13 @@ fn divergences(claimed: &[(&str, u64)], table: &BTreeMap<String, String>) -> Vec
 
 #[test]
 fn every_option_default_fln_core_claims_is_the_one_the_pinned_binary_reports() {
+    let rig = pin::RigRun::new(pin::PinRig::PinOptionDefaults);
     let Some(lean) = pin::pinned_lean() else {
-        eprintln!("{}", pin::skip_notice("pin_option_defaults"));
+        eprintln!(
+            "{}",
+            rig.typed_skip()
+                .expect("record the typed option-default skip")
+        );
         return;
     };
 
@@ -194,6 +199,8 @@ fn every_option_default_fln_core_claims_is_the_one_the_pinned_binary_reports() {
         table.len(),
         table.len() - CLAIMED_DEFAULTS.len()
     );
+    rig.executed()
+        .expect("record the executed option-default differential");
 }
 
 // ---------------------------------------------------------------------------

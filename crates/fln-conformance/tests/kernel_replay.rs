@@ -63,6 +63,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use fln_conformance::pin;
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::name::Name;
@@ -2495,10 +2496,12 @@ fn reference_import_adapter_preserves_one_name_authority_and_rejects_conflicts()
 
 #[test]
 fn present_olean_corpus_inventory_is_closed_and_honest() {
+    let rig = pin::RigRun::new(pin::PinRig::PresentOleanCorpusInventory);
     let Some(reference_lib) = reference_lib() else {
         eprintln!(
-            "SKIP present_olean_corpus_inventory: pinned Reference stdlib not found; \
-             pin-dependent test must run locally"
+            "{}",
+            rig.typed_skip()
+                .expect("record the typed present-olean inventory skip")
         );
         return;
     };
@@ -2563,14 +2566,18 @@ fn present_olean_corpus_inventory_is_closed_and_honest() {
             module.name
         );
     }
+    rig.executed()
+        .expect("record the executed present-olean inventory");
 }
 
 #[test]
 fn present_olean_import_contexts_accept_reference_extended_duplicates() {
+    let rig = pin::RigRun::new(pin::PinRig::PresentOleanImportContexts);
     let Some(reference_lib) = reference_lib() else {
         eprintln!(
-            "SKIP present_olean_import_contexts: pinned Reference stdlib not found; \
-             pin-dependent test must run locally"
+            "{}",
+            rig.typed_skip()
+                .expect("record the typed import-context skip")
         );
         return;
     };
@@ -2709,6 +2716,8 @@ fn present_olean_import_contexts_accept_reference_extended_duplicates() {
         collision_count, 0,
         "valid pinned import closures must all be representable; first={first_collisions:?}"
     );
+    rig.executed()
+        .expect("record the executed present-olean import-context differential");
 }
 
 /// One module's accumulated state in the canonical corpus walk: the PRESENT-import
@@ -3570,10 +3579,12 @@ fn pinned_present_olean_kernel_differential() {
 #[test]
 #[ignore = "cost: the whole pinned corpus replayed at three widths; on-demand lane, not per commit — a documented PG-5 shortfall (bead fln-corpus-thread-matrix-93te R4). The measured wall time is reported by the run itself, in the SUMMARY row, rather than copied here where it would rot"]
 fn present_olean_corpus_thread_matrix_compares_stream_digests() {
+    let rig = pin::RigRun::new(pin::PinRig::PresentOleanCorpusThreadMatrix);
     let Some(reference_lib) = reference_lib() else {
         eprintln!(
-            "SKIP present_olean_corpus_thread_matrix: pinned Reference stdlib not found; \
-             pin-dependent lane. A skip is a typed absence of evidence, never a pass"
+            "{}",
+            rig.typed_skip()
+                .expect("record the typed corpus thread-matrix skip")
         );
         return;
     };
@@ -3895,14 +3906,18 @@ fn present_olean_corpus_thread_matrix_compares_stream_digests() {
         divergences.len(),
         divergences[0]
     );
+    rig.executed()
+        .expect("record the executed corpus thread-matrix observation");
 }
 
 #[test]
 fn prelude_replays_through_the_kernel() {
+    let rig = pin::RigRun::new(pin::PinRig::PreludeKernelReplay);
     let Some((bytes, infos)) = decode_prelude() else {
         eprintln!(
-            "SKIP kernel_replay: pinned Reference stdlib not found \
-             (set FLN_REFERENCE_LIB or install the pin); typed limitation, not a pass"
+            "{}",
+            rig.typed_skip()
+                .expect("record the typed Prelude kernel-replay skip")
         );
         return;
     };
@@ -4433,6 +4448,8 @@ fn prelude_replays_through_the_kernel() {
         rejected_total,
         "triage did not classify every rejection"
     );
+    rig.executed()
+        .expect("record the executed Prelude kernel replay");
 }
 
 // ---------------------------------------------------------------------------
@@ -4610,10 +4627,12 @@ fn admission_fault_matrix_is_typed_and_atomic() {
     // absent and the real-module portion below must skip.
     assert_structural_budget_resource_facts_are_total();
 
+    let rig = pin::RigRun::new(pin::PinRig::AdmissionFaultMatrix);
     let Some((bytes, infos)) = decode_prelude() else {
         eprintln!(
-            "SKIP admission_fault_matrix: pinned Reference stdlib not found \
-             (set FLN_REFERENCE_LIB or install the pin); typed limitation, not a pass"
+            "{}",
+            rig.typed_skip()
+                .expect("record the typed admission fault-matrix skip")
         );
         return;
     };
@@ -5073,6 +5092,8 @@ fn admission_fault_matrix_is_typed_and_atomic() {
             "recovery must reproduce the baseline exactly: {actual} steps={steps_used} (want {s})"
         );
     }
+    rig.executed()
+        .expect("record the executed admission fault matrix");
 }
 
 /// Both corpus censuses must keep disclosing their own claim class, and neither may

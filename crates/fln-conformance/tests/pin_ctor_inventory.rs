@@ -383,8 +383,13 @@ fn divergences(lean_type: &str, row: &str, theirs: &[String], ours: &[&str]) -> 
 
 #[test]
 fn every_constructor_inventory_fln_core_claims_is_the_one_the_pinned_binary_declares() {
+    let rig = pin::RigRun::new(pin::PinRig::PinCtorInventory);
     let Some(lean) = pin::pinned_lean() else {
-        eprintln!("{}", pin::skip_notice("pin_ctor_inventory"));
+        eprintln!(
+            "{}",
+            rig.typed_skip()
+                .expect("record the typed constructor-inventory skip")
+        );
         return;
     };
 
@@ -450,6 +455,8 @@ fn every_constructor_inventory_fln_core_claims_is_the_one_the_pinned_binary_decl
          about the rest of the pin's inductive table and is not a compatibility figure",
         INVENTORIES.len()
     );
+    rig.executed()
+        .expect("record the executed constructor-inventory differential");
 }
 
 // ---------------------------------------------------------------------------
