@@ -388,7 +388,18 @@ mod tests {
         // This module's source is deliberately NOT in any corpus below. A scan whose search space
         // contains its own declaration passes by reading itself, which is the self-match shape
         // `fln-8zsq` paid for; every hit here therefore comes from a producer.
-        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // The checked macro, not the raw compile-time manifest constant: that constant is baked
+        // at build time, so a test binary built in one worktree and run in another resolves
+        // these producers against the tree that COMPILED it while claiming to describe the one
+        // running it — and cargo treats an identical-bytes copy of this package in another tree
+        // as fresh, rebuilding nothing and saying nothing. The first version of this file used
+        // the raw form and the tree-identity guard caught it the moment the file became tracked,
+        // taking tools/structure-guard from 0 raw sites back to 1. The repair then had to be
+        // made TWICE, because the first comment explaining it QUOTED the raw form and the
+        // scanner counts textually — a scanner's prose belongs outside any count it floors, and
+        // that includes the prose of the file being scanned. Bead fln-cross-tree-baked-root-k60n.
+        let crate_root = fln_conformance::checked_manifest_dir!();
+        let crate_root = crate_root.as_path();
         assert!(
             !SCRATCH_FAMILIES.is_empty(),
             "refusing a vacuous scan: the family table is empty"
