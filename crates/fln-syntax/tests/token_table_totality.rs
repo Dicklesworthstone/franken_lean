@@ -26,14 +26,28 @@
 //! `max_token_len` gets its own assertions because the incremental lexer's restart bound is
 //! derived from it: understate it and `relex_incremental` silently stops revisiting decisions
 //! it must revisit. It is a lookahead bound masquerading as a convenience accessor.
+//!
+//! Its depth walk is also a totality boundary. Tokens are installed by user syntax
+//! declarations, so one byte must not become one host-stack frame. Compiler-generated clone,
+//! equality, debug, and drop glue traverse the same recursive representation, so the deep-token
+//! regression exercises the table as a unit. It uses a bounded-stack thread in an isolated
+//! child process, allowing the parent to report a depth-safety regression without losing the
+//! rest of the test run (bead `franken_lean-36di`).
 
 #![forbid(unsafe_code)]
 
 mod common;
 
 use common::Rng;
+use fln_syntax::run::{lex_run, relex_incremental};
+use fln_syntax::source::ByteSpan;
 use fln_syntax::source::{BytePos, SourceText};
 use fln_syntax::token::TokenTable;
+use std::process::Command;
+
+const DEEP_STACK_CHILD: &str = "FLN_TOKEN_TABLE_DEEP_STACK_CHILD";
+const DEEP_TOKEN_BYTES: usize = 16 * 1024;
+const DEEP_THREAD_STACK_BYTES: usize = 64 * 1024;
 
 /// The naive implementation: try every token, keep the longest prefix match.
 ///
@@ -285,6 +299,88 @@ fn max_token_len_is_the_true_maximum_in_bytes() {
             "seed={seed} tokens={chosen:?}"
         );
     }
+}
+
+/// The production incremental path can measure, use, clone, compare, render, and dispose a
+/// user-controlled deep token without making trie depth host-stack depth.
+///
+/// The subprocess is load-bearing: host-stack exhaustion terminates the process rather than
+/// unwinding to `join`, so running the bounded-stack discriminator in this test process would
+/// make the regression incapable of reporting its own failure. The completion marker prevents
+/// an accidentally misspelled `--exact` filter from turning zero executed child tests into
+/// green.
+#[test]
+fn deep_token_operations_are_stack_safe() {
+    if std::env::var_os(DEEP_STACK_CHILD).is_some() {
+        std::thread::Builder::new()
+            .name("fln-token-depth-discriminator".to_string())
+            .stack_size(DEEP_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let token = "<".repeat(DEEP_TOKEN_BYTES);
+                let mut branch = "<".repeat(DEEP_TOKEN_BYTES - 1);
+                branch.push('>');
+                let table = TokenTable::from_tokens(["<", "→", token.as_str(), branch.as_str()]);
+
+                assert_eq!(table.max_token_len(), DEEP_TOKEN_BYTES);
+                assert!(table.contains(&token));
+                assert!(table.contains(&branch));
+
+                let old_raw = format!("{token} x");
+                let old_text = SourceText::from_utf8(old_raw.as_bytes()).expect("valid old text");
+                assert_eq!(
+                    table.match_prefix(&old_text, BytePos(0)),
+                    Some(token.as_str())
+                );
+
+                let cloned = table.clone();
+                assert_eq!(cloned, table);
+                let rendered = format!("{cloned:?}");
+                assert!(rendered.starts_with("TokenTable"));
+                assert!(rendered.len() >= token.len());
+
+                let edited_at = token.len() + 1;
+                let edited = ByteSpan::new(BytePos(edited_at), BytePos(edited_at + 1))
+                    .expect("forward one-byte edit");
+                let new_raw = format!("{token} y");
+                let new_text = SourceText::from_utf8(new_raw.as_bytes()).expect("valid new text");
+                let old_run = lex_run(&old_text, &table);
+                let (incremental, _) = relex_incremental(&old_run, edited, 1, &new_text, &table);
+                assert_eq!(incremental, lex_run(&new_text, &table));
+
+                // Both tables drop on this deliberately small stack. This catches recursive
+                // compiler-generated drop glue separately from the explicit depth walk.
+                drop(cloned);
+                drop(table);
+            })
+            .expect("small-stack discriminator thread starts")
+            .join()
+            .expect("deep-token operations complete on the bounded host stack");
+        println!("fln-token-depth-child: pass bytes={DEEP_TOKEN_BYTES}");
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "deep_token_operations_are_stack_safe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DEEP_STACK_CHILD, "1")
+        .output()
+        .expect("deep-token child process starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "deep-token child failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("fln-token-depth-child: pass bytes=16384"),
+        "deep-token child exited without executing the discriminator\nstdout:\n{stdout}\n\
+         stderr:\n{stderr}"
+    );
 }
 
 /// `contains` is exact: a prefix of a token is not a token, and an extension is not either.

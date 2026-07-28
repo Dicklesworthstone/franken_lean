@@ -58,7 +58,7 @@
 use crate::literal::{self, LiteralError, LiteralKind};
 use crate::source::{BytePos, ByteSpan, SourceText};
 use fln_core::name::Name;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt, mem};
 
 /// A token string in the table — upstream `Lean.Parser.Token = String`.
 pub type Token = String;
@@ -69,16 +69,104 @@ pub type Token = String;
 /// bytes; a char-keyed trie would agree on every token anyone writes but would be a
 /// different function, and the difference would only show up on input that splits a scalar.
 /// Matching the pin's alphabet is cheaper than arguing that the difference is unreachable.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct TokenTable {
     root: TrieNode,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Default)]
 struct TrieNode {
     /// The token ending here, if this path spells one.
     value: Option<Token>,
     children: BTreeMap<u8, TrieNode>,
+}
+
+/// An explicit trie worklist.
+///
+/// Token strings are user-extensible grammar state, so trie depth is input-controlled. Keeping
+/// the traversal state here, on the heap, prevents every caller that walks the table from
+/// turning one token byte into one host-stack frame (bead `franken_lean-36di`).
+struct TrieNodes<'a> {
+    pending: Vec<&'a TrieNode>,
+}
+
+impl<'a> TrieNodes<'a> {
+    fn new(root: &'a TrieNode) -> TrieNodes<'a> {
+        TrieNodes {
+            pending: vec![root],
+        }
+    }
+}
+
+impl<'a> Iterator for TrieNodes<'a> {
+    type Item = &'a TrieNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.pending.pop()?;
+        // Push in reverse byte order so the LIFO walk itself remains canonical. The order is
+        // not needed by `max_token_len`, but it keeps Clone and Debug deterministic too.
+        self.pending.extend(node.children.values().rev());
+        Some(node)
+    }
+}
+
+impl Clone for TokenTable {
+    fn clone(&self) -> TokenTable {
+        let mut cloned = TokenTable::new();
+        for node in TrieNodes::new(&self.root) {
+            if let Some(token) = node.value.as_deref() {
+                cloned.insert(token);
+            }
+        }
+        cloned
+    }
+}
+
+impl PartialEq for TokenTable {
+    fn eq(&self, other: &TokenTable) -> bool {
+        let mut pending = vec![(&self.root, &other.root)];
+        while let Some((left, right)) = pending.pop() {
+            if left.value != right.value || left.children.len() != right.children.len() {
+                return false;
+            }
+            for ((left_byte, left_child), (right_byte, right_child)) in
+                left.children.iter().zip(&right.children).rev()
+            {
+                if left_byte != right_byte {
+                    return false;
+                }
+                pending.push((left_child, right_child));
+            }
+        }
+        true
+    }
+}
+
+impl Eq for TokenTable {}
+
+impl fmt::Debug for TokenTable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tokens: Vec<&str> = TrieNodes::new(&self.root)
+            .filter_map(|node| node.value.as_deref())
+            .collect();
+        formatter
+            .debug_struct("TokenTable")
+            .field("tokens", &tokens)
+            .finish()
+    }
+}
+
+impl Drop for TokenTable {
+    fn drop(&mut self) {
+        // The compiler-generated drop glue would recurse through one `TrieNode` per byte.
+        // Drain every child edge before its node is dropped, leaving only shallow, childless
+        // values for ordinary drop glue. Allocation failure remains outside this API's claim.
+        let mut pending = Vec::new();
+        pending.extend(mem::take(&mut self.root.children).into_values());
+        while let Some(mut node) = pending.pop() {
+            pending.extend(mem::take(&mut node.children).into_values());
+        }
+    }
 }
 
 impl TokenTable {
@@ -146,17 +234,11 @@ impl TokenTable {
     /// walked-but-not-emitted region can silently change a decision it never revisits.
     /// [`crate::run`] consumes it for exactly that.
     pub fn max_token_len(&self) -> usize {
-        fn deepest(node: &TrieNode, depth: usize, best: &mut usize) {
-            if node.value.is_some() {
-                *best = (*best).max(depth);
-            }
-            for child in node.children.values() {
-                deepest(child, depth + 1, best);
-            }
-        }
-        let mut best = 0;
-        deepest(&self.root, 0, &mut best);
-        best
+        TrieNodes::new(&self.root)
+            .filter_map(|node| node.value.as_deref())
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn contains(&self, token: &str) -> bool {
