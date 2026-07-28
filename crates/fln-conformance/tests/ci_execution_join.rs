@@ -2782,6 +2782,51 @@ fn a_complete_structured_rig_record_is_accepted() {
     );
 }
 
+/// A libtest disposition is evidence that the function returned, not that it reached the
+/// assertion-bearing end. Keep the negative and positive cells on the same rig and pin so
+/// the only moved variable is whether the bytes came from libtest or the rig itself.
+#[test]
+fn a_libtest_ok_line_cannot_discharge_a_rig() {
+    const TAG: &str = "v4.32.0";
+    const COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
+    let rig = PinRig::PreludeKernelReplay;
+    let expected_executed = [rig].into();
+    let expected_not_run = BTreeSet::new();
+
+    let function = rig
+        .identity()
+        .rsplit("::")
+        .next()
+        .expect("a test-function identity has a final function component");
+    let libtest_log = format!("test {function} ... ok\n");
+    assert!(
+        RigExecutionRecord::parse(&libtest_log).is_err(),
+        "a passing libtest line must never parse as a rig-emitted disposition"
+    );
+    let log_findings =
+        judge_rig_execution_records(&[], &expected_executed, &expected_not_run, TAG, COMMIT);
+    assert!(
+        log_findings
+            .iter()
+            .any(|finding| finding.starts_with("record-missing:")
+                && finding.contains(rig.identity())),
+        "the log-derived cell must leave the exact rig missing: {log_findings:?}"
+    );
+
+    let emitted = synthetic_rig_record(rig, RigDisposition::Executed, TAG, COMMIT);
+    assert!(
+        judge_rig_execution_records(
+            &[emitted],
+            &expected_executed,
+            &expected_not_run,
+            TAG,
+            COMMIT,
+        )
+        .is_empty(),
+        "the same rig and pin must be discharged by its canonical emitted record"
+    );
+}
+
 #[test]
 fn a_typed_skip_and_a_missing_record_are_distinct_refusals() {
     const TAG: &str = "v4.32.0";
