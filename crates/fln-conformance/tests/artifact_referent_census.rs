@@ -160,6 +160,23 @@
 //! measurement here, which is the direction that matters — a claim about someone else's
 //! arithmetic is worth re-deriving before it is landed on.
 
+//!
+//! **A second law now lives in this file, over the same classification and in the opposite
+//! direction** (bead `franken_lean-ephemeral-manifest-artifact-povo`). Everything above
+//! *discloses* a measured population by equality; [`UNTRACKED_PATH_CITATION_DEBT`] *refuses* a
+//! new member of one sub-population — the citations naming a repository path `git ls-files`
+//! does not contain — bound per `(bead, entry)` rather than per class. The two are not
+//! redundant and neither is sufficient: equality on a class total stops the population
+//! growing and cannot see a repair funding a swap, and one-way membership per member sees the
+//! swap and permits the total to fall. They are stated together here because a reader who
+//! finds one will assume it is the whole law.
+//!
+//! Note what sharing the file buys and what it costs. The classifier is written once, so the
+//! two laws can never disagree about what "untracked" means — the disagreement that cost this
+//! census 22 citations was between two *implementations*, and there is only one here. The cost
+//! is that a single red now has two possible authors, which the failure messages separate by
+//! naming their bead.
+
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -238,6 +255,412 @@ const STRUCTURED_HEADS: &[&str] = &[
     "pinned-toolchain:",
     "hash_identity:",
 ];
+
+/// **The `povo` debt: every untracked path citation live in the manifest, declared PER
+/// MEMBER** (bead `franken_lean-ephemeral-manifest-artifact-povo`).
+///
+/// That bead's repair decision is one predicate: a repository path citation must "normalize
+/// inside the repository, be a regular non-symlink file, and be **Git-tracked**. Existence
+/// without tracked durability does not count." Its acceptance criterion was tightened on
+/// 2026-07-27 from *zero `target/` citations* to **zero untracked citations**, on the
+/// measurement that the original caught 3 of 18 dangling citations and tracked-ness catches
+/// 18 of 18. That criterion is not met today — 150 citations across 48 rows fail it — so what
+/// lands here is the half that can be honest now: the debt is **declared**, and no new member
+/// may join it silently.
+///
+/// **Why per member and not per class, which is the whole reason this exists beside a census
+/// that already binds the totals.** [`UNRESOLVABLE_CENSUS`] pins each class by equality in
+/// both directions, so the population cannot *grow*. It is still an aggregate, and
+/// `fln-cross-tree-baked-root-k60n` measured what that costs over 70 commits: one repair took
+/// a total from 44 to 38 and four new unprotected rigs then landed in four separate commits
+/// under a guard that was green the whole time, because the total never came back. An
+/// aggregate is a budget its own repairs refill. Repair one `rootless_leaf` citation here and
+/// the class count frees a slot any other row may take — the census sees 99 either way. This
+/// table keys on `(bead, entry)`, so a repair frees a slot only in the row that earned it and
+/// a new row has no slot at all.
+///
+/// **The direction is one-way membership, and the missing half is disclosed rather than
+/// built.** Every *measured* untracked citation must appear here; a declared entry that no
+/// longer denotes one is **not** a failure. Reverse membership reddens the commit doing the
+/// repair, which is a wall this repository has already paid for (`igxr`), and the reward for
+/// repairing a row must not be a red build. The cost is stated plainly: this table is an
+/// **upper bound** on the live debt, never a count of it. What stops it drifting upward while
+/// the table drifts down is the sibling equality binding in [`UNRESOLVABLE_CENSUS`], which
+/// forces the same commit to lower a class count — the two laws are load-bearing together and
+/// neither is sufficient alone.
+///
+/// Derived at `84f35ea6` by a second implementation (`povo_population.py`, which has tested
+/// tracked-ness first since before the Rust classifier did) and reconciled against this file's
+/// own classifier **per class**, not per total: 99 / 20 / 15 / 9 / 7 / 0. A total that agrees
+/// is worth much less — the two implementations agreed on no total for their whole
+/// co-existence while disagreeing by 22 inside one class.
+const UNTRACKED_PATH_CITATION_DEBT: &[(&str, &[&str])] = &[
+    ("fln-1dxv", &["tribunal/epoch-lab/tests"]),
+    (
+        "fln-22i1",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    ("fln-23cz", &["crates/fln-syntax/src/syntax.rs"]),
+    (
+        "fln-3oj6",
+        &["tools/structure-guard/kernel-ownership-publisher"],
+    ),
+    (
+        "fln-3tye",
+        &[
+            "contracts/builtin_environment.tsv",
+            "contracts/builtin_partition.tsv",
+        ],
+    ),
+    ("fln-4l15", &["tribunal/epoch-lab/tests"]),
+    ("fln-8138", &["bundle.complete.json", "run.ndjson"]),
+    (
+        "fln-9wya",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "fln-amv.1",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "human.semantic.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "fln-amv.12",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "human.semantic.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "fln-amv.2",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "human.semantic.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "fln-extension-history-checkpoint-identity-41s",
+        &[
+            "env-snapshots/*/bundle.complete.json",
+            "env-snapshots/*/environment_state.out",
+            "env-snapshots/*/environment_state.validation.json",
+            "env-snapshots/*/run.ndjson",
+        ],
+    ),
+    (
+        "fln-extension-merge-validation-proof-debt-dt5",
+        &["target/e2e/env-snapshots-20260727T001352Z-4170014"],
+    ),
+    ("fln-fei1", &["tribunal/epoch-lab/tests"]),
+    (
+        "fln-g6d1",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+            "self-test.json",
+        ],
+    ),
+    (
+        "fln-giap",
+        &[
+            "epoch-lab-live-verify.log",
+            "epoch-lab-test.log",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "fln-history-rewrite-evidence-anchor-reachability-vdi4",
+        &[
+            "crates/fln-syntax/tests/corpus/golden_vellum.json",
+            "crates/fln-syntax/tests/corpus/golden_vellum.provenance.json",
+            "target/check/check-20260727T004746Z-310405",
+            "target/check/check-20260727T025920Z-1712638",
+        ],
+    ),
+    (
+        "fln-identity-path-mutant-recovery-mbco",
+        &[
+            "env-snapshots/*/declaration-membership-fln-amv.1/bundle.complete.json",
+            "env-snapshots/*/declaration-tag-matrix-fln-amv.12/bundle.complete.json",
+            "env-snapshots/*/extension-descriptor-matrix-fln-amv.2/bundle.complete.json",
+            "env-snapshots/*/manifest.json",
+        ],
+    ),
+    (
+        "fln-k5rr",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "human.semantic.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "fln-pu6i",
+        &[
+            "bundle.complete.json",
+            "crates/fln-verdict/tests/CERTIFICATE_GOLDENS_PROVENANCE.md",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    ("fln-q3u4", &["tribunal/epoch-lab/MANIFEST.txt"]),
+    (
+        "fln-rwz",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    ("fln-rzyk", &["tribunal/epoch-lab/tests"]),
+    (
+        "fln-sr2z",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "fln-stc1",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    ("fln-uuuz", &["target/check/check-20260726T234804Z-3984739"]),
+    ("fln-yk3t", &["run.ndjson", "ubs-inventory.json"]),
+    (
+        "fln-zti3",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-1fxz",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "human.semantic.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-1umc",
+        &[
+            "env-snapshots/*/bundle.complete.json",
+            "env-snapshots/*/collision-fln-amv.10",
+            "env-snapshots/*/declaration-membership-fln-amv.1",
+            "env-snapshots/*/declaration-tag-matrix-fln-amv.12",
+            "env-snapshots/*/extension-descriptor-matrix-fln-amv.2",
+            "env-snapshots/*/resource-collision-fln-amv.13",
+        ],
+    ),
+    (
+        "franken_lean-2tcr",
+        &["target/e2e/env-snapshots-20260727T021342Z-1240844"],
+    ),
+    (
+        "franken_lean-83pz",
+        &[
+            "resource-collision-fln-amv.13/bundle.complete.json",
+            "resource-collision-fln-amv.13/manifest.json",
+            "resource-collision-fln-amv.13/run.ndjson",
+        ],
+    ),
+    ("franken_lean-869w", &["tribunal/epoch-lab/tests"]),
+    (
+        "franken_lean-9iqa",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "human.semantic.log",
+            "manifest.json",
+            "run.ndjson",
+            "ubs-inventory.json",
+        ],
+    ),
+    ("franken_lean-9pnc", &["tribunal/epoch-lab/tests"]),
+    (
+        "franken_lean-build-gate-lane-governed-set-98np",
+        &["target/check/check-20260727T004746Z-310405"],
+    ),
+    (
+        "franken_lean-ex54",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-h5z1",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-j8h-admission-lane-seeds-vss4",
+        &[
+            "env-snapshots/*/bundle.complete.json",
+            "env-snapshots/*/declaration_budget_check_omission_mutant.err",
+            "env-snapshots/*/declaration_bytes_unit_hardcoded_mutant.err",
+            "env-snapshots/*/declaration_cancellation_as_resource_mutant.err",
+            "env-snapshots/*/declaration_plan_base_binding_omission_mutant.err",
+            "env-snapshots/*/run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-lsz5",
+        &[
+            "gate-self-test/bundle.complete.json",
+            "gate-self-test/manifest.json",
+            "gate-self-test/run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-lu5",
+        &["target/check/check-20260725T190953Z-814126/bundle.complete.json"],
+    ),
+    (
+        "franken_lean-mrlo",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-r4m8",
+        &["bundle.complete.json", "manifest.json", "run.ndjson"],
+    ),
+    (
+        "franken_lean-rps",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "human.semantic.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-rur",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "human.semantic.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+    ("franken_lean-tkr2", &["crates/fln-syntax/src/syntax.rs"]),
+    (
+        "franken_lean-vugo",
+        &[
+            "gate-self-test/bundle.complete.json",
+            "gate-self-test/manifest.json",
+            "gate-self-test/run.ndjson",
+        ],
+    ),
+    (
+        "franken_lean-w75y",
+        &[
+            "bundle.complete.json",
+            "human.log",
+            "manifest.json",
+            "run.ndjson",
+        ],
+    ),
+];
+
+/// Does this class mean *the citation names a repository path `git ls-files` does not
+/// contain*?
+///
+/// **Derived from [`UNRESOLVABLE_CENSUS`], never hand-listed**, so a class added to the
+/// classifier joins `povo`'s law by construction instead of escaping it until somebody
+/// notices — which is the failure this file's own header records for `existed_then_removed`
+/// and the reason `AGENTS.md` asks that a guard's scope come from the artifact's own fields.
+/// The one unresolvable class that is *not* a path is the commit anchor, and the cardinality
+/// of that exclusion is asserted rather than assumed by the test below.
+fn is_untracked_path_kind(kind: &str) -> bool {
+    UNRESOLVABLE_CENSUS.iter().any(|(class, _)| *class == kind) && !kind.starts_with("commit_")
+}
+
+/// The verdict of `povo`'s law over a population: how many measured untracked citations the
+/// debt above accounts for, and which ones it does not.
+///
+/// A `Result`-shaped pure function over the population rather than an inline
+/// `assert!(…is_empty())`, because the union form the test uses — real rows **plus** planted
+/// members, one assertion naming exactly the plants — needs the verdict as a value. That
+/// shape is what makes gutting the refusal and gutting the plant *both* fail; two separate
+/// tests leave the live assertion unkillable once the population it watches is repaired.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UntrackedVerdict {
+    declared: usize,
+    undeclared: Vec<String>,
+}
+
+fn judge_untracked_citations(rows: &[Row], debt: &[(&str, &[&str])]) -> UntrackedVerdict {
+    let mut verdict = UntrackedVerdict::default();
+    for row in rows {
+        for cite in &row.cites {
+            if !is_untracked_path_kind(cite.kind) {
+                continue;
+            }
+            let permitted = debt
+                .iter()
+                .find(|(bead, _)| *bead == row.bead)
+                .is_some_and(|(_, entries)| entries.contains(&cite.entry.as_str()));
+            if permitted {
+                verdict.declared += 1;
+            } else {
+                verdict
+                    .undeclared
+                    .push(format!("{} :: {} ({})", row.bead, cite.entry, cite.kind));
+            }
+        }
+    }
+    verdict.undeclared.sort();
+    verdict
+}
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
@@ -318,9 +741,28 @@ fn classify(root: &Path, entry: &str, tracked: &BTreeSet<String>) -> &'static st
     }
 }
 
+/// One artifact citation and the class it landed in.
+///
+/// The entry string is retained rather than discarded after classification, because the two
+/// laws in this file need different halves of it: the census arithmetic below needs only the
+/// **kind**, and `povo`'s per-member debt needs the **entry** as well. A second walk that
+/// re-read the manifest for the strings would be a second implementation of the classifier —
+/// the defect family this file exists inside.
+#[derive(Clone)]
+struct Cite {
+    entry: String,
+    kind: &'static str,
+}
+
 struct Row {
     bead: String,
-    kinds: Vec<&'static str>,
+    cites: Vec<Cite>,
+}
+
+impl Row {
+    fn kinds(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.cites.iter().map(|cite| cite.kind)
+    }
 }
 
 fn scan() -> Vec<Row> {
@@ -354,11 +796,14 @@ fn scan() -> Vec<Row> {
                 number + 1
             );
         };
-        let kinds = artifacts
+        let cites = artifacts
             .iter()
-            .map(|entry| classify(&root, entry, &tracked))
+            .map(|entry| Cite {
+                kind: classify(&root, entry, &tracked),
+                entry: entry.clone(),
+            })
             .collect();
-        rows.push(Row { bead, kinds });
+        rows.push(Row { bead, cites });
     }
     assert!(
         rows.len() >= 150,
@@ -389,16 +834,15 @@ struct Measured {
 fn measure(rows: &[Row]) -> Measured {
     let mut m = Measured::default();
     for row in rows {
-        for kind in &row.kinds {
-            *m.counts.entry(*kind).or_default() += 1;
+        for kind in row.kinds() {
+            *m.counts.entry(kind).or_default() += 1;
             m.total += 1;
         }
-        let unresolvable: Vec<&&str> = row
-            .kinds
-            .iter()
+        let unresolvable: Vec<&'static str> = row
+            .kinds()
             .filter(|kind| !RESOLVABLE.contains(kind) && !BY_DESIGN.contains(kind))
             .collect();
-        if unresolvable.is_empty() || unresolvable.len() != row.kinds.len() {
+        if unresolvable.is_empty() || unresolvable.len() != row.cites.len() {
             continue;
         }
         m.fully_unresolvable += 1;
@@ -406,7 +850,7 @@ fn measure(rows: &[Row]) -> Measured {
             m.third_state += 1;
             let blocking: Vec<&'static str> = unresolvable
                 .iter()
-                .map(|kind| **kind)
+                .copied()
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -621,13 +1065,13 @@ fn a_third_state_row_moving_between_blocking_kinds_is_caught_though_the_total_is
         rows.iter()
             .map(|row| Row {
                 bead: row.bead.clone(),
-                kinds: row.kinds.clone(),
+                cites: row.cites.clone(),
             })
             .collect()
     };
     let third_state_row = |rows: &[Row], kind: &str| -> usize {
         rows.iter()
-            .position(|row| !row.kinds.is_empty() && row.kinds.iter().all(|k| *k == kind))
+            .position(|row| !row.cites.is_empty() && row.kinds().all(|k| k == kind))
             .unwrap_or_else(|| {
                 panic!(
                     "no third-state row is blocked solely by {kind:?} — the plant has no subject"
@@ -638,7 +1082,9 @@ fn a_third_state_row_moving_between_blocking_kinds_is_caught_though_the_total_is
     // 1. Move one rootless-leaf-only row to glob-only. Same row count, same total.
     let mut moved = clone(&rows);
     let subject = third_state_row(&moved, "rootless_leaf");
-    moved[subject].kinds = vec!["glob"; moved[subject].kinds.len()];
+    for cite in &mut moved[subject].cites {
+        cite.kind = "glob";
+    }
     let mutant = measure(&moved);
     assert_eq!(
         mutant.third_state, baseline.third_state,
@@ -671,7 +1117,16 @@ fn a_third_state_row_moving_between_blocking_kinds_is_caught_though_the_total_is
     let mut multi = clone(&rows);
     multi.push(Row {
         bead: "planted-multi-kind-decoy".to_owned(),
-        kinds: vec!["rootless_leaf", "glob"],
+        cites: vec![
+            Cite {
+                entry: "planted_decoy_artifact.ndjson".to_owned(),
+                kind: "rootless_leaf",
+            },
+            Cite {
+                entry: "env-snapshots/*/planted-decoy".to_owned(),
+                kind: "glob",
+            },
+        ],
     });
     let mutant = measure(&multi);
     assert_eq!(
@@ -714,7 +1169,7 @@ fn an_undeclared_unresolvable_citation_is_caught_rather_than_joining_silently() 
             .iter()
             .map(|row| Row {
                 bead: row.bead.clone(),
-                kinds: row.kinds.clone(),
+                cites: row.cites.clone(),
             })
             .collect();
         let root = fln_conformance::checked_workspace_root!();
@@ -725,7 +1180,10 @@ fn an_undeclared_unresolvable_citation_is_caught_rather_than_joining_silently() 
             "the planted decoy {planted:?} classifies as {observed:?}, not {kind:?} — a decoy \
              that lands in the wrong class controls nothing"
         );
-        mutated[0].kinds.push(observed);
+        mutated[0].cites.push(Cite {
+            entry: planted.to_owned(),
+            kind: observed,
+        });
 
         let mutant = measure(&mutated).counts;
         let declared = UNRESOLVABLE_CENSUS
@@ -774,5 +1232,206 @@ fn an_empty_or_shallow_scan_is_refused_rather_than_reported_clean() {
     assert!(
         declared_third > 0,
         "an all-zero decomposition would agree with an empty scan for the same reason"
+    );
+}
+
+/// **The wall check: repairing a citation while leaving the debt table alone must stay
+/// GREEN.**
+///
+/// The direction of a declared-remainder guard decides whether it survives the repair it is
+/// asking for, and two of the three available directions hand the repairer a red build as the
+/// reward for doing the work: "every declared entry is still measured" reddens on repair, and
+/// equality on the table's length reddens on both repair and extension. Only one-way
+/// membership survives, and *reviewing the law is not enough* — a precondition inside the test
+/// inherits the same question and has broken this way before.
+///
+/// So it is measured rather than argued. The repair is simulated in memory: one declared row
+/// loses every untracked citation it had, the table is untouched, and the verdict must not
+/// gain an entry. Nothing writes to `ci/VERIFICATION_MANIFEST.jsonl` — it is a shared file in
+/// a shared checkout and a transient edit to it is a governed-input mutation that can end
+/// another pane's lane.
+///
+/// This cell deliberately does **not** assert that the live manifest is clean; the law's own
+/// test does that. A real undeclared citation must kill exactly one test, or a reader cannot
+/// tell which property was load-bearing.
+#[test]
+fn repairing_a_declared_citation_without_touching_the_debt_does_not_redden() {
+    let rows = scan();
+    let before = judge_untracked_citations(&rows, UNTRACKED_PATH_CITATION_DEBT);
+
+    let subject = rows
+        .iter()
+        .position(|row| {
+            row.cites
+                .iter()
+                .any(|cite| is_untracked_path_kind(cite.kind))
+        })
+        .expect(
+            "no row carries an untracked path citation, so this cell simulates nothing. If \
+             povo's debt is genuinely repaired to zero, this test must be rebuilt against a \
+             synthetic row rather than deleted — a guard whose population has emptied stops \
+             checking anything, silently.",
+        );
+    let repaired: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| Row {
+            bead: row.bead.clone(),
+            cites: row
+                .cites
+                .iter()
+                .filter(|cite| index != subject || !is_untracked_path_kind(cite.kind))
+                .cloned()
+                .collect(),
+        })
+        .collect();
+
+    let after = judge_untracked_citations(&repaired, UNTRACKED_PATH_CITATION_DEBT);
+    assert!(
+        after.declared < before.declared,
+        "the simulated repair removed no declared citation ({} before, {} after), so this cell \
+         controls nothing and would pass against any law at all",
+        before.declared,
+        after.declared
+    );
+    assert_eq!(
+        after.undeclared, before.undeclared,
+        "povo's law has become a WALL: repairing row {:?} — deleting untracked citations and \
+         touching nothing else — made the verdict grow. A declared entry that no longer denotes \
+         a live citation must be permitted, because the alternative reddens the commit doing \
+         the repair. The debt table is an UPPER BOUND on the live population by design; what \
+         stops it drifting upward is UNRESOLVABLE_CENSUS's equality binding, not this law.",
+        rows[subject].bead
+    );
+}
+
+/// **`povo`'s law: no untracked path citation may enter the manifest undeclared.**
+///
+/// Judged over the **union** of the real population and two planted members, in one
+/// assertion, because that is the only shape in which both halves are killable per commit. A
+/// separate "the real tree is clean" test plus a separate "a plant is refused" test leaves the
+/// live assertion decorative the day the debt is repaired to zero — measured on
+/// `fln-cross-tree-baked-root-k60n`, where a mutant survived every live guard and died only at
+/// a synthetic plant. Here, gutting the refusal drops both plants from the verdict and gutting
+/// a plant drops one, while a real row that gained an undeclared citation *joins* the verdict:
+/// all three fail the same equality.
+///
+/// **Two plants, because one of them is the only cell that can tell this law from an
+/// artifact-keyed one.** Plant A cites a string declared for nobody, which any matching at all
+/// refuses. Plant B cites a string this table genuinely declares — **for a different bead** —
+/// which a check keyed on the citation rather than on `(bead, entry)` would wave through, and
+/// that is precisely the budget-refilling shape `k60n` measured. Plant B's entry is *derived*
+/// from the debt table rather than written here, so it cannot rot into naming something the
+/// table no longer declares.
+#[test]
+fn an_undeclared_untracked_path_citation_is_refused_and_a_foreign_member_cannot_borrow_a_slot() {
+    // The exclusion in `is_untracked_path_kind` is a negation, and a negation over a derived
+    // set is exactly where a silent widening hides: if a second `commit_*` class appeared, or
+    // the only one were renamed, the law would quietly change scope with no line moving here.
+    let commit_classes = UNRESOLVABLE_CENSUS
+        .iter()
+        .filter(|(class, _)| class.starts_with("commit_"))
+        .count();
+    assert_eq!(
+        commit_classes, 1,
+        "povo's law is `every unresolvable class EXCEPT the commit anchor`, so exactly one \
+         class may be excluded; {commit_classes} match, which means the exclusion no longer \
+         says what this file claims it says"
+    );
+
+    let root = fln_conformance::checked_workspace_root!();
+    let mut rows = scan();
+
+    // Classified by the PRODUCTION classifier rather than hand-labelled: a plant that carries
+    // its own verdict tests the comparison and not the thing being compared.
+    let unknown = "target/check/check-19700101T000000Z-0/planted-decoy.json";
+    let unknown_kind = classify(&root, unknown, &BTreeSet::new());
+    let foreign = UNTRACKED_PATH_CITATION_DEBT
+        .iter()
+        .find_map(|(_, entries)| entries.first().copied())
+        .unwrap_or_else(|| {
+            panic!(
+                "the debt table is EMPTY, so povo's remainder is repaired and the \
+                 foreign-member plant has no subject. This panic is that conversion falling \
+                 due, not a defect: a membership law scoped to an empty remainder checks \
+                 nothing at all, silently, exactly when the surviving rows become load-bearing \
+                 published claims. Rebuild this cell against a synthetic table."
+            )
+        });
+    let foreign_kind = classify(&root, foreign, &BTreeSet::new());
+    for (entry, kind) in [(unknown, unknown_kind), (foreign, foreign_kind)] {
+        assert!(
+            is_untracked_path_kind(kind),
+            "the planted citation {entry:?} classifies as {kind:?}, which povo's law does not \
+             govern — a plant outside the population controls nothing"
+        );
+    }
+
+    let plant_a = "povo-planted-decoy-unknown-citation";
+    let plant_b = "povo-planted-decoy-foreign-member";
+    // Plant C is the NEGATION's plant, and without it that half of the law is inert. The
+    // commit-anchor exclusion is subsumed by live data — `commit_unreachable` measures 0 today
+    // — so deleting it from `is_untracked_path_kind` changes no verdict and no test fails: the
+    // unkillable-declaration shape this repository has already measured. Planting a citation
+    // of that class puts the exclusion back in the assertion's path, where deleting it makes C
+    // appear among the refusals and the equality below fail. The class is *derived* from the
+    // census rather than typed, so a rename cannot leave the plant probing a class that is
+    // gone. Its kind is supplied rather than classified deliberately: `classify` would need a
+    // real 40-hex sha in this source, and a sha written into a tracked file is a fresh
+    // commit-anchor citation — `da1adcb9`'s lesson, where prose about a rotted anchor minted
+    // one.
+    let plant_c = "povo-planted-decoy-commit-anchor";
+    let commit_class = UNRESOLVABLE_CENSUS
+        .iter()
+        .find(|(class, _)| class.starts_with("commit_"))
+        .map(|(class, _)| *class)
+        .expect("the commit-anchor class must be disclosed for the exclusion to have a subject");
+    rows.push(Row {
+        bead: plant_c.to_owned(),
+        cites: vec![Cite {
+            entry: "commit:planted-decoy-deliberately-not-a-sha".to_owned(),
+            kind: commit_class,
+        }],
+    });
+    rows.push(Row {
+        bead: plant_a.to_owned(),
+        cites: vec![Cite {
+            entry: unknown.to_owned(),
+            kind: unknown_kind,
+        }],
+    });
+    rows.push(Row {
+        bead: plant_b.to_owned(),
+        cites: vec![Cite {
+            entry: foreign.to_owned(),
+            kind: foreign_kind,
+        }],
+    });
+
+    let verdict = judge_untracked_citations(&rows, UNTRACKED_PATH_CITATION_DEBT);
+    let mut expected = vec![
+        format!("{plant_a} :: {unknown} ({unknown_kind})"),
+        format!("{plant_b} :: {foreign} ({foreign_kind})"),
+    ];
+    expected.sort();
+    assert_eq!(
+        verdict.undeclared, expected,
+        "povo (bead franken_lean-ephemeral-manifest-artifact-povo): the verdict over the real \
+         manifest plus two planted citations must name EXACTLY the two plants.\n  \
+         An entry present here that is not a plant is a NEW untracked path citation: a \
+         judgement row is resting on a path git does not track, so it is absent from every \
+         fresh clone and from every rch worker, and the next `target/` prune or `git clean` \
+         removes it with nothing going red. Cite a tracked file, or a `bead-comment:`/`test:` \
+         reference, or declare the entry in UNTRACKED_PATH_CITATION_DEBT under YOUR OWN bead \
+         and say so — the debt is per (bead, entry) precisely so that borrowing a peer's slot \
+         is not available.\n  \
+         A plant MISSING from it is the law going quiet: either the refusal stopped firing, or \
+         it stopped keying on the row, and the second reads as a pass on live data forever."
+    );
+    assert!(
+        verdict.declared + verdict.undeclared.len() >= 2,
+        "the verdict accounted for {} citations in total — a walk this short cannot have \
+         reached the manifest, and a broken scan reports the same clean bill as a repaired one",
+        verdict.declared + verdict.undeclared.len()
     );
 }
