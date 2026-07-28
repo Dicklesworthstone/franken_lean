@@ -45,6 +45,7 @@
 use crate::attach::{Attached, attach_from_leaves};
 use crate::source::{ByteSpan, SourceInfo, SourceText};
 use fln_core::name::Name;
+use std::fmt;
 
 /// `Lean.SyntaxNodeKind` — `abbrev SyntaxNodeKind := Name` (Prelude.lean:4919).
 pub type SyntaxNodeKind = Name;
@@ -58,7 +59,6 @@ pub enum Preresolved {
 }
 
 /// `Lean.Syntax` (Prelude.lean:4943), one variant per upstream constructor.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Syntax {
     /// A portion of the tree missing because of a parse error.
     Missing,
@@ -82,6 +82,340 @@ pub enum Syntax {
         val: Name,
         preresolved: Vec<Preresolved>,
     },
+}
+
+enum SyntaxCloneTask<'a> {
+    Visit(&'a Syntax),
+    FinishNode {
+        info: SourceInfo,
+        kind: &'a SyntaxNodeKind,
+        child_start: usize,
+    },
+}
+
+enum SyntaxDebugTask<'a> {
+    Syntax(&'a Syntax, usize),
+    Args(&'a [Syntax], usize),
+    Value(&'a dyn fmt::Debug, usize),
+    Text(&'static str),
+    Indent(usize),
+}
+
+impl Clone for Syntax {
+    fn clone(&self) -> Self {
+        let mut tasks = vec![SyntaxCloneTask::Visit(self)];
+        let mut built = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                SyntaxCloneTask::Visit(Syntax::Missing) => built.push(Syntax::Missing),
+                SyntaxCloneTask::Visit(Syntax::Node { info, kind, args }) => {
+                    tasks.push(SyntaxCloneTask::FinishNode {
+                        info: *info,
+                        kind,
+                        child_start: built.len(),
+                    });
+                    tasks.extend(args.iter().rev().map(SyntaxCloneTask::Visit));
+                }
+                SyntaxCloneTask::Visit(Syntax::Atom { info, val }) => {
+                    built.push(Syntax::Atom {
+                        info: *info,
+                        val: val.clone(),
+                    });
+                }
+                SyntaxCloneTask::Visit(Syntax::Ident {
+                    info,
+                    raw_val,
+                    val,
+                    preresolved,
+                }) => {
+                    built.push(Syntax::Ident {
+                        info: *info,
+                        raw_val: *raw_val,
+                        val: val.clone(),
+                        preresolved: preresolved.clone(),
+                    });
+                }
+                SyntaxCloneTask::FinishNode {
+                    info,
+                    kind,
+                    child_start,
+                } => {
+                    let args = built.split_off(child_start);
+                    built.push(Syntax::Node {
+                        info,
+                        kind: kind.clone(),
+                        args,
+                    });
+                }
+            }
+        }
+
+        debug_assert_eq!(built.len(), 1, "one input tree produces one cloned tree");
+        built
+            .pop()
+            .expect("the clone worklist always emits its root")
+    }
+}
+
+impl PartialEq for Syntax {
+    fn eq(&self, other: &Self) -> bool {
+        let mut pairs = vec![(self, other)];
+
+        while let Some((left, right)) = pairs.pop() {
+            match (left, right) {
+                (Syntax::Missing, Syntax::Missing) => {}
+                (
+                    Syntax::Node {
+                        info: left_info,
+                        kind: left_kind,
+                        args: left_args,
+                    },
+                    Syntax::Node {
+                        info: right_info,
+                        kind: right_kind,
+                        args: right_args,
+                    },
+                ) => {
+                    if left_info != right_info
+                        || left_kind != right_kind
+                        || left_args.len() != right_args.len()
+                    {
+                        return false;
+                    }
+                    pairs.extend(left_args.iter().zip(right_args).rev());
+                }
+                (
+                    Syntax::Atom {
+                        info: left_info,
+                        val: left_val,
+                    },
+                    Syntax::Atom {
+                        info: right_info,
+                        val: right_val,
+                    },
+                ) => {
+                    if left_info != right_info || left_val != right_val {
+                        return false;
+                    }
+                }
+                (
+                    Syntax::Ident {
+                        info: left_info,
+                        raw_val: left_raw_val,
+                        val: left_val,
+                        preresolved: left_preresolved,
+                    },
+                    Syntax::Ident {
+                        info: right_info,
+                        raw_val: right_raw_val,
+                        val: right_val,
+                        preresolved: right_preresolved,
+                    },
+                ) => {
+                    if left_info != right_info
+                        || left_raw_val != right_raw_val
+                        || left_val != right_val
+                        || left_preresolved != right_preresolved
+                    {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+
+        true
+    }
+}
+
+impl Eq for Syntax {}
+
+impl fmt::Debug for Syntax {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pretty = formatter.alternate();
+        let mut tasks = vec![SyntaxDebugTask::Syntax(self, 0)];
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                SyntaxDebugTask::Syntax(Syntax::Missing, _) => formatter.write_str("Missing")?,
+                SyntaxDebugTask::Syntax(Syntax::Node { info, kind, args }, indent) if pretty => {
+                    tasks.push(SyntaxDebugTask::Text("}"));
+                    tasks.push(SyntaxDebugTask::Indent(indent));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Args(args, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("args: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Value(kind, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("kind: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Value(info, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("info: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("Node {\n"));
+                }
+                SyntaxDebugTask::Syntax(Syntax::Node { info, kind, args }, _) => {
+                    tasks.push(SyntaxDebugTask::Text(" }"));
+                    tasks.push(SyntaxDebugTask::Args(args, 0));
+                    tasks.push(SyntaxDebugTask::Text(", args: "));
+                    tasks.push(SyntaxDebugTask::Value(kind, 0));
+                    tasks.push(SyntaxDebugTask::Text(", kind: "));
+                    tasks.push(SyntaxDebugTask::Value(info, 0));
+                    tasks.push(SyntaxDebugTask::Text("Node { info: "));
+                }
+                SyntaxDebugTask::Syntax(Syntax::Atom { info, val }, indent) if pretty => {
+                    tasks.push(SyntaxDebugTask::Text("}"));
+                    tasks.push(SyntaxDebugTask::Indent(indent));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Value(val, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("val: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Value(info, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("info: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("Atom {\n"));
+                }
+                SyntaxDebugTask::Syntax(Syntax::Atom { info, val }, _) => {
+                    tasks.push(SyntaxDebugTask::Text(" }"));
+                    tasks.push(SyntaxDebugTask::Value(val, 0));
+                    tasks.push(SyntaxDebugTask::Text(", val: "));
+                    tasks.push(SyntaxDebugTask::Value(info, 0));
+                    tasks.push(SyntaxDebugTask::Text("Atom { info: "));
+                }
+                SyntaxDebugTask::Syntax(
+                    Syntax::Ident {
+                        info,
+                        raw_val,
+                        val,
+                        preresolved,
+                    },
+                    indent,
+                ) if pretty => {
+                    tasks.push(SyntaxDebugTask::Text("}"));
+                    tasks.push(SyntaxDebugTask::Indent(indent));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Value(preresolved, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("preresolved: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Value(val, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("val: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Value(raw_val, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("raw_val: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text(",\n"));
+                    tasks.push(SyntaxDebugTask::Value(info, indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("info: "));
+                    tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    tasks.push(SyntaxDebugTask::Text("Ident {\n"));
+                }
+                SyntaxDebugTask::Syntax(
+                    Syntax::Ident {
+                        info,
+                        raw_val,
+                        val,
+                        preresolved,
+                    },
+                    _,
+                ) => {
+                    tasks.push(SyntaxDebugTask::Text(" }"));
+                    tasks.push(SyntaxDebugTask::Value(preresolved, 0));
+                    tasks.push(SyntaxDebugTask::Text(", preresolved: "));
+                    tasks.push(SyntaxDebugTask::Value(val, 0));
+                    tasks.push(SyntaxDebugTask::Text(", val: "));
+                    tasks.push(SyntaxDebugTask::Value(raw_val, 0));
+                    tasks.push(SyntaxDebugTask::Text(", raw_val: "));
+                    tasks.push(SyntaxDebugTask::Value(info, 0));
+                    tasks.push(SyntaxDebugTask::Text("Ident { info: "));
+                }
+                SyntaxDebugTask::Args([], _) => {
+                    formatter.write_str("[]")?;
+                }
+                SyntaxDebugTask::Args(args, indent) if pretty => {
+                    tasks.push(SyntaxDebugTask::Text("]"));
+                    tasks.push(SyntaxDebugTask::Indent(indent));
+                    for arg in args.iter().rev() {
+                        tasks.push(SyntaxDebugTask::Text(",\n"));
+                        tasks.push(SyntaxDebugTask::Syntax(arg, indent + 1));
+                        tasks.push(SyntaxDebugTask::Indent(indent + 1));
+                    }
+                    tasks.push(SyntaxDebugTask::Text("[\n"));
+                }
+                SyntaxDebugTask::Args(args, _) => {
+                    tasks.push(SyntaxDebugTask::Text("]"));
+                    for (index, arg) in args.iter().enumerate().rev() {
+                        tasks.push(SyntaxDebugTask::Syntax(arg, 0));
+                        if index > 0 {
+                            tasks.push(SyntaxDebugTask::Text(", "));
+                        }
+                    }
+                    tasks.push(SyntaxDebugTask::Text("["));
+                }
+                SyntaxDebugTask::Value(value, indent) => {
+                    write_debug_value(formatter, value, pretty, indent)?;
+                }
+                SyntaxDebugTask::Text(text) => formatter.write_str(text)?,
+                SyntaxDebugTask::Indent(indent) => write_indent(formatter, indent)?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn write_indent(formatter: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
+    for _ in 0..indent {
+        formatter.write_str("    ")?;
+    }
+    Ok(())
+}
+
+fn write_debug_value(
+    formatter: &mut fmt::Formatter<'_>,
+    value: &dyn fmt::Debug,
+    pretty: bool,
+    continuation_indent: usize,
+) -> fmt::Result {
+    if !pretty {
+        return fmt::Debug::fmt(value, formatter);
+    }
+
+    let rendered = format!("{value:#?}");
+    let mut lines = rendered.split('\n');
+    if let Some(first) = lines.next() {
+        formatter.write_str(first)?;
+    }
+    for line in lines {
+        formatter.write_str("\n")?;
+        write_indent(formatter, continuation_indent)?;
+        formatter.write_str(line)?;
+    }
+    Ok(())
+}
+
+impl Drop for Syntax {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        if let Syntax::Node { args, .. } = self {
+            pending.append(args);
+        }
+
+        let mut drained = 0usize;
+        while let Some(mut node) = pending.pop() {
+            if let Syntax::Node { args, .. } = &mut node {
+                pending.append(args);
+            }
+            drained += 1;
+            if drained.is_multiple_of(4096) {
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 impl Syntax {
@@ -131,27 +465,24 @@ impl Syntax {
     /// counting both would double them.
     pub fn leaves(&self) -> Vec<Attached> {
         let mut out = Vec::new();
-        self.collect_leaves(&mut out);
-        out
-    }
-
-    fn collect_leaves(&self, out: &mut Vec<Attached>) {
-        match self {
-            Syntax::Missing => out.push(Attached::Missing {
-                // A missing leaf has no position of its own; the attachment layer checks
-                // placement against its neighbours, so `at` is the cursor by construction
-                // when the tree was built from a well-formed attachment.
-                at: crate::source::BytePos(0),
-            }),
-            Syntax::Node { args, .. } => {
-                for arg in args {
-                    arg.collect_leaves(out);
+        let mut pending = vec![self];
+        while let Some(syntax) = pending.pop() {
+            match syntax {
+                Syntax::Missing => out.push(Attached::Missing {
+                    // A missing leaf has no position of its own; the attachment layer checks
+                    // placement against its neighbours, so `at` is the cursor by construction
+                    // when the tree was built from a well-formed attachment.
+                    at: crate::source::BytePos(0),
+                }),
+                Syntax::Node { args, .. } => {
+                    pending.extend(args.iter().rev());
+                }
+                Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
+                    out.push(Attached::Token(*info));
                 }
             }
-            Syntax::Atom { info, .. } | Syntax::Ident { info, .. } => {
-                out.push(Attached::Token(*info));
-            }
         }
+        out
     }
 
     /// Reconstruct the text this tree covers, byte for byte.
@@ -170,6 +501,7 @@ mod tests {
     use super::*;
     use crate::attach::{Attachment, TokenExtent, attach};
     use crate::source::{BOM, BytePos};
+    use std::process::Command;
 
     fn name(parts: &[&str]) -> Name {
         parts
@@ -386,5 +718,164 @@ mod tests {
             "a dotted component is not a component sequence"
         );
         assert_ne!(Syntax::node(nested, vec![]), Syntax::node(flat, vec![]));
+    }
+
+    #[test]
+    fn manual_lifecycle_traits_preserve_the_derived_shapes_and_fields() {
+        let span = ByteSpan::new(BytePos(0), BytePos(1)).expect("forward span");
+        let values = [
+            Syntax::Missing,
+            Syntax::node(Name::anonymous(), vec![Syntax::Missing]),
+            Syntax::atom(SourceInfo::None, "x"),
+            Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: span,
+                val: Name::anonymous(),
+                preresolved: Vec::new(),
+            },
+        ];
+
+        for value in &values {
+            assert_eq!(
+                value.clone(),
+                *value,
+                "manual Clone and PartialEq must retain every field"
+            );
+        }
+
+        assert_eq!(format!("{:?}", values[0]), "Missing");
+        assert_eq!(
+            format!("{:?}", values[1]),
+            "Node { info: None, kind: Name(Anonymous), args: [Missing] }"
+        );
+        assert_eq!(
+            format!("{:?}", values[2]),
+            "Atom { info: None, val: \"x\" }"
+        );
+        assert_eq!(
+            format!("{:?}", values[3]),
+            concat!(
+                "Ident { info: None, raw_val: ByteSpan { start: BytePos(0), ",
+                "end: BytePos(1) }, val: Name(Anonymous), preresolved: [] }"
+            )
+        );
+        assert_eq!(
+            format!("{:#?}", values[1]),
+            concat!(
+                "Node {\n",
+                "    info: None,\n",
+                "    kind: Name(\n",
+                "        Anonymous,\n",
+                "    ),\n",
+                "    args: [\n",
+                "        Missing,\n",
+                "    ],\n",
+                "}"
+            )
+        );
+        assert_eq!(
+            format!("{:#?}", values[2]),
+            concat!("Atom {\n", "    info: None,\n", "    val: \"x\",\n", "}")
+        );
+        assert_eq!(
+            format!("{:#?}", values[3]),
+            concat!(
+                "Ident {\n",
+                "    info: None,\n",
+                "    raw_val: ByteSpan {\n",
+                "        start: BytePos(\n",
+                "            0,\n",
+                "        ),\n",
+                "        end: BytePos(\n",
+                "            1,\n",
+                "        ),\n",
+                "    },\n",
+                "    val: Name(\n",
+                "        Anonymous,\n",
+                "    ),\n",
+                "    preresolved: [],\n",
+                "}"
+            )
+        );
+
+        assert_ne!(
+            Syntax::atom(SourceInfo::None, "x"),
+            Syntax::atom(SourceInfo::None, "y")
+        );
+        assert_ne!(
+            Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: span,
+                val: Name::anonymous(),
+                preresolved: Vec::new(),
+            },
+            Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val: ByteSpan::new(BytePos(0), BytePos(2)).expect("forward span"),
+                val: Name::anonymous(),
+                preresolved: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn deep_syntax_tree_operations_complete_on_a_small_stack() {
+        const CHILD_ENV: &str = "FLN_SYNTAX_DEEP_TREE_CHILD";
+        const COMPLETION_MARKER: &str = "fln-syntax-deep-tree-complete";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            std::thread::Builder::new()
+                .name("deep-syntax-tree".to_string())
+                .stack_size(64 * 1024)
+                .spawn(|| {
+                    let mut tree = Syntax::Missing;
+                    for _ in 0..16 * 1024 {
+                        tree = Syntax::node(Name::anonymous(), vec![tree]);
+                    }
+
+                    let cloned = tree.clone();
+                    assert_eq!(tree, cloned, "the deep clone must be structurally equal");
+                    let rendered = format!("{tree:?}");
+                    assert!(
+                        rendered.starts_with("Node {"),
+                        "deep Debug must render the root"
+                    );
+                    assert_eq!(
+                        tree.leaves(),
+                        vec![Attached::Missing { at: BytePos(0) }],
+                        "the unary tree has exactly one source-order leaf"
+                    );
+                    drop(rendered);
+                    drop(cloned);
+                    drop(tree);
+                })
+                .expect("the bounded-stack worker must start")
+                .join()
+                .expect("the bounded-stack worker must complete");
+            println!("{COMPLETION_MARKER}");
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "tree::tests::deep_syntax_tree_operations_complete_on_a_small_stack",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("the isolated regression process must start");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated regression process failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains(COMPLETION_MARKER),
+            "isolated regression process omitted its completion marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
     }
 }
