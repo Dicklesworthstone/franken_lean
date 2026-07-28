@@ -51,6 +51,7 @@ use fln_syntax::source::{ByteSpan, SourceInfo, SourceText};
 use fln_syntax::token::{TokenKind, TokenTable};
 use fln_syntax::tree::Syntax;
 use fln_syntax::view::SourceView;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
@@ -66,6 +67,193 @@ const SUPERSEDED_PRODUCER_COMMIT: &str = "d64218a954f8447b3f29c4ca230ae5d158d56d
 const LEXER_SCHEMA: &str = "fln.vellum.token-stream/1";
 const TREE_SCHEMA: &str = "fln.vellum.green-tree/1";
 const GOLDEN_ROWS: usize = 8;
+const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
+    ".beads/issues.jsonl",
+    "ci/VERIFICATION_MANIFEST.jsonl",
+    "AGENTS.md",
+    "README.md",
+    "COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md",
+    "ci",
+    "crates",
+    "scripts",
+    "tools",
+];
+
+/// Exact backup-only anchor identities reviewed after the 2026-07-25 history rewrite.
+///
+/// Every hex run is at most five characters so this declaration cannot satisfy the scanner it
+/// governs. [`decode_segmented_allowance`] removes the separators and refuses malformed rows.
+/// Exact-set equality, not this population count, is the law; the count is retained as an
+/// independently reviewed anti-vacuity witness and must shrink with a repaired row.
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 166;
+const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
+    "0382d-7b",
+    "041ad-4e0",
+    "059eb-dcd",
+    "05d9e-ad",
+    "08c89-48f64-764f4-b719b-355a3-bb60f-cb19d-afae9",
+    "0bfde-75b",
+    "0c297-df4",
+    "0d37e-f7e",
+    "0ef65-091",
+    "0effc-5b2",
+    "0f014-54",
+    "0f857-f20",
+    "1061f-875",
+    "10c9a-2e3",
+    "1144d-e53",
+    "1210a-2ed2a-9d307-439f4-67276-c9d7a-57fd9-eea4a",
+    "12e1c-205",
+    "13b9a-c63",
+    "14153-28",
+    "15be2-98b",
+    "18d60-c53",
+    "19580-7a9",
+    "195e9-7d7",
+    "199c3-76",
+    "1a1f6-b8d",
+    "1a3cb-dc0",
+    "1b4b8-472",
+    "1caa3-69e",
+    "1eec9-dad",
+    "22817-01",
+    "24b16-eeb",
+    "25c02-44",
+    "25c02-44fc5-f6823-f5dbb-cf935-7e7ba-34d9c-32e15",
+    "265ba-c5c",
+    "26bac-b3e",
+    "26cb2-add",
+    "28577-270",
+    "2a5ec-8ca",
+    "2a7b1-66e",
+    "2b0b1-b24",
+    "2bb41-8c9",
+    "2cba4-c79",
+    "2cba4-c79d0-897df-981b0-b0880-a788e-ccb77-c5247",
+    "2ddde-9eb",
+    "35558-15",
+    "35b39-e16",
+    "35cf9-a6",
+    "35cf9-a63",
+    "368cd-df",
+    "37df8-a3",
+    "3847f-b04",
+    "3ae1f-95",
+    "3ae1f-959",
+    "3c766-88",
+    "3c766-88e",
+    "3ceb3-711",
+    "40558-4bb",
+    "46186-f6",
+    "46186-f67",
+    "4747c-803",
+    "4ad44-02",
+    "4c406-1a",
+    "50d92-55b",
+    "50f65-ba4",
+    "52c3b-bb",
+    "54168-10c",
+    "54603-f69",
+    "54d61-c88",
+    "554f6-bb249-40686-dae48-f9691-2e64c-4b4d9-062d8",
+    "55fe7-108",
+    "564b3-ae",
+    "570fd-57b",
+    "58053-019",
+    "5df2f-968",
+    "5fe33-68e",
+    "5fe33-68e8b-84722-c551e-91bf8-593c6-d42d7-dd388",
+    "61774-1b5",
+    "65a20-263",
+    "66e56-721",
+    "6960d-068",
+    "6b61d-76",
+    "6c0e4-06",
+    "6c0e4-064",
+    "73e68-1cf",
+    "74aed-94a",
+    "768a3-6c4",
+    "76d2e-1ed",
+    "7882e-312",
+    "7a493-32a",
+    "7b788-f7d",
+    "7e07d-6d",
+    "8177e-ccd",
+    "828d9-488",
+    "86035-037",
+    "8773d-2d0",
+    "8bca8-3aa",
+    "8d31a-d5d",
+    "8f129-69b",
+    "8ffaa-15b",
+    "91eba-aea",
+    "93c34-753",
+    "94f56-38d",
+    "97c33-34",
+    "99291-ba6",
+    "a1a69-aabb4-c3038-17c2b-7053c-95e36-c4987-2cc8e",
+    "a21ac-783",
+    "a368e-a0b",
+    "a4251-e7d",
+    "a7bc1-60",
+    "a873e-73c",
+    "a90fa-dad",
+    "aa5d3-44",
+    "ad2aa-8e1",
+    "ad82f-b45",
+    "ae967-368",
+    "af265-46a",
+    "b0611-5fc",
+    "b3863-54",
+    "b3863-547",
+    "b6b80-e98",
+    "b825e-aa",
+    "bb561-892",
+    "bb665-b0b",
+    "be14e-e9",
+    "be14e-e9b",
+    "bf693-bb2",
+    "bf9ef-450",
+    "c0add-37a",
+    "c30b4-9e0",
+    "c4990-9b3",
+    "c4b13-364",
+    "c500d-385",
+    "c500d-3850a-62465-6c81f-e9601-d2cc2-4ccba-18990",
+    "c584e-470db-a1e49-a12ee-17a53-cec9d-87bbc-e14a5",
+    "c821d-9c",
+    "cc8d7-469",
+    "ccde9-57f",
+    "cece9-f1",
+    "d1850-d7",
+    "d5cc0-84b",
+    "d5e69-023",
+    "d6421-8a9",
+    "d6421-8a954-f8447-b3f29-c4ca2-30ae5-d158d-56dc9",
+    "d927b-7d",
+    "d954a-a9f",
+    "dc4e8-1e6",
+    "dd447-7bf",
+    "df2c9-75d",
+    "e14fe-98",
+    "e14fe-98b",
+    "e165d-db1",
+    "e1a59-ac",
+    "e2e19-fb2",
+    "e3164-55e",
+    "e3add-54c",
+    "e493c-7d0",
+    "ea21d-b0e",
+    "f0fc6-718",
+    "f1b25-fa",
+    "f2190-330",
+    "f2578-87",
+    "f3b98-d22",
+    "f4c22-a2d",
+    "f4db9-1f6b8-90785-2e03a-988ea-0d8ca-bf5cb-812c6",
+    "fbe5d-be4",
+    "fce6c-58c",
+];
 static TEMP_REPO_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +293,54 @@ enum AnchorRefusal {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnchorInventoryRefusal {
+    Git(AnchorRefusal),
+    EmptyTrackedScope,
+    DuplicateTrackedPath {
+        path: String,
+    },
+    NonUtf8TrackedPath,
+    NonUtf8Blob {
+        path: String,
+    },
+    ScopeContractMissing {
+        entries: Vec<String>,
+    },
+    AllowanceMalformed {
+        entry: String,
+    },
+    AllowanceDuplicate {
+        anchor: String,
+    },
+    AllowancePopulationDrift {
+        declared: usize,
+        reviewed: usize,
+    },
+    AnchorUndecidable {
+        anchor: String,
+        origins: Vec<String>,
+        reason: AnchorRefusal,
+    },
+    RepositoryChanged {
+        before: String,
+        after: String,
+    },
+    AllowanceMismatch {
+        undeclared: Vec<String>,
+        stale: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchorInventory {
+    tracked_paths: Vec<String>,
+    candidate_origins: BTreeMap<String, BTreeSet<String>>,
+    main_reachable: BTreeSet<String>,
+    local_backup_only: BTreeSet<String>,
+    non_anchors: BTreeSet<String>,
+}
+
 fn git_output<I, S>(repo: &Path, operation: &'static str, args: I) -> Result<Output, AnchorRefusal>
 where
     I: IntoIterator<Item = S>,
@@ -113,6 +349,7 @@ where
     Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "maintenance.auto=false"])
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", repo.join(".fln-no-global-gitconfig"))
@@ -126,11 +363,11 @@ where
         })
 }
 
-fn successful_git_lines<I, S>(
+fn successful_git_bytes<I, S>(
     repo: &Path,
     operation: &'static str,
     args: I,
-) -> Result<Vec<String>, AnchorRefusal>
+) -> Result<Vec<u8>, AnchorRefusal>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -142,7 +379,20 @@ where
             exit_code: output.status.code(),
         });
     }
-    let stdout = std::str::from_utf8(&output.stdout)
+    Ok(output.stdout)
+}
+
+fn successful_git_lines<I, S>(
+    repo: &Path,
+    operation: &'static str,
+    args: I,
+) -> Result<Vec<String>, AnchorRefusal>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let stdout = successful_git_bytes(repo, operation, args)?;
+    let stdout = std::str::from_utf8(&stdout)
         .map_err(|_| AnchorRefusal::MalformedGitOutput { operation })?;
     Ok(stdout
         .lines()
@@ -193,15 +443,11 @@ fn finish_reachability(
     }
 }
 
-fn classify_anchor(repo: &Path, anchor: &str) -> AnchorReachability {
+fn classify_anchor_against(repo: &Path, anchor: &str, main: &str) -> AnchorReachability {
     if !(7..=40).contains(&anchor.len()) || !anchor.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return AnchorReachability::Unresolved(AnchorRefusal::InvalidShape);
     }
 
-    let main_before = match main_commit(repo, "read-main-before") {
-        Ok(main) => main,
-        Err(reason) => return AnchorReachability::Unresolved(reason),
-    };
     let disambiguate = format!("--disambiguate={}", anchor.to_ascii_lowercase());
     let object =
         match successful_git_lines(repo, "resolve-anchor", ["rev-parse", disambiguate.as_str()])
@@ -227,7 +473,7 @@ fn classify_anchor(repo: &Path, anchor: &str) -> AnchorReachability {
     let ancestry = match git_output(
         repo,
         "check-main-ancestry",
-        ["merge-base", "--is-ancestor", &object, "refs/heads/main"],
+        ["merge-base", "--is-ancestor", &object, main],
     ) {
         Ok(output) if output.status.success() => true,
         Ok(output) if output.status.code() == Some(1) => false,
@@ -238,11 +484,31 @@ fn classify_anchor(repo: &Path, anchor: &str) -> AnchorReachability {
         }
         Err(reason) => return AnchorReachability::Unresolved(reason),
     };
+    if ancestry {
+        AnchorReachability::MainReachable { commit: object }
+    } else {
+        AnchorReachability::LocalBackupOnly { commit: object }
+    }
+}
+
+fn classify_anchor(repo: &Path, anchor: &str) -> AnchorReachability {
+    let main_before = match main_commit(repo, "read-main-before") {
+        Ok(main) => main,
+        Err(reason) => return AnchorReachability::Unresolved(reason),
+    };
+    let classification = classify_anchor_against(repo, anchor, &main_before);
     let main_after = match main_commit(repo, "read-main-after") {
         Ok(main) => main,
         Err(reason) => return AnchorReachability::Unresolved(reason),
     };
-    finish_reachability(object, ancestry, main_before, main_after)
+    if main_before == main_after {
+        classification
+    } else {
+        AnchorReachability::Unresolved(AnchorRefusal::RepositoryChanged {
+            before: main_before,
+            after: main_after,
+        })
+    }
 }
 
 fn commit_anchor_candidates(text: &str) -> Vec<String> {
@@ -276,6 +542,216 @@ fn scan_evidence_file(path: &Path) -> Result<Vec<String>, std::io::ErrorKind> {
     fs::read_to_string(path)
         .map(|text| commit_anchor_candidates(&text))
         .map_err(|error| error.kind())
+}
+
+fn tracked_scope_paths(
+    repo: &Path,
+    revision: &str,
+    scope: &[&str],
+) -> Result<Vec<String>, AnchorInventoryRefusal> {
+    let mut args = vec!["ls-tree", "-r", "-z", "--name-only", revision, "--"];
+    args.extend_from_slice(scope);
+    let stdout = successful_git_bytes(repo, "list-tracked-evidence-scope", args)
+        .map_err(AnchorInventoryRefusal::Git)?;
+    let mut seen = BTreeSet::new();
+    let mut paths = Vec::new();
+    for raw_path in stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(raw_path)
+            .map_err(|_| AnchorInventoryRefusal::NonUtf8TrackedPath)?
+            .to_string();
+        if !seen.insert(path.clone()) {
+            return Err(AnchorInventoryRefusal::DuplicateTrackedPath { path });
+        }
+        paths.push(path);
+    }
+    if paths.is_empty() {
+        return Err(AnchorInventoryRefusal::EmptyTrackedScope);
+    }
+    Ok(paths)
+}
+
+fn read_tracked_blob(
+    repo: &Path,
+    revision: &str,
+    path: &str,
+) -> Result<String, AnchorInventoryRefusal> {
+    let object = format!("{revision}:{path}");
+    let bytes = successful_git_bytes(
+        repo,
+        "read-tracked-evidence-blob",
+        ["cat-file", "blob", &object],
+    )
+    .map_err(AnchorInventoryRefusal::Git)?;
+    String::from_utf8(bytes).map_err(|_| AnchorInventoryRefusal::NonUtf8Blob {
+        path: path.to_string(),
+    })
+}
+
+fn decode_segmented_allowance(
+    allowance: &[&str],
+) -> Result<BTreeSet<String>, AnchorInventoryRefusal> {
+    let mut decoded = BTreeSet::new();
+    for entry in allowance {
+        let segments: Vec<&str> = entry.split('-').collect();
+        if segments.len() < 2
+            || segments.iter().any(|segment| {
+                segment.is_empty()
+                    || segment.len() > 5
+                    || !segment.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(AnchorInventoryRefusal::AllowanceMalformed {
+                entry: (*entry).to_string(),
+            });
+        }
+        let anchor = segments.concat().to_ascii_lowercase();
+        if !(7..=40).contains(&anchor.len()) {
+            return Err(AnchorInventoryRefusal::AllowanceMalformed {
+                entry: (*entry).to_string(),
+            });
+        }
+        if !decoded.insert(anchor.clone()) {
+            return Err(AnchorInventoryRefusal::AllowanceDuplicate { anchor });
+        }
+    }
+    Ok(decoded)
+}
+
+fn segment_anchor_for_fixture(anchor: &str) -> String {
+    anchor
+        .as_bytes()
+        .chunks(5)
+        .map(|chunk| std::str::from_utf8(chunk).expect("fixture anchor is ASCII"))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn scan_repository_anchor_inventory(
+    repo: &Path,
+    revision: &str,
+    scope: &[&str],
+) -> Result<AnchorInventory, AnchorInventoryRefusal> {
+    let tracked_paths = tracked_scope_paths(repo, revision, scope)?;
+    let mut candidate_origins: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for path in &tracked_paths {
+        let text = read_tracked_blob(repo, revision, path)?;
+        for candidate in commit_anchor_candidates(&text) {
+            candidate_origins
+                .entry(candidate)
+                .or_default()
+                .insert(path.clone());
+        }
+    }
+
+    let mut main_reachable = BTreeSet::new();
+    let mut local_backup_only = BTreeSet::new();
+    let mut non_anchors = BTreeSet::new();
+    for (anchor, origins) in &candidate_origins {
+        match classify_anchor_against(repo, anchor, revision) {
+            AnchorReachability::MainReachable { .. } => {
+                main_reachable.insert(anchor.clone());
+            }
+            AnchorReachability::LocalBackupOnly { .. } => {
+                local_backup_only.insert(anchor.clone());
+            }
+            AnchorReachability::Unresolved(
+                AnchorRefusal::NoMatchingObject | AnchorRefusal::NotCommit { .. },
+            ) => {
+                non_anchors.insert(anchor.clone());
+            }
+            AnchorReachability::Unresolved(reason) => {
+                return Err(AnchorInventoryRefusal::AnchorUndecidable {
+                    anchor: anchor.clone(),
+                    origins: origins.iter().cloned().collect(),
+                    reason,
+                });
+            }
+        }
+    }
+
+    Ok(AnchorInventory {
+        tracked_paths,
+        candidate_origins,
+        main_reachable,
+        local_backup_only,
+        non_anchors,
+    })
+}
+
+fn audit_anchor_inventory(
+    repo: &Path,
+    scope: &[&str],
+    allowance: &[&str],
+) -> Result<AnchorInventory, AnchorInventoryRefusal> {
+    let main_before =
+        main_commit(repo, "inventory-main-before").map_err(AnchorInventoryRefusal::Git)?;
+    let inventory = scan_repository_anchor_inventory(repo, &main_before, scope)?;
+    let main_after =
+        main_commit(repo, "inventory-main-after").map_err(AnchorInventoryRefusal::Git)?;
+    if main_before != main_after {
+        return Err(AnchorInventoryRefusal::RepositoryChanged {
+            before: main_before,
+            after: main_after,
+        });
+    }
+
+    let declared = decode_segmented_allowance(allowance)?;
+    let undeclared: Vec<String> = inventory
+        .local_backup_only
+        .difference(&declared)
+        .cloned()
+        .collect();
+    let stale: Vec<String> = declared
+        .difference(&inventory.local_backup_only)
+        .cloned()
+        .collect();
+    if !undeclared.is_empty() || !stale.is_empty() {
+        return Err(AnchorInventoryRefusal::AllowanceMismatch { undeclared, stale });
+    }
+    Ok(inventory)
+}
+
+fn validate_repository_scope(paths: &[String]) -> Result<(), AnchorInventoryRefusal> {
+    let present: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+    let mut missing = Vec::new();
+    for required in [
+        ".beads/issues.jsonl",
+        "ci/VERIFICATION_MANIFEST.jsonl",
+        "AGENTS.md",
+        "README.md",
+        "COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md",
+    ] {
+        if !present.contains(required) {
+            missing.push(required.to_string());
+        }
+    }
+    for prefix in ["ci/", "crates/", "scripts/", "tools/"] {
+        if !paths.iter().any(|path| path.starts_with(prefix)) {
+            missing.push(format!("{prefix}**"));
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(AnchorInventoryRefusal::ScopeContractMissing { entries: missing })
+    }
+}
+
+fn audit_checked_in_repository(repo: &Path) -> Result<AnchorInventory, AnchorInventoryRefusal> {
+    let declared = decode_segmented_allowance(LOCAL_BACKUP_ONLY_ALLOWANCE)?;
+    if declared.len() != REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT {
+        return Err(AnchorInventoryRefusal::AllowancePopulationDrift {
+            declared: declared.len(),
+            reviewed: REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT,
+        });
+    }
+    let inventory =
+        audit_anchor_inventory(repo, REPOSITORY_EVIDENCE_SCOPE, LOCAL_BACKUP_ONLY_ALLOWANCE)?;
+    validate_repository_scope(&inventory.tracked_paths)?;
+    Ok(inventory)
 }
 
 fn unique_temp_workspace(label: &str) -> Result<PathBuf, std::io::Error> {
