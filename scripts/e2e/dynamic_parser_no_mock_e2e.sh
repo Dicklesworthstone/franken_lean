@@ -988,7 +988,7 @@ emit_event --new-log --string event run_start \
   --append-string claim_ids fln-33gl-dynamic-parser-no-mock \
   --append-string invariant_ids FL-INV-07 \
   --append-string gate_ids W4 \
-  --string parity_ledger_row bounded_dynamic_registration_and_inconclusive_law \
+  --string parity_ledger_row not_applicable_dynamic_parser_registration \
   --string interleaving_claim self_differential_support_only_not_FL_INV_01_proof \
   --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
   --string platform "$(uname -srm)" --integer thread_count 1 \

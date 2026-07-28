@@ -123,7 +123,7 @@ for module in "${!C3_MODULES[@]}"; do
     exit 1
   fi
   witnessed=$((witnessed + 1))
-  emit witness passed "\"module\":\"$module\",\"verdict\":\"accepted\",\"fixture\":\"$fixture\",\"fixture_matches_pin\":true,\"claim\":\"kernel-witness-agreement\",\"parity_ledger_row\":\"kernel.witness.$module\""
+  emit witness passed "\"module\":\"$module\",\"verdict\":\"accepted\",\"fixture\":\"$fixture\",\"fixture_matches_pin\":true,\"claim\":\"kernel-witness-agreement\",\"parity_ledger_row\":\"not_applicable_foreign_kernel_witness\""
   note "witness: $module accepted by the reference kernel (leanchecker), fixture matches pin"
 done
 emit witnesses passed "\"count\":$witnessed,\"all\":\"accepted\""

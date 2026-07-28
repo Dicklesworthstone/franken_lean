@@ -21,6 +21,41 @@ fn trusted_script(relative: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("{relative} must be readable: {error}"))
 }
 
+#[test]
+fn parity_ledger_evidence_references_are_resolved_on_both_production_paths() {
+    let evidence = trusted_script("scripts/evidence.py");
+    let loader = evidence
+        .split_once("def load_ndjson_snapshot(")
+        .expect("evidence.py must define its NDJSON snapshot loader")
+        .1
+        .split_once("\ndef load_ndjson(")
+        .expect("the NDJSON snapshot loader must have a bounded source body")
+        .0;
+    let self_test = evidence
+        .split_once("def cmd_self_test(")
+        .expect("evidence.py must define its hermetic self-test")
+        .1
+        .split_once("\ndef build_parser(")
+        .expect("the evidence self-test must have a bounded source body")
+        .0;
+
+    assert!(
+        evidence.contains("def validate_parity_ledger_reference(")
+            && evidence.contains("def validate_parity_ledger_emitters("),
+        "evidence.py must retain the shared reference resolver and governed-emitter scan"
+    );
+    assert!(
+        loader.contains("validate_parity_ledger_reference(")
+            && loader.contains("load_parity_ledger_symbols()"),
+        "every produced NDJSON record must resolve parity_ledger_row while loading"
+    );
+    assert!(
+        self_test.contains("validate_parity_ledger_emitters()")
+            && self_test.contains("\"parity_ledger_reference_integrity\""),
+        "the mandatory evidence self-test must scan legacy and central shell emitters"
+    );
+}
+
 const RECEIPT_EXECUTION_AUTHORITY_PROBE: &str = r#"
 import importlib.util
 import sys

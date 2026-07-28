@@ -938,7 +938,7 @@ emit_event --new-log --string event run_start \
   --append-string claim_ids franken_lean-urd1-parser-corpus-no-mock \
   --append-string invariant_ids FL-INV-07 \
   --append-string gate_ids W4 \
-  --string parity_ledger_row bounded_pratt_suite_and_recovery_law \
+  --string parity_ledger_row not_applicable_bounded_parser_suite \
   --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
   --string platform "$(uname -srm)" --integer thread_count 1 \
   --json-value thread_matrix '[1]' \

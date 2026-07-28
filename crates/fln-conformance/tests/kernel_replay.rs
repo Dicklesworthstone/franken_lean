@@ -943,7 +943,7 @@ impl EmitCtx {
              \"invariant_relation\":\"single-authority-admission\",\
              \"determinism_invariant\":\"FL-INV-01\",\"gate_id\":\"G1\",\
              \"gate_relation\":\"partial-component-evidence\",\
-             \"parity_ledger_row\":\"init-prelude-admission-replay\",\
+             \"parity_ledger_row\":\"not_applicable_kernel_admission_replay\",\
              \"data_grade\":\"verified\",\"epoch\":\"lean-v4.32.0\",\"mode\":\"sound\",\
              \"profile\":\"e2e\",\"platform\":{},\"seed\":\"module-order-kahn-v1\",\
              \"cache_state\":{},\"canonical_input_root\":{},\"scenario\":{},\

@@ -314,7 +314,7 @@ else
     --append-string invariant_ids FL-INV-02 \
     --append-string invariant_ids FL-INV-07 \
     --append-string gate_ids G1 \
-    --string parity_ledger_row init-prelude-admission-replay \
+    --string parity_ledger_row not_applicable_kernel_admission_replay \
     --string epoch "lean-$PIN_TAG" --string mode sound --string profile e2e \
     --string platform "$(uname -srm)" \
     --json-value host_facts "$("${PYTHON[@]}" -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \

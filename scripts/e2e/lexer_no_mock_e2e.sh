@@ -570,7 +570,7 @@ emit_event --new-log --string event run_start \
   --append-string invariant_ids FL-INV-01 \
   --append-string invariant_ids FL-INV-07 \
   --append-string gate_ids W4 \
-  --string parity_ledger_row bounded_lexer_suite_and_acceptance_law \
+  --string parity_ledger_row not_applicable_bounded_lexer_suite \
   --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
   --string platform "$(uname -srm)" --integer thread_count 32 \
   --json-value thread_matrix '[1,8,32]' \

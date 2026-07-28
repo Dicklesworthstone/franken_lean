@@ -1114,6 +1114,8 @@ KERNEL_ADMISSION_TESTS = (
     "prelude_replays_through_the_kernel",
     "admission_fault_matrix_is_typed_and_atomic",
 )
+KERNEL_ADMISSION_TARGET_PASSED = 14
+KERNEL_ADMISSION_TARGET_IGNORED = 2
 KERNEL_ADMISSION_BUDGET_STEPS = 10_000_000
 KERNEL_ADMISSION_BUDGET_DEPTH = 4_096
 # The pinned Init.Prelude verdict census (beads franken_lean-irm +
@@ -1297,6 +1299,20 @@ KERNEL_ADMISSION_FAULT_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
 MAX_RECORD_BYTES = 1_048_576
 MAX_LOG_BYTES = 67_108_864
 MAX_EXEC_STATUS_BYTES = 4096
+PARITY_LEDGER_SCHEMA = "fln-parity-ledger/1"
+PARITY_LEDGER_RELATIVE_PATH = Path("ci/PARITY_LEDGER.txt")
+PARITY_LEDGER_MAX_BYTES = 1_048_576
+PARITY_LEDGER_MAX_REFERENCE_BYTES = 512
+PARITY_LEDGER_SENTINEL_PREFIX = "not_applicable_"
+PARITY_LEDGER_SENTINEL_PATTERN = re.compile(
+    r"\Anot_applicable_[a-z0-9]+(?:_[a-z0-9]+)*\Z"
+)
+PARITY_LEDGER_DIRECT_EMITTER_PATTERN = re.compile(
+    r"--string[ \t]+parity_ledger_row[ \t]+([^\s\\]+)"
+)
+PARITY_LEDGER_JSON_EMITTER_PATTERN = re.compile(
+    r'\\"parity_ledger_row\\":\\"([^"\\]*)\\"'
+)
 STOPPED_GATE_READY_TOKEN = b"fln-private-ready-v1\n"
 STOPPED_GATE_RELEASE_TOKEN = b"fln-private-release-v1\n"
 SUPERVISOR_TEST_FAULT_POINTS = {
@@ -1602,6 +1618,212 @@ def stable_file_facts(
     if total != before.st_size:
         raise EvidenceError(f"file size changed while being read: {absolute}")
     return b"".join(chunks), total, digest.hexdigest()
+
+
+def load_parity_ledger_symbols(path: Path | None = None) -> frozenset[str]:
+    """Load the unambiguous symbol namespace referenced by evidence records."""
+
+    ledger_path = (
+        Path(__file__).resolve().parent.parent / PARITY_LEDGER_RELATIVE_PATH
+        if path is None
+        else path
+    )
+    data, _size, _digest = stable_file_facts(
+        ledger_path, max_bytes=PARITY_LEDGER_MAX_BYTES
+    )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"parity ledger is not UTF-8: {ledger_path}") from error
+
+    schema_seen = False
+    symbols: set[str] = set()
+    for number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if not schema_seen:
+            expected = f"schema {PARITY_LEDGER_SCHEMA}"
+            if line != expected:
+                raise EvidenceError(
+                    f"{ledger_path}:{number}: expected {expected!r}"
+                )
+            schema_seen = True
+            continue
+        if not line.startswith("row "):
+            raise EvidenceError(
+                f"{ledger_path}:{number}: expected a parity ledger row"
+            )
+        fields = [field.strip() for field in line[4:].split("|")]
+        if len(fields) != 12 or any(not field for field in fields):
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger row must have "
+                "12 non-empty fields"
+            )
+        if fields[4] not in {"L0", "L1", "L2", "L3", "L4"}:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger L-level must be L0..L4"
+            )
+        if fields[5] not in {"faithful", "sound", "frontier"}:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger mode is invalid"
+            )
+        if fields[9] not in {"D0", "D1", "D2", "D3", "D4"}:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger determinism class is invalid"
+            )
+        if fields[10] not in {
+            "OBSERVED",
+            "TARGETED",
+            "HYPOTHESIS",
+            "PROVEN",
+            "BLOCKED",
+        }:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger claim state is invalid"
+            )
+        fixtures = [fixture.strip() for fixture in fields[8].split(",")]
+        if fields[4] != "L0" and not any(fixtures):
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger row above L0 "
+                "must cite a fixture"
+            )
+        symbol = fields[1]
+        if len(symbol.encode("utf-8")) > PARITY_LEDGER_MAX_REFERENCE_BYTES:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger symbol is too large"
+            )
+        if symbol.startswith(PARITY_LEDGER_SENTINEL_PREFIX):
+            raise EvidenceError(
+                f"{ledger_path}:{number}: ledger symbol uses the reserved "
+                f"{PARITY_LEDGER_SENTINEL_PREFIX!r} namespace"
+            )
+        if symbol in symbols:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: duplicate parity ledger symbol {symbol!r}"
+            )
+        symbols.add(symbol)
+
+    if not schema_seen:
+        raise EvidenceError(f"parity ledger has no schema directive: {ledger_path}")
+    if not symbols:
+        raise EvidenceError(f"parity ledger has no symbol rows: {ledger_path}")
+    return frozenset(symbols)
+
+
+def validate_parity_ledger_reference(
+    value: Any,
+    *,
+    subject: str,
+    symbols: frozenset[str],
+) -> None:
+    """Require one exact live symbol or a canonical non-applicability reason."""
+
+    if not isinstance(value, str) or not value:
+        raise EvidenceError(f"{subject}: parity_ledger_row must be a string")
+    if len(value.encode("utf-8")) > PARITY_LEDGER_MAX_REFERENCE_BYTES:
+        raise EvidenceError(f"{subject}: parity_ledger_row is too large")
+    if value.startswith(PARITY_LEDGER_SENTINEL_PREFIX):
+        if PARITY_LEDGER_SENTINEL_PATTERN.fullmatch(value) is None:
+            raise EvidenceError(
+                f"{subject}: malformed parity ledger non-applicability sentinel"
+            )
+        return
+    if value not in symbols:
+        raise EvidenceError(
+            f"{subject}: dangling parity ledger symbol reference {value!r}"
+        )
+
+
+def validate_parity_ledger_source(
+    data: bytes,
+    *,
+    subject: str,
+    symbols: frozenset[str],
+) -> int:
+    """Resolve every statically classifiable shell emission in one source."""
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"{subject}: emitter source is not UTF-8") from error
+    active_text = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    occurrence_count = active_text.count("parity_ledger_row")
+    references = [
+        *PARITY_LEDGER_DIRECT_EMITTER_PATTERN.findall(active_text),
+        *PARITY_LEDGER_JSON_EMITTER_PATTERN.findall(active_text),
+    ]
+    if len(references) != occurrence_count:
+        raise EvidenceError(
+            f"{subject}: found {occurrence_count} parity_ledger_row emissions "
+            f"but classified {len(references)}"
+        )
+    for index, reference in enumerate(references, 1):
+        validate_parity_ledger_reference(
+            reference,
+            subject=f"{subject}:parity_ledger_row:{index}",
+            symbols=symbols,
+        )
+    return len(references)
+
+
+def validate_parity_ledger_emitters(
+    repository_root: Path | None = None,
+) -> dict[str, int]:
+    """Scan every governed shell emitter, including legacy direct publishers."""
+
+    root = lexical_absolute(
+        Path(__file__).resolve().parent.parent
+        if repository_root is None
+        else repository_root
+    )
+    symbols = load_parity_ledger_symbols(root / PARITY_LEDGER_RELATIVE_PATH)
+    emitter_files: list[Path] = []
+    for relative in (Path("scripts/e2e"), Path("scripts/tribunal")):
+        emitter_root = root / relative
+        try:
+            root_facts = emitter_root.lstat()
+        except OSError as error:
+            raise EvidenceError(
+                f"parity ledger emitter root is unavailable: {emitter_root}: {error}"
+            ) from error
+        if not stat.S_ISDIR(root_facts.st_mode):
+            raise EvidenceError(
+                f"parity ledger emitter root is not a directory: {emitter_root}"
+            )
+        emitter_files.extend(sorted(emitter_root.rglob("*.sh")))
+    if not emitter_files:
+        raise EvidenceError("parity ledger emitter scan is empty")
+
+    references = 0
+    for emitter in emitter_files:
+        try:
+            emitter_facts = emitter.lstat()
+        except OSError as error:
+            raise EvidenceError(
+                f"parity ledger emitter is unavailable: {emitter}: {error}"
+            ) from error
+        if not stat.S_ISREG(emitter_facts.st_mode):
+            raise EvidenceError(
+                f"parity ledger emitter is not a regular file: {emitter}"
+            )
+        data, _size, _digest = stable_file_facts(
+            emitter, max_bytes=PARITY_LEDGER_MAX_BYTES
+        )
+        references += validate_parity_ledger_source(
+            data,
+            subject=str(emitter),
+            symbols=symbols,
+        )
+    if references == 0:
+        raise EvidenceError("parity ledger emitter reference scan is empty")
+    return {
+        "files": len(emitter_files),
+        "references": references,
+        "symbols": len(symbols),
+    }
 
 
 def stable_symlink_facts(path: Path) -> tuple[bytes, int, str]:
@@ -4105,6 +4327,7 @@ def run_supervised(
 def load_ndjson_snapshot(path: Path) -> tuple[list[dict[str, Any]], str]:
     data, _size, digest = stable_file_facts(path, max_bytes=MAX_LOG_BYTES)
     records: list[dict[str, Any]] = []
+    parity_symbols: frozenset[str] | None = None
     for number, raw in enumerate(data.splitlines(keepends=True), 1):
         if len(raw) > MAX_RECORD_BYTES:
             raise EvidenceError(f"{path}:{number}: record too large")
@@ -4113,6 +4336,14 @@ def load_ndjson_snapshot(path: Path) -> tuple[list[dict[str, Any]], str]:
         value = parse_json(raw, subject=f"{path}:{number}")
         if not isinstance(value, dict):
             raise EvidenceError(f"{path}:{number}: record is not an object")
+        if "parity_ledger_row" in value:
+            if parity_symbols is None:
+                parity_symbols = load_parity_ledger_symbols()
+            validate_parity_ledger_reference(
+                value["parity_ledger_row"],
+                subject=f"{path}:{number}",
+                symbols=parity_symbols,
+            )
         records.append(value)
     if not records:
         raise EvidenceError(f"NDJSON is empty: {path}")
@@ -10937,11 +11168,19 @@ def validate_kernel_admission(
         for line in stdout_text.splitlines()
         if line.strip().startswith("test result: ok.")
     ]
-    if len(pass_result_lines) != 1 or not re.match(
-        r"^test result: ok\. 2 passed; 0 failed;", pass_result_lines[0]
+    expected_summary = re.compile(
+        rf"^test result: ok\. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
+        rf"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
+        r"0 measured; 0 filtered out; finished in .+$"
+    )
+    if (
+        len(pass_result_lines) != 1
+        or expected_summary.fullmatch(pass_result_lines[0]) is None
     ):
         raise EvidenceError(
-            f"kernel-admission {phase} log lacks the exact two-test pass summary"
+            f"kernel-admission {phase} log lacks the exact full-target "
+            f"{KERNEL_ADMISSION_TARGET_PASSED}-pass/"
+            f"{KERNEL_ADMISSION_TARGET_IGNORED}-ignore summary"
         )
 
     matrix_records: list[dict[str, Any]] = []
@@ -10977,7 +11216,7 @@ def validate_kernel_admission(
         "determinism_invariant": "FL-INV-01",
         "gate_id": "G1",
         "gate_relation": "partial-component-evidence",
-        "parity_ledger_row": "init-prelude-admission-replay",
+        "parity_ledger_row": "not_applicable_kernel_admission_replay",
         "data_grade": "verified",
         "epoch": "lean-v4.32.0",
         "mode": "sound",
@@ -17823,6 +18062,141 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         path.mkdir()
         return path
 
+    parity_root = case_dir("parity_ledger_reference_integrity")
+    parity_row = (
+        "row meta-api | Lean.Name.hash | function | native | L2 | faithful "
+        "| pinned-binary | exact | self-test.fixture | D0 | OBSERVED "
+        "| parity-reference-self-test\n"
+    )
+    parity_ledger = parity_root / "positive.txt"
+    write_new(
+        parity_ledger,
+        f"schema {PARITY_LEDGER_SCHEMA}\n{parity_row}".encode(),
+    )
+    parity_symbols = load_parity_ledger_symbols(parity_ledger)
+    require(
+        parity_symbols == frozenset({"Lean.Name.hash"}),
+        "positive parity ledger did not expose its exact symbol namespace",
+    )
+    validate_parity_ledger_reference(
+        "Lean.Name.hash",
+        subject="parity ledger live-symbol self-test",
+        symbols=parity_symbols,
+    )
+    validate_parity_ledger_reference(
+        "not_applicable_self_test",
+        subject="parity ledger sentinel self-test",
+        symbols=parity_symbols,
+    )
+
+    parity_mutants_killed = 0
+
+    def expect_parity_ledger_rejection(label: str, payload: bytes) -> None:
+        nonlocal parity_mutants_killed
+        mutant = parity_root / f"{label}.txt"
+        write_new(mutant, payload)
+        try:
+            load_parity_ledger_symbols(mutant)
+        except EvidenceError:
+            parity_mutants_killed += 1
+            return
+        raise EvidenceError(f"{label} parity ledger mutant was accepted")
+
+    expect_parity_ledger_rejection(
+        "schema_only",
+        f"schema {PARITY_LEDGER_SCHEMA}\n".encode(),
+    )
+    expect_parity_ledger_rejection(
+        "duplicate_symbol",
+        f"schema {PARITY_LEDGER_SCHEMA}\n{parity_row}{parity_row}".encode(),
+    )
+    expect_parity_ledger_rejection(
+        "malformed_row",
+        (
+            f"schema {PARITY_LEDGER_SCHEMA}\n"
+            "row meta-api | Lean.Name.hash | function | native | L2 | faithful "
+            "| pinned-binary | exact | self-test.fixture | D0 | OBSERVED\n"
+        ).encode(),
+    )
+    expect_parity_ledger_rejection(
+        "malformed_schema",
+        f"schema fln-parity-ledger/999\n{parity_row}".encode(),
+    )
+    expect_parity_ledger_rejection(
+        "malformed_enum",
+        (
+            f"schema {PARITY_LEDGER_SCHEMA}\n"
+            + parity_row.replace(" | D0 | ", " | D9 | ")
+        ).encode(),
+    )
+
+    def expect_parity_reference_rejection(label: str, value: Any) -> None:
+        nonlocal parity_mutants_killed
+        try:
+            validate_parity_ledger_reference(
+                value,
+                subject=f"{label} parity reference self-test",
+                symbols=parity_symbols,
+            )
+        except EvidenceError:
+            parity_mutants_killed += 1
+            return
+        raise EvidenceError(f"{label} parity reference mutant was accepted")
+
+    expect_parity_reference_rejection("dangling_symbol", "Lean.Missing.symbol")
+    expect_parity_reference_rejection(
+        "malformed_sentinel", "not_applicable_Bad-Reason"
+    )
+
+    positive_source = (
+        b"--string parity_ledger_row Lean.Name.hash\n"
+        br'emit row pass "\"parity_ledger_row\":\"not_applicable_self_test\""'
+        b"\n"
+    )
+    require(
+        validate_parity_ledger_source(
+            positive_source,
+            subject="positive parity emitter self-test",
+            symbols=parity_symbols,
+        )
+        == 2,
+        "positive parity emitter source did not expose both reference forms",
+    )
+    for label, source in (
+        ("dynamic_direct_emitter", b"--string parity_ledger_row $row\n"),
+        (
+            "dynamic_json_emitter",
+            br'emit row pass "\"parity_ledger_row\":\"kernel.$module\""'
+            b"\n",
+        ),
+        (
+            "unclassifiable_emitter",
+            b'--string "parity_ledger_row" Lean.Name.hash\n',
+        ),
+    ):
+        try:
+            validate_parity_ledger_source(
+                source,
+                subject=f"{label} self-test",
+                symbols=parity_symbols,
+            )
+        except EvidenceError:
+            parity_mutants_killed += 1
+        else:
+            raise EvidenceError(f"{label} parity emitter mutant was accepted")
+
+    emitter_facts = validate_parity_ledger_emitters()
+    cases.append(
+        {
+            "case": "parity_ledger_reference_integrity",
+            "ok": True,
+            "mutants_killed": parity_mutants_killed,
+            "emitter_files": emitter_facts["files"],
+            "emitter_references": emitter_facts["references"],
+            "ledger_symbols": emitter_facts["symbols"],
+        }
+    )
+
     census_receipt_root = case_dir("census_availability_receipt")
     census_probe_root = str(art_dir)
     census_receipt = {
@@ -23607,7 +23981,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "determinism_invariant": "FL-INV-01",
             "gate_id": "G1",
             "gate_relation": "partial-component-evidence",
-            "parity_ledger_row": "init-prelude-admission-replay",
+            "parity_ledger_row": "not_applicable_kernel_admission_replay",
             "data_grade": "verified",
             "epoch": "lean-v4.32.0",
             "mode": "sound",
@@ -23821,9 +24195,15 @@ def cmd_self_test(args: argparse.Namespace) -> int:
 
     def admission_pass_log(records: list[dict[str, Any]]) -> bytes:
         return (
-            b"running 2 tests\n"
-            + b"".join(canonical_json(record) for record in records)
-            + b"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured\n"
+            f"running {KERNEL_ADMISSION_TARGET_PASSED + KERNEL_ADMISSION_TARGET_IGNORED} "
+            "tests\n"
+        ).encode() + (
+            b"".join(canonical_json(record) for record in records)
+            + (
+                f"test result: ok. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
+                f"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
+                "0 measured; 0 filtered out; finished in 0.01s\n"
+            ).encode()
         )
 
     admission_stderr_bytes = (
@@ -23962,13 +24342,33 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "valid kernel-admission recovery evidence lost its identity",
     )
 
+    stale_admission_out = "admission_stale_test_floor.out"
+    stale_admission_err = "admission_stale_test_floor.err"
+    stale_admission_records = admission_records_for(
+        stale_admission_out, stale_admission_err
+    )
+    expect_admission_rejection(
+        "stale two-test kernel-admission floor",
+        "admission_stale_test_floor",
+        stdout_bytes=(
+            b"running 2 tests\n"
+            + b"".join(
+                canonical_json(record) for record in stale_admission_records
+            )
+            + b"test result: ok. 2 passed; 0 failed; 0 ignored; "
+            b"0 measured; 0 filtered out; finished in 0.01s\n"
+        ),
+        expected_message="exact full-target 14-pass/2-ignore summary",
+    )
+
     expect_admission_rejection(
         "malformed kernel-admission row",
         "admission_malformed",
         stdout_bytes=(
-            b"running 2 tests\n"
+            b"running 16 tests\n"
             + b'{"schema":"' + KERNEL_ADMISSION_SCHEMA.encode() + b'", not-json\n'
-            + b"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured\n"
+            + b"test result: ok. 14 passed; 0 failed; 2 ignored; "
+            b"0 measured; 0 filtered out; finished in 0.01s\n"
         ),
     )
 
