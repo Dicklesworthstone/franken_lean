@@ -471,6 +471,22 @@ E2E_STEP_ORDERS = {
         "internal_fault_probe",
         "final_real_recheck",
     ],
+    "lexer_no_mock_e2e": [
+        "lexer_state_model",
+        "lexer_fuzz",
+        "lexer_thread_matrix",
+        "lexer_resource_bounds",
+        "token_table_totality",
+        "incremental_lex_property",
+        "golden_vellum",
+        "syntax_lib",
+        "build_real_file_driver",
+        "positive_file",
+        "failure_file",
+        "recovery_file",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
     "vellum_naming_no_mock_e2e": [
         "registry_gate",
         "collision_model",
@@ -511,6 +527,21 @@ VERDICT_MAX_WORKERS = 41
 VERDICT_FAILURE_MARKER = (
     "FLN_VERDICT_E2E_EXPECTED_FAILURE: unknown proof opcode 255 at byte 21"
 )
+
+LEXER_SEMANTIC_SCHEMA = "fln.e2e.lexer-semantic"
+LEXER_TELEMETRY_SCHEMA = "fln.e2e.lexer-telemetry"
+LEXER_VALIDATION_SCHEMA = "fln.e2e.lexer-validation/1"
+LEXER_SCHEMA_VERSION = 1
+LEXER_MAX_INPUT_BYTES = 4_096
+LEXER_MAX_DIAGNOSTICS = 8
+LEXER_TAB_DIAGNOSTIC = (
+    "tabs are not allowed; please configure your editor to expand them"
+)
+LEXER_CASE_INPUTS = {
+    "positive": ("inputs/positive.lean", b"def answer := 42\n"),
+    "failure": ("inputs/failure.lean", b"def bad :=\t42\n"),
+    "recovery": ("inputs/recovery.lean", b"def bad :=\t42\n#check\tbad\n"),
+}
 
 ENVIRONMENT_COLLISION_SCHEMA = "fln.e2e.environment-collision"
 ENVIRONMENT_COLLISION_VERSION = 2
@@ -6571,6 +6602,230 @@ def verdict_read_canonical_record(
     if canonical_json(record) != data:
         raise EvidenceError(f"{label}: record is not canonical single-row NDJSON")
     return record, digest
+
+
+def lexer_read_canonical_record(
+    path: Path, *, label: str, max_bytes: int
+) -> tuple[dict[str, Any], str]:
+    data, _size, digest = stable_file_facts(path, max_bytes=max_bytes)
+    record = parse_json(data, subject=label)
+    if not isinstance(record, dict):
+        raise EvidenceError(f"{label}: expected one JSON object")
+    if canonical_json(record) != data:
+        raise EvidenceError(f"{label}: record is not canonical single-row NDJSON")
+    return record, digest
+
+
+def lexer_exact_non_negative_integer(
+    record: Mapping[str, Any], key: str, *, label: str
+) -> int:
+    value = record.get(key)
+    if type(value) is not int or value < 0:
+        raise EvidenceError(f"{label} {key} is not a non-negative integer")
+    return value
+
+
+def lexer_expected_diagnostics(
+    raw_input: bytes, *, recovering: bool
+) -> list[dict[str, Any]]:
+    tab_offsets = [offset for offset, byte in enumerate(raw_input) if byte == 0x09]
+    if not recovering:
+        tab_offsets = tab_offsets[:1]
+    return [
+        {"byte_offset": offset, "message": LEXER_TAB_DIAGNOSTIC}
+        for offset in tab_offsets
+    ]
+
+
+def validate_lexer_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_paths: Mapping[str, Path],
+    telemetry_paths: Mapping[str, Path],
+    input_paths: Mapping[str, Path],
+    stdout_paths: Mapping[str, Path],
+    stderr_paths: Mapping[str, Path],
+    artifact_root: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("lexer expected run id must be non-empty")
+    expected_cases = set(LEXER_CASE_INPUTS)
+    for label, paths in (
+        ("semantic", semantic_paths),
+        ("telemetry", telemetry_paths),
+        ("input", input_paths),
+        ("stdout", stdout_paths),
+        ("stderr", stderr_paths),
+    ):
+        if set(paths) != expected_cases:
+            raise EvidenceError(
+                f"lexer {label} cases differ from the frozen positive/failure/recovery set"
+            )
+
+    semantic_fields = {
+        "acceptance_relation",
+        "case",
+        "data_grade",
+        "input_artifact",
+        "input_sha256",
+        "plain",
+        "recovering",
+        "run_id",
+        "schema",
+        "status",
+        "version",
+    }
+    telemetry_fields = {
+        "case",
+        "event",
+        "max_diagnostics",
+        "max_input_bytes",
+        "observed_diagnostics",
+        "observed_input_bytes",
+        "run_id",
+        "schema",
+        "timing_used_as_gate",
+        "version",
+    }
+    validation_cases: list[dict[str, Any]] = []
+    for case in ("positive", "failure", "recovery"):
+        expected_artifact, expected_input = LEXER_CASE_INPUTS[case]
+        input_path = input_paths[case]
+        try:
+            actual_artifact = input_path.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise EvidenceError(
+                f"lexer {case} input escapes the artifact root"
+            ) from error
+        if actual_artifact != expected_artifact:
+            raise EvidenceError(
+                f"lexer {case} input artifact {actual_artifact!r}, "
+                f"expected {expected_artifact!r}"
+            )
+        raw_input, input_size, input_digest = stable_file_facts(
+            input_path, max_bytes=LEXER_MAX_INPUT_BYTES
+        )
+        if raw_input != expected_input:
+            raise EvidenceError(f"lexer {case} real input bytes changed")
+
+        semantic, semantic_digest = lexer_read_canonical_record(
+            semantic_paths[case],
+            label=f"lexer {case} semantic evidence",
+            max_bytes=65_536,
+        )
+        telemetry, telemetry_digest = lexer_read_canonical_record(
+            telemetry_paths[case],
+            label=f"lexer {case} telemetry",
+            max_bytes=4_096,
+        )
+        stdout, _stdout_size, stdout_digest = stable_file_facts(
+            stdout_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        stderr, _stderr_size, stderr_digest = stable_file_facts(
+            stderr_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        if stdout != f"lexer-semantic case={case} status=pass\n".encode():
+            raise EvidenceError(f"lexer {case} producer stdout is not exact")
+        if stderr:
+            raise EvidenceError(f"lexer {case} producer wrote stderr")
+
+        if set(semantic) != semantic_fields:
+            raise EvidenceError(
+                f"lexer {case} semantic fields differ from the frozen schema"
+            )
+        if (
+            semantic.get("schema") != LEXER_SEMANTIC_SCHEMA
+            or semantic.get("run_id") != expected_run_id
+            or semantic.get("case") != case
+            or semantic.get("data_grade") != "verified"
+            or semantic.get("input_artifact") != expected_artifact
+            or semantic.get("input_sha256") != input_digest
+            or semantic.get("acceptance_relation") != "equal"
+            or semantic.get("status") != "pass"
+            or type(semantic.get("version")) is not int
+            or semantic.get("version") != LEXER_SCHEMA_VERSION
+        ):
+            raise EvidenceError(f"lexer {case} semantic identity is malformed")
+
+        tab_count = expected_input.count(b"\t")
+        expected_accepted = tab_count == 0
+        expected_plain = {
+            "accepted": expected_accepted,
+            "diagnostics": lexer_expected_diagnostics(expected_input, recovering=False),
+        }
+        expected_recovering = {
+            "accepted": expected_accepted,
+            "diagnostics": lexer_expected_diagnostics(expected_input, recovering=True),
+        }
+        plain = semantic.get("plain")
+        recovering = semantic.get("recovering")
+        if not isinstance(plain, dict) or not isinstance(recovering, dict):
+            raise EvidenceError(f"lexer {case} result envelopes are not objects")
+        if (
+            plain.get("accepted") is not expected_accepted
+            or recovering.get("accepted") is not expected_accepted
+            or plain != expected_plain
+            or recovering != expected_recovering
+        ):
+            raise EvidenceError(
+                f"lexer {case} diagnostics or acceptance relation changed"
+            )
+
+        if set(telemetry) != telemetry_fields:
+            raise EvidenceError(
+                f"lexer {case} telemetry fields differ from the frozen schema"
+            )
+        max_diagnostics = lexer_exact_non_negative_integer(
+            telemetry, "max_diagnostics", label=f"lexer {case} telemetry"
+        )
+        max_input_bytes = lexer_exact_non_negative_integer(
+            telemetry, "max_input_bytes", label=f"lexer {case} telemetry"
+        )
+        observed_diagnostics = lexer_exact_non_negative_integer(
+            telemetry, "observed_diagnostics", label=f"lexer {case} telemetry"
+        )
+        observed_input_bytes = lexer_exact_non_negative_integer(
+            telemetry, "observed_input_bytes", label=f"lexer {case} telemetry"
+        )
+        expected_diagnostics = len(expected_plain["diagnostics"]) + len(
+            expected_recovering["diagnostics"]
+        )
+        if (
+            telemetry.get("schema") != LEXER_TELEMETRY_SCHEMA
+            or telemetry.get("run_id") != expected_run_id
+            or telemetry.get("case") != case
+            or telemetry.get("event") != "phase_resources"
+            or telemetry.get("timing_used_as_gate") is not False
+            or type(telemetry.get("version")) is not int
+            or telemetry.get("version") != LEXER_SCHEMA_VERSION
+            or max_diagnostics != LEXER_MAX_DIAGNOSTICS
+            or max_input_bytes != LEXER_MAX_INPUT_BYTES
+            or observed_diagnostics != expected_diagnostics
+            or observed_diagnostics > max_diagnostics
+            or observed_input_bytes != input_size
+            or observed_input_bytes > max_input_bytes
+        ):
+            raise EvidenceError(f"lexer {case} telemetry is malformed or out of bounds")
+
+        validation_cases.append(
+            {
+                "case": case,
+                "input_sha256": input_digest,
+                "semantic_sha256": semantic_digest,
+                "stderr_sha256": stderr_digest,
+                "stdout_sha256": stdout_digest,
+                "telemetry_sha256": telemetry_digest,
+            }
+        )
+
+    return {
+        "acceptance_law": "plain.accepted == recovering.accepted",
+        "cases": validation_cases,
+        "diagnostic": LEXER_TAB_DIAGNOSTIC,
+        "run_id": expected_run_id,
+        "schema": LEXER_VALIDATION_SCHEMA,
+        "verdict": "pass",
+    }
 
 
 def verdict_exact_integer(record: Mapping[str, Any], key: str) -> int:
@@ -15777,6 +16032,53 @@ def cmd_validate_verdict_schema(args: argparse.Namespace) -> int:
     if args.output:
         output = require_within(
             Path(args.output), artifact_root, label="Verdict schema validation"
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_lexer_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    semantic_paths = {
+        case: artifact(
+            getattr(args, f"{case}_semantic"), f"lexer {case} semantic evidence"
+        )
+        for case in LEXER_CASE_INPUTS
+    }
+    telemetry_paths = {
+        case: artifact(getattr(args, f"{case}_telemetry"), f"lexer {case} telemetry")
+        for case in LEXER_CASE_INPUTS
+    }
+    input_paths = {
+        case: artifact(getattr(args, f"{case}_input"), f"lexer {case} input")
+        for case in LEXER_CASE_INPUTS
+    }
+    stdout_paths = {
+        case: artifact(getattr(args, f"{case}_stdout"), f"lexer {case} stdout")
+        for case in LEXER_CASE_INPUTS
+    }
+    stderr_paths = {
+        case: artifact(getattr(args, f"{case}_stderr"), f"lexer {case} stderr")
+        for case in LEXER_CASE_INPUTS
+    }
+    report = validate_lexer_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_paths=semantic_paths,
+        telemetry_paths=telemetry_paths,
+        input_paths=input_paths,
+        stdout_paths=stdout_paths,
+        stderr_paths=stderr_paths,
+        artifact_root=artifact_root,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output), artifact_root, label="lexer semantic validation"
         )
         write_new(output, canonical_json(report))
     else:
@@ -25440,6 +25742,21 @@ def build_parser() -> argparse.ArgumentParser:
     verdict_parser.add_argument("--artifact-root", required=True)
     verdict_parser.add_argument("--output")
     verdict_parser.set_defaults(func=cmd_validate_verdict_schema)
+
+    lexer_parser = subparsers.add_parser(
+        "validate-lexer-no-mock",
+        help="independently validate lexer real-file semantics and bounded telemetry",
+    )
+    lexer_parser.add_argument("--expected-run-id", required=True)
+    for lexer_case in ("positive", "failure", "recovery"):
+        lexer_parser.add_argument(f"--{lexer_case}-semantic", required=True)
+        lexer_parser.add_argument(f"--{lexer_case}-telemetry", required=True)
+        lexer_parser.add_argument(f"--{lexer_case}-input", required=True)
+        lexer_parser.add_argument(f"--{lexer_case}-stdout", required=True)
+        lexer_parser.add_argument(f"--{lexer_case}-stderr", required=True)
+    lexer_parser.add_argument("--artifact-root", required=True)
+    lexer_parser.add_argument("--output")
+    lexer_parser.set_defaults(func=cmd_validate_lexer_no_mock)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",

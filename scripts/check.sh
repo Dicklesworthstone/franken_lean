@@ -193,7 +193,8 @@ INPUT_PATHS=(
   scripts/extract/gen_extern_census.sh scripts/extract/gen_extern_census.lean
   scripts/e2e/contract_drift.sh scripts/e2e/contract_handoff.sh
   scripts/e2e/olean_resurrection.sh
-  scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh
+  scripts/e2e/kernel_replay.sh scripts/e2e/lexer_no_mock_e2e.sh
+  scripts/e2e/vellum_naming_no_mock_e2e.sh
   scripts/e2e/verdict_schema.sh scripts/e2e/unsafe_note_clippy.sh
   scripts/tribunal/leanchecker_witness.sh
   contracts ABI_CONTRACT.md OLEAN_CONTRACT.md rustfmt.toml
@@ -1597,7 +1598,8 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/lib/gate_lock.sh \
   scripts/e2e/contract_drift.sh scripts/e2e/contract_handoff.sh \
   scripts/e2e/olean_resurrection.sh \
   scripts/extract/gen_extern_census.sh scripts/extract/census_materialize.sh \
-  scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh \
+  scripts/e2e/kernel_replay.sh scripts/e2e/lexer_no_mock_e2e.sh \
+  scripts/e2e/vellum_naming_no_mock_e2e.sh \
   scripts/e2e/verdict_schema.sh scripts/e2e/unsafe_note_clippy.sh \
   scripts/tribunal/leanchecker_witness.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh \

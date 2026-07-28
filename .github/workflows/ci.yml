@@ -684,6 +684,39 @@ jobs:
           fi
           exit "$command_rc"
 
+      - name: e2e smoke — Vellum lexer real-file contract
+        id: lexer_no_mock_e2e
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/lexer-no-mock"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/lexer_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "lexer no-mock lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
       - name: e2e smoke — vellum naming contract
         id: vellum_naming
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
@@ -770,6 +803,8 @@ jobs:
           ENVIRONMENT_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.artifact_path }}
           ENVIRONMENT_RESOURCE_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.resource_artifact_path }}
           ENVIRONMENT_COLLISION_EXIT: ${{ steps.environment_collision.outputs.command_exit }}
+          LEXER_NO_MOCK_ARTIFACT: ${{ steps.lexer_no_mock_e2e.outputs.artifact_path }}
+          LEXER_NO_MOCK_EXIT: ${{ steps.lexer_no_mock_e2e.outputs.command_exit }}
           VELLUM_NAMING_ARTIFACT: ${{ steps.vellum_naming.outputs.artifact_path }}
           VELLUM_NAMING_EXIT: ${{ steps.vellum_naming.outputs.command_exit }}
           VERDICT_SCHEMA_ARTIFACT: ${{ steps.verdict_schema.outputs.artifact_path }}
@@ -806,6 +841,7 @@ jobs:
                   # env_snapshots is the sole parent bundle at this shared root;
                   # the two collision scenarios are its named children.
                   "environment-collision",
+                  "lexer-no-mock",
                   "vellum-naming",
                   "verdict-schema",
               },
@@ -881,6 +917,13 @@ jobs:
                   os.environ.get("ENVIRONMENT_COLLISION_EXIT", ""),
                   e2e_root / "environment-collision",
                   "resource-collision-fln-amv.13",
+              ),
+              (
+                  "lexer_no_mock_e2e",
+                  os.environ.get("LEXER_NO_MOCK_ARTIFACT", ""),
+                  os.environ.get("LEXER_NO_MOCK_EXIT", ""),
+                  e2e_root / "lexer-no-mock",
+                  True,
               ),
               (
                   "vellum_naming",

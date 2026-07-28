@@ -2797,14 +2797,14 @@ fn classify_lane(
 /// **What this changes about the row it binds.** AGENTS.md said `any fln.e2e/2 lane —
 /// **no** — hash-tree --vendor-path is its first governed step`: a universal verdict with a
 /// single stated producer. The verdict survives measurement; the producer does not. Of the
-/// eight declared `fln.e2e/2` lanes, seven carry `vendor-binding`, and the eighth —
+/// nine declared `fln.e2e/2` lanes, eight carry `vendor-binding`, and the ninth —
 /// `unsafe_note_clippy.sh` — carries no `--vendor-path` anywhere and reaches `run_git`, if
 /// it does, through `emit --governed-path` / `--producer-binding-root` and
 /// `manifest --input-root` instead. So the row was right for a reason that is wrong for at
 /// least one member, which is item 7's shape: a claim whose stated producer is not the
 /// thing producing it.
 ///
-/// **I did not resolve that eighth lane and this guard says so rather than guessing.** Its
+/// **I did not resolve that ninth lane and this guard says so rather than guessing.** Its
 /// distinctive subcommand IS measured — `unsafe-note-clippy-sites --operation extract`
 /// exits 0 on a gitdir-pointer root with an empty report, against a real-`.git` control —
 /// but six other subcommands it invokes reach `run_git` statically in unmeasured shapes.
@@ -2904,7 +2904,7 @@ fn the_worktree_refusal_scope_is_derived_from_the_lane_population() {
         let text = fs::read_to_string(repo.join(path))
             .unwrap_or_else(|error| panic!("{path} must be readable: {error}"));
         // The row speaks of `fln.e2e/2` lanes, not of every script in the directory. Those
-        // are different sets — 21 scripts, 8 declared lanes — and conflating them is
+        // are different sets — 22 scripts, 9 declared lanes — and conflating them is
         // `bkw6`'s shape, the scope measured differing from the scope meant.
         if !text.contains("fln.e2e/2") {
             continue;
