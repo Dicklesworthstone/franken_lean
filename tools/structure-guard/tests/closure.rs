@@ -6,44 +6,30 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::ops::Deref;
 
 use structure_guard::checks::{self, RunOutcome};
 use structure_guard::contract_handoff::{
     REQUIRED_OUTPUTS, SCHEMA_DEFINITION as HANDOFF_SCHEMA_DEFINITION,
 };
 use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
+use structure_guard::scratch::{CLOSURE_PREFIX, ScratchRoot};
 use structure_guard::{
     ABI_TARGET_LAYOUT_FILE, CONTRACT_HANDOFF_FILE, CONTRACT_HANDOFF_POLICY_FILE,
     CONTRACT_HANDOFF_SCHEMA_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
     CONTRACT_INVENTORY_SCHEMA_FILE, EXTERN_BUILTIN_ENVIRONMENT_FILE, OLEAN_ILEAN_FORMAT_FILE,
 };
 
-/// Materialized retained fixture root (mirrors the seeded.rs no-deletion policy).
-fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let root = loop {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let candidate = std::env::temp_dir().join(format!(
-            "structure-guard-closure-{}-{stamp}-{n}-{tag}",
-            std::process::id()
-        ));
-        let created = fs::create_dir(&candidate);
-        if created
-            .as_ref()
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
-        {
-            continue;
-        }
-        created.expect("create retained fixture root");
-        break candidate;
-    };
+/// A fixture root that reclaims itself when its test passes and is retained when the test fails
+/// (bead `franken_lean-s2sn`). The fence, the `Drop` body and the retention message live once in
+/// `structure_guard::scratch`; this file holds no second copy of them.
+///
+/// This was the largest unrepaired producer in the workspace: **3,776 directories / 2,486.9 MiB
+/// allocated** on 2026-07-28, still growing that afternoon. It is larger than the
+/// `contract-handoff-` pile by allocated bytes despite being a fortieth of it by *apparent*
+/// bytes, which is the whole reason `st_blocks` is the measure and `st_size` is not.
+fn materialize(tag: &str, files: &[(String, String)]) -> ScratchRoot {
+    let root = ScratchRoot::create(CLOSURE_PREFIX, "closure", tag).expect("create fixture root");
     let mut rendered_files: Vec<(String, String)> = files
         .iter()
         .map(|(rel, content)| {
@@ -107,7 +93,6 @@ fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
     {
         let _ = structure_guard::contract_handoff::publish(&root);
     }
-    eprintln!("retained closure fixture: {}", root.display());
     root
 }
 
@@ -312,11 +297,35 @@ fn base_files() -> Vec<(String, String)> {
     files
 }
 
-fn run_with(tag: &str, mutate: impl FnOnce(&mut Vec<(String, String)>)) -> RunOutcome {
+/// A guard run together with the fixture it ran against.
+///
+/// The fixture must outlive the *assertions*, not merely the guard invocation: a closure test
+/// asserts on the outcome after `run_with` returns, so binding the root inside `run_with` would
+/// reclaim it before the assertion that fails — losing exactly the workspace a failing run wants
+/// inspected. Deref-transparent to [`RunOutcome`], so `codes(&out)` and `out.findings` at the
+/// eighteen call sites are unchanged.
+struct FixtureRun {
+    outcome: RunOutcome,
+    _root: ScratchRoot,
+}
+
+impl Deref for FixtureRun {
+    type Target = RunOutcome;
+
+    fn deref(&self) -> &RunOutcome {
+        &self.outcome
+    }
+}
+
+fn run_with(tag: &str, mutate: impl FnOnce(&mut Vec<(String, String)>)) -> FixtureRun {
     let mut files = base_files();
     mutate(&mut files);
     let root = materialize(tag, &files);
-    checks::run(&root).expect("guard runs")
+    let outcome = checks::run(&root).expect("guard runs");
+    FixtureRun {
+        outcome,
+        _root: root,
+    }
 }
 
 fn codes(outcome: &RunOutcome) -> Vec<&'static str> {

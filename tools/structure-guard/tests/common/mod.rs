@@ -17,14 +17,13 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use structure_guard::checks::{self, RunOutcome};
 use structure_guard::contract_handoff::{
     REQUIRED_OUTPUTS, SCHEMA_DEFINITION as HANDOFF_SCHEMA_DEFINITION,
 };
 use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
+use structure_guard::scratch::{SEEDED_PREFIX, ScratchRoot, is_reclaimable};
 use structure_guard::{
     ABI_TARGET_LAYOUT_FILE, CONTRACT_HANDOFF_FILE, CONTRACT_HANDOFF_POLICY_FILE,
     CONTRACT_HANDOFF_SCHEMA_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
@@ -57,54 +56,10 @@ use structure_guard::{
 pub struct TempWs {
     tag: String,
     files: RefCell<BTreeMap<String, Vec<u8>>>,
-    /// Every root this recipe materialized, reclaimed on drop unless the test is failing.
-    roots: RefCell<Vec<PathBuf>>,
-}
-
-/// Whether a path is one of ours and therefore safe to reclaim.
-///
-/// Belt and braces on a `remove_dir_all`: the parent must be exactly the temp dir this
-/// harness materializes into, and the final component must carry the fixture prefix. A
-/// bug that corrupted a stored root then cannot reach anything outside that namespace —
-/// the reclaimer refuses instead of guessing, and says so.
-fn is_reclaimable_fixture_root(root: &Path) -> bool {
-    root.parent() == Some(std::env::temp_dir().as_path())
-        && root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("structure-guard-test-"))
-}
-
-impl Drop for TempWs {
-    fn drop(&mut self) {
-        let roots = self.roots.borrow();
-        // A failing test is precisely the case the retention was for. `panicking()` is
-        // true for the whole unwind, so this covers an assertion failure anywhere in the
-        // test body, not merely one raised while the fixture is in scope.
-        if std::thread::panicking() {
-            for root in roots.iter() {
-                eprintln!("retained structure-guard fixture: {}", root.display());
-            }
-            return;
-        }
-        for root in roots.iter() {
-            if !is_reclaimable_fixture_root(root) {
-                eprintln!(
-                    "refusing to reclaim a fixture root outside this harness's namespace: {}",
-                    root.display()
-                );
-                continue;
-            }
-            // Never panic in Drop: on the success path that would convert a passing test
-            // into a confusing abort, and the disk is the lesser problem.
-            if let Err(error) = fs::remove_dir_all(root) {
-                eprintln!(
-                    "could not reclaim structure-guard fixture {}: {error}",
-                    root.display()
-                );
-            }
-        }
-    }
+    /// Every root this recipe materialized. Each one reclaims itself when dropped unless the
+    /// test is failing; `TempWs` therefore needs no `Drop` of its own, and the fence and the
+    /// retention message exist once, in `structure_guard::scratch`.
+    roots: RefCell<Vec<ScratchRoot>>,
 }
 
 impl TempWs {
@@ -142,24 +97,10 @@ impl TempWs {
     }
 
     pub fn materialize(&self) -> Result<PathBuf, String> {
-        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
-            .as_nanos();
-        let root = loop {
-            let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-            let candidate = std::env::temp_dir().join(format!(
-                "structure-guard-test-{}-{stamp}-{sequence}-{}",
-                std::process::id(),
-                self.tag
-            ));
-            match fs::create_dir(&candidate) {
-                Ok(()) => break candidate,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(format!("create retained fixture root: {error}")),
-            }
-        };
+        // Bound to the guard from the first instant: an error path below now reclaims by
+        // unwinding out of scope, where the previous body left the half-built root behind.
+        let root = ScratchRoot::create(SEEDED_PREFIX, "structure-guard", &self.tag)
+            .map_err(|error| format!("create retained fixture root: {error}"))?;
 
         let mut files = self.files.borrow().clone();
         if !files.contains_key(CONTRACT_INVENTORY_FILE)
@@ -229,8 +170,9 @@ impl TempWs {
             // divergence and the handoff adapter suppresses its dependent finding.
             let _ = structure_guard::contract_handoff::publish(&root);
         }
-        self.roots.borrow_mut().push(root.clone());
-        Ok(root)
+        let path = root.path().to_path_buf();
+        self.roots.borrow_mut().push(root);
+        Ok(path)
     }
 
     pub fn run(&self) -> RunOutcome {
@@ -623,22 +565,39 @@ fn a_passing_fixture_is_reclaimed_and_a_failing_one_is_retained() {
 
 /// The reclaimer refuses anything outside its own namespace, so a corrupted stored root
 /// cannot widen a `remove_dir_all` into someone else's directory.
+///
+/// Asked of the SHARED predicate under THIS harness's prefix (bead `franken_lean-s2sn`), which
+/// is the join that matters now the fence lives in one place: `scratch` proves the fence is
+/// correct, and this proves the fence `TempWs` is actually standing behind is the one that
+/// admits `structure-guard-test-` and nothing else. A prefix constant silently rewritten here
+/// would leave `scratch`'s own cells green and this one red.
 #[test]
 fn the_reclaimer_refuses_a_root_it_did_not_create() {
     let temp = std::env::temp_dir();
-    assert!(is_reclaimable_fixture_root(
-        &temp.join("structure-guard-test-1-2-3-tag")
+    assert!(is_reclaimable(
+        &temp.join("structure-guard-test-1-2-3-tag"),
+        SEEDED_PREFIX
     ));
     assert!(
-        !is_reclaimable_fixture_root(&temp.join("someone-elses-scratch")),
+        !is_reclaimable(&temp.join("someone-elses-scratch"), SEEDED_PREFIX),
         "the prefix is what makes a directory ours"
     );
     assert!(
-        !is_reclaimable_fixture_root(&temp.join("nested").join("structure-guard-test-1-2-3-tag")),
+        !is_reclaimable(
+            &temp.join("nested").join("structure-guard-test-1-2-3-tag"),
+            SEEDED_PREFIX
+        ),
         "a matching name deeper in the tree is not one of ours"
     );
     assert!(
-        !is_reclaimable_fixture_root(Path::new("/")),
+        !is_reclaimable(Path::new("/"), SEEDED_PREFIX),
         "a root with no parent is never reclaimable"
+    );
+    assert!(
+        !is_reclaimable(
+            &temp.join("structure-guard-closure-1-2-3-tag"),
+            SEEDED_PREFIX
+        ),
+        "a sibling harness's root is not this harness's to reclaim"
     );
 }

@@ -34,6 +34,7 @@ pub mod manifest;
 pub mod mode_closure;
 pub mod ownership_publication;
 pub mod report;
+pub mod scratch;
 
 /// Workspace-relative path of the reviewed graph acknowledgment file.
 pub const GRAPH_FILE: &str = "ci/WORKSPACE_GRAPH.txt";

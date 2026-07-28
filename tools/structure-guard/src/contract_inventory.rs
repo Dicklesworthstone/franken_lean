@@ -3183,10 +3183,10 @@ pub fn audit(root: &Path) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::{INVENTORY_PREFIX, ScratchRoot};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     const TEST_SUITE_LOCK: &str = "\
 schema fln-suite-lock/1
@@ -3233,35 +3233,17 @@ row target:0001 kind=target support=required target-class=certified abi-class=no
 row toolchain kind=toolchain support=required target-class=none abi-class=none
 ";
 
-    fn retained_root(tag: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        loop {
-            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "fln-contract-inventory-{}-{stamp}-{sequence}-{tag}",
-                std::process::id()
-            ));
-            match fs::create_dir(&root) {
-                Ok(()) => {
-                    eprintln!("retained contract-inventory fixture: {}", root.display());
-                    return root;
-                }
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::AlreadyExists) => {
-                    continue;
-                }
-                Err(error) => {
-                    assert!(
-                        matches!(error.kind(), std::io::ErrorKind::AlreadyExists),
-                        "create retained fixture: {error}"
-                    );
-                    continue;
-                }
-            }
-        }
+    /// A fixture root that reclaims itself when its test passes and is retained when the test
+    /// fails (bead `franken_lean-s2sn`). The fence, the `Drop` body and the retention message
+    /// live once in [`crate::scratch`]; this file holds no second copy of them.
+    ///
+    /// The unconditional retention this replaces had reached **1,267 directories / 76.4 MiB**
+    /// allocated on 2026-07-28, and it announced itself on every passing run: the old body
+    /// printed `retained contract-inventory fixture: …` on the success path, so the line that
+    /// looked like a diagnostic was in fact the leak reporting itself once per test.
+    fn retained_root(tag: &str) -> ScratchRoot {
+        ScratchRoot::create(INVENTORY_PREFIX, "contract-inventory", tag)
+            .expect("create retained fixture")
     }
 
     fn write_new(path: &Path, bytes: &[u8]) {
@@ -3277,7 +3259,7 @@ row toolchain kind=toolchain support=required target-class=none abi-class=none
         file.sync_all().expect("sync fixture file");
     }
 
-    fn fixture_root(tag: &str, policy: &str) -> PathBuf {
+    fn fixture_root(tag: &str, policy: &str) -> ScratchRoot {
         let root = retained_root(tag);
         write_new(&root.join(SUITE_LOCK_FILE), TEST_SUITE_LOCK.as_bytes());
         write_new(

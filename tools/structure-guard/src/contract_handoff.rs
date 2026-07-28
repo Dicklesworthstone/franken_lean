@@ -1300,10 +1300,10 @@ pub fn audit(root: &Path) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::{HANDOFF_PREFIX, ScratchRoot};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     const SUITE_LOCK: &str = include_str!("../../../SUITE.lock");
     const INVENTORY_SCHEMA: &str = include_str!("../../../contracts/CONTRACT_INVENTORY_V1.txt");
@@ -1313,27 +1313,16 @@ mod tests {
     const ENVIRONMENT: &str = include_str!("../../../contracts/EXTERN_BUILTIN_ENVIRONMENT.txt");
     const HANDOFF_POLICY: &str = include_str!("../../../ci/CONTRACT_HANDOFF_POLICY.txt");
 
-    fn retained_root(tag: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        loop {
-            let path = std::env::temp_dir().join(format!(
-                "contract-handoff-{tag}-{}-{stamp}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return path,
-                Err(error) => assert_eq!(
-                    error.kind(),
-                    std::io::ErrorKind::AlreadyExists,
-                    "create retained root"
-                ),
-            }
-        }
+    /// A fixture root that reclaims itself when its test passes and is retained when the test
+    /// fails (bead `franken_lean-s2sn`). The fence, the `Drop` body and the retention message
+    /// live once in [`crate::scratch`]; this file holds no second copy of them.
+    ///
+    /// Before this change every root here was kept unconditionally: **2,080 directories** on
+    /// 2026-07-28, `321.7 MiB` allocated — of which 181 were `resource-exhaustion` roots each
+    /// holding a *sparse* 512 MiB file, which is why the apparent size of this family read
+    /// `92,763.8 MiB` and meant nothing.
+    fn retained_root(tag: &str) -> ScratchRoot {
+        ScratchRoot::create(HANDOFF_PREFIX, "contract-handoff", tag).expect("create retained root")
     }
 
     fn write_new(root: &Path, relative: &str, bytes: &[u8]) {
@@ -1347,7 +1336,7 @@ mod tests {
         file.write_all(bytes).expect("write fixture");
     }
 
-    fn fixture_root(tag: &str) -> PathBuf {
+    fn fixture_root(tag: &str) -> ScratchRoot {
         let root = retained_root(tag);
         write_new(&root, "SUITE.lock", SUITE_LOCK.as_bytes());
         write_new(
