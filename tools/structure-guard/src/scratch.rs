@@ -201,12 +201,6 @@ impl ScratchRoot {
         }
     }
 
-    /// Adopt a root some other code created, so that harness gets the same reclamation without
-    /// giving up its own naming scheme.
-    pub fn adopt(path: PathBuf, prefix: &'static str, kind: &'static str) -> ScratchRoot {
-        ScratchRoot { path, prefix, kind }
-    }
-
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -359,7 +353,7 @@ mod tests {
         );
         assert!(
             !is_reclaimable(&temp.join("undeclared-prefix-1-2-3"), "undeclared-prefix-"),
-            "a prefix absent from SCRATCH_PREFIXES is refused even if the name matches it"
+            "a prefix absent from SCRATCH_FAMILIES is refused even if the name matches it"
         );
     }
 
@@ -427,10 +421,8 @@ mod tests {
                 text.len()
             );
 
-            // A ROUTED producer must name its constant and must NOT also carry the raw literal:
-            // two spellings of one prefix is how this table starts lying.
-            //
-            // A DECLARED REMAINDER cannot name the constant, and that is the whole reason it is
+            // A ROUTED producer must bind its constant at the construction site; a DECLARED
+            // REMAINDER cannot name the constant, and that is the whole reason it is
             // a remainder — `kernel-ownership-publisher` is a nested workspace with no dependency
             // on this crate, so the identifier is unreachable there and the literal is the only
             // spelling available. Requiring the constant of it would be a wall against the exact
