@@ -33,6 +33,7 @@ import sys
 import sysconfig
 import threading
 import time
+import tomllib
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -4012,9 +4013,13 @@ def _run_supervised_impl(
     return wrapper_exit
 
 
-def parse_rust_lock(lock_path: Path) -> dict[str, str]:
-    """Read the pinned Rust rows of SUITE.lock and enforce the lock's own law
-    that `rust-nightly` equals rust-toolchain.toml's `[toolchain].channel`."""
+def parse_rust_lock(lock_path: Path) -> dict[str, Any]:
+    """Read the pinned Rust rows and the toolchain manifest they govern.
+
+    The channel must agree in both files, and the declared component array is
+    retained for command-specific admission checks. An unreadable component
+    declaration is a setup fault rather than an empty component set.
+    """
     try:
         lock_text = lock_path.read_text(encoding="utf-8")
     except OSError as error:
@@ -4053,6 +4058,30 @@ def parse_rust_lock(lock_path: Path) -> dict[str, str]:
             f"rust-toolchain.toml channel {channel_match.group(1) if channel_match else None!r} "
             f"!= SUITE.lock rust-nightly {rows['rust-nightly']!r}",
         )
+    try:
+        toolchain_document = tomllib.loads(toml_text)
+    except tomllib.TOMLDecodeError as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_components_unreadable",
+            f"rust-toolchain.toml is not valid TOML: {error}",
+        ) from error
+    toolchain_table = toolchain_document.get("toolchain")
+    components = (
+        toolchain_table.get("components")
+        if isinstance(toolchain_table, dict)
+        else None
+    )
+    if (
+        not isinstance(components, list)
+        or not components
+        or not all(isinstance(item, str) and item for item in components)
+        or len(components) != len(set(components))
+    ):
+        raise SealedCompilerRejection(
+            "sealed_compiler_components_unreadable",
+            "rust-toolchain.toml components must be unique non-empty quoted names",
+        )
+    rows["rust-components"] = components
     return rows
 
 
@@ -4084,7 +4113,7 @@ def scan_ancestor_cargo_config(cwd: Path) -> list[str]:
     return sorted(offenders)
 
 
-def resolve_sealed_toolchain(lock_rows: Mapping[str, str]) -> dict[str, str]:
+def resolve_sealed_toolchain(lock_rows: Mapping[str, Any]) -> dict[str, Any]:
     """Locate the pinned rustup toolchain and prove its identity: the resolved
     rustc must report exactly the locked release and commit hash."""
     machine = platform.machine()
@@ -4174,6 +4203,54 @@ def prepare_sealed_cargo(
         )
     lock_rows = parse_rust_lock(suite_lock_path)
     toolchain = resolve_sealed_toolchain(lock_rows)
+    declared_components = list(lock_rows["rust-components"])
+    component_requirement = (
+        ("rustfmt", ("cargo-fmt", "rustfmt"))
+        if len(argv) >= 2 and argv[0] == "cargo" and argv[1] == "fmt"
+        else None
+    )
+    if component_requirement is not None:
+        component, executables = component_requirement
+        component_facts: dict[str, Any] = {
+            **toolchain,
+            "declared_components": declared_components,
+            "required_component": component,
+            "required_component_executables": list(executables),
+        }
+        if component not in declared_components:
+            raise SealedCompilerRejection(
+                "sealed_compiler_component_undeclared",
+                f"cargo fmt requires {component}, which rust-toolchain.toml does not declare",
+                facts=component_facts,
+            )
+        executable_paths = [
+            Path(toolchain["toolchain_root"]) / "bin" / executable
+            for executable in executables
+        ]
+        component_facts["required_executable_paths"] = [
+            str(path) for path in executable_paths
+        ]
+        missing_executables = [
+            path.name
+            for path in executable_paths
+            if not path.is_file() or not os.access(path, os.X_OK)
+        ]
+        if missing_executables:
+            raise SealedCompilerRejection(
+                "sealed_compiler_component_absent",
+                f"declared component {component} lacks executable(s) "
+                f"{','.join(missing_executables)} under {toolchain['toolchain_root']}/bin",
+                facts=component_facts,
+            )
+        toolchain.update(
+            {
+                "required_component": component,
+                "required_component_executables": list(executables),
+                "required_executable_paths": [
+                    str(path) for path in executable_paths
+                ],
+            }
+        )
     cargo_home = sealed_build_root / "cargo-home"
     target_dir = sealed_build_root / "target"
     try:
@@ -4205,6 +4282,7 @@ def prepare_sealed_cargo(
         argv[0] = toolchain["cargo_path"]
     facts = {
         **toolchain,
+        "declared_components": declared_components,
         "cargo_home": str(cargo_home),
         "target_dir": str(target_dir),
         "admitted_env": sorted(sealed_env),
@@ -12675,6 +12753,66 @@ def validate_supervisor_object(
                         f"{path}:{record_number}: sealed-compiler "
                         f"{environment_field} is malformed"
                     )
+            component_reason = value["reason_code"] in {
+                "sealed_compiler_component_undeclared",
+                "sealed_compiler_component_absent",
+            }
+            fmt_released = (
+                value["argv"][:2] == ["cargo", "fmt"]
+                and value["classification"] in {"pass", "fail"}
+            )
+            if component_reason or fmt_released:
+                declared_components = sealed.get("declared_components")
+                required_component = sealed.get("required_component")
+                required_executables = sealed.get(
+                    "required_component_executables"
+                )
+                if (
+                    not isinstance(declared_components, list)
+                    or not declared_components
+                    or not all(
+                        isinstance(item, str) and item
+                        for item in declared_components
+                    )
+                    or len(declared_components) != len(set(declared_components))
+                    or required_component != "rustfmt"
+                    or required_executables != ["cargo-fmt", "rustfmt"]
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: fmt component-admission facts are malformed"
+                    )
+                component_declared = required_component in declared_components
+                if (
+                    value["reason_code"] == "sealed_compiler_component_undeclared"
+                    and component_declared
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: undeclared fmt component is declared"
+                    )
+                if (
+                    value["reason_code"] != "sealed_compiler_component_undeclared"
+                    and not component_declared
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: admitted fmt component is undeclared"
+                    )
+                if value["reason_code"] != "sealed_compiler_component_undeclared":
+                    executable_paths = sealed.get("required_executable_paths")
+                    if (
+                        not isinstance(executable_paths, list)
+                        or len(executable_paths) != len(required_executables)
+                        or not all(
+                            isinstance(item, str)
+                            and Path(item).is_absolute()
+                            and Path(item).name == executable
+                            for item, executable in zip(
+                                executable_paths, required_executables, strict=True
+                            )
+                        )
+                    ):
+                        raise EvidenceError(
+                            f"{path}:{record_number}: fmt executable paths are malformed"
+                        )
     if schema == "fln.supervisor/5":
         sealed_interpreter = value["sealed_interpreter"]
         if not isinstance(sealed_interpreter, dict):
@@ -13299,6 +13437,9 @@ def validate_supervisor_object(
             "sealed_compiler_lock_incomplete",
             "sealed_compiler_toolchain_toml_unreadable",
             "sealed_compiler_channel_disagreement",
+            "sealed_compiler_components_unreadable",
+            "sealed_compiler_component_undeclared",
+            "sealed_compiler_component_absent",
             "sealed_compiler_unsupported_host",
             "sealed_compiler_toolchain_unresolved",
             "sealed_compiler_probe_failure",
@@ -18046,6 +18187,263 @@ def require(condition: bool, detail: str) -> None:
         raise EvidenceError(detail)
 
 
+def run_sealed_supervisor_case(
+    *,
+    stem: str,
+    sealed_root: Path,
+    env_overrides: Mapping[str, str],
+    cwd: Path,
+    suite_lock: Path,
+    expected_reason: str,
+    expected_class: str,
+    expected_exit: int,
+    target_argv: Sequence[str] = ("cargo", "-V"),
+) -> dict[str, Any]:
+    """Run one real sealed-cargo supervisor cell and validate its envelope."""
+    base_env = {
+        "PATH": SEALED_PATH_TAIL,
+        "HOME": os.environ.get("HOME", str(Path.home())),
+    }
+    base_env.update(env_overrides)
+    invocation = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(__file__).resolve()),
+            "run",
+            "--cwd",
+            str(cwd),
+            "--metadata",
+            str(sealed_root / f"{stem}.meta.json"),
+            "--stdout",
+            str(sealed_root / f"{stem}.out"),
+            "--stderr",
+            str(sealed_root / f"{stem}.err"),
+            "--readiness",
+            str(sealed_root / f"{stem}.ready.json"),
+            "--artifact-root",
+            str(sealed_root),
+            "--capture-bytes",
+            "65536",
+            "--output-budget-bytes",
+            "1048576",
+            "--timeout-ms",
+            "120000",
+            "--grace-ms",
+            "2000",
+            "--stage-id",
+            stem,
+            "--sealed-cargo",
+            "--suite-lock",
+            str(suite_lock),
+            "--sealed-build-root",
+            str(sealed_root / "build"),
+            "--",
+            *target_argv,
+        ],
+        capture_output=True,
+        env=base_env,
+        timeout=180,
+        check=False,
+    )
+    require(
+        invocation.returncode == expected_exit,
+        f"sealed case {stem}: exit {invocation.returncode}, "
+        f"expected {expected_exit}: {invocation.stderr!r}",
+    )
+    metadata = sealed_root / f"{stem}.meta.json"
+    envelope = read_json_object(metadata)
+    validate_supervisor_object(metadata, 1, envelope, expected_stage_id=stem)
+    require(
+        envelope["classification"] == expected_class
+        and envelope["reason_code"] == expected_reason,
+        f"sealed case {stem}: {envelope['classification']}/"
+        f"{envelope['reason_code']}, expected {expected_class}/{expected_reason}",
+    )
+    return envelope
+
+
+def run_fmt_component_admission_self_test(root: Path) -> dict[str, Any]:
+    """Exercise U4J7 before the broader self-test reaches recursive gate probes."""
+    repo = Path(__file__).resolve().parent.parent
+    work = root / "work"
+    work.mkdir()
+    for pin_name in ("SUITE.lock", "rust-toolchain.toml"):
+        (work / pin_name).write_bytes((repo / pin_name).read_bytes())
+    lock_rows = parse_rust_lock(work / "SUITE.lock")
+    toolchain = resolve_sealed_toolchain(lock_rows)
+    triple = SEALED_HOST_TRIPLES[platform.machine()]
+    component_home = root / "component-rustup-home"
+    component_bin = (
+        component_home
+        / "toolchains"
+        / f"{lock_rows['rust-nightly']}-{triple}"
+        / "bin"
+    )
+    component_bin.mkdir(parents=True)
+    (component_bin / "rustc").symlink_to(toolchain["rustc_path"])
+    (component_bin / "cargo").symlink_to(toolchain["cargo_path"])
+    component_marker = component_bin / "RUSTFMT-EXECUTED"
+    missing = run_sealed_supervisor_case(
+        stem="sealed_fmt_component_absent",
+        sealed_root=root,
+        env_overrides={"RUSTUP_HOME": str(component_home)},
+        cwd=work,
+        suite_lock=work / "SUITE.lock",
+        expected_reason="sealed_compiler_component_absent",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+        target_argv=("cargo", "fmt", "--version"),
+    )
+    require(
+        missing["phase_timing"]["execution_start_ns"] is None
+        and not component_marker.exists(),
+        "a cargo fmt target executed after its pinned rustfmt component was refused",
+    )
+    undeclared_work = root / "undeclared-work"
+    undeclared_work.mkdir()
+    (undeclared_work / "SUITE.lock").write_bytes((work / "SUITE.lock").read_bytes())
+    manifest = (work / "rust-toolchain.toml").read_text()
+    undeclared_manifest = manifest.replace('"rustfmt", ', "")
+    require(
+        undeclared_manifest != manifest,
+        "the rustfmt declaration needle moved before the undeclared-component cell",
+    )
+    (undeclared_work / "rust-toolchain.toml").write_text(undeclared_manifest)
+    undeclared = run_sealed_supervisor_case(
+        stem="sealed_fmt_component_undeclared",
+        sealed_root=root,
+        env_overrides={"RUSTUP_HOME": str(component_home)},
+        cwd=undeclared_work,
+        suite_lock=undeclared_work / "SUITE.lock",
+        expected_reason="sealed_compiler_component_undeclared",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+        target_argv=("cargo", "fmt", "--version"),
+    )
+    require(
+        undeclared["phase_timing"]["execution_start_ns"] is None,
+        "cargo fmt executed after rustfmt disappeared from the pin",
+    )
+    malformed_work = root / "malformed-work"
+    malformed_work.mkdir()
+    (malformed_work / "SUITE.lock").write_bytes((work / "SUITE.lock").read_bytes())
+    malformed_manifest = manifest.replace("components =", "components_disabled =")
+    require(
+        malformed_manifest != manifest,
+        "the components declaration needle moved before the malformed-manifest cell",
+    )
+    (malformed_work / "rust-toolchain.toml").write_text(malformed_manifest)
+    malformed = run_sealed_supervisor_case(
+        stem="sealed_fmt_components_unreadable",
+        sealed_root=root,
+        env_overrides={"RUSTUP_HOME": str(component_home)},
+        cwd=malformed_work,
+        suite_lock=malformed_work / "SUITE.lock",
+        expected_reason="sealed_compiler_components_unreadable",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+        target_argv=("cargo", "fmt", "--version"),
+    )
+    require(
+        malformed["phase_timing"]["execution_start_ns"] is None,
+        "cargo fmt executed after its component declaration became unreadable",
+    )
+    fake_rustfmt = component_bin / "rustfmt"
+    fake_rustfmt.write_text(
+        "#!/bin/sh\n"
+        "printf 'rustfmt u4j7-control\\n'\n"
+    )
+    fake_rustfmt.chmod(0o755)
+    fake_cargo_fmt = component_bin / "cargo-fmt"
+    fake_cargo_fmt.write_text(
+        "#!/bin/sh\n"
+        "printf 'executed\\n' > \"${0%/*}/RUSTFMT-EXECUTED\"\n"
+        "printf 'cargo-fmt u4j7-control\\n'\n"
+    )
+    fake_cargo_fmt.chmod(0o755)
+    recovery = run_sealed_supervisor_case(
+        stem="sealed_fmt_component_recovery",
+        sealed_root=root,
+        env_overrides={"RUSTUP_HOME": str(component_home)},
+        cwd=work,
+        suite_lock=work / "SUITE.lock",
+        expected_reason="exit_zero",
+        expected_class="pass",
+        expected_exit=PASS,
+        target_argv=("cargo", "fmt", "--version"),
+    )
+    require(
+        recovery["phase_timing"]["execution_start_ns"] is not None
+        and component_marker.read_text() == "executed\n",
+        "restoring the pinned rustfmt executable did not admit and execute cargo fmt",
+    )
+
+    def reject_component_metadata_mutation(
+        label: str,
+        source: dict[str, Any],
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> None:
+        candidate = parse_json(
+            canonical_json(source),
+            subject=f"fmt component metadata mutation {label}",
+        )
+        if not isinstance(candidate, dict):
+            raise EvidenceError("fmt component mutation source is not an object")
+        mutate(candidate)
+        try:
+            validate_supervisor_object(
+                root / f"{source['stage_id']}.meta.json",
+                1,
+                candidate,
+                expected_stage_id=source["stage_id"],
+            )
+        except EvidenceError:
+            return
+        raise EvidenceError(
+            f"fmt component validator accepted metadata mutation: {label}"
+        )
+
+    reject_component_metadata_mutation(
+        "undeclared-but-listed",
+        undeclared,
+        lambda candidate: candidate["sealed_compiler"][
+            "declared_components"
+        ].insert(0, "rustfmt"),
+    )
+    reject_component_metadata_mutation(
+        "absent-but-not-declared",
+        missing,
+        lambda candidate: candidate["sealed_compiler"][
+            "declared_components"
+        ].remove("rustfmt"),
+    )
+    reject_component_metadata_mutation(
+        "executable-order",
+        recovery,
+        lambda candidate: candidate["sealed_compiler"].__setitem__(
+            "required_component_executables", ["rustfmt", "cargo-fmt"]
+        ),
+    )
+    reject_component_metadata_mutation(
+        "executable-path",
+        recovery,
+        lambda candidate: candidate["sealed_compiler"][
+            "required_executable_paths"
+        ].__setitem__(0, "/tmp/not-cargo-fmt"),
+    )
+    return {
+        "case": "sealed_fmt_component_admission",
+        "ok": True,
+        "absence": "sealed_compiler_component_absent",
+        "undeclared": "sealed_compiler_component_undeclared",
+        "unreadable": "sealed_compiler_components_unreadable",
+        "recovery": "exit_zero",
+        "validator_mutants": 4,
+    }
+
+
 def cmd_self_test(args: argparse.Namespace) -> int:
     """Exercise supervisor boundary cases without mocks or disposable fixtures."""
     art_dir = lexical_absolute(Path(args.art_dir))
@@ -18082,6 +18480,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         path = art_dir / name
         path.mkdir()
         return path
+
+    cases.append(
+        run_fmt_component_admission_self_test(
+            case_dir("sealed_fmt_component_admission")
+        )
+    )
 
     parity_root = case_dir("parity_ledger_reference_integrity")
     parity_row = (
@@ -26559,73 +26963,21 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         expected_reason: str,
         expected_class: str,
         expected_exit: int,
+        target_argv: Sequence[str] = ("cargo", "-V"),
     ) -> dict[str, Any]:
         sealed_case_counter[0] += 1
         stem = f"{label}-{sealed_case_counter[0]}"
-        base_env = {
-            "PATH": SEALED_PATH_TAIL,
-            "HOME": os.environ.get("HOME", str(Path.home())),
-        }
-        base_env.update(env_overrides)
-        invocation = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-S",
-                str(Path(__file__).resolve()),
-                "run",
-                "--cwd",
-                str(cwd),
-                "--metadata",
-                str(sealed_root / f"{stem}.meta.json"),
-                "--stdout",
-                str(sealed_root / f"{stem}.out"),
-                "--stderr",
-                str(sealed_root / f"{stem}.err"),
-                "--readiness",
-                str(sealed_root / f"{stem}.ready.json"),
-                "--artifact-root",
-                str(sealed_root),
-                "--capture-bytes",
-                "65536",
-                "--output-budget-bytes",
-                "1048576",
-                "--timeout-ms",
-                "120000",
-                "--grace-ms",
-                "2000",
-                "--stage-id",
-                stem,
-                "--sealed-cargo",
-                "--suite-lock",
-                str(suite_lock),
-                "--sealed-build-root",
-                str(sealed_root / "build"),
-                "--",
-                "cargo",
-                "-V",
-            ],
-            capture_output=True,
-            env=base_env,
-            timeout=180,
-            check=False,
+        return run_sealed_supervisor_case(
+            stem=stem,
+            sealed_root=sealed_root,
+            env_overrides=env_overrides,
+            cwd=cwd,
+            suite_lock=suite_lock,
+            expected_reason=expected_reason,
+            expected_class=expected_class,
+            expected_exit=expected_exit,
+            target_argv=target_argv,
         )
-        require(
-            invocation.returncode == expected_exit,
-            f"sealed case {label}: exit {invocation.returncode}, "
-            f"expected {expected_exit}: {invocation.stderr!r}",
-        )
-        envelope = json.loads((sealed_root / f"{stem}.meta.json").read_text())
-        validate_supervisor_object(
-            sealed_root / f"{stem}.meta.json", 1, envelope, expected_stage_id=stem
-        )
-        require(
-            envelope["classification"] == expected_class
-            and envelope["reason_code"] == expected_reason,
-            f"sealed case {label}: {envelope['classification']}/"
-            f"{envelope['reason_code']}, expected {expected_class}/{expected_reason}",
-        )
-        return envelope
 
     hostile_channels = {
         "sealed_reject_rustflags": {"RUSTFLAGS": "--cap-lints allow"},

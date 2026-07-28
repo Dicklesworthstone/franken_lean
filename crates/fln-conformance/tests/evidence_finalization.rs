@@ -4066,9 +4066,14 @@ fn registered_semantic_exit(check_sh: &str, stage: &str) -> Option<String> {
 /// Judge the pin/gate/doctrine triple, returning a finding per broken property.
 ///
 /// Findings rather than assertions so each property can be gutted alone and every mutant is
-/// planted in the ARGUMENTS. All three inputs are plain text, so the campaign below costs no
+/// planted in the ARGUMENTS. All four inputs are plain text, so the campaign below costs no
 /// process spawns and never writes a governed file.
-fn pin_component_findings(manifest: &str, check_sh: &str, agents: &str) -> Vec<String> {
+fn pin_component_findings(
+    manifest: &str,
+    check_sh: &str,
+    evidence: &str,
+    agents: &str,
+) -> Vec<String> {
     let mut findings = Vec::new();
     let components = declared_pin_components(manifest);
     if components.len() < 4 {
@@ -4139,34 +4144,55 @@ fn pin_component_findings(manifest: &str, check_sh: &str, agents: &str) -> Vec<S
     // cannot fail reads exactly like coverage, which is the one thing worse than an absent
     // check — `f2t9`'s two deleted `dep:`/`pkg/feat` assertions, same reasoning.
 
-    // And the gate that is NOT separable must stay disclosed. It is an open defect of this
-    // repository rather than of RCH, and a disclosure that quietly vanishes is worse than the
-    // defect, because the next reader will trust the gate.
-    if !(section.contains("cargo fmt --check") && section.contains("**no**")) {
+    // U4J7 closes the ambiguous-exit hole before process spawn. The raw cargo command still
+    // returns 1 both when formatting differs and when rustfmt is absent, so the only sound join
+    // is the sealed admission check plus its missing/recovery execution cells. Bind all three
+    // producer tokens: a dormant check or a negative cell with no recovery is not the repair.
+    let fmt_preflight_bound = evidence.contains("sealed_compiler_component_absent")
+        && evidence.contains("sealed_fmt_component_absent")
+        && evidence.contains("sealed_fmt_component_undeclared")
+        && evidence.contains("sealed_fmt_components_unreadable")
+        && evidence.contains("sealed_fmt_component_recovery")
+        && evidence.contains("component_marker.read_text() == \"executed\\n\"")
+        && evidence.contains("\"validator_mutants\": 4");
+    if !fmt_preflight_bound {
         findings.push(
-            "disclosure-dropped: the AGENTS.md section no longer discloses that `cargo fmt \
-             --check` cannot separate a component-absent failure from a real finding — both exit \
-             1. That disclosure is the only thing standing between a missing `rustfmt` and a \
-             reader diagnosing their own formatting."
+            "fmt-preflight-unbound: scripts/evidence.py no longer carries the typed missing-\
+             rustfmt refusal, the planted absent-component cell, and the executable recovery \
+             control as one mechanism. The raw cargo fmt exit remains ambiguous, so losing any \
+             one of those joins reopens an environment fault as a code finding."
+                .to_string(),
+        );
+    }
+    if !(section.contains("cargo fmt --check")
+        && section.contains("sealed_compiler_component_absent")
+        && section.contains("sealed_fmt_component_recovery"))
+    {
+        findings.push(
+            "fmt-doctrine-stale: AGENTS.md no longer states that sealed admission separates the \
+             raw cargo fmt exit by refusing absent rustfmt before spawn and admitting the \
+             executable recovery control. A live check whose operator doctrine still says \
+             'non-separable' is an unbound repair."
                 .to_string(),
         );
     }
     findings
 }
 
-fn pin_inputs() -> (String, String, String) {
+fn pin_inputs() -> (String, String, String, String) {
     let repo = worker_repo();
     (
         fs::read_to_string(repo.join("rust-toolchain.toml")).expect("rust-toolchain.toml"),
         fs::read_to_string(repo.join("scripts/check.sh")).expect("scripts/check.sh"),
+        fs::read_to_string(repo.join("scripts/evidence.py")).expect("scripts/evidence.py"),
         fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md"),
     )
 }
 
 #[test]
-fn the_pin_declares_components_and_the_gates_that_cannot_separate_them_are_disclosed() {
-    let (manifest, check_sh, agents) = pin_inputs();
-    let findings = pin_component_findings(&manifest, &check_sh, &agents);
+fn the_pin_declares_components_and_sealed_admission_separates_fmt_absence() {
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
+    let findings = pin_component_findings(&manifest, &check_sh, &evidence, &agents);
     assert!(
         findings.is_empty(),
         "the pin's declared components, the gate that consumes them, and the doctrine that \
@@ -4178,10 +4204,10 @@ fn the_pin_declares_components_and_the_gates_that_cannot_separate_them_are_discl
 /// Gut 1: the clippy stage starts registering the environment-fault exit as semantic.
 #[test]
 fn a_clippy_stage_that_registers_the_component_absent_exit_is_caught() {
-    let (manifest, check_sh, agents) = pin_inputs();
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
     let mutated = check_sh.replace("--semantic-failure-exit 101", "--semantic-failure-exit 1");
     assert_ne!(mutated, check_sh, "the registration needle has moved");
-    let findings = pin_component_findings(&manifest, &mutated, &agents);
+    let findings = pin_component_findings(&manifest, &mutated, &evidence, &agents);
     assert!(
         findings.iter().any(|f| f.starts_with("gate-conflates")),
         "registering the component-absent exit as a semantic failure must be caught — that one \
@@ -4192,13 +4218,13 @@ fn a_clippy_stage_that_registers_the_component_absent_exit_is_caught() {
 /// Gut 2: a component is added to the pin and nobody classifies it.
 #[test]
 fn a_new_pin_component_that_nobody_classifies_is_caught() {
-    let (manifest, check_sh, agents) = pin_inputs();
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
     let mutated = manifest.replace(
         "components = [\"rustfmt\"",
         "components = [\"llvm-tools-preview\", \"rustfmt\"",
     );
     assert_ne!(mutated, manifest, "the components needle has moved");
-    let findings = pin_component_findings(&mutated, &check_sh, &agents);
+    let findings = pin_component_findings(&mutated, &check_sh, &evidence, &agents);
     assert!(
         findings
             .iter()
@@ -4210,10 +4236,10 @@ fn a_new_pin_component_that_nobody_classifies_is_caught() {
 /// Gut 3: the pin's component array becomes unreadable — a refusal, never a clean pin.
 #[test]
 fn a_pin_whose_components_cannot_be_read_refuses() {
-    let (manifest, check_sh, agents) = pin_inputs();
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
     let mutated = manifest.replace("components = [", "components_disabled = (");
     assert_ne!(mutated, manifest, "the components needle has moved");
-    let findings = pin_component_findings(&mutated, &check_sh, &agents);
+    let findings = pin_component_findings(&mutated, &check_sh, &evidence, &agents);
     assert!(
         findings.iter().any(|f| f.starts_with("pin-floor")),
         "a pin whose component array cannot be read must refuse, because that is \
@@ -4224,39 +4250,82 @@ fn a_pin_whose_components_cannot_be_read_refuses() {
 /// Gut 4: the doctrine section disappears.
 #[test]
 fn a_missing_component_doctrine_section_refuses() {
-    let (manifest, check_sh, agents) = pin_inputs();
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
     let mutated = agents.replace(
         "### The worker may lack a component of the pin",
         "### Removed",
     );
     assert_ne!(mutated, agents, "the heading needle has moved");
-    let findings = pin_component_findings(&manifest, &check_sh, &mutated);
+    let findings = pin_component_findings(&manifest, &check_sh, &evidence, &mutated);
     assert!(
         findings.iter().any(|f| f.starts_with("doctrine-missing")),
         "losing the section that classifies a component-absent failure must refuse: {findings:?}"
     );
 }
 
-/// Gut 5: the disclosure of the gate that CANNOT separate is quietly dropped.
+/// Gut 5: the executable recovery half of the fmt preflight disappears.
 #[test]
-fn dropping_the_non_separable_gate_disclosure_is_caught() {
-    let (manifest, check_sh, agents) = pin_inputs();
-    let mutated = agents.replace("| `cargo fmt --check` | **1** | **1** |", "| (removed) |");
-    assert_ne!(mutated, agents, "the disclosure needle has moved");
-    let findings = pin_component_findings(&manifest, &check_sh, &mutated);
+fn dropping_the_fmt_component_recovery_cell_is_caught() {
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
+    let mutated = evidence.replace(
+        "sealed_fmt_component_recovery",
+        "fmt_component_recovery_removed",
+    );
+    assert_ne!(mutated, evidence, "the recovery-cell needle has moved");
+    let findings = pin_component_findings(&manifest, &check_sh, &mutated, &agents);
     assert!(
-        findings.iter().any(|f| f.starts_with("disclosure-dropped")),
-        "dropping the disclosure that fmt cannot separate must be caught: {findings:?}"
+        findings
+            .iter()
+            .any(|f| f.starts_with("fmt-preflight-unbound")),
+        "dropping the recovery half of the fmt preflight must be caught: {findings:?}"
     );
 }
 
-/// Gut 6: `check.sh` is restructured so the registration cannot be found.
+/// Gut 6: component declaration drift is no longer exercised.
+#[test]
+fn dropping_the_fmt_component_declaration_cells_is_caught() {
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
+    let mutated = evidence
+        .replace(
+            "sealed_fmt_component_undeclared",
+            "fmt_component_undeclared_removed",
+        )
+        .replace(
+            "sealed_fmt_components_unreadable",
+            "fmt_components_unreadable_removed",
+        );
+    assert_ne!(mutated, evidence, "the declaration-cell needles have moved");
+    let findings = pin_component_findings(&manifest, &check_sh, &mutated, &agents);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("fmt-preflight-unbound")),
+        "dropping the declaration-binding cells must be caught: {findings:?}"
+    );
+}
+
+/// Gut 7: the metadata validator's mutation campaign disappears.
+#[test]
+fn dropping_the_fmt_component_validator_mutants_is_caught() {
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
+    let mutated = evidence.replace("\"validator_mutants\": 4", "\"validator_mutants\": 0");
+    assert_ne!(mutated, evidence, "the validator-mutant needle has moved");
+    let findings = pin_component_findings(&manifest, &check_sh, &mutated, &agents);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("fmt-preflight-unbound")),
+        "dropping the component-fact validator mutants must be caught: {findings:?}"
+    );
+}
+
+/// Gut 8: `check.sh` is restructured so the registration cannot be found.
 #[test]
 fn a_gate_whose_registration_cannot_be_located_refuses() {
-    let (manifest, check_sh, agents) = pin_inputs();
+    let (manifest, check_sh, evidence, agents) = pin_inputs();
     let mutated = check_sh.replace("|clippy|", "|clippy-stage|");
     assert_ne!(mutated, check_sh, "the case-arm needle has moved");
-    let findings = pin_component_findings(&manifest, &mutated, &agents);
+    let findings = pin_component_findings(&manifest, &mutated, &evidence, &agents);
     assert!(
         findings.iter().any(|f| f.starts_with("gate-unreadable")),
         "a gate whose registration this can no longer read must refuse rather than pass on a \
