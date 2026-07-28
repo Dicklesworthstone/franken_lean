@@ -62,6 +62,16 @@ use fln_conformance::execution::{
 
 const CENSUS: &str = "scripts/agents_enforcement_census.py";
 
+/// Invoke the checked-in producer through its shebang.
+///
+/// A `python3 <path>` wrapper would let the executable bit or shebang rot while every test stayed
+/// green, even though AGENTS.md documents the script itself as the runnable producer.
+fn census_command(root: &Path) -> Command {
+    let mut command = Command::new(root.join(CENSUS));
+    command.current_dir(root);
+    command
+}
+
 fn workspace_root() -> PathBuf {
     // Through the tree check, not this file's compile-time manifest dir: a binary compiled in
     // another checkout would otherwise census that tree's AGENTS.md and report the verdict here
@@ -74,8 +84,7 @@ fn workspace_root() -> PathBuf {
 /// Run the census, returning (exit code, stdout+stderr).
 fn run(agents: Option<&PathBuf>) -> (i32, String) {
     let root = workspace_root();
-    let mut command = Command::new("python3");
-    command.arg("-I").arg("-S").arg("-B").arg(root.join(CENSUS));
+    let mut command = census_command(&root);
     command.arg("--check");
     if let Some(path) = agents {
         command.arg("--agents").arg(path);
@@ -83,7 +92,6 @@ fn run(agents: Option<&PathBuf>) -> (i32, String) {
         command.arg("--agents").arg(root.join("AGENTS.md"));
     }
     let out = command
-        .current_dir(&root)
         .output()
         .unwrap_or_else(|err| panic!("{CENSUS} must be runnable: {err}"));
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1357,15 +1365,10 @@ struct OperationalReferent {
 
 fn extract_operational_referents(agents: &Path) -> Result<Vec<OperationalReferent>, String> {
     let root = workspace_root();
-    let out = Command::new("python3")
-        .arg("-I")
-        .arg("-S")
-        .arg("-B")
-        .arg(root.join(CENSUS))
+    let out = census_command(&root)
         .arg("--referents")
         .arg("--agents")
         .arg(agents)
-        .current_dir(&root)
         .output()
         .map_err(|error| format!("{CENSUS} --referents could not run: {error}"))?;
     if !out.status.success() {
