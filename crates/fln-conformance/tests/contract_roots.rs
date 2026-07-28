@@ -29,7 +29,7 @@
 //!
 //! ## Where the delegate runs (bead `franken_lean-0kpa`)
 //!
-//! The pin-dependent lane runs weekly and on demand in
+//! The pin-dependent lane is configured to run weekly and on demand in
 //! `.github/workflows/contract-drift.yml`. That workflow installs the exact Reference
 //! tag parsed from `SUITE.lock`, exposes the toolchain/vendor identity joins, and runs
 //! every extractor check plus the lane's seeded mutants. It deliberately does not run
@@ -41,10 +41,196 @@ use fln_conformance::execution::{TriggerReachability, trigger_reachability};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const CONTRACT_DRIFT_LANE: &str = "scripts/e2e/contract_drift.sh";
+const CONTRACT_DRIFT_WORKFLOW: &str = ".github/workflows/contract-drift.yml";
+const CONFIGURED_CADENCE_CLAIM: &str =
+    "configured to run weekly and on demand in `.github/workflows/contract-drift.yml`";
+const CADENCE_CLAIM_SITES: [&str; 3] = [
+    "crates/fln-conformance/tests/contract_roots.rs",
+    "crates/fln-rt/tests/abi_contract.rs",
+    "crates/fln-olean/tests/olean_contract.rs",
+];
+
 fn root() -> PathBuf {
     fln_conformance::checked_workspace_root!()
         .canonicalize()
         .expect("repo root")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DeclaredCadence {
+    workflow_dispatch: bool,
+    crons: Vec<String>,
+}
+
+/// Read only the trigger block that can schedule a workflow.
+///
+/// This is an indentation reader, not a YAML parser. It deliberately refuses flow-style
+/// `on: {schedule: ...}` rather than scanning the whole file: a file-wide search can count
+/// `schedule:` or `cron:` inside a job's shell script and recreate `acm4` as a false clean.
+/// [`trigger_reachability`] remains the shared authority for whether a workflow can fire at
+/// all; this narrower reader answers which configured triggers back the cadence claim.
+fn declared_cadence(workflow: &str) -> Result<DeclaredCadence, String> {
+    if trigger_reachability(workflow) != TriggerReachability::Reachable {
+        return Err("the workflow has no classifiable, reachable top-level `on` key".to_string());
+    }
+
+    let lines: Vec<&str> = workflow.lines().collect();
+    let on_start = lines
+        .iter()
+        .position(|line| !line.starts_with([' ', '\t']) && mapping_key(line) == Some("on"))
+        .ok_or_else(|| "the reachable `on` key could not be located".to_string())?;
+    let (_, inline_value) = lines[on_start]
+        .split_once(':')
+        .ok_or_else(|| "the `on` key has no colon".to_string())?;
+    let inline_value = inline_value.trim();
+    if !inline_value.is_empty() && !inline_value.starts_with('#') {
+        return Err(
+            "the cadence reader refuses an inline `on` value; use a block mapping".to_string(),
+        );
+    }
+
+    let on_end = lines
+        .iter()
+        .enumerate()
+        .skip(on_start + 1)
+        .find(|(_, line)| {
+            !line.trim().is_empty()
+                && !line.trim_start().starts_with('#')
+                && !line.starts_with([' ', '\t'])
+        })
+        .map_or(lines.len(), |(index, _)| index);
+    let block = &lines[on_start + 1..on_end];
+    if block.iter().any(|line| line.starts_with('\t')) {
+        return Err("the cadence reader refuses tab-indented trigger keys".to_string());
+    }
+
+    let trigger_indent = block
+        .iter()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|line| line.len() - line.trim_start_matches(' ').len())
+        .filter(|indent| *indent > 0)
+        .min()
+        .ok_or_else(|| "the `on` block declares no triggers".to_string())?;
+
+    let mut current_trigger: Option<&str> = None;
+    let mut workflow_dispatch = false;
+    let mut crons = Vec::new();
+    for line in block {
+        let trimmed = line.trim_start_matches(' ');
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent == trigger_indent {
+            current_trigger = mapping_key(trimmed);
+            if current_trigger == Some("workflow_dispatch") {
+                workflow_dispatch = true;
+            }
+            continue;
+        }
+        if indent <= trigger_indent || current_trigger != Some("schedule") {
+            continue;
+        }
+        let cron_row = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        if mapping_key(cron_row) != Some("cron") {
+            continue;
+        }
+        let (_, value) = cron_row
+            .split_once(':')
+            .ok_or_else(|| format!("unparseable cron row: {line:?}"))?;
+        let value = value.trim().trim_matches(['"', '\'']);
+        if value.is_empty() {
+            return Err(format!("empty cron row: {line:?}"));
+        }
+        crons.push(value.to_string());
+    }
+
+    Ok(DeclaredCadence {
+        workflow_dispatch,
+        crons,
+    })
+}
+
+/// Return the block-mapping key on one line, accepting YAML's quoted and spaced forms.
+fn mapping_key(line: &str) -> Option<&str> {
+    let (head, _) = line.split_once(':')?;
+    let key = head.trim().trim_matches(['"', '\'']).trim();
+    let valid = !key.is_empty()
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    valid.then_some(key)
+}
+
+/// The GitHub cron names exactly one minute on exactly one day of each week.
+fn is_once_weekly_cron(cron: &str) -> bool {
+    let fields: Vec<&str> = cron.split_whitespace().collect();
+    if fields.len() != 5 || fields[2] != "*" || fields[3] != "*" {
+        return false;
+    }
+    let minute = fields[0].parse::<u8>();
+    let hour = fields[1].parse::<u8>();
+    let weekday = fields[4].parse::<u8>();
+    matches!((minute, hour, weekday), (Ok(0..=59), Ok(0..=23), Ok(0..=7)))
+}
+
+fn configured_weekly_and_on_demand(workflow: &str) -> Result<(), String> {
+    if !workflow_invokes_lane(workflow, CONTRACT_DRIFT_LANE) {
+        return Err(format!(
+            "{CONTRACT_DRIFT_WORKFLOW} does not execute {CONTRACT_DRIFT_LANE} from a reachable \
+             workflow"
+        ));
+    }
+    let cadence = declared_cadence(workflow)?;
+    if !cadence.workflow_dispatch {
+        return Err(format!(
+            "{CONTRACT_DRIFT_WORKFLOW} has no workflow_dispatch trigger"
+        ));
+    }
+    if cadence.crons.len() != 1 || !is_once_weekly_cron(&cadence.crons[0]) {
+        return Err(format!(
+            "{CONTRACT_DRIFT_WORKFLOW} must declare exactly one once-weekly cron; found {:?}",
+            cadence.crons
+        ));
+    }
+    Ok(())
+}
+
+/// Bind the configured producer to every prose claim in both directions.
+fn cadence_binding_verdict(configured: bool, claims: &[(&str, bool)]) -> Result<(), String> {
+    if !configured {
+        return Err(format!(
+            "{CONTRACT_DRIFT_WORKFLOW} no longer configures {CONTRACT_DRIFT_LANE} weekly and on \
+             demand; the three delegating suites may not keep claiming that cadence"
+        ));
+    }
+    let missing: Vec<&str> = claims
+        .iter()
+        .filter_map(|(path, present)| (!present).then_some(*path))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{CONTRACT_DRIFT_WORKFLOW} still configures the cadence, but these delegating suites \
+             stopped disclosing it: {missing:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Collapse only the leading module-documentation block.
+///
+/// The claim needle also exists below that block as [`CONFIGURED_CADENCE_CLAIM`]. Scanning
+/// the whole source would therefore let the guard satisfy itself after every human-facing
+/// claim was deleted — the exact false clean this join exists to prevent.
+fn module_documentation(source: &str) -> String {
+    source
+        .lines()
+        .take_while(|line| line.starts_with("//!") || line.trim().is_empty())
+        .filter_map(|line| line.strip_prefix("//!"))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn find_digest(text: &str, marker: &str) -> Option<String> {
@@ -257,7 +443,6 @@ fn the_scanner_distinguishes_command_position_from_mention() {
 /// than against either one.
 #[test]
 fn a_workflow_that_can_never_fire_does_not_count_as_invoking_a_lane() {
-    const LANE: &str = "scripts/e2e/contract_drift.sh";
     let steps = "jobs:\n  c:\n    steps:\n      - run: |\n          ./scripts/e2e/contract_drift.sh --check\n";
     let with_trigger = format!("on:\n  workflow_dispatch:\n{steps}");
     let no_trigger = steps.to_string();
@@ -266,7 +451,8 @@ fn a_workflow_that_can_never_fire_does_not_count_as_invoking_a_lane() {
     // to the difference. Asserted, not assumed: if this stopped holding, the control below
     // would be varying nothing.
     assert!(
-        invoked_by_ci_yml(&with_trigger, LANE) && invoked_by_ci_yml(&no_trigger, LANE),
+        invoked_by_ci_yml(&with_trigger, CONTRACT_DRIFT_LANE)
+            && invoked_by_ci_yml(&no_trigger, CONTRACT_DRIFT_LANE),
         "both fixtures must execute the lane, or this control no longer isolates reachability"
     );
 
@@ -284,11 +470,92 @@ fn a_workflow_that_can_never_fire_does_not_count_as_invoking_a_lane() {
     // The decision the real scan makes, not its ingredients. Asserting only the two lines
     // above leaves the conjunction in `workflow_invokes_lane` untested, and a mutant deleting
     // it passes every other assertion in this file — measured, not supposed.
-    assert!(workflow_invokes_lane(&with_trigger, LANE));
+    assert!(workflow_invokes_lane(&with_trigger, CONTRACT_DRIFT_LANE));
     assert!(
-        !workflow_invokes_lane(&no_trigger, LANE),
+        !workflow_invokes_lane(&no_trigger, CONTRACT_DRIFT_LANE),
         "the lane is executed by this workflow and the workflow can never run, so the lane is \
          not invoked by it — this is the assertion acm4's repair actually rests on"
+    );
+}
+
+/// The configured cadence and all three claims about it are one closed contract.
+///
+/// This binds **configuration**, not an observed run. A cron GitHub silently disables remains
+/// invisible from inside the repository, so the guarded wording says "configured to run".
+/// Both directions are load-bearing: removing the cron while retaining the prose is an
+/// overclaim, while retaining the cron and dropping any claim hides where the delegated
+/// verification actually runs. Removing both also fails because this lane is required to
+/// remain scheduled; a deliberate withdrawal must change this contract explicitly.
+#[test]
+fn the_contract_drift_cadence_claim_is_bound_to_its_dispatcher() {
+    let root = root();
+    let workflow = fs::read_to_string(root.join(CONTRACT_DRIFT_WORKFLOW))
+        .unwrap_or_else(|error| panic!("{CONTRACT_DRIFT_WORKFLOW}: {error}"));
+    configured_weekly_and_on_demand(&workflow)
+        .unwrap_or_else(|error| panic!("configured contract-drift cadence: {error}"));
+
+    let claims: Vec<(&str, bool)> = CADENCE_CLAIM_SITES
+        .iter()
+        .map(|path| {
+            let text = fs::read_to_string(root.join(path))
+                .unwrap_or_else(|error| panic!("{path}: {error}"));
+            (
+                *path,
+                module_documentation(&text).contains(CONFIGURED_CADENCE_CLAIM),
+            )
+        })
+        .collect();
+    cadence_binding_verdict(true, &claims)
+        .unwrap_or_else(|error| panic!("contract-drift cadence binding: {error}"));
+}
+
+/// Controls for each direction of the cadence join, including the cron-frequency axis.
+#[test]
+fn the_cadence_reader_and_binding_refuse_each_unbacked_direction() {
+    let job = "jobs:\n  c:\n    steps:\n      - run: |\n          ./scripts/e2e/contract_drift.sh --check\n";
+    let weekly =
+        format!("on:\n  schedule:\n    - cron: \"17 5 * * 1\"\n  workflow_dispatch:\n{job}");
+    let on_demand_only = format!("on:\n  workflow_dispatch:\n{job}");
+    let daily =
+        format!("on:\n  schedule:\n    - cron: \"17 5 * * *\"\n  workflow_dispatch:\n{job}");
+
+    assert!(
+        configured_weekly_and_on_demand(&weekly).is_ok(),
+        "the positive control must configure the lane weekly and on demand"
+    );
+    assert!(
+        configured_weekly_and_on_demand(&on_demand_only).is_err(),
+        "removing only schedule/cron while retaining workflow_dispatch and the lane command \
+         must fail the cadence claim"
+    );
+    assert!(
+        configured_weekly_and_on_demand(&daily).is_err(),
+        "a daily cron is scheduled but does not back a weekly claim"
+    );
+
+    let complete_claims = [("a.rs", true), ("b.rs", true), ("c.rs", true)];
+    assert!(cadence_binding_verdict(true, &complete_claims).is_ok());
+    let no_producer = cadence_binding_verdict(false, &complete_claims)
+        .expect_err("claims without a configured producer must fail");
+    assert!(
+        no_producer.contains("no longer configures"),
+        "wrong no-producer complaint: {no_producer}"
+    );
+    let missing_claim =
+        cadence_binding_verdict(true, &[("a.rs", true), ("b.rs", false), ("c.rs", true)])
+            .expect_err("a configured producer with a missing claim must fail");
+    assert!(
+        missing_claim.contains("b.rs") && missing_claim.contains("stopped disclosing"),
+        "wrong missing-claim complaint: {missing_claim}"
+    );
+
+    let decoy = format!(
+        "//! This module no longer states the cadence.\n\n\
+         const DECOY: &str = {CONFIGURED_CADENCE_CLAIM:?};\n"
+    );
+    assert!(
+        !module_documentation(&decoy).contains(CONFIGURED_CADENCE_CLAIM),
+        "the code-side claim needle must not satisfy a check over the human-facing module docs"
     );
 }
 
@@ -445,27 +712,30 @@ fn allowance_verdict_fails_in_both_directions() {
 #[test]
 fn the_lane_this_suite_delegates_to_is_present_and_invoked() {
     let root = root();
-    const LANE: &str = "scripts/e2e/contract_drift.sh";
 
-    let lane = fs::read_to_string(root.join(LANE));
+    let lane = fs::read_to_string(root.join(CONTRACT_DRIFT_LANE));
     assert!(
         lane.is_ok(),
-        "{LANE} is missing, and three test suites delegate their digest \
+        "{CONTRACT_DRIFT_LANE} is missing, and three test suites delegate their digest \
          verification to it. Either restore it or stop claiming the delegation in \
          those headers — a dangling pointer reads as coverage."
     );
     let lane = lane.expect("asserted above");
     assert!(
         lane.contains("--check"),
-        "{LANE} no longer invokes an extractor --check lane, so the delegation it \
+        "{CONTRACT_DRIFT_LANE} no longer invokes an extractor --check lane, so the delegation it \
          receives is no longer honoured"
     );
 
     let declared = UNWIRED_LANE_ALLOWANCE
         .iter()
-        .find(|(path, _)| *path == LANE)
+        .find(|(path, _)| *path == CONTRACT_DRIFT_LANE)
         .map(|(_, reason)| *reason);
-    let verdict = allowance_verdict(LANE, lane_is_invoked(&root, LANE), declared);
+    let verdict = allowance_verdict(
+        CONTRACT_DRIFT_LANE,
+        lane_is_invoked(&root, CONTRACT_DRIFT_LANE),
+        declared,
+    );
     assert!(verdict.is_ok(), "{}", verdict.err().unwrap_or_default());
 
     // Negative controls, varying the axis this assertion actually depends on:
@@ -474,8 +744,8 @@ fn the_lane_this_suite_delegates_to_is_present_and_invoked() {
     // `contains` check reported as registered.
     let gate = fs::read_to_string(root.join("scripts/check.sh")).expect("scripts/check.sh");
     assert!(
-        gate.contains(LANE) && !invoked_by_check_sh(&gate, LANE),
-        "the mention-versus-invocation control no longer holds: {LANE} must still be \
+        gate.contains(CONTRACT_DRIFT_LANE) && !invoked_by_check_sh(&gate, CONTRACT_DRIFT_LANE),
+        "the mention-versus-invocation control no longer holds: {CONTRACT_DRIFT_LANE} must still be \
          NAMED in scripts/check.sh while not being invoked by it, or this test can no \
          longer demonstrate that it tells the two apart"
     );
