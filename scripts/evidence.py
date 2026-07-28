@@ -4883,6 +4883,28 @@ def verification_artifact_path_token(artifact: str) -> str | None:
     return artifact
 
 
+def verification_test_function_claim(
+    artifact: str,
+) -> tuple[str, str, str] | None:
+    """Parse the stable join key resolved by fln-conformance's execution guard.
+
+    This parser establishes syntax, not execution.  The Rust-side join remains
+    authoritative for resolving the package, target, and exact libtest
+    function and for deciding whether CI runs it.  ``split(..., 2)`` is
+    deliberate: a lib-target test path may itself contain ``::`` components.
+    """
+    if not artifact.startswith("test:"):
+        return None
+    parts = artifact.removeprefix("test:").split("::", 2)
+    if (
+        len(parts) != 3
+        or any(not part for part in parts)
+        or parts[2].startswith("::")
+    ):
+        return None
+    return parts[0], parts[1], parts[2]
+
+
 def verification_path_lexical_classification(path: str) -> str | None:
     if Path(path).is_absolute():
         return "absolute_path"
@@ -5024,6 +5046,12 @@ def verification_artifact_classification(
     authority: Mapping[str, Any],
     receipts: Mapping[str, Mapping[str, Any]],
 ) -> str:
+    if artifact.startswith("test:"):
+        return (
+            "test_function_claim"
+            if verification_test_function_claim(artifact) is not None
+            else "malformed_test_function_claim"
+        )
     if artifact.startswith(VERIFICATION_RECEIPT_REFERENCE_PREFIX):
         receipt_id = artifact.removeprefix("receipt:")
         if re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_id) is None:
@@ -5087,6 +5115,7 @@ def validate_verification_artifact_references(
         "bead",
         "commit",
         "receipt",
+        "test_function_claim",
     }
     used_legacy: set[tuple[str, str]] = set()
     artifact_pairs_scanned = 0
@@ -17217,6 +17246,516 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         same_second_report["closure_bound_rows"] == 1,
         "a comment written in the closing second was not accepted",
     )
+
+    # A test citation is a stable join key, not proof of execution.  Keep the
+    # Python syntax reader byte-for-byte aligned in meaning with
+    # fln-conformance's Rust resolver, then exercise the complete artifact
+    # classifier against real filesystem shapes.  In particular, existing and
+    # pruned target paths have the same forbidden class: pruning cannot turn an
+    # invalid citation into a valid one.
+    classification_root = verification_root / "artifact-classification"
+    classification_root.mkdir()
+    write_new(classification_root / "tracked.log", b"tracked\n")
+    write_new(classification_root / "untracked.log", b"untracked\n")
+    write_new(classification_root / "ignored.log", b"ignored\n")
+    (classification_root / "directory").mkdir()
+    write_new(
+        classification_root / "directory" / "tracked-child.log",
+        b"tracked child\n",
+    )
+    (classification_root / "symlink.log").symlink_to("tracked.log")
+    (classification_root / "target").mkdir()
+    write_new(classification_root / "target" / "live.log", b"transient\n")
+    classification_absolute_path = str(
+        (classification_root / "tracked.log").resolve()
+    )
+    classification_authority = {
+        "root": classification_root,
+        "head": "1" * 40,
+        "index_digest": f"sha256:{'1' * 64}",
+        "tracked_modes": {
+            "directory/tracked-child.log": "100644",
+            "missing-tracked.log": "100644",
+            "tracked.log": "100644",
+        },
+        "ignored_paths": {"ignored.log"},
+        "reachable_commits": {"1" * 40},
+        "live_git": False,
+    }
+    classification_beads = bead_tracker_projection(positive_beads)
+    classification_expectations = {
+        "test:fixture::integration::passes": "test_function_claim",
+        "test:fixture::lib::module::nested::passes": "test_function_claim",
+        "test:": "malformed_test_function_claim",
+        "test:::integration::passes": "malformed_test_function_claim",
+        "test:fixture::::passes": "malformed_test_function_claim",
+        "test:fixture::integration": "malformed_test_function_claim",
+        "test:fixture::integration::": "malformed_test_function_claim",
+        "test:fixture::integration::::passes": (
+            "malformed_test_function_claim"
+        ),
+        "bead-comment:rur:41": "bead_comment",
+        "bead-comment:rur-consumer:44": "invalid_comment",
+        "bead:rur:description": "bead",
+        "bead:rur-consumer:description": "invalid_bead",
+        f"commit:{'1' * 40}": "commit",
+        "commit:1111111": "short_commit",
+        "tracked.log": "tracked_file",
+        "repo-file:tracked.log": "tracked_file",
+        "untracked.log": "untracked",
+        "ignored.log": "ignored",
+        "missing.log": "missing",
+        "missing-tracked.log": "missing",
+        "directory": "directory",
+        "symlink.log": "symlink",
+        "target/live.log": "target_path",
+        "target/pruned.log": "target_path",
+        "../escape.log": "traversal_path",
+        "./tracked.log": "traversal_path",
+        "*.log": "glob",
+        classification_absolute_path: "absolute_path",
+        "legacy:terminal-evidence": "unknown_structured",
+        f"{VERIFICATION_RECEIPT_REFERENCE_PREFIX}{'0' * 64}": (
+            "unknown_receipt"
+        ),
+    }
+    for artifact, expected_classification in classification_expectations.items():
+        actual_classification = verification_artifact_classification(
+            "rur",
+            artifact,
+            bead_states=classification_beads,
+            authority=classification_authority,
+            receipts={},
+        )
+        require(
+            actual_classification == expected_classification,
+            f"verification artifact {artifact!r} classified as "
+            f"{actual_classification!r}, expected {expected_classification!r}",
+        )
+
+    legacy_artifact = "legacy:terminal-evidence"
+    legacy_pair_id = verification_legacy_pair_id("rur", legacy_artifact)
+    registry_migration_commit = "1" * 40
+    registry_adoption_pair_ids = [legacy_pair_id]
+    registry_authority_hash = verification_legacy_adoption_authority_hash(
+        registry_migration_commit,
+        registry_adoption_pair_ids,
+    )
+    receipt_record = {
+        "schema": VERIFICATION_EVIDENCE_RECEIPT_SCHEMA,
+        "kind": "receipt",
+        "receipt": f"sha256:{'0' * 64}",
+        "producer": {
+            "tool": "scripts/evidence.py:promote-verification-receipt/1",
+            "run_schema": "fln.check/2",
+            "run_id": "check-receipt-registry-fixture",
+            "bead": "rur",
+            "scenario": "quality_gate",
+            "producing_commit": "unavailable",
+            "commit_binding": "unbound",
+        },
+        "outcome": {
+            "verdict": "pass",
+            "process_exit": 0,
+            "reason_code": "all_obligations_passed",
+            "input_root": f"sha256:{'2' * 64}",
+            "final_root": f"sha256:{'2' * 64}",
+            "governed_state_static": True,
+            "governed_scope": "lane_declared_subset",
+            "governed_set": "unavailable",
+        },
+        "source": {
+            "bundle_commit_sha256": f"sha256:{'3' * 64}",
+            "manifest_sha256": f"sha256:{'4' * 64}",
+            "manifest_digest_sha256": f"sha256:{'5' * 64}",
+            "run_log_sha256": f"sha256:{'6' * 64}",
+        },
+        "execution": {
+            "authority": "structured_run_log",
+            "executed": ["stage:verification-manifest"],
+            "expected_failure": [],
+            "typed_skip": [],
+            "not_run": [],
+        },
+        "reference": {
+            "status": "unobserved",
+            "binding_sha256": "not_applicable",
+        },
+    }
+    receipt_record["receipt"] = verification_receipt_content_address(
+        receipt_record
+    )
+    receipt_reference = f"receipt:{receipt_record['receipt']}"
+    registry_header = {
+        "schema": VERIFICATION_EVIDENCE_REGISTRY_SCHEMA,
+        "kind": "registry",
+        "source": VERIFICATION_MANIFEST_PATH,
+        "projection": "exact-terminal-artifact-pairs-v1",
+        "hash_algorithm": "sha256",
+        "hash_preimage": (
+            "fln.verification-evidence.legacy-pair/1+nul+"
+            "u64le-length-prefixed-bead+artifact"
+        ),
+        "migration_commit": registry_migration_commit,
+        "adoption_record_count": len(registry_adoption_pair_ids),
+        "adoption_projection_hash": (
+            verification_legacy_adoption_projection_hash(
+                registry_adoption_pair_ids
+            )
+        ),
+        "adoption_pair_ids": registry_adoption_pair_ids,
+        "record_count": 2,
+        "receipt_count": 1,
+        "target_artifact_ceiling": 0,
+    }
+    legacy_record = {
+        "schema": VERIFICATION_EVIDENCE_REGISTRY_SCHEMA,
+        "kind": "legacy-artifact",
+        "pair_id": legacy_pair_id,
+        "bead": "rur",
+        "artifact": legacy_artifact,
+        "classification": "unknown_structured",
+        "tracking_bead": VERIFICATION_LEGACY_TRACKING_BEAD,
+    }
+    registry_records = [
+        registry_header,
+        legacy_record,
+        receipt_record,
+    ]
+
+    def receipt_registry_manifest_records() -> list[dict[str, Any]]:
+        records = clone_records(verification_records)
+        records[1]["artifacts"] = sorted(
+            [
+                legacy_artifact,
+                receipt_reference,
+                "test:fixture::lib::rur::registry_is_enforced",
+            ]
+        )
+        records[2]["artifacts"] = [
+            "test:fixture::integration::consumer_registry_is_enforced"
+        ]
+        return records
+
+    def receipt_registry_beads() -> list[dict[str, Any]]:
+        beads = clone_records(verification_beads)
+        beads[1]["status"] = "closed"
+        beads[1]["closed_at"] = fixture_close_exempt
+        return beads
+
+    def write_receipt_registry_case(
+        name: str,
+        records: list[dict[str, Any]],
+        beads: list[dict[str, Any]],
+        receipt_records: list[dict[str, Any]],
+    ) -> tuple[Path, Path, Path]:
+        manifest, tracker = write_verification_case(name, records, beads)
+        registry_path = manifest.with_name(
+            Path(VERIFICATION_EVIDENCE_REGISTRY_PATH).name
+        )
+        write_new(
+            registry_path,
+            b"".join(canonical_json(record) for record in receipt_records),
+        )
+        return manifest, tracker, registry_path
+
+    registry_manifest, registry_tracker, registry_path = (
+        write_receipt_registry_case(
+            "receipt-registry-positive",
+            receipt_registry_manifest_records(),
+            receipt_registry_beads(),
+            clone_records(registry_records),
+        )
+    )
+    registry_report = validate_verification_manifest(
+        registry_manifest,
+        registry_tracker,
+        expected_adoption_authority_hash=verification_authority_hash,
+        receipt_registry_path=registry_path,
+        artifact_authority=classification_authority,
+        expected_legacy_authority_hash=registry_authority_hash,
+    )
+    require(
+        registry_report["artifact_reference_validation"] == "enforced"
+        and registry_report["artifact_pairs_scanned"] == 4
+        and registry_report["durable_artifact_pairs"] == 3
+        and registry_report["legacy_artifact_pairs"] == 1
+        and registry_report["receipt_references"] == 1
+        and registry_report["receipt_rows"] == 1
+        and registry_report["target_artifact_ceiling"] == 0,
+        "verification receipt registry positive control lost its exact census",
+    )
+    require(
+        verification_artifact_classification(
+            "rur",
+            receipt_reference,
+            bead_states=classification_beads,
+            authority=classification_authority,
+            receipts={receipt_record["receipt"]: receipt_record},
+        )
+        == "receipt",
+        "a known verification receipt did not resolve through the registry",
+    )
+
+    def replace_fixture_artifact(
+        records: list[dict[str, Any]],
+        *,
+        row: int,
+        old: str,
+        new: str,
+    ) -> None:
+        records[row]["artifacts"] = sorted(
+            new if artifact == old else artifact
+            for artifact in records[row]["artifacts"]
+        )
+
+    def reject_receipt_registry_case(
+        name: str,
+        mutate: Callable[
+            [
+                list[dict[str, Any]],
+                list[dict[str, Any]],
+                list[dict[str, Any]],
+            ],
+            None,
+        ],
+        *,
+        because: tuple[str, ...],
+    ) -> None:
+        nonlocal verification_mutants
+        records = receipt_registry_manifest_records()
+        beads = receipt_registry_beads()
+        receipt_records = clone_records(registry_records)
+        mutate(records, beads, receipt_records)
+        manifest, tracker, mutant_registry = write_receipt_registry_case(
+            name,
+            records,
+            beads,
+            receipt_records,
+        )
+        try:
+            validate_verification_manifest(
+                manifest,
+                tracker,
+                expected_adoption_authority_hash=verification_authority_hash,
+                receipt_registry_path=mutant_registry,
+                artifact_authority=classification_authority,
+                expected_legacy_authority_hash=registry_authority_hash,
+            )
+        except EvidenceError as error:
+            missing = [needle for needle in because if needle not in str(error)]
+            if missing:
+                raise EvidenceError(
+                    f"verification receipt registry mutant {name} was "
+                    f"refused for the wrong reason (missing {missing!r}): "
+                    f"{error}"
+                ) from error
+            verification_mutants += 1
+        else:
+            raise EvidenceError(
+                f"verification receipt registry mutant survived: {name}"
+            )
+
+    reject_receipt_registry_case(
+        "receipt-registry-live-target",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=1,
+            old=legacy_artifact,
+            new="target/live.log",
+        ),
+        because=("transient target artifact", "promoted before citation"),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-pruned-target",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=1,
+            old=legacy_artifact,
+            new="target/pruned.log",
+        ),
+        because=("transient target artifact", "promoted before citation"),
+    )
+    for name, artifact, classification in (
+        ("present-untracked", "untracked.log", "untracked"),
+        ("present-ignored", "ignored.log", "ignored"),
+        ("missing-tracked", "missing-tracked.log", "missing"),
+        ("tracked-directory", "directory", "directory"),
+        ("tracked-symlink", "symlink.log", "symlink"),
+        ("traversal", "../escape.log", "traversal_path"),
+        ("absolute", classification_absolute_path, "absolute_path"),
+        ("glob", "*.log", "glob"),
+    ):
+        reject_receipt_registry_case(
+            f"receipt-registry-{name}",
+            lambda records, _beads, _registry, artifact=artifact: (
+                replace_fixture_artifact(
+                    records,
+                    row=1,
+                    old=legacy_artifact,
+                    new=artifact,
+                )
+            ),
+            because=(
+                "non-durable artifact",
+                classification,
+                "no exact migration allowance",
+            ),
+        )
+    reject_receipt_registry_case(
+        "receipt-registry-unknown-receipt",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=1,
+            old=receipt_reference,
+            new=f"{VERIFICATION_RECEIPT_REFERENCE_PREFIX}{'0' * 64}",
+        ),
+        because=("does not resolve through the tracked registry",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-stale-legacy",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=1,
+            old=legacy_artifact,
+            new="test:fixture::lib::rur::legacy_was_repaired",
+        ),
+        because=("legacy allowances outlived their exact non-durable pairs",),
+    )
+
+    def expand_receipt_registry_adoption(
+        _records: list[dict[str, Any]],
+        _beads: list[dict[str, Any]],
+        receipt_records: list[dict[str, Any]],
+    ) -> None:
+        expanded_artifact = "legacy:expanded"
+        expanded_pair_id = verification_legacy_pair_id(
+            "baseline-closed",
+            expanded_artifact,
+        )
+        expanded_pair_ids = sorted(
+            [*receipt_records[0]["adoption_pair_ids"], expanded_pair_id]
+        )
+        receipt_records[0].update(
+            adoption_pair_ids=expanded_pair_ids,
+            adoption_record_count=len(expanded_pair_ids),
+            adoption_projection_hash=(
+                verification_legacy_adoption_projection_hash(
+                    expanded_pair_ids
+                )
+            ),
+            record_count=3,
+        )
+        receipt_records.insert(
+            1,
+            {
+                "schema": VERIFICATION_EVIDENCE_REGISTRY_SCHEMA,
+                "kind": "legacy-artifact",
+                "pair_id": expanded_pair_id,
+                "bead": "baseline-closed",
+                "artifact": expanded_artifact,
+                "classification": "unknown_structured",
+                "tracking_bead": VERIFICATION_LEGACY_TRACKING_BEAD,
+            },
+        )
+
+    reject_receipt_registry_case(
+        "receipt-registry-adoption-expansion",
+        expand_receipt_registry_adoption,
+        because=("legacy adoption authority differs from the frozen migration",),
+    )
+
+    def reopen_receipt_registry_legacy_bead(
+        _records: list[dict[str, Any]],
+        beads: list[dict[str, Any]],
+        _registry: list[dict[str, Any]],
+    ) -> None:
+        beads[1]["status"] = "in_progress"
+        beads[1].pop("closed_at", None)
+
+    reject_receipt_registry_case(
+        "receipt-registry-nonterminal-legacy",
+        reopen_receipt_registry_legacy_bead,
+        because=("nonterminal bead consumes legacy debt",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-malformed-test-claim",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=2,
+            old="test:fixture::integration::consumer_registry_is_enforced",
+            new="test:fixture::integration::",
+        ),
+        because=(
+            "nonterminal coverage cannot consume legacy artifact debt",
+            "malformed_test_function_claim",
+        ),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-stale-record-count",
+        lambda _records, _beads, registry: registry[0].update(
+            record_count=99
+        ),
+        because=("registry record count is stale",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-stale-receipt-count",
+        lambda _records, _beads, registry: registry[0].update(
+            receipt_count=0
+        ),
+        because=("receipt count is stale",),
+    )
+
+    def reverse_receipt_registry_rows(
+        _records: list[dict[str, Any]],
+        _beads: list[dict[str, Any]],
+        receipt_records: list[dict[str, Any]],
+    ) -> None:
+        receipt_records[1], receipt_records[2] = (
+            receipt_records[2],
+            receipt_records[1],
+        )
+
+    reject_receipt_registry_case(
+        "receipt-registry-row-order",
+        reverse_receipt_registry_rows,
+        because=("legacy-then-receipt canonical order",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-authority-substitution",
+        lambda _records, _beads, registry: registry[0].update(
+            migration_commit="2" * 40
+        ),
+        because=("legacy adoption authority differs from the frozen migration",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-target-ceiling",
+        lambda _records, _beads, registry: registry[0].update(
+            target_artifact_ceiling=1
+        ),
+        because=("target artifact ceiling must remain zero",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-stale-projection",
+        lambda _records, _beads, registry: registry[0].update(
+            adoption_projection_hash=f"sha256:{'0' * 64}"
+        ),
+        because=("adoption projection hash is stale",),
+    )
+
+    def tamper_receipt_without_readdressing(
+        _records: list[dict[str, Any]],
+        _beads: list[dict[str, Any]],
+        receipt_records: list[dict[str, Any]],
+    ) -> None:
+        receipt_records[2]["outcome"]["reason_code"] = "tampered"
+
+    reject_receipt_registry_case(
+        "receipt-registry-tampered-receipt",
+        tamper_receipt_without_readdressing,
+        because=("receipt content address differs",),
+    )
+
     # The two fixture closes must stay either side of the production boundary, or
     # the cases above stop testing the law they were written for: an exempt case
     # that drifted past the boundary would demand a citation, and a bound case
@@ -17294,7 +17833,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     else:
         raise EvidenceError("truncated verification manifest was accepted")
     require(
-        verification_mutants == 24,
+        verification_mutants == 46,
         "verification manifest mutation matrix is incomplete",
     )
     cases.append(
@@ -17302,6 +17841,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "case": "verification_manifest_model",
             "ok": True,
             "mutants_killed": verification_mutants,
+            "artifact_classification_checks": len(
+                classification_expectations
+            ),
         }
     )
     cases.extend(
