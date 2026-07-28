@@ -205,7 +205,7 @@ const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
     ("never_existed", 15),
     ("commit_unreachable", 0),
     ("present_but_untracked", 9),
-    ("under_target_ephemeral", 7),
+    ("under_target_ephemeral", 6),
     ("existed_then_removed", 0),
 ];
 
