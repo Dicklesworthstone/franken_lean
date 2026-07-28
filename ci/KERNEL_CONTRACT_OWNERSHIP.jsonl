@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":409,"projection_hash":"cb27d708b999dbe31cf70ebc6c44cf94d341bce085d4a4e4600d18f4d7d8c482"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":411,"projection_hash":"16b4b916607a35dffa03b5aa01ace45692778f7eb23af83f78a1dbec3dbfbc73"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -275,6 +275,7 @@
 {"id":"franken_lean-eb3"}
 {"id":"franken_lean-eh0c"}
 {"id":"franken_lean-eikp"}
+{"id":"franken_lean-eir2"}
 {"id":"franken_lean-engine-backed-tactic-integration-c90"}
 {"id":"franken_lean-ephemeral-manifest-artifact-povo"}
 {"id":"franken_lean-epoch-migration-autopilot-q9w"}
@@ -370,6 +371,7 @@
 {"id":"franken_lean-skmi"}
 {"id":"franken_lean-sno"}
 {"id":"franken_lean-sxsk"}
+{"id":"franken_lean-syntax-tree-depth-totality-qxs7"}
 {"id":"franken_lean-terminal-infoview-client-9q6"}
 {"id":"franken_lean-timy"}
 {"id":"franken_lean-tiw9"}
