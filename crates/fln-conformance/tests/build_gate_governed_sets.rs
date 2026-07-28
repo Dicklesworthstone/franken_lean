@@ -22,7 +22,8 @@
 //! * the **prose** above the table — "Eight lanes declare a governed set; thirteen declare none at
 //!   all" — against both. AGENTS.md item 7 records a day spent with that sentence and its own
 //!   table disagreeing, because a row was added and only two of the three places stating the
-//!   cardinality were moved. That is this guard's own failure mode, so it is checked.
+//!   cardinality were moved. The current split is ten declaring and thirteen empty. That is this
+//!   guard's own failure mode, so it is checked.
 //!
 //! # Two traps this guard is built against, both paid for once already
 //!

@@ -487,6 +487,18 @@ E2E_STEP_ORDERS = {
         "semantic_validation",
         "final_real_recheck",
     ],
+    "parser_corpus_no_mock_e2e": [
+        "parser_category_inventory",
+        "pratt_precedence_model",
+        "parse_roundtrip_property",
+        "parser_fuzz",
+        "build_real_file_driver",
+        "positive_file",
+        "failure_file",
+        "recovery_file",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
     "vellum_naming_no_mock_e2e": [
         "registry_gate",
         "collision_model",
@@ -541,6 +553,20 @@ LEXER_CASE_INPUTS = {
     "positive": ("inputs/positive.lean", b"def answer := 42\n"),
     "failure": ("inputs/failure.lean", b"def bad :=\t42\n"),
     "recovery": ("inputs/recovery.lean", b"def bad :=\t42\n#check\tbad\n"),
+}
+
+PARSER_CORPUS_SEMANTIC_SCHEMA = "fln.e2e.parser-corpus-semantic"
+PARSER_CORPUS_TELEMETRY_SCHEMA = "fln.e2e.parser-corpus-telemetry"
+PARSER_CORPUS_VALIDATION_SCHEMA = "fln.e2e.parser-corpus-validation/1"
+PARSER_CORPUS_SCHEMA_VERSION = 1
+PARSER_CORPUS_MAX_INPUT_BYTES = 4_096
+PARSER_CORPUS_MAX_TOKENS = 32
+PARSER_CORPUS_MAX_DIAGNOSTICS = 4
+PARSER_CORPUS_LEFTOVER_DIAGNOSTIC = "unexpected token '='; expected command"
+PARSER_CORPUS_CASE_INPUTS = {
+    "positive": ("inputs/positive.lean", b"1 + 2 * 3\n"),
+    "failure": ("inputs/failure.lean", b"1 = 2 = 3\n"),
+    "recovery": ("inputs/recovery.lean", b"1 = 2 = 3\n"),
 }
 
 ENVIRONMENT_COLLISION_SCHEMA = "fln.e2e.environment-collision"
@@ -6604,7 +6630,7 @@ def verdict_read_canonical_record(
     return record, digest
 
 
-def lexer_read_canonical_record(
+def read_canonical_record(
     path: Path, *, label: str, max_bytes: int
 ) -> tuple[dict[str, Any], str]:
     data, _size, digest = stable_file_facts(path, max_bytes=max_bytes)
@@ -6616,7 +6642,7 @@ def lexer_read_canonical_record(
     return record, digest
 
 
-def lexer_exact_non_negative_integer(
+def exact_non_negative_integer(
     record: Mapping[str, Any], key: str, *, label: str
 ) -> int:
     value = record.get(key)
@@ -6708,12 +6734,12 @@ def validate_lexer_no_mock_evidence(
         if raw_input != expected_input:
             raise EvidenceError(f"lexer {case} real input bytes changed")
 
-        semantic, semantic_digest = lexer_read_canonical_record(
+        semantic, semantic_digest = read_canonical_record(
             semantic_paths[case],
             label=f"lexer {case} semantic evidence",
             max_bytes=65_536,
         )
-        telemetry, telemetry_digest = lexer_read_canonical_record(
+        telemetry, telemetry_digest = read_canonical_record(
             telemetry_paths[case],
             label=f"lexer {case} telemetry",
             max_bytes=4_096,
@@ -6775,16 +6801,16 @@ def validate_lexer_no_mock_evidence(
             raise EvidenceError(
                 f"lexer {case} telemetry fields differ from the frozen schema"
             )
-        max_diagnostics = lexer_exact_non_negative_integer(
+        max_diagnostics = exact_non_negative_integer(
             telemetry, "max_diagnostics", label=f"lexer {case} telemetry"
         )
-        max_input_bytes = lexer_exact_non_negative_integer(
+        max_input_bytes = exact_non_negative_integer(
             telemetry, "max_input_bytes", label=f"lexer {case} telemetry"
         )
-        observed_diagnostics = lexer_exact_non_negative_integer(
+        observed_diagnostics = exact_non_negative_integer(
             telemetry, "observed_diagnostics", label=f"lexer {case} telemetry"
         )
-        observed_input_bytes = lexer_exact_non_negative_integer(
+        observed_input_bytes = exact_non_negative_integer(
             telemetry, "observed_input_bytes", label=f"lexer {case} telemetry"
         )
         expected_diagnostics = len(expected_plain["diagnostics"]) + len(
@@ -6824,6 +6850,238 @@ def validate_lexer_no_mock_evidence(
         "diagnostic": LEXER_TAB_DIAGNOSTIC,
         "run_id": expected_run_id,
         "schema": LEXER_VALIDATION_SCHEMA,
+        "verdict": "pass",
+    }
+
+
+def validate_parser_corpus_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_paths: Mapping[str, Path],
+    telemetry_paths: Mapping[str, Path],
+    input_paths: Mapping[str, Path],
+    stdout_paths: Mapping[str, Path],
+    stderr_paths: Mapping[str, Path],
+    artifact_root: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("parser corpus expected run id must be non-empty")
+    expected_cases = set(PARSER_CORPUS_CASE_INPUTS)
+    for label, paths in (
+        ("semantic", semantic_paths),
+        ("telemetry", telemetry_paths),
+        ("input", input_paths),
+        ("stdout", stdout_paths),
+        ("stderr", stderr_paths),
+    ):
+        if set(paths) != expected_cases:
+            raise EvidenceError(
+                "parser corpus "
+                f"{label} cases differ from the frozen positive/failure/recovery set"
+            )
+
+    semantic_fields = {
+        "accepted",
+        "boundary_diagnostics",
+        "case",
+        "data_grade",
+        "input_artifact",
+        "input_sha256",
+        "parse_stop_byte",
+        "parser_diagnostics",
+        "partial_tree",
+        "run_id",
+        "schema",
+        "status",
+        "trailing_refusal_discarded",
+        "version",
+    }
+    telemetry_fields = {
+        "case",
+        "event",
+        "max_diagnostics",
+        "max_input_bytes",
+        "max_tokens",
+        "observed_diagnostics",
+        "observed_input_bytes",
+        "observed_tokens",
+        "run_id",
+        "schema",
+        "timing_used_as_gate",
+        "version",
+    }
+    validation_cases: list[dict[str, Any]] = []
+    input_digests: dict[str, str] = {}
+    for case in ("positive", "failure", "recovery"):
+        expected_artifact, expected_input = PARSER_CORPUS_CASE_INPUTS[case]
+        input_path = input_paths[case]
+        try:
+            actual_artifact = input_path.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise EvidenceError(
+                f"parser corpus {case} input escapes the artifact root"
+            ) from error
+        if actual_artifact != expected_artifact:
+            raise EvidenceError(
+                f"parser corpus {case} input artifact {actual_artifact!r}, "
+                f"expected {expected_artifact!r}"
+            )
+        raw_input, input_size, input_digest = stable_file_facts(
+            input_path, max_bytes=PARSER_CORPUS_MAX_INPUT_BYTES
+        )
+        if raw_input != expected_input:
+            raise EvidenceError(f"parser corpus {case} real input bytes changed")
+        input_digests[case] = input_digest
+
+        semantic, semantic_digest = read_canonical_record(
+            semantic_paths[case],
+            label=f"parser corpus {case} semantic evidence",
+            max_bytes=65_536,
+        )
+        telemetry, telemetry_digest = read_canonical_record(
+            telemetry_paths[case],
+            label=f"parser corpus {case} telemetry",
+            max_bytes=4_096,
+        )
+        stdout, _stdout_size, stdout_digest = stable_file_facts(
+            stdout_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        stderr, _stderr_size, stderr_digest = stable_file_facts(
+            stderr_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        if stdout != (
+            f"parser-corpus-semantic case={case} status=pass\n".encode()
+        ):
+            raise EvidenceError(
+                f"parser corpus {case} producer stdout is not exact"
+            )
+        if stderr:
+            raise EvidenceError(f"parser corpus {case} producer wrote stderr")
+
+        if set(semantic) != semantic_fields:
+            raise EvidenceError(
+                f"parser corpus {case} semantic fields differ from the frozen schema"
+        )
+        expected_accepted = case == "positive"
+        expected_tree = "(1 + (2 * 3))" if expected_accepted else "(1 = 2)"
+        expected_stop = 9 if expected_accepted else 5
+        expected_boundary = (
+            []
+            if expected_accepted
+            else [
+                {
+                    "byte_offset": 6,
+                    "message": PARSER_CORPUS_LEFTOVER_DIAGNOSTIC,
+                    "origin": "command_boundary",
+                }
+            ]
+        )
+        parse_stop = exact_non_negative_integer(
+            semantic, "parse_stop_byte", label=f"parser corpus {case} semantic"
+        )
+        if (
+            semantic.get("schema") != PARSER_CORPUS_SEMANTIC_SCHEMA
+            or semantic.get("run_id") != expected_run_id
+            or semantic.get("case") != case
+            or semantic.get("data_grade") != "verified"
+            or semantic.get("input_artifact") != expected_artifact
+            or semantic.get("input_sha256") != input_digest
+            or semantic.get("accepted") is not expected_accepted
+            or semantic.get("partial_tree") != expected_tree
+            or parse_stop != expected_stop
+            or semantic.get("parser_diagnostics") != []
+            or semantic.get("boundary_diagnostics") != expected_boundary
+            or semantic.get("status") != "pass"
+            or semantic.get("trailing_refusal_discarded")
+            is not (not expected_accepted)
+            or type(semantic.get("version")) is not int
+            or semantic.get("version") != PARSER_CORPUS_SCHEMA_VERSION
+        ):
+            raise EvidenceError(
+                f"parser corpus {case} semantics or diagnostic origin changed"
+            )
+
+        if set(telemetry) != telemetry_fields:
+            raise EvidenceError(
+                f"parser corpus {case} telemetry fields differ from the frozen schema"
+            )
+        max_diagnostics = exact_non_negative_integer(
+            telemetry,
+            "max_diagnostics",
+            label=f"parser corpus {case} telemetry",
+        )
+        max_input_bytes = exact_non_negative_integer(
+            telemetry,
+            "max_input_bytes",
+            label=f"parser corpus {case} telemetry",
+        )
+        max_tokens = exact_non_negative_integer(
+            telemetry, "max_tokens", label=f"parser corpus {case} telemetry"
+        )
+        observed_diagnostics = exact_non_negative_integer(
+            telemetry,
+            "observed_diagnostics",
+            label=f"parser corpus {case} telemetry",
+        )
+        observed_input_bytes = exact_non_negative_integer(
+            telemetry,
+            "observed_input_bytes",
+            label=f"parser corpus {case} telemetry",
+        )
+        observed_tokens = exact_non_negative_integer(
+            telemetry,
+            "observed_tokens",
+            label=f"parser corpus {case} telemetry",
+        )
+        if (
+            telemetry.get("schema") != PARSER_CORPUS_TELEMETRY_SCHEMA
+            or telemetry.get("run_id") != expected_run_id
+            or telemetry.get("case") != case
+            or telemetry.get("event") != "phase_resources"
+            or telemetry.get("timing_used_as_gate") is not False
+            or type(telemetry.get("version")) is not int
+            or telemetry.get("version") != PARSER_CORPUS_SCHEMA_VERSION
+            or max_diagnostics != PARSER_CORPUS_MAX_DIAGNOSTICS
+            or max_input_bytes != PARSER_CORPUS_MAX_INPUT_BYTES
+            or max_tokens != PARSER_CORPUS_MAX_TOKENS
+            or observed_diagnostics != len(expected_boundary)
+            or observed_diagnostics > max_diagnostics
+            or observed_input_bytes != input_size
+            or observed_input_bytes > max_input_bytes
+            or observed_tokens != 5
+            or observed_tokens > max_tokens
+        ):
+            raise EvidenceError(
+                f"parser corpus {case} telemetry is malformed or out of bounds"
+            )
+
+        validation_cases.append(
+            {
+                "accepted": expected_accepted,
+                "case": case,
+                "input_sha256": input_digest,
+                "semantic_sha256": semantic_digest,
+                "stderr_sha256": stderr_digest,
+                "stdout_sha256": stdout_digest,
+                "telemetry_sha256": telemetry_digest,
+            }
+        )
+
+    if not hmac.compare_digest(
+        input_digests["failure"], input_digests["recovery"]
+    ):
+        raise EvidenceError(
+            "parser failure and recovery did not use byte-identical real input"
+        )
+    return {
+        "acceptance_law": "failure.accepted == recovery.accepted == false",
+        "cases": validation_cases,
+        "diagnostic_law": (
+            "nonassociative trailing refusal is discarded; "
+            "the command boundary emits exactly one diagnostic"
+        ),
+        "run_id": expected_run_id,
+        "schema": PARSER_CORPUS_VALIDATION_SCHEMA,
         "verdict": "pass",
     }
 
@@ -16079,6 +16337,65 @@ def cmd_validate_lexer_no_mock(args: argparse.Namespace) -> int:
     if args.output:
         output = require_within(
             Path(args.output), artifact_root, label="lexer semantic validation"
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_parser_corpus_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    semantic_paths = {
+        case: artifact(
+            getattr(args, f"{case}_semantic"),
+            f"parser corpus {case} semantic evidence",
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    telemetry_paths = {
+        case: artifact(
+            getattr(args, f"{case}_telemetry"),
+            f"parser corpus {case} telemetry",
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    input_paths = {
+        case: artifact(
+            getattr(args, f"{case}_input"), f"parser corpus {case} input"
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    stdout_paths = {
+        case: artifact(
+            getattr(args, f"{case}_stdout"), f"parser corpus {case} stdout"
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    stderr_paths = {
+        case: artifact(
+            getattr(args, f"{case}_stderr"), f"parser corpus {case} stderr"
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    report = validate_parser_corpus_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_paths=semantic_paths,
+        telemetry_paths=telemetry_paths,
+        input_paths=input_paths,
+        stdout_paths=stdout_paths,
+        stderr_paths=stderr_paths,
+        artifact_root=artifact_root,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="parser corpus semantic validation",
         )
         write_new(output, canonical_json(report))
     else:
@@ -25757,6 +26074,34 @@ def build_parser() -> argparse.ArgumentParser:
     lexer_parser.add_argument("--artifact-root", required=True)
     lexer_parser.add_argument("--output")
     lexer_parser.set_defaults(func=cmd_validate_lexer_no_mock)
+
+    parser_corpus_parser = subparsers.add_parser(
+        "validate-parser-corpus-no-mock",
+        help=(
+            "independently validate Pratt real-file semantics "
+            "and bounded telemetry"
+        ),
+    )
+    parser_corpus_parser.add_argument("--expected-run-id", required=True)
+    for parser_corpus_case in ("positive", "failure", "recovery"):
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-semantic", required=True
+        )
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-telemetry", required=True
+        )
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-input", required=True
+        )
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-stdout", required=True
+        )
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-stderr", required=True
+        )
+    parser_corpus_parser.add_argument("--artifact-root", required=True)
+    parser_corpus_parser.add_argument("--output")
+    parser_corpus_parser.set_defaults(func=cmd_validate_parser_corpus_no_mock)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",
