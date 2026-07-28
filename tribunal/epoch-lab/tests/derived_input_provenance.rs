@@ -1407,3 +1407,51 @@ fn a_content_digest_edited_after_publication_fails() {
         other => panic!("an edited content digest was accepted: {other:?}"),
     }
 }
+
+#[test]
+fn a_feature_gated_marker_is_discovered_and_recorded_ungated() {
+    // Remainder item 3 of fln-8fwh, bound as the DECLARED behaviour it is: a
+    // text scan cannot see cfg, so an edge whose marker sits behind
+    // #[cfg(feature = ...)] is recorded with an EMPTY requires set — reachable
+    // in every combination rather than some. That is an over-report, and the
+    // safe direction: the reachability scan considers the edge present under
+    // every feature subset, so it can only block more, never less. This test
+    // is what stops the safe direction from silently becoming attribution: if
+    // someone teaches the scan to parse gating, this cell forces them to
+    // arrive with a parser good enough to defend UNDER-reporting, which is the
+    // dangerous direction.
+    let root = scratch("gated-marker");
+    std::fs::create_dir_all(root.join("crates/gated/src")).expect("dirs");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .expect("root manifest");
+    std::fs::write(
+        root.join("crates/gated/Cargo.toml"),
+        "[package]\nname = \"gated\"\n[features]\ndev-lockstep = []\n",
+    )
+    .expect("member manifest");
+    // The marker text sits inside a feature-gated module IN THE ENTRY FILE —
+    // the file the target scan actually reads.
+    std::fs::write(
+        root.join("crates/gated/src/lib.rs"),
+        "#[cfg(feature = \"dev-lockstep\")]\npub mod lockstep {\n    pub const TAG: &str = \"ORACLE_FALLBACK\";\n}\n",
+    )
+    .expect("entry file");
+
+    let targets = fln_epoch_lab::derive::derive_targets(&root).expect("targets derive");
+    let edges =
+        fln_epoch_lab::derive::derive_oracle_edges(&root, targets.value()).expect("edges derive");
+    let edge = edges
+        .value()
+        .iter()
+        .find(|e| e.capability == fln_epoch_lab::poison::OracleCapability::OracleFallback)
+        .expect("the gated marker must still be discovered — an under-report here is the dangerous direction");
+    assert!(
+        edge.requires.is_empty(),
+        "a text scan cannot honestly attribute feature gating; requires must be \
+         empty (= present in every combination), got {:?}",
+        edge.requires
+    );
+}
