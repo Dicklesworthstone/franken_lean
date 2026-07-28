@@ -578,6 +578,163 @@ fn the_d18_product_population_disclosure_matches_the_measured_workspace() {
     // is not re-added as an improvement.
 }
 
+/// **The sidecar has no producer, and the ORDERING is the finding rather than the gap.**
+///
+/// Bead `fln-d18-product-half-rgsg`, measured at `732fdba5` on 2026-07-28. The bead's
+/// acceptance opens with *"Emit a registered canonical sidecar binding mode, epoch, CGSE
+/// policy, determinism class, target, build profile, closure root, and product root"*,
+/// and the obvious reading is that nothing of it exists. That reading is wrong in a way
+/// that matters, so it is recorded here with its measurement.
+///
+/// **The value type already exists and binds exactly those eight fields.**
+/// `fln_core::mode`'s coordinates struct carries `epoch`, `cgse_policy`, `determinism`,
+/// `reproducibility`, `target`, `build_profile`, `closure_root` and `product_root`, with
+/// the mode itself carried by the artifact's type parameter. So the sidecar is not
+/// undesigned. What is missing is a **canonical encoding** — `mode.rs`'s own header puts
+/// that in `fln-hash`, which has none — and a **producer**.
+///
+/// **Why the producer cannot be written yet, which is the ordering.** Two of the eight
+/// fields, `closure_root` and `product_root`, are content roots *of a built product*.
+/// Measured on this workspace: 0 declared product roots, 0 closures scanned, 0 product
+/// binaries. Registering a durable `SchemaId` now would freeze a canonical format whose
+/// two defining fields hash an artifact that does not exist, with no producer and no
+/// consumer — which is what G0 exists to prevent, and is this bead's own recorded
+/// position rather than a preference of mine. The rest of the acceptance hangs off the
+/// same peg: byte-identical builds and the no-mock product E2E cannot be evidence about a
+/// product root that does not denote.
+///
+/// So the honest artifact is **the ordering, filed and bound** — not a sidecar built for
+/// a population of zero. This guard holds that population at zero and fails when it
+/// moves, in **both** directions: a producer appearing before a product root exists is
+/// the wrong-order construction this bead exists to prevent, and a producer appearing
+/// after one does is the moment the disclosure above becomes false.
+///
+/// **The positive control is what makes the zero mean anything**, and it is the half a
+/// scan like this normally omits. A misspelt needle finds nothing everywhere and reads
+/// exactly like a clean tree, so this refuses unless it finds the type in the one file
+/// that certainly defines it. A search returning nothing is evidence of absence only when
+/// the search is known to be capable of finding the thing.
+///
+/// The needle is assembled at run time from two halves, so the literal never appears in
+/// this file. That is deliberate: a scanning guard whose needle is written plainly in its
+/// own source matches itself, and the usual repair — "my own file is excluded" — is
+/// vacuous for exactly that reason. Here the self-exclusion is a real assertion, because
+/// this file genuinely does not contain the literal.
+///
+/// **What this does not earn.** It counts FILES MENTIONING a type, which is coarser than
+/// counting producers: a file naming it in prose would count, and a producer that
+/// constructs the record through a re-export under another name would not. That is the
+/// safe direction for a floor — it can over-count and not under-count. It says nothing
+/// about whether a sidecar, once written, is correct. One host, one commit, class
+/// `bounded_model`.
+const D18_SIDECAR_PRODUCER_FILES: usize = 0;
+
+/// The defining module, excluded from the count and required to match by the control.
+const D18_SIDECAR_HOME: &str = "crates/fln-core/src/mode.rs";
+
+/// A source walk that read fewer files than this is broken, not a small workspace. The
+/// tree carries 213 under members' `src/` and `tests/`.
+const D18_SIDECAR_SCAN_FLOOR: usize = 150;
+
+/// Every `.rs` file under each workspace member's `src/` and `tests/`.
+fn workspace_rust_sources(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = ["crates", "tools"]
+        .iter()
+        .map(|top| root.join(top))
+        .filter(|path| path.is_dir())
+        .collect();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // `target/` is build output, never a source population.
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn the_d18_sidecar_has_no_producer_and_the_ordering_is_the_finding() {
+    let root = fln_conformance::checked_workspace_root!();
+    // Assembled so the literal is absent from this file; the self-check below is then a
+    // real assertion rather than a needle matching its own source.
+    let needle = concat!("Artifact", "Coordinates");
+    let this_file = "tools/structure-guard/tests/real_workspace.rs";
+
+    let sources = workspace_rust_sources(&root);
+    assert!(
+        sources.len() >= D18_SIDECAR_SCAN_FLOOR,
+        "walked only {} Rust sources against a floor of {D18_SIDECAR_SCAN_FLOOR}. A walk \
+         this small is a BROKEN SCAN, and a broken scan reports zero producers exactly as \
+         an unbuilt sidecar does.",
+        sources.len(),
+    );
+
+    let mut home_matched = false;
+    let mut producers: Vec<String> = Vec::new();
+    let mut self_matched = false;
+    for path in &sources {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !text.contains(needle) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == D18_SIDECAR_HOME {
+            home_matched = true;
+        } else if relative == this_file {
+            self_matched = true;
+        } else {
+            producers.push(relative);
+        }
+    }
+
+    assert!(
+        home_matched,
+        "the needle was not found in {D18_SIDECAR_HOME}, which certainly defines the \
+         type. The needle is wrong or the walk missed the file, so every zero this test \
+         would otherwise report is a broken scan wearing the shape of a clean tree."
+    );
+    assert!(
+        !self_matched,
+        "this guard's own file matched the needle. The needle is assembled at run time \
+         precisely so it cannot, and a scanner inside its own search space reports its \
+         own text as a finding."
+    );
+
+    producers.sort();
+    assert_eq!(
+        producers.len(),
+        D18_SIDECAR_PRODUCER_FILES,
+        "the D18 sidecar coordinates type is named by {} file(s) outside its defining \
+         module — {producers:?} — against a disclosed population of \
+         {D18_SIDECAR_PRODUCER_FILES}. BOTH directions matter here. If a product root \
+         does NOT yet exist, this is a sidecar being built for a population of zero: its \
+         closure_root and product_root fields are content roots of an artifact that does \
+         not exist, and registering a canonical SchemaId for it freezes a durable format \
+         with no producer and no consumer. If a product root DOES now exist, this is the \
+         good direction — raise D18_SIDECAR_PRODUCER_FILES in the same commit and revise \
+         the ordering disclosure above, which has just become false.",
+        producers.len(),
+    );
+}
+
 #[test]
 fn robot_rejects_an_unbound_rustc_override_without_executing_it() {
     let root = fln_conformance::checked_workspace_root!();
