@@ -22,7 +22,7 @@
 //! * the **prose** above the table — "Eight lanes declare a governed set; thirteen declare none at
 //!   all" — against both. AGENTS.md item 7 records a day spent with that sentence and its own
 //!   table disagreeing, because a row was added and only two of the three places stating the
-//!   cardinality were moved. The current split is ten declaring and thirteen empty. That is this
+//!   cardinality were moved. The current split is eleven declaring and thirteen empty. That is this
 //!   guard's own failure mode, so it is checked.
 //!
 //! # Two traps this guard is built against, both paid for once already
@@ -115,7 +115,7 @@ struct Declared {
     named: BTreeMap<String, usize>,
     /// The `| 0 | the other N |` row's N.
     zero_lanes: usize,
-    /// "**Eight** lanes declare a governed set; **thirteen** declare none at all".
+    /// "**Eleven** lanes declare a governed set; **thirteen** declare none at all".
     prose_declaring: usize,
     prose_zero: usize,
 }

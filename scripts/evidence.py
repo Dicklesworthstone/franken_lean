@@ -499,6 +499,18 @@ E2E_STEP_ORDERS = {
         "semantic_validation",
         "final_real_recheck",
     ],
+    "dynamic_parser_no_mock_e2e": [
+        "registration_state_model",
+        "grammar_effect_totality",
+        "parser_interleaving_dpor",
+        "dynamic_parser_mutations",
+        "build_real_file_driver",
+        "positive_file",
+        "failure_file",
+        "recovery_file",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
     "vellum_naming_no_mock_e2e": [
         "registry_gate",
         "collision_model",
@@ -567,6 +579,44 @@ PARSER_CORPUS_CASE_INPUTS = {
     "positive": ("inputs/positive.lean", b"1 + 2 * 3\n"),
     "failure": ("inputs/failure.lean", b"1 = 2 = 3\n"),
     "recovery": ("inputs/recovery.lean", b"1 = 2 = 3\n"),
+}
+
+DYNAMIC_PARSER_SEMANTIC_SCHEMA = "fln.e2e.dynamic-parser-semantic"
+DYNAMIC_PARSER_TELEMETRY_SCHEMA = "fln.e2e.dynamic-parser-telemetry"
+DYNAMIC_PARSER_VALIDATION_SCHEMA = "fln.e2e.dynamic-parser-validation/1"
+DYNAMIC_PARSER_SCHEMA_VERSION = 1
+DYNAMIC_PARSER_MAX_INPUT_BYTES = 4_096
+DYNAMIC_PARSER_MAX_COMMANDS = 16
+DYNAMIC_PARSER_MAX_REQUESTS = 32
+DYNAMIC_PARSER_MAX_DIAGNOSTICS = 4
+DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC = (
+    "unknown category `nosuchcategory`"
+)
+DYNAMIC_PARSER_INTERLEAVING_CLAIM = (
+    "self_differential_support_only_not_FL_INV_01_proof"
+)
+DYNAMIC_PARSER_CASE_INPUTS = {
+    "positive": (
+        "inputs/positive.registry",
+        (
+            b"category term\n"
+            b"register term tok dynamicTerm\n"
+            b"lookup term tok\n"
+        ),
+    ),
+    "failure": (
+        "inputs/failure.registry",
+        b"register nosuchcategory zz zz\n",
+    ),
+    "recovery": (
+        "inputs/recovery.registry",
+        (
+            b"category term\n"
+            b"register term existing existing\n"
+            b"budget 3\n"
+            b"batch term tok k0 k1 k2 k3\n"
+        ),
+    ),
 }
 
 ENVIRONMENT_COLLISION_SCHEMA = "fln.e2e.environment-collision"
@@ -7082,6 +7132,362 @@ def validate_parser_corpus_no_mock_evidence(
         ),
         "run_id": expected_run_id,
         "schema": PARSER_CORPUS_VALIDATION_SCHEMA,
+        "verdict": "pass",
+    }
+
+
+def validate_dynamic_parser_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_paths: Mapping[str, Path],
+    telemetry_paths: Mapping[str, Path],
+    input_paths: Mapping[str, Path],
+    stdout_paths: Mapping[str, Path],
+    stderr_paths: Mapping[str, Path],
+    artifact_root: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("dynamic parser expected run id must be non-empty")
+    expected_cases = set(DYNAMIC_PARSER_CASE_INPUTS)
+    for label, paths in (
+        ("semantic", semantic_paths),
+        ("telemetry", telemetry_paths),
+        ("input", input_paths),
+        ("stdout", stdout_paths),
+        ("stderr", stderr_paths),
+    ):
+        if set(paths) != expected_cases:
+            raise EvidenceError(
+                "dynamic parser "
+                f"{label} cases differ from the frozen positive/failure/recovery set"
+            )
+
+    semantic_fields = {
+        "case",
+        "categories",
+        "claim_grade",
+        "data_grade",
+        "diagnostics",
+        "epoch_after",
+        "epoch_before",
+        "grammar_root_after",
+        "grammar_root_before",
+        "input_artifact",
+        "input_sha256",
+        "interleaving_claim",
+        "lookup_kinds",
+        "outcome",
+        "production_count_after",
+        "production_count_before",
+        "resource_usage",
+        "retry_control_completed",
+        "run_id",
+        "schema",
+        "status",
+        "store_unchanged",
+        "version",
+    }
+    telemetry_fields = {
+        "case",
+        "event",
+        "max_commands",
+        "max_diagnostics",
+        "max_input_bytes",
+        "max_requests",
+        "observed_commands",
+        "observed_diagnostics",
+        "observed_input_bytes",
+        "observed_requests",
+        "run_id",
+        "schema",
+        "timing_used_as_gate",
+        "version",
+    }
+    positive_root = "cat term Default\n  lead tok [dynamicTerm]\n"
+    recovery_root = "cat term Default\n  lead existing [existing]\n"
+    expectations = {
+        "positive": {
+            "categories": ["term"],
+            "claim_grade": "production_path",
+            "diagnostics": [],
+            "epoch_after": 2,
+            "epoch_before": 0,
+            "grammar_root_after": positive_root,
+            "grammar_root_before": "",
+            "lookup_kinds": ["dynamicTerm"],
+            "outcome": "accepted",
+            "production_count_after": 1,
+            "production_count_before": 0,
+            "resource_usage": None,
+            "retry_control_completed": False,
+            "store_unchanged": False,
+            "observed_commands": 3,
+            "observed_requests": 0,
+        },
+        "failure": {
+            "categories": [],
+            "claim_grade": "production_path",
+            "diagnostics": [
+                {
+                    "message": DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC,
+                    "origin": "register_error",
+                }
+            ],
+            "epoch_after": 0,
+            "epoch_before": 0,
+            "grammar_root_after": "",
+            "grammar_root_before": "",
+            "lookup_kinds": [],
+            "outcome": "rejected",
+            "production_count_after": 0,
+            "production_count_before": 0,
+            "resource_usage": None,
+            "retry_control_completed": False,
+            "store_unchanged": True,
+            "observed_commands": 1,
+            "observed_requests": 0,
+        },
+        "recovery": {
+            "categories": ["term"],
+            "claim_grade": "bounded_model",
+            "diagnostics": [],
+            "epoch_after": 2,
+            "epoch_before": 2,
+            "grammar_root_after": recovery_root,
+            "grammar_root_before": recovery_root,
+            "lookup_kinds": [],
+            "outcome": "inconclusive",
+            "production_count_after": 1,
+            "production_count_before": 1,
+            "resource_usage": {
+                "allowed": 3,
+                "observed": 5,
+                "unit": "produced_nodes",
+            },
+            "retry_control_completed": True,
+            "store_unchanged": True,
+            "observed_commands": 4,
+            "observed_requests": 4,
+        },
+    }
+    validation_cases: list[dict[str, Any]] = []
+    for case in ("positive", "failure", "recovery"):
+        expected_artifact, expected_input = DYNAMIC_PARSER_CASE_INPUTS[case]
+        expected = expectations[case]
+        input_path = input_paths[case]
+        try:
+            actual_artifact = input_path.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise EvidenceError(
+                f"dynamic parser {case} input escapes the artifact root"
+            ) from error
+        if actual_artifact != expected_artifact:
+            raise EvidenceError(
+                f"dynamic parser {case} input artifact {actual_artifact!r}, "
+                f"expected {expected_artifact!r}"
+            )
+        raw_input, input_size, input_digest = stable_file_facts(
+            input_path, max_bytes=DYNAMIC_PARSER_MAX_INPUT_BYTES
+        )
+        if raw_input != expected_input:
+            raise EvidenceError(f"dynamic parser {case} real input bytes changed")
+
+        semantic, semantic_digest = read_canonical_record(
+            semantic_paths[case],
+            label=f"dynamic parser {case} semantic evidence",
+            max_bytes=65_536,
+        )
+        telemetry, telemetry_digest = read_canonical_record(
+            telemetry_paths[case],
+            label=f"dynamic parser {case} telemetry",
+            max_bytes=4_096,
+        )
+        stdout, _stdout_size, stdout_digest = stable_file_facts(
+            stdout_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        stderr, _stderr_size, stderr_digest = stable_file_facts(
+            stderr_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        if stdout != (
+            f"dynamic-parser-semantic case={case} status=pass\n".encode()
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} producer stdout is not exact"
+            )
+        if stderr:
+            raise EvidenceError(f"dynamic parser {case} producer wrote stderr")
+
+        if set(semantic) != semantic_fields:
+            raise EvidenceError(
+                f"dynamic parser {case} semantic fields differ from the frozen schema"
+            )
+        epoch_after = exact_non_negative_integer(
+            semantic, "epoch_after", label=f"dynamic parser {case} semantic"
+        )
+        epoch_before = exact_non_negative_integer(
+            semantic, "epoch_before", label=f"dynamic parser {case} semantic"
+        )
+        production_count_after = exact_non_negative_integer(
+            semantic,
+            "production_count_after",
+            label=f"dynamic parser {case} semantic",
+        )
+        production_count_before = exact_non_negative_integer(
+            semantic,
+            "production_count_before",
+            label=f"dynamic parser {case} semantic",
+        )
+        resource_usage = semantic.get("resource_usage")
+        expected_resource_usage = expected["resource_usage"]
+        if resource_usage is not None:
+            if (
+                not isinstance(expected_resource_usage, dict)
+                or not isinstance(resource_usage, dict)
+                or set(resource_usage) != {"allowed", "observed", "unit"}
+                or exact_non_negative_integer(
+                    resource_usage,
+                    "allowed",
+                    label=f"dynamic parser {case} resource usage",
+                )
+                != expected_resource_usage["allowed"]
+                or exact_non_negative_integer(
+                    resource_usage,
+                    "observed",
+                    label=f"dynamic parser {case} resource usage",
+                )
+                != expected_resource_usage["observed"]
+                or resource_usage.get("unit")
+                != expected_resource_usage["unit"]
+            ):
+                raise EvidenceError(
+                    f"dynamic parser {case} resource usage changed"
+                )
+        if (
+            semantic.get("schema") != DYNAMIC_PARSER_SEMANTIC_SCHEMA
+            or semantic.get("run_id") != expected_run_id
+            or semantic.get("case") != case
+            or semantic.get("data_grade") != "verified"
+            or semantic.get("claim_grade") != expected["claim_grade"]
+            or semantic.get("input_artifact") != expected_artifact
+            or semantic.get("input_sha256") != input_digest
+            or semantic.get("interleaving_claim")
+            != DYNAMIC_PARSER_INTERLEAVING_CLAIM
+            or semantic.get("categories") != expected["categories"]
+            or semantic.get("diagnostics") != expected["diagnostics"]
+            or epoch_after != expected["epoch_after"]
+            or epoch_before != expected["epoch_before"]
+            or semantic.get("grammar_root_after")
+            != expected["grammar_root_after"]
+            or semantic.get("grammar_root_before")
+            != expected["grammar_root_before"]
+            or semantic.get("lookup_kinds") != expected["lookup_kinds"]
+            or semantic.get("outcome") != expected["outcome"]
+            or production_count_after != expected["production_count_after"]
+            or production_count_before != expected["production_count_before"]
+            or resource_usage != expected_resource_usage
+            or semantic.get("retry_control_completed")
+            is not expected["retry_control_completed"]
+            or semantic.get("store_unchanged")
+            is not expected["store_unchanged"]
+            or semantic.get("status") != "pass"
+            or type(semantic.get("version")) is not int
+            or semantic.get("version") != DYNAMIC_PARSER_SCHEMA_VERSION
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} semantics or outcome class changed"
+            )
+
+        if set(telemetry) != telemetry_fields:
+            raise EvidenceError(
+                f"dynamic parser {case} telemetry fields differ from the frozen schema"
+            )
+        max_commands = exact_non_negative_integer(
+            telemetry,
+            "max_commands",
+            label=f"dynamic parser {case} telemetry",
+        )
+        max_diagnostics = exact_non_negative_integer(
+            telemetry,
+            "max_diagnostics",
+            label=f"dynamic parser {case} telemetry",
+        )
+        max_input_bytes = exact_non_negative_integer(
+            telemetry,
+            "max_input_bytes",
+            label=f"dynamic parser {case} telemetry",
+        )
+        max_requests = exact_non_negative_integer(
+            telemetry,
+            "max_requests",
+            label=f"dynamic parser {case} telemetry",
+        )
+        observed_commands = exact_non_negative_integer(
+            telemetry,
+            "observed_commands",
+            label=f"dynamic parser {case} telemetry",
+        )
+        observed_diagnostics = exact_non_negative_integer(
+            telemetry,
+            "observed_diagnostics",
+            label=f"dynamic parser {case} telemetry",
+        )
+        observed_input_bytes = exact_non_negative_integer(
+            telemetry,
+            "observed_input_bytes",
+            label=f"dynamic parser {case} telemetry",
+        )
+        observed_requests = exact_non_negative_integer(
+            telemetry,
+            "observed_requests",
+            label=f"dynamic parser {case} telemetry",
+        )
+        if (
+            telemetry.get("schema") != DYNAMIC_PARSER_TELEMETRY_SCHEMA
+            or telemetry.get("run_id") != expected_run_id
+            or telemetry.get("case") != case
+            or telemetry.get("event") != "phase_resources"
+            or telemetry.get("timing_used_as_gate") is not False
+            or type(telemetry.get("version")) is not int
+            or telemetry.get("version") != DYNAMIC_PARSER_SCHEMA_VERSION
+            or max_commands != DYNAMIC_PARSER_MAX_COMMANDS
+            or max_diagnostics != DYNAMIC_PARSER_MAX_DIAGNOSTICS
+            or max_input_bytes != DYNAMIC_PARSER_MAX_INPUT_BYTES
+            or max_requests != DYNAMIC_PARSER_MAX_REQUESTS
+            or observed_commands != expected["observed_commands"]
+            or observed_commands > max_commands
+            or observed_diagnostics != len(expected["diagnostics"])
+            or observed_diagnostics > max_diagnostics
+            or observed_input_bytes != input_size
+            or observed_input_bytes > max_input_bytes
+            or observed_requests != expected["observed_requests"]
+            or observed_requests > max_requests
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} telemetry is malformed or out of bounds"
+            )
+
+        validation_cases.append(
+            {
+                "case": case,
+                "input_sha256": input_digest,
+                "outcome": expected["outcome"],
+                "semantic_sha256": semantic_digest,
+                "stderr_sha256": stderr_digest,
+                "stdout_sha256": stdout_digest,
+                "telemetry_sha256": telemetry_digest,
+            }
+        )
+
+    return {
+        "cases": validation_cases,
+        "interleaving_claim": DYNAMIC_PARSER_INTERLEAVING_CLAIM,
+        "resource_law": (
+            "budget exhaustion is Inconclusive with an untouched store "
+            "and no diagnostic"
+        ),
+        "run_id": expected_run_id,
+        "schema": DYNAMIC_PARSER_VALIDATION_SCHEMA,
+        "typed_refusal": DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC,
         "verdict": "pass",
     }
 
@@ -16396,6 +16802,65 @@ def cmd_validate_parser_corpus_no_mock(args: argparse.Namespace) -> int:
             Path(args.output),
             artifact_root,
             label="parser corpus semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_dynamic_parser_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    semantic_paths = {
+        case: artifact(
+            getattr(args, f"{case}_semantic"),
+            f"dynamic parser {case} semantic evidence",
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    telemetry_paths = {
+        case: artifact(
+            getattr(args, f"{case}_telemetry"),
+            f"dynamic parser {case} telemetry",
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    input_paths = {
+        case: artifact(
+            getattr(args, f"{case}_input"), f"dynamic parser {case} input"
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    stdout_paths = {
+        case: artifact(
+            getattr(args, f"{case}_stdout"), f"dynamic parser {case} stdout"
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    stderr_paths = {
+        case: artifact(
+            getattr(args, f"{case}_stderr"), f"dynamic parser {case} stderr"
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    report = validate_dynamic_parser_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_paths=semantic_paths,
+        telemetry_paths=telemetry_paths,
+        input_paths=input_paths,
+        stdout_paths=stdout_paths,
+        stderr_paths=stderr_paths,
+        artifact_root=artifact_root,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="dynamic parser semantic validation",
         )
         write_new(output, canonical_json(report))
     else:
@@ -26102,6 +26567,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser_corpus_parser.add_argument("--artifact-root", required=True)
     parser_corpus_parser.add_argument("--output")
     parser_corpus_parser.set_defaults(func=cmd_validate_parser_corpus_no_mock)
+
+    dynamic_parser = subparsers.add_parser(
+        "validate-dynamic-parser-no-mock",
+        help=(
+            "independently validate dynamic-registration real-file "
+            "semantics and bounded telemetry"
+        ),
+    )
+    dynamic_parser.add_argument("--expected-run-id", required=True)
+    for dynamic_parser_case in ("positive", "failure", "recovery"):
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-semantic", required=True
+        )
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-telemetry", required=True
+        )
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-input", required=True
+        )
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-stdout", required=True
+        )
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-stderr", required=True
+        )
+    dynamic_parser.add_argument("--artifact-root", required=True)
+    dynamic_parser.add_argument("--output")
+    dynamic_parser.set_defaults(func=cmd_validate_dynamic_parser_no_mock)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",
