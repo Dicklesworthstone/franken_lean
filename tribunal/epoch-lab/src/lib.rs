@@ -222,6 +222,11 @@ impl Chain {
         &self.revisions
     }
 
+    /// The head root in the hex form downstream gates consume.
+    pub fn head_root_hex(&self) -> String {
+        self.head().root.to_hex()
+    }
+
     pub fn head(&self) -> &Revision {
         self.revisions.last().expect("a chain is never empty")
     }

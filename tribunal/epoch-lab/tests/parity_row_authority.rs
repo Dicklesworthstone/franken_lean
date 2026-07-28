@@ -82,7 +82,22 @@ use fln_epoch_lab::parity::{
 };
 use std::path::PathBuf;
 
-const HEAD: &str = "7e554b20907d81a272d10718c26da2c25e2e6d70b2e962dc87516bb24dc18a75";
+/// The chain every fixture's freshness is judged against — a REAL genesis
+/// chain, not a hex literal, because `VerifiedHead`'s only constructor is
+/// `From<&Chain>` (bead `fln-8fwh`): the API change this suite absorbs is that
+/// a caller can no longer write a head down, and a schema test pays the same
+/// price as a gate on purpose.
+static CHAIN: std::sync::LazyLock<fln_epoch_lab::Chain> = std::sync::LazyLock::new(|| {
+    fln_epoch_lab::Chain::genesis(
+        "v4.32.0",
+        fln_epoch_lab::content_digest(b"parity schema fixture manifest"),
+    )
+});
+static HEAD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| CHAIN.head_root_hex());
+
+fn vh() -> fln_epoch_lab::parity::VerifiedHead {
+    fln_epoch_lab::parity::VerifiedHead::from(&*CHAIN)
+}
 const ROOT_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const ROOT_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 const FIXTURE_DIGEST: &str = "3333333333333333333333333333333333333333333333333333333333333333";
@@ -236,8 +251,8 @@ fn reasons(blocks: &[Block]) -> Vec<&'static str> {
 fn a_complete_and_current_ledger_passes() {
     // Without this, every refusal test below could be passing because the
     // fixture is broken rather than because the rule works.
-    let l = parsed(HEAD, &[Row::valid("Nat.succ_le_of_lt")]);
-    let blocks = verify(&l, &["Nat.succ_le_of_lt"], HEAD);
+    let l = parsed(&HEAD, &[Row::valid("Nat.succ_le_of_lt")]);
+    let blocks = verify(&l, &["Nat.succ_le_of_lt"], &vh());
     assert!(blocks.is_empty(), "a valid ledger was refused: {blocks:?}");
     assert!(report(&blocks).contains("verdict=pass"));
 }
@@ -261,7 +276,8 @@ fn a_row_missing_any_required_field_does_not_parse() {
         let rest = &full[at + 1..];
         let end = rest.find(' ').map_or(full.len(), |e| at + 1 + e);
         let mutilated = format!("{}{}", &full[..at], &full[end..]);
-        let text = format!("{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n{mutilated}\n");
+        let head = HEAD.as_str();
+        let text = format!("{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {head}\n{mutilated}\n");
         assert!(
             parse(&text).is_err(),
             "a row without {field:?} parsed anyway"
@@ -277,7 +293,7 @@ fn stated_limitations_must_be_stated() {
     // assertion somebody made, not a field somebody forgot.
     let mut r = Row::valid("Nat.succ_le_of_lt");
     r.limits = String::new();
-    let text = ledger_text(HEAD, &[r]);
+    let text = ledger_text(&HEAD, &[r]);
     match parse(&text) {
         Err(b) => assert_eq!(reasons(&b), vec!["malformed"]),
         Ok(_) => panic!("a row with empty limits= parsed"),
@@ -288,8 +304,9 @@ fn stated_limitations_must_be_stated() {
 fn a_reordered_or_repeated_field_does_not_parse() {
     // Fixed field order keeps the file diffable and makes a reordered row a
     // refusal rather than a silent acceptance.
+    let head = HEAD.as_str();
     let reordered = format!(
-        "{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n\
+        "{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {head}\n\
          row Nat.foo fixture_digest={FIXTURE_DIGEST} fixture=fixtures/nat.lean \
          ours_root={ROOT_A} oracle_root={ROOT_A} oracle=reference-binary \
          comparison=byte-identical normalizer=- claim=bounded_model \
@@ -299,7 +316,7 @@ fn a_reordered_or_repeated_field_does_not_parse() {
     );
     assert!(parse(&reordered).is_err(), "a reordered row parsed");
 
-    let repeated = ledger_text(HEAD, &[Row::valid("Nat.foo")]).replace(
+    let repeated = ledger_text(&HEAD, &[Row::valid("Nat.foo")]).replace(
         "oracle=reference-binary",
         "oracle=reference-binary oracle=reference-checker",
     );
@@ -313,13 +330,14 @@ fn a_reordered_or_repeated_field_does_not_parse() {
 fn hostile_input_is_refused_and_never_panics() {
     // Totality. Malformed input must not panic (FL-INV-07), and must not
     // become a partially-valid ledger either.
+    let head = HEAD.as_str();
     for text in [
         "",
         "not-a-schema",
         OUTCOME_SCHEMA,
         &format!("{OUTCOME_SCHEMA}\n"),
         &format!("{OUTCOME_SCHEMA}\nepoch v4.32.0\n"),
-        &format!("{OUTCOME_SCHEMA}\nrevision {HEAD}\n"),
+        &format!("{OUTCOME_SCHEMA}\nrevision {head}\n"),
         &format!("{OUTCOME_SCHEMA}\nepoch v\nrevision r\nrow\n"),
         &format!("{OUTCOME_SCHEMA}\nepoch v\nrevision r\nrow x limits=\n"),
         &format!("{OUTCOME_SCHEMA}\nepoch v\nrevision r\nnonsense verb here\n"),
@@ -335,16 +353,16 @@ fn hostile_input_is_refused_and_never_panics() {
 
 #[test]
 fn a_missing_symbol_blocks() {
-    let l = parsed(HEAD, &[Row::valid("Nat.a")]);
-    let blocks = verify(&l, &["Nat.a", "Nat.b"], HEAD);
+    let l = parsed(&HEAD, &[Row::valid("Nat.a")]);
+    let blocks = verify(&l, &["Nat.a", "Nat.b"], &vh());
     assert_eq!(reasons(&blocks), vec!["missing"]);
     assert!(matches!(&blocks[0], Block::MissingSymbol { symbol } if symbol == "Nat.b"));
 }
 
 #[test]
 fn a_duplicate_row_blocks() {
-    let l = parsed(HEAD, &[Row::valid("Nat.a"), Row::valid("Nat.a")]);
-    let blocks = verify(&l, &["Nat.a"], HEAD);
+    let l = parsed(&HEAD, &[Row::valid("Nat.a"), Row::valid("Nat.a")]);
+    let blocks = verify(&l, &["Nat.a"], &vh());
     assert_eq!(reasons(&blocks), vec!["duplicate"]);
     match &blocks[0] {
         Block::DuplicateRow { key } => {
@@ -365,20 +383,20 @@ fn the_same_symbol_on_two_platforms_or_modes_is_not_a_duplicate() {
     other_platform.platform = "macos-aarch64".to_string();
     let mut other_mode = Row::valid("Nat.a");
     other_mode.mode = "faithful".to_string();
-    let l = parsed(HEAD, &[Row::valid("Nat.a"), other_platform, other_mode]);
-    let blocks = verify(&l, &["Nat.a"], HEAD);
+    let l = parsed(&HEAD, &[Row::valid("Nat.a"), other_platform, other_mode]);
+    let blocks = verify(&l, &["Nat.a"], &vh());
     assert!(blocks.is_empty(), "false duplicate reported: {blocks:?}");
 }
 
 #[test]
 fn a_stale_revision_blocks() {
     let l = parsed(ROOT_B, &[Row::valid("Nat.a")]);
-    let blocks = verify(&l, &["Nat.a"], HEAD);
+    let blocks = verify(&l, &["Nat.a"], &vh());
     assert_eq!(reasons(&blocks), vec!["stale"]);
     match &blocks[0] {
         Block::StaleRevision { stated, head } => {
             assert_eq!(stated, ROOT_B);
-            assert_eq!(head, HEAD);
+            assert_eq!(head, &*HEAD);
         }
         other => panic!("expected StaleRevision, got {other:?}"),
     }
@@ -389,13 +407,13 @@ fn a_revision_that_merely_prefixes_the_head_is_still_stale() {
     // Guards the comparison itself. A truncated or abbreviated revision must
     // not satisfy the freshness check by being a prefix of the real head.
     let l = parsed(&HEAD[..16], &[Row::valid("Nat.a")]);
-    assert_eq!(reasons(&verify(&l, &["Nat.a"], HEAD)), vec!["stale"]);
+    assert_eq!(reasons(&verify(&l, &["Nat.a"], &vh())), vec!["stale"]);
 }
 
 #[test]
 fn an_unknown_symbol_blocks() {
-    let l = parsed(HEAD, &[Row::valid("Nat.a"), Row::valid("Nat.ghost")]);
-    let blocks = verify(&l, &["Nat.a"], HEAD);
+    let l = parsed(&HEAD, &[Row::valid("Nat.a"), Row::valid("Nat.ghost")]);
+    let blocks = verify(&l, &["Nat.a"], &vh());
     assert_eq!(reasons(&blocks), vec!["unknown"]);
     assert!(matches!(&blocks[0], Block::UnknownSymbol { symbol } if symbol == "Nat.ghost"));
 }
@@ -406,8 +424,8 @@ fn a_root_mismatch_blocks() {
     // parity its own digests contradict.
     let mut r = Row::valid("Nat.a");
     r.oracle_root = ROOT_B.to_string();
-    let l = parsed(HEAD, &[r]);
-    let blocks = verify(&l, &["Nat.a"], HEAD);
+    let l = parsed(&HEAD, &[r]);
+    let blocks = verify(&l, &["Nat.a"], &vh());
     assert_eq!(reasons(&blocks), vec!["root-mismatch"]);
 }
 
@@ -418,7 +436,7 @@ fn the_comparison_class_decides_what_the_roots_must_say() {
     let mut cited = Row::valid("Nat.a");
     cited.comparison = "acceptance-only".to_string();
     assert_eq!(
-        reasons(&verify(&parsed(HEAD, &[cited]), &["Nat.a"], HEAD)),
+        reasons(&verify(&parsed(&HEAD, &[cited]), &["Nat.a"], &vh())),
         vec!["root-mismatch"]
     );
 
@@ -427,7 +445,7 @@ fn the_comparison_class_decides_what_the_roots_must_say() {
     honest.comparison = "acceptance-only".to_string();
     honest.ours_root = "-".to_string();
     honest.oracle_root = "-".to_string();
-    assert!(verify(&parsed(HEAD, &[honest]), &["Nat.a"], HEAD).is_empty());
+    assert!(verify(&parsed(&HEAD, &[honest]), &["Nat.a"], &vh()).is_empty());
 
     // A normalized comparison must cite both roots.
     let mut normalized = Row::valid("Nat.a");
@@ -435,7 +453,7 @@ fn the_comparison_class_decides_what_the_roots_must_say() {
     normalized.normalizer = "diagnostic-text/1".to_string();
     normalized.ours_root = "-".to_string();
     assert_eq!(
-        reasons(&verify(&parsed(HEAD, &[normalized]), &["Nat.a"], HEAD)),
+        reasons(&verify(&parsed(&HEAD, &[normalized]), &["Nat.a"], &vh())),
         vec!["root-mismatch"]
     );
 }
@@ -449,14 +467,14 @@ fn a_comparison_class_and_a_normalizer_that_disagree_block() {
     unnamed.comparison = "normalized-identical".to_string();
     unnamed.oracle_root = ROOT_B.to_string();
     assert!(
-        reasons(&verify(&parsed(HEAD, &[unnamed]), &["Nat.a"], HEAD))
+        reasons(&verify(&parsed(&HEAD, &[unnamed]), &["Nat.a"], &vh()))
             .contains(&"incoherent-comparison")
     );
 
     let mut spurious = Row::valid("Nat.a");
     spurious.normalizer = "diagnostic-text/1".to_string();
     assert_eq!(
-        reasons(&verify(&parsed(HEAD, &[spurious]), &["Nat.a"], HEAD)),
+        reasons(&verify(&parsed(&HEAD, &[spurious]), &["Nat.a"], &vh())),
         vec!["incoherent-comparison"]
     );
 }
@@ -466,7 +484,7 @@ fn a_mock_backed_row_cannot_close_an_l_level() {
     // A mock may support a unit test and may NOT close a public claim.
     let mut r = Row::valid("Nat.a");
     r.backing = "mock".to_string();
-    let blocks = verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[r]), &["Nat.a"], &vh());
     assert_eq!(reasons(&blocks), vec!["mock-only"]);
     match &blocks[0] {
         Block::MockOnlyClosure { symbol, level } => {
@@ -481,7 +499,7 @@ fn a_mock_backed_row_cannot_close_an_l_level() {
     let mut l0 = Row::valid("Nat.a");
     l0.backing = "mock".to_string();
     l0.level = "L0".to_string();
-    assert!(verify(&parsed(HEAD, &[l0]), &["Nat.a"], HEAD).is_empty());
+    assert!(verify(&parsed(&HEAD, &[l0]), &["Nat.a"], &vh()).is_empty());
 }
 
 #[test]
@@ -493,7 +511,7 @@ fn an_unearned_level_blocks() {
         // A non-established state also caps the claim, so keep the claim at the
         // floor to isolate the LEVEL rule from the CLAIM rule.
         r.claim = "benchmark".to_string();
-        let blocks = verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD);
+        let blocks = verify(&parsed(&HEAD, &[r]), &["Nat.a"], &vh());
         assert!(
             reasons(&blocks).contains(&"overclaimed-level"),
             "state {state} at L2 did not block the level: {blocks:?}"
@@ -509,7 +527,7 @@ fn an_observation_is_not_a_proof() {
     for claim in ["proof", "invariant"] {
         let mut r = Row::valid("Nat.a");
         r.claim = claim.to_string();
-        let blocks = verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD);
+        let blocks = verify(&parsed(&HEAD, &[r]), &["Nat.a"], &vh());
         assert_eq!(
             reasons(&blocks),
             vec!["overclaimed-claim"],
@@ -520,7 +538,7 @@ fn an_observation_is_not_a_proof() {
     let mut proven = Row::valid("Nat.a");
     proven.state = "proven".to_string();
     proven.claim = "invariant".to_string();
-    assert!(verify(&parsed(HEAD, &[proven]), &["Nat.a"], HEAD).is_empty());
+    assert!(verify(&parsed(&HEAD, &[proven]), &["Nat.a"], &vh()).is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +556,7 @@ fn the_level_rule_does_not_read_the_claim_type() {
             baseline.state = state.to_string();
             baseline.level = level.to_string();
             baseline.claim = "benchmark".to_string();
-            let want = reasons(&verify(&parsed(HEAD, &[baseline]), &["Nat.a"], HEAD))
+            let want = reasons(&verify(&parsed(&HEAD, &[baseline]), &["Nat.a"], &vh()))
                 .contains(&"overclaimed-level");
 
             for claim in [
@@ -553,7 +571,7 @@ fn the_level_rule_does_not_read_the_claim_type() {
                 r.state = state.to_string();
                 r.level = level.to_string();
                 r.claim = claim.to_string();
-                let got = reasons(&verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD))
+                let got = reasons(&verify(&parsed(&HEAD, &[r]), &["Nat.a"], &vh()))
                     .contains(&"overclaimed-level");
                 assert!(
                     got == want,
@@ -574,7 +592,7 @@ fn the_claim_rule_does_not_read_the_l_level() {
             baseline.state = state.to_string();
             baseline.claim = claim.to_string();
             baseline.level = "L0".to_string();
-            let want = reasons(&verify(&parsed(HEAD, &[baseline]), &["Nat.a"], HEAD))
+            let want = reasons(&verify(&parsed(&HEAD, &[baseline]), &["Nat.a"], &vh()))
                 .contains(&"overclaimed-claim");
 
             for level in ["L0", "L1", "L2", "L3", "L4"] {
@@ -582,7 +600,7 @@ fn the_claim_rule_does_not_read_the_l_level() {
                 r.state = state.to_string();
                 r.claim = claim.to_string();
                 r.level = level.to_string();
-                let got = reasons(&verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD))
+                let got = reasons(&verify(&parsed(&HEAD, &[r]), &["Nat.a"], &vh()))
                     .contains(&"overclaimed-claim");
                 assert!(
                     got == want,
@@ -606,7 +624,7 @@ fn the_mock_rule_reads_backing_and_level_and_nothing_else() {
             r.state = state.to_string();
             r.claim = claim.to_string();
             assert!(
-                reasons(&verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD)).contains(&"mock-only"),
+                reasons(&verify(&parsed(&HEAD, &[r]), &["Nat.a"], &vh())).contains(&"mock-only"),
                 "the mock rule moved with state {state} / claim {claim}"
             );
         }
@@ -624,8 +642,8 @@ fn an_aggregate_row_blocks() {
     for symbol in [
         "TOTAL", "ALL", "SUMMARY", "OVERALL", "AVERAGE", "Nat.*", "97%", "0.97", "12", "42ms",
     ] {
-        let l = parsed(HEAD, &[Row::valid(symbol)]);
-        let blocks = verify(&l, &[symbol], HEAD);
+        let l = parsed(&HEAD, &[Row::valid(symbol)]);
+        let blocks = verify(&l, &[symbol], &vh());
         assert!(
             reasons(&blocks).contains(&"aggregate"),
             "{symbol:?} was admitted as a row: {blocks:?}"
@@ -653,7 +671,7 @@ fn a_ledger_reports_every_block_it_finds_not_the_first() {
     let mut mock = Row::valid("Nat.a");
     mock.backing = "mock".to_string();
     let l = parsed(ROOT_B, &[mock, Row::valid("Nat.ghost")]);
-    let blocks = verify(&l, &["Nat.a", "Nat.b"], HEAD);
+    let blocks = verify(&l, &["Nat.a", "Nat.b"], &vh());
     let r = reasons(&blocks);
     for want in ["stale", "mock-only", "unknown", "missing"] {
         assert!(r.contains(&want), "{want} was not reported: {blocks:?}");
@@ -667,7 +685,7 @@ fn a_block_is_never_downgraded_to_a_warning() {
     // blocking conditions. Any non-empty verification fails.
     let mut r = Row::valid("Nat.a");
     r.backing = "mock".to_string();
-    let blocks = verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[r]), &["Nat.a"], &vh());
     assert!(!blocks.is_empty());
     let text = report(&blocks);
     assert!(text.contains("verdict=fail"));
@@ -685,7 +703,7 @@ fn evidence_state_and_claim_type_survive_a_round_trip_unconflated() {
     r.state = "proven".to_string();
     r.claim = "invariant".to_string();
     r.level = "L4".to_string();
-    let l = parsed(HEAD, &[r]);
+    let l = parsed(&HEAD, &[r]);
     let row = &l.rows[0];
     assert_eq!(row.state, EvidenceState::Proven);
     assert_eq!(row.claim, ClaimType::Invariant);
@@ -709,11 +727,11 @@ fn a_row_that_invents_a_fixture_digest_is_refused() {
     // before fln-8fwh the schema had no way to know.
     let mut r = Row::valid("Nat.a");
     r.symbol = "Nat.a".to_string();
-    let l = parsed(HEAD, &[r]);
+    let l = parsed(&HEAD, &[r]);
     // The row's fixture path is fixtures/nat.lean, which does not exist; point
     // the check at a real file to isolate the DIGEST failure from the missing
     // -file failure.
-    let blocks = verify_with_fixtures(&l, &["Nat.a"], HEAD, &repo_root());
+    let blocks = verify_with_fixtures(&l, &["Nat.a"], &vh(), &repo_root());
     assert!(
         blocks.iter().any(|b| b.reason() == "fixture-unverified"),
         "an invented fixture digest was recorded: {blocks:?}"
@@ -730,8 +748,9 @@ fn a_row_whose_fixture_verifies_is_accepted() {
         .expect("AGENTS.md is readable")
         .into_parts()
         .0;
+    let head = HEAD.as_str();
     let text = format!(
-        "{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {HEAD}\n\
+        "{OUTCOME_SCHEMA}\nepoch v4.32.0\nrevision {head}\n\
          row Nat.a fixture={fixture} fixture_digest={digest} \
          ours_root={ROOT_A} oracle_root={ROOT_A} ours_verdict=accepted \
          oracle_verdict=accepted assessment=agree disposition=- \
@@ -742,7 +761,7 @@ fn a_row_whose_fixture_verifies_is_accepted() {
          limits=no-known-limitations\n"
     );
     let l = parse(&text).expect("the ledger parses");
-    let blocks = verify_with_fixtures(&l, &["Nat.a"], HEAD, &root);
+    let blocks = verify_with_fixtures(&l, &["Nat.a"], &vh(), &root);
     assert!(
         blocks.is_empty(),
         "a verifiable row was refused: {blocks:?}"
@@ -751,8 +770,8 @@ fn a_row_whose_fixture_verifies_is_accepted() {
 
 #[test]
 fn a_row_naming_a_fixture_that_does_not_exist_is_refused() {
-    let l = parsed(HEAD, &[Row::valid("Nat.a")]);
-    let blocks = verify_with_fixtures(&l, &["Nat.a"], HEAD, &repo_root());
+    let l = parsed(&HEAD, &[Row::valid("Nat.a")]);
+    let blocks = verify_with_fixtures(&l, &["Nat.a"], &vh(), &repo_root());
     let found = blocks.iter().any(|b| match b {
         Block::FixtureUnverified { detail, .. } => detail.contains("cannot read"),
         _ => false,
@@ -783,8 +802,8 @@ fn an_agreeing_symbol_is_expressible() {
     // The compared declarations that agreed. This is the case schema 1 was
     // designed around and it still works unchanged — the extension is additive
     // for the row kind that already fit.
-    let l = parsed(HEAD, &[Row::valid("Nat.succ_le_of_lt")]);
-    assert!(verify(&l, &["Nat.succ_le_of_lt"], HEAD).is_empty());
+    let l = parsed(&HEAD, &[Row::valid("Nat.succ_le_of_lt")]);
+    assert!(verify(&l, &["Nat.succ_le_of_lt"], &vh()).is_empty());
 }
 
 #[test]
@@ -794,8 +813,8 @@ fn a_restrictive_divergence_is_expressible_and_reads_as_uncalled() {
     // and schema 1 refused it: the two roots necessarily differ, so
     // byte-identical blocked it as a root mismatch, and no ComparisonClass
     // meant "compared, and they disagreed".
-    let l = parsed(HEAD, &[Row::restrictive_uncalled("Lean.Arrow")]);
-    let blocks = verify(&l, &["Lean.Arrow"], HEAD);
+    let l = parsed(&HEAD, &[Row::restrictive_uncalled("Lean.Arrow")]);
+    let blocks = verify(&l, &["Lean.Arrow"], &vh());
     assert!(
         blocks.is_empty(),
         "a restrictive divergence was refused: {blocks:?}"
@@ -823,8 +842,8 @@ fn an_uncalled_divergence_is_not_the_same_row_as_a_called_one() {
     let mut called = Row::restrictive_uncalled("Lean.Arrow");
     called.disposition = "harness".to_string();
     called.limits = "our decoder truncates extended imports at this scope".to_string();
-    let l = parsed(HEAD, &[called]);
-    assert!(verify(&l, &["Lean.Arrow"], HEAD).is_empty());
+    let l = parsed(&HEAD, &[called]);
+    assert!(verify(&l, &["Lean.Arrow"], &vh()).is_empty());
     assert!(census(&l).contains("assessment=restrictive disposition=harness n=1"));
 }
 
@@ -834,8 +853,8 @@ fn an_oracle_silent_symbol_is_expressible_and_the_old_lie_is_refused() {
     // checker legitimately cannot judge — unsafe or partial constants its own
     // replay never submits. That is a real bound on the oracle and belongs in
     // the report as a stated limit on a row, not as an absence from the file.
-    let l = parsed(HEAD, &[Row::oracle_silent("Nat.unsafeCast")]);
-    let blocks = verify(&l, &["Nat.unsafeCast"], HEAD);
+    let l = parsed(&HEAD, &[Row::oracle_silent("Nat.unsafeCast")]);
+    let blocks = verify(&l, &["Nat.unsafeCast"], &vh());
     assert!(
         blocks.is_empty(),
         "an oracle-silent row was refused: {blocks:?}"
@@ -855,7 +874,7 @@ fn an_oracle_silent_symbol_is_expressible_and_the_old_lie_is_refused() {
     lie.ours_root = "-".to_string();
     lie.oracle_root = "-".to_string();
     lie.oracle_verdict = "no-answer:out-of-scope".to_string();
-    let blocks = verify(&parsed(HEAD, &[lie.clone()]), &["Nat.unsafeCast"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[lie.clone()]), &["Nat.unsafeCast"], &vh());
     assert!(
         reasons(&blocks).contains(&"misscored"),
         "the version-1 encoding of an oracle-silent symbol still passes: {blocks:?}"
@@ -868,7 +887,7 @@ fn an_oracle_silent_symbol_is_expressible_and_the_old_lie_is_refused() {
     let mut honest_score = lie;
     honest_score.assessment = "unscorable".to_string();
     honest_score.level = "L0".to_string(); // isolate: an uncompared row closes no level either
-    let blocks = verify(&parsed(HEAD, &[honest_score]), &["Nat.unsafeCast"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[honest_score]), &["Nat.unsafeCast"], &vh());
     assert_eq!(reasons(&blocks), vec!["uncompared"]);
 }
 
@@ -879,8 +898,8 @@ fn an_unassessed_symbol_is_expressible_and_is_not_a_missing_symbol() {
     // all and then Block::MissingSymbol — and "we have no row for this symbol"
     // and "we have a row saying nobody looked" are different facts.
     let scan = ["A", "B"];
-    let l = parsed(HEAD, &[Row::valid("A"), Row::unassessed("B")]);
-    let blocks = verify(&l, &scan, HEAD);
+    let l = parsed(&HEAD, &[Row::valid("A"), Row::unassessed("B")]);
+    let blocks = verify(&l, &scan, &vh());
     assert!(
         blocks.is_empty(),
         "an unassessed row was refused: {blocks:?}"
@@ -893,8 +912,8 @@ fn an_unassessed_symbol_is_expressible_and_is_not_a_missing_symbol() {
     // MissingSymbol survives, and is now a sharper refusal than it was: it means
     // the ledger does not mention the symbol AT ALL, which after schema 2 is a
     // publication defect rather than the only way to say "not assessed".
-    let thin = parsed(HEAD, &[Row::valid("A")]);
-    assert!(reasons(&verify(&thin, &scan, HEAD)).contains(&"missing"));
+    let thin = parsed(&HEAD, &[Row::valid("A")]);
+    assert!(reasons(&verify(&thin, &scan, &vh())).contains(&"missing"));
 }
 
 #[test]
@@ -905,7 +924,7 @@ fn an_unassessed_symbol_cannot_carry_a_compatibility_level() {
     // checked could be published as attested by a row that lies about nothing.
     let mut r = Row::unassessed("B");
     r.level = "L3".to_string();
-    let blocks = verify(&parsed(HEAD, &[r]), &["B"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[r]), &["B"], &vh());
     assert_eq!(reasons(&blocks), vec!["level-without-comparison"]);
 }
 
@@ -923,7 +942,7 @@ fn a_row_whose_assessment_its_own_sides_do_not_support_is_refused() {
     lying.ours_verdict = "rejected".to_string();
     lying.oracle_verdict = "accepted".to_string();
     // ...but the row still claims they agreed.
-    let blocks = verify(&parsed(HEAD, &[lying]), &["Nat.a"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[lying]), &["Nat.a"], &vh());
     assert!(
         reasons(&blocks).contains(&"misscored"),
         "a misscored row was not refused: {blocks:?}"
@@ -994,7 +1013,7 @@ fn a_non_answer_from_either_side_is_never_a_divergence_in_a_row() {
     for mut r in [Row::oracle_silent("Nat.a"), Row::unassessed("Nat.a")] {
         r.assessment = "restrictive".to_string();
         r.disposition = "semantic".to_string();
-        let blocks = verify(&parsed(HEAD, &[r]), &["Nat.a"], HEAD);
+        let blocks = verify(&parsed(&HEAD, &[r]), &["Nat.a"], &vh());
         assert!(
             reasons(&blocks).contains(&"misscored"),
             "a non-answer was published as a divergence: {blocks:?}"
@@ -1009,13 +1028,13 @@ fn a_divergence_must_say_whether_it_was_called() {
     // what let an unclassified divergence be filed as a clean pass.
     let mut silent = Row::restrictive_uncalled("Lean.Arrow");
     silent.disposition = "-".to_string();
-    let blocks = verify(&parsed(HEAD, &[silent]), &["Lean.Arrow"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[silent]), &["Lean.Arrow"], &vh());
     assert_eq!(reasons(&blocks), vec!["incoherent-disposition"]);
 
     // And the converse: a row with nothing to call must not name a cause.
     let mut spurious = Row::valid("Nat.a");
     spurious.disposition = "semantic".to_string();
-    let blocks = verify(&parsed(HEAD, &[spurious]), &["Nat.a"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[spurious]), &["Nat.a"], &vh());
     assert_eq!(reasons(&blocks), vec!["incoherent-disposition"]);
 }
 
@@ -1028,7 +1047,7 @@ fn a_divergence_whose_roots_are_identical_is_refused() {
     // are the same bytes is a row contradicting its own evidence.
     let mut r = Row::restrictive_uncalled("Lean.Arrow");
     r.oracle_root = ROOT_A.to_string(); // same as ours: nothing actually differs
-    let blocks = verify(&parsed(HEAD, &[r]), &["Lean.Arrow"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[r]), &["Lean.Arrow"], &vh());
     assert_eq!(reasons(&blocks), vec!["root-mismatch"]);
 }
 
@@ -1038,7 +1057,7 @@ fn a_silent_oracle_cannot_have_its_root_cited() {
     // a fabrication, and it is the shape a copy-pasted row takes.
     let mut r = Row::oracle_silent("Nat.unsafeCast");
     r.oracle_root = ROOT_B.to_string();
-    let blocks = verify(&parsed(HEAD, &[r]), &["Nat.unsafeCast"], HEAD);
+    let blocks = verify(&parsed(&HEAD, &[r]), &["Nat.unsafeCast"], &vh());
     assert_eq!(reasons(&blocks), vec!["root-mismatch"]);
 }
 
@@ -1048,12 +1067,14 @@ fn a_comparison_class_is_named_exactly_when_something_was_compared() {
     let mut classed = Row::oracle_silent("Nat.a");
     classed.comparison = "acceptance-only".to_string();
     classed.ours_root = "-".to_string();
-    assert!(reasons(&verify(&parsed(HEAD, &[classed]), &["Nat.a"], HEAD)).contains(&"uncompared"));
+    assert!(
+        reasons(&verify(&parsed(&HEAD, &[classed]), &["Nat.a"], &vh())).contains(&"uncompared")
+    );
 
     let mut classless = Row::valid("Nat.a");
     classless.comparison = "-".to_string();
     assert!(
-        reasons(&verify(&parsed(HEAD, &[classless]), &["Nat.a"], HEAD)).contains(&"uncompared")
+        reasons(&verify(&parsed(&HEAD, &[classless]), &["Nat.a"], &vh())).contains(&"uncompared")
     );
 }
 
@@ -1064,7 +1085,7 @@ fn an_inconclusive_must_name_what_was_inconclusive() {
     // how kxbj's depth bound stays distinguishable from a scope decision.
     let mut bare = Row::unassessed("B");
     bare.ours_verdict = "inconclusive:".to_string();
-    let err = parse(&ledger_text(HEAD, &[bare])).expect_err("a bare inconclusive parsed");
+    let err = parse(&ledger_text(&HEAD, &[bare])).expect_err("a bare inconclusive parsed");
     assert!(reasons(&err).contains(&"malformed"), "{err:?}");
 }
 
@@ -1078,8 +1099,8 @@ fn the_report_verdicts_on_the_schema_and_says_so() {
     // that gets quoted as "we match the Reference". What `report` decides is
     // whether the FILE is admissible, and after schema 2 — where a well-formed
     // ledger can be 90% not-assessed — the word has to carry its own scope.
-    let l = parsed(HEAD, &[Row::unassessed("A")]);
-    let blocks = verify(&l, &["A"], HEAD);
+    let l = parsed(&HEAD, &[Row::unassessed("A")]);
+    let blocks = verify(&l, &["A"], &vh());
     assert!(blocks.is_empty(), "the fixture ledger is admissible");
     let text = report(&blocks);
     assert!(text.contains("schema-verdict=pass"), "{text}");
@@ -1096,7 +1117,7 @@ fn the_census_disaggregates_and_never_totals() {
     // disaggregation — and a report that printed only blocks would satisfy the
     // "no aggregates" rule by saying nothing about the corpus at all.
     let l = parsed(
-        HEAD,
+        &HEAD,
         &[
             Row::valid("A"),
             Row::restrictive_uncalled("B"),
@@ -1121,4 +1142,50 @@ fn the_census_disaggregates_and_never_totals() {
     // Four rows, three classes: the classes are what is reported, and the count
     // of rows is never printed as one number.
     assert_eq!(text.lines().count(), 3, "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// The gate path: the head comes from the PUBLISHED chain, not from anyone's
+// hand (bead fln-8fwh, remainder item 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn freshness_is_judged_against_the_head_verify_epoch_returns() {
+    // Before this bead's repair, staleness was a DECLARATION: verify() took a
+    // &str and compared the ledger against whatever the caller wrote down, so
+    // a gate holding a stale or invented hex passed with full confidence. Now
+    // the only path to a VerifiedHead is From<&Chain>, and the only honest
+    // Chain is the one verify_epoch parses AND verifies against the committed
+    // manifest. This test walks that exact path over the REAL published epoch:
+    // tribunal/epochs/v4.32.0, the chain the program actually ships.
+    let epoch_dir = repo_root().join("tribunal/epochs/v4.32.0");
+    let chain = fln_epoch_lab::verify_epoch(&epoch_dir, "v4.32.0", "MANIFEST.txt")
+        .expect("the committed epoch chain verifies against its committed manifest");
+    let real_head = fln_epoch_lab::parity::VerifiedHead::from(&chain);
+
+    // Fresh: a ledger written against the head the chain actually published.
+    let fresh = parsed(real_head.as_hex(), &[Row::valid("Nat.a")]);
+    assert!(
+        verify(&fresh, &["Nat.a"], &real_head).is_empty(),
+        "a ledger at the published head must be fresh"
+    );
+
+    // Stale: the same ledger judged after the chain has moved on. The head is
+    // still obtained from a real Chain — the API leaves no other way — so this
+    // cell is the honest form of "the world advanced and the ledger did not".
+    let advanced = chain.appended(fln_epoch_lab::content_digest(b"a newer manifest"));
+    let newer_head = fln_epoch_lab::parity::VerifiedHead::from(&advanced);
+    let blocks = verify(&fresh, &["Nat.a"], &newer_head);
+    assert_eq!(
+        reasons(&blocks),
+        vec!["stale"],
+        "a ledger left behind by the chain must block as stale"
+    );
+    match &blocks[0] {
+        Block::StaleRevision { stated, head } => {
+            assert_eq!(stated, real_head.as_hex());
+            assert_eq!(head, newer_head.as_hex());
+        }
+        other => panic!("expected StaleRevision, got {other:?}"),
+    }
 }

@@ -112,6 +112,7 @@
 //! first-class value, and the census below reports it as its own class — never
 //! folded into a pass and never into a finding.
 
+use crate::Chain;
 use crate::normalize::{NormalizerId, NormalizerVersion};
 use crate::oracle::{
     ClaimType, ComparisonClass, EvidenceKind, EvidenceState, Freshness, LLevel, Mode,
@@ -922,20 +923,51 @@ fn claim_strength(c: ClaimType) -> u8 {
     }
 }
 
+/// The chain head as something a caller cannot invent (bead `fln-8fwh`).
+///
+/// Freshness used to be checked against a caller-supplied `&str`, which made
+/// staleness a DECLARATION: the check compared the ledger against whatever the
+/// caller said the head was, and a gate holding a stale or invented hex passed
+/// with full confidence. The only constructor is `From<&Chain>`, and a `Chain`
+/// is obtained from [`crate::verify_epoch`], which parses AND verifies the
+/// published chain against its manifest — so by the time a head reaches this
+/// type, the chain it names has already been proven to be the one on disk.
+/// A schema-only test pays the same price deliberately: it builds a real
+/// genesis chain rather than writing a hex literal, because a constructor that
+/// admits a string would readmit the lie for every caller at once.
+pub struct VerifiedHead {
+    hex: String,
+}
+
+impl From<&Chain> for VerifiedHead {
+    fn from(chain: &Chain) -> VerifiedHead {
+        VerifiedHead {
+            hex: chain.head_root_hex(),
+        }
+    }
+}
+
+impl VerifiedHead {
+    /// The hex form, for reports and refusal messages only.
+    pub fn as_hex(&self) -> &str {
+        &self.hex
+    }
+}
+
 /// Verify a ledger against the expected symbol set and the epoch chain head.
 ///
 /// Returns EVERY block found, not the first: a ledger with four problems should
 /// report four. A non-empty result blocks; there is no warning level.
-pub fn verify(ledger: &Ledger, expected: &[&str], chain_head: &str) -> Vec<Block> {
+pub fn verify(ledger: &Ledger, expected: &[&str], chain_head: &VerifiedHead) -> Vec<Block> {
     let mut blocks = Vec::new();
 
     // STALE. The ledger describes a manifest revision; if that is not the head
     // the chain published, the ledger is describing something that has since
     // moved and every row in it is suspect.
-    if ledger.revision != chain_head {
+    if ledger.revision != chain_head.hex {
         blocks.push(Block::StaleRevision {
             stated: ledger.revision.clone(),
-            head: chain_head.to_string(),
+            head: chain_head.hex.clone(),
         });
     }
 
@@ -1171,7 +1203,7 @@ pub fn verify(ledger: &Ledger, expected: &[&str], chain_head: &str) -> Vec<Block
 pub fn verify_with_fixtures(
     ledger: &Ledger,
     expected: &[&str],
-    chain_head: &str,
+    chain_head: &VerifiedHead,
     fixture_root: &std::path::Path,
 ) -> Vec<Block> {
     let mut blocks = verify(ledger, expected, chain_head);
