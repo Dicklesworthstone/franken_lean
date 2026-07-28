@@ -61,6 +61,7 @@ pub mod rules {
     pub const EPOCH_TREE: &str = "fln.derive.epoch-tree/1";
     pub const TARGETS: &str = "fln.derive.cargo-targets/1";
     pub const ORACLE_EDGES: &str = "fln.derive.oracle-edges/1";
+    pub const NORMAL_DEPS: &str = "fln.derive.normal-dependencies/1";
 }
 
 /// What was scanned, at which pin, under which rule.
@@ -1682,4 +1683,179 @@ pub fn corroboration_report(rows: &[CorroboratedRow]) -> String {
         uncorroborated_suppressions(rows).len()
     ));
     out
+}
+
+// ---------------------------------------------------------------------------
+// 9. Normal-dependency edges — the closure witness that is available TODAY
+//    (bead fln-8fwh; the mechanism recommended by fln-atgf's review)
+// ---------------------------------------------------------------------------
+
+/// One `[dependencies]` edge between two workspace members.
+///
+/// Normal dependencies only, and that restriction is the whole point: cargo
+/// puts a crate in a release artifact's closure through `[dependencies]` and
+/// never through `[dev-dependencies]` or `[build-dependencies]` — the same law
+/// [`classify`]'s mechanical floor uses for test and bench targets. So these
+/// edges are the half of shippability that is a fact about the tree rather
+/// than a judgement about the product.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NormalDepEdge {
+    pub from: String,
+    pub to: String,
+}
+
+/// Derive every member-to-member `[dependencies]` edge from the real manifests.
+///
+/// [`derive_dependency_closure`] already witnesses shippability over the
+/// *declared* edges of `ci/WORKSPACE_GRAPH.txt`, from product-binary roots —
+/// and is honestly [`ClosureAvailability::Unavailable`] today, because no
+/// product binary exists yet. This derivation answers the question that IS
+/// answerable today, from the bytes cargo itself reads: which crates does each
+/// crate pull into a release closure? Its consumer is
+/// [`policy_closure_violations`], the policy's own coherence law.
+///
+/// The reader is deliberately strict, like every reader in this file: inside a
+/// `[dependencies]` section, a line it does not understand is an
+/// [`DeriveError::Unparseable`], never a skipped line — a dependency the scan
+/// silently drops is an edge outside the certificate, which is the exact hole
+/// this module exists to close. The accepted shapes are this workspace's
+/// uniform manifest style (enforced by structure-guard): a single-line
+/// `name = { path = "…" }` table or a `name = "version"` string.
+pub fn derive_normal_dependencies(root: &Path) -> Result<Derived<Vec<NormalDepEdge>>, DeriveError> {
+    let inventory = derive_workspace_inventory(root)?;
+    let member_names: BTreeSet<&str> = inventory
+        .value()
+        .members
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+
+    let mut edges: Vec<NormalDepEdge> = Vec::new();
+    for m in &inventory.value().members {
+        let manifest = root.join(&m.dir).join("Cargo.toml");
+        let text = read(&manifest)?;
+        let mut section: Option<String> = None;
+        for (idx, line) in text.lines().enumerate() {
+            let l = line.trim();
+            if l.starts_with('[') {
+                section = Some(l.to_string());
+                continue;
+            }
+            if section.as_deref() != Some("[dependencies]") || l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            let Some((name, rest)) = l.split_once('=') else {
+                return Err(DeriveError::Unparseable {
+                    path: manifest.display().to_string(),
+                    line: idx + 1,
+                    detail: format!("dependency line without '=': {l:?}"),
+                });
+            };
+            let name = name.trim();
+            let rest = rest.trim();
+            let shape_ok = name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && !name.is_empty()
+                && ((rest.starts_with("{ path = \"") && rest.ends_with('}'))
+                    || (rest.starts_with('"') && rest.ends_with('"')));
+            if !shape_ok {
+                return Err(DeriveError::Unparseable {
+                    path: manifest.display().to_string(),
+                    line: idx + 1,
+                    detail: format!(
+                        "dependency shape this reader does not understand \
+                         (a misread edge is worse than a refusal): {l:?}"
+                    ),
+                });
+            }
+            // Edges to non-members (the pinned suite) are real but outside the
+            // POLICY's vocabulary — the policy classifies workspace crates only,
+            // so only member-to-member edges can witness or violate it.
+            if member_names.contains(name) {
+                edges.push(NormalDepEdge {
+                    from: m.name.clone(),
+                    to: name.to_string(),
+                });
+            }
+        }
+    }
+    edges.sort();
+    edges.dedup();
+    if edges.is_empty() {
+        // 29 member-to-member edges exist at the time of writing; a scan
+        // returning zero found a broken reader, not an unusually flat tree.
+        return Err(DeriveError::EmptyScan {
+            path: root.display().to_string(),
+            rule: rules::NORMAL_DEPS,
+        });
+    }
+    let keys: Vec<String> = edges
+        .iter()
+        .map(|e| format!("{}\u{1}{}", e.from, e.to))
+        .collect();
+    let digest = set_digest(rules::NORMAL_DEPS, &keys);
+    let count = edges.len();
+    Ok(Derived::new(
+        edges,
+        Provenance {
+            source: root.display().to_string(),
+            pin: "-".to_string(),
+            rule: rules::NORMAL_DEPS,
+            source_digest: digest,
+            item_count: count,
+        },
+    ))
+}
+
+/// The policy's own coherence law: a shippable crate's normal-dependency
+/// closure may not contain a development-only crate.
+///
+/// This is the DANGEROUS direction of `fln-atgf`'s review, mechanised. A crate
+/// wrongly marked development-only is invisible to the reachability scan — it
+/// is simply not enumerated, so the scan reports Clean with full confidence
+/// over its wrong premise. But if any shippable crate normal-depends on it,
+/// cargo would put it in a release closure regardless of what the policy says,
+/// and that contradiction is derivable. An empty result therefore means the
+/// policy's development-only rows carry a second, independent witness; a
+/// non-empty one names exactly which shippable crate would carry which
+/// development-only crate into a release.
+pub fn policy_closure_violations(
+    policy: &[(String, Shippability)],
+    edges: &[NormalDepEdge],
+) -> Vec<(String, String)> {
+    let dev_only: BTreeSet<&str> = policy
+        .iter()
+        .filter(|(_, s)| *s == Shippability::DevelopmentOnly)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for e in edges {
+        adjacency
+            .entry(e.from.as_str())
+            .or_default()
+            .push(e.to.as_str());
+    }
+    let mut violations: Vec<(String, String)> = Vec::new();
+    for (name, s) in policy {
+        if *s != Shippability::Shippable {
+            continue;
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            if n != name && dev_only.contains(n) {
+                violations.push((name.clone(), n.to_string()));
+            }
+            if let Some(next) = adjacency.get(n) {
+                stack.extend(next.iter().copied());
+            }
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
 }

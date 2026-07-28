@@ -1122,3 +1122,168 @@ fn per_source_coverage_is_reported_so_partial_cannot_read_as_full() {
     );
     assert!(text.contains("single_source=32"));
 }
+
+// ---------------------------------------------------------------------------
+// Normal-dependency edges and the policy's coherence law (bead fln-8fwh; the
+// mechanism recommended by fln-atgf's review, comment 1644)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_shippable_closure_reaches_no_development_only_crate() {
+    // The DANGEROUS direction of the shippability review, held per run rather
+    // than measured once. A crate wrongly marked development-only is invisible
+    // to the reachability scan, so development-only rows carry all the risk —
+    // and whether any shippable crate would pull one into a release closure is
+    // a fact about the manifests, not a judgement. fln-atgf's review derived
+    // this once at a081ce7e and found it clean; this test is that derivation
+    // with a lifetime.
+    let deps = fln_epoch_lab::derive::derive_normal_dependencies(&repo_root())
+        .expect("the real manifests are readable in the uniform style");
+    let edges = deps.value();
+    // Anti-vacuity floor: 29 member-to-member edges exist at the time of
+    // writing. A partial scan that dropped most of the tree would otherwise
+    // read as an unusually flat workspace, and a flat answer here corroborates
+    // every development-only row for free.
+    assert!(
+        edges.len() >= 20,
+        "implausibly few dependency edges ({}) — a partial scan, not a flat tree",
+        edges.len()
+    );
+    let violations = fln_epoch_lab::derive::policy_closure_violations(&policy(), edges);
+    assert!(
+        violations.is_empty(),
+        "a shippable crate's normal-dependency closure reaches a development-only \
+         crate, so the policy and the manifests disagree and the reachability \
+         scan's premise is wrong: {violations:?}"
+    );
+    // Sharper than the closure, and free: the three development-only rows have
+    // zero DIRECT normal-dependents of any classification.
+    for dev in ["fln-bench", "fln-conformance", "structure-guard"] {
+        let dependents: Vec<_> = edges.iter().filter(|e| e.to == dev).collect();
+        assert!(
+            dependents.is_empty(),
+            "{dev} is development-only but is normal-depended on by {dependents:?}"
+        );
+    }
+}
+
+#[test]
+fn a_planted_shippable_edge_into_a_development_only_crate_is_caught() {
+    // Both the direct and the transitive vector, because a checker that only
+    // walks one hop reads a laundering chain as clean.
+    use fln_epoch_lab::derive::{NormalDepEdge, policy_closure_violations};
+    use fln_epoch_lab::poison::Shippability;
+    let policy = vec![
+        ("prod-a".to_string(), Shippability::Shippable),
+        ("prod-b".to_string(), Shippability::Shippable),
+        ("mid".to_string(), Shippability::Shippable),
+        ("rig".to_string(), Shippability::DevelopmentOnly),
+    ];
+    let direct = vec![NormalDepEdge {
+        from: "prod-a".to_string(),
+        to: "rig".to_string(),
+    }];
+    assert_eq!(
+        policy_closure_violations(&policy, &direct),
+        vec![("prod-a".to_string(), "rig".to_string())],
+        "the direct edge must be named exactly"
+    );
+    let transitive = vec![
+        NormalDepEdge {
+            from: "prod-b".to_string(),
+            to: "mid".to_string(),
+        },
+        NormalDepEdge {
+            from: "mid".to_string(),
+            to: "rig".to_string(),
+        },
+    ];
+    let got = policy_closure_violations(&policy, &transitive);
+    assert!(
+        got.contains(&("prod-b".to_string(), "rig".to_string())),
+        "the two-hop path must be caught: {got:?}"
+    );
+    // The control that separates a working checker from one that always fires:
+    // remove the offending edges and the same policy is clean.
+    assert!(
+        policy_closure_violations(&policy, &[]).is_empty(),
+        "no edges, no violations — otherwise every refusal above is vacuous"
+    );
+}
+
+#[test]
+fn a_dependency_shape_the_reader_does_not_understand_is_refused() {
+    // The reader's strictness is the certificate's edge-completeness: a line it
+    // silently skipped would be an edge outside the scan. A git dependency is
+    // also a D1 violation in its own right, which makes it the right plant.
+    let root = scratch("git-dep");
+    let members = root.join("crates");
+    std::fs::create_dir_all(members.join("one")).expect("dirs");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .expect("root manifest");
+    std::fs::write(
+        members.join("one/Cargo.toml"),
+        "[package]\nname = \"one\"\n[dependencies]\nserde = { git = \"https://example.invalid\" }\n",
+    )
+    .expect("member manifest");
+    match fln_epoch_lab::derive::derive_normal_dependencies(&root) {
+        Err(DeriveError::Unparseable { detail, .. }) => {
+            assert!(
+                detail.contains("does not understand"),
+                "the refusal must say why: {detail}"
+            );
+        }
+        other => panic!("a git dependency must be refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_empty_dependency_scan_is_refused_as_a_broken_scan() {
+    // Zero edges over a workspace whose members declare none is
+    // indistinguishable from a reader that matched nothing — and an empty edge
+    // set corroborates every development-only row for free, which is the
+    // vacuous-green this suite's own closure type refuses one section up.
+    let root = scratch("no-deps");
+    let members = root.join("crates");
+    std::fs::create_dir_all(members.join("lone")).expect("dirs");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .expect("root manifest");
+    std::fs::write(
+        members.join("lone/Cargo.toml"),
+        "[package]\nname = \"lone\"\n",
+    )
+    .expect("member manifest");
+    match fln_epoch_lab::derive::derive_normal_dependencies(&root) {
+        Err(DeriveError::EmptyScan { rule, .. }) => {
+            assert_eq!(rule, "fln.derive.normal-dependencies/1");
+        }
+        other => panic!("an empty scan must refuse, got {other:?}"),
+    }
+}
+
+#[test]
+fn dev_dependencies_do_not_create_shippable_edges() {
+    // The whole load-bearing distinction: structure-guard REALLY dev-depends on
+    // fln-conformance in this tree (for checked_workspace_root!), and that edge
+    // must be invisible here, because cargo never puts a dev-dependency in a
+    // release closure. A reader that swept [dev-dependencies] into the edge set
+    // would report that real, legitimate edge as a policy violation — a wall
+    // against a correct practice, in the exact place the review promised the
+    // opposite.
+    let deps = fln_epoch_lab::derive::derive_normal_dependencies(&repo_root())
+        .expect("the real manifests are readable");
+    assert!(
+        !deps
+            .value()
+            .iter()
+            .any(|e| e.from == "structure-guard" && e.to == "fln-conformance"),
+        "structure-guard's DEV-dependency on fln-conformance leaked into the \
+         normal-dependency edge set"
+    );
+}
