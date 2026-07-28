@@ -384,13 +384,21 @@ fn the_committed_module_artifact_verifies() {
     let text = committed_module_artifact();
     let d = verify_module_artifact(&text).expect("the committed artifact must verify");
     assert_eq!(d.provenance().pin, "leanprover/lean4:v4.32.0");
-    assert_eq!(d.provenance().rule, "fln.derive.module-scan/1");
+    assert_eq!(d.provenance().rule, "fln.derive.module-scan/2");
     assert!(
         d.provenance().item_count > 2000,
         "only {} modules; the scan is not covering the stdlib",
         d.provenance().item_count
     );
-    assert_eq!(d.value().tests.len(), d.provenance().item_count);
+    assert_eq!(d.value().modules.len(), d.provenance().item_count);
+    // Version 2's whole point: every row is content-bound.
+    assert!(
+        d.value()
+            .modules
+            .iter()
+            .all(|(_, sha)| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())),
+        "a committed row carries no content digest"
+    );
     // Host independence: the recorded source must not be somebody's home
     // directory, or the artifact regenerates differently on every machine and
     // the diff noise trains people to ignore it.
@@ -420,7 +428,10 @@ fn a_row_added_or_removed_fails_on_the_count_before_the_digest() {
     let text = committed_module_artifact();
 
     let mut with_extra = text.clone();
-    with_extra.push_str("module Fabricated/Module.lean\n");
+    with_extra.push_str(
+        "module Fabricated/Module.lean \
+         1111111111111111111111111111111111111111111111111111111111111111\n",
+    );
     match verify_module_artifact(&with_extra) {
         Err(DeriveError::ArtifactInconsistent { detail }) => {
             assert!(detail.contains("header says"), "{detail}");
@@ -443,7 +454,7 @@ fn an_artifact_from_a_different_rule_is_refused() {
     // Enumeration rules are versioned so an artifact produced under an older
     // walk cannot be silently reinterpreted under a newer one.
     let text = committed_module_artifact();
-    let retagged = text.replace("fln.derive.module-scan/1", "fln.derive.module-scan/2");
+    let retagged = text.replace("fln.derive.module-scan/2", "fln.derive.module-scan/1");
     match verify_module_artifact(&retagged) {
         Err(DeriveError::ArtifactInconsistent { detail }) => {
             assert!(detail.contains("rule"), "{detail}");
@@ -457,11 +468,19 @@ fn a_malformed_artifact_is_refused_and_never_panics() {
     for text in [
         "",
         "not-a-schema\n",
-        "fln-c1-module-inventory/1\n",
-        "fln-c1-module-inventory/1\npin p\n",
-        "fln-c1-module-inventory/1\npin p\nrule fln.derive.module-scan/1\nsource s\ncount x\ndigest d\n",
-        "fln-c1-module-inventory/1\nnonsense\n",
-        "fln-c1-module-inventory/1\nunknownkey value\n",
+        // The version-1 header is a refusal, not a legacy path: a name-only
+        // inventory wearing an accepted schema would silently reintroduce the
+        // content blindness version 2 exists to close.
+        "fln-c1-module-inventory/1\npin p\nrule fln.derive.module-scan/1\nsource s\ncount 0\ndigest d\n",
+        "fln-c1-module-inventory/2\n",
+        "fln-c1-module-inventory/2\npin p\n",
+        "fln-c1-module-inventory/2\npin p\nrule fln.derive.module-scan/2\nsource s\ncount x\ndigest d\n",
+        "fln-c1-module-inventory/2\nnonsense\n",
+        "fln-c1-module-inventory/2\nunknownkey value\n",
+        // A module row without a digest is a version-1 row wearing a
+        // version-2 header; one with a short digest is corruption either way.
+        "fln-c1-module-inventory/2\nmodule OnlyAName.lean\n",
+        "fln-c1-module-inventory/2\nmodule X.lean abc123\n",
     ] {
         assert!(
             verify_module_artifact(text).is_err(),
@@ -509,7 +528,12 @@ fn every_derivation_records_what_it_scanned_and_under_which_rule() {
             "{} is unnamespaced",
             p.rule
         );
-        assert!(p.rule.ends_with("/1"), "{} is unversioned", p.rule);
+        let version = p.rule.rsplit_once('/').map(|(_, v)| v).unwrap_or("");
+        assert!(
+            !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
+            "{} is unversioned",
+            p.rule
+        );
         assert_eq!(p.source_digest.len(), 64, "{} has no source digest", p.rule);
         assert!(p.item_count > 0, "{} scanned nothing", p.rule);
     }
@@ -1286,4 +1310,100 @@ fn dev_dependencies_do_not_create_shippable_edges() {
         "structure-guard's DEV-dependency on fln-conformance leaked into the \
          normal-dependency edge set"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Content binding (bead fln-8fwh, remainder item 2): version 2 of the module
+// inventory notices an edit version 1 was structurally blind to
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pin_file_edited_in_place_changes_the_derived_artifact() {
+    // THE test for the remainder. Under version 1 the artifact digest was over
+    // the NAME set, so editing a pin file's contents left re-extraction
+    // producing a byte-identical artifact — drift with no witness. Both cells
+    // below hold the name set constant and vary only content, one variable,
+    // in a synthetic toolchain so no cell touches the real pin.
+    let root = scratch("content-drift");
+    let src = root.join("src/lean/Init");
+    std::fs::create_dir_all(&src).expect("dirs");
+    std::fs::write(src.join("A.lean"), "theorem a : True := trivial\n").expect("write A");
+    std::fs::write(src.join("B.lean"), "theorem b : True := trivial\n").expect("write B");
+
+    let before = fln_epoch_lab::derive::derive_module_scan(&root, "test-pin")
+        .expect("the synthetic toolchain scans");
+    // The control: an UNCHANGED tree re-derives to the identical artifact.
+    let again = fln_epoch_lab::derive::derive_module_scan(&root, "test-pin")
+        .expect("the synthetic toolchain scans again");
+    assert_eq!(
+        before.provenance().source_digest,
+        again.provenance().source_digest,
+        "an untouched tree must re-derive identically or every drift below is noise"
+    );
+
+    // The edit: same file NAME, different bytes.
+    std::fs::write(src.join("B.lean"), "theorem b : False := sorry\n").expect("edit B");
+    let after = fln_epoch_lab::derive::derive_module_scan(&root, "test-pin")
+        .expect("the edited toolchain scans");
+
+    let names = |inv: &fln_epoch_lab::derive::ModuleInventory| -> Vec<String> {
+        inv.modules.iter().map(|(p, _)| p.clone()).collect()
+    };
+    assert_eq!(
+        names(before.value()),
+        names(after.value()),
+        "the name set must be identical — otherwise this test varies two things"
+    );
+    assert_ne!(
+        before.provenance().source_digest,
+        after.provenance().source_digest,
+        "an in-place content edit must change the artifact digest; version 1's \
+         blindness has returned"
+    );
+    let sha_of = |inv: &fln_epoch_lab::derive::ModuleInventory, name: &str| -> String {
+        inv.modules
+            .iter()
+            .find(|(p, _)| p.ends_with(name))
+            .map(|(_, s)| s.clone())
+            .expect("row exists")
+    };
+    assert_ne!(
+        sha_of(before.value(), "B.lean"),
+        sha_of(after.value(), "B.lean"),
+        "the edited file's row must carry a new content digest"
+    );
+    assert_eq!(
+        sha_of(before.value(), "A.lean"),
+        sha_of(after.value(), "A.lean"),
+        "the untouched file's row must not move"
+    );
+}
+
+#[test]
+fn a_content_digest_edited_after_publication_fails() {
+    // The row-surgery cell for the CONTENT half: keep every name, flip one hex
+    // character of one sha. Only the recomputed digest notices, exactly as it
+    // does for an edited path.
+    let text = committed_module_artifact();
+    let row_start = text.find("\nmodule ").expect("has module rows") + 1;
+    let row_end = text[row_start..].find('\n').expect("row ends") + row_start;
+    let row = &text[row_start..row_end];
+    let (prefix, sha) = row.rsplit_once(' ').expect("v2 rows end with a sha");
+    let flipped: String = sha
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i == 0 {
+                if c == '0' { '1' } else { '0' }
+            } else {
+                c
+            }
+        })
+        .collect();
+    let edited = text.replacen(row, &format!("{prefix} {flipped}"), 1);
+    assert_ne!(edited, text, "the surgery did not change anything");
+    match verify_module_artifact(&edited) {
+        Err(DeriveError::DigestMismatch { .. }) => {}
+        other => panic!("an edited content digest was accepted: {other:?}"),
+    }
 }

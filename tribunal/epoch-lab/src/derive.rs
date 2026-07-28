@@ -57,7 +57,7 @@ pub mod rules {
     pub const FIXTURE_DIGEST: &str = "fln.derive.fixture-digest/1";
     pub const WORKSPACE_INVENTORY: &str = "fln.derive.workspace-inventory/1";
     pub const G0_ROSTER: &str = "fln.derive.g0-roster/1";
-    pub const MODULE_SCAN: &str = "fln.derive.module-scan/1";
+    pub const MODULE_SCAN: &str = "fln.derive.module-scan/2";
     pub const EPOCH_TREE: &str = "fln.derive.epoch-tree/1";
     pub const TARGETS: &str = "fln.derive.cargo-targets/1";
     pub const ORACLE_EDGES: &str = "fln.derive.oracle-edges/1";
@@ -511,7 +511,12 @@ pub fn derive_g0_roster(plan: &Path) -> Result<Derived<Vec<RosterSpike>>, Derive
 // ---------------------------------------------------------------------------
 
 /// Schema line of the committed module-inventory artifact.
-pub const MODULE_ARTIFACT_SCHEMA: &str = "fln-c1-module-inventory/1";
+/// Version 2 binds each module's CONTENT, not only its name (bead `fln-8fwh`,
+/// remainder item 2): under version 1 a pin file edited in place was invisible,
+/// because the digest was over the name set and re-extraction reproduced the
+/// same names. A version-1 artifact is refused outright rather than accepted
+/// with weaker meaning — no legacy path, per the repository's no-tech-debt law.
+pub const MODULE_ARTIFACT_SCHEMA: &str = "fln-c1-module-inventory/2";
 
 /// Walk the pinned toolchain's Lean source tree.
 ///
@@ -525,7 +530,41 @@ pub const MODULE_ARTIFACT_SCHEMA: &str = "fln-c1-module-inventory/1";
 /// part of the distributed toolchain at all, so the C1 test half cannot be
 /// derived from here. That is recorded as a typed absence on the bead rather
 /// than papered over with a smaller scan.
-pub fn derive_module_scan(toolchain: &Path, pin: &str) -> Result<Derived<PinScan>, DeriveError> {
+/// The C1 module inventory, content-bound.
+///
+/// `modules` pairs each toolchain-relative path with the sha256 of its bytes.
+/// [`ModuleInventory::to_pin_scan`] projects the name set for the corpus
+/// completeness comparison, which is about WHICH modules exist; the content
+/// half exists so that re-extraction against an edited pin produces a
+/// DIFFERENT artifact rather than the same one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleInventory {
+    pub pin: String,
+    /// (toolchain-relative path, sha256 hex of the file's bytes), sorted.
+    pub modules: Vec<(String, String)>,
+}
+
+impl ModuleInventory {
+    /// The name-set projection the corpus completeness comparison consumes.
+    pub fn to_pin_scan(&self) -> PinScan {
+        PinScan {
+            pin: self.pin.clone(),
+            tests: self
+                .modules
+                .iter()
+                .map(|(id, _)| OfficialTest {
+                    id: id.clone(),
+                    kind: OfficialTestKind::ElabExpected,
+                })
+                .collect(),
+        }
+    }
+}
+
+pub fn derive_module_scan(
+    toolchain: &Path,
+    pin: &str,
+) -> Result<Derived<ModuleInventory>, DeriveError> {
     let src = toolchain.join("src").join("lean");
     let mut found: Vec<String> = Vec::new();
     walk_lean(&src, &src, &mut found)?;
@@ -539,19 +578,28 @@ pub fn derive_module_scan(toolchain: &Path, pin: &str) -> Result<Derived<PinScan
         });
     }
 
-    let digest = set_digest(rules::MODULE_SCAN, &found);
-    let count = found.len();
-    let tests = found
-        .into_iter()
-        .map(|id| OfficialTest {
-            id,
-            kind: OfficialTestKind::ElabExpected,
-        })
+    // Content, not only names: a pin file edited in place leaves the name set
+    // identical, so under version 1 re-extraction reproduced the same artifact
+    // and the edit was invisible. Reading happens HERE, on the extraction side
+    // — the gate still consumes only the committed artifact text.
+    let mut modules: Vec<(String, String)> = Vec::with_capacity(found.len());
+    for rel in found {
+        let bytes = std::fs::read(src.join(&rel)).map_err(|e| DeriveError::SourceUnavailable {
+            path: src.join(&rel).display().to_string(),
+            detail: e.to_string(),
+        })?;
+        modules.push((rel, source_digest(&bytes)));
+    }
+    let keys: Vec<String> = modules
+        .iter()
+        .map(|(path, sha)| format!("{path}\u{1}{sha}"))
         .collect();
+    let digest = set_digest(rules::MODULE_SCAN, &keys);
+    let count = modules.len();
     Ok(Derived::new(
-        PinScan {
+        ModuleInventory {
             pin: pin.to_string(),
-            tests,
+            modules,
         },
         Provenance {
             // Recorded RELATIVE to the toolchain root, not as an absolute path.
@@ -589,14 +637,14 @@ fn walk_lean(base: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), Deriv
 }
 
 /// Render a committed module-inventory artifact.
-pub fn render_module_artifact(scan: &Derived<PinScan>) -> String {
+pub fn render_module_artifact(scan: &Derived<ModuleInventory>) -> String {
     let p = scan.provenance();
     let mut out = format!(
         "{MODULE_ARTIFACT_SCHEMA}\npin {}\nrule {}\nsource {}\ncount {}\ndigest {}\n",
         p.pin, p.rule, p.source, p.item_count, p.source_digest
     );
-    for t in &scan.value().tests {
-        out.push_str(&format!("module {}\n", t.id));
+    for (path, sha) in &scan.value().modules {
+        out.push_str(&format!("module {path} {sha}\n"));
     }
     out
 }
@@ -607,13 +655,13 @@ pub fn render_module_artifact(scan: &Derived<PinScan>) -> String {
 /// over its own rows; it never opens the toolchain, so no gate run consults the
 /// Reference. An artifact whose header disagrees with its rows — a row added,
 /// removed, or edited after publication — fails here.
-pub fn verify_module_artifact(text: &str) -> Result<Derived<PinScan>, DeriveError> {
+pub fn verify_module_artifact(text: &str) -> Result<Derived<ModuleInventory>, DeriveError> {
     let mut pin = None;
     let mut rule = None;
     let mut source = None;
     let mut count = None;
     let mut digest = None;
-    let mut modules: Vec<String> = Vec::new();
+    let mut modules: Vec<(String, String)> = Vec::new();
 
     let mut lines = text.lines().enumerate();
     match lines.next() {
@@ -646,7 +694,25 @@ pub fn verify_module_artifact(text: &str) -> Result<Derived<PinScan>, DeriveErro
             "source" => source = Some(v.to_string()),
             "count" => count = v.parse::<usize>().ok(),
             "digest" => digest = Some(v.to_string()),
-            "module" => modules.push(v.to_string()),
+            "module" => {
+                // Version 2 rows are `module <path> <sha256>`; a row without a
+                // content digest is a version-1 row wearing a version-2 header.
+                let Some((path, sha)) = v.rsplit_once(' ') else {
+                    return Err(DeriveError::Unparseable {
+                        path: "<artifact>".to_string(),
+                        line: idx + 1,
+                        detail: format!("module row without a content digest: {v:?}"),
+                    });
+                };
+                if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(DeriveError::Unparseable {
+                        path: "<artifact>".to_string(),
+                        line: idx + 1,
+                        detail: format!("module row with a malformed content digest: {sha:?}"),
+                    });
+                }
+                modules.push((path.to_string(), sha.to_string()));
+            }
             other => {
                 return Err(DeriveError::Unparseable {
                     path: "<artifact>".to_string(),
@@ -680,7 +746,14 @@ pub fn verify_module_artifact(text: &str) -> Result<Derived<PinScan>, DeriveErro
             ),
         });
     }
-    let recomputed = set_digest(rules::MODULE_SCAN, &modules);
+    // The digest is recomputed over the SAME keys the extraction side used —
+    // path and content together — so a row whose sha was edited after
+    // publication fails here exactly as an edited path does.
+    let keys: Vec<String> = modules
+        .iter()
+        .map(|(path, sha)| format!("{path}\u{1}{sha}"))
+        .collect();
+    let recomputed = set_digest(rules::MODULE_SCAN, &keys);
     if recomputed != digest {
         return Err(DeriveError::DigestMismatch {
             path: "<artifact>".to_string(),
@@ -689,17 +762,10 @@ pub fn verify_module_artifact(text: &str) -> Result<Derived<PinScan>, DeriveErro
         });
     }
 
-    let tests = modules
-        .into_iter()
-        .map(|id| OfficialTest {
-            id,
-            kind: OfficialTestKind::ElabExpected,
-        })
-        .collect();
     Ok(Derived::new(
-        PinScan {
+        ModuleInventory {
             pin: pin.clone(),
-            tests,
+            modules,
         },
         Provenance {
             source,
@@ -729,7 +795,11 @@ mod structural {
         v.dedup();
         assert_eq!(v.len(), n, "two derivations share a rule id");
         for r in all {
-            assert!(r.ends_with("/1"), "{r} is not versioned");
+            let (_, version) = r.rsplit_once('/').expect("rule ids carry /<version>");
+            assert!(
+                !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
+                "{r} is not versioned"
+            );
             assert!(r.starts_with("fln.derive."), "{r} is not namespaced");
         }
     }
