@@ -332,6 +332,8 @@ struct Citation {
     start: usize,
     end: usize,
     construct: String,
+    /// The item the cited line sits inside, for rows whose construct RECURS in its file.
+    site: Option<String>,
 }
 
 fn agents_md() -> String {
@@ -353,14 +355,123 @@ fn citation_registry(text: &str) -> Vec<Citation> {
                     (only, only)
                 }
             };
+            let (construct, site) = match construct.split_once(" @@ ") {
+                Some((construct, site)) => (construct, Some(site.trim().to_string())),
+                None => (construct, None),
+            };
             Some(Citation {
                 path: path.trim().to_string(),
                 start,
                 end,
                 construct: construct.trim().to_string(),
+                site,
             })
         })
         .collect()
+}
+
+/// `pub`, `pub(crate)`, `pub(super)` — removed so a visibility change is not a false drift.
+fn strip_visibility(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("pub") else {
+        return text;
+    };
+    let rest = rest.trim_start();
+    let rest = if rest.starts_with('(') {
+        rest.split_once(')').map_or(rest, |(_, after)| after)
+    } else {
+        rest
+    };
+    rest.trim_start()
+}
+
+/// The nearest item header at or above `line` (1-indexed): the citation's *site*.
+fn enclosing_item(lines: &[&str], line: usize) -> String {
+    const KINDS: [&str; 7] = ["fn", "impl", "struct", "enum", "trait", "const", "static"];
+    for raw in lines[..line.min(lines.len())].iter().rev() {
+        let text = strip_visibility(raw.trim_start());
+        let text = text.strip_prefix("async ").unwrap_or(text);
+        for kind in KINDS {
+            let Some(rest) = text
+                .strip_prefix(kind)
+                .and_then(|rest| rest.strip_prefix(' '))
+            else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| {
+                    c.is_alphanumeric() || matches!(c, '_' | ' ' | ':' | '<' | '>' | '\'')
+                })
+                .collect();
+            return format!("{kind} {}", name.trim());
+        }
+    }
+    "<top of file>".to_string()
+}
+
+/// Every way a row can RESOLVE while DENOTING something else, refused.
+///
+/// `region.contains(construct)` under-reports drift, and by how much was measured rather than
+/// reasoned: `0f2ae0ba` shifted four of this file's citations by 45 lines and only two
+/// reddened. Two shapes did it — a wide region absorbing the shift, and a needle recurring
+/// inside the region so another occurrence satisfied the check.
+///
+/// Measured over all 11 rows at `b58d0b09` before this rule existed: the recurring-in-region
+/// shape was **absent** and the wide-region shape covered **six** rows, worst tolerance 50
+/// lines. So the repair is width 1, which drives that tolerance to zero by construction, plus
+/// a site declaration for the one row whose construct recurs in its FILE — the only vector
+/// left once a citation names a single line.
+///
+/// The site field is required ONLY where the needle recurs. Elsewhere any shift already breaks
+/// containment, so a second assertion could never fail and would be decoration.
+fn denotation_complaints(citation: &Citation, body: &str) -> Vec<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let Citation {
+        path,
+        start,
+        end,
+        construct,
+        site,
+    } = citation;
+    let mut out = Vec::new();
+
+    if end != start {
+        out.push(format!(
+            "AGENTS.md cites {path}:{start}-{end}, a {}-line RANGE. A range tolerates any shift \
+             that keeps the construct inside it — measured at up to 50 lines on this registry — \
+             so a citation can resolve while denoting something else. Cite the single line the \
+             construct sits on. Width 1 reddens on any insertion above it, which is the point: \
+             it fails loudly where a range failed silently.",
+            end - start + 1
+        ));
+    }
+
+    let occurrences = lines
+        .iter()
+        .filter(|line| line.contains(construct.as_str()))
+        .count();
+    if occurrences > 1 {
+        match site {
+            None => out.push(format!(
+                "AGENTS.md cites `{construct}` in {path}, where it occurs {occurrences} times. At \
+                 width 1 a shift landing exactly on another occurrence still resolves, so this \
+                 row must name the item it sits inside: `cite {path}:{start} :: {construct} @@ \
+                 fn <name>`."
+            )),
+            Some(declared) => {
+                let actual = enclosing_item(&lines, *start);
+                if &actual != declared {
+                    out.push(format!(
+                        "AGENTS.md's row for {path}:{start} declares it sits inside `{declared}`, \
+                         but that line is inside `{actual}`. `{construct}` occurs {occurrences} \
+                         times, so the line still CONTAINS it and containment stays green — this \
+                         is the tolerance containment cannot see. Re-derive the citation."
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Every `<path>.<ext>:<line>` the prose cites, keyed by basename and start line.
@@ -454,13 +565,14 @@ fn every_agents_line_citation_points_at_the_construct_it_names() {
         rows.len()
     );
 
-    for Citation {
-        path,
-        start,
-        end,
-        construct,
-    } in &rows
-    {
+    for citation in &rows {
+        let Citation {
+            path,
+            start,
+            end,
+            construct,
+            ..
+        } = citation;
         let body = std::fs::read_to_string(root.join(path))
             .unwrap_or_else(|err| panic!("AGENTS.md cites {path}, which is unreadable: {err}"));
         let lines: Vec<&str> = body.lines().collect();
@@ -468,6 +580,15 @@ fn every_agents_line_citation_points_at_the_construct_it_names() {
             *start >= 1 && *end >= *start && *end <= lines.len(),
             "AGENTS.md cites {path}:{start}-{end}, but that file has {} lines",
             lines.len()
+        );
+
+        // RESOLVING is weaker than DENOTING, and the gap was measured at up to 50 lines on
+        // this very registry. Checked before containment because a range is refused outright.
+        let denotation = denotation_complaints(citation, &body);
+        assert!(
+            denotation.is_empty(),
+            "AGENTS.md's citation registry no longer denotes what it names:\n  {}",
+            denotation.join("\n  ")
         );
         let region = lines[start - 1..*end].join("\n");
         if region.contains(construct.as_str()) {
@@ -500,6 +621,98 @@ fn every_agents_line_citation_points_at_the_construct_it_names() {
              had been correct on the day it was written."
         );
     }
+}
+
+/// The denotation rules fire, are correctly scoped, and their MEASURED LIMIT is pinned here.
+///
+/// Driven over injected text, not the tree, and that is load-bearing rather than stylistic:
+/// after the repair AGENTS.md has **zero** rows whose construct recurs, so the site branch has
+/// no members and the real registry can never exercise it. A repaired population's live guard
+/// is unkillable; only a planted member still catches the mutant.
+#[test]
+fn the_denotation_rules_fire_and_their_measured_limit_is_pinned() {
+    let two_homes = "\
+fn first_home() {
+    let x = MARKER;
+}
+
+fn second_home() {
+    let y = MARKER;
+}
+";
+    let one_item = "\
+fn only_home() {
+    let a = MARKER;
+    let b = MARKER;
+}
+";
+    let unique = "fn solo_home() {\n    let z = SOLO;\n}\n";
+
+    let cite = |start: usize, end: usize, construct: &str, site: Option<&str>| Citation {
+        path: "tools/structure-guard/src/checks.rs".into(),
+        start,
+        end,
+        construct: construct.into(),
+        site: site.map(str::to_string),
+    };
+
+    // NEGATIVE CONTROL FIRST, or every cell below proves only that the function complains.
+    assert!(
+        denotation_complaints(&cite(2, 2, "SOLO", None), unique).is_empty(),
+        "a width-1 row with a unique construct must be silent"
+    );
+
+    // A range is refused outright — the shape that absorbed a 45-line shift.
+    let ranged = denotation_complaints(&cite(1, 7, "SOLO", None), unique);
+    assert!(
+        ranged.iter().any(|line| line.contains("7-line RANGE")),
+        "a range must be refused, naming its width: {ranged:?}"
+    );
+
+    // A recurring construct with no site declared is refused, naming the count.
+    let unsited = denotation_complaints(&cite(2, 2, "MARKER", None), two_homes);
+    assert!(
+        unsited
+            .iter()
+            .any(|l| l.contains("occurs 2 times") && l.contains("@@")),
+        "an unsited recurring row must say why and how to repair it: {unsited:?}"
+    );
+
+    // Declared and wrong.
+    let wrong = denotation_complaints(&cite(2, 2, "MARKER", Some("fn second_home")), two_homes);
+    assert!(
+        wrong
+            .iter()
+            .any(|l| l.contains("fn first_home") && l.contains("fn second_home")),
+        "a wrong site must name both declared and actual: {wrong:?}"
+    );
+
+    // Declared and right.
+    assert!(
+        denotation_complaints(&cite(6, 6, "MARKER", Some("fn second_home")), two_homes).is_empty(),
+        "a correct site must be accepted"
+    );
+
+    // SCOPING: a unique construct is exempt even with a wrong site, because containment
+    // already catches any shift and a second check there could never fail.
+    assert!(
+        denotation_complaints(&cite(2, 2, "SOLO", Some("fn nonsense")), unique).is_empty(),
+        "the site rule must not reach a construct that occurs once"
+    );
+
+    // THE MEASURED LIMIT, pinned so nobody reads the site rule as total. Two occurrences
+    // INSIDE ONE ITEM: the enclosing item is a coarser identity than the occurrence, so a
+    // citation on the wrong one is NOT caught. Measured against the real `FLN-STRUCT-024`
+    // row, whose seven occurrences all sit in `fn validate_constitutional_baseline`; that row
+    // was repaired by taking a unique needle instead, not by this mechanism.
+    assert!(
+        denotation_complaints(&cite(2, 2, "MARKER", Some("fn only_home")), one_item).is_empty()
+            && denotation_complaints(&cite(3, 3, "MARKER", Some("fn only_home")), one_item)
+                .is_empty(),
+        "this cell documents a KNOWN BLIND SPOT: within one item the site cannot discriminate. \
+         If it now fails, the rule got stronger — delete this cell and say so, do not weaken \
+         the rule to restore it."
+    );
 }
 
 /// Conservation, in both directions.
