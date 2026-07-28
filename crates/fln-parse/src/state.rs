@@ -47,6 +47,7 @@
 use fln_core::name::Name;
 use fln_syntax::source::BytePos;
 use fln_syntax::tree::Syntax;
+use std::sync::Arc;
 
 /// A precedence level. `Nat` upstream, so unsigned and unbounded there; `u32` here is far above
 /// any level the language uses and keeps the arithmetic total.
@@ -345,14 +346,20 @@ pub const PREC_MESSAGE: &str =
 /// A production: a function over the state, plus the precedence and priority it was declared
 /// with.
 ///
-/// A boxed closure rather than a trait object with associated types because the engine needs a
+/// A shared closure rather than a trait object with associated types because the engine needs a
 /// *homogeneous list* it can score against each other, which is what `longestMatchFn` consumes.
+///
+/// Sharing is semantic, not just an allocation optimization: a [`crate::registry::Registry`]
+/// must be able to materialize the executable grammar at an older epoch. Replacing a callback
+/// with a metadata-only stand-in would make the historical category look right while parsing
+/// differently. `Arc` lets a view retain the exact immutable callback and captured state.
+#[derive(Clone)]
 pub struct Production {
     /// The node kind this production builds, for diagnostics and for the category inventory.
     pub kind: Name,
     /// Declaration priority — the third and weakest component of the score.
     pub priority: u32,
-    pub run: Box<dyn Fn(&mut ParserState) + Send + Sync>,
+    pub run: Arc<dyn Fn(&mut ParserState) + Send + Sync>,
 }
 
 impl Production {
@@ -364,7 +371,7 @@ impl Production {
         Production {
             kind,
             priority,
-            run: Box::new(run),
+            run: Arc::new(run),
         }
     }
 }

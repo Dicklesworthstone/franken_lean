@@ -101,10 +101,19 @@ type Hook = Box<dyn Fn(&Name, &Name) + Send + Sync>;
 struct Registered {
     production: Production,
     /// The epoch at which this became visible. A lookup at epoch `e` includes it when
-    /// `at <= e` — which is the interleaving law.
-    at: GrammarEpoch,
-    /// `None` for a global registration; `Some(depth)` for one that dies with its scope.
+    /// `registered_at <= e` — which is the interleaving law.
+    registered_at: GrammarEpoch,
+    /// The first epoch at which this is no longer visible. Scope exit retires a registration
+    /// instead of deleting it so older epoch views remain stable and executable.
+    retired_at: Option<GrammarEpoch>,
+    /// `None` for a global registration; `Some(depth)` for one retired with its scope.
     scope: Option<ScopeDepth>,
+}
+
+impl Registered {
+    fn is_live_at(&self, epoch: GrammarEpoch) -> bool {
+        self.registered_at <= epoch && self.retired_at.is_none_or(|retired_at| epoch < retired_at)
+    }
 }
 
 /// The dynamic grammar: categories, their productions, and the scope stack.
@@ -118,6 +127,8 @@ pub struct Registry {
 
 struct CategoryState {
     name: Name,
+    /// The first epoch at which the category exists.
+    registered_at: GrammarEpoch,
     behavior: LeadingIdentBehavior,
     /// Append-only, per token. See the module docs: shadowing is additive.
     leading: BTreeMap<String, Vec<Registered>>,
@@ -152,16 +163,18 @@ impl Registry {
         if self.categories.contains_key(&key) {
             return Err(RegisterError::CategoryExists { name });
         }
+        let epoch = self.epoch.next();
         self.categories.insert(
             key,
             CategoryState {
                 name,
+                registered_at: epoch,
                 behavior,
                 leading: BTreeMap::new(),
                 trailing: BTreeMap::new(),
             },
         );
-        self.epoch = self.epoch.next();
+        self.epoch = epoch;
         Ok(self.epoch)
     }
 
@@ -222,7 +235,8 @@ impl Registry {
             };
             table.entry(token.into()).or_default().push(Registered {
                 production,
-                at: epoch,
+                registered_at: epoch,
+                retired_at: None,
                 scope,
             });
         }
@@ -238,32 +252,41 @@ impl Registry {
         self.epoch
     }
 
-    /// Close the innermost scope, discarding exactly the registrations it owns.
+    /// Close the innermost scope, retiring exactly the registrations it owns.
     ///
     /// Observed at the pin: `local notation` inside `section ... end` is gone after `end`, and with
     /// sections nested, `end` on the inner one leaves the outer one's registrations in place.
     ///
     /// The comparison is equality on depth. I first wrote here that a `>=` would take the
     /// enclosing scope with it, and **that was wrong** — the plant proved it, by failing to fail.
-    /// `>=` discards deeper-or-equal, and a scoped registration can never be deeper than the
-    /// current depth, so `>=` and `==` are the same function on every reachable state. The variant
-    /// that actually breaks the outer scope is `<=`, which discards shallower-or-equal; that one is
-    /// planted and caught. Recorded because a plausible-sounding claim about which comparison is
-    /// dangerous is worth exactly as much as the plant that checks it.
+    /// `>=` selects deeper-or-equal, and an active scoped registration can never be deeper than
+    /// the current depth, so `>=` and `==` are the same function on every reachable state. The
+    /// variant that actually breaks the outer scope is `<=`, which selects shallower-or-equal;
+    /// that one is planted and caught. Recorded because a plausible-sounding claim about which
+    /// comparison is dangerous is worth exactly as much as the plant that checks it.
+    ///
+    /// Retirement is stamped with the new epoch rather than physically removing the entry.
+    /// Thus the grammar at every earlier epoch remains byte-identical after a later `end`, while
+    /// the returned pop epoch observes the restored outer grammar.
     pub fn pop_scope(&mut self) -> Result<GrammarEpoch, RegisterError> {
         if self.depth.0 == 0 {
             return Err(RegisterError::NoScopeOpen);
         }
         let dying = self.depth;
+        let epoch = self.epoch.next();
         for state in self.categories.values_mut() {
             for table in [&mut state.leading, &mut state.trailing] {
                 for productions in table.values_mut() {
-                    productions.retain(|entry| entry.scope != Some(dying));
+                    for entry in productions {
+                        if entry.scope == Some(dying) && entry.retired_at.is_none() {
+                            entry.retired_at = Some(epoch);
+                        }
+                    }
                 }
             }
         }
         self.depth = ScopeDepth(self.depth.0 - 1);
-        self.epoch = self.epoch.next();
+        self.epoch = epoch;
         Ok(self.epoch)
     }
 
@@ -297,29 +320,19 @@ impl Registry {
     /// way to replay a parse against the grammar it actually had.
     pub fn view_at(&self, category: &Name, epoch: GrammarEpoch) -> Option<Category> {
         let state = self.categories.get(&category.to_display_string())?;
+        if state.registered_at > epoch {
+            return None;
+        }
         let mut view = Category::new(state.name.clone(), state.behavior);
         for (token, productions) in &state.leading {
-            for entry in productions.iter().filter(|entry| entry.at <= epoch) {
-                view.leading.insert(
-                    token.clone(),
-                    Production::new(entry.production.kind.clone(), entry.production.priority, {
-                        // The view holds a re-entrant copy: `Production` owns a boxed closure and
-                        // cannot be cloned, so the view's production delegates by kind. A view is
-                        // for *inspecting* which productions were live, which is what every
-                        // assertion in this bead needs.
-                        move |_state| {}
-                    }),
-                );
+            for entry in productions.iter().filter(|entry| entry.is_live_at(epoch)) {
+                view.leading.insert(token.clone(), entry.production.clone());
             }
         }
         for (token, productions) in &state.trailing {
-            for entry in productions.iter().filter(|entry| entry.at <= epoch) {
-                view.trailing.insert(
-                    token.clone(),
-                    Production::new(entry.production.kind.clone(), entry.production.priority, {
-                        move |_state| {}
-                    }),
-                );
+            for entry in productions.iter().filter(|entry| entry.is_live_at(epoch)) {
+                view.trailing
+                    .insert(token.clone(), entry.production.clone());
             }
         }
         Some(view)
@@ -333,13 +346,16 @@ impl Registry {
         let Some(state) = self.categories.get(&category.to_display_string()) else {
             return Vec::new();
         };
+        if state.registered_at > epoch {
+            return Vec::new();
+        }
         state
             .leading
             .get(token)
             .map(|productions| {
                 productions
                     .iter()
-                    .filter(|entry| entry.at <= epoch)
+                    .filter(|entry| entry.is_live_at(epoch))
                     .map(|entry| entry.production.kind.to_display_string())
                     .collect()
             })
@@ -431,11 +447,14 @@ impl Registry {
     pub fn grammar_root(&self, epoch: GrammarEpoch) -> GrammarRoot {
         let mut out = String::new();
         for (key, state) in &self.categories {
+            if state.registered_at > epoch {
+                continue;
+            }
             out.push_str(&format!("cat {key} {:?}\n", state.behavior));
             for (token, productions) in &state.leading {
                 let live: Vec<String> = productions
                     .iter()
-                    .filter(|entry| entry.at <= epoch)
+                    .filter(|entry| entry.is_live_at(epoch))
                     .map(|entry| entry.production.kind.to_display_string())
                     .collect();
                 if !live.is_empty() {
@@ -445,7 +464,7 @@ impl Registry {
             for (token, productions) in &state.trailing {
                 let live: Vec<String> = productions
                     .iter()
-                    .filter(|entry| entry.at <= epoch)
+                    .filter(|entry| entry.is_live_at(epoch))
                     .map(|entry| entry.production.kind.to_display_string())
                     .collect();
                 if !live.is_empty() {
@@ -458,6 +477,33 @@ impl Registry {
 
     /// How many productions are registered, live at the current epoch.
     pub fn production_count(&self) -> u64 {
+        let epoch = self.epoch;
+        self.categories
+            .values()
+            .map(|state| {
+                let count: usize = state
+                    .leading
+                    .values()
+                    .chain(state.trailing.values())
+                    .map(|productions| {
+                        productions
+                            .iter()
+                            .filter(|entry| entry.is_live_at(epoch))
+                            .count()
+                    })
+                    .sum();
+                count as u64
+            })
+            .sum()
+    }
+
+    /// How many production records the registry retains across every epoch.
+    ///
+    /// Historical callbacks occupy memory even when they are no longer live. Resource admission
+    /// therefore uses this count, while [`Self::production_count`] remains the public measure of
+    /// the current grammar. Treating retired history as free would let repeated local scopes grow
+    /// the registry without ever approaching `RegistryBudget::max_productions`.
+    fn retained_production_count(&self) -> u64 {
         self.categories
             .values()
             .map(|state| {
@@ -508,7 +554,7 @@ impl Registry {
                 categories,
             );
         }
-        let projected = self.production_count() + requests.len() as u64;
+        let projected = self.retained_production_count() + requests.len() as u64;
         if projected > budget.max_productions {
             // Checked BEFORE applying anything, so a refused batch leaves the grammar untouched —
             // the atomicity a caller needs to retry with a larger allowance.
@@ -537,7 +583,15 @@ fn exhausted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use crate::category::LeadingToken;
+    use crate::pratt::Lookup;
+    use crate::state::{ParserState, Resolution, longest_match};
+    use fln_syntax::source::{BytePos, SourceInfo};
+    use fln_syntax::tree::Syntax;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn name(text: &str) -> Name {
         Name::str(Name::anonymous(), text)
@@ -554,6 +608,20 @@ mod tests {
             .declare_category(term.clone(), LeadingIdentBehavior::Default)
             .expect("a fresh category declares");
         (registry, term)
+    }
+
+    fn run_leading(category: &Category, token: &str) -> (Resolution, ParserState) {
+        let lookup = category.leading_at(&LeadingToken::Atom(token.to_string()));
+        assert!(
+            matches!(lookup, Lookup::Productions(_)),
+            "a lexable atom must yield a production list"
+        );
+        let Lookup::Productions(productions) = lookup else {
+            return (Resolution::None, ParserState::new(0));
+        };
+        let mut state = ParserState::new(0);
+        let resolution = longest_match(&mut state, None, &productions);
+        (resolution, state)
     }
 
     /// **SHADOWING IS ADDITIVE.** Two productions under one token both stay registered.
@@ -874,28 +942,283 @@ mod tests {
         );
     }
 
-    /// A view at an epoch reports which productions were live, and the view is a `Category` the
-    /// engine's lookup accepts — so the interleaving law and the lookup law compose.
+    /// A historical view retains the exact parser callback, not merely its kind and priority.
+    ///
+    /// The callback is exercised through the real category lookup and `longest_match` path. A
+    /// metadata-only replacement can satisfy every inventory assertion while leaving the
+    /// position, precedence, syntax and captured effect unchanged; this cell binds all four.
     #[test]
-    fn a_view_at_an_epoch_is_a_usable_category() {
+    fn a_view_at_an_epoch_replays_the_original_production() {
         let (mut registry, term) = registry_with_term();
         let before = registry.epoch();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let callback_fired = Arc::clone(&fired);
         let after = registry
-            .add_leading(&term, "tok", production("p"), false)
+            .add_leading(
+                &term,
+                "tok",
+                Production::new(name("replayed"), 7, move |state| {
+                    callback_fired.fetch_add(1, Ordering::SeqCst);
+                    state.set_pos(BytePos(3));
+                    state.set_lhs_prec(41);
+                    state.push(Syntax::atom(
+                        SourceInfo::Synthetic {
+                            pos: BytePos(0),
+                            end_pos: BytePos(3),
+                            canonical: false,
+                        },
+                        "replayed",
+                    ));
+                }),
+                false,
+            )
             .expect("registers");
 
         let old = registry
             .view_at(&term, before)
-            .expect("the category exists");
+            .expect("the category already exists");
         assert!(
             old.leading.get("tok").is_none(),
             "the older view must not contain the later registration"
         );
-        let new = registry.view_at(&term, after).expect("exists");
+
+        let current = registry.view_at(&term, after).expect("exists");
+        let (resolution, state) = run_leading(&current, "tok");
+        assert_eq!(resolution, Resolution::Unique);
+        assert_eq!(state.pos(), BytePos(3));
+        assert_eq!(state.lhs_prec(), 41);
         assert!(
-            new.leading.get("tok").is_some(),
-            "the newer view must contain it"
+            matches!(state.back(), Some(Syntax::Atom { val, .. }) if val == "replayed"),
+            "the original callback must build its original syntax"
         );
-        assert_eq!(new.behavior, LeadingIdentBehavior::Default);
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "the historical view must invoke the captured callback exactly once"
+        );
+        assert_eq!(current.behavior, LeadingIdentBehavior::Default);
+    }
+
+    /// Trailing tables retain executable callbacks by the same law as leading tables.
+    #[test]
+    fn a_historical_view_replays_the_original_trailing_production() {
+        let (mut registry, term) = registry_with_term();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let callback_fired = Arc::clone(&fired);
+        let epoch = registry
+            .add_trailing(
+                &term,
+                "+",
+                Production::new(name("plus"), 3, move |state| {
+                    callback_fired.fetch_add(1, Ordering::SeqCst);
+                    let left = state.pop().unwrap_or(Syntax::Missing);
+                    state.set_pos(BytePos(4));
+                    state.set_lhs_prec(29);
+                    state.push(Syntax::node(name("plus"), vec![left]));
+                }),
+                false,
+            )
+            .expect("registers");
+        let historical = registry.view_at(&term, epoch).expect("exists");
+        let lookup = historical.trailing_at(&LeadingToken::Atom("+".to_string()));
+        assert!(
+            matches!(lookup, Lookup::Productions(_)),
+            "a lexable atom must yield a production list"
+        );
+        let Lookup::Productions(productions) = lookup else {
+            return;
+        };
+        let mut state = ParserState::new(0);
+        let resolution = longest_match(&mut state, Some(Syntax::Missing), &productions);
+
+        assert_eq!(resolution, Resolution::Unique);
+        assert_eq!(state.pos(), BytePos(4));
+        assert_eq!(state.lhs_prec(), 29);
+        assert!(
+            matches!(state.back(), Some(Syntax::Node { kind, args, .. }) if kind == &name("plus") && args == &[Syntax::Missing])
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    /// Scope exit changes the grammar from the pop epoch onward; it must not rewrite history.
+    #[test]
+    fn scope_exit_preserves_the_inside_epoch_and_retires_only_the_future() {
+        let (mut registry, term) = registry_with_term();
+        registry.push_scope();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let callback_fired = Arc::clone(&fired);
+        let inside = registry
+            .add_leading(
+                &term,
+                "local",
+                Production::new(name("local"), 0, move |state| {
+                    callback_fired.fetch_add(1, Ordering::SeqCst);
+                    state.set_pos(BytePos(5));
+                    state.push(Syntax::Missing);
+                }),
+                true,
+            )
+            .expect("registers");
+        let inside_root = registry.grammar_root(inside);
+
+        let outside = registry.pop_scope().expect("pops");
+
+        assert_eq!(
+            registry.grammar_root(inside),
+            inside_root,
+            "a later scope exit must not rewrite an earlier grammar root"
+        );
+        assert_eq!(
+            registry.kinds_at(&term, "local", inside),
+            vec!["local"],
+            "the inside epoch retains the local production"
+        );
+        assert!(
+            registry.kinds_at(&term, "local", outside).is_empty(),
+            "the pop epoch observes the restored grammar"
+        );
+
+        let historical = registry
+            .view_at(&term, inside)
+            .expect("the historical category exists");
+        let (resolution, state) = run_leading(&historical, "local");
+        assert_eq!(resolution, Resolution::Unique);
+        assert_eq!(state.pos(), BytePos(5));
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+        let restored = registry
+            .view_at(&term, outside)
+            .expect("the category survives its local production");
+        assert!(
+            restored.leading.get("local").is_none(),
+            "a current view must not expose a retired local production"
+        );
+    }
+
+    /// Reusing one numeric depth for a later scope creates a new lifetime, not a continuation of
+    /// the earlier scope.
+    #[test]
+    fn sequential_scopes_at_one_depth_have_disjoint_epoch_intervals() {
+        let (mut registry, term) = registry_with_term();
+        registry.push_scope();
+        let first = registry
+            .add_leading(&term, "same", production("first"), true)
+            .expect("registers first");
+        registry.pop_scope().expect("pops first");
+
+        registry.push_scope();
+        let second = registry
+            .add_leading(&term, "same", production("second"), true)
+            .expect("registers second");
+        let after_second = registry.pop_scope().expect("pops second");
+
+        assert_eq!(registry.kinds_at(&term, "same", first), vec!["first"]);
+        assert_eq!(
+            registry.kinds_at(&term, "same", second),
+            vec!["second"],
+            "the retired entry from the earlier scope must not revive when its depth is reused"
+        );
+        assert!(
+            registry.kinds_at(&term, "same", after_second).is_empty(),
+            "both local lifetimes are retired after the second pop"
+        );
+    }
+
+    /// Category declarations are grammar mutations too, so a pre-declaration epoch cannot see
+    /// the category merely because the registry object contains its later state.
+    #[test]
+    fn a_category_is_absent_before_its_declaration_epoch() {
+        let mut registry = Registry::new();
+        let term = name("term");
+        let before = registry.epoch();
+        let declared = registry
+            .declare_category(term.clone(), LeadingIdentBehavior::Default)
+            .expect("declares");
+
+        assert!(registry.view_at(&term, before).is_none());
+        assert_eq!(registry.grammar_root(before), GrammarRoot(String::new()));
+        assert!(registry.view_at(&term, declared).is_some());
+        assert!(
+            registry
+                .grammar_root(declared)
+                .0
+                .contains("cat term Default"),
+            "the declaration epoch activates the category"
+        );
+    }
+
+    /// Retired history is absent from the current grammar but still consumes retained storage.
+    #[test]
+    fn current_and_retained_production_counts_have_distinct_resource_meanings() {
+        let (mut registry, term) = registry_with_term();
+        registry.push_scope();
+        registry
+            .add_leading(&term, "old", production("old"), true)
+            .expect("registers");
+        registry.pop_scope().expect("pops");
+        assert_eq!(registry.production_count(), 0);
+
+        let request = || Request {
+            key: (0, "new".to_string()),
+            category: term.clone(),
+            token: "new".to_string(),
+            production: production("new"),
+            scoped: false,
+        };
+        let refused = registry.apply_batch_bounded(
+            vec![request()],
+            RegistryBudget {
+                max_categories: 1,
+                max_productions: 1,
+            },
+        );
+        assert!(
+            matches!(refused, Outcome::Inconclusive(_)),
+            "the retired callback is not live grammar, but it still occupies retained storage"
+        );
+        assert_eq!(
+            registry.production_count(),
+            0,
+            "resource refusal must leave the current grammar unchanged"
+        );
+
+        let admitted = registry.apply_batch_bounded(
+            vec![request()],
+            RegistryBudget {
+                max_categories: 1,
+                max_productions: 2,
+            },
+        );
+        assert!(
+            matches!(admitted, Outcome::Complete(Ok(_))),
+            "one retired and one live production fit a two-record storage budget"
+        );
+        assert_eq!(registry.production_count(), 1);
+    }
+
+    /// A current-grammar count does not accidentally include a retired callback merely because
+    /// it remains available to old views.
+    #[test]
+    fn production_count_reports_only_the_current_epoch() {
+        let (mut registry, term) = registry_with_term();
+        registry
+            .add_leading(&term, "global", production("global"), false)
+            .expect("registers global");
+        registry.push_scope();
+        registry
+            .add_leading(&term, "local", production("local"), true)
+            .expect("registers local");
+        assert_eq!(registry.production_count(), 2);
+        registry.pop_scope().expect("pops");
+        assert_eq!(registry.production_count(), 1);
+        assert_eq!(
+            registry.kinds_at(&term, "global", registry.epoch()),
+            vec!["global"]
+        );
+        assert!(
+            registry
+                .kinds_at(&term, "local", registry.epoch())
+                .is_empty()
+        );
     }
 }
