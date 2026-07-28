@@ -85,7 +85,7 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
 /// governs. [`decode_segmented_allowance`] removes the separators and refuses malformed rows.
 /// Exact-set equality, not this population count, is the law; the count is retained as an
 /// independently reviewed anti-vacuity witness and must shrink with a repaired row.
-const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 167;
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 168;
 const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0382d-7b",
     "041ad-4e0",
@@ -202,6 +202,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "ad2aa-8e1",
     "ad82f-b45",
     "ae906-30b",
+    "ae906-30b9c-c825f-08c80-095dd-15602-2edb5-44475",
     "ae967-368",
     "af265-46a",
     "b0611-5fc",
@@ -787,6 +788,22 @@ fn unique_temp_workspace(label: &str) -> Result<PathBuf, std::io::Error> {
     }
 }
 
+/// Resolve the tree Cargo invoked this test from without baking a checkout path into the binary.
+///
+/// The repository-wide audit is Git-backed, so the invocation tree is the authority it must read.
+/// A compile-time `env!` here would make a shared target directory capable of running a binary
+/// built in another checkout against that other checkout's evidence.
+fn invoking_workspace_root() -> PathBuf {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("Cargo must identify the invoking crate directory");
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .expect("the workspace root is two levels above the invoking crate directory")
+}
+
 fn must_git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> String {
     let mut child = Command::new("git")
         .arg("-C")
@@ -1256,7 +1273,7 @@ fn the_corpus_and_the_input_set_agree() {
 /// clone through backup refs.
 #[test]
 fn the_checked_in_producer_anchor_is_reachable_from_main() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = invoking_workspace_root();
     assert_eq!(
         classify_anchor(&repo, PRODUCER_COMMIT),
         AnchorReachability::MainReachable {
@@ -1277,7 +1294,7 @@ fn the_checked_in_producer_anchor_is_reachable_from_main() {
 /// permitted. Two consecutive moving snapshots remain a failure rather than being rendered clean.
 #[test]
 fn the_repository_wide_anchor_allowance_matches_main_in_both_directions() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = invoking_workspace_root();
     let first = audit_checked_in_repository(&repo);
     let result = if matches!(first, Err(AnchorInventoryRefusal::RepositoryChanged { .. })) {
         audit_checked_in_repository(&repo)
@@ -1287,10 +1304,14 @@ fn the_repository_wide_anchor_allowance_matches_main_in_both_directions() {
     let inventory =
         result.expect("the committed repository anchor inventory must be decidable and reviewed");
 
+    let declared = decode_segmented_allowance(LOCAL_BACKUP_ONLY_ALLOWANCE)
+        .expect("the production audit already accepted this allowance");
+    let reviewed_but_unavailable = inventory.missing_objects.intersection(&declared).count();
     assert_eq!(
-        inventory.local_backup_only.len(),
+        inventory.local_backup_only.len() + reviewed_but_unavailable,
         REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT,
-        "the exact-set audit passed, so its independently reviewed population must agree too"
+        "the exact-set audit passed, so its independently reviewed retained population must \
+         agree even in a transport clone that lacks forensic refs"
     );
     assert_eq!(
         inventory.candidate_origins.len(),

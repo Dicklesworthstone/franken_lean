@@ -89,8 +89,11 @@ use std::process::{Command, Stdio};
 /// measured, not theoretical — `k60n` watched four new unprotected rigs land in four commits
 /// under a green aggregate guard.
 const BACKUP_ONLY_ALLOWANCE: &[(&str, usize)] = &[
-    ("AGENTS.md", 2),
-    ("ci/VERIFICATION_MANIFEST.jsonl", 12),
+    // VDI4.1 deliberately records both the reviewed abbreviation and the full object identity
+    // for ae90630b. The exact identity set is guarded bidirectionally by golden_vellum; these
+    // per-file counts retain the independent multiplicity wall against duplicate citation growth.
+    ("AGENTS.md", 3),
+    ("ci/VERIFICATION_MANIFEST.jsonl", 14),
     ("ci/WORKSPACE_GRAPH.txt", 1),
     ("crates/fln-conformance/src/witness.rs", 3),
     (

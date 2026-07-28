@@ -398,11 +398,18 @@ impl NeedleDrift {
 /// alone is not enough — every guard body must be out of scope, not merely one's own.
 ///
 /// Checked in **both** directions: an entry that no longer diverges is refused as stale.
-pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[(
-    "crates/fln-conformance/src/tree_identity.rs",
-    "this module: needle fragments, the run-time read in manifest_dir_of, the failure prose \
-     naming the repair, and the decoy's own format string",
-)];
+pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
+    (
+        "crates/fln-conformance/src/tree_identity.rs",
+        "this module: needle fragments, the run-time read in manifest_dir_of, the failure prose \
+         naming the repair, and the decoy's own format string",
+    ),
+    (
+        "crates/fln-syntax/tests/golden_vellum.rs",
+        "the VDI4.1 Git audit reads CARGO_MANIFEST_DIR only at run time so a shared target cannot \
+         bake another checkout's evidence root into this test binary",
+    ),
+];
 
 /// Reconcile the precise needle against a coarser, independent one, per file.
 ///
