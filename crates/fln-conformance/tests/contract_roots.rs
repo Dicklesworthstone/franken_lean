@@ -662,41 +662,142 @@ fn every_vendored_source_the_olean_extractor_reads_is_recorded_in_its_contract()
     );
 }
 
-/// Both contracts must disclose the D5/D9 producer-side tree obligation as **UNMET**
+/// Both contracts must disclose that the D5/D9 producer-side tree obligation is now **met at the
+/// producer**, and must keep disclosing the one thing that is still not
 /// (bead `franken_lean-contract-pin-tree-producer-side-f8zo`).
 ///
-/// The obligation is real and unmet: `rev-parse`, `ls-tree` and `hash_object` occur zero times
-/// in either extractor, so no producer computes a tree identity. It is covered lane-side only.
-/// Without this test, an edit restoring a single-voice pin line — or softening "UNMET" to
-/// "verified by the lanes" — is caught only by the byte-compare and goes green again on the next
-/// regeneration, which is exactly the unwatched join the bead was split off for.
+/// This test previously required the word **UNMET**. That was correct while `rev-parse`, `ls-tree`
+/// and `hash_object` occurred zero times in either extractor. They still do — the repair does not
+/// reimplement tree hashing, it *calls* the predicate that already does it — so the needle had to
+/// move with the claim rather than be deleted. Without this, softening the disclosure back toward
+/// a single-voice pin line is caught only by the byte-compare and goes green on the next
+/// regeneration, which is the unwatched join this bead was split off for.
+///
+/// The residual disclosure is load-bearing and is asserted separately: the rendered bytes do NOT
+/// vary with the per-run outcome. They cannot — `scripts/e2e/contract_handoff.sh` builds its cold
+/// root with `git archive`, which yields a tree with no `.git`, and requires `--check` to exit 0
+/// there. An artifact that varied would report DRIFT for the ENVIRONMENT, which is the
+/// `franken_lean-worktree-gitdir-refusal-hugg` class one layer up. So a run whose establishment
+/// came back `inconclusive` renders these same bytes and only its stderr says so, and the contract
+/// must keep admitting that.
 #[test]
-fn both_contracts_disclose_the_producer_side_tree_obligation_as_unmet() {
+fn both_contracts_disclose_producer_side_tree_establishment_and_its_residual() {
     let root = root();
     for name in ["OLEAN_CONTRACT.md", "ABI_CONTRACT.md"] {
         let raw = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
         // Strip blockquote prefixes and collapse whitespace before matching. These blocks are
         // hard-wrapped by the renderer, so a needle that spans a wrap point tests the wrapping
-        // rather than the claim: `is **UNMET**` matched the `.olean` contract and missed the ABI
-        // one purely because the line broke between the two words.
+        // rather than the claim: `is **UNMET**` once matched the `.olean` contract and missed the
+        // ABI one purely because the line broke between the two words.
         let text = raw
             .lines()
             .map(|l| l.trim_start().trim_start_matches('>').trim())
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
-            text.contains("**UNMET**"),
-            "{name} must state the producer-side tree obligation is UNMET, not deferred or handled"
+            text.contains("established at the producer"),
+            "{name} must state the tree is established AT THE PRODUCER — that is the D5/D9 \
+             obligation this bead exists to meet"
         );
         assert!(
-            text.contains("LANE-SIDE only"),
-            "{name} must state the coverage is lane-side ONLY — a lane that covers it is not a \
-             producer that establishes it"
+            text.contains("scripts/evidence.py vendor-binding"),
+            "{name} must NAME the predicate it calls. A disclosure that says `established` without \
+             naming what establishes it is a claim with no producer, which is item 7's defect \
+             family arriving inside the repair for it"
+        );
+        assert!(
+            text.contains("inconclusive"),
+            "{name} must disclose the FL-INV-07 inconclusive state; an environment fault is never \
+             a verdict about the tree and never a silent pass"
+        );
+        assert!(
+            text.contains("NOT rendered here") || text.contains("NOT rendered"),
+            "{name} must disclose that the per-run outcome is NOT rendered into these bytes — the \
+             residual, and the reason `--check` does not drift for the environment"
         );
         assert!(
             text.contains("franken_lean-contract-pin-tree-producer-side-f8zo"),
-            "{name} must cite the bead tracking the unmet obligation, so the disclosure has a \
-             producer and cannot outlive the work"
+            "{name} must cite the bead, so the disclosure has a producer and cannot outlive the work"
+        );
+    }
+}
+
+/// The establishment block is duplicated in both extractors and must stay BYTE-IDENTICAL
+/// (bead `franken_lean-contract-pin-tree-producer-side-f8zo`).
+///
+/// The duplication is forced, not chosen. Both extractors are invoked `python3 -I -S`, and `-I`
+/// drops the script's own directory from `sys.path`, so a sibling import raises
+/// `ModuleNotFoundError` — measured, rc=1 under `-I -S` against rc=0 plain. The other candidate
+/// home, `scripts/evidence.py`, is the file the predicate is called *into*, not a producer.
+///
+/// So the choice was never "share or duplicate"; it was "duplicate watched or duplicate unwatched".
+/// This is the watch. Without it the two copies drift and one extractor silently stops establishing
+/// anything while its contract still says it does — a second copy of a predicate free to diverge,
+/// which is the defect this repository names most often.
+#[test]
+fn the_vendor_tree_establishment_block_is_byte_identical_in_both_extractors() {
+    const START: &str = "# --- producer-side vendor tree establishment (bead f8zo)";
+    const END: &str = "die(f\"vendor tree binding failed: {detail}\")";
+
+    let root = root();
+    let mut blocks = Vec::new();
+    for name in [
+        "scripts/extract/gen_abi_contract.py",
+        "scripts/extract/gen_olean_contract.py",
+    ] {
+        let text = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let start = text
+            .find(START)
+            .unwrap_or_else(|| panic!("{name} has no producer-side establishment block"));
+        let end = text
+            .rfind(END)
+            .unwrap_or_else(|| panic!("{name} has no establishment block terminator"))
+            + END.len();
+        assert!(
+            end > start,
+            "{name}: establishment block terminator precedes its start — refusing a broken scan"
+        );
+        let block = text[start..end].to_string();
+        // Anti-vacuity: two empty or trivially short slices compare equal, so a scan that located
+        // nothing would pass. The block is ~4.5 KB; this floor is far below that and far above a
+        // degenerate match.
+        assert!(
+            block.len() > 1000,
+            "{name}: establishment block is only {} bytes — refusing a broken scan rather than \
+             reporting two equal fragments as agreement",
+            block.len()
+        );
+        // The block must actually contain the call, not merely the banner comment.
+        assert!(
+            block.contains("vendor-binding") && block.contains("VENDOR_BINDING_ENVIRONMENT_REFUSALS"),
+            "{name}: establishment block does not contain the predicate call it exists to make"
+        );
+        blocks.push((name, block));
+    }
+
+    let (first_name, first) = &blocks[0];
+    let (second_name, second) = &blocks[1];
+    assert_eq!(
+        first, second,
+        "the producer-side establishment block has DRIFTED between {first_name} and {second_name}. \
+         It is duplicated because `python3 -I -S` forbids a sibling import, so the copies are held \
+         equal here instead. Re-sync them rather than relaxing this test"
+    );
+
+    // Both extractors must actually CALL it. A byte-identical block that nobody invokes is a
+    // producer that does not produce, and the contracts assert establishment happens every run.
+    for name in [
+        "scripts/extract/gen_abi_contract.py",
+        "scripts/extract/gen_olean_contract.py",
+    ] {
+        let text = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let calls = text.matches("report_vendor_tree_binding(").count();
+        assert!(
+            calls >= 2,
+            "{name} defines report_vendor_tree_binding but calls it {} time(s); the contract it \
+             renders says establishment runs on every run, so the definition and one call site are \
+             both required",
+            calls.saturating_sub(1)
         );
     }
 }

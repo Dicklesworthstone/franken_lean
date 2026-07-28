@@ -5,15 +5,26 @@
 >
 > pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35`
 > — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
-> — all three pin fields above are **transcribed from `SUITE.lock` and NOT
->   established by this extractor**: it verifies neither the tag, the commit,
->   nor the tree. The D5/D9 producer-side obligation to establish the tree is
->   **UNMET** — not deferred, and not handled elsewhere: no producer in this
->   repository computes a tree identity at all, and this gap is symmetric
->   across both contract extractors. Coverage is LANE-SIDE only, by
->   `scripts/verify_vendor_tree.sh`, which the contract lanes run before
->   extraction — so an extraction performed outside those lanes establishes no
->   tree identity whatever. Tracked as bead
+> — the tag and commit above are **transcribed from `SUITE.lock`** and this
+>   extractor verifies neither. The **tree is established at the producer**:
+>   every run, before anything is rendered, invokes the one predicate in this
+>   repository that establishes it — `scripts/evidence.py vendor-binding`,
+>   the same one `scripts/verify_vendor_tree.sh` runs lane-side — which
+>   recomputes the staged `vendor/lean4-src` tree and refuses unless it equals
+>   the pinned tree. The extractor calls that predicate rather than
+>   reimplementing tree hashing, so no second copy of it exists.
+> — the **outcome is typed on stderr and is deliberately NOT rendered here**,
+>   in three states: `established`; `inconclusive`, where the repository
+>   `.git` is absent or is not a directory so the predicate cannot run at all
+>   — an FL-INV-07 environment fault, never a verdict about the tree and
+>   never a silent pass; and a hard failure, which *is* a verdict and stops
+>   extraction. These bytes do not vary with that outcome on purpose: a cold
+>   root built by `git archive` has no `.git`, so an artifact that varied
+>   would report `--check` DRIFT for the ENVIRONMENT rather than for the
+>   contract. The artifact states the rule; the run states the result.
+> — so what remains UNESTABLISHED here is narrow and named: a run whose
+>   establishment came back `inconclusive` renders these same bytes, and
+>   only its stderr says so. Bead
 >   `franken_lean-contract-pin-tree-producer-side-f8zo`.
 > — what this extractor **does** establish: the vendored source below is
 >   byte-identical to the installed pinned toolchain's own copy of it, and the

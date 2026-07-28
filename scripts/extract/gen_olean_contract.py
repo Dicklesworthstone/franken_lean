@@ -98,6 +98,99 @@ def read_pin() -> dict:
     die("SUITE.lock has no reference row")
 
 
+# --- producer-side vendor tree establishment (bead f8zo) ---------------------
+# THE BLOCK FROM HERE TO THE END OF report_vendor_tree_binding IS BYTE-IDENTICAL
+# IN gen_abi_contract.py AND gen_olean_contract.py, and a conformance test
+# requires that. It is duplicated because it CANNOT be shared: both extractors
+# are invoked `python3 -I -S`, and `-I` drops the script's own directory from
+# sys.path, so a sibling import raises ModuleNotFoundError -- measured, rc=1
+# under `-I -S` against rc=0 plain. The other candidate home, scripts/evidence.py,
+# is the file this predicate is called INTO and is not a producer. The
+# duplication is therefore forced rather than chosen, and binding the two copies
+# turns it into a watched join instead of a second copy free to drift.
+VENDOR_BINDING_ENVIRONMENT_REFUSALS = (
+    "requires an explicit repository .git directory",
+    "requires a real repository .git directory",
+)
+
+
+def establish_vendor_tree_binding() -> tuple[str, str]:
+    """Establish the vendor tree identity at the PRODUCER (D5/D9, bead f8zo).
+
+    Neither contract extractor established the tree it rendered: rev-parse,
+    ls-tree and hash_object occurred ZERO times in both. This calls the one
+    predicate in this repository that does establish it -- `vendor-binding` in
+    scripts/evidence.py, the same predicate scripts/verify_vendor_tree.sh runs
+    lane-side -- rather than reimplementing tree hashing, which would plant a
+    second copy of the predicate.
+
+    THE CLASSIFICATION IS ON THE MESSAGE, NEVER THE EXIT CODE. Measured, one
+    variable, three roots identical but for the shape of `.git`: an absent
+    `.git` and a gitdir-pointer `.git` both refuse inside run_git, while a real
+    `.git` directory reaches PAST run_git and fails on git's own terms. All
+    three exit 2, so the exit code discriminates nothing.
+
+      "established"  the working vendor tree IS the pinned tree. vendor-binding
+                     compares it against SUITE.lock itself and raises on
+                     mismatch, so a zero exit IS the establishment.
+      "inconclusive" the repository `.git` is absent or is not a directory, so
+                     the predicate cannot run at all. FL-INV-07: an environment
+                     fault is Inconclusive, never a verdict about the claim and
+                     never a silent pass. A linked worktree and an rch worker
+                     checkout are both this case.
+      "failed"       anything else, which IS a verdict about the claim.
+
+    WHY THIS RETURNS A STATE INSTEAD OF WRITING ONE, and it is the reason the
+    rendered disclosure states a RULE rather than a per-run result:
+    scripts/e2e/contract_handoff.sh builds its cold root with `git archive`,
+    which produces a tree with NO `.git`, and then requires `--check` to exit 0
+    there -- measured, 672 MB, both extractors exit 0 today. An artifact whose
+    bytes varied with this outcome would report DRIFT for the ENVIRONMENT in
+    that lane, which is the franken_lean-worktree-gitdir-refusal-hugg class one
+    layer up: in the artifact instead of in the tool. So the outcome is reported
+    on stderr, which nothing compares, and the artifact text is invariant.
+    """
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(ROOT / "scripts" / "evidence.py"),
+            "vendor-binding",
+            "--root",
+            str(ROOT),
+            "--vendor-path",
+            "vendor/lean4-src",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode == 0:
+        try:
+            binding = json.loads(completed.stdout)
+        except ValueError:
+            return ("failed", "vendor-binding exited 0 with unparseable output")
+        return (
+            "established",
+            f"commit={binding.get('commit', '?')} tree={binding.get('tree', '?')}",
+        )
+    message = (completed.stderr or completed.stdout).strip()
+    last = message.splitlines()[-1] if message else "no diagnostic"
+    for needle in VENDOR_BINDING_ENVIRONMENT_REFUSALS:
+        if needle in message:
+            return ("inconclusive", last)
+    return ("failed", last)
+
+
+def report_vendor_tree_binding(producer: str) -> None:
+    """Run the establishment, type the outcome on stderr, and fail only on a claim failure."""
+    state, detail = establish_vendor_tree_binding()
+    print(f"{producer}: vendor-tree-binding {state}: {detail}", file=sys.stderr)
+    if state == "failed":
+        die(f"vendor tree binding failed: {detail}")
+
+
 def src_meta(path: Path) -> dict:
     text = path.read_text(encoding="utf-8")
     return {
@@ -1750,13 +1843,27 @@ def render_markdown(inv: dict, digest: str) -> str:
     w.append(">   Reference binary's `lean --version` and against every pinned `.olean`")
     w.append(">   artifact's `lean_version` and `githash` fields.")
     if pin["tree"]:
-        w.append(f"> — tree `{pin['tree']}` is **transcribed from `SUITE.lock` and NOT")
-        w.append(">   established by this extractor**. The D5/D9 producer-side obligation to")
-        w.append(">   establish it is **UNMET** — not deferred, and not handled elsewhere: no")
-        w.append(">   producer in this repository computes a tree identity at all. Coverage is")
-        w.append(">   LANE-SIDE only, by `scripts/verify_vendor_tree.sh`, which the contract")
-        w.append(">   lanes run before extraction — so an extraction performed outside those")
-        w.append(">   lanes establishes no tree identity whatever. Tracked as bead")
+        w.append(f"> — tree `{pin['tree']}` is transcribed from `SUITE.lock` and is now")
+        w.append(">   **established at the producer**: every run, before anything is")
+        w.append(">   rendered, invokes the one predicate in this repository that establishes")
+        w.append(">   it — `scripts/evidence.py vendor-binding`, the same one")
+        w.append(">   `scripts/verify_vendor_tree.sh` runs lane-side — which recomputes the")
+        w.append(">   staged `vendor/lean4-src` tree and refuses unless it equals the pinned")
+        w.append(">   tree. The extractor calls that predicate rather than reimplementing")
+        w.append(">   tree hashing, so no second copy of it exists.")
+        w.append("> — the **outcome is typed on stderr and is deliberately NOT rendered")
+        w.append(">   here**, in three states: `established`; `inconclusive`, where the")
+        w.append(">   repository `.git` is absent or is not a directory so the predicate")
+        w.append(">   cannot run at all — an FL-INV-07 environment fault, never a verdict")
+        w.append(">   about the tree and never a silent pass; and a hard failure, which *is*")
+        w.append(">   a verdict and stops extraction. These bytes do not vary with that")
+        w.append(">   outcome on purpose: a cold root built by `git archive` has no `.git`,")
+        w.append(">   so an artifact that varied would report `--check` DRIFT for the")
+        w.append(">   ENVIRONMENT rather than for the contract. The artifact states the rule;")
+        w.append(">   the run states the result.")
+        w.append("> — so what remains UNESTABLISHED here is narrow and named: a run whose")
+        w.append(">   establishment came back `inconclusive` renders these same bytes, and")
+        w.append(">   only its stderr says so. Bead")
         w.append(">   `franken_lean-contract-pin-tree-producer-side-f8zo`.")
         w.append("> — what IS bound here is *content*: a sha256 is recorded below for **every**")
         w.append(">   vendored source this extractor reads, and that set is DERIVED from the")
@@ -1876,6 +1983,10 @@ def main() -> int:
     if unknown:
         die(f"unknown arguments: {unknown}; supported usage is optional --check")
     check = "--check" in arguments
+    # D5/D9 provenance at the producer: establish the tree BEFORE rendering
+    # anything that describes it. Typed on stderr; hard-fails only on a verdict
+    # about the claim, never on an environment fault (bead f8zo).
+    report_vendor_tree_binding("gen_olean_contract")
     output_paths = [
         INVENTORY_PATH,
         EXACT_FORMAT_PATH,
