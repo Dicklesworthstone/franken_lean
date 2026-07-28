@@ -33,16 +33,21 @@
 //! runs, or enforces what the sentence says. A claim citing a deleted test still counts as
 //! bound.
 //!
-//! Making the producer *denote* is pfei R2, and **two kinds of referent are now walked**. Line
+//! Making the producer *denote* is pfei R2, and **four kinds of referent are now walked**. Line
 //! citations came first: the kind whose denotation is mechanical, and also the worst — eight of
 //! twelve were pointing at the wrong code. **Test-function names came second**, at `984a1555`,
 //! and are the kind whose denotation is load-bearing: a cited test is how a sentence claims to
 //! be enforced per commit, so a cited test that does not exist, is ambiguous, is `#[ignore]`d or
-//! sits outside every walked member is a claim with no producer. Both halves live below.
+//! sits outside every walked member is a claim with no producer. **Operational referents came
+//! third**: lane and workflow paths must exist and be reachable from CI, and bead IDs must resolve
+//! in the tracker. The Python census remains the sole sentence extractor; this Rust side consumes
+//! its line protocol rather than reimplementing the enforcement-claim regex.
 //!
-//! The kinds still **not** resolved: a cited lane is not required to be registered in
-//! `scripts/check.sh` and `ci.yml`, and a cited bead is not required to be in the tracker. Read
-//! the census's `bound` figure with that scope in mind — R2 is part walked, not done.
+//! R3 binds every still-unbound claim to one reviewed-unwalked row, under a ceiling. That is an
+//! honest inventory, not executable proof of each reason. R5 adds an independent live-population
+//! floor, so softening a sentence, lowering the disclosure, and deleting its review row is a typed
+//! refusal. What remains unwatched is semantic truth: an existing test, lane, workflow, bead, or
+//! source site can still fail to enforce the sentence's argument.
 
 #![forbid(unsafe_code)]
 
@@ -50,7 +55,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use fln_conformance::execution::{ignored_tests, test_functions, workspace_member_patterns};
+use fln_conformance::execution::{
+    Field, TriggerReachability, ignored_tests, logical_lines, record_field, test_functions,
+    trigger_reachability, workspace_member_patterns,
+};
 
 const CENSUS: &str = "scripts/agents_enforcement_census.py";
 
@@ -1321,5 +1329,533 @@ fn an_allowance_that_outlived_its_reason_is_refused() {
         findings.iter().any(|f| f.starts_with("stale allowance")
             && f.contains("present_olean_corpus_thread_matrix_compares_stream_digests")),
         "an ignored-citation allowance must shrink when the test starts running: {findings:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// pfei R2, operational referents — lanes/workflows must be reachable, beads must resolve.
+//
+// The Python census remains the only authority for which sentences are enforcement claims. It
+// emits the three operational referent kinds as a deliberately tiny line protocol; this side
+// resolves them against the live repository. Re-implementing ENFORCE here would create two
+// populations that could shrink together and agree perfectly while dropping a claim.
+// ------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperationalKind {
+    Lane,
+    Workflow,
+    Bead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OperationalReferent {
+    line: usize,
+    kind: OperationalKind,
+    value: String,
+}
+
+fn extract_operational_referents(agents: &Path) -> Result<Vec<OperationalReferent>, String> {
+    let root = workspace_root();
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg("-S")
+        .arg("-B")
+        .arg(root.join(CENSUS))
+        .arg("--referents")
+        .arg("--agents")
+        .arg(agents)
+        .current_dir(&root)
+        .output()
+        .map_err(|error| format!("{CENSUS} --referents could not run: {error}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{CENSUS} --referents exited {:?}:\n{}{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout)
+        .map_err(|error| format!("{CENSUS} --referents emitted non-UTF-8: {error}"))?;
+    let mut referents = Vec::new();
+    for (output_line, raw) in stdout.lines().enumerate() {
+        if raw.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = raw.split('\t').collect();
+        if fields.len() != 3 {
+            return Err(format!(
+                "{CENSUS} --referents line {} has {} tab-separated fields, expected 3: {raw:?}",
+                output_line + 1,
+                fields.len()
+            ));
+        }
+        let line = fields[0].parse().map_err(|error| {
+            format!(
+                "{CENSUS} --referents line {} has a non-numeric AGENTS.md line {:?}: {error}",
+                output_line + 1,
+                fields[0]
+            )
+        })?;
+        let kind = match fields[1] {
+            "lane" => OperationalKind::Lane,
+            "workflow" => OperationalKind::Workflow,
+            "bead" => OperationalKind::Bead,
+            other => {
+                return Err(format!(
+                    "{CENSUS} --referents line {} has unknown kind {other:?}",
+                    output_line + 1
+                ));
+            }
+        };
+        if fields[2].is_empty() {
+            return Err(format!(
+                "{CENSUS} --referents line {} has an empty value",
+                output_line + 1
+            ));
+        }
+        referents.push(OperationalReferent {
+            line,
+            kind,
+            value: fields[2].to_string(),
+        });
+    }
+    Ok(referents)
+}
+
+struct OperationalInputs {
+    check_sh: String,
+    ci: String,
+    beads: String,
+}
+
+fn operational_inputs(root: &Path) -> OperationalInputs {
+    let read = |path: &str| {
+        std::fs::read_to_string(root.join(path)).unwrap_or_else(|error| {
+            panic!("operational referent input {path} is unreadable: {error}")
+        })
+    };
+    OperationalInputs {
+        check_sh: read("scripts/check.sh"),
+        ci: read(".github/workflows/ci.yml"),
+        beads: read(".beads/issues.jsonl"),
+    }
+}
+
+const MIN_LIVE_BEAD_REFERENTS: usize = 4;
+
+fn judge_operational_referents(
+    root: &Path,
+    referents: &[OperationalReferent],
+    inputs: &OperationalInputs,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    let check_lines = logical_lines(&inputs.check_sh);
+    let ci_lines = logical_lines(&inputs.ci);
+    let ci_reachability = trigger_reachability(&inputs.ci);
+
+    let mut tracker_ids = BTreeSet::new();
+    let mut malformed_tracker_lines = Vec::new();
+    for (index, line) in inputs.beads.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match record_field(line, "id") {
+            Some(Field::Text(id)) => {
+                tracker_ids.insert(id);
+            }
+            _ => malformed_tracker_lines.push(index + 1),
+        }
+    }
+    if !malformed_tracker_lines.is_empty() {
+        findings.push(format!(
+            "tracker-unreadable: .beads/issues.jsonl has record(s) without a decodable text id at \
+             lines {malformed_tracker_lines:?}; a broken tracker reader is inconclusive, never a \
+             clean referent population"
+        ));
+    }
+
+    let live_beads: BTreeSet<&str> = referents
+        .iter()
+        .filter(|referent| referent.kind == OperationalKind::Bead)
+        .map(|referent| referent.value.as_str())
+        .collect();
+    if live_beads.len() < MIN_LIVE_BEAD_REFERENTS {
+        findings.push(format!(
+            "operational scan floor: only {} unique bead referent(s) were derived; \
+             {MIN_LIVE_BEAD_REFERENTS} were live when this binding landed. An empty referent \
+             stream and a document with none look identical without this floor.",
+            live_beads.len()
+        ));
+    }
+
+    for referent in referents {
+        match referent.kind {
+            OperationalKind::Lane => {
+                if !root.join(&referent.value).is_file() {
+                    findings.push(format!(
+                        "lane-denotes-nothing: AGENTS.md:{} names {}, which is not a file",
+                        referent.line, referent.value
+                    ));
+                    continue;
+                }
+                if !check_lines
+                    .iter()
+                    .any(|line| line.contains(&referent.value))
+                {
+                    findings.push(format!(
+                        "lane-not-registered: AGENTS.md:{} names {}, but no logical non-comment \
+                         scripts/check.sh line names it",
+                        referent.line, referent.value
+                    ));
+                }
+                let invocation = format!("./{}", referent.value);
+                if !ci_lines.iter().any(|line| line.contains(&invocation)) {
+                    findings.push(format!(
+                        "lane-not-executed: AGENTS.md:{} names {}, but .github/workflows/ci.yml \
+                         never executes {invocation}",
+                        referent.line, referent.value
+                    ));
+                }
+                if ci_reachability != TriggerReachability::Reachable {
+                    findings.push(format!(
+                        "lane-ci-unreachable: AGENTS.md:{} names {}, but ci.yml's top-level \
+                         trigger is {ci_reachability:?}; job text cannot execute from a workflow \
+                         that cannot fire",
+                        referent.line, referent.value
+                    ));
+                }
+            }
+            OperationalKind::Workflow => {
+                let path = root.join(&referent.value);
+                if !path.is_file() {
+                    findings.push(format!(
+                        "workflow-denotes-nothing: AGENTS.md:{} names {}, which is not a file",
+                        referent.line, referent.value
+                    ));
+                    continue;
+                }
+                let body = if referent.value == ".github/workflows/ci.yml" {
+                    inputs.ci.clone()
+                } else {
+                    match std::fs::read_to_string(&path) {
+                        Ok(body) => body,
+                        Err(error) => {
+                            findings.push(format!(
+                                "workflow-unreadable: AGENTS.md:{} names {}, which cannot be read: \
+                                 {error}",
+                                referent.line, referent.value
+                            ));
+                            continue;
+                        }
+                    }
+                };
+                match trigger_reachability(&body) {
+                    TriggerReachability::Reachable => {}
+                    TriggerReachability::NeverFires => findings.push(format!(
+                        "workflow-never-fires: AGENTS.md:{} names {}, but it has no top-level on \
+                         key",
+                        referent.line, referent.value
+                    )),
+                    TriggerReachability::Unreadable => findings.push(format!(
+                        "workflow-trigger-unreadable: AGENTS.md:{} names {}, whose trigger cannot \
+                         be classified; inconclusive is not reachable",
+                        referent.line, referent.value
+                    )),
+                }
+            }
+            OperationalKind::Bead => {
+                if !tracker_ids.contains(&referent.value) {
+                    findings.push(format!(
+                        "bead-denotes-nothing: AGENTS.md:{} names {}, which has no record in \
+                         .beads/issues.jsonl",
+                        referent.line, referent.value
+                    ));
+                }
+            }
+        }
+    }
+    findings
+}
+
+#[test]
+fn every_agents_operational_referent_denotes_a_reachable_producer() {
+    let root = workspace_root();
+    let referents = extract_operational_referents(&root.join("AGENTS.md"))
+        .expect("the operational referent stream must parse");
+    let findings = judge_operational_referents(&root, &referents, &operational_inputs(&root));
+    assert!(
+        findings.is_empty(),
+        "AGENTS.md names operational producers that do not denote or cannot run:\n\n{}",
+        findings.join("\n\n")
+    );
+}
+
+#[test]
+fn planted_missing_lane_and_bead_referents_are_refused_then_deletion_is_clean() {
+    let root = workspace_root();
+    let inputs = operational_inputs(&root);
+    let (_guard, planted) = doctored(|text| {
+        text + "\nCI refuses a planted missing lane through \
+                scripts/e2e/pfei_planted_missing_lane.sh.\n\
+                A planted release blocks the gate under bead \
+                `fln-pfei-planted-missing-bead`.\n"
+    });
+    let referents = extract_operational_referents(&planted).expect("the planted stream parses");
+    let findings = judge_operational_referents(&root, &referents, &inputs);
+    assert!(
+        findings.iter().any(|finding| {
+            finding.starts_with("lane-denotes-nothing")
+                && finding.contains("pfei_planted_missing_lane.sh")
+        }),
+        "the planted missing lane was not refused: {findings:?}"
+    );
+    assert!(
+        findings.iter().any(|finding| {
+            finding.starts_with("bead-denotes-nothing")
+                && finding.contains("fln-pfei-planted-missing-bead")
+        }),
+        "the planted missing bead was not refused: {findings:?}"
+    );
+
+    let restored =
+        extract_operational_referents(&root.join("AGENTS.md")).expect("the restored stream parses");
+    let findings = judge_operational_referents(&root, &restored, &inputs);
+    assert!(
+        findings.is_empty(),
+        "deleting only the planted referents must return the real document to silence: \
+         {findings:?}"
+    );
+}
+
+fn without_top_level_on(workflow: &str) -> String {
+    let lines: Vec<&str> = workflow.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| {
+            !line.starts_with([' ', '\t'])
+                && line
+                    .split_once(':')
+                    .is_some_and(|(key, _)| key.trim().trim_matches(['"', '\'']) == "on")
+        })
+        .expect("control needs ci.yml's top-level on key");
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| {
+            !line.trim().is_empty()
+                && !line.trim_start().starts_with('#')
+                && !line.starts_with([' ', '\t'])
+        })
+        .map_or(lines.len(), |(index, _)| index);
+    let mut kept = Vec::new();
+    kept.extend_from_slice(&lines[..start]);
+    kept.extend_from_slice(&lines[end..]);
+    kept.join("\n") + "\n"
+}
+
+#[test]
+fn a_real_lane_requires_check_registration_ci_execution_and_a_reachable_trigger() {
+    let root = workspace_root();
+    let lane = "scripts/e2e/closure_audit.sh";
+    let (_guard, planted) = doctored(|text| {
+        text + "\nCI refuses a closure regression through scripts/e2e/closure_audit.sh.\n\
+                CI refuses a dormant workflow through .github/workflows/ci.yml.\n"
+    });
+    let referents = extract_operational_referents(&planted).expect("the planted stream parses");
+    let inputs = operational_inputs(&root);
+    let baseline = judge_operational_referents(&root, &referents, &inputs);
+    assert!(
+        baseline.is_empty(),
+        "the real closure-audit lane and ci workflow must be a clean positive control: {baseline:?}"
+    );
+
+    assert!(
+        inputs.check_sh.contains(lane),
+        "control needs the real check.sh registration"
+    );
+    let no_registration = OperationalInputs {
+        check_sh: inputs
+            .check_sh
+            .replace(lane, "scripts/e2e/pfei_muted_registration.sh"),
+        ci: inputs.ci.clone(),
+        beads: inputs.beads.clone(),
+    };
+    let findings = judge_operational_referents(&root, &referents, &no_registration);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("lane-not-registered")),
+        "removing only the check.sh registration must be refused: {findings:?}"
+    );
+
+    let invocation = format!("./{lane}");
+    assert!(
+        inputs.ci.contains(&invocation),
+        "control needs ci.yml's real lane execution"
+    );
+    let no_execution = OperationalInputs {
+        check_sh: inputs.check_sh.clone(),
+        ci: inputs
+            .ci
+            .replace(&invocation, "./scripts/e2e/pfei_muted_execution.sh"),
+        beads: inputs.beads.clone(),
+    };
+    let findings = judge_operational_referents(&root, &referents, &no_execution);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("lane-not-executed")),
+        "removing only CI's execution must be refused: {findings:?}"
+    );
+
+    let unreachable = without_top_level_on(&inputs.ci);
+    assert_ne!(
+        trigger_reachability(&unreachable),
+        TriggerReachability::Reachable,
+        "the trigger mutant must actually make ci.yml unreachable"
+    );
+    let no_trigger = OperationalInputs {
+        check_sh: inputs.check_sh,
+        ci: unreachable,
+        beads: inputs.beads,
+    };
+    let findings = judge_operational_referents(&root, &referents, &no_trigger);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.starts_with("lane-ci-unreachable"))
+            && findings
+                .iter()
+                .any(|finding| finding.starts_with("workflow-never-fires")),
+        "removing only the top-level trigger must redden both lane and workflow joins: \
+         {findings:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// pfei R3/R5 — every still-unbound claim is declared; wording-only shrinkage is refused.
+// ------------------------------------------------------------------------------------------
+
+fn disclosed_reviewed_count() -> usize {
+    let text = agents_md();
+    let line = text
+        .lines()
+        .find(|line| line.contains("enforcement-census: live="))
+        .expect("AGENTS.md's census disclosure");
+    line.split_once("reviewed=")
+        .and_then(|(_, rest)| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .unwrap_or_else(|| panic!("cannot read reviewed= from disclosure line: {line:?}"))
+}
+
+fn replace_disclosure_value(text: String, key: &str, before: usize, after: usize) -> String {
+    let needle = format!("{key}={before}");
+    assert_eq!(
+        text.matches(&needle).count(),
+        1,
+        "control must change exactly the disclosure's {needle:?} field"
+    );
+    text.replacen(&needle, &format!("{key}={after}"), 1)
+}
+
+#[test]
+fn a_new_unbound_claim_without_a_review_row_is_refused() {
+    let (live, _, unbound, _) = disclosed_counts();
+    let (_guard, path) = doctored(|text| {
+        let text = replace_disclosure_value(text, "live", live, live + 1);
+        let text = replace_disclosure_value(text, "unbound", unbound, unbound + 1);
+        text + "\nA planted registry decoy: CI refuses every undeclared PFEI remainder.\n"
+    });
+    let (code, output) = run(Some(&path));
+    assert_eq!(
+        code, 1,
+        "the missing review row must be a typed red:\n{output}"
+    );
+    assert!(
+        output.contains("matches 0 reviewed-unwalked rows")
+            && output.contains("undeclared PFEI remainder"),
+        "the refusal must name the newly unreviewed claim: {output}"
+    );
+}
+
+#[test]
+fn a_claim_becoming_bound_makes_its_old_review_row_stale() {
+    let (_, bound, unbound, _) = disclosed_counts();
+    let needle = "documentation CI rejects wording stronger than the matrix permits";
+    let (_guard, path) = doctored(|text| {
+        assert_eq!(
+            text.matches(needle).count(),
+            1,
+            "control needs the unique PFEI-U01 claim"
+        );
+        let text = text.replace(
+            needle,
+            &format!("{needle} through `scripts/agents_enforcement_census.py`"),
+        );
+        let text = replace_disclosure_value(text, "bound", bound, bound + 1);
+        replace_disclosure_value(text, "unbound", unbound, unbound - 1)
+    });
+    let (code, output) = run(Some(&path));
+    assert_eq!(code, 1, "a stale review row must be refused:\n{output}");
+    assert!(
+        output.contains("reviewed-unwalked PFEI-U01")
+            && output.contains("matches 0 still-unbound claims"),
+        "the stale row must be named, not silently retained: {output}"
+    );
+}
+
+#[test]
+fn a_seventeenth_reviewed_remainder_exceeds_the_deliberate_ceiling() {
+    let (live, _, unbound, _) = disclosed_counts();
+    let reviewed = disclosed_reviewed_count();
+    let (_guard, path) = doctored(|text| {
+        let text = replace_disclosure_value(text, "live", live, live + 1);
+        let text = replace_disclosure_value(text, "unbound", unbound, unbound + 1);
+        let text = replace_disclosure_value(text, "reviewed", reviewed, reviewed + 1);
+        text + "\nA planted ceiling claim: CI refuses every seventeenth reviewed remainder.\n\
+                > reviewed-unwalked PFEI-U17 :: CI refuses every seventeenth reviewed remainder \
+                :: planted unique ceiling control\n"
+    });
+    let (code, output) = run(Some(&path));
+    assert_eq!(code, 1, "allowance growth must be deliberate:\n{output}");
+    assert!(
+        output.contains("registry has 17 rows against ceiling 16"),
+        "the ceiling refusal must state both populations: {output}"
+    );
+}
+
+#[test]
+fn softening_a_claim_lowering_counts_and_deleting_its_row_hits_the_independent_floor() {
+    let (live, _, unbound, _) = disclosed_counts();
+    let reviewed = disclosed_reviewed_count();
+    let (_guard, path) = doctored(|text| {
+        let softened = text.replace(
+            "documentation CI rejects wording stronger than the matrix permits",
+            "documentation CI records wording stronger than the matrix permits",
+        );
+        assert_ne!(softened, text, "control must soften the PFEI-U01 sentence");
+        let without_row = softened
+            .lines()
+            .filter(|line| !line.contains("> reviewed-unwalked PFEI-U01 ::"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let text = replace_disclosure_value(without_row, "live", live, live - 1);
+        let text = replace_disclosure_value(text, "unbound", unbound, unbound - 1);
+        replace_disclosure_value(text, "reviewed", reviewed, reviewed - 1)
+    });
+    let (code, output) = run(Some(&path));
+    assert_eq!(
+        code, 2,
+        "coordinated prose softening must hit the typed anti-softening floor:\n{output}"
+    );
+    assert!(
+        output.contains("anti-softening floor") && output.contains("below the measured floor 33"),
+        "the refusal must identify the independent floor, not a stale count: {output}"
     );
 }
