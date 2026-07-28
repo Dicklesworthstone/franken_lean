@@ -412,6 +412,172 @@ fn the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous() {
     }
 }
 
+/// The measured D18 product population. **Zero, and that zero is a DISCLOSURE.**
+///
+/// Bead `fln-d18-product-half-rgsg`, re-measured at `889dca57` on 2026-07-28 — the bead's
+/// own blocker figures were taken at `08688c9a` two days earlier and a block is a claim
+/// that expires, so they were re-derived rather than inherited.
+///
+/// `structure-guard` prints `d18-mode-closure scan=vacuous product-roots=0
+/// closures-scanned=0 closure-nodes=0` on every run of this workspace and then exits `0`
+/// with `verdict=pass, findings=0`. Nothing in that verdict distinguishes a D18 check
+/// that examined the product closures and found them clean from one that **examined
+/// nothing at all**, and an empty scan is a failure rather than a clean tree. The claim
+/// `FLN-D18-REGISTERED-IN-THE-PRODUCTION-STRUCTURE-GUARD` (`franken_lean-r2st`) rests on
+/// eight `mode_closure::tests::` fixture unit tests; a fixture is not the production
+/// path, and on the production path the scan is empty.
+///
+/// This is [`fln-bench-apparatus-empty-referent-bkw6`]'s shape — a claim whose far end
+/// has **no instances**, where there is nothing to compare against and so every
+/// does-the-claim-still-match-its-evidence technique fails silently. The move that works
+/// is bkw6's: **bind the claim to the cardinality of what it asserts, and let the number
+/// fail in both directions.** Equality both ways is right here for the reason the
+/// closure-binding exempt population records — this is a disclosure of a *measured
+/// population*, not a declared remainder of permitted violations that shrinks as people
+/// repair it, so one-way-plus-a-floor would let the population grow silently.
+///
+/// **What makes this different from the deferral guard above, which must NOT be
+/// equality-bound.** That one decides whether the remainder bead may *close*, so it is
+/// deliberately one-way and walls nobody who lands a real product. This one decides
+/// whether the *disclosure is current*. When the first product root lands, this fails and
+/// names the edit: raise the number here in the same commit, and revisit r2st's claim,
+/// whose evidence basis has just changed. That failure is the sequencing signal
+/// `fln-d18-product-half-rgsg` asks for — it fires exactly when the blocker lifts.
+///
+/// **The anti-vacuity floor is the load-bearing half, because a check asserting
+/// `measured == 0` is satisfied by a broken scan.** Two independent producers must agree:
+/// this test resolves the workspace `members` globs itself and counts markers straight
+/// out of the manifests, while `product_roots` comes from the production scan. A scan
+/// that silently stopped selecting reports zero and would pass a one-sided check. So the
+/// derivation is floored on having actually read the workspace (`nodes` must equal the
+/// members this test resolved), and a members resolution that came back implausibly small
+/// is refused as a broken scan rather than reported as a clean tree.
+///
+/// **What this does not earn.** It counts *declarations*, so it inherits the limit cc_3
+/// measured and recorded on the bead: a product root is two Cargo.toml **comments**, and
+/// prose can answer "is anything declared?" without anything being built. This guard
+/// makes the count honest; it does not make the declaration mean anything. Only the
+/// canonical sidecar — this bead's own content — does that. The marker parse below is a
+/// deliberately CRUDE tripwire and not a second copy of `declared_product_root`: it
+/// matches the prefix and accepts the three registered mode words, so it can over-count
+/// relative to the production parser but never under-count, which is the safe direction
+/// for a floor. One host, one commit, class `bounded_model`.
+const D18_DECLARED_PRODUCT_ROOTS: usize = 0;
+
+/// A members resolution smaller than this is a broken scan, not a small workspace. The
+/// tree carries 33; the floor is set well below it so an ordinary crate removal does not
+/// wall anyone, while a glob that resolved to nothing still fails loudly.
+const D18_MEMBERS_FLOOR: usize = 20;
+
+/// Resolve the workspace `members` globs and count manifests declaring a product root.
+///
+/// Returns `(members_resolved, product_root_declarations)`. The globs are read from the
+/// root manifest rather than hard-coded, so moving `members` moves this derivation with
+/// it instead of silently narrowing what is counted.
+fn measure_declared_product_roots(root: &std::path::Path) -> (usize, usize) {
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
+        .expect("the workspace root manifest must be readable to resolve members");
+    let members_line = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("members"))
+        .expect("the root manifest must declare workspace members");
+    let prefixes: Vec<String> = members_line
+        .split('"')
+        .filter(|piece| piece.ends_with("/*"))
+        .map(|piece| piece.trim_end_matches("/*").to_string())
+        .collect();
+    assert!(
+        !prefixes.is_empty(),
+        "no member globs were parsed out of {members_line:?}; a resolution that matches \
+         nothing is a broken scan and would make every count below vacuously zero"
+    );
+
+    let (mut members, mut declared) = (0usize, 0usize);
+    for prefix in prefixes {
+        let entries = std::fs::read_dir(root.join(&prefix))
+            .unwrap_or_else(|error| panic!("member glob {prefix}/* is unreadable: {error}"));
+        for entry in entries {
+            let path = entry
+                .expect("member directory entry")
+                .path()
+                .join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            members += 1;
+            if text.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("# fln-product-root:")
+                    .map(str::trim)
+                    .is_some_and(|mode| matches!(mode, "faithful" | "sound" | "frontier"))
+            }) {
+                declared += 1;
+            }
+        }
+    }
+    (members, declared)
+}
+
+#[test]
+fn the_d18_product_population_disclosure_matches_the_measured_workspace() {
+    let root = fln_conformance::checked_workspace_root!();
+    let (members, declared) = measure_declared_product_roots(&root);
+
+    assert!(
+        members >= D18_MEMBERS_FLOOR,
+        "resolved only {members} workspace members against a floor of \
+         {D18_MEMBERS_FLOOR}. A members resolution this small is a BROKEN SCAN, and a \
+         broken scan reports zero product roots exactly as a clean tree does — which is \
+         the one reading this guard exists to refuse."
+    );
+
+    let outcome = structure_guard::checks::run(&root).expect("structure-guard setup");
+    let facts = &outcome.mode_closure;
+
+    assert_eq!(
+        facts.nodes, members,
+        "the production scan walked {} nodes while this test resolved {members} \
+         workspace members. The two producers disagree about what the workspace IS, so \
+         neither the disclosed population below nor the scan's own zero can be trusted \
+         until that is resolved.",
+        facts.nodes,
+    );
+
+    assert_eq!(
+        declared, D18_DECLARED_PRODUCT_ROOTS,
+        "the manifests declare {declared} D18 product root(s); this file discloses \
+         {D18_DECLARED_PRODUCT_ROOTS}. If a product root has LANDED, this is the good \
+         direction and the edit is deliberate rather than mechanical: raise \
+         D18_DECLARED_PRODUCT_ROOTS to {declared} in the same commit, and revisit \
+         franken_lean-r2st's claim \
+         FLN-D18-REGISTERED-IN-THE-PRODUCTION-STRUCTURE-GUARD, whose evidence basis has \
+         just changed from eight fixture unit tests over an EMPTY production scan to a \
+         scan that traverses something. Bead fln-d18-product-half-rgsg becomes \
+         actionable at that moment.",
+    );
+
+    assert_eq!(
+        facts.product_roots, declared,
+        "the production scan counted {} product roots while reading the manifests \
+         directly finds {declared}. These are two independent producers for one number \
+         and they must agree: a scan that has stopped selecting reports zero, which is \
+         indistinguishable from a workspace that declares nothing.",
+        facts.product_roots,
+    );
+
+    // A fifth assertion stood here — `facts.is_vacuous() == (declared == 0)` — and it is
+    // REMOVED rather than kept, because the campaign could not kill it and the reason is
+    // structural, not a gap in the plants. `is_vacuous()` is `closures_scanned == 0`;
+    // once the assertion above pins `product_roots == declared == 0`, the existing
+    // `scanned <= product_roots` law forces vacuity, so no input reaches it with a
+    // different answer. It also duplicated two live guards —
+    // `the_terminal_record_discloses_the_d18_scope_of_the_verdict_it_carries` and
+    // `mode_closure::tests::the_scan_class_agrees_with_the_closure_count_in_both_directions`.
+    // An assertion subsumed by a broader rule in the same predicate is unkillable by
+    // construction and reads as coverage it does not provide. Noted where it stood so it
+    // is not re-added as an improvement.
+}
+
 #[test]
 fn robot_rejects_an_unbound_rustc_override_without_executing_it() {
     let root = fln_conformance::checked_workspace_root!();
