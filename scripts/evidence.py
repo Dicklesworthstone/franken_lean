@@ -418,6 +418,8 @@ E2E_STEP_ORDERS = {
         "extension_state_recovery",
         "set_union_mutant",
         "set_union_recovery",
+        "extension_descriptor_stop_as_conflict_mutant",
+        "extension_descriptor_stop_as_conflict_recovery",
         "declaration_membership_mutant",
         "declaration_membership_recovery",
         "declaration_tag_mutant",

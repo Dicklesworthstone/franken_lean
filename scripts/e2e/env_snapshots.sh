@@ -1156,6 +1156,25 @@ mutations = {
             limits.descriptor,
         ) {""",
     ),
+    "descriptor_stop_as_conflict": (
+        b"""            Err((resource, limit, actual)) => {
+                return MergeReport::stopped(MergeNonAnswer::resource(
+                    MergeStop::Descriptor {
+                        extension: extension.clone(),
+                        resource,
+                    },
+                    resource.structural_unit(),
+                    limit,
+                    actual,
+                ));
+            }""",
+        b"""            Err((resource, limit, actual)) => {
+                let _ = (resource, limit, actual);
+                return MergeReport::decided(Err(MergeConflict::ConcurrentChanges {
+                    extension: extension.clone(),
+                }));
+            }""",
+    ),
     "policy_before_validation": (
         b"""        match admit_descriptors_within(
             &base.descriptor,
@@ -1316,6 +1335,11 @@ PY
     "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 }
 
+run_identity_path_mutant_recovery extension_descriptor_stop_as_conflict \
+  fln-env/src/extensions.rs descriptor_stop_as_conflict \
+  extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence \
+  'extensions::tests::extension_merge_refusals_e2e_emit_detailed_real_path_evidence --- FAILED' \
+  'expected a non-answer, got Complete(Err(ConcurrentChanges'
 run_identity_path_mutant_recovery declaration_membership \
   fln-env/src/environment.rs opaque_membership_omission \
   environment::tests::mutual_block_membership_changes_the_content_digest \
