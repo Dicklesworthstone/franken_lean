@@ -316,6 +316,105 @@ fn agents_md() -> String {
     std::fs::read_to_string(workspace_root().join("AGENTS.md")).expect("AGENTS.md is readable")
 }
 
+/// A `check.sh` governing fewer paths than this is a broken extractor, not a small gate.
+/// The array carried 53 when this landed; the floor sits well below so an ordinary
+/// deregistration does not wall anyone, while a scan that came back near-empty still fails.
+const CHECK_SH_GOVERNED_FLOOR: usize = 30;
+
+/// Bare directories in `check.sh`'s `INPUT_PATHS`, which is the claim the sentence beneath the
+/// governed-set table makes. Equality both ways: this is a measured population, not a declared
+/// remainder that shrinks as it is repaired.
+const CHECK_SH_BARE_DIRECTORY_ENTRIES: usize = 5;
+
+/// **The reference number every row of the governed-set table is stated relative to, joined to
+/// the array it counts** (bead `fln-tlbo`).
+///
+/// The table's per-lane counts have been held per commit and in both directions since 98np R4.
+/// The number in its *header* — the one each row's third cell is measured against — was the one
+/// figure in that table with no producer, and `fln-tlbo` filed it as accurate-but-unjoined.
+///
+/// **It was falsified twice before anything noticed, which is why this is a guard and not a
+/// correction.** At the bead's own measurement it read 50. `scripts/lib/gate_lock.sh` took the
+/// array to 51 and the header was moved to match by hand; the two `.github/workflows/` entries
+/// then took it to **53** and nothing moved. Meanwhile the prose beneath the table still said
+/// "fifty", so AGENTS.md stated one number two ways and disagreed with itself as well as with
+/// the array — and a comment in this very file quoted the header as 50, a third value. Three
+/// statements, three numbers, none of them right. Registering a script edits `INPUT_PATHS`, so
+/// the falsifying event is *routine*.
+///
+/// The repair is the one this file already applies to the rows: derive, then bind in **both**
+/// directions, so registering a script obliges its author to move the number and a table edit
+/// cannot invent one. The duplicate statement in the prose was **removed** rather than bound —
+/// two copies that must move together is the defect, not the fix, and `word_to_number` above
+/// stops at twenty-one so the word form was unbindable anyway.
+///
+/// **The floor is what stops a broken extractor reading as a repair.** `governed_paths` is
+/// reused rather than reimplemented — a second copy would be free to drift from the one the
+/// rows are judged by — and it is the extractor whose earlier version reported a false zero for
+/// `AP6_INPUT_PATHS`. A zero here would silently satisfy nothing at all.
+///
+/// **What this does not earn.** It counts `INPUT_PATHS` *entries*, not the files they expand to:
+/// five of them are bare directories covering most of the repository, which is exactly what the
+/// sentence beneath the table says and what no count can capture. It does not check that the
+/// entries are the *right* ones. One host, one commit, class `bounded_model`.
+#[test]
+fn the_governed_set_table_states_check_sh_s_own_cardinality() {
+    let script = std::fs::read_to_string(workspace_root().join("scripts/check.sh"))
+        .expect("scripts/check.sh is readable");
+    let paths = governed_paths(&script);
+
+    assert!(
+        paths.len() >= CHECK_SH_GOVERNED_FLOOR,
+        "derived only {} governed paths from scripts/check.sh against a floor of \
+         {CHECK_SH_GOVERNED_FLOOR}. That is a BROKEN EXTRACTOR, not a small gate — and a broken \
+         extractor that returns few paths reads exactly like a repair. This is the \
+         `AP6_INPUT_PATHS` false zero one file over.",
+        paths.len(),
+    );
+
+    let stated = agents_md()
+        .lines()
+        .find_map(|line| {
+            line.split_once(TABLE_ANCHOR)?
+                .1
+                .split_whitespace()
+                .find_map(|word| {
+                    word.trim_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<usize>()
+                        .ok()
+                })
+        })
+        .expect(
+            "the governed-set table header must state the number its rows are relative to; if \
+             that cell lost its number this guard is enforcing a claim that no longer exists",
+        );
+
+    assert_eq!(
+        stated,
+        paths.len(),
+        "AGENTS.md's governed-set table is stated relative to {stated} `check.sh` entries, but \
+         `INPUT_PATHS` declares {}. BOTH directions are a real event. If a script was just \
+         REGISTERED, move the header cell to {} in the same commit — every row's third cell is \
+         measured against it, so a stale header silently restates every row. If the header moved \
+         without the array, it invented a number. This figure was falsified twice before anything \
+         noticed (50 -> 51 -> 53) and that is what this guard exists to end.",
+        paths.len(),
+        paths.len(),
+    );
+
+    let bare = paths
+        .iter()
+        .filter(|entry| workspace_root().join(entry).is_dir())
+        .count();
+    assert_eq!(
+        bare, CHECK_SH_BARE_DIRECTORY_ENTRIES,
+        "the sentence beneath the table says {CHECK_SH_BARE_DIRECTORY_ENTRIES} of check.sh's \
+         entries are bare directories; {bare} of them are. That sentence is the whole reason the \
+         path COUNT does not tell you whether your write voids a lane, so it may not drift: a \
+         bare directory covers every file beneath it."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The law
 // ---------------------------------------------------------------------------

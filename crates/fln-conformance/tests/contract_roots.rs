@@ -769,7 +769,8 @@ fn the_vendor_tree_establishment_block_is_byte_identical_in_both_extractors() {
         );
         // The block must actually contain the call, not merely the banner comment.
         assert!(
-            block.contains("vendor-binding") && block.contains("VENDOR_BINDING_ENVIRONMENT_REFUSALS"),
+            block.contains("vendor-binding")
+                && block.contains("VENDOR_BINDING_ENVIRONMENT_REFUSALS"),
             "{name}: establishment block does not contain the predicate call it exists to make"
         );
         blocks.push((name, block));
