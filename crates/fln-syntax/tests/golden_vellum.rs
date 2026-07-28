@@ -85,7 +85,7 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
 /// governs. [`decode_segmented_allowance`] removes the separators and refuses malformed rows.
 /// Exact-set equality, not this population count, is the law; the count is retained as an
 /// independently reviewed anti-vacuity witness and must shrink with a repaired row.
-const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 166;
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 167;
 const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0382d-7b",
     "041ad-4e0",
@@ -201,6 +201,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "aa5d3-44",
     "ad2aa-8e1",
     "ad82f-b45",
+    "ae906-30b",
     "ae967-368",
     "af265-46a",
     "b0611-5fc",
@@ -338,6 +339,7 @@ struct AnchorInventory {
     candidate_origins: BTreeMap<String, BTreeSet<String>>,
     main_reachable: BTreeSet<String>,
     local_backup_only: BTreeSet<String>,
+    missing_objects: BTreeSet<String>,
     non_anchors: BTreeSet<String>,
 }
 
@@ -648,6 +650,7 @@ fn scan_repository_anchor_inventory(
 
     let mut main_reachable = BTreeSet::new();
     let mut local_backup_only = BTreeSet::new();
+    let mut missing_objects = BTreeSet::new();
     let mut non_anchors = BTreeSet::new();
     for (anchor, origins) in &candidate_origins {
         match classify_anchor_against(repo, anchor, revision) {
@@ -657,9 +660,11 @@ fn scan_repository_anchor_inventory(
             AnchorReachability::LocalBackupOnly { .. } => {
                 local_backup_only.insert(anchor.clone());
             }
-            AnchorReachability::Unresolved(
-                AnchorRefusal::NoMatchingObject | AnchorRefusal::NotCommit { .. },
-            ) => {
+            AnchorReachability::Unresolved(AnchorRefusal::NoMatchingObject) => {
+                missing_objects.insert(anchor.clone());
+                non_anchors.insert(anchor.clone());
+            }
+            AnchorReachability::Unresolved(AnchorRefusal::NotCommit { .. }) => {
                 non_anchors.insert(anchor.clone());
             }
             AnchorReachability::Unresolved(reason) => {
@@ -677,10 +682,18 @@ fn scan_repository_anchor_inventory(
         candidate_origins,
         main_reachable,
         local_backup_only,
+        missing_objects,
         non_anchors,
     })
 }
 
+/// Audit retained historical anchors without requiring a clone to carry local forensic refs.
+///
+/// A reviewed token that is still present in tracked evidence may be unavailable in a transport
+/// clone, but it never becomes current authority: only main ancestry does that. The allowance
+/// remains bidirectional because removing the token from the tracked scope, resolving it to a
+/// current commit, or resolving it to a non-commit makes the declaration stale. A locally
+/// resolvable backup-only commit that is not declared remains an immediate refusal.
 fn audit_anchor_inventory(
     repo: &Path,
     scope: &[&str],
@@ -699,15 +712,22 @@ fn audit_anchor_inventory(
     }
 
     let declared = decode_segmented_allowance(allowance)?;
+    let unavailable_but_retained: BTreeSet<String> = inventory
+        .missing_objects
+        .intersection(&declared)
+        .cloned()
+        .collect();
+    let retained: BTreeSet<String> = inventory
+        .local_backup_only
+        .union(&unavailable_but_retained)
+        .cloned()
+        .collect();
     let undeclared: Vec<String> = inventory
         .local_backup_only
         .difference(&declared)
         .cloned()
         .collect();
-    let stale: Vec<String> = declared
-        .difference(&inventory.local_backup_only)
-        .cloned()
-        .collect();
+    let stale: Vec<String> = declared.difference(&retained).cloned().collect();
     if !undeclared.is_empty() || !stale.is_empty() {
         return Err(AnchorInventoryRefusal::AllowanceMismatch { undeclared, stale });
     }
@@ -1250,6 +1270,53 @@ fn the_checked_in_producer_anchor_is_reachable_from_main() {
     );
 }
 
+/// The repository-wide half of vdi4 runs in plain `cargo test`, over the committed evidence
+/// surfaces rather than over a hand-built substitute.
+///
+/// A concurrent main movement is an environmental refusal, so one wholly fresh attempt is
+/// permitted. Two consecutive moving snapshots remain a failure rather than being rendered clean.
+#[test]
+fn the_repository_wide_anchor_allowance_matches_main_in_both_directions() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let first = audit_checked_in_repository(&repo);
+    let result = if matches!(first, Err(AnchorInventoryRefusal::RepositoryChanged { .. })) {
+        audit_checked_in_repository(&repo)
+    } else {
+        first
+    };
+    let inventory =
+        result.expect("the committed repository anchor inventory must be decidable and reviewed");
+
+    assert_eq!(
+        inventory.local_backup_only.len(),
+        REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT,
+        "the exact-set audit passed, so its independently reviewed population must agree too"
+    );
+    assert_eq!(
+        inventory.candidate_origins.len(),
+        inventory.main_reachable.len()
+            + inventory.local_backup_only.len()
+            + inventory.non_anchors.len(),
+        "every scanned candidate must land in exactly one terminal class"
+    );
+    assert!(
+        !inventory.main_reachable.is_empty(),
+        "a repository scan finding no current commit anchor is a broken scan, not a clean tree"
+    );
+    assert!(
+        !inventory.non_anchors.is_empty(),
+        "the live scope must retain incidental digest-shaped controls so commit promotion stays \
+         discriminating"
+    );
+    assert!(
+        inventory
+            .candidate_origins
+            .values()
+            .all(|origins| !origins.is_empty()),
+        "every candidate must retain at least one tracked origin"
+    );
+}
+
 /// R2/R5: exercise the history-rewrite shape, not merely a missing-object substitute.
 ///
 /// The old commit remains a real object under backup refs after `main` is replaced by an
@@ -1329,6 +1396,48 @@ fn rewritten_history_separates_current_backup_only_and_unresolved_anchors() {
         ],
         "a 64-hex content digest is not a Git commit candidate"
     );
+    must_git(&origin, &["add", "anchors.txt"]);
+    must_git(&origin, &["commit", "--quiet", "-m", "record anchors"]);
+
+    let segmented_old = segment_anchor_for_fixture(&old_commit);
+    let reviewed_allowance = [segmented_old.as_str()];
+    let inventory = audit_anchor_inventory(&origin, &["anchors.txt"], &reviewed_allowance)
+        .expect("the reviewed fixture inventory passes");
+    assert_eq!(inventory.tracked_paths, vec!["anchors.txt"]);
+    assert_eq!(inventory.candidate_origins.len(), 3);
+    assert_eq!(
+        inventory.main_reachable,
+        BTreeSet::from([current_commit.clone()])
+    );
+    assert_eq!(
+        inventory.local_backup_only,
+        BTreeSet::from([old_commit.clone()])
+    );
+    assert_eq!(
+        inventory.missing_objects,
+        BTreeSet::from([missing.to_string()])
+    );
+    assert_eq!(inventory.non_anchors, BTreeSet::from([missing.to_string()]));
+
+    assert_eq!(
+        audit_anchor_inventory(&origin, &["anchors.txt"], &[]),
+        Err(AnchorInventoryRefusal::AllowanceMismatch {
+            undeclared: vec![old_commit.clone()],
+            stale: Vec::new(),
+        }),
+        "a newly observed backup-only anchor must fail until it is reviewed"
+    );
+    let segmented_current = segment_anchor_for_fixture(&current_commit);
+    let stale_allowance = [segmented_old.as_str(), segmented_current.as_str()];
+    assert_eq!(
+        audit_anchor_inventory(&origin, &["anchors.txt"], &stale_allowance),
+        Err(AnchorInventoryRefusal::AllowanceMismatch {
+            undeclared: Vec::new(),
+            stale: vec![current_commit.clone()],
+        }),
+        "an allowance entry must fail as soon as its anchor is current rather than backup-only"
+    );
+
     assert_eq!(
         classify_anchor(&origin, &current_commit),
         AnchorReachability::MainReachable {
@@ -1391,6 +1500,36 @@ fn rewritten_history_separates_current_backup_only_and_unresolved_anchors() {
         classify_anchor(&fresh, &old_commit),
         AnchorReachability::Unresolved(AnchorRefusal::NoMatchingObject),
         "the old object is a local forensic aid and must not cross the transport clone"
+    );
+    let fresh_inventory = audit_anchor_inventory(&fresh, &["anchors.txt"], &reviewed_allowance)
+        .expect("the reviewed historical token remains retained in a main-only clone");
+    assert!(
+        fresh_inventory.local_backup_only.is_empty(),
+        "a transport clone must not invent the local backup ref"
+    );
+    assert!(
+        fresh_inventory.missing_objects.contains(&old_commit),
+        "the reviewed token remains present in tracked evidence but its old object is unavailable"
+    );
+    must_git(&fresh, &["config", "user.name", "Vellum Fixture"]);
+    must_git(&fresh, &["config", "user.email", "vellum-fixture.invalid"]);
+    fs::write(
+        fresh.join("anchors.txt"),
+        format!("current {current_commit}\nmissing {missing}\ndigest {content_digest}\n"),
+    )
+    .expect("remove only the reviewed historical token from the bounded fixture");
+    must_git(&fresh, &["add", "anchors.txt"]);
+    must_git(
+        &fresh,
+        &["commit", "--quiet", "-m", "repair historical anchor"],
+    );
+    assert_eq!(
+        audit_anchor_inventory(&fresh, &["anchors.txt"], &reviewed_allowance),
+        Err(AnchorInventoryRefusal::AllowanceMismatch {
+            undeclared: Vec::new(),
+            stale: vec![old_commit.clone()],
+        }),
+        "a reviewed unavailable token must become stale when tracked evidence stops naming it"
     );
 }
 
