@@ -71,6 +71,11 @@ pub enum RegisterError {
     UnknownCategory { name: Name },
     /// A category was declared twice.
     CategoryExists { name: Name },
+    /// Two requests in one batch claimed the same canonical position.
+    ///
+    /// Additive shadowing makes production order semantic, so accepting an equal-key pair would
+    /// let its arrival order choose the grammar root. The entire batch is refused instead.
+    DuplicateRequestKey { key: (u64, String) },
     /// `pop_scope` with no scope open — a `end` without a `section`.
     NoScopeOpen,
 }
@@ -87,6 +92,9 @@ impl RegisterError {
                     "category `{}` has already been declared",
                     name.to_display_string()
                 )
+            }
+            RegisterError::DuplicateRequestKey { key } => {
+                format!("duplicate registry request key ({}, {:?})", key.0, key.1)
             }
             RegisterError::NoScopeOpen => "no open scope to close".to_string(),
         }
@@ -415,6 +423,9 @@ pub struct GrammarRoot(pub String);
 /// determinism doctrine asks for (FL-INV-01, and franken_networkx's CGSE policy shape).
 pub struct Request {
     /// The canonical key — in practice a declaration's source order or its name.
+    ///
+    /// Keys must be unique within one batch. Equal keys are refused before any request is
+    /// published because stable sorting would otherwise preserve schedule-dependent arrival order.
     pub key: (u64, String),
     pub category: Name,
     pub token: String,
@@ -524,12 +535,15 @@ impl Registry {
     /// applying on arrival is the whole mechanism: because shadowing is additive, arrival order
     /// would otherwise change the sequence of productions under a token and therefore the grammar
     /// root itself.
-    pub fn apply_batch(
-        &mut self,
-        mut requests: Vec<Request>,
-    ) -> Result<GrammarEpoch, RegisterError> {
-        requests.sort_by(|a, b| a.key.cmp(&b.key));
+    ///
+    /// Validation is a preflight over the whole canonical batch. Duplicate keys and unknown
+    /// categories are therefore typed refusals with no published prefix: the epoch, grammar root,
+    /// retained callbacks, and hook observations all remain unchanged.
+    pub fn apply_batch(&mut self, requests: Vec<Request>) -> Result<GrammarEpoch, RegisterError> {
+        let requests = self.preflight_batch(requests)?;
         for request in requests {
+            // Preflight checked every category against this same exclusively borrowed registry.
+            // Registration cannot remove categories, so no typed failure remains reachable here.
             self.add_leading(
                 &request.category,
                 request.token,
@@ -540,7 +554,34 @@ impl Registry {
         Ok(self.epoch)
     }
 
+    fn preflight_batch(&self, mut requests: Vec<Request>) -> Result<Vec<Request>, RegisterError> {
+        requests.sort_by(|a, b| a.key.cmp(&b.key));
+
+        if let Some(pair) = requests.windows(2).find(|pair| pair[0].key == pair[1].key) {
+            return Err(RegisterError::DuplicateRequestKey {
+                key: pair[0].key.clone(),
+            });
+        }
+
+        for request in &requests {
+            if !self
+                .categories
+                .contains_key(&request.category.to_display_string())
+            {
+                return Err(RegisterError::UnknownCategory {
+                    name: request.category.clone(),
+                });
+            }
+        }
+
+        Ok(requests)
+    }
+
     /// Apply a batch under a budget. Exceeding it is `Inconclusive`, never a rejection.
+    ///
+    /// Resource preflight intentionally precedes request validation: lack of capacity says the
+    /// registry did not inspect the whole batch, so FL-INV-07 keeps that result inconclusive rather
+    /// than promoting a partial inspection to a user-input rejection.
     pub fn apply_batch_bounded(
         &mut self,
         requests: Vec<Request>,
@@ -601,6 +642,16 @@ mod tests {
         Production::new(name(label), 0, |_state| {})
     }
 
+    fn request(key: (u64, &str), category: &Name, token: &str, kind: &str) -> Request {
+        Request {
+            key: (key.0, key.1.to_string()),
+            category: category.clone(),
+            token: token.to_string(),
+            production: production(kind),
+            scoped: false,
+        }
+    }
+
     fn registry_with_term() -> (Registry, Name) {
         let mut registry = Registry::new();
         let term = name("term");
@@ -622,6 +673,178 @@ mod tests {
         let mut state = ParserState::new(0);
         let resolution = longest_match(&mut state, None, &productions);
         (resolution, state)
+    }
+
+    fn mutation_state(registry: &Registry) -> (GrammarEpoch, GrammarRoot, u64, u64) {
+        (
+            registry.epoch(),
+            registry.grammar_root(registry.epoch()),
+            registry.production_count(),
+            registry.retained_production_count(),
+        )
+    }
+
+    #[test]
+    fn an_unknown_category_in_a_batch_is_refused_before_any_request_is_published() {
+        for reverse_arrival in [false, true] {
+            let (mut registry, term) = registry_with_term();
+            registry
+                .add_leading(&term, "existing", production("existing"), false)
+                .expect("the control production registers");
+            let hooks = Arc::new(AtomicUsize::new(0));
+            let hook_count = Arc::clone(&hooks);
+            registry.register_hook(move |_category, _kind| {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            });
+            let before = mutation_state(&registry);
+            let missing = name("missing");
+            let mut batch = vec![
+                request((10, "valid"), &term, "new", "valid"),
+                request((20, "invalid"), &missing, "bad", "invalid"),
+            ];
+            if reverse_arrival {
+                batch.reverse();
+            }
+
+            assert_eq!(
+                registry.apply_batch(batch),
+                Err(RegisterError::UnknownCategory {
+                    name: missing.clone()
+                }),
+                "canonical validation must report the same refusal for either arrival order"
+            );
+            assert_eq!(
+                mutation_state(&registry),
+                before,
+                "an invalid suffix must not publish the valid prefix"
+            );
+            assert_eq!(
+                hooks.load(Ordering::SeqCst),
+                0,
+                "a batch that publishes nothing must fire no hooks"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_request_keys_are_refused_before_arrival_can_choose_production_order() {
+        let duplicate_key = (7, "same".to_string());
+        for reverse_arrival in [false, true] {
+            let (mut registry, term) = registry_with_term();
+            let before = mutation_state(&registry);
+            let mut batch = vec![
+                request((7, "same"), &term, "dup", "first"),
+                request((7, "same"), &term, "dup", "second"),
+            ];
+            if reverse_arrival {
+                batch.reverse();
+            }
+
+            assert_eq!(
+                registry.apply_batch(batch),
+                Err(RegisterError::DuplicateRequestKey {
+                    key: duplicate_key.clone()
+                })
+            );
+            assert_eq!(
+                mutation_state(&registry),
+                before,
+                "neither equal-key arrival order may become semantic production order"
+            );
+        }
+
+        assert_eq!(
+            RegisterError::DuplicateRequestKey { key: duplicate_key }.message(),
+            "duplicate registry request key (7, \"same\")"
+        );
+
+        let (mut registry, term) = registry_with_term();
+        registry
+            .apply_batch(vec![
+                request((20, "second"), &term, "dup", "second"),
+                request((10, "first"), &term, "dup", "first"),
+            ])
+            .expect("distinct keys are canonicalizable");
+        assert_eq!(
+            registry.kinds_at(&term, "dup", registry.epoch()),
+            vec!["first", "second"],
+            "distinct canonical keys, not arrival order, choose the production sequence"
+        );
+    }
+
+    #[test]
+    fn a_corrected_retry_after_batch_refusal_matches_a_clean_control() {
+        let make_batch = |term: &Name, second_category: &Name| {
+            vec![
+                request((10, "first"), term, "tok", "first"),
+                request((20, "second"), second_category, "tok", "second"),
+            ]
+        };
+
+        let (mut retried, term) = registry_with_term();
+        let missing = name("missing");
+        assert!(matches!(
+            retried.apply_batch(make_batch(&term, &missing)),
+            Err(RegisterError::UnknownCategory { .. })
+        ));
+        retried
+            .apply_batch(make_batch(&term, &term))
+            .expect("the corrected retry applies");
+
+        let (mut control, control_term) = registry_with_term();
+        control
+            .apply_batch(make_batch(&control_term, &control_term))
+            .expect("the clean control applies");
+
+        assert_eq!(
+            mutation_state(&retried),
+            mutation_state(&control),
+            "a refused attempt must leave no state that a corrected retry can inherit"
+        );
+    }
+
+    #[test]
+    fn bounded_batches_keep_resource_preflight_ahead_of_input_validation() {
+        let invalid_batch = |term: &Name| {
+            vec![
+                request((10, "valid"), term, "new", "valid"),
+                request((20, "invalid"), &name("missing"), "bad", "invalid"),
+            ]
+        };
+        let (mut registry, term) = registry_with_term();
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let hook_count = Arc::clone(&hooks);
+        registry.register_hook(move |_category, _kind| {
+            hook_count.fetch_add(1, Ordering::SeqCst);
+        });
+        let before = mutation_state(&registry);
+
+        let admitted = registry.apply_batch_bounded(
+            invalid_batch(&term),
+            RegistryBudget {
+                max_categories: 1,
+                max_productions: 2,
+            },
+        );
+        assert!(matches!(
+            admitted,
+            Outcome::Complete(Err(RegisterError::UnknownCategory { .. }))
+        ));
+        assert_eq!(mutation_state(&registry), before);
+
+        let exhausted = registry.apply_batch_bounded(
+            invalid_batch(&term),
+            RegistryBudget {
+                max_categories: 1,
+                max_productions: 1,
+            },
+        );
+        assert!(
+            matches!(exhausted, Outcome::Inconclusive(_)),
+            "capacity exhaustion must remain inconclusive before the invalid request is inspected"
+        );
+        assert_eq!(mutation_state(&registry), before);
+        assert_eq!(hooks.load(Ordering::SeqCst), 0);
     }
 
     /// **SHADOWING IS ADDITIVE.** Two productions under one token both stay registered.
