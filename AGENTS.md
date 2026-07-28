@@ -569,7 +569,7 @@ The same correction applies to anything else naming holders by argv — an orche
 |---|---|---|
 | 40 | `contract_handoff.sh` | 2 outside: `scripts/extract/census_materialize.sh`, `…/validate_extern_builtin_census.py` |
 | 19 | `vellum_naming_no_mock_e2e.sh` | 3 outside: **`AGENTS.md`**, `README.md`, the plan |
-| 15 | `closure_audit.sh`, `structure_gate.sh` | contained |
+| 18 | `closure_audit.sh`, `structure_gate.sh` | contained |
 | 14 | `parser_corpus_no_mock_e2e.sh` | contained |
 | 13 | `dynamic_parser_no_mock_e2e.sh`, `env_snapshots.sh`, `lexer_no_mock_e2e.sh` | contained — `env_snapshots.sh` is the lane every generalisation here was made from |
 | 12 | `unsafe_note_clippy.sh` | contained |

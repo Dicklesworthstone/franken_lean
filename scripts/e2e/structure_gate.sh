@@ -79,13 +79,17 @@ ART_DIR_CLAIMED=0
 EARLY_STEP=preflight
 TEST_EARLY_FAULT="${FLN_SG_TEST_EARLY_FAULT:-}"
 INPUT_PATHS=(
-  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
+  ABI_CONTRACT.md OLEAN_CONTRACT.md ci contracts crates tools
   vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh .github/workflows/ci.yml
 )
-SUBJECT_PATHS=(Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools)
+SUBJECT_PATHS=(
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
+  ABI_CONTRACT.md OLEAN_CONTRACT.md ci contracts crates tools
+)
 VENDOR_PATH="vendor/lean4-src"
 VENDOR_BINDING="$ART_DIR/vendor-binding.json"
 HASH_ARGS=()

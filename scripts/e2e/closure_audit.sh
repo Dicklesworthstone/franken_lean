@@ -87,13 +87,17 @@ ART_DIR_CLAIMED=0
 EARLY_STEP=preflight
 TEST_EARLY_FAULT="${FLN_CA_TEST_EARLY_FAULT:-}"
 INPUT_PATHS=(
-  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
+  ABI_CONTRACT.md OLEAN_CONTRACT.md ci contracts crates tools
   vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh .github/workflows/ci.yml
 )
-SUBJECT_PATHS=(Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools)
+SUBJECT_PATHS=(
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
+  ABI_CONTRACT.md OLEAN_CONTRACT.md ci contracts crates tools
+)
 VENDOR_PATH="vendor/lean4-src"
 VENDOR_BINDING="$ART_DIR/vendor-binding.json"
 HASH_ARGS=()
@@ -913,11 +917,13 @@ copy_workspace() {
   local destination="$1" step="$2"
   mkdir "$destination"
   # One supervised copy plus before/after source hashes prevents a fixture from
-  # silently becoming a hybrid of two governed workspace states.
-  run_pass_step "$step" "$ROOT" cp -R -- \
-    "$ROOT/ci" "$ROOT/crates" "$ROOT/tools" \
+  # silently becoming a hybrid of two governed workspace states. Reflinks keep
+  # the generated census shards cheap without excluding them from that state.
+  run_pass_step "$step" "$ROOT" cp -R --reflink=auto -- \
+    "$ROOT/ci" "$ROOT/contracts" "$ROOT/crates" "$ROOT/tools" \
     "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" "$ROOT/SUITE.lock" \
-    "$ROOT/rust-toolchain.toml" "$destination/"
+    "$ROOT/rust-toolchain.toml" "$ROOT/ABI_CONTRACT.md" \
+    "$ROOT/OLEAN_CONTRACT.md" "$destination/"
 }
 
 if [ "$TEST_EARLY_FAULT" = unexpected_first_step ]; then
