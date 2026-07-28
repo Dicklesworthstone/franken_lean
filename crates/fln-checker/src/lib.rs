@@ -136,7 +136,7 @@
 //!
 //! This section previously said two prohibitions were missing. **One of them has
 //! landed**, and the paragraph outlived it — which is the defect this crate's own
-//! matrix row was corrected for once already (`witness.rs:496`, where
+//! matrix row was corrected for once already (`witness.rs:535`, where
 //! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
 //! throughout). So the state is measured here rather than remembered, at
 //! `53a5e3ec`:
@@ -168,7 +168,7 @@
 //!
 //! * **ENFORCED at item granularity.** `FLN-STRUCT-037` refuses `fln-checker`
 //!   *reaching* a SEMANTIC item across this boundary
-//!   (`tools/structure-guard/src/checks.rs:1023`). It is planted three ways:
+//!   (`tools/structure-guard/src/checks.rs:1068`). It is planted three ways:
 //!   `seeded.rs:1296` proves the baseline clean, `seeded.rs:1306`
 //!   `every_semantic_item_is_refused_inside_fln_checker` plants one violation per
 //!   inventory item and asserts each fires **alone** so an over-broad matcher
@@ -267,8 +267,8 @@
 //! cite crates/fln-hash/src/canon.rs:1044 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:542 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
-//! cite crates/fln-conformance/src/witness.rs:496 :: id: "B3-INDEPENDENT-CHECKER"
-//! cite tools/structure-guard/src/checks.rs:1023 :: code: "FLN-STRUCT-037"
+//! cite crates/fln-conformance/src/witness.rs:535 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite tools/structure-guard/src/checks.rs:1068 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1296 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1306 :: fn every_semantic_item_is_refused_inside_fln_checker
 //! cite tools/structure-guard/tests/seeded.rs:1341 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
@@ -276,8 +276,27 @@
 //!
 //! **What this does not earn.** A bound citation proves the line still holds the construct
 //! named; it does not prove the surrounding prose is a correct reading of that construct. And
-//! the registry covers this file only — `tools/structure-guard/src/checks.rs:904 (foreign)`/`:931`/`:936`
+//! the registry covers this file only — `tools/structure-guard/src/checks.rs:980 (foreign)`/`:1006`/`:1011`
 //! transcribe the same `tc.rs` line numbers into `FLN-STRUCT-037`'s finding text, so a violator
 //! is still sent to a line by a guard that cannot know whether it moved. That half belongs to
 //! structure-guard's owner.
+//!
+//! **The registry rotted twice while this paragraph stood, and repairing only the row that
+//! shouted would have left the build red.** Re-derived at `ef5af198`, every row rather than the
+//! loud one: `witness.rs:496 (historical)` became 535 (`f1a2b899`, then `d2cb11ae` — both `kl4h`
+//! commits, so this charter was rotted by the pane that maintains it), and
+//! `checks.rs:1023 (historical)` became 1068 (`0f2ae0ba`). The test asserts *inside* its loop,
+//! so it reports the **first** mismatch only and a green after one repair would have been the
+//! next red. `0f2ae0ba` is the same commit AGENTS.md records as drifting its own four
+//! `checks.rs` citations by +45: one insertion, two registries, and only the other one was
+//! repaired — this registry's own defect arriving from the outside.
+//!
+//! **Two of the three foreign citations above cannot be seen by the conservation check**, which
+//! is why they were stale and silent. Its needle is `.rs:`, so only the **first** member of a
+//! `/`-joined list carries a filename; `:1006` and `:1011` are scanned by nothing, marked or
+//! not. They read `:904`/`:931`/`:936` until this repair and pointed at `),`, a `.map_err` line
+//! and `.file_type()`. Corrected by deriving the three sites that actually transcribe a `tc.rs`
+//! line number, not by shifting the old numbers — a shift assumes they moved together, which is
+//! the assumption that produced the plausible-looking `witness.rs:479 (historical)` this
+//! registry exists to prevent.
 #![forbid(unsafe_code)]
