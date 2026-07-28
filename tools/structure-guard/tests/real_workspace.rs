@@ -143,6 +143,13 @@ fn robot_real_workspace_binds_complete_authority_evidence() {
     // indistinguishable in the artifact alone.
     if stdout.contains("\"contract_handoff_root\":null") {
         assert!(
+            stdout.contains(
+                "\"data_grade\":\"provisional\",\"unestablished\":[\"contract_handoff\"]"
+            ),
+            "a run without a handoff root must name its provisional grade and missing audit: \
+             {stdout}"
+        );
+        assert!(
             !root.join("contracts/builtin_environment.tsv").exists(),
             "the artifact withheld a contract-handoff root while the census EXISTS at {}; that \
              is a misdirected probe, not a fresh clone",
@@ -157,6 +164,10 @@ fn robot_real_workspace_binds_complete_authority_evidence() {
             root.display()
         );
     } else {
+        assert!(
+            stdout.contains("\"data_grade\":\"verified\",\"unestablished\":[]"),
+            "a run with a handoff root must carry the derived verified grade: {stdout}"
+        );
         assert!(
             stdout.contains("\"contract_handoff_root\":\"fnv1a64:"),
             "a contract-handoff root must be a digest or an explicit null, never absent: {stdout}"
@@ -792,6 +803,8 @@ fn robot_help_remains_machine_only_in_either_argument_order() {
         assert!(stdout.contains("\"event\":\"help\""));
         assert!(stdout.contains("\"reason_code\":\"help_requested\""));
         assert!(stdout.contains("\"exit_code\":0"));
+        assert!(stdout.contains("\"data_grade\":\"not_applicable\""));
+        assert!(stdout.contains("\"unestablished\":[]"));
 
         // The usage text names the robot schema to a HUMAN reader, and `main.rs` spells that
         // version out as a literal because `USAGE` is a `const` and `concat!` cannot take one.
@@ -1036,9 +1049,8 @@ fn judge_covenant_disclosure(
 /// `franken_lean-2ki4` both closed on a disclosure and bought nothing about the thing
 /// disclosed. It buys exactly two things: the correct number is now reachable, and its
 /// movement is now visible. The value is in the sealed human log and **not** in the robot
-/// NDJSON, because `require_guard_keys` compares the terminal key set for exact equality —
-/// measured, `extra=['line_count_covenants']` — so that half is a `structure-guard/4` to
-/// `/5` bump blocked on another pane's uncommitted `scripts/evidence.py`.
+/// NDJSON. `structure-guard/5` is now occupied by the independent krb0 data-grade contract,
+/// so adding `line_count_covenants` requires `/6` and the same exact-key consumer move.
 #[test]
 fn the_line_count_covenant_is_disclosed_by_the_walk_that_enforces_it() {
     let root = fln_conformance::checked_workspace_root!();

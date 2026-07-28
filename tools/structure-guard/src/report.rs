@@ -3,7 +3,7 @@
 //! decoration (AGENTS.md, Agent Ergonomics).
 
 use crate::NDJSON_SCHEMA;
-use crate::checks::{AUTHORITY_COUNT_RULE, Finding, RunOutcome};
+use crate::checks::{AUTHORITY_COUNT_RULE, Finding, RunOutcome, TerminalSubject};
 use crate::mode_closure::ModeClosureFacts;
 
 /// FNV-1a 64-bit — a dependency-free content digest for run provenance. Labeled as
@@ -35,13 +35,21 @@ pub fn json_escape(s: &str) -> String {
 
 pub fn render_human(root_display: &str, outcome: &RunOutcome) -> String {
     let mut out = String::new();
+    let unestablished = outcome.unestablished();
+    let unestablished_display = if unestablished.is_empty() {
+        "none".to_string()
+    } else {
+        unestablished.join(",")
+    };
     out.push_str(&format!(
-        "structure-guard: root={root_display} root-identity={} crates={} edges={} graph-digest=fnv1a64:{:016x} contract-handoff-root={} governed-root=fnv1a64:{:016x}\n",
+        "structure-guard: root={root_display} root-identity={} crates={} edges={} graph-digest=fnv1a64:{:016x} contract-handoff-root={} data-grade={} unestablished={} governed-root=fnv1a64:{:016x}\n",
         outcome.root_identity,
         outcome.crate_count,
         outcome.edge_count,
         outcome.graph_digest,
         outcome.contract_handoff_root.as_deref().unwrap_or("unavailable"),
+        outcome.data_grade(),
+        unestablished_display,
         outcome.governed_root_after,
     ));
     // The human reader has the same problem the robot reader had: a verdict with no
@@ -128,14 +136,13 @@ fn json_string_array(values: &[String]) -> String {
 /// bead (`franken_lean-kernel-loc-covenant-not-disclosed-t0g7`). Tenths of a percent, so a
 /// trend is readable without putting a float in an evidence record.
 ///
-/// **This belongs in the robot `run_end` line and is not there yet.** Measured at `2f9112f7`:
-/// `scripts/evidence.py`'s `require_guard_keys` compares the terminal record's key set for
-/// EXACT equality, so adding `line_count_covenants` to `structure-guard/4` is refused with
-/// `extra=['line_count_covenants']` — it is a schema bump to `/5`, moving the producer, the
-/// validator's schema check and its fixtures together, and that file is currently carrying
-/// another pane's uncommitted work. The human log is sealed into every bundle
-/// (`terminal_human_log_is_sealed_before_manifest_generation`), so the number is disclosed and
-/// citable today; it is not yet machine-parseable, and no row may claim that it is.
+/// **This belongs in the robot `run_end` line and is not there yet.** `structure-guard/5`
+/// was consumed by the independently required `data_grade` and `unestablished` exact-key-set
+/// change (bead `fln-census-empty-referent-no-mock-krb0`). Adding
+/// `line_count_covenants` now requires `/6`, moving the producer, validator, shell contracts,
+/// and fixtures together. The human log is sealed into every bundle
+/// (`terminal_human_log_is_sealed_before_manifest_generation`), so the number is disclosed
+/// and citable today; it is not yet machine-parseable, and no row may claim that it is.
 fn covenant_human_line(covenants: &[crate::checks::CovenantFact]) -> String {
     if covenants.is_empty() {
         // Not "no covenants" — this walk declares at least fln-kernel, so an empty set is a
@@ -166,6 +173,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
     let mut lines = Vec::with_capacity(outcome.findings.len() + 2);
     let compiler = &outcome.compiler_identity;
     let environment = &outcome.admitted_environment;
+    let unestablished = outcome.unestablished();
     lines.push(format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":\"{}\",\"graph_digest\":\"fnv1a64:{:016x}\",\"crates\":{},\"edges\":{},\"authority_inventory\":{{\"package_class\":\"workspace-graph-exact\",\"packages\":{},\"target_class\":\"cargo-auto-discovery-closed\",\"targets\":{},\"feature_class\":\"manifest-enumerated\",\"features\":{},\"target_triple_class\":\"suite-lock-declared\",\"target_triples\":{}}},\"effective_compiler_identity\":{{\"source\":\"{}\",\"channel\":{},\"release\":{},\"commit\":{},\"host\":{},\"contract_declared\":{},\"configuration_match\":{},\"contract_match\":{}}},\"admitted_environment\":{{\"policy\":\"{}\",\"admitted_names\":{},\"compiler_override_names\":{}}}}}",
         json_escape(root_display),
@@ -191,11 +199,13 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
     ));
     lines.extend(outcome.findings.iter().map(finding_ndjson));
     lines.push(format!(
-        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"authority\":\"{}\",\"contract_handoff_root\":{},\"traversal\":{{\"directories_visited\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped_unreadable\":{}}},\"mode_closure\":{},\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":{},\"governed_root_before\":\"fnv1a64:{:016x}\",\"governed_root_after\":\"fnv1a64:{:016x}\",\"governed_root_unchanged\":{},\"duration_ms\":{duration_ms}}}",
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"authority\":\"{}\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":{},\"traversal\":{{\"directories_visited\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped_unreadable\":{}}},\"mode_closure\":{},\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":{},\"governed_root_before\":\"fnv1a64:{:016x}\",\"governed_root_after\":\"fnv1a64:{:016x}\",\"governed_root_unchanged\":{},\"duration_ms\":{duration_ms}}}",
         outcome.verdict(),
         outcome.exit_code(),
         outcome.findings.len(),
         outcome.authority.as_str(),
+        outcome.data_grade(),
+        json_string_array(&unestablished),
         optional_json_string(outcome.contract_handoff_root.as_deref()),
         outcome.traversal.directories_visited,
         outcome.traversal.files_discovered,
@@ -213,10 +223,13 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
 /// Render a robot-visible setup failure. Robot mode must never move diagnostics to a
 /// human-only stream or omit its terminal record.
 pub fn render_setup_failure_ndjson(root_display: &str, error: &str, duration_ms: u128) -> String {
+    let subject = TerminalSubject::NotStarted;
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(root_display),
+        subject.data_grade(),
+        json_string_array(&subject.unestablished()),
         json_escape(error)
     )
 }
@@ -224,10 +237,13 @@ pub fn render_setup_failure_ndjson(root_display: &str, error: &str, duration_ms:
 /// Render a robot-visible CLI parse failure. The CLI did not reach workspace setup,
 /// but its request still receives a complete run envelope and terminal exit status.
 pub fn render_cli_failure_ndjson(root_display: &str, error: &str, duration_ms: u128) -> String {
+    let subject = TerminalSubject::NotStarted;
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(root_display),
+        subject.data_grade(),
+        json_string_array(&subject.unestablished()),
         json_escape(error)
     )
 }
@@ -235,11 +251,14 @@ pub fn render_cli_failure_ndjson(root_display: &str, error: &str, duration_ms: u
 /// Render help without leaking human decoration into robot mode. Help is a successful
 /// request response, not a structural verdict, and is labeled accordingly.
 pub fn render_help_ndjson(usage: &str, duration_ms: u128) -> String {
+    let subject = TerminalSubject::NoAudit;
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":null,\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
          {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"help\",\"usage\":\"{}\"}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"authority\":\"not_applicable\",\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
-        json_escape(usage)
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"authority\":\"not_applicable\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
+        json_escape(usage),
+        subject.data_grade(),
+        json_string_array(&subject.unestablished()),
     )
 }
 
@@ -304,6 +323,8 @@ mod tests {
         assert!(lines[0].contains("\\\"b"));
         assert!(lines[1].contains("\"verdict\":\"setup_error\""));
         assert!(lines[1].contains("\"exit_code\":2"));
+        assert!(lines[1].contains("\"data_grade\":\"not_established\""));
+        assert!(lines[1].contains("\"unestablished\":[]"));
         assert!(lines[1].contains("bad\\nroot"));
     }
 
@@ -315,6 +336,8 @@ mod tests {
         assert!(lines.iter().all(|line| line.contains(NDJSON_SCHEMA)));
         assert!(lines[1].contains("\"reason_code\":\"cli_parse_failure\""));
         assert!(lines[1].contains("\"exit_code\":2"));
+        assert!(lines[1].contains("\"data_grade\":\"not_established\""));
+        assert!(lines[1].contains("\"unestablished\":[]"));
     }
 
     #[test]
@@ -328,5 +351,7 @@ mod tests {
         assert!(lines[1].contains("usage: x\\n"));
         assert!(lines[2].contains("\"reason_code\":\"help_requested\""));
         assert!(lines[2].contains("\"exit_code\":0"));
+        assert!(lines[2].contains("\"data_grade\":\"not_applicable\""));
+        assert!(lines[2].contains("\"unestablished\":[]"));
     }
 }

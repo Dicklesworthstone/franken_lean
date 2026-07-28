@@ -87,6 +87,7 @@ VERIFICATION_LEGACY_CLASSIFICATIONS = frozenset(
 CHECK_HUMAN_SCHEMA = "fln.check-human/1"
 CHECK_HUMAN_LOG = "human.semantic.log"
 CENSUS_AVAILABILITY_SCHEMA = "fln.census-availability/1"
+STRUCTURE_GUARD_SCHEMA = "structure-guard/5"
 CENSUS_AVAILABILITY_STAGE = "contract-handoff-no-mock"
 CENSUS_AVAILABILITY_RECEIPT = f"{CENSUS_AVAILABILITY_STAGE}.availability.json"
 CENSUS_SKIP_LIMITATION_SUFFIX = (
@@ -6347,7 +6348,7 @@ def validate_guard(
     path = lexical_absolute(path)
     records, digest = load_ndjson_snapshot(path)
     for index, record in enumerate(records):
-        if record.get("schema") != "structure-guard/4":
+        if record.get("schema") != STRUCTURE_GUARD_SCHEMA:
             raise EvidenceError(f"{path}:{index + 1}: wrong schema")
     if records[0].get("event") != "run_start":
         raise EvidenceError(f"{path}: first record is not run_start")
@@ -6388,6 +6389,8 @@ def validate_guard(
         "exit_code",
         "findings",
         "authority",
+        "data_grade",
+        "unestablished",
         "contract_handoff_root",
         "traversal",
         "mode_closure",
@@ -6461,6 +6464,22 @@ def validate_guard(
             raise EvidenceError(f"{path}: passing authority inventory is not closed")
 
         contract_handoff_root = terminal.get("contract_handoff_root")
+        expected_data_grade = (
+            "verified" if contract_handoff_root is not None else "provisional"
+        )
+        expected_unestablished = (
+            [] if contract_handoff_root is not None else ["contract_handoff"]
+        )
+        if terminal.get("data_grade") != expected_data_grade:
+            raise EvidenceError(
+                f"{path}: data_grade {terminal.get('data_grade')!r} disagrees "
+                f"with contract_handoff_root"
+            )
+        if terminal.get("unestablished") != expected_unestablished:
+            raise EvidenceError(
+                f"{path}: unestablished {terminal.get('unestablished')!r} "
+                f"disagrees with contract_handoff_root"
+            )
         if contract_handoff_root is None:
             if expected_verdict == "pass":
                 raise EvidenceError(
@@ -6633,6 +6652,8 @@ def validate_guard(
             raise EvidenceError(f"{path}: setup failure claims structural authority")
         if (
             terminal.get("authority") != "not_established"
+            or terminal.get("data_grade") != "not_established"
+            or terminal.get("unestablished") != []
             or terminal.get("contract_handoff_root") is not None
             or terminal.get("traversal") is not None
             or terminal.get("mode_closure") is not None
@@ -19634,12 +19655,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
 
     # The structure guard's robot stream is a versioned evidence contract, not a
-    # best-effort JSON bag. Exercise one complete /4 stream and discriminating
+    # best-effort JSON bag. Exercise one complete /5 stream and discriminating
     # mutations here so the validator cannot silently stop checking newly authoritative
     # fields while the E2E lanes continue to look green.
     guard_root = case_dir("structure-guard-contract")
     guard_start = {
-        "schema": "structure-guard/4",
+        "schema": STRUCTURE_GUARD_SCHEMA,
         "event": "run_start",
         "root": str(guard_root),
         "root_identity": str(guard_root.resolve(strict=True)),
@@ -19673,12 +19694,14 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         },
     }
     guard_end = {
-        "schema": "structure-guard/4",
+        "schema": STRUCTURE_GUARD_SCHEMA,
         "event": "run_end",
         "verdict": "pass",
         "exit_code": 0,
         "findings": 0,
         "authority": "complete",
+        "data_grade": "verified",
+        "unestablished": [],
         "contract_handoff_root": "fnv1a64:0123456789abcdef",
         "traversal": {
             "directories_visited": 3,
@@ -19718,18 +19741,75 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     guard_valid = write_guard_stream("valid")
     validate_guard(guard_valid, PASS, "pass", [], str(guard_root), PASS)
 
+    def provisional_guard(records: list[dict[str, Any]]) -> None:
+        records[1].update(
+            {
+                "verdict": "inconclusive",
+                "exit_code": INCONCLUSIVE,
+                "authority": "incomplete",
+                "data_grade": "provisional",
+                "unestablished": ["contract_handoff"],
+                "contract_handoff_root": None,
+            }
+        )
+
+    provisional_valid = write_guard_stream("provisional-valid", provisional_guard)
+    validate_guard(
+        provisional_valid,
+        INCONCLUSIVE,
+        "inconclusive",
+        [],
+        str(guard_root),
+        INCONCLUSIVE,
+    )
+
+    def provisional_lies_verified(records: list[dict[str, Any]]) -> None:
+        provisional_guard(records)
+        records[1]["data_grade"] = "verified"
+
+    def provisional_omits_unestablished(records: list[dict[str, Any]]) -> None:
+        provisional_guard(records)
+        records[1]["unestablished"] = []
+
+    provisional_mutants = (
+        ("provisional-lies-verified", provisional_lies_verified),
+        ("provisional-omits-unestablished", provisional_omits_unestablished),
+    )
+    for mutant_name, mutate in provisional_mutants:
+        mutant = write_guard_stream(mutant_name, mutate)
+        try:
+            validate_guard(
+                mutant,
+                INCONCLUSIVE,
+                "inconclusive",
+                [],
+                str(guard_root),
+                INCONCLUSIVE,
+            )
+        except EvidenceError:
+            pass
+        else:
+            raise EvidenceError(
+                f"structure-guard validator survived mutant {mutant_name}"
+            )
+
     def old_guard_schema(records: list[dict[str, Any]]) -> None:
-        # The IMMEDIATELY preceding version, not an ancient one: `/3` differs from `/4`
-        # only by the D18 scope object, so this is the mutant that proves the version is
-        # rejected on its own account rather than because its shape happens to be wrong.
+        # The immediately preceding version is the discriminating mutant: `/4` has the
+        # same D18 scope but no data-grade join.
         for record in records:
-            record["schema"] = "structure-guard/3"
+            record["schema"] = "structure-guard/4"
 
     def missing_guard_field(records: list[dict[str, Any]]) -> None:
         records[0].pop("root_identity")
 
     def extra_guard_field(records: list[dict[str, Any]]) -> None:
         records[1]["unversioned_claim"] = True
+
+    def false_guard_data_grade(records: list[dict[str, Any]]) -> None:
+        records[1]["data_grade"] = "provisional"
+
+    def false_guard_unestablished(records: list[dict[str, Any]]) -> None:
+        records[1]["unestablished"] = ["contract_handoff"]
 
     def missing_guard_handoff_root(records: list[dict[str, Any]]) -> None:
         records[1]["contract_handoff_root"] = None
@@ -19787,6 +19867,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         ("old-schema", old_guard_schema),
         ("missing-field", missing_guard_field),
         ("extra-field", extra_guard_field),
+        ("false-data-grade", false_guard_data_grade),
+        ("false-unestablished", false_guard_unestablished),
         ("missing-contract-handoff-root", missing_guard_handoff_root),
         ("malformed-contract-handoff-root", malformed_guard_handoff_root),
         ("broken-conservation", broken_guard_conservation),
@@ -19811,9 +19893,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             raise EvidenceError(f"structure-guard validator survived mutant {mutant_name}")
     cases.append(
         {
-            "case": "structure_guard_v4_contract",
+            "case": "structure_guard_v5_contract",
             "ok": True,
-            "mutants_killed": [name for name, _mutate in guard_mutants],
+            "mutants_killed": [
+                name for name, _mutate in (*provisional_mutants, *guard_mutants)
+            ],
         }
     )
 

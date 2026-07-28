@@ -105,4 +105,8 @@ pub const KERNEL_OWNERSHIP_CANDIDATE_FILE: &str = "ci/KERNEL_CONTRACT_OWNERSHIP.
 /// `set(record) != expected` — so a consumer pinned to `/3` is broken by an added key
 /// exactly as it is by a removed one. A schema id that stayed put while its exact key set
 /// moved would be a version claiming to describe a shape it no longer describes.
-pub const NDJSON_SCHEMA: &str = "structure-guard/4";
+///
+/// `/5` adds terminal `data_grade` and `unestablished` fields (bead
+/// `fln-census-empty-referent-no-mock-krb0`). They distinguish an audited handoff root from
+/// an audit that established no evidence without promoting the latter to a failure.
+pub const NDJSON_SCHEMA: &str = "structure-guard/5";

@@ -1942,11 +1942,8 @@ fn a_caller_chosen_return_type_is_refused_even_with_a_reviewed_row() {
 /// Without that equality this test would pass just as well against a grade wired to
 /// `verdict`, which would carry no new information at all.
 ///
-/// **This asserts the DERIVATION, not the artifact.** Neither field is rendered into the
-/// `structure-guard/4` robot stream yet: `scripts/evidence.py`'s `require_guard_keys`
-/// compares the terminal key set for exact equality, so emitting them is a `/5` bump that
-/// must move the producer, the validator and its fixtures together, and two of those live
-/// in another pane's uncommitted file. No record claims this grade today.
+/// The same assertions are made against the rendered `/5` terminal record, so a correct
+/// `RunOutcome` with a stale or transcribed artifact cannot satisfy this test.
 #[test]
 fn the_data_grade_is_the_only_field_that_separates_an_unaudited_tree() {
     let audited = TempWs::new("krb0-grade-audited");
@@ -2002,4 +1999,21 @@ fn the_data_grade_is_the_only_field_that_separates_an_unaudited_tree() {
 
     // `provisional` is not a failure, and a caller must never render it as one.
     assert_eq!(unaudited.exit_code(), 0);
+
+    let audited_robot = structure_guard::report::render_ndjson("fixture", &audited, 1);
+    assert!(
+        audited_robot.contains(
+            "\"data_grade\":\"verified\",\"unestablished\":[],\
+             \"contract_handoff_root\":\"fnv1a64:"
+        ),
+        "audited terminal record lost the data-grade join: {audited_robot}"
+    );
+    let unaudited_robot = structure_guard::report::render_ndjson("fixture", &unaudited, 1);
+    assert!(
+        unaudited_robot.contains(
+            "\"data_grade\":\"provisional\",\"unestablished\":[\"contract_handoff\"],\
+             \"contract_handoff_root\":null"
+        ),
+        "unaudited terminal record lost the data-grade join: {unaudited_robot}"
+    );
 }

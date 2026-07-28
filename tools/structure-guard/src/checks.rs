@@ -248,6 +248,17 @@ impl RunOutcome {
         }
     }
 
+    /// The subject graded by this outcome's terminal record.
+    ///
+    /// The setup, CLI-failure, and help renderers have no `RunOutcome`, so they construct
+    /// another `TerminalSubject` variant and use the same accessors. That keeps all terminal
+    /// paths on one derivation instead of transcribing a grade beside a null handoff root.
+    pub fn terminal_subject(&self) -> TerminalSubject<'_> {
+        TerminalSubject::Audited {
+            contract_handoff_root: self.contract_handoff_root.as_deref(),
+        }
+    }
+
     /// Which audits contributing to this verdict established no evidence.
     ///
     /// DERIVED from the same `Option` the root is rendered from, never set by a caller. A
@@ -262,11 +273,7 @@ impl RunOutcome {
     /// would notice on its own, and no caller may read a one-member list as a complete
     /// inventory of what went unestablished.
     pub fn unestablished(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.contract_handoff_root.is_none() {
-            out.push("contract_handoff".to_string());
-        }
-        out
+        self.terminal_subject().unestablished()
     }
 
     /// The FL-INV-07 data grade AGENTS.md's Agent Ergonomics section already requires of a
@@ -286,10 +293,48 @@ impl RunOutcome {
     /// case is "not audited"; the third established a rejection and is still graded
     /// `provisional` here. A reader who needs those separated must read `findings`, not this.
     pub fn data_grade(&self) -> &'static str {
-        if self.unestablished().is_empty() {
-            "verified"
-        } else {
-            "provisional"
+        self.terminal_subject().data_grade()
+    }
+}
+
+/// What a terminal record grades.
+///
+/// Completed runs derive the grade from their contract-handoff root. Setup and CLI failures
+/// never started an audit, while help requested no audit. Keeping those cases distinct avoids
+/// both false `verified` grades and the opposite error of describing a CLI typo as a completed
+/// but provisional repository audit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalSubject<'a> {
+    Audited {
+        contract_handoff_root: Option<&'a str>,
+    },
+    NotStarted,
+    NoAudit,
+}
+
+impl TerminalSubject<'_> {
+    /// The FL-INV-07 data grade summarized by the terminal record.
+    pub fn data_grade(&self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_established",
+            Self::NoAudit => "not_applicable",
+            Self::Audited { .. } => {
+                if self.unestablished().is_empty() {
+                    "verified"
+                } else {
+                    "provisional"
+                }
+            }
+        }
+    }
+
+    /// Audits reached by this terminal subject that established no evidence.
+    pub fn unestablished(&self) -> Vec<String> {
+        match self {
+            Self::Audited {
+                contract_handoff_root: None,
+            } => vec!["contract_handoff".to_string()],
+            Self::Audited { .. } | Self::NotStarted | Self::NoAudit => Vec::new(),
         }
     }
 }

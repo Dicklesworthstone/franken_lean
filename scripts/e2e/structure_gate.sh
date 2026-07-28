@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Real-path E2E for fln-8mj's structural policy. Every child is bounded and its
-# structure-guard/4 output is parsed as JSON with an exact ordered finding contract.
+# structure-guard/5 output is parsed as JSON with an exact ordered finding contract.
 # Negative fixtures are immutable evidence; recovery uses independent clean fixtures.
 
 set -Eeuo pipefail
@@ -958,12 +958,12 @@ guard_step() {
     --expected-exit "$expected_exit" --expected-verdict "$expected_verdict" \
     --expected-root "$fixture_root" --observed-exit "$LAST_CHILD_EXIT" \
     --artifact-root "$ART_DIR" "${validate_args[@]}" --output "$validation"; then
-    record_contract_failure "$step" structure-guard/4_exact_contract_mismatch \
+    record_contract_failure "$step" structure-guard/5_exact_contract_mismatch \
       "$expected_classification" "$expected_wrapper" "$expected_exit" \
       "$SUBJECT_BEFORE" "$SUBJECT_AFTER" "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
   fi
   record_step "$step" pass \
-    "structure-guard/4:$expected_verdict/wrapper=$expected_wrapper/child=$expected_exit" \
+    "structure-guard/5:$expected_verdict/wrapper=$expected_wrapper/child=$expected_exit" \
     "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
     "${validation#"$ART_DIR"/}" "$expected_classification" "$expected_wrapper" \
     "$expected_exit" "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
@@ -1222,7 +1222,11 @@ EXPORTED="$SCRATCH_ROOT/exported"
 copy_fixture copy_exported "$EXPORTED"
 printf '\npub fn seeded_public_export<T>() -> T { panic!("not executed") }\n' \
   >> "$EXPORTED/crates/fln-unsafe-abi/src/lib.rs"
+# The one plant violates two independent FLN-STRUCT-022 laws: it is absent from the reviewed
+# boundary inventory, and its caller-chosen return type cannot be reviewed away. The exact
+# contract retains both findings even though their stable code/path identities coincide.
 guard_step seeded_export "$EXPORTED" 1 fail \
+  FLN-STRUCT-022@crates/fln-unsafe-abi/src/lib.rs \
   FLN-STRUCT-022@crates/fln-unsafe-abi/src/lib.rs
 
 RESTRICTED="$SCRATCH_ROOT/restricted"
