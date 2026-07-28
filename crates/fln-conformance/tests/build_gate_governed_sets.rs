@@ -344,9 +344,29 @@ const CHECK_SH_BARE_DIRECTORY_ENTRIES: usize = 5;
 ///
 /// The repair is the one this file already applies to the rows: derive, then bind in **both**
 /// directions, so registering a script obliges its author to move the number and a table edit
-/// cannot invent one. The duplicate statement in the prose was **removed** rather than bound —
-/// two copies that must move together is the defect, not the fix, and `word_to_number` above
-/// stops at twenty-one so the word form was unbindable anyway.
+/// cannot invent one. The duplicate statements in the prose were **removed** rather than bound —
+/// two copies that must move together is the defect, not the fix, and `english` above stops at
+/// twenty-one so the word form was unbindable anyway.
+///
+/// **That sentence was FALSE in this file for one commit, and how it was false is the finding.**
+/// It read "the duplicate statement ... was **removed**", singular, and credited the reason to
+/// `word_to_number` — an identifier that occurs nowhere in this repository, so the stated ground
+/// for the repair named a producer that does not denote. There were **two** word-form statements
+/// on one line of AGENTS.md. `0d37f95b` removed the first and landed with the second intact, so
+/// the file stated this one array's cardinality as `53` in a header this guard holds per commit,
+/// and as "fifty" twice in unbound prose seventeen words later, with the suite green — verbatim
+/// the defect the guard was built to end, inside the commit that built it. A stale comment below
+/// quoting the header as `50` made it three statements and three values again. Found by cc_2
+/// against the uncommitted copy, re-measured live at `196be5b7` and repaired here.
+///
+/// **Binding that clause instead of deleting the number was priced, and it is a WALL in both
+/// available forms** — recorded because "bind it" is the reflex this file otherwise rewards.
+/// Refusing the array's cardinality in digits within that paragraph collides with the paragraph's
+/// own `40`, a legitimate reference to the `contract_handoff.sh` row, which becomes a false red
+/// the day `check.sh` carries 40 entries — above the floor, so reachable. Refusing word forms the
+/// binder cannot read fires on `forty`, three times, on correct prose **today**. A guard that
+/// reddens a correct state is this file's recurring error shape, so the number is deleted where it
+/// was never load-bearing and bound where it is.
 ///
 /// **The floor is what stops a broken extractor reading as a repair.** `governed_paths` is
 /// reused rather than reimplemented — a second copy would be free to drift from the one the
@@ -412,6 +432,168 @@ fn the_governed_set_table_states_check_sh_s_own_cardinality() {
          entries are bare directories; {bare} of them are. That sentence is the whole reason the \
          path COUNT does not tell you whether your write voids a lane, so it may not drift: a \
          bare directory covers every file beneath it."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The count is stated in the header, which is bound above — and nowhere beneath it
+// ---------------------------------------------------------------------------
+
+/// The granularity paragraph beneath the governed-set table, located by a phrase that is its own
+/// subject rather than by a line number — AGENTS.md's own registry section records what a line
+/// citation costs when anyone inserts above it.
+const GRANULARITY_ANCHOR: &str = "What that binding covers is every lane's path COUNT";
+
+/// Does this token state a quantity? A digit run, or an English number word — including the tens
+/// `english` above deliberately stops short of, which is exactly the range the surviving duplicate
+/// lived in. Markdown emphasis and sentence punctuation are stripped first, because `**Fifty**`
+/// and `fifty,` are the same claim as `fifty`.
+fn states_a_quantity(token: &str) -> bool {
+    let word = token
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .to_ascii_lowercase();
+    if word.is_empty() {
+        return false;
+    }
+    if word.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if english(&word).is_some() {
+        return true;
+    }
+    const TENS: [&str; 9] = [
+        "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred", "thousand",
+    ];
+    TENS.iter().any(|tens| {
+        word == *tens
+            || word
+                .strip_prefix(tens)
+                .is_some_and(|rest| rest.starts_with('-'))
+    })
+}
+
+/// The entries-vs-paths contrast beneath the table may CONTRAST; it may not RESTATE the count.
+///
+/// The header cell is bound to the array by the test above. This refuses a *second* statement of
+/// the same cardinality in the paragraph beneath it — the shape that survived `0d37f95b` — while
+/// leaving the contrast itself, which is the paragraph's whole argument, untouched.
+///
+/// Scoped to a quantity sitting **immediately before an emphasised entries/paths token**, and that
+/// narrowness is the point rather than an implementation detail: the two broader predicates were
+/// measured to be walls, and both are named in the header test's docstring above. This one cannot
+/// fire on the paragraph's `40`, on `forty files or forty trees`, or on `Five of check.sh's
+/// entries` — none of which is a claim about the array's cardinality.
+fn quantities_restated_beneath_the_table(agents_md: &str) -> Result<(), String> {
+    let at = agents_md.find(GRANULARITY_ANCHOR).ok_or_else(|| {
+        format!(
+            "AGENTS.md must carry the granularity paragraph beneath the governed-set table \
+             (anchor: {GRANULARITY_ANCHOR:?}). If it moved or was reworded this check is judging \
+             a claim that no longer exists, and must be updated rather than quietly passing."
+        )
+    })?;
+    let paragraph = agents_md[at..].split("\n\n").next().unwrap_or_default();
+    let tokens: Vec<&str> = paragraph.split_whitespace().collect();
+
+    let emphasised: Vec<(usize, &str)> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| token.contains('*'))
+        .filter_map(|(i, token)| {
+            let bare = token
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .to_ascii_lowercase();
+            match bare.as_str() {
+                "entry" | "entries" => Some((i, "entries")),
+                "path" | "paths" => Some((i, "paths")),
+                _ => None,
+            }
+        })
+        .collect();
+
+    // Anti-vacuity. Deleting the number drove the live population to ZERO, so a reworded
+    // paragraph carrying nothing to judge would satisfy this check while covering nothing —
+    // a repaired population's live guard is unkillable unless it refuses its own emptiness.
+    for kind in ["entries", "paths"] {
+        if !emphasised.iter().any(|(_, k)| *k == kind) {
+            return Err(format!(
+                "the granularity paragraph carries no emphasised *{kind}* token. The \
+                 entries-vs-paths contrast is the thing this check judges, so its absence is a \
+                 VACUOUS PASS and not a clean one: reinstate the clause, or retire this check \
+                 deliberately rather than by rewording."
+            ));
+        }
+    }
+
+    let offences: Vec<String> = emphasised
+        .iter()
+        .filter_map(|(i, _)| {
+            let prev = i.checked_sub(1).and_then(|j| tokens.get(j))?;
+            states_a_quantity(prev).then(|| format!("{prev} {}", tokens[*i]))
+        })
+        .collect();
+
+    if offences.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the granularity paragraph beneath the governed-set table RESTATES a count on the \
+         entries-vs-paths contrast: {}. That cardinality is stated once, in the table header, \
+         where the test above holds it to `check.sh`'s array per commit. A second copy in \
+         unbound prose is the defect this guard exists to end — it already survived one commit \
+         (53 in the header, \"fifty\" twice seventeen words later, suite green). Delete the \
+         quantity; the contrast carries the argument without it.",
+        offences.join("; ")
+    ))
+}
+
+/// Four cells: the real file, a planted decoy, and both anti-vacuity refusals.
+#[test]
+fn the_count_is_stated_in_the_bound_header_and_nowhere_beneath_it() {
+    let real = agents_md();
+
+    // Cell 1 — the production text. The only cell that says anything about this tree.
+    if let Err(complaint) = quantities_restated_beneath_the_table(&real) {
+        panic!("{complaint}");
+    }
+
+    // Cell 2 — the planted decoy, restoring verbatim what `0d37f95b` left behind. Without an
+    // injected member this check has no live population to fire on and would read as coverage
+    // it does not have.
+    let decoy = real.replace(
+        "*Entries* are not *paths*",
+        "Fifty *entries* is not fifty *paths*",
+    );
+    assert_ne!(
+        decoy, real,
+        "the decoy planted nothing, so cell 2 is vacuous"
+    );
+    let refused = quantities_restated_beneath_the_table(&decoy)
+        .expect_err("the exact clause this guard was built for was NOT refused");
+    assert!(
+        refused.contains("Fifty *entries*") && refused.contains("fifty *paths*"),
+        "the refusal must name BOTH restatements; only one of the two was reported, which is how \
+         the first repair removed one copy and left the other: {refused}"
+    );
+
+    // Cell 3 — the clause reworded away. A check that passes on a paragraph with nothing to
+    // judge is decorative, so emptiness is refused rather than reported clean.
+    let hollow = real.replace("*Entries* are not *paths*, ", "");
+    assert_ne!(hollow, real, "cell 3 planted nothing");
+    let vacuous = quantities_restated_beneath_the_table(&hollow)
+        .expect_err("a paragraph with no contrast clause left was reported CLEAN");
+    assert!(
+        vacuous.contains("VACUOUS PASS"),
+        "emptiness must be refused as vacuity, not as a count violation: {vacuous}"
+    );
+
+    // Cell 4 — the paragraph itself gone. The anchor is prose and prose moves.
+    let anchorless = real.replace(GRANULARITY_ANCHOR, "What that binding covers");
+    assert_ne!(anchorless, real, "cell 4 planted nothing");
+    let lost = quantities_restated_beneath_the_table(&anchorless)
+        .expect_err("a missing granularity paragraph was reported CLEAN");
+    assert!(
+        lost.contains("no longer exists"),
+        "a lost anchor must say the claim is gone, not pass: {lost}"
     );
 }
 
@@ -503,7 +685,7 @@ fn an_empty_or_short_scan_is_refused_rather_than_reported_clean() {
     // Isolating it took a correction: deleting the whole table made `declared` panic on the
     // zero row first, so the assertion passed for a reason that had nothing to do with the floor.
     // The predicate must be the same shape the parser uses — a leading cell that is a NUMBER —
-    // not "contains a .sh name". The header cell reads ``relative to `check.sh`'s 50``, so a
+    // not "contains a .sh name". The header cell reads ``relative to `check.sh`'s <N>``, so a
     // substring test deleted the anchor itself and the guard panicked for the wrong reason.
     let rowless: String = real
         .lines()
