@@ -69,7 +69,12 @@ pub const LEAD_PREC: Prec = MAX_PREC - 2;
 /// for every fallback production that declined to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
-    pub message: String,
+    /// The unexpected side of the diagnostic, already phrased for rendering. Empty when a
+    /// parser contributes only an expected alternative.
+    unexpected: String,
+    /// Expected alternatives in parser-composition order. Rendering sorts and deduplicates
+    /// them exactly as the pin does; retaining the raw list keeps merging lossless.
+    expected: Vec<String>,
     pub at: BytePos,
     /// Whether the production consumed input before failing. The trailing loop treats a
     /// *non-consuming* failure as "this production does not apply here" and a consuming one as
@@ -80,7 +85,8 @@ pub struct ParseError {
 impl ParseError {
     pub fn new(message: impl Into<String>, at: BytePos) -> ParseError {
         ParseError {
-            message: message.into(),
+            unexpected: message.into(),
+            expected: Vec::new(),
             at,
             consumed: false,
         }
@@ -88,11 +94,114 @@ impl ParseError {
 
     pub fn consuming(message: impl Into<String>, at: BytePos) -> ParseError {
         ParseError {
-            message: message.into(),
+            unexpected: message.into(),
+            expected: Vec::new(),
             at,
             consumed: true,
         }
     }
+
+    /// A parser contribution that names only what was expected.
+    pub fn expecting(expected: impl Into<String>, at: BytePos) -> ParseError {
+        ParseError {
+            unexpected: String::new(),
+            expected: vec![expected.into()],
+            at,
+            consumed: false,
+        }
+    }
+
+    /// A consuming parser contribution that names only what was expected.
+    pub fn consuming_expecting(expected: impl Into<String>, at: BytePos) -> ParseError {
+        ParseError {
+            unexpected: String::new(),
+            expected: vec![expected.into()],
+            at,
+            consumed: true,
+        }
+    }
+
+    /// Construct the complete Reference error shape: one optional unexpected description and
+    /// zero or more expected alternatives.
+    pub fn with_expected<I, S>(
+        unexpected: impl Into<String>,
+        expected: I,
+        at: BytePos,
+        consumed: bool,
+    ) -> ParseError
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        ParseError {
+            unexpected: unexpected.into(),
+            expected: expected.into_iter().map(Into::into).collect(),
+            at,
+            consumed,
+        }
+    }
+
+    pub fn unexpected(&self) -> &str {
+        &self.unexpected
+    }
+
+    pub fn expected_items(&self) -> &[String] {
+        &self.expected
+    }
+
+    /// Render `Lean.Parser.Error.toString`: expected alternatives are sorted, deduplicated, and
+    /// joined with the pin's zero/one/two/many grammar.
+    pub fn message(&self) -> String {
+        let mut expected = self.expected.clone();
+        expected.sort();
+        expected.dedup();
+
+        let expected = if expected.is_empty() {
+            String::new()
+        } else {
+            format!("expected {}", expected_to_string(&expected))
+        };
+        match (self.unexpected.is_empty(), expected.is_empty()) {
+            (false, false) => format!("{}; {expected}", self.unexpected),
+            (false, true) => self.unexpected.clone(),
+            (true, false) => expected,
+            (true, true) => String::new(),
+        }
+    }
+
+    /// `Lean.Parser.Error.merge`: the newer nonempty unexpected description wins, expected
+    /// alternatives concatenate without losing information, and the newer token position is
+    /// retained. Rendering performs the pin's sort and duplicate erasure.
+    fn merge(&self, newer: &ParseError) -> ParseError {
+        let unexpected = if newer.unexpected.is_empty() {
+            self.unexpected.clone()
+        } else {
+            newer.unexpected.clone()
+        };
+        let mut expected = self.expected.clone();
+        expected.extend(newer.expected.iter().cloned());
+        ParseError {
+            unexpected,
+            expected,
+            at: newer.at,
+            consumed: self.consumed || newer.consumed,
+        }
+    }
+}
+
+fn expected_to_string(expected: &[String]) -> String {
+    let mut rendered = String::new();
+    for (index, item) in expected.iter().enumerate() {
+        if index > 0 {
+            if index + 1 == expected.len() {
+                rendered.push_str(" or ");
+            } else {
+                rendered.push_str(", ");
+            }
+        }
+        rendered.push_str(item);
+    }
+    rendered
 }
 
 /// The engine's state: a syntax stack, a position, the two precedence registers, and at most
@@ -353,44 +462,43 @@ pub fn longest_match(
         let error = state.error().cloned();
         let lhs_prec = state.lhs_prec();
 
-        match &best {
-            None => {
-                best = Some((score, produced, lhs_prec, error));
+        let Some(best_entry) = &mut best else {
+            best = Some((score, produced, lhs_prec, error));
+            tied.clear();
+            tied_lhs_prec = lhs_prec;
+            continue;
+        };
+        match score.cmp(&best_entry.0) {
+            std::cmp::Ordering::Greater => {
+                *best_entry = (score, produced, lhs_prec, error);
                 tied.clear();
                 tied_lhs_prec = lhs_prec;
             }
-            Some((best_score, _, _, _)) if score > *best_score => {
-                best = Some((score, produced, lhs_prec, error));
-                tied.clear();
-                tied_lhs_prec = lhs_prec;
-            }
-            Some((best_score, _, _, _)) if score == *best_score => {
-                // A TIE. Both are kept — see the module docs on why discarding one is the
-                // single most consequential defect available here.
-                // Only *successful* candidates tie into a choice node. Upstream tests the
-                // previous candidate's error alone (`Basic.lean:1433`), which is equivalent here
-                // because the score's second component already makes equal scores agree about
-                // error-ness — both errored or neither did.
-                //
-                // RECORDED GAP: when tied candidates have both errored, upstream calls
-                // `mergeErrors` so the diagnostic lists every alternative that could have
-                // applied ("expected X or Y"). This keeps the best error instead. That is a
-                // diagnostic-quality divergence, not an acceptance one — the same inputs are
-                // accepted and rejected either way — and it belongs with the expected-token
-                // diagnostics slice, which is where the merged form has a consumer. Written down
-                // rather than left for someone to discover as a worse error message.
-                if let Some((_, best_produced, _, best_error)) = &best
-                    && best_error.is_none()
-                    && error.is_none()
-                {
-                    if tied.is_empty() {
-                        tied.extend(best_produced.iter().cloned());
+            std::cmp::Ordering::Equal => {
+                // A successful tie preserves every alternative under a choice node. A failing
+                // tie remains one failure but merges the expected alternatives, exactly as
+                // `ParserState.mergeErrors` does at the pin.
+                match (&best_entry.3, &error) {
+                    (None, None) => {
+                        if tied.is_empty() {
+                            tied.extend(best_entry.1.iter().cloned());
+                        }
+                        tied.extend(produced.iter().cloned());
+                        tied_lhs_prec = tied_lhs_prec.min(lhs_prec);
                     }
-                    tied.extend(produced.iter().cloned());
-                    tied_lhs_prec = tied_lhs_prec.min(lhs_prec);
+                    (Some(old_error), Some(new_error)) => {
+                        let merged = old_error.merge(new_error);
+                        best_entry.3 = Some(merged);
+                    }
+                    // `Score::succeeded` is derived from `has_error`, so these cases cannot
+                    // arise from the current state representation. Keep the resolver total if
+                    // those representations are ever decoupled: retain an established error,
+                    // or adopt the only error available.
+                    (Some(_), None) => {}
+                    (None, Some(new_error)) => best_entry.3 = Some(new_error.clone()),
                 }
             }
-            Some(_) => {}
+            std::cmp::Ordering::Less => {}
         }
     }
 
@@ -508,6 +616,18 @@ mod tests {
         Production::new(name(kind), priority, move |state| {
             state.set_pos(BytePos(end));
             state.set_error(ParseError::consuming("no", BytePos(end)));
+        })
+    }
+
+    /// A production that contributes one expected alternative before failing.
+    fn expecting_failure(kind: &str, expected: &str, priority: u32, end: usize) -> Production {
+        let expected = expected.to_string();
+        Production::new(name(kind), priority, move |state| {
+            state.set_pos(BytePos(end));
+            state.set_error(ParseError::consuming_expecting(
+                expected.clone(),
+                BytePos(end),
+            ));
         })
     }
 
@@ -750,7 +870,7 @@ mod tests {
             !state.check_prec(64),
             "a production below the context's demand does not apply"
         );
-        assert_eq!(state.error().expect("an error").message, PREC_MESSAGE);
+        assert_eq!(state.error().expect("an error").message(), PREC_MESSAGE);
 
         // checkLhsPrec succeeds when what was just parsed binds at least as tightly.
         let mut state = ParserState::new(0);
@@ -758,7 +878,101 @@ mod tests {
         assert!(state.check_lhs_prec(50));
         assert!(state.check_lhs_prec(49));
         assert!(!state.check_lhs_prec(51));
-        assert_eq!(state.error().expect("an error").message, PREC_MESSAGE);
+        assert_eq!(state.error().expect("an error").message(), PREC_MESSAGE);
+    }
+
+    #[test]
+    fn parse_error_rendering_matches_the_pins_expected_list_grammar() {
+        let none = ParseError::with_expected("", std::iter::empty::<&str>(), BytePos(0), false);
+        assert_eq!(none.message(), "");
+
+        let one = ParseError::expecting("term", BytePos(0));
+        assert_eq!(one.message(), "expected term");
+
+        let two = ParseError::with_expected("", ["term", "identifier"], BytePos(0), false);
+        assert_eq!(two.message(), "expected identifier or term");
+
+        let many = ParseError::with_expected(
+            "unexpected token '?'",
+            ["term", "numeral", "identifier", "term"],
+            BytePos(0),
+            true,
+        );
+        assert_eq!(
+            many.message(),
+            "unexpected token '?'; expected identifier, numeral or term"
+        );
+    }
+
+    #[test]
+    fn merging_errors_keeps_the_newest_nonempty_unexpected_description() {
+        let older = ParseError::with_expected("unexpected old token", ["term"], BytePos(1), false);
+        let newer_without_unexpected =
+            ParseError::with_expected("", ["identifier"], BytePos(2), true);
+        let merged = older.merge(&newer_without_unexpected);
+        assert_eq!(merged.unexpected(), "unexpected old token");
+        assert_eq!(
+            merged.message(),
+            "unexpected old token; expected identifier or term"
+        );
+        assert_eq!(merged.at, BytePos(2));
+        assert!(merged.consumed);
+
+        let newest =
+            ParseError::with_expected("unexpected new token", ["numeral"], BytePos(3), false);
+        let merged = merged.merge(&newest);
+        assert_eq!(merged.unexpected(), "unexpected new token");
+        assert_eq!(
+            merged.message(),
+            "unexpected new token; expected identifier, numeral or term"
+        );
+        assert_eq!(merged.at, BytePos(3));
+    }
+
+    #[test]
+    fn tied_failures_preserve_every_expected_alternative_in_any_order() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["term", "identifier"], "expected identifier or term"),
+            (&["identifier", "term"], "expected identifier or term"),
+            (
+                &["term", "identifier", "numeral"],
+                "expected identifier, numeral or term",
+            ),
+            (
+                &["numeral", "term", "identifier"],
+                "expected identifier, numeral or term",
+            ),
+        ];
+        for (expected, rendered) in cases {
+            let productions: Vec<Production> = expected
+                .iter()
+                .map(|item| expecting_failure(item, item, 7, 5))
+                .collect();
+            let (resolution, state) = run(&productions);
+            assert_eq!(resolution, Resolution::Failed);
+            assert_eq!(state.error().expect("merged error").message(), *rendered);
+        }
+    }
+
+    #[test]
+    fn unequal_failure_scores_select_one_error_instead_of_merging() {
+        for productions in [
+            vec![
+                expecting_failure("short", "shorter", 99, 4),
+                expecting_failure("long", "longer", 1, 8),
+            ],
+            vec![
+                expecting_failure("long", "longer", 1, 8),
+                expecting_failure("short", "shorter", 99, 4),
+            ],
+        ] {
+            let (resolution, state) = run(&productions);
+            assert_eq!(resolution, Resolution::Failed);
+            assert_eq!(
+                state.error().expect("winning error").message(),
+                "expected longer"
+            );
+        }
     }
 
     /// Two candidates that both fail at the same position are one error, not an ambiguity.

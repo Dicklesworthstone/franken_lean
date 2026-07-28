@@ -102,12 +102,11 @@ pub fn leading_parser(grammar: &dyn Grammar, state: &mut ParserState) {
     if productions.is_empty() {
         let at = state.pos();
         match grammar.consume_token(state) {
-            Ok(token) => state.set_error(ParseError::consuming(
-                format!(
-                    "unexpected token '{token}'; expected {}",
-                    kind_text(grammar)
-                ),
+            Ok(token) => state.set_error(ParseError::with_expected(
+                format!("unexpected token '{token}'"),
+                [kind_text(grammar)],
                 at,
+                true,
             )),
             // No token to consume: end of input, which upstream reports through `tokenFn`'s own
             // EOI error rather than as an unexpected token.
@@ -471,7 +470,7 @@ mod tests {
             state.has_error(),
             "a trailing failure that consumed input must be reported"
         );
-        assert_eq!(state.error().expect("error").message, "malformed");
+        assert_eq!(state.error().expect("error").message(), "malformed");
         assert!(
             state.pos().0 > 3,
             "and the position reflects what it consumed"
@@ -516,7 +515,8 @@ mod tests {
 
         let error = state.error().expect("an unexpected-token error");
         assert_eq!(
-            error.message, "unexpected token '?'; expected term",
+            error.message(),
+            "unexpected token '?'; expected term",
             "the message names the token and the category, as the pin's does"
         );
         assert!(
@@ -539,7 +539,7 @@ mod tests {
         let mut state = ParserState::new(0);
         pratt_parser(&grammar, &mut state);
         assert_eq!(
-            state.error().expect("error").message,
+            state.error().expect("error").message(),
             "unexpected end of input"
         );
     }
@@ -569,7 +569,7 @@ mod tests {
         let mut state = ParserState::new(0);
         pratt_parser(&Exploding, &mut state);
         assert_eq!(
-            state.error().expect("error").message,
+            state.error().expect("error").message(),
             "bad token",
             "the leading error must survive; if the trailing loop had run it would have \
              overwritten or discarded it"

@@ -427,14 +427,16 @@ impl FixtureGrammar {
     fn take_symbol(&self, state: &mut ParserState, expected: &str) -> Result<Syntax, ParseError> {
         let at = state.pos();
         let Some(index) = self.next_token_index(at) else {
-            return Err(ParseError::consuming(
-                format!("expected {expected:?}, found end of input"),
+            return Err(ParseError::with_expected(
+                "unexpected end of input",
+                [format!("{expected:?}")],
                 at,
+                true,
             ));
         };
         let token = &self.tokens[index];
         if !matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == expected) {
-            return Err(ParseError::consuming(format!("expected {expected:?}"), at));
+            return Err(ParseError::consuming_expecting(format!("{expected:?}"), at));
         }
         state.set_pos(token.extent.end());
         self.leaves
@@ -445,14 +447,16 @@ impl FixtureGrammar {
     fn take_ident(&self, state: &mut ParserState) -> Result<Syntax, ParseError> {
         let at = state.pos();
         let Some(index) = self.next_token_index(at) else {
-            return Err(ParseError::consuming(
-                "expected identifier, found end of input",
+            return Err(ParseError::with_expected(
+                "unexpected end of input",
+                ["identifier"],
                 at,
+                true,
             ));
         };
         let token = &self.tokens[index];
         if !matches!(token.kind, TokenKind::Ident(_)) {
-            return Err(ParseError::consuming("expected identifier", at));
+            return Err(ParseError::consuming_expecting("identifier", at));
         }
         state.set_pos(token.extent.end());
         self.leaves
@@ -921,7 +925,8 @@ fn parse(source: &str, operators: &'static [Operator]) -> Result<Syntax, String>
     if let Some(error) = state.error() {
         return Err(format!(
             "parser refused {source:?} at byte {}: {}",
-            error.at.0, error.message
+            error.at.0,
+            error.message()
         ));
     }
     if let Some(token_index) = grammar.next_token_index(state.pos()) {
