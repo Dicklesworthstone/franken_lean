@@ -490,15 +490,15 @@ fn a_workflow_that_can_never_fire_does_not_count_as_invoking_a_lane() {
 fn the_contract_drift_cadence_claim_is_bound_to_its_dispatcher() {
     let root = root();
     let workflow = fs::read_to_string(root.join(CONTRACT_DRIFT_WORKFLOW))
-        .unwrap_or_else(|error| panic!("{CONTRACT_DRIFT_WORKFLOW}: {error}"));
+        .expect("the contract-drift workflow must be readable");
     configured_weekly_and_on_demand(&workflow)
-        .unwrap_or_else(|error| panic!("configured contract-drift cadence: {error}"));
+        .expect("the contract-drift workflow must configure the declared cadence");
 
     let claims: Vec<(&str, bool)> = CADENCE_CLAIM_SITES
         .iter()
         .map(|path| {
             let text = fs::read_to_string(root.join(path))
-                .unwrap_or_else(|error| panic!("{path}: {error}"));
+                .expect("every contract-drift cadence claim site must be readable");
             (
                 *path,
                 module_documentation(&text).contains(CONFIGURED_CADENCE_CLAIM),
@@ -506,7 +506,7 @@ fn the_contract_drift_cadence_claim_is_bound_to_its_dispatcher() {
         })
         .collect();
     cadence_binding_verdict(true, &claims)
-        .unwrap_or_else(|error| panic!("contract-drift cadence binding: {error}"));
+        .expect("the configured contract-drift cadence must match every claim");
 }
 
 /// Controls for each direction of the cadence join, including the cron-frequency axis.
