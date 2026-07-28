@@ -93,7 +93,7 @@ const BACKUP_ONLY_ALLOWANCE: &[(&str, usize)] = &[
     // for ae906-30b. The exact identity set is guarded bidirectionally by golden_vellum; these
     // per-file counts retain the independent multiplicity wall against duplicate citation growth.
     ("AGENTS.md", 3),
-    ("ci/VERIFICATION_MANIFEST.jsonl", 14),
+    ("ci/VERIFICATION_MANIFEST.jsonl", 13),
     ("ci/WORKSPACE_GRAPH.txt", 1),
     ("crates/fln-conformance/src/witness.rs", 3),
     (
