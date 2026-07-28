@@ -4352,6 +4352,25 @@ def require_exact_object_keys(
     return value
 
 
+def verification_receipt_execution_identity_kind(identity: str) -> str | None:
+    """Classify the only execution identities a receipt may carry.
+
+    ``stage``, ``step``, and ``self_test`` identities are emitted as distinct
+    events by the structured runner.  A ``test`` identity names a libtest
+    function, whose ``ok`` line proves only that it returned.  The latter may
+    therefore be retained by a bundle-only inventory but cannot inherit
+    structured-run-log execution authority.
+    """
+    for kind in ("stage", "step", "self_test"):
+        if identity.startswith(f"{kind}:") and identity.removeprefix(
+            f"{kind}:"
+        ):
+            return kind
+    if verification_test_function_claim(identity) is not None:
+        return "test"
+    return None
+
+
 def validate_verification_receipt_record(
     path: Path,
     number: int,
@@ -4567,6 +4586,24 @@ def validate_verification_receipt_record(
     seen_dispositions: dict[str, str] = {}
     for field, identities in dispositions.items():
         for identity in identities:
+            identity_kind = verification_receipt_execution_identity_kind(
+                identity
+            )
+            if identity_kind is None:
+                raise EvidenceError(
+                    f"{path}:{number}: execution identity {identity!r} "
+                    "has an unsupported kind"
+                )
+            if (
+                execution["authority"] == "structured_run_log"
+                and identity_kind == "test"
+            ):
+                raise EvidenceError(
+                    f"{path}:{number}: libtest identity {identity!r} cannot "
+                    "carry structured-run-log execution authority; a passing "
+                    "libtest disposition does not prove the function reached "
+                    "its assertion-bearing end"
+                )
             prior = seen_dispositions.setdefault(identity, field)
             if prior != field:
                 raise EvidenceError(
@@ -4616,6 +4653,115 @@ def validate_verification_receipt_record(
             f"{path}:{number}: receipt content address differs"
         )
     return receipt_id
+
+
+def self_test_verification_receipt_execution_authority() -> dict[str, str]:
+    """Exercise the libtest disposition boundary without a filesystem fixture."""
+    sha256 = f"sha256:{'1' * 64}"
+    bead = "fln-log-derived-disposition-not-execution-xes2"
+    path = Path("verification-receipt-execution-authority-self-test")
+    base: dict[str, Any] = {
+        "schema": VERIFICATION_EVIDENCE_RECEIPT_SCHEMA,
+        "kind": "receipt",
+        "receipt": f"sha256:{'0' * 64}",
+        "producer": {
+            "tool": "scripts/evidence.py:promote-verification-receipt/1",
+            "run_schema": "fln.check/2",
+            "run_id": "xes2-focused",
+            "bead": bead,
+            "scenario": "quality_gate",
+            "producing_commit": "1" * 40,
+            "commit_binding": "recorded",
+        },
+        "outcome": {
+            "verdict": "pass",
+            "process_exit": PASS,
+            "reason_code": "all_obligations_passed",
+            "input_root": sha256,
+            "final_root": sha256,
+            "governed_state_static": True,
+            "governed_scope": "lane_declared_subset",
+            "governed_set": sha256,
+        },
+        "source": {
+            "bundle_commit_sha256": sha256,
+            "manifest_sha256": sha256,
+            "manifest_digest_sha256": sha256,
+            "run_log_sha256": sha256,
+        },
+        "execution": {
+            "authority": "structured_run_log",
+            "executed": ["stage:cargo-test"],
+            "expected_failure": [],
+            "typed_skip": [],
+            "not_run": [],
+        },
+        "reference": {
+            "status": "unobserved",
+            "binding_sha256": "not_applicable",
+        },
+    }
+    bead_states = {bead: {}}
+
+    def sealed(record: dict[str, Any]) -> dict[str, Any]:
+        record["receipt"] = verification_receipt_content_address(record)
+        return record
+
+    validate_verification_receipt_record(
+        path, 1, sealed(base), bead_states
+    )
+
+    libtest_identity = (
+        "test:fln-conformance::kernel_replay::"
+        "prelude_replays_through_the_kernel"
+    )
+    log_derived_test_mutant = parse_json(
+        canonical_json(base),
+        subject="log-derived libtest execution mutant",
+    )
+    log_derived_test_mutant["execution"]["executed"] = [libtest_identity]
+    try:
+        validate_verification_receipt_record(
+            path,
+            2,
+            sealed(log_derived_test_mutant),
+            bead_states,
+        )
+    except EvidenceError as error:
+        if (
+            "cannot carry structured-run-log execution authority"
+            not in str(error)
+        ):
+            raise EvidenceError(
+                "log-derived libtest mutant produced the wrong failure"
+            ) from error
+    else:
+        raise EvidenceError(
+            "a passing libtest disposition acquired execution authority"
+        )
+
+    bundle_only_test_inventory = parse_json(
+        canonical_json(base),
+        subject="bundle-only libtest inventory control",
+    )
+    bundle_only_test_inventory["execution"] = {
+        "authority": "bundle_only",
+        "executed": [],
+        "expected_failure": [],
+        "typed_skip": [],
+        "not_run": [libtest_identity],
+    }
+    validate_verification_receipt_record(
+        path,
+        3,
+        sealed(bundle_only_test_inventory),
+        bead_states,
+    )
+    return {
+        "bundle_only_test_inventory": "accepted",
+        "log_derived_libtest_execution": "refused",
+        "structured_stage_execution": "accepted",
+    }
 
 
 def load_verification_evidence_registry(
@@ -23447,6 +23593,16 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         and disposition_projection["not_run"] == ["stage:not-run"]
         and disposition_projection["expected_failure"] == [],
         "receipt projection collapsed typed skip, not-run, or execution",
+    )
+
+    require(
+        self_test_verification_receipt_execution_authority()
+        == {
+            "bundle_only_test_inventory": "accepted",
+            "log_derived_libtest_execution": "refused",
+            "structured_stage_execution": "accepted",
+        },
+        "receipt execution-authority self-test reported an unknown cell",
     )
 
     legacy_marker = {"schema": LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA}

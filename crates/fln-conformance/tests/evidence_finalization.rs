@@ -21,6 +21,52 @@ fn trusted_script(relative: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("{relative} must be readable: {error}"))
 }
 
+const RECEIPT_EXECUTION_AUTHORITY_PROBE: &str = r#"
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fln_evidence_xes2_probe", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+cells = module.self_test_verification_receipt_execution_authority()
+for name in sorted(cells):
+    print(f"{name}={cells[name]}")
+print("PROBE-COMPLETE")
+"#;
+
+/// A passing libtest line is not an observation that the function reached its
+/// assertion-bearing end. Exercise the production receipt validator, including the
+/// non-overbroad control: process-level structured events retain authority, and a
+/// test-function identity may be inventoried only under non-discharging `bundle_only`.
+#[test]
+fn verification_receipts_never_promote_libtest_ok_to_execution() {
+    let root = fln_conformance::checked_workspace_root!();
+    let evidence = root.join("scripts/evidence.py");
+    let run = std::process::Command::new("python3")
+        .args(["-I", "-S", "-B", "-c", RECEIPT_EXECUTION_AUTHORITY_PROBE])
+        .arg(&evidence)
+        .output()
+        .expect("the sealed interpreter must run the receipt-authority probe");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success() && stdout.contains("PROBE-COMPLETE"),
+        "receipt-authority probe did not complete against {}: status={:?} stderr={stderr}",
+        evidence.display(),
+        run.status.code()
+    );
+    for expected in [
+        "bundle_only_test_inventory=accepted",
+        "log_derived_libtest_execution=refused",
+        "structured_stage_execution=accepted",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "receipt-authority probe omitted {expected:?}: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn terminal_human_log_is_sealed_before_manifest_generation() {
     let script = check_script();
