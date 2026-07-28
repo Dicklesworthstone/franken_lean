@@ -255,15 +255,34 @@
 //! line stops containing its construct, and if the prose cites a location this registry does
 //! not cover. **Fix the registry, not the test** — the registry is the source.
 //!
+//! **`@@ <item>` closes the tolerance that containment cannot see, and six rows carry it.**
+//! Containment asks only whether line N holds construct C. Where C **recurs** in its file that
+//! is satisfied by *any* occurrence, so a shift can move a citation onto a different site and
+//! stay green — the tolerance is the distance between occurrences, and it is the reason
+//! `0f2ae0ba` shifted four of AGENTS.md's citations by 45 lines while only two reddened. A row
+//! whose construct recurs must therefore name the item the line sits inside, and that name is
+//! checked. `ExprNode::Sort { level }` occurs **7** times in `tc.rs` and `!e.has_fvar()` **3**,
+//! which is why exactly those six rows are sited and the other ten are not: where a construct
+//! occurs once, any shift already breaks containment, so a site check there could never fail
+//! and would be decoration reading as coverage.
+//!
+//! **Measured before it was built, at `84f35ea6`, over all 16 rows:** every one was still on
+//! its original occurrence and inside its original item, so the tolerance was real and had
+//! **never been exercised**. It is closed rather than merely disclosed because the shift nobody
+//! watches is the next one. What that measurement does not earn: it compares each row against
+//! the commit where the row last took its present form, so a row rewritten at the same commit
+//! as the code it cites is verified against itself, and it establishes site identity — never
+//! that the prose reading the site is sound.
+//!
 //! ```text
 //! cite crates/fln-kernel/src/tc.rs:949 :: lt.is_equiv(ls)
-//! cite crates/fln-kernel/src/tc.rs:896 :: ExprNode::Sort { level }
-//! cite crates/fln-kernel/src/tc.rs:1224 :: ExprNode::Sort { level }
-//! cite crates/fln-kernel/src/tc.rs:1889 :: ExprNode::Sort { level }
+//! cite crates/fln-kernel/src/tc.rs:896 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
+//! cite crates/fln-kernel/src/tc.rs:1224 :: ExprNode::Sort { level } @@ fn is_prop
+//! cite crates/fln-kernel/src/tc.rs:1889 :: ExprNode::Sort { level } @@ fn infer_proj
 //! cite crates/fln-kernel/src/tc.rs:176 :: e.loose_bvar_range() <= k
-//! cite crates/fln-kernel/src/tc.rs:1645 :: !e.has_fvar()
-//! cite crates/fln-kernel/src/tc.rs:1707 :: !e.has_fvar()
-//! cite crates/fln-kernel/src/tc.rs:1779 :: !e.has_fvar()
+//! cite crates/fln-kernel/src/tc.rs:1645 :: !e.has_fvar() @@ fn abstract_fvar
+//! cite crates/fln-kernel/src/tc.rs:1707 :: !e.has_fvar() @@ fn abstract_shifted
+//! cite crates/fln-kernel/src/tc.rs:1779 :: !e.has_fvar() @@ fn replace_fvar
 //! cite crates/fln-hash/src/canon.rs:1044 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:542 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr

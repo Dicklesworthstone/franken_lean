@@ -57,11 +57,13 @@ fn charter() -> String {
         .expect("the charter must be readable")
 }
 
-/// One `cite <path>:<line> :: <construct>` row of the charter's registry.
+/// One `cite <path>:<line> :: <construct>[ @@ <site>]` row of the charter's registry.
 struct Citation {
     path: String,
     line: usize,
     construct: String,
+    /// The item the cited line sits inside, for rows whose construct RECURS in its file.
+    site: Option<String>,
 }
 
 fn registry(charter: &str) -> Vec<Citation> {
@@ -70,15 +72,110 @@ fn registry(charter: &str) -> Vec<Citation> {
         .filter_map(|raw| {
             let rest = raw.trim_start().strip_prefix("//!")?.trim_start();
             let rest = rest.strip_prefix("cite ")?;
-            let (locator, construct) = rest.split_once(" :: ")?;
+            let (locator, tail) = rest.split_once(" :: ")?;
             let (path, line) = locator.rsplit_once(':')?;
+            let (construct, site) = match tail.split_once(" @@ ") {
+                Some((construct, site)) => (construct, Some(site.trim().to_string())),
+                None => (tail, None),
+            };
             Some(Citation {
                 path: path.to_string(),
                 line: line.parse().ok()?,
                 construct: construct.trim().to_string(),
+                site,
             })
         })
         .collect()
+}
+
+/// `pub`, `pub(crate)`, `pub(super)` — removed so a visibility change is not a false drift.
+fn strip_visibility(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("pub") else {
+        return text;
+    };
+    let rest = rest.trim_start();
+    let rest = if rest.starts_with('(') {
+        rest.split_once(')').map_or(rest, |(_, after)| after)
+    } else {
+        rest
+    };
+    rest.trim_start()
+}
+
+/// The nearest item header at or above `line` (1-indexed): the citation's *site*.
+fn enclosing_item(lines: &[&str], line: usize) -> String {
+    const KINDS: [&str; 7] = ["fn", "impl", "struct", "enum", "trait", "const", "static"];
+    for raw in lines[..line.min(lines.len())].iter().rev() {
+        let text = strip_visibility(raw.trim_start());
+        let text = text.strip_prefix("async ").unwrap_or(text);
+        for kind in KINDS {
+            let Some(rest) = text
+                .strip_prefix(kind)
+                .and_then(|rest| rest.strip_prefix(' '))
+            else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| {
+                    c.is_alphanumeric() || matches!(c, '_' | ' ' | ':' | '<' | '>' | '\'')
+                })
+                .collect();
+            return format!("{kind} {}", name.trim());
+        }
+    }
+    "<top of file>".to_string()
+}
+
+/// The tolerance the containment check cannot see, closed.
+///
+/// `every_charter_citation_points_at_the_construct_it_names` asks only whether line N holds
+/// construct C. Where C **recurs**, that is satisfied by ANY occurrence, so a shift can move
+/// the citation onto a different site and stay green — the tolerance is the distance between
+/// occurrences. AGENTS.md measured this exact shape: `0f2ae0ba` shifted four of its own
+/// citations by 45 lines and only two of them reddened, because a wide region and a recurring
+/// needle absorbed the other two.
+///
+/// Measured before building this: all six recurring rows here were still on their original
+/// occurrence and inside their original item, so the tolerance was real and **unexercised**.
+/// It is closed now rather than disclosed, because the next shift is the one nobody watches.
+///
+/// Scoped to recurring constructs DELIBERATELY. Where a construct occurs once, any shift
+/// already makes the line stop containing it, so containment catches it first and a site
+/// assertion could never fail — and a check that cannot fail is decoration that reads as
+/// coverage.
+fn site_drift(citation: &Citation, text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let occurrences = lines
+        .iter()
+        .filter(|line| line.contains(&citation.construct))
+        .count();
+    if occurrences <= 1 {
+        return None;
+    }
+    let Citation {
+        path,
+        line,
+        construct,
+        site,
+    } = citation;
+    let Some(declared) = site.as_deref() else {
+        return Some(format!(
+            "{path}:{line} cites `{construct}`, which occurs {occurrences} times in that file. \
+             A citation to a recurring construct is satisfied by ANY of them, so a shift can \
+             move it onto a different site and stay green. Name the item it sits inside: \
+             `cite {path}:{line} :: {construct} @@ fn <name>`."
+        ));
+    };
+    let actual = enclosing_item(&lines, *line);
+    (actual != declared).then(|| {
+        format!(
+            "{path}:{line} declares it sits inside `{declared}`, but that line is inside \
+             `{actual}`. `{construct}` occurs {occurrences} times in the file, so the line \
+             still CONTAINS it and the containment check stays green — this is precisely the \
+             tolerance that check cannot see. Re-derive the citation; do not relax this."
+        )
+    })
 }
 
 #[test]
@@ -93,12 +190,13 @@ fn every_charter_citation_points_at_the_construct_it_names() {
     );
 
     let root = workspace_root();
-    for Citation {
-        path,
-        line,
-        construct,
-    } in &rows
-    {
+    for citation in &rows {
+        let Citation {
+            path,
+            line,
+            construct,
+            ..
+        } = citation;
         let read = std::fs::read_to_string(root.join(path));
         assert!(
             read.is_ok(),
@@ -123,7 +221,86 @@ fn every_charter_citation_points_at_the_construct_it_names() {
              plausible for hours after it stopped being correct.",
             actual.trim()
         );
+
+        // A green above does NOT mean the citation points where it was written to point.
+        assert!(
+            site_drift(citation, &text).is_none(),
+            "{}",
+            site_drift(citation, &text).expect("asserted present immediately above")
+        );
     }
+}
+
+/// The recurring-needle rule fires, and it is scoped so it cannot fire where it would be
+/// decoration.
+///
+/// Driven over INJECTED text rather than the tree, for the reason `build_gate_governed_sets`
+/// records: a rule whose real population is currently clean can never exercise its own
+/// branches, so the checks that exist for the day something breaks are exactly the ones a
+/// healthy tree cannot prove. All six real rows are correct today — which is why the cells
+/// below are synthetic.
+#[test]
+fn a_recurring_needle_must_name_its_site_and_the_site_is_checked() {
+    // Two occurrences of one construct, in two different functions. Line 6 is the second.
+    let text = "\
+fn first_home(&self) {
+    let x = MARKER;
+}
+
+fn second_home(&self) {
+    let y = MARKER;
+}
+";
+    let cite = |line: usize, site: Option<&str>| Citation {
+        path: "crates/fln-kernel/src/tc.rs".into(),
+        line,
+        construct: "MARKER".into(),
+        site: site.map(str::to_string),
+    };
+
+    // The negative control FIRST: a correct row must be silent, or every cell below proves
+    // nothing but that the function complains.
+    assert!(
+        site_drift(&cite(6, Some("fn second_home")), text).is_none(),
+        "a row naming the site it really sits in must be accepted"
+    );
+
+    // A recurring construct with no site declared is refused, naming the occurrence count.
+    let missing = site_drift(&cite(6, None), text).expect("an unsited recurring row must fail");
+    assert!(
+        missing.contains("occurs 2 times") && missing.contains("@@"),
+        "the refusal must say why and how to repair it: {missing}"
+    );
+
+    // THE CASE THE CONTAINMENT CHECK CANNOT SEE: the citation has drifted onto the OTHER
+    // occurrence. Line 2 still contains `MARKER`, so containment is green and only this fires.
+    assert!(
+        text.lines().nth(1).is_some_and(|l| l.contains("MARKER")),
+        "the fixture must keep containment satisfied, or it tests the wrong refusal"
+    );
+    let drifted =
+        site_drift(&cite(2, Some("fn second_home")), text).expect("a moved citation must fail");
+    assert!(
+        drifted.contains("fn first_home") && drifted.contains("fn second_home"),
+        "the refusal must name both the declared and the actual site: {drifted}"
+    );
+
+    // SCOPING: a construct occurring once is left alone even with a wrong site, because
+    // containment already catches any shift and a second check there could never fail.
+    let unique = "fn only_home() {\n    let z = SOLO;\n}\n";
+    assert!(
+        site_drift(
+            &Citation {
+                path: "p".into(),
+                line: 2,
+                construct: "SOLO".into(),
+                site: Some("fn something_else".into()),
+            },
+            unique
+        )
+        .is_none(),
+        "a unique construct must not be subject to the site rule"
+    );
 }
 
 #[test]
