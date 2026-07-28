@@ -389,10 +389,11 @@ fn source_read_at_l1_and_value_produced_above_it_are_both_permitted() {
 // (bead fln-parity-ledger-freshness-names-the-run-igxr)
 // ---------------------------------------------------------------------------
 
-/// The live ledger obeys the freshness law, and every tag it denies is still live.
+/// The live ledger obeys the freshness law, and a retired source-reading tag remains denied.
 ///
-/// The second assertion is the one that shrinks: when the last row carrying
-/// `pin-census-v4.32.0` is repaired, this fails until the tag leaves the declared list.
+/// The second assertion is the anti-forgetting half. `pin-census-v4.32.0` no longer occurs
+/// on a real row, but removing it from the denylist would let a future produced-value row
+/// reuse provenance already known to name a source-reading run.
 #[test]
 fn the_real_ledger_never_names_a_source_reading_run_for_a_produced_value() {
     let text = std::fs::read_to_string(workspace_root().join("ci/PARITY_LEDGER.txt"))
@@ -477,9 +478,10 @@ fn a_two_field_repair_that_leaves_its_freshness_tag_behind_is_refused() {
 
 /// THE PERMISSION HALF, in both directions, so the law is not a wall.
 ///
-/// A three-field repair is admitted on a tag that exists nowhere in the real ledger, which is
-/// the case an allowlist would have refused: both pin rigs are deliberately fixture-less, so
-/// the run naming their evidence has no tag until cod_2 coins one.
+/// A three-field repair is admitted on a tag outside the source-reading denylist. When this
+/// guard was introduced the tag did not yet exist; the completed qydn repair now uses it on
+/// eight real rows. That transition is the permission proof: a denylist admits a new honest
+/// producing run without requiring a second registry to predict its name.
 #[test]
 fn the_three_field_repair_is_admitted_and_an_unrepaired_row_is_untouched() {
     let three_field = synthetic(&[
@@ -493,8 +495,9 @@ fn the_three_field_repair_is_admitted_and_an_unrepaired_row_is_untouched() {
          law asks for — refusing it would make the repair unlandable"
     );
 
-    // Still at pinned-source: the oracle law owns it, and this law must stay silent or it
-    // would redden the build today for twelve rows that are correctly declared.
+    // Still at pinned-source: the oracle law owns it, and this law must stay silent. No real
+    // row remains in this state today; this synthetic cell preserves the handoff boundary so
+    // a future declared remainder is not reported twice for two different reasons.
     let unrepaired = synthetic(&[
         "row meta-api | maxRecDepth | option | native | L2 | faithful | pinned-source | exact \
          | crates/fln-core/tests/pin_inventory_census.rs | D0 | OBSERVED | pin-census-v4.32.0",
