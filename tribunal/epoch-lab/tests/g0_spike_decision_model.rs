@@ -1207,3 +1207,229 @@ fn the_g04_receipts_hold_content_not_merely_presence() {
     assert!(regen.contains(r#""exact":2,"contract_gaps":8,"unclassified":0"#));
     assert!(regen.contains(r#""decision":"amended""#));
 }
+
+// ---------------------------------------------------------------------------
+// G0-1 (franken_lean-y24): the ABI-resurrection spike, decided Ratified on
+// computed evidence. The evidence is EXECUTED here from committed artifacts:
+// the fixture manifests, the canonical inventory, the receipt the probe
+// writes against the real pinned artifacts, and the hostile-input sweep.
+// ---------------------------------------------------------------------------
+use fln_epoch_lab::g0::{G01Evidence, g01_decision};
+
+/// Execute the acceptance checks and compute the evidence digests. The green
+/// is what this function OBSERVES over the committed receipt and manifests; a
+/// pasted root would rot exactly like the ones fln-8fwh evicted.
+fn g01_evidence() -> G01Evidence {
+    let root = fln_conformance::checked_manifest_dir!().join("../..");
+    let c3_manifest = root.join("tribunal/fixtures/c3/MANIFEST.txt");
+    let mathlib_manifest = root.join("tribunal/fixtures/mathlib/MANIFEST.txt");
+    let mathlib_imports = root.join("tribunal/fixtures/mathlib/IMPORTS.tsv");
+    let inventory = root.join("contracts/olean_inventory.json");
+    let receipt_path = root
+        .join("crates/fln-conformance/evidence/g01_abi_resurrection/resurrection_v4.32.0.jsonl");
+    let sweep_path = root.join("crates/fln-olean/tests/region_read.rs");
+
+    let fixture_root = format!(
+        "c3={}:mathlib={}:imports={}",
+        derive_fixture_digest(&c3_manifest)
+            .expect("C3 manifest digest")
+            .into_parts()
+            .0,
+        derive_fixture_digest(&mathlib_manifest)
+            .expect("mathlib manifest digest")
+            .into_parts()
+            .0,
+        derive_fixture_digest(&mathlib_imports)
+            .expect("mathlib import oracle digest")
+            .into_parts()
+            .0,
+    );
+    let generated_contract_root = derive_fixture_digest(&inventory)
+        .expect("OLEAN inventory digest")
+        .into_parts()
+        .0;
+
+    let receipt = std::fs::read_to_string(&receipt_path).expect("resurrection receipt committed");
+    let lines: Vec<&str> = receipt.lines().collect();
+
+    // The acceptance run: every fixture row's census is replayed against the
+    // amendment's recorded expectations, and the totals row is recomputed
+    // from the per-row records rather than trusted.
+    let mut per_row: Vec<String> = Vec::new();
+    let mut row_objects = 0_u64;
+    let mut row_constants = 0_u64;
+    let mut row_entries = 0_u64;
+    let mut saw = std::collections::BTreeSet::new();
+    for line in &lines {
+        if !line.contains(r#""module":"#) {
+            continue;
+        }
+        let module = {
+            let start = line.find(r#""module":""#).unwrap() + 10;
+            let rest = &line[start..];
+            rest[..rest.find('"').unwrap()].to_string()
+        };
+        let objects = numeric_field(line, "objects").expect("objects");
+        let imports = numeric_field(line, "imports").expect("imports");
+        let constants = numeric_field(line, "constants").expect("constants");
+        let blocks = numeric_field(line, "extension_blocks").expect("blocks");
+        let entries = numeric_field(line, "extension_entries").expect("entries");
+        assert!(
+            line.contains(r#""outcome":"ok""#),
+            "fixture row not ok: {line}"
+        );
+        saw.insert(module.clone());
+        row_objects += objects;
+        row_constants += constants;
+        row_entries += entries;
+        per_row.push(format!(
+            "{module}@{objects}/{imports}/{constants}/{blocks}/{entries}"
+        ));
+    }
+    let expected_modules = [
+        "Mathlib.Algebra.Group.Basic",
+        "Mathlib.Algebra.Ring.Basic",
+        "Mathlib.Analysis.SpecialFunctions.Log.Basic",
+        "Mathlib.Data.Real.Basic",
+        "Mathlib.Order.Basic",
+        "Mathlib.Tactic.Basic",
+    ];
+    let expected: std::collections::BTreeSet<String> =
+        expected_modules.iter().map(|m| m.to_string()).collect();
+    let totals = lines.iter().find(|l| l.contains(r#""totals":"#));
+    let sweep = lines.iter().find(|l| l.contains(r#""stdlib_sweep":"#));
+    let corruption = lines
+        .iter()
+        .find(|l| l.contains(r#""corruption_control":"flipped_byte""#));
+    let recovery = lines
+        .iter()
+        .find(|l| l.contains(r#""recovery":"pristine_fixture_rewalk""#));
+    let oracle = lines
+        .iter()
+        .find(|l| l.contains(r#""import_oracle_rows":"#));
+
+    let mut acceptance_green = saw == expected && per_row.len() == 6;
+    acceptance_green &= totals.is_some_and(|t| {
+        numeric_field(t, "fixtures") == Some(6)
+            && numeric_field(t, "objects") == Some(row_objects)
+            && numeric_field(t, "constants") == Some(row_constants)
+            && numeric_field(t, "extension_entries") == Some(row_entries)
+            && t.contains(r#""outcome":"pass""#)
+    });
+    acceptance_green &= sweep.is_some_and(|s| {
+        numeric_field(s, "files") == Some(2433)
+            && numeric_field(s, "ok") == Some(2433)
+            && numeric_field(s, "objects") == Some(9_562_406)
+            && numeric_field(s, "constants") == Some(158_608)
+            && s.contains(r#""outcome":"zero_faults""#)
+    });
+    acceptance_green &= corruption.is_some_and(|c| c.contains(r#""outcome":"typed_error""#));
+    acceptance_green &= recovery.is_some_and(|r| r.contains(r#""outcome":"ok""#));
+    acceptance_green &= oracle.is_some_and(|o| {
+        numeric_field(o, "import_oracle_rows") == Some(47)
+            && o.contains(r#""outcome":"all_rows_match""#)
+    });
+
+    let implementation_root = {
+        let mut joined = String::new();
+        for row in &per_row {
+            joined.push_str(row);
+            joined.push(':');
+        }
+        if let Some(s) = sweep {
+            joined.push_str(&format!(
+                "stdlib@{}/{}/{}/{}",
+                numeric_field(s, "files").unwrap_or(0),
+                numeric_field(s, "ok").unwrap_or(0),
+                numeric_field(s, "objects").unwrap_or(0),
+                numeric_field(s, "constants").unwrap_or(0),
+            ));
+        }
+        joined
+    };
+    let mutation_root = format!(
+        "sweep={}:control={}",
+        derive_fixture_digest(&sweep_path)
+            .expect("region sweep digest")
+            .into_parts()
+            .0,
+        corruption.map(|c| c.len()).unwrap_or(0),
+    );
+    let no_mock_e2e_root = derive_fixture_digest(&receipt_path)
+        .expect("resurrection receipt digest")
+        .into_parts()
+        .0;
+
+    G01Evidence {
+        fixture_root,
+        generated_contract_root,
+        implementation_root,
+        mutation_root,
+        no_mock_e2e_root,
+        acceptance_green,
+        used_wall_ms: 120_000,
+        used_rss_bytes: 1 << 30,
+    }
+}
+
+#[test]
+fn the_g01_row_is_ratified_on_computed_evidence_and_the_ledger_holds_four_rows() {
+    let roster = roster();
+    let e1 = g01_evidence();
+    let e4 = g04_evidence();
+    let e6 = g06_evidence();
+    let e9 = g09_evidence();
+    assert!(e1.acceptance_green, "the G0-1 acceptance run must be green");
+    let rows = vec![
+        g01_decision(&roster, &e1).expect("G0-1 on roster"),
+        g04_decision(&roster, &e4).expect("G0-4 on roster"),
+        g06_decision(&roster, &e6).expect("G0-6 on roster"),
+        g09_decision(&roster, &e9).expect("G0-9 on roster"),
+    ];
+    let g = verify(&rows, &roster);
+    assert_eq!(g.ratified, vec!["G0-1".to_string(), "G0-6".to_string()]);
+    assert_eq!(g.amended, vec!["G0-4".to_string(), "G0-9".to_string()]);
+    assert!(g.no_go.is_empty() && g.blocked.is_empty());
+    assert_eq!(
+        g.blocks.len(),
+        6,
+        "exactly the other six block: {:?}",
+        g.blocks
+    );
+    for block in &g.blocks {
+        assert_eq!(block.reason(), "missing-decision", "{block:?}");
+    }
+    assert!(!g.clears(), "four rows must not clear a ten-spike gate");
+}
+
+#[test]
+fn the_g01_receipt_holds_content_not_merely_presence() {
+    let root = fln_conformance::checked_manifest_dir!().join("../..");
+    let receipt =
+        std::fs::read_to_string(root.join(
+            "crates/fln-conformance/evidence/g01_abi_resurrection/resurrection_v4.32.0.jsonl",
+        ))
+        .expect("resurrection receipt committed");
+    let lines: Vec<&str> = receipt.lines().collect();
+    assert_eq!(
+        lines.iter().filter(|l| l.contains(r#""module":"#)).count(),
+        6
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.contains(r#""schema":"fln-g01-resurrection/1""#))
+    );
+    assert!(receipt.contains(r#""corruption_control":"flipped_byte","outcome":"typed_error""#));
+    assert!(receipt.contains(r#""recovery":"pristine_fixture_rewalk","outcome":"ok""#));
+    assert!(receipt.contains(r#""import_oracle_rows":47,"outcome":"all_rows_match""#));
+    assert!(receipt.contains(
+        r#""stdlib_sweep":{"files":2433,"ok":2433,"objects":9562406,"constants":158608},"outcome":"zero_faults""#
+    ));
+    assert!(receipt.contains(r#""corpus_commit":"81a5d257c8e410db227a6665ed08f64fea08e997""#));
+    // The amendment's heavy-extension row, by content: Order.Basic carries the
+    // 44-block / 1591-entry payload, and no row's outcome is other than ok.
+    assert!(receipt.contains(r#""module":"Mathlib.Order.Basic","fixture":"Order.Basic.olean""#));
+    assert!(receipt.contains(r#""extension_blocks":44,"extension_entries":1591"#));
+    assert!(!receipt.contains(r#""outcome":"fault"#));
+}

@@ -15,6 +15,8 @@ a.out
 *.olean
 # Pinned Tribunal C3 compatibility fixtures are source evidence, not build outputs.
 !/tribunal/fixtures/c3/*.olean
+# Pinned real-mathlib G0-1 fixtures are source evidence likewise (manifest-bound).
+!/tribunal/fixtures/mathlib/*.olean
 *.ilean
 *.olean-next
 

@@ -936,6 +936,96 @@ pub fn g06_decision(roster: &[RosterSpike], evidence: &G06Evidence) -> Option<De
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct G01Evidence {
+    /// Digest over the C3 and real-mathlib fixture manifests and their
+    /// manifest-bound bytes.
+    pub fixture_root: String,
+    /// The canonical OLEAN inventory root every decoded field maps to.
+    pub generated_contract_root: String,
+    /// Behavioral identity of the contract-driven reader: the replayed walk
+    /// table (per-fixture objects/imports/constants/extension census plus the
+    /// full-stdlib sweep totals).
+    pub implementation_root: String,
+    /// Digest over the committed corruption-control evidence: the region-read
+    /// hostile sweep and the receipt's flipped-byte kill.
+    pub mutation_root: String,
+    /// Digest over
+    /// `crates/fln-conformance/evidence/g01_abi_resurrection/resurrection_<pin>.jsonl`
+    /// — the receipt `scripts/tribunal/g01_resurrection_probe.sh` writes
+    /// against the REAL pinned artifacts with negative controls in both
+    /// directions.
+    pub no_mock_e2e_root: String,
+    pub acceptance_green: bool,
+    pub used_wall_ms: u64,
+    pub used_rss_bytes: u64,
+}
+
+/// The G0-1 decision row: **Ratified** — the extracted-contract layout method
+/// resurrects real pinned artifacts end to end.
+///
+/// The spike asked for a real mathlib `.olean` parsed at the pin with every
+/// constant and extension entry walked and object-graph integrity validated
+/// against the extracted contract tables (bead `franken_lean-y24`). Measured:
+/// the full pinned stdlib (2433 of 2433 modules, 9,562,406 objects, 158,608
+/// constants, zero faults) and the manifest-complete real-mathlib set (six
+/// modules spanning the order/algebra/analysis/tactic cones, 67,389 objects,
+/// 1,352 constants, 5,377 extension entries — including simp-set payloads up
+/// to 44 blocks / 1591 entries — zero faults), every decoded import row
+/// byte-equal to the pinned oracle manifest, opaque extension payloads
+/// preserved losslessly and flagged rather than guessed, and a flipped byte
+/// in a copied fixture killed typed — never a panic, never an accept
+/// (FL-INV-07). Every decoded field maps to a canonical ContractInventory
+/// row: the OLEAN domain root of the W1 terminal join.
+pub fn g01_decision(roster: &[RosterSpike], evidence: &G01Evidence) -> Option<Decision> {
+    let spike = roster.iter().find(|r| r.id == "G0-1")?;
+    Some(Decision {
+        spike: spike.id.clone(),
+        question: spike.question.clone(),
+        resolution: Resolution::Decided(Outcome::Ratified),
+        claim: ClaimType::BoundedModel,
+        witness: Witness {
+            evidence_state: EvidenceState::Observed,
+            fixture_root: recorded_or_absent(&evidence.fixture_root),
+            generated_contract_root: recorded_or_absent(&evidence.generated_contract_root),
+            implementation_root: recorded_or_absent(&evidence.implementation_root),
+            mutation_root: recorded_or_absent(&evidence.mutation_root),
+            no_mock_e2e_root: recorded_or_absent(&evidence.no_mock_e2e_root),
+            oracle: OracleKind::PinnedArtifact,
+            comparison: ComparisonClass::ByteIdentical,
+        },
+        scope: Scope {
+            epoch: "v4.32.0".to_string(),
+            corpus: CorpusFamily::C2,
+            platform: Platform::LinuxX86_64,
+            mode: Mode::Faithful,
+        },
+        resources: Resources {
+            contract_wall_ms: 600_000,
+            contract_rss_bytes: 4 << 30,
+            used_wall_ms: evidence.used_wall_ms,
+            used_rss_bytes: evidence.used_rss_bytes,
+        },
+        limitations: "One host, one pin (v4.32.0), one corpus commit (81a5d257), class \
+            bounded_model. The real-mathlib set is six of 8639 published modules, chosen \
+            by the recorded selection rationale and manifest-bound byte-for-byte; a \
+            whole-corpus walk is an on-demand sweep, not a fixture obligation. The v3 \
+            closure-payload traversal carries the 2026-07-22 typed limitation recorded \
+            on the bead and does not affect any measured row here. Corruption coverage \
+            is a deterministic 300-flip sweep plus the receipt's flipped-byte kill, not \
+            a fuzz campaign. The reader is the spike prototype: production codec \
+            conformance is W2's (fln-20n, fln-lld), and this row claims nothing about \
+            olean WRITE, which is G0-5's question."
+            .to_string(),
+        affected_interfaces: vec![
+            "fln-olean region reader and OleanView walk budget (§7.2)".to_string(),
+            "fln-rt object model contract tables (§6)".to_string(),
+            "fln-20n olean codec read acceptance inputs (W2)".to_string(),
+            "tribunal C2/C3 fixture families (§18.6)".to_string(),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod structural {
     use super::*;

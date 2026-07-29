@@ -176,6 +176,73 @@ else
   note "SKIP: pinned toolchain library not installed (typed limitation)"
 fi
 
+# ---- lane 4b: the real-mathlib fixture set (G0-1 review amendment) -----------
+# The manifest-complete real-mathlib rows: tracked bytes verified against the
+# manifest, walked clean, import oracle diffed row-for-row. These bytes are
+# tracked source evidence (see tribunal/fixtures/mathlib/SELECTION.md), so
+# this lane always runs — the typed-skip shape belongs to the corpus-wide
+# sweep, not to the fixture set.
+MFX="$ROOT/tribunal/fixtures/mathlib"
+if [ -f "$MFX/MANIFEST.txt" ]; then
+  note "verifying and resurrecting the real-mathlib fixture set"
+  mfail=0
+  mrows=0 mobjects=0 mconsts=0 mentries=0
+  while read -r sha bytes module file objects imports constants blocks entries; do
+    case "$sha" in \#*|schema|"") continue ;; esac
+    actual_sha="$(sha256sum "$MFX/$file" | cut -d' ' -f1)"
+    actual_bytes="$(stat -c%s "$MFX/$file")"
+    if [ "$actual_sha" != "$sha" ] || [ "$actual_bytes" != "$bytes" ]; then
+      note "MATHLIB FIXTURE DRIFT: $file"
+      mfail=1
+      continue
+    fi
+    row="$("$WALKER" "$MFX/$file" 2>>"$ART_DIR/mathlib_walk.err")"
+    w_objects="$(printf '%s' "$row" | cut -f3)"
+    w_imports="$(printf '%s' "$row" | cut -f4)"
+    w_consts="$(printf '%s' "$row" | cut -f5)"
+    w_blocks="$(printf '%s' "$row" | cut -f6)"
+    w_entries="$(printf '%s' "$row" | cut -f7)"
+    w_status="$(printf '%s' "$row" | cut -f8)"
+    if [ "$w_status" != ok ] || [ "$w_objects" != "$objects" ] || [ "$w_imports" != "$imports" ] \
+      || [ "$w_consts" != "$constants" ] || [ "$w_blocks" != "$blocks" ] || [ "$w_entries" != "$entries" ]; then
+      note "MATHLIB WALK MISMATCH: $module (got $row)"
+      mfail=1
+      continue
+    fi
+    mrows=$((mrows + 1))
+    mobjects=$((mobjects + objects))
+    mconsts=$((mconsts + constants))
+    mentries=$((mentries + entries))
+  done < "$MFX/MANIFEST.txt"
+  if [ "$mfail" -ne 0 ] || [ "$mrows" -ne 6 ]; then
+    emit mathlib_fixtures failed "\"rows\":$mrows,\"expected\":6,\"artifact\":\"mathlib_walk.err\""
+    note "FAIL: mathlib fixture resurrection incomplete ($mrows/6 clean)"
+    exit 1
+  fi
+  # The ordered import oracle, duplicate-preserving, flags exact.
+  set +e
+  ( cd "$MFX" && "$WALKER" --imports-tsv "$ART_DIR/mathlib_imports.tsv" \
+      Order.Basic.olean Algebra.Group.Basic.olean Data.Real.Basic.olean \
+      Tactic.Basic.olean Analysis.SpecialFunctions.Log.Basic.olean Algebra.Ring.Basic.olean \
+      > /dev/null 2>>"$ART_DIR/mathlib_imports.err" )
+  rc=$?
+  set -e
+  grep -v '^#' "$MFX/IMPORTS.tsv" > "$ART_DIR/mathlib_imports.expected"
+  grep -v '^#' "$ART_DIR/mathlib_imports.tsv" > "$ART_DIR/mathlib_imports.actual"
+  diff -u "$ART_DIR/mathlib_imports.expected" "$ART_DIR/mathlib_imports.actual" > "$ART_DIR/mathlib_imports.diff"
+  drc=$?
+  if [ "$rc" -ne 0 ] || [ "$drc" -ne 0 ]; then
+    emit mathlib_fixtures failed "\"reason\":\"import_oracle_mismatch\",\"artifact\":\"mathlib_imports.diff\""
+    note "FAIL: mathlib import oracle mismatch"
+    exit 1
+  fi
+  emit mathlib_fixtures passed "\"rows\":$mrows,\"objects\":$mobjects,\"constants\":$mconsts,\"extension_entries\":$mentries,\"artifact\":\"mathlib_imports.tsv\""
+  note "mathlib resurrection: $mrows fixtures, $mobjects objects, $mconsts constants, $mentries extension entries, zero faults"
+else
+  emit mathlib_fixtures skipped "\"reason\":\"manifest_absent\",\"limitation\":\"L0: real-mathlib fixture set not present on this host\""
+  note "SKIP: mathlib fixture manifest absent (typed limitation)"
+fi
+
 # ---- lane 5: seeded corruption — flipped byte must be killed, never accepted -----------
 note "seeding corruption: single byte flipped in a copied region"
 CORRUPT="$ART_DIR/corrupt.olean"
