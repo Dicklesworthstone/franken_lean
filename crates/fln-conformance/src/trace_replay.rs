@@ -270,6 +270,103 @@ pub fn replay(events: &[TraceEvent]) -> ReplayReport {
     report
 }
 
+/// The versioned schema this rig replays against (acceptance b's letter). The
+/// typed events are [`TraceEvent`]; the **stable id** of an event is its stream
+/// ordinal, which is deterministic because the trace itself is (measured
+/// byte-identical, both fixtures); **source anchors** ride the `--json` message
+/// envelopes (`pos`/`endPos`, measured deterministic on the bead) rather than
+/// this text form. Bump the suffix when the event shape or the family set
+/// moves; a consumer refuses an unknown version rather than guessing.
+pub const TRACE_REPLAY_SCHEMA: &str = "fln-g09-trace-replay/1";
+
+/// One deterministic parallel replay outcome. Counts are sums; the divergence
+/// root is a **set** reduction (order-free XOR of per-query digests), per the
+/// reduction doctrine: a serial stream's root is order-sensitive, a parallel
+/// partition's root is set-semantic, and conflating the two is how a
+/// schedule-dependent answer sneaks into a determinism claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelReplay {
+    pub queries: usize,
+    pub agreements: usize,
+    pub unscored: usize,
+    /// XOR of the FNV-1a digest of every diverging query's (lhs, rhs, oracle).
+    pub divergence_set_root: u64,
+    /// Queries scored per worker — every entry must be nonzero for the run to
+    /// count as parallel work (an empty partition is a relabeled serial loop).
+    pub partitions: Vec<usize>,
+}
+
+/// Replay the defeq queries across `workers` real threads, partitioned by
+/// contiguous chunks, reduced canonically. The scoring of one query depends on
+/// nothing but that query, so this is genuine dataflow parallelism; the
+/// ORDER-sensitive artifacts ([`family_root`]) deliberately stay serial,
+/// because intrinsically ordered event production is not parallel work.
+pub fn replay_parallel(events: &[TraceEvent], workers: usize) -> ParallelReplay {
+    let queries: Vec<&TraceEvent> = events
+        .iter()
+        .filter(|e| e.class == "Meta.isDefEq" && e.body.contains(" =?= "))
+        .collect();
+    let workers = workers.clamp(1, queries.len().max(1));
+    let chunk = queries.len().div_ceil(workers);
+    let digest = |r: &Replayed| {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for bytes in [
+            r.lhs.as_bytes(),
+            b"\xff" as &[u8],
+            r.rhs.as_bytes(),
+            r.oracle.status_byte(),
+        ] {
+            for &b in bytes {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    };
+    let score = |part: &[&TraceEvent]| {
+        let mut agreements = 0usize;
+        let mut unscored = 0usize;
+        let mut root = 0u64;
+        for event in part {
+            let (lhs, rhs) = event.body.split_once(" =?= ").expect("filtered above");
+            let replayed = Replayed {
+                line: event.line,
+                lhs: lhs.to_string(),
+                rhs: rhs.to_string(),
+                oracle: event.verdict,
+                toy: toy_unify(lhs, rhs),
+            };
+            match replayed.agreement() {
+                Some(true) => agreements += 1,
+                Some(false) => root ^= digest(&replayed),
+                None => unscored += 1,
+            }
+        }
+        (part.len(), agreements, unscored, root)
+    };
+    let results: Vec<(usize, usize, usize, u64)> = if workers == 1 {
+        vec![score(&queries)]
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = queries
+                .chunks(chunk)
+                .map(|part| scope.spawn(move || score(part)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker"))
+                .collect()
+        })
+    };
+    ParallelReplay {
+        queries: results.iter().map(|r| r.0).sum(),
+        agreements: results.iter().map(|r| r.1).sum(),
+        unscored: results.iter().map(|r| r.2).sum(),
+        divergence_set_root: results.iter().fold(0, |a, r| a ^ r.3),
+        partitions: results.iter().map(|r| r.0).collect(),
+    }
+}
+
 /// The stock event families of TraceContractV1, classified from the pin's own
 /// class names. `Diagnostics` is the heartbeat/depth family at the **amended**
 /// granularity increment 5 measured: per-declaration counter blocks, since zero
@@ -824,6 +921,68 @@ mod tests {
                 "{untouched:?} must be unmoved"
             );
         }
+    }
+
+    #[test]
+    fn the_replay_is_schedule_independent_at_1_8_and_32_workers_with_real_partitions() {
+        // The productive-thread amendment, seeded at replay scale: the same
+        // governed input replayed at {1, 8, 32} REAL threads must yield the
+        // identical semantic answer under canonical set-reduction, and every
+        // worker partition must be nonempty — a relabeled serial loop or an
+        // idle-worker profile blocks, so both are asserted rather than assumed.
+        let events = parse_trace(MULTI_TRACE).expect("parses");
+        let serial = replay(&events);
+        let runs: Vec<ParallelReplay> = [1usize, 8, 32]
+            .iter()
+            .map(|w| replay_parallel(&events, *w))
+            .collect();
+        for (w, run) in [1usize, 8, 32].iter().zip(&runs) {
+            assert_eq!(run.partitions.len(), *w, "worker profile at {w}");
+            assert!(
+                run.partitions.iter().all(|&p| p > 0),
+                "an empty partition at {w} workers is a relabeled serial loop: {:?}",
+                run.partitions
+            );
+            // The parallel counts agree with the serial replay — the reduction
+            // is canonical, not merely internally consistent.
+            assert_eq!(run.queries, serial.queries, "queries at {w}");
+            assert_eq!(run.agreements, serial.agreements, "agreements at {w}");
+            assert_eq!(run.unscored, serial.unscored, "unscored at {w}");
+        }
+        // The SEMANTIC tuple is identical across the matrix; the worker
+        // profile (`partitions`) is telemetry and varies by construction —
+        // comparing whole structs here would demand the telemetry be equal,
+        // which is the separation law violated in the opposite direction.
+        let semantic =
+            |r: &ParallelReplay| (r.queries, r.agreements, r.unscored, r.divergence_set_root);
+        assert_eq!(semantic(&runs[0]), semantic(&runs[1]), "1 vs 8 workers");
+        assert_eq!(semantic(&runs[1]), semantic(&runs[2]), "8 vs 32 workers");
+        assert_ne!(
+            runs[0].divergence_set_root, 0,
+            "the set root must be fed by real divergences, or the identity above is vacuous"
+        );
+        // And the root is honest: flipping one oracle verdict moves it.
+        let mut mutated = events.clone();
+        let victim = mutated
+            .iter_mut()
+            .find(|e| e.class == "Meta.isDefEq" && e.body.contains(" =?= "))
+            .expect("a query exists");
+        victim.verdict = match victim.verdict {
+            TracedVerdict::Accepted => TracedVerdict::Rejected,
+            other => other,
+        };
+        assert_ne!(
+            replay_parallel(&mutated, 8).divergence_set_root,
+            runs[1].divergence_set_root,
+            "a moved verdict must move the set root"
+        );
+        // The schema this all replays against is versioned, digit-suffixed.
+        assert!(
+            TRACE_REPLAY_SCHEMA
+                .rsplit_once('/')
+                .is_some_and(|(_, v)| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())),
+            "schema version suffix: {TRACE_REPLAY_SCHEMA}"
+        );
     }
 
     #[test]
