@@ -25,7 +25,7 @@ source path=contracts/CLI_LAKE_TRANSCRIPTS.txt hash=fnv1a64:cc1b4ef17f5f5d8c
 source path=crates/fln-conformance/src/cli_lake_census.rs hash=fnv1a64:267aa9cece6ee516
 source path=crates/fln-conformance/tests/cli_lake_census.rs hash=fnv1a64:2a20af3e51910201
 source path=crates/fln-conformance/tests/cli_lake_census_no_mock_e2e.rs hash=fnv1a64:1caee33b380c8f9f
-source path=scripts/extract/gen_cli_lake_census.py hash=fnv1a64:13f9f946f5a1604d
+source path=scripts/extract/gen_cli_lake_census.py hash=fnv1a64:745e8a4db99c062f
 source path=tribunal/epochs/v4.32.0/MANIFEST.txt hash=fnv1a64:07535ed88e8ee924
 source path=vendor/lean4-src/src/Lean/Shell.lean hash=fnv1a64:d68e36ae146d83d6
 source path=vendor/lean4-src/src/bin/leanc.in hash=fnv1a64:55853375785b2e4d
@@ -357,7 +357,7 @@ transcript key=leanc:help personality=leanc argv=--help stdin=none exit=0 stdout
 transcript key=leanc:version personality=leanc argv=--version stdin=none exit=0 stdout=fnv1a64:5752864827c78f0f stderr=fnv1a64:cbf29ce484222325 stdout-bytes=184 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=leanc:unknown-option personality=leanc argv=--fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:c2ea5af023beaf6c stdout-bytes=0 stderr-bytes=55 channel=stderr normalizer=paths-crlf-ansi-v1
 raw-end
-raw-root fnv1a64:9b5622c70f0d6097
+raw-root fnv1a64:ddce2194b888957d
 policy-root fnv1a64:1c626200d46049e6
 transcript-root fnv1a64:a687b3f8f8ae3bdf
-inventory-root fnv1a64:71d2e1e9835ee532
+inventory-root fnv1a64:f95094c7988d092d

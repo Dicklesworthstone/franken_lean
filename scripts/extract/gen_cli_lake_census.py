@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Extract and verify the pinned Lean/Leanc/Lake command-surface census.
 
 The generated contract deliberately has three authorities:
