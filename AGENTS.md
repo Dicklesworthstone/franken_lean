@@ -565,7 +565,7 @@ The same correction applies to anything else naming holders by argv — an orche
 
 **Narrowness is a property of the lane you are running, never of lanes.** Derived per commit from all 25 scripts in `scripts/e2e/` rather than read off one — 98np R1. **Thirteen lanes declare a governed set; twelve declare none at all** and so cannot raise M2/M3/M4 under any write:
 
-| governed paths | lane | relative to `check.sh`'s 58 |
+| governed paths | lane | relative to `check.sh`'s 59 |
 |---|---|---|
 | 40 | `contract_handoff.sh` | 2 outside: `scripts/extract/census_materialize.sh`, `…/validate_extern_builtin_census.py` |
 | 19 | `vellum_naming_no_mock_e2e.sh` | 3 outside: **`AGENTS.md`**, `README.md`, the plan |
