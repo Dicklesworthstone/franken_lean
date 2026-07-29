@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Independent validator for a reference_reference_no_mock_e2e bundle (bead fln-euo).
 
 Separate from the writer on purpose — "validates the final bundle independently" is the
