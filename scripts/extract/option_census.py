@@ -334,11 +334,93 @@ def extract():
     return buf.getvalue(), counts, emitted
 
 
+# Binary-only options, each ANCHORED by name: the C++-registered surface that .lean
+# scanning structurally cannot see, measured at the pin via getOptionDeclsArray. A
+# fifth binary-only name refuses the cross-check — new C++ options must be added
+# here deliberately, with the measurement that found them.
+BINARY_ONLY_ALLOWLIST = {
+    "interpreter.prefer_native": "bool:true",
+    "max_memory": "nat:0",
+    "timeout": "nat:0",
+    "verbose": "bool:true",
+}
+
+
+def crosscheck(census_path, dump_path):
+    """Reconcile the source census against the running binary's own registry dump
+    (name TAB typed-default TAB descr, plus a TOTAL line). Refuses on: a source row
+    missing from the binary, an unallowlisted binary-only name, or a literal default
+    disagreement. Returns receipt rows."""
+    src = {}
+    dynamic = 0
+    for line in open(census_path, encoding="utf-8"):
+        row_start = line.find('"kind":"')
+        kind = line[row_start + 8 :].split('"')[0] if row_start >= 0 else "?"
+        name_start = line.find('"name":"')
+        name = line[name_start + 8 :].split('"')[0] if name_start >= 0 else "?"
+        default_start = line.find('"default":"')
+        default = line[default_start + 11 :].split('"')[0] if default_start >= 0 else None
+        if kind == "dynamic":
+            dynamic += 1
+        elif kind in ("builtin_option", "option", "trace_class"):
+            src[name] = default
+    binary = {}
+    for line in open(dump_path, encoding="utf-8"):
+        if "\t" not in line or line.startswith("TOTAL\t"):
+            continue
+        name, value, _ = line.rstrip("\n").split("\t", 2)
+        binary[name] = value
+    problems = []
+    for name in sorted(set(src) - set(binary)):
+        problems.append(f"source-only option {name} not registered in the binary")
+    for name in sorted(set(binary) - set(src)):
+        if BINARY_ONLY_ALLOWLIST.get(name) != binary[name]:
+            problems.append(
+                f"binary-only option {name}={binary[name]} outside the anchored allowlist"
+            )
+    agree = 0
+    nonliteral = 0
+    for name, default in src.items():
+        if name not in binary:
+            continue
+        bval = binary[name].partition(":")[2]
+        d = (default or "").strip()
+        if d in ("true", "false") or d.isdigit():
+            if d == bval:
+                agree += 1
+            else:
+                problems.append(f"default mismatch {name}: source={d} binary={binary[name]}")
+        else:
+            nonliteral += 1
+    if problems:
+        for p in problems[:20]:
+            print(f"CROSSCHECK: {p}", file=sys.stderr)
+        raise SystemExit(f"REFUSE: {len(problems)} cross-check problems")
+    return {
+        "source_rows": len(src),
+        "dynamic_rows": dynamic,
+        "binary_rows": len(binary),
+        "binary_only_allowlisted": len(set(binary) - set(src)),
+        "literal_defaults_agree": agree,
+        "nonliteral_defaults": nonliteral,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--crosscheck", metavar="DUMP",
+                    help="reconcile an existing census (--out required as the census "
+                         "path to read) against a binary registry dump; refuses on "
+                         "any unexplained difference")
     args = ap.parse_args()
+    if args.crosscheck:
+        if not args.out:
+            raise SystemExit("REFUSE: --crosscheck needs --out naming the census to read")
+        stats = crosscheck(args.out, args.crosscheck)
+        print(" ".join(f"{k}={v}" for k, v in sorted(stats.items())))
+        return
     text, counts, emitted = extract()
     if args.verify:
         text2, _, _ = extract()
