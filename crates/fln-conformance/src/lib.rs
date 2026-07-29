@@ -55,6 +55,8 @@ pub mod pin;
 #[cfg(feature = "oracle-fallback-dev")]
 pub mod poison;
 pub mod precedence;
+pub mod public_surface;
+mod public_surface_generated;
 pub mod syntax_hygiene;
 pub mod trace_replay;
 pub mod tree_identity;

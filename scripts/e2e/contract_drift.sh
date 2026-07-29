@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # contract_drift.sh — shared E2E scenario for the extracted ABI/OLEAN contracts,
-# CLI/Lake census, and extern census (bead franken_lean-53v, plan Appendix B/C).
+# CLI/Lake census, joined PublicSurface contract, and extern census (beads
+# franken_lean-53v and fln-20ri, plan Appendix B/C).
 #
 # Real-path, no-mock: the checked-in extraction scripts re-run against the REAL
 # pinned vendor tree (and, when the pinned Reference binary is installed, the
@@ -108,7 +109,21 @@ if [ "$rc" -ne 0 ]; then
 fi
 emit cli_lake_drift passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"cli_lake_check.log\""
 
-# ---- lane 4: extern census drift (requires the pinned Reference binary) ----------------
+# ---- lane 4: joined public-surface contract is drift-free ------------------------------
+note "PublicSurface join drift check (option + CLI/Lake + LSP)"
+set +e
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_public_surface_contract.py" --check \
+  > "$ART_DIR/public_surface_check.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit public_surface_drift failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"public_surface_check.log\""
+  note "FAIL: joined PublicSurface contract drifted from its canonical domain inputs"
+  exit 1
+fi
+emit public_surface_drift passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"public_surface_check.log\""
+
+# ---- lane 5: extern census drift (requires the pinned Reference binary) ----------------
 PIN_TAG="$(sed -E 's/.*tag=([^ ]+).*/\1/' <<<"$(grep -E '^reference ' "$ROOT/SUITE.lock")")"
 if [ -x "$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/bin/lean" ]; then
   note "extern census drift check (pin-verified environment walk)"
@@ -129,12 +144,13 @@ else
   note "SKIP: pinned Reference binary not installed; census drift lane skipped (typed limitation)"
 fi
 
-# ---- lane 5: the consuming Rust suites -------------------------------------------------
+# ---- lane 6: the consuming Rust suites -------------------------------------------------
 note "running the contract consumer suites (fln-rt, fln-olean, conformance linkage)"
 set +e
 ( cd "$ROOT" \
     && CARGO_TARGET_DIR=target_local cargo test -q -p fln-rt -p fln-olean \
-    && CARGO_TARGET_DIR=target_local cargo test -q -p fln-conformance --test contract_roots ) \
+    && CARGO_TARGET_DIR=target_local cargo test -q -p fln-conformance \
+      --test contract_roots --test public_surface ) \
   > "$ART_DIR/suite.log" 2>&1
 rc=$?
 set -e
@@ -145,7 +161,7 @@ if [ "$rc" -ne 0 ]; then
 fi
 emit suite passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"suite.log\""
 
-# ---- lane 6: seeded mutation A — perturbed generated layout constant -------------------
+# ---- lane 7: seeded mutation A — perturbed generated layout constant -------------------
 ABI_RS="$ROOT/crates/fln-rt/src/abi.rs"
 BACKUP="$ART_DIR/abi.rs.orig"
 cp "$ABI_RS" "$BACKUP"
@@ -186,7 +202,7 @@ fi
 emit mutant_a passed "\"check_exit\":$check_rc,\"suite_exit\":$suite_rc,\"restored_sha\":\"$sha_after\",\"artifacts\":\"mutant_a_check.log,mutant_a_suite.log\""
 note "mutant A killed by both the drift lane and the named tripwire test"
 
-# ---- lane 7: seeded mutation B — rendered artifact desynced from inventory root --------
+# ---- lane 8: seeded mutation B — rendered artifact desynced from inventory root --------
 MD="$ROOT/ABI_CONTRACT.md"
 BACKUP_MD="$ART_DIR/ABI_CONTRACT.md.orig"
 cp "$MD" "$BACKUP_MD"
@@ -224,7 +240,7 @@ fi
 emit mutant_b passed "\"suite_exit\":$suite_rc,\"restored_sha\":\"$sha_after\",\"artifact\":\"mutant_b_suite.log\""
 note "mutant B killed by the cross-artifact linkage test"
 
-# ---- lane 8: seeded mutation C — perturbed generated OLEAN header size -----------------
+# ---- lane 9: seeded mutation C — perturbed generated OLEAN header size -----------------
 OLEAN_RS="$ROOT/crates/fln-olean/src/format.rs"
 BACKUP_OLEAN="$ART_DIR/format.rs.orig"
 cp "$OLEAN_RS" "$BACKUP_OLEAN"
@@ -269,7 +285,68 @@ fi
 emit mutant_c passed "\"check_exit\":$check_rc,\"restored_sha\":\"$sha_after\",\"artifact\":\"mutant_c_check.log\""
 note "mutant C killed by the exact OLEAN drift discriminator"
 
-# ---- lane 9: recovery — everything green again after restoration -----------------------
+# ---- lane 10: interrupted PublicSurface publication recovers atomically ----------------
+PUBLIC_CONTRACT="$ROOT/contracts/PUBLIC_SURFACE_CONTRACT.txt"
+PUBLIC_DOCUMENT="$ROOT/contracts/PUBLIC_SURFACE_CONTRACT.md"
+PUBLIC_RUST="$ROOT/crates/fln-conformance/src/public_surface_generated.rs"
+PUBLIC_CONTRACT_CANDIDATE="$PUBLIC_CONTRACT.candidate"
+PUBLIC_DOCUMENT_CANDIDATE="$PUBLIC_DOCUMENT.candidate"
+PUBLIC_RUST_CANDIDATE="$PUBLIC_RUST.candidate"
+for candidate in \
+  "$PUBLIC_CONTRACT_CANDIDATE" \
+  "$PUBLIC_DOCUMENT_CANDIDATE" \
+  "$PUBLIC_RUST_CANDIDATE"; do
+  if [ -e "$candidate" ]; then
+    emit public_surface_recovery failed "\"reason\":\"preexisting_candidate\",\"path\":\"$candidate\""
+    note "FAIL: PublicSurface recovery drill found a pre-existing candidate"
+    exit 1
+  fi
+done
+public_sha_before="$(
+  sha256sum "$PUBLIC_CONTRACT" "$PUBLIC_DOCUMENT" "$PUBLIC_RUST" \
+    | sha256sum | cut -d' ' -f1
+)"
+cp "$PUBLIC_CONTRACT" "$PUBLIC_CONTRACT_CANDIDATE"
+cp "$PUBLIC_DOCUMENT" "$PUBLIC_DOCUMENT_CANDIDATE"
+cp "$PUBLIC_RUST" "$PUBLIC_RUST_CANDIDATE"
+set +e
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_public_surface_contract.py" --check \
+  > "$ART_DIR/public_surface_interrupted_check.log" 2>&1
+check_rc=$?
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_public_surface_contract.py" --recover \
+  > "$ART_DIR/public_surface_recover.log" 2>&1
+recover_rc=$?
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_public_surface_contract.py" --check \
+  > "$ART_DIR/public_surface_recovered_check.log" 2>&1
+recovered_check_rc=$?
+set -e
+public_sha_after="$(
+  sha256sum "$PUBLIC_CONTRACT" "$PUBLIC_DOCUMENT" "$PUBLIC_RUST" \
+    | sha256sum | cut -d' ' -f1
+)"
+if [ "$check_rc" -eq 0 ] \
+    || [ "$recover_rc" -ne 0 ] \
+    || [ "$recovered_check_rc" -ne 0 ] \
+    || [ "$public_sha_before" != "$public_sha_after" ] \
+    || [ -e "$PUBLIC_CONTRACT_CANDIDATE" ] \
+    || [ -e "$PUBLIC_DOCUMENT_CANDIDATE" ] \
+    || [ -e "$PUBLIC_RUST_CANDIDATE" ]; then
+  for candidate in \
+    "$PUBLIC_CONTRACT_CANDIDATE" \
+    "$PUBLIC_DOCUMENT_CANDIDATE" \
+    "$PUBLIC_RUST_CANDIDATE"; do
+    if [ -e "$candidate" ]; then
+      mv "$candidate" "$ART_DIR/$(basename "$candidate").retained"
+    fi
+  done
+  emit public_surface_recovery failed "\"interrupted_check_exit\":$check_rc,\"recover_exit\":$recover_rc,\"recovered_check_exit\":$recovered_check_rc,\"before\":\"$public_sha_before\",\"after\":\"$public_sha_after\",\"artifacts\":\"public_surface_interrupted_check.log,public_surface_recover.log,public_surface_recovered_check.log\""
+  note "FAIL: PublicSurface interrupted publication did not recover byte-identically"
+  exit 1
+fi
+emit public_surface_recovery passed "\"interrupted_check_exit\":$check_rc,\"recover_exit\":0,\"recovered_check_exit\":0,\"restored_sha\":\"$public_sha_after\",\"artifacts\":\"public_surface_interrupted_check.log,public_surface_recover.log,public_surface_recovered_check.log\""
+note "PublicSurface interrupted candidate set recovered before canonical authority"
+
+# ---- lane 11: recovery — everything green again after restoration ----------------------
 note "recovery: drift checks and linkage green after restoration"
 set +e
 "${PYTHON[@]}" "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/recovery_abi.log" 2>&1
@@ -279,18 +356,26 @@ rc2=$?
 "${PYTHON[@]}" "$ROOT/scripts/extract/gen_cli_lake_census.py" --check \
   > "$ART_DIR/recovery_cli_lake.log" 2>&1
 rc3=$?
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_public_surface_contract.py" --check \
+  > "$ART_DIR/recovery_public_surface.log" 2>&1
+rc4=$?
 ( cd "$ROOT" \
     && CARGO_TARGET_DIR=target_local cargo test -q -p fln-rt --test abi_contract \
-    && CARGO_TARGET_DIR=target_local cargo test -q -p fln-conformance --test contract_roots ) \
+    && CARGO_TARGET_DIR=target_local cargo test -q -p fln-conformance \
+      --test contract_roots --test public_surface ) \
   > "$ART_DIR/recovery_suite.log" 2>&1
-rc4=$?
+rc5=$?
 set -e
-if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ] || [ "$rc3" -ne 0 ] || [ "$rc4" -ne 0 ]; then
-  emit recovery failed "\"abi_check_exit\":$rc1,\"olean_check_exit\":$rc2,\"cli_lake_check_exit\":$rc3,\"suite_exit\":$rc4,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_cli_lake.log,recovery_suite.log\""
-  note "FAIL: recovery lane not green (abi_check=$rc1 olean_check=$rc2 cli_lake_check=$rc3 suite=$rc4)"
+if [ "$rc1" -ne 0 ] \
+    || [ "$rc2" -ne 0 ] \
+    || [ "$rc3" -ne 0 ] \
+    || [ "$rc4" -ne 0 ] \
+    || [ "$rc5" -ne 0 ]; then
+  emit recovery failed "\"abi_check_exit\":$rc1,\"olean_check_exit\":$rc2,\"cli_lake_check_exit\":$rc3,\"public_surface_check_exit\":$rc4,\"suite_exit\":$rc5,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_cli_lake.log,recovery_public_surface.log,recovery_suite.log\""
+  note "FAIL: recovery lane not green (abi_check=$rc1 olean_check=$rc2 cli_lake_check=$rc3 public_surface_check=$rc4 suite=$rc5)"
   exit 1
 fi
-emit recovery passed "\"abi_check_exit\":0,\"olean_check_exit\":0,\"cli_lake_check_exit\":0,\"suite_exit\":0,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_cli_lake.log,recovery_suite.log\""
+emit recovery passed "\"abi_check_exit\":0,\"olean_check_exit\":0,\"cli_lake_check_exit\":0,\"public_surface_check_exit\":0,\"suite_exit\":0,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_cli_lake.log,recovery_public_surface.log,recovery_suite.log\""
 
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS: all lanes green (artifacts in target/e2e/$RUN_ID)"

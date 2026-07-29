@@ -58,6 +58,7 @@ pub enum PinRig {
     AdmissionFaultMatrix,
     LspCensusNoMockE2e,
     CliLakeCensusNoMockE2e,
+    PublicSurfaceNoMockE2e,
     G04NoMockE2e,
     DiagnosticProjectionNoMockE2e,
 }
@@ -74,6 +75,7 @@ impl PinRig {
         Self::AdmissionFaultMatrix,
         Self::LspCensusNoMockE2e,
         Self::CliLakeCensusNoMockE2e,
+        Self::PublicSurfaceNoMockE2e,
         Self::G04NoMockE2e,
         Self::DiagnosticProjectionNoMockE2e,
     ];
@@ -111,6 +113,9 @@ impl PinRig {
             Self::CliLakeCensusNoMockE2e => {
                 "test:fln-conformance::cli_lake_census_no_mock_e2e::cli_lake_census_no_mock_e2e"
             }
+            Self::PublicSurfaceNoMockE2e => {
+                "test:fln-conformance::public_surface_no_mock_e2e::public_surface_no_mock_e2e"
+            }
             Self::G04NoMockE2e => "test:fln-conformance::g0_4_no_mock_e2e::g0_4_no_mock_e2e",
             Self::DiagnosticProjectionNoMockE2e => {
                 "test:fln-conformance::diag_render::diagnostic_projection_no_mock_e2e"
@@ -131,6 +136,7 @@ impl PinRig {
             Self::AdmissionFaultMatrix => "AdmissionFaultMatrix",
             Self::LspCensusNoMockE2e => "LspCensusNoMockE2e",
             Self::CliLakeCensusNoMockE2e => "CliLakeCensusNoMockE2e",
+            Self::PublicSurfaceNoMockE2e => "PublicSurfaceNoMockE2e",
             Self::G04NoMockE2e => "G04NoMockE2e",
             Self::DiagnosticProjectionNoMockE2e => "DiagnosticProjectionNoMockE2e",
         }
@@ -148,6 +154,7 @@ impl PinRig {
             Self::AdmissionFaultMatrix => "admission_fault_matrix",
             Self::LspCensusNoMockE2e => "lsp_census_no_mock_e2e",
             Self::CliLakeCensusNoMockE2e => "cli_lake_census_no_mock_e2e",
+            Self::PublicSurfaceNoMockE2e => "public_surface_no_mock_e2e",
             Self::G04NoMockE2e => "g0_4_no_mock_e2e",
             Self::DiagnosticProjectionNoMockE2e => "diagnostic_projection_no_mock_e2e",
         }

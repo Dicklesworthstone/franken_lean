@@ -110,6 +110,11 @@ jobs:
           python3 -I -S scripts/extract/gen_cli_lake_census.py --check
           python3 -I -S scripts/extract/gen_cli_lake_census.py --check-probes
 
+      - name: verify the joined public-surface contract
+        shell: bash
+        run: |
+          python3 -I -S scripts/extract/gen_public_surface_contract.py --check
+
       - name: pin-dependent conformance suites (fln-rgha)
         shell: bash
         env:
@@ -119,7 +124,8 @@ jobs:
           # ci/VERIFICATION_MANIFEST.jsonl; the fifth is the manifest-complete LSP producer
           # proof, the sixth is the G0-4 syntax/hygiene Reference differential, and the
           # seventh is the per-frontend diagnostic projection differential. The eighth is
-          # the complete CLI/Lake census differential. All eight are
+          # the complete CLI/Lake census differential, and the ninth joins the option,
+          # CLI/Lake, and LSP products through fresh real processes. All nine are
           # compiled PinRig entries. Until this step the nine cited rows
           # had never executed in any workflow: ci.yml installs no Lean pin and this workflow
           # ran no cargo, so the intersection was empty (bead fln-rgha).
@@ -156,6 +162,7 @@ jobs:
             --test pin_ctor_inventory \
             --test lsp_census_no_mock_e2e \
             --test cli_lake_census_no_mock_e2e \
+            --test public_surface_no_mock_e2e \
             --test g0_4_no_mock_e2e \
             --test diag_render \
             -- --nocapture > "$log" 2>&1
@@ -183,12 +190,12 @@ jobs:
           fi
           # These two floors answer only whether the command shape collapsed. They do not
           # carry execution evidence; the structured records above do.
-          if (( result_lines < 8 )); then
-            echo "rgha-join: REFUSED - only $result_lines of 8 binaries reported a result" >&2
+          if (( result_lines < 9 )); then
+            echo "rgha-join: REFUSED - only $result_lines of 9 binaries reported a result" >&2
             fail=1
           fi
-          if (( passed < 28 )); then
-            echo "rgha-join: REFUSED - only $passed tests ran (floor 28 after CLI/Lake census registration); a zero-test cargo success is not a run" >&2
+          if (( passed < 29 )); then
+            echo "rgha-join: REFUSED - only $passed tests ran (floor 29 after PublicSurface registration); a zero-test cargo success is not a run" >&2
             fail=1
           fi
           (( fail )) && exit 2
@@ -308,8 +315,11 @@ jobs:
           ./scripts/e2e/contract_drift.sh
           git diff --exit-code -- \
             ABI_CONTRACT.md \
+            contracts/PUBLIC_SURFACE_CONTRACT.md \
+            contracts/PUBLIC_SURFACE_CONTRACT.txt \
             crates/fln-rt/src/abi.rs \
-            crates/fln-olean/src/format.rs
+            crates/fln-olean/src/format.rs \
+            crates/fln-conformance/src/public_surface_generated.rs
 
       - name: archive contract drift evidence
         if: always()
