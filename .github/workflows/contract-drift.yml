@@ -179,6 +179,64 @@ jobs:
           # It proves that the registered assertion-bearing bodies executed and did not
           # silently skip; the soundness of the assertions remains their own obligation.
 
+      - name: run the governed kernel replay evidence lane
+        shell: bash
+        run: |
+          # Registration and shellcheck never established that this lane ran. Execute the
+          # actual script in the pin-bearing workflow and retain its committed fln.e2e/2
+          # admission child. The outer fln.e2e/1 journal is legacy compatibility evidence;
+          # the independently validated child is the authoritative receipt.
+          step_root="target/e2e/contract-drift-kernel-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$step_root"
+          FLN_E2E_ART_ROOT="$PWD/$step_root" \
+            FLN_E2E_CACHE_STATE="github-actions-contract-drift" \
+            ./scripts/e2e/kernel_replay.sh
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          if (( ${#bundles[@]} != 1 )); then
+            echo "kernel replay lane published ${#bundles[@]} outer bundles; expected one" >&2
+            exit 2
+          fi
+          artifact="${bundles[0]}"
+          child="$artifact/admission-ap6"
+          python3 -I -S scripts/evidence.py validate-bundle \
+            --art-dir "$child" \
+            --manifest "$child/manifest.json" \
+            --digest "$child/manifest.digest" \
+            --commit "$child/bundle.complete.json" \
+            --artifact-root "$child"
+
+      - name: verify the epoch lab and run Reference-vs-Reference E2E
+        shell: bash
+        run: |
+          # This lane belongs here rather than in ci.yml: it requires the 2.8 GB
+          # SUITE.lock-pinned Reference toolchain installed above. The shared
+          # fln.e2e/2 bundle remains mandatory in this weekly/on-demand workflow;
+          # crates/fln-conformance/tests/contract_roots.rs binds both commands to
+          # this reachable dispatcher so a governed-input or shellcheck mention
+          # cannot satisfy the obligation.
+          ./scripts/tribunal/gen_epoch_manifest.sh --check
+          step_root="target/e2e/contract-drift-ref-vs-ref-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$step_root"
+          FLN_E2E_ART_ROOT="$PWD/$step_root" \
+            FLN_E2E_CACHE_STATE="github-actions-contract-drift" \
+            ./scripts/tribunal/ref_vs_ref.sh
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          if (( ${#bundles[@]} != 1 )); then
+            echo "Reference-vs-Reference lane published ${#bundles[@]} bundles; expected one" >&2
+            exit 2
+          fi
+          artifact="${bundles[0]}"
+          python3 -I -S scripts/evidence.py validate-bundle \
+            --art-dir "$artifact" \
+            --manifest "$artifact/manifest.json" \
+            --digest "$artifact/manifest.digest" \
+            --commit "$artifact/bundle.complete.json" \
+            --artifact-root "$artifact"
+
       - name: run the seeded contract drift lane
         shell: bash
         run: |

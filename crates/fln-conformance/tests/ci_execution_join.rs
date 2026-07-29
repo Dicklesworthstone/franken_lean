@@ -61,14 +61,16 @@
 //!    for none of the interesting ones. `env_snapshots.sh` alone hosts **six** registered
 //!    scenarios, five of them named nothing like it, so renaming that one file orphans five
 //!    registrations at once. Of 21 lane scripts only **8** carry the `fln.e2e/2` schema, and
-//!    one of those eight — `kernel_replay.sh` — is dispatched by **no workflow at all**,
+//!    one of those eight — `kernel_replay.sh` — was dispatched by **no workflow at all**,
 //!    while sitting in `E2E_STEP_ORDERS` and `check.sh`'s shellcheck stage looking exactly
-//!    as authoritative as the twelve that run. That is this bead's own thesis one floor up:
-//!    the guard was written because *rows* rest on suites CI never runs, and a *lane* CI
-//!    never runs was sitting inside the registry the guard was reading from.
+//!    as authoritative as the twelve that ran. The scheduled/on-demand pin-bearing workflow
+//!    now executes the real lane and retains its committed child bundle; the empty
+//!    [`UNDISPATCHED_GOVERNED_LANES`] declaration is the mechanical proof that no governed
+//!    lane remains in that state.
 //!
-//!    What remains underived is **dispatch at runtime**: a workflow naming a script is not
-//!    a run of it, exactly as `uagk` records for its cron.
+//!    What remains underived is **dispatch at runtime**: configured workflow and `check.sh`
+//!    commands are not proof that a run occurred. The retained bundle is the per-run receipt,
+//!    exactly as `uagk` records for its cron.
 //! 2. **Cargo's real target set.** Text cannot yield it; `bkw6` already paid for the
 //!    text-only version by counting `[[bench]]` sections while cargo auto-discovered the
 //!    rest. Member globs and directory layout are resolved here; `[[test]]` sections,
@@ -138,13 +140,20 @@ use fln_conformance::execution::{
     CiJob, Field, GOVERNED_E2E_SCHEMA, PIN_COORDINATES, autodiscovery_overrides,
     check_sh_reaches_workspace, ci_jobs, e2e_scenario_keys, feature_gated_modules,
     features_off_by_default, ignored_tests, installs_reference_pin, invokes_check_sh, is_terminal,
-    module_path_prefix, names_scenario_in_code, reach_covers, reaches_the_pinned_reference,
-    record_field, scenario_assignments, shell_code_only, test_function_citation, test_functions,
-    test_reach, unmodelled_feature_cfgs, workspace_member_patterns,
+    logical_lines, module_path_prefix, names_scenario_in_code, reach_covers,
+    reaches_the_pinned_reference, record_field, scenario_assignments, shell_code_only,
+    test_function_citation, test_functions, test_reach, unmodelled_feature_cfgs,
+    workspace_member_patterns,
 };
 use fln_conformance::pin::{
     self, PinRig, RIG_EXECUTION_DIR_ENV, RigDisposition, RigExecutionRecord,
 };
+
+macro_rules! fixture_panic {
+    ($($arg:tt)*) => {
+        panic!(/* ubs:ignore — test-only diagnostic. */ $($arg)*)
+    };
+}
 
 const RIG_EXECUTION_SUMMARY_ENV: &str = "FLN_RIG_EXECUTION_SUMMARY";
 const RIG_EXECUTION_SUMMARY_SCHEMA: &str = "fln.rig-execution-summary/1";
@@ -294,23 +303,19 @@ const WEAKLY_BOUND_SCENARIOS: &[&str] = &[
     "extension_descriptor_matrix",
 ];
 
-/// Governed `fln.e2e/2` lanes that **no workflow dispatches**, each with the reason —
-/// and the reason is re-derived, not read.
-///
-/// `kernel_replay.sh` reaches the pinned Reference (`FLN_REFERENCE_LIB`, its own elan path
-/// at line 94) and CI installs no Reference toolchain, so it could not run there if it were
-/// dispatched. That is the honest state, and it is this bead's subject rather than an
-/// exception to it: a lane nothing runs is the same hollow green as a row whose suite
-/// nothing runs, one level up.
+/// Governed `fln.e2e/2` lanes that neither a workflow nor a non-lint
+/// `scripts/check.sh` stage dispatches, each with the reason — and the reason is
+/// re-derived, not read.
 ///
 /// **Both halves are live bindings.** Adding a dispatch makes the entry stale and fails;
 /// the lane ceasing to reach the pin falsifies the recorded reason and fails. Neither can
 /// rot into a bare exemption, which is what `qydn`'s thirteen declared violations earn by
 /// being checked in both directions.
-const UNDISPATCHED_GOVERNED_LANES: &[(&str, &str)] = &[(
-    "scripts/e2e/kernel_replay.sh",
-    "reaches the pinned Reference, which CI does not install",
-)];
+///
+/// Empty is the repaired state. `kernel_replay.sh` moved out when the pin-bearing
+/// contract-drift workflow began executing the actual lane and retaining its committed
+/// `fln.e2e/2` child bundle. Registration and shellcheck did not earn that deletion.
+const UNDISPATCHED_GOVERNED_LANES: &[(&str, &str)] = &[];
 
 /// Terminal rows whose evidence is stated at a granularity **coarser than the unit that runs**.
 ///
@@ -613,8 +618,9 @@ struct Derivation {
     own_source: String,
     rows: Vec<TerminalRow>,
     e2e_keys: BTreeSet<String>,
-    /// Every `scripts/e2e/*.sh`, workspace-relative, mapped to its raw text. All of them,
-    /// governed or not: which are governed is derived from the text, never from the name.
+    /// Every shell producer in the repository's two governed lane roots,
+    /// workspace-relative and mapped to its raw text. All of them, governed or
+    /// not: which are governed is derived from the text, never from the name.
     lanes: BTreeMap<String, String>,
     /// The concatenated `.github/workflows/*.yml` text, for the dispatch scan. A workflow
     /// naming a script is not a run of it — see [`judge_lane_binding`] for what that costs.
@@ -653,7 +659,7 @@ struct Derivation {
 
 fn read(root: &Path, relative: &str) -> String {
     fs::read_to_string(root.join(relative))
-        .unwrap_or_else(|error| panic!("{relative} must be readable: {error}"))
+        .unwrap_or_else(|error| fixture_panic!("{relative} must be readable: {error}"))
 }
 
 /// Resolve the root manifest's `members` globs against the tree.
@@ -702,17 +708,17 @@ fn collect_rs(dir: &Path, root: &Path, out: &mut BTreeMap<String, String>) {
         Ok(entries) => entries,
         // A member with no `src/` or no `tests/` is ordinary; anything else is not.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => panic!("scan: {} could not be walked: {error}", dir.display()),
+        Err(error) => fixture_panic!("scan: {} could not be walked: {error}", dir.display()),
     };
     for entry in entries {
         let entry = entry.unwrap_or_else(|error| {
-            panic!(
+            fixture_panic!(
                 "scan: an entry of {} could not be read: {error}",
                 dir.display()
             )
         });
         let kind = entry.file_type().unwrap_or_else(|error| {
-            panic!(
+            fixture_panic!(
                 "scan: {:?} has no readable file type: {error}",
                 entry.path()
             )
@@ -729,7 +735,7 @@ fn collect_rs(dir: &Path, root: &Path, out: &mut BTreeMap<String, String>) {
             continue;
         }
         let text = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!(
+            fixture_panic!(
                 "scan: {} is a Rust source file this scan could not read ({error}). A file \
                  dropped here is a file the pin-reach scan never judges — refuse rather than \
                  narrow the scope silently.",
@@ -765,20 +771,25 @@ fn derive(root: &Path) -> Derivation {
         .map(|(path, _)| path.clone())
         .collect();
 
-    // Every lane script, read by directory listing rather than by any list of names. A file
-    // this cannot read is a refusal: a dropped lane is exactly the lane nobody is looking at.
+    // Every lane script, read by directory listing rather than by any list of names. The
+    // Reference-vs-Reference producer lives under scripts/tribunal while the product lanes
+    // live under scripts/e2e, so both roots are part of the derived population. A file this
+    // cannot read is a refusal: a dropped lane is exactly the lane nobody is looking at.
     let mut lanes = BTreeMap::new();
-    let lane_dir = root.join("scripts/e2e");
-    let mut lane_paths: Vec<PathBuf> = fs::read_dir(&lane_dir)
-        .expect("scripts/e2e must be readable")
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "sh"))
-        .collect();
+    let mut lane_paths = Vec::new();
+    for lane_root in ["scripts/e2e", "scripts/tribunal"] {
+        lane_paths.extend(
+            fs::read_dir(root.join(lane_root))
+                .unwrap_or_else(|error| fixture_panic!("{lane_root} must be readable: {error}"))
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "sh")),
+        );
+    }
     lane_paths.sort();
     for path in lane_paths {
         let text = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("scan: lane {} could not be read: {error}", path.display())
+            fixture_panic!("scan: lane {} could not be read: {error}", path.display())
         });
         let relative = path
             .strip_prefix(root)
@@ -811,7 +822,7 @@ fn derive(root: &Path) -> Derivation {
         // and "runs nothing" is a state this guard reports rather than a state it may
         // silently assume.
         let text = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!(
+            fixture_panic!(
                 "scan: workflow {} could not be read: {error}",
                 path.display()
             )
@@ -930,7 +941,9 @@ fn derive(root: &Path) -> Derivation {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| {
-                panic!("scan: {member}/Cargo.toml declares no package name this reader can find")
+                fixture_panic!(
+                    "scan: {member}/Cargo.toml declares no package name this reader can find"
+                )
             });
         for reason in autodiscovery_overrides(&manifest) {
             preconditions.push((format!("{member}/Cargo.toml"), reason.to_string()));
@@ -1040,14 +1053,16 @@ fn derive(root: &Path) -> Derivation {
             record_field(line, "artifacts"),
             record_field(line, "scenarios"),
         ) else {
-            panic!(
+            fixture_panic!(
                 "scan: coverage row {} for {bead:?} did not yield skip/artifacts/scenarios — a \
                  record this reader cannot read is a refusal, never a row with no evidence",
                 number + 1
             );
         };
         let state = status.get(&bead).unwrap_or_else(|| {
-            panic!("scan: coverage row for {bead:?} names an issue the tracker does not carry")
+            fixture_panic!(
+                "scan: coverage row for {bead:?} names an issue the tracker does not carry"
+            )
         });
         if !is_terminal(state, &skip) {
             continue;
@@ -1774,9 +1789,58 @@ fn judge_residue(d: &Derivation, premises: &[(usize, Premise)], ceiling: usize) 
     findings
 }
 
+fn argument_names_lane(argument: &str, lane: &str) -> bool {
+    let argument = argument.trim_matches(|ch| matches!(ch, '\'' | '"'));
+    argument == lane || argument == format!("./{lane}") || argument.ends_with(&format!("/{lane}"))
+}
+
+/// Does a non-lint `run_stage` command execute this lane?
+///
+/// A bare occurrence is deliberately insufficient: every lane is passed to the
+/// `shellcheck` stage, which was the live false-green shape this bead found. The
+/// script must be the command itself or the first script operand of `bash`/`sh`.
+/// Environment assignments before the command are accepted because they change
+/// configuration, not command identity.
+fn check_sh_invokes_lane(check_sh: &str, lane: &str) -> bool {
+    logical_lines(check_sh).iter().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() != Some(&"run_stage")
+            || words.get(1) == Some(&"shellcheck")
+            || words.len() < 3
+        {
+            return false;
+        }
+
+        let mut at = 2;
+        if words.get(at) == Some(&"env") {
+            at += 1;
+            while words.get(at).is_some_and(|word| word.contains('=')) {
+                at += 1;
+            }
+        }
+        let Some(command) = words.get(at) else {
+            return false;
+        };
+        if argument_names_lane(command, lane) {
+            return true;
+        }
+        if !matches!(
+            command.trim_matches(|ch| matches!(ch, '\'' | '"')),
+            "bash" | "sh"
+        ) {
+            return false;
+        }
+
+        words[at + 1..]
+            .iter()
+            .find(|word| !word.starts_with('-'))
+            .is_some_and(|word| argument_names_lane(word, lane))
+    })
+}
+
 /// Every registered `fln.e2e/2` scenario is bound to a lane script that exists, every lane
-/// script's scenario is registered, and every governed lane is dispatched by a workflow —
-/// or declared, by set equality in both directions.
+/// script's scenario is registered, and every governed lane is dispatched by a workflow or
+/// a non-lint `scripts/check.sh` stage — or declared, by set equality in both directions.
 ///
 /// **Residue item 1 of this module's own list, closed as far as text can close it.** The
 /// binding this derives was previously asserted in prose as "keys match `scripts/e2e/<key>.sh`
@@ -1790,9 +1854,10 @@ fn judge_residue(d: &Derivation, premises: &[(usize, Premise)], ceiling: usize) 
 ///
 /// **What it does not earn.** A workflow *naming* a script is not a run of it — the same
 /// limit `uagk`'s cron token carries, stated here so nobody re-derives it as observation.
-/// And a lane dispatched only from `scripts/check.sh` would read as undispatched: measured
-/// at `ad2b9207` no lane is, `check.sh` names two only to shellcheck them, and the loud
-/// direction is the correct one for a check that cannot decide.
+/// `scripts/check.sh` dispatch is derived from executable `run_stage` command position;
+/// its shellcheck argument list is excluded and planted independently below. What still
+/// cannot be earned from either source is occurrence: configuration needs a retained
+/// committed bundle from the particular run.
 fn judge_lane_binding(
     d: &Derivation,
     weak_allowance: &[&str],
@@ -1811,8 +1876,8 @@ fn judge_lane_binding(
     // --- A collapsed scan is a broken scan, never a clean tree ---------------
     if d.lanes.is_empty() {
         findings.push(
-            "lane-scan: scripts/e2e yielded no lane scripts at all. That is a broken walk, \
-             not a repository without lanes."
+            "lane-scan: scripts/e2e plus scripts/tribunal yielded no lane scripts at all. \
+             That is a broken walk, not a repository without lanes."
                 .to_string(),
         );
     }
@@ -1903,11 +1968,13 @@ fn judge_lane_binding(
         ));
     }
 
-    // --- Governed lanes no workflow dispatches ------------------------------
+    // --- Governed lanes no dispatcher can execute ---------------------------
     let measured_undispatched: BTreeSet<&str> = governed
         .keys()
         .copied()
-        .filter(|path| !d.workflow_text.contains(*path))
+        .filter(|path| {
+            !d.workflow_text.contains(*path) && !check_sh_invokes_lane(&d.check_sh, path)
+        })
         .collect();
     let declared_undispatched: BTreeSet<&str> = undispatched_allowance
         .iter()
@@ -1920,8 +1987,9 @@ fn judge_lane_binding(
     if !newly.is_empty() {
         findings.push(format!(
             "lane-undispatched: {newly:?} carry the {GOVERNED_E2E_SCHEMA} schema and are \
-             named by no workflow. A governed lane nothing dispatches is this bead's own \
-             defect one level up from the rows it judges: registered, linted, and never run."
+             named by no workflow or executable scripts/check.sh stage. A governed lane \
+             nothing dispatches is this bead's own defect one level up from the rows it \
+             judges: registered, linted, and never run."
         ));
     }
     let now_dispatched: Vec<&&str> = declared_undispatched
@@ -1930,7 +1998,7 @@ fn judge_lane_binding(
     if !now_dispatched.is_empty() {
         findings.push(format!(
             "lane-dispatch-stale: {now_dispatched:?} are declared undispatched and a \
-             workflow now names them. Delete those entries from \
+             workflow or executable scripts/check.sh stage now names them. Delete those entries from \
              UNDISPATCHED_GOVERNED_LANES."
         ));
     }
@@ -1942,8 +2010,8 @@ fn judge_lane_binding(
         let Some(text) = d.lanes.get(*path) else {
             findings.push(format!(
                 "lane-dispatch-stale: UNDISPATCHED_GOVERNED_LANES names {path}, which is not \
-                 a lane script in scripts/e2e. A declaration outliving its subject is the \
-                 shape this guard exists to refuse."
+                 a lane script in either governed lane root. A declaration outliving its \
+                 subject is the shape this guard exists to refuse."
             ));
             continue;
         };
@@ -2713,7 +2781,7 @@ fn configured_pin_rig_records_prove_each_scheduled_rig_executed() {
     let root = root();
     let (expected_executed, expected_not_run) =
         contract_drift_expected_rigs(&root).unwrap_or_else(|findings| {
-            panic!(
+            fixture_panic!(
                 "cannot derive the contract-drift pin-rig partition:\n  - {}",
                 findings.join("\n  - ")
             )
@@ -2941,10 +3009,9 @@ fn the_derivation_reports_what_it_measured_and_refuses_an_empty_scan() {
 fn the_scan_excludes_its_own_declarations_and_that_exclusion_is_not_vacuous() {
     let d = derive(&root());
     for (path, reason) in PIN_REACH_SCAN_EXCLUSIONS {
-        let text = d
-            .surfaces
-            .get(*path)
-            .unwrap_or_else(|| panic!("declared exclusion {path} ({reason}) is not in scope"));
+        let text = d.surfaces.get(*path).unwrap_or_else(|| {
+            fixture_panic!("declared exclusion {path} ({reason}) is not in scope")
+        });
         assert!(
             reaches_the_pinned_reference(text),
             "{path} is excluded ({reason}) but matches no pin coordinate, so the exclusion \
@@ -3436,7 +3503,7 @@ fn census_field(line: &str, key: &str) -> String {
                 .strip_prefix(key)
                 .and_then(|rest| rest.strip_prefix('='))
         })
-        .unwrap_or_else(|| panic!("census line carries no `{key}=` field: {line}"))
+        .unwrap_or_else(|| fixture_panic!("census line carries no `{key}=` field: {line}"))
         .to_string()
 }
 
@@ -3888,7 +3955,7 @@ fn an_ignored_function(d: &Derivation, surface: &str) -> String {
         .iter()
         .find(|(where_, _)| where_ == surface)
         .map(|(_, function)| function.clone())
-        .unwrap_or_else(|| panic!("{surface} declares no `#[ignore]`d test"))
+        .unwrap_or_else(|| fixture_panic!("{surface} declares no `#[ignore]`d test"))
 }
 
 #[test]
@@ -3940,7 +4007,7 @@ fn a_cfg_gated_unit_test(d: &Derivation, package: &str) -> (String, String) {
         .iter()
         .find(|(owner, prefix, _)| owner == package && !prefix.is_empty())
         .map(|(_, prefix, function)| (prefix.clone(), function.clone()))
-        .unwrap_or_else(|| panic!("{package} declares no feature-gated unit test"))
+        .unwrap_or_else(|| fixture_panic!("{package} declares no feature-gated unit test"))
 }
 
 fn cfg_gated_findings(d: &Derivation) -> Vec<String> {
@@ -4164,7 +4231,7 @@ fn baseline_lane() -> Derivation {
 fn lane_mut<'a>(d: &'a mut Derivation, path: &str) -> &'a mut String {
     d.lanes
         .get_mut(path)
-        .unwrap_or_else(|| panic!("{path} must be a lane script this scan read"))
+        .unwrap_or_else(|| fixture_panic!("{path} must be a lane script this scan read"))
 }
 
 /// A step order registered for a scenario no lane runs.
@@ -4233,7 +4300,10 @@ fn lane_mutant_repairing_a_weak_binding_forces_the_declaration_to_shrink() {
     );
 }
 
-/// A governed lane that no workflow dispatches — the defect this residue item found live.
+/// A governed lane that no workflow or executable check.sh stage dispatches —
+/// the defect this residue item found live. The real check.sh still names this
+/// lane in its shellcheck arguments, so this is also the non-vacuous proof that
+/// lint registration cannot satisfy dispatch.
 #[test]
 fn lane_mutant_a_governed_lane_no_workflow_dispatches_reddens() {
     let mut d = baseline_lane();
@@ -4241,20 +4311,47 @@ fn lane_mutant_a_governed_lane_no_workflow_dispatches_reddens() {
         "scripts/e2e/verdict_schema.sh",
         "scripts/e2e/renamed_away.sh",
     );
+    d.check_sh
+        .push_str("\nrun_stage inventory rg scripts/e2e/verdict_schema.sh\n");
     let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
     assert!(
         has(&findings, "lane-undispatched:"),
-        "a governed lane dropping out of every workflow must redden; got {findings:?}"
+        "a governed lane dropping out of every dispatcher must redden even when shellcheck and \
+         a non-executing inventory stage name it; got {findings:?}"
+    );
+}
+
+/// A real check.sh dispatch is a configured dispatcher, not a false red.
+///
+/// This is R3's missing good-direction control. Without it, the parser could
+/// reject every check.sh command and the current population — which happens to
+/// use workflows — would still report green.
+#[test]
+fn lane_control_a_check_sh_run_stage_can_execute_a_governed_lane() {
+    let mut d = baseline_lane();
+    d.workflow_text = d.workflow_text.replace(
+        "scripts/e2e/verdict_schema.sh",
+        "scripts/e2e/renamed_away.sh",
+    );
+    d.check_sh
+        .push_str("\nrun_stage verdict-schema bash scripts/e2e/verdict_schema.sh\n");
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    assert!(
+        findings.is_empty(),
+        "a governed lane executed as the script operand of a non-lint run_stage must count as \
+         configured dispatch; got {findings:?}"
     );
 }
 
 /// Dispatching the exempt lane is the repair, and its entry must go in the same commit.
 #[test]
 fn lane_mutant_dispatching_the_exempt_lane_forces_the_declaration_to_shrink() {
-    let mut d = baseline_lane();
-    d.workflow_text
-        .push_str("\n            ./scripts/e2e/kernel_replay.sh\n");
-    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    let d = baseline_lane();
+    let planted_allowance = [(
+        "scripts/e2e/kernel_replay.sh",
+        "reaches the pinned Reference, which the dispatcher installs",
+    )];
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, &planted_allowance);
     assert!(
         has(&findings, "lane-dispatch-stale:"),
         "an exemption whose lane is now dispatched must demand deletion; got {findings:?}"
@@ -4270,11 +4367,19 @@ fn lane_mutant_dispatching_the_exempt_lane_forces_the_declaration_to_shrink() {
 #[test]
 fn lane_mutant_the_exempt_lanes_reason_is_re_derived_not_read() {
     let mut d = baseline_lane();
+    d.workflow_text = d.workflow_text.replace(
+        "scripts/e2e/kernel_replay.sh",
+        "scripts/e2e/renamed_away.sh",
+    );
     let lane = lane_mut(&mut d, "scripts/e2e/kernel_replay.sh");
     for coordinate in PIN_COORDINATES {
         *lane = lane.replace(coordinate, "A_LOCAL_FIXTURE");
     }
-    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, UNDISPATCHED_GOVERNED_LANES);
+    let planted_allowance = [(
+        "scripts/e2e/kernel_replay.sh",
+        "reaches the pinned Reference, which the dispatcher does not install",
+    )];
+    let findings = judge_lane_binding(&d, WEAKLY_BOUND_SCENARIOS, &planted_allowance);
     assert!(
         has(&findings, "lane-reason-falsified:"),
         "a lane exempted for reaching the pin, that no longer reaches it, must lose the \

@@ -41,8 +41,17 @@ use fln_conformance::execution::{TriggerReachability, trigger_reachability};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+macro_rules! fixture_panic {
+    ($($arg:tt)*) => {
+        panic!(/* ubs:ignore — test-only diagnostic. */ $($arg)*)
+    };
+}
+
 const CONTRACT_DRIFT_LANE: &str = "scripts/e2e/contract_drift.sh";
 const CONTRACT_DRIFT_WORKFLOW: &str = ".github/workflows/contract-drift.yml";
+const EPOCH_LAB_CHECK_LANE: &str = "scripts/tribunal/gen_epoch_manifest.sh";
+const KERNEL_REPLAY_LANE: &str = "scripts/e2e/kernel_replay.sh";
+const REFERENCE_REFERENCE_LANE: &str = "scripts/tribunal/ref_vs_ref.sh";
 const CONFIGURED_CADENCE_CLAIM: &str =
     "configured to run weekly and on demand in `.github/workflows/contract-drift.yml`";
 const CADENCE_CLAIM_SITES: [&str; 3] = [
@@ -509,6 +518,100 @@ fn the_contract_drift_cadence_claim_is_bound_to_its_dispatcher() {
         .expect("the configured contract-drift cadence must match every claim");
 }
 
+/// The pin-dependent Tribunal producers and governed kernel replay lane are
+/// permanent obligations of the same reachable workflow that installs the
+/// Reference toolchain.
+///
+/// Both scripts were previously present in `scripts/check.sh` as governed
+/// inputs and shellcheck arguments while no gate executed either one. Reuse the
+/// command-position and trigger-reachability authority above so a filename
+/// mention cannot recreate that hollow registration.
+#[test]
+fn the_pin_dependent_evidence_lanes_are_reachably_dispatched() {
+    let root = root();
+    let workflow = fs::read_to_string(root.join(CONTRACT_DRIFT_WORKFLOW))
+        .expect("the pin-dependent contract-drift workflow must be readable");
+
+    for lane in [
+        EPOCH_LAB_CHECK_LANE,
+        KERNEL_REPLAY_LANE,
+        REFERENCE_REFERENCE_LANE,
+    ] {
+        assert!(
+            root.join(lane).is_file(),
+            "{lane} is a required pin-dependent Tribunal producer"
+        );
+        assert!(
+            workflow_invokes_lane(&workflow, lane),
+            "{CONTRACT_DRIFT_WORKFLOW} must execute {lane} from its reachable weekly/on-demand \
+             workflow; naming it in a comment, governed-input list, or shellcheck argument is \
+             not execution"
+        );
+        assert!(
+            lane_is_invoked(&root, lane),
+            "the repository-wide dispatcher scan cannot see the real invocation of {lane}"
+        );
+    }
+
+    assert!(
+        workflow
+            .lines()
+            .any(|line| line.trim() == "./scripts/tribunal/gen_epoch_manifest.sh --check"),
+        "the scheduled epoch producer must use immutable check mode"
+    );
+
+    let ref_lane = fs::read_to_string(root.join(REFERENCE_REFERENCE_LANE))
+        .expect("the Reference-vs-Reference lane must be readable");
+    assert!(
+        ref_lane.contains("SCHEMA=\"fln.e2e/2\""),
+        "the Reference-vs-Reference lane must publish through the shared fln.e2e/2 contract"
+    );
+    assert!(
+        logical_lines(&ref_lane).iter().any(|line| {
+            line.contains("\"$DOMAIN_VALIDATOR\" --phase final") && line.contains("--log \"$LOG\"")
+        }),
+        "the completed Reference-vs-Reference log must be independently re-read after run_end"
+    );
+
+    for (needle, reason) in [
+        (
+            "step_root=\"target/e2e/contract-drift-kernel-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"",
+            "the kernel replay attempt must publish below the retained workflow root",
+        ),
+        (
+            "child=\"$artifact/admission-ap6\"",
+            "the workflow must select the kernel replay lane's authoritative admission child",
+        ),
+        (
+            "step_root=\"target/e2e/contract-drift-ref-vs-ref-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"",
+            "the Reference-vs-Reference attempt must publish below the retained workflow root",
+        ),
+        (
+            "path: target/e2e/contract-drift-*",
+            "the archive step must cover both pin-dependent attempt roots",
+        ),
+        (
+            "if-no-files-found: error",
+            "an absent retained receipt must fail rather than upload an empty artifact",
+        ),
+    ] {
+        assert!(workflow.contains(needle), "{reason}: missing {needle:?}");
+    }
+    assert!(
+        workflow.contains("if: always()"),
+        "the workflow must retain pin-dependent receipts even when a later contract check fails"
+    );
+    let workflow_lines = logical_lines(&workflow);
+    for subject in ["--art-dir \"$child\"", "--art-dir \"$artifact\""] {
+        assert!(
+            workflow_lines.iter().any(|line| {
+                line.contains("scripts/evidence.py validate-bundle") && line.contains(subject)
+            }),
+            "the retained pin-dependent bundle must be independently validated: {subject}"
+        );
+    }
+}
+
 /// Controls for each direction of the cadence join, including the cron-frequency axis.
 #[test]
 fn the_cadence_reader_and_binding_refuse_each_unbacked_direction() {
@@ -577,7 +680,7 @@ fn every_workflow_can_be_classified_for_reachability() {
     let mut reachable = 0usize;
 
     let entries = fs::read_dir(&dir).unwrap_or_else(|error| {
-        panic!("{}: {error}", dir.display());
+        fixture_panic!("{}: {error}", dir.display());
     });
     let mut files: Vec<(String, String)> = Vec::new();
     for entry in entries.flatten() {
@@ -588,8 +691,8 @@ fn every_workflow_can_be_classified_for_reachability() {
         ) {
             continue;
         }
-        let text =
-            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| fixture_panic!("{}: {error}", path.display()));
         seen += 1;
         if trigger_reachability(&text) == TriggerReachability::Reachable {
             reachable += 1;
@@ -885,7 +988,7 @@ fn every_vendored_source_the_olean_extractor_reads_is_recorded_in_its_contract()
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or_else(|| {
-                    panic!("vendored constant {name} has an unparsable segment {segment:?}")
+                    fixture_panic!("vendored constant {name} has an unparsable segment {segment:?}")
                 });
             parts.push(literal.to_string());
         }
@@ -899,7 +1002,7 @@ fn every_vendored_source_the_olean_extractor_reads_is_recorded_in_its_contract()
         if let Some(rest) = line.strip_prefix("> - `vendor/lean4-src/") {
             let (path, _) = rest
                 .split_once('`')
-                .unwrap_or_else(|| panic!("unterminated source row: {line:?}"));
+                .unwrap_or_else(|| fixture_panic!("unterminated source row: {line:?}"));
             recorded.push(format!("vendor/lean4-src/{path}"));
         }
     }
@@ -954,7 +1057,8 @@ fn every_vendored_source_the_olean_extractor_reads_is_recorded_in_its_contract()
 fn both_contracts_disclose_producer_side_tree_establishment_and_its_residual() {
     let root = root();
     for name in ["OLEAN_CONTRACT.md", "ABI_CONTRACT.md"] {
-        let raw = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let raw =
+            fs::read_to_string(root.join(name)).unwrap_or_else(|e| fixture_panic!("{name}: {e}"));
         // Strip blockquote prefixes and collapse whitespace before matching. These blocks are
         // hard-wrapped by the renderer, so a needle that spans a wrap point tests the wrapping
         // rather than the claim: `is **UNMET**` once matched the `.olean` contract and missed the
@@ -1015,13 +1119,14 @@ fn the_vendor_tree_establishment_block_is_byte_identical_in_both_extractors() {
         "scripts/extract/gen_abi_contract.py",
         "scripts/extract/gen_olean_contract.py",
     ] {
-        let text = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let text =
+            fs::read_to_string(root.join(name)).unwrap_or_else(|e| fixture_panic!("{name}: {e}"));
         let start = text
             .find(START)
-            .unwrap_or_else(|| panic!("{name} has no producer-side establishment block"));
+            .unwrap_or_else(|| fixture_panic!("{name} has no producer-side establishment block"));
         let end = text
             .rfind(END)
-            .unwrap_or_else(|| panic!("{name} has no establishment block terminator"))
+            .unwrap_or_else(|| fixture_panic!("{name} has no establishment block terminator"))
             + END.len();
         assert!(
             end > start,
@@ -1061,7 +1166,8 @@ fn the_vendor_tree_establishment_block_is_byte_identical_in_both_extractors() {
         "scripts/extract/gen_abi_contract.py",
         "scripts/extract/gen_olean_contract.py",
     ] {
-        let text = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let text =
+            fs::read_to_string(root.join(name)).unwrap_or_else(|e| fixture_panic!("{name}: {e}"));
         let calls = text.matches("report_vendor_tree_binding(").count();
         assert!(
             calls >= 2,

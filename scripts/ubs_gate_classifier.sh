@@ -24,6 +24,15 @@
 # exit code is not a verdict." The gate was keyed to the one signal its own doctrine documents
 # as insufficient.
 #
+# A second defect became observable when this wrapper first reached the real four-file gate:
+# UBS's meta-runner launched its Python and Rust modules concurrently. Rust completed, while
+# Python stopped partway through its category walk; the meta-runner still emitted a four-file,
+# zero-critical Combined Summary and exited 1. The classifier correctly refused that terminal,
+# but merely retrying the same concurrent orchestration could never establish an attributable
+# green. This wrapper now dispatches each supported language in its own UBS invocation, in a
+# fixed order, and aggregates only completed module answers. `--jobs=1` is not a substitute:
+# UBS passes that hint to child scanners but still backgrounds the language modules themselves.
+#
 # WHY NOT REPAIR scripts/evidence.py's classify_terminal INSTEAD. That is the more precise fix
 # and it is blocked: `inconclusive` is reachable there only from a supervisor-observed timeout,
 # an output-budget exhaustion, or a child signal -- there is NO child-exit path to it. A UBS
@@ -57,111 +66,221 @@ say() { printf 'ubs-gate: %s\n' "$1" >&2; }
 
 if [ "$#" -eq 0 ]; then
     say 'REFUSED - no input paths were supplied.'
+    # Backticks name the literal registered command surface in this diagnostic.
+    # shellcheck disable=SC2016
     say 'This script is invoked as the target of `evidence.py exec-ubs-inventory`, which appends'
     say 'the validated inventory paths to argv. An empty argv means the inventory was empty or'
     say 'the wiring changed; either way nothing was scanned and no verdict may be rendered.'
     exit 2
 fi
 
+# The Python module's measured two-file run takes about sixteen minutes on this host. UBS's
+# meta-runner default is 300 seconds, while check.sh's outer stage authority is 1,200 seconds.
+# Give one language 1,080 seconds by default: enough for the measured scan, still strictly
+# inside the outer supervisor so a wedged child is typed here before the whole stage is killed.
+module_timeout_seconds=${FLN_UBS_MODULE_TIMEOUT_SECONDS:-${UBS_MODULE_TIMEOUT:-1080}}
+case "$module_timeout_seconds" in
+    ''|*[!0-9]*|0)
+        say "REFUSED - UBS module timeout must be a positive integer, got: $module_timeout_seconds"
+        exit 2
+        ;;
+esac
+
+declare -a python_paths=()
+declare -a rust_paths=()
+declare -a toml_paths=()
+for input_path in "$@"; do
+    case "$input_path" in
+        *.py) python_paths+=("$input_path") ;;
+        *.rs) rust_paths+=("$input_path") ;;
+        *.toml) toml_paths+=("$input_path") ;;
+        *)
+            say "REFUSED - input path has no governed UBS inventory suffix: $input_path"
+            say 'The registered inventory admits only .py, .rs, and .toml paths. Accepting any'
+            say 'other suffix here would make the wrapper and its input authority disagree.'
+            exit 2
+            ;;
+    esac
+done
+
+expected_supported=$((${#python_paths[@]} + ${#rust_paths[@]}))
+unsupported_count=${#toml_paths[@]}
+if [ "$expected_supported" -eq 0 ]; then
+    # `.toml` is intentionally in the project-authored change inventory but UBS v5.3.7 has no
+    # TOML scanner. This is a recorded non-pass, not a synthetic clean invocation.
+    printf 'ubs-gate-classification: class=not_applicable_no_supported_inputs ubs_exits=none gate_exit=0 expected_supported=0 accounted_supported=0 unsupported=%s files=0 critical=0 warning=0 info=0\n' \
+        "$unsupported_count"
+    say 'not_applicable_no_supported_inputs - NOT A PASS - zero scanner coverage; use the applicable validators for these inputs'
+    exit 0
+fi
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ubs-gate.XXXXXXXX") || {
     say 'REFUSED - could not create a capture directory; the terminal text cannot be read.'
     exit 2
 }
-OUT="$WORK/ubs.out"
-ERR="$WORK/ubs.err"
 
-ubs --ci "$@" > "$OUT" 2> "$ERR"
-ubs_exit=$?
+total_files=0
+total_critical=0
+total_warning=0
+total_info=0
+accounted_supported=0
+exit_vector=''
+timeout_seen=no
+no_scanner_seen=no
+inconclusive_seen=no
+findings_seen=no
 
-# The child's own output is the stage's evidence: pass it through UNMODIFIED and FIRST, so the
-# retained ubs.out/ubs.err artifacts are byte-identical to an unwrapped run and this script can
-# never be accused of having eaten the finding it was judging.
-cat "$OUT"
-cat "$ERR" >&2
+scan_language() {
+    local language=$1
+    shift
+    local expected=$#
+    local out="$WORK/$language.out"
+    local err="$WORK/$language.err"
+    local ubs_exit
+    local summary=''
+    local files=''
+    local critical=''
+    local warning=''
+    local info=''
+    local timed_out=no
+    local no_scanner=no
+    local scanner_identified=no
+    local module_class=''
+    local module_detail=''
 
-# ---- terminal facts, each read from a FILE -----------------------------------------------
-# The LAST Combined Summary block is authoritative; UBS prints one per run at the end.
-files=''
-critical=''
-warning=''
-info=''
-if grep -q 'Combined Summary' "$OUT"; then
-    summary=$(sed -n '/Combined Summary/,$p' "$OUT" | tail -20)
-    files=$(printf '%s\n' "$summary" | sed -n 's/^Files:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
-    critical=$(printf '%s\n' "$summary" | sed -n 's/^Critical:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
-    warning=$(printf '%s\n' "$summary" | sed -n 's/^Warning:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
-    info=$(printf '%s\n' "$summary" | sed -n 's/^Info:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
+    say "dispatching $language scanner over $expected governed input(s)"
+    UBS_MODULE_TIMEOUT="$module_timeout_seconds" \
+        ubs --only="$language" --ci "$@" > "$out" 2> "$err"
+    ubs_exit=$?
+
+    # Each child's bytes are passed through unmodified. With more than one language the stage
+    # artifact is their fixed-order concatenation, followed by the wrapper's module and aggregate
+    # records; it is intentionally no longer represented as one concurrent meta-runner answer.
+    cat "$out"
+    cat "$err" >&2
+
+    # ---- terminal facts, each read from this module's capture FILE -----------------------
+    # The LAST Combined Summary block is authoritative within one language invocation.
+    if grep -q 'Combined Summary' "$out"; then
+        summary=$(sed -n '/Combined Summary/,$p' "$out" | tail -20)
+        files=$(printf '%s\n' "$summary" | sed -n 's/^Files:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
+        critical=$(printf '%s\n' "$summary" | sed -n 's/^Critical:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
+        warning=$(printf '%s\n' "$summary" | sed -n 's/^Warning:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
+        info=$(printf '%s\n' "$summary" | sed -n 's/^Info:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
+    fi
+    if grep -q "^Detected: $language\$" "$out"; then
+        scanner_identified=yes
+    fi
+    if grep -q 'MODULE_TIMEOUT' "$out" || grep -q 'MODULE_TIMEOUT' "$err"; then
+        timed_out=yes
+    fi
+    if grep -q 'no supported languages detected' "$out" \
+        || grep -q 'nothing was checked (this is NOT a pass)' "$out"; then
+        no_scanner=yes
+    fi
+
+    # Order is load-bearing. A timeout's synthetic `Critical: 1` is not a code finding.
+    if [ "$timed_out" = yes ]; then
+        module_class=staging_or_scanner_failure
+        module_detail='scanner module hit its budget and was terminated'
+        timeout_seen=yes
+    elif [ "$no_scanner" = yes ]; then
+        module_class=no_scanner_executed
+        module_detail='supported inputs were supplied but UBS reported no scanner'
+        no_scanner_seen=yes
+    elif [ -z "$files" ] || [ -z "$critical" ] || [ -z "$warning" ] || [ -z "$info" ]; then
+        module_class=inconclusive
+        module_detail='no complete parseable Combined Summary'
+        inconclusive_seen=yes
+    elif [ "$files" -eq 0 ]; then
+        module_class=no_scanner_executed
+        module_detail="scan accounted for 0 of $expected intended file(s)"
+        no_scanner_seen=yes
+    elif [ "$files" -ne "$expected" ]; then
+        module_class=inconclusive
+        module_detail="scan accounted for $files of $expected intended file(s)"
+        inconclusive_seen=yes
+    elif [ "$scanner_identified" != yes ]; then
+        module_class=no_scanner_executed
+        module_detail="terminal did not positively identify the requested $language scanner"
+        no_scanner_seen=yes
+    elif [ "$ubs_exit" -eq 0 ] && [ "$critical" -eq 0 ]; then
+        module_class=completed_clean
+        module_detail="$files file(s) accounted for, zero blocking findings"
+    elif [ "$critical" -gt 0 ]; then
+        module_class=completed_findings
+        module_detail="$critical critical finding(s) over $files accounted file(s)"
+        findings_seen=yes
+    elif [ "$ubs_exit" -ne 0 ]; then
+        module_class=inconclusive
+        module_detail="ubs exited $ubs_exit with complete accounting and Critical: 0"
+        inconclusive_seen=yes
+    else
+        module_class=inconclusive
+        module_detail='terminal facts could not be reconciled'
+        inconclusive_seen=yes
+    fi
+
+    if [ "$module_class" = completed_clean ] || [ "$module_class" = completed_findings ]; then
+        accounted_supported=$((accounted_supported + files))
+        total_files=$((total_files + files))
+        total_critical=$((total_critical + critical))
+        total_warning=$((total_warning + warning))
+        total_info=$((total_info + info))
+    fi
+    if [ -n "$exit_vector" ]; then
+        exit_vector="$exit_vector,"
+    fi
+    exit_vector="${exit_vector}${language}:${ubs_exit}"
+    printf 'ubs-gate-module: language=%s class=%s ubs_exit=%s timeout_seconds=%s expected=%s files=%s critical=%s warning=%s info=%s\n' \
+        "$language" "$module_class" "$ubs_exit" "$module_timeout_seconds" "$expected" "${files:-unknown}" \
+        "${critical:-unknown}" "${warning:-unknown}" "${info:-unknown}"
+    say "$language: $module_class - $module_detail"
+}
+
+# Fixed source order is itself part of the evidence: there is never more than one live UBS
+# language module, independent of UBS's internal backgrounding policy.
+if [ "${#python_paths[@]}" -gt 0 ]; then
+    scan_language python "${python_paths[@]}"
+fi
+if [ "${#rust_paths[@]}" -gt 0 ]; then
+    scan_language rust "${rust_paths[@]}"
 fi
 
-timed_out=no
-if grep -q 'MODULE_TIMEOUT' "$OUT" || grep -q 'MODULE_TIMEOUT' "$ERR"; then
-    timed_out=yes
-fi
-
-no_scanner=no
-if grep -q 'no supported languages detected' "$OUT" \
-    || grep -q 'nothing was checked (this is NOT a pass)' "$OUT"; then
-    no_scanner=yes
-fi
-
-# ---- classification, most-specific first -------------------------------------------------
-# Order matters and is the whole design. A timeout carrying `Critical: 1` must be typed by the
-# TIMEOUT, never by the count: that count IS the timeout notice, one critical recorded over zero
-# files scanned. Reading the count first is precisely how this defect was rendered as a
-# rejection in the first place.
 class=''
 gate_exit=''
 detail=''
-
-if [ "$timed_out" = yes ]; then
+if [ "$timeout_seen" = yes ]; then
     class=staging_or_scanner_failure
     gate_exit=2
-    detail='a scanner module hit its budget and was terminated; the scan is partial'
-elif [ "$no_scanner" = yes ]; then
-    # AGENTS.md: "supplies no scanner evidence and is never called a pass, but it does not block
-    # an unsupported-only documentation/JSONL commit". run_stage's vocabulary has no outcome for
-    # "recorded non-pass that does not block", so the class is RECORDED here and not promoted to
-    # a blocking type. Typing it internal_fault would wall a correct .toml-only change, since the
-    # UBS inventory admits .toml while UBS supports no such scanner. Disclosed, not silent.
-    class=not_applicable_no_supported_inputs
-    gate_exit=0
-    detail='NOT A PASS - zero scanner coverage; use the applicable validators for these inputs'
-elif [ -z "$files" ] || [ -z "$critical" ]; then
-    class=inconclusive
-    gate_exit=2
-    detail='no parseable Combined Summary; the terminal shape is not the one this gate reads'
-elif [ "$files" -eq 0 ]; then
-    # Bead R2, and it is independent of the timeout branch above: a scan accounting for ZERO
-    # files may never produce a terminal verdict of any polarity, whatever it reports finding.
+    detail='at least one scanner module timed out; the aggregate is partial'
+elif [ "$no_scanner_seen" = yes ]; then
     class=no_scanner_executed
     gate_exit=2
-    detail="scan accounted for 0 files while reporting Critical: $critical - a count with no referent"
-elif [ "$ubs_exit" -eq 0 ] && [ "$critical" -eq 0 ]; then
-    class=completed_clean
-    gate_exit=0
-    detail="$files file(s) accounted for, zero blocking findings"
-elif [ "$critical" -gt 0 ]; then
-    class=completed_findings
-    gate_exit=1
-    detail="$critical critical finding(s) over $files file(s) - a real verdict about the code"
-elif [ "$ubs_exit" -ne 0 ]; then
-    # Nonzero with a complete accounting and no criticals: --fail-on-warning, or a mode this
-    # gate has not measured. Refuse rather than guess a polarity in either direction.
+    detail='at least one intended scanner did not positively account for its inputs'
+elif [ "$inconclusive_seen" = yes ]; then
     class=inconclusive
     gate_exit=2
-    detail="ubs exited $ubs_exit over $files file(s) with Critical: 0 - unmodelled terminal"
+    detail='at least one module returned an unmodelled or contradictory terminal'
+elif [ "$findings_seen" = yes ]; then
+    class=completed_findings
+    gate_exit=1
+    detail="$total_critical critical finding(s) over $accounted_supported accounted supported input(s)"
+elif [ "$accounted_supported" -eq "$expected_supported" ]; then
+    class=completed_clean
+    gate_exit=0
+    detail="$accounted_supported supported input(s) accounted for, zero blocking findings"
 else
     class=inconclusive
     gate_exit=2
-    detail='terminal facts could not be reconciled'
+    detail="aggregate accounted for $accounted_supported of $expected_supported supported input(s)"
 fi
 
-# The machine-readable record. It is emitted for EVERY class including the passing ones, so a
-# not_applicable run leaves positive evidence of its own zero coverage in the stage artifacts
-# rather than being indistinguishable from a clean scan.
-printf 'ubs-gate-classification: class=%s ubs_exit=%s gate_exit=%s files=%s critical=%s warning=%s info=%s\n' \
-    "$class" "$ubs_exit" "$gate_exit" "${files:-unknown}" "${critical:-unknown}" \
-    "${warning:-unknown}" "${info:-unknown}"
+# The machine-readable aggregate is emitted for every terminal class. `unsupported` counts
+# governed .toml inputs, which remain outside UBS rather than being silently folded into Files.
+printf 'ubs-gate-classification: class=%s ubs_exits=%s gate_exit=%s expected_supported=%s accounted_supported=%s unsupported=%s files=%s critical=%s warning=%s info=%s\n' \
+    "$class" "$exit_vector" "$gate_exit" "$expected_supported" "$accounted_supported" \
+    "$unsupported_count" "$total_files" "$total_critical" "$total_warning" "$total_info"
 say "$class - $detail"
 if [ "$gate_exit" -eq 2 ]; then
     say 'FL-INV-07: this is a NON-ANSWER, not a finding about the code. The gate types it'
@@ -169,9 +288,7 @@ if [ "$gate_exit" -eq 2 ]; then
     say 'happens to succeed - that is how an unattributed green gets adopted.'
 fi
 
-# Non-recursive on purpose. This repository forbids unattended recursive deletion, and the two
-# files below are the only ones this script created; if anything else is in there, `rmdir` fails
-# harmlessly and the directory is left for a human rather than removed by a guess.
-rm -f "$OUT" "$ERR"
-rmdir "$WORK" 2>/dev/null || true
+# The per-language capture files are deliberately retained. AGENTS.md forbids deleting even
+# files created by this process without explicit user permission; the authoritative gate also
+# retains the byte-identical child streams in its own stage artifacts.
 exit "$gate_exit"

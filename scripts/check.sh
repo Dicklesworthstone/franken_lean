@@ -78,13 +78,31 @@ BEAD="franken_lean-rur"
 # shellcheck source=scripts/lib/gate_lock.sh
 # shellcheck disable=SC1091
 . "$REPO/scripts/lib/gate_lock.sh"
-fln_gate_acquire "$SCENARIO"
+# The authoritative lane owns the build gate. Its nested test-control consumers do not:
+# evidence.py's self-test launches finalizer probes, early-envelope probes, and planted
+# short-circuit runs of this same script while the parent lane still holds the lock. The
+# parent also invokes the read-only tribunal-manifest inventory as one supervised stage.
+# Making those children re-acquire the parent's non-inherited flock self-deadlocks them
+# before they can publish a result.
+#
+# These are not alternate ways to run the quality gate. Each form is already bound into the
+# terminal evidence as a probe or plant and cannot publish an ordinary pass. `--self-test`
+# itself remains authoritative and takes the gate; only the children it launches match one
+# of the conditions below.
+if [ "$TRIBUNAL_MANIFEST_INVENTORY_ONLY" -eq 0 ] \
+   && [ "$FINALIZER_PROBE" -eq 0 ] \
+   && [ "$EARLY_FAULT_PROBE" -eq 0 ] \
+   && [ -z "${FLN_CHECK_PLANT:-}" ] \
+   && [ -z "${FLN_CHECK_PLANT_UNEXPECTED:-}" ]; then
+  fln_gate_acquire "$SCENARIO"
+fi
 
 VERIFICATION_MANIFEST_REL="ci/VERIFICATION_MANIFEST.jsonl"
 VERIFICATION_MANIFEST="$REPO/$VERIFICATION_MANIFEST_REL"
 CHECK_STAGE_ORDER=(
-  evidence-self-test verification-manifest shellcheck fmt check clippy
-  contract-handoff-no-mock test tribunal-manifest-inventory epoch-lab-test
+  evidence-self-test verification-manifest shellcheck ubs-gate-classifier
+  projection-guard-harness fmt check clippy contract-handoff-no-mock test
+  tribunal-manifest-inventory epoch-lab-test
   epoch-lab-live-verify structure-guard vendor-tree ubs
 )
 RUN_ID="check-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -1716,10 +1734,12 @@ elif command -v ubs >/dev/null 2>&1; then
     # genuine critical finding and a scanner MODULE_TIMEOUT, so registering it directly against
     # --semantic-failure-exit 1 renders resource exhaustion as a REJECTION — an FL-INV-07
     # violation in a lane whose own run_start declares FL-INV-07. exec-ubs-inventory execs its
-    # target with the validated paths appended, so the classifier receives exactly the same argv
-    # `ubs` would have, runs it, reads the terminal MESSAGE TEXT that carries the distinction,
-    # and exits 1 ONLY for completed_findings. Every non-answer exits 2, which is outside this
-    # stage's semantic set and therefore types internal_fault rather than fail.
+    # target with the validated paths appended. The classifier partitions the admitted .py/.rs
+    # inputs, dispatches exactly one language module at a time in Python-then-Rust order, requires
+    # each module to identify its scanner and account for its exact intended file count, and only
+    # then aggregates their terminal MESSAGE TEXT. It exits 1 ONLY for completed_findings. Every
+    # non-answer exits 2, which is outside this stage's semantic set and therefore types
+    # internal_fault rather than fail.
     run_stage ubs "${PYTHON[@]}" "$EVIDENCE" exec-ubs-inventory \
       --root "$REPO" --inventory "$UBS_INVENTORY" -- \
       bash "$REPO/scripts/ubs_gate_classifier.sh"

@@ -42,7 +42,17 @@ SCENARIO="closure_audit"
 # shellcheck source=scripts/lib/gate_lock.sh
 # shellcheck disable=SC1091
 . "$ROOT/scripts/lib/gate_lock.sh"
-fln_gate_acquire "$SCENARIO"
+TEST_EARLY_FAULT="${FLN_CA_TEST_EARLY_FAULT:-}"
+# The evidence harness runs these two exact internal-fault controls beneath an
+# authoritative check.sh that already owns the gate. Its supervised process
+# boundary deliberately closes non-owned descriptors, so reacquiring here
+# would wait on our own ancestor for the full 2,400-second contention window.
+# Both values are terminally bound below and cannot publish an ordinary pass;
+# every other value, including an unknown test value, still takes the gate.
+case "$TEST_EARLY_FAULT" in
+  unexpected_first_step|post_run_start_abort) ;;
+  *) fln_gate_acquire "$SCENARIO" ;;
+esac
 RUN_ID="closure-audit-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
@@ -85,7 +95,6 @@ EVENT_COMMAND=()
 RUN_STARTED=0
 ART_DIR_CLAIMED=0
 EARLY_STEP=preflight
-TEST_EARLY_FAULT="${FLN_CA_TEST_EARLY_FAULT:-}"
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
   ABI_CONTRACT.md OLEAN_CONTRACT.md ci contracts crates tools

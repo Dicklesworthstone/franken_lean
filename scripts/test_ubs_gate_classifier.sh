@@ -19,21 +19,43 @@ CLASSIFIER=${1:?usage: test_ubs_gate_classifier.sh /path/to/ubs_gate_classifier.
 PASSES=0
 FAILS=0
 LAB=$(mktemp -d "${TMPDIR:-/tmp}/ubs-gate-lab.XXXXXXXX")
-trap 'rm -rf "$LAB"' EXIT
+STUB_INDEX=0
+STUB_BIN=''
 
 note() { printf '  %s\n' "$1"; }
 
 # stub_ubs <exit> <stdout-file> [stderr-file]
 stub_ubs() {
     local rc=$1 out=$2 err=${3:-/dev/null}
-    mkdir -p "$LAB/bin"
+    STUB_INDEX=$((STUB_INDEX + 1))
+    STUB_BIN="$LAB/bin-$STUB_INDEX"
+    mkdir "$STUB_BIN"
     {
         printf '#!/usr/bin/env bash\n'
         printf 'cat %q\n' "$out"
         printf 'cat %q >&2\n' "$err"
         printf 'exit %s\n' "$rc"
-    } > "$LAB/bin/ubs"
-    chmod +x "$LAB/bin/ubs"
+    } > "$STUB_BIN/ubs"
+    chmod +x "$STUB_BIN/ubs"
+}
+
+# stub_ubs_by_language <python-exit> <python-stdout> <rust-exit> <rust-stdout>
+# One stub varies by the wrapper's explicit --only argument, so a mixed-input cell proves both
+# dispatches occurred and that their independently completed answers were aggregated.
+stub_ubs_by_language() {
+    local python_rc=$1 python_out=$2 rust_rc=$3 rust_out=$4
+    STUB_INDEX=$((STUB_INDEX + 1))
+    STUB_BIN="$LAB/bin-$STUB_INDEX"
+    mkdir "$STUB_BIN"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'case " $* " in\n'
+        printf '  *" --only=python "*) cat %q; exit %s ;;\n' "$python_out" "$python_rc"
+        printf '  *" --only=rust "*) cat %q; exit %s ;;\n' "$rust_out" "$rust_rc"
+        printf '  *) printf "unexpected UBS fixture argv: %%s\\n" "$*" >&2; exit 99 ;;\n'
+        printf 'esac\n'
+    } > "$STUB_BIN/ubs"
+    chmod +x "$STUB_BIN/ubs"
 }
 
 # check <name> <want_exit> <want_class> <got_exit> <got_text>
@@ -55,13 +77,14 @@ check() {
 }
 
 run_cell() { # emits: exit code on line 1 via global CELL_RC, text via CELL_TEXT
-    CELL_TEXT=$(PATH="$LAB/bin:$PATH" bash "$CLASSIFIER" "$@" 2>&1)
+    CELL_TEXT=$(PATH="$STUB_BIN:$PATH" bash "$CLASSIFIER" "$@" 2>&1)
     CELL_RC=$?
 }
 
 # ---- terminal fixtures, copied from real UBS v5.3.7 runs -----------------------------------
 cat > "$LAB/clean.out" <<'EOF'
 UBS Meta-Runner v5.3.7
+Detected: rust
 ──────── Combined Summary ────────
 Files: 1
 Critical: 0
@@ -71,6 +94,7 @@ EOF
 
 cat > "$LAB/findings.out" <<'EOF'
 UBS Meta-Runner v5.3.7
+Detected: rust
 Priority Actions:
   FIX CRITICAL ISSUES IMMEDIATELY
 ──────── Combined Summary ────────
@@ -78,6 +102,16 @@ Files: 1
 Critical: 1
 Warning: 3
 Info: 2
+EOF
+
+cat > "$LAB/python-clean.out" <<'EOF'
+UBS Meta-Runner v5.3.7
+Detected: python
+──────── Combined Summary ────────
+Files: 1
+Critical: 0
+Warning: 2
+Info: 3
 EOF
 
 # Verbatim from target/check/check-20260727T055459Z-3616684/ubs.out, the run this bead is about.
@@ -117,6 +151,7 @@ EOF
 
 cat > "$LAB/zerofiles.out" <<'EOF'
 UBS Meta-Runner v5.3.7
+Detected: rust
 ──────── Combined Summary ────────
 Files: 0
 Critical: 0
@@ -124,13 +159,34 @@ Warning: 0
 Info: 0
 EOF
 
+cat > "$LAB/wrong-count.out" <<'EOF'
+UBS Meta-Runner v5.3.7
+Detected: rust
+──────── Combined Summary ────────
+Files: 2
+Critical: 0
+Warning: 0
+Info: 0
+EOF
+
+cat > "$LAB/unidentified-clean.out" <<'EOF'
+UBS Meta-Runner v5.3.7
+──────── Combined Summary ────────
+Files: 1
+Critical: 0
+Warning: 0
+Info: 0
+EOF
+
+touch "$LAB/subject.py"
 touch "$LAB/subject.rs"
+touch "$LAB/subject.toml"
 
 printf 'UBS gate classifier — %s\n' "$CLASSIFIER"
 
 # ---- 1. THE DEFECT ITSELF: a module timeout must NOT be a rejection -----------------------
 stub_ubs 1 "$LAB/timeout.out" "$LAB/timeout.err"
-run_cell "$LAB/subject.rs"
+run_cell "$LAB/subject.py"
 check 'a MODULE_TIMEOUT exiting 1 is a NON-ANSWER, not a rejection' \
     2 staging_or_scanner_failure "$CELL_RC" "$CELL_TEXT"
 
@@ -154,21 +210,51 @@ run_cell "$LAB/subject.rs"
 check 'a scan accounting for ZERO files is a non-answer even exiting 0' \
     2 no_scanner_executed "$CELL_RC" "$CELL_TEXT"
 
-# ---- 5. an unparseable terminal is refused, never guessed -----------------------------------
+# ---- 5. positive but inexact file accounting is refused --------------------------------------
+stub_ubs 0 "$LAB/wrong-count.out"
+run_cell "$LAB/subject.rs"
+check 'a scanner count that does not equal the intended file set is inconclusive' \
+    2 inconclusive "$CELL_RC" "$CELL_TEXT"
+
+# ---- 6. a summary without positive scanner identity is vacuous -------------------------------
+stub_ubs 0 "$LAB/unidentified-clean.out"
+run_cell "$LAB/subject.rs"
+check 'a clean-looking summary without the requested scanner identity is a non-answer' \
+    2 no_scanner_executed "$CELL_RC" "$CELL_TEXT"
+
+# ---- 7. an unparseable terminal is refused, never guessed -----------------------------------
 stub_ubs 0 "$LAB/garbage.out"
 run_cell "$LAB/subject.rs"
 check 'an unparseable terminal is inconclusive, not a pass' \
     2 inconclusive "$CELL_RC" "$CELL_TEXT"
 
-# ---- 6. not_applicable is recorded and does NOT block ---------------------------------------
-stub_ubs 0 "$LAB/nolang.out"
-run_cell "$LAB/subject.rs"
+# ---- 8. unsupported-only not_applicable is recorded and does NOT block -----------------------
+run_cell "$LAB/subject.toml"
 check 'no supported inputs is recorded as a non-pass and does not block' \
     0 not_applicable_no_supported_inputs "$CELL_RC" "$CELL_TEXT"
 
-# ---- 7. empty argv is refused: nothing scanned means no verdict ------------------------------
+# ---- 9. unsupported siblings do not disappear from a completed supported scan ----------------
 stub_ubs 0 "$LAB/clean.out"
-CELL_TEXT=$(PATH="$LAB/bin:$PATH" bash "$CLASSIFIER" 2>&1); CELL_RC=$?
+run_cell "$LAB/subject.rs" "$LAB/subject.toml"
+check 'a supported scan may complete while separately recording unsupported inputs' \
+    0 completed_clean "$CELL_RC" "$CELL_TEXT"
+if printf '%s' "$CELL_TEXT" | grep -qF 'unsupported=1'; then
+    printf 'ok   a mixed supported/unsupported inventory discloses its zero-coverage member\n'
+    PASSES=$((PASSES + 1))
+else
+    printf 'FAIL mixed supported/unsupported classification hid the unsupported member\n%s\n' "$CELL_TEXT"
+    FAILS=$((FAILS + 1))
+fi
+
+# ---- 10. a supported input with no scanner is blocking, even when UBS exits zero --------------
+stub_ubs 0 "$LAB/nolang.out"
+run_cell "$LAB/subject.rs"
+check 'a supported input whose scanner did not run is a blocking non-answer' \
+    2 no_scanner_executed "$CELL_RC" "$CELL_TEXT"
+
+# ---- 11. empty argv is refused: nothing scanned means no verdict -----------------------------
+stub_ubs 0 "$LAB/clean.out"
+CELL_TEXT=$(PATH="$STUB_BIN:$PATH" bash "$CLASSIFIER" 2>&1); CELL_RC=$?
 if [ "$CELL_RC" -eq 2 ]; then
     printf 'ok   an empty input set is refused rather than passed (exit 2)\n'
     PASSES=$((PASSES + 1))
@@ -177,7 +263,19 @@ else
     FAILS=$((FAILS + 1))
 fi
 
-# ---- 8. the child's own output must survive the wrapper --------------------------------------
+# ---- 12. an invalid scanner budget is refused rather than silently replaced -------------------
+CELL_TEXT=$(FLN_UBS_MODULE_TIMEOUT_SECONDS=unbounded PATH="$STUB_BIN:$PATH" \
+    bash "$CLASSIFIER" "$LAB/subject.rs" 2>&1)
+CELL_RC=$?
+if [ "$CELL_RC" -eq 2 ] && printf '%s' "$CELL_TEXT" | grep -qF 'timeout must be a positive integer'; then
+    printf 'ok   an invalid UBS module budget is refused rather than silently defaulted\n'
+    PASSES=$((PASSES + 1))
+else
+    printf 'FAIL invalid UBS module budget returned an untyped or permissive result\n%s\n' "$CELL_TEXT"
+    FAILS=$((FAILS + 1))
+fi
+
+# ---- 13. the child's own output must survive the wrapper -------------------------------------
 # A classifier that swallowed UBS's text would destroy the stage's evidence while still
 # returning the right code, and every cell above would still pass.
 stub_ubs 1 "$LAB/findings.out"
@@ -190,7 +288,35 @@ else
     FAILS=$((FAILS + 1))
 fi
 
-# ---- 9. THE STUB'S OWN FIDELITY, against the real binary -------------------------------------
+# ---- 14. mixed languages are dispatched separately and aggregated in fixed order -------------
+stub_ubs_by_language 0 "$LAB/python-clean.out" 1 "$LAB/findings.out"
+run_cell "$LAB/subject.py" "$LAB/subject.rs"
+check 'separate Python clean and Rust finding answers aggregate to a rejection' \
+    1 completed_findings "$CELL_RC" "$CELL_TEXT"
+if printf '%s' "$CELL_TEXT" | grep -qF 'ubs_exits=python:0,rust:1'; then
+    printf 'ok   mixed-language dispatch records the fixed Python-then-Rust exit vector\n'
+    PASSES=$((PASSES + 1))
+else
+    printf 'FAIL mixed-language dispatch did not record both modules in fixed order\n%s\n' "$CELL_TEXT"
+    FAILS=$((FAILS + 1))
+fi
+
+# ---- 15. one incomplete language keeps the aggregate non-answer -------------------------------
+# The Rust cell must still run after Python's malformed terminal; the exit vector proves the
+# wrapper collected all available evidence without promoting the clean half to a global pass.
+stub_ubs_by_language 1 "$LAB/garbage.out" 0 "$LAB/clean.out"
+run_cell "$LAB/subject.py" "$LAB/subject.rs"
+check 'one incomplete module dominates another module cleanly completing' \
+    2 inconclusive "$CELL_RC" "$CELL_TEXT"
+if printf '%s' "$CELL_TEXT" | grep -qF 'ubs_exits=python:1,rust:0'; then
+    printf 'ok   dispatch continues after a module non-answer without hiding the partial result\n'
+    PASSES=$((PASSES + 1))
+else
+    printf 'FAIL dispatch stopped early or lost the partial module exit vector\n%s\n' "$CELL_TEXT"
+    FAILS=$((FAILS + 1))
+fi
+
+# ---- 16. THE STUB'S OWN FIDELITY, against the real binary ------------------------------------
 # Everything above is a statement about fixtures unless the real tool agrees. This cell is
 # skipped LOUDLY rather than silently when ubs is absent, because a silent skip here would leave
 # the suite green while the only non-fixture cell never ran.
@@ -207,9 +333,11 @@ RS
     check 'REAL ubs on a real critical finding types as a rejection' \
         1 completed_findings "$CELL_RC" "$CELL_TEXT"
 else
-    printf 'FAIL cell 9 could not run: ubs is not on PATH, so every cell above is a claim about a fixture\n'
+    printf 'FAIL cell 16 could not run: ubs is not on PATH, so every cell above is a claim about a fixture\n'
     FAILS=$((FAILS + 1))
 fi
 
 printf '\n%s passed, %s failed\n' "$PASSES" "$FAILS"
+# LAB and the classifier capture directories are intentionally retained. AGENTS.md forbids
+# deleting even process-created files without explicit user permission.
 [ "$FAILS" -eq 0 ]
