@@ -16,12 +16,19 @@
 //! So this file binds every family row to its declared source in both directions, and
 //! classifies every `temp_dir` call site in the workspace — routed machinery, declared
 //! remainder, self-cleaning, or non-producer — with conservation and floors so neither
-//! direction can drift quietly. It walks sources only; it creates nothing, which is
-//! why it is not itself a family row.
+//! direction can drift quietly. It walks sources only.
+//!
+//! It also hosts the both-directions retention proofs for the two families whose
+//! producer surfaces are pin-dependent (`golden_vellum.rs`, `reference_differential.rs`):
+//! those surfaces ask the pinned Reference, CI installs none, and the CI-execution join
+//! (fln-rgha) reads any `test:` citation into them as "evidence CI never executed" —
+//! surface-granular, so a pin-independent function is invisible to it (f2t9). The proofs
+//! live here, in a pin-free surface, exercising the same family constructors directly; the
+//! guard-owned roots they create reclaim exactly like the producer's own fixtures.
 
 #![forbid(unsafe_code)]
 
-use fln_core::scratch::SCRATCH_FAMILIES;
+use fln_core::scratch::{REFDIFF_PREFIX, SCRATCH_FAMILIES, ScratchRoot, VDI4_PREFIX};
 use std::path::{Path, PathBuf};
 
 /// The call every scratch-root producer that bypasses the fence must make.
@@ -275,4 +282,77 @@ fn every_family_row_is_bound_to_its_source() {
         ["fln-derive-", "fln-epoch-lab-", "fln-ownership-publisher-"],
         "the declared remainder is exactly these three rows"
     );
+}
+
+/// `franken_lean-eir2` acceptance criterion 3 for the vdi4 family: retention on failure,
+/// proved in BOTH directions through the family's own constructor. Lives here rather than
+/// beside the producer because `golden_vellum.rs` is a pin-dependent surface and the
+/// CI-execution join reads citations into it as unexecuted (see the file header).
+#[test]
+fn vdi4_workspaces_reclaim_on_pass_and_retain_on_failure() {
+    let passing = {
+        let root = ScratchRoot::create(VDI4_PREFIX, "golden-vellum", "reclaim-pass")
+            .expect("create passing workspace");
+        root.path().to_path_buf()
+    };
+    assert!(
+        !passing.exists(),
+        "a passing cell's workspace must be reclaimed: {}",
+        passing.display()
+    );
+
+    let observed = std::cell::RefCell::new(None);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let root = ScratchRoot::create(VDI4_PREFIX, "golden-vellum", "reclaim-fail")
+            .expect("create failing workspace");
+        *observed.borrow_mut() = Some(root.path().to_path_buf());
+        panic!("deliberate failure so the fixture guard drops during an unwind");
+    }));
+    assert!(unwound.is_err(), "the failing cell must actually unwind");
+    let retained = observed
+        .into_inner()
+        .expect("the failing cell materialized before it panicked");
+    assert!(
+        retained.exists(),
+        "a failing cell's workspace must be retained: {}",
+        retained.display()
+    );
+    std::fs::remove_dir_all(&retained).expect("the probe reclaims what it retained");
+}
+
+/// `franken_lean-eir2` acceptance criterion 3 for the refdiff family: retention on
+/// failure, proved in BOTH directions through the family's own constructor. Lives here
+/// rather than beside the producer because `reference_differential.rs` asks the pinned
+/// Reference and the CI-execution join reads citations into it as unexecuted (see the
+/// file header).
+#[test]
+fn reference_differential_roots_reclaim_on_pass_and_retain_on_failure() {
+    let passing = {
+        let root = ScratchRoot::create(REFDIFF_PREFIX, "reference-differential", "reclaim-pass")
+            .expect("create passing workspace");
+        root.path().to_path_buf()
+    };
+    assert!(
+        !passing.exists(),
+        "a passing cell's oracle workspace must be reclaimed: {}",
+        passing.display()
+    );
+
+    let observed = std::cell::RefCell::new(None);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let root = ScratchRoot::create(REFDIFF_PREFIX, "reference-differential", "reclaim-fail")
+            .expect("create failing workspace");
+        *observed.borrow_mut() = Some(root.path().to_path_buf());
+        panic!("deliberate failure so the fixture guard drops during an unwind");
+    }));
+    assert!(unwound.is_err(), "the failing cell must actually unwind");
+    let retained = observed
+        .into_inner()
+        .expect("the failing cell materialized before it panicked");
+    assert!(
+        retained.exists(),
+        "a failing cell's oracle workspace must be retained: {}",
+        retained.display()
+    );
+    std::fs::remove_dir_all(&retained).expect("the probe reclaims what it retained");
 }
