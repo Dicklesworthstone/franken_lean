@@ -658,7 +658,7 @@ pub fn g09_decision(roster: &[RosterSpike], evidence: &G09Evidence) -> Option<De
                  per-event-tick need"
                     .to_string(),
             ],
-            acceptance_suite: "fln-conformance --lib trace_replay (13 tests: parse \
+            acceptance_suite: "fln-conformance --lib trace_replay (12 tests: parse \
                 totality, family checkers, planted omission/reordering/payload/outcome \
                 divergences, thread matrix {1,8,32})"
                 .to_string(),
