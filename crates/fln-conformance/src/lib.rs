@@ -48,6 +48,7 @@ pub mod ledger;
 pub mod lsp_census;
 pub mod naming;
 pub mod normalize;
+pub mod options;
 pub mod ownership;
 pub mod pin;
 #[cfg(feature = "oracle-fallback-dev")]

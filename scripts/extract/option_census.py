@@ -175,7 +175,7 @@ def split_field_value(value):
     return value.rstrip(), ""
 
 
-FIELD_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*:=\s*(.+?)\s*$")
+FIELD_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*\??)\s*:=\s*(.+?)\s*$")
 
 
 def parse_block(lines, start):
@@ -262,13 +262,18 @@ def extract():
                     })
                 else:
                     counts[kind] += 1
-                    rows.append({
+                    row = {
                         "schema": SCHEMA, "kind": kind,
                         "name": m.group(1), "value_type": m.group(2),
                         "default": fields["defValue"].rstrip(","),
                         "descr": fields.get("descr", "").strip('"'),
                         "source": anchor,
-                    })
+                    }
+                    dep = fields.get("deprecation?", "")
+                    if dep and dep != "none":
+                        sm = re.search(r'since\s*:=\s*"([^"]+)"', dep)
+                        row["deprecated_since"] = sm.group(1) if sm else "?"
+                    rows.append(row)
                 i = end
                 consumed = True
                 break
