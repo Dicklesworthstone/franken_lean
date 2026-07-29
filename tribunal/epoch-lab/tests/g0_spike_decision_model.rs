@@ -823,3 +823,153 @@ fn the_g09_receipts_hold_their_content_not_merely_their_presence() {
         "the regen summary must bind the pin"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The second real row: G0-6, Ratified on computed evidence. The ledger now
+// holds two rows; exactly the other eight block as missing.
+// ---------------------------------------------------------------------------
+
+use fln_conformance::fuel::{
+    FUEL_SCHEMA, FuelVerdict, TICKS_PER_UNIT, parse_receipt, replay_verdict,
+};
+use fln_epoch_lab::g0::{G06Evidence, g06_decision};
+
+fn g06_evidence() -> G06Evidence {
+    let root = fln_conformance::checked_manifest_dir!().join("../..");
+    let evidence_dir = root.join("crates/fln-conformance/evidence/g06_fuel_parity");
+
+    let receipt_text = std::fs::read_to_string(evidence_dir.join("thresholds_v4.32.0.jsonl"))
+        .expect("thresholds receipt committed");
+    let rows = parse_receipt(&receipt_text).expect("receipt parses");
+
+    // fixture_root: the sixteen pinned corpus inputs the thresholds were
+    // bisected on, digested from the vendored tree.
+    let fixture_digests: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            derive_fixture_digest(&root.join("vendor/lean4-src").join(&r.file))
+                .unwrap_or_else(|e| panic!("corpus input {} unreadable: {e}", r.file))
+                .into_parts()
+                .0
+        })
+        .collect();
+    let fold = |parts: &[String]| -> String {
+        let mut joined = String::new();
+        for p in parts {
+            joined.push_str(p);
+            joined.push(':');
+        }
+        joined
+    };
+
+    // The acceptance run: every bracketed row's verdicts across the grid, by
+    // interval endpoints, plus the strictness and zero-disables cells.
+    let mut table = Vec::new();
+    let mut acceptance_green = true;
+    for row in rows.iter().filter(|r| r.threshold.is_some()) {
+        let c = row.threshold.unwrap();
+        let cells = [
+            (c - 1, FuelVerdict::TimedOut),
+            (c, FuelVerdict::Completed),
+            (2 * c, FuelVerdict::Completed),
+            (0, FuelVerdict::Completed),
+        ];
+        for (budget, want) in cells {
+            let got = replay_verdict(c, budget);
+            acceptance_green &= got == Some(want);
+            table.push(format!("{}@{budget}={got:?}", row.file));
+        }
+    }
+    acceptance_green &= rows.len() == 16
+        && rows.iter().filter(|r| r.threshold.is_some()).count() == 9
+        && TICKS_PER_UNIT == 1000;
+
+    let mutation_root =
+        derive_fixture_digest(&evidence_dir.join("mutation_campaign_v4.32.0.jsonl"))
+            .expect("mutation receipt committed")
+            .into_parts()
+            .0;
+    let no_mock_e2e_root = derive_fixture_digest(&evidence_dir.join("thresholds_v4.32.0.jsonl"))
+        .expect("thresholds receipt committed")
+        .into_parts()
+        .0;
+
+    G06Evidence {
+        fixture_root: fold(&fixture_digests),
+        generated_contract_root: format!(
+            "{FUEL_SCHEMA}:ticks-per-unit=1000:strict-gt:zero-disables"
+        ),
+        implementation_root: fold(&table),
+        mutation_root,
+        no_mock_e2e_root,
+        acceptance_green,
+        used_wall_ms: 300_000,
+        used_rss_bytes: 1 << 29,
+    }
+}
+
+#[test]
+fn the_g06_row_is_ratified_on_computed_evidence_and_the_ledger_holds_two_rows() {
+    let roster = roster();
+    let e9 = g09_evidence();
+    let e6 = g06_evidence();
+    assert!(e6.acceptance_green, "the fuel acceptance run must be green");
+    let rows = vec![
+        g09_decision(&roster, &e9).expect("G0-9 on roster"),
+        g06_decision(&roster, &e6).expect("G0-6 on roster"),
+    ];
+    let g = verify(&rows, &roster);
+    assert_eq!(g.ratified, vec!["G0-6".to_string()], "G0-6 lands ratified");
+    assert_eq!(g.amended, vec!["G0-9".to_string()], "G0-9 stays amended");
+    assert!(g.no_go.is_empty() && g.blocked.is_empty());
+    assert_eq!(
+        g.blocks.len(),
+        8,
+        "exactly the other eight block: {:?}",
+        g.blocks
+    );
+    for b in &g.blocks {
+        assert_eq!(b.reason(), "missing-decision", "{b:?}");
+    }
+    assert!(!g.clears(), "two rows must never clear a ten-spike gate");
+}
+
+#[test]
+fn the_g06_mutation_receipt_holds_its_content_not_merely_its_presence() {
+    let evidence_dir = fln_conformance::checked_manifest_dir!()
+        .join("../../crates/fln-conformance/evidence/g06_fuel_parity");
+    let mutation = std::fs::read_to_string(evidence_dir.join("mutation_campaign_v4.32.0.jsonl"))
+        .expect("mutation receipt committed");
+    let mut outcomes: std::collections::BTreeMap<&str, &str> = Default::default();
+    let mut baseline_green = false;
+    let mut restored_green = false;
+    for line in mutation.lines() {
+        assert!(
+            line.contains("\"schema\": \"fln-g06-fuel-mutation/1\""),
+            "unversioned receipt row: {line}"
+        );
+        let field = |key: &str| -> Option<&str> {
+            let tag = format!("\"{key}\": \"");
+            let start = line.find(&tag)? + tag.len();
+            line[start..].split('"').next()
+        };
+        let (Some(mutant), Some(outcome)) = (field("mutant"), field("outcome")) else {
+            panic!("receipt row missing mutant/outcome: {line}");
+        };
+        match mutant {
+            "baseline" => baseline_green = outcome == "green",
+            "restored" => restored_green = outcome == "green",
+            m => {
+                outcomes.insert(m, outcome);
+            }
+        }
+    }
+    assert!(
+        baseline_green && restored_green,
+        "campaign endpoints must be green"
+    );
+    assert_eq!(outcomes.len(), 10, "ten mutants gutted: {outcomes:?}");
+    for (mutant, outcome) in &outcomes {
+        assert_eq!(*outcome, "killed-by-named", "{mutant}");
+    }
+}

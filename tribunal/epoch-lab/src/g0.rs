@@ -705,6 +705,95 @@ pub fn g09_decision(roster: &[RosterSpike], evidence: &G09Evidence) -> Option<De
     })
 }
 
+/// The measured evidence behind the G0-6 row, injected exactly as
+/// [`G09Evidence`] is: every digest computed by the verifying test from a real
+/// committed artifact, empty demoted to Absent, the acceptance green executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct G06Evidence {
+    /// Content digests over the sixteen pinned corpus input files, folded — the
+    /// pilot slice the thresholds were bisected on.
+    pub fixture_root: String,
+    /// The versioned fuel-model schema plus its source-cited constants.
+    pub generated_contract_root: String,
+    /// The model's behavioral identity: the replayed verdict table.
+    pub implementation_root: String,
+    /// Digest over `evidence/g06_fuel_parity/mutation_campaign_<pin>.jsonl`.
+    pub mutation_root: String,
+    /// Digest over `evidence/g06_fuel_parity/thresholds_<pin>.jsonl` — the
+    /// receipt `scripts/tribunal/g06_fuel_probe.sh` writes against the REAL
+    /// pinned binary with negative controls in both directions.
+    pub no_mock_e2e_root: String,
+    pub acceptance_green: bool,
+    pub used_wall_ms: u64,
+    pub used_rss_bytes: u64,
+}
+
+/// The G0-6 decision row: **Ratified** — the fuel law is calibrated and the
+/// declared tolerance class is EXACT at the observable granularity.
+///
+/// The law, extracted from the pin's source and validated by measurement (bead
+/// `franken_lean-7zr`, comments 1663–1666): one tick per small allocation
+/// (`alloc.cpp:391`), user budgets in thousands (`CoreM.lean:176`), a
+/// per-command delta (`:441`), a STRICT boundary (`:490` — exactly-at-budget
+/// completes), zero disabling the limit. Verdict parity holds on every measured
+/// cell — 56 of 56 across declaration and file granularity, every threshold
+/// deterministic on re-bisection, context drift bounded below one user unit —
+/// and rejects are budget-independent on the pilot slice, so a fuel mismatch
+/// cannot mask a reject there. Depth accounting is three distinct regimes
+/// (~2.015 frames per step on meta-level paths, ~zero on flattened binop
+/// chains, exempt on compiled evaluation), which downstream allocator/kernel/VM
+/// owners inherit as requirements. OQ-2 closes with tolerance class EXACT for
+/// timeout/no-timeout verdicts at the pin's own 1000-tick user granularity;
+/// sub-unit drift is unobservable through the pinned user surface and is a
+/// stated limitation, not a divergence class.
+pub fn g06_decision(roster: &[RosterSpike], evidence: &G06Evidence) -> Option<Decision> {
+    let spike = roster.iter().find(|r| r.id == "G0-6")?;
+    Some(Decision {
+        spike: spike.id.clone(),
+        question: spike.question.clone(),
+        resolution: Resolution::Decided(Outcome::Ratified),
+        claim: ClaimType::BoundedModel,
+        witness: Witness {
+            evidence_state: EvidenceState::Observed,
+            fixture_root: recorded_or_absent(&evidence.fixture_root),
+            generated_contract_root: recorded_or_absent(&evidence.generated_contract_root),
+            implementation_root: recorded_or_absent(&evidence.implementation_root),
+            mutation_root: recorded_or_absent(&evidence.mutation_root),
+            no_mock_e2e_root: recorded_or_absent(&evidence.no_mock_e2e_root),
+            oracle: OracleKind::ReferenceBinary,
+            comparison: ComparisonClass::ByteIdentical,
+        },
+        scope: Scope {
+            epoch: "v4.32.0".to_string(),
+            corpus: CorpusFamily::C1,
+            platform: Platform::LinuxX86_64,
+            mode: Mode::Faithful,
+        },
+        resources: Resources {
+            contract_wall_ms: 600_000,
+            contract_rss_bytes: 4 << 30,
+            used_wall_ms: evidence.used_wall_ms,
+            used_rss_bytes: evidence.used_rss_bytes,
+        },
+        limitations: "One host, one pin (v4.32.0), class bounded_model. The tolerance \
+            class is EXACT for VERDICTS at 1000-tick user granularity on the measured \
+            slice; sub-unit tick drift is not excluded by measurement and cannot be \
+            expressed through the pinned user surface. Context independence is bounded \
+            below one user unit on the probed cells, not proven globally. The prototype \
+            is a spike model replaying measured intervals, not the production \
+            allocator; the production counting seam must keep the committed edge \
+            fixtures green under scripts/tribunal/g06_fuel_probe.sh. Recursion-shape \
+            coverage: application chains, binop chains, structural recursion under \
+            reduce/eval/decide — match/mutual/well-founded shapes are future cells."
+            .to_string(),
+        affected_interfaces: vec![
+            "fln-rt allocator counting seam (§6.3)".to_string(),
+            "fln-kernel fuel accounting (§8.5)".to_string(),
+            "faithful-mode timeout parity claims (§4.2, BN-08)".to_string(),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod structural {
     use super::*;

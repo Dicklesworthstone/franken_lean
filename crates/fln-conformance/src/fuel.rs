@@ -316,6 +316,24 @@ mod tests {
     }
 
     #[test]
+    fn n_small_allocs_equal_one_batched_charge_of_n() {
+        // The metamorphic cell the campaign's design pass demanded: the
+        // per-allocation path and the batched path must agree tick-for-tick,
+        // so a dropped or doubled single-tick charge is visible against the
+        // batched control. 21_000 is a real measured threshold (t3).
+        let mut singles = FuelMeter::new();
+        for _ in 0..21 * TICKS_PER_UNIT {
+            singles.charge_small_alloc();
+        }
+        let mut batched = FuelMeter::new();
+        batched.charge(21 * TICKS_PER_UNIT);
+        assert_eq!(singles, batched, "paths must agree exactly");
+        assert_eq!(singles.consumed_ticks(), 21 * TICKS_PER_UNIT);
+        assert_eq!(singles.verdict(21), FuelVerdict::Completed);
+        assert_eq!(singles.verdict(20), FuelVerdict::TimedOut);
+    }
+
+    #[test]
     fn overflow_is_sticky_inconclusive_never_a_verdict() {
         let mut meter = FuelMeter::new();
         meter.charge(u64::MAX - 5);
