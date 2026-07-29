@@ -208,6 +208,7 @@ INPUT_PATHS=(
   scripts/extract/gen_core_ext_fixtures.sh scripts/extract/gen_core_ext_fixtures.lean
   scripts/extract/convert_blake3_vectors.py scripts/extract/gen_bignum_vectors.py
   scripts/extract/gen_abi_contract.py scripts/extract/gen_olean_contract.py
+  scripts/extract/gen_lsp_wire_census.py
   scripts/extract/gen_extern_census.sh scripts/extract/gen_extern_census.lean
   scripts/e2e/contract_drift.sh scripts/e2e/contract_handoff.sh
   scripts/e2e/olean_resurrection.sh

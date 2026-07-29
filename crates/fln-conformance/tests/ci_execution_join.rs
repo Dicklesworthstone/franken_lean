@@ -2765,7 +2765,7 @@ fn every_pin_dependent_skip_is_typed_and_joined_to_its_exact_function() {
     );
 }
 
-/// Runtime verifier invoked by the pin-bearing workflow after the four governed test
+/// Runtime verifier invoked by the pin-bearing workflow after the five governed test
 /// binaries. Ordinary developer runs do not configure a collector and therefore exercise
 /// the pure registry and mutant tests around this function instead. In the workflow, a
 /// missing summary path is itself a refusal: evidence that cannot be archived cannot

@@ -56,6 +56,7 @@ pub enum PinRig {
     PresentOleanCorpusThreadMatrix,
     PreludeKernelReplay,
     AdmissionFaultMatrix,
+    LspCensusNoMockE2e,
 }
 
 impl PinRig {
@@ -68,6 +69,7 @@ impl PinRig {
         Self::PresentOleanCorpusThreadMatrix,
         Self::PreludeKernelReplay,
         Self::AdmissionFaultMatrix,
+        Self::LspCensusNoMockE2e,
     ];
 
     /// The exact executable unit this record describes.
@@ -97,6 +99,9 @@ impl PinRig {
             Self::AdmissionFaultMatrix => {
                 "test:fln-conformance::kernel_replay::admission_fault_matrix_is_typed_and_atomic"
             }
+            Self::LspCensusNoMockE2e => {
+                "test:fln-conformance::lsp_census_no_mock_e2e::lsp_census_no_mock_e2e"
+            }
         }
     }
 
@@ -111,6 +116,7 @@ impl PinRig {
             Self::PresentOleanCorpusThreadMatrix => "PresentOleanCorpusThreadMatrix",
             Self::PreludeKernelReplay => "PreludeKernelReplay",
             Self::AdmissionFaultMatrix => "AdmissionFaultMatrix",
+            Self::LspCensusNoMockE2e => "LspCensusNoMockE2e",
         }
     }
 
@@ -124,6 +130,7 @@ impl PinRig {
             Self::PresentOleanCorpusThreadMatrix => "present_olean_corpus_thread_matrix",
             Self::PreludeKernelReplay => "kernel_replay",
             Self::AdmissionFaultMatrix => "admission_fault_matrix",
+            Self::LspCensusNoMockE2e => "lsp_census_no_mock_e2e",
         }
     }
 

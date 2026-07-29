@@ -99,15 +99,21 @@ jobs:
           echo "toolchain/vendor lean.h join: byte-identical"
           ./scripts/verify_vendor_tree.sh
 
+      - name: verify the pinned LSP wire inventory
+        shell: bash
+        run: |
+          python3 -I -S scripts/extract/gen_lsp_wire_census.py --check
+
       - name: pin-dependent conformance suites (fln-rgha)
         shell: bash
         env:
           PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
         run: |
-          # The four test binaries carrying the typed-skip sites that NINE terminal coverage
-          # rows in ci/VERIFICATION_MANIFEST.jsonl cite as their evidence. Until this step
-          # those rows had never executed in any workflow: ci.yml installs no Lean pin and
-          # this workflow ran no cargo, so the intersection was empty (bead fln-rgha).
+          # Four binaries carry typed-skip sites cited by NINE terminal coverage rows in
+          # ci/VERIFICATION_MANIFEST.jsonl; the fifth is the manifest-complete LSP producer
+          # proof. All five are compiled PinRig entries. Until this step the nine cited rows
+          # had never executed in any workflow: ci.yml installs no Lean pin and this workflow
+          # ran no cargo, so the intersection was empty (bead fln-rgha).
           #
           # They run HERE, not in ci.yml, deliberately. ci.yml installs no elan on purpose --
           # see the comment above its contract-handoff step, where a prior attempt produced a
@@ -139,6 +145,7 @@ jobs:
             --test pin_option_defaults \
             --test ext_observable_capture \
             --test pin_ctor_inventory \
+            --test lsp_census_no_mock_e2e \
             -- --nocapture > "$log" 2>&1
           rc=$?
           cargo test --locked -p fln-conformance \
@@ -164,8 +171,8 @@ jobs:
           fi
           # These two floors answer only whether the command shape collapsed. They do not
           # carry execution evidence; the structured records above do.
-          if (( result_lines < 4 )); then
-            echo "rgha-join: REFUSED - only $result_lines of 4 binaries reported a result" >&2
+          if (( result_lines < 5 )); then
+            echo "rgha-join: REFUSED - only $result_lines of 5 binaries reported a result" >&2
             fail=1
           fi
           if (( passed < 20 )); then

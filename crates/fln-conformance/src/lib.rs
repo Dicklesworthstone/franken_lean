@@ -45,6 +45,7 @@ pub mod corpus;
 pub mod execution;
 pub mod fuel;
 pub mod ledger;
+pub mod lsp_census;
 pub mod naming;
 pub mod normalize;
 pub mod ownership;
