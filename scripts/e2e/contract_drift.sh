@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# contract_drift.sh — shared E2E scenario for the extracted ABI/OLEAN contracts
-# and the extern census (bead franken_lean-53v, plan Appendix B/C).
+# contract_drift.sh — shared E2E scenario for the extracted ABI/OLEAN contracts,
+# CLI/Lake census, and extern census (bead franken_lean-53v, plan Appendix B/C).
 #
 # Real-path, no-mock: the checked-in extraction scripts re-run against the REAL
 # pinned vendor tree (and, when the pinned Reference binary is installed, the
@@ -94,7 +94,21 @@ if [ "$rc" -ne 0 ]; then
 fi
 emit olean_drift passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"olean_check.log\""
 
-# ---- lane 3: extern census drift (requires the pinned Reference binary) ----------------
+# ---- lane 3: CLI/Lake source census is drift-free against the pin ----------------------
+note "CLI/Lake census source drift check (pinned sources -> inventory)"
+set +e
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_cli_lake_census.py" --check \
+  > "$ART_DIR/cli_lake_check.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit cli_lake_drift failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"cli_lake_check.log\""
+  note "FAIL: CLI/Lake census drifted from the pinned sources or policy"
+  exit 1
+fi
+emit cli_lake_drift passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"cli_lake_check.log\""
+
+# ---- lane 4: extern census drift (requires the pinned Reference binary) ----------------
 PIN_TAG="$(sed -E 's/.*tag=([^ ]+).*/\1/' <<<"$(grep -E '^reference ' "$ROOT/SUITE.lock")")"
 if [ -x "$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/bin/lean" ]; then
   note "extern census drift check (pin-verified environment walk)"
@@ -110,12 +124,12 @@ if [ -x "$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/bin/lean" ]; then
   emit census_drift passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"census_check.log\""
 else
   # Typed, honest skip: without the oracle binary this lane cannot run; the
-  # checked-in census stays validated by lane 4's coherence tests only.
+  # checked-in census stays validated by lane 5's coherence tests only.
   emit census_drift skipped "\"reason\":\"reference_binary_absent\",\"limitation\":\"L0: census-vs-pin unverified on this host\""
   note "SKIP: pinned Reference binary not installed; census drift lane skipped (typed limitation)"
 fi
 
-# ---- lane 4: the consuming Rust suites -------------------------------------------------
+# ---- lane 5: the consuming Rust suites -------------------------------------------------
 note "running the contract consumer suites (fln-rt, fln-olean, conformance linkage)"
 set +e
 ( cd "$ROOT" \
@@ -131,7 +145,7 @@ if [ "$rc" -ne 0 ]; then
 fi
 emit suite passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"suite.log\""
 
-# ---- lane 5: seeded mutation A — perturbed generated layout constant -------------------
+# ---- lane 6: seeded mutation A — perturbed generated layout constant -------------------
 ABI_RS="$ROOT/crates/fln-rt/src/abi.rs"
 BACKUP="$ART_DIR/abi.rs.orig"
 cp "$ABI_RS" "$BACKUP"
@@ -172,7 +186,7 @@ fi
 emit mutant_a passed "\"check_exit\":$check_rc,\"suite_exit\":$suite_rc,\"restored_sha\":\"$sha_after\",\"artifacts\":\"mutant_a_check.log,mutant_a_suite.log\""
 note "mutant A killed by both the drift lane and the named tripwire test"
 
-# ---- lane 6: seeded mutation B — rendered artifact desynced from inventory root --------
+# ---- lane 7: seeded mutation B — rendered artifact desynced from inventory root --------
 MD="$ROOT/ABI_CONTRACT.md"
 BACKUP_MD="$ART_DIR/ABI_CONTRACT.md.orig"
 cp "$MD" "$BACKUP_MD"
@@ -210,7 +224,7 @@ fi
 emit mutant_b passed "\"suite_exit\":$suite_rc,\"restored_sha\":\"$sha_after\",\"artifact\":\"mutant_b_suite.log\""
 note "mutant B killed by the cross-artifact linkage test"
 
-# ---- lane 7: seeded mutation C — perturbed generated OLEAN header size -----------------
+# ---- lane 8: seeded mutation C — perturbed generated OLEAN header size -----------------
 OLEAN_RS="$ROOT/crates/fln-olean/src/format.rs"
 BACKUP_OLEAN="$ART_DIR/format.rs.orig"
 cp "$OLEAN_RS" "$BACKUP_OLEAN"
@@ -255,25 +269,28 @@ fi
 emit mutant_c passed "\"check_exit\":$check_rc,\"restored_sha\":\"$sha_after\",\"artifact\":\"mutant_c_check.log\""
 note "mutant C killed by the exact OLEAN drift discriminator"
 
-# ---- lane 8: recovery — everything green again after restoration -----------------------
+# ---- lane 9: recovery — everything green again after restoration -----------------------
 note "recovery: drift checks and linkage green after restoration"
 set +e
 "${PYTHON[@]}" "$ROOT/scripts/extract/gen_abi_contract.py" --check > "$ART_DIR/recovery_abi.log" 2>&1
 rc1=$?
 "${PYTHON[@]}" "$ROOT/scripts/extract/gen_olean_contract.py" --check > "$ART_DIR/recovery_olean.log" 2>&1
 rc2=$?
+"${PYTHON[@]}" "$ROOT/scripts/extract/gen_cli_lake_census.py" --check \
+  > "$ART_DIR/recovery_cli_lake.log" 2>&1
+rc3=$?
 ( cd "$ROOT" \
     && CARGO_TARGET_DIR=target_local cargo test -q -p fln-rt --test abi_contract \
     && CARGO_TARGET_DIR=target_local cargo test -q -p fln-conformance --test contract_roots ) \
   > "$ART_DIR/recovery_suite.log" 2>&1
-rc3=$?
+rc4=$?
 set -e
-if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ] || [ "$rc3" -ne 0 ]; then
-  emit recovery failed "\"abi_check_exit\":$rc1,\"olean_check_exit\":$rc2,\"suite_exit\":$rc3,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_suite.log\""
-  note "FAIL: recovery lane not green (abi_check=$rc1 olean_check=$rc2 suite=$rc3)"
+if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ] || [ "$rc3" -ne 0 ] || [ "$rc4" -ne 0 ]; then
+  emit recovery failed "\"abi_check_exit\":$rc1,\"olean_check_exit\":$rc2,\"cli_lake_check_exit\":$rc3,\"suite_exit\":$rc4,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_cli_lake.log,recovery_suite.log\""
+  note "FAIL: recovery lane not green (abi_check=$rc1 olean_check=$rc2 cli_lake_check=$rc3 suite=$rc4)"
   exit 1
 fi
-emit recovery passed "\"abi_check_exit\":0,\"olean_check_exit\":0,\"suite_exit\":0,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_suite.log\""
+emit recovery passed "\"abi_check_exit\":0,\"olean_check_exit\":0,\"cli_lake_check_exit\":0,\"suite_exit\":0,\"artifacts\":\"recovery_abi.log,recovery_olean.log,recovery_cli_lake.log,recovery_suite.log\""
 
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS: all lanes green (artifacts in target/e2e/$RUN_ID)"

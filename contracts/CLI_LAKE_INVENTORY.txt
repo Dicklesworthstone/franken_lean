@@ -1,0 +1,363 @@
+schema fln-cli-lake-inventory/1
+extractor pinned-cli-lake-source-walk version=1
+hash fnv1a64 framing=u64le-length-prefixed
+policy-join exact-surface-bijection
+platform linux-x86_64
+surface-count 291
+transcript-count 25
+source-count 20
+command-count 46
+config-default-count 11
+environment-count 36
+executable-count 3
+facet-count 53
+leanc-rule-count 5
+option-count 127
+outcome-count 7
+personality-count 3
+leanc-surface inherited-compiler-delegation-not-native-flag-parity
+cancellation-outcome typed-inconclusive
+resource-outcome typed-inconclusive
+raw-begin
+reference repo=leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91
+source path=SUITE.lock hash=fnv1a64:ad256683f7fee4fd
+source path=contracts/CLI_LAKE_TRANSCRIPTS.txt hash=fnv1a64:cc1b4ef17f5f5d8c
+source path=crates/fln-conformance/src/cli_lake_census.rs hash=fnv1a64:267aa9cece6ee516
+source path=crates/fln-conformance/tests/cli_lake_census.rs hash=fnv1a64:2a20af3e51910201
+source path=crates/fln-conformance/tests/cli_lake_census_no_mock_e2e.rs hash=fnv1a64:1caee33b380c8f9f
+source path=scripts/extract/gen_cli_lake_census.py hash=fnv1a64:13f9f946f5a1604d
+source path=tribunal/epochs/v4.32.0/MANIFEST.txt hash=fnv1a64:07535ed88e8ee924
+source path=vendor/lean4-src/src/Lean/Shell.lean hash=fnv1a64:d68e36ae146d83d6
+source path=vendor/lean4-src/src/bin/leanc.in hash=fnv1a64:55853375785b2e4d
+source path=vendor/lean4-src/src/lake/Lake/Build/Actions.lean hash=fnv1a64:78e82daa0f0f168b
+source path=vendor/lean4-src/src/lake/Lake/Build/Facets.lean hash=fnv1a64:5ae97ba1b1a1e1f1
+source path=vendor/lean4-src/src/lake/Lake/Build/Infos.lean hash=fnv1a64:9b08110bbcc1759f
+source path=vendor/lean4-src/src/lake/Lake/CLI/Help.lean hash=fnv1a64:a6ad5e9996bfd733
+source path=vendor/lean4-src/src/lake/Lake/CLI/Main.lean hash=fnv1a64:f99abf35d25d50a0
+source path=vendor/lean4-src/src/lake/Lake/CLI/Serve.lean hash=fnv1a64:f836502f4cf7e9aa
+source path=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean hash=fnv1a64:a513edc7c084595c
+source path=vendor/lean4-src/src/lake/Lake/Config/Env.lean hash=fnv1a64:3bff275db0cffd51
+source path=vendor/lean4-src/src/lake/Lake/Config/InstallPath.lean hash=fnv1a64:55059a0ab92d0757
+source path=vendor/lean4-src/src/lake/Lake/Util/NativeLib.lean hash=fnv1a64:86fc0aa368617e91
+source path=vendor/lean4-src/src/util/shell.cpp hash=fnv1a64:2bf4bff8aa34e760
+surface key=command:lake:build kind=command action=build namespace=top personality=lake spelling=build source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1260 evidence=fnv1a64:cee7fb16d9ed0521
+surface key=command:lake:cache kind=command action=cache namespace=top personality=lake spelling=cache source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1269 evidence=fnv1a64:8776c5bc6becd4ff
+surface key=command:lake:cache/add kind=command action=add namespace=cache personality=lake spelling=add source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:823 evidence=fnv1a64:b044b16bd88f1a5a
+surface key=command:lake:cache/clean kind=command action=clean namespace=cache personality=lake spelling=clean source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:829 evidence=fnv1a64:c5221e4c786dd15a
+surface key=command:lake:cache/get kind=command action=get namespace=cache personality=lake spelling=get source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:824 evidence=fnv1a64:b8a56caf6a222b27
+surface key=command:lake:cache/help kind=command action=help namespace=cache personality=lake spelling=help source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:831 evidence=fnv1a64:c2bf92a4dc37177b
+surface key=command:lake:cache/put kind=command action=put namespace=cache personality=lake spelling=put source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:825 evidence=fnv1a64:5ded17f3ed0aac8c
+surface key=command:lake:cache/put-staged kind=command action=putStaged namespace=cache personality=lake spelling=put-staged source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:828 evidence=fnv1a64:a2ca180a0dfb9c8e
+surface key=command:lake:cache/services kind=command action=services namespace=cache personality=lake spelling=services source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:830 evidence=fnv1a64:42e547251647d3cc
+surface key=command:lake:cache/stage kind=command action=stage namespace=cache personality=lake spelling=stage source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:826 evidence=fnv1a64:495ef2af2ebb604f
+surface key=command:lake:cache/unstage kind=command action=unstage namespace=cache personality=lake spelling=unstage source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:827 evidence=fnv1a64:ee039f4bcbf597a2
+surface key=command:lake:check-build kind=command action=checkBuild namespace=top personality=lake spelling=check-build source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1261 evidence=fnv1a64:0fcd5baca08d5ca2
+surface key=command:lake:check-lint kind=command action=checkLint namespace=top personality=lake spelling=check-lint source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1274 evidence=fnv1a64:bbd8b7545c08b61a
+surface key=command:lake:check-test kind=command action=checkTest namespace=top personality=lake spelling=check-test source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1272 evidence=fnv1a64:3419cb6cdc768c35
+surface key=command:lake:clean kind=command action=clean namespace=top personality=lake spelling=clean source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1275 evidence=fnv1a64:5161cdd594a97ce2
+surface key=command:lake:env kind=command action=env namespace=top personality=lake spelling=env source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1281 evidence=fnv1a64:43268cb53d0d926e
+surface key=command:lake:exe kind=command action=exe namespace=top personality=lake spelling=exe source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1282 evidence=fnv1a64:9696cd52f9c77e3f
+surface key=command:lake:exec kind=command action=exe namespace=top personality=lake spelling=exec source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1282 evidence=fnv1a64:78409a39ea810caf
+surface key=command:lake:help kind=command action=help namespace=top personality=lake spelling=help source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1288 evidence=fnv1a64:a581db5234604403
+surface key=command:lake:init kind=command action=init namespace=top personality=lake spelling=init source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1259 evidence=fnv1a64:4559e111baf2e57a
+surface key=command:lake:lean kind=command action=lean namespace=top personality=lake spelling=lean source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1283 evidence=fnv1a64:54937904d5772820
+surface key=command:lake:lint kind=command action=lint namespace=top personality=lake spelling=lint source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1273 evidence=fnv1a64:043579fdf4e48731
+surface key=command:lake:new kind=command action=new namespace=top personality=lake spelling=new source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1258 evidence=fnv1a64:9170f3131743f575
+surface key=command:lake:pack kind=command action=pack namespace=top personality=lake spelling=pack source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1266 evidence=fnv1a64:5ba2b0cb97a49a6d
+surface key=command:lake:query kind=command action=query namespace=top personality=lake spelling=query source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1262 evidence=fnv1a64:a0a156ecab268c8d
+surface key=command:lake:query-kind kind=command action=queryKind namespace=top personality=lake spelling=query-kind source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1263 evidence=fnv1a64:a5671daa8780a44f
+surface key=command:lake:reservoir-config kind=command action=reservoirConfig namespace=top personality=lake spelling=reservoir-config source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1285 evidence=fnv1a64:753cc865d0f20466
+surface key=command:lake:resolve-deps kind=command action=resolveDeps namespace=top personality=lake spelling=resolve-deps source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1265 evidence=fnv1a64:a9291ee28086fbf9
+surface key=command:lake:run kind=command action=script namespace=top personality=lake spelling=run source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1279 evidence=fnv1a64:adf7ffa28a0f234f
+surface key=command:lake:script kind=command action=script namespace=top personality=lake spelling=script source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1277 evidence=fnv1a64:64244f76c372ca71
+surface key=command:lake:script/doc kind=command action=doc namespace=script personality=lake spelling=doc source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:879 evidence=fnv1a64:1db8594f22c423d3
+surface key=command:lake:script/help kind=command action=help namespace=script personality=lake spelling=help source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:880 evidence=fnv1a64:8147cb9596d7ef71
+surface key=command:lake:script/list kind=command action=list namespace=script personality=lake spelling=list source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:877 evidence=fnv1a64:b59decd232ea40d2
+surface key=command:lake:script/run kind=command action=run namespace=script personality=lake spelling=run source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:878 evidence=fnv1a64:50675c63cf62f77a
+surface key=command:lake:scripts kind=command action=script namespace=top personality=lake spelling=scripts source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1278 evidence=fnv1a64:5e4ca8097e6496c1
+surface key=command:lake:self-check kind=command action=selfCheck namespace=top personality=lake spelling=self-check source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1287 evidence=fnv1a64:32716655acd1b633
+surface key=command:lake:serve kind=command action=serve namespace=top personality=lake spelling=serve source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1280 evidence=fnv1a64:b5ba8e6e8ca029a4
+surface key=command:lake:setup-file kind=command action=setupFile namespace=top personality=lake spelling=setup-file source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1270 evidence=fnv1a64:61188329f3ba7814
+surface key=command:lake:shake kind=command action=shake namespace=top personality=lake spelling=shake source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1276 evidence=fnv1a64:e4664f66eec0a3fb
+surface key=command:lake:test kind=command action=test namespace=top personality=lake spelling=test source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1271 evidence=fnv1a64:7da516bb02fd07bc
+surface key=command:lake:translate-config kind=command action=translateConfig namespace=top personality=lake spelling=translate-config source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1284 evidence=fnv1a64:3861aee1f8a36ad7
+surface key=command:lake:unpack kind=command action=unpack namespace=top personality=lake spelling=unpack source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1267 evidence=fnv1a64:6980cee14de08654
+surface key=command:lake:update kind=command action=update namespace=top personality=lake spelling=update source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1264 evidence=fnv1a64:7cb39260e52197e7
+surface key=command:lake:upgrade kind=command action=update namespace=top personality=lake spelling=upgrade source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1264 evidence=fnv1a64:7b84f2d790a1ef63
+surface key=command:lake:upload kind=command action=upload namespace=top personality=lake spelling=upload source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1268 evidence=fnv1a64:2ca7f4ea0e5ed237
+surface key=command:lake:version-tags kind=command action=versionTags namespace=top personality=lake spelling=version-tags source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1286 evidence=fnv1a64:2c2d7c14781e57b8
+surface key=config-default:lake:defaultBinDir kind=config-default name=defaultBinDir personality=lake value=bin source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:47 evidence=fnv1a64:1a495fca9d613c75
+surface key=config-default:lake:defaultBuildDir kind=config-default name=defaultBuildDir personality=lake value=.lake/build source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:38 evidence=fnv1a64:6ffa7be017abbfe6
+surface key=config-default:lake:defaultConfigFile kind=config-default name=defaultConfigFile personality=lake value=lakefile source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:26 evidence=fnv1a64:be5068de217e6cba
+surface key=config-default:lake:defaultIrDir kind=config-default name=defaultIrDir personality=lake value=ir source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:50 evidence=fnv1a64:927eb0baf4050102
+surface key=config-default:lake:defaultLakeDir kind=config-default name=defaultLakeDir personality=lake value=.lake source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:20 evidence=fnv1a64:7c7d9354f129baab
+surface key=config-default:lake:defaultLeanConfigFile kind=config-default name=defaultLeanConfigFile personality=lake value=lakefile.lean source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:29 evidence=fnv1a64:ba75a7e911ecb323
+surface key=config-default:lake:defaultLeanLibDir kind=config-default name=defaultLeanLibDir personality=lake value=lib/lean source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:41 evidence=fnv1a64:8cd9e97bd3fb4843
+surface key=config-default:lake:defaultManifestFile kind=config-default name=defaultManifestFile personality=lake value=lake-manifest.json source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:35 evidence=fnv1a64:ccbc27fc33af2868
+surface key=config-default:lake:defaultNativeLibDir kind=config-default name=defaultNativeLibDir personality=lake value=lib source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:44 evidence=fnv1a64:e3238da6d451290b
+surface key=config-default:lake:defaultPackagesDir kind=config-default name=defaultPackagesDir personality=lake value=.lake/packages source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:23 evidence=fnv1a64:dd693be6fff26d9a
+surface key=config-default:lake:defaultTomlConfigFile kind=config-default name=defaultTomlConfigFile personality=lake value=lakefile.toml source=vendor/lean4-src/src/lake/Lake/Config/Defaults.lean:32 evidence=fnv1a64:0f804caa9b14cc43
+surface key=environment:lake:AR kind=environment name=AR personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Config/InstallPath.lean:256 evidence=fnv1a64:41cc0cd7692e54c8
+surface key=environment:lake:CC kind=environment name=CC personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Config/InstallPath.lean:267 evidence=fnv1a64:a66ef259ff258fc4
+surface key=environment:lake:COPYFILE_DISABLE kind=environment name=COPYFILE_DISABLE personality=lake role=write site-count=1 source=vendor/lean4-src/src/lake/Lake/Build/Actions.lean:208 evidence=fnv1a64:0a763a14769b3326
+surface key=environment:lake:DYLD_LIBRARY_PATH kind=environment name=DYLD_LIBRARY_PATH personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Util/NativeLib.lean:38 evidence=fnv1a64:6ab88dad44d19b3a
+surface key=environment:lake:ELAN kind=environment name=ELAN personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:289 evidence=fnv1a64:d8bd7df799539929
+surface key=environment:lake:ELAN_HOME kind=environment name=ELAN_HOME personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:290 evidence=fnv1a64:03ddbb931fe43f25
+surface key=environment:lake:ELAN_TOOLCHAIN kind=environment name=ELAN_TOOLCHAIN personality=lake role=read-write site-count=3 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:132 evidence=fnv1a64:c25de0d4292d5ee6
+surface key=environment:lake:HOME kind=environment name=HOME personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:97 evidence=fnv1a64:be1d27a206b6d8ac
+surface key=environment:lake:HOMEDRIVE kind=environment name=HOMEDRIVE personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:92 evidence=fnv1a64:fcd2eafa06b5c856
+surface key=environment:lake:HOMEPATH kind=environment name=HOMEPATH personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:94 evidence=fnv1a64:35179ec9c6e8e29c
+surface key=environment:lake:LAKE kind=environment name=LAKE personality=lake role=write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:276 evidence=fnv1a64:a2ace3a7843389ff
+surface key=environment:lake:LAKE_ARTIFACT_CACHE kind=environment name=LAKE_ARTIFACT_CACHE personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:177 evidence=fnv1a64:094f0535014894df
+surface key=environment:lake:LAKE_CACHE_ARTIFACT_ENDPOINT kind=environment name=LAKE_CACHE_ARTIFACT_ENDPOINT personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:181 evidence=fnv1a64:2f71617eba59d9f1
+surface key=environment:lake:LAKE_CACHE_DIR kind=environment name=LAKE_CACHE_DIR personality=lake role=read-write site-count=4 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:135 evidence=fnv1a64:33e32e32336ac5c3
+surface key=environment:lake:LAKE_CACHE_KEY kind=environment name=LAKE_CACHE_KEY personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:180 evidence=fnv1a64:314823d43060b9ad
+surface key=environment:lake:LAKE_CACHE_REVISION_ENDPOINT kind=environment name=LAKE_CACHE_REVISION_ENDPOINT personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:182 evidence=fnv1a64:e0b16f2f0d6236ed
+surface key=environment:lake:LAKE_CACHE_SERVICE kind=environment name=LAKE_CACHE_SERVICE personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:183 evidence=fnv1a64:af713b85c62dc1dd
+surface key=environment:lake:LAKE_CONFIG kind=environment name=LAKE_CONFIG personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:179 evidence=fnv1a64:a520be105789f49d
+surface key=environment:lake:LAKE_HOME kind=environment name=LAKE_HOME personality=lake role=read-write site-count=3 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:279 evidence=fnv1a64:ae0e22b5e131b174
+surface key=environment:lake:LAKE_NO_CACHE kind=environment name=LAKE_NO_CACHE personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:176 evidence=fnv1a64:5f6ebba7784eafc5
+surface key=environment:lake:LAKE_OVERRIDE_LEAN kind=environment name=LAKE_OVERRIDE_LEAN personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:278 evidence=fnv1a64:caaad5e6d943e8d9
+surface key=environment:lake:LAKE_PKG_URL_MAP kind=environment name=LAKE_PKG_URL_MAP personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:206 evidence=fnv1a64:29074bd12408d185
+surface key=environment:lake:LAKE_RESTORE_ARTIFACTS kind=environment name=LAKE_RESTORE_ARTIFACTS personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:178 evidence=fnv1a64:1df72a4b04ec78d5
+surface key=environment:lake:LD_LIBRARY_PATH kind=environment name=LD_LIBRARY_PATH personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Util/NativeLib.lean:38 evidence=fnv1a64:efff6a55eb0c3804
+surface key=environment:lake:LEAN kind=environment name=LEAN personality=lake role=read-write site-count=3 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:280 evidence=fnv1a64:c15693474d68d4ea
+surface key=environment:lake:LEAN_AR kind=environment name=LEAN_AR personality=lake role=read-write site-count=3 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:283 evidence=fnv1a64:8e238c10a13be1fa
+surface key=environment:lake:LEAN_CC kind=environment name=LEAN_CC personality=lake role=read-write site-count=3 source=vendor/lean4-src/src/bin/leanc.in:10 evidence=fnv1a64:9c2254b22bc80780
+surface key=environment:lake:LEAN_GITHASH kind=environment name=LEAN_GITHASH personality=lake role=read-write site-count=3 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:184 evidence=fnv1a64:3ffc013792cb201e
+surface key=environment:lake:LEAN_PATH kind=environment name=LEAN_PATH personality=lake role=read-write site-count=4 source=vendor/lean4-src/src/lake/Lake/Build/Actions.lean:62 evidence=fnv1a64:0a275d1047963933
+surface key=environment:lake:LEAN_SRC_PATH kind=environment name=LEAN_SRC_PATH personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:187 evidence=fnv1a64:f9471c5b67e7c73f
+surface key=environment:lake:LEAN_SYSROOT kind=environment name=LEAN_SYSROOT personality=lake role=read-write site-count=3 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:282 evidence=fnv1a64:8023de58be9d20a2
+surface key=environment:lake:MACOSX_DEPLOYMENT_TARGET kind=environment name=MACOSX_DEPLOYMENT_TARGET personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Build/Actions.lean:144 evidence=fnv1a64:d0a3e7f1eb8a057d
+surface key=environment:lake:PATH kind=environment name=PATH personality=lake role=read-write site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:189 evidence=fnv1a64:033ce67c36804c91
+surface key=environment:lake:RESERVOIR_API_BASE_URL kind=environment name=RESERVOIR_API_BASE_URL personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:169 evidence=fnv1a64:3dfd8a4c56747460
+surface key=environment:lake:RESERVOIR_API_URL kind=environment name=RESERVOIR_API_URL personality=lake role=read site-count=1 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:175 evidence=fnv1a64:7429bb8f7f8dde04
+surface key=environment:lake:XDG_CACHE_HOME kind=environment name=XDG_CACHE_HOME personality=lake role=read site-count=2 source=vendor/lean4-src/src/lake/Lake/Config/Env.lean:103 evidence=fnv1a64:e12f845135aa58bd
+surface key=executable:lake kind=executable bytes=13840 personality=lake platform=linux-x86_64 sha256=60330ab6f07dce20f3fa9ebb08e8b984ea9549eac172afeb15d9d2227060e2b3 source=tribunal/epochs/v4.32.0/MANIFEST.txt:11 evidence=fnv1a64:4c3fbb7d4b3a21f6
+surface key=executable:lean kind=executable bytes=9024 personality=lean platform=linux-x86_64 sha256=e8baaa71855a616dc351028f3ad2200051b0671f423a1696a100e809302d5550 source=tribunal/epochs/v4.32.0/MANIFEST.txt:13 evidence=fnv1a64:33da2e84dd14d082
+surface key=executable:leanc kind=executable bytes=36688 personality=leanc platform=linux-x86_64 sha256=0f51753a7921fadb2813b24c9e9e3cfccf02bdb606b7a34feebd763c63754fcc source=tribunal/epochs/v4.32.0/MANIFEST.txt:14 evidence=fnv1a64:54f22975ff5c866f
+surface key=facet:lake:ExternLib:default kind=facet declaration=default name=default personality=lake target-kind=ExternLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:257 evidence=fnv1a64:2041fb800a5b9ec4
+surface key=facet:lake:ExternLib:dynlib kind=facet declaration=dynlib name=dynlib personality=lake target-kind=ExternLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:266 evidence=fnv1a64:d755cf3cb0f10210
+surface key=facet:lake:ExternLib:shared kind=facet declaration=shared name=shared personality=lake target-kind=ExternLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:263 evidence=fnv1a64:a0921a1bcf476a0b
+surface key=facet:lake:ExternLib:static kind=facet declaration=static name=static personality=lake target-kind=ExternLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:260 evidence=fnv1a64:007d88ac1ddda4cc
+surface key=facet:lake:InputDir:default kind=facet declaration=default name=default personality=lake target-kind=InputDir source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:275 evidence=fnv1a64:6b9fa0a0d7719c04
+surface key=facet:lake:InputFile:default kind=facet declaration=default name=default personality=lake target-kind=InputFile source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:269 evidence=fnv1a64:b0dd72efa093b226
+surface key=facet:lake:LeanExe:default kind=facet declaration=default name=default personality=lake target-kind=LeanExe source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:251 evidence=fnv1a64:7eca8025d6aa9de2
+surface key=facet:lake:LeanExe:exe kind=facet declaration=exe name=exe personality=lake target-kind=LeanExe source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:254 evidence=fnv1a64:d575c623aa929915
+surface key=facet:lake:LeanLib:default kind=facet declaration=default name=default personality=lake target-kind=LeanLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:226 evidence=fnv1a64:f9ba83847c424544
+surface key=facet:lake:LeanLib:extraDep kind=facet declaration=extraDep name=extraDep personality=lake target-kind=LeanLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:248 evidence=fnv1a64:6d553a47b4e6686f
+surface key=facet:lake:LeanLib:leanArts kind=facet declaration=leanArts name=leanArts personality=lake target-kind=LeanLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:229 evidence=fnv1a64:cc4722023b10b326
+surface key=facet:lake:LeanLib:modules kind=facet declaration=modules name=modules personality=lake target-kind=LeanLib source=vendor/lean4-src/src/lake/Lake/Build/Infos.lean:93 evidence=fnv1a64:f941a576b467a958
+surface key=facet:lake:LeanLib:shared kind=facet declaration=shared name=shared personality=lake target-kind=LeanLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:245 evidence=fnv1a64:eb190381447faf53
+surface key=facet:lake:LeanLib:static kind=facet declaration=static name=static personality=lake target-kind=LeanLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:232 evidence=fnv1a64:297f08467e9fe6fc
+surface key=facet:lake:LeanLib:static.export kind=facet declaration=staticExportFacet name=static.export personality=lake target-kind=LeanLib source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:242 evidence=fnv1a64:dadf13d4fcc0dfd0
+surface key=facet:lake:Module:bc kind=facet declaration=bc name=bc personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:151 evidence=fnv1a64:739ca4eefcf9ccf7
+surface key=facet:lake:Module:bc.o kind=facet declaration=bcoFacet name=bc.o personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:166 evidence=fnv1a64:854d3d55628566d9
+surface key=facet:lake:Module:c kind=facet declaration=c name=c personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:148 evidence=fnv1a64:fcde5be7c808e892
+surface key=facet:lake:Module:c.o kind=facet declaration=coFacet name=c.o personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:157 evidence=fnv1a64:bf71f71203bb4540
+surface key=facet:lake:Module:c.o.export kind=facet declaration=coExportFacet name=c.o.export personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:160 evidence=fnv1a64:2cbe068b0ceed628
+surface key=facet:lake:Module:c.o.noexport kind=facet declaration=coNoExportFacet name=c.o.noexport personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:163 evidence=fnv1a64:9c6f49123c26eb6f
+surface key=facet:lake:Module:deps kind=facet declaration=deps name=deps personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:61 evidence=fnv1a64:d27379d0d92cf71e
+surface key=facet:lake:Module:dynlib kind=facet declaration=dynlib name=dynlib personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Infos.lean:90 evidence=fnv1a64:d178d0a1e610f8a0
+surface key=facet:lake:Module:exportInfo kind=facet declaration=exportInfo name=exportInfo personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:110 evidence=fnv1a64:daea7db0474f2690
+surface key=facet:lake:Module:header kind=facet declaration=header name=header personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:47 evidence=fnv1a64:2f00ef2dfb58d33d
+surface key=facet:lake:Module:ilean kind=facet declaration=ilean name=ilean personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:142 evidence=fnv1a64:2cacb43712a6b3fc
+surface key=facet:lake:Module:importAllArts kind=facet declaration=importAllArts name=importAllArts personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:119 evidence=fnv1a64:e3ec8af4d8d738e5
+surface key=facet:lake:Module:importArts kind=facet declaration=importArts name=importArts personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:113 evidence=fnv1a64:06f7ad99d06b428b
+surface key=facet:lake:Module:importInfo kind=facet declaration=importInfo name=importInfo personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:80 evidence=fnv1a64:517d15316e6ea2a9
+surface key=facet:lake:Module:imports kind=facet declaration=imports name=imports personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Infos.lean:81 evidence=fnv1a64:b250ff0727ee84d7
+surface key=facet:lake:Module:input kind=facet declaration=input name=input personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Infos.lean:78 evidence=fnv1a64:3a9c0b3251e67d5f
+surface key=facet:lake:Module:ir kind=facet declaration=ir name=ir personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:145 evidence=fnv1a64:eea1a51c809e4ecf
+surface key=facet:lake:Module:lean kind=facet declaration=lean name=lean personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:44 evidence=fnv1a64:aa67f4bff68463d8
+surface key=facet:lake:Module:leanArts kind=facet declaration=leanArts name=leanArts personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:127 evidence=fnv1a64:15f4e2b7bc303906
+surface key=facet:lake:Module:ltar kind=facet declaration=ltar name=ltar personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:130 evidence=fnv1a64:0423e6b6954ef855
+surface key=facet:lake:Module:o kind=facet declaration=o name=o personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:173 evidence=fnv1a64:4191c69f3eac2f26
+surface key=facet:lake:Module:o.export kind=facet declaration=oExportFacet name=o.export personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:176 evidence=fnv1a64:d4e04697ec3186be
+surface key=facet:lake:Module:o.noexport kind=facet declaration=oNoExportFacet name=o.noexport personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:179 evidence=fnv1a64:cebe95bd6f6dc66f
+surface key=facet:lake:Module:olean kind=facet declaration=olean name=olean personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:133 evidence=fnv1a64:300c5e57d547f6f6
+surface key=facet:lake:Module:olean.private kind=facet declaration=oleanPrivateFacet name=olean.private personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:139 evidence=fnv1a64:973c758b53b4716c
+surface key=facet:lake:Module:olean.server kind=facet declaration=oleanServerFacet name=olean.server personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:136 evidence=fnv1a64:3ac84913a3ee3e8b
+surface key=facet:lake:Module:precompileImports kind=facet declaration=precompileImports name=precompileImports personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Infos.lean:87 evidence=fnv1a64:eeda0c4be6141077
+surface key=facet:lake:Module:setup kind=facet declaration=setup name=setup personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:55 evidence=fnv1a64:52365da39b73e0e2
+surface key=facet:lake:Module:transImports kind=facet declaration=transImports name=transImports personality=lake target-kind=Module source=vendor/lean4-src/src/lake/Lake/Build/Infos.lean:84 evidence=fnv1a64:511c2ac0a51eb3a8
+surface key=facet:lake:Package:barrel kind=facet declaration=reservoirBarrelFacet name=barrel personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:206 evidence=fnv1a64:2889964517dde75c
+surface key=facet:lake:Package:cache kind=facet declaration=buildCacheFacet name=cache personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:194 evidence=fnv1a64:644edaa489588392
+surface key=facet:lake:Package:deps kind=facet declaration=deps name=deps personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Infos.lean:96 evidence=fnv1a64:7cd837c13b47016a
+surface key=facet:lake:Package:extraDep kind=facet declaration=extraDep name=extraDep personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:221 evidence=fnv1a64:8922f68d47f17c2b
+surface key=facet:lake:Package:optBarrel kind=facet declaration=optReservoirBarrelFacet name=optBarrel personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:200 evidence=fnv1a64:9e29d838199e002a
+surface key=facet:lake:Package:optCache kind=facet declaration=optBuildCacheFacet name=optCache personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:188 evidence=fnv1a64:b4cbd9f46acb5c28
+surface key=facet:lake:Package:optRelease kind=facet declaration=optGitHubReleaseFacet name=optRelease personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:212 evidence=fnv1a64:442773daa435676f
+surface key=facet:lake:Package:release kind=facet declaration=gitHubReleaseFacet name=release personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Facets.lean:218 evidence=fnv1a64:9ecb7215ede01253
+surface key=facet:lake:Package:transDeps kind=facet declaration=transDeps name=transDeps personality=lake target-kind=Package source=vendor/lean4-src/src/lake/Lake/Build/Infos.lean:99 evidence=fnv1a64:52d5c6e897db84e3
+surface key=leanc-rule:compiler kind=leanc-rule personality=leanc platform=linux-x86_64 rule=LEAN_CC-or-pinned-default surface=inherited-compiler-delegation source=vendor/lean4-src/src/bin/leanc.in:10 evidence=fnv1a64:6ef432f47be90b16
+surface key=leanc-rule:forward kind=leanc-rule personality=leanc platform=linux-x86_64 rule=forward-all-user-arguments surface=inherited-compiler-delegation source=vendor/lean4-src/src/bin/leanc.in:5 evidence=fnv1a64:9e8b84f257e62d6a
+surface key=leanc-rule:include kind=leanc-rule personality=leanc platform=linux-x86_64 rule=prepend-toolchain-include surface=inherited-compiler-delegation source=vendor/lean4-src/src/bin/leanc.in:10 evidence=fnv1a64:d2e0a9492cb4d86b
+surface key=leanc-rule:link kind=leanc-rule personality=leanc platform=linux-x86_64 rule=append-toolchain-link-flags-unless-c surface=inherited-compiler-delegation source=vendor/lean4-src/src/bin/leanc.in:7 evidence=fnv1a64:6ae296b0289fb890
+surface key=leanc-rule:verbose kind=leanc-rule personality=leanc platform=linux-x86_64 rule=echo-expanded-command-on-v surface=inherited-compiler-delegation source=vendor/lean4-src/src/bin/leanc.in:12 evidence=fnv1a64:9fbea7d9057eab33
+surface key=option:lake:-- kind=option argument=no personality=lake position=before-or-after-command spelling=-- source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:342 evidence=fnv1a64:0838116ee7ee2bf2
+surface key=option:lake:--add-public kind=option argument=no personality=lake position=before-or-after-command spelling=--add-public source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:371 evidence=fnv1a64:18bd36334983a83a
+surface key=option:lake:--allow-empty kind=option argument=no personality=lake position=before-or-after-command spelling=--allow-empty source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:281 evidence=fnv1a64:597f589800abf808
+surface key=option:lake:--ansi kind=option argument=no personality=lake position=before-or-after-command spelling=--ansi source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:328 evidence=fnv1a64:b0e2d81e77af0132
+surface key=option:lake:--builtin-lint kind=option argument=no personality=lake position=before-or-after-command spelling=--builtin-lint source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:346 evidence=fnv1a64:706833d13ae4f6ca
+surface key=option:lake:--builtin-only kind=option argument=no personality=lake position=before-or-after-command spelling=--builtin-only source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:347 evidence=fnv1a64:5f84393e397aab1e
+surface key=option:lake:--dir kind=option argument=required personality=lake position=before-or-after-command spelling=--dir source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:335 evidence=fnv1a64:4c75295a3d12f318
+surface key=option:lake:--download-arts kind=option argument=no personality=lake position=before-or-after-command spelling=--download-arts source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:292 evidence=fnv1a64:54e8cd75c73a93a8
+surface key=option:lake:--explain kind=option argument=no personality=lake position=before-or-after-command spelling=--explain source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:373 evidence=fnv1a64:4be232dcfcfe51c8
+surface key=option:lake:--fail-level kind=option argument=required personality=lake position=before-or-after-command spelling=--fail-level source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:325 evidence=fnv1a64:8dcd538c147c1f76
+surface key=option:lake:--file kind=option argument=required personality=lake position=before-or-after-command spelling=--file source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:338 evidence=fnv1a64:7af5fd8fedd41f5a
+surface key=option:lake:--fix kind=option argument=no personality=lake position=before-or-after-command spelling=--fix source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:375 evidence=fnv1a64:dcb6a0cdba6dafe0
+surface key=option:lake:--force kind=option argument=no personality=lake position=before-or-after-command spelling=--force source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:366 evidence=fnv1a64:2cb7ccb773eef934
+surface key=option:lake:--force-download kind=option argument=no personality=lake position=before-or-after-command spelling=--force-download source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:291 evidence=fnv1a64:f730338b0a5d737a
+surface key=option:lake:--force-overwrite kind=option argument=no personality=lake position=before-or-after-command spelling=--force-overwrite source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:290 evidence=fnv1a64:ea1a8422b0423d9c
+surface key=option:lake:--gh-style kind=option argument=no personality=lake position=before-or-after-command spelling=--gh-style source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:372 evidence=fnv1a64:aa6ae0ff572250c2
+surface key=option:lake:--help kind=option argument=no personality=lake position=before-or-after-command spelling=--help source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:341 evidence=fnv1a64:2a2dec5aa9653eca
+surface key=option:lake:--iofail kind=option argument=no personality=lake position=before-or-after-command spelling=--iofail source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:288 evidence=fnv1a64:eb8d5b3a434d7dee
+surface key=option:lake:--json kind=option argument=no personality=lake position=before-or-after-command spelling=--json source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:280 evidence=fnv1a64:748dde5dea88ce2a
+surface key=option:lake:--keep-implied kind=option argument=no personality=lake position=before-or-after-command spelling=--keep-implied source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:368 evidence=fnv1a64:818735fa0d1372c2
+surface key=option:lake:--keep-prefix kind=option argument=no personality=lake position=before-or-after-command spelling=--keep-prefix source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:369 evidence=fnv1a64:834c57b93b8dd302
+surface key=option:lake:--keep-public kind=option argument=no personality=lake position=before-or-after-command spelling=--keep-public source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:370 evidence=fnv1a64:aad3240a5477560c
+surface key=option:lake:--keep-toolchain kind=option argument=no personality=lake position=before-or-after-command spelling=--keep-toolchain source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:276 evidence=fnv1a64:ba0a72581a7b86fe
+surface key=option:lake:--lint-only kind=option argument=required personality=lake position=before-or-after-command spelling=--lint-only source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:357 evidence=fnv1a64:96a7574ad1c84baa
+surface key=option:lake:--linters kind=option argument=required personality=lake position=before-or-after-command spelling=--linters source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:350 evidence=fnv1a64:12fc98612c0ad1a4
+surface key=option:lake:--log-level kind=option argument=required personality=lake position=before-or-after-command spelling=--log-level source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:322 evidence=fnv1a64:7bda06419b22b108
+surface key=option:lake:--mappings-only kind=option argument=no personality=lake position=before-or-after-command spelling=--mappings-only source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:293 evidence=fnv1a64:268b0a3c6a5fe542
+surface key=option:lake:--max-revs kind=option argument=required personality=lake position=before-or-after-command spelling=--max-revs source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:318 evidence=fnv1a64:28f620a2d701ff32
+surface key=option:lake:--no-ansi kind=option argument=no personality=lake position=before-or-after-command spelling=--no-ansi source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:329 evidence=fnv1a64:6c06298062535194
+surface key=option:lake:--no-build kind=option argument=no personality=lake position=before-or-after-command spelling=--no-build source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:282 evidence=fnv1a64:68017b760b6f56d6
+surface key=option:lake:--no-cache kind=option argument=no personality=lake position=before-or-after-command spelling=--no-cache source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:283 evidence=fnv1a64:2adb193cd6b8010e
+surface key=option:lake:--no-overwrite kind=option argument=no personality=lake position=before-or-after-command spelling=--no-overwrite source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:289 evidence=fnv1a64:05d2fe07e122e4c2
+surface key=option:lake:--offline kind=option argument=no personality=lake position=before-or-after-command spelling=--offline source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:286 evidence=fnv1a64:a8e408317e572188
+surface key=option:lake:--old kind=option argument=no personality=lake position=before-or-after-command spelling=--old source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:278 evidence=fnv1a64:752801bd4f7848b0
+surface key=option:lake:--only kind=option argument=required personality=lake position=before-or-after-command spelling=--only source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:376 evidence=fnv1a64:3c49a530be5929c2
+surface key=option:lake:--packages kind=option argument=required personality=lake position=before-or-after-command spelling=--packages source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:330 evidence=fnv1a64:65b9087130767082
+surface key=option:lake:--platform kind=option argument=required personality=lake position=before-or-after-command spelling=--platform source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:304 evidence=fnv1a64:68af4ab8680dddd2
+surface key=option:lake:--quiet kind=option argument=no personality=lake position=before-or-after-command spelling=--quiet source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:273 evidence=fnv1a64:5978da713575e16e
+surface key=option:lake:--reconfigure kind=option argument=no personality=lake position=before-or-after-command spelling=--reconfigure source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:277 evidence=fnv1a64:56fd8b45750735e8
+surface key=option:lake:--record-exceptions kind=option argument=no personality=lake position=before-or-after-command spelling=--record-exceptions source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:348 evidence=fnv1a64:089972ede1f4d5ca
+surface key=option:lake:--rehash kind=option argument=no personality=lake position=before-or-after-command spelling=--rehash source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:285 evidence=fnv1a64:855ce37f23665462
+surface key=option:lake:--repo kind=option argument=required personality=lake position=before-or-after-command spelling=--repo source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:300 evidence=fnv1a64:fc3ad8c1a2a41d66
+surface key=option:lake:--rev kind=option argument=required personality=lake position=before-or-after-command spelling=--rev source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:315 evidence=fnv1a64:faba0f271587e450
+surface key=option:lake:--scope kind=option argument=required personality=lake position=before-or-after-command spelling=--scope source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:297 evidence=fnv1a64:a7dd5d3cb79af4be
+surface key=option:lake:--service kind=option argument=required personality=lake position=before-or-after-command spelling=--service source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:294 evidence=fnv1a64:3c8743ee768e72d0
+surface key=option:lake:--text kind=option argument=no personality=lake position=before-or-after-command spelling=--text source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:279 evidence=fnv1a64:84efb5cbe07e8152
+surface key=option:lake:--toolchain kind=option argument=required personality=lake position=before-or-after-command spelling=--toolchain source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:309 evidence=fnv1a64:51ab15dd790cce1c
+surface key=option:lake:--trace kind=option argument=no personality=lake position=before-or-after-command spelling=--trace source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:374 evidence=fnv1a64:0defcaaf8ae77ef4
+surface key=option:lake:--try-cache kind=option argument=no personality=lake position=before-or-after-command spelling=--try-cache source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:284 evidence=fnv1a64:21f61eec8c3bf83a
+surface key=option:lake:--update kind=option argument=no personality=lake position=before-or-after-command spelling=--update source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:275 evidence=fnv1a64:4ca562bd04c2864a
+surface key=option:lake:--verbose kind=option argument=no personality=lake position=before-or-after-command spelling=--verbose source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:274 evidence=fnv1a64:d3f6f3789027521e
+surface key=option:lake:--wfail kind=option argument=no personality=lake position=before-or-after-command spelling=--wfail source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:287 evidence=fnv1a64:992e6a9fbc2db740
+surface key=option:lake:-H kind=option argument=no personality=lake position=before-or-after-command spelling=-H source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:221 evidence=fnv1a64:2962b44f4990bbc2
+surface key=option:lake:-J kind=option argument=no personality=lake position=before-or-after-command spelling=-J source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:222 evidence=fnv1a64:5214aeb9627813fa
+surface key=option:lake:-K kind=option argument=required personality=lake position=before-or-after-command spelling=-K source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:215 evidence=fnv1a64:45325a32da379856
+surface key=option:lake:-R kind=option argument=no personality=lake position=before-or-after-command spelling=-R source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:219 evidence=fnv1a64:d1d9374488fbac2a
+surface key=option:lake:-U kind=option argument=no personality=lake position=before-or-after-command spelling=-U source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:216 evidence=fnv1a64:a1812997f7e2a252
+surface key=option:lake:-d kind=option argument=required personality=lake position=before-or-after-command spelling=-d source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:212 evidence=fnv1a64:eb60abe1d85bc4c2
+surface key=option:lake:-f kind=option argument=required personality=lake position=before-or-after-command spelling=-f source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:213 evidence=fnv1a64:6101f442b7b891ae
+surface key=option:lake:-h kind=option argument=no personality=lake position=before-or-after-command spelling=-h source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:220 evidence=fnv1a64:a43486b775514c42
+surface key=option:lake:-o kind=option argument=required personality=lake position=before-or-after-command spelling=-o source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:214 evidence=fnv1a64:a6dc6c2a41c5cdc6
+surface key=option:lake:-q kind=option argument=no personality=lake position=before-or-after-command spelling=-q source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:210 evidence=fnv1a64:4db14eafdee479ba
+surface key=option:lake:-v kind=option argument=no personality=lake position=before-or-after-command spelling=-v source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:211 evidence=fnv1a64:a65bd4508a52a3c2
+surface key=option:lean:--bc kind=option argument=optional availability=all dispatch=b personality=lean spelling=--bc source=vendor/lean4-src/src/util/shell.cpp:179 evidence=fnv1a64:cbba46b8c3f5b7d5
+surface key=option:lean:--c kind=option argument=optional availability=all dispatch=c personality=lean spelling=--c source=vendor/lean4-src/src/util/shell.cpp:178 evidence=fnv1a64:9dac6796d642f464
+surface key=option:lean:--debug kind=option argument=required availability=feature:debug dispatch=B personality=lean spelling=--debug source=vendor/lean4-src/src/util/shell.cpp:199 evidence=fnv1a64:c39754a78c1d72b0
+surface key=option:lean:--deps kind=option argument=no availability=all dispatch=d personality=lean spelling=--deps source=vendor/lean4-src/src/util/shell.cpp:174 evidence=fnv1a64:293149b779b159c8
+surface key=option:lean:--deps-json kind=option argument=no availability=all dispatch=N personality=lean spelling=--deps-json source=vendor/lean4-src/src/util/shell.cpp:176 evidence=fnv1a64:fab1acf26bb6d61a
+surface key=option:lean:--error kind=option argument=required availability=all dispatch=E personality=lean spelling=--error source=vendor/lean4-src/src/util/shell.cpp:191 evidence=fnv1a64:7d7f9d19762b5b71
+surface key=option:lean:--exitOnPanic kind=option argument=no availability=all dispatch=e personality=lean spelling=--exitOnPanic source=vendor/lean4-src/src/util/shell.cpp:181 evidence=fnv1a64:ab77efe55902fe35
+surface key=option:lean:--features kind=option argument=no availability=all dispatch=f personality=lean spelling=--features source=vendor/lean4-src/src/util/shell.cpp:180 evidence=fnv1a64:97f57fe1ad917172
+surface key=option:lean:--githash kind=option argument=no availability=all dispatch=g personality=lean spelling=--githash source=vendor/lean4-src/src/util/shell.cpp:162 evidence=fnv1a64:0c0370cd43468583
+surface key=option:lean:--help kind=option argument=no availability=all dispatch=h personality=lean spelling=--help source=vendor/lean4-src/src/util/shell.cpp:161 evidence=fnv1a64:ae9de468ed4cf204
+surface key=option:lean:--i kind=option argument=optional availability=all dispatch=i personality=lean spelling=--i source=vendor/lean4-src/src/util/shell.cpp:166 evidence=fnv1a64:8f01987410cff082
+surface key=option:lean:--incr-header-save kind=option argument=required availability=all dispatch=H personality=lean spelling=--incr-header-save source=vendor/lean4-src/src/util/shell.cpp:197 evidence=fnv1a64:d9bc6bc055933910
+surface key=option:lean:--incr-load kind=option argument=required availability=all dispatch=Z personality=lean spelling=--incr-load source=vendor/lean4-src/src/util/shell.cpp:196 evidence=fnv1a64:119a45a4feabceda
+surface key=option:lean:--incr-save kind=option argument=required availability=all dispatch=Y personality=lean spelling=--incr-save source=vendor/lean4-src/src/util/shell.cpp:195 evidence=fnv1a64:94e09ec04899c241
+surface key=option:lean:--json kind=option argument=no availability=all dispatch=J personality=lean spelling=--json source=vendor/lean4-src/src/util/shell.cpp:192 evidence=fnv1a64:8b9f2daf03396226
+surface key=option:lean:--load-dynlib kind=option argument=required availability=all dispatch=l personality=lean spelling=--load-dynlib source=vendor/lean4-src/src/util/shell.cpp:189 evidence=fnv1a64:5cca3f8ab88abe6c
+surface key=option:lean:--memory kind=option argument=required availability=all dispatch=M personality=lean spelling=--memory source=vendor/lean4-src/src/util/shell.cpp:169 evidence=fnv1a64:4fd9f2cf00d31a19
+surface key=option:lean:--o kind=option argument=optional availability=all dispatch=o personality=lean spelling=--o source=vendor/lean4-src/src/util/shell.cpp:165 evidence=fnv1a64:6e2cfe741e91aae0
+surface key=option:lean:--plugin kind=option argument=required availability=all dispatch=p personality=lean spelling=--plugin source=vendor/lean4-src/src/util/shell.cpp:188 evidence=fnv1a64:8fd4f2c24de85cf0
+surface key=option:lean:--print-libdir kind=option argument=no availability=all dispatch=L personality=lean spelling=--print-libdir source=vendor/lean4-src/src/util/shell.cpp:194 evidence=fnv1a64:ab3d2f6fc16c4cf0
+surface key=option:lean:--print-prefix kind=option argument=no availability=all dispatch=x personality=lean spelling=--print-prefix source=vendor/lean4-src/src/util/shell.cpp:193 evidence=fnv1a64:fc6ffb4c4cfdc4b8
+surface key=option:lean:--profile kind=option argument=no availability=all dispatch=P personality=lean spelling=--profile source=vendor/lean4-src/src/util/shell.cpp:171 evidence=fnv1a64:87f619a19d01010c
+surface key=option:lean:--quiet kind=option argument=no availability=all dispatch=q personality=lean spelling=--quiet source=vendor/lean4-src/src/util/shell.cpp:173 evidence=fnv1a64:77d5fd4d0359ddb1
+surface key=option:lean:--root kind=option argument=required availability=all dispatch=R personality=lean spelling=--root source=vendor/lean4-src/src/util/shell.cpp:168 evidence=fnv1a64:bdf9af9a85801946
+surface key=option:lean:--run kind=option argument=no availability=all dispatch=r personality=lean spelling=--run source=vendor/lean4-src/src/util/shell.cpp:164 evidence=fnv1a64:cba4622c1efa06da
+surface key=option:lean:--server kind=option argument=no availability=feature:multi-thread dispatch=S personality=lean spelling=--server source=vendor/lean4-src/src/util/shell.cpp:185 evidence=fnv1a64:17d653f72a4f2f7f
+surface key=option:lean:--setup kind=option argument=required availability=all dispatch=u personality=lean spelling=--setup source=vendor/lean4-src/src/util/shell.cpp:190 evidence=fnv1a64:f8f14440d45a039b
+surface key=option:lean:--short-version kind=option argument=no availability=all dispatch=V personality=lean spelling=--short-version source=vendor/lean4-src/src/util/shell.cpp:163 evidence=fnv1a64:b515885baf8f8256
+surface key=option:lean:--src-deps kind=option argument=no availability=all dispatch=O personality=lean spelling=--src-deps source=vendor/lean4-src/src/util/shell.cpp:175 evidence=fnv1a64:bc90de6cc7f1bc77
+surface key=option:lean:--stats kind=option argument=no availability=all dispatch=a personality=lean spelling=--stats source=vendor/lean4-src/src/util/shell.cpp:172 evidence=fnv1a64:7df06d0bf59dcdc7
+surface key=option:lean:--stdin kind=option argument=no availability=all dispatch=I personality=lean spelling=--stdin source=vendor/lean4-src/src/util/shell.cpp:167 evidence=fnv1a64:7c09c5e95bec18fd
+surface key=option:lean:--threads kind=option argument=required availability=feature:multi-thread dispatch=j personality=lean spelling=--threads source=vendor/lean4-src/src/util/shell.cpp:183 evidence=fnv1a64:77a5102e64d488fc
+surface key=option:lean:--timeout kind=option argument=optional availability=all dispatch=T personality=lean spelling=--timeout source=vendor/lean4-src/src/util/shell.cpp:177 evidence=fnv1a64:2d7f5d1ece3017e5
+surface key=option:lean:--trust kind=option argument=required availability=all dispatch=t personality=lean spelling=--trust source=vendor/lean4-src/src/util/shell.cpp:170 evidence=fnv1a64:ecc34b198597c30e
+surface key=option:lean:--tstack kind=option argument=required availability=feature:multi-thread dispatch=s personality=lean spelling=--tstack source=vendor/lean4-src/src/util/shell.cpp:184 evidence=fnv1a64:abb91ae7c94135a5
+surface key=option:lean:--version kind=option argument=no availability=all dispatch=v personality=lean spelling=--version source=vendor/lean4-src/src/util/shell.cpp:160 evidence=fnv1a64:a7e49dcd376de9e0
+surface key=option:lean:--worker kind=option argument=no availability=feature:multi-thread dispatch=W personality=lean spelling=--worker source=vendor/lean4-src/src/util/shell.cpp:186 evidence=fnv1a64:3553edb27b781e45
+surface key=option:lean:-C kind=option aliases=none argument=required availability=all dispatch=unknown personality=lean spelling=-C source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:9f6fe3fd920e4309
+surface key=option:lean:-D kind=option aliases=none argument=required availability=all dispatch=handled personality=lean spelling=-D source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:b70c139e3bc351e9
+surface key=option:lean:-E kind=option aliases=--error argument=required availability=all dispatch=handled personality=lean spelling=-E source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:98add3e3bd084c0e
+surface key=option:lean:-H kind=option aliases=--incr-header-save argument=required availability=all dispatch=handled personality=lean spelling=-H source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:969a030610e890f5
+surface key=option:lean:-M kind=option aliases=--memory argument=required availability=all dispatch=handled personality=lean spelling=-M source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:2d5780a3f6e06542
+surface key=option:lean:-P kind=option aliases=--profile argument=no availability=all dispatch=handled personality=lean spelling=-P source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:a645930486284181
+surface key=option:lean:-R kind=option aliases=--root argument=required availability=all dispatch=handled personality=lean spelling=-R source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:d6ef92fc0ffa5d1f
+surface key=option:lean:-T kind=option aliases=--timeout argument=required availability=all dispatch=handled personality=lean spelling=-T source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:b9b5ea1231949123
+surface key=option:lean:-V kind=option aliases=--short-version argument=no availability=all dispatch=handled personality=lean spelling=-V source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:ac695a7ce6127e59
+surface key=option:lean:-Y kind=option aliases=--incr-save argument=required availability=all dispatch=handled personality=lean spelling=-Y source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:91d5d3048c934b78
+surface key=option:lean:-Z kind=option aliases=--incr-load argument=required availability=all dispatch=handled personality=lean spelling=-Z source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:b85981d63751a713
+surface key=option:lean:-a kind=option aliases=--stats argument=no availability=all dispatch=handled personality=lean spelling=-a source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:c9c7608c6cdbbc8f
+surface key=option:lean:-b kind=option aliases=--bc argument=required availability=all dispatch=handled personality=lean spelling=-b source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:bd82ec6839f77b16
+surface key=option:lean:-c kind=option aliases=--c argument=required availability=all dispatch=handled personality=lean spelling=-c source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:4d5c1e6fa07c96dd
+surface key=option:lean:-d kind=option aliases=--deps argument=no availability=all dispatch=handled personality=lean spelling=-d source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:265d0c94c29008d1
+surface key=option:lean:-e kind=option aliases=--exitOnPanic argument=no availability=all dispatch=handled personality=lean spelling=-e source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:c58f10d11bfb434e
+surface key=option:lean:-g kind=option aliases=--githash argument=no availability=all dispatch=handled personality=lean spelling=-g source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:7a62f82cabf3455a
+surface key=option:lean:-h kind=option aliases=--help argument=no availability=all dispatch=handled personality=lean spelling=-h source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:eb09b73e8ea2af38
+surface key=option:lean:-i kind=option aliases=--i argument=required availability=all dispatch=handled personality=lean spelling=-i source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:2ab14d678c493307
+surface key=option:lean:-j kind=option aliases=--threads argument=required availability=all dispatch=handled personality=lean spelling=-j source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:7e4992e2ad8c2149
+surface key=option:lean:-o kind=option aliases=--o argument=required availability=all dispatch=handled personality=lean spelling=-o source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:855dff90c4e8dcd1
+surface key=option:lean:-p kind=option aliases=--plugin argument=required availability=all dispatch=handled personality=lean spelling=-p source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:b430f023b70d470a
+surface key=option:lean:-q kind=option aliases=--quiet argument=no availability=all dispatch=handled personality=lean spelling=-q source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:44458a5a0889582c
+surface key=option:lean:-r kind=option aliases=--run argument=no availability=all dispatch=handled personality=lean spelling=-r source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:e733ed39aeb9327d
+surface key=option:lean:-s kind=option aliases=--tstack argument=required availability=feature:multi-thread dispatch=handled personality=lean spelling=-s source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:5e71b5bebb8231b9
+surface key=option:lean:-t kind=option aliases=--trust argument=required availability=all dispatch=handled personality=lean spelling=-t source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:37092c5d515ec4a4
+surface key=option:lean:-v kind=option aliases=--version argument=no availability=all dispatch=handled personality=lean spelling=-v source=vendor/lean4-src/src/util/shell.cpp:204 evidence=fnv1a64:c3496121fb4b6358
+surface key=outcome:cancelled kind=outcome disposition=inconclusive input=cancelled personality=all source=crates/fln-conformance/src/cli_lake_census.rs:1 evidence=fnv1a64:5e8cec987769b82a
+surface key=outcome:error kind=outcome disposition=rejected input=error personality=all source=crates/fln-conformance/src/cli_lake_census.rs:1 evidence=fnv1a64:7b33b88d7c4b7128
+surface key=outcome:internal-fault kind=outcome disposition=internal-fault input=internal-fault personality=all source=crates/fln-conformance/src/cli_lake_census.rs:1 evidence=fnv1a64:e41bdb3f038990cc
+surface key=outcome:malformed kind=outcome disposition=rejected input=malformed personality=all source=crates/fln-conformance/src/cli_lake_census.rs:1 evidence=fnv1a64:d448840d439c0700
+surface key=outcome:resource-exhausted kind=outcome disposition=inconclusive input=resource-exhausted personality=all source=crates/fln-conformance/src/cli_lake_census.rs:1 evidence=fnv1a64:4245ee1306180232
+surface key=outcome:success kind=outcome disposition=accepted input=success personality=all source=crates/fln-conformance/src/cli_lake_census.rs:1 evidence=fnv1a64:d0b5d8408d783e2f
+surface key=outcome:unknown kind=outcome disposition=rejected input=unknown personality=all source=crates/fln-conformance/src/cli_lake_census.rs:1 evidence=fnv1a64:76cf16e3f072a1f0
+surface key=personality:lake kind=personality binary=lake personality=lake source=vendor/lean4-src/src/lake/Lake/CLI/Main.lean:1 evidence=fnv1a64:e89fd05c8de52c1d
+surface key=personality:lean kind=personality binary=lean personality=lean source=vendor/lean4-src/src/Lean/Shell.lean:1 evidence=fnv1a64:5ce9855dc8262b7e
+surface key=personality:leanc kind=personality binary=leanc personality=leanc source=vendor/lean4-src/src/bin/leanc.in:1 evidence=fnv1a64:00cdb2d989cb7a10
+transcript key=lean:help personality=lean argv=--help stdin=none exit=0 stdout=fnv1a64:b46747cc09ef0f0d stderr=fnv1a64:cbf29ce484222325 stdout-bytes=2994 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lean:version personality=lean argv=--version stdin=none exit=0 stdout=fnv1a64:0cb47751408537f0 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=106 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lean:short-version personality=lean argv=--short-version stdin=none exit=0 stdout=fnv1a64:b38d9f98ca51abaa stderr=fnv1a64:cbf29ce484222325 stdout-bytes=7 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lean:githash personality=lean argv=--githash stdin=none exit=0 stdout=fnv1a64:6f817141cac2c7f2 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=41 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lean:features personality=lean argv=--features stdin=none exit=0 stdout=fnv1a64:dcd1cd1a2138b85d stderr=fnv1a64:cbf29ce484222325 stdout-bytes=3 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lean:print-prefix personality=lean argv=--print-prefix stdin=none exit=0 stdout=fnv1a64:3a6bc51a826b4fe6 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=12 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lean:print-libdir personality=lean argv=--print-libdir stdin=none exit=0 stdout=fnv1a64:2600cabf472239c9 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=21 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lean:unknown-option personality=lean argv=--fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:c9aa4d51397dbd0c stdout-bytes=0 stderr-bytes=3087 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=lean:malformed-timeout personality=lean argv=--timeout%3Dnot-a-number stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:3fe67dc693fdccc0 stdout-bytes=0 stderr-bytes=49 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=lean:stdin-success personality=lean argv=--stdin stdin=fnv1a64:20e69cf785adc705 exit=0 stdout=fnv1a64:cffade031a48fc6c stderr=fnv1a64:cbf29ce484222325 stdout-bytes=11 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lean:json-error personality=lean argv=--json%1F--stdin stdin=fnv1a64:be31e3b8471a7832 exit=1 stdout=fnv1a64:0386c33020347a32 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=249 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lake:usage personality=lake argv=%3Cnone%3E stdin=none exit=0 stdout=fnv1a64:467de32e53924325 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=3632 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lake:help personality=lake argv=--help stdin=none exit=0 stdout=fnv1a64:467de32e53924325 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=3632 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lake:help-build personality=lake argv=help%1Fbuild stdin=none exit=0 stdout=fnv1a64:af05068acad7c179 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=2435 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lake:help-query personality=lake argv=help%1Fquery stdin=none exit=0 stdout=fnv1a64:0cac46a28894ba99 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=512 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lake:help-env personality=lake argv=help%1Fenv stdin=none exit=0 stdout=fnv1a64:4daf9734ceea4795 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=1235 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lake:version personality=lake argv=--version stdin=none exit=0 stdout=fnv1a64:6020b3f4664e231d stderr=fnv1a64:cbf29ce484222325 stdout-bytes=53 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=lake:unknown-command personality=lake argv=fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:bfd9b9f64279927d stdout-bytes=0 stderr-bytes=44 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=lake:unknown-option personality=lake argv=--fln-census-unknown%1Fhelp stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:29c39a3bf54c2791 stdout-bytes=0 stderr-bytes=50 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=lake:missing-dir-value personality=lake argv=--dir stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:516858335aeccc48 stdout-bytes=0 stderr-bytes=30 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=lake:missing-root personality=lake argv=--dir%1F/fln-cli-census/absent%1Fbuild stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:4ea31563d5e9857e stdout-bytes=0 stderr-bytes=61 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript key=lake:json-help personality=lake argv=--json%1Fhelp%1Fquery stdin=none exit=0 stdout=fnv1a64:0cac46a28894ba99 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=512 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=leanc:help personality=leanc argv=--help stdin=none exit=0 stdout=fnv1a64:062f7574691c742b stderr=fnv1a64:cbf29ce484222325 stdout-bytes=131382 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=leanc:version personality=leanc argv=--version stdin=none exit=0 stdout=fnv1a64:5752864827c78f0f stderr=fnv1a64:cbf29ce484222325 stdout-bytes=184 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+transcript key=leanc:unknown-option personality=leanc argv=--fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:c2ea5af023beaf6c stdout-bytes=0 stderr-bytes=55 channel=stderr normalizer=paths-crlf-ansi-v1
+raw-end
+raw-root fnv1a64:9b5622c70f0d6097
+policy-root fnv1a64:1c626200d46049e6
+transcript-root fnv1a64:a687b3f8f8ae3bdf
+inventory-root fnv1a64:71d2e1e9835ee532

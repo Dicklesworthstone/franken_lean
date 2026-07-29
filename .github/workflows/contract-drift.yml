@@ -104,6 +104,12 @@ jobs:
         run: |
           python3 -I -S scripts/extract/gen_lsp_wire_census.py --check
 
+      - name: verify the pinned CLI and Lake census
+        shell: bash
+        run: |
+          python3 -I -S scripts/extract/gen_cli_lake_census.py --check
+          python3 -I -S scripts/extract/gen_cli_lake_census.py --check-probes
+
       - name: pin-dependent conformance suites (fln-rgha)
         shell: bash
         env:
@@ -112,7 +118,8 @@ jobs:
           # Four binaries carry typed-skip sites cited by NINE terminal coverage rows in
           # ci/VERIFICATION_MANIFEST.jsonl; the fifth is the manifest-complete LSP producer
           # proof, the sixth is the G0-4 syntax/hygiene Reference differential, and the
-          # seventh is the per-frontend diagnostic projection differential. All seven are
+          # seventh is the per-frontend diagnostic projection differential. The eighth is
+          # the complete CLI/Lake census differential. All eight are
           # compiled PinRig entries. Until this step the nine cited rows
           # had never executed in any workflow: ci.yml installs no Lean pin and this workflow
           # ran no cargo, so the intersection was empty (bead fln-rgha).
@@ -148,6 +155,7 @@ jobs:
             --test ext_observable_capture \
             --test pin_ctor_inventory \
             --test lsp_census_no_mock_e2e \
+            --test cli_lake_census_no_mock_e2e \
             --test g0_4_no_mock_e2e \
             --test diag_render \
             -- --nocapture > "$log" 2>&1
@@ -175,12 +183,12 @@ jobs:
           fi
           # These two floors answer only whether the command shape collapsed. They do not
           # carry execution evidence; the structured records above do.
-          if (( result_lines < 7 )); then
-            echo "rgha-join: REFUSED - only $result_lines of 7 binaries reported a result" >&2
+          if (( result_lines < 8 )); then
+            echo "rgha-join: REFUSED - only $result_lines of 8 binaries reported a result" >&2
             fail=1
           fi
-          if (( passed < 27 )); then
-            echo "rgha-join: REFUSED - only $passed tests ran (floor 27 after diag_render registration); a zero-test cargo success is not a run" >&2
+          if (( passed < 28 )); then
+            echo "rgha-join: REFUSED - only $passed tests ran (floor 28 after CLI/Lake census registration); a zero-test cargo success is not a run" >&2
             fail=1
           fi
           (( fail )) && exit 2

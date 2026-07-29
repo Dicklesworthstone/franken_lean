@@ -1,0 +1,30 @@
+schema fln-cli-lake-transcripts/1
+reference tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 platform=linux-x86_64
+normalizer paths-crlf-ansi-v1
+probe-count 25
+probe key=lean:help personality=lean argv=--help stdin=none exit=0 stdout=fnv1a64:b46747cc09ef0f0d stderr=fnv1a64:cbf29ce484222325 stdout-bytes=2994 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lean:version personality=lean argv=--version stdin=none exit=0 stdout=fnv1a64:0cb47751408537f0 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=106 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lean:short-version personality=lean argv=--short-version stdin=none exit=0 stdout=fnv1a64:b38d9f98ca51abaa stderr=fnv1a64:cbf29ce484222325 stdout-bytes=7 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lean:githash personality=lean argv=--githash stdin=none exit=0 stdout=fnv1a64:6f817141cac2c7f2 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=41 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lean:features personality=lean argv=--features stdin=none exit=0 stdout=fnv1a64:dcd1cd1a2138b85d stderr=fnv1a64:cbf29ce484222325 stdout-bytes=3 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lean:print-prefix personality=lean argv=--print-prefix stdin=none exit=0 stdout=fnv1a64:3a6bc51a826b4fe6 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=12 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lean:print-libdir personality=lean argv=--print-libdir stdin=none exit=0 stdout=fnv1a64:2600cabf472239c9 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=21 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lean:unknown-option personality=lean argv=--fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:c9aa4d51397dbd0c stdout-bytes=0 stderr-bytes=3087 channel=stderr normalizer=paths-crlf-ansi-v1
+probe key=lean:malformed-timeout personality=lean argv=--timeout%3Dnot-a-number stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:3fe67dc693fdccc0 stdout-bytes=0 stderr-bytes=49 channel=stderr normalizer=paths-crlf-ansi-v1
+probe key=lean:stdin-success personality=lean argv=--stdin stdin=fnv1a64:20e69cf785adc705 exit=0 stdout=fnv1a64:cffade031a48fc6c stderr=fnv1a64:cbf29ce484222325 stdout-bytes=11 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lean:json-error personality=lean argv=--json%1F--stdin stdin=fnv1a64:be31e3b8471a7832 exit=1 stdout=fnv1a64:0386c33020347a32 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=249 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lake:usage personality=lake argv=%3Cnone%3E stdin=none exit=0 stdout=fnv1a64:467de32e53924325 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=3632 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lake:help personality=lake argv=--help stdin=none exit=0 stdout=fnv1a64:467de32e53924325 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=3632 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lake:help-build personality=lake argv=help%1Fbuild stdin=none exit=0 stdout=fnv1a64:af05068acad7c179 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=2435 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lake:help-query personality=lake argv=help%1Fquery stdin=none exit=0 stdout=fnv1a64:0cac46a28894ba99 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=512 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lake:help-env personality=lake argv=help%1Fenv stdin=none exit=0 stdout=fnv1a64:4daf9734ceea4795 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=1235 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lake:version personality=lake argv=--version stdin=none exit=0 stdout=fnv1a64:6020b3f4664e231d stderr=fnv1a64:cbf29ce484222325 stdout-bytes=53 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=lake:unknown-command personality=lake argv=fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:bfd9b9f64279927d stdout-bytes=0 stderr-bytes=44 channel=stderr normalizer=paths-crlf-ansi-v1
+probe key=lake:unknown-option personality=lake argv=--fln-census-unknown%1Fhelp stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:29c39a3bf54c2791 stdout-bytes=0 stderr-bytes=50 channel=stderr normalizer=paths-crlf-ansi-v1
+probe key=lake:missing-dir-value personality=lake argv=--dir stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:516858335aeccc48 stdout-bytes=0 stderr-bytes=30 channel=stderr normalizer=paths-crlf-ansi-v1
+probe key=lake:missing-root personality=lake argv=--dir%1F/fln-cli-census/absent%1Fbuild stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:4ea31563d5e9857e stdout-bytes=0 stderr-bytes=61 channel=stderr normalizer=paths-crlf-ansi-v1
+probe key=lake:json-help personality=lake argv=--json%1Fhelp%1Fquery stdin=none exit=0 stdout=fnv1a64:0cac46a28894ba99 stderr=fnv1a64:cbf29ce484222325 stdout-bytes=512 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=leanc:help personality=leanc argv=--help stdin=none exit=0 stdout=fnv1a64:062f7574691c742b stderr=fnv1a64:cbf29ce484222325 stdout-bytes=131382 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=leanc:version personality=leanc argv=--version stdin=none exit=0 stdout=fnv1a64:5752864827c78f0f stderr=fnv1a64:cbf29ce484222325 stdout-bytes=184 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
+probe key=leanc:unknown-option personality=leanc argv=--fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:c2ea5af023beaf6c stdout-bytes=0 stderr-bytes=55 channel=stderr normalizer=paths-crlf-ansi-v1
+transcript-root fnv1a64:a687b3f8f8ae3bdf

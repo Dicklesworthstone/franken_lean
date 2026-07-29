@@ -41,6 +41,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cli_lake_census;
 pub mod corpus;
 pub mod execution;
 pub mod fuel;
