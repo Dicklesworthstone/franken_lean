@@ -630,11 +630,16 @@ fn limb_layout(count: usize) -> Layout {
 /// fln-bignum shim; this slice owns allocation, view, and teardown.
 ///
 /// # Safety
-/// Caller owns the result. `limbs` must be normalized (no leading zero limb)
-/// for value-semantics comparisons to match upstream.
+/// Caller owns the result. Redundant high zero limbs are trimmed before
+/// allocation, and a zero magnitude cannot retain a negative sign.
 // UNSAFE-LEDGER: FLN-UL-0032
 #[allow(unsafe_code)]
 pub(crate) unsafe fn alloc_mpz(limbs: &[u64], negative: bool) -> *mut LeanObject {
+    let live = limbs
+        .iter()
+        .rposition(|limb| *limb != 0)
+        .map_or(0, |index| index + 1);
+    let limbs = &limbs[..live];
     let n = limbs.len();
     assert!(i32::try_from(n).is_ok(), "mpz limb count exceeds i32");
     let buf = if n == 0 {
@@ -671,26 +676,27 @@ pub(crate) unsafe fn alloc_mpz(limbs: &[u64], negative: bool) -> *mut LeanObject
     o
 }
 
-/// Mpz salient view `(m_alloc, m_size, limb copy)`.
+/// Raw mpz salient fields `(m_alloc, m_size, limb pointer, live count)`.
+///
+/// This function deliberately does not turn the pointer into either an owned
+/// allocation or a reference with an unconstrained lifetime. The safe
+/// [`crate::handle::Obj`] observer binds the immutable slice to `&self`; the C
+/// export bridge binds it to a non-escaping callback invocation.
 ///
 /// # Safety
 /// `o` live mpz object.
 // UNSAFE-LEDGER: FLN-UL-0033
 #[allow(unsafe_code)]
-pub(crate) unsafe fn mpz_fields(o: *mut LeanObject) -> (i32, i32, Vec<u64>) {
-    // SAFETY: live mpz; |m_size| limbs are salient per the G0-1 law.
+pub(crate) unsafe fn mpz_fields(o: *mut LeanObject) -> (i32, i32, *const u64, usize) {
+    // SAFETY: live mpz; these are fixed-size field reads. The pointer is not
+    // dereferenced here.
     unsafe {
         let m = o.cast::<LeanMpzObject>();
         let alloc_ct = (&raw const (*m).m_alloc).read();
         let size = (&raw const (*m).m_size).read();
         let p = (&raw const (*m).m_limbs).read();
         let live = usize::try_from(size.unsigned_abs()).expect("mpz size");
-        let copy = if p.is_null() {
-            Vec::new()
-        } else {
-            core::slice::from_raw_parts(p, live).to_vec()
-        };
-        (alloc_ct, size, copy)
+        (alloc_ct, size, p.cast_const(), live)
     }
 }
 

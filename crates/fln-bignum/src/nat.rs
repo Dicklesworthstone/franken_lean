@@ -8,6 +8,9 @@
 //! trailing zero limbs; the empty limb vector is zero. This is deliberately
 //! identical to `fln_core::expr::NatLit`'s representation, which is what lets
 //! `interop` move values across the term-plane boundary without reshaping them.
+//! [`BigNatView`] applies the same invariant to borrowed storage by shortening
+//! a slice only, so the ABI boundary can consume limbs without first copying
+//! them into an owned value.
 //!
 //! No hot path recurses. The two operations whose *result* grows without bound
 //! in their argument — [`BigNat::shl`] and [`BigNat::pow`] — size that result
@@ -24,6 +27,17 @@ use std::cmp::Ordering;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BigNat {
     limbs: Vec<u64>,
+}
+
+/// Immutable, zero-copy view of a natural-number magnitude.
+///
+/// The view borrows normalized little-endian limbs. Construction trims only
+/// trailing zero limbs by shortening the slice; it never allocates or rewrites
+/// the borrowed storage. This is the Marrow bridge: an ABI `mpz` limb buffer can
+/// participate in arithmetic directly, with allocations reserved for results.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BigNatView<'a> {
+    limbs: &'a [u64],
 }
 
 /// `10^19`: the largest power of ten with `10^k - 1` representable in `u64`.
@@ -92,6 +106,209 @@ fn shl1_in_place(r: &mut Vec<u64>) {
     }
 }
 
+fn bit_length_limbs(limbs: &[u64]) -> u64 {
+    match limbs.last() {
+        None => 0,
+        Some(&top) => (limbs.len() as u64 - 1) * 64 + u64::from(64 - top.leading_zeros()),
+    }
+}
+
+fn add_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let mut out = Vec::with_capacity(longer.len() + 1);
+    let mut carry = 0u128;
+    let mut short_iter = shorter.iter();
+    for &a in longer {
+        let b = short_iter.next().copied().unwrap_or(0);
+        let sum = u128::from(a) + u128::from(b) + carry;
+        out.push(sum as u64);
+        carry = sum >> 64;
+    }
+    if carry != 0 {
+        out.push(carry as u64);
+    }
+    BigNat { limbs: out }
+}
+
+fn sub_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    if cmp_limbs(a, b) != Ordering::Greater {
+        return BigNat::zero();
+    }
+    let mut out = a.to_vec();
+    sub_in_place(&mut out, b);
+    BigNat { limbs: out }
+}
+
+fn mul_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    if a.is_empty() || b.is_empty() {
+        return BigNat::zero();
+    }
+    let mut out = vec![0u64; a.len() + b.len()];
+    for (i, &x) in a.iter().enumerate() {
+        let mut carry = 0u128;
+        for (j, &y) in b.iter().enumerate() {
+            if let Some(slot) = out.get_mut(i + j) {
+                let cur = u128::from(*slot) + u128::from(x) * u128::from(y) + carry;
+                *slot = cur as u64;
+                carry = cur >> 64;
+            }
+        }
+        if let Some(slot) = out.get_mut(i + b.len()) {
+            *slot = (u128::from(*slot) + carry) as u64;
+        }
+    }
+    BigNat::from_limbs_le(out)
+}
+
+fn div_rem_limbs(dividend: &[u64], divisor: &[u64]) -> (BigNat, BigNat) {
+    if divisor.is_empty() || cmp_limbs(dividend, divisor) == Ordering::Less {
+        return (BigNat::zero(), BigNat::from_limbs_le(dividend.to_vec()));
+    }
+    let bits = bit_length_limbs(dividend);
+    let mut quotient = vec![0u64; dividend.len()];
+    let mut remainder: Vec<u64> = Vec::with_capacity(divisor.len() + 1);
+    for i in (0..bits).rev() {
+        shl1_in_place(&mut remainder);
+        let limb_idx = (i / 64) as usize;
+        let bit = dividend
+            .get(limb_idx)
+            .map_or(0, |&limb| (limb >> (i % 64)) & 1);
+        if bit == 1 {
+            if let Some(first) = remainder.first_mut() {
+                *first |= 1;
+            } else {
+                remainder.push(1);
+            }
+        }
+        if cmp_limbs(&remainder, divisor) != Ordering::Less {
+            sub_in_place(&mut remainder, divisor);
+            if let Some(slot) = quotient.get_mut(limb_idx) {
+                *slot |= 1u64 << (i % 64);
+            }
+        }
+    }
+    (
+        BigNat::from_limbs_le(quotient),
+        BigNat::from_limbs_le(remainder),
+    )
+}
+
+fn checked_pow_limbs(limbs: &[u64], exp: u32) -> Option<BigNat> {
+    let result_bits = u128::from(bit_length_limbs(limbs)) * u128::from(exp);
+    if result_bits / 64 + 1 > MAX_LIMBS as u128 {
+        return None;
+    }
+    let source = BigNatView::from_limbs_le(limbs);
+    let mut result = BigNat::from_u64(1);
+    let mut squared: Option<BigNat> = None;
+    let mut e = exp;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = match squared.as_ref() {
+                Some(base) => mul_limbs(result.limbs_le(), base.limbs_le()),
+                None => mul_limbs(result.limbs_le(), source.limbs_le()),
+            };
+        }
+        e >>= 1;
+        if e > 0 {
+            squared = Some(match squared.as_ref() {
+                Some(base) => mul_limbs(base.limbs_le(), base.limbs_le()),
+                None => mul_limbs(source.limbs_le(), source.limbs_le()),
+            });
+        }
+    }
+    Some(result)
+}
+
+impl<'a> BigNatView<'a> {
+    /// Borrow little-endian limbs, normalizing by shortening the view only.
+    pub fn from_limbs_le(mut limbs: &'a [u64]) -> Self {
+        while limbs.last() == Some(&0) {
+            limbs = &limbs[..limbs.len() - 1];
+        }
+        Self { limbs }
+    }
+
+    /// The borrowed normalized little-endian limbs.
+    pub fn limbs_le(self) -> &'a [u64] {
+        self.limbs
+    }
+
+    /// Materialize an owned value when ownership is explicitly required.
+    pub fn to_owned(self) -> BigNat {
+        BigNat::from_limbs_le(self.limbs.to_vec())
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.limbs.is_empty()
+    }
+
+    pub fn bit_length(self) -> u64 {
+        bit_length_limbs(self.limbs)
+    }
+
+    pub fn to_u64(self) -> Option<u64> {
+        match self.limbs {
+            [] => Some(0),
+            [value] => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn beq(self, other: BigNatView<'_>) -> bool {
+        cmp_limbs(self.limbs, other.limbs) == Ordering::Equal
+    }
+
+    pub fn ble(self, other: BigNatView<'_>) -> bool {
+        cmp_limbs(self.limbs, other.limbs) != Ordering::Greater
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(self, other: BigNatView<'_>) -> BigNat {
+        add_limbs(self.limbs, other.limbs)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn sub(self, other: BigNatView<'_>) -> BigNat {
+        sub_limbs(self.limbs, other.limbs)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn mul(self, other: BigNatView<'_>) -> BigNat {
+        mul_limbs(self.limbs, other.limbs)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn div(self, other: BigNatView<'_>) -> BigNat {
+        self.div_rem(other).0
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn rem(self, other: BigNatView<'_>) -> BigNat {
+        self.div_rem(other).1
+    }
+
+    pub fn div_rem(self, other: BigNatView<'_>) -> (BigNat, BigNat) {
+        div_rem_limbs(self.limbs, other.limbs)
+    }
+
+    pub fn checked_pow(self, exp: u32) -> Option<BigNat> {
+        checked_pow_limbs(self.limbs, exp)
+    }
+
+    /// # Panics
+    /// If the result would exceed [`MAX_LIMBS`] limbs.
+    pub fn pow(self, exp: u32) -> BigNat {
+        self.checked_pow(exp).unwrap_or_else(|| {
+            panic!(
+                "BigNatView::pow: raising a {}-bit value to {exp} exceeds MAX_LIMBS \
+                 ({MAX_LIMBS}); the caller must charge the result size before exponentiating",
+                self.bit_length()
+            )
+        })
+    }
+}
+
 impl BigNat {
     /// The natural number zero (empty limb vector).
     pub fn zero() -> BigNat {
@@ -111,6 +328,11 @@ impl BigNat {
     pub fn from_limbs_le(mut limbs: Vec<u64>) -> BigNat {
         normalize(&mut limbs);
         BigNat { limbs }
+    }
+
+    /// Borrow this value without copying its limb storage.
+    pub fn as_view(&self) -> BigNatView<'_> {
+        BigNatView { limbs: &self.limbs }
     }
 
     /// Parses a decimal string. `None` on empty input or any non-digit byte;
@@ -184,79 +406,37 @@ impl BigNat {
 
     /// Number of significant bits; `bit_length(0) = 0`.
     pub fn bit_length(&self) -> u64 {
-        match self.limbs.last() {
-            None => 0,
-            Some(&top) => (self.limbs.len() as u64 - 1) * 64 + u64::from(64 - top.leading_zeros()),
-        }
+        bit_length_limbs(&self.limbs)
     }
 
     /// Kernel-facing `Nat.beq` (KR-313).
     pub fn beq(&self, other: &BigNat) -> bool {
-        self == other
+        self.as_view().beq(other.as_view())
     }
 
     /// Kernel-facing `Nat.ble` (KR-313).
     pub fn ble(&self, other: &BigNat) -> bool {
-        self <= other
+        self.as_view().ble(other.as_view())
     }
 
     /// `self + other`.
     #[allow(clippy::should_implement_trait)]
     pub fn add(&self, other: &BigNat) -> BigNat {
-        let (longer, shorter) = if self.limbs.len() >= other.limbs.len() {
-            (&self.limbs, &other.limbs)
-        } else {
-            (&other.limbs, &self.limbs)
-        };
-        let mut out = Vec::with_capacity(longer.len() + 1);
-        let mut carry = 0u128;
-        let mut short_iter = shorter.iter();
-        for &a in longer {
-            let b = short_iter.next().copied().unwrap_or(0);
-            let sum = u128::from(a) + u128::from(b) + carry;
-            out.push(sum as u64);
-            carry = sum >> 64;
-        }
-        if carry != 0 {
-            out.push(carry as u64);
-        }
-        BigNat { limbs: out }
+        add_limbs(&self.limbs, &other.limbs)
     }
 
     /// Truncated subtraction, Lean `Nat.sub` semantics: `self - other`, floored
     /// at zero (KR-313).
     #[allow(clippy::should_implement_trait)]
     pub fn sub(&self, other: &BigNat) -> BigNat {
-        if self <= other {
-            return BigNat::zero();
-        }
-        let mut out = self.limbs.clone();
-        sub_in_place(&mut out, &other.limbs);
-        BigNat { limbs: out }
+        sub_limbs(&self.limbs, &other.limbs)
     }
 
     /// `self * other`, schoolbook with `u128` intermediates (KR-313;
     /// performance is gated later, PG-K).
     #[allow(clippy::should_implement_trait)]
     pub fn mul(&self, other: &BigNat) -> BigNat {
-        if self.is_zero() || other.is_zero() {
-            return BigNat::zero();
-        }
-        let mut out = vec![0u64; self.limbs.len() + other.limbs.len()];
-        for (i, &x) in self.limbs.iter().enumerate() {
-            let mut carry = 0u128;
-            for (j, &y) in other.limbs.iter().enumerate() {
-                if let Some(slot) = out.get_mut(i + j) {
-                    let cur = u128::from(*slot) + u128::from(x) * u128::from(y) + carry;
-                    *slot = cur as u64;
-                    carry = cur >> 64;
-                }
-            }
-            if let Some(slot) = out.get_mut(i + other.limbs.len()) {
-                *slot = (u128::from(*slot) + carry) as u64;
-            }
-        }
-        BigNat::from_limbs_le(out)
+        mul_limbs(&self.limbs, &other.limbs)
     }
 
     /// Euclidean quotient with Lean semantics: `x / 0 = 0` (KR-313).
@@ -274,37 +454,7 @@ impl BigNat {
     /// Lean laws: `(x, 0) -> (0, x)`. Invariant on exit for nonzero divisor:
     /// `self = q * other + r` with `r < other`.
     pub fn div_rem(&self, other: &BigNat) -> (BigNat, BigNat) {
-        if other.is_zero() || self < other {
-            return (BigNat::zero(), self.clone());
-        }
-        let bits = self.bit_length();
-        let mut quotient = vec![0u64; self.limbs.len()];
-        let mut remainder: Vec<u64> = Vec::with_capacity(other.limbs.len() + 1);
-        for i in (0..bits).rev() {
-            shl1_in_place(&mut remainder);
-            let limb_idx = (i / 64) as usize;
-            let bit = self
-                .limbs
-                .get(limb_idx)
-                .map_or(0, |&limb| (limb >> (i % 64)) & 1);
-            if bit == 1 {
-                if let Some(first) = remainder.first_mut() {
-                    *first |= 1;
-                } else {
-                    remainder.push(1);
-                }
-            }
-            if cmp_limbs(&remainder, &other.limbs) != Ordering::Less {
-                sub_in_place(&mut remainder, &other.limbs);
-                if let Some(slot) = quotient.get_mut(limb_idx) {
-                    *slot |= 1u64 << (i % 64);
-                }
-            }
-        }
-        (
-            BigNat::from_limbs_le(quotient),
-            BigNat::from_limbs_le(remainder),
-        )
+        div_rem_limbs(&self.limbs, &other.limbs)
     }
 
     /// `self ^ exp` by iterative square-and-multiply; `x ^ 0 = 1` (KR-313
@@ -332,23 +482,7 @@ impl BigNat {
     /// is heading for — the loop stops squaring once the exponent is exhausted
     /// — so bounding the result bounds every intermediate too.
     pub fn checked_pow(&self, exp: u32) -> Option<BigNat> {
-        let result_bits = u128::from(self.bit_length()) * u128::from(exp);
-        if result_bits / 64 + 1 > MAX_LIMBS as u128 {
-            return None;
-        }
-        let mut result = BigNat::from_u64(1);
-        let mut base = self.clone();
-        let mut e = exp;
-        while e > 0 {
-            if e & 1 == 1 {
-                result = result.mul(&base);
-            }
-            e >>= 1;
-            if e > 0 {
-                base = base.mul(&base);
-            }
-        }
-        Some(result)
+        checked_pow_limbs(&self.limbs, exp)
     }
 
     /// Greatest common divisor, iterative Euclid via `rem`; `gcd(0, x) = x`

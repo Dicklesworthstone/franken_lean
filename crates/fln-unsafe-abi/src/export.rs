@@ -1208,22 +1208,41 @@ pub(crate) extern "C" fn export_lean_string_hash(s: *mut LeanObject) -> u64 {
 // truncations read low bits exactly as the pin's `mpz_fdiv_r_2exp` /
 // lowest-limb accessors do for non-negative values.
 
-use fln_bignum::nat::BigNat;
+use fln_bignum::nat::{BigNat, BigNatView};
 
-/// Borrowed Nat operand → owned `BigNat` value copy.
+/// Run `f` with a zero-copy view of a borrowed Nat operand.
+///
+/// Scalars use one stack limb for the callback invocation. Heap Nats borrow
+/// the mpz object's immutable ABI limb buffer directly. Because the callback's
+/// result type is independent of that borrow, the view cannot escape.
 ///
 /// # Safety
 /// `o` is a live boxed scalar or mpz Nat object.
 // UNSAFE-LEDGER: FLN-UL-0134
 #[allow(unsafe_code)]
-unsafe fn nat_as_bignat(o: *mut LeanObject) -> BigNat {
+unsafe fn with_nat_view<R>(o: *mut LeanObject, f: impl FnOnce(BigNatView<'_>) -> R) -> R {
     if is_scalar(o) {
-        BigNat::from_u64(crate::tagged::unbox(o) as u64)
+        let word = [crate::tagged::unbox(o) as u64];
+        let limbs = if word[0] == 0 { &[] } else { &word[..] };
+        f(BigNatView::from_limbs_le(limbs))
     } else {
         // SAFETY: live mpz object; |m_size| limbs are salient (Nat: >= 0).
-        let (_, size, limbs) = unsafe { object::mpz_fields(o) };
-        debug_assert!(size >= 0, "Nat mpz objects are non-negative");
-        BigNat::from_limbs_le(limbs)
+        let (alloc, size, pointer, live) = unsafe { object::mpz_fields(o) };
+        assert!(size >= 0, "Nat mpz objects are non-negative");
+        assert!(alloc >= 0, "mpz allocation count is negative");
+        assert!(
+            live <= alloc as usize,
+            "mpz live limb count exceeds its allocation"
+        );
+        let limbs = if live == 0 {
+            &[]
+        } else {
+            assert!(!pointer.is_null(), "nonempty mpz has a null limb buffer");
+            // SAFETY: live <= allocation was checked above; the borrowed Nat
+            // remains live for the duration of this non-escaping callback.
+            unsafe { core::slice::from_raw_parts(pointer, live) }
+        };
+        f(BigNatView::from_limbs_le(limbs))
     }
 }
 
@@ -1269,8 +1288,7 @@ unsafe fn nat_obj_from_bignat_core(n: &BigNat) -> *mut LeanObject {
 #[allow(unsafe_code)]
 unsafe fn big_nat_limb0(a: *mut LeanObject) -> u64 {
     // SAFETY: live mpz per the contract.
-    let (_, _, limbs) = unsafe { object::mpz_fields(a) };
-    limbs.first().copied().unwrap_or(0)
+    unsafe { with_nat_view(a, |value| value.limbs_le().first().copied().unwrap_or(0)) }
 }
 
 /// `lean_nat_big_add` (`object.cpp:1383-1391`): every arm is `_core` — a
@@ -1284,7 +1302,7 @@ pub(crate) extern "C" fn export_lean_nat_big_add(
 ) -> *mut LeanObject {
     // SAFETY: borrowed live Nat operands.
     unsafe {
-        let r = nat_as_bignat(a1).add(&nat_as_bignat(a2));
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.add(n2)));
         nat_obj_from_bignat_core(&r)
     }
 }
@@ -1303,12 +1321,19 @@ pub(crate) extern "C" fn export_lean_nat_big_sub(
         if is_scalar(a1) {
             return crate::tagged::boxi(0);
         }
-        let n1 = nat_as_bignat(a1);
-        let n2 = nat_as_bignat(a2);
-        if !is_scalar(a2) && n1.ble(&n2) && !n2.ble(&n1) {
+        let r = with_nat_view(a1, |n1| {
+            with_nat_view(a2, |n2| {
+                if !is_scalar(a2) && n1.ble(n2) && !n2.ble(n1) {
+                    None
+                } else {
+                    Some(n1.sub(n2))
+                }
+            })
+        });
+        let Some(r) = r else {
             return crate::tagged::boxi(0);
-        }
-        nat_obj_from_bignat(&n1.sub(&n2))
+        };
+        nat_obj_from_bignat(&r)
     }
 }
 
@@ -1323,7 +1348,7 @@ pub(crate) extern "C" fn export_lean_nat_big_mul(
 ) -> *mut LeanObject {
     // SAFETY: borrowed live Nat operands.
     unsafe {
-        let r = nat_as_bignat(a1).mul(&nat_as_bignat(a2));
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.mul(n2)));
         if is_scalar(a1) || is_scalar(a2) {
             nat_obj_from_bignat(&r)
         } else {
@@ -1361,7 +1386,7 @@ pub(crate) extern "C" fn export_lean_nat_big_div(
         if is_scalar(a2) && crate::tagged::unbox(a2) == 0 {
             return a2;
         }
-        let r = nat_as_bignat(a1).div(&nat_as_bignat(a2));
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.div(n2)));
         nat_obj_from_bignat(&r)
     }
 }
@@ -1386,7 +1411,7 @@ pub(crate) extern "C" fn export_lean_nat_big_mod(
             inc(a1);
             return a1;
         }
-        let r = nat_as_bignat(a1).rem(&nat_as_bignat(a2));
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.rem(n2)));
         nat_obj_from_bignat(&r)
     }
 }
@@ -1402,7 +1427,7 @@ pub(crate) extern "C" fn export_lean_nat_big_eq(a1: *mut LeanObject, a2: *mut Le
         if is_scalar(a1) || is_scalar(a2) {
             return false;
         }
-        nat_as_bignat(a1).beq(&nat_as_bignat(a2))
+        with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.beq(n2)))
     }
 }
 
@@ -1420,7 +1445,7 @@ pub(crate) extern "C" fn export_lean_nat_big_le(a1: *mut LeanObject, a2: *mut Le
         if is_scalar(a2) {
             return false;
         }
-        nat_as_bignat(a1).ble(&nat_as_bignat(a2))
+        with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.ble(n2)))
     }
 }
 
@@ -1437,9 +1462,7 @@ pub(crate) extern "C" fn export_lean_nat_big_lt(a1: *mut LeanObject, a2: *mut Le
         if is_scalar(a2) {
             return false;
         }
-        let n1 = nat_as_bignat(a1);
-        let n2 = nat_as_bignat(a2);
-        n1.ble(&n2) && !n1.beq(&n2)
+        with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.ble(n2) && !n1.beq(n2)))
     }
 }
 
@@ -1457,7 +1480,7 @@ pub(crate) extern "C" fn export_lean_nat_pow(
         if !is_scalar(a2) || crate::tagged::unbox(a2) > u32::MAX as usize {
             internal_panic_impl("Nat.pow exponent is too big");
         }
-        let r = nat_as_bignat(a1).pow(crate::tagged::unbox(a2) as u32);
+        let r = with_nat_view(a1, |n| n.pow(crate::tagged::unbox(a2) as u32));
         nat_obj_from_bignat(&r)
     }
 }

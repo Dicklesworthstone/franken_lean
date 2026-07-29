@@ -839,7 +839,7 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                     out.extend_from_slice(&mp_size.to_le_bytes());
                     let limb_addr = base.wrapping_add(offset + MPZ_FIXED as u64);
                     out.extend_from_slice(&limb_addr.to_le_bytes());
-                    for l in &limbs {
+                    for l in limbs {
                         out.extend_from_slice(&l.to_le_bytes());
                     }
                 } else {

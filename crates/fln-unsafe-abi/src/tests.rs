@@ -376,7 +376,32 @@ fn closure_ref_thunk_task_mpz_facts() {
     let (alloc, size, limbs) = m.mpz_view();
     assert_eq!(alloc, 2);
     assert_eq!(size, -2, "sign of the value is the sign of m_size");
-    assert_eq!(limbs, vec![0xDEAD_BEEF, 0x1]);
+    assert_eq!(limbs, &[0xDEAD_BEEF, 0x1]);
+}
+
+#[test]
+fn mpz_view_is_zero_copy_normalized_and_excludes_negative_zero() {
+    let _g = lock();
+    let m = Obj::mk_mpz(&[0xDEAD_BEEF, 0x1], false);
+    let (alloc, size, first) = m.mpz_view();
+    let (_, _, second) = m.mpz_view();
+    assert_eq!((alloc, size), (2, 2));
+    assert_eq!(first.as_ptr(), second.as_ptr(), "the view must not copy");
+    let magnitude = fln_bignum::nat::BigNatView::from_limbs_le(first);
+    assert_eq!(
+        magnitude.limbs_le().as_ptr(),
+        first.as_ptr(),
+        "the bignum view must alias the ABI limb buffer"
+    );
+
+    let normalized = Obj::mk_mpz(&[7, 0, 0], true);
+    let (alloc, size, limbs) = normalized.mpz_view();
+    assert_eq!((alloc, size, limbs), (1, -1, &[7][..]));
+
+    let zero = Obj::mk_mpz(&[0, 0], true);
+    let (alloc, size, limbs) = zero.mpz_view();
+    assert_eq!((alloc, size), (0, 0), "negative zero is impossible");
+    assert!(limbs.is_empty());
 }
 
 #[test]
@@ -1231,17 +1256,29 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
     // UNSAFE-LEDGER: FLN-UL-0160
     #[allow(unsafe_code)]
     unsafe {
+        let mpz_copy = |object| {
+            let (alloc, size, pointer, live) = crate::object::mpz_fields(object);
+            assert!(alloc >= 0 && live <= alloc as usize);
+            let limbs = if live == 0 {
+                Vec::new()
+            } else {
+                assert!(!pointer.is_null());
+                core::slice::from_raw_parts(pointer, live).to_vec()
+            };
+            (size, limbs)
+        };
+
         // Boundary law: MAX_SMALL_NAT boxes, MAX_SMALL_NAT+1 mints mpz.
         let max_small = tagged::MAX_SMALL_NAT;
         assert!(tagged::is_scalar(export_lean_big_usize_to_nat(max_small)));
         let big = export_lean_big_uint64_to_nat(u64::MAX);
         assert!(!tagged::is_scalar(big), "2^64-1 exceeds MAX_SMALL_NAT");
-        let (_, sz, limbs) = crate::object::mpz_fields(big);
+        let (sz, limbs) = mpz_copy(big);
         assert_eq!((sz, limbs.as_slice()), (1, &[u64::MAX][..]));
 
         // add: big + 1 = 2^64 (stays mpz, _core arm).
         let big2 = export_lean_nat_big_add(big, tagged::boxi(1));
-        let (_, sz2, limbs2) = crate::object::mpz_fields(big2);
+        let (sz2, limbs2) = mpz_copy(big2);
         assert_eq!((sz2, limbs2.as_slice()), (2, &[0, 1][..]));
 
         // sub: 2^64 - (2^64-1) = 1 -> NORMALIZED to a boxed scalar.
@@ -1294,13 +1331,13 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
 
         // overflow_mul: 2^40 * 2^40 = 2^80.
         let of = export_lean_nat_overflow_mul(1 << 40, 1 << 40);
-        let (_, osz, olimbs) = crate::object::mpz_fields(of);
+        let (osz, olimbs) = mpz_copy(of);
         assert_eq!((osz, olimbs.as_slice()), (2, &[0, 1 << 16][..]));
 
         // cstr parse: small and 2^128 + 1.
         assert_eq!(tagged::unbox(export_lean_cstr_to_nat(c"123".as_ptr())), 123);
         let c128 = export_lean_cstr_to_nat(c"340282366920938463463374607431768211457".as_ptr());
-        let (_, csz, climbs) = crate::object::mpz_fields(c128);
+        let (csz, climbs) = mpz_copy(c128);
         assert_eq!((csz, climbs.as_slice()), (3, &[1, 0, 1][..]));
 
         // truncations: lowest limb / low bits.

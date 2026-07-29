@@ -9,7 +9,8 @@
 //! > object on which this `Obj` owns exactly one RC reference. Constructors
 //! > establish the invariant; `clone_ref` adds a reference before copying
 //! > the pointer; `Drop` surrenders the reference. Borrowed reads never
-//! > escape raw pointers to callers.
+//! > expose raw pointers. Immutable variable-size payloads may escape only as
+//! > slices whose lifetime is tied to the owning `&Obj`.
 //!
 //! Handles are deliberately `!Send`/`!Sync` (raw-pointer field): the ST fast
 //! path's exclusivity is structural. Cross-thread traffic goes through
@@ -266,11 +267,29 @@ impl Obj {
         }
     }
 
-    /// Mpz salient view `(alloc, size, limbs)`.
-    pub fn mpz_view(&self) -> (i32, i32, Vec<u64>) {
+    /// Mpz salient borrowed view `(alloc, size, limbs)`.
+    ///
+    /// The returned slice aliases the object's immutable ABI limb buffer and
+    /// is valid only while this handle remains borrowed. No limb allocation,
+    /// copy, radix conversion, or ownership transfer occurs.
+    pub fn mpz_view(&self) -> (i32, i32, &[u64]) {
         assert!(self.obj_tag() == usize::from(crate::contract::TAG_MPZ));
         // SAFETY: invariant + tag assertion.
-        unsafe { object::mpz_fields(self.0) }
+        unsafe {
+            let (alloc, size, pointer, live) = object::mpz_fields(self.0);
+            assert!(alloc >= 0, "mpz allocation count is negative");
+            assert!(
+                live <= alloc as usize,
+                "mpz live limb count exceeds its allocation"
+            );
+            let limbs = if live == 0 {
+                &[]
+            } else {
+                assert!(!pointer.is_null(), "nonempty mpz has a null limb buffer");
+                core::slice::from_raw_parts(pointer, live)
+            };
+            (alloc, size, limbs)
+        }
     }
 
     /// Closure `(arity, num_fixed)`.
