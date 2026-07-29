@@ -378,11 +378,19 @@ seed_census() {
     exit 2
   fi
 }
-seed_census "$SCRATCH_A"
-seed_census "$SCRATCH_B"
-
+# Seal the archived checkouts BEFORE seeding the census shards: the seal proves
+# the retained archive is byte-exact the source commit, and the four census
+# shards are governed outputs that are deliberately untracked (bead
+# fln-census-out-of-git-2ya9), so force-adding them into the sealed archive
+# makes the archived tree differ from the commit tree by exactly those four
+# paths. Seeding first therefore made this setup check unpassable from the
+# moment fd98be1f introduced it. The shards' own integrity is bound by
+# census_materialize.sh --verify-only inside seed_census.
 seal_archived_checkout "$SCRATCH_A"
 seal_archived_checkout "$SCRATCH_B"
+
+seed_census "$SCRATCH_A"
+seed_census "$SCRATCH_B"
 
 run_step() {
   local step="$1" subject="$2" expected_class="$3" expected_wrapper="$4"
