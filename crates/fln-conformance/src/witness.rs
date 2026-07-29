@@ -609,10 +609,12 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         sites: &SITES_TOOLCHAIN_BINARIES,
         claim_type: ClaimType::BoundedModel,
         state: ClaimState::Targeted,
-        evidence: "The workspace produces no product binary. Exactly two main.rs files exist, \
-                   both dev apparatus (tools/structure-guard and its \
-                   kernel-ownership-publisher); no crate manifest declares a [[bin]]; \
-                   crates/fln-cli and crates/fln are 6-line charter stubs.",
+        evidence: "The product workspace produces no toolchain binary. Its two main.rs files \
+                   are dev apparatus (tools/structure-guard and its \
+                   kernel-ownership-publisher); the third repository main.rs belongs to the \
+                   Tribunal's separate nested epoch-lab workspace; no crate manifest declares \
+                   a [[bin]]. crates/fln-cli and crates/fln now expose W1 diagnostic-projection \
+                   library adapters, not executable product surfaces.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -666,9 +668,10 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         sites: &SITES_WARM_ATTACH,
         claim_type: ClaimType::Slo,
         state: ClaimState::Hypothesis,
-        evidence: "crates/fln-server is a 6-line charter stub; there is no daemon to attach \
-                   to. AGENTS.md D7 item 10 already forbids this shape: no benchmark claim \
-                   without corpus, machine, and claim state.",
+        evidence: "crates/fln-server now owns W1's deterministic LSP diagnostic projection, \
+                   but it still exposes no listener, session lifecycle, daemon entry point or \
+                   product binary to attach to. No warm-attach benchmark records corpus, \
+                   machine or claim state, as AGENTS.md D7 item 10 requires.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -816,9 +819,9 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
     ),
     (
         "DAEMON-WARM-ATTACH-SLO",
-        Citation::FileAtMostLines {
+        Citation::FileAtLeastLines {
             path: "crates/fln-server/src/lib.rs",
-            max_lines: 10,
+            min_lines: 300,
         },
     ),
     (
@@ -837,9 +840,9 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
     ),
     (
         "PRODUCT-TOOLCHAIN-BINARIES",
-        Citation::FileAtMostLines {
+        Citation::FileAtLeastLines {
             path: "crates/fln-cli/src/lib.rs",
-            max_lines: 10,
+            min_lines: 400,
         },
     ),
     // ---- the ratchet: one citation for every previously-uncited row ------------------

@@ -314,6 +314,9 @@ E2E_STEP_ORDERS = {
         "stale_declaration_mutant",
         "stale_declaration_recovery",
     ],
+    "diagnostic_projection_no_mock_e2e": [
+        "diagnostic_projection_contract",
+    ],
     "contract_handoff": [
         "cold_regeneration_a",
         "cold_regeneration_b",
@@ -599,6 +602,29 @@ LEXER_CASE_INPUTS = {
     "failure": ("inputs/failure.lean", b"def bad :=\t42\n"),
     "recovery": ("inputs/recovery.lean", b"def bad :=\t42\n#check\tbad\n"),
 }
+
+DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA = (
+    "fln.diagnostic-projection.semantic/1"
+)
+DIAGNOSTIC_PROJECTION_TELEMETRY_SCHEMA = (
+    "fln.diagnostic-projection.telemetry/1"
+)
+DIAGNOSTIC_PROJECTION_VALIDATION_SCHEMA = (
+    "fln.diagnostic-projection.validation/1"
+)
+DIAGNOSTIC_PROJECTION_CASES = (
+    "reference",
+    "corrupt",
+    "malformed",
+    "aged_epoch",
+    "mock_substitution",
+    "resource",
+    "cancelled",
+    "internal_fault",
+    "recovery",
+)
+DIAGNOSTIC_PROJECTION_MAX_SEMANTIC_BYTES = 65_536
+DIAGNOSTIC_PROJECTION_MAX_TELEMETRY_BYTES = 8_192
 
 PARSER_CORPUS_SEMANTIC_SCHEMA = "fln.e2e.parser-corpus-semantic"
 PARSER_CORPUS_TELEMETRY_SCHEMA = "fln.e2e.parser-corpus-telemetry"
@@ -7060,6 +7086,302 @@ def exact_non_negative_integer(
     if type(value) is not int or value < 0:
         raise EvidenceError(f"{label} {key} is not a non-negative integer")
     return value
+
+
+def validate_diagnostic_projection_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("diagnostic projection run id must be non-empty")
+
+    semantic_data, _semantic_size, semantic_digest = stable_file_facts(
+        semantic_path,
+        max_bytes=DIAGNOSTIC_PROJECTION_MAX_SEMANTIC_BYTES,
+    )
+    semantic_lines = semantic_data.splitlines(keepends=True)
+    if len(semantic_lines) != len(DIAGNOSTIC_PROJECTION_CASES):
+        raise EvidenceError(
+            "diagnostic projection semantic evidence must contain exactly "
+            f"{len(DIAGNOSTIC_PROJECTION_CASES)} records"
+        )
+
+    full_fields = {
+        "actual",
+        "actualExit",
+        "actualRoot",
+        "authority",
+        "case",
+        "channel",
+        "comparisonClass",
+        "epoch",
+        "expected",
+        "expectedExit",
+        "expectedRoot",
+        "format",
+        "frontend",
+        "mode",
+        "schema",
+        "sequence",
+    }
+    bounded_fields = {
+        "actual",
+        "actualExit",
+        "actualRoot",
+        "authority",
+        "case",
+        "expected",
+        "schema",
+        "sequence",
+    }
+    semantic_records: list[dict[str, Any]] = []
+    for sequence, (expected_case, line) in enumerate(
+        zip(DIAGNOSTIC_PROJECTION_CASES, semantic_lines, strict=True)
+    ):
+        record = parse_json(
+            line,
+            subject=f"diagnostic projection semantic record {sequence}",
+        )
+        if not isinstance(record, dict):
+            raise EvidenceError(
+                f"diagnostic projection semantic record {sequence} is not an object"
+            )
+        if canonical_json(record) != line:
+            raise EvidenceError(
+                f"diagnostic projection semantic record {sequence} is not canonical"
+            )
+        if record.get("schema") != DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA:
+            raise EvidenceError(
+                f"diagnostic projection semantic record {sequence} has unknown schema"
+            )
+        if (
+            type(record.get("sequence")) is not int
+            or record.get("sequence") != sequence
+            or record.get("case") != expected_case
+        ):
+            raise EvidenceError(
+                f"diagnostic projection semantic sequence {sequence} is malformed"
+            )
+        expected_fields = (
+            full_fields
+            if expected_case in {"reference", "corrupt", "recovery"}
+            else bounded_fields
+        )
+        if set(record) != expected_fields:
+            raise EvidenceError(
+                f"diagnostic projection {expected_case} fields differ "
+                "from the frozen schema"
+            )
+        semantic_records.append(record)
+
+    semantic_by_case = {
+        record["case"]: record for record in semantic_records
+    }
+
+    def require_root(value: Any, *, label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"fnv1a64:[0-9a-f]{16}", value) is None
+        ):
+            raise EvidenceError(f"{label} is not a bounded semantic root")
+        return value
+
+    def require_full_case(
+        case: str,
+        *,
+        relation: str,
+        expected_root: str | None,
+    ) -> tuple[str, str]:
+        record = semantic_by_case[case]
+        if (
+            record.get("actual") != relation
+            or record.get("actualExit") != "user_error"
+            or record.get("authority") is not True
+            or record.get("channel") != "stdout"
+            or record.get("comparisonClass") != "exact"
+            or record.get("epoch") != "v4.32.0"
+            or record.get("expected") != relation
+            or record.get("expectedExit") != "user_error"
+            or record.get("format") != "human"
+            or record.get("frontend") != "cli"
+            or record.get("mode") != "faithful"
+        ):
+            raise EvidenceError(
+                f"diagnostic projection {case} comparison contract changed"
+            )
+        actual = require_root(
+            record.get("actualRoot"),
+            label=f"diagnostic projection {case} actual root",
+        )
+        expected = require_root(
+            record.get("expectedRoot"),
+            label=f"diagnostic projection {case} expected root",
+        )
+        if expected_root is not None and expected != expected_root:
+            raise EvidenceError(
+                f"diagnostic projection {case} expected root drifted"
+            )
+        return actual, expected
+
+    reference_actual, reference_expected = require_full_case(
+        "reference",
+        relation="equal",
+        expected_root=None,
+    )
+    if not hmac.compare_digest(reference_actual, reference_expected):
+        raise EvidenceError(
+            "diagnostic projection reference roots are not equal"
+        )
+
+    corrupt_actual, corrupt_expected = require_full_case(
+        "corrupt",
+        relation="divergent",
+        expected_root=reference_actual,
+    )
+    if (
+        not hmac.compare_digest(corrupt_expected, reference_actual)
+        or hmac.compare_digest(corrupt_actual, reference_actual)
+    ):
+        raise EvidenceError(
+            "diagnostic projection corrupt control did not diverge"
+        )
+
+    for case in ("malformed", "aged_epoch", "mock_substitution"):
+        record = semantic_by_case[case]
+        if (
+            record.get("actual") != "typed_refusal"
+            or record.get("actualExit") != "refused"
+            or record.get("actualRoot") != "none"
+            or record.get("authority") is not False
+            or record.get("expected") != "typed_refusal"
+        ):
+            raise EvidenceError(
+                f"diagnostic projection {case} was not a typed refusal"
+            )
+
+    for case, expected_outcome, expected_exit in (
+        ("resource", "inconclusive", "inconclusive"),
+        ("cancelled", "inconclusive", "inconclusive"),
+        ("internal_fault", "internal_fault", "internal_fault"),
+    ):
+        record = semantic_by_case[case]
+        if (
+            record.get("actual") != expected_outcome
+            or record.get("actualExit") != expected_exit
+            or record.get("authority") is not False
+            or record.get("expected") != expected_outcome
+        ):
+            raise EvidenceError(
+                f"diagnostic projection {case} changed outcome authority"
+            )
+        require_root(
+            record.get("actualRoot"),
+            label=f"diagnostic projection {case} actual root",
+        )
+
+    recovery_actual, recovery_expected = require_full_case(
+        "recovery",
+        relation="equal",
+        expected_root=reference_actual,
+    )
+    if (
+        not hmac.compare_digest(recovery_actual, reference_actual)
+        or not hmac.compare_digest(recovery_expected, reference_actual)
+    ):
+        raise EvidenceError(
+            "diagnostic projection recovery did not restore the reference root"
+        )
+
+    telemetry, telemetry_digest = read_canonical_record(
+        telemetry_path,
+        label="diagnostic projection telemetry",
+        max_bytes=DIAGNOSTIC_PROJECTION_MAX_TELEMETRY_BYTES,
+    )
+    telemetry_fields = {
+        "durationNs",
+        "pid",
+        "rawProcessExits",
+        "runId",
+        "schema",
+        "scratch",
+    }
+    if set(telemetry) != telemetry_fields:
+        raise EvidenceError(
+            "diagnostic projection telemetry fields differ from the frozen schema"
+        )
+    duration_ns = exact_non_negative_integer(
+        telemetry,
+        "durationNs",
+        label="diagnostic projection telemetry",
+    )
+    pid = exact_non_negative_integer(
+        telemetry,
+        "pid",
+        label="diagnostic projection telemetry",
+    )
+    scratch = telemetry.get("scratch")
+    if (
+        telemetry.get("schema") != DIAGNOSTIC_PROJECTION_TELEMETRY_SCHEMA
+        or telemetry.get("runId") != expected_run_id
+        or duration_ns == 0
+        or pid == 0
+        or not isinstance(scratch, str)
+        or not scratch
+        or not Path(scratch).is_absolute()
+    ):
+        raise EvidenceError(
+            "diagnostic projection telemetry identity is malformed"
+        )
+
+    raw_exits = telemetry.get("rawProcessExits")
+    expected_exit_keys = {
+        "aged_epoch",
+        "cancelled",
+        "corrupt",
+        "internal-fault",
+        "malformed",
+        "mock_substitution",
+        "recovery",
+        "reference_oracle",
+        "reference_projection",
+        "resource",
+    }
+    if not isinstance(raw_exits, dict) or set(raw_exits) != expected_exit_keys:
+        raise EvidenceError(
+            "diagnostic projection raw process exit inventory changed"
+        )
+    for name, expected_code in {
+        "cancelled": 2,
+        "corrupt": 1,
+        "internal-fault": 3,
+        "recovery": 1,
+        "reference_oracle": 1,
+        "reference_projection": 1,
+        "resource": 2,
+    }.items():
+        if type(raw_exits.get(name)) is not int or raw_exits[name] != expected_code:
+            raise EvidenceError(
+                f"diagnostic projection {name} process exit changed"
+            )
+    for name in ("aged_epoch", "malformed", "mock_substitution"):
+        code = raw_exits.get(name)
+        if type(code) is not int or code <= 3:
+            raise EvidenceError(
+                f"diagnostic projection {name} did not refuse before projection"
+            )
+
+    return {
+        "case_count": len(semantic_records),
+        "recovery_root": reference_actual,
+        "run_id": expected_run_id,
+        "schema": DIAGNOSTIC_PROJECTION_VALIDATION_SCHEMA,
+        "semantic_sha256": semantic_digest,
+        "separation_law": "semantic_records_exclude_host_process_telemetry",
+        "telemetry_sha256": telemetry_digest,
+        "verdict": "pass",
+    }
 
 
 def lexer_expected_diagnostics(
@@ -17186,6 +17508,38 @@ def cmd_validate_verdict_schema(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_diagnostic_projection(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    semantic_path = require_exact_artifact_path(
+        Path(args.semantic),
+        artifact_root,
+        "semantic.ndjson",
+        label="diagnostic projection semantic evidence",
+    )
+    telemetry_path = require_exact_artifact_path(
+        Path(args.telemetry),
+        artifact_root,
+        "telemetry.ndjson",
+        label="diagnostic projection telemetry",
+    )
+    report = validate_diagnostic_projection_evidence(
+        expected_run_id=args.run_id,
+        semantic_path=semantic_path,
+        telemetry_path=telemetry_path,
+    )
+    if args.output:
+        output = require_exact_artifact_path(
+            Path(args.output),
+            artifact_root,
+            "projection.validation.json",
+            label="diagnostic projection validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_validate_lexer_no_mock(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
 
@@ -18539,6 +18893,258 @@ def run_fmt_component_admission_self_test(root: Path) -> dict[str, Any]:
     }
 
 
+def run_diagnostic_projection_validator_self_test(
+    root: Path,
+) -> dict[str, Any]:
+    reference_root = "fnv1a64:0000000000000001"
+    corrupt_root = "fnv1a64:0000000000000002"
+    full = {
+        "channel": "stdout",
+        "comparisonClass": "exact",
+        "epoch": "v4.32.0",
+        "expectedExit": "user_error",
+        "expectedRoot": reference_root,
+        "format": "human",
+        "frontend": "cli",
+        "mode": "faithful",
+        "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+    }
+    records = [
+        {
+            **full,
+            "actual": "equal",
+            "actualExit": "user_error",
+            "actualRoot": reference_root,
+            "authority": True,
+            "case": "reference",
+            "expected": "equal",
+            "sequence": 0,
+        },
+        {
+            **full,
+            "actual": "divergent",
+            "actualExit": "user_error",
+            "actualRoot": corrupt_root,
+            "authority": True,
+            "case": "corrupt",
+            "expected": "divergent",
+            "sequence": 1,
+        },
+        {
+            "actual": "typed_refusal",
+            "actualExit": "refused",
+            "actualRoot": "none",
+            "authority": False,
+            "case": "malformed",
+            "expected": "typed_refusal",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 2,
+        },
+        {
+            "actual": "typed_refusal",
+            "actualExit": "refused",
+            "actualRoot": "none",
+            "authority": False,
+            "case": "aged_epoch",
+            "expected": "typed_refusal",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 3,
+        },
+        {
+            "actual": "typed_refusal",
+            "actualExit": "refused",
+            "actualRoot": "none",
+            "authority": False,
+            "case": "mock_substitution",
+            "expected": "typed_refusal",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 4,
+        },
+        {
+            "actual": "inconclusive",
+            "actualExit": "inconclusive",
+            "actualRoot": "fnv1a64:0000000000000003",
+            "authority": False,
+            "case": "resource",
+            "expected": "inconclusive",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 5,
+        },
+        {
+            "actual": "inconclusive",
+            "actualExit": "inconclusive",
+            "actualRoot": "fnv1a64:0000000000000004",
+            "authority": False,
+            "case": "cancelled",
+            "expected": "inconclusive",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 6,
+        },
+        {
+            "actual": "internal_fault",
+            "actualExit": "internal_fault",
+            "actualRoot": "fnv1a64:0000000000000005",
+            "authority": False,
+            "case": "internal_fault",
+            "expected": "internal_fault",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 7,
+        },
+        {
+            **full,
+            "actual": "equal",
+            "actualExit": "user_error",
+            "actualRoot": reference_root,
+            "authority": True,
+            "case": "recovery",
+            "expected": "equal",
+            "sequence": 8,
+        },
+    ]
+    telemetry = {
+        "durationNs": 1,
+        "pid": 1,
+        "rawProcessExits": {
+            "aged_epoch": 101,
+            "cancelled": 2,
+            "corrupt": 1,
+            "internal-fault": 3,
+            "malformed": 101,
+            "mock_substitution": 101,
+            "recovery": 1,
+            "reference_oracle": 1,
+            "reference_projection": 1,
+            "resource": 2,
+        },
+        "runId": "diagnostic-projection-self-test",
+        "schema": DIAGNOSTIC_PROJECTION_TELEMETRY_SCHEMA,
+        "scratch": "/tmp/diagnostic-projection-self-test",
+    }
+
+    def write_records(path: Path, value: Sequence[Mapping[str, Any]]) -> None:
+        write_new(path, b"".join(canonical_json(record) for record in value))
+
+    semantic = root / "positive.semantic.ndjson"
+    telemetry_path = root / "positive.telemetry.ndjson"
+    write_records(semantic, records)
+    write_new(telemetry_path, canonical_json(telemetry))
+    report = validate_diagnostic_projection_evidence(
+        expected_run_id="diagnostic-projection-self-test",
+        semantic_path=semantic,
+        telemetry_path=telemetry_path,
+    )
+    require(
+        report["verdict"] == "pass" and report["case_count"] == 9,
+        "diagnostic projection positive validator control failed",
+    )
+
+    mutants_killed = 0
+
+    def cloned_records() -> list[dict[str, Any]]:
+        candidate = parse_json(
+            canonical_json(records),
+            subject="diagnostic projection self-test records",
+        )
+        if not isinstance(candidate, list) or not all(
+            isinstance(record, dict) for record in candidate
+        ):
+            raise EvidenceError(
+                "diagnostic projection self-test clone is malformed"
+            )
+        return candidate
+
+    def expect_semantic_rejection(
+        label: str,
+        mutate: Callable[[list[dict[str, Any]]], None],
+    ) -> None:
+        nonlocal mutants_killed
+        candidate = cloned_records()
+        mutate(candidate)
+        path = root / f"{label}.semantic.ndjson"
+        write_records(path, candidate)
+        try:
+            validate_diagnostic_projection_evidence(
+                expected_run_id="diagnostic-projection-self-test",
+                semantic_path=path,
+                telemetry_path=telemetry_path,
+            )
+        except EvidenceError:
+            mutants_killed += 1
+            return
+        raise EvidenceError(
+            f"diagnostic projection validator accepted {label} mutation"
+        )
+
+    expect_semantic_rejection("case_omission", lambda value: value.pop())
+    expect_semantic_rejection(
+        "inconclusive_as_user_error",
+        lambda value: value[5].__setitem__("actualExit", "user_error"),
+    )
+    expect_semantic_rejection(
+        "internal_fault_as_user_error",
+        lambda value: value[7].__setitem__("actualExit", "user_error"),
+    )
+    expect_semantic_rejection(
+        "unknown_epoch",
+        lambda value: value[0].__setitem__("epoch", "v99.0.0"),
+    )
+    expect_semantic_rejection(
+        "sequence_reorder",
+        lambda value: value.__setitem__(slice(0, 2), [value[1], value[0]]),
+    )
+    expect_semantic_rejection(
+        "corrupt_root_borrow",
+        lambda value: value[1].__setitem__("actualRoot", reference_root),
+    )
+    expect_semantic_rejection(
+        "recovery_root_drift",
+        lambda value: value[8].__setitem__("actualRoot", corrupt_root),
+    )
+    expect_semantic_rejection(
+        "mock_authority_promotion",
+        lambda value: value[4].__setitem__("authority", True),
+    )
+    expect_semantic_rejection(
+        "semantic_pid_leak",
+        lambda value: value[0].__setitem__("pid", 1),
+    )
+    expect_semantic_rejection(
+        "comparison_fact_loss",
+        lambda value: value[0].pop("expected"),
+    )
+
+    telemetry_mutant = parse_json(
+        canonical_json(telemetry),
+        subject="diagnostic projection telemetry self-test",
+    )
+    if not isinstance(telemetry_mutant, dict):
+        raise EvidenceError(
+            "diagnostic projection telemetry self-test clone is malformed"
+        )
+    telemetry_mutant["rawProcessExits"]["resource"] = 1
+    mutant_telemetry_path = root / "resource_exit.telemetry.ndjson"
+    write_new(mutant_telemetry_path, canonical_json(telemetry_mutant))
+    try:
+        validate_diagnostic_projection_evidence(
+            expected_run_id="diagnostic-projection-self-test",
+            semantic_path=semantic,
+            telemetry_path=mutant_telemetry_path,
+        )
+    except EvidenceError:
+        mutants_killed += 1
+    else:
+        raise EvidenceError(
+            "diagnostic projection validator accepted resource exit mutation"
+        )
+
+    return {
+        "case": "diagnostic_projection_validator",
+        "ok": True,
+        "mutants_killed": mutants_killed,
+        "positive_cases": len(records),
+    }
+
+
 def cmd_self_test(args: argparse.Namespace) -> int:
     """Exercise supervisor boundary cases without mocks or disposable fixtures."""
     art_dir = lexical_absolute(Path(args.art_dir))
@@ -18579,6 +19185,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     cases.append(
         run_fmt_component_admission_self_test(
             case_dir("sealed_fmt_component_admission")
+        )
+    )
+    cases.append(
+        run_diagnostic_projection_validator_self_test(
+            case_dir("diagnostic_projection_validator")
         )
     )
 
@@ -27472,6 +28083,22 @@ def build_parser() -> argparse.ArgumentParser:
     verdict_parser.add_argument("--artifact-root", required=True)
     verdict_parser.add_argument("--output")
     verdict_parser.set_defaults(func=cmd_validate_verdict_schema)
+
+    diagnostic_projection_parser = subparsers.add_parser(
+        "validate-diagnostic-projection",
+        help=(
+            "independently validate diagnostic projection semantics "
+            "and disjoint host telemetry"
+        ),
+    )
+    diagnostic_projection_parser.add_argument("--semantic", required=True)
+    diagnostic_projection_parser.add_argument("--telemetry", required=True)
+    diagnostic_projection_parser.add_argument("--run-id", required=True)
+    diagnostic_projection_parser.add_argument("--artifact-root", required=True)
+    diagnostic_projection_parser.add_argument("--output")
+    diagnostic_projection_parser.set_defaults(
+        func=cmd_validate_diagnostic_projection
+    )
 
     lexer_parser = subparsers.add_parser(
         "validate-lexer-no-mock",

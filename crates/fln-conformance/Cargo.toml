@@ -11,12 +11,15 @@ publish = false
 oracle-fallback-dev = []
 
 [dependencies]
+fln = { path = "../fln" }
+fln-cli = { path = "../fln-cli" }
 fln-core = { path = "../fln-core" }
 fln-env = { path = "../fln-env" }
 fln-hash = { path = "../fln-hash" }
 fln-kernel = { path = "../fln-kernel" }
 fln-olean = { path = "../fln-olean" }
 fln-parse = { path = "../fln-parse" }
+fln-server = { path = "../fln-server" }
 fln-syntax = { path = "../fln-syntax" }
 # The corpus projection (bead franken_lean-dgxa) covers every row of SCHEMA_REGISTRY,
 # three of which are fln-verdict's wire formats. §21 puts fln-conformance last in the

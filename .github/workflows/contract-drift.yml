@@ -111,8 +111,9 @@ jobs:
         run: |
           # Four binaries carry typed-skip sites cited by NINE terminal coverage rows in
           # ci/VERIFICATION_MANIFEST.jsonl; the fifth is the manifest-complete LSP producer
-          # proof, and the sixth is the G0-4 syntax/hygiene Reference differential. All six
-          # are compiled PinRig entries. Until this step the nine cited rows
+          # proof, the sixth is the G0-4 syntax/hygiene Reference differential, and the
+          # seventh is the per-frontend diagnostic projection differential. All seven are
+          # compiled PinRig entries. Until this step the nine cited rows
           # had never executed in any workflow: ci.yml installs no Lean pin and this workflow
           # ran no cargo, so the intersection was empty (bead fln-rgha).
           #
@@ -148,6 +149,7 @@ jobs:
             --test pin_ctor_inventory \
             --test lsp_census_no_mock_e2e \
             --test g0_4_no_mock_e2e \
+            --test diag_render \
             -- --nocapture > "$log" 2>&1
           rc=$?
           cargo test --locked -p fln-conformance \
@@ -173,12 +175,12 @@ jobs:
           fi
           # These two floors answer only whether the command shape collapsed. They do not
           # carry execution evidence; the structured records above do.
-          if (( result_lines < 6 )); then
-            echo "rgha-join: REFUSED - only $result_lines of 6 binaries reported a result" >&2
+          if (( result_lines < 7 )); then
+            echo "rgha-join: REFUSED - only $result_lines of 7 binaries reported a result" >&2
             fail=1
           fi
-          if (( passed < 20 )); then
-            echo "rgha-join: REFUSED - only $passed tests ran (floor 20, measured 29); a zero-test cargo success is not a run" >&2
+          if (( passed < 27 )); then
+            echo "rgha-join: REFUSED - only $passed tests ran (floor 27 after diag_render registration); a zero-test cargo success is not a run" >&2
             fail=1
           fi
           (( fail )) && exit 2
@@ -201,6 +203,29 @@ jobs:
           )
           if (( ${#runs[@]} != 1 )); then
             echo "G0-4 lane retained ${#runs[@]} runs; expected one" >&2
+            exit 2
+          fi
+          artifact="${runs[0]}"
+          python3 -I -S scripts/evidence.py validate-run \
+            --file "$artifact/run.ndjson" --schema fln.e2e/2 \
+            --expected-verdict pass --artifact-root "$artifact" --offline
+          python3 -I -S scripts/evidence.py validate-manifest \
+            --art-dir "$artifact" --manifest "$artifact/manifest.json" \
+            --digest "$artifact/manifest.digest" --offline
+
+      - name: run the per-frontend diagnostic projection no-mock lane
+        shell: bash
+        run: |
+          step_root="target/e2e/contract-drift-diagnostic-projection-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$step_root"
+          FLN_E2E_ART_ROOT="$PWD/$step_root" \
+            FLN_E2E_CACHE_STATE="github-actions-contract-drift" \
+            ./scripts/e2e/diag_goldens.sh
+          mapfile -d '' -t runs < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          if (( ${#runs[@]} != 1 )); then
+            echo "diagnostic projection lane retained ${#runs[@]} runs; expected one" >&2
             exit 2
           fi
           artifact="${runs[0]}"

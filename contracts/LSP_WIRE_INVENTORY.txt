@@ -20,7 +20,7 @@ raw-begin
 reference repo=leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91
 source path=SUITE.lock hash=fnv1a64:ad256683f7fee4fd
 source path=crates/fln-conformance/tests/lsp_census_no_mock_e2e.rs hash=fnv1a64:dd46b3481198e3ed
-source path=scripts/evidence.py hash=fnv1a64:c20b89adb21704d4
+source path=scripts/evidence.py hash=fnv1a64:8c12ca9ecce99d5b
 source path=scripts/extract/gen_lsp_wire_census.py hash=fnv1a64:bc522ad0d6983a01
 source path=vendor/lean4-src/src/Lean/Data/Lsp/Basic.lean hash=fnv1a64:435d05f4e1e40461
 source path=vendor/lean4-src/src/Lean/Data/Lsp/BasicAux.lean hash=fnv1a64:7a92d4561cf946cf
@@ -913,6 +913,6 @@ fixture name=plainTermGoal.lean source=vendor/lean4-src/tests/server_interactive
 fixture name=semanticTokens.lean source=vendor/lean4-src/tests/server_interactive/semanticTokens.lean source-hash=fnv1a64:05d34991de81810e expected=vendor/lean4-src/tests/server_interactive/semanticTokens.lean.out.expected expected-hash=fnv1a64:fe7856c941d52e36 normalizer=lean-test-suite-normalized-v1 directives=collectDiagnostics%2CtextDocument/semanticTokens/full
 fixture name=userWidget.lean source=vendor/lean4-src/tests/server_interactive/userWidget.lean source-hash=fnv1a64:0661094e6ab5c39f expected=vendor/lean4-src/tests/server_interactive/userWidget.lean.out.expected expected-hash=fnv1a64:140d4d89d6bfdcee normalizer=lean-test-suite-normalized-v1 directives=widgets
 raw-end
-raw-root fnv1a64:288438ff8bc389c7
+raw-root fnv1a64:c70d0dbdac4785dc
 policy-root fnv1a64:85170c7de27b0f02
-inventory-root fnv1a64:1e88ec447ec36602
+inventory-root fnv1a64:d4277bddf8d1c452

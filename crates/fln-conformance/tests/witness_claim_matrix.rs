@@ -160,14 +160,14 @@ fn evidence_that_has_gone_stale_is_caught_even_though_the_anchors_still_match() 
     assert!(citation.is_some(), "{} has a cited fact", target.id);
     let citation = citation.expect("asserted Some above");
 
-    // The row's evidence says crates/fln-server is a stub. Implement it, and the row is
-    // wrong while its anchor in README.md is untouched.
-    let implemented = "x\n".repeat(400);
+    // The row's evidence now names the implemented diagnostic-projection surface. Remove it,
+    // and the row is wrong while its warm-attach anchor in README.md is untouched.
+    let erased = String::new();
     let faults = scan(
         &[*target],
         &[],
         &[(target.id, citation)],
-        real_with_path(citation.path(), implemented),
+        real_with_path(citation.path(), erased),
     )
     .expect_err("a row whose cited fact moved must fail");
 
