@@ -688,10 +688,40 @@ pub fn validate_freshness_names_the_oracle_it_claims(
 }
 
 /// Validate fixture references against the workspace root: every cited fixture must
-/// exist. A ledger citing a missing fixture is marketing, not evidence.
+/// exist, and must be CONFINED to the workspace. A ledger citing a missing fixture is
+/// marketing, not evidence — and one citing `/etc/hostname` or `../../anything` is
+/// citing evidence the repository does not contain, which is worse, because it exists
+/// and so used to pass (bead `fln-euo`; RubyForest's 2026-07-22 15:04 finding, live
+/// until this line: `root.join(fixture)` hands an ABSOLUTE fixture path straight back,
+/// and walks wherever `..` points).
+///
+/// Confinement is lexical: no absolute paths, no `..` components, no drive/root
+/// prefixes. A symlink inside the tree pointing out is beyond a lexical check and is
+/// deliberately out of scope here — ledger fixtures are tracked repository files, and
+/// the tracked-tree guards own that class.
 pub fn validate_fixtures(ledger: &Ledger, root: &Path) -> Result<(), LedgerError> {
     for row in &ledger.rows {
         for fixture in &row.fixtures {
+            let cited = Path::new(fixture);
+            let escapes = cited.is_absolute()
+                || cited.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                });
+            if escapes {
+                return Err(LedgerError {
+                    line: row.line,
+                    what: format!(
+                        "row for `{}` cites fixture `{fixture}` outside the workspace \
+                         (absolute or parent-traversing paths cannot be evidence here)",
+                        row.symbol
+                    ),
+                });
+            }
             if !root.join(fixture).exists() {
                 return Err(LedgerError {
                     line: row.line,
@@ -790,5 +820,34 @@ mod tests {
         let bad = parse(&ghost).expect("parses");
         let err = validate_fixtures(&bad, &root).expect_err("ghost fixture rejected");
         assert_eq!(err.line, 2, "reports the row's source line, not its index");
+    }
+
+    #[test]
+    fn a_fixture_outside_the_workspace_is_refused_even_when_it_exists() {
+        // RubyForest's 2026-07-22 finding, previously live: `root.join(fixture)` hands
+        // an absolute path straight back, so `/etc/hostname` EXISTED and therefore
+        // PASSED — a ledger row resting on evidence the repository does not contain.
+        // Both escape shapes, each against a target that genuinely exists, because a
+        // refusal proven only against missing files is the existence check wearing a
+        // confinement check's name.
+        let root = crate::checked_workspace_root!();
+        for escape in ["/etc/hostname", "../../../../etc/hostname"] {
+            let escaped = OK.replace(
+                "crates/fln-conformance/fixtures/core_observables.txt",
+                escape,
+            );
+            let bad = parse(&escaped).expect("parses");
+            let err = validate_fixtures(&bad, &root)
+                .expect_err("an escaping fixture citation must be refused");
+            assert!(
+                err.what.contains("outside the workspace"),
+                "the refusal must name confinement, not existence: {}",
+                err.what
+            );
+        }
+        // The control that keeps the fence from widening into a wall: the honest
+        // repo-relative citation still validates.
+        let ledger = parse(OK).expect("parses");
+        validate_fixtures(&ledger, &root).expect("a confined existing fixture still passes");
     }
 }
