@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """The pinned option census: mechanical extraction of every option registration in the
 Reference source tree (bead franken_lean-4xsz; plan D5/D9, Appendix census method).
 
@@ -152,6 +152,32 @@ def brace_delta(line, in_string=False):
     return delta
 
 
+def split_field_value(value):
+    """A field's raw right-hand side may carry `, nextField := ...` (measured:
+    printMessageEndPos) or a trailing `-- comment` (measured: eval.type). Split at
+    the first comma or `--` OUTSIDE string literals; return (own_value, rest)."""
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            in_string = not in_string
+        elif not in_string and ch == ",":
+            return value[:i].rstrip(), value[i + 1 :].lstrip()
+        elif not in_string and value[i : i + 2] == "--":
+            return value[:i].rstrip(), ""
+        i += 1
+    return value.rstrip(), ""
+
+
+FIELD_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*:=\s*(.+?)\s*$")
+
+
 def parse_block(lines, start):
     fields = {}
     depth = 1
@@ -159,7 +185,7 @@ def parse_block(lines, start):
     while i + 1 < len(lines) and depth > 0:
         i += 1
         line = lines[i]
-        m = re.match(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*:=\s*(.+?)\s*$", line)
+        m = FIELD_RE.match(line)
         if m:
             depth += brace_delta(line)
             value, joined_to = join_string_gaps(m.group(2), lines, i)
@@ -169,7 +195,18 @@ def parse_block(lines, start):
                 # carry block braces.
                 depth += brace_delta(lines[joined_to], in_string=True)
                 i = joined_to
-            fields.setdefault(m.group(1), value)
+            name = m.group(1)
+            # Multiple `f := v` pairs may share one line; a trailing `}` on the
+            # value is block syntax, not value text.
+            while True:
+                own, rest = split_field_value(value)
+                if own.endswith("}") and brace_delta(own) < 0:
+                    own = own.rstrip("}").rstrip()
+                fields.setdefault(name, own)
+                m2 = FIELD_RE.match(rest) if rest else None
+                if not m2:
+                    break
+                name, value = m2.group(1), m2.group(2)
         else:
             depth += brace_delta(line)
     return (fields if depth == 0 else None), i
