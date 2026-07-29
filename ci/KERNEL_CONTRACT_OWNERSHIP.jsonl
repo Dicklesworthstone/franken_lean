@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":415,"projection_hash":"a39cabcd62c7a9b9bfd31b832b849147c92578f73a50f05dc7841e50460e06ac"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":416,"projection_hash":"16b6ac5bcdda62815144dfb043b8dc82446b1604c140f62ca749e883930752ab"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
 {"id":"fln-171x"}
@@ -141,6 +141,7 @@
 {"id":"fln-parity-freshness-denylist-direction-dy22"}
 {"id":"fln-parity-ledger-freshness-names-the-run-igxr"}
 {"id":"fln-parity-ledger-l2-pinned-source-qydn"}
+{"id":"fln-parser-structural-identity-tzux"}
 {"id":"fln-path-classification-coverage-unbound-9teu"}
 {"id":"fln-pu6i"}
 {"id":"fln-publish-rewrite-indexes-gca"}
