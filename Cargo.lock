@@ -119,6 +119,7 @@ name = "fln-parse"
 version = "0.0.0"
 dependencies = [
  "fln-core",
+ "fln-hash",
  "fln-syntax",
 ]
 

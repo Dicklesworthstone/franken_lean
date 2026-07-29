@@ -168,19 +168,19 @@ fn mutant_last_wins_is_killed_by_the_additive_shadowing_observation() {
         .declare_category(term.clone(), LeadingIdentBehavior::Default)
         .expect("declares");
     registry
-        .add_leading(&term, "dup", production("first"), false)
+        .add_leading(&term, name("dup"), production("first"), false)
         .expect("registers");
     registry
-        .add_leading(&term, "dup", production("second"), false)
+        .add_leading(&term, name("dup"), production("second"), false)
         .expect("registers");
-    let real = registry.kinds_at(&term, "dup", registry.epoch());
+    let real = registry.kinds_at(&term, &name("dup"), registry.epoch());
 
     // The mutant: keep only the last.
-    let mutant: Vec<String> = real.last().cloned().into_iter().collect();
+    let mutant: Vec<Name> = real.last().cloned().into_iter().collect();
 
     assert_eq!(
         real,
-        vec!["first", "second"],
+        vec![name("first"), name("second")],
         "the real registry is additive"
     );
     assert_ne!(
@@ -196,13 +196,13 @@ fn mutant_last_wins_is_killed_by_the_additive_shadowing_observation() {
         .declare_category(term.clone(), LeadingIdentBehavior::Default)
         .expect("declares");
     reversed
-        .add_leading(&term, "dup", production("second"), false)
+        .add_leading(&term, name("dup"), production("second"), false)
         .expect("registers");
     reversed
-        .add_leading(&term, "dup", production("first"), false)
+        .add_leading(&term, name("dup"), production("first"), false)
         .expect("registers");
-    let mutant_reversed: Vec<String> = reversed
-        .kinds_at(&term, "dup", reversed.epoch())
+    let mutant_reversed: Vec<Name> = reversed
+        .kinds_at(&term, &name("dup"), reversed.epoch())
         .last()
         .cloned()
         .into_iter()
@@ -225,12 +225,12 @@ fn mutant_ignoring_the_epoch_is_killed_by_the_interleaving_observation() {
         .expect("declares");
     let before = registry.epoch();
     registry
-        .add_leading(&term, "tok", production("later"), false)
+        .add_leading(&term, name("tok"), production("later"), false)
         .expect("registers");
 
-    let real = registry.kinds_at(&term, "tok", before);
+    let real = registry.kinds_at(&term, &name("tok"), before);
     // The mutant ignores the epoch and reports everything.
-    let mutant = registry.kinds_at(&term, "tok", registry.epoch());
+    let mutant = registry.kinds_at(&term, &name("tok"), registry.epoch());
 
     assert!(
         real.is_empty(),
@@ -254,10 +254,10 @@ fn mutant_ignoring_scoping_is_killed_by_the_scope_restore_observation() {
             .expect("declares");
         registry.push_scope();
         registry
-            .add_leading(&term, "loc", production("local"), scoped)
+            .add_leading(&term, name("loc"), production("local"), scoped)
             .expect("registers");
         let after = registry.pop_scope().expect("pops");
-        registry.kinds_at(&term, "loc", after)
+        registry.kinds_at(&term, &name("loc"), after)
     };
 
     assert!(
@@ -266,7 +266,7 @@ fn mutant_ignoring_scoping_is_killed_by_the_scope_restore_observation() {
     );
     assert_eq!(
         build(false),
-        vec!["local"],
+        vec![name("local")],
         "the mutant treats it as global, so it survives — which the pin says it must not"
     );
 }
@@ -278,7 +278,7 @@ fn mutant_autocreating_a_category_is_killed_by_the_typed_refusal() {
     let missing = name("nosuchcategory");
     assert!(
         registry
-            .add_leading(&missing, "zz", production("zz"), false)
+            .add_leading(&missing, name("zz"), production("zz"), false)
             .is_err(),
         "the pin gives `unknown category 'nosuchcategory'`, so registration must refuse"
     );
@@ -312,7 +312,7 @@ fn mutant_partial_batch_application_is_killed_by_our_own_atomicity_rule() {
         .map(|index| Request {
             key: (index, format!("k{index}")),
             category: term.clone(),
-            token: "tok".to_string(),
+            token: name("tok"),
             production: production(&format!("k{index}")),
             scoped: false,
         })

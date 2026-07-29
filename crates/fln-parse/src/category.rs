@@ -101,13 +101,14 @@ pub enum LeadingToken {
 
 /// A map from token to the productions indexed under it — upstream `TokenMap`.
 ///
-/// `BTreeMap` rather than a hash map so iteration is ordered: the candidate list's order reaches
-/// [`crate::state::longest_match`], and while the resolution rule is order-independent for a
-/// *winner*, the order decides which of two equal candidates is reported first. Determinism is a
-/// contract (FL-INV-01), so the container is chosen to have one rather than to be fast.
+/// The pin keys this table by structural [`Name`] (`Basic.lean:1601`), not by the name's rendered
+/// spelling. That distinction is observable for numeric versus string components and for a single
+/// dotted component versus several components. `BTreeMap` supplies a defined traversal order for
+/// diagnostics and grammar projection. Like the pin's `v :: vs` insertion, a newer production is
+/// offered before older productions under the same key.
 #[derive(Debug, Default)]
 pub struct TokenMap {
-    entries: BTreeMap<String, Vec<Production>>,
+    entries: BTreeMap<Name, Vec<Production>>,
 }
 
 impl TokenMap {
@@ -116,11 +117,8 @@ impl TokenMap {
     }
 
     /// Index `production` under `token`.
-    pub fn insert(&mut self, token: impl Into<String>, production: Production) {
-        self.entries
-            .entry(token.into())
-            .or_default()
-            .push(production);
+    pub fn insert(&mut self, token: Name, production: Production) {
+        self.entries.entry(token).or_default().insert(0, production);
     }
 
     /// The productions under `token`, or `None` if the token has no entry.
@@ -128,7 +126,7 @@ impl TokenMap {
     /// `None` and `Some(empty)` are deliberately distinguishable because upstream's `map.get?`
     /// is what `symbol` branches on: an *absent* entry falls back to identKind, and that fallback
     /// is the difference between `symbol` and `default`.
-    pub fn get(&self, token: &str) -> Option<&[Production]> {
+    pub fn get(&self, token: &Name) -> Option<&[Production]> {
         self.entries.get(token).map(Vec::as_slice)
     }
 
@@ -197,8 +195,11 @@ impl Category {
                     fln_syntax::source::BytePos(0),
                 ));
             }
-            LeadingToken::Atom(symbol) => refs(map.get(symbol)),
-            LeadingToken::Node(kind) => refs(map.get(&kind.to_display_string())),
+            LeadingToken::Atom(symbol) => {
+                let token = Name::str(Name::anonymous(), symbol);
+                refs(map.get(&token))
+            }
+            LeadingToken::Node(kind) => refs(map.get(kind)),
             LeadingToken::Other => Vec::new(),
             LeadingToken::Ident(value) => Self::for_ident(map, value, behavior),
         };
@@ -215,18 +216,17 @@ impl Category {
         value: &Name,
         behavior: LeadingIdentBehavior,
     ) -> Vec<&'a Production> {
-        let ident = ident_kind().to_display_string();
-        let spelled = value.to_display_string();
+        let ident = ident_kind();
         match behavior {
             // The identifier's own name is not consulted at all.
             LeadingIdentBehavior::Default => refs(map.get(&ident)),
             // The identifier's own name wins outright when it has productions; identKind is
             // reached ONLY as a fallback when it does not.
-            LeadingIdentBehavior::Symbol => match map.get(&spelled) {
+            LeadingIdentBehavior::Symbol => match map.get(value) {
                 Some(productions) => productions.iter().collect(),
                 None => refs(map.get(&ident)),
             },
-            LeadingIdentBehavior::Both => match map.get(&spelled) {
+            LeadingIdentBehavior::Both => match map.get(value) {
                 Some(productions) => {
                     // THE DEDUP GUARD. An identifier literally named `ident` looks up the same
                     // entry twice; appending both copies would make the identKind productions tie
@@ -234,7 +234,7 @@ impl Category {
                     // `longest_match` would build a `choice` node, manufacturing an ambiguity out
                     // of a file that has none. Transcribed from the pin, not observed: a spurious
                     // choice node is invisible without an elaborator to complain about it.
-                    if spelled == ident {
+                    if value == &ident {
                         productions.iter().collect()
                     } else {
                         let mut both: Vec<&Production> = productions.iter().collect();
@@ -282,10 +282,12 @@ mod tests {
     /// `ident` — the exact shape of the pin probes.
     fn category(behavior: LeadingIdentBehavior) -> Category {
         let mut category = Category::new(name("c"), behavior);
-        category.leading.insert("pun", production("punProduction"));
         category
             .leading
-            .insert("ident", production("identProduction"));
+            .insert(name("pun"), production("punProduction"));
+        category
+            .leading
+            .insert(ident_kind(), production("identProduction"));
         category
     }
 
@@ -403,10 +405,10 @@ mod tests {
             LeadingIdentBehavior::Both,
         ] {
             let mut category = Category::new(name("c"), behavior);
-            category.leading.insert("+", production("plus"));
+            category.leading.insert(name("+"), production("plus"));
             category
                 .leading
-                .insert("ident", production("identProduction"));
+                .insert(ident_kind(), production("identProduction"));
             assert_eq!(
                 labels(category.leading_at(&LeadingToken::Atom("+".to_string()))),
                 vec!["plus"],
@@ -430,10 +432,12 @@ mod tests {
             LeadingIdentBehavior::Both,
         ] {
             let mut category = Category::new(name("c"), behavior);
-            category.trailing.insert("pun", production("punTrailing"));
             category
                 .trailing
-                .insert("ident", production("identTrailing"));
+                .insert(name("pun"), production("punTrailing"));
+            category
+                .trailing
+                .insert(ident_kind(), production("identTrailing"));
             assert_eq!(
                 labels(category.trailing_at(&LeadingToken::Ident(name("pun")))),
                 vec!["identTrailing"],
@@ -485,10 +489,49 @@ mod tests {
     #[test]
     fn a_node_token_is_indexed_under_its_kind() {
         let mut category = Category::new(name("c"), LeadingIdentBehavior::Default);
-        category.leading.insert("numLit", production("numeral"));
+        category
+            .leading
+            .insert(name("numLit"), production("numeral"));
         assert_eq!(
             labels(category.leading_at(&LeadingToken::Node(name("numLit")))),
             vec!["numeral"]
+        );
+    }
+
+    #[test]
+    fn token_map_identity_is_structural_not_the_display_projection() {
+        let numeric = Name::num(Name::anonymous(), 1);
+        let string = Name::str(Name::anonymous(), "1");
+        assert_eq!(numeric.to_display_string(), string.to_display_string());
+
+        let mut category = Category::new(name("c"), LeadingIdentBehavior::Default);
+        category
+            .leading
+            .insert(numeric.clone(), production("numeric"));
+        category
+            .leading
+            .insert(string.clone(), production("string"));
+
+        assert_eq!(
+            labels(category.leading_at(&LeadingToken::Node(numeric))),
+            vec!["numeric"]
+        );
+        assert_eq!(
+            labels(category.leading_at(&LeadingToken::Node(string))),
+            vec!["string"]
+        );
+    }
+
+    #[test]
+    fn token_map_offers_newer_productions_first_like_the_pin() {
+        let token = name("same");
+        let mut category = Category::new(name("c"), LeadingIdentBehavior::Default);
+        category.leading.insert(token.clone(), production("older"));
+        category.leading.insert(token.clone(), production("newer"));
+
+        assert_eq!(
+            labels(category.leading_at(&LeadingToken::Node(token))),
+            vec!["newer", "older"]
         );
     }
 
@@ -499,13 +542,16 @@ mod tests {
         let mut category = Category::new(name("c"), LeadingIdentBehavior::Symbol);
         category
             .leading
-            .insert("ident", production("identProduction"));
+            .insert(ident_kind(), production("identProduction"));
         // `pun` is absent, so symbol falls back to identKind.
         assert_eq!(
             labels(category.leading_at(&LeadingToken::Ident(name("pun")))),
             vec!["identProduction"]
         );
-        assert!(category.leading.get("pun").is_none(), "absent, not empty");
+        assert!(
+            category.leading.get(&name("pun")).is_none(),
+            "absent, not empty"
+        );
     }
 
     /// The category name is what the Pratt loop puts in "expected ..." — checked here so the two

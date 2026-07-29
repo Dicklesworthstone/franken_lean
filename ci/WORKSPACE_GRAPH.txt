@@ -86,6 +86,7 @@ edge fln-olean -> fln-core         # declaration decoder builds term-plane value
 edge fln-syntax -> fln-core        # SyntaxNodeKind and identifiers are Name (franken_lean-vrmi; §21, AGENTS.md crate map)
 edge fln-parse -> fln-syntax       # the Pratt engine consumes lexer tokens and builds Syntax (fln-ffam; §9, ranks 8 -> 7)
 edge fln-parse -> fln-core         # SyntaxNodeKind, category names and precedences are Name (fln-ffam; §21, AGENTS.md crate map)
+edge fln-parse -> fln-hash         # grammar identity embeds the canonical Name codec (franken_lean-9km; §9.1, ranks 8 -> 1)
 edge fln-olean -> fln-env          # declaration decoder yields ConstantInfo (franken_lean-z6c)
 edge fln-conformance -> fln-env    # kernel replay builds environments from decoded modules (franken_lean-z6c)
 edge fln-conformance -> fln-kernel # kernel replay drives the one authority (franken_lean-z6c)

@@ -40,6 +40,7 @@ use crate::state::Production;
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
+use fln_hash::canon::Canonical;
 use std::collections::BTreeMap;
 
 /// A point in the registration history — upstream's parser state as of one command.
@@ -126,7 +127,7 @@ impl Registered {
 
 /// The dynamic grammar: categories, their productions, and the scope stack.
 pub struct Registry {
-    categories: BTreeMap<String, CategoryState>,
+    categories: BTreeMap<Name, CategoryState>,
     epoch: GrammarEpoch,
     depth: ScopeDepth,
     /// Hooks, in registration order. Run in **reverse** — see [`Registry::run_hooks`].
@@ -139,8 +140,8 @@ struct CategoryState {
     registered_at: GrammarEpoch,
     behavior: LeadingIdentBehavior,
     /// Append-only, per token. See the module docs: shadowing is additive.
-    leading: BTreeMap<String, Vec<Registered>>,
-    trailing: BTreeMap<String, Vec<Registered>>,
+    leading: BTreeMap<Name, Vec<Registered>>,
+    trailing: BTreeMap<Name, Vec<Registered>>,
 }
 
 impl Registry {
@@ -167,13 +168,12 @@ impl Registry {
         name: Name,
         behavior: LeadingIdentBehavior,
     ) -> Result<GrammarEpoch, RegisterError> {
-        let key = name.to_display_string();
-        if self.categories.contains_key(&key) {
+        if self.categories.contains_key(&name) {
             return Err(RegisterError::CategoryExists { name });
         }
         let epoch = self.epoch.next();
         self.categories.insert(
-            key,
+            name.clone(),
             CategoryState {
                 name,
                 registered_at: epoch,
@@ -194,7 +194,7 @@ impl Registry {
     pub fn add_leading(
         &mut self,
         category: &Name,
-        token: impl Into<String>,
+        token: Name,
         production: Production,
         scoped: bool,
     ) -> Result<GrammarEpoch, RegisterError> {
@@ -205,7 +205,7 @@ impl Registry {
     pub fn add_trailing(
         &mut self,
         category: &Name,
-        token: impl Into<String>,
+        token: Name,
         production: Production,
         scoped: bool,
     ) -> Result<GrammarEpoch, RegisterError> {
@@ -215,13 +215,12 @@ impl Registry {
     fn add(
         &mut self,
         category: &Name,
-        token: impl Into<String>,
+        token: Name,
         production: Production,
         scoped: bool,
         leading: bool,
     ) -> Result<GrammarEpoch, RegisterError> {
-        let key = category.to_display_string();
-        if !self.categories.contains_key(&key) {
+        if !self.categories.contains_key(category) {
             return Err(RegisterError::UnknownCategory {
                 name: category.clone(),
             });
@@ -230,18 +229,17 @@ impl Registry {
         let scope = scoped.then_some(self.depth);
         let kind = production.kind.clone();
         {
-            let state =
-                self.categories
-                    .get_mut(&key)
-                    .ok_or_else(|| RegisterError::UnknownCategory {
-                        name: category.clone(),
-                    })?;
+            let state = self.categories.get_mut(category).ok_or_else(|| {
+                RegisterError::UnknownCategory {
+                    name: category.clone(),
+                }
+            })?;
             let table = if leading {
                 &mut state.leading
             } else {
                 &mut state.trailing
             };
-            table.entry(token.into()).or_default().push(Registered {
+            table.entry(token).or_default().push(Registered {
                 production,
                 registered_at: epoch,
                 retired_at: None,
@@ -327,11 +325,13 @@ impl Registry {
     /// after it. Asking for an old epoch is therefore not a debugging convenience; it is the only
     /// way to replay a parse against the grammar it actually had.
     pub fn view_at(&self, category: &Name, epoch: GrammarEpoch) -> Option<Category> {
-        let state = self.categories.get(&category.to_display_string())?;
+        let state = self.categories.get(category)?;
         if state.registered_at > epoch {
             return None;
         }
         let mut view = Category::new(state.name.clone(), state.behavior);
+        // History is stored oldest-to-newest. TokenMap::insert prepends like the pin, so replaying
+        // it in this order reconstructs the pin's newest-first candidate list at this epoch.
         for (token, productions) in &state.leading {
             for entry in productions.iter().filter(|entry| entry.is_live_at(epoch)) {
                 view.leading.insert(token.clone(), entry.production.clone());
@@ -350,8 +350,8 @@ impl Registry {
     ///
     /// The direct form of the additive-shadowing law: two registrations under one token yield two
     /// kinds here, and a registry that replaced would yield one.
-    pub fn kinds_at(&self, category: &Name, token: &str, epoch: GrammarEpoch) -> Vec<String> {
-        let Some(state) = self.categories.get(&category.to_display_string()) else {
+    pub fn kinds_at(&self, category: &Name, token: &Name, epoch: GrammarEpoch) -> Vec<Name> {
+        let Some(state) = self.categories.get(category) else {
             return Vec::new();
         };
         if state.registered_at > epoch {
@@ -364,7 +364,7 @@ impl Registry {
                 productions
                     .iter()
                     .filter(|entry| entry.is_live_at(epoch))
-                    .map(|entry| entry.production.kind.to_display_string())
+                    .map(|entry| entry.production.kind.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -372,12 +372,14 @@ impl Registry {
 
     /// Whether `category` exists.
     pub fn has_category(&self, category: &Name) -> bool {
-        self.categories.contains_key(&category.to_display_string())
+        self.categories.contains_key(category)
     }
 
-    /// Every category name, sorted — determinism is a contract (FL-INV-01), so the iteration order
-    /// of the registry is defined rather than incidental.
-    pub fn category_names(&self) -> Vec<String> {
+    /// Every category name, in structural [`Name`] order.
+    ///
+    /// Determinism is a contract (FL-INV-01), which is why the underlying map has a defined
+    /// structural order rather than a rendered-string projection or insertion order.
+    pub fn category_names(&self) -> Vec<Name> {
         self.categories.keys().cloned().collect()
     }
 }
@@ -399,20 +401,88 @@ impl std::fmt::Debug for Registry {
     }
 }
 
-/// A canonical projection of the whole grammar — the value FL-INV-01 requires to be identical at
-/// every thread count.
+/// A canonical projection of the active parser-table fields the current engine can encode.
 ///
-/// A *string* rather than a hash, deliberately: when two roots differ the diff has to say what
-/// differs, and a digest says only that something did. The projection is ordered by construction
-/// (categories sorted, tokens sorted, kinds in registration order) so equal grammars have equal
-/// roots and unequal ones are legible.
+/// A *string* rather than a hash, deliberately: when two roots differ the diff should expose the
+/// differing input rather than only a digest. The format is versioned and length-framed, and names
+/// embed the schema-headed canonical `fln-hash` bytes as hex. Punctuation in a token cannot forge
+/// a record boundary, and a numeric name component cannot imitate a string component.
 ///
-/// Kinds are in **registration order** and not sorted, because that order is semantically load
-/// bearing: shadowing is additive, so the sequence of productions under a token is part of the
-/// grammar rather than an artefact of how it was built. Sorting them here would hide a real
-/// difference and make the determinism claim weaker than it looks.
+/// Categories and tokens use their defined map orders. Productions remain in **registration
+/// order**, because additive shadowing makes that sequence semantic. Each production also binds
+/// its leading/trailing position, priority, and scope ownership.
+///
+/// This is not yet complete registry identity: [`Production::run`] is an opaque closure with no
+/// stable descriptor for its code or captured state, and the current scope-stack depth and hook
+/// identities affect future mutations without changing an active lookup table. A future
+/// content-hashed [`GrammarEpoch`] must add those effect-state descriptors and use the canonical
+/// hash codec rather than treating this diagnostic projection as a durable artifact.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GrammarRoot(pub String);
+
+const GRAMMAR_ROOT_SCHEMA: &str = "fln.grammar-root/2;";
+
+fn push_decimal(out: &mut String, value: impl ToString) {
+    out.push_str(&value.to_string());
+    out.push(';');
+}
+
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    out.push_str(&bytes.len().to_string());
+    out.push(':');
+    for byte in bytes {
+        for nibble in [byte >> 4, byte & 0x0f] {
+            out.push(char::from(if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            }));
+        }
+    }
+    out.push(';');
+}
+
+/// Append the schema-headed canonical `Name` bytes, rendered as hex so [`GrammarRoot`] remains a
+/// string. The codec is owned by `fln-hash`; this module does not maintain a second structural
+/// encoding that could drift from artifact identity.
+fn push_name(out: &mut String, name: &Name) {
+    out.push('N');
+    push_hex(out, &name.to_canonical_bytes());
+}
+
+fn push_productions(
+    out: &mut String,
+    position: char,
+    table: &BTreeMap<Name, Vec<Registered>>,
+    epoch: GrammarEpoch,
+) {
+    for (token, productions) in table {
+        for (order, entry) in productions
+            .iter()
+            .filter(|entry| entry.is_live_at(epoch))
+            .enumerate()
+        {
+            out.push('P');
+            out.push(position);
+            out.push('T');
+            push_name(out, token);
+            out.push('K');
+            push_name(out, &entry.production.kind);
+            out.push('R');
+            push_decimal(out, entry.production.priority);
+            out.push('O');
+            push_decimal(out, order);
+            out.push('S');
+            match entry.scope {
+                None => out.push_str("0;"),
+                Some(depth) => {
+                    out.push_str("1;");
+                    push_decimal(out, depth.0);
+                }
+            }
+        }
+    }
+}
 
 /// A registration request, carrying the key that decides its canonical position.
 ///
@@ -428,7 +498,7 @@ pub struct Request {
     /// published because stable sorting would otherwise preserve schedule-dependent arrival order.
     pub key: (u64, String),
     pub category: Name,
-    pub token: String,
+    pub token: Name,
     pub production: Production,
     pub scoped: bool,
 }
@@ -454,34 +524,25 @@ impl RegistryBudget {
 }
 
 impl Registry {
-    /// The canonical projection of the whole grammar as of `epoch`.
+    /// The canonical projection of the named, active registry fields as of `epoch`.
     pub fn grammar_root(&self, epoch: GrammarEpoch) -> GrammarRoot {
-        let mut out = String::new();
-        for (key, state) in &self.categories {
+        let mut out = String::from(GRAMMAR_ROOT_SCHEMA);
+        for (name, state) in &self.categories {
             if state.registered_at > epoch {
                 continue;
             }
-            out.push_str(&format!("cat {key} {:?}\n", state.behavior));
-            for (token, productions) in &state.leading {
-                let live: Vec<String> = productions
-                    .iter()
-                    .filter(|entry| entry.is_live_at(epoch))
-                    .map(|entry| entry.production.kind.to_display_string())
-                    .collect();
-                if !live.is_empty() {
-                    out.push_str(&format!("  lead {token} [{}]\n", live.join(",")));
-                }
-            }
-            for (token, productions) in &state.trailing {
-                let live: Vec<String> = productions
-                    .iter()
-                    .filter(|entry| entry.is_live_at(epoch))
-                    .map(|entry| entry.production.kind.to_display_string())
-                    .collect();
-                if !live.is_empty() {
-                    out.push_str(&format!("  trail {token} [{}]\n", live.join(",")));
-                }
-            }
+            out.push('C');
+            push_name(&mut out, name);
+            out.push('B');
+            out.push(match state.behavior {
+                LeadingIdentBehavior::Default => '0',
+                LeadingIdentBehavior::Symbol => '1',
+                LeadingIdentBehavior::Both => '2',
+            });
+            out.push(';');
+            push_productions(&mut out, 'L', &state.leading, epoch);
+            push_productions(&mut out, 'T', &state.trailing, epoch);
+            out.push_str("E;");
         }
         GrammarRoot(out)
     }
@@ -564,10 +625,7 @@ impl Registry {
         }
 
         for request in &requests {
-            if !self
-                .categories
-                .contains_key(&request.category.to_display_string())
-            {
+            if !self.categories.contains_key(&request.category) {
                 return Err(RegisterError::UnknownCategory {
                     name: request.category.clone(),
                 });
@@ -646,7 +704,7 @@ mod tests {
         Request {
             key: (key.0, key.1.to_string()),
             category: category.clone(),
-            token: token.to_string(),
+            token: name(token),
             production: production(kind),
             scoped: false,
         }
@@ -684,12 +742,30 @@ mod tests {
         )
     }
 
+    fn root_with_registered(kind: Name, priority: u32, scoped: bool, leading: bool) -> GrammarRoot {
+        let (mut registry, term) = registry_with_term();
+        if scoped {
+            registry.push_scope();
+        }
+        let production = Production::new(kind, priority, |_state| {});
+        if leading {
+            registry
+                .add_leading(&term, name("tok"), production, scoped)
+                .expect("registers leading production");
+        } else {
+            registry
+                .add_trailing(&term, name("tok"), production, scoped)
+                .expect("registers trailing production");
+        }
+        registry.grammar_root(registry.epoch())
+    }
+
     #[test]
     fn an_unknown_category_in_a_batch_is_refused_before_any_request_is_published() {
         for reverse_arrival in [false, true] {
             let (mut registry, term) = registry_with_term();
             registry
-                .add_leading(&term, "existing", production("existing"), false)
+                .add_leading(&term, name("existing"), production("existing"), false)
                 .expect("the control production registers");
             let hooks = Arc::new(AtomicUsize::new(0));
             let hook_count = Arc::clone(&hooks);
@@ -766,8 +842,8 @@ mod tests {
             ])
             .expect("distinct keys are canonicalizable");
         assert_eq!(
-            registry.kinds_at(&term, "dup", registry.epoch()),
-            vec!["first", "second"],
+            registry.kinds_at(&term, &name("dup"), registry.epoch()),
+            vec![name("first"), name("second")],
             "distinct canonical keys, not arrival order, choose the production sequence"
         );
     }
@@ -847,6 +923,130 @@ mod tests {
         assert_eq!(hooks.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn category_identity_is_structural_not_the_display_projection() {
+        let lookalikes = [
+            (
+                Name::num(Name::anonymous(), 1),
+                Name::str(Name::anonymous(), "1"),
+            ),
+            (
+                Name::str(Name::anonymous(), "a.b"),
+                Name::str(Name::str(Name::anonymous(), "a"), "b"),
+            ),
+        ];
+
+        for (left, right) in lookalikes {
+            assert_ne!(
+                left, right,
+                "the control names must be structurally distinct"
+            );
+            assert_eq!(
+                left.to_display_string(),
+                right.to_display_string(),
+                "the control names must share their presentation"
+            );
+
+            let mut registry = Registry::new();
+            registry
+                .declare_category(left.clone(), LeadingIdentBehavior::Default)
+                .expect("the first structural name declares");
+            registry
+                .declare_category(right.clone(), LeadingIdentBehavior::Default)
+                .expect("an equal display string is not a duplicate category");
+            registry
+                .add_leading(&left, name("tok"), production("left"), false)
+                .expect("the left category remains addressable");
+            registry
+                .add_leading(&right, name("tok"), production("right"), false)
+                .expect("the right category remains addressable");
+
+            assert_eq!(
+                registry.kinds_at(&left, &name("tok"), registry.epoch()),
+                vec![name("left")]
+            );
+            assert_eq!(
+                registry.kinds_at(&right, &name("tok"), registry.epoch()),
+                vec![name("right")]
+            );
+            assert_eq!(
+                registry.category_names(),
+                vec![left, right],
+                "the identity inventory must retain both structural categories"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_root_frames_lists_and_names_without_display_collisions() {
+        let root_for_kinds = |kinds: &[&str]| {
+            let (mut registry, term) = registry_with_term();
+            for kind in kinds {
+                registry
+                    .add_leading(&term, name("tok"), production(kind), false)
+                    .expect("registers");
+            }
+            registry.grammar_root(registry.epoch())
+        };
+        assert_ne!(
+            root_for_kinds(&["first,second"]),
+            root_for_kinds(&["first", "second"]),
+            "one punctuated kind is not a two-production list"
+        );
+
+        let numeric = Name::num(Name::anonymous(), 1);
+        let string = Name::str(Name::anonymous(), "1");
+        assert_eq!(numeric.to_display_string(), string.to_display_string());
+        assert_ne!(
+            root_with_registered(numeric.clone(), 0, false, true),
+            root_with_registered(string.clone(), 0, false, true),
+            "a production kind's component tag is part of grammar identity"
+        );
+
+        let root_for_token = |token: Name| {
+            let (mut registry, term) = registry_with_term();
+            registry
+                .add_leading(&term, token, production("same"), false)
+                .expect("registers");
+            registry.grammar_root(registry.epoch())
+        };
+        assert_ne!(
+            root_for_token(numeric),
+            root_for_token(string),
+            "a token key's component tag is part of grammar identity"
+        );
+    }
+
+    #[test]
+    fn grammar_root_binds_priority_position_and_scope_ownership() {
+        let baseline = root_with_registered(name("same"), 7, false, true);
+        assert_ne!(
+            baseline,
+            root_with_registered(name("same"), 8, false, true),
+            "priority participates in parser resolution"
+        );
+        assert_ne!(
+            baseline,
+            root_with_registered(name("same"), 7, false, false),
+            "leading and trailing tables have different parser roles"
+        );
+        assert_ne!(
+            baseline,
+            root_with_registered(name("same"), 7, true, true),
+            "scope exit treats a scoped registration differently"
+        );
+    }
+
+    #[test]
+    fn independently_built_equal_registry_states_have_equal_roots() {
+        let kind = || Name::str(Name::str(Name::anonymous(), "a.b"), "c;d");
+        assert_eq!(
+            root_with_registered(kind(), 17, true, false),
+            root_with_registered(kind(), 17, true, false),
+            "allocation identity must not enter the grammar projection"
+        );
+    }
+
     /// **SHADOWING IS ADDITIVE.** Two productions under one token both stay registered.
     ///
     /// Observed at the pin: two `notation "dup"` declarations then `#eval dup` gives
@@ -857,18 +1057,44 @@ mod tests {
     fn a_second_production_under_the_same_token_does_not_replace_the_first() {
         let (mut registry, term) = registry_with_term();
         registry
-            .add_leading(&term, "dup", production("first"), false)
+            .add_leading(&term, name("dup"), production("first"), false)
             .expect("registers");
         let epoch = registry
-            .add_leading(&term, "dup", production("second"), false)
+            .add_leading(&term, name("dup"), production("second"), false)
             .expect("registers");
 
         assert_eq!(
-            registry.kinds_at(&term, "dup", epoch),
-            vec!["first", "second"],
+            registry.kinds_at(&term, &name("dup"), epoch),
+            vec![name("first"), name("second")],
             "both productions must be live; replacing the first would drop an ambiguity the \
              elaborator is supposed to resolve"
         );
+    }
+
+    #[test]
+    fn a_category_view_offers_newer_productions_first_at_each_epoch() {
+        let (mut registry, term) = registry_with_term();
+        let token = name("dup");
+        let first = registry
+            .add_leading(&term, token.clone(), production("first"), false)
+            .expect("registers");
+        let second = registry
+            .add_leading(&term, token.clone(), production("second"), false)
+            .expect("registers");
+
+        let kinds = |epoch| {
+            registry
+                .view_at(&term, epoch)
+                .expect("the category exists")
+                .leading
+                .get(&token)
+                .expect("the token exists")
+                .iter()
+                .map(|production| production.kind.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(first), vec![name("first")]);
+        assert_eq!(kinds(second), vec![name("second"), name("first")]);
     }
 
     /// **INTERLEAVING.** A lookup at an epoch sees only registrations made before it.
@@ -880,25 +1106,25 @@ mod tests {
         let (mut registry, term) = registry_with_term();
         let before = registry.epoch();
         let after_first = registry
-            .add_leading(&term, "tok", production("first"), false)
+            .add_leading(&term, name("tok"), production("first"), false)
             .expect("registers");
         let after_second = registry
-            .add_leading(&term, "tok", production("second"), false)
+            .add_leading(&term, name("tok"), production("second"), false)
             .expect("registers");
 
         assert!(
-            registry.kinds_at(&term, "tok", before).is_empty(),
+            registry.kinds_at(&term, &name("tok"), before).is_empty(),
             "an epoch before any registration sees none — this is the `#check` before the \
              `syntax` declaration"
         );
         assert_eq!(
-            registry.kinds_at(&term, "tok", after_first),
-            vec!["first"],
+            registry.kinds_at(&term, &name("tok"), after_first),
+            vec![name("first")],
             "the epoch after the first registration sees exactly it"
         );
         assert_eq!(
-            registry.kinds_at(&term, "tok", after_second),
-            vec!["first", "second"],
+            registry.kinds_at(&term, &name("tok"), after_second),
+            vec![name("first"), name("second")],
             "and the later epoch sees both"
         );
     }
@@ -910,13 +1136,13 @@ mod tests {
         let mut seen = vec![registry.epoch()];
         seen.push(
             registry
-                .add_leading(&term, "a", production("a"), false)
+                .add_leading(&term, name("a"), production("a"), false)
                 .expect("registers"),
         );
         seen.push(registry.push_scope());
         seen.push(
             registry
-                .add_leading(&term, "b", production("b"), true)
+                .add_leading(&term, name("b"), production("b"), true)
                 .expect("registers"),
         );
         seen.push(registry.pop_scope().expect("pops"));
@@ -946,23 +1172,26 @@ mod tests {
     fn closing_a_scope_discards_its_registrations() {
         let (mut registry, term) = registry_with_term();
         registry
-            .add_leading(&term, "global", production("global"), false)
+            .add_leading(&term, name("global"), production("global"), false)
             .expect("registers");
         registry.push_scope();
         registry
-            .add_leading(&term, "local", production("local"), true)
+            .add_leading(&term, name("local"), production("local"), true)
             .expect("registers");
         let inside = registry.epoch();
-        assert_eq!(registry.kinds_at(&term, "local", inside), vec!["local"]);
+        assert_eq!(
+            registry.kinds_at(&term, &name("local"), inside),
+            vec![name("local")]
+        );
 
         let outside = registry.pop_scope().expect("pops");
         assert!(
-            registry.kinds_at(&term, "local", outside).is_empty(),
+            registry.kinds_at(&term, &name("local"), outside).is_empty(),
             "the scoped registration must be gone after the scope closes"
         );
         assert_eq!(
-            registry.kinds_at(&term, "global", outside),
-            vec!["global"],
+            registry.kinds_at(&term, &name("global"), outside),
+            vec![name("global")],
             "and the global one must survive"
         );
     }
@@ -978,25 +1207,33 @@ mod tests {
         let (mut registry, term) = registry_with_term();
         registry.push_scope();
         registry
-            .add_leading(&term, "outer", production("outer"), true)
+            .add_leading(&term, name("outer"), production("outer"), true)
             .expect("registers");
         registry.push_scope();
         registry
-            .add_leading(&term, "inner", production("inner"), true)
+            .add_leading(&term, name("inner"), production("inner"), true)
             .expect("registers");
 
         let both = registry.epoch();
-        assert_eq!(registry.kinds_at(&term, "outer", both), vec!["outer"]);
-        assert_eq!(registry.kinds_at(&term, "inner", both), vec!["inner"]);
+        assert_eq!(
+            registry.kinds_at(&term, &name("outer"), both),
+            vec![name("outer")]
+        );
+        assert_eq!(
+            registry.kinds_at(&term, &name("inner"), both),
+            vec![name("inner")]
+        );
 
         let after_inner = registry.pop_scope().expect("pops the inner scope");
         assert!(
-            registry.kinds_at(&term, "inner", after_inner).is_empty(),
+            registry
+                .kinds_at(&term, &name("inner"), after_inner)
+                .is_empty(),
             "the inner scope's registration is gone"
         );
         assert_eq!(
-            registry.kinds_at(&term, "outer", after_inner),
-            vec!["outer"],
+            registry.kinds_at(&term, &name("outer"), after_inner),
+            vec![name("outer")],
             "the OUTER scope's registration must survive. The discard that breaks this is `<=` \
              on depth, not `>=`: `>=` cannot break it, because no registration is ever deeper than \
              the scope being closed."
@@ -1004,7 +1241,9 @@ mod tests {
 
         let after_outer = registry.pop_scope().expect("pops the outer scope");
         assert!(
-            registry.kinds_at(&term, "outer", after_outer).is_empty(),
+            registry
+                .kinds_at(&term, &name("outer"), after_outer)
+                .is_empty(),
             "and closing the outer scope discards it"
         );
     }
@@ -1016,12 +1255,12 @@ mod tests {
         let (mut registry, term) = registry_with_term();
         registry.push_scope();
         registry
-            .add_leading(&term, "tok", production("notLocal"), false)
+            .add_leading(&term, name("tok"), production("notLocal"), false)
             .expect("registers");
         let after = registry.pop_scope().expect("pops");
         assert_eq!(
-            registry.kinds_at(&term, "tok", after),
-            vec!["notLocal"],
+            registry.kinds_at(&term, &name("tok"), after),
+            vec![name("notLocal")],
             "a plain `notation` inside a section outlives the section"
         );
     }
@@ -1033,7 +1272,7 @@ mod tests {
     fn registering_into_an_unknown_category_is_refused_with_the_pins_wording() {
         let (mut registry, _) = registry_with_term();
         let missing = name("nosuchcategory");
-        let refused = registry.add_leading(&missing, "zz", production("zz"), false);
+        let refused = registry.add_leading(&missing, name("zz"), production("zz"), false);
         assert_eq!(
             refused,
             Err(RegisterError::UnknownCategory {
@@ -1059,7 +1298,7 @@ mod tests {
     fn declaring_a_category_twice_is_refused() {
         let (mut registry, term) = registry_with_term();
         registry
-            .add_leading(&term, "tok", production("p"), false)
+            .add_leading(&term, name("tok"), production("p"), false)
             .expect("registers");
         let refused = registry.declare_category(term.clone(), LeadingIdentBehavior::Both);
         assert_eq!(
@@ -1067,8 +1306,8 @@ mod tests {
             Err(RegisterError::CategoryExists { name: term.clone() })
         );
         assert_eq!(
-            registry.kinds_at(&term, "tok", registry.epoch()),
-            vec!["p"],
+            registry.kinds_at(&term, &name("tok"), registry.epoch()),
+            vec![name("p")],
             "and the existing productions are untouched"
         );
     }
@@ -1100,7 +1339,7 @@ mod tests {
             });
         }
         registry
-            .add_leading(&term, "tok", production("p"), false)
+            .add_leading(&term, name("tok"), production("p"), false)
             .expect("registers");
 
         assert_eq!(
@@ -1124,7 +1363,7 @@ mod tests {
             ));
         });
         registry
-            .add_leading(&term, "tok", production("myProduction"), false)
+            .add_leading(&term, name("tok"), production("myProduction"), false)
             .expect("registers");
         assert_eq!(
             seen.lock().expect("lock").as_slice(),
@@ -1143,13 +1382,13 @@ mod tests {
             *counter.lock().expect("lock") += 1;
         });
         registry
-            .add_leading(&name("nosuchcategory"), "zz", production("zz"), false)
+            .add_leading(&name("nosuchcategory"), name("zz"), production("zz"), false)
             .expect_err("refused");
         assert_eq!(*fired.lock().expect("lock"), 0);
     }
 
-    /// The registry's iteration order is defined, because determinism is a contract (FL-INV-01)
-    /// and the candidate order reaches `longest_match`.
+    /// The registry's identity inventory has a defined structural order because determinism is a
+    /// contract (FL-INV-01).
     #[test]
     fn category_iteration_order_is_defined() {
         let mut registry = Registry::new();
@@ -1160,7 +1399,7 @@ mod tests {
         }
         assert_eq!(
             registry.category_names(),
-            vec!["attr", "command", "tactic", "term"],
+            vec![name("attr"), name("command"), name("tactic"), name("term")],
             "sorted, not insertion-ordered"
         );
     }
@@ -1179,7 +1418,7 @@ mod tests {
         let after = registry
             .add_leading(
                 &term,
-                "tok",
+                name("tok"),
                 Production::new(name("replayed"), 7, move |state| {
                     callback_fired.fetch_add(1, Ordering::SeqCst);
                     state.set_pos(BytePos(3));
@@ -1201,7 +1440,7 @@ mod tests {
             .view_at(&term, before)
             .expect("the category already exists");
         assert!(
-            old.leading.get("tok").is_none(),
+            old.leading.get(&name("tok")).is_none(),
             "the older view must not contain the later registration"
         );
 
@@ -1231,7 +1470,7 @@ mod tests {
         let epoch = registry
             .add_trailing(
                 &term,
-                "+",
+                name("+"),
                 Production::new(name("plus"), 3, move |state| {
                     callback_fired.fetch_add(1, Ordering::SeqCst);
                     let left = state.pop().unwrap_or(Syntax::Missing);
@@ -1273,7 +1512,7 @@ mod tests {
         let inside = registry
             .add_leading(
                 &term,
-                "local",
+                name("local"),
                 Production::new(name("local"), 0, move |state| {
                     callback_fired.fetch_add(1, Ordering::SeqCst);
                     state.set_pos(BytePos(5));
@@ -1292,12 +1531,12 @@ mod tests {
             "a later scope exit must not rewrite an earlier grammar root"
         );
         assert_eq!(
-            registry.kinds_at(&term, "local", inside),
-            vec!["local"],
+            registry.kinds_at(&term, &name("local"), inside),
+            vec![name("local")],
             "the inside epoch retains the local production"
         );
         assert!(
-            registry.kinds_at(&term, "local", outside).is_empty(),
+            registry.kinds_at(&term, &name("local"), outside).is_empty(),
             "the pop epoch observes the restored grammar"
         );
 
@@ -1313,7 +1552,7 @@ mod tests {
             .view_at(&term, outside)
             .expect("the category survives its local production");
         assert!(
-            restored.leading.get("local").is_none(),
+            restored.leading.get(&name("local")).is_none(),
             "a current view must not expose a retired local production"
         );
     }
@@ -1325,24 +1564,29 @@ mod tests {
         let (mut registry, term) = registry_with_term();
         registry.push_scope();
         let first = registry
-            .add_leading(&term, "same", production("first"), true)
+            .add_leading(&term, name("same"), production("first"), true)
             .expect("registers first");
         registry.pop_scope().expect("pops first");
 
         registry.push_scope();
         let second = registry
-            .add_leading(&term, "same", production("second"), true)
+            .add_leading(&term, name("same"), production("second"), true)
             .expect("registers second");
         let after_second = registry.pop_scope().expect("pops second");
 
-        assert_eq!(registry.kinds_at(&term, "same", first), vec!["first"]);
         assert_eq!(
-            registry.kinds_at(&term, "same", second),
-            vec!["second"],
+            registry.kinds_at(&term, &name("same"), first),
+            vec![name("first")]
+        );
+        assert_eq!(
+            registry.kinds_at(&term, &name("same"), second),
+            vec![name("second")],
             "the retired entry from the earlier scope must not revive when its depth is reused"
         );
         assert!(
-            registry.kinds_at(&term, "same", after_second).is_empty(),
+            registry
+                .kinds_at(&term, &name("same"), after_second)
+                .is_empty(),
             "both local lifetimes are retired after the second pop"
         );
     }
@@ -1359,14 +1603,13 @@ mod tests {
             .expect("declares");
 
         assert!(registry.view_at(&term, before).is_none());
-        assert_eq!(registry.grammar_root(before), GrammarRoot(String::new()));
+        let empty_root = GrammarRoot(GRAMMAR_ROOT_SCHEMA.to_string());
+        assert_eq!(registry.grammar_root(before), empty_root);
         assert!(registry.view_at(&term, declared).is_some());
-        assert!(
-            registry
-                .grammar_root(declared)
-                .0
-                .contains("cat term Default"),
-            "the declaration epoch activates the category"
+        assert_ne!(
+            registry.grammar_root(declared),
+            empty_root,
+            "the declaration epoch activates the structurally encoded category"
         );
     }
 
@@ -1376,7 +1619,7 @@ mod tests {
         let (mut registry, term) = registry_with_term();
         registry.push_scope();
         registry
-            .add_leading(&term, "old", production("old"), true)
+            .add_leading(&term, name("old"), production("old"), true)
             .expect("registers");
         registry.pop_scope().expect("pops");
         assert_eq!(registry.production_count(), 0);
@@ -1384,7 +1627,7 @@ mod tests {
         let request = || Request {
             key: (0, "new".to_string()),
             category: term.clone(),
-            token: "new".to_string(),
+            token: name("new"),
             production: production("new"),
             scoped: false,
         };
@@ -1425,22 +1668,22 @@ mod tests {
     fn production_count_reports_only_the_current_epoch() {
         let (mut registry, term) = registry_with_term();
         registry
-            .add_leading(&term, "global", production("global"), false)
+            .add_leading(&term, name("global"), production("global"), false)
             .expect("registers global");
         registry.push_scope();
         registry
-            .add_leading(&term, "local", production("local"), true)
+            .add_leading(&term, name("local"), production("local"), true)
             .expect("registers local");
         assert_eq!(registry.production_count(), 2);
         registry.pop_scope().expect("pops");
         assert_eq!(registry.production_count(), 1);
         assert_eq!(
-            registry.kinds_at(&term, "global", registry.epoch()),
-            vec!["global"]
+            registry.kinds_at(&term, &name("global"), registry.epoch()),
+            vec![name("global")]
         );
         assert!(
             registry
-                .kinds_at(&term, "local", registry.epoch())
+                .kinds_at(&term, &name("local"), registry.epoch())
                 .is_empty()
         );
     }

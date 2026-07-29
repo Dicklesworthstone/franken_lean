@@ -48,7 +48,7 @@ fn production(label: &str) -> Production {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Model {
     /// (token, kind, scope-depth-or-none), in registration order — additive, never replacing.
-    live: Vec<(String, String, Option<usize>)>,
+    live: Vec<(Name, Name, Option<usize>)>,
     depth: usize,
 }
 
@@ -56,7 +56,7 @@ impl Model {
     /// ADD and SHADOW: append, never replace. From the `Ambiguous term` observation.
     fn add(&mut self, token: &str, kind: &str, scoped: bool) {
         let scope = scoped.then_some(self.depth);
-        self.live.push((token.to_string(), kind.to_string(), scope));
+        self.live.push((name(token), name(kind), scope));
     }
 
     fn push_scope(&mut self) {
@@ -70,10 +70,10 @@ impl Model {
         self.depth -= 1;
     }
 
-    fn kinds(&self, token: &str) -> Vec<String> {
+    fn kinds(&self, grammar_key: &Name) -> Vec<Name> {
         self.live
             .iter()
-            .filter(|(t, _, _)| t == token)
+            .filter(|(key, _, _)| key.cmp(grammar_key).is_eq())
             .map(|(_, kind, _)| kind.clone())
             .collect()
     }
@@ -107,7 +107,7 @@ fn apply(ops: &[Op]) -> (Registry, Model, Name) {
                 scoped,
             } => {
                 registry
-                    .add_leading(&term, *token, production(kind), *scoped)
+                    .add_leading(&term, name(token), production(kind), *scoped)
                     .expect("registers");
                 model.add(token, kind, *scoped);
             }
@@ -128,9 +128,10 @@ fn agree(ops: &[Op], tokens: &[&str], context: &str) {
     let (registry, model, term) = apply(ops);
     let epoch = registry.epoch();
     for token in tokens {
+        let token = name(token);
         assert_eq!(
-            registry.kinds_at(&term, token, epoch),
-            model.kinds(token),
+            registry.kinds_at(&term, &token, epoch),
+            model.kinds(&token),
             "{context}: registry and model disagree on {token:?} after {ops:?}"
         );
     }
@@ -174,8 +175,8 @@ fn adding_accumulates_and_never_replaces() {
         },
     ]);
     assert_eq!(
-        registry.kinds_at(&term, "dup", registry.epoch()),
-        vec!["first", "second"],
+        registry.kinds_at(&term, &name("dup"), registry.epoch()),
+        vec![name("first"), name("second")],
         "the pin gives `Ambiguous term` for two notations under one token, which is only possible \
          if both are live"
     );
@@ -300,19 +301,23 @@ fn a_last_wins_model_disagrees_with_the_registry() {
     let (registry, additive, term) = apply(&ops);
 
     // The wrong model: replace on collision.
-    let mut last_wins: Vec<(String, String)> = Vec::new();
+    let mut last_wins: Vec<(Name, Name)> = Vec::new();
     for op in &ops {
         if let Op::Add { token, kind, .. } = op {
-            last_wins.retain(|(t, _)| t != token);
-            last_wins.push((token.to_string(), kind.to_string()));
+            let grammar_key = name(token);
+            last_wins.retain(|(existing, _)| existing.cmp(&grammar_key).is_ne());
+            last_wins.push((grammar_key, name(kind)));
         }
     }
-    let wrong: Vec<String> = last_wins.iter().map(|(_, k)| k.clone()).collect();
+    let wrong: Vec<Name> = last_wins.iter().map(|(_, kind)| kind.clone()).collect();
 
-    assert_eq!(additive.kinds("dup"), vec!["first", "second"]);
-    assert_eq!(wrong, vec!["second"]);
+    assert_eq!(
+        additive.kinds(&name("dup")),
+        vec![name("first"), name("second")]
+    );
+    assert_eq!(wrong, vec![name("second")]);
     assert_ne!(
-        registry.kinds_at(&term, "dup", registry.epoch()),
+        registry.kinds_at(&term, &name("dup"), registry.epoch()),
         wrong,
         "a last-wins model must disagree with the registry — otherwise the model is a \
          transcription of the implementation and agreeing with it proves nothing"
@@ -326,7 +331,7 @@ fn the_registry_refuses_unreachable_operations() {
     let mut registry = Registry::new();
     assert_eq!(registry.pop_scope(), Err(RegisterError::NoScopeOpen));
     assert_eq!(
-        registry.add_leading(&name("nope"), "t", production("p"), false),
+        registry.add_leading(&name("nope"), name("t"), production("p"), false),
         Err(RegisterError::UnknownCategory { name: name("nope") })
     );
     assert_eq!(registry.epoch(), GrammarEpoch(0), "refusals are inert");

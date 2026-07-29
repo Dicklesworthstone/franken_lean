@@ -69,7 +69,7 @@ fn build_requests(term: &Name, order: &[(u64, String, String)]) -> Vec<Request> 
         .map(|(index, token, kind)| Request {
             key: (*index, kind.clone()),
             category: term.clone(),
-            token: token.clone(),
+            token: name(token),
             production: production(kind),
             scoped: false,
         })
@@ -194,7 +194,7 @@ fn without_canonicalisation_arrival_order_does_change_the_root() {
             .expect("declares");
         for (_, token, kind) in order {
             registry
-                .add_leading(&term, token.clone(), production(kind), false)
+                .add_leading(&term, name(token), production(kind), false)
                 .expect("registers");
         }
         registry.grammar_root(registry.epoch())

@@ -42,7 +42,7 @@ fn request(index: u64, token: &str, kind: &str, category: &Name) -> Request {
     Request {
         key: (index, kind.to_string()),
         category: category.clone(),
-        token: token.to_string(),
+        token: name(token),
         production: production(kind),
         scoped: false,
     }
@@ -78,23 +78,23 @@ fn every_effect_answers_for_every_input() {
     // each gets a typed answer.
     assert!(
         registry
-            .add_leading(&name("nope"), "t", production("p"), false)
+            .add_leading(&name("nope"), name("t"), production("p"), false)
             .is_err()
     );
     assert!(
         registry
-            .add_leading(&term, "", production("p"), false)
+            .add_leading(&term, name(""), production("p"), false)
             .is_ok(),
         "an empty token is a legal key"
     );
     assert!(
         registry
-            .add_leading(&term, "x".repeat(4096), production("p"), false)
+            .add_leading(&term, name(&"x".repeat(4096)), production("p"), false)
             .is_ok()
     );
     assert!(
         registry
-            .add_leading(&term, "😀→λ", production("p"), false)
+            .add_leading(&term, name("😀→λ"), production("p"), false)
             .is_ok()
     );
     assert!(
@@ -106,7 +106,7 @@ fn every_effect_answers_for_every_input() {
 
     // Lookups at absurd epochs answer rather than panicking.
     for epoch in [GrammarEpoch(0), GrammarEpoch(u64::MAX)] {
-        let _ = registry.kinds_at(&term, "x", epoch);
+        let _ = registry.kinds_at(&term, &name("x"), epoch);
         let _ = registry.grammar_root(epoch);
         let _ = registry.view_at(&term, epoch);
     }
@@ -114,7 +114,7 @@ fn every_effect_answers_for_every_input() {
     assert!(registry.view_at(&name("nope"), registry.epoch()).is_none());
     assert!(
         registry
-            .kinds_at(&name("nope"), "x", registry.epoch())
+            .kinds_at(&name("nope"), &name("x"), registry.epoch())
             .is_empty()
     );
 }
@@ -150,7 +150,7 @@ fn a_generous_budget_produces_exactly_the_unbounded_grammar() {
 fn an_exceeded_budget_is_inconclusive_and_leaves_the_grammar_untouched() {
     let (mut registry, term) = term_registry();
     registry
-        .add_leading(&term, "existing", production("existing"), false)
+        .add_leading(&term, name("existing"), production("existing"), false)
         .expect("registers");
     let before = registry.grammar_root(registry.epoch());
     let before_epoch = registry.epoch();
