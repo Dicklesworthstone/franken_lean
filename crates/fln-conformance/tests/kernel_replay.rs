@@ -6167,3 +6167,380 @@ fn the_width_comparator_names_the_pair_and_the_unit_that_diverged() {
         "differing consumption at equal verdicts must still diverge: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// G0-2 acceptance (a): the chosen module set — a Std module and a defeq-heavy
+// mathlib file — replayed through the one authority with verdicts diffed
+// against the foreign witness (bead franken_lean-z6c).
+//
+// The legs reuse the corpus machinery but cost their import CLOSURE, never
+// the whole corpus: a BFS inventory from the chosen module over the
+// provisioned roots (toolchain lib, the mathlib cache's own tree, and every
+// dependency package the pinned lakefile declares), then exactly one
+// replayed module per leg.
+// ---------------------------------------------------------------------------
+
+/// first module-name component -> the lib dir holding that prefix's oleans.
+/// The mathlib corpus location is overridable because it is host provisioning,
+/// never a repository input: `FLN_MATHLIB_CORPUS`, defaulting to the path the
+/// G0-1 session provisioned.
+fn chosen_set_roots(reference_lib: &Path) -> Vec<(String, PathBuf)> {
+    let corpus = std::env::var("FLN_MATHLIB_CORPUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/data/tmp/mathlib4-corpus"));
+    let pkg = |name: &str| {
+        corpus.join(format!(".lake/packages/{name}/.lake/build/lib/lean"))
+    };
+    vec![
+        ("Init".to_string(), reference_lib.to_path_buf()),
+        ("Std".to_string(), reference_lib.to_path_buf()),
+        ("Lean".to_string(), reference_lib.to_path_buf()),
+        ("Batteries".to_string(), pkg("batteries")),
+        ("Aesop".to_string(), pkg("aesop")),
+        ("Qq".to_string(), pkg("Qq")),
+        ("ProofWidgets".to_string(), pkg("proofwidgets")),
+        ("ImportGraph".to_string(), pkg("importGraph")),
+        ("Plausible".to_string(), pkg("plausible")),
+        ("LeanSearchClient".to_string(), pkg("LeanSearchClient")),
+        // Cli has no built oleans in the cache and no Mathlib module imports
+        // it (it backs the cache tool itself), so it has no root here.
+        ("Mathlib".to_string(), corpus.join(".lake/build/lib/lean")),
+    ]
+}
+
+fn chosen_module_file(roots: &[(String, PathBuf)], name: &str) -> Option<PathBuf> {
+    let first = name.split('.').next()?;
+    let (_, root) = roots.iter().find(|(prefix, _)| prefix == first)?;
+    let candidate = root.join(format!("{}.olean", name.replace('.', "/")));
+    candidate.is_file().then_some(candidate)
+}
+
+/// BFS inventory from the chosen module through decoded import rows, folded
+/// with the same scheme as `inventory_present_oleans` so the two fixture
+/// hashes mean the same thing over their different populations.
+fn closure_inventory(
+    roots: &[(String, PathBuf)],
+    chosen: &str,
+) -> Result<CorpusInventory, String> {
+    let mut modules = BTreeMap::new();
+    let mut decoded = 0_u64;
+    let mut oracle_skipped = 0_u64;
+    let mut aggregate = Vec::new();
+    aggregate.extend_from_slice(b"fln.kernel-reference-corpus.inventory/1\0");
+    let mut queue = vec![chosen.to_string()];
+    while let Some(name) = queue.pop() {
+        if modules.contains_key(&name) {
+            continue;
+        }
+        let path = chosen_module_file(roots, &name)
+            .ok_or_else(|| format!("no provisioned olean for import {name}"))?;
+        let bytes = fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+        let view = OleanView::parse(&bytes)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+        let module_data = view
+            .module_data(WalkBudget::default())
+            .map_err(|error| format!("module data {}: {error}", path.display()))?;
+        let infos = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .map_err(|error| format!("decode {}: {error}", path.display()))?;
+        let decoded_here = u64::try_from(infos.len())
+            .map_err(|_| format!("declaration count overflow in {}", path.display()))?;
+        let skipped_here = infos
+            .iter()
+            .filter(|info| reference_replay_skips(info))
+            .count() as u64;
+        let olean_hash = tagged_fixture_hash(
+            b"fln.kernel-reference-corpus.olean/1",
+            &[name.as_bytes(), &bytes],
+        );
+        let imports = module_data
+            .imports
+            .iter()
+            .map(|import| import.module.to_display_string())
+            .collect::<BTreeSet<_>>();
+        for import in &imports {
+            if !modules.contains_key(import) {
+                queue.push(import.clone());
+            }
+        }
+        modules.insert(
+            name.clone(),
+            CorpusModule {
+                name: name.clone(),
+                path,
+                olean_hash: olean_hash.clone(),
+                imports,
+                decoded: decoded_here,
+                oracle_skipped: skipped_here,
+            },
+        );
+        decoded = decoded
+            .checked_add(decoded_here)
+            .ok_or_else(|| "decoded declaration census overflow".to_string())?;
+        oracle_skipped = oracle_skipped
+            .checked_add(skipped_here)
+            .ok_or_else(|| "oracle-skipped declaration census overflow".to_string())?;
+        aggregate.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        aggregate.extend_from_slice(name.as_bytes());
+        aggregate.extend_from_slice(&(olean_hash.len() as u64).to_le_bytes());
+        aggregate.extend_from_slice(olean_hash.as_bytes());
+    }
+    let present = modules.keys().cloned().collect::<BTreeSet<_>>();
+    let mut missing_imports = Vec::new();
+    for module in modules.values() {
+        for import in module.imports.difference(&present) {
+            missing_imports.push((module.name.clone(), import.clone()));
+        }
+    }
+    Ok(CorpusInventory {
+        modules,
+        decoded,
+        oracle_skipped,
+        missing_imports,
+        fixture_hash: hash(Domain::Fixture, &aggregate).to_hex(),
+    })
+}
+
+/// One chosen-set leg: the verdict census of one replayed module over its
+/// faithfully reconstructed import context, plus the context's own facts.
+struct ChosenLegReport {
+    module: String,
+    closure_modules: u64,
+    closure_decoded: u64,
+    context_faithful: bool,
+    collision_count: u64,
+    units: u64,
+    decls_total: u64,
+    unchecked: BTreeMap<String, u64>,
+    artifact_incomplete: u64,
+    accepted: u64,
+    rejected: BTreeMap<String, u64>,
+    inconclusive: u64,
+    stream_digest: String,
+    wall_ms: u64,
+}
+
+fn run_chosen_leg(
+    inventory: &CorpusInventory,
+    chosen: &str,
+) -> Result<ChosenLegReport, String> {
+    let started = Instant::now();
+    let order = corpus_module_order(inventory)?;
+    let order_index = order
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut states = BTreeMap::<String, CorpusFixtureState>::new();
+    for module_name in &order {
+        let module = &inventory.modules[module_name];
+        let (bytes, infos) = decode_corpus_module(&module.path)?;
+        let current_hash = tagged_fixture_hash(
+            b"fln.kernel-reference-corpus.olean/1",
+            &[module.name.as_bytes(), &bytes],
+        );
+        if current_hash != module.olean_hash {
+            return Err(format!(
+                "{} changed between inventory and replay",
+                module.name
+            ));
+        }
+        let (active_infos, _, _) = reference_active_rows(&infos);
+        let ReconstructedImportContext {
+            imported: imported_context,
+            closure,
+            faithful: context_faithful,
+            collisions,
+        } = reconstruct_import_context(module, inventory, &order_index, &states);
+        if module_name == chosen {
+            if !context_faithful {
+                return Err(format!(
+                    "{chosen}: import context not faithfully representable ({} collisions)",
+                    collisions.len()
+                ));
+            }
+            let prep = prepare_replay_from(
+                imported_context.environment.clone(),
+                Some(&imported_context),
+                &active_infos,
+                false,
+            );
+            let run = check_matrix_run(&prep, 1, Budget::DEFAULT);
+            return Ok(ChosenLegReport {
+                module: chosen.to_string(),
+                closure_modules: inventory.modules.len() as u64,
+                closure_decoded: inventory.decoded,
+                context_faithful: true,
+                collision_count: collisions.len() as u64,
+                units: prep.items.len() as u64,
+                decls_total: prep.decls_total as u64,
+                unchecked: prep
+                    .unchecked
+                    .iter()
+                    .map(|(kind, count)| (kind.to_string(), *count))
+                    .collect(),
+                artifact_incomplete: prep.artifact_incomplete.len() as u64,
+                accepted: run.accepted,
+                rejected: run.rejected,
+                inconclusive: run.inconclusive,
+                stream_digest: run.stream_digest,
+                wall_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+        let (context, _) = extend_reference_fixture_environment(
+            imported_context,
+            &active_infos,
+            &module.name,
+        )?;
+        states.insert(
+            module.name.clone(),
+            CorpusFixtureState {
+                closure,
+                context,
+                active_infos,
+                faithful: context_faithful,
+            },
+        );
+    }
+    Err(format!("chosen module {chosen} absent from its own closure"))
+}
+
+/// The two acceptance-(a) legs beyond Init: a Std module and one defeq-heavy
+/// mathlib file, each replayed through the one authority and diffed against
+/// the pinned leanchecker as the ReferenceKernelOracle witness (the review
+/// amendment's authority classification: leanchecker embeds the Reference C++
+/// kernel, so it is ReferenceKernelOracle, never ForeignIndependent).
+///
+/// `#[ignore]`d: the mathlib leg costs its ~200-module closure decode plus a
+/// defeq-heavy replay — on-demand evidence, produced into a committed receipt
+/// the way the corpus matrix's receipt works (bead franken_lean-p6x1's
+/// retention law). Run with:
+///   cargo test -p fln-conformance --test kernel_replay \
+///     chosen_set_replays_and_witnesses -- --ignored --nocapture
+#[ignore = "cost: two closure inventories plus a defeq-heavy replay; on-demand probe lane, receipt committed per run"]
+#[test]
+fn chosen_set_replays_and_witnesses() {
+    let reference_lib = reference_lib().expect("pinned toolchain required for the chosen set");
+    let roots = chosen_set_roots(&reference_lib);
+    for (_, root) in &roots {
+        // A root that does not exist makes the leg's provenance a lie by
+        // omission; refuse loudly rather than silently narrowing the closure.
+        assert!(root.is_dir(), "chosen-set root missing: {}", root.display());
+    }
+    // Std.Data.HashMap.Basic: real data-structure code (structure projections,
+    // instances, Nat-accelerated index arithmetic) rather than the Std.Do
+    // aggregator, which decodes to zero replay units and so proves nothing.
+    let legs = ["Std.Data.HashMap.Basic", "Mathlib.Order.Basic"];
+    let mut reports = Vec::new();
+    for leg in legs {
+        let inventory = closure_inventory(&roots, leg)
+            .unwrap_or_else(|error| panic!("{leg}: closure inventory failed: {error}"));
+        assert!(
+            inventory.missing_imports.is_empty(),
+            "{leg}: closure has unresolved imports: {:?}",
+            inventory.missing_imports
+        );
+        let report = run_chosen_leg(&inventory, leg)
+            .unwrap_or_else(|error| panic!("{leg}: replay failed: {error}"));
+        eprintln!(
+            "chosen_set leg={} closure_modules={} closure_decoded={} units={} \
+             accepted={} rejected={:?} inconclusive={} artifact_incomplete={} \
+             unchecked={:?} digest={} wall_ms={}",
+            report.module,
+            report.closure_modules,
+            report.closure_decoded,
+            report.units,
+            report.accepted,
+            report.rejected,
+            report.inconclusive,
+            report.artifact_incomplete,
+            report.unchecked,
+            report.stream_digest,
+            report.wall_ms,
+        );
+        reports.push(report);
+    }
+    // The foreign-witness differential: the pinned leanchecker replays each
+    // chosen module through the Reference C++ kernel over the same provisioned
+    // oleans (LEAN_PATH = every chosen-set root), and its verdict MUST be
+    // acceptance — the Reference accepted these modules when it wrote them.
+    let lean_path = roots
+        .iter()
+        .map(|(_, root)| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    let checker = reference_lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|bin| bin.join("bin/leanchecker"))
+        .expect("leanchecker beside lean in the pinned toolchain");
+    assert!(checker.is_file(), "leanchecker missing at {}", checker.display());
+    let mut witness_rows = Vec::new();
+    for report in &reports {
+        let out = std::process::Command::new(&checker)
+            .arg(&report.module)
+            .env("LEAN_PATH", &lean_path)
+            .output()
+            .expect("spawn leanchecker");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let accepted = out.status.success()
+            && !stderr.to_lowercase().contains("uncaught exception")
+            && !stdout.to_lowercase().contains("uncaught exception");
+        eprintln!(
+            "chosen_set witness module={} verdict={} rc={:?}",
+            report.module,
+            if accepted { "accepted" } else { "rejected" },
+            out.status.code(),
+        );
+        assert!(
+            accepted,
+            "foreign witness rejected {}: {stderr}",
+            report.module
+        );
+        witness_rows.push((report.module.clone(), accepted));
+    }
+    // The committed receipt: per-leg census plus witness agreement, keyed by
+    // the pin so advancing SUITE.lock makes the file absent rather than stale.
+    let evidence_dir = fln_conformance::checked_manifest_dir!()
+        .join("../../crates/fln-conformance/evidence/g02_kernel_verdict");
+    std::fs::create_dir_all(&evidence_dir).expect("create g02 evidence dir");
+    let receipt_path = evidence_dir.join("chosen_set_v4.32.0.jsonl");
+    let mut receipt = String::new();
+    for (report, (_, witness_accepted)) in reports.iter().zip(&witness_rows) {
+        let rejected_json = if report.rejected.is_empty() {
+            "{}".to_string()
+        } else {
+            format!(
+                "{{{}}}",
+                report
+                    .rejected
+                    .iter()
+                    .map(|(class, count)| format!("\"{class}\":{count}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        receipt.push_str(&format!(
+            "{{\"schema\":\"fln-g02-chosen-set/1\",\"module\":{m},\"closure_modules\":{cm},\"closure_decoded\":{cd},\"units\":{u},\"decls_total\":{dt},\"accepted\":{a},\"rejected\":{r},\"inconclusive\":{i},\"artifact_incomplete\":{ai},\"witness\":\"ReferenceKernelOracle:leanchecker\",\"witness_accepted\":{w},\"stream_digest\":{sd},\"wall_ms\":{wm}}}\n",
+            m = json_string(&report.module),
+            cm = report.closure_modules,
+            cd = report.closure_decoded,
+            u = report.units,
+            dt = report.decls_total,
+            a = report.accepted,
+            r = rejected_json,
+            i = report.inconclusive,
+            ai = report.artifact_incomplete,
+            w = witness_accepted,
+            sd = json_string(&report.stream_digest),
+            wm = report.wall_ms,
+        ));
+    }
+    std::fs::write(&receipt_path, receipt).expect("write chosen-set receipt");
+    eprintln!(
+        "chosen_set receipt written: {} ({} legs)",
+        receipt_path.display(),
+        reports.len()
+    );
+}

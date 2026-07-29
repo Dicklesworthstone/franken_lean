@@ -1026,6 +1026,101 @@ pub fn g01_decision(roster: &[RosterSpike], evidence: &G01Evidence) -> Option<De
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct G02Evidence {
+    /// Digest over the C3 fixtures, the real-mathlib fixture set, and the
+    /// judgment-inventory coverage publication.
+    pub fixture_root: String,
+    /// Digest over `KERNEL_CONTRACT.md` — the rule-anchored inventory the
+    /// replays are scored against.
+    pub generated_contract_root: String,
+    /// Behavioral identity of the replay: the census (accepted/rejected
+    /// families/inconclusive/artifact-incomplete) across the three legs plus
+    /// the witness agreements.
+    pub implementation_root: String,
+    /// Digest over the hostile-input evidence: the region corruption sweep
+    /// and the witness's anti-rubber-stamp control.
+    pub mutation_root: String,
+    /// Digest over
+    /// `crates/fln-conformance/evidence/g02_kernel_verdict/chosen_set_<pin>.jsonl`
+    /// and the leanchecker witness lane, the no-mock differential legs.
+    pub no_mock_e2e_root: String,
+    pub acceptance_green: bool,
+    pub used_wall_ms: u64,
+    pub used_rss_bytes: u64,
+}
+
+/// The G0-2 decision row: **Ratified** — the kernel's judgment inventory met
+/// reality and agreed with a foreign witness on real modules.
+///
+/// The spike asked for a prototype Crucible checking a nontrivial upstream
+/// module from its olean — statements AND proofs — with verdicts diffed
+/// against lean4checker (bead `franken_lean-z6c`). Measured at the pin:
+/// Init.Prelude 2198/2198 accepted (0 rejected, 6 typed artifact-incomplete
+/// per FL-INV-07), the Std leg Std.Data.HashMap.Basic 92/92 over a
+/// 165-module closure, and the defeq-heavy mathlib leg Mathlib.Order.Basic
+/// 376/376 over a 1286-module closure — 2,666 accepted declarations with
+/// zero rejected, and the pinned leanchecker independently accepting every
+/// chosen module as ReferenceKernelOracle (the review amendment's authority
+/// class: it embeds the Reference C++ kernel, never a foreign-independent
+/// one). Every rejection along the way was triaged to a named reduction-gap
+/// family and converted by named follow-ups (fln-5p2, fln-d4x, fln-irm):
+/// the triage is machine-checked in `kernel_replay.rs`, total, and currently
+/// empty. The row-per-Appendix-A inventory is published with two explicit
+/// blockers visible (KR-318 native hooks unexercised; the quarantine rules
+/// oracle-unscorable by design). Soundness runs one way only: the Reference
+/// accepted every replayed declaration when it wrote them, so any K1
+/// rejection is a false-reject by construction — never a false-accept.
+pub fn g02_decision(roster: &[RosterSpike], evidence: &G02Evidence) -> Option<Decision> {
+    let spike = roster.iter().find(|r| r.id == "G0-2")?;
+    Some(Decision {
+        spike: spike.id.clone(),
+        question: spike.question.clone(),
+        resolution: Resolution::Decided(Outcome::Ratified),
+        claim: ClaimType::BoundedModel,
+        witness: Witness {
+            evidence_state: EvidenceState::Observed,
+            fixture_root: recorded_or_absent(&evidence.fixture_root),
+            generated_contract_root: recorded_or_absent(&evidence.generated_contract_root),
+            implementation_root: recorded_or_absent(&evidence.implementation_root),
+            mutation_root: recorded_or_absent(&evidence.mutation_root),
+            no_mock_e2e_root: recorded_or_absent(&evidence.no_mock_e2e_root),
+            oracle: OracleKind::ReferenceChecker,
+            comparison: ComparisonClass::ByteIdentical,
+        },
+        scope: Scope {
+            epoch: "v4.32.0".to_string(),
+            corpus: CorpusFamily::C2,
+            platform: Platform::LinuxX86_64,
+            mode: Mode::Faithful,
+        },
+        resources: Resources {
+            contract_wall_ms: 1_200_000,
+            contract_rss_bytes: 6 << 30,
+            used_wall_ms: evidence.used_wall_ms,
+            used_rss_bytes: evidence.used_rss_bytes,
+        },
+        limitations: "One host, one pin (v4.32.0), one corpus commit (81a5d257), class \
+            bounded_model. The chosen set is three real modules plus their closures, not \
+            the corpus: acceptance (a) says 'chosen module set' and is satisfied at that \
+            bound; a whole-corpus differential is the standing rig's business (§8.7), \
+            seeded here as `chosen_set_replays_and_witnesses`. The two published blockers \
+            are load-bearing: KR-318 native reduction hooks are unexercised, and \
+            partial/unsafe quarantine rows are oracle-unscorable by design — nothing in \
+            this row reads past either. K2 is out of scope by the spike's own text: this \
+            row says the rules are correctly understood, nothing about speed. The 6 typed \
+            artifact-incomplete declarations on the Init.Prelude leg are FL-INV-07 \
+            outcomes — counted, never accepted, never rejected."
+            .to_string(),
+        affected_interfaces: vec![
+            "fln-kernel K1 judgment paths (§8, Appendix A)".to_string(),
+            "fln-conformance standing kernel differential rig (§8.7)".to_string(),
+            "fln-env declaration-closure admission (FL-INV-07 counting)".to_string(),
+            "G1 Independent Judge gate inputs (§22.2 W3)".to_string(),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod structural {
     use super::*;

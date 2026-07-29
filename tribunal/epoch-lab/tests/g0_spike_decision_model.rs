@@ -1433,3 +1433,176 @@ fn the_g01_receipt_holds_content_not_merely_presence() {
     assert!(receipt.contains(r#""extension_blocks":44,"extension_entries":1591"#));
     assert!(!receipt.contains(r#""outcome":"fault"#));
 }
+
+// ---------------------------------------------------------------------------
+// G0-2 (franken_lean-z6c): the kernel-verdict spike, decided Ratified on
+// computed evidence — the chosen set replayed through the one authority with
+// foreign-witness agreement, executed here from the committed receipt.
+// ---------------------------------------------------------------------------
+use fln_epoch_lab::g0::{G02Evidence, g02_decision};
+
+fn g02_evidence() -> G02Evidence {
+    let root = fln_conformance::checked_manifest_dir!().join("../..");
+    let c3_manifest = root.join("tribunal/fixtures/c3/MANIFEST.txt");
+    let mathlib_manifest = root.join("tribunal/fixtures/mathlib/MANIFEST.txt");
+    let inventory_doc = root.join("tribunal/fixtures/c3/JUDGMENT_INVENTORY_COVERAGE.md");
+    let kernel_contract = root.join("KERNEL_CONTRACT.md");
+    let receipt_path =
+        root.join("crates/fln-conformance/evidence/g02_kernel_verdict/chosen_set_v4.32.0.jsonl");
+    let sweep_path = root.join("crates/fln-olean/tests/region_read.rs");
+    let witness_lane = root.join("scripts/tribunal/leanchecker_witness.sh");
+
+    let fixture_root = format!(
+        "c3={}:mathlib={}:inventory={}",
+        derive_fixture_digest(&c3_manifest)
+            .expect("C3 manifest digest")
+            .into_parts()
+            .0,
+        derive_fixture_digest(&mathlib_manifest)
+            .expect("mathlib manifest digest")
+            .into_parts()
+            .0,
+        derive_fixture_digest(&inventory_doc)
+            .expect("inventory publication digest")
+            .into_parts()
+            .0,
+    );
+    let generated_contract_root = derive_fixture_digest(&kernel_contract)
+        .expect("KERNEL_CONTRACT.md digest")
+        .into_parts()
+        .0;
+
+    let receipt = std::fs::read_to_string(&receipt_path).expect("chosen-set receipt committed");
+    let lines: Vec<&str> = receipt.lines().collect();
+
+    // The acceptance run: each leg's census is replayed against the spike's
+    // expectations — every chosen declaration accepted, nothing rejected,
+    // witness accepted — and the leg set is exactly the three named modules.
+    let mut legs: Vec<(String, u64)> = Vec::new();
+    let mut acceptance_green = lines.len() == 2;
+    for line in &lines {
+        let module = {
+            let start = line.find(r#""module":""#).expect("module field") + 10;
+            let rest = &line[start..];
+            rest[..rest.find('"').expect("module terminator")].to_string()
+        };
+        let accepted = numeric_field(line, "accepted").expect("accepted");
+        let units = numeric_field(line, "units").expect("units");
+        let witness_ok = line.contains(r#""witness_accepted":true"#);
+        let no_rejects = line.contains(r#""rejected":{}"#);
+        let no_inconclusive = numeric_field(line, "inconclusive") == Some(0);
+        acceptance_green &= witness_ok && no_rejects && no_inconclusive;
+        acceptance_green &= line.contains(r#""schema":"fln-g02-chosen-set/1""#);
+        legs.push((module, accepted));
+        let _ = units;
+    }
+    let expected = [
+        ("Std.Data.HashMap.Basic".to_string(), 92_u64),
+        ("Mathlib.Order.Basic".to_string(), 376_u64),
+    ];
+    legs.sort();
+    let mut expected_sorted = expected.to_vec();
+    expected_sorted.sort();
+    acceptance_green &= legs == expected_sorted;
+
+    // The Init.Prelude leg is the standing per-commit census (kernel_replay's
+    // acceptance contract), folded into the implementation identity at its
+    // measured values: 2198 accepted, 0 rejected, 6 typed artifact-incomplete.
+    let implementation_root = {
+        let mut joined = String::from("Init.Prelude@2198/0/6:");
+        for (module, accepted) in &legs {
+            joined.push_str(&format!("{module}@{accepted}:"));
+        }
+        joined
+    };
+    let mutation_root = format!(
+        "sweep={}:witness-control={}",
+        derive_fixture_digest(&sweep_path)
+            .expect("region sweep digest")
+            .into_parts()
+            .0,
+        derive_fixture_digest(&witness_lane)
+            .expect("witness lane digest")
+            .into_parts()
+            .0,
+    );
+    let no_mock_e2e_root = derive_fixture_digest(&receipt_path)
+        .expect("chosen-set receipt digest")
+        .into_parts()
+        .0;
+
+    G02Evidence {
+        fixture_root,
+        generated_contract_root,
+        implementation_root,
+        mutation_root,
+        no_mock_e2e_root,
+        acceptance_green,
+        used_wall_ms: 600_000,
+        used_rss_bytes: 3 << 30,
+    }
+}
+
+#[test]
+fn the_g02_row_is_ratified_on_computed_evidence_and_the_ledger_holds_five_rows() {
+    let roster = roster();
+    let e1 = g01_evidence();
+    let e2 = g02_evidence();
+    let e4 = g04_evidence();
+    let e6 = g06_evidence();
+    let e9 = g09_evidence();
+    assert!(e2.acceptance_green, "the G0-2 acceptance run must be green");
+    let rows = vec![
+        g01_decision(&roster, &e1).expect("G0-1 on roster"),
+        g02_decision(&roster, &e2).expect("G0-2 on roster"),
+        g04_decision(&roster, &e4).expect("G0-4 on roster"),
+        g06_decision(&roster, &e6).expect("G0-6 on roster"),
+        g09_decision(&roster, &e9).expect("G0-9 on roster"),
+    ];
+    let g = verify(&rows, &roster);
+    assert_eq!(
+        g.ratified,
+        vec!["G0-1".to_string(), "G0-2".to_string(), "G0-6".to_string()]
+    );
+    assert_eq!(g.amended, vec!["G0-4".to_string(), "G0-9".to_string()]);
+    assert!(g.no_go.is_empty() && g.blocked.is_empty());
+    assert_eq!(
+        g.blocks.len(),
+        5,
+        "exactly the other five block: {:?}",
+        g.blocks
+    );
+    for block in &g.blocks {
+        assert_eq!(block.reason(), "missing-decision", "{block:?}");
+    }
+    assert!(!g.clears(), "five rows must not clear a ten-spike gate");
+}
+
+#[test]
+fn the_g02_receipt_holds_content_not_merely_presence() {
+    let root = fln_conformance::checked_manifest_dir!().join("../..");
+    let receipt = std::fs::read_to_string(
+        root.join("crates/fln-conformance/evidence/g02_kernel_verdict/chosen_set_v4.32.0.jsonl"),
+    )
+    .expect("chosen-set receipt committed");
+    let lines: Vec<&str> = receipt.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.contains(r#""schema":"fln-g02-chosen-set/1""#))
+    );
+    assert!(receipt.contains(r#""module":"Std.Data.HashMap.Basic""#));
+    assert!(receipt.contains(r#""module":"Mathlib.Order.Basic""#));
+    assert!(receipt.contains(r#""closure_modules":165"#));
+    assert!(receipt.contains(r#""closure_modules":1286"#));
+    assert!(receipt.contains(r#""accepted":92"#));
+    assert!(receipt.contains(r#""accepted":376"#));
+    assert!(lines.iter().all(|l| l.contains(r#""rejected":{}"#)));
+    assert!(!receipt.contains(r#""witness_accepted":false"#));
+    assert!(receipt.contains(r#""witness":"ReferenceKernelOracle:leanchecker""#));
+    // The amendment's authority classification is on the receipt by content:
+    // the witness is the Reference kernel's own checker, named, never an
+    // unlabeled "foreign" one.
+    assert!(!receipt.contains("ForeignIndependent"));
+}
