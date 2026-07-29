@@ -2317,31 +2317,53 @@ impl<'a> JsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fln_core::scratch::{OWNERSHIP_FIXTURE_PREFIX, ScratchRoot};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+    /// One fixture root per cell, reclaimed when the cell passes and retained when it
+    /// fails (franken_lean-eir2 routes this producer through the workspace fence; it
+    /// was 13,919 retained directories at the census, the largest by count).
+    fn fixture_root(label: &str) -> ScratchRoot {
+        let root = ScratchRoot::create(OWNERSHIP_FIXTURE_PREFIX, "ownership", label)
+            .expect("create ownership fixture root");
+        fs::create_dir(root.join("ci")).expect("create fixture ci directory");
+        fs::create_dir(root.join(".beads")).expect("create fixture beads directory");
+        root
+    }
 
-    fn fixture_root(label: &str) -> PathBuf {
-        loop {
-            let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "fln-ownership-{}-{serial}-{label}",
-                std::process::id()
-            ));
-            let creation = fs::create_dir(&root);
-            if creation
-                .as_ref()
-                .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists)
-            {
-                continue;
-            }
-            creation.expect("create retained fixture root");
-            fs::create_dir(root.join("ci")).expect("create retained ci fixture");
-            fs::create_dir(root.join(".beads")).expect("create retained beads fixture");
-            return root;
-        }
+    /// `franken_lean-eir2` acceptance criterion 3: retention on failure is proved in
+    /// BOTH directions for this family, never inferred from the passing cell.
+    /// `panicking()` is only true during an unwind, so the failing direction needs a
+    /// real `catch_unwind`, and the probe reclaims what it deliberately retained.
+    #[test]
+    fn ownership_fixtures_reclaim_on_pass_and_retain_on_failure() {
+        let passing = {
+            let root = fixture_root("reclaim-pass");
+            root.path().to_path_buf()
+        };
+        assert!(
+            !passing.exists(),
+            "a passing cell's fixture must be reclaimed: {}",
+            passing.display()
+        );
+
+        let observed = std::cell::RefCell::new(None);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let root = fixture_root("reclaim-fail");
+            *observed.borrow_mut() = Some(root.path().to_path_buf());
+            panic!("deliberate failure so the fixture guard drops during an unwind");
+        }));
+        assert!(unwound.is_err(), "the failing cell must actually unwind");
+        let retained = observed
+            .into_inner()
+            .expect("the failing cell materialized before it panicked");
+        assert!(
+            retained.exists(),
+            "a failing cell's fixture must be retained: {}",
+            retained.display()
+        );
+        fs::remove_dir_all(&retained).expect("the probe reclaims what it retained");
     }
 
     fn set(values: &[&str]) -> BTreeSet<String> {

@@ -33,7 +33,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use fln_core::scratch::{GATE_DISCRIMINATOR_PREFIX, ScratchRoot};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The library under test, resolved through the k60n tree check so a binary baked in one
@@ -48,22 +49,23 @@ fn library() -> PathBuf {
     lib
 }
 
-/// A per-process scratch lockfile. Deterministic per cell so repeated runs overwrite rather than
-/// accumulate, and process-scoped so two panes running `cargo test` at once cannot collide.
-fn scratch(cell: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("fln-gate-discriminator-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch directory is creatable");
+/// A per-cell scratch lockfile inside a guard-owned root, reclaimed when the cell passes and
+/// retained when it fails (franken_lean-eir2). The guard must outlive the cell, so the caller
+/// binds both halves.
+fn scratch(cell: &str) -> (ScratchRoot, PathBuf) {
+    let dir = ScratchRoot::create(GATE_DISCRIMINATOR_PREFIX, "gate-discriminator", cell)
+        .expect("scratch directory is creatable");
     let path = dir.join(format!("{cell}.lockfile"));
     assert!(
         !path.starts_with("/data/tmp/fln-gate.lockfile"),
         "refusing to run against the real build gate"
     );
-    path
+    (dir, path)
 }
 
 /// Run a bash fragment with the gate library sourced and the scratch lockfile bound, and return
 /// the reported `FLN_GATE_STATE`.
-fn gate_state(lib: &PathBuf, lockfile: &PathBuf, wrapper: Wrapper, fragment: &str) -> String {
+fn gate_state(lib: &Path, lockfile: &Path, wrapper: Wrapper, fragment: &str) -> String {
     let journal = lockfile.with_extension("journal");
     let script = format!(
         r#"set -u
@@ -124,7 +126,7 @@ const OPEN_BUT_UNLOCKED_FD: &str = r#"exec 7>>"$FLN_GATE_LOCKFILE""#;
 #[test]
 fn an_open_but_unlocked_descriptor_is_not_mistaken_for_a_held_gate() {
     let lib = library();
-    let lock = scratch("cell1");
+    let (_guard, lock) = scratch("cell1");
     let state = gate_state(&lib, &lock, Wrapper::None, OPEN_BUT_UNLOCKED_FD);
     assert_eq!(
         state, "acquired",
@@ -143,7 +145,7 @@ fn an_open_but_unlocked_descriptor_is_not_mistaken_for_a_held_gate() {
 #[test]
 fn a_genuine_ancestor_lock_is_still_detected_as_inherited() {
     let lib = library();
-    let lock = scratch("cell2");
+    let (_guard, lock) = scratch("cell2");
     let state = gate_state(&lib, &lock, Wrapper::GenuineAncestorLock, "");
     assert_eq!(
         state, "inherited",
@@ -171,7 +173,7 @@ fn the_pre_repair_detector_is_measurably_wrong_so_cell_one_is_not_vacuous() {
          needle from the current library before trusting cell 1."
     );
 
-    let lock = scratch("cell3");
+    let (_guard, lock) = scratch("cell3");
     let mutant = lock.with_extension("mutant.sh");
     std::fs::write(&mutant, &mutant_body).expect("the mutant library is writable");
 
@@ -183,4 +185,36 @@ fn the_pre_repair_detector_is_measurably_wrong_so_cell_one_is_not_vacuous() {
          mutant now agrees with the repaired library, the two are no longer distinguished by \
          this input and cell 1 has stopped testing the discriminator."
     );
+}
+
+/// `franken_lean-eir2` acceptance criterion 3: retention on failure is proved in BOTH
+/// directions for this family, never inferred from the passing cell.
+#[test]
+fn gate_discriminator_roots_reclaim_on_pass_and_retain_on_failure() {
+    let passing = {
+        let (guard, _lock) = scratch("reclaim-pass");
+        guard.path().to_path_buf()
+    };
+    assert!(
+        !passing.exists(),
+        "a passing cell's scratch root must be reclaimed: {}",
+        passing.display()
+    );
+
+    let observed = std::cell::RefCell::new(None);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (guard, _lock) = scratch("reclaim-fail");
+        *observed.borrow_mut() = Some(guard.path().to_path_buf());
+        panic!("deliberate failure so the fixture guard drops during an unwind");
+    }));
+    assert!(unwound.is_err(), "the failing cell must actually unwind");
+    let retained = observed
+        .into_inner()
+        .expect("the failing cell materialized before it panicked");
+    assert!(
+        retained.exists(),
+        "a failing cell's scratch root must be retained: {}",
+        retained.display()
+    );
+    std::fs::remove_dir_all(&retained).expect("the probe reclaims what it retained");
 }

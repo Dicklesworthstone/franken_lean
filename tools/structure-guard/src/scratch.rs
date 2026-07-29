@@ -1,289 +1,35 @@
-//! One reclaimer for every scratch root this crate materializes (bead
-//! `franken_lean-s2sn`, successor to `fln-fixture-retention-unbounded-evit`).
+//! The fence moved to `fln-core` (bead `franken_lean-eir2`, Option B); this module
+//! re-exports it so this crate's producers, probes and cited cells keep their names.
 //!
-//! # Why this module exists rather than a fourth copy of the same twelve lines
+//! # What lives here and why
 //!
-//! `evit` measured `tools/structure-guard/tests/common/mod.rs` retaining every fixture it
-//! ever built — 16,370 directories and 11 GB in `/data/tmp`, growing about 1.3 GB per hour
-//! under swarm load — and repaired that one harness at `b0a52442` with a [`Drop`] that
-//! reclaims on the passing path and retains on the failing one. It closed with an explicit
-//! unmeasured remainder: *"Only structure-guard was fixed. Other harnesses may retain scratch
-//! state the same way and I have not looked."*
+//! `s2sn` landed the reclaimer in this crate at `b0a52442` because every leaking
+//! producer then known was in this crate. `eir2` censused six more producers outside
+//! it and moved the machinery — [`ScratchRoot`], [`is_reclaimable`], the family table
+//! — to `fln_core::scratch`, rank 0, which every producer crate already depends on.
+//! Exactly one `Drop` body and one predicate exist across the workspace; nothing here
+//! re-implements either. The module documentation, the measurement trap
+//! (`st_blocks * 512`, never `st_size`), the retention semantics, and the declared
+//! remainders with their reasons all live with the fence in `fln-core`.
 //!
-//! They do. Measured at 2026-07-28 16:19 local against `/data/tmp`, with the producer of each
-//! family derived by reading every `std::env::temp_dir()` call site under `crates/`, `tools/`
-//! and `tribunal/` rather than guessed from the directory names:
-//!
-//! ```text
-//! family                        n   allocMiB  producer
-//! structure-guard-test-     10911    7248.8   tests/common/mod.rs        (repaired at b0a52442)
-//! structure-guard-closure-   3776    2486.9   tests/closure.rs
-//! contract-handoff-          2080     321.7   src/contract_handoff.rs
-//! fln-contract-inventory-    1267      76.4   src/contract_inventory.rs
-//! ```
-//!
-//! Three unrepaired producers inside this one crate, still growing that day, holding
-//! **2,885.0 MiB of the 3,235.0 MiB workspace-wide live leak**. They are routed through this
-//! module instead of each growing a private reclaimer, because three more copies of one fence
-//! is `franken_lean-evidence-python-config-rule-drift-imuu`'s defect — two unbound copies of a
-//! rule, free to drift — and reproducing it inside its own repair is not a trade worth making.
-//!
-//! # The measurement trap, recorded because it inverts the conclusion in both directions
-//!
-//! Apparent size (`st_size`) is wrong here twice over, and the two errors point opposite ways.
-//! `contract-handoff-` reads **92,763.8 MiB apparent against 321.7 MiB allocated** — 288× over,
-//! because 181 of those roots hold a deliberately *sparse* 512 MiB file planted by the
-//! `resource-exhaustion` cell, and the whole 181-root set costs 20.5 MiB of real disk.
-//! `structure-guard-test-` reads **600.2 MiB apparent against 7,248.8 MiB allocated** — 12×
-//! *under*, because 10,911 directories of small files each round up to a 4 KiB block. The first
-//! figure reads as an emergency that does not exist; the second reads as "not worth fixing" and
-//! is the largest pile on the box. Measure `st_blocks * 512`.
-//!
-//! # What retention still buys, and why it is kept
-//!
-//! A failing guard run is exactly the case the retained workspace was for, and nobody has
-//! measured how often one is actually read afterwards. So the value side of that trade is
-//! unpriced, and this module does not decide it: [`ScratchRoot::drop`] checks
-//! [`std::thread::panicking`] and leaves a failing test's root on disk with the same message it
-//! always printed. Only the passing path reclaims.
-//!
-//! # What this module does not do
-//!
-//! It removes nothing that exists. The directories already on disk when this landed are
-//! `evit` item 1, parked with the repository owner, and no code here can reach them: every
-//! reclamation is of a root this process created seconds earlier and still holds. RULE 1
-//! forbids an *agent* deleting files; the orchestrator ruled on 2026-07-26 that a harness
-//! reclaiming its own scratch directory is ordinary hygiene, which is the authority
-//! `b0a52442` landed under and the authority this module inherits.
+//! What stays in this file is what is *about* this crate: the manifest-cited cells
+//! (`s2sn`'s coverage row cites four `test:structure-guard::lib::scratch::tests::*`
+//! functions, which must keep resolving and running here) and the crate-local half
+//! of the family binding — this crate's rows of the unified table bound to this
+//! crate's sources. The workspace-wide half (every row, every `temp_dir` call site,
+//! the site classification in both directions) is `scratch_reclamation_census` in
+//! fln-conformance; deliberately narrower scope here, not a second copy of the rule.
 
-use std::fs;
-use std::io;
-use std::ops::Deref;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// `tools/structure-guard/tests/common/mod.rs` — the seeded-law and authority workspaces.
-pub const SEEDED_PREFIX: &str = "structure-guard-test-";
-/// `tools/structure-guard/tests/closure.rs` — the dependency-closure audit fixtures.
-pub const CLOSURE_PREFIX: &str = "structure-guard-closure-";
-/// `tools/structure-guard/src/contract_handoff.rs` — the handoff publication fixtures.
-pub const HANDOFF_PREFIX: &str = "contract-handoff-";
-/// `tools/structure-guard/src/contract_inventory.rs` — the contract-inventory fixtures.
-pub const INVENTORY_PREFIX: &str = "fln-contract-inventory-";
-/// `tools/structure-guard/kernel-ownership-publisher/src/main.rs` — the publisher fixtures.
-pub const PUBLISHER_PREFIX: &str = "fln-ownership-publisher-";
-
-/// One scratch-root namespace: its prefix, the constant producers name it by, the source that
-/// produces it, and whether that source routes through [`ScratchRoot`].
-pub struct ScratchFamily {
-    /// The literal leading component of every root in this namespace.
-    pub prefix: &'static str,
-    /// The identifier a producer must name. Producers reference the constant rather than
-    /// retyping the literal, so the binding check below looks for the *identifier*: a producer
-    /// that inlined the string would be reintroducing exactly the drift this table prevents.
-    pub constant: &'static str,
-    /// Crate-relative path of the single source that materializes this namespace.
-    pub producer: &'static str,
-    /// Whether that producer reclaims via [`ScratchRoot`], or is a declared remainder.
-    pub routed: bool,
-}
-
-/// Every scratch-root namespace this tool tree materializes under [`std::env::temp_dir`].
-///
-/// One table, so the fence, the producers and the disclosure cannot disagree. A producer that
-/// invents a prefix outside it cannot be reclaimed at all — [`is_reclaimable`] refuses it — and
-/// a row whose producer has stopped naming its constant is a stale entry keeping a slot warm for
-/// a future mismatch. Both directions are checked against the crate's own sources by
-/// `every_declared_scratch_prefix_has_exactly_one_producer`.
-///
-/// `routed: false` is a **declared remainder**, and there is exactly one.
-/// `kernel-ownership-publisher` is a deliberately nested workspace with its own `Cargo.lock`,
-/// and its manifest says in as many words that its dependency edges "must not add a tooling-only
-/// edge to the product workspace or force unrelated agents to rewrite the root `Cargo.lock`".
-/// Reaching this module from there means a new dependency on `structure-guard`, which is a graph
-/// decision belonging to the graph's owner and not to a disk-hygiene repair. It is also the
-/// cheapest row to leave: the 2026-07-28 census found **0** directories under that prefix on a
-/// box holding 33,928 others, so routing it would buy nothing measurable today — a reason to
-/// defer it, never evidence that it cannot leak later.
-///
-/// The remainder is one-way plus a floor: a row moves to `routed: true` when its producer starts
-/// constructing a guard, and cannot move the other way without someone deciding to.
-pub const SCRATCH_FAMILIES: &[ScratchFamily] = &[
-    ScratchFamily {
-        prefix: SEEDED_PREFIX,
-        constant: "SEEDED_PREFIX",
-        producer: "tests/common/mod.rs",
-        routed: true,
-    },
-    ScratchFamily {
-        prefix: CLOSURE_PREFIX,
-        constant: "CLOSURE_PREFIX",
-        producer: "tests/closure.rs",
-        routed: true,
-    },
-    ScratchFamily {
-        prefix: HANDOFF_PREFIX,
-        constant: "HANDOFF_PREFIX",
-        producer: "src/contract_handoff.rs",
-        routed: true,
-    },
-    ScratchFamily {
-        prefix: INVENTORY_PREFIX,
-        constant: "INVENTORY_PREFIX",
-        producer: "src/contract_inventory.rs",
-        routed: true,
-    },
-    ScratchFamily {
-        prefix: PUBLISHER_PREFIX,
-        constant: "PUBLISHER_PREFIX",
-        producer: "kernel-ownership-publisher/src/main.rs",
-        routed: false,
-    },
-];
-
-/// Whether `root` is one of ours under `prefix`, and therefore safe to reclaim.
-///
-/// Belt and braces on a `remove_dir_all`: the parent must be exactly the temp directory this
-/// harness materializes into, and the final component must carry `prefix`. A bug that corrupted
-/// a stored root then cannot reach anything outside that namespace — the reclaimer refuses and
-/// says so instead of guessing. `prefix` must itself name a [`SCRATCH_FAMILIES`] row, so a
-/// caller cannot widen the fence by passing `""` and turning it into "anything in `/tmp`".
-pub fn is_reclaimable(root: &Path, prefix: &str) -> bool {
-    SCRATCH_FAMILIES
-        .iter()
-        .any(|family| family.prefix == prefix)
-        && root.parent() == Some(std::env::temp_dir().as_path())
-        && root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(prefix))
-}
-
-/// A uniquely named scratch directory that reclaims itself when its test passes.
-///
-/// Deref-transparent to [`Path`], so a harness that used to bind a `PathBuf` binds this instead
-/// and every `&root` and `root.join(..)` at the call sites keeps compiling unchanged. The
-/// reclamation happens when the binding goes out of scope, which is the end of the test body —
-/// so a fixture stays alive for exactly as long as the test that owns it.
-pub struct ScratchRoot {
-    path: PathBuf,
-    prefix: &'static str,
-    /// What to call this fixture in the retention line a failing test prints.
-    kind: &'static str,
-}
-
-impl ScratchRoot {
-    /// Create a fresh root named `{prefix}{pid}-{stamp}-{serial}-{tag}` under the harness temp
-    /// directory, retrying on the (vanishingly unlikely) collision rather than overwriting.
-    ///
-    /// `create_new`-style semantics are deliberate and predate this module: a fixture must never
-    /// silently inherit a previous run's bytes, which is a property worth more than the disk.
-    pub fn create(prefix: &'static str, kind: &'static str, tag: &str) -> io::Result<ScratchRoot> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| {
-                io::Error::other(format!("system clock precedes the Unix epoch: {error}"))
-            })?
-            .as_nanos();
-        loop {
-            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "{prefix}{}-{stamp}-{serial}-{tag}",
-                std::process::id()
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(ScratchRoot { path, prefix, kind }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Give up ownership: the directory outlives this guard and is never reclaimed.
-    ///
-    /// Used only by the tests that *prove* retention happens, which must inspect a root after
-    /// the guard that retained it is gone.
-    pub fn into_retained(self) -> PathBuf {
-        let path = self.path.clone();
-        std::mem::forget(self);
-        path
-    }
-}
-
-impl Deref for ScratchRoot {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl AsRef<Path> for ScratchRoot {
-    fn as_ref(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// So a root can be handed to `Command::env` and friends exactly as a `PathBuf` could. Without
-/// it every such call site would need a `&*root`, which is churn that teaches the reader nothing.
-impl AsRef<std::ffi::OsStr> for ScratchRoot {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        self.path.as_os_str()
-    }
-}
-
-impl std::fmt::Debug for ScratchRoot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScratchRoot")
-            .field("path", &self.path)
-            .field("prefix", &self.prefix)
-            .finish()
-    }
-}
-
-impl Drop for ScratchRoot {
-    fn drop(&mut self) {
-        // A failing test is precisely the case the retention was for. `panicking()` is true for
-        // the whole unwind, so this covers an assertion failure anywhere in the test body, not
-        // merely one raised while the fixture happens to be in scope.
-        if std::thread::panicking() {
-            eprintln!("retained {} fixture: {}", self.kind, self.path.display());
-            return;
-        }
-        reclaim(&self.path, self.prefix, self.kind);
-    }
-}
-
-/// Reclaim one root, refusing anything the fence does not recognise.
-///
-/// Never panics: on the success path a panic here would convert a passing test into a confusing
-/// abort, and a directory left on disk is the lesser problem by a wide margin.
-fn reclaim(path: &Path, prefix: &str, kind: &str) {
-    if !is_reclaimable(path, prefix) {
-        eprintln!(
-            "refusing to reclaim a {kind} fixture root outside this harness's namespace: {}",
-            path.display()
-        );
-        return;
-    }
-    if let Err(error) = fs::remove_dir_all(path) {
-        eprintln!(
-            "could not reclaim {kind} fixture {}: {error}",
-            path.display()
-        );
-    }
-}
+pub use fln_core::scratch::{
+    CLOSURE_PREFIX, HANDOFF_PREFIX, INVENTORY_PREFIX, PUBLISHER_PREFIX, SCRATCH_FAMILIES,
+    SEEDED_PREFIX, ScratchFamily, ScratchRoot, is_reclaimable,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::Path;
 
     #[test]
     fn a_passing_root_is_reclaimed_and_a_failing_one_is_retained() {
@@ -355,6 +101,14 @@ mod tests {
             !is_reclaimable(&temp.join("undeclared-prefix-1-2-3"), "undeclared-prefix-"),
             "a prefix absent from SCRATCH_FAMILIES is refused even if the name matches it"
         );
+        assert!(
+            !is_reclaimable(
+                &temp.join("fln-ownership-publisher-1-2-3"),
+                PUBLISHER_PREFIX
+            ),
+            "a declared remainder's prefix is refused: the declaration says the fence \
+             does not stand behind that namespace"
+        );
     }
 
     #[test]
@@ -374,39 +128,44 @@ mod tests {
 
     #[test]
     fn every_declared_scratch_prefix_has_exactly_one_producer() {
-        // The fence is only as good as the family table, and a table nobody checks rots in both
-        // directions: a producer that invents a prefix is silently unreclaimable, and a row whose
-        // producer is gone keeps a slot warm for a future mismatch. So each row is bound to the
-        // crate's own sources rather than to this module's memory of them.
+        // The crate-local half of the family binding: this crate's rows of the unified
+        // table, bound to this crate's own sources. The workspace-wide half — every row,
+        // every `std::env::temp_dir()` call site, the site classification in both
+        // directions — is fln-conformance's `scratch_reclamation_census`, and this test
+        // deliberately does not duplicate it: two copies of one census is
+        // `franken_lean-evidence-python-config-rule-drift-imuu`'s defect.
         //
-        // This module's source is deliberately NOT in any corpus below. A scan whose search space
-        // contains its own declaration passes by reading itself, which is the self-match shape
-        // `fln-8zsq` paid for; every hit here therefore comes from a producer.
-        // The checked macro, not the raw compile-time manifest constant: that constant is baked
-        // at build time, so a test binary built in one worktree and run in another resolves
-        // these producers against the tree that COMPILED it while claiming to describe the one
-        // running it — and cargo treats an identical-bytes copy of this package in another tree
-        // as fresh, rebuilding nothing and saying nothing. The first version of this file used
-        // the raw form and the tree-identity guard caught it the moment the file became tracked,
-        // taking tools/structure-guard from 0 raw sites back to 1. The repair then had to be
-        // made TWICE, because the first comment explaining it QUOTED the raw form and the
-        // scanner counts textually — a scanner's prose belongs outside any count it floors, and
-        // that includes the prose of the file being scanned. Bead fln-cross-tree-baked-root-k60n.
-        let crate_root = fln_conformance::checked_manifest_dir!();
-        let crate_root = crate_root.as_path();
-        assert!(
-            !SCRATCH_FAMILIES.is_empty(),
-            "refusing a vacuous scan: the family table is empty"
+        // This module's source is deliberately NOT in any corpus below. A scan whose
+        // search space contains its own declaration passes by reading itself, which is
+        // the self-match shape `fln-8zsq` paid for; every hit here therefore comes from
+        // a producer.
+        //
+        // The checked macro, not the raw compile-time manifest constant: that constant is
+        // baked at build time, so a test binary built in one worktree and run in another
+        // resolves these producers against the tree that COMPILED it while claiming to
+        // describe the one running it (bead fln-cross-tree-baked-root-k60n).
+        let workspace_root = fln_conformance::checked_workspace_root!();
+        let workspace_root = workspace_root.as_path();
+
+        let own: Vec<&ScratchFamily> = SCRATCH_FAMILIES
+            .iter()
+            .filter(|family| family.producer.starts_with("tools/structure-guard/"))
+            .collect();
+        assert_eq!(
+            own.len(),
+            5,
+            "this crate declares exactly five scratch families (four routed, one \
+             remainder); a sixth appears here only as a deliberate, disclosed act"
         );
 
         let mut routed = 0usize;
         let mut remainder = 0usize;
-        for family in SCRATCH_FAMILIES {
-            let path = crate_root.join(family.producer);
-            // assert-then-expect rather than `unwrap_or_else(|_| panic!(..))`: the message needs
-            // the interpolated path, and `expect(&format!(..))` is what clippy's `expect_fun_call`
-            // refuses. It also separates "the declared producer is gone" from "it is unreadable",
-            // which are different failures of this table.
+        for family in own {
+            let path = workspace_root.join(family.producer);
+            // assert-then-expect rather than `unwrap_or_else(|_| panic!(..))`: the message
+            // needs the interpolated path, and `expect(&format!(..))` is what clippy's
+            // `expect_fun_call` refuses. It also separates "the declared producer is
+            // gone" from "it is unreadable", which are different failures of this table.
             assert!(
                 path.is_file(),
                 "declared producer for {:?} does not exist: {}",
@@ -421,24 +180,26 @@ mod tests {
                 text.len()
             );
 
-            // A ROUTED producer must bind its constant at the construction site; a DECLARED
-            // REMAINDER cannot name the constant, and that is the whole reason it is
-            // a remainder — `kernel-ownership-publisher` is a nested workspace with no dependency
-            // on this crate, so the identifier is unreachable there and the literal is the only
-            // spelling available. Requiring the constant of it would be a wall against the exact
-            // condition being disclosed. So the needle is chosen by the row: constant when routed,
+            // A ROUTED producer must bind its constant at the construction site; a
+            // DECLARED REMAINDER cannot name the constant, and that is the whole reason
+            // it is a remainder — `kernel-ownership-publisher` is a nested workspace
+            // with no dependency on the fence's crate, so the identifier is unreachable
+            // there and the literal is the only spelling available. Requiring the
+            // constant of it would be a wall against the exact condition being
+            // disclosed. So the needle is chosen by the row: constant when routed,
             // literal when not, and each direction is refused for the other kind.
             if family.routed {
-                // The constant must be the FIRST ARGUMENT of the construction, not merely
-                // present somewhere in the file. A blanket "the literal appears nowhere" ban was
-                // tried first and is wrong: `tests/common/mod.rs` legitimately writes
-                // `structure-guard-test-1-2-3-tag` as fence *test input*, so that rule refused a
-                // correct file — a wall against the practice it was meant to protect. Bind the
-                // call site instead, which is the thing that could actually drift.
+                // The constant must be the FIRST ARGUMENT of the construction, not
+                // merely present somewhere in the file. A blanket "the literal appears
+                // nowhere" ban was tried first and is wrong: `tests/common/mod.rs`
+                // legitimately writes `structure-guard-test-1-2-3-tag` as fence *test
+                // input*, so that rule refused a correct file — a wall against the
+                // practice it was meant to protect. Bind the call site instead, which
+                // is the thing that could actually drift.
                 assert!(
                     text.contains(&format!("ScratchRoot::create({}", family.constant)),
-                    "{} is routed but never calls ScratchRoot::create({}); the declared prefix \
-                     {:?} therefore has no producer binding it",
+                    "{} is routed but never calls ScratchRoot::create({}); the declared \
+                     prefix {:?} therefore has no producer binding it",
                     path.display(),
                     family.constant,
                     family.prefix
@@ -446,16 +207,16 @@ mod tests {
             } else {
                 assert!(
                     text.contains(&format!("\"{}", family.prefix)),
-                    "{} is a declared remainder but does not carry the literal {:?}, so the \
-                     disclosure names a producer that no longer produces it",
+                    "{} is a declared remainder but does not carry the literal {:?}, so \
+                     the disclosure names a producer that no longer produces it",
                     path.display(),
                     family.prefix
                 );
             }
 
-            // A routed producer must actually construct a guard, and a declared remainder must
-            // not. Without this the `routed` column is a comment: a producer could stop routing
-            // while the table still claimed it did.
+            // A routed producer must actually construct a guard, and a declared
+            // remainder must not. Without this the `routed` column is a comment: a
+            // producer could stop routing while the table still claimed it did.
             let constructs_guard = text.contains("ScratchRoot::create");
             assert_eq!(
                 constructs_guard,
@@ -474,35 +235,24 @@ mod tests {
             }
         }
 
-        // Conservation, so the remainder cannot be emptied by deleting a row instead of by
-        // routing its producer, and a floor so it cannot silently grow.
+        // Conservation, so the remainder cannot be emptied by deleting a row instead of
+        // by routing its producer, and a floor so it cannot silently grow.
         assert_eq!(
             routed + remainder,
-            SCRATCH_FAMILIES.len(),
-            "every family is either routed or a declared remainder"
+            5,
+            "every one of this crate's five families is either routed or a declared \
+             remainder"
         );
         assert_eq!(
             remainder, 1,
-            "the declared remainder is one row (kernel-ownership-publisher). A change here is a \
-             decision: raise it deliberately with the reason, or lower it by routing a producer"
+            "this crate's declared remainder is one row (kernel-ownership-publisher). A \
+             change here is a decision: raise it deliberately with the reason, or lower \
+             it by routing a producer"
         );
-        assert!(
-            routed >= 4,
-            "at least four producers route through ScratchRoot; found {routed}"
+        assert_eq!(
+            routed, 4,
+            "exactly four of this crate's producers route through ScratchRoot; found \
+             {routed}"
         );
-
-        // Prefixes are distinct, and no prefix is a prefix of another — otherwise one family's
-        // fence would admit another's roots and the `routed` column would not mean what it says.
-        for (i, a) in SCRATCH_FAMILIES.iter().enumerate() {
-            assert!(!a.prefix.is_empty(), "an empty prefix admits everything");
-            for b in SCRATCH_FAMILIES.iter().skip(i + 1) {
-                assert!(
-                    !a.prefix.starts_with(b.prefix) && !b.prefix.starts_with(a.prefix),
-                    "prefixes {:?} and {:?} overlap, so one fence admits the other's roots",
-                    a.prefix,
-                    b.prefix
-                );
-            }
-        }
     }
 }

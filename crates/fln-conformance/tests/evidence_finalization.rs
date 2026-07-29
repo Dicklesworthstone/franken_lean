@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use fln_core::scratch::{RCH_STAGED_PREFIX, ScratchRoot};
+
 fn check_script() -> String {
     let path = fln_conformance::checked_workspace_root!().join("scripts/check.sh");
     fs::read_to_string(path).expect("scripts/check.sh must be readable")
@@ -3317,16 +3319,47 @@ fn the_rch_tracker_exclusion_row_matches_the_measured_population() {
 // them: with 214 real files present, `walked >= 150` cannot fire. `build_gate_governed_sets`
 // paid for that lesson — inject the inputs or the check is decorative.
 
-/// A staged root with `crates/` and `tools/`, uniquely named so no run inherits another's files.
-fn rch_staged_root(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock must be after the epoch")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("fln-rch-{}-{tag}-{nanos}", std::process::id()));
+/// A staged root with `crates/` and `tools/`, uniquely named so no run inherits another's
+/// files, and reclaimed when its cell passes (franken_lean-eir2 routes this producer
+/// through the workspace fence: 1,727 retained directories at the census).
+fn rch_staged_root(tag: &str) -> ScratchRoot {
+    let root = ScratchRoot::create(RCH_STAGED_PREFIX, "rch-staged", tag)
+        .expect("the staged root must be creatable");
     fs::create_dir_all(root.join("crates")).expect("the staged crates dir must be creatable");
     fs::create_dir_all(root.join("tools")).expect("the staged tools dir must be creatable");
     root
+}
+
+/// `franken_lean-eir2` acceptance criterion 3: retention on failure is proved in BOTH
+/// directions for this family, never inferred from the passing cell.
+#[test]
+fn rch_staged_roots_reclaim_on_pass_and_retain_on_failure() {
+    let passing = {
+        let root = rch_staged_root("reclaim-pass");
+        root.path().to_path_buf()
+    };
+    assert!(
+        !passing.exists(),
+        "a passing cell's staged root must be reclaimed: {}",
+        passing.display()
+    );
+
+    let observed = std::cell::RefCell::new(None);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let root = rch_staged_root("reclaim-fail");
+        *observed.borrow_mut() = Some(root.path().to_path_buf());
+        panic!("deliberate failure so the fixture guard drops during an unwind");
+    }));
+    assert!(unwound.is_err(), "the failing cell must actually unwind");
+    let retained = observed
+        .into_inner()
+        .expect("the failing cell materialized before it panicked");
+    assert!(
+        retained.exists(),
+        "a failing cell's staged root must be retained: {}",
+        retained.display()
+    );
+    fs::remove_dir_all(&retained).expect("the probe reclaims what it retained");
 }
 
 /// Write `relative` under the staged root, naming the tracker or not.
@@ -3363,7 +3396,7 @@ fn rch_section(provenance: &str, population: &str, reads: &str, non_reads: &str)
 }
 
 /// The baseline root the whole campaign varies one thing against.
-fn rch_baseline_root(tag: &str) -> PathBuf {
+fn rch_baseline_root(tag: &str) -> ScratchRoot {
     let root = rch_staged_root(tag);
     rch_stage_file(&root, "crates/alpha/src/reader.rs", true);
     rch_stage_file(&root, "tools/beta/src/mentioner.rs", true);
@@ -3492,28 +3525,51 @@ fn rch_mutant_interception_claimed_below_its_own_threshold_is_caught() {
     );
 }
 
+/// Assert that a judged mutant REFUSED with `needle` in the panic payload — the
+/// `catch_unwind` form of `#[should_panic(expected = ...)]`. The four root-creating
+/// cells below use this form rather than the attribute on purpose: a `should_panic`
+/// cell passes BY unwinding, and the scratch fence reads any unwind as a failure and
+/// retains the root (franken_lean-eir2), so the attribute would leak every passing
+/// cell's fixture. The refusal evidence is identical — payload asserted against the
+/// same needle — and the root is reclaimed when the cell passes.
+fn assert_panicked_with(cell: std::thread::Result<()>, needle: &str) {
+    let payload = cell.expect_err("the judged mutant must refuse, never agree");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    assert!(
+        message.contains(needle),
+        "the refusal must name the expected cause ({needle:?}); got: {message}"
+    );
+}
+
 #[test]
-#[should_panic(expected = "broken scan")]
 fn rch_mutant_a_collapsed_walk_refuses_instead_of_agreeing() {
     let root = rch_baseline_root("collapsed");
     let (measured, walked) = rch_tracker_mentions(&root);
     // The floor is what a healthy tree can never exercise, so it is exercised here.
-    let _ = judge_rch_population(&rch_baseline_section(), &measured, walked, 4);
+    let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = judge_rch_population(&rch_baseline_section(), &measured, walked, 4);
+    }));
+    assert_panicked_with(refusal, "broken scan");
 }
 
 #[test]
-#[should_panic(expected = "never a clean tree")]
 fn rch_mutant_an_empty_scan_refuses_instead_of_reporting_clean() {
     let root = rch_staged_root("empty");
     rch_stage_file(&root, "crates/alpha/src/quiet.rs", false);
     rch_stage_file(&root, "tools/beta/src/quiet.rs", false);
     let (measured, walked) = rch_tracker_mentions(&root);
     assert!(measured.is_empty(), "the staged root must name nothing");
-    let _ = judge_rch_population(&rch_baseline_section(), &measured, walked, 2);
+    let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = judge_rch_population(&rch_baseline_section(), &measured, walked, 2);
+    }));
+    assert_panicked_with(refusal, "never a clean tree");
 }
 
 #[test]
-#[should_panic(expected = "twice")]
 fn rch_mutant_a_doubled_disclosure_line_refuses() {
     let root = rch_baseline_root("doubled");
     let (measured, walked) = rch_tracker_mentions(&root);
@@ -3521,16 +3577,21 @@ fn rch_mutant_a_doubled_disclosure_line_refuses() {
         "{}\nrch-tracker-population: mentions=9 non-reads=9 reads=9\n",
         rch_baseline_section()
     );
-    let _ = judge_rch_population(&doubled, &measured, walked, 2);
+    let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = judge_rch_population(&doubled, &measured, walked, 2);
+    }));
+    assert_panicked_with(refusal, "twice");
 }
 
 #[test]
-#[should_panic(expected = "no longer carries")]
 fn rch_mutant_a_missing_disclosure_line_refuses() {
     let root = rch_baseline_root("missing");
     let (measured, walked) = rch_tracker_mentions(&root);
     let section = rch_baseline_section().replace("rch-tracker-population:", "rch-tracker-absent:");
-    let _ = judge_rch_population(&section, &measured, walked, 2);
+    let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = judge_rch_population(&section, &measured, walked, 2);
+    }));
+    assert_panicked_with(refusal, "no longer carries");
 }
 
 #[test]

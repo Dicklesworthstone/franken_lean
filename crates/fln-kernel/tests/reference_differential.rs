@@ -82,6 +82,7 @@
 use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
+use fln_core::scratch::{REFDIFF_PREFIX, ScratchRoot};
 use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, TheoremVal,
 };
@@ -127,8 +128,11 @@ enum OracleVerdict {
 
 /// Run the pinned Reference over `source` and classify what it said.
 fn ask_reference(lean: &PathBuf, case_id: &str, source: &str) -> OracleVerdict {
-    let dir = std::env::temp_dir().join(format!("fln-refdiff-{case_id}"));
-    let _ = std::fs::create_dir_all(&dir);
+    // Guard-owned oracle workspace: reclaimed when the case passes, retained when it
+    // fails (franken_lean-eir2). The guard's pid/stamp/serial naming also repairs the
+    // old `fln-refdiff-{case_id}` collision between two concurrent test processes.
+    let dir = ScratchRoot::create(REFDIFF_PREFIX, "reference-differential", case_id)
+        .expect("create oracle workspace");
     let file = dir.join("Case.lean");
     std::fs::write(&file, source).expect("write oracle source");
 
@@ -814,4 +818,39 @@ fn oracle_does_not_mistake_a_codegen_error_for_a_kernel_verdict() {
         "a tagged codegen error must be refused as a non-verdict, not read as a \
          rejection; got {verdict:?}"
     );
+}
+
+/// `franken_lean-eir2` acceptance criterion 3: retention on failure is proved in BOTH
+/// directions for this family, never inferred from the passing cell. This cell uses the
+/// family's own constructor directly, so it does not need the pinned Reference to run.
+#[test]
+fn reference_differential_roots_reclaim_on_pass_and_retain_on_failure() {
+    let passing = {
+        let root = ScratchRoot::create(REFDIFF_PREFIX, "reference-differential", "reclaim-pass")
+            .expect("create passing workspace");
+        root.path().to_path_buf()
+    };
+    assert!(
+        !passing.exists(),
+        "a passing cell's oracle workspace must be reclaimed: {}",
+        passing.display()
+    );
+
+    let observed = std::cell::RefCell::new(None);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let root = ScratchRoot::create(REFDIFF_PREFIX, "reference-differential", "reclaim-fail")
+            .expect("create failing workspace");
+        *observed.borrow_mut() = Some(root.path().to_path_buf());
+        panic!("deliberate failure so the fixture guard drops during an unwind");
+    }));
+    assert!(unwound.is_err(), "the failing cell must actually unwind");
+    let retained = observed
+        .into_inner()
+        .expect("the failing cell materialized before it panicked");
+    assert!(
+        retained.exists(),
+        "a failing cell's oracle workspace must be retained: {}",
+        retained.display()
+    );
+    std::fs::remove_dir_all(&retained).expect("the probe reclaims what it retained");
 }

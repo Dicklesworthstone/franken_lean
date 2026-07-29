@@ -14,12 +14,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use fln_core::mode::{
     BuildProfileId, CgsePolicyId, ContentRoot, EpochId, Mode, ReproducibilityProfile, TargetId,
 };
 use fln_core::outcome::Outcome;
+use fln_core::scratch::{SHADOW_PROMOTION_PREFIX, ScratchRoot};
 use fln_hash::shadow::{
     CandidateResultV1, ClaimTypeV1, ComparisonClassV1, EngineVersionV1, EvidenceStateV1,
     FixtureComparisonV1, FixtureManifestV1, FixtureVerdictV1, IncidentObservationV1,
@@ -292,15 +292,15 @@ fn run_child(path: &Path, mode: &str) -> ExitStatus {
         .expect("launch publication child")
 }
 
-fn unique_journal_path() -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "fln-shadow-promotion-{}-{stamp}.journal",
-        std::process::id()
-    ))
+/// One guard-owned journal root per run: the journal file lives INSIDE the guard's
+/// directory, so file and root reclaim together on a pass and retain together on a
+/// failure (franken_lean-eir2; the journal previously lived directly in the temp dir
+/// and was never reclaimed).
+fn journal_fixture() -> (ScratchRoot, PathBuf) {
+    let root = ScratchRoot::create(SHADOW_PROMOTION_PREFIX, "shadow-promotion", "journal")
+        .expect("journal fixture root is creatable");
+    let path = root.join("shadow-promotion.journal");
+    (root, path)
 }
 
 #[test]
@@ -308,7 +308,7 @@ fn promotion_protocol_no_mock_e2e() {
     if std::env::var_os(CHILD_MODE).is_some() {
         return;
     }
-    let path = unique_journal_path();
+    let (_guard, path) = journal_fixture();
     assert!(run_child(&path, "base").success(), "base child");
 
     let base_bytes = std::fs::read(&path).expect("read real journal");
@@ -356,4 +356,50 @@ fn promotion_protocol_no_mock_e2e() {
     assert!(!promoted.semantic_ndjson().contains("worker_count"));
     assert!(promoted.telemetry_ndjson().contains("latency_micros"));
     assert!(promoted.telemetry_ndjson().contains("worker_count"));
+}
+
+/// `franken_lean-eir2` acceptance criterion 3: retention on failure is proved in BOTH
+/// directions for this family, never inferred from the passing cell — and the journal
+/// file must share its root's fate in both directions, which is the point of moving
+/// the file inside the guard's directory.
+#[test]
+fn shadow_promotion_roots_reclaim_on_pass_and_retain_on_failure() {
+    let (passing_root, passing_journal) = {
+        let (guard, journal) = journal_fixture();
+        std::fs::write(&journal, b"journal-bytes").expect("plant a journal");
+        (guard.path().to_path_buf(), journal)
+    };
+    assert!(
+        !passing_root.exists(),
+        "a passing cell's journal root must be reclaimed: {}",
+        passing_root.display()
+    );
+    assert!(
+        !passing_journal.exists(),
+        "the journal inside a reclaimed root is gone with it: {}",
+        passing_journal.display()
+    );
+
+    let observed = std::cell::RefCell::new(None);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (guard, journal) = journal_fixture();
+        std::fs::write(&journal, b"journal-bytes").expect("plant a journal");
+        *observed.borrow_mut() = Some((guard.path().to_path_buf(), journal));
+        panic!("deliberate failure so the fixture guard drops during an unwind");
+    }));
+    assert!(unwound.is_err(), "the failing cell must actually unwind");
+    let (retained_root, retained_journal) = observed
+        .into_inner()
+        .expect("the failing cell materialized before it panicked");
+    assert!(
+        retained_root.exists(),
+        "a failing cell's journal root must be retained: {}",
+        retained_root.display()
+    );
+    assert!(
+        retained_journal.exists(),
+        "the journal inside a retained root is kept with it: {}",
+        retained_journal.display()
+    );
+    std::fs::remove_dir_all(&retained_root).expect("the probe reclaims what it retained");
 }

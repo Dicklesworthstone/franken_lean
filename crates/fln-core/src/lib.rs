@@ -20,6 +20,11 @@
 //!   internal-fault, kept orthogonal to the [`diag`] cause vocabulary;
 //! * [`pos`] — byte positions and the `FileMap` line/column model;
 //! * [`ids`] — the distinct semantic-kind newtypes of §8.2b.
+//!
+//! [`scratch`] is the deliberate exception to "term-plane vocabulary": the
+//! workspace's single test-scratch reclaimer lives at rank 0 so every harness
+//! stands behind one fence with zero new dependency edges (bead
+//! `franken_lean-eir2`, Option B; the decision record is the module's own header).
 
 #![forbid(unsafe_code)]
 
@@ -35,3 +40,4 @@ pub mod name;
 pub mod options;
 pub mod outcome;
 pub mod pos;
+pub mod scratch;

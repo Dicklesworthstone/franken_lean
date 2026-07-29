@@ -45,6 +45,7 @@
 #![forbid(unsafe_code)]
 
 use fln_core::name::Name;
+use fln_core::scratch::{ScratchRoot, VDI4_PREFIX};
 use fln_syntax::attach::{TokenExtent, attach};
 use fln_syntax::run::{Event, lex_run};
 use fln_syntax::source::{ByteSpan, SourceInfo, SourceText};
@@ -57,7 +58,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const CORPUS: &str = include_str!("corpus/vellum_goldens.hex");
 const PROVENANCE: &str = include_str!("corpus/VELLUM_GOLDENS_PROVENANCE.md");
@@ -256,8 +256,6 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "fbe5d-be4",
     "fce6c-58c",
 ];
-static TEMP_REPO_ID: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AnchorReachability {
     MainReachable { commit: String },
@@ -775,17 +773,42 @@ fn audit_checked_in_repository(repo: &Path) -> Result<AnchorInventory, AnchorInv
     Ok(inventory)
 }
 
-fn unique_temp_workspace(label: &str) -> Result<PathBuf, std::io::Error> {
-    loop {
-        let id = TEMP_REPO_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("fln-vdi4-{label}-{}-{id}", std::process::id()));
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::AlreadyExists) => {}
-            Err(error) => return Err(error),
-        }
-    }
+/// One scratch workspace per cell, reclaimed when the cell passes and retained when it
+/// fails (franken_lean-eir2 routes this producer through the workspace fence).
+fn unique_temp_workspace(label: &str) -> Result<ScratchRoot, std::io::Error> {
+    ScratchRoot::create(VDI4_PREFIX, "golden-vellum", label)
+}
+
+/// `franken_lean-eir2` acceptance criterion 3: retention on failure is proved in BOTH
+/// directions for this family, never inferred from the passing cell.
+#[test]
+fn golden_vellum_workspaces_reclaim_on_pass_and_retain_on_failure() {
+    let passing = {
+        let root = unique_temp_workspace("reclaim-pass").expect("create passing workspace");
+        root.path().to_path_buf()
+    };
+    assert!(
+        !passing.exists(),
+        "a passing cell's workspace must be reclaimed: {}",
+        passing.display()
+    );
+
+    let observed = std::cell::RefCell::new(None);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let root = unique_temp_workspace("reclaim-fail").expect("create failing workspace");
+        *observed.borrow_mut() = Some(root.path().to_path_buf());
+        panic!("deliberate failure so the fixture guard drops during an unwind");
+    }));
+    assert!(unwound.is_err(), "the failing cell must actually unwind");
+    let retained = observed
+        .into_inner()
+        .expect("the failing cell materialized before it panicked");
+    assert!(
+        retained.exists(),
+        "a failing cell's workspace must be retained: {}",
+        retained.display()
+    );
+    fs::remove_dir_all(&retained).expect("the probe reclaims what it retained");
 }
 
 /// Resolve the tree Cargo invoked this test from without baking a checkout path into the binary.
