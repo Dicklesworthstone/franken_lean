@@ -16,6 +16,8 @@ fln-env = { path = "../fln-env" }
 fln-hash = { path = "../fln-hash" }
 fln-kernel = { path = "../fln-kernel" }
 fln-olean = { path = "../fln-olean" }
+fln-parse = { path = "../fln-parse" }
+fln-syntax = { path = "../fln-syntax" }
 # The corpus projection (bead franken_lean-dgxa) covers every row of SCHEMA_REGISTRY,
 # three of which are fln-verdict's wire formats. §21 puts fln-conformance last in the
 # crate map, so this edge points downward like every other one here.

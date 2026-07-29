@@ -12,11 +12,14 @@
 //!   (trail.posOf '\n').offsetBy trail.startPos
 //! ```
 //!
-//! A token's **trailing** trivia runs from just past the token to *just before the first
-//! newline* after it — `posOf` yields the substring's length when the character is absent,
-//! so a run with no newline is taken whole. Everything from that newline onward, up to the
-//! next token, is the next token's **leading** trivia (`updateLeadingAux`, which threads
-//! the previous token's trailing stop as state).
+//! Before a **following token**, the previous token's trailing trivia runs from just past
+//! the token to *just before the first newline* — `posOf` yields the substring's length
+//! when the character is absent, so a run with no newline is taken whole. Everything from
+//! that newline onward, up to the next token, is the next token's **leading** trivia
+//! (`updateLeadingAux`, which threads the previous token's trailing stop as state). The
+//! terminal token has no successor update, so it retains the whole terminal trivia,
+//! including a final newline. G0-4's pinned `Parser.runParserCategory` observation is the
+//! executable authority for that terminal half of the rule.
 //!
 //! That is the intuitive rule made exact: a comment on the same line as a token belongs to
 //! *that* token, and a comment on its own line belongs to the token *following* it. Both
@@ -113,15 +116,13 @@ pub enum TokenExtent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
     entries: Vec<Attached>,
-    /// Trivia after the last token's trailing stop.
+    /// Bytes not attributable to a present token.
     ///
-    /// This slot exists because the rule leaves a genuine remainder: the last token's
-    /// trailing stops at its first following newline, and whatever comes after that has no
-    /// *next* token to become the leading trivia of. Upstream's parser consumes it without
-    /// the tree attributing it, which is fine for a command-at-a-time parse and not fine
-    /// for a whole-file tree that claims to reconstruct the file. Naming it is the honest
-    /// alternative to silently dropping it — a file that is nothing but a comment is
-    /// entirely epilogue.
+    /// [`attach`] leaves this empty after a terminal present token because that token owns
+    /// all remaining trivia. The slot is still necessary for a file with no present tokens:
+    /// a file that is only trivia is entirely epilogue, as is a file whose entries are all
+    /// missing-token markers. Naming that remainder is the honest alternative to silently
+    /// dropping it from whole-file reconstruction.
     epilogue: ByteSpan,
 }
 
@@ -267,17 +268,16 @@ pub fn attach(text: &SourceText, extents: &[TokenExtent]) -> Result<Attachment, 
                 continue;
             }
         };
-        // Trailing runs to the first newline after the token, bounded by the next token's
-        // start (or end of text). Bounding matters: without it a token with no newline
-        // before the next token would swallow the next token's leading trivia.
-        let next_start = extents[index + 1..]
-            .iter()
-            .find_map(|later| match later {
-                TokenExtent::Present(span) => Some(span.start().0),
-                TokenExtent::Missing(_) => None,
-            })
-            .unwrap_or(text.len_bytes());
-        let trail_stop = nice_trail_stop(span.end().0, next_start);
+        // With a successor, trailing runs to the first newline before that token.
+        // The terminal token has no successor update and owns all remaining trivia,
+        // including the final newline.
+        let next_start = extents[index + 1..].iter().find_map(|later| match later {
+            TokenExtent::Present(span) => Some(span.start().0),
+            TokenExtent::Missing(_) => None,
+        });
+        let trail_stop = next_start.map_or(text.len_bytes(), |limit| {
+            nice_trail_stop(span.end().0, limit)
+        });
 
         entries.push(Attached::Token(SourceInfo::Original {
             leading: ByteSpan::new(BytePos(leading_start), span.start())
@@ -481,6 +481,25 @@ mod tests {
         // And the two abut exactly, so no byte is claimed twice or dropped.
         assert_eq!(a_trail.end(), b_lead.start());
         assert_eq!(attachment.reconstruct(&text).as_deref(), Some(&raw[..]));
+    }
+
+    /// The terminal half of the pin's rule: there is no successor whose leading trivia
+    /// could own the newline, so the last token keeps all remaining bytes.
+    #[test]
+    fn a_terminal_token_keeps_its_final_comment_and_newline() {
+        let raw = "β -- trailing\n".as_bytes();
+        let text = text_of(raw);
+        let extents = extents_of(text.as_str(), &["β"]);
+        let attachment = attach(&text, &extents).expect("valid");
+        let trailing = match attachment.entries().first() {
+            Some(Attached::Token(SourceInfo::Original { trailing, .. })) => Some(*trailing),
+            _ => None,
+        };
+        assert!(trailing.is_some(), "expected an original token");
+        let trailing = trailing.expect("original-token shape was asserted");
+        assert_eq!(text.span_str(trailing), Some(" -- trailing\n"));
+        assert_eq!(attachment.epilogue().len_bytes(), 0);
+        assert_eq!(attachment.reconstruct(&text).as_deref(), Some(raw));
     }
 
     /// Faithful, not "nice": `posOf` scans bytes, so a newline inside a block comment is a
@@ -716,12 +735,9 @@ d";
     /// a bound that always returned something non-empty would get wrong.
     #[test]
     fn an_edit_in_the_epilogue_damages_no_entry() {
-        let raw = b"a
--- trailing only
-";
+        let raw = b"-- trivia only\n";
         let text = text_of(raw);
-        let extents = extents_of(text.as_str(), &["a"]);
-        let attachment = attach(&text, &extents).expect("valid");
+        let attachment = attach(&text, &[]).expect("valid");
         assert!(
             attachment.epilogue().len_bytes() > 0,
             "the fixture needs a non-empty epilogue"

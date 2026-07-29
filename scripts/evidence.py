@@ -539,6 +539,11 @@ E2E_STEP_ORDERS = {
         "semantic_validation",
         "final_real_recheck",
     ],
+    "g0_4_no_mock_e2e": [
+        "syntax_hygiene_contract",
+        "pratt_precedence_contract",
+        "terminal_trivia_contract",
+    ],
     "vellum_naming_no_mock_e2e": [
         "registry_gate",
         "collision_model",

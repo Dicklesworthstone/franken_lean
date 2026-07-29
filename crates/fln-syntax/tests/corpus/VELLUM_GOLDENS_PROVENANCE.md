@@ -64,6 +64,11 @@ to a byte comparison. This field is where it shows up.
 | `comment-and-trivia` | comment plus parens, CRLF | comment trivia and bracket tokens under normalization |
 | `unicode-and-doc` | doc comment, `α`, `λ` | multi-byte tokens, and `/--` as a token rather than trivia |
 
+Every nonempty row ending in LF also pins the terminal half of the attachment rule:
+the final token owns that final newline as trailing trivia and the epilogue is empty.
+This was remeasured by G0-4 against the SUITE.lock Reference after the earlier
+goldens had assigned the newline to epilogue.
+
 ## The contrast the corpus exists for
 
 `crlf-two-lines` and `lone-cr-preserved` are the same two statements differing **only** in line

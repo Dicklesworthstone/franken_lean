@@ -973,3 +973,237 @@ fn the_g06_mutation_receipt_holds_its_content_not_merely_its_presence() {
         assert_eq!(*outcome, "killed-by-named", "{mutant}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The third real row: G0-4, Amended on a manifest-complete C0-C2 comparison.
+// The ledger now holds three rows; exactly the other seven block as missing.
+// ---------------------------------------------------------------------------
+
+use fln_conformance::syntax_hygiene::{
+    FixtureManifest, fixture_digest, measure_contract_usage, run_budget_matrix,
+    stock_trace_contract,
+};
+use fln_epoch_lab::g0::{G04Evidence, g04_decision};
+
+fn numeric_field(line: &str, key: &str) -> Option<u64> {
+    let tag = format!("\"{key}\":");
+    let start = line.find(&tag)? + tag.len();
+    let digits = line[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn g04_evidence() -> G04Evidence {
+    let conformance = conformance_root();
+    let fixture_dir = conformance.join("fixtures");
+    let evidence_dir = conformance.join("evidence/g04_syntax_hygiene");
+    let manifest_path = fixture_dir.join("g04_syntax_manifest.tsv");
+    let reference_fixture_path = fixture_dir.join("g04_reference_fixture.lean");
+    let semantic_path = evidence_dir.join("semantic_v4.32.0.ndjson");
+    let telemetry_path = evidence_dir.join("telemetry_v4.32.0.ndjson");
+    let mutation_path = evidence_dir.join("mutation_campaign_v4.32.0.ndjson");
+    let regen_path = evidence_dir.join("regen_v4.32.0.ndjson");
+
+    let manifest = FixtureManifest::load_embedded().expect("G0-4 manifest");
+    manifest.validate_grammar_roots().expect("grammar roots");
+    let semantic = std::fs::read_to_string(&semantic_path).expect("semantic evidence");
+    let telemetry = std::fs::read_to_string(&telemetry_path).expect("telemetry evidence");
+    let mutation = std::fs::read_to_string(&mutation_path).expect("mutation evidence");
+    let regen = std::fs::read_to_string(&regen_path).expect("regeneration evidence");
+
+    let semantic_lines = semantic.lines().collect::<Vec<_>>();
+    let exact_rows = semantic_lines
+        .iter()
+        .filter(|line| line.contains(r#""classification":"exact""#))
+        .count();
+    let contract_gaps = semantic_lines
+        .iter()
+        .filter(|line| line.contains(r#""classification":"contract-gap""#))
+        .count();
+    let unclassified_rows = semantic_lines.len() - exact_rows - contract_gaps;
+
+    let trace = stock_trace_contract().expect("stock G0-9 TraceContractV1");
+    let one = run_budget_matrix(&manifest, 1).expect("one-thread budget matrix");
+    let eight = run_budget_matrix(&manifest, 8).expect("eight-thread budget matrix");
+    let thirty_two = run_budget_matrix(&manifest, 32).expect("32-thread budget matrix");
+    let usage = measure_contract_usage(&manifest).expect("contract usage");
+    let mutation_lines = mutation.lines().collect::<Vec<_>>();
+    let semantic_root = fixture_digest(semantic.as_bytes());
+    let telemetry_root = fixture_digest(telemetry.as_bytes());
+    let mutation_receipt_root = fixture_digest(mutation.as_bytes());
+    let mutation_root = derive_fixture_digest(&mutation_path)
+        .expect("mutation receipt digest")
+        .into_parts()
+        .0;
+    let regen_root = derive_fixture_digest(&regen_path)
+        .expect("regeneration receipt digest")
+        .into_parts()
+        .0;
+
+    let behavior = format!(
+        "semantic={semantic_root}:manifest={}:trace={}:budget={}:usage={}",
+        manifest.root(),
+        trace.fixture_root,
+        thirty_two.stream_root,
+        usage.root()
+    );
+    let generated_contract = format!(
+        "manifest={}:trace-schema={}:trace-root={}:budget={}:usage={}",
+        manifest.root(),
+        trace.schema,
+        trace.fixture_root,
+        thirty_two.stream_root,
+        usage.root()
+    );
+    let fixture_inputs = format!(
+        "manifest={}:fixture={}",
+        derive_fixture_digest(&manifest_path)
+            .expect("manifest digest")
+            .into_parts()
+            .0,
+        derive_fixture_digest(&reference_fixture_path)
+            .expect("Reference fixture digest")
+            .into_parts()
+            .0
+    );
+
+    let all_mutants_killed = mutation_lines.len() == 13
+        && mutation_lines.iter().enumerate().all(|(sequence, line)| {
+            line.contains(r#""schema":"fln-g04-mutation/1""#)
+                && line.contains(&format!(r#""sequence":{sequence}"#))
+                && line.contains(r#""actual":"killed""#)
+        });
+    let regen_bound = regen.lines().count() == 1
+        && regen.contains(r#""schema":"fln-g04-regen/1""#)
+        && regen.contains(&format!(r#""manifest_root":"{}""#, manifest.root()))
+        && regen.contains(&format!(r#""semantic_root":"{semantic_root}""#))
+        && regen.contains(&format!(r#""telemetry_root":"{telemetry_root}""#))
+        && regen.contains(&format!(r#""mutation_root":"{mutation_receipt_root}""#))
+        && regen.contains(&format!(r#""trace_root":"{}""#, trace.fixture_root))
+        && regen.contains(&format!(r#""budget_root":"{}""#, thirty_two.stream_root))
+        && regen.contains(&format!(r#""usage_root":"{}""#, usage.root()))
+        && regen.contains(r#""exact":2,"contract_gaps":8,"unclassified":0"#)
+        && regen.contains(r#""decision":"amended""#);
+    let acceptance_green = semantic_lines.len() == 10
+        && exact_rows == 2
+        && contract_gaps == 8
+        && unclassified_rows == 0
+        && trace.elab_step_count == 261
+        && one.stream_root == eight.stream_root
+        && eight.stream_root == thirty_two.stream_root
+        && [&one.partitions, &eight.partitions, &thirty_two.partitions]
+            .into_iter()
+            .all(|partitions| partitions.iter().all(|count| *count > 0))
+        && all_mutants_killed
+        && regen_bound;
+    if !acceptance_green {
+        eprintln!(
+            "g04-acceptance-debug rows={} exact={} gaps={} unclassified={} \
+             trace_steps={} roots_equal={} productive={} mutants={} regen={}",
+            semantic_lines.len(),
+            exact_rows,
+            contract_gaps,
+            unclassified_rows,
+            trace.elab_step_count,
+            one.stream_root == eight.stream_root && eight.stream_root == thirty_two.stream_root,
+            [&one.partitions, &eight.partitions, &thirty_two.partitions]
+                .into_iter()
+                .all(|partitions| partitions.iter().all(|count| *count > 0)),
+            all_mutants_killed,
+            regen_bound
+        );
+    }
+
+    let telemetry_line = telemetry.lines().next().expect("one telemetry row");
+    let wall_micros = numeric_field(telemetry_line, "wall_micros").expect("wall_micros");
+    let used_rss_bytes = numeric_field(telemetry_line, "peak_rss_bytes").expect("sampled peak RSS");
+
+    G04Evidence {
+        fixture_root: fixture_digest(fixture_inputs.as_bytes()),
+        generated_contract_root: fixture_digest(generated_contract.as_bytes()),
+        implementation_root: semantic_root,
+        mutation_root,
+        no_mock_e2e_root: regen_root,
+        acceptance_root: fixture_digest(behavior.as_bytes()),
+        acceptance_green,
+        exact_rows,
+        contract_gaps,
+        unclassified_rows,
+        used_wall_ms: wall_micros.saturating_add(999) / 1000,
+        used_rss_bytes,
+    }
+}
+
+#[test]
+fn the_g04_row_is_amended_on_computed_evidence_and_the_ledger_holds_three_rows() {
+    let roster = roster();
+    let e4 = g04_evidence();
+    let e6 = g06_evidence();
+    let e9 = g09_evidence();
+    assert!(e4.acceptance_green, "the G0-4 acceptance run must be green");
+    assert_eq!(
+        (e4.exact_rows, e4.contract_gaps, e4.unclassified_rows),
+        (2, 8, 0)
+    );
+    let rows = vec![
+        g04_decision(&roster, &e4).expect("G0-4 on roster"),
+        g06_decision(&roster, &e6).expect("G0-6 on roster"),
+        g09_decision(&roster, &e9).expect("G0-9 on roster"),
+    ];
+    let g = verify(&rows, &roster);
+    assert_eq!(g.ratified, vec!["G0-6".to_string()]);
+    assert_eq!(g.amended, vec!["G0-4".to_string(), "G0-9".to_string()]);
+    assert!(g.no_go.is_empty() && g.blocked.is_empty());
+    assert_eq!(
+        g.blocks.len(),
+        7,
+        "exactly the other seven block: {:?}",
+        g.blocks
+    );
+    for block in &g.blocks {
+        assert_eq!(block.reason(), "missing-decision", "{block:?}");
+    }
+    assert!(!g.clears(), "three rows must not clear a ten-spike gate");
+}
+
+#[test]
+fn the_g04_receipts_hold_content_not_merely_presence() {
+    let evidence_dir = conformance_root().join("evidence/g04_syntax_hygiene");
+    let semantic =
+        std::fs::read_to_string(evidence_dir.join("semantic_v4.32.0.ndjson")).expect("semantic");
+    let telemetry =
+        std::fs::read_to_string(evidence_dir.join("telemetry_v4.32.0.ndjson")).expect("telemetry");
+    let mutation = std::fs::read_to_string(evidence_dir.join("mutation_campaign_v4.32.0.ndjson"))
+        .expect("mutation");
+    let regen = std::fs::read_to_string(evidence_dir.join("regen_v4.32.0.ndjson")).expect("regen");
+
+    assert_eq!(semantic.lines().count(), 10);
+    assert_eq!(
+        semantic
+            .lines()
+            .filter(|line| line.contains(r#""classification":"exact""#))
+            .count(),
+        2
+    );
+    assert_eq!(
+        semantic
+            .lines()
+            .filter(|line| line.contains(r#""classification":"contract-gap""#))
+            .count(),
+        8
+    );
+    assert!(!semantic.contains("wall_micros"));
+    assert!(telemetry.contains(r#""schema":"fln-g04-telemetry/1""#));
+    assert!(telemetry.contains(r#""peak_rss_state":"sampled""#));
+    assert!(!telemetry.contains("reference_root"));
+    assert_eq!(mutation.lines().count(), 13);
+    assert!(mutation.lines().all(|line| {
+        line.contains(r#""schema":"fln-g04-mutation/1""#) && line.contains(r#""actual":"killed""#)
+    }));
+    assert_eq!(regen.lines().count(), 1);
+    assert!(regen.contains(r#""reference_processes":2,"repetitions_equal":true"#));
+    assert!(regen.contains(r#""exact":2,"contract_gaps":8,"unclassified":0"#));
+    assert!(regen.contains(r#""decision":"amended""#));
+}

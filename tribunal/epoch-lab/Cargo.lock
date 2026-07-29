@@ -18,6 +18,8 @@ dependencies = [
  "fln-hash",
  "fln-kernel",
  "fln-olean",
+ "fln-parse",
+ "fln-syntax",
  "fln-verdict",
 ]
 
@@ -68,11 +70,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "fln-parse"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-hash",
+ "fln-syntax",
+]
+
+[[package]]
 name = "fln-rt"
 version = "0.0.0"
 dependencies = [
  "fln-unsafe-abi",
  "fln-unsafe-region",
+]
+
+[[package]]
+name = "fln-syntax"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
 ]
 
 [[package]]

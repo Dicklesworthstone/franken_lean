@@ -65,6 +65,8 @@ crate structure-guard   kind=tool
 # ---- acknowledged dependency edges ----------------------------------------------------
 # every future edge lands here in the same change as its Cargo.toml counterpart
 edge fln-conformance -> fln-core   # C0 core-observable fixture diff harness (franken_lean-p8a)
+edge fln-conformance -> fln-parse  # G0-4 syntax fidelity spike drives real Pratt and grammar-epoch surfaces (franken_lean-hly)
+edge fln-conformance -> fln-syntax # G0-4 syntax fidelity spike binds lexer, trivia, SourceInfo, and tree identity (franken_lean-hly)
 edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)
 edge fln-bench -> fln-hash         # canonical benchmark evidence records and roots (franken_lean-oy62)
 edge fln-env -> fln-core           # environment holds term-plane constants (fln-amv)

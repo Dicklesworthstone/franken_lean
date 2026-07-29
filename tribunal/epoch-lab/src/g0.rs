@@ -599,6 +599,148 @@ fn recorded_or_absent(digest: &str) -> WitnessRoot {
     }
 }
 
+/// The measured evidence behind the G0-4 row. The caller computes every root
+/// from committed artifacts and executes the acceptance apparatus; this type
+/// carries no pasted green defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct G04Evidence {
+    /// Digest over the closed C0-C2 manifest and the executable Reference
+    /// fixture that supplies the observations.
+    pub fixture_root: String,
+    /// Behavioral identity of the generated grammar-epoch, trace, and budget
+    /// contracts.
+    pub generated_contract_root: String,
+    /// Root of the canonical semantic comparison stream.
+    pub implementation_root: String,
+    /// Digest over the committed planted-cell campaign.
+    pub mutation_root: String,
+    /// Digest over the committed two-process pinned-Reference receipt.
+    pub no_mock_e2e_root: String,
+    /// Digest over the acceptance run's semantic and model outputs.
+    pub acceptance_root: String,
+    /// Computed by executing every named acceptance surface.
+    pub acceptance_green: bool,
+    /// Byte-identical production rows in the manifest-complete comparison.
+    pub exact_rows: usize,
+    /// Explicit, stable production-contract gaps.
+    pub contract_gaps: usize,
+    /// Any row neither exact nor one of the declared gaps.
+    pub unclassified_rows: usize,
+    pub used_wall_ms: u64,
+    pub used_rss_bytes: u64,
+}
+
+/// The G0-4 decision row: **Amended**.
+///
+/// The complete C0-C2 manifest proves two things at once. First, the existing
+/// production lexer, attachment builder, and Pratt parser are byte-identical
+/// to the pinned Reference for the two accepted C0 rows, including Unicode byte
+/// positions, nested trivia, terminal comments, and the final newline. Second,
+/// a lexical success or a bounded hygiene/quotation model is not macro
+/// expansion fidelity: the other eight rows remain named gaps spanning
+/// diagnostic rendering, builtin application adaptation, dynamic productions,
+/// recovery, macro expansion, `pp` separators, nested antiquotation, and macro
+/// diagnostic source maps. Ratifying one undifferentiated syntax/hygiene
+/// identity would therefore launder the model into a production claim.
+///
+/// The amendment separates syntax identity from expansion identity, preserves
+/// the exact C0 result, and makes the eight gaps acceptance obligations for the
+/// downstream macro transaction lane. Returns `None` when G0-4 is absent from
+/// the roster.
+pub fn g04_decision(roster: &[RosterSpike], evidence: &G04Evidence) -> Option<Decision> {
+    let spike = roster.iter().find(|r| r.id == "G0-4")?;
+    Some(Decision {
+        spike: spike.id.clone(),
+        question: spike.question.clone(),
+        resolution: Resolution::Decided(Outcome::Amended(Amendment {
+            section_25_wording: "AmendSyntaxOrExpansionIdentity: syntax identity and \
+                expansion identity are separate compatibility axes. G0-4 ratifies \
+                byte-exact C0 token, tree, SourceInfo, trivia, position, and \
+                grammar-epoch apparatus at the pinned epoch. C1/C2 dynamic grammar, \
+                macro expansion, hygiene, quotation/antiquotation/splice, generated \
+                identity, recovery, and diagnostic source-map identity remain named \
+                W4 acceptance gates. A bounded Name or quotation model, lexical \
+                success, or an unclassified omission cannot satisfy expansion identity."
+                .to_string(),
+            rationale: "The manifest-complete real-Reference comparison has exactly \
+                two byte-identical production C0 rows, eight explicit contract-gap \
+                rows, and zero unclassified rows. It also exposed and repaired a real \
+                terminal-trivia defect: the final newline belongs to the terminal \
+                token's SourceInfo rather than an epilogue. The dynamic production \
+                and macro-expansion paths do not yet exist, so \
+                RatifyVellumSyntaxAndHygieneContracts would overstate the implementation."
+                .to_string(),
+            blast_radius: vec![
+                "fln-syntax terminal-trivia attachment and SourceInfo identity".to_string(),
+                "fln-parse dynamic grammar registration and recovery".to_string(),
+                "franken_lean-4nv downstream macro transaction and expansion lane".to_string(),
+                "W4 parser/macro interface freeze and faithful compatibility claims".to_string(),
+            ],
+            owners: vec![
+                "FoggyForge".to_string(),
+                "bead:franken_lean-4nv".to_string(),
+            ],
+            dependency_updates: vec![
+                "franken_lean-4nv must close the eight committed G0-4 contract-gap \
+                 codes before any C1/C2 expansion-identity claim"
+                    .to_string(),
+                "W4 must retain the G0-4 manifest, stock TraceContractV1 binding, \
+                 resource/cancellation matrix, and pinned no-mock comparator as \
+                 permanent acceptance inputs"
+                    .to_string(),
+            ],
+            acceptance_suite: "syntax_fixture_manifest; pratt_precedence_model; \
+                hygiene_scope_capture_model; quotation_splice_model; \
+                grammar_epoch_transition_model; syntax_budget_matrix; \
+                g0_4_no_mock_e2e"
+                .to_string(),
+            acceptance_green: evidence.acceptance_green
+                && evidence.exact_rows == 2
+                && evidence.contract_gaps == 8
+                && evidence.unclassified_rows == 0,
+            acceptance_root: recorded_or_absent(&evidence.acceptance_root),
+        })),
+        claim: ClaimType::BoundedModel,
+        witness: Witness {
+            evidence_state: EvidenceState::Observed,
+            fixture_root: recorded_or_absent(&evidence.fixture_root),
+            generated_contract_root: recorded_or_absent(&evidence.generated_contract_root),
+            implementation_root: recorded_or_absent(&evidence.implementation_root),
+            mutation_root: recorded_or_absent(&evidence.mutation_root),
+            no_mock_e2e_root: recorded_or_absent(&evidence.no_mock_e2e_root),
+            oracle: OracleKind::ReferenceBinary,
+            comparison: ComparisonClass::ByteIdentical,
+        },
+        scope: Scope {
+            epoch: "v4.32.0".to_string(),
+            corpus: CorpusFamily::C2,
+            platform: Platform::LinuxX86_64,
+            mode: Mode::Faithful,
+        },
+        resources: Resources {
+            contract_wall_ms: 600_000,
+            contract_rss_bytes: 4 << 30,
+            used_wall_ms: evidence.used_wall_ms,
+            used_rss_bytes: evidence.used_rss_bytes,
+        },
+        limitations: "One Linux x86_64 host, one Reference pin (v4.32.0), one \
+            mathlib pin, and ten manifest rows; claim class bounded_model. \
+            ByteIdentical applies only to the two exact C0 production rows. The \
+            other eight rows are explicit contract gaps, not failures, rejects, \
+            matches, or sampled coverage. Hygiene and quotation results are \
+            bounded models over the production Name representation, not a \
+            production macro engine. RSS is sampled from Linux /proc while both \
+            Reference children execute; it is an observed run fact, not an SLO."
+            .to_string(),
+        affected_interfaces: vec![
+            "fln-syntax token attachment and SourceInfo".to_string(),
+            "fln-parse grammar epochs and Pratt precedence".to_string(),
+            "Vellum C1/C2 macro parsing and expansion".to_string(),
+            "Tribunal syntax/hygiene parity rows".to_string(),
+        ],
+    })
+}
+
 /// The G0-9 decision row: **Amended**, not Ratified, because the spike's own
 /// measurements moved the contract it was asked to ratify.
 ///
