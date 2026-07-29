@@ -1,0 +1,5 @@
+{"schema":"fln-g09-trace-regen/1","step":"pilot","source":"g09_pilot.lean","fixture":"g09_pilot_trace.txt","sha256":"daf0db34791db92c1ba83c42ed0ea59a918fa875aa922bd2af4db10228c55ce5","runs_identical":true,"fixture_identical":true,"wall_ms":414}
+{"schema":"fln-g09-trace-regen/1","step":"multi_family","source":"g09_multi_family.lean","fixture":"g09_multi_family_trace.txt","sha256":"aaad00594ad3cc4bca4e640ce7a5a8238e80c459bcc34469ad3be9a07db52827","runs_identical":true,"fixture_identical":true,"wall_ms":986}
+{"schema":"fln-g09-trace-regen/1","step":"diag","source":"g09_diag.lean","fixture":"g09_diag_trace.txt","sha256":"fd7478419f9964a11654f06f5ce1df3c89b645d1693ed9fd1cb68f702963648f","runs_identical":true,"fixture_identical":true,"wall_ms":307}
+{"schema":"fln-g09-trace-regen/1","step":"negative_control","corrupted_copy_detected":true}
+{"schema":"fln-g09-trace-regen/1","step":"summary","pin":"v4.32.0","fixtures":3,"verdict":"all-identical"}

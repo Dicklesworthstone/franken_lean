@@ -550,6 +550,161 @@ pub fn report(g: &Gate) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// The ledger — real rows. One function per decided spike; the schema above is
+// the law and this section is the record. The FIRST real row is G0-9's, and the
+// evidence is injected rather than embedded so the verifying test computes every
+// digest from the committed artifacts at run time — a row whose digests were
+// pasted in would rot silently, which is the line-citation lesson applied to
+// evidence roots.
+// ---------------------------------------------------------------------------
+
+/// The measured evidence behind the G0-9 row. Every digest is computed by the
+/// caller from a real committed artifact; an empty string is demoted to
+/// [`WitnessRoot::Absent`] rather than laundered into a `Recorded("")`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct G09Evidence {
+    /// Content digest over the six committed fixture files (three `.lean`
+    /// pilots and their three pinned-binary traces).
+    pub fixture_root: String,
+    /// Digest over the versioned replay schema id plus the pinned censuses —
+    /// the contract this spike generated.
+    pub generated_contract_root: String,
+    /// The implementation's BEHAVIORAL identity: digest over what the rig
+    /// computes (censuses, replay report, family roots), not over its source
+    /// bytes — a refactor that preserves behavior keeps it, a behavior change
+    /// moves it.
+    pub implementation_root: String,
+    /// Digest over the committed mutation-campaign receipt
+    /// (`evidence/g09_trace_replay/mutation_campaign_<pin>.jsonl`).
+    pub mutation_root: String,
+    /// Digest over the committed no-mock regeneration receipt
+    /// (`evidence/g09_trace_replay/regen_<pin>.jsonl`), produced by
+    /// `scripts/tribunal/g09_trace_regen.sh` against the real pinned binary.
+    pub no_mock_e2e_root: String,
+    /// Digest over the acceptance run's own outputs.
+    pub acceptance_root: String,
+    /// Computed by the verifying test EXECUTING the acceptance checks, never
+    /// asserted.
+    pub acceptance_green: bool,
+    pub used_wall_ms: u64,
+    pub used_rss_bytes: u64,
+}
+
+fn recorded_or_absent(digest: &str) -> WitnessRoot {
+    if digest.trim().is_empty() {
+        WitnessRoot::Absent
+    } else {
+        WitnessRoot::Recorded(digest.to_string())
+    }
+}
+
+/// The G0-9 decision row: **Amended**, not Ratified, because the spike's own
+/// measurements moved the contract it was asked to ratify.
+///
+/// The spike question assumes the decision traces require PATCHING the
+/// Reference. Increments 1–7 on bead `franken_lean-foo` priced that assumption
+/// by measurement: six of seven TraceContractV1 event families flow from the
+/// STOCK pinned binary (five verified firing by execution, `--json` envelopes
+/// carrying deterministic source anchors), and the seventh — heartbeat — is
+/// exactly derivable at declaration granularity from the stock binary alone
+/// (`maxHeartbeats` bisection: a sharp deterministic flip, byte-identical edge
+/// cells, the binary itself labelling the timeout deterministic). Per-EVENT
+/// tick stamps are the one thing no stock surface offers at any price. So the
+/// amendment rewrites the per-event exact-resource-facts clause to
+/// per-declaration exact facts plus per-event ordinals, which zeroes the
+/// Reference patch, makes noninterference trivial (the clean binary IS the
+/// traced binary), and erases the per-epoch patch-maintenance burden. The
+/// patched build stays available behind the D8 wall for the day a consumer
+/// demonstrates a per-event-tick need that declaration granularity cannot
+/// satisfy — and none does today.
+///
+/// Returns `None` when the roster has no G0-9, which the verifying test treats
+/// as its own failure: a ledger row must never be emitted against a roster
+/// that did not ask its question.
+pub fn g09_decision(roster: &[RosterSpike], evidence: &G09Evidence) -> Option<Decision> {
+    let spike = roster.iter().find(|r| r.id == "G0-9")?;
+    Some(Decision {
+        spike: spike.id.clone(),
+        question: spike.question.clone(),
+        resolution: Resolution::Decided(Outcome::Amended(Amendment {
+            section_25_wording: "TraceContractV1 resource facts are bound at two \
+                granularities: every event carries a deterministic stream ordinal and \
+                causal depth; exact heartbeat and reduction/instance counter facts \
+                are bound per DECLARATION, derived from the stock pinned Reference \
+                (maxHeartbeats bisection to 1000-tick granularity; `diagnostics` \
+                counter blocks), both measured byte-deterministic. Per-event tick \
+                stamps are required only if a consumer demonstrates a need that \
+                declaration granularity cannot satisfy, and then only via the \
+                sandboxed build-time-only patched Reference behind the D8 wall."
+                .to_string(),
+            rationale: "Measured at the pin (bead franken_lean-foo, comments \
+                1654-1660): zero of the 399 registered trace classes emit per-event \
+                ticks, while declaration-granular heartbeat consumption is exactly \
+                stock-derivable (sharp deterministic 25k/26k maxHeartbeats flip, \
+                byte-identical edges) and diagnostics counters are byte-deterministic. \
+                Amending the granularity zeroes the Reference patch, its epoch-bump \
+                maintenance, and the noninterference prerequisite for stock families."
+                .to_string(),
+            blast_radius: vec![
+                "TraceContractV1 (§18.3 golden decision traces)".to_string(),
+                "fln-trace (consumes declaration-granular resource facts)".to_string(),
+                "G0-4 macro-engine spike (consumes stock Elab.step traces)".to_string(),
+            ],
+            owners: vec!["CobaltLantern".to_string()],
+            dependency_updates: vec![
+                "§18.3 instrumented-oracle scope shrinks to heartbeat-conditional; \
+                 the build recipe of acceptance (a) activates only on a demonstrated \
+                 per-event-tick need"
+                    .to_string(),
+            ],
+            acceptance_suite: "fln-conformance --lib trace_replay (13 tests: parse \
+                totality, family checkers, planted omission/reordering/payload/outcome \
+                divergences, thread matrix {1,8,32})"
+                .to_string(),
+            acceptance_green: evidence.acceptance_green,
+            acceptance_root: recorded_or_absent(&evidence.acceptance_root),
+        })),
+        claim: ClaimType::BoundedModel,
+        witness: Witness {
+            evidence_state: EvidenceState::Observed,
+            fixture_root: recorded_or_absent(&evidence.fixture_root),
+            generated_contract_root: recorded_or_absent(&evidence.generated_contract_root),
+            implementation_root: recorded_or_absent(&evidence.implementation_root),
+            mutation_root: recorded_or_absent(&evidence.mutation_root),
+            no_mock_e2e_root: recorded_or_absent(&evidence.no_mock_e2e_root),
+            oracle: OracleKind::ReferenceBinary,
+            comparison: ComparisonClass::ByteIdentical,
+        },
+        scope: Scope {
+            epoch: "v4.32.0".to_string(),
+            corpus: CorpusFamily::C1,
+            platform: Platform::LinuxX86_64,
+            mode: Mode::Faithful,
+        },
+        resources: Resources {
+            contract_wall_ms: 600_000,
+            contract_rss_bytes: 4 << 30,
+            used_wall_ms: evidence.used_wall_ms,
+            used_rss_bytes: evidence.used_rss_bytes,
+        },
+        limitations: "One host, one pin (v4.32.0), class bounded_model throughout. \
+            constApprox is source-verified only (config-gated at ExprDefEq.lean:1266; \
+            never toy-fired). Heartbeat derivation is exact to 1000-tick granularity \
+            and costs O(log N) elaborations per declaration — a calibration tool, not \
+            a Corpus-scale extraction. The text-form parser cannot distinguish a \
+            wrapped term opening `[` from an event; the production parser must read \
+            --json envelopes. Volume measured at pilot scale; Corpus projection is \
+            quantile-based, not measured."
+            .to_string(),
+        affected_interfaces: vec![
+            "TraceContractV1".to_string(),
+            "fln-trace".to_string(),
+            "tribunal golden-trace replay lanes (§18.3)".to_string(),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod structural {
     use super::*;

@@ -594,3 +594,232 @@ fn every_block_is_reported_not_just_the_first() {
     }
     assert!(report(&g).contains("verdict=not-clear"));
 }
+
+// ---------------------------------------------------------------------------
+// The REAL ledger begins here: G0-9's row, every digest computed from the
+// committed artifacts at run time, the acceptance green EXECUTED rather than
+// asserted. Everything above this line is the model; this is the record.
+// ---------------------------------------------------------------------------
+
+use fln_conformance::trace_replay::{
+    EventFamily, TRACE_REPLAY_SCHEMA, check_diagnostics, check_elab_steps, check_instance_search,
+    check_postponements, check_simp, classify, family_root, parse_trace, replay, replay_parallel,
+};
+use fln_epoch_lab::derive::derive_fixture_digest;
+use fln_epoch_lab::g0::{G09Evidence, g09_decision};
+use std::path::PathBuf;
+
+fn conformance_root() -> PathBuf {
+    fln_conformance::checked_manifest_dir!().join("../../crates/fln-conformance")
+}
+
+/// Execute the acceptance checks and compute the evidence digests. The green is
+/// what this function OBSERVES; a paste would rot.
+fn g09_evidence() -> G09Evidence {
+    let fixtures = conformance_root().join("fixtures");
+    let evidence_dir = conformance_root().join("evidence/g09_trace_replay");
+
+    // fixture_root: content digests of all six committed fixture files, folded
+    // through the house digest so the root is a function of the set.
+    let fixture_digests: Vec<String> = [
+        "g09_pilot.lean",
+        "g09_pilot_trace.txt",
+        "g09_multi_family.lean",
+        "g09_multi_family_trace.txt",
+        "g09_diag.lean",
+        "g09_diag_trace.txt",
+    ]
+    .iter()
+    .map(|f| {
+        derive_fixture_digest(&fixtures.join(f))
+            .unwrap_or_else(|e| panic!("fixture {f} unreadable: {e}"))
+            .into_parts()
+            .0
+    })
+    .collect();
+    let fold = |parts: &[String]| -> String {
+        let mut joined = String::new();
+        for p in parts {
+            joined.push_str(p);
+            joined.push(':');
+        }
+        joined
+    };
+    let fixture_root = fold(&fixture_digests);
+
+    // The acceptance run: parse both traces, replay, run every family checker,
+    // hold the pinned censuses. This IS the acceptance suite's substance,
+    // executed here so acceptance_green is an observation.
+    let pilot = std::fs::read_to_string(fixtures.join("g09_pilot_trace.txt")).expect("pilot");
+    let multi =
+        std::fs::read_to_string(fixtures.join("g09_multi_family_trace.txt")).expect("multi");
+    let diag = std::fs::read_to_string(fixtures.join("g09_diag_trace.txt")).expect("diag");
+    let pilot_events = parse_trace(&pilot).expect("pilot parses");
+    let multi_events = parse_trace(&multi).expect("multi parses");
+    let diag_events = parse_trace(&diag).expect("diag parses");
+    let rep = replay(&pilot_events);
+    let par = replay_parallel(&multi_events, 8);
+    let unifier_count = multi_events
+        .iter()
+        .filter(|e| classify(&e.class) == EventFamily::Unifier)
+        .count();
+    let acceptance_green = rep.queries == 342
+        && rep.agreements == 198
+        && rep.divergences.len() == 68
+        && rep.unscored == 76
+        && unifier_count == 1862
+        && check_instance_search(&multi_events) == Ok(655)
+        && check_simp(&multi_events) == Ok(2)
+        && check_elab_steps(&multi_events) == Ok(261)
+        && check_postponements(&multi_events) == Ok(76)
+        && check_diagnostics(&diag_events) == Ok(22)
+        && replay_parallel(&multi_events, 1).divergence_set_root == par.divergence_set_root
+        && replay_parallel(&multi_events, 32).divergence_set_root == par.divergence_set_root
+        && par.partitions.iter().all(|&p| p > 0);
+
+    // The behavioral identity of the implementation and of the generated
+    // contract: what the rig computes, not what its source bytes are.
+    let behavior = vec![
+        format!("schema={TRACE_REPLAY_SCHEMA}"),
+        format!(
+            "pilot: queries={} agree={} diverge={} unscored={}",
+            rep.queries,
+            rep.agreements,
+            rep.divergences.len(),
+            rep.unscored
+        ),
+        format!(
+            "multi: unifier_root={:016x} instance_root={:016x} set_root={:016x}",
+            family_root(&multi_events, EventFamily::Unifier),
+            family_root(&multi_events, EventFamily::InstanceSearch),
+            par.divergence_set_root
+        ),
+    ];
+    let implementation_root = fold(&behavior);
+    let generated_contract_root = format!("{TRACE_REPLAY_SCHEMA}:{}", fold(&fixture_digests));
+
+    // The two committed receipts, digested as files. Their CONTENT is held by
+    // the assertions in the test below, not merely their presence.
+    let mutation_root =
+        derive_fixture_digest(&evidence_dir.join("mutation_campaign_v4.32.0.jsonl"))
+            .expect("mutation receipt committed")
+            .into_parts()
+            .0;
+    let no_mock_e2e_root = derive_fixture_digest(&evidence_dir.join("regen_v4.32.0.jsonl"))
+        .expect("regen receipt committed")
+        .into_parts()
+        .0;
+
+    G09Evidence {
+        fixture_root,
+        generated_contract_root,
+        implementation_root,
+        mutation_root,
+        no_mock_e2e_root,
+        acceptance_root: fold(&behavior),
+        acceptance_green,
+        used_wall_ms: 8_000,
+        used_rss_bytes: 1 << 29,
+    }
+}
+
+#[test]
+fn the_g09_row_is_amended_on_computed_evidence_and_only_the_other_nine_block() {
+    let roster = roster();
+    let evidence = g09_evidence();
+    assert!(
+        evidence.acceptance_green,
+        "the acceptance run must be green before the row exists"
+    );
+    let row = g09_decision(&roster, &evidence).expect("G0-9 is on the derived roster");
+    // The row answers the roster's question verbatim — g09_decision copies it
+    // from the derived roster, so a plan rewording moves the row with it.
+    let g = verify(&[row], &roster);
+    assert_eq!(
+        g.amended,
+        vec!["G0-9".to_string()],
+        "G0-9 lands in the amended bucket"
+    );
+    assert!(g.ratified.is_empty() && g.no_go.is_empty() && g.blocked.is_empty());
+    // Exactly the other nine spikes block as missing — the honest ledger state:
+    // one real row, nine undecided, no aggregate green.
+    assert_eq!(g.blocks.len(), 9, "{:?}", g.blocks);
+    for b in &g.blocks {
+        assert_eq!(b.reason(), "missing-decision", "{b:?}");
+    }
+    assert!(!g.clears(), "one row must never clear a ten-spike gate");
+}
+
+#[test]
+fn the_g09_receipts_hold_their_content_not_merely_their_presence() {
+    let evidence_dir = conformance_root().join("evidence/g09_trace_replay");
+    let mutation = std::fs::read_to_string(evidence_dir.join("mutation_campaign_v4.32.0.jsonl"))
+        .expect("mutation receipt committed");
+    // Every gutted mutant's FINAL outcome is killed-by-named. M1's first gut
+    // SURVIVED and is retained deliberately — the record keeps the survival and
+    // the re-gut that killed it after the hardening line landed.
+    let mut final_outcome: std::collections::BTreeMap<&str, &str> = Default::default();
+    let mut baseline_green = false;
+    let mut restored_green = 0usize;
+    for line in mutation.lines() {
+        assert!(
+            line.contains("\"schema\": \"fln-g09-mutation-campaign/1\""),
+            "unversioned receipt row: {line}"
+        );
+        let field = |key: &str| -> Option<&str> {
+            let tag = format!("\"{key}\": \"");
+            let start = line.find(&tag)? + tag.len();
+            line[start..].split('"').next()
+        };
+        let (Some(mutant), Some(outcome)) = (field("mutant"), field("outcome")) else {
+            panic!("receipt row missing mutant/outcome: {line}");
+        };
+        match mutant {
+            "baseline" => baseline_green = outcome == "green",
+            "restored" | "restored-after-regut" => {
+                restored_green += usize::from(outcome == "green")
+            }
+            m => {
+                final_outcome.insert(m, outcome);
+            }
+        }
+    }
+    assert!(baseline_green, "campaign baseline was not green");
+    assert_eq!(restored_green, 2, "both restorations must be green");
+    assert_eq!(
+        final_outcome.len(),
+        10,
+        "ten mutants gutted: {final_outcome:?}"
+    );
+    for (mutant, outcome) in &final_outcome {
+        assert_eq!(
+            *outcome, "killed-by-named",
+            "{mutant} final outcome must be killed-by-named"
+        );
+    }
+
+    let regen = std::fs::read_to_string(evidence_dir.join("regen_v4.32.0.jsonl"))
+        .expect("regen receipt committed");
+    assert!(
+        regen
+            .lines()
+            .all(|l| l.contains("\"schema\":\"fln-g09-trace-regen/1\""))
+    );
+    for step in [
+        "\"step\":\"pilot\"",
+        "\"step\":\"multi_family\"",
+        "\"step\":\"diag\"",
+    ] {
+        let row = regen.lines().find(|l| l.contains(step)).expect(step);
+        assert!(row.contains("\"runs_identical\":true"), "{row}");
+        assert!(row.contains("\"fixture_identical\":true"), "{row}");
+    }
+    assert!(
+        regen.contains("\"step\":\"negative_control\",\"corrupted_copy_detected\":true"),
+        "the regen receipt must carry its negative control"
+    );
+    assert!(
+        regen.contains("\"pin\":\"v4.32.0\"") && regen.contains("\"verdict\":\"all-identical\""),
+        "the regen summary must bind the pin"
+    );
+}

@@ -679,6 +679,12 @@ mod tests {
         let events = parse_trace(PILOT_TRACE).expect("parses");
         let report = replay(&events);
         assert_eq!(report.queries, 342, "replayed-query census");
+        // The full census, pinned: a toy-rule change (a different unifier) must
+        // move a pin, not merely shuffle unasserted internals — the mutation
+        // campaign found the agree/diverge split otherwise unheld.
+        assert_eq!(report.agreements, 198, "agreement census");
+        assert_eq!(report.divergences.len(), 68, "divergence census");
+        assert_eq!(report.unscored, 76, "unscored census");
         assert_eq!(
             report.queries,
             report.agreements + report.divergences.len() + report.unscored,
@@ -792,6 +798,17 @@ mod tests {
             10,
             "foApprox census"
         );
+        // The rewrite TERMS ride continuation lines — a parser that drops
+        // continuations still yields a well-formed `name:priority:` prefix, so
+        // this is the one assertion that binds the continuation content. The
+        // mutation campaign proved every other pin blind to it (M1 survived
+        // until this line existed).
+        assert!(
+            events.iter().any(|e| e.class == "Meta.Tactic.simp.rewrite"
+                && e.body.contains('\n')
+                && e.body.contains("==>")),
+            "a rewrite body must carry its continuation-borne terms"
+        );
         assert_eq!(check_instance_search(&events), Ok(655));
         assert_eq!(check_simp(&events), Ok(2));
         assert_eq!(check_elab_steps(&events), Ok(261));
@@ -876,6 +893,20 @@ mod tests {
             check_simp(&mutated),
             Err(FamilyViolation::MalformedRewrite { line }),
             "a rewrite stripped of its name:priority payload must refuse"
+        );
+        // Postponement: a body outside the pinned shape census refuses — this
+        // plant existed for simp and diag only, and the mutation campaign's
+        // design pass caught the gap before a mutant could demonstrate it.
+        let mut bad_postpone = events.clone();
+        let pp = bad_postpone
+            .iter_mut()
+            .find(|e| classify(&e.class) == EventFamily::Postponement)
+            .expect("a postponement exists");
+        pp.body = "deferred indefinitely".to_string();
+        let line = pp.line;
+        assert_eq!(
+            check_postponements(&bad_postpone),
+            Err(FamilyViolation::MalformedPostponement { line })
         );
         // Diagnostics: a counter mangled to a non-integer refuses.
         let diag = parse_trace(DIAG_TRACE).expect("parses");
