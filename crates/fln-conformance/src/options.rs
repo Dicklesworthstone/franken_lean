@@ -290,6 +290,18 @@ mod tests {
         ] {
             assert!(parse_census(junk).is_err(), "must refuse: {junk}");
         }
+        // A row VALID in every field except its schema must still refuse — the
+        // campaign proved every other hostile cell fails for a later reason
+        // too, so only this cell keeps the schema check itself alive (M1).
+        let wrong_schema_only = concat!(
+            "{\"schema\":\"fln.option-census/999\",\"kind\":\"builtin_option\",",
+            "\"name\":\"x.y\",\"value_type\":\"Bool\",\"default\":\"true\",",
+            "\"source\":\"vendor/lean4-src/src/Lean/X.lean:1\"}"
+        );
+        assert!(
+            parse_census(wrong_schema_only).is_err(),
+            "a well-formed row under a wrong schema version must refuse"
+        );
     }
 
     #[test]
@@ -326,6 +338,39 @@ mod tests {
             deprecated_since: None,
         };
         assert_eq!(validate_domains(&[bad_default]).len(), 1);
+        // A trace-class row that is not Bool:false is refused — no such row
+        // exists in the real census, so only this plant keeps the rule alive
+        // (the repaired-population lesson: a live guard over an empty
+        // population is unkillable without a synthetic member).
+        let bad_trace = OptionRow {
+            kind: "trace_class".to_string(),
+            name: "trace.x".to_string(),
+            value_type: "Bool".to_string(),
+            default: "true".to_string(),
+            source: "vendor/lean4-src/src/Lean/X.lean:1".to_string(),
+            deprecated_since: None,
+        };
+        assert_eq!(
+            validate_domains(&[bad_trace]).len(),
+            1,
+            "trace rule must fire"
+        );
+        // A widened type domain must be caught AS a type violation: a Float row
+        // whose default rides the named-constant table slips every other check,
+        // so only the domain membership itself refuses it (M7).
+        let widened = OptionRow {
+            kind: "builtin_option".to_string(),
+            name: "x.z".to_string(),
+            value_type: "Float".to_string(),
+            default: "defWidth".to_string(),
+            source: "vendor/lean4-src/src/Lean/X.lean:1".to_string(),
+            deprecated_since: None,
+        };
+        let v = validate_domains(&[widened]);
+        assert!(
+            v.iter().any(|d| d.reason.contains("value type")),
+            "the type-domain rule must be the thing that fires: {v:#?}"
+        );
     }
 
     #[test]
