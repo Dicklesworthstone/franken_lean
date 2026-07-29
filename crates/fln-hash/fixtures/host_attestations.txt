@@ -7,7 +7,7 @@
 # EARNED — multi-HOST identity on the certified target. Every row below was produced by
 # running domain::tests::emit_host_attestation on a distinct physical machine, and all
 # rows agree on both digests. `fixture_digest` covers the whole of domain_vectors.txt, so
-# it carries all twelve domain tags and all forty-eight frozen vectors in one field: if any
+# it carries all sixteen domain tags and all sixty-four frozen vectors in one field: if any
 # domain's tag or any vector differed on another host, that host's digest would differ.
 # `logical_root` is a LogicalRoot over a fixed closure of eight declarations and one
 # extension delta, built from constants so it depends on nothing but the code.
@@ -32,8 +32,8 @@
 # single-host test that reads as multi-host evidence. A host that could not be reached is
 # not a host that agreed, and is simply absent.
 #
-# PROVENANCE: sensedemobox is the primary development machine; hetzner2 is an RCH remote
-# build worker. Distinct physical machines, same target triple, same pinned nightly from
-# SUITE.lock. Recorded 2026-07-25.
-x86_64-linux-unix-64bit-le|sensedemobox|a24527ebe52caa72b76fc015af4de870d5b85080451ed8200632d5b9e23f3243|17a64c7e4c8b7b806883641ee907c36a7156e90598d95e4bf5a1197b66ee559a
-x86_64-linux-unix-64bit-le|hetzner2|a24527ebe52caa72b76fc015af4de870d5b85080451ed8200632d5b9e23f3243|17a64c7e4c8b7b806883641ee907c36a7156e90598d95e4bf5a1197b66ee559a
+# PROVENANCE: hetzner2 and ns3365308 are distinct RCH remote build workers. Distinct
+# physical machines, same target triple, same pinned nightly from SUITE.lock. Re-recorded
+# 2026-07-29 after the shadow authority added four registered domains to the fixture.
+x86_64-linux-unix-64bit-le|hetzner2|d9944947994da9f94581a28e3a32799f3989da006a000e2f9f6ced619a4eeea3|17a64c7e4c8b7b806883641ee907c36a7156e90598d95e4bf5a1197b66ee559a
+x86_64-linux-unix-64bit-le|ns3365308|d9944947994da9f94581a28e3a32799f3989da006a000e2f9f6ced619a4eeea3|17a64c7e4c8b7b806883641ee907c36a7156e90598d95e4bf5a1197b66ee559a

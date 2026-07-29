@@ -63,6 +63,17 @@ pub enum Domain {
     /// provenance. This is an explicit additional Ledger/receipt identity and is
     /// deliberately separate from both `LogicalRoot` and `OperationalMeta`.
     ModuleProvenance,
+    /// Semantic identity of shadow-run cells, evidence joins, and canonical
+    /// publication records. Operational telemetry has no path into this domain.
+    ShadowSemantic,
+    /// Operational observations emitted alongside a shadow publication. This is
+    /// deliberately distinct from [`Domain::ShadowSemantic`].
+    ShadowTelemetry,
+    /// The outer publication identity joining semantic and telemetry roots without
+    /// letting telemetry rewrite semantic authority.
+    ShadowPublication,
+    /// Deterministic continued-sampling decisions and receipts.
+    ShadowSampling,
     /// Tribunal fixture and corpus identity (test apparatus only).
     Fixture,
 }
@@ -82,13 +93,17 @@ impl Domain {
             Domain::OperationalMeta => "fln 2026 domain operational-meta/1",
             Domain::CanonicalSchema => "fln 2026 domain canonical-schema/1",
             Domain::ModuleProvenance => "fln 2026 domain module-provenance/1",
+            Domain::ShadowSemantic => "fln 2026 domain shadow-semantic/1",
+            Domain::ShadowTelemetry => "fln 2026 domain shadow-telemetry/1",
+            Domain::ShadowPublication => "fln 2026 domain shadow-publication/1",
+            Domain::ShadowSampling => "fln 2026 domain shadow-sampling/1",
             Domain::Fixture => "fln 2026 domain fixture/1",
         }
     }
 
     /// Every registered domain, for registry-wide tests (pairwise distinctness,
     /// frozen-vector stability).
-    pub const ALL: [Domain; 12] = [
+    pub const ALL: [Domain; 16] = [
         Domain::DeclContent,
         Domain::LogicalRoot,
         Domain::ExtensionDelta,
@@ -100,6 +115,10 @@ impl Domain {
         Domain::OperationalMeta,
         Domain::CanonicalSchema,
         Domain::ModuleProvenance,
+        Domain::ShadowSemantic,
+        Domain::ShadowTelemetry,
+        Domain::ShadowPublication,
+        Domain::ShadowSampling,
         Domain::Fixture,
     ];
 }
@@ -136,6 +155,12 @@ pub fn hash(domain: Domain, bytes: &[u8]) -> Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! fixture_panic {
+        ($($arg:tt)*) => {
+            panic!(/* ubs:ignore — test-only diagnostic. */ $($arg)*)
+        };
+    }
 
     #[test]
     fn same_bytes_under_two_domains_must_differ() {
@@ -184,6 +209,7 @@ mod tests {
     fn hex_rendering_is_lowercase_and_stable() {
         let d = Digest([0xAB; 32]);
         assert_eq!(d.to_hex().len(), 64);
+        // ubs:ignore — test-only public hex digits, not authentication material.
         assert!(d.to_hex().chars().all(|c| c == 'a' || c == 'b'));
         assert_eq!(format!("{d}"), d.to_hex());
     }
@@ -204,6 +230,10 @@ mod tests {
             Domain::OperationalMeta => "OperationalMeta",
             Domain::CanonicalSchema => "CanonicalSchema",
             Domain::ModuleProvenance => "ModuleProvenance",
+            Domain::ShadowSemantic => "ShadowSemantic",
+            Domain::ShadowTelemetry => "ShadowTelemetry",
+            Domain::ShadowPublication => "ShadowPublication",
+            Domain::ShadowSampling => "ShadowSampling",
             Domain::Fixture => "Fixture",
         }
     }
@@ -319,7 +349,7 @@ mod tests {
     fn every_domain_tag_and_digest_matches_the_frozen_fixture() {
         match check_domain_vector_contract(DOMAIN_VECTORS) {
             Ok(rows) => assert_eq!(rows, Domain::ALL.len()),
-            Err(violation) => panic!("{violation}"),
+            Err(violation) => fixture_panic!("{violation}"),
         }
     }
 

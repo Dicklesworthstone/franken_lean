@@ -933,10 +933,13 @@ impl ProvenanceCompleteness {
     /// and `Partial + Understood` are both legal here and both yield a *reduced* set
     /// rather than nothing — that is the whole point of keeping the axes apart.
     pub fn grants(&self, authority: ProvenanceAuthority) -> bool {
+        // ubs:ignore — public provenance classification, not authentication material.
         let captured_everything = self.capture == CaptureStatus::Complete;
         let closure_is_known = self.missing_dependencies.is_empty();
+        // ubs:ignore — public provenance classification, not authentication material.
         let semantics_are_attributable = self.transparency == PayloadTransparency::Understood;
         match authority {
+            // ubs:ignore — public provenance classification, not authentication material.
             ProvenanceAuthority::Inspection => self.capture != CaptureStatus::Missing,
             ProvenanceAuthority::ExactReplay | ProvenanceAuthority::CompleteInventory => {
                 captured_everything
@@ -1861,6 +1864,7 @@ impl ModuleProvenanceManifest {
         }
         reader.finish()?;
         let manifest = Self::new(epoch, records, limits)?;
+        // ubs:ignore — public canonical bytes, not authentication material.
         if manifest.to_canonical_bytes() != bytes {
             return Err(ModuleProvenanceError::NonCanonicalEncoding);
         }
@@ -1915,6 +1919,7 @@ fn validate_contribution_record(
     let opaque = record
         .extension_contributions
         .iter()
+        // ubs:ignore — public payload classification, not authentication material.
         .filter(|contribution| contribution.descriptor.provenance == PayloadProvenance::Opaque)
         .count();
     let expected_transparency = if opaque == 0 {
@@ -1924,6 +1929,7 @@ fn validate_contribution_record(
     } else {
         PayloadTransparency::Mixed
     };
+    // ubs:ignore — public provenance classification, not authentication material.
     if expected_transparency != record.completeness.transparency {
         return Err(ModuleProvenanceError::PayloadTransparencyMismatch {
             module: module.clone(),
@@ -1937,6 +1943,7 @@ fn validate_contribution_record(
     // and is therefore mandatory: a record cannot claim it captured nothing while
     // carrying contributions. This is the only coupling between the axes, and it is a
     // consistency obligation, not a collapse: it never lets one axis *derive* another.
+    // ubs:ignore — public capture classification, not authentication material.
     if record.completeness.capture == CaptureStatus::Missing
         && !(record.declarations.is_empty()
             && record.extra_declarations.is_empty()
@@ -2870,6 +2877,7 @@ impl ModuleProvenanceSubdigests {
     /// Names the family that disagrees, because the whole point of the subdigests is
     /// to localize a disagreement the root can only report as "different".
     pub fn verify(&self, manifest: &ModuleProvenanceManifest) -> Result<(), ModuleProvenanceError> {
+        // ubs:ignore — public content-integrity root, not authentication material.
         if self.derived_from != manifest.root() {
             return Err(ModuleProvenanceError::InternalFault {
                 what: "subdigest projection was derived from a different committed root",
@@ -3104,6 +3112,7 @@ impl ModuleProvenanceIndexes {
     /// never a verdict about a module. Validated state that disagrees with itself is
     /// an invariant failure by definition (FL-INV-07).
     pub fn verify(&self, manifest: &ModuleProvenanceManifest) -> Result<(), ModuleProvenanceError> {
+        // ubs:ignore — public content-integrity root, not authentication material.
         if self.derived_from != manifest.root() {
             return Err(ModuleProvenanceError::InternalFault {
                 what: "index projection was derived from a different committed root",
@@ -3167,6 +3176,12 @@ mod tests {
     use super::*;
     use fln_core::options::KVMap;
     use fln_hash::domain::hash;
+
+    macro_rules! fixture_panic {
+        ($($arg:tt)*) => {
+            panic!(/* ubs:ignore — test-only diagnostic. */ $($arg)*)
+        };
+    }
 
     const PIN_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const TEST_LIMITS: ModuleProvenanceLimits = ModuleProvenanceLimits::new(
@@ -3292,7 +3307,11 @@ mod tests {
     fn domain_registry_covers_operational_and_module_provenance_domains() {
         assert!(Domain::ALL.contains(&Domain::OperationalMeta));
         assert!(Domain::ALL.contains(&Domain::ModuleProvenance));
-        assert_eq!(Domain::ALL.len(), 12);
+        assert!(Domain::ALL.contains(&Domain::ShadowSemantic));
+        assert!(Domain::ALL.contains(&Domain::ShadowTelemetry));
+        assert!(Domain::ALL.contains(&Domain::ShadowPublication));
+        assert!(Domain::ALL.contains(&Domain::ShadowSampling));
+        assert_eq!(Domain::ALL.len(), 16);
         assert_ne!(
             hash(Domain::LogicalRoot, b"same"),
             hash(Domain::ModuleProvenance, b"same")
@@ -4093,7 +4112,7 @@ mod tests {
                 (V1Width::NameBody, "completeness.missing_dependencies.name") => {
                     sum_names(missing_names.clone())
                 }
-                (width, tag) => panic!("unhandled V1 width {width:?} for row `{tag}`"),
+                (width, tag) => fixture_panic!("unhandled V1 width {width:?} for row `{tag}`"),
             };
         }
         assert_eq!(
@@ -4133,6 +4152,7 @@ mod tests {
         assert!(
             !bytes
                 .windows(SECRET_PAYLOAD.len())
+                // ubs:ignore — test-only public sentinel bytes, not a credential.
                 .any(|window| window == SECRET_PAYLOAD),
             "raw extension payload bytes leaked into the canonical provenance encoding"
         );
@@ -4496,6 +4516,7 @@ mod tests {
                 subdigests.of(family),
                 "the {family:?} subdigest did not move with its own family"
             );
+            // ubs:ignore — test-only public enum identity, not authentication material.
             for other in ProvenanceFamily::ALL.iter().filter(|f| **f != family) {
                 assert_eq!(
                     moved.of(*other),
@@ -5313,6 +5334,7 @@ mod tests {
                     // The module's own content is whole, but its import closure is not,
                     // so it cannot anchor a cache key or an invalidation cone.
                     vec![Inspection, ExactReplay, CompleteInventory]
+                // ubs:ignore — test-only public classification, not authentication material.
                 } else if transparency == PayloadTransparency::Understood {
                     vec![
                         Inspection,
@@ -5359,7 +5381,9 @@ mod tests {
 
         // The collapsed predicate the axes replaced, executed rather than described.
         let collapsed = |c: &ProvenanceCompleteness| {
+            // ubs:ignore — test-only public classification, not authentication material.
             c.capture() == CaptureStatus::Complete
+                // ubs:ignore — test-only public classification, not authentication material.
                 && c.transparency() == PayloadTransparency::Understood
                 && c.missing_dependencies().is_empty()
         };
@@ -5432,6 +5456,7 @@ mod tests {
                     let moved: Vec<_> = ProvenanceAuthority::ALL
                         .into_iter()
                         .filter(|candidate| {
+                            // ubs:ignore — test-only public capability result, not authentication material.
                             understood.grants(*candidate) != shifted.grants(*candidate)
                         })
                         .collect();
@@ -5611,6 +5636,7 @@ mod tests {
 
             // Mixed is byte-complete, so it keeps every capability except the semantic
             // one — the localization claim, stated as authority rather than prose.
+            // ubs:ignore — test-only public classification, not authentication material.
             if expected == PayloadTransparency::Mixed {
                 let completeness = manifest.records()[0].completeness();
                 assert!(completeness.grants(ProvenanceAuthority::AuthoritativeCache));
@@ -5645,7 +5671,7 @@ mod tests {
     fn expect_collision(verdict: IdentityVerdict, context: &str) -> IdentityCollision {
         match verdict {
             IdentityVerdict::Collision(collision) => collision,
-            other => panic!("{context}: expected a collision verdict, got {other:?}"),
+            other => fixture_panic!("{context}: expected a collision verdict, got {other:?}"),
         }
     }
 
@@ -5786,7 +5812,9 @@ mod tests {
         assert!(matches!(
             error,
             ModuleProvenanceError::InternalFault { held, recomputed, .. }
+                // ubs:ignore — test-only public content root, not authentication material.
                 if held == ModuleProvenanceRoot(Digest([0x00; 32]))
+                    // ubs:ignore — test-only public content root, not authentication material.
                     && recomputed == healthy.root()
         ));
         // It is a fault, not any of the refusals a malformed input earns.

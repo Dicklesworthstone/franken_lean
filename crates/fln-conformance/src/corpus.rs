@@ -48,6 +48,9 @@
 use fln_core::diag::{Diagnostic, ErrorValue, ResourceReason, Severity, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
+use fln_core::mode::{
+    BuildProfileId, CgsePolicyId, ContentRoot, EpochId, Mode, ReproducibilityProfile, TargetId,
+};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap};
 use fln_core::pos::Position;
@@ -64,10 +67,17 @@ use fln_env::provenance::{
     ModuleProvenanceManifest, PayloadTransparency, ProvenanceCompleteness,
 };
 use fln_hash::canon::{
-    CanonWriter, Canonical, SCHEMA_KVMAP_SET, SCHEMA_REGISTRY, SchemaId, SchemaRow,
+    CanonWriter, Canonical, SCHEMA_KVMAP_SET, SCHEMA_REGISTRY, SCHEMA_SHADOW_CELL,
+    SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON, SchemaId, SchemaRow,
     kvmap_canonical_set_bytes,
 };
 use fln_hash::domain::{Digest, Domain, DomainHasher};
+use fln_hash::shadow::{
+    CandidateResultV1, ClaimTypeV1, ComparisonClassV1, EngineVersionV1, FixtureManifestV1,
+    ParityRowV1, PolicyVersionV1, ProductV1, SamplingObligationV1, SemanticResultV1,
+    ShadowCellSpecV1, ShadowCellV1, ShadowPublicationV1, ShadowScopeV1, ShadowTelemetryV1,
+    recover_journal,
+};
 use fln_verdict::{
     Assignment, CNF_SCHEMA, Clause, ClauseId, Cnf, InputClause, Literal as SatLiteral, ProofRule,
     ProofStep, SAT_MODEL_SCHEMA, SatModel, SchemaLimits, UNSAT_PROOF_SCHEMA, UnsatProof,
@@ -302,7 +312,7 @@ pub fn projection_root(descriptors: &[CorpusDescriptor<'_>]) -> Digest {
 ///
 /// One row per `SCHEMA_REGISTRY` row, joined in both directions by [`project`]. The
 /// order matches the registry's for readability only — the join does not depend on it.
-pub const CORPUS_COVERAGE: [CorpusCoverage; 11] = [
+pub const CORPUS_COVERAGE: [CorpusCoverage; 14] = [
     CorpusCoverage {
         schema: "fln.canon.name",
         version: 1,
@@ -349,6 +359,31 @@ pub const CORPUS_COVERAGE: [CorpusCoverage; 11] = [
                    and over a kernel-inconclusive carrying the structural-budget \
                    resource reason whose tag forced the v1 -> v2 bump",
         run: exercise_diag,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.shadow-cell",
+        version: 1,
+        exercise: "round trip and re-encode byte identity of a complete generic \
+                   shadow-run cell binding mode/profile/epoch roots, separate \
+                   claim/evidence axes, fixture and Parity identities, versioned \
+                   engines and policy, and a continued-sampling obligation",
+        run: exercise_shadow_cell,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.shadow-semantic-ndjson",
+        version: 1,
+        exercise: "build a canonical shadow publication, recover its append-only frame \
+                   through the independent NDJSON parser, and prove operational \
+                   telemetry cannot move the semantic projection root",
+        run: exercise_shadow_semantic_ndjson,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.shadow-telemetry-ndjson",
+        version: 1,
+        exercise: "build two publications of one semantic cell with different worker \
+                   and latency observations, recover both independently, and prove \
+                   telemetry moves only its own and the outer publication root",
+        run: exercise_shadow_telemetry_ndjson,
     },
     CorpusCoverage {
         schema: "fln.env.module-provenance",
@@ -683,6 +718,178 @@ fn exercise_diag(row: &SchemaRow) -> Result<(), String> {
         &inconclusive,
         "kernel inconclusive under a structural budget",
     )
+}
+
+// ---------------------------------------------------------------------------
+// Generic shadow promotion authority (fln-hash)
+// ---------------------------------------------------------------------------
+
+fn shadow_root(seed: u8) -> ContentRoot {
+    ContentRoot::new([seed; 32])
+}
+
+fn shadow_engine(id: u128, version: u64, seed: u8) -> EngineVersionV1 {
+    EngineVersionV1 {
+        engine_id: id,
+        version,
+        binary_root: shadow_root(seed),
+    }
+}
+
+fn shadow_policy() -> PolicyVersionV1 {
+    PolicyVersionV1 {
+        policy_id: CgsePolicyId::new(300),
+        version: 2,
+        policy_root: shadow_root(30),
+    }
+}
+
+fn shadow_cell() -> Result<ShadowCellV1, String> {
+    let policy = shadow_policy();
+    let fixture_manifest = FixtureManifestV1::from_fixture_ids(vec![501, 502, 503])
+        .map_err(|error| format!("fixture manifest: {error:?}"))?;
+    ShadowCellV1::new(ShadowCellSpecV1 {
+        scope: ShadowScopeV1 {
+            workload_id: 200,
+            workload_root: shadow_root(20),
+            epoch: EpochId::new(201),
+            epoch_root: shadow_root(21),
+            mode: Mode::Sound,
+            reproducibility: ReproducibilityProfile::Certified,
+            build_profile: BuildProfileId::new(202),
+            profile_root: shadow_root(22),
+            target: TargetId::new(203),
+            target_root: shadow_root(23),
+        },
+        baseline: ProductV1 {
+            engine: shadow_engine(210, 4, 24),
+            product_root: shadow_root(25),
+            semantic_result: SemanticResultV1::Accepted {
+                result_root: shadow_root(26),
+            },
+        },
+        candidate: CandidateResultV1::Complete(ProductV1 {
+            engine: shadow_engine(211, 8, 27),
+            product_root: shadow_root(28),
+            semantic_result: SemanticResultV1::Accepted {
+                result_root: shadow_root(26),
+            },
+        }),
+        comparison_class: ComparisonClassV1::ExactParity,
+        fixture_manifest,
+        policy,
+        claim_type: ClaimTypeV1::BoundedModel,
+        parity_row: ParityRowV1 {
+            row_id: 220,
+            row_root: shadow_root(29),
+        },
+        sampling: SamplingObligationV1 {
+            policy,
+            seed_root: shadow_root(31),
+            divisor: 16,
+            required_initial_passes: 3,
+        },
+    })
+    .map_err(|error| format!("shadow cell: {error:?}"))
+}
+
+fn recover_shadow(publication: &ShadowPublicationV1) -> Result<(), String> {
+    let recovered = recover_journal(&publication.journal_frame())
+        .into_complete()
+        .map_err(|non_authoritative| format!("recovery non-authoritative: {non_authoritative:?}"))?
+        .map_err(|error| format!("recovery refused publication: {error:?}"))?;
+    let latest = recovered
+        .latest
+        .ok_or_else(|| "recovery returned no complete publication".to_string())?;
+    if latest.publication.cell() != publication.cell() {
+        return Err("recovery returned a different shadow cell".to_string());
+    }
+    Ok(())
+}
+
+fn exercise_shadow_cell(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_SHADOW_CELL)?;
+    round_trip(&shadow_cell()?, "generic shadow cell")
+}
+
+fn exercise_shadow_semantic_ndjson(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_SHADOW_SEMANTIC_NDJSON)?;
+    let cell = shadow_cell()?;
+    let first = ShadowPublicationV1::build(
+        cell.clone(),
+        ShadowTelemetryV1 {
+            attempts: 1,
+            latency_micros: 10,
+            worker_count: 1,
+            dropped_events: 0,
+        },
+    )
+    .map_err(|error| format!("build semantic publication: {error:?}"))?;
+    let second = ShadowPublicationV1::build(
+        cell,
+        ShadowTelemetryV1 {
+            attempts: 99,
+            latency_micros: 1_000_000,
+            worker_count: 32,
+            dropped_events: 7,
+        },
+    )
+    .map_err(|error| format!("build semantic publication variant: {error:?}"))?;
+    if !first
+        .semantic_ndjson()
+        .starts_with("{\"schema\":\"fln.canon.shadow-semantic-ndjson/1\"")
+    {
+        return Err("semantic NDJSON does not begin with its registered schema".to_string());
+    }
+    if first.semantic_root() != second.semantic_root() {
+        return Err("operational telemetry moved semantic shadow authority".to_string());
+    }
+    recover_shadow(&first)?;
+    recover_shadow(&second)
+}
+
+fn exercise_shadow_telemetry_ndjson(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_SHADOW_TELEMETRY_NDJSON)?;
+    let cell = shadow_cell()?;
+    let first = ShadowPublicationV1::build(
+        cell.clone(),
+        ShadowTelemetryV1 {
+            attempts: 1,
+            latency_micros: 10,
+            worker_count: 1,
+            dropped_events: 0,
+        },
+    )
+    .map_err(|error| format!("build telemetry publication: {error:?}"))?;
+    let second = ShadowPublicationV1::build(
+        cell,
+        ShadowTelemetryV1 {
+            attempts: 2,
+            latency_micros: 11,
+            worker_count: 8,
+            dropped_events: 1,
+        },
+    )
+    .map_err(|error| format!("build telemetry publication variant: {error:?}"))?;
+    if !first
+        .telemetry_ndjson()
+        .starts_with("{\"schema\":\"fln.canon.shadow-telemetry-ndjson/1\"")
+    {
+        return Err("telemetry NDJSON does not begin with its registered schema".to_string());
+    }
+    if first.semantic_root() != second.semantic_root() {
+        return Err("telemetry changed the semantic projection".to_string());
+    }
+    if first.telemetry_root() == second.telemetry_root()
+        || first.publication_root() == second.publication_root()
+    {
+        return Err(
+            "changed telemetry did not move its own root and the outer publication root"
+                .to_string(),
+        );
+    }
+    recover_shadow(&first)?;
+    recover_shadow(&second)
 }
 
 // ---------------------------------------------------------------------------

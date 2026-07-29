@@ -101,7 +101,7 @@ fn every_coverage_claim_demonstrates_itself() {
     }
     assert_eq!(
         live.len(),
-        11,
+        14,
         "the exercise count moved; if a durable format was added or removed, say so in \
          this assertion deliberately rather than letting the loop shrink silently"
     );

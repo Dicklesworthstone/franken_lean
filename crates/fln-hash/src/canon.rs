@@ -49,6 +49,22 @@ pub const SCHEMA_KVMAP_SET: SchemaId = SchemaId {
     name: "fln.canon.kvmap-set",
     version: 1,
 };
+/// Durable snapshot of one generic shadow-run promotion cell.
+pub const SCHEMA_SHADOW_CELL: SchemaId = SchemaId {
+    name: "fln.canon.shadow-cell",
+    version: 1,
+};
+/// Canonical semantic NDJSON projection of a shadow publication.
+pub const SCHEMA_SHADOW_SEMANTIC_NDJSON: SchemaId = SchemaId {
+    name: "fln.canon.shadow-semantic-ndjson",
+    version: 1,
+};
+/// Canonical operational NDJSON projection carried beside, never inside, semantic
+/// shadow authority.
+pub const SCHEMA_SHADOW_TELEMETRY_NDJSON: SchemaId = SchemaId {
+    name: "fln.canon.shadow-telemetry-ndjson",
+    version: 1,
+};
 
 /// The crate that defines a durable format's codec.
 ///
@@ -119,7 +135,7 @@ pub struct SchemaRow {
 ///
 /// Adding a durable format means adding a row here. That is the point: the registry is
 /// the reviewed inventory the conformance corpus is meant to be a projection of.
-pub const SCHEMA_REGISTRY: [SchemaRow; 11] = [
+pub const SCHEMA_REGISTRY: [SchemaRow; 14] = [
     SchemaRow {
         id: SCHEMA_NAME,
         owner: SchemaOwner::Hash,
@@ -149,6 +165,21 @@ pub const SCHEMA_REGISTRY: [SchemaRow; 11] = [
         id: SCHEMA_DIAG,
         owner: SchemaOwner::Hash,
         covers: "a diagnostic under the D8 typed error taxonomy",
+    },
+    SchemaRow {
+        id: SCHEMA_SHADOW_CELL,
+        owner: SchemaOwner::Hash,
+        covers: "one versioned generic shadow-run promotion authority cell",
+    },
+    SchemaRow {
+        id: SCHEMA_SHADOW_SEMANTIC_NDJSON,
+        owner: SchemaOwner::Hash,
+        covers: "the canonical semantic NDJSON projection of a shadow publication",
+    },
+    SchemaRow {
+        id: SCHEMA_SHADOW_TELEMETRY_NDJSON,
+        owner: SchemaOwner::Hash,
+        covers: "the separate canonical operational NDJSON projection of a shadow publication",
     },
     SchemaRow {
         id: SchemaId {
@@ -1640,6 +1671,12 @@ mod tests {
 
     use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
 
+    macro_rules! fixture_panic {
+        ($($arg:tt)*) => {
+            panic!(/* ubs:ignore — test-only diagnostic. */ $($arg)*)
+        };
+    }
+
     /// The stop facts a budgeted decode records, so assertions that used to read
     /// `Exhausted` fields directly keep asserting exactly the same things after the fold
     /// to `Outcome` (bead fln-8gz3). Panics loudly on any other outcome shape, so a test
@@ -1651,11 +1688,11 @@ mod tests {
                     ResourceReason::StructuralBudget { unit } => {
                         (unit, usage.allowed, usage.observed)
                     }
-                    ref other => panic!("expected a structural budget, got {other:?}"),
+                    ref other => fixture_panic!("expected a structural budget, got {other:?}"),
                 },
-                other => panic!("expected resource exhaustion, got {other:?}"),
+                other => fixture_panic!("expected resource exhaustion, got {other:?}"),
             },
-            other => panic!("expected an inconclusive outcome, got {other:?}"),
+            other => fixture_panic!("expected an inconclusive outcome, got {other:?}"),
         }
     }
 
@@ -1667,7 +1704,7 @@ mod tests {
                 .as_deref()
                 .map(|text| text.text().to_string())
                 .expect("a budget stop records where it stopped"),
-            other => panic!("expected an inconclusive outcome, got {other:?}"),
+            other => fixture_panic!("expected an inconclusive outcome, got {other:?}"),
         }
     }
 
@@ -1745,24 +1782,33 @@ mod tests {
             (SCHEMA_KVMAP, "fln.canon.kvmap"),
             (SCHEMA_KVMAP_SET, "fln.canon.kvmap-set"),
             (SCHEMA_DIAG, "fln.canon.diag"),
+            (SCHEMA_SHADOW_CELL, "fln.canon.shadow-cell"),
+            (
+                SCHEMA_SHADOW_SEMANTIC_NDJSON,
+                "fln.canon.shadow-semantic-ndjson",
+            ),
+            (
+                SCHEMA_SHADOW_TELEMETRY_NDJSON,
+                "fln.canon.shadow-telemetry-ndjson",
+            ),
         ] {
             assert_eq!(constant.name, expected);
             let row = registered(constant.name)
-                .unwrap_or_else(|| panic!("{expected} is not in SCHEMA_REGISTRY"));
+                .unwrap_or_else(|| fixture_panic!("{expected} is not in SCHEMA_REGISTRY"));
             assert_eq!(
                 row.id, constant,
                 "the row for {expected} is not the constant"
             );
             assert_eq!(row.owner, SchemaOwner::Hash);
         }
-        // And every Hash-owned row is one of those five: a row added here without a
+        // And every Hash-owned row is one of those constants: a row added here without a
         // constant would otherwise pass the loop above by never being visited.
         let hash_rows = SCHEMA_REGISTRY
             .iter()
             .filter(|row| row.owner == SchemaOwner::Hash)
             .count();
         assert_eq!(
-            hash_rows, 6,
+            hash_rows, 9,
             "fln-hash owns a schema the constant join above does not cover"
         );
     }
@@ -1834,7 +1880,7 @@ mod tests {
                 recurse.encode(inner, w);
                 std::hint::black_box(w.buf.len());
             }
-            _ => panic!("the level mutation probe expects a Succ chain"),
+            _ => fixture_panic!("the level mutation probe expects a Succ chain"),
         }
     }
 
@@ -1867,7 +1913,7 @@ mod tests {
                 recurse.encode(a, w);
                 std::hint::black_box(w.buf.len());
             }
-            _ => panic!("the expression mutation probe expects an App chain"),
+            _ => fixture_panic!("the expression mutation probe expects an App chain"),
         }
     }
 
@@ -2711,7 +2757,7 @@ mod tests {
                 map
             );
             if let Some(previous) = seen.insert(encoded, map.clone()) {
-                panic!("two distinct maps share an encoding: {previous:?} and {map:?}");
+                fixture_panic!("two distinct maps share an encoding: {previous:?} and {map:?}");
             }
         }
     }
@@ -2855,12 +2901,12 @@ mod tests {
                     }
                     if mutant.as_deref() == Some("recursive-level-encoder") {
                         recursive_level_encoder_mutant(&level, &mut CanonWriter::new());
-                        panic!("recursive Level encoder mutation unexpectedly survived");
+                        fixture_panic!("recursive Level encoder mutation unexpectedly survived");
                     }
                     let level_bytes = level.to_canonical_bytes();
                     if mutant.as_deref() == Some("recursive-level-decoder") {
                         let _ = decode_with_mutant_level(&level_bytes);
-                        panic!("recursive Level decoder mutation unexpectedly survived");
+                        fixture_panic!("recursive Level decoder mutation unexpectedly survived");
                     }
                     let decoded_level = Level::from_canonical_bytes(&level_bytes)
                         .expect("deep valid level decodes");
@@ -2876,12 +2922,12 @@ mod tests {
                     }
                     if mutant.as_deref() == Some("recursive-expr-encoder") {
                         recursive_expr_encoder_mutant(&expr, &mut CanonWriter::new());
-                        panic!("recursive Expr encoder mutation unexpectedly survived");
+                        fixture_panic!("recursive Expr encoder mutation unexpectedly survived");
                     }
                     let expr_bytes = expr.to_canonical_bytes();
                     if mutant.as_deref() == Some("recursive-expr-decoder") {
                         let _ = decode_with_mutant_expr(&expr_bytes);
-                        panic!("recursive Expr decoder mutation unexpectedly survived");
+                        fixture_panic!("recursive Expr decoder mutation unexpectedly survived");
                     }
                     let decoded_expr = Expr::from_canonical_bytes(&expr_bytes)
                         .expect("deep valid expression decodes");
@@ -3150,11 +3196,13 @@ mod tests {
                 );
             }
             Outcome::Complete(Err(error)) => {
-                panic!("a budget stop was rendered as a rejection about the bytes: {error:?}")
+                fixture_panic!(
+                    "a budget stop was rendered as a rejection about the bytes: {error:?}"
+                )
             }
-            Outcome::Complete(Ok(_)) => panic!("the budget was not honoured"),
+            Outcome::Complete(Ok(_)) => fixture_panic!("the budget was not honoured"),
             Outcome::InternalFault(fault) => {
-                panic!("the decoder's own budget accounting broke: {fault:?}")
+                fixture_panic!("the decoder's own budget accounting broke: {fault:?}")
             }
         }
 
@@ -3188,7 +3236,7 @@ mod tests {
                     .expect("progress localizes to a byte offset");
                 assert!(at <= cap, "no byte beyond the cap was consumed");
             }
-            other => panic!("expected an inconclusive stop, got {other:?}"),
+            other => fixture_panic!("expected an inconclusive stop, got {other:?}"),
         }
     }
 
@@ -3200,7 +3248,7 @@ mod tests {
         truncated.truncate(truncated.len() - 1);
         match Expr::from_canonical_bytes_budgeted(&truncated, DecodeBudget::unlimited()) {
             Outcome::Complete(Err(error)) => assert_eq!(error.what, "input truncated"),
-            other => panic!("a malformed artifact must be rejected, got {other:?}"),
+            other => fixture_panic!("a malformed artifact must be rejected, got {other:?}"),
         }
 
         // And a malformed prefix under a *tiny* byte budget is still a rejection if
@@ -3211,7 +3259,7 @@ mod tests {
         let unknown_tag = w.into_bytes();
         match Expr::from_canonical_bytes_budgeted(&unknown_tag, DecodeBudget::new(u64::MAX, 8)) {
             Outcome::Complete(Err(error)) => assert_eq!(error.what, "unknown expr tag"),
-            other => panic!("the malformation is reached first, got {other:?}"),
+            other => fixture_panic!("the malformation is reached first, got {other:?}"),
         }
     }
 
@@ -3433,10 +3481,12 @@ mod tests {
                     assert!(attempts < 32, "budget growth did not converge")
                 }
                 Outcome::Complete(Err(error)) => {
-                    panic!("raising a budget turned a valid artifact into a rejection: {error:?}")
+                    fixture_panic!(
+                        "raising a budget turned a valid artifact into a rejection: {error:?}"
+                    )
                 }
                 Outcome::InternalFault(fault) => {
-                    panic!("raising a budget broke the decoder's own accounting: {fault:?}")
+                    fixture_panic!("raising a budget broke the decoder's own accounting: {fault:?}")
                 }
             }
         }
@@ -3488,12 +3538,12 @@ mod tests {
                         assert_eq!(allowed, 1_000);
                         assert!(observed > allowed, "a stop reports what it cost");
                     }
-                    Outcome::Complete(Err(error)) => panic!(
+                    Outcome::Complete(Err(error)) => fixture_panic!(
                         "budget exhaustion was reported as a claim about the bytes: {error:?}"
                     ),
-                    Outcome::Complete(Ok(_)) => panic!("the budget was not honoured"),
+                    Outcome::Complete(Ok(_)) => fixture_panic!("the budget was not honoured"),
                     Outcome::InternalFault(fault) => {
-                        panic!("the decoder's own budget accounting broke: {fault:?}")
+                        fixture_panic!("the decoder's own budget accounting broke: {fault:?}")
                     }
                 }
 
@@ -3516,7 +3566,7 @@ mod tests {
                         error.what, "input truncated",
                         "the operands never arrive, and that is a well-formedness fact"
                     ),
-                    other => panic!("expected a typed rejection, got {other:?}"),
+                    other => fixture_panic!("expected a typed rejection, got {other:?}"),
                 }
 
                 // The byte limit is the other half of the contract, on the same input.
@@ -3532,7 +3582,7 @@ mod tests {
                             .expect("progress localizes to a byte offset");
                         assert!(at <= 512);
                     }
-                    other => panic!("expected a byte-budget stop, got {other:?}"),
+                    other => fixture_panic!("expected a byte-budget stop, got {other:?}"),
                 }
 
                 // NO NESTING CAP: a legitimately deep VALID artifact still decodes
@@ -3668,7 +3718,7 @@ mod tests {
                 assert_eq!(data.entries().len(), 2, "MData folded the duplicate");
                 assert_eq!(data.find(&key), Some(&DataValue::OfNat(1)));
             }
-            other => panic!("expected an MData node, got {other:?}"),
+            other => fixture_panic!("expected an MData node, got {other:?}"),
         }
     }
 

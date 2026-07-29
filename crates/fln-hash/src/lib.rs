@@ -28,3 +28,4 @@ pub(crate) mod blake3;
 pub mod canon;
 pub mod domain;
 pub mod root;
+pub mod shadow;
