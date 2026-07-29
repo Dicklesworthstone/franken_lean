@@ -211,6 +211,22 @@ emit_event --string event run_end --string verdict pass \
 "${PYTHON[@]}" "$EVIDENCE" validate-manifest --art-dir "$ART_DIR" \
   --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
   --offline
+"${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
+  --manifest "$ART_DIR/manifest.json" \
+  --digest "$ART_DIR/manifest.digest" \
+  --output "$ART_DIR/bundle.complete.json" \
+  --governed-root "$ROOT" "${GOVERNED_ARGS[@]}" \
+  --expected-root "$FINAL_ROOT" --vendor-path vendor/lean4-src
+"${PYTHON[@]}" "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
+  --manifest "$ART_DIR/manifest.json" \
+  --digest "$ART_DIR/manifest.digest" \
+  --commit "$ART_DIR/bundle.complete.json" \
+  --artifact-root "$ART_DIR" >/dev/null
+"${PYTHON[@]}" "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+  --manifest "$ART_DIR/manifest.json" \
+  --digest "$ART_DIR/manifest.digest" \
+  --commit "$ART_DIR/bundle.complete.json" \
+  --artifact-root "$ART_DIR" >/dev/null
 
-printf '[diagnostic_projection] PASS semantic=%s telemetry=%s evidence=%s\n' \
+printf '[diagnostic_projection] PASS committed semantic=%s telemetry=%s evidence=%s\n' \
   "$SEMANTIC_ROOT" "$TELEMETRY_ROOT" "$ART_DIR" >&2

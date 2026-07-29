@@ -4433,3 +4433,37 @@ fn lane_control_renaming_the_dispatch_helper_does_not_break_the_binding() {
          here is keyed to a spelling, not derived from the artefacts; got {findings:?}"
     );
 }
+
+/// The W1 lane names a write-once bundle in its terminal record, so it must publish,
+/// idempotently adopt, and validate that exact bundle after manifest construction.
+#[test]
+fn diagnostic_projection_lane_commits_the_bundle_its_terminal_names() {
+    let script = read(&root(), "scripts/e2e/diag_goldens.sh");
+    let positions = [
+        ("run_end", "--string event run_end"),
+        ("manifest", "\"$EVIDENCE\" manifest --art-dir"),
+        ("complete", "\"$EVIDENCE\" complete-bundle --art-dir"),
+        ("adopt", "\"$EVIDENCE\" adopt-bundle --art-dir"),
+        ("validate", "\"$EVIDENCE\" validate-bundle --art-dir"),
+    ]
+    .map(|(label, needle)| {
+        let count = script.matches(needle).count();
+        assert_eq!(
+            count, 1,
+            "diagnostic projection lane must carry one {label} operation; found {count}"
+        );
+        script.find(needle).expect("counted one occurrence")
+    });
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "diagnostic projection finalization must order run_end, manifest, complete, adopt, \
+         and validate; positions={positions:?}"
+    );
+    assert_eq!(
+        script
+            .matches("--string bundle_commit bundle.complete.json")
+            .count(),
+        1,
+        "the terminal bundle name must remain singular and exact"
+    );
+}
