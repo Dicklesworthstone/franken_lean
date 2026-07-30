@@ -192,6 +192,9 @@ dependencies = [
 [[package]]
 name = "fln-vm"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+]
 
 [[package]]
 name = "fln-wasm"

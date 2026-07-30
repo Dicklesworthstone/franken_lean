@@ -115,6 +115,18 @@ jobs:
         run: |
           python3 -I -S scripts/extract/gen_public_surface_contract.py --check
 
+      - name: materialize the extern/builtin census shards
+        shell: bash
+        run: |
+          # The extern row join reads the untracked builtin shards; with the pin
+          # installed above they regenerate and verify against the tracked envelope.
+          ./scripts/extract/census_materialize.sh
+
+      - name: verify the extern row contract
+        shell: bash
+        run: |
+          python3 -I -S scripts/extract/gen_extern_rows.py --check
+
       - name: pin-dependent conformance suites (fln-rgha)
         shell: bash
         env:
