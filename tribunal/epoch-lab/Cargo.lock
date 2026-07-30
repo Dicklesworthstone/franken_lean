@@ -58,6 +58,7 @@ version = "0.0.0"
 dependencies = [
  "fln-conformance",
  "fln-hash",
+ "fln-olean",
 ]
 
 [[package]]

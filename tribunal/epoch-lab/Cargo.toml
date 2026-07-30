@@ -23,6 +23,7 @@ fln-hash = { path = "../../crates/fln-hash" }
 # pair of concerns the comment below records.
 [dev-dependencies]
 fln-conformance = { path = "../../crates/fln-conformance" }
+fln-olean = { path = "../../crates/fln-olean" }
 
 # Deliberately a nested workspace, following tools/structure-guard/
 # kernel-ownership-publisher. The epoch lab is Tribunal apparatus, not a product

@@ -24,6 +24,47 @@ use crate::format;
 use crate::region::{OleanView, RegionError, WalkBudget};
 use fln_rt::abi;
 
+/// Versioned schema of the serialization-freedom table (acceptance b of the
+/// G0-5 spike). Bump on any row change; a consumer refuses unknown versions.
+pub const FREEDOM_TABLE_SCHEMA: &str = "fln-g05-freedom-table/1";
+
+/// One enumerated serialization freedom with its pinned per-direction policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerializationFreedom {
+    pub name: &'static str,
+    /// What varies, measured.
+    pub class: &'static str,
+    /// The pinned policy for the read->rebuild direction (FL-INV-04's byte law).
+    pub read_rebuild_policy: &'static str,
+    /// The pinned policy for fresh emission (the R3-reserved direction).
+    pub fresh_emission_policy: &'static str,
+}
+
+/// THE EXHAUSTIVE ENUMERATION, and the exhaustiveness is measured rather than
+/// asserted: one row, because the corpus sweep
+/// (`every_shipped_stdlib_olean_rebuilds_byte_identical`, all 2,433 shipped
+/// oleans) reproduced every byte from parsed semantics plus declared content
+/// classes with ZERO findings — no nonzero padding, no capacity surprises, no
+/// undeclared byte class anywhere at the pin. A new freedom cannot enter
+/// silently: it would surface as a byte divergence or a named finding in that
+/// same sweep.
+pub const SERIALIZATION_FREEDOMS: &[SerializationFreedom] = &[SerializationFreedom {
+    name: "base_addr",
+    class: "per-emission mmap placement: six different values across six shipped \
+            oleans within ONE toolchain build, yet deterministic across repeated \
+            quiet single-process emissions on one host (bead franken_lean-0vf, \
+            comment 1710); region pointers are stored absolute, so the freedom \
+            rebases every pointer in the file",
+    read_rebuild_policy: "REPRODUCE the original file's base_addr from its own \
+            header and rebase identically - byte identity survives with no R3 \
+            scope-down (held by the pilot and corpus rebuild suites)",
+    fresh_emission_policy: "byte-matching a Reference fixture requires ADOPTING \
+            that fixture's base_addr (CGSE-registered choice); a canonical fixed \
+            base is load-compatible but not byte-identical to arbitrary fixtures. \
+            This is the R3 fallback shape, reserved for fresh emission only and \
+            unexercised until Athanor exists",
+}];
+
 /// How the rebuild accounted for each byte of the data region.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RebuildReport {
@@ -326,6 +367,29 @@ mod tests {
             report.rederived_bytes > report.copied_string_bytes + report.copied_ctor_tail_bytes,
             "re-derivation must dominate declared copies"
         );
+        // The freedom table is bound to the measurement that makes it
+        // exhaustive: exactly one row (base_addr), versioned, every field
+        // non-empty - and the zero-findings corpus sweep above is what earns
+        // the word "exhaustive".
+        assert!(
+            FREEDOM_TABLE_SCHEMA
+                .rsplit_once('/')
+                .is_some_and(|(_, v)| v.bytes().all(|b| b.is_ascii_digit())),
+            "{FREEDOM_TABLE_SCHEMA}"
+        );
+        assert_eq!(SERIALIZATION_FREEDOMS.len(), 1, "freedom census");
+        let row = &SERIALIZATION_FREEDOMS[0];
+        assert_eq!(row.name, "base_addr");
+        for field in [
+            row.class,
+            row.read_rebuild_policy,
+            row.fresh_emission_policy,
+        ] {
+            assert!(
+                !field.trim().is_empty(),
+                "a freedom row with an empty policy"
+            );
+        }
     }
 
     /// Locate the pinned Reference stdlib (the kernel_replay pattern): override

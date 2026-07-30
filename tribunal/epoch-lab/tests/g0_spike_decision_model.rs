@@ -1606,3 +1606,175 @@ fn the_g02_receipt_holds_content_not_merely_presence() {
     // unlabeled "foreign" one.
     assert!(!receipt.contains("ForeignIndependent"));
 }
+
+// ---------------------------------------------------------------------------
+// The sixth real row: G0-5, Ratified on computed evidence.
+// ---------------------------------------------------------------------------
+
+use fln_epoch_lab::g0::{G05Evidence, g05_decision};
+use fln_olean::rebuild::{FREEDOM_TABLE_SCHEMA, SERIALIZATION_FREEDOMS, rebuild};
+
+fn g05_evidence() -> G05Evidence {
+    let root = fln_conformance::checked_manifest_dir!().join("../..");
+    let olean_dir = root.join("crates/fln-olean");
+
+    let fixture_digests: Vec<String> = ["fixtures/g05_pilot.lean", "fixtures/g05_pilot.olean"]
+        .iter()
+        .map(|f| {
+            derive_fixture_digest(&olean_dir.join(f))
+                .unwrap_or_else(|e| panic!("fixture {f} unreadable: {e}"))
+                .into_parts()
+                .0
+        })
+        .collect();
+    let fold = |parts: &[String]| -> String {
+        let mut joined = String::new();
+        for p in parts {
+            joined.push_str(p);
+            joined.push(':');
+        }
+        joined
+    };
+
+    // The acceptance, EXECUTED: the committed pilot rebuilds byte-identical
+    // through the re-derivation path, and the freedom table is well-formed.
+    let pilot = std::fs::read(olean_dir.join("fixtures/g05_pilot.olean")).expect("pilot");
+    let (out, report) = rebuild(&pilot).expect("the pilot rebuilds");
+    let acceptance_green = out == pilot
+        && report.objects == 2407
+        && report.nonzero_padding_bytes == 0
+        && report.findings.is_empty()
+        && SERIALIZATION_FREEDOMS.len() == 1
+        && SERIALIZATION_FREEDOMS[0].name == "base_addr";
+
+    let behavior = vec![
+        format!("schema={FREEDOM_TABLE_SCHEMA}"),
+        format!(
+            "pilot: objects={} rederived={} strings={} tails={} mpz={} padding={} slack={}",
+            report.objects,
+            report.rederived_bytes,
+            report.copied_string_bytes,
+            report.copied_ctor_tail_bytes,
+            report.copied_mpz_limb_bytes,
+            report.padding_bytes,
+            report.slack_bytes
+        ),
+    ];
+
+    let mutation_root =
+        derive_fixture_digest(&olean_dir.join("evidence/g05_rebuild_mutation_v4.32.0.jsonl"))
+            .expect("mutation receipt committed")
+            .into_parts()
+            .0;
+    let no_mock_e2e_root =
+        derive_fixture_digest(&olean_dir.join("evidence/g05_reemit_probe_v4.32.0.jsonl"))
+            .expect("reemit probe receipt committed")
+            .into_parts()
+            .0;
+
+    G05Evidence {
+        fixture_root: fold(&fixture_digests),
+        generated_contract_root: format!(
+            "{}:{FREEDOM_TABLE_SCHEMA}",
+            fln_olean::format::INVENTORY_DIGEST
+        ),
+        implementation_root: fold(&behavior),
+        mutation_root,
+        no_mock_e2e_root,
+        acceptance_green,
+        used_wall_ms: 30_000,
+        used_rss_bytes: 1 << 29,
+    }
+}
+
+#[test]
+fn the_g05_row_is_ratified_on_computed_evidence_and_the_ledger_holds_six_rows() {
+    let roster = roster();
+    let e5 = g05_evidence();
+    assert!(e5.acceptance_green, "the G0-5 acceptance run must be green");
+    let rows = vec![
+        g01_decision(&roster, &g01_evidence()).expect("G0-1 on roster"),
+        g02_decision(&roster, &g02_evidence()).expect("G0-2 on roster"),
+        g04_decision(&roster, &g04_evidence()).expect("G0-4 on roster"),
+        g05_decision(&roster, &e5).expect("G0-5 on roster"),
+        g06_decision(&roster, &g06_evidence()).expect("G0-6 on roster"),
+        g09_decision(&roster, &g09_evidence()).expect("G0-9 on roster"),
+    ];
+    let g = verify(&rows, &roster);
+    assert_eq!(
+        g.ratified,
+        vec![
+            "G0-1".to_string(),
+            "G0-2".to_string(),
+            "G0-5".to_string(),
+            "G0-6".to_string()
+        ]
+    );
+    assert_eq!(g.amended, vec!["G0-4".to_string(), "G0-9".to_string()]);
+    assert!(g.no_go.is_empty() && g.blocked.is_empty());
+    assert_eq!(
+        g.blocks.len(),
+        4,
+        "exactly the other four block: {:?}",
+        g.blocks
+    );
+    for b in &g.blocks {
+        assert_eq!(b.reason(), "missing-decision", "{b:?}");
+    }
+    assert!(!g.clears(), "six rows must never clear a ten-spike gate");
+}
+
+#[test]
+fn the_g05_receipts_hold_their_content_not_merely_their_presence() {
+    let olean_dir = fln_conformance::checked_manifest_dir!().join("../../crates/fln-olean");
+    let mutation =
+        std::fs::read_to_string(olean_dir.join("evidence/g05_rebuild_mutation_v4.32.0.jsonl"))
+            .expect("mutation receipt committed");
+    let mut outcomes: std::collections::BTreeMap<&str, &str> = Default::default();
+    let mut endpoints = 0usize;
+    for line in mutation.lines() {
+        assert!(
+            line.contains("\"schema\": \"fln-g05-rebuild-mutation/1\""),
+            "unversioned receipt row: {line}"
+        );
+        let field = |key: &str| -> Option<&str> {
+            let tag = format!("\"{key}\": \"");
+            let start = line.find(&tag)? + tag.len();
+            line[start..].split('\"').next()
+        };
+        let (Some(mutant), Some(outcome)) = (field("mutant"), field("outcome")) else {
+            panic!("receipt row missing mutant/outcome: {line}");
+        };
+        match mutant {
+            "baseline" | "restored" | "restored-after-regut" => {
+                assert_eq!(outcome, "green", "{mutant}");
+                endpoints += 1;
+            }
+            m => {
+                outcomes.insert(m, outcome);
+            }
+        }
+    }
+    assert_eq!(endpoints, 3, "baseline + both restorations");
+    assert_eq!(outcomes.len(), 9, "nine mutants gutted: {outcomes:?}");
+    for (mutant, outcome) in &outcomes {
+        assert_eq!(*outcome, "killed-by-named", "{mutant}");
+    }
+
+    let probe = std::fs::read_to_string(olean_dir.join("evidence/g05_reemit_probe_v4.32.0.jsonl"))
+        .expect("probe receipt committed");
+    assert!(
+        probe
+            .lines()
+            .all(|l| l.contains("\"schema\":\"fln-g05-reemit-probe/1\""))
+    );
+    for fact in [
+        "\"step\":\"fresh_determinism\",\"runs_identical\":true",
+        "\"fixture_identical\":true",
+        "\"step\":\"async_identity\",\"identical_to_sync\":true",
+        "\"step\":\"negative_control\",\"corrupted_copy_detected\":true",
+        "\"pin\":\"v4.32.0\"",
+    ] {
+        assert!(probe.contains(fact), "missing {fact}");
+    }
+}

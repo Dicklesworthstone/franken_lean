@@ -1121,6 +1121,95 @@ pub fn g02_decision(roster: &[RosterSpike], evidence: &G02Evidence) -> Option<De
     })
 }
 
+/// The measured evidence behind the G0-5 row, injected exactly as its four
+/// siblings are: every digest computed by the verifying test from committed
+/// artifacts, the acceptance EXECUTED.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct G05Evidence {
+    /// Content digests of the committed pilot pair (source + pinned-binary
+    /// emission), folded.
+    pub fixture_root: String,
+    /// The generated olean contract digest plus the versioned freedom table.
+    pub generated_contract_root: String,
+    /// The rebuilder's behavioral identity: the executed accounting report.
+    pub implementation_root: String,
+    /// Digest over `crates/fln-olean/evidence/g05_rebuild_mutation_<pin>.jsonl`.
+    pub mutation_root: String,
+    /// Digest over `crates/fln-olean/evidence/g05_reemit_probe_<pin>.jsonl` —
+    /// the real-binary determinism/provenance/async cells with their negative
+    /// control, written by `scripts/tribunal/g05_reemit_probe.sh`.
+    pub no_mock_e2e_root: String,
+    pub acceptance_green: bool,
+    pub used_wall_ms: u64,
+    pub used_rss_bytes: u64,
+}
+
+/// The G0-5 decision row: **Ratified** — FL-INV-04's byte law stands as stated
+/// for the read->rebuild direction, and the serialization-freedom enumeration
+/// is measured-exhaustive.
+///
+/// The spike's evidence (bead `franken_lean-0vf`, comments 1707-1713): six
+/// emission-determinism cells against the real pinned binary, all in the good
+/// direction (fresh-emission, cross-directory and async-elaboration byte
+/// identity; import emission deterministic and mtime-independent); ONE real
+/// serialization freedom found and policy-pinned per direction (`base_addr`,
+/// per-emission mmap placement rebasing every absolute pointer — reproduced
+/// from the file's own header on rebuild, R3 fallback shape reserved for fresh
+/// emission only); the rebuilder re-deriving every understood byte class from
+/// parsed semantics with pilot byte-identity under exact accounting pins AND
+/// the ENTIRE 2,433-file shipped corpus byte-identical with zero findings; a
+/// 9/9 killed-by-name mutation campaign whose padding plant found a live
+/// FL-INV-07 panic before the campaign ran. The fresh-emission direction is
+/// the stated residue: it awaits Athanor, and its R3 choice is written in the
+/// freedom table rather than deferred silently.
+pub fn g05_decision(roster: &[RosterSpike], evidence: &G05Evidence) -> Option<Decision> {
+    let spike = roster.iter().find(|r| r.id == "G0-5")?;
+    Some(Decision {
+        spike: spike.id.clone(),
+        question: spike.question.clone(),
+        resolution: Resolution::Decided(Outcome::Ratified),
+        claim: ClaimType::BoundedModel,
+        witness: Witness {
+            evidence_state: EvidenceState::Observed,
+            fixture_root: recorded_or_absent(&evidence.fixture_root),
+            generated_contract_root: recorded_or_absent(&evidence.generated_contract_root),
+            implementation_root: recorded_or_absent(&evidence.implementation_root),
+            mutation_root: recorded_or_absent(&evidence.mutation_root),
+            no_mock_e2e_root: recorded_or_absent(&evidence.no_mock_e2e_root),
+            oracle: OracleKind::ReferenceBinary,
+            comparison: ComparisonClass::ByteIdentical,
+        },
+        scope: Scope {
+            epoch: "v4.32.0".to_string(),
+            corpus: CorpusFamily::C1,
+            platform: Platform::LinuxX86_64,
+            mode: Mode::Faithful,
+        },
+        resources: Resources {
+            contract_wall_ms: 600_000,
+            contract_rss_bytes: 4 << 30,
+            used_wall_ms: evidence.used_wall_ms,
+            used_rss_bytes: evidence.used_rss_bytes,
+        },
+        limitations: "One host, one pin (v4.32.0), class bounded_model. The byte law is \
+            ratified for READ->REBUILD: pilot plus all 2,433 shipped stdlib oleans, \
+            re-derivation not copying, zero findings. FRESH EMISSION is not exercised: \
+            it awaits Athanor, and its base_addr choice is the R3 fallback shape \
+            written in the freedom table (fln_olean::rebuild::SERIALIZATION_FREEDOMS), \
+            reserved for that direction only. Emission-determinism cells are \
+            pilot-scale (six cells); corpus-scale emission determinism is untested \
+            because re-elaborating the stdlib is a build-system act, not a spike act. \
+            The corpus sweep is env-gated on the installed pin and typed-skips \
+            elsewhere."
+            .to_string(),
+        affected_interfaces: vec![
+            "FL-INV-04 (codec fidelity: stands as stated for read->rebuild)".to_string(),
+            "fln-olean writer (Grimoire, seeded by fln_olean::rebuild)".to_string(),
+            "the standing codec rig (plan section 18.2, PG-8)".to_string(),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod structural {
     use super::*;
