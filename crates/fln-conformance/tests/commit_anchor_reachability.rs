@@ -79,9 +79,11 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 /// Backup-only anchors this repository has not repaired, **per file**.
 ///
@@ -132,9 +134,10 @@ const EXCLUDED: &[&str] = &[":!vendor", ":!.beads/issues.jsonl"];
 const BEADS_BACKUP_ONLY_FLOOR: usize = 90;
 
 /// Binary files the harvest cannot parse, asserted so a fourth is a disclosure change rather
-/// than a silent narrowing of the denominator. Nine at `b4409be2`: the three C3 `.olean`
-/// fixtures plus the six real-mathlib G0-1 fixtures under `tribunal/fixtures/mathlib/`.
-const BINARY_FILES_SKIPPED: usize = 9;
+/// than a silent narrowing of the denominator. Ten at `4d6badc5`: the three C3 `.olean`
+/// fixtures, the six real-mathlib G0-1 fixtures under `tribunal/fixtures/mathlib/`, and the
+/// G0-5 re-emit pilot `crates/fln-olean/fixtures/g05_pilot.olean`.
+const BINARY_FILES_SKIPPED: usize = 10;
 
 /// Anti-vacuity floors on the *denominator*. A repaired population can legitimately drive the
 /// finding count to zero; nothing can legitimately drive these to zero except a broken scan.
@@ -226,6 +229,111 @@ fn parse_harvest(text: &str) -> BTreeMap<String, BTreeSet<String>> {
     found
 }
 
+/// One round of the interleaved exchange: write a chunk of queries, then drain
+/// exactly that chunk's answer lines before writing the next. Sixty-four lines
+/// is a few KB a side per round — comfortably below the 64 KiB pipe buffer, so
+/// neither pipe can fill against an undrained peer (bead `fln-llg3`: at 239
+/// manifest rows the old write-everything-then-read shape deadlocked, child in
+/// `anon_pipe_write` with its stdout full, harness in a futex, both forever).
+const BATCH_CHUNK_LINES: usize = 64;
+
+/// The wall-clock budget for the whole batch exchange. The interleave makes the
+/// measured deadlock impossible; the budget is the backstop for a wedged child,
+/// and it fails typed rather than waiting forever.
+const BATCH_BUDGET: Duration = Duration::from_secs(120);
+
+/// A poison-tolerant lock: a panicking worker must not turn the watchdog's own
+/// report into a second panic.
+fn lock_slot(slot: &Mutex<Option<Child>>) -> std::sync::MutexGuard<'_, Option<Child>> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run `git cat-file --batch-check` over `tokens` on a worker thread behind the
+/// wall-clock budget, returning one answer line per token in positional order.
+fn batch_check_lines(root: &Path, tokens: &[String]) -> Vec<String> {
+    let (verdict_tx, verdict_rx) = mpsc::channel::<Result<Vec<String>, String>>();
+    let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let watchdog_slot = Arc::clone(&child_slot);
+    let root = root.to_path_buf();
+    let tokens = tokens.to_vec();
+
+    std::thread::spawn(move || {
+        let run = || -> Result<Vec<String>, String> {
+            let mut child = Command::new("git")
+                .current_dir(&root)
+                .args(["cat-file", "--batch-check"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|error| format!("git cat-file --batch-check must spawn: {error}"))?;
+            // The handles come out of the child so the worker owns the pipes while
+            // the slot holds the child itself — `Child::kill` needs neither, and a
+            // blocked read on the worker unblocks as EOF when the watchdog kills it.
+            let mut stdin = child.stdin.take().ok_or("stdin was piped but is absent")?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or("stdout was piped but is absent")?;
+            *lock_slot(&child_slot) = Some(child);
+
+            let mut reader = BufReader::new(stdout);
+            let mut lines = Vec::with_capacity(tokens.len());
+            for chunk in tokens.chunks(BATCH_CHUNK_LINES) {
+                stdin
+                    .write_all(chunk.join("\n").as_bytes())
+                    .and_then(|()| stdin.write_all(b"\n"))
+                    .map_err(|error| format!("writing a batch chunk: {error}"))?;
+                stdin
+                    .flush()
+                    .map_err(|error| format!("flushing a batch chunk: {error}"))?;
+                for _ in 0..chunk.len() {
+                    let mut line = String::new();
+                    let read = reader
+                        .read_line(&mut line)
+                        .map_err(|error| format!("draining a batch answer: {error}"))?;
+                    if read == 0 {
+                        return Err(format!(
+                            "batch-check closed stdout after {} of {} answers",
+                            lines.len(),
+                            tokens.len()
+                        ));
+                    }
+                    lines.push(line.trim_end().to_string());
+                }
+            }
+            drop(stdin);
+            let mut child = lock_slot(&child_slot)
+                .take()
+                .ok_or("the child vanished from its slot")?;
+            let status = child
+                .wait()
+                .map_err(|error| format!("awaiting batch-check: {error}"))?;
+            if !status.success() {
+                return Err(format!("batch-check exited with {status}"));
+            }
+            Ok(lines)
+        };
+        let _ = verdict_tx.send(run());
+    });
+
+    match verdict_rx.recv_timeout(BATCH_BUDGET) {
+        Ok(Ok(lines)) => lines,
+        Ok(Err(message)) => panic!("{message}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if let Some(mut child) = lock_slot(&watchdog_slot).take() {
+                let _ = child.kill();
+            }
+            panic!(
+                "batch-check exceeded its {BATCH_BUDGET:?} wall-clock budget: a wedged \
+                 child was killed and reported typed, never waited on forever (fln-llg3)"
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the batch worker died without a verdict")
+        }
+    }
+}
+
 /// Which of `tokens` name a commit, and whether it is reachable from `refs/heads/main`.
 ///
 /// One `git cat-file --batch-check` for the whole set. **The join is positional**: batch-check
@@ -246,29 +354,7 @@ fn classify(root: &Path, tokens: &[String]) -> BTreeMap<String, bool> {
         main.len()
     );
 
-    let mut child = Command::new("git")
-        .current_dir(root)
-        .args(["cat-file", "--batch-check"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("git cat-file --batch-check must spawn");
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(tokens.join("\n").as_bytes())
-        .expect("the token list must be writable to batch-check");
-    let out = child.wait_with_output().expect("batch-check must complete");
-    let lines: Vec<&str> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<String>>()
-        .leak()
-        .iter()
-        .map(String::as_str)
-        .collect();
-
+    let lines = batch_check_lines(root, tokens);
     assert_eq!(
         lines.len(),
         tokens.len(),
@@ -279,7 +365,7 @@ fn classify(root: &Path, tokens: &[String]) -> BTreeMap<String, bool> {
     );
 
     let mut verdict = BTreeMap::new();
-    for (token, line) in tokens.iter().zip(lines) {
+    for (token, line) in tokens.iter().zip(lines.iter()) {
         let mut fields = line.split_whitespace();
         let (Some(oid), Some(kind)) = (fields.next(), fields.next()) else {
             continue; // "<token> missing" — not an object at all
@@ -631,4 +717,63 @@ fn the_allowance_carries_no_dead_or_zero_rows() {
              path can regrow to {allowed} without the guard noticing"
         );
     }
+}
+
+/// `fln-llg3`'s regression cell, pinned ABOVE the measured deadlock threshold
+/// (239 manifest rows): the interleaved batch exchange must complete over 600
+/// tokens with positional conservation intact and the control verdicts exact —
+/// measured, not assumed.
+#[test]
+fn the_batch_exchange_completes_above_the_deadlock_threshold() {
+    const THRESHOLD_CROSSED_AT: usize = 239;
+    let root = root();
+    let head = git(&root, &["rev-parse", "refs/heads/main"]);
+    let head = head.trim();
+    let parent = git(&root, &["rev-parse", "refs/heads/main~1"]);
+    let parent = parent.trim();
+
+    let mut tokens: Vec<String> = Vec::with_capacity(600);
+    tokens.push(head.to_string());
+    tokens.push(parent.to_string());
+    tokens.push("0".repeat(64));
+    tokens.push("not-a-real-token".to_string());
+    for index in 0..596 {
+        tokens.push(format!("deadbeef{index:0>56x}"));
+    }
+    assert!(
+        tokens.len() > THRESHOLD_CROSSED_AT * 2,
+        "the cell must sit decisively above the measured threshold"
+    );
+
+    let started = std::time::Instant::now();
+    let verdict = classify(&root, &tokens);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "600 tokens must classify in well under the 120 s budget, not near it: {elapsed:?}"
+    );
+
+    assert_eq!(
+        verdict.get(head).copied(),
+        Some(true),
+        "HEAD is a commit reachable from main"
+    );
+    assert_eq!(
+        verdict.get(parent).copied(),
+        Some(true),
+        "HEAD~1 is a commit reachable from main"
+    );
+    assert!(
+        !verdict.contains_key(&"0".repeat(64)),
+        "a syntactically valid but absent oid is missing, not a commit"
+    );
+    assert!(
+        !verdict.contains_key("not-a-real-token"),
+        "a garbage token is missing, not a commit"
+    );
+    assert_eq!(
+        verdict.len(),
+        2,
+        "exactly the two real commits classify; the 598 missing tokens are skipped"
+    );
 }
