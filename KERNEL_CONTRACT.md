@@ -607,10 +607,16 @@ loop would overwrite that malformed raw block member.
 
 ### KR-978 · The unchecked door is not a rule
 anchor: vendor/lean4-src/src/kernel/environment.cpp:275 (lean_add_decl) expect="lean_add_decl"
-fixtures: stub owner=franken_lean-z6c
+fixtures: crates/fln-kernel/tests/checked_declaration_capability.rs, crates/fln-kernel/tests/consensus_seat.rs, crates/fln-kernel/tests/k1_judgments.rs
 The Reference exposes an add-without-checking entry point. In FrankenLean nothing
 outside `fln-kernel` can admit a constant (FL-INV-02); trust-level bypasses are
-journaled and surfaced in receipts, never silent (plan §4.1 wire/CLI row).
+journaled and surfaced in receipts, never silent (plan §4.1 wire/CLI row). An
+acceptance mints a private, non-serializable, single-use capability bound to the
+exact declaration and immutable base environment; council agreement is the only
+transition to publication. Multi-constant declarations stage their checked rows in
+private persistent environments and expose only the complete final environment.
+A duplicate, resource stop, cancellation, or internal fault at any member exposes
+no accepted prefix.
 
 ---
 

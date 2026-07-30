@@ -22,6 +22,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
+
 use fln_core::expr::Expr;
 use fln_core::level::Level;
 use fln_core::name::Name;
@@ -30,7 +32,10 @@ use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal,
     ReducibilityHints,
 };
-use fln_env::environment::{DeclarationBudget, DeclarationCommitted, Environment};
+use fln_env::environment::{
+    DeclarationBudget, DeclarationCommitted, Environment, preflight_declaration,
+};
+use fln_env::modules::CancellationProbe;
 use fln_env::pmap::CollisionBudget;
 use fln_kernel::Declaration;
 use fln_kernel::capability::{Admitted, Published, admit};
@@ -54,6 +59,33 @@ fn axiom(name: &str, type_: Expr) -> Declaration {
         },
         is_unsafe: false,
     })
+}
+
+struct TripAfter {
+    remaining: Cell<usize>,
+    samples: Cell<usize>,
+}
+
+impl TripAfter {
+    fn new(remaining: usize) -> Self {
+        Self {
+            remaining: Cell::new(remaining),
+            samples: Cell::new(0),
+        }
+    }
+}
+
+impl CancellationProbe for TripAfter {
+    fn is_cancelled(&self) -> bool {
+        self.samples.set(self.samples.get() + 1);
+        let remaining = self.remaining.get();
+        if remaining == 0 {
+            true
+        } else {
+            self.remaining.set(remaining - 1);
+            false
+        }
+    }
 }
 
 fn accepted<'e>(
@@ -395,36 +427,11 @@ fn the_base_environment_cannot_be_substituted_or_moved() {
 }
 
 // ---------------------------------------------------------------------------
-// Blocks refuse rather than publish through a per-constant path
+// Blocks publish as one failure-atomic capability transition
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_block_declaration_publishes_nothing_through_this_handoff() {
-    // An inductive block publishes several constants at once. The bound handoff
-    // for that is not built, and the honest behaviour is to publish NOTHING
-    // rather than to push the block through a per-constant path that never
-    // checked it as a unit. Refusing is safe; the alternative is not.
-    let env = Environment::new();
-    let quot = Declaration::Quotient(vec![]);
-    // If the empty quotient block is not accepted the refusal is upstream and
-    // equally fine — nothing was published either way.
-    let Outcome::Complete(admitted) = admit(&env, quot, Budget::DEFAULT) else {
-        return;
-    };
-    if let CouncilOutcome::Agreed(cap) = convene(&Council::nobody_was_asked(), admitted) {
-        match cap.publish(
-            DeclarationBudget::default(),
-            CollisionBudget::default(),
-            None,
-        ) {
-            Outcome::Complete(Published::BlockHandoffUnavailable) => {}
-            other => panic!("a block published through the single-constant path: {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn an_accepted_mutual_block_publishes_nothing_through_the_single_constant_handoff() {
+fn an_accepted_mutual_block_publishes_every_member_and_only_the_final_environment() {
     let env = Environment::new();
     let names = vec![n("mutualA"), n("mutualB")];
     let member = |name: &str| DefinitionVal {
@@ -438,24 +445,178 @@ fn an_accepted_mutual_block_publishes_nothing_through_the_single_constant_handof
         safety: DefinitionSafety::Partial,
         all: names.clone(),
     };
-    let block = Declaration::Mutual(vec![member("mutualA"), member("mutualB")]);
-    let Outcome::Complete(admitted) = admit(&env, block, Budget::DEFAULT) else {
-        panic!("a well-typed mutual block must reach the council");
-    };
-    let CouncilOutcome::Agreed(cap) = convene(&Council::nobody_was_asked(), admitted) else {
-        panic!("an empty council must agree with an accepted mutual block");
-    };
+    let a = member("mutualA");
+    let b = member("mutualB");
+    let cap = accepted(&env, Declaration::Mutual(vec![a.clone(), b.clone()]));
     assert_eq!(cap.name(), None, "a block has no single publication name");
-    assert!(matches!(
-        cap.publish(
-            DeclarationBudget::default(),
-            CollisionBudget::default(),
-            None,
-        ),
-        Outcome::Complete(Published::BlockHandoffUnavailable)
-    ));
+
+    match cap.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    ) {
+        Outcome::Complete(Published::BlockCommitted(publication)) => {
+            assert_eq!(publication.names, names);
+            assert_eq!(
+                publication.environment.find(&n("mutualA")),
+                Some(&ConstantInfo::Defn(a))
+            );
+            assert_eq!(
+                publication.environment.find(&n("mutualB")),
+                Some(&ConstantInfo::Defn(b))
+            );
+        }
+        other => panic!("an accepted mutual block did not publish atomically: {other:?}"),
+    }
     assert!(
         env.find(&n("mutualA")).is_none() && env.find(&n("mutualB")).is_none(),
-        "the unavailable block handoff must publish no prefix"
+        "block publication must leave the checked base untouched"
+    );
+}
+
+#[test]
+fn a_one_member_mutual_declaration_remains_a_block_publication() {
+    let env = Environment::new();
+    let only = DefinitionVal {
+        base: ConstantVal {
+            name: n("onlyMutualMember"),
+            level_params: vec![],
+            type_: sort1(),
+        },
+        value: Expr::sort(Level::zero()),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Partial,
+        all: vec![n("onlyMutualMember")],
+    };
+    let cap = accepted(&env, Declaration::Mutual(vec![only]));
+    match cap.publish(
+        DeclarationBudget::UNBOUNDED,
+        CollisionBudget::default(),
+        None,
+    ) {
+        Outcome::Complete(Published::BlockCommitted(publication)) => {
+            assert_eq!(publication.names, vec![n("onlyMutualMember")]);
+            assert!(
+                publication
+                    .environment
+                    .find(&n("onlyMutualMember"))
+                    .is_some()
+            );
+        }
+        other => panic!("a one-member mutual declaration lost block atomicity: {other:?}"),
+    }
+}
+
+#[test]
+fn a_late_block_admission_stop_exposes_no_prefix_and_a_clean_retry_recovers() {
+    let env = Environment::new();
+    let first_name = n("a");
+    let second_name = n("secondMemberWhoseLongNameMakesItsCanonicalRowLarger");
+    let names = vec![first_name.clone(), second_name.clone()];
+    let member = |name: &str| DefinitionVal {
+        base: ConstantVal {
+            name: n(name),
+            level_params: vec![],
+            type_: sort1(),
+        },
+        value: Expr::sort(Level::zero()),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Partial,
+        all: names.clone(),
+    };
+    let first = member("a");
+    let second = member("secondMemberWhoseLongNameMakesItsCanonicalRowLarger");
+    let first_info = ConstantInfo::Defn(first.clone());
+    let second_info = ConstantInfo::Defn(second.clone());
+    let Outcome::Complete(first_usage) =
+        preflight_declaration(&first_info, DeclarationBudget::UNBOUNDED, None)
+    else {
+        panic!("the first fixture must have a measurable declaration row");
+    };
+    let Outcome::Complete(second_usage) =
+        preflight_declaration(&second_info, DeclarationBudget::UNBOUNDED, None)
+    else {
+        panic!("the second fixture must have a measurable declaration row");
+    };
+    assert!(
+        second_usage.canonical_bytes > first_usage.canonical_bytes,
+        "the stop fixture must pass one member before the larger second member"
+    );
+    let stops_on_second = DeclarationBudget {
+        max_canonical_bytes: first_usage.canonical_bytes,
+        ..DeclarationBudget::UNBOUNDED
+    };
+    let cap = accepted(
+        &env,
+        Declaration::Mutual(vec![first.clone(), second.clone()]),
+    );
+    assert!(matches!(
+        cap.publish(stops_on_second, CollisionBudget::default(), None,),
+        Outcome::Inconclusive(_)
+    ));
+    assert!(
+        env.find(&first_name).is_none() && env.find(&second_name).is_none(),
+        "a stop after staging the first member must expose no accepted prefix"
+    );
+
+    let retry = accepted(&env, Declaration::Mutual(vec![first, second]));
+    match retry.publish(
+        DeclarationBudget::UNBOUNDED,
+        CollisionBudget::default(),
+        None,
+    ) {
+        Outcome::Complete(Published::BlockCommitted(publication)) => {
+            assert_eq!(publication.names, names);
+            assert!(
+                publication
+                    .names
+                    .iter()
+                    .all(|name| publication.environment.find(name).is_some())
+            );
+        }
+        other => panic!("an unbounded clean retry did not publish the whole block: {other:?}"),
+    }
+}
+
+#[test]
+fn cancellation_after_one_staged_member_exposes_no_prefix() {
+    let env = Environment::new();
+    let first_name = n("cancelA");
+    let second_name = n("cancelB");
+    let names = vec![first_name.clone(), second_name.clone()];
+    let member = |name: &str| DefinitionVal {
+        base: ConstantVal {
+            name: n(name),
+            level_params: vec![],
+            type_: sort1(),
+        },
+        value: Expr::sort(Level::zero()),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Partial,
+        all: names.clone(),
+    };
+    let cap = accepted(
+        &env,
+        Declaration::Mutual(vec![member("cancelA"), member("cancelB")]),
+    );
+    // One definition samples before its type, before its body, and before its
+    // staged publication. The fourth sample is therefore inside member two.
+    let cancellation = TripAfter::new(3);
+    assert!(matches!(
+        cap.publish(
+            DeclarationBudget::UNBOUNDED,
+            CollisionBudget::default(),
+            Some(&cancellation),
+        ),
+        Outcome::Inconclusive(_)
+    ));
+    assert_eq!(
+        cancellation.samples.get(),
+        4,
+        "the fixture must stop after one complete staged member"
+    );
+    assert!(
+        env.find(&first_name).is_none() && env.find(&second_name).is_none(),
+        "cancellation during member two must expose no member-one prefix"
     );
 }

@@ -450,11 +450,14 @@ pub fn publish_reflected_theorem(
         | Outcome::Complete(KernelPublished::DuplicateName { name }) => {
             ReflectedTheoremOutcome::Refused(ReflectedTheoremRefusal::DuplicateName { name })
         }
-        Outcome::Complete(KernelPublished::BlockHandoffUnavailable) => {
+        Outcome::Complete(KernelPublished::BlockCommitted(publication)) => {
             ReflectedTheoremOutcome::InternalFault(ReflectedTheoremInternalFault::Bridge(
                 InternalFault::new(
                     "FL-INV-06",
-                    "kernel capability lost the single-theorem publication handoff",
+                    format!(
+                        "single-theorem capability produced a {}-member block publication",
+                        publication.names.len()
+                    ),
                 ),
             ))
         }

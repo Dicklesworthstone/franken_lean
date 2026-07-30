@@ -15,7 +15,10 @@ use fln_env::constants::{
     InductiveVal, OpaqueVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints,
     TheoremVal,
 };
-use fln_env::environment::Environment;
+use fln_env::environment::{DeclarationBudget, Environment};
+use fln_env::pmap::CollisionBudget;
+use fln_kernel::capability::{Published, admit as capability_admit};
+use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::{Budget, RejectClass, Verdict};
 use fln_kernel::{Declaration, check, check_def_eq};
 
@@ -4321,14 +4324,75 @@ fn kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration() {
     // byte-for-byte. An inverted KR-604 universe condition, a dropped
     // consume_type_annotations, or any generation drift rejects this block.
     let (types, ctors, recursors) = mynat_block();
-    let verdict = check(
-        &Environment::new(),
-        &block_decl(types, ctors, recursors),
-        Budget::DEFAULT,
-    );
+    let declaration = block_decl(types, ctors, recursors);
+    let env = Environment::new();
+    let verdict = check(&env, &declaration, Budget::DEFAULT);
     assert!(
         verdict.is_accepted(),
         "MyNat block must admit; got {verdict:?}"
+    );
+
+    // The capability handoff must carry every row the block checker compared,
+    // in the same type/constructor/recursor order, and expose no prefix.
+    let admitted = match capability_admit(&env, declaration, Budget::DEFAULT) {
+        Outcome::Complete(admitted) => admitted,
+        Outcome::Inconclusive(_) => {
+            panic!("an accepted MyNat block became inconclusive at the capability boundary")
+        }
+        Outcome::InternalFault(_) => {
+            panic!("an accepted MyNat block faulted at the capability boundary")
+        }
+    };
+    let checked = match convene(&Council::nobody_was_asked(), admitted) {
+        CouncilOutcome::Agreed(checked) => checked,
+        CouncilOutcome::KernelRejected { class, .. } => {
+            panic!("the capability path rejected the accepted MyNat block as {class:?}")
+        }
+        CouncilOutcome::Halted(halt) => {
+            panic!(
+                "an empty council halted the MyNat block: {}",
+                halt.summary()
+            )
+        }
+    };
+    match checked.publish(
+        DeclarationBudget::UNBOUNDED,
+        CollisionBudget::default(),
+        None,
+    ) {
+        Outcome::Complete(Published::BlockCommitted(publication)) => {
+            assert_eq!(
+                publication.names,
+                vec![
+                    n("MyNat"),
+                    nn("MyNat", "zero"),
+                    nn("MyNat", "succ"),
+                    nn("MyNat", "rec")
+                ]
+            );
+            assert!(matches!(
+                publication.environment.find(&n("MyNat")),
+                Some(ConstantInfo::Induct(_))
+            ));
+            assert!(matches!(
+                publication.environment.find(&nn("MyNat", "zero")),
+                Some(ConstantInfo::Ctor(_))
+            ));
+            assert!(matches!(
+                publication.environment.find(&nn("MyNat", "succ")),
+                Some(ConstantInfo::Ctor(_))
+            ));
+            assert!(matches!(
+                publication.environment.find(&nn("MyNat", "rec")),
+                Some(ConstantInfo::Rec(_))
+            ));
+        }
+        other => panic!("the checked MyNat block did not publish atomically: {other:?}"),
+    }
+    assert_eq!(
+        env.len(),
+        0,
+        "publishing the block must not mutate its checked base"
     );
 }
 
