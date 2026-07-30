@@ -236,7 +236,8 @@ impl<'env> CheckedDecl<'env> {
             Declaration::Axiom(v) => Some(ConstantInfo::Axiom(v.clone())),
             Declaration::Defn(v) => Some(ConstantInfo::Defn(v.clone())),
             Declaration::Thm(v) => Some(ConstantInfo::Thm(v.clone())),
-            Declaration::Inductive(_) | Declaration::Quotient(_) => None,
+            Declaration::Opaque(v) => Some(ConstantInfo::Opaque(v.clone())),
+            Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_) => None,
         }
     }
 

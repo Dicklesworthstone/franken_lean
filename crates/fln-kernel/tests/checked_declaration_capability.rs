@@ -26,7 +26,10 @@ use fln_core::expr::Expr;
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::outcome::Outcome;
-use fln_env::constants::{AxiomVal, ConstantVal};
+use fln_env::constants::{
+    AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal,
+    ReducibilityHints,
+};
 use fln_env::environment::{DeclarationBudget, DeclarationCommitted, Environment};
 use fln_env::pmap::CollisionBudget;
 use fln_kernel::Declaration;
@@ -109,6 +112,44 @@ fn an_accepted_declaration_publishes_through_its_capability() {
     // And the base is untouched: publication returns a NEW environment rather
     // than mutating the one that was checked against.
     assert!(env.find(&n("A")).is_none(), "the base was mutated in place");
+}
+
+#[test]
+fn an_accepted_opaque_publishes_as_the_exact_opaque_that_was_checked() {
+    let env = Environment::new();
+    let opaque = Declaration::Opaque(OpaqueVal {
+        base: ConstantVal {
+            name: n("Sealed"),
+            level_params: vec![],
+            type_: sort1(),
+        },
+        value: Expr::sort(Level::zero()),
+        is_unsafe: false,
+        all: vec![n("Sealed")],
+    });
+    let cap = accepted(&env, opaque);
+    assert_eq!(cap.name(), Some(&n("Sealed")));
+    match cap.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    ) {
+        Outcome::Complete(Published::Committed(DeclarationCommitted::Published(p))) => {
+            assert!(
+                matches!(
+                    p.environment.find(&n("Sealed")),
+                    Some(ConstantInfo::Opaque(value))
+                        if value.value == Expr::sort(Level::zero())
+                ),
+                "the checked opaque must retain its opaque kind and exact body"
+            );
+        }
+        other => panic!("an accepted opaque did not publish: {other:?}"),
+    }
+    assert!(
+        env.find(&n("Sealed")).is_none(),
+        "opaque publication mutated its checked base"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -380,4 +421,41 @@ fn a_block_declaration_publishes_nothing_through_this_handoff() {
             other => panic!("a block published through the single-constant path: {other:?}"),
         }
     }
+}
+
+#[test]
+fn an_accepted_mutual_block_publishes_nothing_through_the_single_constant_handoff() {
+    let env = Environment::new();
+    let names = vec![n("mutualA"), n("mutualB")];
+    let member = |name: &str| DefinitionVal {
+        base: ConstantVal {
+            name: n(name),
+            level_params: vec![],
+            type_: sort1(),
+        },
+        value: Expr::sort(Level::zero()),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Partial,
+        all: names.clone(),
+    };
+    let block = Declaration::Mutual(vec![member("mutualA"), member("mutualB")]);
+    let Outcome::Complete(admitted) = admit(&env, block, Budget::DEFAULT) else {
+        panic!("a well-typed mutual block must reach the council");
+    };
+    let CouncilOutcome::Agreed(cap) = convene(&Council::nobody_was_asked(), admitted) else {
+        panic!("an empty council must agree with an accepted mutual block");
+    };
+    assert_eq!(cap.name(), None, "a block has no single publication name");
+    assert!(matches!(
+        cap.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ),
+        Outcome::Complete(Published::BlockHandoffUnavailable)
+    ));
+    assert!(
+        env.find(&n("mutualA")).is_none() && env.find(&n("mutualB")).is_none(),
+        "the unavailable block handoff must publish no prefix"
+    );
 }

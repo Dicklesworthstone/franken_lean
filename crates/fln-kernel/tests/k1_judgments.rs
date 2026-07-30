@@ -12,7 +12,8 @@ use fln_core::options::KVMap;
 use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause, Outcome, ResourceUsage};
 use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
-    InductiveVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints, TheoremVal,
+    InductiveVal, OpaqueVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints,
+    TheoremVal,
 };
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, RejectClass, Verdict};
@@ -95,8 +96,9 @@ fn admit(env: &Environment, decl: &Declaration) -> Environment {
         Declaration::Axiom(v) => ConstantInfo::Axiom(v),
         Declaration::Defn(v) => ConstantInfo::Defn(v),
         Declaration::Thm(v) => ConstantInfo::Thm(v),
+        Declaration::Opaque(v) => ConstantInfo::Opaque(v),
         // Block declarations use their own admission helpers in these tests.
-        Declaration::Inductive(_) | Declaration::Quotient(_) => {
+        Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_) => {
             unreachable!("admit() is only used for single-constant declarations")
         }
     };
@@ -5076,6 +5078,219 @@ fn kr950_quotient_init_checks_the_eq_constructor_not_only_the_eq_type() {
         !reject_message(&control).contains("type for 'Eq' type constructor"),
         "the correct refl must clear the constructor check; got: {}",
         reject_message(&control)
+    );
+}
+
+#[test]
+fn kr974_opaque_declarations_check_the_body_and_stay_opaque_to_defeq() {
+    // Pin environment.cpp:add_opaque checks an opaque's header and body with
+    // the ordinary safe type checker, then stores it as ConstantInfo::Opaque.
+    // The body is evidence for admission, not a delta-reduction rule.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_type = || Expr::const_(n("A"), vec![]);
+    let env = admit(&env, &axiom("a", a_type()));
+    let opaque = OpaqueVal {
+        base: cval(n("sealed"), vec![], a_type()),
+        value: Expr::const_(n("a"), vec![]),
+        is_unsafe: false,
+        all: vec![n("sealed")],
+    };
+    let verdict = check(&env, &Declaration::Opaque(opaque.clone()), Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "a well-typed opaque must admit; got {verdict:?}"
+    );
+
+    let with_opaque = add_info(&env, ConstantInfo::Opaque(opaque));
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &with_opaque,
+            &[],
+            &Expr::const_(n("sealed"), vec![]),
+            &Expr::const_(n("a"), vec![]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "an admitted opaque body must not become a delta-reduction rule"
+    );
+
+    let bad = OpaqueVal {
+        base: cval(n("badOpaque"), vec![], a_type()),
+        value: Expr::const_(n("A"), vec![]),
+        is_unsafe: false,
+        all: vec![n("badOpaque")],
+    };
+    assert_eq!(
+        reject_class(&check(&env, &Declaration::Opaque(bad), Budget::DEFAULT)),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "an opaque body still has to inhabit its declared type"
+    );
+
+    // This is subtle pin behavior: OpaqueVal.isUnsafe is metadata, but
+    // add_opaque constructs the ordinary SAFE checker. Marking the declaration
+    // unsafe therefore does not let its body reference an unsafe definition.
+    let function_type = Expr::forall_e(n("x"), a_type(), a_type(), BinderInfo::Default);
+    let unsafe_info = DefinitionVal {
+        base: cval(n("unsafeId"), vec![], function_type.clone()),
+        value: Expr::lam(
+            n("x"),
+            a_type(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Unsafe,
+        all: vec![n("unsafeId")],
+    };
+    let unsafe_env = add_info(&env, ConstantInfo::Defn(unsafe_info));
+    let unsafe_opaque = OpaqueVal {
+        base: cval(n("unsafeOpaque"), vec![], function_type),
+        value: Expr::const_(n("unsafeId"), vec![]),
+        is_unsafe: true,
+        all: vec![n("unsafeOpaque")],
+    };
+    assert_eq!(
+        reject_class(&check(
+            &unsafe_env,
+            &Declaration::Opaque(unsafe_opaque),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::SafetyViolation),
+        "OpaqueVal.isUnsafe must not silently widen the pin's safe body checker"
+    );
+}
+
+#[test]
+fn kr977_mutual_definitions_predeclare_the_whole_block_and_fail_atomically() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_type = || Expr::const_(n("A"), vec![]);
+    let function_type = || Expr::forall_e(n("x"), a_type(), a_type(), BinderInfo::Default);
+    let all = vec![n("mutualF"), n("mutualG")];
+    let member = |name: &str, target: &str| DefinitionVal {
+        base: cval(n(name), vec![], function_type()),
+        value: Expr::lam(
+            n("x"),
+            a_type(),
+            Expr::app(
+                Expr::const_(n(target), vec![]),
+                Expr::bvar(0).expect("packs"),
+            ),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Partial,
+        all: all.clone(),
+    };
+    let f = member("mutualF", "mutualG");
+    let g = member("mutualG", "mutualF");
+
+    // A single partial definition sees itself, but not its not-yet-added peer.
+    // The same first member therefore fails outside the block. This is the
+    // discriminating control for "predeclare EVERY member before ANY body".
+    assert_eq!(
+        reject_class(&check(&env, &Declaration::Defn(f.clone()), Budget::DEFAULT)),
+        Some(RejectClass::UnknownConstant)
+    );
+
+    let block = Declaration::Mutual(vec![f.clone(), g.clone()]);
+    let verdict = check(&env, &block, Budget::DEFAULT);
+    let used = match verdict {
+        Outcome::Complete(Verdict::Accepted { consumption }) => consumption.steps_used,
+        other => panic!("a well-typed partial mutual block must admit: {other:?}"),
+    };
+    assert!(used > 1, "the block must perform real shared work");
+
+    // The allowance is shared across headers and bodies. Exact work passes;
+    // moving the boundary by one produces typed Inconclusive, never rejection.
+    assert!(
+        check(
+            &env,
+            &block,
+            Budget::DEFAULT.narrowed(used, Budget::DEFAULT.depth)
+        )
+        .is_accepted(),
+        "the exact measured step boundary must admit"
+    );
+    assert!(
+        check(
+            &env,
+            &block,
+            Budget::DEFAULT.narrowed(used - 1, Budget::DEFAULT.depth)
+        )
+        .is_inconclusive(),
+        "one step below the shared boundary must be typed Inconclusive"
+    );
+
+    let mut bad_g = g;
+    bad_g.value = Expr::sort(Level::zero());
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &Declaration::Mutual(vec![f, bad_g]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::DefinitionTypeMismatch)
+    );
+    assert!(
+        !env.contains(&n("mutualF")) && !env.contains(&n("mutualG")),
+        "checking a block must not publish an accepted prefix"
+    );
+}
+
+#[test]
+fn kr977_mutual_definition_shape_is_nonempty_uniform_and_nonsafe() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_type = || Expr::const_(n("A"), vec![]);
+    let function_type = || Expr::forall_e(n("x"), a_type(), a_type(), BinderInfo::Default);
+    let member = |name: &str, safety: DefinitionSafety| DefinitionVal {
+        base: cval(n(name), vec![], function_type()),
+        value: Expr::lam(
+            n("x"),
+            a_type(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Regular(1),
+        safety,
+        all: vec![n("shapeF"), n("shapeG")],
+    };
+
+    assert_eq!(
+        reject_class(&check(&env, &Declaration::Mutual(vec![]), Budget::DEFAULT)),
+        Some(RejectClass::BlockMismatch),
+        "the pin refuses an empty mutual definition"
+    );
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &Declaration::Mutual(vec![member("safeMutual", DefinitionSafety::Safe)]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::BlockMismatch),
+        "safe mutual definitions are not a kernel declaration form"
+    );
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &Declaration::Mutual(vec![
+                member("shapeF", DefinitionSafety::Partial),
+                member("shapeG", DefinitionSafety::Unsafe),
+            ]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::BlockMismatch),
+        "every mutual member must carry the same safety annotation"
+    );
+
+    let duplicate = member("duplicateMutual", DefinitionSafety::Partial);
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &Declaration::Mutual(vec![duplicate.clone(), duplicate]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::AlreadyDeclared),
+        "the private scratch environment must preserve one-name-one-constant"
     );
 }
 
