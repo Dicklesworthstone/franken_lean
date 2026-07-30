@@ -409,6 +409,12 @@ pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
         "the VDI4.1 Git audit reads CARGO_MANIFEST_DIR only at run time so a shared target cannot \
          bake another checkout's evidence root into this test binary",
     ),
+    (
+        "crates/fln-vm/tests/extern_dispatch_no_mock_e2e.rs",
+        "the extern dispatch e2e resolves the repository root at run time for its mirror drill, \
+         so a shared target cannot bake another checkout's artifacts into the generator it \
+         drives (franken_lean-pw6t)",
+    ),
 ];
 
 /// Reconcile the precise needle against a coarser, independent one, per file.
