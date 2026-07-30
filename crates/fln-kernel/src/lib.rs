@@ -14,7 +14,8 @@
 //! KR-100..112, whnf KR-200..205 with recursor computation — quotient
 //! reduction KR-955, inductive iota KR-316, K conversion KR-317 — literal
 //! acceleration KR-313/KR-314, defeq subset KR-300..315 + KR-903, admission
-//! KR-970..974 for axioms/definitions (all safety levels)/theorems, inductive
+//! KR-970..977 for axioms/definitions (all safety levels)/theorems/opaques and
+//! mutual non-safe definition blocks, inductive
 //! BLOCK admission KR-600..608 with elimination universes KR-700..702 and
 //! full recursor REGENERATION KR-800..803 (decoded rows are untrusted and
 //! compared against the kernel's own generation), and quotient initialization
@@ -36,7 +37,7 @@ use fln_core::diag::ResourceReason;
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_env::constants::{
-    AxiomVal, ConstantInfo, DefinitionSafety, DefinitionVal, QuotVal, TheoremVal,
+    AxiomVal, ConstantInfo, DefinitionSafety, DefinitionVal, OpaqueVal, QuotVal, TheoremVal,
 };
 use fln_env::environment::Environment;
 
@@ -46,14 +47,17 @@ use crate::verdict::{Budget, RejectClass, Verdict};
 
 /// The declaration envelope. Axioms, definitions (all safety levels), and
 /// theorems check individually; an inductive block (types + constructors +
-/// recursors, decoded and untrusted) and the quotient initialization check as
-/// units under the KR-6xx/7xx/8xx/95x rules (bead franken_lean-ap6). Opaques
-/// and mutual definition blocks remain follow-up slices (KR-97x).
+/// recursors, decoded and untrusted), a non-safe mutual definition block, and
+/// the quotient initialization check as units. The block rules are
+/// KR-6xx/7xx/8xx/95x and KR-977 (beads franken_lean-ap6 and
+/// franken_lean-zht).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Declaration {
     Axiom(AxiomVal),
     Defn(DefinitionVal),
     Thm(TheoremVal),
+    Opaque(OpaqueVal),
+    Mutual(Vec<DefinitionVal>),
     Inductive(InductiveBlock),
     Quotient(Vec<QuotVal>),
 }
@@ -64,7 +68,8 @@ impl Declaration {
             Declaration::Axiom(v) => Some(&v.base.name),
             Declaration::Defn(v) => Some(&v.base.name),
             Declaration::Thm(v) => Some(&v.base.name),
-            Declaration::Inductive(_) | Declaration::Quotient(_) => None,
+            Declaration::Opaque(v) => Some(&v.base.name),
+            Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_) => None,
         }
     }
 
@@ -73,7 +78,8 @@ impl Declaration {
             Declaration::Axiom(v) => &v.base.level_params,
             Declaration::Defn(v) => &v.base.level_params,
             Declaration::Thm(v) => &v.base.level_params,
-            Declaration::Inductive(_) | Declaration::Quotient(_) => &[],
+            Declaration::Opaque(v) => &v.base.level_params,
+            Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_) => &[],
         }
     }
 }
@@ -96,6 +102,9 @@ pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Outcome<V
             let (outcome, consumption) = admit::check_quotient_init(env, decls, budget);
             return check_result_to_outcome(outcome, consumption, budget);
         }
+        Declaration::Mutual(definitions) => {
+            return check_mutual_definitions(env, definitions, budget);
+        }
         _ => {}
     }
     // Pin add_definition (unsafe branch) / add_mutual (partial|unsafe):
@@ -112,6 +121,37 @@ pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Outcome<V
     let outcome = check_inner(env, decl, &mut checker);
     let consumption = checker.consumption();
     check_result_to_outcome(outcome, consumption, budget)
+}
+
+fn add_consumption(total: &mut verdict::Consumption, increment: verdict::Consumption) {
+    total.steps_used += increment.steps_used;
+    total.max_depth = total.max_depth.max(increment.max_depth);
+}
+
+fn remaining_budget(budget: Budget, total: verdict::Consumption) -> Budget {
+    budget.narrowed(budget.steps.saturating_sub(total.steps_used), budget.depth)
+}
+
+/// The only row a non-safe body checker needs in its private recursive
+/// environment: name, universe parameters, type, hints, and safety.
+///
+/// K1 never delta-unfolds `unsafe` or `partial` definitions
+/// (`TypeChecker::unfold_definition` admits only `DefinitionSafety::Safe`), so
+/// retaining the untrusted body here would be semantically inert while making
+/// the scratch environment's identity preflight traverse it *before* the
+/// kernel's own budgeted body check. A tiny unreachable placeholder preserves
+/// the exact observable header and keeps attacker-sized body work behind the
+/// typed kernel budget. The mutual-membership list is metadata the pin says the
+/// kernel does not use; it is likewise absent from this non-published scratch
+/// row.
+fn recursive_header(definition: &DefinitionVal) -> DefinitionVal {
+    DefinitionVal {
+        base: definition.base.clone(),
+        value: fln_core::expr::Expr::sort(fln_core::level::Level::zero()),
+        hints: definition.hints,
+        safety: definition.safety,
+        all: Vec::new(),
+    }
 }
 
 /// Pin environment.cpp:160/225 (`add_definition` unsafe branch, `add_mutual`):
@@ -135,8 +175,7 @@ fn check_nonsafe_definition(
     );
     let c = header.consumption();
     drop(header);
-    total.steps_used += c.steps_used;
-    total.max_depth = total.max_depth.max(c.max_depth);
+    add_consumption(&mut total, c);
     if let Err(stop) = header_outcome {
         return stop_to_outcome(stop, total, budget);
     }
@@ -145,12 +184,15 @@ fn check_nonsafe_definition(
     // see `admit::scratch_admit` for why the budget here is explicitly
     // UNBOUNDED rather than absent, and why a non-answer never becomes a
     // rejection.
-    let scratch =
-        match crate::admit::scratch_admit(env, ConstantInfo::Defn(v.clone()), &v.base.name) {
-            Ok(scratch) => scratch,
-            Err(stop) => return stop_to_outcome(stop, total, budget),
-        };
-    let remaining = budget.narrowed(budget.steps.saturating_sub(total.steps_used), budget.depth);
+    let scratch = match crate::admit::scratch_admit(
+        env,
+        ConstantInfo::Defn(recursive_header(v)),
+        &v.base.name,
+    ) {
+        Ok(scratch) => scratch,
+        Err(stop) => return stop_to_outcome(stop, total, budget),
+    };
+    let remaining = remaining_budget(budget, total);
     let mut body =
         TypeChecker::new_with_safety(&scratch, &v.base.level_params, remaining, v.safety);
     let outcome = (|| -> Result<(), Stop> {
@@ -168,8 +210,104 @@ fn check_nonsafe_definition(
         Ok(())
     })();
     let c = body.consumption();
-    total.steps_used += c.steps_used;
-    total.max_depth = total.max_depth.max(c.max_depth);
+    add_consumption(&mut total, c);
+    check_result_to_outcome(outcome, total, budget)
+}
+
+/// Pin `environment::add_mutual` (environment.cpp:224): a mutual definition
+/// block is non-empty, uniformly `unsafe` or `partial`, checks every header
+/// against the original environment, adds every definition to one private
+/// scratch environment, and only then checks every body against that complete
+/// block. The scratch value never escapes this function, so a failure in any
+/// member publishes none of them.
+fn check_mutual_definitions(
+    env: &Environment,
+    definitions: &[DefinitionVal],
+    budget: Budget,
+) -> Outcome<Verdict> {
+    let mut total = verdict::Consumption::default();
+    let outcome = (|| -> Result<(), Stop> {
+        let Some(first) = definitions.first() else {
+            return Err(Stop::Reject(
+                RejectClass::BlockMismatch,
+                "invalid empty mutual definition block".to_string(),
+            ));
+        };
+        let safety = first.safety;
+        if safety == DefinitionSafety::Safe {
+            return Err(Stop::Reject(
+                RejectClass::BlockMismatch,
+                "mutual definitions must be tagged unsafe or partial".to_string(),
+            ));
+        }
+
+        // Headers are checked against the ORIGINAL environment. No member is
+        // visible while another member's type is checked, matching the pin.
+        for definition in definitions {
+            if definition.safety != safety {
+                return Err(Stop::Reject(
+                    RejectClass::BlockMismatch,
+                    "mutual definitions must share one safety annotation".to_string(),
+                ));
+            }
+            let remaining = remaining_budget(budget, total);
+            let mut checker =
+                TypeChecker::new_with_safety(env, &definition.base.level_params, remaining, safety);
+            let result = check_header(
+                env,
+                &definition.base.name,
+                &definition.base.level_params,
+                &definition.base.type_,
+                &mut checker,
+            );
+            add_consumption(&mut total, checker.consumption());
+            result?;
+        }
+
+        // Build the complete block privately. `scratch_admit` propagates an
+        // environment non-answer as a kernel InternalFault; it never turns one
+        // into a rejection (FL-INV-07).
+        let mut scratch = env.clone();
+        for definition in definitions {
+            scratch = crate::admit::scratch_admit(
+                &scratch,
+                ConstantInfo::Defn(recursive_header(definition)),
+                &definition.base.name,
+            )?;
+        }
+
+        // One shared step allowance across every body. Each checker may carry
+        // distinct universe parameters, while the safety context is the
+        // block's single annotation.
+        for definition in definitions {
+            let remaining = remaining_budget(budget, total);
+            let mut checker = TypeChecker::new_with_safety(
+                &scratch,
+                &definition.base.level_params,
+                remaining,
+                safety,
+            );
+            let result = (|| -> Result<(), Stop> {
+                let value_type = checker.infer(&definition.value, 0)?;
+                if !checker.def_eq_public(&value_type, &definition.base.type_, 0)? {
+                    return Err(Stop::Reject(
+                        RejectClass::DefinitionTypeMismatch,
+                        format!(
+                            "mutual declaration `{}` body type does not match its declared type: \
+                             body has `{}`, declared `{}`",
+                            definition.base.name.to_display_string(),
+                            tc::brief_public(&value_type),
+                            tc::brief_public(&definition.base.type_)
+                        ),
+                    ));
+                }
+                Ok(())
+            })();
+            add_consumption(&mut total, checker.consumption());
+            result?;
+        }
+        Ok(())
+    })();
     check_result_to_outcome(outcome, total, budget)
 }
 
@@ -332,8 +470,11 @@ fn check_inner(
         Declaration::Axiom(v) => (&v.base.type_, None),
         Declaration::Defn(v) => (&v.base.type_, Some(&v.value)),
         Declaration::Thm(v) => (&v.base.type_, Some(&v.value)),
+        Declaration::Opaque(v) => (&v.base.type_, Some(&v.value)),
         // Dispatched to admit.rs before this path; nothing to do here.
-        Declaration::Inductive(_) | Declaration::Quotient(_) => return Ok(()),
+        Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_) => {
+            return Ok(());
+        }
     };
     let type_sort = checker.infer(type_, 0)?;
     let type_sort = checker.whnf_public(&type_sort, 0)?;

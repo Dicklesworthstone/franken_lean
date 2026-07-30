@@ -574,10 +574,14 @@ An axiom is its checked type; no body, no defeq obligation.
 
 ### KR-974 · Definitions, theorems, opaques
 anchor: vendor/lean4-src/src/kernel/environment.cpp:160 (add_definition) expect="add_definition"
-fixtures: stub owner=franken_lean-z6c
+anchor: vendor/lean4-src/src/kernel/environment.cpp:192 (add_theorem) expect="add_theorem"
+anchor: vendor/lean4-src/src/kernel/environment.cpp:211 (add_opaque) expect="add_opaque"
+fixtures: crates/fln-kernel/tests/k1_judgments.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
 The body's inferred type must be defeq to the declared type; theorems additionally
 require a Prop-valued type; unsafe definitions check header-first to permit
-recursion.
+recursion. Opaques are checked with the ordinary safe checker even when their
+`isUnsafe` metadata bit is set; an accepted opaque publishes as opaque and its body
+never becomes a delta-reduction rule.
 
 ### KR-975 · The unsafe quarantine
 anchor: vendor/lean4-src/src/kernel/type_checker.cpp:101 (infer_constant) expect="is_unsafe"
@@ -592,17 +596,27 @@ Safe definitions may not reference partial definitions.
 
 ### KR-977 · Mutual definitions are unsafe-only
 anchor: vendor/lean4-src/src/kernel/environment.cpp:224 (add_mutual) expect="add_mutual"
-fixtures: stub owner=franken_lean-z6c
+fixtures: crates/fln-kernel/tests/k1_judgments.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
 A mutual definition block must be non-empty, must not be tagged safe, and all
-members must share one safety annotation; headers first, then each body defeq to
-its type.
+members must share one safety annotation. Every header checks against the original
+environment, every member is then visible in one private scratch environment, and
+only then is each body checked defeq to its type under one shared budget. Failure
+publishes no prefix. FrankenLean additionally applies KR-970 inside the private
+scratch block and refuses a duplicate member name; the pin's unchecked `add_core`
+loop would overwrite that malformed raw block member.
 
 ### KR-978 · The unchecked door is not a rule
 anchor: vendor/lean4-src/src/kernel/environment.cpp:275 (lean_add_decl) expect="lean_add_decl"
-fixtures: stub owner=franken_lean-z6c
+fixtures: crates/fln-kernel/tests/checked_declaration_capability.rs, crates/fln-kernel/tests/consensus_seat.rs, crates/fln-kernel/tests/k1_judgments.rs
 The Reference exposes an add-without-checking entry point. In FrankenLean nothing
 outside `fln-kernel` can admit a constant (FL-INV-02); trust-level bypasses are
-journaled and surfaced in receipts, never silent (plan §4.1 wire/CLI row).
+journaled and surfaced in receipts, never silent (plan §4.1 wire/CLI row). An
+acceptance mints a private, non-serializable, single-use capability bound to the
+exact declaration and immutable base environment; council agreement is the only
+transition to publication. Multi-constant declarations stage their checked rows in
+private persistent environments and expose only the complete final environment.
+A duplicate, resource stop, cancellation, or internal fault at any member exposes
+no accepted prefix.
 
 ---
 

@@ -1,5 +1,5 @@
 //! Property and metamorphic laws for the owned bignum core (bead
-//! `franken_lean-npl`, KR-313 / plan §8.4).
+//! `franken_lean-npl` / `fln-msou`, KR-313 / plan §8.4).
 //!
 //! `fln-bignum` replaces GMP under every literal the kernel reduces, so a defect
 //! here is kernel-critical: it does not produce a wrong answer in one tactic, it
@@ -25,11 +25,13 @@
 //! Deterministic and replayable: fixed seeds, a dependency-free generator (D1
 //! covers the apparatus too), and every failure prints the operands in decimal
 //! and limb form plus the seed and trial that produced them.
+//! Dedicated wide cases straddle both multiplication crossovers, so optimized
+//! paths cannot hide above the small independent model's ceiling.
 
 #![forbid(unsafe_code)]
 
 use fln_bignum::interop::{bignat_from_literal, literal_from_bignat};
-use fln_bignum::nat::BigNat;
+use fln_bignum::nat::{BigNat, BigNatView, KARATSUBA_THRESHOLD, TOOM3_THRESHOLD};
 
 // ---------------------------------------------------------------------------
 // Deterministic generation
@@ -72,6 +74,14 @@ impl SplitMix64 {
         let limbs: Vec<u64> = (0..count).map(|_| self.limb()).collect();
         BigNat::from_limbs_le(limbs)
     }
+
+    fn bignat_exact(&mut self, limb_count: usize) -> BigNat {
+        let mut limbs: Vec<u64> = (0..limb_count).map(|_| self.limb()).collect();
+        if let Some(top) = limbs.last_mut() {
+            *top |= 1 << 63;
+        }
+        BigNat::from_limbs_le(limbs)
+    }
 }
 
 const SEEDS: [u64; 3] = [
@@ -80,9 +90,11 @@ const SEEDS: [u64; 3] = [
     0xfeed_face_cafe_d00d,
 ];
 const TRIALS: usize = 200;
-/// Operands stay small enough that `mul`, `pow` and the division loop are cheap;
-/// the laws do not get truer with wider inputs, and the corpus covers width.
-const MAX_LIMBS: u64 = 4;
+/// The general law suite spans enough limbs to exercise carries and quotient
+/// estimates beyond the tiny model. Dedicated crossover tests below reach the
+/// much wider Karatsuba and Toom boundaries without making every property case
+/// pay that cost.
+const MAX_LIMBS: u64 = 12;
 
 /// Values that sit exactly on the representation's seams: zero and one, the top
 /// and bottom of a limb, both sides of every limb boundary up to three limbs,
@@ -428,6 +440,48 @@ fn addition_and_multiplication_form_a_commutative_semiring() {
 }
 
 #[test]
+fn crossover_widths_preserve_semiring_division_and_gcd_laws() {
+    let widths = [
+        KARATSUBA_THRESHOLD - 1,
+        KARATSUBA_THRESHOLD,
+        KARATSUBA_THRESHOLD + 1,
+        TOOM3_THRESHOLD - 1,
+        TOOM3_THRESHOLD,
+        TOOM3_THRESHOLD + 1,
+    ];
+    let mut rng = SplitMix64(0x4352_4f53_534f_5645);
+    for width in widths {
+        let a = rng.bignat_exact(width);
+        let b = rng.bignat_exact(width);
+        let c = rng.bignat_exact(width);
+        assert_eq!(
+            a.mul(&b),
+            b.mul(&a),
+            "multiplication is commutative at width {width}"
+        );
+        assert_eq!(
+            a.mul(&b.add(&c)),
+            a.mul(&b).add(&a.mul(&c)),
+            "multiplication distributes at width {width}"
+        );
+
+        let product = a.mul(&b);
+        let (quotient, remainder) = product.div_rem(&a);
+        assert_eq!(quotient, b, "exact quotient at width {width}");
+        assert!(remainder.is_zero(), "exact remainder at width {width}");
+
+        if width <= KARATSUBA_THRESHOLD + 1 {
+            let common = rng.bignat_exact(2);
+            assert_eq!(
+                a.mul(&common).gcd(&b.mul(&common)),
+                a.gcd(&b).mul(&common),
+                "gcd scaling law at width {width}"
+            );
+        }
+    }
+}
+
+#[test]
 fn powers_agree_with_repeated_multiplication_and_split_over_exponents() {
     for seed in SEEDS {
         let mut rng = SplitMix64(seed);
@@ -727,6 +781,66 @@ fn decimal_limb_and_literal_round_trips_preserve_the_value() {
             check(&a, &format!("seed {seed:#x} trial {trial}"));
         }
     }
+}
+
+#[test]
+fn borrowed_limb_views_alias_storage_and_match_owned_arithmetic() {
+    let mut checked = 0usize;
+    for seed in SEEDS {
+        let mut rng = SplitMix64(seed);
+        for trial in 0..TRIALS {
+            let a_count = rng.below(MAX_LIMBS + 1);
+            let b_count = rng.below(MAX_LIMBS + 1);
+            let mut a_limbs: Vec<u64> = (0..a_count).map(|_| rng.limb()).collect();
+            let mut b_limbs: Vec<u64> = (0..b_count).map(|_| rng.limb()).collect();
+            // Force redundant top zeros regularly. The borrowed constructor
+            // must normalize by shortening the slice, never by allocating.
+            if trial % 3 == 0 {
+                a_limbs.extend([0, 0]);
+            }
+            if trial % 5 == 0 {
+                b_limbs.push(0);
+            }
+            let a_view = BigNatView::from_limbs_le(&a_limbs);
+            let b_view = BigNatView::from_limbs_le(&b_limbs);
+            let a = BigNat::from_limbs_le(a_limbs.clone());
+            let b = BigNat::from_limbs_le(b_limbs.clone());
+            let origin = format!("seed {seed:#x} trial {trial}");
+
+            assert_eq!(a_view.limbs_le(), a.limbs_le(), "{origin}: a view");
+            assert_eq!(b_view.limbs_le(), b.limbs_le(), "{origin}: b view");
+            if !a_view.is_zero() {
+                assert_eq!(
+                    a_view.limbs_le().as_ptr(),
+                    a_limbs.as_ptr(),
+                    "{origin}: a view copied its storage"
+                );
+            }
+            if !b_view.is_zero() {
+                assert_eq!(
+                    b_view.limbs_le().as_ptr(),
+                    b_limbs.as_ptr(),
+                    "{origin}: b view copied its storage"
+                );
+            }
+
+            assert_eq!(a_view.beq(b_view), a.beq(&b), "{origin}: equality");
+            assert_eq!(a_view.ble(b_view), a.ble(&b), "{origin}: ordering");
+            assert_eq!(a_view.add(b_view), a.add(&b), "{origin}: addition");
+            assert_eq!(a_view.sub(b_view), a.sub(&b), "{origin}: subtraction");
+            assert_eq!(a_view.mul(b_view), a.mul(&b), "{origin}: multiplication");
+            assert_eq!(a_view.div_rem(b_view), a.div_rem(&b), "{origin}: division");
+            let exponent = rng.below(5) as u32;
+            assert_eq!(
+                a_view.checked_pow(exponent),
+                a.checked_pow(exponent),
+                "{origin}: power"
+            );
+            assert_eq!(a_view.to_owned(), a, "{origin}: explicit ownership");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, SEEDS.len() * TRIALS, "anti-vacuity floor");
 }
 
 // ---------------------------------------------------------------------------

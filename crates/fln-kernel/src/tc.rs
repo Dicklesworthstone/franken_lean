@@ -11,11 +11,12 @@
 //! Bool.true-reflection machinery in defeq, wired to fln-bignum), String literal
 //! expansion (KR-314: recursor major, projection scrutinee, and the defeq
 //! `String.ofList` rung), unit-like eta (KR-315), structure eta in defeq
-//! (KR-903), and declaration admission for axioms, definitions, and theorems
-//! (KR-970..974). `reduce_native` (`Lean.reduceBool`/`Lean.reduceNat` — the
-//! native_decide trust surface), opaque/mutual admission, and receipts are
-//! follow-up slices; none of their absence widens acceptance — an unimplemented
-//! reduction can only make defeq FAIL (a rejection), never succeed.
+//! (KR-903), and declaration admission for axioms, definitions, theorems,
+//! opaques, and non-safe mutual definitions (KR-970..977). `reduce_native`
+//! (`Lean.reduceBool`/`Lean.reduceNat` — the native_decide trust surface) and
+//! receipts are follow-up slices; neither absence widens acceptance — an
+//! unimplemented reduction can only make defeq FAIL (a rejection), never
+//! succeed.
 //!
 //! Traversal discipline (§8.2c): every recursive descent charges the step budget
 //! and carries an explicit depth that is checked BEFORE descending, so

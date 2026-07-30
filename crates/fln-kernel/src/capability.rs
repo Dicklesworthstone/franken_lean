@@ -50,7 +50,7 @@
 use crate::verdict::{Consumption, RejectClass, Verdict};
 use crate::{Declaration, check};
 use fln_core::name::Name;
-use fln_core::outcome::Outcome;
+use fln_core::outcome::{InternalFault, Outcome};
 use fln_env::constants::ConstantInfo;
 use fln_env::environment::{DeclarationBudget, DeclarationCommitted, DeclarationPlan, Environment};
 use fln_env::modules::CancellationProbe;
@@ -166,11 +166,54 @@ pub enum Published {
     Committed(DeclarationCommitted),
     /// The base already holds this name. Nothing published.
     DuplicateName { name: Name },
-    /// This declaration form publishes several constants at once and the bound
-    /// handoff for blocks is not built yet. **Nothing is published** — refusing
-    /// is safe, whereas publishing a block through a per-constant path that
-    /// never checked the block as a unit would not be.
-    BlockHandoffUnavailable,
+    /// Every member of one kernel-checked block committed, and only the final
+    /// environment is exposed.
+    BlockCommitted(BlockPublication),
+}
+
+/// The atomic publication of one multi-constant declaration.
+///
+/// `names` preserves the declaration's source order for receipts and
+/// diagnostics. No intermediate environment is retained here: a caller can
+/// either carry the complete block forward or carry none of it.
+#[derive(Debug, Clone)]
+pub struct BlockPublication {
+    /// The one immutable environment containing the complete checked block.
+    pub environment: Environment,
+    /// Every published constant name, in the block's checked order.
+    pub names: Vec<Name>,
+}
+
+/// The constants one checked declaration is allowed to publish.
+///
+/// Keeping the single/block distinction after moving the declaration matters:
+/// a one-member mutual block is still one block authority transition, not a
+/// single declaration that happened to arrive in a vector.
+enum PublicationUnits {
+    Single(ConstantInfo),
+    Block(Vec<ConstantInfo>),
+}
+
+fn publication_units(decl: Declaration) -> PublicationUnits {
+    match decl {
+        Declaration::Axiom(v) => PublicationUnits::Single(ConstantInfo::Axiom(v)),
+        Declaration::Defn(v) => PublicationUnits::Single(ConstantInfo::Defn(v)),
+        Declaration::Thm(v) => PublicationUnits::Single(ConstantInfo::Thm(v)),
+        Declaration::Opaque(v) => PublicationUnits::Single(ConstantInfo::Opaque(v)),
+        Declaration::Mutual(definitions) => {
+            PublicationUnits::Block(definitions.into_iter().map(ConstantInfo::Defn).collect())
+        }
+        Declaration::Inductive(block) => {
+            let mut constants = Vec::new();
+            constants.extend(block.types.into_iter().map(ConstantInfo::Induct));
+            constants.extend(block.ctors.into_iter().map(ConstantInfo::Ctor));
+            constants.extend(block.recursors.into_iter().map(ConstantInfo::Rec));
+            PublicationUnits::Block(constants)
+        }
+        Declaration::Quotient(declarations) => {
+            PublicationUnits::Block(declarations.into_iter().map(ConstantInfo::Quot).collect())
+        }
+    }
 }
 
 /// The single admission authority: check, and on acceptance mint the capability
@@ -230,16 +273,6 @@ impl<'env> CheckedDecl<'env> {
         self.decl.name()
     }
 
-    /// The single constant this declaration publishes, if it publishes one.
-    fn single_constant(&self) -> Option<ConstantInfo> {
-        match &self.decl {
-            Declaration::Axiom(v) => Some(ConstantInfo::Axiom(v.clone())),
-            Declaration::Defn(v) => Some(ConstantInfo::Defn(v.clone())),
-            Declaration::Thm(v) => Some(ConstantInfo::Thm(v.clone())),
-            Declaration::Inductive(_) | Declaration::Quotient(_) => None,
-        }
-    }
-
     /// Publish, consuming the capability.
     ///
     /// Takes no environment: it publishes into the base it was checked against.
@@ -254,27 +287,88 @@ impl<'env> CheckedDecl<'env> {
         collisions: CollisionBudget,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Outcome<Published> {
-        let Some(info) = self.single_constant() else {
-            return Outcome::complete(Published::BlockHandoffUnavailable);
-        };
-        match self
-            .base
-            .plan_add_decl(info, budget, collisions, cancellation)
-        {
-            Outcome::Complete(DeclarationPlan::Prepared(plan)) => {
-                match plan.commit(self.base, cancellation) {
-                    Outcome::Complete(committed) => {
-                        Outcome::complete(Published::Committed(committed))
+        let CheckedDecl {
+            base,
+            decl,
+            consumption: _,
+            budget: _,
+            _seal: _,
+        } = self;
+        match publication_units(decl) {
+            PublicationUnits::Single(info) => {
+                match base.plan_add_decl(info, budget, collisions, cancellation) {
+                    Outcome::Complete(DeclarationPlan::Prepared(plan)) => {
+                        match plan.commit(base, cancellation) {
+                            Outcome::Complete(committed) => {
+                                Outcome::complete(Published::Committed(committed))
+                            }
+                            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                        }
+                    }
+                    Outcome::Complete(DeclarationPlan::DuplicateName { name }) => {
+                        Outcome::complete(Published::DuplicateName { name })
                     }
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
                 }
             }
-            Outcome::Complete(DeclarationPlan::DuplicateName { name }) => {
-                Outcome::complete(Published::DuplicateName { name })
+            PublicationUnits::Block(constants) => {
+                publish_block(base, constants, budget, collisions, cancellation)
             }
-            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         }
     }
+}
+
+/// Publish one already-checked block without ever exposing an accepted prefix.
+///
+/// Each `plan_add_decl`/`commit` pair produces an immutable staged environment.
+/// Those values remain private locals until every member succeeds; duplicate,
+/// resource, cancellation, and internal-fault paths drop the staged value and
+/// return no environment. The existing declaration and collision budgets apply
+/// to each member exactly as they do to a single declaration, while the kernel
+/// check that minted this capability already bounded and accepted the block as
+/// a unit.
+fn publish_block(
+    base: &Environment,
+    constants: Vec<ConstantInfo>,
+    budget: DeclarationBudget,
+    collisions: CollisionBudget,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<Published> {
+    if constants.is_empty() {
+        return Outcome::InternalFault(InternalFault::new(
+            "FL-INV-02",
+            "the kernel accepted a block with no constants to publish",
+        ));
+    }
+
+    let mut staged = base.clone();
+    let mut names = Vec::with_capacity(constants.len());
+    for info in constants {
+        let name = info.name().clone();
+        let plan = match staged.plan_add_decl(info, budget, collisions, cancellation) {
+            Outcome::Complete(DeclarationPlan::Prepared(plan)) => plan,
+            Outcome::Complete(DeclarationPlan::DuplicateName { name }) => {
+                return Outcome::complete(Published::DuplicateName { name });
+            }
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        };
+        match plan.commit(&staged, cancellation) {
+            Outcome::Complete(DeclarationCommitted::Published(publication)) => {
+                staged = publication.environment;
+                names.push(name);
+            }
+            Outcome::Complete(DeclarationCommitted::DuplicateName { name }) => {
+                return Outcome::complete(Published::DuplicateName { name });
+            }
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        }
+    }
+    Outcome::complete(Published::BlockCommitted(BlockPublication {
+        environment: staged,
+        names,
+    }))
 }
