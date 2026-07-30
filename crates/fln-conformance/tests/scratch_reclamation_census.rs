@@ -271,11 +271,11 @@ fn every_family_row_is_bound_to_its_source() {
     // grow without a deliberate edit to this census.
     assert_eq!(
         SCRATCH_FAMILIES.len(),
-        14,
-        "the workspace declares exactly 14 scratch families; a change here is a \
+        15,
+        "the workspace declares exactly 15 scratch families; a change here is a \
          deliberate, disclosed act"
     );
-    assert_eq!(routed, 11, "exactly 11 producers route through ScratchRoot");
+    assert_eq!(routed, 12, "exactly 12 producers route through ScratchRoot");
     remainder_prefixes.sort_unstable();
     assert_eq!(
         remainder_prefixes,

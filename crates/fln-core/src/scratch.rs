@@ -129,6 +129,9 @@ pub const CORE_SELFTEST_PREFIX: &str = "fln-core-scratch-selftest-";
 pub const EPOCH_LAB_PREFIX: &str = "fln-epoch-lab-";
 /// `tribunal/epoch-lab/tests/derived_input_provenance.rs` — the synthetic workspaces.
 pub const DERIVE_PREFIX: &str = "fln-derive-";
+/// `crates/fln-vm/tests/extern_dispatch_no_mock_e2e.rs` — the extern dispatch e2e's
+/// mirror-tree roots (bead `franken_lean-pw6t`).
+pub const EXTERN_E2E_PREFIX: &str = "fln-extern-e2e-";
 
 /// One scratch-root namespace: its prefix, the constant producers name it by, the source
 /// that produces it, and whether that source routes through [`ScratchRoot`].
@@ -217,6 +220,12 @@ pub const SCRATCH_FAMILIES: &[ScratchFamily] = &[
         prefix: CORE_SELFTEST_PREFIX,
         constant: "CORE_SELFTEST_PREFIX",
         producer: "crates/fln-core/src/scratch.rs",
+        routed: true,
+    },
+    ScratchFamily {
+        prefix: EXTERN_E2E_PREFIX,
+        constant: "EXTERN_E2E_PREFIX",
+        producer: "crates/fln-vm/tests/extern_dispatch_no_mock_e2e.rs",
         routed: true,
     },
     // --- declared remainders; each one's reason is in the module header. A row here
@@ -545,8 +554,8 @@ mod tests {
              producer"
         );
         assert!(
-            routed >= 11,
-            "at least eleven producers route through ScratchRoot; found {routed}"
+            routed >= 12,
+            "at least twelve producers route through ScratchRoot; found {routed}"
         );
 
         // Prefixes are distinct, and no prefix is a prefix of another — otherwise one

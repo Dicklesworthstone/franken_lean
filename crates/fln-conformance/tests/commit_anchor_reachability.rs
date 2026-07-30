@@ -45,10 +45,11 @@
 //!   — the cry-wolf failure this repository has already measured twice. The file is disclosed
 //!   with a **floor** rather than an equality: it may churn upward freely and may not silently
 //!   vanish, which is a broken scan rather than a clean tree.
-//! * **binary files** — `git grep -I`. Three `.olean` fixtures under `tribunal/fixtures/`
-//!   match the hex shape and emit `Binary file … matches` instead of a parsable record. Any
-//!   hex inside a compiled artifact is data, not a citation. The count is asserted, so a
-//!   fourth binary joining the tree is a disclosure change rather than a silent narrowing.
+//! * **binary files** — `git grep -I`. Nine `.olean` fixtures under `tribunal/fixtures/`
+//!   (three C3, six real-mathlib G0-1) match the hex shape and emit `Binary file … matches`
+//!   instead of a parsable record. Any hex inside a compiled artifact is data, not a
+//!   citation. The count is asserted, so a tenth binary joining the tree is a disclosure
+//!   change rather than a silent narrowing.
 //!
 //! # The direction of the binding, which is not the same as its neighbour's
 //!
@@ -131,8 +132,9 @@ const EXCLUDED: &[&str] = &[":!vendor", ":!.beads/issues.jsonl"];
 const BEADS_BACKUP_ONLY_FLOOR: usize = 90;
 
 /// Binary files the harvest cannot parse, asserted so a fourth is a disclosure change rather
-/// than a silent narrowing of the denominator.
-const BINARY_FILES_SKIPPED: usize = 3;
+/// than a silent narrowing of the denominator. Nine at `b4409be2`: the three C3 `.olean`
+/// fixtures plus the six real-mathlib G0-1 fixtures under `tribunal/fixtures/mathlib/`.
+const BINARY_FILES_SKIPPED: usize = 9;
 
 /// Anti-vacuity floors on the *denominator*. A repaired population can legitimately drive the
 /// finding count to zero; nothing can legitimately drive these to zero except a broken scan.
