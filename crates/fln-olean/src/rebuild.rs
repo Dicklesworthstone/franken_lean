@@ -304,6 +304,91 @@ mod tests {
         );
     }
 
+    /// Locate the pinned Reference stdlib (the kernel_replay pattern): override
+    /// with FLN_REFERENCE_LIB, default to the elan-installed pin, typed skip
+    /// when absent — the committed pilot covers the format; this cell is the
+    /// corpus-scale claim.
+    fn reference_lib() -> Option<std::path::PathBuf> {
+        if let Ok(dir) = std::env::var("FLN_REFERENCE_LIB") {
+            let p = std::path::PathBuf::from(dir);
+            return p.is_dir().then_some(p);
+        }
+        let home = std::env::var("HOME").ok()?;
+        let p = std::path::PathBuf::from(home)
+            .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean");
+        p.is_dir().then_some(p)
+    }
+
+    #[test]
+    fn every_shipped_stdlib_olean_rebuilds_byte_identical() {
+        // The corpus-scale half of acceptance (a): EVERY shipped olean — no
+        // sampling, because a filter that continues is a sampler — rebuilds
+        // byte-identical, with every finding named. Typed skip without the pin.
+        let Some(lib) = reference_lib() else {
+            eprintln!("SKIP: pinned Reference stdlib not installed");
+            return;
+        };
+        let mut paths = Vec::new();
+        let mut stack = vec![lib];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("readable stdlib dir") {
+                let p = entry.expect("dir entry").path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|e| e == "olean") {
+                    paths.push(p);
+                }
+            }
+        }
+        paths.sort();
+        assert!(
+            paths.len() > 2000,
+            "anti-vacuity: the pinned stdlib ships >2400 oleans, found {}",
+            paths.len()
+        );
+        let mut identical = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        let mut findings: Vec<String> = Vec::new();
+        for p in &paths {
+            let bytes = std::fs::read(p).expect("readable olean");
+            match rebuild(&bytes) {
+                Ok((out, report)) => {
+                    if out == bytes {
+                        identical += 1;
+                    } else {
+                        let first = out
+                            .iter()
+                            .zip(bytes.iter())
+                            .position(|(a, b)| a != b)
+                            .map(|i| i as i64)
+                            .unwrap_or(-1);
+                        failures.push(format!("{}: diverges at byte {first}", p.display()));
+                    }
+                    for f in report.findings {
+                        findings.push(format!("{}: {f}", p.display()));
+                    }
+                }
+                Err(e) => failures.push(format!("{}: refused: {e:?}", p.display())),
+            }
+            if failures.len() > 10 {
+                break; // ten named failures is a report, not a sampler
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "rebuild failures ({} of {} identical):\n{}",
+            identical,
+            paths.len(),
+            failures.join("\n")
+        );
+        assert_eq!(identical, paths.len());
+        assert!(
+            findings.is_empty(),
+            "named findings (candidate freedom rows):\n{}",
+            findings.join("\n")
+        );
+    }
+
     #[test]
     fn a_flipped_pointer_field_is_refused_not_reproduced() {
         // Corrupt one high byte of the root slot's pointer: deref must refuse
