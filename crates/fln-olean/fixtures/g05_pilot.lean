@@ -7,3 +7,5 @@ structure P where
   x : Nat
   y : Nat
 def area (p : P) : Nat := p.x * p.y
+def big : Nat := 123456789012345678901234567890123456789
+def uni : String := "héllo — ∀ε>0 ∃δ"

@@ -292,15 +292,30 @@ mod tests {
             "rebuild diverges at byte {first_diff:?}; report: {report:#?}"
         );
         // The identity is not a copy: most of the file is re-derived.
-        assert!(report.objects > 100, "anti-vacuity: {report:#?}");
-        assert!(
-            report.rederived_bytes > report.copied_string_bytes + report.copied_ctor_tail_bytes,
-            "re-derivation must dominate declared copies: {report:#?}"
+        // The full accounting, pinned from measurement (a regenerated fixture
+        // moves these WITH the fixture, in one commit). The mutation campaign's
+        // design pass demanded exact pins: without them, a mutant that shuffles
+        // bytes between accounting classes (slack vs padding) survives because
+        // the byte-diff cannot see bookkeeping.
+        assert_eq!(report.objects, 2407, "object census");
+        assert_eq!(report.rederived_bytes, 69_888, "re-derived census");
+        assert_eq!(report.copied_string_bytes, 1_315, "string census");
+        assert_eq!(report.copied_sarray_bytes, 0, "sarray census");
+        assert_eq!(report.copied_ctor_tail_bytes, 14_576, "ctor-tail census");
+        assert_eq!(
+            report.copied_mpz_limb_bytes, 16,
+            "mpz-limb census (the big literal)"
         );
+        assert_eq!(report.padding_bytes, 589, "padding census");
         assert_eq!(
             report.nonzero_padding_bytes, 0,
-            "nonzero padding would be a hidden freedom: {:?}",
-            report.findings
+            "nonzero padding is a hidden freedom"
+        );
+        assert_eq!(report.slack_bytes, 0, "slack census");
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            report.rederived_bytes > report.copied_string_bytes + report.copied_ctor_tail_bytes,
+            "re-derivation must dominate declared copies"
         );
     }
 
