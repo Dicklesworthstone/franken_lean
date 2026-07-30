@@ -327,7 +327,11 @@ const LANE_CITED_ROWS: usize = 1;
 /// These are the machine-resolvable ones. They are held by a **ratchet**: a row that
 /// resolves today must keep resolving, because if the test it cites is renamed or deleted
 /// the row reclassifies as prose and the counts below move, which fails.
-const SYMBOL_RESOLVED_ROWS: usize = 59;
+///
+/// 59 -> 58 at `c2f6f17a` (franken_lean-npl): FLN-UL-0033's evidence rewrite dropped the
+/// `mpz_view` citation (the function still exists; the row no longer names it), moving the
+/// row from symbol-resolved to prose.
+const SYMBOL_RESOLVED_ROWS: usize = 58;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -337,7 +341,12 @@ const SYMBOL_RESOLVED_ROWS: usize = 59;
 /// before this constant existed. Counting tokens makes each citation individually
 /// accountable — the difference between "this row still cites something real" and "every
 /// symbol this row names still exists".
-const RESOLVING_CITATION_TOKENS: usize = 71;
+///
+/// 71 -> 70 at `c2f6f17a` (franken_lean-npl): the FLN-UL-0033 evidence rewrite dropped the
+/// `mpz_view` citation — the function still exists in fln-unsafe-abi, and the row's checks
+/// stand; what changed is that the row no longer names it. Measured by diffing the two
+/// rows' resolving tokens across the edit.
+const RESOLVING_CITATION_TOKENS: usize = 70;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -346,7 +355,11 @@ const RESOLVING_CITATION_TOKENS: usize = 71;
 /// "declared, not silent" is supposed to prevent. Pinned exactly and in both directions, so
 /// a new prose row fails and a prose row converted to a resolvable citation ALSO fails until
 /// the numbers move — the remainder shrinks deliberately or not at all.
-const PROSE_EVIDENCE_ROWS: usize = 120;
+///
+/// 120 -> 121 at `c2f6f17a` (franken_lean-npl): FLN-UL-0033 moved here from symbol-resolved
+/// when its evidence stopped naming `mpz_view` — a citation removal by the row's own author,
+/// measured, not silent.
+const PROSE_EVIDENCE_ROWS: usize = 121;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\

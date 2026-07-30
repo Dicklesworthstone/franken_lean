@@ -691,7 +691,10 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         sites: &SITES_GOLEM,
         claim_type: ClaimType::BoundedModel,
         state: ClaimState::Hypothesis,
-        evidence: "crates/fln-vm and crates/fln-elab are 6-line charter stubs. The Parity \
+        evidence: "crates/fln-elab is still a charter stub, and crates/fln-vm now carries the \
+                   W5 extern row schema and dispatch foundation (franken_lean-pw6t, 066127e6: \
+                   the 954-row generated table, the registry, five suites) but no FLBC \
+                   interpreter or value model — so tactics execute nowhere yet. The Parity \
                    Ledger's 94 rows are term-plane observables (Lean.Name.hash, \
                    Lean.Level.normalize, Lean.Expr.data) against the pinned binary — the \
                    right shape of evidence, and not tactic execution.",
@@ -788,7 +791,7 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 /// floor under it.
 ///
 /// [`every_row_cites_a_checkable_fact`]: ../../tests/witness_claim_matrix.rs
-pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 18] = [
     // How many rows depend on the disputed definition. The sites pin the two definitions;
     // this pins the population, and it fires the moment ANY row's level moves — which is
     // exactly when "85 of 94, and zero under the plan's reading" stops being true.
@@ -822,13 +825,6 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
         Citation::FileAtLeastLines {
             path: "crates/fln-server/src/lib.rs",
             min_lines: 300,
-        },
-    ),
-    (
-        "TACTICS-ON-GOLEM",
-        Citation::FileAtMostLines {
-            path: "crates/fln-vm/src/lib.rs",
-            max_lines: 10,
         },
     ),
     (
