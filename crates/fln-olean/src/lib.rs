@@ -26,4 +26,5 @@
 
 pub mod decl;
 pub mod format;
+pub mod rebuild;
 pub mod region;
