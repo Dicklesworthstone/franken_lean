@@ -476,11 +476,12 @@ mod tests {
         let mut string_off = None;
         let mut probe = data_start + 8;
         while probe + 8 < PILOT.len() as u64 {
-            if let Ok((tag, _, _)) = view.obj_header(probe) {
-                if tag == abi::TAG_STRING && view.read_u64(probe + 8).unwrap_or(0) > 1 {
-                    string_off = Some(probe);
-                    break;
-                }
+            if let Ok((tag, _, _)) = view.obj_header(probe)
+                && tag == abi::TAG_STRING
+                && view.read_u64(probe + 8).unwrap_or(0) > 1
+            {
+                string_off = Some(probe);
+                break;
             }
             probe += 8;
         }
