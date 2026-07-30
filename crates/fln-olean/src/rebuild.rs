@@ -146,7 +146,10 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
                 }
             }
             // Unused capacity is slack: measured and copied, never assumed.
-            let slack = (capacity - size) * 8;
+            let slack = capacity.checked_sub(size).ok_or(RegionError::DecodeShape {
+                offset: off,
+                reason: "array size exceeds capacity",
+            })? * 8;
             if slack > 0 {
                 out.extend_from_slice(view.read_bytes(off + 24 + 8 * size, slack)?);
                 report.slack_bytes += slack;
@@ -161,7 +164,10 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             let payload = size * elem;
             out.extend_from_slice(view.read_bytes(off + 24, payload)?);
             report.copied_sarray_bytes += payload;
-            let slack = (capacity - size) * elem;
+            let slack = capacity.checked_sub(size).ok_or(RegionError::DecodeShape {
+                offset: off,
+                reason: "scalar-array size exceeds capacity",
+            })? * elem;
             if slack > 0 {
                 out.extend_from_slice(view.read_bytes(off + 24 + payload, slack)?);
                 report.slack_bytes += slack;
@@ -176,7 +182,10 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             out.extend_from_slice(&length.to_le_bytes());
             out.extend_from_slice(view.read_bytes(off + 32, size)?);
             report.copied_string_bytes += size;
-            let slack = capacity - size;
+            let slack = capacity.checked_sub(size).ok_or(RegionError::DecodeShape {
+                offset: off,
+                reason: "string size exceeds capacity",
+            })?;
             if slack > 0 {
                 out.extend_from_slice(view.read_bytes(off + 32 + size, slack)?);
                 report.slack_bytes += slack;
@@ -415,6 +424,76 @@ mod tests {
             rebuild(&bad).is_err(),
             "a corrupted root pointer must refuse"
         );
+    }
+
+    #[test]
+    fn a_nonzero_padding_byte_is_reported_and_still_reproduced() {
+        // The finding path guards an empty population (pilot and the whole
+        // 2433-file corpus both measure zero nonzero-padding), so only a plant
+        // keeps it alive — the repaired-population lesson. Scan for the first
+        // inter-object pad byte by flipping candidates until the report says
+        // exactly one nonzero pad byte; the rebuild must still reproduce it
+        // (padding is copied) while NAMING it.
+        let mut found = false;
+        for i in (crate::format::OLEAN_HEADER_SIZE + 8)..PILOT.len() {
+            let mut planted = PILOT.to_vec();
+            if planted[i] != 0 {
+                continue;
+            }
+            planted[i] = 0xAA;
+            let Ok((out, report)) = rebuild(&planted) else {
+                continue; // flipped a structural zero, not padding
+            };
+            if report.nonzero_padding_bytes == 1 {
+                assert_eq!(out, planted, "padding must be reproduced, not laundered");
+                assert!(
+                    report
+                        .findings
+                        .iter()
+                        .any(|f| f.contains("nonzero padding")),
+                    "the finding must be NAMED: {:?}",
+                    report.findings
+                );
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "no pad byte locatable — the plant lost its population"
+        );
+    }
+
+    #[test]
+    fn a_string_whose_size_exceeds_capacity_refuses_typed() {
+        // The campaign's M9: relaxing checked_sub to saturating_sub survived
+        // every other cell because nothing constructs the inconsistent shape.
+        // Locate a real string object in the pilot and corrupt its capacity
+        // below its size: the rebuild must REFUSE, never saturate slack to
+        // zero and reproduce a structurally-lying object.
+        let view = OleanView::parse(PILOT).expect("pilot parses");
+        let data_start = crate::format::OLEAN_HEADER_SIZE as u64;
+        let mut string_off = None;
+        let mut probe = data_start + 8;
+        while probe + 8 < PILOT.len() as u64 {
+            if let Ok((tag, _, _)) = view.obj_header(probe) {
+                if tag == abi::TAG_STRING && view.read_u64(probe + 8).unwrap_or(0) > 1 {
+                    string_off = Some(probe);
+                    break;
+                }
+            }
+            probe += 8;
+        }
+        let off = string_off.expect("the pilot contains a string object") as usize;
+        let mut bad = PILOT.to_vec();
+        bad[off + 16..off + 24].copy_from_slice(&0u64.to_le_bytes());
+        match rebuild(&bad) {
+            Err(RegionError::DecodeShape { reason, .. }) => {
+                assert!(reason.contains("capacity"), "wrong refusal: {reason}");
+            }
+            Err(other) => panic!("refused, but not by the capacity law: {other:?}"),
+            Ok(_) => panic!("a size>capacity string was rebuilt instead of refused"),
+        }
     }
 
     #[test]
