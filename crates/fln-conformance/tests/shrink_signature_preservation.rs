@@ -51,7 +51,7 @@ fn chunk_removals(input: &String) -> Vec<String> {
 
 /// Fails with "contains X" when the input has one; fails with "too long" when it
 /// does not but is long; passes otherwise. Two signatures, so drift is observable.
-fn toy_oracle(input: &String) -> ShrinkVerdict {
+fn toy_oracle(input: &str) -> ShrinkVerdict {
     if input.contains('X') {
         ShrinkVerdict::Failure(sig("contains-X"))
     } else if input.len() > 12 {
@@ -68,7 +68,7 @@ fn a_shrink_reduces_to_a_minimum_with_the_signature_intact() {
             "aaaaXXXXaaaaaaaaaaaaaaaa".to_string(),
             |s: &String| s.len(),
             chunk_removals,
-            toy_oracle,
+            |input: &String| toy_oracle(input),
         )
         .expect("the original fails");
     assert_eq!(report.signature, sig("contains-X"));
@@ -81,10 +81,17 @@ fn a_shrink_reduces_to_a_minimum_with_the_signature_intact() {
     assert!(report.local_minimum, "it stopped at a local minimum");
     // The lineage is monotone decreasing — every accepted step really shrank.
     for pair in report.lineage.windows(2) {
-        assert!(pair[1] < pair[0], "lineage is monotone: {:?}", report.lineage);
+        assert!(
+            pair[1] < pair[0],
+            "lineage is monotone: {:?}",
+            report.lineage
+        );
     }
     // And the final candidate still fails with the preserved signature.
-    assert!(matches!(toy_oracle(&"X".to_string()), ShrinkVerdict::Failure(_)));
+    assert!(matches!(
+        toy_oracle(&"X".to_string()),
+        ShrinkVerdict::Failure(_)
+    ));
 }
 
 #[test]
@@ -92,7 +99,12 @@ fn a_signature_drift_is_never_accepted() {
     // The only way to shrink below the X is to drop it, which flips the failure to
     // "too-long" — a drift the shrink must refuse, so it stops with the X intact.
     let report = Shrinker { max_rounds: 64 }
-        .shrink("Xaaaaaaaaaaaaaaaaaaaa".to_string(), |s: &String| s.len(), chunk_removals, toy_oracle)
+        .shrink(
+            "Xaaaaaaaaaaaaaaaaaaaa".to_string(),
+            |s: &String| s.len(),
+            chunk_removals,
+            |input: &String| toy_oracle(input),
+        )
         .expect("the original fails");
     assert_eq!(report.signature, sig("contains-X"));
     assert!(
@@ -100,17 +112,26 @@ fn a_signature_drift_is_never_accepted() {
         "the X is never shrunk away: {:?}",
         report.lineage
     );
-    // Every accepted state still contains X — drift would have removed it.
+    // Every accepted state still contains X — replayed with the shrinker's own rule:
+    // at each round the accepted candidate is the first smaller candidate that fails
+    // with the preserved signature.
     let mut current = "Xaaaaaaaaaaaaaaaaaaaa".to_string();
     for &accepted in report.lineage.iter().skip(1) {
-        for candidate in chunk_removals(&current) {
-            if candidate.len() == accepted {
-                assert!(candidate.contains('X'), "an accepted state keeps the signature");
-                current = candidate;
-                break;
-            }
-        }
+        let next = chunk_removals(&current)
+            .into_iter()
+            .find(|candidate| {
+                candidate.len() < current.len()
+                    && candidate.len() == accepted
+                    && matches!(toy_oracle(candidate), ShrinkVerdict::Failure(s) if s == sig("contains-X"))
+            })
+            .expect("every lineage measure came from an accepted candidate");
+        assert!(next.contains('X'), "an accepted state keeps the signature");
+        current = next;
     }
+    assert!(
+        current.contains('X'),
+        "the final state keeps the X: a drift to 'too-long' was refused every time"
+    );
 }
 
 #[test]
@@ -118,7 +139,12 @@ fn a_passing_candidate_is_never_accepted() {
     // After shrinking to just "X", every further candidate is empty — which passes
     // the oracle. The shrink must keep the failure: the final state still fails.
     let report = Shrinker { max_rounds: 64 }
-        .shrink("XX".to_string(), |s: &String| s.len(), chunk_removals, toy_oracle)
+        .shrink(
+            "XX".to_string(),
+            |s: &String| s.len(),
+            chunk_removals,
+            |input: &String| toy_oracle(input),
+        )
         .expect("the original fails");
     assert_eq!(report.final_measure, 1, "it stops at one X, never at zero");
     assert!(report.local_minimum);
@@ -131,7 +157,7 @@ fn a_budget_stop_never_claims_a_minimum() {
             "aaaaXXXXaaaaaaaaaaaaaaaa".to_string(),
             |s: &String| s.len(),
             chunk_removals,
-            toy_oracle,
+            |input: &String| toy_oracle(input),
         )
         .expect("the original fails");
     assert!(
@@ -147,7 +173,7 @@ fn a_non_failing_original_has_nothing_to_preserve() {
         "ok".to_string(),
         |s: &String| s.len(),
         chunk_removals,
-        toy_oracle,
+        |input: &String| toy_oracle(input),
     );
     assert_eq!(report, None, "a passing input cannot be shrunk");
 }
@@ -169,7 +195,12 @@ fn a_resource_class_move_is_refused() {
         }
     };
     let report = Shrinker { max_rounds: 8 }
-        .shrink("Xabc".to_string(), |s: &String| s.len(), chunk_removals, oracle)
+        .shrink(
+            "Xabc".to_string(),
+            |s: &String| s.len(),
+            chunk_removals,
+            oracle,
+        )
         .expect("the original fails");
     assert_eq!(
         report.signature.resource,
@@ -186,12 +217,16 @@ fn a_resource_class_move_is_refused() {
 /// from the real `KillLedger::row_from_ndjson`. Two malformed rows that fail for
 /// different reasons have different signatures, so a shrink cannot wander from
 /// "missing field" into "unknown verdict" and call it the same bug.
-fn parser_signature(input: &String) -> ShrinkVerdict {
+fn parser_signature(input: &str) -> ShrinkVerdict {
     match KillLedger::row_from_ndjson(input) {
         Ok(_) => ShrinkVerdict::NotAFailure,
         Err(error) => {
             let text = format!("{error:?}");
-            let variant = text.split([' ', '{', '(']).next().unwrap_or("?").to_string();
+            let variant = text
+                .split([' ', '{', '('])
+                .next()
+                .unwrap_or("?")
+                .to_string();
             ShrinkVerdict::Failure(FailureSignature {
                 class: variant,
                 resource: ResourceClass::ShapeRefusal,
@@ -203,16 +238,20 @@ fn parser_signature(input: &String) -> ShrinkVerdict {
 #[test]
 fn the_real_target_shrink_a_malformed_ledger_row() {
     // A genuinely malformed row: valid shape, schema token destroyed by padding.
-    let original = format!(
-        "{{\"schema\":\"fln.mutation-kill-ledger/1-PADDED-WRONG-WRONG\",\
+    let original = "{\"schema\":\"fln.mutation-kill-ledger/1-PADDED-WRONG-WRONG\",\
          \"mutant_id\":\"m1\",\"source_root_digest\":\"a1b2c3d4\",\
          \"patch_digest\":\"e5f60718\",\"build_identity\":\"b\",\"target_path\":\"t\",\
          \"expected_discriminator\":\"d\",\"release_exclusion_proof\":\"p\",\
          \"disposition\":\"active\",\"exclusion_evidence\":\"\",\"verdict\":\"unrun\",\
-         \"not_a_kill\":\"\"}}"
-    );
+         \"not_a_kill\":\"\"}"
+        .to_string();
     let report = Shrinker { max_rounds: 200 }
-        .shrink(original.clone(), |s: &String| s.len(), chunk_removals, parser_signature)
+        .shrink(
+            original.clone(),
+            |s: &String| s.len(),
+            chunk_removals,
+            |input: &String| parser_signature(input),
+        )
         .expect("the padded row fails");
     assert_eq!(
         report.signature.class, "NdjsonInvalid",
