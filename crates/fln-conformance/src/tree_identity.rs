@@ -623,6 +623,7 @@ pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
     ("crates/fln-rt/tests/region_engine.rs", 1),
     ("crates/fln-rt/tests/region_fuzz.rs", 2),
     ("crates/fln-syntax/tests/golden_vellum.rs", 1),
+    ("crates/fln-unsafe-abi/src/tests.rs", 1),
     ("crates/fln-unsafe-region/src/tests.rs", 1),
     ("crates/fln-verdict/src/checker.rs", 1),
     ("crates/fln-verdict/tests/input_validation.rs", 1),

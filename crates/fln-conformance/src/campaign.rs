@@ -1065,3 +1065,302 @@ fn parse_json_string(input: &str) -> Result<(String, &str), CampaignError> {
     }
     Err(invalid("unterminated string"))
 }
+
+// ---------------------------------------------------------------------------
+// Framework 3: budgeted fuzz generation and replay
+// ---------------------------------------------------------------------------
+
+/// splitmix64 — the same eight lines the per-suite `common` modules carry, chosen
+/// because it has no state beyond a `u64` and passes the statistical bar for choosing
+/// test inputs. Promoted here so a campaign's seed means the same stream everywhere;
+/// the per-crate commons keep their copies until their owners migrate them (td9's
+/// adapters are downstream work, not this framework's).
+#[derive(Debug, Clone)]
+pub struct Splitmix64(u64);
+
+impl Splitmix64 {
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A value in `0..n`, or 0 when `n` is 0.
+    pub fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    /// `n` deterministic bytes.
+    pub fn bytes(&mut self, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            out.extend_from_slice(&self.next_u64().to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+}
+
+/// The budget a fuzz run answers to (td9: "budgeted fuzz generation/replay"). Every
+/// dimension is checked per case; meeting one stops the run and is *reported*, never
+/// silently truncated — a budget is an FL-INV-07 resource limit, and exhaustion is a
+/// typed answer, not a crash and not a quiet short count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuzzBudget {
+    /// The design's case count: reaching it is completion, not exhaustion.
+    pub max_cases: u64,
+    /// Largest single generated input, in bytes. A generator asking for more is
+    /// refused once and the run ends typed.
+    pub max_input_bytes: usize,
+    /// Wall-clock ceiling. Checked per case; a generator or oracle that hangs is
+    /// out of scope for the model (that is what the timeout kill-switch on the
+    /// *lane* is for), but a long series of slow cases is caught here.
+    pub max_duration: std::time::Duration,
+}
+
+/// Why a run stopped. `CasesCompleted` is the only successful end; everything else is
+/// a typed non-answer or a finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FuzzStop {
+    /// All `max_cases` cases ran with no failure.
+    CasesCompleted,
+    /// The wall-clock ceiling was met mid-run. Typed exhaustion (FL-INV-07).
+    DurationExhausted,
+    /// A generated input exceeded `max_input_bytes`. Typed exhaustion.
+    InputBytesExhausted { case_index: u64 },
+    /// The oracle failed on this case. The seed plus this index reproduce the
+    /// failing input exactly — a fuzz failure nobody can replay is a rumour.
+    FailureFound { case_index: u64, detail: String },
+}
+
+/// What the oracle says about one input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaseOutcome {
+    Pass,
+    Fail { detail: String },
+}
+
+/// The replay receipt (schema `fln.fuzz-replay/1`): everything a later run needs to
+/// reproduce this one — generator, target, build, seed, algorithm, budget, stop —
+/// plus the D7 class, which for fuzzing is always `statistical`: a fuzz campaign
+/// detects counterexamples and never proves an invariant (td9's D7 law, so a receipt
+/// can never be cited as proof of the property it sampled).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuzzReceipt {
+    pub generator: String,
+    pub target: String,
+    pub build: String,
+    pub seed: u64,
+    pub prng: String,
+    pub budget: FuzzBudget,
+    pub cases_run: u64,
+    pub stop: FuzzStop,
+}
+
+/// The receipt schema token.
+pub const FUZZ_RECEIPT_SCHEMA: &str = "fln.fuzz-replay/1";
+
+/// The PRNG algorithm id, so a receipt's stream is reproducible under exactly one
+/// algorithm — if the workspace ever grows a second generator, old receipts still
+/// mean the stream they meant.
+pub const FUZZ_PRNG_ID: &str = "splitmix64";
+
+/// The D7 claim class every fuzz receipt carries.
+pub const FUZZ_CLAIM_CLASS: &str = "statistical";
+
+impl FuzzReceipt {
+    /// Emit the receipt as one canonical NDJSON row (keys in fixed order).
+    pub fn to_ndjson(&self) -> String {
+        let (stop_token, stop_detail) = match &self.stop {
+            FuzzStop::CasesCompleted => ("cases_completed", String::new()),
+            FuzzStop::DurationExhausted => ("duration_exhausted", String::new()),
+            FuzzStop::InputBytesExhausted { case_index } => {
+                ("input_bytes_exhausted", case_index.to_string())
+            }
+            FuzzStop::FailureFound { case_index, detail } => {
+                ("failure_found", format!("{case_index}: {detail}"))
+            }
+        };
+        let mut out = json_row(&[
+            ("schema", FUZZ_RECEIPT_SCHEMA),
+            ("class", FUZZ_CLAIM_CLASS),
+            ("generator", &self.generator),
+            ("target", &self.target),
+            ("build", &self.build),
+            ("seed", &self.seed.to_string()),
+            ("prng", &self.prng),
+            ("max_cases", &self.budget.max_cases.to_string()),
+            ("max_input_bytes", &self.budget.max_input_bytes.to_string()),
+            (
+                "max_duration_ms",
+                &self.budget.max_duration.as_millis().to_string(),
+            ),
+            ("cases_run", &self.cases_run.to_string()),
+            ("stop", stop_token),
+            ("stop_detail", &stop_detail),
+        ]);
+        out.push('\n');
+        out
+    }
+
+    /// Parse a receipt row back, strictly: the schema token is exact, every field is
+    /// present, numbers parse, and the stop token is one of the four.
+    pub fn from_ndjson(line: &str) -> Result<Self, CampaignError> {
+        let fields = parse_json_object(line)?;
+        let get = |key: &str| -> Result<&str, CampaignError> {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .ok_or_else(|| CampaignError::NdjsonInvalid {
+                    reason: format!("missing field `{key}`"),
+                })
+        };
+        if get("schema")? != FUZZ_RECEIPT_SCHEMA {
+            return Err(CampaignError::NdjsonInvalid {
+                reason: format!("schema is not `{FUZZ_RECEIPT_SCHEMA}`"),
+            });
+        }
+        let number = |key: &str| -> Result<u64, CampaignError> {
+            get(key)?
+                .parse::<u64>()
+                .map_err(|_| CampaignError::NdjsonInvalid {
+                    reason: format!("field `{key}` is not a u64"),
+                })
+        };
+        let stop = match get("stop")? {
+            "cases_completed" => FuzzStop::CasesCompleted,
+            "duration_exhausted" => FuzzStop::DurationExhausted,
+            "input_bytes_exhausted" => FuzzStop::InputBytesExhausted {
+                case_index: get("stop_detail")?.parse::<u64>().map_err(|_| {
+                    CampaignError::NdjsonInvalid {
+                        reason: "stop_detail is not a case index".to_string(),
+                    }
+                })?,
+            },
+            "failure_found" => {
+                let detail = get("stop_detail")?;
+                let (index, text) =
+                    detail
+                        .split_once(": ")
+                        .ok_or_else(|| CampaignError::NdjsonInvalid {
+                            reason: "failure stop_detail does not carry `<index>: <detail>`"
+                                .to_string(),
+                        })?;
+                FuzzStop::FailureFound {
+                    case_index: index
+                        .parse::<u64>()
+                        .map_err(|_| CampaignError::NdjsonInvalid {
+                            reason: "failure case index is not a u64".to_string(),
+                        })?,
+                    detail: text.to_string(),
+                }
+            }
+            other => {
+                return Err(CampaignError::NdjsonInvalid {
+                    reason: format!("unknown stop token `{other}`"),
+                });
+            }
+        };
+        Ok(Self {
+            generator: get("generator")?.to_string(),
+            target: get("target")?.to_string(),
+            build: get("build")?.to_string(),
+            seed: number("seed")?,
+            prng: get("prng")?.to_string(),
+            budget: FuzzBudget {
+                max_cases: number("max_cases")?,
+                max_input_bytes: number("max_input_bytes")? as usize,
+                max_duration: std::time::Duration::from_millis(number("max_duration_ms")?),
+            },
+            cases_run: number("cases_run")?,
+            stop,
+        })
+    }
+}
+
+/// The runner. Given a deterministic generator and an oracle, execute cases within
+/// the budget and return the receipt. The runner never writes anything — artifacts
+/// are the caller's explicit choice (td9: campaigns leave no automatic workspace
+/// edits), so the model carries no path at all.
+pub struct FuzzRunner {
+    pub generator: String,
+    pub target: String,
+    pub build: String,
+    pub budget: FuzzBudget,
+    pub seed: u64,
+}
+
+impl FuzzRunner {
+    /// Run the campaign. The generator receives the PRNG and the case index; the
+    /// oracle judges each input; `measure` reports an input's size for the byte
+    /// budget (a generic input carries no length of its own — `size_of_val` would
+    /// measure the type, which is a bug, not a budget). Deterministic by
+    /// construction: the same seed, generator, and oracle produce the same receipt
+    /// modulo `cases_run` under a duration stop (wall time is the one
+    /// non-reproducible dimension, and the receipt records it as what it is).
+    pub fn run<I>(
+        &self,
+        mut generate: impl FnMut(&mut Splitmix64, u64) -> I,
+        mut measure: impl FnMut(&I) -> usize,
+        mut oracle: impl FnMut(&I) -> CaseOutcome,
+    ) -> FuzzReceipt {
+        let mut rng = Splitmix64::new(self.seed);
+        let started = std::time::Instant::now();
+        let mut cases_run = 0u64;
+        let mut stop = FuzzStop::CasesCompleted;
+        for case_index in 0..self.budget.max_cases {
+            if started.elapsed() > self.budget.max_duration {
+                stop = FuzzStop::DurationExhausted;
+                break;
+            }
+            let input = generate(&mut rng, case_index);
+            if measure(&input) > self.budget.max_input_bytes {
+                stop = FuzzStop::InputBytesExhausted { case_index };
+                break;
+            }
+            cases_run += 1;
+            if let CaseOutcome::Fail { detail } = oracle(&input) {
+                stop = FuzzStop::FailureFound { case_index, detail };
+                break;
+            }
+        }
+        FuzzReceipt {
+            generator: self.generator.clone(),
+            target: self.target.clone(),
+            build: self.build.clone(),
+            seed: self.seed,
+            prng: FUZZ_PRNG_ID.to_string(),
+            budget: self.budget,
+            cases_run,
+            stop,
+        }
+    }
+
+    /// Reproduce one case's input from a receipt: the same seed, advanced to the
+    /// case's index. This is the replay law made a function — the caller compares
+    /// the replayed input against what the original run saw, and the campaign's
+    /// claim that the failure is reproducible is checked rather than believed.
+    pub fn replay_input<I>(
+        receipt: &FuzzReceipt,
+        case_index: u64,
+        mut generate: impl FnMut(&mut Splitmix64, u64) -> I,
+    ) -> I {
+        let mut rng = Splitmix64::new(receipt.seed);
+        let mut input = generate(&mut rng, 0);
+        for index in 1..=case_index {
+            input = generate(&mut rng, index);
+        }
+        input
+    }
+}
