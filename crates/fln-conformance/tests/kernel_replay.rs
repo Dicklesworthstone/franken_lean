@@ -6298,6 +6298,14 @@ fn closure_inventory(roots: &[(String, PathBuf)], chosen: &str) -> Result<Corpus
 
 /// One chosen-set leg: the verdict census of one replayed module over its
 /// faithfully reconstructed import context, plus the context's own facts.
+// The two `expect`ed fields are MistyEagle's mid-flight work, swept into a commit
+// anonymously at bc4e1b3d before their readers landed. `expect` (not `allow`) is the
+// honest deferral: it passes only while the fields are unread, and reddens the moment
+// the readers land, forcing removal of the attribute — a typed TODO, not a suppression.
+#[expect(
+    dead_code,
+    reason = "fields await their readers in the remainder of this in-flight change"
+)]
 struct ChosenLegReport {
     module: String,
     closure_modules: u64,
