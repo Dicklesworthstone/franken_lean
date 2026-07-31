@@ -9,7 +9,7 @@
 //! loader already present in every process image, so this adds NO dependency.
 //! Linux-only, exactly like the layout mirrors' target gate in `lib.rs`.
 
-use core::ffi::{c_char, c_int, c_void, CStr};
+use core::ffi::{CStr, c_char, c_int, c_void};
 
 /// `RTLD_NOW` (`dlfcn.h`, glibc): resolve every undefined symbol at load time —
 /// the whole-membrane bind the spike wants, where one missing export fails
@@ -56,7 +56,7 @@ impl LoadedPlugin {
     /// the demand-list measurement continuing itself).
     pub(crate) fn open(path: &CStr, flags: c_int) -> Result<LoadedPlugin, String> {
         // SAFETY: `path` is a valid NUL-terminated string; dlopen's contract.
-        // UNSAFE-LEDGER: FLN-UL-0188
+        // UNSAFE-LEDGER: FLN-UL-0190
         #[allow(unsafe_code)]
         let h = unsafe { dlopen(path.as_ptr(), flags) };
         if h.is_null() {
@@ -71,7 +71,7 @@ impl LoadedPlugin {
     pub(crate) fn symbol(&self, name: &CStr) -> Result<*mut c_void, String> {
         // SAFETY: live handle; dlsym's contract. A null result with no error
         // is a genuinely-null symbol, reported as absent.
-        // UNSAFE-LEDGER: FLN-UL-0188
+        // UNSAFE-LEDGER: FLN-UL-0191
         #[allow(unsafe_code)]
         let p = unsafe { dlsym(self.0, name.as_ptr()) };
         if p.is_null() {
@@ -87,7 +87,7 @@ impl Drop for LoadedPlugin {
         // SAFETY: live handle, closed exactly once; a nonzero dlclose is
         // loader-internal and unreportable from Drop — the spike accepts it,
         // the product door will receipt it.
-        // UNSAFE-LEDGER: FLN-UL-0188
+        // UNSAFE-LEDGER: FLN-UL-0192
         #[allow(unsafe_code)]
         unsafe {
             let _ = dlclose(self.0);

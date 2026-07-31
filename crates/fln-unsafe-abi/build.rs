@@ -1,3 +1,8 @@
+// D3: a boundary crate's build script is a crate root and carries the deny
+// like every other root here — this script is pure `println!` and never will
+// contain an unsafe site.
+#![deny(unsafe_code)]
+
 fn main() {
     // The G0-3 plugin e2e (tests.rs `door_loads_a_reference_built_plugin_end_to_end`)
     // dlopens a Reference-built shared library under RTLD_NOW, so every lean_*

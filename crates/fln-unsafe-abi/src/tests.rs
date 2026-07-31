@@ -1836,3 +1836,122 @@ fn export_assert_violation_format_matches_upstream() {
         "LEAN ASSERTION VIOLATION\nFile: plug.c\nLine: 42\nx != NULL\n"
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn door_loads_a_reference_built_plugin_end_to_end() {
+    let _g = lock();
+    use crate::door::{LoadedPlugin, RTLD_GLOBAL, RTLD_NOW};
+    use std::ffi::CString;
+    use std::process::Command;
+
+    // Env-gated on the pinned toolchain (the kernel_replay pattern): the
+    // committed fixture is the SOURCE plus the build protocol; the .so is
+    // regenerable platform-bound output, never committed.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let bin =
+        std::path::PathBuf::from(&home).join(".elan/toolchains/leanprover--lean4---v4.32.0/bin");
+    if !bin.join("lean").is_file() {
+        eprintln!("SKIP: pinned Reference toolchain not installed");
+        return;
+    }
+    let plug_lean =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fln-vm/fixtures/g03/plug.lean");
+    let work = std::env::temp_dir().join(format!("fln-g03-door-{}", std::process::id()));
+    std::fs::create_dir_all(&work).expect("workdir");
+    std::fs::copy(&plug_lean, work.join("plug.lean")).expect("fixture copy");
+
+    let run = |cmd: &mut Command| {
+        let out = cmd.output().expect("spawn");
+        assert!(
+            out.status.success(),
+            "{:?} failed:\n{}",
+            cmd,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    // The receipt protocol from the plugin import census, verbatim.
+    run(Command::new(bin.join("lean"))
+        .current_dir(&work)
+        .env_remove("LEAN_PATH")
+        .env_remove("LEAN_SYSROOT")
+        .env("LC_ALL", "C")
+        .args(["plug.lean", "-c", "plug.c"]));
+    run(Command::new(bin.join("leanc")).current_dir(&work).args([
+        "-DLEAN_EXPORTING",
+        "-shared",
+        "-fPIC",
+        "plug.c",
+        "-o",
+        "plug.so",
+    ]));
+    // The initializer shim: initialize_Init served as a leanc-compiled object
+    // whose io-result construction resolves against THIS binary's exports.
+    std::fs::write(
+        work.join("shim.c"),
+        "#include <lean/lean.h>\nLEAN_EXPORT lean_object * initialize_Init(uint8_t builtin) {\n  (void)builtin;\n  return lean_io_result_mk_ok(lean_box(0));\n}\n",
+    )
+    .expect("shim");
+    run(Command::new(bin.join("leanc")).current_dir(&work).args([
+        "-DLEAN_EXPORTING",
+        "-shared",
+        "-fPIC",
+        "shim.c",
+        "-o",
+        "shim.so",
+    ]));
+
+    shadow::enable();
+    {
+        // RTLD_NOW on both loads: every undefined symbol — the census demand
+        // list — must resolve at bind time against this test binary's
+        // -rdynamic export surface, or the loader names the first miss.
+        let cpath =
+            |p: std::path::PathBuf| CString::new(p.into_os_string().into_encoded_bytes()).unwrap();
+        let _shim = LoadedPlugin::open(&cpath(work.join("shim.so")), RTLD_NOW | RTLD_GLOBAL)
+            .expect("the initializer shim binds against Marrow's exports");
+        let plug = LoadedPlugin::open(&cpath(work.join("plug.so")), RTLD_NOW)
+            .expect("the REAL Reference-built plugin binds against Marrow's exports");
+
+        let init = plug
+            .symbol(&CString::new("initialize_plug").unwrap())
+            .expect("initializer");
+        let add = plug
+            .symbol(&CString::new("plug_add_five").unwrap())
+            .expect("plug_add_five");
+        let greet = plug
+            .symbol(&CString::new("plug_greet").unwrap())
+            .expect("plug_greet");
+        // SAFETY: the census-declared signatures — initializer (uint8_t) ->
+        // lean_object*, and the two boxed-convention exports; every returned
+        // object is owned here and released here.
+        // UNSAFE-LEDGER: FLN-UL-0189
+        #[allow(unsafe_code)]
+        unsafe {
+            let f: extern "C" fn(u8) -> *mut LeanObject = core::mem::transmute(init);
+            let res = f(1);
+            assert!(!tagged::is_scalar(res), "io-result is a heap object");
+            assert_eq!(crate::rc::read_header(res).tag, 0, "ok-branch ctor tag");
+            crate::rc::dec_ref(res);
+
+            // The exported functions are callable from the host over ABI
+            // values: the corpus meaning holds through a REAL plugin.
+            let fa: extern "C" fn(*mut LeanObject) -> *mut LeanObject = core::mem::transmute(add);
+            assert_eq!(
+                tagged::unbox(fa(tagged::boxi(37))),
+                42,
+                "addFive 37 through the membrane"
+            );
+
+            let fg: extern "C" fn(*mut LeanObject) -> *mut LeanObject = core::mem::transmute(greet);
+            let s = crate::object::mk_string_unchecked(b"hello", 5);
+            let out = fg(s);
+            let (_, _, olen, obytes) = crate::object::string_fields(out);
+            assert_eq!(&obytes[..21], b"hello from the plugin");
+            assert_eq!(olen, 21, "the plugin's append ran on OUR wrapper");
+            crate::rc::dec_ref(out);
+        }
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the whole plugin round trip");
+}
