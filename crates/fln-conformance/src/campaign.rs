@@ -620,6 +620,392 @@ fn parse_json_object(line: &str) -> Result<Vec<(String, String)>, CampaignError>
     Ok(fields)
 }
 
+// ---------------------------------------------------------------------------
+// Framework 2: the campaign owner matrix (ci/CAMPAIGN_OWNER_MATRIX.txt)
+// ---------------------------------------------------------------------------
+
+/// The six reusable campaign families td9 owns. The matrix's adapter rows make each
+/// family mandatory on named subsystem owners; a framework existing is never the same
+/// thing as its production adapter being active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CampaignFamily {
+    Mutation,
+    Fuzz,
+    FaultDrill,
+    Shrink,
+    NoMockAttestation,
+    ThreadMatrix,
+}
+
+impl CampaignFamily {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Mutation => "mutation",
+            Self::Fuzz => "fuzz",
+            Self::FaultDrill => "fault-drill",
+            Self::Shrink => "shrink",
+            Self::NoMockAttestation => "no-mock-attestation",
+            Self::ThreadMatrix => "thread-matrix",
+        }
+    }
+
+    fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "mutation" => Some(Self::Mutation),
+            "fuzz" => Some(Self::Fuzz),
+            "fault-drill" => Some(Self::FaultDrill),
+            "shrink" => Some(Self::Shrink),
+            "no-mock-attestation" => Some(Self::NoMockAttestation),
+            "thread-matrix" => Some(Self::ThreadMatrix),
+            _ => None,
+        }
+    }
+}
+
+/// An adapter's activation state. The gate law is the whole point of the type:
+/// only `Green` satisfies a downstream gate, and `Green` is unconstructable at parse
+/// time without its run evidence — so a registered-but-inactive adapter cannot
+/// satisfy anything, and an evidence-less upgrade cannot be written down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdapterState {
+    /// Declared in the matrix only. Satisfies no gate.
+    Registered,
+    /// Wired into the owner's rig; the evidence names the wiring.
+    Active { evidence: String },
+    /// Active and currently passing; the evidence names the run.
+    Green { evidence: String },
+}
+
+impl AdapterState {
+    /// The gate law (td9): "a registered-but-inactive production adapter cannot
+    /// satisfy its downstream gate" — and only a green one can.
+    pub fn satisfies_gate(&self) -> bool {
+        matches!(self, Self::Green { .. })
+    }
+}
+
+/// One adapter row: a campaign family owed by a subsystem owner on a target domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterRow {
+    /// The bead's domains: grammar-source, kernel-terms, olean-read, olean-write,
+    /// vm-opcodes, cas-manifest, server-editor.
+    pub domain: String,
+    pub family: CampaignFamily,
+    /// The bead that owns the adapter and cannot close its downstream gate until the
+    /// adapter is green.
+    pub owner_bead: String,
+    pub state: AdapterState,
+    /// The 1-based line in the matrix file, so findings name their site.
+    pub line: usize,
+}
+
+/// One invariant row: a campaign id bound to the FL-INV ids it feeds (td9's design
+/// law — e.g. the thread matrix is the standing FL-INV-01 enforcement lane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvariantRow {
+    pub campaign: String,
+    pub inv_ids: Vec<String>,
+    pub line: usize,
+}
+
+/// The parsed matrix.
+#[derive(Debug, Clone, Default)]
+pub struct OwnerMatrix {
+    pub adapters: Vec<AdapterRow>,
+    pub invariants: Vec<InvariantRow>,
+}
+
+/// The matrix file's schema token.
+pub const OWNER_MATRIX_SCHEMA: &str = "fln-campaign-owner-matrix/1";
+
+/// Every way a matrix file can be refused, each naming its line. Validation findings
+/// (as opposed to parse refusals) are returned as a list: a broken matrix reports
+/// everything wrong with it, not just the first thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatrixError {
+    /// The first non-comment line was not the schema declaration, or carried a
+    /// different token.
+    Schema { found: String },
+    /// A row's shape is wrong; the message says what and the line says where.
+    Malformed { line: usize, reason: String },
+    /// A family token no campaign owns.
+    UnknownFamily { line: usize, token: String },
+    /// A state token outside registered/active/green.
+    UnknownState { line: usize, token: String },
+    /// `active` or `green` written without evidence — the honesty law that makes the
+    /// gate ungameable in text.
+    StateWithoutEvidence { line: usize, state: &'static str },
+    /// An FL-INV id outside the seven the type theory declares.
+    UnknownInvariant { line: usize, token: String },
+    /// The same (domain, family, owner) adapter declared twice.
+    DuplicateAdapter { line: usize, domain: String, family: &'static str },
+    /// A domain the bead does not assign to any owner got an adapter row. Validation
+    /// (not parse), because the domain set is the bead's own and moves with it.
+    UnknownDomain { line: usize, domain: String },
+    /// An owner bead that does not exist in the tracker.
+    UnknownOwnerBead { line: usize, bead: String },
+    /// A declared domain with no adapter rows at all (validation, totality).
+    DomainWithoutAdapter { domain: String },
+    /// An FL-INV id no invariant row feeds (validation, totality).
+    InvariantUnfed { inv_id: String },
+}
+
+impl fmt::Display for MatrixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Schema { found } => write!(
+                f,
+                "the matrix must open with `schema {OWNER_MATRIX_SCHEMA}`, found `{found}`"
+            ),
+            Self::Malformed { line, reason } => write!(f, "line {line}: {reason}"),
+            Self::UnknownFamily { line, token } => {
+                write!(f, "line {line}: unknown campaign family `{token}`")
+            }
+            Self::UnknownState { line, token } => {
+                write!(f, "line {line}: unknown adapter state `{token}`")
+            }
+            Self::StateWithoutEvidence { line, state } => write!(
+                f,
+                "line {line}: state `{state}` requires evidence; an evidence-less upgrade \
+                 is how a gate gets gamed in text"
+            ),
+            Self::UnknownInvariant { line, token } => {
+                write!(f, "line {line}: `{token}` is not one of FL-INV-01..07")
+            }
+            Self::DuplicateAdapter { line, domain, family } => write!(
+                f,
+                "line {line}: adapter ({domain}, {family}) is already declared"
+            ),
+            Self::UnknownDomain { line, domain } => {
+                write!(f, "line {line}: `{domain}` is not a domain the bead assigns")
+            }
+            Self::UnknownOwnerBead { line, bead } => {
+                write!(f, "line {line}: owner bead `{bead}` does not exist in the tracker")
+            }
+            Self::DomainWithoutAdapter { domain } => {
+                write!(f, "domain `{domain}` has no adapter rows")
+            }
+            Self::InvariantUnfed { inv_id } => {
+                write!(f, "{inv_id} is fed by no campaign row")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MatrixError {}
+
+/// The domains td9 assigns, in the bead's own words: grammar/source on Vellum, kernel
+/// terms on the kernel differential rig, region/OLEAN on the W2 codecs (read and
+/// write separately), VM opcodes on Golem/FLBC, CAS/manifest on the W8 Ledger, and
+/// server/editor on the replay/protocol rigs.
+pub const MATRIX_DOMAINS: [&str; 7] = [
+    "grammar-source",
+    "kernel-terms",
+    "olean-read",
+    "olean-write",
+    "vm-opcodes",
+    "cas-manifest",
+    "server-editor",
+];
+
+/// The seven invariants, derived from the FL-INV numbering rather than transcribed.
+pub fn all_inv_ids() -> Vec<String> {
+    (1..=7).map(|n| format!("FL-INV-0{n}")).collect()
+}
+
+impl OwnerMatrix {
+    /// Parse a matrix file. Structural refusals are returned immediately; semantic
+    /// findings (unknown domains, unknown beads, totality) come from [`Self::validate`].
+    pub fn parse(text: &str) -> Result<Self, MatrixError> {
+        let mut matrix = OwnerMatrix::default();
+        let mut schema_seen = false;
+        for (index, raw) in text.lines().enumerate() {
+            let line = index + 1;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if !schema_seen {
+                match trimmed.strip_prefix("schema ") {
+                    Some(token) if token.trim() == OWNER_MATRIX_SCHEMA => {
+                        schema_seen = true;
+                        continue;
+                    }
+                    _ => {
+                        return Err(MatrixError::Schema {
+                            found: trimmed.to_string(),
+                        });
+                    }
+                }
+            }
+            if let Some(rest) = trimmed.strip_prefix("adapter ") {
+                matrix.adapters.push(parse_adapter_row(rest, line)?);
+            } else if let Some(rest) = trimmed.strip_prefix("invariant ") {
+                matrix.invariants.push(parse_invariant_row(rest, line)?);
+            } else {
+                return Err(MatrixError::Malformed {
+                    line,
+                    reason: "row kind is neither `adapter` nor `invariant`".to_string(),
+                });
+            }
+        }
+        if !schema_seen {
+            return Err(MatrixError::Schema {
+                found: "<file carried no schema line>".to_string(),
+            });
+        }
+        Ok(matrix)
+    }
+
+    /// The semantic laws, as a list of every violation found: totality (every domain
+    /// adapted, every invariant fed), real owners (the callback answers whether a bead
+    /// exists), declared domains only, no duplicate adapters.
+    pub fn validate(&self, bead_exists: impl Fn(&str) -> bool) -> Vec<MatrixError> {
+        let mut errors = Vec::new();
+        for row in &self.adapters {
+            if !MATRIX_DOMAINS.contains(&row.domain.as_str()) {
+                errors.push(MatrixError::UnknownDomain {
+                    line: row.line,
+                    domain: row.domain.clone(),
+                });
+            }
+            if !bead_exists(&row.owner_bead) {
+                errors.push(MatrixError::UnknownOwnerBead {
+                    line: row.line,
+                    bead: row.owner_bead.clone(),
+                });
+            }
+        }
+        for domain in MATRIX_DOMAINS {
+            if !self.adapters.iter().any(|row| row.domain == domain) {
+                errors.push(MatrixError::DomainWithoutAdapter {
+                    domain: domain.to_string(),
+                });
+            }
+        }
+        let mut seen: BTreeMap<(&str, CampaignFamily, &str), usize> = BTreeMap::new();
+        for row in &self.adapters {
+            let key = (row.domain.as_str(), row.family, row.owner_bead.as_str());
+            if seen.insert(key, row.line).is_some() {
+                errors.push(MatrixError::DuplicateAdapter {
+                    line: row.line,
+                    domain: row.domain.clone(),
+                    family: row.family.token(),
+                });
+            }
+        }
+        for inv_id in all_inv_ids() {
+            if !self
+                .invariants
+                .iter()
+                .any(|row| row.inv_ids.iter().any(|id| *id == inv_id))
+            {
+                errors.push(MatrixError::InvariantUnfed { inv_id });
+            }
+        }
+        errors
+    }
+
+    /// The gate law, applied: the adapter for (domain, family) satisfies its
+    /// downstream gate only when green. An absent row satisfies nothing — a gate
+    /// cannot be satisfied by an adapter nobody declared.
+    pub fn satisfies_downstream_gate(&self, domain: &str, family: CampaignFamily) -> bool {
+        self.adapters
+            .iter()
+            .filter(|row| row.domain == domain && row.family == family)
+            .any(|row| row.state.satisfies_gate())
+    }
+}
+
+fn parse_adapter_row(rest: &str, line: usize) -> Result<AdapterRow, MatrixError> {
+    let fields: Vec<&str> = rest.split('|').map(str::trim).collect();
+    if fields.len() < 4 {
+        return Err(MatrixError::Malformed {
+            line,
+            reason: "an adapter row needs <domain> | <family> | <owner bead> | <state>"
+                .to_string(),
+        });
+    }
+    let family = CampaignFamily::from_token(fields[1]).ok_or_else(|| MatrixError::UnknownFamily {
+        line,
+        token: fields[1].to_string(),
+    })?;
+    let evidence = fields.get(4).copied().unwrap_or("");
+    let state = match fields[3] {
+        "registered" => AdapterState::Registered,
+        "active" => {
+            if evidence.is_empty() {
+                return Err(MatrixError::StateWithoutEvidence { line, state: "active" });
+            }
+            AdapterState::Active {
+                evidence: evidence.to_string(),
+            }
+        }
+        "green" => {
+            if evidence.is_empty() {
+                return Err(MatrixError::StateWithoutEvidence { line, state: "green" });
+            }
+            AdapterState::Green {
+                evidence: evidence.to_string(),
+            }
+        }
+        other => {
+            return Err(MatrixError::UnknownState {
+                line,
+                token: other.to_string(),
+            });
+        }
+    };
+    if fields[0].is_empty() || fields[2].is_empty() {
+        return Err(MatrixError::Malformed {
+            line,
+            reason: "domain and owner bead must be non-empty".to_string(),
+        });
+    }
+    Ok(AdapterRow {
+        domain: fields[0].to_string(),
+        family,
+        owner_bead: fields[2].to_string(),
+        state,
+        line,
+    })
+}
+
+fn parse_invariant_row(rest: &str, line: usize) -> Result<InvariantRow, MatrixError> {
+    let fields: Vec<&str> = rest.split('|').map(str::trim).collect();
+    if fields.len() < 2 || fields[0].is_empty() {
+        return Err(MatrixError::Malformed {
+            line,
+            reason: "an invariant row needs <campaign id> | <FL-INV id>...".to_string(),
+        });
+    }
+    let all = all_inv_ids();
+    let mut inv_ids = Vec::new();
+    for token in &fields[1..] {
+        if token.is_empty() {
+            continue;
+        }
+        if !all.iter().any(|id| id == token) {
+            return Err(MatrixError::UnknownInvariant {
+                line,
+                token: token.to_string(),
+            });
+        }
+        inv_ids.push(token.to_string());
+    }
+    if inv_ids.is_empty() {
+        return Err(MatrixError::Malformed {
+            line,
+            reason: "an invariant row must feed at least one FL-INV id".to_string(),
+        });
+    }
+    Ok(InvariantRow {
+        campaign: fields[0].to_string(),
+        inv_ids,
+        line,
+    })
+}
+
 /// Parse one quoted string at the head of `input`, returning the decoded string and
 /// the remainder. Handles exactly the escapes the emitter produces.
 fn parse_json_string(input: &str) -> Result<(String, &str), CampaignError> {
