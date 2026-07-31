@@ -1,0 +1,5 @@
+# exit=0 paths_normalized=false backtrace_lines_dropped=0
+#[1, 2, 3, 4]
+[10, 99, 30]
+20
+#[0, 2, 4]

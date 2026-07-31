@@ -1,0 +1,10 @@
+# exit=1 paths_normalized=false backtrace_lines_dropped=0
+nonterm_guard.lean:2:4: error: fail to show termination for
+  loops
+with errors
+failed to infer structural recursion:
+Not considering parameter #1 of loops:
+  it is unchanged in the recursive calls
+no parameters suitable for structural recursion
+
+well-founded recursion cannot be used, `loops` does not take any (non-fixed) arguments

@@ -1,0 +1,4 @@
+# exit=0 paths_normalized=true backtrace_lines_dropped=101
+42
+PANIC at risky panics:2:16: zero not allowed
+0

@@ -1,0 +1,8 @@
+# exit=0 paths_normalized=false backtrace_lines_dropped=0
+io_file.lean:4:36: warning: `String.trim` has been deprecated: Use `String.trimAscii` instead
+
+Note: The updated constant has a different type:
+  String → String.Slice
+instead of
+  String → String
+read back: roundtrip payload ∀ (20 chars)
