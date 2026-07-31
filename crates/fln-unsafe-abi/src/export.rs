@@ -1866,6 +1866,25 @@ unsafe fn apply_core(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObj
     }
 }
 
+/// `lean_string_append` (`object.cpp:2084-2105`): `s1` owned, `s2` borrowed
+/// (`lean.h:1225`); arms ported in [`object::string_append_core`], with the
+/// exclusivity verdict taken here exactly as upstream takes it.
+// UNSAFE-LEDGER: FLN-UL-0184
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_append")]
+pub(crate) extern "C" fn export_lean_string_append(
+    s1: *mut LeanObject,
+    s2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: census-signatured entry — callers hand live string objects under
+    // the lean.h ownership convention; the exclusivity read and the core's
+    // arms settle s1 in every path, s2 is never consumed.
+    unsafe {
+        let exclusive = is_exclusive(s1);
+        object::string_append_core(s1, s2, exclusive)
+    }
+}
+
 /// `lean_apply_1` (`apply.cpp:101-158`).
 // UNSAFE-LEDGER: FLN-UL-0165
 #[allow(unsafe_code)]

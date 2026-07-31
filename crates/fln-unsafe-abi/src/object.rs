@@ -340,6 +340,108 @@ pub(crate) unsafe fn mk_string_unchecked(bytes: &[u8], len: usize) -> *mut LeanO
     o
 }
 
+/// `alloc_string` with an explicit capacity (`object.cpp` at the pin): the
+/// data area beyond the fields is salient only up to what the caller writes;
+/// header/size/capacity/length are set here.
+///
+/// # Safety
+/// Caller owns the result and must write `size` data bytes (including the
+/// terminating NUL) before the object is read as a string.
+// UNSAFE-LEDGER: FLN-UL-0182
+#[allow(unsafe_code)]
+pub(crate) unsafe fn alloc_string_cap(size: usize, capacity: usize, len: usize) -> *mut LeanObject {
+    let total = size_of::<LeanStringObject>()
+        .checked_add(capacity)
+        .expect("string capacity overflow");
+    // SAFETY: overflow-checked; fields written below; data bytes are the
+    // caller's declared obligation per the doc contract.
+    let o = unsafe { membrane::alloc_big(total) };
+    // SAFETY: `alloc_big` diverges rather than returning null, so `o` is a
+    // live exclusively owned block of `total` bytes; every field write below
+    // lies inside it.
+    unsafe {
+        init_st_header(o, TAG_STRING, 0);
+        let s = o.cast::<LeanStringObject>();
+        (&raw mut (*s).m_size).write(size);
+        (&raw mut (*s).m_capacity).write(capacity);
+        (&raw mut (*s).m_length).write(len);
+    }
+    membrane::note_alloc(o, total, TAG_STRING);
+    o
+}
+
+/// `lean_string_append`'s object-model core (`object.cpp:2084-2105`), ported
+/// arm-for-arm. `exclusive` is the caller's `lean_is_exclusive(s1)` verdict:
+/// the SHARED arm allocates fresh at `mk_capacity(new_sz) == 2 * new_sz` and
+/// `dec_ref`s `s1`; the EXCLUSIVE arm reuses `s1` in place when capacity
+/// suffices and otherwise reallocates at `cap + sz1 + (sz2 - 1)` with a raw
+/// dealloc of the old block (`string_ensure_capacity`, `object.cpp:1966`).
+/// `s2` is borrowed and never consumed, exactly as the `b_lean_obj_arg`
+/// signature states.
+///
+/// # Safety
+/// `s1` and `s2` live string objects; `s1` owned by the caller (consumed in
+/// every arm), `s2` borrowed; `exclusive` truthful for `s1`.
+// UNSAFE-LEDGER: FLN-UL-0183
+#[allow(unsafe_code)]
+pub(crate) unsafe fn string_append_core(
+    s1: *mut LeanObject,
+    s2: *mut LeanObject,
+    exclusive: bool,
+) -> *mut LeanObject {
+    // SAFETY: live strings per the contract; every read/write below is within
+    // the objects' declared salient bytes, and each arm settles s1's
+    // ownership exactly as annotated.
+    unsafe {
+        let a = s1.cast::<LeanStringObject>();
+        let b = s2.cast::<LeanStringObject>();
+        let sz1 = (&raw const (*a).m_size).read();
+        let sz2 = (&raw const (*b).m_size).read();
+        let len1 = (&raw const (*a).m_length).read();
+        let len2 = (&raw const (*b).m_length).read();
+        let new_len = len1.checked_add(len2).expect("string length overflow");
+        let new_sz = sz1
+            .checked_add(sz2)
+            .and_then(|s| s.checked_sub(1))
+            .expect("string size overflow");
+        let r = if !exclusive {
+            let cap = new_sz.checked_mul(2).expect("capacity overflow");
+            let r = alloc_string_cap(new_sz, cap, new_len);
+            let dst = (&raw mut (*r.cast::<LeanStringObject>()).m_data).cast::<u8>();
+            let src = (&raw const (*a).m_data).cast::<u8>();
+            core::ptr::copy_nonoverlapping(src, dst, sz1 - 1);
+            crate::rc::dec_ref(s1);
+            r
+        } else {
+            let cap = (&raw const (*a).m_capacity).read();
+            let extra = sz2 - 1;
+            if sz1 + extra > cap {
+                let grown_cap = cap
+                    .checked_add(sz1)
+                    .and_then(|c| c.checked_add(extra))
+                    .expect("capacity overflow");
+                let r = alloc_string_cap(sz1, grown_cap, len1);
+                let dst = (&raw mut (*r.cast::<LeanStringObject>()).m_data).cast::<u8>();
+                let src = (&raw const (*a).m_data).cast::<u8>();
+                core::ptr::copy_nonoverlapping(src, dst, sz1);
+                let old_bytes = size_of::<LeanStringObject>() + cap;
+                membrane::release_with_size(s1, old_bytes, "object.string_append.grow");
+                r
+            } else {
+                s1
+            }
+        };
+        let rs = r.cast::<LeanStringObject>();
+        let dst = (&raw mut (*rs).m_data).cast::<u8>();
+        let src2 = (&raw const (*b).m_data).cast::<u8>();
+        core::ptr::copy_nonoverlapping(src2, dst.add(sz1 - 1), sz2 - 1);
+        (&raw mut (*rs).m_size).write(new_sz);
+        (&raw mut (*rs).m_length).write(new_len);
+        dst.add(new_sz - 1).write(0);
+        r
+    }
+}
+
 /// String salient fields `(m_size, m_capacity, m_length)` plus a copy of the
 /// data bytes including the NUL (`lean.h:1208-1223` accessor family).
 ///

@@ -199,7 +199,7 @@ row lean_st_ref_get | Unsupported | franken_lean-83r | census (fln-rt::abi) | la
 row lean_st_ref_reset | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_st_ref_set | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_st_ref_swap | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_string_append | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_append | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export string suites (tests.rs export_*); the G0-3 plugin import census demands it | s1 owned with upstream's exclusive/shared arms and capacity laws (object.cpp:2084-2105 via string_append_core), s2 borrowed
 row lean_string_compare | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_data | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | next_utf8 decode incl. invalid-byte fallback; consumes via dec_ref exactly as upstream
 row lean_string_eq_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | byte compare over m_size bytes

@@ -1763,3 +1763,65 @@ fn handle_apply_reproduces_the_arrays_and_strings_corpus_slices_with_rc_balance(
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance across arrays, strings, and ctors");
 }
+
+#[test]
+fn export_string_append_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::export_lean_string_append;
+    shadow::enable();
+    // SAFETY: every string below is allocated here and settled here: owned
+    // references are yielded to the append exactly per lean.h:1225 (s1 owned,
+    // s2 borrowed), borrowed ones dec'd at the end; field reads are within
+    // live objects. `lock()` serialises the heap-observing tests.
+    // UNSAFE-LEDGER: FLN-UL-0185
+    #[allow(unsafe_code)]
+    unsafe {
+        // SHARED arm (object.cpp:2084-2096): a second reference forces the
+        // fresh-alloc path — capacity EXACTLY mk_capacity(new_sz) = 2*new_sz,
+        // and the shared original survives with its bytes intact.
+        let s1 = crate::object::mk_string_unchecked(b"franken", 7);
+        crate::rc::inc_ref_n(s1, 1); // the keeper reference
+        let s2 = crate::object::mk_string_unchecked(b"lean", 4);
+        let appended = export_lean_string_append(s1, s2);
+        assert_ne!(appended, s1, "shared arm allocates fresh");
+        let (a_size, a_cap, a_len, a_bytes) = crate::object::string_fields(appended);
+        assert_eq!(&a_bytes[..11], b"frankenlean");
+        assert_eq!(
+            (a_size, a_len),
+            (12, 11),
+            "combined bytes + NUL / char count"
+        );
+        assert_eq!(a_cap, 24, "shared arm: capacity == 2 * new_sz exactly");
+        let (_, _, _, kept) = crate::object::string_fields(s1);
+        assert_eq!(&kept[..7], b"franken", "the shared original is untouched");
+        crate::rc::dec_ref(s1); // drop the keeper
+
+        // EXCLUSIVE arm, in-place: `appended` is exclusively owned with
+        // capacity 24 and size 12 — room for the tail, so identity holds.
+        let bang = crate::object::mk_string_unchecked(b"!", 1);
+        let grown = export_lean_string_append(appended, bang);
+        assert_eq!(grown, appended, "exclusive fit reuses the block in place");
+        let (g_size, g_cap, g_len, g_bytes) = crate::object::string_fields(grown);
+        assert_eq!(&g_bytes[..12], b"frankenlean!");
+        assert_eq!((g_size, g_cap, g_len), (13, 24, 12));
+        crate::rc::dec_ref(grown);
+        crate::rc::dec_ref(bang);
+
+        // EXCLUSIVE arm, grow (string_ensure_capacity, object.cpp:1966): a
+        // fresh exact-capacity string must reallocate at cap + sz1 + extra,
+        // and the old identity dies.
+        let tight = crate::object::mk_string_unchecked(b"ab", 2); // size 3, cap 3
+        let add = crate::object::mk_string_unchecked(b"cd", 2); // sz2 = 3, extra = 2
+        let g2 = export_lean_string_append(tight, add);
+        assert_ne!(g2, tight, "exclusive grow reallocates");
+        let (z_size, z_cap, z_len, z_bytes) = crate::object::string_fields(g2);
+        assert_eq!(&z_bytes[..4], b"abcd");
+        assert_eq!((z_size, z_len), (5, 4));
+        assert_eq!(z_cap, 3 + 3 + 2, "grow law: cap + sz1 + extra");
+        crate::rc::dec_ref(g2);
+        crate::rc::dec_ref(add);
+        crate::rc::dec_ref(s2);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across all three append arms");
+}
