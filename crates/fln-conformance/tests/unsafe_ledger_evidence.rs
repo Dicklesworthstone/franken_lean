@@ -336,7 +336,14 @@ const LANE_CITED_ROWS: usize = 1;
 /// cites boundary functions that now exist (`mk_closure_native`, `mk_closure_fn1`, the
 /// closures-corpus test), so one prose-free row joins the resolvable class by its own
 /// landing, measured.
-const SYMBOL_RESOLVED_ROWS: usize = 59;
+///
+/// 59 -> 63 at `c8c33d4a` (lean_string_append): the plugin demand list's one export gap
+/// landed four new rows (FLN-UL-0182 through 0185), all four citing boundary-crate symbols
+/// that now resolve (`alloc_string_cap`, `export_lean_string_append`,
+/// `export_string_append_matches_upstream_arms`, `string_append_core`). The ledger is 185
+/// rows and the prose class is unchanged at 121, so the growth is symbol-side by measured
+/// landing, not silent prose accretion — traced commit-by-commit.
+const SYMBOL_RESOLVED_ROWS: usize = 63;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
