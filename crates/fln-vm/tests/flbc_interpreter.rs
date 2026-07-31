@@ -2008,13 +2008,7 @@ fn cyclic_cfg_register_reuse_executes_zero_one_and_bounded_many_iterations() {
                 assert!(usage.is_genuine_exhaustion());
                 assert_eq!(usage.allowed, 15);
                 assert_eq!(usage.observed, 16);
-                assert_eq!(
-                    usage.reason,
-                    ResourceReason::Heartbeats {
-                        consumed: 16,
-                        limit: 15,
-                    }
-                );
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
             other => panic!("expected cyclic reuse step exhaustion, got {other:?}"),
         },
@@ -2554,13 +2548,7 @@ fn fir_cyclic_cfg_ownership_returns_or_stops_bounded_without_leaking() {
                 assert!(usage.is_genuine_exhaustion());
                 assert_eq!(usage.allowed, 14);
                 assert_eq!(usage.observed, 15);
-                assert_eq!(
-                    usage.reason,
-                    ResourceReason::Heartbeats {
-                        consumed: 15,
-                        limit: 14,
-                    }
-                );
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
             other => panic!("expected loop step exhaustion, got {other:?}"),
         },
@@ -6203,10 +6191,7 @@ fn managerless_task_stops_and_panics_do_not_publish_or_leak() {
                 inconclusive.cause,
                 InconclusiveCause::ResourceExhausted { ref usage }
                     if usage.reason
-                        == ResourceReason::Heartbeats {
-                            consumed: 4,
-                            limit: 3,
-                        }
+                        == ResourceReason::ExecutionSteps
             )
     ));
 
@@ -7051,26 +7036,29 @@ fn step_stack_and_cancellation_stops_are_non_authoritative() {
                 assert!(usage.is_genuine_exhaustion());
                 assert_eq!(usage.allowed, 3);
                 assert_eq!(usage.observed, 4);
-                assert_eq!(
-                    usage.reason,
-                    ResourceReason::Heartbeats {
-                        consumed: 4,
-                        limit: 3
-                    }
-                );
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
             }
             other => panic!("expected step exhaustion, got {other:?}"),
         },
         other => panic!("expected Inconclusive, got {other:?}"),
     }
 
-    let cancelled = || true;
+    let cancellation_polls = Cell::new(0u64);
+    let cancelled = || {
+        cancellation_polls.set(cancellation_polls.get() + 1);
+        true
+    };
     let stopped = execute(&loop_program, ExecutionLimits::default(), Some(&cancelled));
     assert!(matches!(
         stopped,
         Outcome::Inconclusive(ref inconclusive)
             if matches!(inconclusive.cause, InconclusiveCause::Cancelled { .. })
     ));
+    assert_eq!(
+        cancellation_polls.get(),
+        1,
+        "a cancelled instruction is polled but never charged as executed work"
+    );
 
     let recursive = validated(vec![function(
         0,
@@ -7705,6 +7693,7 @@ fn intrinsic_plan_cache_matches_uncached_and_refused_contracts_never_install() {
     let uncached = returned(execute(&valid, ExecutionLimits::default(), None));
     assert_eq!(uncached.value.unbox(), 42);
     assert_eq!(uncached.usage.steps, 4);
+    assert_eq!(uncached.usage.system_polls, 4);
     for expected_hits in [0, 1] {
         let cached = returned(execute_cached(
             &valid,

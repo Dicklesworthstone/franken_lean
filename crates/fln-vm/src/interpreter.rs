@@ -3,8 +3,8 @@
 //! The register file contains only [`Obj`] handles from Marrow's safe surface:
 //! there is no host-value shadow representation and no conversion at calls.
 //! Execution accepts only [`ValidatedProgram`]. Cooperative cancellation and
-//! step/stack exhaustion use the shared FL-INV-07 [`Outcome`] algebra, whose
-//! non-authoritative arms cannot carry a partially published object.
+//! instruction/stack exhaustion use the shared FL-INV-07 [`Outcome`] algebra,
+//! whose non-authoritative arms cannot carry a partially published object.
 //!
 //! Interpreter closures are real Marrow closure objects. Their first fixed
 //! slot is a tagged function-table word followed by captured ABI values. The
@@ -38,8 +38,10 @@ use fln_rt::abi;
 use fln_rt::obj::Obj;
 use std::fmt;
 
-/// Caller-supplied execution limits. A value of zero permits no work in that
-/// dimension; the first attempted unit reports `observed = 1`.
+/// Caller-supplied execution limits. `max_steps` is a FrankenLean-owned FLBC
+/// instruction allowance, not the Reference's allocation-linked heartbeat
+/// option. A value of zero permits no work in that dimension; the first
+/// attempted unit reports `observed = 1`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionLimits {
     pub max_steps: u64,
@@ -58,7 +60,15 @@ impl Default for ExecutionLimits {
 /// Logical resource use of a terminal, authoritative execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionUsage {
+    /// Successfully executed FLBC instructions.
     pub steps: u64,
+    /// Cooperative system polls issued for successfully executed instructions.
+    ///
+    /// The current policy polls once immediately before each instruction, so a
+    /// completed result has `system_polls == steps`. This is a separate field
+    /// because the policy can evolve without relabeling instruction work or
+    /// allocator heartbeats.
+    pub system_polls: u64,
     pub peak_stack_depth: u64,
 }
 
@@ -869,8 +879,12 @@ impl fmt::Display for VmRefusal {
 
 impl std::error::Error for VmRefusal {}
 
-/// Cooperative cancellation source. It is sampled before every instruction;
+/// Cooperative cancellation source. Golem samples it before every instruction;
 /// a true observation stops without executing or publishing that instruction.
+///
+/// This VM scheduling checkpoint is distinct from both allocation-linked
+/// heartbeats and the explicit `Lean.Core.checkSystem` calls that the Native
+/// Mirror will lower through the intrinsic surface.
 pub trait CancellationProbe {
     fn is_cancelled(&self) -> bool;
 }
@@ -1117,7 +1131,11 @@ fn run(
             ))
         })?;
         if observed_steps > limits.max_steps {
-            return Err(step_exhausted(limits.max_steps, observed_steps, &location));
+            return Err(execution_steps_exhausted(
+                limits.max_steps,
+                observed_steps,
+                &location,
+            ));
         }
         steps = observed_steps;
 
@@ -2203,17 +2221,15 @@ fn empty_registers(count: u16) -> Vec<Option<Obj>> {
 fn usage(steps: u64, peak_stack_depth: u64) -> ExecutionUsage {
     ExecutionUsage {
         steps,
+        system_polls: steps,
         peak_stack_depth,
     }
 }
 
-fn step_exhausted(allowed: u64, observed: u64, location: &str) -> Stop {
+fn execution_steps_exhausted(allowed: u64, observed: u64, location: &str) -> Stop {
     Stop::Inconclusive(
         Inconclusive::resource(ResourceUsage {
-            reason: ResourceReason::Heartbeats {
-                consumed: observed,
-                limit: allowed,
-            },
+            reason: ResourceReason::ExecutionSteps,
             allowed,
             observed,
         })

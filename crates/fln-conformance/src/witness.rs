@@ -587,9 +587,11 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    and ci/PARITY_LEDGER.txt rows 204/206 for the maxHeartbeats OPTION surface \
                    — the option exists and its default matches the pin, which says nothing \
                    about consumption and is the row most likely to be quoted as if it did. The \
-                   kernel reports its step counter under ResourceReason::Heartbeats while \
-                   counting inference nodes, reduction steps and defeq queries rather than \
-                   allocations, so the NAME is already ahead of the quantity.",
+                   kernel and Golem now classify their native work counters as \
+                   ResourceReason::ExecutionSteps rather than borrowing the allocation-linked \
+                   heartbeat name. That repairs the typed cause, not fuel parity: neither \
+                   counter measures allocator ticks and no relationship to the pin has been \
+                   established.",
         enforcement: Enforcement::Acknowledged,
     },
     // ---- the rest of the seeded corpus ----------------------------------------------

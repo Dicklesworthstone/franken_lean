@@ -236,7 +236,7 @@ fn classify(outcome: &Outcome<Verdict>) -> String {
         Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
             InconclusiveCause::ResourceExhausted { usage } => match usage.reason {
                 ResourceReason::RecursionDepth { .. } => RESULT_DEPTH_EXHAUSTED.to_string(),
-                ResourceReason::Heartbeats { .. } => "STEPS_EXHAUSTED".to_string(),
+                ResourceReason::ExecutionSteps => "STEPS_EXHAUSTED".to_string(),
                 _ => "OTHER_RESOURCE".to_string(),
             },
             _ => "OTHER_INCONCLUSIVE".to_string(),

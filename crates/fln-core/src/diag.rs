@@ -62,6 +62,13 @@ impl Severity {
 pub enum ResourceReason {
     /// `maxHeartbeats` exhausted (thousand-unit option; effective ×1000).
     Heartbeats { consumed: u64, limit: u64 },
+    /// A FrankenLean-owned deterministic execution-step budget was exhausted.
+    ///
+    /// This is deliberately distinct from [`ResourceReason::Heartbeats`].
+    /// Reference heartbeats count small-object allocations plus explicit bumps;
+    /// kernel reductions and VM instructions are native work units and must not
+    /// borrow that name before allocator-linked fuel parity exists.
+    ExecutionSteps,
     /// `maxRecDepth` exhausted.
     RecursionDepth { limit: u64 },
     /// Cooperative cancellation observed.
@@ -251,6 +258,10 @@ impl ErrorValue {
             ErrorValue::KernelInconclusive { decl, resource } => match resource {
                 ResourceReason::Heartbeats { .. } => format!(
                     "(deterministic) timeout at `{}`, maximum number of heartbeats has been reached",
+                    decl.to_display_string()
+                ),
+                ResourceReason::ExecutionSteps => format!(
+                    "execution-step budget exhausted at `{}`",
                     decl.to_display_string()
                 ),
                 ResourceReason::RecursionDepth { .. } => {
@@ -989,6 +1000,7 @@ fn ordered_diagnostics(
 fn resource_reason_class(usage: &ResourceUsage) -> &'static str {
     match &usage.reason {
         ResourceReason::Heartbeats { .. } => "heartbeats",
+        ResourceReason::ExecutionSteps => "execution_steps",
         ResourceReason::RecursionDepth { .. } => "recursion_depth",
         ResourceReason::Cancelled => "cancelled_not_exhaustion",
         ResourceReason::Memory { .. } => "memory",

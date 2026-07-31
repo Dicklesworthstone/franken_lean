@@ -39,6 +39,10 @@ fn every_variant() -> Vec<ErrorValue> {
             },
         },
         ErrorValue::KernelInconclusive {
+            decl: n("bounded"),
+            resource: ResourceReason::ExecutionSteps,
+        },
+        ErrorValue::KernelInconclusive {
             decl: n("deep"),
             resource: ResourceReason::RecursionDepth { limit: 512 },
         },
@@ -121,7 +125,7 @@ fn every_taxonomy_variant_round_trips() {
 
 #[test]
 fn an_unknown_newer_variant_tag_fails_typed_never_garbles() {
-    // A hypothetical taxonomy v2 value: schema header + valid envelope + tag 99.
+    // A hypothetical newer taxonomy value: schema header + valid envelope + tag 99.
     let mut w = CanonWriter::new();
     w.schema(SCHEMA_DIAG);
     w.str("Foo.lean");

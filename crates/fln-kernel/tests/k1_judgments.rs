@@ -506,13 +506,7 @@ fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
     let usage = exhausted_usage(&verdict);
     assert!(usage.observed > tiny.steps);
     assert_eq!(usage.allowed, tiny.steps);
-    assert_eq!(
-        usage.reason,
-        ResourceReason::Heartbeats {
-            consumed: usage.observed,
-            limit: tiny.steps,
-        }
-    );
+    assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
     assert_eq!(
         verdict.cache_admission(),
         CacheAdmission::Refused {
@@ -3633,10 +3627,7 @@ fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
     assert!(usage.observed > usage.allowed);
     assert_eq!(
         usage.reason,
-        ResourceReason::Heartbeats {
-            consumed: usage.observed,
-            limit: usage.allowed,
-        },
+        ResourceReason::ExecutionSteps,
         "an infeasible shift is an outcome about the run"
     );
     // A count beyond u64 entirely (2^64, limbs [0,1]) takes the same typed path.

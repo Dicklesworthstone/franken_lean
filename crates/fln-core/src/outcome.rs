@@ -151,8 +151,8 @@ impl ResourceUsage {
     /// checked only the outer pair, so a usage claiming `allowed: 10, observed: 20` while
     /// its reason said `limit: 900` passed as a genuine exhaustion and no reader could tell
     /// which number was the budget. Now the inner numbers must agree with the outer ones
-    /// wherever the reason carries them. `StructuralBudget` deliberately carries none, so
-    /// it cannot contradict anything.
+    /// wherever the reason carries them. `ExecutionSteps` and `StructuralBudget`
+    /// deliberately carry none, so they cannot contradict anything.
     ///
     /// `Cancelled` is refused outright: cancellation is not exhaustion. It is a
     /// `ResourceReason` because D8's `KernelInconclusive` uses that enum as its cause
@@ -168,6 +168,7 @@ impl ResourceUsage {
             ResourceReason::Heartbeats { consumed, limit } => {
                 *limit == self.allowed && *consumed == self.observed
             }
+            ResourceReason::ExecutionSteps => true,
             ResourceReason::RecursionDepth { limit } => *limit == self.allowed,
             ResourceReason::Memory { limit_bytes } => *limit_bytes == self.allowed,
             // No numbers to contradict — the shape this variant was given on purpose.
@@ -881,6 +882,15 @@ mod tests {
             }
             .is_genuine_exhaustion(),
             "an agreeing depth limit must still pass"
+        );
+        assert!(
+            ResourceUsage {
+                reason: ResourceReason::ExecutionSteps,
+                allowed: 10,
+                observed: 20,
+            }
+            .is_genuine_exhaustion(),
+            "a native execution-step overrun is genuine without masquerading as heartbeats"
         );
 
         // NEW: cancellation is not exhaustion. Accepting it here would let a cancelled run

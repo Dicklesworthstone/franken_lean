@@ -4486,7 +4486,8 @@ fn structural_unit_evidence_name(unit: StructuralUnit) -> &'static str {
 
 fn resource_usage_facts(usage: &ResourceUsage) -> (String, u64, u32) {
     match usage.reason {
-        ResourceReason::Heartbeats { .. } => ("inconclusive:Steps".into(), usage.observed, 0),
+        ResourceReason::Heartbeats { .. } => ("inconclusive:Heartbeats".into(), usage.observed, 0),
+        ResourceReason::ExecutionSteps => ("inconclusive:Steps".into(), usage.observed, 0),
         ResourceReason::RecursionDepth { .. } => (
             "inconclusive:Depth".into(),
             0,
@@ -4985,12 +4986,10 @@ fn admission_fault_matrix_is_typed_and_atomic() {
         let ok = matches!(
             resource_exhaustion(&v),
             Some(ResourceUsage {
-                reason: ResourceReason::Heartbeats { consumed, limit },
+                reason: ResourceReason::ExecutionSteps,
                 allowed,
                 observed,
-            }) if *consumed == *observed
-                && *limit == under.steps
-                && *allowed == under.steps
+            }) if *allowed == under.steps
                 && *observed > *allowed
         );
         let root_after = subject.env.logical_root(&options).to_string();

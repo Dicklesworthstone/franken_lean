@@ -1344,20 +1344,22 @@ fn read_expr_iter(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
 
 // ---- Diagnostic (the D8 typed error taxonomy, versioned on the wire) -------------------
 
-/// **Version 2** since bead franken_lean-vui8 added `ResourceReason::StructuralBudget`
-/// (wire tag `RES_STRUCTURAL`).
+/// **Version 3** adds `ResourceReason::ExecutionSteps` (wire tag
+/// `RES_EXECUTION_STEPS`) so FrankenLean-owned kernel/VM work budgets cannot be
+/// serialized under the Reference's allocation-linked heartbeat vocabulary.
 ///
-/// Bumped even though no existing value's bytes moved and no golden was re-pinned. The
-/// reason is skew, not layout: a v1 reader meeting tag 4 fails closed with "unknown
-/// resource-reason tag", so if the version had stayed at 1 then two artifacts both
-/// labelled `fln.canon.diag/1` would exist — one every reader can decode and one only new
-/// readers can. A version whose value does not identify the language it names is worse
-/// than useless, because it invites exactly the confident misread it is supposed to
-/// prevent. The bump was free here: nothing persists a diagnostic encoding yet and no
-/// fixture or digest pins one, which was checked rather than assumed.
+/// Version 2 was introduced by bead franken_lean-vui8 when
+/// `ResourceReason::StructuralBudget` added wire tag `RES_STRUCTURAL`.
+///
+/// Bumped even though no existing value's bytes moved. The reason is skew, not
+/// layout: a v2 reader meeting tag 5 fails closed with "unknown resource-reason
+/// tag", so retaining version 2 would create two incompatible languages both
+/// labelled `fln.canon.diag/2`. A version whose value does not identify the
+/// language it names invites exactly the confident misread it is supposed to
+/// prevent.
 pub const SCHEMA_DIAG: SchemaId = SchemaId {
     name: "fln.canon.diag",
-    version: 2,
+    version: 3,
 };
 
 const SEV_INFO: u8 = 0;
@@ -1371,6 +1373,8 @@ const RES_MEMORY: u8 = 3;
 /// Added with the structural budget axis (bead franken_lean-vui8). Tags are permanent
 /// once published; a new reason takes the next free value and never reuses one.
 const RES_STRUCTURAL: u8 = 4;
+/// Native deterministic work, distinct from the pin's allocation heartbeat.
+const RES_EXECUTION_STEPS: u8 = 5;
 
 const SU_INPUT_BYTES: u8 = 0;
 const SU_PRODUCED_NODES: u8 = 1;
@@ -1400,6 +1404,7 @@ fn write_resource(w: &mut CanonWriter, resource: &ResourceReason) {
             w.u64(*consumed);
             w.u64(*limit);
         }
+        ResourceReason::ExecutionSteps => w.u8(RES_EXECUTION_STEPS),
         ResourceReason::RecursionDepth { limit } => {
             w.u8(RES_REC_DEPTH);
             w.u64(*limit);
@@ -1424,6 +1429,7 @@ fn read_resource(r: &mut CanonReader<'_>) -> Result<ResourceReason, CanonError> 
             consumed: r.u64()?,
             limit: r.u64()?,
         },
+        RES_EXECUTION_STEPS => ResourceReason::ExecutionSteps,
         RES_REC_DEPTH => ResourceReason::RecursionDepth { limit: r.u64()? },
         RES_CANCELLED => ResourceReason::Cancelled,
         RES_MEMORY => ResourceReason::Memory {

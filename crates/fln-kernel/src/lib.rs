@@ -373,10 +373,7 @@ fn exhaustion_outcome(
 ) -> Outcome<Verdict> {
     let usage = match reason {
         verdict::ExhaustionReason::Steps => ResourceUsage {
-            reason: ResourceReason::Heartbeats {
-                consumed: consumption.steps_used,
-                limit: budget.steps,
-            },
+            reason: ResourceReason::ExecutionSteps,
             allowed: budget.steps,
             observed: consumption.steps_used,
         },
