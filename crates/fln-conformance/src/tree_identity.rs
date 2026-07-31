@@ -415,6 +415,11 @@ pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
          so a shared target cannot bake another checkout's artifacts into the generator it \
          drives (franken_lean-pw6t)",
     ),
+    (
+        "crates/fln-olean/tests/hostile_input.rs",
+        "the hostile-input suite resolves the invoking crate directory at run time so a shared \
+         target cannot bake another checkout's fixtures into its byte surgery (fln-abaz)",
+    ),
 ];
 
 /// Reconcile the precise needle against a coarser, independent one, per file.

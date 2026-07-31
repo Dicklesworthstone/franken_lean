@@ -20,7 +20,13 @@ use fln_rt::abi;
 use fln_rt::region::parse_olean_envelope;
 
 fn fixture(path: &str) -> Vec<u8> {
-    let full = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+    // Resolved at run time, never baked at compile time: a test binary built in
+    // one checkout and run from another must read the INVOKING tree (the
+    // golden_vellum pattern, not a raw env! site — k60n).
+    let root = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("cargo identifies the invoking crate directory");
+    let full = root.join(path);
     let data = std::fs::read(&full);
     assert!(
         data.is_ok(),
