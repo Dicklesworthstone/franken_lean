@@ -2103,3 +2103,181 @@ impl NoMockAttestation {
         out
     }
 }
+
+// ---------------------------------------------------------------------------
+// Framework 7: the productive thread matrix
+// ---------------------------------------------------------------------------
+
+/// The matrix widths td9 names. The weekly 96+ qualified host is a lane property,
+/// not a model constant — the model judges whatever width set a run used, and the
+/// suite pins this set as the framework's own.
+pub const MATRIX_WIDTHS: [usize; 3] = [1, 8, 32];
+
+/// Host facts and wall time: recorded, never compared. Keeping telemetry in its
+/// own struct — and out of the judge's API — is how semantic/telemetry mixing
+/// (a td9 self-mutant) is made inexpressible rather than discouraged: the verdict
+/// function cannot see this data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunTelemetry {
+    /// Wall time of the run.
+    pub wall_ms: u64,
+    /// The host's identity (a facts string, not a secret).
+    pub host: String,
+    /// The OS thread count the runtime reported.
+    pub os_threads: usize,
+}
+
+/// One width's run: the identical content-hashed closure it ran, the canonical
+/// semantic output, and the partition it actually used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidthRun {
+    /// The matrix width (partition count) of this run.
+    pub width: usize,
+    /// The content hash of the input closure. The matrix law is *identical*
+    /// closures: two runs with different closure digests are not comparable, and
+    /// the judge refuses the comparison rather than averaging it.
+    pub closure_digest: String,
+    /// The canonical semantic output digest (the environment, the verdict stream,
+    /// the artifact bytes — whatever the workload's semantic product is, reduced
+    /// to one canonical hash).
+    pub semantic_digest: String,
+    /// Work units per partition, in partition order. The productivity law lives
+    /// here: a "parallel" run that put everything in one partition is a fake
+    /// thread label, and the judge refuses it.
+    pub partitions: Vec<u64>,
+    /// Recorded, never judged.
+    pub telemetry: RunTelemetry,
+}
+
+/// The matrix verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatrixVerdict {
+    /// Every width produced the same canonical semantic output: schedule
+    /// independence, observed (FL-INV-01's campaign shape).
+    ScheduleIndependent,
+    /// Two widths differ semantically. The pair is named.
+    ScheduleDivergence { width_a: usize, width_b: usize },
+}
+
+/// Every way a matrix run set can be refused before any comparison happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadMatrixError {
+    /// Fewer than two widths were offered — a matrix of one run compares nothing.
+    TooFewWidths { offered: usize },
+    /// Two runs carried different closure digests: not the same workload, so the
+    /// comparison would be meaningless.
+    ClosureMismatch { width_a: usize, width_b: usize },
+    /// A run wider than 1 used fewer than two partitions, or carried an empty
+    /// one — the fake-thread-label refusal.
+    NonProductiveWidth { width: usize, reason: String },
+    /// A required field was blank (a digest is not a label).
+    BlankField { width: usize, field: &'static str },
+}
+
+impl fmt::Display for ThreadMatrixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooFewWidths { offered } => {
+                write!(f, "a matrix needs at least two widths, offered {offered}")
+            }
+            Self::ClosureMismatch { width_a, width_b } => write!(
+                f,
+                "widths {width_a} and {width_b} ran different closures: not comparable"
+            ),
+            Self::NonProductiveWidth { width, reason } => {
+                write!(
+                    f,
+                    "width {width} is not a productive parallel run: {reason}"
+                )
+            }
+            Self::BlankField { width, field } => {
+                write!(f, "width {width} has a blank {field}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ThreadMatrixError {}
+
+/// Judge a matrix: every refusal first (closure identity, productivity, blanks,
+/// width count, all listed), then the semantic comparison. The judge's API takes
+/// the semantic fields only — telemetry never enters this function, which is the
+/// separation law made a type.
+pub fn judge_matrix(runs: &[WidthRun]) -> Result<MatrixVerdict, Vec<ThreadMatrixError>> {
+    let mut errors = Vec::new();
+    if runs.len() < 2 {
+        errors.push(ThreadMatrixError::TooFewWidths {
+            offered: runs.len(),
+        });
+    }
+    for run in runs {
+        if run.closure_digest.trim().is_empty() {
+            errors.push(ThreadMatrixError::BlankField {
+                width: run.width,
+                field: "closure_digest",
+            });
+        }
+        if run.semantic_digest.trim().is_empty() {
+            errors.push(ThreadMatrixError::BlankField {
+                width: run.width,
+                field: "semantic_digest",
+            });
+        }
+        if run.width > 1 {
+            if run.partitions.len() < 2 {
+                errors.push(ThreadMatrixError::NonProductiveWidth {
+                    width: run.width,
+                    reason: format!(
+                        "{} partition(s) is not a parallel partition",
+                        run.partitions.len()
+                    ),
+                });
+            } else if run.partitions.contains(&0) {
+                errors.push(ThreadMatrixError::NonProductiveWidth {
+                    width: run.width,
+                    reason: "an empty partition rode along".to_string(),
+                });
+            }
+        }
+    }
+    for pair in runs.windows(2) {
+        if !pair[0].closure_digest.trim().is_empty()
+            && pair[0].closure_digest != pair[1].closure_digest
+        {
+            errors.push(ThreadMatrixError::ClosureMismatch {
+                width_a: pair[0].width,
+                width_b: pair[1].width,
+            });
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let first = &runs[0];
+    for run in &runs[1..] {
+        if run.semantic_digest != first.semantic_digest {
+            return Ok(MatrixVerdict::ScheduleDivergence {
+                width_a: first.width,
+                width_b: run.width,
+            });
+        }
+    }
+    Ok(MatrixVerdict::ScheduleIndependent)
+}
+
+/// Partition a workload across a width: contiguous chunks, every partition
+/// nonempty when `units >= width` (the productivity law's honest shape — when
+/// there is less work than width, the run is narrower than the label, and the
+/// partitions say so rather than pretending).
+pub fn partition_units(units: u64, width: usize) -> Vec<u64> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let width = width as u64;
+    let base = units / width;
+    let extra = units % width;
+    (0..width)
+        .map(|i| base + u64::from(i < extra))
+        .filter(|&units| units > 0)
+        .collect()
+}
