@@ -1559,3 +1559,93 @@ fn export_once_cells_initialize_exactly_once() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// G0-3: the closures-corpus semantics through the SAFE surface, with the RC
+// shadow asserting balance per cell (bead franken_lean-7xe; the raw arms are
+// 83r slice 4's, held by export_apply_arms_match_generated_semantics — these
+// cells hold the covenant surface and acceptance (c) in the same breath).
+// ---------------------------------------------------------------------------
+
+mod corpus_targets {
+    use crate::layout::LeanObject;
+    use crate::tagged;
+
+    /// `addN`'s body under the boxed convention: `fun n x => x + n` at
+    /// saturation (fixed `n`, applied `x`).
+    pub(crate) extern "C" fn add2(n: *mut LeanObject, x: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(n) + tagged::unbox(x))
+    }
+
+    /// `(· * 2)`.
+    pub(crate) extern "C" fn double(x: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(x) * 2)
+    }
+
+    /// `fun x y z => x * y + z` — the corpus's ternary lambda.
+    pub(crate) extern "C" fn mul_add3(
+        x: *mut LeanObject,
+        y: *mut LeanObject,
+        z: *mut LeanObject,
+    ) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(x) * tagged::unbox(y) + tagged::unbox(z))
+    }
+}
+
+#[test]
+fn handle_apply_reproduces_the_closures_corpus_semantics_with_rc_balance() {
+    let _g = lock();
+    use crate::handle::Obj;
+    shadow::enable();
+    {
+        // corpus closures.lean line 3: `compose (addN 5) (· * 2) 10` = 25.
+        // compose = fun f g x => f (g x), evaluated by chaining the safe
+        // surface exactly as the corpus's saturated call tree does.
+        let add5 = Obj::mk_closure_fn2(corpus_targets::add2, vec![Obj::mk_nat(5)]);
+        let doubled =
+            Obj::mk_closure_fn1(corpus_targets::double, vec![]).apply(vec![Obj::mk_nat(10)]);
+        let composed = add5.apply(vec![doubled]);
+        assert_eq!(composed.unbox(), 25, "compose (addN 5) (.*2) 10");
+
+        // corpus line 4 shape: under-application curries — `addN 100` alone is
+        // a closure with one fixed slot, and applying it later completes.
+        let add100 =
+            Obj::mk_closure_fn2(corpus_targets::add2, vec![]).apply(vec![Obj::mk_nat(100)]);
+        assert!(!add100.is_scalar(), "under-application yields a closure");
+        assert_eq!(
+            add100.header().tag,
+            crate::contract::TAG_CLOSURE,
+            "curried value is a closure object"
+        );
+        assert_eq!(
+            add100.apply(vec![Obj::mk_nat(4)]).unbox(),
+            104,
+            "addN 100 applied to 4"
+        );
+
+        // corpus line 5: `(fun x y z => x * y + z) 2 3 4` = 10 — saturation in
+        // one call, and the same result arg-by-arg (over-application re-entry
+        // through the chunked safe path).
+        let f3 = Obj::mk_closure_fn3(corpus_targets::mul_add3, vec![]);
+        assert_eq!(
+            f3.apply(vec![Obj::mk_nat(2), Obj::mk_nat(3), Obj::mk_nat(4)])
+                .unbox(),
+            10
+        );
+        let g3 = Obj::mk_closure_fn3(corpus_targets::mul_add3, vec![]);
+        assert_eq!(
+            g3.apply(vec![Obj::mk_nat(2)])
+                .apply(vec![Obj::mk_nat(3)])
+                .apply(vec![Obj::mk_nat(4)])
+                .unbox(),
+            10,
+            "one-at-a-time currying agrees with saturation"
+        );
+    }
+    // Acceptance (c)'s instrument: every closure allocated above was freed
+    // exactly once — no leak, no double-free — under the debug ownership
+    // shadow. Scalars are unboxed and never enter the shadow, so live=0 is
+    // the whole balance claim.
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance: every apply cell freed its objects");
+}

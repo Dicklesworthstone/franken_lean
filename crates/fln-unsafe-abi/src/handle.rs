@@ -18,11 +18,31 @@
 //! discipline exactly.
 
 use crate::contract::TAG_MAX_CTOR_TAG;
+use crate::export;
 use crate::layout::LeanObject;
 use crate::object;
 use crate::rc::{self, Header};
 use crate::shadow;
 use crate::tagged;
+
+/// Boxed-convention function types for the callable-closure constructors: every
+/// parameter and the result are `lean_object*`, per the pin's `m_fun` contract
+/// (`lean.h:211-217`; apply arms `apply.cpp:101-460`).
+///
+/// Reachable today from the apply cells only (hence the scoped dead_code
+/// allowance, contract.rs precedent): the production consumer is Golem's
+/// dispatch (bead franken_lean-7xe increments 5+), which widens these to the
+/// reviewed public surface through fln-rt when it lands — a deliberate act
+/// with BOUNDARY_API rows, never a default.
+#[allow(dead_code)]
+pub(crate) type BoxedFn1 = extern "C" fn(*mut LeanObject) -> *mut LeanObject;
+/// Binary boxed-convention target ([`BoxedFn1`]).
+#[allow(dead_code)]
+pub(crate) type BoxedFn2 = extern "C" fn(*mut LeanObject, *mut LeanObject) -> *mut LeanObject;
+/// Ternary boxed-convention target ([`BoxedFn1`]).
+#[allow(dead_code)]
+pub(crate) type BoxedFn3 =
+    extern "C" fn(*mut LeanObject, *mut LeanObject, *mut LeanObject) -> *mut LeanObject;
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -104,10 +124,14 @@ impl Obj {
         }
     }
 
-    /// Closure shell (function never invoked in slice 1); consumes `fixed`.
+    /// Closure shell (function pointer dangling; layout/RC suites only). A
+    /// shell must never reach [`Obj::apply`] — the callable constructors are
+    /// the `mk_closure_fn*` family, where the arity comes from the TYPE.
     pub fn mk_closure(arity: u16, fixed: Vec<Obj>) -> Obj {
         // SAFETY: fresh allocation; fixed slots initialized with owned refs;
-        // the dangling fun pointer is data until the apply machinery exists.
+        // the dangling fun pointer is inert layout data — the apply machinery
+        // (export.rs `apply_core`, 83r slice 4) is only reachable through the
+        // typed `mk_closure_fn*` constructors below.
         unsafe {
             let o = object::alloc_closure(
                 core::ptr::dangling_mut::<c_void>(),
@@ -119,6 +143,78 @@ impl Obj {
             }
             Obj(o)
         }
+    }
+
+    /// Callable unary closure. The arity is derived from the function TYPE, so
+    /// the closure/target contract cannot lie — the soundness condition the
+    /// boxed convention needs is carried by the signature itself.
+    #[allow(dead_code)]
+    pub(crate) fn mk_closure_fn1(fun: BoxedFn1, fixed: Vec<Obj>) -> Obj {
+        Self::mk_closure_native(fun as *mut c_void, 1, fixed)
+    }
+
+    /// Callable binary closure (arity from the type, as [`Obj::mk_closure_fn1`]).
+    #[allow(dead_code)]
+    pub(crate) fn mk_closure_fn2(fun: BoxedFn2, fixed: Vec<Obj>) -> Obj {
+        Self::mk_closure_native(fun as *mut c_void, 2, fixed)
+    }
+
+    /// Callable ternary closure (arity from the type, as [`Obj::mk_closure_fn1`]).
+    #[allow(dead_code)]
+    pub(crate) fn mk_closure_fn3(fun: BoxedFn3, fixed: Vec<Obj>) -> Obj {
+        Self::mk_closure_native(fun as *mut c_void, 3, fixed)
+    }
+
+    fn mk_closure_native(fun: *mut c_void, arity: u16, fixed: Vec<Obj>) -> Obj {
+        assert!(
+            usize::from(arity) > fixed.len(),
+            "fixed args must leave at least one open slot"
+        );
+        // SAFETY: fresh allocation; fixed slots initialized with owned refs;
+        // `fun` is a real extern "C" function pointer whose boxed-convention
+        // arity equals `arity` BY TYPE at every public call site (the
+        // `mk_closure_fn{1,2,3}` wrappers), which is exactly the precondition
+        // `apply_core`'s saturated call relies on.
+        // UNSAFE-LEDGER: FLN-UL-0181
+        #[allow(unsafe_code)]
+        unsafe {
+            let o =
+                object::alloc_closure(fun, arity, u16::try_from(fixed.len()).expect("num_fixed"));
+            for (i, f) in fixed.into_iter().enumerate() {
+                object::closure_set(o, i, f.into_raw());
+            }
+            Obj(o)
+        }
+    }
+
+    /// Apply this value to `args` under the pin's boxed convention
+    /// (`apply.cpp` semantics via export.rs `apply_core`): saturation calls
+    /// the target, under-application curries a new closure, over-application
+    /// re-enters with the remainder, and a scalar callee absorbs its
+    /// arguments (the erased-proof arm). Consumes `self` and every argument;
+    /// panics on an empty argument list (an application of nothing is a
+    /// caller bug, not a runtime state).
+    #[allow(dead_code)]
+    pub(crate) fn apply(self, args: Vec<Obj>) -> Obj {
+        assert!(!args.is_empty(), "apply needs at least one argument");
+        let mut f = self.into_raw();
+        let mut raw: Vec<*mut LeanObject> = args.into_iter().map(Obj::into_raw).collect();
+        let mut i = 0usize;
+        while i < raw.len() {
+            let left = raw.len() - i;
+            // The exported arms are safe fns over owned raw pointers; chunking
+            // through arity 4 reproduces over-application re-entry exactly
+            // (apply_core's own third arm does the same).
+            f = match left {
+                1 => export::export_lean_apply_1(f, raw[i]),
+                2 => export::export_lean_apply_2(f, raw[i], raw[i + 1]),
+                3 => export::export_lean_apply_3(f, raw[i], raw[i + 1], raw[i + 2]),
+                _ => export::export_lean_apply_4(f, raw[i], raw[i + 1], raw[i + 2], raw[i + 3]),
+            };
+            i += left.min(4);
+        }
+        raw.clear();
+        Obj(f)
     }
 
     /// `IO.Ref` cell; consumes the value.
