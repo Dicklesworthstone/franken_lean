@@ -1723,3 +1723,144 @@ impl FaultRegistry {
         self.points.is_empty()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Framework 5: failure-signature-preserving shrink
+// ---------------------------------------------------------------------------
+
+/// The resource class of a failure (td9: shrinking preserves the resource class).
+/// A shrink that moves a failure from one class to another has found a different
+/// bug, which is a finding to record separately — never the same bug shrunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResourceClass {
+    /// The target rejected the input (a parse/shape refusal).
+    ShapeRefusal,
+    /// The target stopped on a budget (time/memory/fuel) — FL-INV-07 territory.
+    ResourceStop,
+    /// The target crashed or faulted.
+    TargetFault,
+}
+
+impl ResourceClass {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::ShapeRefusal => "shape-refusal",
+            Self::ResourceStop => "resource-stop",
+            Self::TargetFault => "target-fault",
+        }
+    }
+}
+
+/// The failure signature a shrink must preserve exactly (td9: "shrinking preserves
+/// original failure signature, oracle authority/comparison, resource class, and
+/// reproduction"). The class token is the oracle's own (a verdict kind, an error
+/// variant) — free text, because the oracle is the authority and the model does
+/// not second-guess its vocabulary; the resource class is the model's own taxonomy
+/// and is checked separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureSignature {
+    pub class: String,
+    pub resource: ResourceClass,
+}
+
+/// What the oracle says about one candidate. The oracle is the named authority
+/// (td9: "oracle authority/comparison" is preserved): it is one closure for the
+/// whole shrink, so the comparison cannot be swapped mid-run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShrinkVerdict {
+    /// The candidate does not fail. It is never an acceptable shrink: shrinking
+    /// past the failure boundary loses the failure.
+    NotAFailure,
+    /// The candidate fails with this signature.
+    Failure(FailureSignature),
+}
+
+/// The shrink report — the candidate artifact td9 names. Emitted, never committed:
+/// checking a shrunk fixture into the repository is a separate reviewed action,
+/// so the report carries everything that review needs and the framework carries
+/// no path at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShrinkReport {
+    /// The signature preserved through every accepted step.
+    pub signature: FailureSignature,
+    /// The original input's measure.
+    pub original_measure: usize,
+    /// The shrunk candidate's measure.
+    pub final_measure: usize,
+    /// Every accepted reduction's measure, in order — the lineage a reviewer
+    /// replays to see the shrink rather than trust it.
+    pub lineage: Vec<usize>,
+    /// True when no candidate of the final input was accepted: the shrink stopped
+    /// at a local minimum rather than at the round budget.
+    pub local_minimum: bool,
+}
+
+/// The shrinker. Greedy: at each round, the first candidate that (a) fails and
+/// (b) fails with the *preserved* signature is accepted; rounds continue until no
+/// candidate is accepted (local minimum) or the round budget is met (typed stop —
+/// a shrink that ran out of rounds says so rather than calling its last
+/// intermediate state minimal).
+pub struct Shrinker {
+    /// How many candidate rounds the shrink may take before it must stop typed.
+    pub max_rounds: u64,
+}
+
+impl Shrinker {
+    /// Run the shrink. `candidates` produces a candidate's reductions (each strictly
+    /// smaller by `measure`); `oracle` is the single named authority; `measure` is
+    /// the input's size. The original input must fail, and its signature is the one
+    /// preserved — a shrink over a non-failing input is refused with `None`, because
+    /// there is nothing to preserve.
+    pub fn shrink<I>(
+        &self,
+        original: I,
+        measure: impl Fn(&I) -> usize,
+        mut candidates: impl FnMut(&I) -> Vec<I>,
+        mut oracle: impl FnMut(&I) -> ShrinkVerdict,
+    ) -> Option<ShrinkReport> {
+        let signature = match oracle(&original) {
+            ShrinkVerdict::NotAFailure => return None,
+            ShrinkVerdict::Failure(signature) => signature,
+        };
+        let mut current = original;
+        let mut lineage = vec![measure(&current)];
+        let mut local_minimum = false;
+        for _ in 0..self.max_rounds {
+            let mut accepted = false;
+            for candidate in candidates(&current) {
+                if measure(&candidate) >= measure(&current) {
+                    // Not a reduction. A candidate generator offering a non-shrinking
+                    // step is skipped rather than trusted: the shrink's monotonicity
+                    // is a law of the model, not of the generator.
+                    continue;
+                }
+                match oracle(&candidate) {
+                    ShrinkVerdict::NotAFailure => {}
+                    ShrinkVerdict::Failure(candidate_signature) => {
+                        if candidate_signature == signature {
+                            lineage.push(measure(&candidate));
+                            current = candidate;
+                            accepted = true;
+                            break;
+                        }
+                        // Signature drift: the candidate fails *differently*. That is
+                        // a new finding, not a shrink — recorded by refusal here, and
+                        // the drift never enters the lineage.
+                    }
+                }
+            }
+            if !accepted {
+                local_minimum = true;
+                break;
+            }
+        }
+        let final_measure = measure(&current);
+        Some(ShrinkReport {
+            signature,
+            original_measure: lineage[0],
+            final_measure,
+            lineage,
+            local_minimum,
+        })
+    }
+}
