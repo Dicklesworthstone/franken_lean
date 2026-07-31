@@ -182,6 +182,8 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
     "franken_lean-2jht",
     "franken_lean-c24a",
     "franken_lean-ext-observable-fixture-drift-gap-vqnu",
+    "fln-0bw5",
+    "fln-mandated-mutant-join-unwatched-uagk",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -190,7 +192,17 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// by growing back to twelve with no visible change to a literal. Equality makes the
 /// ceiling a ratchet whose only legitimate edit is downward, and makes any upward edit a
 /// deliberate, reviewable change to a constant that says what it is.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 4;
+///
+/// 4 -> 6 at `8a78e4fd` (the G0-3 door test): `door_loads_a_reference_built_plugin_end_to_end`
+/// landed in `crates/fln-unsafe-abi/src/tests.rs` with a code-level `.elan/toolchains`
+/// coordinate, making that surface pin-reaching the day it landed. The two rows that cite
+/// the surface — fln-0bw5's four membrane tests and uagk's dropped-retain killer — rest on
+/// tests that are NOT the pin-gated one: each cited test runs pinless in CI and passes,
+/// while the door test alone takes the typed skip the project's pinless-CI design intends.
+/// The guard is surface-granular and cannot see that; these declarations name it. The debt
+/// shrinks the day either row migrates off the surface, or CI runs the surface with the
+/// pin installed.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 6;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
@@ -258,6 +270,15 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          keyed by pin, so advancing SUITE.lock fails the retention check (fln-corpus-thread-matrix-93te)",
     ),
     (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "chosen_set_replays_and_witnesses",
+        "an on-demand probe lane whose every run commits a pin-keyed receipt at \
+         evidence/g02_kernel_verdict/chosen_set_v4.32.0.jsonl — keyed by pin, so advancing \
+         SUITE.lock makes the file absent rather than stale (93te's retention law). Declared \
+         from the lane's own docstring after bc4e1b3d swept it in mid-flight; the first \
+         recorded run and its retention guard are the owner's remainder",
+    ),
+    (
         "crates/fln-conformance/tests/mandated_mutants.rs",
         "the_mandated_mutants_are_planted_and_their_killers_die",
         "fln-mandated-mutant-join-unwatched-uagk's per-commit retention receipt, weekly \
@@ -279,7 +300,13 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 
 /// The ratchet for [`IGNORED_PRODUCER_ALLOWANCE`], by equality, for the reason
 /// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
-const IGNORED_PRODUCER_CEILING: usize = 5;
+///
+/// 5 -> 6 at the bc4e1b3d sweep: the anonymous commit landed MistyEagle's mid-flight
+/// `chosen_set_replays_and_witnesses` — an on-demand, pin-keyed-receipt probe lane
+/// whose design is the corpus-matrix retention pattern — with no declaration. The
+/// entry is the repair; the ceiling moves with it, disclosed here, and the lane's
+/// first recorded run plus its retention guard remain the owner's remainder.
+const IGNORED_PRODUCER_CEILING: usize = 6;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
