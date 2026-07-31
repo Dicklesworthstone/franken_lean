@@ -18,8 +18,11 @@
 //! intrinsic rows. A delayed thunk claims its closure once and completes only
 //! through the ordinary return continuation. The manager-absent `Task.spawn`,
 //! `Task.map`, and `Task.bind` fallbacks use that same continuation machinery
-//! and produce only finished tasks. Scheduled tasks, concurrent thunk forcing,
-//! ambient IO, and capability effects remain outside this slice.
+//! and produce only finished tasks. The allocation-linked
+//! `IO.getNumHeartbeats` / `IO.setNumHeartbeats` rows share Marrow's runtime
+//! counter and preserve arbitrary-`Nat` low-64 semantics. Scheduled tasks,
+//! concurrent thunk forcing, ambient IO, and capability effects remain outside
+//! this slice.
 
 use crate::extern_row::{
     ArgumentOwnership as ContractArgumentOwnership, Ownership as ExternOwnership,
@@ -435,6 +438,8 @@ enum IntrinsicImplementation {
     ArrayGetInternal,
     ArrayGetBorrowed,
     ArrayPush,
+    IoGetNumHeartbeats,
+    IoSetNumHeartbeats,
     RefNew,
     RefGet,
     RefTake,
@@ -461,6 +466,8 @@ impl IntrinsicImplementation {
             "extern:Array.getInternal" => Self::ArrayGetInternal,
             "extern:Array.ugetBorrowed" => Self::ArrayGetBorrowed,
             "extern:Array.push" => Self::ArrayPush,
+            "extern:IO.getNumHeartbeats" => Self::IoGetNumHeartbeats,
+            "extern:IO.setNumHeartbeats" => Self::IoSetNumHeartbeats,
             "extern:ST.Prim.mkRef" => Self::RefNew,
             "extern:ST.Prim.Ref.get" => Self::RefGet,
             "extern:ST.Prim.Ref.take" => Self::RefTake,
@@ -2619,6 +2626,18 @@ fn invoke_intrinsic(
             items.push(args[1].clone_ref());
             Ok(IntrinsicResult::raw_object(Obj::mk_array(items)))
         }
+        IntrinsicImplementation::IoGetNumHeartbeats => {
+            expect_arity(row, args, 0)?;
+            Ok(IntrinsicResult::owned(nat_from_u64(
+                fln_rt::heartbeat::allocation_heartbeats(),
+            )))
+        }
+        IntrinsicImplementation::IoSetNumHeartbeats => {
+            expect_arity(row, args, 1)?;
+            let count = nat_low_u64(&args[0], "IO.setNumHeartbeats", 0)?;
+            fln_rt::heartbeat::set_allocation_heartbeats(count);
+            Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
+        }
         IntrinsicImplementation::RefNew => {
             expect_arity(row, args, 1)?;
             Ok(IntrinsicResult::owned(Obj::mk_ref(args[0].clone_ref())))
@@ -2777,6 +2796,8 @@ fn managerless_task_application(
         | IntrinsicImplementation::ArrayGetInternal
         | IntrinsicImplementation::ArrayGetBorrowed
         | IntrinsicImplementation::ArrayPush
+        | IntrinsicImplementation::IoGetNumHeartbeats
+        | IntrinsicImplementation::IoSetNumHeartbeats
         | IntrinsicImplementation::RefNew
         | IntrinsicImplementation::RefGet
         | IntrinsicImplementation::RefTake
@@ -2878,6 +2899,28 @@ fn nat_value(value: &Obj, operation: &'static str, argument: usize) -> Result<us
         return Err(type_mismatch(operation, argument, "Nat scalar", value));
     }
     Ok(value.unbox())
+}
+
+fn nat_low_u64(value: &Obj, operation: &'static str, argument: usize) -> Result<u64, VmRefusal> {
+    if value.is_scalar() {
+        return Ok(value.unbox() as u64);
+    }
+    if value_kind(value) != ValueKind::Mpz {
+        return Err(type_mismatch(operation, argument, "Nat", value));
+    }
+    let (_, size, limbs) = value.mpz_view();
+    if size < 0 {
+        return Err(type_mismatch(operation, argument, "Nat", value));
+    }
+    Ok(limbs.first().copied().unwrap_or(0))
+}
+
+fn nat_from_u64(value: u64) -> Obj {
+    if value <= (usize::MAX >> 1) as u64 {
+        Obj::mk_nat(value as usize)
+    } else {
+        Obj::mk_mpz(&[value], false)
+    }
 }
 
 fn bool_value(value: &Obj, operation: &'static str, argument: usize) -> Result<bool, VmRefusal> {

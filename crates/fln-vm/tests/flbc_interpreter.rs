@@ -19,8 +19,8 @@ use fln_core::mode::{BuildProfileId, ContentRoot, Mode};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{Authority, InconclusiveCause, Outcome};
-use fln_rt::abi;
 use fln_rt::obj::{Obj, shadow};
+use fln_rt::{abi, heartbeat};
 use fln_vm::extern_row::{
     ArgumentOwnership as ContractArgumentOwnership, Ownership as ExternOwnership,
     ResultOwnership as ContractResultOwnership,
@@ -6332,6 +6332,84 @@ fn pure_effect_intrinsics_refuse_wrong_abi_kinds_without_leaks() {
                 && event.kind != shadow::EventKind::ForeignPointer
         }),
         "typed effect refusals preserve the owned object graph"
+    );
+}
+
+#[test]
+fn heartbeat_io_intrinsics_share_marrow_state_through_the_u64_boundary() {
+    let _guard = lock();
+    heartbeat::set_allocation_heartbeats(0);
+    shadow::enable();
+
+    let small = validated(vec![function(
+        0,
+        0,
+        4,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 37,
+            },
+            intrinsic(r(1), "extern:IO.setNumHeartbeats", vec![r(0)]),
+            intrinsic(r(2), "extern:IO.getNumHeartbeats", Vec::new()),
+            Instruction::Array {
+                dst: r(3),
+                items: vec![r(1), r(2)],
+            },
+            Instruction::Return { src: r(3) },
+        ],
+    )]);
+    let completed = returned(execute(&small, ExecutionLimits::default(), None));
+    assert_eq!(completed.usage.steps, 5);
+    assert_eq!(completed.usage.system_polls, 5);
+    assert_eq!(completed.value.array_child(0).unbox(), 0);
+    assert_eq!(completed.value.array_child(1).unbox(), 37);
+    assert_eq!(heartbeat::allocation_heartbeats(), 37);
+    drop(completed);
+
+    // A big Nat exercises the pin's low-64 setter and owned-result arms.
+    // Each getter snapshots MAX, then allocating the returned mpz advances the
+    // live counter once and wraps it to zero.
+    heartbeat::set_allocation_heartbeats(u64::MAX);
+    let wide = validated(vec![function(
+        0,
+        0,
+        4,
+        vec![
+            intrinsic(r(0), "extern:IO.getNumHeartbeats", Vec::new()),
+            intrinsic(r(1), "extern:IO.setNumHeartbeats", vec![r(0)]),
+            intrinsic(r(2), "extern:IO.getNumHeartbeats", Vec::new()),
+            Instruction::Array {
+                dst: r(3),
+                items: vec![r(0), r(1), r(2)],
+            },
+            Instruction::Return { src: r(3) },
+        ],
+    )]);
+    let completed = returned(execute(&wide, ExecutionLimits::default(), None));
+    assert_eq!(completed.usage.steps, 5);
+    assert_eq!(completed.usage.system_polls, 5);
+
+    for index in [0, 2] {
+        let value = completed.value.array_child(index);
+        assert_eq!(value_kind(&value), ValueKind::Mpz);
+        let (_, size, limbs) = value.mpz_view();
+        assert_eq!(size, 1);
+        assert_eq!(limbs, &[u64::MAX]);
+    }
+    assert_eq!(completed.value.array_child(1).unbox(), 0);
+    assert_eq!(heartbeat::allocation_heartbeats(), 0);
+    drop(completed);
+    heartbeat::set_allocation_heartbeats(0);
+
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "heartbeat IO execution retained no ABI value");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "heartbeat IO execution preserves the Marrow ownership graph"
     );
 }
 

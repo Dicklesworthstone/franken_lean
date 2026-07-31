@@ -72,5 +72,21 @@ pub mod rc;
 pub mod shadow;
 mod tagged;
 
+/// Read this runtime thread's allocation-linked heartbeat counter.
+///
+/// This is the counter surfaced by `IO.getNumHeartbeats`, not the separate
+/// native `check_system` poll counter in the pinned C++ runtime.
+pub fn allocation_heartbeats() -> u64 {
+    membrane::get_num_heartbeats()
+}
+
+/// Replace this runtime thread's allocation-linked heartbeat counter.
+///
+/// Small Marrow allocations and explicit ABI heartbeat bumps subsequently
+/// advance the installed value with wrapping `u64` arithmetic.
+pub fn set_allocation_heartbeats(count: u64) {
+    membrane::set_heartbeats(count);
+}
+
 #[cfg(test)]
 mod tests;

@@ -14,8 +14,9 @@
 //!
 //! This crate is `forbid(unsafe_code)`: the safety of everything here rests
 //! on the boundary crate's ledgered membrane plus the covenant, never on
-//! local unsafe. Effects (IO/Task semantics on asupersync) arrive with bead
-//! fln-3gv.
+//! local unsafe. The allocation-linked heartbeat state is exposed through
+//! [`heartbeat`]; the remaining IO/Task semantics on asupersync arrive with
+//! bead fln-3gv.
 
 #![forbid(unsafe_code)]
 
@@ -34,4 +35,10 @@ pub mod obj {
             EventKind, ShadowEvent, disable_and_drain, enable, enabled,
         };
     }
+}
+
+/// Allocation-linked runtime heartbeat state shared by Marrow, generated C,
+/// and Golem's `IO.getNumHeartbeats` / `IO.setNumHeartbeats` intrinsic rows.
+pub mod heartbeat {
+    pub use fln_unsafe_abi::{allocation_heartbeats, set_allocation_heartbeats};
 }
