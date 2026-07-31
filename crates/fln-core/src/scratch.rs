@@ -293,6 +293,18 @@ impl ScratchRoot {
     /// never silently inherit a previous run's bytes, which is a property worth more than
     /// the disk.
     pub fn create(prefix: &'static str, kind: &'static str, tag: &str) -> io::Result<ScratchRoot> {
+        // A guard the fence cannot reclaim is a silent leak: the prefix must name a
+        // routed family row. This is a programmer error, not data — a producer that
+        // mistypes or inlines a prefix fails HERE, loudly, rather than at a quiet
+        // eprintln on the drop path where the test still passes.
+        assert!(
+            SCRATCH_FAMILIES
+                .iter()
+                .any(|family| family.prefix == prefix && family.routed),
+            "ScratchRoot::create with unregistered prefix {prefix:?}: the prefix must name \
+             a routed SCRATCH_FAMILIES row (add the row deliberately, or use the family's \
+             constant)"
+        );
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -481,6 +493,27 @@ mod tests {
             !is_reclaimable(&temp.join("fln-epoch-lab-1-2-3"), EPOCH_LAB_PREFIX),
             "a declared remainder's prefix is refused: the declaration says the fence does \
              not stand behind that namespace"
+        );
+    }
+
+    #[test]
+    fn create_with_an_unregistered_prefix_fails_loudly() {
+        // The assert is the fence against a silent leak: a producer that mistypes or
+        // inlines a prefix must panic here, at construction, rather than at a quiet
+        // eprintln on the drop path where the test still passes. Exercised directly,
+        // because a guard nobody fires is decoration.
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _ = ScratchRoot::create("fln-no-such-family-", "probe", "tag");
+        }));
+        let payload = unwound.expect_err("an unregistered prefix must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string payload>");
+        assert!(
+            message.contains("fln-no-such-family-") && message.contains("routed"),
+            "the refusal must name the prefix and the law: {message}"
         );
     }
 

@@ -89,6 +89,23 @@ pub fn parse(text: &str) -> Result<ExternRowContract, ContractError> {
             "contract name is {name:?}, expected {CONTRACT_NAME:?}"
         )));
     }
+    // The rest of the fixed header is validated exactly, not merely hashed: a
+    // hand-edited framing line with a resealed root must fail by name, not
+    // slip through the root law.
+    let expected_header = [
+        "hash fnv1a64-noncryptographic framing=u64le-length-prefixed",
+        "semantic-schema fln.extern-rows.semantic/1",
+        "telemetry-schema fln.extern-rows.telemetry/1",
+    ];
+    for (offset, expected) in expected_header.iter().enumerate() {
+        if lines[2 + offset] != *expected {
+            return Err(ContractError::new(format!(
+                "header line {} is {:?}, expected {expected:?}",
+                2 + offset,
+                lines[2 + offset]
+            )));
+        }
+    }
     let reference = lines[5]
         .strip_prefix("reference ")
         .ok_or_else(|| ContractError::new("sixth line is not the reference row"))?;
@@ -104,6 +121,10 @@ pub fn parse(text: &str) -> Result<ExternRowContract, ContractError> {
         .strip_prefix("row-count ")
         .and_then(|count| count.parse().ok())
         .ok_or_else(|| ContractError::new("eighth line is not the row-count row"))?;
+    let declared_symbols: usize = lines[8]
+        .strip_prefix("symbol-count ")
+        .and_then(|count| count.parse().ok())
+        .ok_or_else(|| ContractError::new("ninth line is not the symbol-count row"))?;
 
     let root_line = lines
         .last()
@@ -191,6 +212,17 @@ pub fn parse(text: &str) -> Result<ExternRowContract, ContractError> {
         return Err(ContractError::new(format!(
             "row-count declares {declared_count} but {} rows are present",
             rows.len()
+        )));
+    }
+    let distinct_symbols = rows
+        .iter()
+        .map(|row| row.symbol.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    if distinct_symbols != declared_symbols {
+        return Err(ContractError::new(format!(
+            "symbol-count declares {declared_symbols} but {distinct_symbols} distinct \
+             symbols are present"
         )));
     }
     if rows.len() != DECLARED_ROW_COUNT {

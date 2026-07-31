@@ -313,7 +313,16 @@ fn batch_check_lines(root: &Path, tokens: &[String]) -> Vec<String> {
             }
             Ok(lines)
         };
-        let _ = verdict_tx.send(run());
+        let result = run();
+        // Always reap the child, whatever the outcome: on an error path it may
+        // still be alive (stdin EOF has not necessarily propagated), and an
+        // unwaited child is a zombie even in a test binary. The success path
+        // already took it from the slot, so this is a no-op there.
+        if let Some(mut child) = lock_slot(&child_slot).take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = verdict_tx.send(result);
     });
 
     match verdict_rx.recv_timeout(BATCH_BUDGET) {

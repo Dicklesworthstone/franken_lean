@@ -191,13 +191,17 @@ def reference_identity():
     if not repo or not tag or not commit or not tree:
         raise GenerationFault("SUITE.lock reference row is missing repo/tag/commit/tree")
     manifest_path = ROOT / "tribunal" / "epochs" / tag / "MANIFEST.txt"
-    if manifest_path.is_file():
-        manifest = read_text(manifest_path)
-        for needle in (repo, tag, commit):
-            if needle not in manifest:
-                raise GenerationFault(
-                    f"{relative(manifest_path)} disagrees with SUITE.lock on {needle!r}"
-                )
+    if not manifest_path.is_file():
+        raise GenerationFault(
+            f"{relative(manifest_path)} is missing — the Reference identity cannot be \
+             cross-checked without the epoch manifest, and an unchecked pin is not a pin"
+        )
+    manifest = read_text(manifest_path)
+    for needle in (repo, tag, commit):
+        if needle not in manifest:
+            raise GenerationFault(
+                f"{relative(manifest_path)} disagrees with SUITE.lock on {needle!r}"
+            )
     return repo, tag, commit, tree
 
 
@@ -358,10 +362,8 @@ def parse_telescope(raw: str):
         return []
     binders = []
     for cell in raw.split(";"):
-        parts = cell.rsplit(":", 3)
-        # cell shape: "quoted-name":info:mix256:h1:h2:h3:h4
-        # the hash carries three colons, so split from the right is wrong there;
-        # the shape is name:info:mix256:... — split into at most 3 parts instead.
+        # cell shape: "quoted-name":info:mix256:h1:h2:h3:h4 — the hash carries
+        # colons of its own, so split at most twice from the left.
         parts = cell.split(":", 2)
         if len(parts) != 3:
             raise GenerationFault(f"malformed telescope cell {cell!r}")
@@ -585,7 +587,7 @@ def render_rust(rows, contract_root):
         "/// One canonical extern row, `&'static` projection form. Field order is the",
         "/// canonical order of `ExternRow::root_fields` — wire, hash and table agree,",
         "/// so no projection can disagree about what the bytes mean.",
-        "#derive_placeholder",
+        "#[derive(Clone, Copy, Debug)]",
         "pub struct GeneratedExternRow {",
         '    pub id: &\'static str,',
         '    pub name: &\'static str,',
@@ -796,9 +798,7 @@ def main(argv):
             )
 
         contract_text, contract_root = render_contract(rows, reference, digests)
-        rust_text = render_rust(rows, contract_root).replace(
-            "#derive_placeholder", "#[derive(Clone, Copy, Debug)]"
-        )
+        rust_text = render_rust(rows, contract_root)
 
         if mode == "--check":
             drift = []
