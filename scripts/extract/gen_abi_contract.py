@@ -482,7 +482,26 @@ def parse_functions(stripped: str, lmap: LineMap) -> list[dict]:
         r"^static[ \t]+inline[ \t]+(?:LEAN_ALWAYS_INLINE[ \t]+)?([^\n;{]*?)\b(lean_\w+)[ \t]*\(",
         re.M,
     )
-    for kind, rx, terminator in (("export", export_rx, ";"), ("inline", inline_rx, "{")):
+    # The census hole the G0-3 plugin demand list surfaced (bead
+    # franken_lean-7xe, comment 1735): lean.h declares lean_notify_assert at
+    # file scope WITHOUT the LEAN_EXPORT token (lean.h:66) while the runtime
+    # definition exports it (debug.cpp:144) and real plugin object files link
+    # against it. A token-keyed sweep is structurally blind to this form, so
+    # the bare-declaration scan below closes it as a CLASS: any file-scope
+    # `lean_*` prototype with none of LEAN_EXPORT/static/inline is an exported
+    # symbol by the platform's default linkage, and the self-consistency check
+    # at the bottom counts it separately so a new instance is loud.
+    bare_rx = re.compile(
+        r"^[ \t]*(?!LEAN_EXPORT)(?!static)(?!typedef)(?!#)"
+        r"((?:void|bool|int|unsigned|size_t|uint\d+_t|double|float|lean_object[ \t]*\*|lean_obj_res)"
+        r"[^\n;{(=]*?)\b(lean_\w+)[ \t]*\(",
+        re.M,
+    )
+    for kind, rx, terminator in (
+        ("export", export_rx, ";"),
+        ("inline", inline_rx, "{"),
+        ("export", bare_rx, ";"),
+    ):
         for m in rx.finditer(stripped):
             close = scan_balanced(stripped, m.end() - 1)
             tail = stripped[close:close + 200].lstrip()
@@ -503,7 +522,9 @@ def parse_functions(stripped: str, lmap: LineMap) -> list[dict]:
                 "line": lmap.line(m.start()),
             })
     # Self-consistency: parsed counts must match raw pattern counts.
-    raw_exports = len(re.findall(r"^[ \t]*LEAN_EXPORT\b", stripped, re.M))
+    raw_exports = len(re.findall(r"^[ \t]*LEAN_EXPORT\b", stripped, re.M)) + len(
+        bare_rx.findall(stripped)
+    )
     raw_inlines = len(re.findall(r"^static[ \t]+inline\b", stripped, re.M))
     n_export = sum(1 for f in fns if f["linkage"] == "export")
     n_inline = sum(1 for f in fns if f["linkage"] == "inline")

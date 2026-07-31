@@ -8,7 +8,7 @@
 
 /// BLAKE-independent binding to the canonical inventory this module was rendered from
 /// (SHA-256 of `contracts/abi_inventory.json`).
-pub const INVENTORY_DIGEST: &str = "f61654c61c404f3c34bfefbe695269dafaffadd146643083ffca3e73340e2254";
+pub const INVENTORY_DIGEST: &str = "3eefadc8e70c2fd711a95d47e033d26f7451d6066a06adbf0eedd7790d1018f6";
 /// The Reference pin this contract is extracted from.
 pub const PIN_TAG: &str = "v4.32.0";
 pub const PIN_COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
@@ -241,7 +241,7 @@ pub struct AbiFn {
     pub line: u32,
 }
 
-/// The full `lean.h` function census: 210 `LEAN_EXPORT` prototypes and
+/// The full `lean.h` function census: 211 `LEAN_EXPORT` prototypes and
 /// 565 `static inline` definitions, sorted by (name, line).
 pub static FUNCTION_CENSUS: &[AbiFn] = &[
     AbiFn { name: "lean_align", linkage: Linkage::Inline, ret_c_type: "size_t", ret_ownership: Ownership::Value, params: &[AbiParam { c_type: "size_t", name: "v", ownership: Ownership::Value }, AbiParam { c_type: "size_t", name: "a", ownership: Ownership::Value }], line: 390 },
@@ -759,6 +759,7 @@ pub static FUNCTION_CENSUS: &[AbiFn] = &[
     AbiFn { name: "lean_nat_sub", linkage: Linkage::Inline, ret_c_type: "lean_obj_res", ret_ownership: Ownership::OwnedRes, params: &[AbiParam { c_type: "b_lean_obj_arg", name: "a1", ownership: Ownership::BorrowedArg }, AbiParam { c_type: "b_lean_obj_arg", name: "a2", ownership: Ownership::BorrowedArg }], line: 1430 },
     AbiFn { name: "lean_nat_succ", linkage: Linkage::Inline, ret_c_type: "lean_obj_res", ret_ownership: Ownership::OwnedRes, params: &[AbiParam { c_type: "b_lean_obj_arg", name: "a", ownership: Ownership::BorrowedArg }], line: 1416 },
     AbiFn { name: "lean_nat_to_int", linkage: Linkage::Inline, ret_c_type: "lean_obj_res", ret_ownership: Ownership::OwnedRes, params: &[AbiParam { c_type: "lean_obj_arg", name: "a", ownership: Ownership::OwnedArg }], line: 1641 },
+    AbiFn { name: "lean_notify_assert", linkage: Linkage::Export, ret_c_type: "void", ret_ownership: Ownership::Value, params: &[AbiParam { c_type: "const char *", name: "fileName", ownership: Ownership::Value }, AbiParam { c_type: "int", name: "line", ownership: Ownership::Value }, AbiParam { c_type: "const char *", name: "condition", ownership: Ownership::Value }], line: 66 },
     AbiFn { name: "lean_obj_once", linkage: Linkage::Inline, ret_c_type: "lean_object*", ret_ownership: Ownership::RawObject, params: &[AbiParam { c_type: "lean_object**", name: "loc", ownership: Ownership::RawObject }, AbiParam { c_type: "lean_once_cell_t*", name: "tok", ownership: Ownership::Value }, AbiParam { c_type: "lean_object* (*init)(void)", name: "", ownership: Ownership::RawObject }], line: 3278 },
     AbiFn { name: "lean_obj_once_cold", linkage: Linkage::Export, ret_c_type: "lean_object*", ret_ownership: Ownership::RawObject, params: &[AbiParam { c_type: "lean_object**", name: "loc", ownership: Ownership::RawObject }, AbiParam { c_type: "lean_once_cell_t*", name: "tok", ownership: Ownership::Value }, AbiParam { c_type: "lean_object* (*init)(void)", name: "", ownership: Ownership::RawObject }], line: 3276 },
     AbiFn { name: "lean_obj_tag", linkage: Linkage::Inline, ret_c_type: "unsigned", ret_ownership: Ownership::Value, params: &[AbiParam { c_type: "lean_object *", name: "o", ownership: Ownership::RawObject }], line: 597 },

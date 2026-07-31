@@ -1866,6 +1866,50 @@ unsafe fn apply_core(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObj
     }
 }
 
+/// The exact 4-line violation block `notify_assertion_violation` prints
+/// (`debug.cpp:48-55`), factored pure so the byte layout is testable without
+/// crossing the crash path.
+pub(crate) fn format_assert_violation(file: &str, line: i32, condition: &str) -> String {
+    format!("LEAN ASSERTION VIOLATION\nFile: {file}\nLine: {line}\n{condition}\n")
+}
+
+/// `lean_notify_assert` (`debug.cpp:144-147`; declared at `lean.h:66` WITHOUT
+/// the `LEAN_EXPORT` token — the census-hole symbol the G0-3 plugin demand
+/// list surfaced). Prints upstream's exact violation block to stderr, then
+/// ABORTS. Documented divergence, crash-path only: upstream follows the print
+/// with `invoke_debugger()`, which by default throws a C++ exception
+/// reachable only by a C++ host; a Rust wrapper cannot throw one, and an
+/// assert violation is an invariant failure either way (FL-INV-07: never a
+/// user diagnostic, never a silent continue).
+// UNSAFE-LEDGER: FLN-UL-0186
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_notify_assert")]
+pub(crate) extern "C" fn export_lean_notify_assert(
+    file_name: *const core::ffi::c_char,
+    line: core::ffi::c_int,
+    condition: *const core::ffi::c_char,
+) -> ! {
+    // SAFETY: census-signatured entry; callers hand NUL-terminated C strings
+    // per the assert macro's expansion (`lean.h:67`). A null pointer is
+    // rendered as a placeholder rather than dereferenced.
+    let render = |p: *const core::ffi::c_char| -> String {
+        if p.is_null() {
+            "<null>".to_string()
+        } else {
+            // SAFETY: non-null per the branch; NUL-terminated per the assert
+            // macro's expansion (`lean.h:67` hands string literals).
+            unsafe { core::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    eprint!(
+        "{}",
+        format_assert_violation(&render(file_name), line, &render(condition))
+    );
+    std::process::abort()
+}
+
 /// `lean_string_append` (`object.cpp:2084-2105`): `s1` owned, `s2` borrowed
 /// (`lean.h:1225`); arms ported in [`object::string_append_core`], with the
 /// exclusivity verdict taken here exactly as upstream takes it.

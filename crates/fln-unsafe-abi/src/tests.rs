@@ -1825,3 +1825,14 @@ fn export_string_append_matches_upstream_arms() {
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance across all three append arms");
 }
+
+#[test]
+fn export_assert_violation_format_matches_upstream() {
+    // debug.cpp:48-55 byte-for-byte: four lines, each newline-terminated, the
+    // condition bare on its own line. The abort half is the crash path and is
+    // deliberately not crossed in-process; the format is the testable half.
+    assert_eq!(
+        crate::export::format_assert_violation("plug.c", 42, "x != NULL"),
+        "LEAN ASSERTION VIOLATION\nFile: plug.c\nLine: 42\nx != NULL\n"
+    );
+}

@@ -33,7 +33,7 @@
 >   which is the one dimension in which it is NOT short where the `.olean`
 >   extractor was (bead `franken_lean-contract-pin-tree-unestablished-monc`).
 > source: `vendor/lean4-src/src/include/lean/lean.h` (3352 lines, sha256 `22eed50aa703c4403010fabc12a7231ffa34dc979bd59ca1bfbac13c29a1dad2`)
-> inventory: `contracts/abi_inventory.json` sha256 `f61654c61c404f3c34bfefbe695269dafaffadd146643083ffca3e73340e2254`
+> inventory: `contracts/abi_inventory.json` sha256 `3eefadc8e70c2fd711a95d47e033d26f7451d6066a06adbf0eedd7790d1018f6`
 > rust: `crates/fln-rt/src/abi.rs` (rendered from the same inventory)
 > rust (boundary): `crates/fln-unsafe-abi/src/contract.rs` (layout partition, `pub(crate)`, same inventory)
 
@@ -210,7 +210,7 @@ The reference-count field `m_rc` encodes thread-state: `> 0` single-threaded,
 
 ## 5. Function census
 
-210 `LEAN_EXPORT` prototypes; 565 `static inline` definitions.
+211 `LEAN_EXPORT` prototypes; 565 `static inline` definitions.
 Ownership classes: `owned_arg`/`borrowed_arg`/`unique_arg` (`lean_obj_arg`/
 `b_lean_obj_arg`/`u_lean_obj_arg`), `owned_res`/`borrowed_res`, `raw_object`
 (bare `lean_object *`), `value` (non-object). Duplicate names arise from
@@ -733,6 +733,7 @@ platform `#if` branches and are intentional; rows are keyed by (name, line).
 | `lean_nat_sub` | inline | (a1: borrowed_arg, a2: borrowed_arg) -> owned_res | 1430 |
 | `lean_nat_succ` | inline | (a: borrowed_arg) -> owned_res | 1416 |
 | `lean_nat_to_int` | inline | (a: owned_arg) -> owned_res | 1641 |
+| `lean_notify_assert` | export | (fileName: value, line: value, condition: value) -> value | 66 |
 | `lean_obj_once` | inline | (loc: raw_object, tok: value, raw_object) -> raw_object | 3278 |
 | `lean_obj_once_cold` | export | (loc: raw_object, tok: value, raw_object) -> raw_object | 3276 |
 | `lean_obj_tag` | inline | (o: raw_object) -> value | 597 |
