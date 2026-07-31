@@ -223,33 +223,33 @@ fn an_active_or_green_row_without_evidence_is_refused() {
 #[test]
 fn unknown_tokens_are_refused_with_their_line() {
     let mut text = planted("registered |");
-    text = text.replacen("mutation | fln-7li", "alchemy | fln-7li");
+    text = text.replace("mutation | fln-7li", "alchemy | fln-7li");
     assert_eq!(
-        OwnerMatrix::parse(&text),
-        Err(MatrixError::UnknownFamily {
+        OwnerMatrix::parse(&text).unwrap_err(),
+        MatrixError::UnknownFamily {
             line: 2,
             token: "alchemy".to_string()
-        })
+        }
     );
 
     let mut text = planted("registered |");
-    text = text.replacen("FL-INV-03", "FL-INV-99");
+    text = text.replace("FL-INV-03", "FL-INV-99");
     assert_eq!(
-        OwnerMatrix::parse(&text),
-        Err(MatrixError::UnknownInvariant {
+        OwnerMatrix::parse(&text).unwrap_err(),
+        MatrixError::UnknownInvariant {
             line: 11,
             token: "FL-INV-99".to_string()
-        })
+        }
     );
 
     let mut text = planted("registered |");
-    text = text.replacen("registered |\nadapter kernel-terms", "golden |\nadapter kernel-terms");
+    text = text.replace("registered |\nadapter kernel-terms", "golden |\nadapter kernel-terms");
     assert_eq!(
-        OwnerMatrix::parse(&text),
-        Err(MatrixError::UnknownState {
+        OwnerMatrix::parse(&text).unwrap_err(),
+        MatrixError::UnknownState {
             line: 2,
             token: "golden".to_string()
-        })
+        }
     );
 }
 
