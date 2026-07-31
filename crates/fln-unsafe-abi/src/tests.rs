@@ -1062,9 +1062,10 @@ fn collect_c4_facts() -> Vec<(String, i64)> {
 fn export_small_heap_prefix_roundtrip() {
     let _g = lock();
     use crate::export::{
-        export_lean_alloc_small, export_lean_free_small, export_lean_small_mem_size,
-        export_mi_free, export_mi_malloc_small,
+        export_lean_alloc_small, export_lean_free_small, export_lean_inc_heartbeat,
+        export_lean_small_mem_size, export_mi_free, export_mi_malloc_small,
     };
+    let before = crate::membrane::heartbeat_value();
     // mi twin: size preserved through the prefix, pointer 8-aligned.
     let p = export_mi_malloc_small(24);
     assert!(!p.is_null());
@@ -1077,11 +1078,32 @@ fn export_small_heap_prefix_roundtrip() {
     let z = export_mi_malloc_small(0);
     assert!(!z.is_null());
     export_mi_free(z);
+    assert_eq!(
+        crate::membrane::heartbeat_value(),
+        before,
+        "the raw mimalloc shim is downstream of lean.h's explicit bump"
+    );
+    // The distributed lean.h path performs this exact composition:
+    // lean_inc_heartbeat(), then mi_malloc_small(). It must charge once.
+    export_lean_inc_heartbeat();
+    let composed = export_mi_malloc_small(16);
+    assert!(!composed.is_null());
+    export_mi_free(composed);
+    assert_eq!(
+        crate::membrane::heartbeat_value(),
+        before + 1,
+        "the distributed lean.h small-allocation path must not double-charge"
+    );
     // SMALL_ALLOCATOR surface: aligned size + slot-idx law.
     let q = export_lean_alloc_small(32, 3);
     assert!(!q.is_null());
     assert_eq!(export_lean_small_mem_size(q), 32);
     export_lean_free_small(q);
+    assert_eq!(
+        crate::membrane::heartbeat_value(),
+        before + 2,
+        "the small-allocator entry point owns exactly one bump"
+    );
 }
 
 #[test]
@@ -1232,20 +1254,42 @@ fn export_panic_fn_balances_ownership_and_returns_default() {
 #[test]
 fn export_heartbeat_is_thread_local_counting() {
     let _g = lock();
-    use crate::export::{export_lean_inc_heartbeat, heartbeat_value};
-    let before = heartbeat_value();
+    use crate::export::export_lean_inc_heartbeat;
+    let before = crate::membrane::heartbeat_value();
     for _ in 0..5 {
         export_lean_inc_heartbeat();
     }
-    assert_eq!(heartbeat_value(), before + 5);
+    assert_eq!(crate::membrane::heartbeat_value(), before + 5);
     // A fresh thread starts its own counter (LEAN_THREAD_VALUE semantics).
     std::thread::spawn(|| {
-        assert_eq!(heartbeat_value(), 0);
+        assert_eq!(crate::membrane::heartbeat_value(), 0);
         export_lean_inc_heartbeat();
-        assert_eq!(heartbeat_value(), 1);
+        assert_eq!(crate::membrane::heartbeat_value(), 1);
     })
     .join()
     .expect("heartbeat thread");
+}
+
+#[test]
+fn marrow_small_objects_charge_and_big_objects_do_not() {
+    let _g = lock();
+    let before = crate::membrane::heartbeat_value();
+
+    let small = Obj::mk_ref(Obj::mk_nat(7));
+    assert_eq!(
+        crate::membrane::heartbeat_value(),
+        before + 1,
+        "a Marrow small-object constructor charges one allocation tick"
+    );
+    drop(small);
+
+    let big = Obj::mk_array(Vec::new());
+    assert_eq!(
+        crate::membrane::heartbeat_value(),
+        before + 1,
+        "the Reference heartbeat law does not charge a big allocation"
+    );
+    drop(big);
 }
 
 #[test]

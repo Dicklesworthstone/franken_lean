@@ -32,14 +32,16 @@
 //! unwinding toward an ABI boundary (§6.5 panic law). The *exported* C
 //! surface instead mirrors the pin's observable OOM behavior
 //! (`lean_internal_panic_out_of_memory`); see `export.rs`. The owned
-//! size-classed allocator with the heartbeat hook replaces `std::alloc`
-//! underneath this interface in bead fln-8w8; the membrane discipline and
-//! observable header facts are already final here.
+//! calibrated heartbeat hook is installed at the small-allocation seam; the
+//! size-classed backend that replaces `std::alloc` underneath this interface
+//! remains bead fln-8w8 work. The membrane discipline and observable header
+//! facts are already final here.
 
 use crate::contract::{MAX_SMALL_OBJECT_SIZE, OBJECT_SIZE_DELTA, TAG_RESERVED};
 use crate::layout::LeanObject;
 use crate::shadow;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::cell::Cell;
 
 /// `lean_align` (`lean.h:390-392`) at `OBJECT_SIZE_DELTA` granularity.
 #[inline(always)]
@@ -56,6 +58,28 @@ const OBJ_ALIGN: usize = 8;
 /// Hidden size prefix on every small-heap block (`lean.h:425-429` shape):
 /// one word, so the returned object pointer stays 8-aligned.
 const SMALL_PREFIX: usize = size_of::<usize>();
+
+thread_local! {
+    /// `g_heartbeat` / `heap::m_heartbeat` at the pin: one counter per
+    /// runtime thread, shared by small allocations and explicit bumps.
+    static HEARTBEAT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Add explicit heartbeat ticks with the pin's wrapping unsigned arithmetic.
+pub(crate) fn add_heartbeats(ticks: u64) {
+    HEARTBEAT.with(|heartbeat| heartbeat.set(heartbeat.get().wrapping_add(ticks)));
+}
+
+/// The counting hook used by both supported small-allocator entry paths.
+pub(crate) fn charge_small_allocation() {
+    add_heartbeats(1);
+}
+
+/// Test-only observation of the current runtime thread's counter.
+#[cfg(test)]
+pub(crate) fn heartbeat_value() -> u64 {
+    HEARTBEAT.with(Cell::get)
+}
 
 fn obj_layout(size: usize) -> Layout {
     debug_assert!(size > 0);
@@ -135,6 +159,7 @@ pub(crate) unsafe fn small_mem_size_raw(p: *mut u8) -> usize {
 pub(crate) unsafe fn alloc_small(sz: usize) -> *mut LeanObject {
     let aligned = align_obj_size(sz);
     debug_assert!(aligned <= MAX_SMALL_OBJECT_SIZE);
+    charge_small_allocation();
     // SAFETY: aligned > 0; block minted by the small heap; m_cs_sz is
     // in-bounds of the fresh exclusively-owned block.
     unsafe {

@@ -40,7 +40,6 @@ use crate::rc;
 use crate::tagged::is_scalar;
 use core::ffi::{c_char, c_uint, c_void};
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::cell::Cell;
 use std::io::Write;
 
 // ---------------------------------------------------------------- panic core
@@ -86,20 +85,6 @@ fn panic_impl(msg: &[u8]) {
     if should_abort_on_panic() {
         std::process::abort();
     }
-}
-
-thread_local! {
-    /// `g_heartbeat` (`interrupt.cpp:18`): thread-local allocation/progress
-    /// counter. The calibrated heartbeat *law* (fuel parity) is bead
-    /// fln-8w8/G0-6; the counting twin lives here so the exported symbol has
-    /// the pin's exact storage discipline from day one.
-    static HEARTBEAT: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Test hook: current thread's heartbeat count.
-#[cfg(test)]
-pub(crate) fn heartbeat_value() -> usize {
-    HEARTBEAT.with(Cell::get)
 }
 
 // ---------------------------------------------------------------- UTF-8 core
@@ -302,6 +287,7 @@ pub(crate) extern "C" fn export_lean_alloc_small(sz: c_uint, slot_idx: c_uint) -
     debug_assert!(sz > 0 && sz.is_multiple_of(8));
     debug_assert!(slot_idx == sz / 8 - 1, "lean_get_slot_idx law (lean.h:394)");
     let _ = slot_idx;
+    membrane::charge_small_allocation();
     // SAFETY: sz > 0 per the inline callers' contract (asserted upstream).
     let p = unsafe { membrane::small_alloc_raw(sz as usize) };
     if p.is_null() {
@@ -401,7 +387,7 @@ pub(crate) extern "C" fn export_lean_free_object(o: *mut LeanObject) {
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_inc_heartbeat")]
 pub(crate) extern "C" fn export_lean_inc_heartbeat() {
-    HEARTBEAT.with(|h| h.set(h.get().wrapping_add(1)));
+    membrane::add_heartbeats(1);
 }
 
 // ---- reference counting ------------------------------------------------------

@@ -33,8 +33,10 @@
 //!   asupersync);
 //! * forcing thunks / applying closures / external `m_foreach` traversal —
 //!   bead franken_lean-7xe (Golem apply machinery);
-//! * compacted-region loading — bead fln-wgp; the owned allocator — fln-8w8;
-//!   mpz arithmetic — the fln-bignum shim (Crucible workstream).
+//! * compacted-region loading — bead fln-wgp; the size-classed allocator
+//!   backend, deterministic thread-matrix, and soak evidence — fln-8w8 (its
+//!   calibrated small-allocation heartbeat hook is installed);
+//! * mpz arithmetic — the fln-bignum shim (Crucible workstream).
 
 #![deny(unsafe_code)]
 // D3's SAFETY-note half, now enforced here as it already was in the other two boundary
