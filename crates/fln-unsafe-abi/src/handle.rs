@@ -250,6 +250,13 @@ impl Obj {
         unsafe { Obj(object::alloc_thunk_value(value.into_raw())) }
     }
 
+    /// Unevaluated thunk carrying one owned closure.
+    pub fn mk_thunk_closure(closure: Obj) -> Obj {
+        assert!(closure.obj_tag() == usize::from(crate::contract::TAG_CLOSURE));
+        // SAFETY: fresh allocation initialized with the consumed closure.
+        unsafe { Obj(object::alloc_thunk_closure(closure.into_raw())) }
+    }
+
     /// Finished task (`Task.pure`); consumes the value.
     pub fn mk_task_pure(value: Obj) -> Obj {
         // SAFETY: fresh allocation initialized with the owned value.
@@ -418,6 +425,149 @@ impl Obj {
         unsafe {
             let (_, arity, num_fixed, _) = object::closure_fields(self.0);
             (arity, num_fixed)
+        }
+    }
+
+    /// Inspect a non-callable closure shell and retain each fixed argument.
+    ///
+    /// `None` distinguishes a native closure carrying a real function pointer
+    /// from the shells created by [`Obj::mk_closure`]. The returned children
+    /// are fresh owned references; no raw function or object pointer escapes.
+    pub fn closure_shell_parts(&self) -> Option<(u16, Vec<Obj>)> {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_CLOSURE));
+        // SAFETY: invariant + tag assertion. The function pointer is compared
+        // only with the shell sentinel and never dereferenced. Every child is
+        // retained before an owned handle escapes.
+        unsafe {
+            let (fun, arity, num_fixed, args) = object::closure_fields(self.0);
+            if fun != core::ptr::dangling_mut::<c_void>() {
+                return None;
+            }
+            let mut fixed = Vec::with_capacity(usize::from(num_fixed));
+            for i in 0..usize::from(num_fixed) {
+                let child = args.add(i).read();
+                if !tagged::is_scalar(child) {
+                    rc::inc_ref_n(child, 1);
+                }
+                fixed.push(Obj(child));
+            }
+            Some((arity, fixed))
+        }
+    }
+
+    /// Read an `ST.Ref` cell as a fresh owned reference.
+    pub fn ref_get(&self) -> Obj {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_REF));
+        // SAFETY: invariant + tag assertion; the raw operation retains the
+        // borrowed cell value before it escapes.
+        unsafe { Obj(object::ref_get_owned(self.0)) }
+    }
+
+    /// Transfer the current `ST.Ref` value and leave the cell empty.
+    ///
+    /// The caller must refill the cell with [`Obj::ref_set`] before any
+    /// operation that requires a live occupant.
+    pub fn ref_take(&self) -> Obj {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_REF));
+        // SAFETY: invariant + tag assertion; the raw operation transfers the
+        // cell's owned token without retaining or releasing it.
+        unsafe { Obj(object::ref_take(self.0)) }
+    }
+
+    /// Replace an `ST.Ref` cell, consuming the new value.
+    pub fn ref_set(&self, value: Obj) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_REF));
+        // SAFETY: invariant + tag assertion; into_raw transfers exactly the
+        // owned reference consumed by the cell.
+        unsafe { object::ref_set(self.0, value.into_raw()) };
+    }
+
+    /// Replace an `ST.Ref` cell and return its previous owned value.
+    pub fn ref_swap(&self, value: Obj) -> Obj {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_REF));
+        // SAFETY: invariant + tag assertion; into_raw transfers the new cell
+        // token and the raw operation transfers the old token back.
+        unsafe { Obj(object::ref_swap(self.0, value.into_raw())) }
+    }
+
+    /// Reference identity equality without exposing either address.
+    pub fn ref_ptr_eq(&self, other: &Obj) -> bool {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_REF));
+        assert!(other.obj_tag() == usize::from(crate::contract::TAG_REF));
+        self.0 == other.0
+    }
+
+    /// Retain the value of an already evaluated thunk.
+    ///
+    /// `None` denotes an unevaluated or in-flight thunk; forcing it requires
+    /// the closure-application state machine rather than this observer.
+    pub fn evaluated_thunk_value(&self) -> Option<Obj> {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_THUNK));
+        // SAFETY: invariant + tag assertion. Evaluated thunks have a non-null
+        // value and null closure; the value is retained before escape.
+        unsafe {
+            let (value, closure) = object::thunk_fields(self.0);
+            if value.is_null() || !closure.is_null() {
+                return None;
+            }
+            if !tagged::is_scalar(value) {
+                rc::inc_ref_n(value, 1);
+            }
+            Some(Obj(value))
+        }
+    }
+
+    /// Atomically claim an unevaluated thunk's closure.
+    ///
+    /// At most one caller receives `Some`; a later `None` means the thunk is
+    /// already evaluated or another force is in flight.
+    pub fn claim_thunk_closure(&self) -> Option<Obj> {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_THUNK));
+        // SAFETY: invariant + tag assertion; the atomic exchange transfers the
+        // stored ownership token to this handle.
+        unsafe {
+            let closure = object::thunk_take_closure(self.0);
+            if closure.is_null() {
+                None
+            } else {
+                Some(Obj(closure))
+            }
+        }
+    }
+
+    /// Install the value produced by a claimed thunk computation.
+    ///
+    /// The value is consumed on success. On a lost or invalid completion race
+    /// it is released here and `false` is returned.
+    pub fn complete_claimed_thunk(&self, value: Obj) -> bool {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_THUNK));
+        let value = value.into_raw();
+        // SAFETY: invariant + tag assertion; value is one owned reference and
+        // the raw operation consumes it only when the compare-exchange wins.
+        let installed = unsafe { object::thunk_try_set_value(self.0, value) };
+        if !installed {
+            drop(Obj(value));
+        }
+        installed
+    }
+
+    /// Retain the value of a finished task.
+    ///
+    /// `None` denotes a scheduled, waiting, or malformed task state; the
+    /// scheduler owns those transitions.
+    pub fn finished_task_value(&self) -> Option<Obj> {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_TASK));
+        // SAFETY: invariant + tag assertion. A finished task has a non-null
+        // value and no task implementation; retain before escape.
+        unsafe {
+            let (value, implementation) = object::task_fields(self.0);
+            if value.is_null() || !implementation.is_null() {
+                return None;
+            }
+            if !tagged::is_scalar(value) {
+                rc::inc_ref_n(value, 1);
+            }
+            Some(Obj(value))
         }
     }
 

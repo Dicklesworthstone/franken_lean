@@ -356,27 +356,196 @@ fn array_and_sarray_facts() {
 #[test]
 fn closure_ref_thunk_task_mpz_facts() {
     let _g = lock();
-    let cl = Obj::mk_closure(3, vec![Obj::mk_nat(9)]);
-    assert_eq!(cl.closure_view(), (3, 1));
+    let cl = Obj::mk_closure(3, vec![Obj::mk_nat(9), Obj::mk_string("fixed")]);
+    assert_eq!(cl.closure_view(), (3, 2));
+    let (arity, fixed) = cl
+        .closure_shell_parts()
+        .expect("mk_closure produces an inspectable shell");
+    assert_eq!(arity, 3);
+    assert_eq!(fixed.len(), 2);
+    assert_eq!(fixed[0].unbox(), 9);
     assert_eq!(cl.header().cs_sz, 0, "closures ride the big path");
+    drop(cl);
+    let (size, _, _, bytes) = fixed[1].string_view();
+    assert_eq!(
+        &bytes[..size],
+        b"fixed\0",
+        "retained shell children outlive the original closure handle"
+    );
 
     let r = Obj::mk_ref(Obj::mk_string("cell"));
     assert_eq!(
         usize::from(r.header().cs_sz),
         align_obj_size(size_of::<LeanRefObject>())
     );
+    let alias = r.clone_ref();
+    assert!(r.ref_ptr_eq(&alias));
+    let distinct = Obj::mk_ref(Obj::mk_string("cell"));
+    assert!(
+        !r.ref_ptr_eq(&distinct),
+        "equal contents do not collapse reference identity"
+    );
+    let before = r.ref_get();
+    let old = r.ref_swap(Obj::mk_string("swapped"));
+    let after = alias.ref_get();
+    let (_, _, _, before_bytes) = before.string_view();
+    let (_, _, _, old_bytes) = old.string_view();
+    let (_, _, _, after_bytes) = after.string_view();
+    assert_eq!(before_bytes, b"cell\0");
+    assert_eq!(old_bytes, b"cell\0");
+    assert_eq!(after_bytes, b"swapped\0");
+    alias.ref_set(Obj::mk_string("set"));
+    let set = r.ref_get();
+    let (_, _, _, set_bytes) = set.string_view();
+    assert_eq!(set_bytes, b"set\0");
 
-    let t = Obj::mk_thunk_value(Obj::mk_nat(4));
+    let t = Obj::mk_thunk_value(Obj::mk_string("thunk"));
     assert_eq!(t.obj_tag(), usize::from(contract::TAG_THUNK));
+    let thunk_value = t
+        .evaluated_thunk_value()
+        .expect("Thunk.pure is already evaluated");
+    drop(t);
+    let (_, _, _, thunk_bytes) = thunk_value.string_view();
+    assert_eq!(
+        thunk_bytes, b"thunk\0",
+        "retained thunk payload outlives its container"
+    );
 
-    let task = Obj::mk_task_pure(Obj::mk_nat(5));
+    let delayed = Obj::mk_thunk_closure(Obj::mk_closure(1, Vec::new()));
+    assert!(delayed.evaluated_thunk_value().is_none());
+    let claimed = delayed
+        .claim_thunk_closure()
+        .expect("the delayed closure is claimed exactly once");
+    assert_eq!(claimed.closure_view(), (1, 0));
+    assert!(
+        delayed.claim_thunk_closure().is_none(),
+        "a second force sees the in-flight state"
+    );
+    drop(claimed);
+    assert!(delayed.complete_claimed_thunk(Obj::mk_string("forced")));
+    assert!(
+        !delayed.complete_claimed_thunk(Obj::mk_string("discarded")),
+        "a completed thunk cannot be overwritten"
+    );
+    let delayed_value = delayed
+        .evaluated_thunk_value()
+        .expect("the completed payload is retained");
+    let (_, _, _, delayed_bytes) = delayed_value.string_view();
+    assert_eq!(delayed_bytes, b"forced\0");
+
+    let task = Obj::mk_task_pure(Obj::mk_string("task"));
     assert_eq!(task.obj_tag(), usize::from(contract::TAG_TASK));
+    let task_value = task
+        .finished_task_value()
+        .expect("Task.pure is already finished");
+    drop(task);
+    let (_, _, _, task_bytes) = task_value.string_view();
+    assert_eq!(
+        task_bytes, b"task\0",
+        "retained task payload outlives its container"
+    );
 
     let m = Obj::mk_mpz(&[0xDEAD_BEEF, 0x1], true);
     let (alloc, size, limbs) = m.mpz_view();
     assert_eq!(alloc, 2);
     assert_eq!(size, -2, "sign of the value is the sign of m_size");
     assert_eq!(limbs, &[0xDEAD_BEEF, 0x1]);
+}
+
+#[test]
+fn ref_take_transfers_the_exact_cell_token_and_refill_restores_ownership() {
+    let _g = lock();
+    shadow::enable();
+    {
+        let payload = Obj::mk_string("single-threaded");
+        let payload_identity = payload.identity_token();
+        let cell = Obj::mk_ref(payload);
+        let taken = cell.ref_take();
+        assert_eq!(
+            taken.identity_token(),
+            payload_identity,
+            "take transfers the cell token without retaining or replacing it"
+        );
+        cell.ref_set(Obj::mk_string("refilled"));
+        let refilled = cell.ref_get();
+        let (_, _, _, refilled_bytes) = refilled.string_view();
+        assert_eq!(refilled_bytes, b"refilled\0");
+
+        let shared_payload = Obj::mk_string("shared");
+        let shared_identity = shared_payload.identity_token();
+        let shared_cell = Obj::mk_ref(shared_payload);
+        let shared_alias = shared_cell.clone_ref();
+        shared_cell.make_mt();
+        let shared_taken = shared_alias.ref_take();
+        assert_eq!(
+            shared_taken.identity_token(),
+            shared_identity,
+            "the atomic lane transfers the same owned cell token"
+        );
+        shared_cell.ref_set(Obj::mk_string("shared-refill"));
+        let shared_refilled = shared_alias.ref_get();
+        let (_, _, _, shared_bytes) = shared_refilled.string_view();
+        assert_eq!(shared_bytes, b"shared-refill\0");
+
+        let drop_payload = Obj::mk_string("outlives-empty-cell");
+        let drop_identity = drop_payload.identity_token();
+        let empty_cell = Obj::mk_ref(drop_payload);
+        let survivor = empty_cell.ref_take();
+        drop(empty_cell);
+        assert_eq!(
+            survivor.identity_token(),
+            drop_identity,
+            "dropping an empty cell does not release the transferred token"
+        );
+        let (_, _, _, survivor_bytes) = survivor.string_view();
+        assert_eq!(survivor_bytes, b"outlives-empty-cell\0");
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "take and refill leave no live ABI allocation");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::DoubleRelease && event.kind != EventKind::ForeignPointer
+        }),
+        "take and refill preserve exact cell ownership"
+    );
+}
+
+#[test]
+fn mt_ref_cell_operations_preserve_owned_values_on_the_atomic_lane() {
+    let _g = lock();
+    shadow::enable();
+    {
+        let cell = Obj::mk_ref(Obj::mk_string("old"));
+        let alias = cell.clone_ref();
+        cell.make_mt();
+        assert_eq!(cell.header().rc, -2);
+
+        cell.ref_set(Obj::mk_string("new"));
+        let retained = alias.ref_get();
+        assert!(
+            retained.header().rc <= -2,
+            "the cell and owned read retain distinct MT references"
+        );
+        let previous = cell.ref_swap(Obj::mk_string("final"));
+        assert_eq!(
+            retained.identity_token(),
+            previous.identity_token(),
+            "swap transfers the exact previous ABI object"
+        );
+        let (_, _, _, previous_bytes) = previous.string_view();
+        assert_eq!(previous_bytes, b"new\0");
+        let current = alias.ref_get();
+        let (_, _, _, current_bytes) = current.string_view();
+        assert_eq!(current_bytes, b"final\0");
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::DoubleRelease && event.kind != EventKind::ForeignPointer
+        }),
+        "the atomic ref lane preserves exact ownership"
+    );
 }
 
 #[test]

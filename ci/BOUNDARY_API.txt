@@ -78,6 +78,19 @@ row FLN-BX-0051 | crates/fln-unsafe-abi/src/handle.rs | fn probe_foreign_pointer
 row FLN-BX-0052 | crates/fln-unsafe-abi/src/handle.rs | fn probe_quarantine_poison | () -> u8 | shadow_quarantine_poisons_headers | scripted probe, shadows-gated
 row FLN-BX-0067 | crates/fln-unsafe-abi/src/handle.rs | fn probe_cold_double_release | () | shadow_kills_cold_double_release | scripted misuse, shadows-gated, self-contained
 
+# ---- bead franken_lean-zoe: safe ABI-value operations consumed by Golem ----
+row FLN-BX-0068 | crates/fln-unsafe-abi/src/handle.rs | fn closure_shell_parts | (&self) -> Option<(u16, Vec<Obj>)> | closure_ref_thunk_task_mpz_facts; flbc closure application suite | shell sentinel comparison plus inc-before-escape children; no raw pointer, native call authority, or kernel type escapes
+row FLN-BX-0069 | crates/fln-unsafe-abi/src/handle.rs | fn ref_get | (&self) -> Obj | closure_ref_thunk_task_mpz_facts; FLBC pure effect suite | retains the cell occupant before returning one owned ABI value; no raw pointer or kernel type escapes
+row FLN-BX-0070 | crates/fln-unsafe-abi/src/handle.rs | fn ref_set | (&self, Obj) | closure_ref_thunk_task_mpz_facts; FLBC pure effect suite | consumes one owned ABI value into a tag-checked cell and releases the prior occupant; no admission surface
+row FLN-BX-0071 | crates/fln-unsafe-abi/src/handle.rs | fn ref_swap | (&self, Obj) -> Obj | closure_ref_thunk_task_mpz_facts; FLBC pure effect suite | exchanges one owned ABI value for the prior owned ABI value under the tag-checked cell protocol
+row FLN-BX-0072 | crates/fln-unsafe-abi/src/handle.rs | fn ref_ptr_eq | (&self, &Obj) -> bool | closure_ref_thunk_task_mpz_facts; FLBC pure effect suite | compares two tag-checked identities without exposing either address or an address-derived ordering token
+row FLN-BX-0073 | crates/fln-unsafe-abi/src/handle.rs | fn evaluated_thunk_value | (&self) -> Option<Obj> | closure_ref_thunk_task_mpz_facts; FLBC pure effect suite | retains only a completed ABI payload; delayed closure and raw pointer state do not escape
+row FLN-BX-0074 | crates/fln-unsafe-abi/src/handle.rs | fn finished_task_value | (&self) -> Option<Obj> | closure_ref_thunk_task_mpz_facts; FLBC pure effect suite | retains only a finished ABI payload; scheduler implementation and raw pointer state do not escape
+row FLN-BX-0075 | crates/fln-unsafe-abi/src/handle.rs | fn mk_thunk_closure | (Obj) -> Obj | closure_ref_thunk_task_mpz_facts; delayed FLBC thunk suite | consumes one tag-checked closure into a fresh ABI thunk; no callable pointer or kernel type escapes
+row FLN-BX-0076 | crates/fln-unsafe-abi/src/handle.rs | fn claim_thunk_closure | (&self) -> Option<Obj> | closure_ref_thunk_task_mpz_facts; delayed FLBC thunk suite | transfers the stored closure token to at most one claimant without exposing its raw pointer
+row FLN-BX-0077 | crates/fln-unsafe-abi/src/handle.rs | fn complete_claimed_thunk | (&self, Obj) -> bool | closure_ref_thunk_task_mpz_facts; delayed FLBC thunk suite | consumes exactly one completed ABI value on success and releases a losing value on refusal
+row FLN-BX-0078 | crates/fln-unsafe-abi/src/handle.rs | fn ref_take | (&self) -> Obj | ref_take_transfers_the_exact_cell_token_and_refill_restores_ownership; FLBC take/refill suite | transfers one owned ABI value from a tag-checked cell without exposing a raw pointer, address, kernel type, or admission capability
+
 # ---- bead fln-wgp slice 1: fln-unsafe-region mapping surface + compactor identity ----
 row FLN-BX-0053 | crates/fln-unsafe-abi/src/handle.rs | fn identity_token | (&self) -> usize | region compact sharing tests | opaque dedup key; address-derived, never enters artifacts/digests (CGSE)
 row FLN-BX-0054 | crates/fln-unsafe-region/src/lib.rs | mod mapping | module: RegionMapping surface | region suites | exposes only rows below

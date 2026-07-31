@@ -18,9 +18,9 @@ use crate::layout::{
     LeanThunkObject,
 };
 use crate::membrane;
-use crate::rc::init_st_header;
+use crate::rc::{self, init_st_header};
 use core::ffi::c_void;
-use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
 // ---------------------------------------------------------------- ctor
@@ -569,6 +569,135 @@ pub(crate) unsafe fn ref_value(o: *mut LeanObject) -> *mut LeanObject {
     unsafe { (&raw const (*o.cast::<LeanRefObject>()).m_value).read() }
 }
 
+/// Owned `lean_st_ref_get` result. The MT/persistent arm temporarily claims
+/// the cell's RC token before retaining it, exactly as the pinned runtime.
+///
+/// # Safety
+/// `o` live ref object whose cell is non-null.
+// UNSAFE-LEDGER: FLN-UL-0193
+#[allow(unsafe_code)]
+pub(crate) unsafe fn ref_get_owned(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live ref per caller contract. A non-positive header count selects
+    // the atomic cell protocol; a positive count carries ST exclusivity.
+    unsafe {
+        if rc::read_header(o).rc <= 0 {
+            let slot = AtomicPtr::from_ptr(&raw mut (*o.cast::<LeanRefObject>()).m_value);
+            loop {
+                let value = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if value.is_null() {
+                    continue;
+                }
+                if !crate::tagged::is_scalar(value) {
+                    rc::inc_ref_n(value, 1);
+                }
+                let displaced = slot.swap(value, Ordering::SeqCst);
+                if !displaced.is_null() && !crate::tagged::is_scalar(displaced) {
+                    rc::dec_ref(displaced);
+                }
+                return value;
+            }
+        }
+
+        let value = (&raw const (*o.cast::<LeanRefObject>()).m_value).read();
+        assert!(!value.is_null(), "null reference read");
+        if !crate::tagged::is_scalar(value) {
+            rc::inc_ref_n(value, 1);
+        }
+        value
+    }
+}
+
+/// `lean_st_ref_take`: transfer the cell's owned value to the caller and
+/// leave the slot null until a later set. The MT/persistent arm retries a
+/// transient null exactly as the pinned runtime.
+///
+/// # Safety
+/// `o` live ref object whose cell is non-null.
+// UNSAFE-LEDGER: FLN-UL-0199
+#[allow(unsafe_code)]
+pub(crate) unsafe fn ref_take(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live ref per caller contract. A shared ref uses the pinned
+    // atomic exchange loop; an ST-exclusive ref transfers its slot directly.
+    unsafe {
+        if rc::read_header(o).rc <= 0 {
+            let slot = AtomicPtr::from_ptr(&raw mut (*o.cast::<LeanRefObject>()).m_value);
+            loop {
+                let value = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if !value.is_null() {
+                    return value;
+                }
+            }
+        }
+
+        let slot = &raw mut (*o.cast::<LeanRefObject>()).m_value;
+        let value = slot.read();
+        assert!(!value.is_null(), "null reference take");
+        slot.write(core::ptr::null_mut());
+        value
+    }
+}
+
+/// `lean_st_ref_set`: consume `value`, replace the cell, release any old
+/// occupant, and preserve the Reference's MT reachability invariant.
+///
+/// # Safety
+/// `o` live ref object; `value` is one owned ABI reference.
+// UNSAFE-LEDGER: FLN-UL-0194
+#[allow(unsafe_code)]
+pub(crate) unsafe fn ref_set(o: *mut LeanObject, value: *mut LeanObject) {
+    // SAFETY: live ref and owned value per caller contract. A shared ref uses
+    // the atomic slot and requires every reachable heap object to be MT.
+    unsafe {
+        let old = if rc::read_header(o).rc <= 0 {
+            if !crate::tagged::is_scalar(value) {
+                rc::mark_mt(value);
+            }
+            AtomicPtr::from_ptr(&raw mut (*o.cast::<LeanRefObject>()).m_value)
+                .swap(value, Ordering::SeqCst)
+        } else {
+            let slot = &raw mut (*o.cast::<LeanRefObject>()).m_value;
+            let old = slot.read();
+            slot.write(value);
+            old
+        };
+        if !old.is_null() && !crate::tagged::is_scalar(old) {
+            rc::dec_ref(old);
+        }
+    }
+}
+
+/// `lean_st_ref_swap`: consume `value` and return the previous owned cell
+/// value. The transient-null retry matches the pinned MT protocol.
+///
+/// # Safety
+/// `o` live ref object; `value` is one owned ABI reference.
+// UNSAFE-LEDGER: FLN-UL-0195
+#[allow(unsafe_code)]
+pub(crate) unsafe fn ref_swap(o: *mut LeanObject, value: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live ref and owned value per caller contract. Shared cells use
+    // the same exchange loop as runtime/io.cpp.
+    unsafe {
+        if rc::read_header(o).rc <= 0 {
+            if !crate::tagged::is_scalar(value) {
+                rc::mark_mt(value);
+            }
+            let slot = AtomicPtr::from_ptr(&raw mut (*o.cast::<LeanRefObject>()).m_value);
+            loop {
+                let old = slot.swap(value, Ordering::SeqCst);
+                if !old.is_null() {
+                    return old;
+                }
+            }
+        }
+
+        let slot = &raw mut (*o.cast::<LeanRefObject>()).m_value;
+        let old = slot.read();
+        assert!(!old.is_null(), "null reference read");
+        slot.write(value);
+        old
+    }
+}
+
 /// Evaluated-thunk constructor (`lean_thunk_pure` shape, `lean.h` thunk
 /// family): `m_value = v`, `m_closure = NULL`. Both fields legally nullable
 /// (G0-1 item 10); forcing unevaluated thunks needs the apply machinery
@@ -591,6 +720,28 @@ pub(crate) unsafe fn alloc_thunk_value(v: *mut LeanObject) -> *mut LeanObject {
         let t = o.cast::<LeanThunkObject>();
         (&raw mut (*t).m_value).write(AtomicPtr::new(v));
         (&raw mut (*t).m_closure).write(AtomicPtr::new(core::ptr::null_mut()));
+    }
+    membrane::note_alloc(o, membrane::align_obj_size(sz), TAG_THUNK);
+    o
+}
+
+/// Delayed-thunk constructor (`lean_mk_thunk`): `m_value = NULL` and
+/// `m_closure = closure`.
+///
+/// # Safety
+/// Caller owns the result; `closure` reference is consumed.
+// UNSAFE-LEDGER: FLN-UL-0196
+#[allow(unsafe_code)]
+pub(crate) unsafe fn alloc_thunk_closure(closure: *mut LeanObject) -> *mut LeanObject {
+    let sz = size_of::<LeanThunkObject>();
+    // SAFETY: fixed small size; every field is initialized before publication.
+    let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: fresh exclusively owned block of at least sz bytes.
+    unsafe {
+        init_st_header(o, TAG_THUNK, 0);
+        let thunk = o.cast::<LeanThunkObject>();
+        (&raw mut (*thunk).m_value).write(AtomicPtr::new(core::ptr::null_mut()));
+        (&raw mut (*thunk).m_closure).write(AtomicPtr::new(closure));
     }
     membrane::note_alloc(o, membrane::align_obj_size(sz), TAG_THUNK);
     o
@@ -656,6 +807,49 @@ pub(crate) unsafe fn thunk_fields(o: *mut LeanObject) -> (*mut LeanObject, *mut 
             (*t).m_value.load(core::sync::atomic::Ordering::Acquire),
             (*t).m_closure.load(core::sync::atomic::Ordering::Acquire),
         )
+    }
+}
+
+/// Claim an unevaluated thunk's owned closure exactly once.
+///
+/// # Safety
+/// `o` live thunk object.
+// UNSAFE-LEDGER: FLN-UL-0197
+#[allow(unsafe_code)]
+pub(crate) unsafe fn thunk_take_closure(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live thunk per caller contract; AcqRel transfers the stored
+    // closure's ownership token to the successful claimant.
+    unsafe {
+        (*o.cast::<LeanThunkObject>())
+            .m_closure
+            .swap(core::ptr::null_mut(), Ordering::AcqRel)
+    }
+}
+
+/// Complete a claimed thunk by installing one owned value if its value slot is
+/// still empty. Returns false without consuming `value` if another value won.
+///
+/// # Safety
+/// `o` live thunk object; `value` is one owned ABI reference.
+// UNSAFE-LEDGER: FLN-UL-0198
+#[allow(unsafe_code)]
+pub(crate) unsafe fn thunk_try_set_value(o: *mut LeanObject, value: *mut LeanObject) -> bool {
+    // SAFETY: live thunk per caller contract. A non-null closure means no
+    // claimant owns the computation yet, so completion must refuse.
+    unsafe {
+        let thunk = o.cast::<LeanThunkObject>();
+        if !(*thunk).m_closure.load(Ordering::Acquire).is_null() {
+            return false;
+        }
+        (*thunk)
+            .m_value
+            .compare_exchange(
+                core::ptr::null_mut(),
+                value,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
