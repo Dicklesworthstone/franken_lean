@@ -59,6 +59,8 @@ compile_error!(
 );
 
 mod contract;
+#[cfg(all(test, target_os = "linux"))]
+mod door;
 mod export;
 pub mod handle;
 mod layout;
