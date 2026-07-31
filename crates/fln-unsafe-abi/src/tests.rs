@@ -1649,3 +1649,58 @@ fn handle_apply_reproduces_the_closures_corpus_semantics_with_rc_balance() {
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance: every apply cell freed its objects");
 }
+
+#[test]
+fn handle_apply_reproduces_the_arrays_and_strings_corpus_slices_with_rc_balance() {
+    let _g = lock();
+    use crate::handle::Obj;
+    shadow::enable();
+    {
+        // arrays.lean line 3 shape: `#[1,2,3,4].map (· * 2) |>.foldl (· + ·) 0`
+        // = 20 — map as apply-per-element through the safe surface, fold as a
+        // chained binary apply, exactly Golem's dispatch shape.
+        let arr = Obj::mk_array(vec![
+            Obj::mk_nat(1),
+            Obj::mk_nat(2),
+            Obj::mk_nat(3),
+            Obj::mk_nat(4),
+        ]);
+        let (size, capacity) = arr.array_view();
+        assert_eq!((size, capacity), (4, 4), "capacity == size by construction");
+        let mut mapped = Vec::new();
+        for i in 0..size {
+            let doubler = Obj::mk_closure_fn1(corpus_targets::double, vec![]);
+            mapped.push(doubler.apply(vec![arr.array_child(i)]));
+        }
+        let mut acc = Obj::mk_nat(0);
+        for m in mapped {
+            let adder = Obj::mk_closure_fn2(corpus_targets::add2, vec![]);
+            acc = adder.apply(vec![acc, m]);
+        }
+        assert_eq!(acc.unbox(), 20, "map-then-fold over the ABI array");
+
+        // strings.lean semantics natively: the UTF-8 length law ("héllo" is 5
+        // chars / 6 bytes, m_size includes NUL) and append reproducing the
+        // corpus's byte-and-char accounting.
+        let s = Obj::mk_string("héllo");
+        let (m_size, m_capacity, m_length, bytes) = s.string_view();
+        assert_eq!(m_length, 5, "char length (the corpus's .length observable)");
+        assert_eq!(m_size, 7, "byte size includes the NUL");
+        assert!(m_capacity >= m_size);
+        assert_eq!(&bytes[..6], "héllo".as_bytes());
+        let appended = Obj::mk_string(&format!("{}{}", "franken", "lean"));
+        let (_, _, app_len, app_bytes) = appended.string_view();
+        assert_eq!(app_len, 11);
+        assert_eq!(&app_bytes[..11], b"frankenlean");
+
+        // The ctor slice: Tree.node Tree.leaf Tree.leaf from the corpus's
+        // inductive, traversed back out through ctor_child.
+        let leaf = || Obj::mk_ctor(0, vec![], &[]);
+        let node = Obj::mk_ctor(1, vec![leaf(), leaf()], &[]);
+        assert_eq!(node.header().tag, 1);
+        assert_eq!(node.ctor_child(0).header().tag, 0);
+        assert_eq!(node.ctor_child(1).header().tag, 0);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across arrays, strings, and ctors");
+}
