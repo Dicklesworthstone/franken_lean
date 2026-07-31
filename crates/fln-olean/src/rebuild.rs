@@ -109,7 +109,14 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
     let mut report = RebuildReport::default();
     let mut spans: Vec<Span> = Vec::new();
 
-    let encode_ptr = |file_off: u64| base + file_off;
+    let encode_ptr = |file_off: u64| -> Result<u64, RegionError> {
+        // The pointer base plus an in-file offset must fit a u64, or the
+        // re-emitted word silently encodes a wrapped address (fln-abaz finding 3).
+        base.checked_add(file_off).ok_or(RegionError::DecodeShape {
+            offset: file_off,
+            reason: "pointer base plus file offset overflows u64",
+        })
+    };
     let reencode_word = |view: &OleanView, raw: u64| -> Result<u64, RegionError> {
         if raw & 1 == 1 {
             // Tagged scalar: re-derive from the value.
@@ -117,7 +124,7 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
         } else if raw == 0 {
             Ok(0)
         } else {
-            Ok(encode_ptr(view.deref(raw)?))
+            encode_ptr(view.deref(raw)?)
         }
     };
 
@@ -187,12 +194,22 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
                 }
             }
             // Unused capacity is slack: measured and copied, never assumed.
-            let slack = capacity.checked_sub(size).ok_or(RegionError::DecodeShape {
-                offset: off,
-                reason: "array size exceeds capacity",
-            })? * 8;
+            let slack = capacity
+                .checked_sub(size)
+                .and_then(|rest| rest.checked_mul(8))
+                .ok_or(RegionError::DecodeShape {
+                    offset: off,
+                    reason: "array slack overflows the address space",
+                })?;
             if slack > 0 {
-                out.extend_from_slice(view.read_bytes(off + 24 + 8 * size, slack)?);
+                let slack_off = off
+                    .checked_add(24)
+                    .and_then(|base| base.checked_add(size.checked_mul(8)?))
+                    .ok_or(RegionError::DecodeShape {
+                        offset: off,
+                        reason: "array slack offset overflows the address space",
+                    })?;
+                out.extend_from_slice(view.read_bytes(slack_off, slack)?);
                 report.slack_bytes += slack;
             }
         } else if tag == abi::TAG_SCALAR_ARRAY {
@@ -202,15 +219,28 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             out.extend_from_slice(&size.to_le_bytes());
             out.extend_from_slice(&capacity.to_le_bytes());
             let elem = other.max(1) as u64;
-            let payload = size * elem;
+            let payload = size.checked_mul(elem).ok_or(RegionError::DecodeShape {
+                offset: off,
+                reason: "scalar-array payload overflows the address space",
+            })?;
             out.extend_from_slice(view.read_bytes(off + 24, payload)?);
             report.copied_sarray_bytes += payload;
-            let slack = capacity.checked_sub(size).ok_or(RegionError::DecodeShape {
-                offset: off,
-                reason: "scalar-array size exceeds capacity",
-            })? * elem;
+            let slack = capacity
+                .checked_sub(size)
+                .and_then(|rest| rest.checked_mul(elem))
+                .ok_or(RegionError::DecodeShape {
+                    offset: off,
+                    reason: "scalar-array slack overflows the address space",
+                })?;
             if slack > 0 {
-                out.extend_from_slice(view.read_bytes(off + 24 + payload, slack)?);
+                let slack_off = off
+                    .checked_add(24)
+                    .and_then(|base| base.checked_add(payload))
+                    .ok_or(RegionError::DecodeShape {
+                        offset: off,
+                        reason: "scalar-array slack offset overflows the address space",
+                    })?;
+                out.extend_from_slice(view.read_bytes(slack_off, slack)?);
                 report.slack_bytes += slack;
             }
         } else if tag == abi::TAG_STRING {
@@ -237,14 +267,18 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             out.extend_from_slice(&packed.to_le_bytes());
             let limb_raw = view.read_u64(off + 16)?;
             let limb_off = view.deref(limb_raw)?;
-            out.extend_from_slice(&encode_ptr(limb_off).to_le_bytes());
+            out.extend_from_slice(&encode_ptr(limb_off)?.to_le_bytes());
             let limbs = (((packed >> 32) as u32) as i32).unsigned_abs() as u64;
+            let limb_bytes = limbs.checked_mul(8).ok_or(RegionError::DecodeShape {
+                offset: off,
+                reason: "mpz limb extent overflows the address space",
+            })?;
             spans.push(Span {
                 off: limb_off,
-                bytes: view.read_bytes(limb_off, limbs * 8)?.to_vec(),
+                bytes: view.read_bytes(limb_off, limb_bytes)?.to_vec(),
                 kind: "mpz-limbs",
             });
-            report.copied_mpz_limb_bytes += limbs * 8;
+            report.copied_mpz_limb_bytes += limb_bytes;
         } else if tag == abi::TAG_THUNK || tag == abi::TAG_TASK || tag == abi::TAG_REF {
             // Present in the walk's vocabulary but not expected in module data
             // at the pin; refuse rather than guess a size law.

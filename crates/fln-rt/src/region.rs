@@ -173,7 +173,15 @@ pub fn parse_olean_envelope(file: &[u8]) -> RResult<OleanEnvelope> {
     if !(base_addr as usize).is_multiple_of(rc::REGION_ALIGN) {
         return Err(RegionFault::MisalignedBase { base: base_addr });
     }
+    // The one envelope law the rest of the codec leans on: the payload's pointer
+    // base plus the file's extent must fit a u64, or every base+offset add
+    // downstream either panics (debug) or wraps into an address the audit then
+    // cannot tell from a valid one (fln-abaz finding 3).
     let (data_off, _) = header_field("data");
+    let extent = base_addr
+        .checked_add(file.len() as u64)
+        .ok_or(RegionFault::MisalignedBase { base: base_addr })?;
+    let _ = extent;
     Ok(OleanEnvelope {
         version,
         base_addr,
