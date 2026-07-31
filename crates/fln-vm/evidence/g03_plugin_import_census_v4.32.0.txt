@@ -1,0 +1,25 @@
+# fln-g03-plugin-import-census/1 — the membrane demand list from a REAL
+# Reference-built plugin (bead franken_lean-7xe, acceptance b; pin v4.32.0).
+#
+# Build protocol (deliberate regeneration; both steps against the pinned bin):
+#   lean plug.lean -c plug.c
+#   leanc -DLEAN_EXPORTING -shared -fPIC plug.c -o plug.so
+# The -DLEAN_EXPORTING flag is LOAD-BEARING and was measured, not assumed: without
+# it LEAN_EXPORT expands empty under leanc's -fvisibility=hidden and the .so
+# retains no plugin symbols at all (first build: 6200 bytes, _init/_fini only).
+#
+# Exports (nm -D, T): initialize_plug plug_add_five plug_greet
+# Imports (nm -D -u, non-glibc), each with its ABI_EXPORT_STATUS.txt verdict:
+import initialize_Init                    | door-work: module-initializer ordering (§11.5), not an ABI symbol
+import lean_big_usize_to_nat              | CompatWrapper — already served by Marrow
+import lean_dec_ref_cold                  | CompatWrapper — already served
+import lean_inc_heartbeat                 | CompatWrapper — already served
+import lean_internal_panic_out_of_memory  | CompatWrapper — already served
+import lean_internal_panic_overflow       | CompatWrapper — already served
+import lean_nat_big_add                   | CompatWrapper — already served
+import lean_notify_assert                 | NOT IN THE STATUS FILE — census hole, filed on the bead
+import lean_string_append                 | Unsupported (83r: "later export slice") — the ONE export gap
+#
+# Verdict: 6 of 8 ABI imports already served; the spike-scale door needs exactly
+# ONE new export (lean_string_append), ONE census repair (lean_notify_assert),
+# and the initializer-ordering half that IS the door's design work.
