@@ -1864,3 +1864,242 @@ impl Shrinker {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Framework 6: no-mock evidence attestation
+// ---------------------------------------------------------------------------
+
+/// How one boundary an evidence run crossed is classified (td9/§18: "release-level
+/// claims close only against the real thing: real Reference binaries, real
+/// filesystems, real editor clients, real corruption. Mocked boundaries are fine
+/// for unit tests and rejected by the evidence gate").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BoundaryKind {
+    /// The pinned Reference toolchain's real binary/libraries.
+    RealReference,
+    /// A real filesystem (not a RAM-backed fixture harness pretending to be one).
+    RealFilesystem,
+    /// A real child process (not an in-process impersonation).
+    RealProcess,
+    /// A real editor/LSP client (not a scripted message pump).
+    RealEditor,
+    /// Real corruption introduced on real bytes (not a simulated fault flag).
+    RealCorruption,
+    /// A mock. It may support a unit test; it may never close anything stronger.
+    Mock,
+}
+
+impl BoundaryKind {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::RealReference => "real-reference",
+            Self::RealFilesystem => "real-filesystem",
+            Self::RealProcess => "real-process",
+            Self::RealEditor => "real-editor",
+            Self::RealCorruption => "real-corruption",
+            Self::Mock => "mock",
+        }
+    }
+
+    /// True for every `Real*` kind — the evidence requirement below keys off this,
+    /// and a new real kind added later must not slip past it.
+    pub fn is_real(self) -> bool {
+        !matches!(self, Self::Mock)
+    }
+}
+
+/// The strength of claim an artifact is offered to close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ClosureLevel {
+    /// A unit test. Mocks are welcome here.
+    Unit,
+    /// A Parity-Ledger L-level row.
+    EvidenceLevel,
+    /// A performance gate (PG-n).
+    PerformanceGate,
+    /// A public claim (README, release note, the claim matrix).
+    PublicClaim,
+}
+
+/// One boundary crossing, attested. A `Real*` boundary without its evidence is a
+/// label, not an attestation — the constructor refuses it (the mock-substitution
+/// self-mutant: a boundary declared real with nothing to show is exactly how a
+/// mock dresses up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundaryAttestation {
+    /// The boundary's name (e.g. `reference-binary`, `editor-client`, `cas-store`).
+    pub boundary: String,
+    pub kind: BoundaryKind,
+    /// What makes it real: the binary's content hash, the device/inode facts of the
+    /// filesystem, the child's pid lineage, the editor's protocol handshake, the
+    /// corrupted byte offsets. Empty is only ever legal for `Mock` — a mock says
+    /// what it is and needs no proof of it.
+    pub evidence: String,
+}
+
+/// Every way an attestation can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestationError {
+    /// A `Real*` boundary carried no evidence.
+    RealBoundaryWithoutEvidence { boundary: String },
+    /// The artifact's declared digest does not match its content — the attestation
+    /// and the artifact describe different runs.
+    ArtifactBindingMismatch { artifact: String },
+    /// A mock boundary was offered toward a closure stronger than `Unit`.
+    MockBeyondUnit {
+        boundary: String,
+        level: &'static str,
+    },
+    /// A required field was empty.
+    BlankField { field: &'static str },
+    /// An NDJSON row did not parse, carried the wrong schema, or an unknown token.
+    NdjsonInvalid { reason: String },
+}
+
+impl fmt::Display for AttestationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RealBoundaryWithoutEvidence { boundary } => write!(
+                f,
+                "boundary `{boundary}` is attested real with no evidence: a label is \
+                 not an attestation"
+            ),
+            Self::ArtifactBindingMismatch { artifact } => write!(
+                f,
+                "the attestation's digest does not match artifact `{artifact}`: it \
+                 describes a different run"
+            ),
+            Self::MockBeyondUnit { boundary, level } => write!(
+                f,
+                "mock boundary `{boundary}` cannot support {level}: mocks are for \
+                 unit tests, never for closing one"
+            ),
+            Self::BlankField { field } => write!(f, "attestation field `{field}` is blank"),
+            Self::NdjsonInvalid { reason } => {
+                write!(f, "invalid attestation NDJSON: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AttestationError {}
+
+/// The attestation for one evidence artifact: what produced it, which boundaries
+/// the run crossed, and the content binding that ties the attestation to the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoMockAttestation {
+    /// The evidence artifact (repo-relative path).
+    pub artifact: String,
+    /// Its content digest (fln_hash hex) — the binding.
+    pub artifact_digest: String,
+    /// The lane or binary that produced it.
+    pub producer: String,
+    pub boundaries: Vec<BoundaryAttestation>,
+}
+
+/// The attestation schema token.
+pub const ATTESTATION_SCHEMA: &str = "fln.no-mock-attestation/1";
+
+impl NoMockAttestation {
+    /// Construct and validate: required fields non-blank, and every `Real*`
+    /// boundary carrying its evidence.
+    pub fn new(
+        artifact: &str,
+        artifact_digest: &str,
+        producer: &str,
+        boundaries: Vec<BoundaryAttestation>,
+    ) -> Result<Self, AttestationError> {
+        let artifact = artifact.trim();
+        if artifact.is_empty() {
+            return Err(AttestationError::BlankField { field: "artifact" });
+        }
+        let artifact_digest = artifact_digest.trim();
+        if artifact_digest.is_empty() {
+            return Err(AttestationError::BlankField {
+                field: "artifact_digest",
+            });
+        }
+        let producer = producer.trim();
+        if producer.is_empty() {
+            return Err(AttestationError::BlankField { field: "producer" });
+        }
+        for boundary in &boundaries {
+            if boundary.kind.is_real() && boundary.evidence.trim().is_empty() {
+                return Err(AttestationError::RealBoundaryWithoutEvidence {
+                    boundary: boundary.boundary.clone(),
+                });
+            }
+        }
+        Ok(Self {
+            artifact: artifact.to_string(),
+            artifact_digest: artifact_digest.to_string(),
+            producer: producer.to_string(),
+            boundaries,
+        })
+    }
+
+    /// The closure law (td9/§18 verbatim): a mock may support a unit test but may
+    /// not close an L-level, PG gate, or public claim. An attestation with no mock
+    /// boundaries permits any level; one with a mock permits `Unit` alone, and the
+    /// refusal names the boundary.
+    pub fn permits_closure(&self, level: ClosureLevel) -> Result<(), AttestationError> {
+        if matches!(level, ClosureLevel::Unit) {
+            return Ok(());
+        }
+        let level_name = match level {
+            ClosureLevel::Unit => unreachable!(),
+            ClosureLevel::EvidenceLevel => "an L-level row",
+            ClosureLevel::PerformanceGate => "a performance gate",
+            ClosureLevel::PublicClaim => "a public claim",
+        };
+        for boundary in &self.boundaries {
+            if boundary.kind == BoundaryKind::Mock {
+                return Err(AttestationError::MockBeyondUnit {
+                    boundary: boundary.boundary.clone(),
+                    level: level_name,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind the attestation to its artifact: the caller supplies the artifact's
+    /// bytes (the model never touches the filesystem — where the bytes come from
+    /// is the caller's attested fact), and a mismatch is a refusal, not a warning.
+    pub fn verify_artifact_binding(&self, artifact_bytes: &[u8]) -> Result<(), AttestationError> {
+        let digest =
+            fln_hash::domain::hash(fln_hash::domain::Domain::Fixture, artifact_bytes).to_hex();
+        if digest != self.artifact_digest {
+            return Err(AttestationError::ArtifactBindingMismatch {
+                artifact: self.artifact.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Emit the attestation as one canonical NDJSON row.
+    pub fn to_ndjson(&self) -> String {
+        let boundaries: Vec<String> = self
+            .boundaries
+            .iter()
+            .map(|b| {
+                json_row(&[
+                    ("boundary", &b.boundary),
+                    ("kind", b.kind.token()),
+                    ("evidence", &b.evidence),
+                ])
+            })
+            .collect();
+        let mut out = json_row(&[
+            ("schema", ATTESTATION_SCHEMA),
+            ("artifact", &self.artifact),
+            ("artifact_digest", &self.artifact_digest),
+            ("producer", &self.producer),
+        ]);
+        out.pop();
+        out.push_str(",\"boundaries\":[");
+        out.push_str(&boundaries.join(","));
+        out.push_str("]}\n");
+        out
+    }
+}
