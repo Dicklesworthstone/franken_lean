@@ -738,7 +738,11 @@ pub enum MatrixError {
     /// An FL-INV id outside the seven the type theory declares.
     UnknownInvariant { line: usize, token: String },
     /// The same (domain, family, owner) adapter declared twice.
-    DuplicateAdapter { line: usize, domain: String, family: &'static str },
+    DuplicateAdapter {
+        line: usize,
+        domain: String,
+        family: &'static str,
+    },
     /// A domain the bead does not assign to any owner got an adapter row. Validation
     /// (not parse), because the domain set is the bead's own and moves with it.
     UnknownDomain { line: usize, domain: String },
@@ -772,15 +776,25 @@ impl fmt::Display for MatrixError {
             Self::UnknownInvariant { line, token } => {
                 write!(f, "line {line}: `{token}` is not one of FL-INV-01..07")
             }
-            Self::DuplicateAdapter { line, domain, family } => write!(
+            Self::DuplicateAdapter {
+                line,
+                domain,
+                family,
+            } => write!(
                 f,
                 "line {line}: adapter ({domain}, {family}) is already declared"
             ),
             Self::UnknownDomain { line, domain } => {
-                write!(f, "line {line}: `{domain}` is not a domain the bead assigns")
+                write!(
+                    f,
+                    "line {line}: `{domain}` is not a domain the bead assigns"
+                )
             }
             Self::UnknownOwnerBead { line, bead } => {
-                write!(f, "line {line}: owner bead `{bead}` does not exist in the tracker")
+                write!(
+                    f,
+                    "line {line}: owner bead `{bead}` does not exist in the tracker"
+                )
             }
             Self::DomainWithoutAdapter { domain } => {
                 write!(f, "domain `{domain}` has no adapter rows")
@@ -898,7 +912,7 @@ impl OwnerMatrix {
             if !self
                 .invariants
                 .iter()
-                .any(|row| row.inv_ids.iter().any(|id| *id == inv_id))
+                .any(|row| row.inv_ids.contains(&inv_id))
             {
                 errors.push(MatrixError::InvariantUnfed { inv_id });
             }
@@ -922,20 +936,23 @@ fn parse_adapter_row(rest: &str, line: usize) -> Result<AdapterRow, MatrixError>
     if fields.len() < 4 {
         return Err(MatrixError::Malformed {
             line,
-            reason: "an adapter row needs <domain> | <family> | <owner bead> | <state>"
-                .to_string(),
+            reason: "an adapter row needs <domain> | <family> | <owner bead> | <state>".to_string(),
         });
     }
-    let family = CampaignFamily::from_token(fields[1]).ok_or_else(|| MatrixError::UnknownFamily {
-        line,
-        token: fields[1].to_string(),
-    })?;
+    let family =
+        CampaignFamily::from_token(fields[1]).ok_or_else(|| MatrixError::UnknownFamily {
+            line,
+            token: fields[1].to_string(),
+        })?;
     let evidence = fields.get(4).copied().unwrap_or("");
     let state = match fields[3] {
         "registered" => AdapterState::Registered,
         "active" => {
             if evidence.is_empty() {
-                return Err(MatrixError::StateWithoutEvidence { line, state: "active" });
+                return Err(MatrixError::StateWithoutEvidence {
+                    line,
+                    state: "active",
+                });
             }
             AdapterState::Active {
                 evidence: evidence.to_string(),
@@ -943,7 +960,10 @@ fn parse_adapter_row(rest: &str, line: usize) -> Result<AdapterRow, MatrixError>
         }
         "green" => {
             if evidence.is_empty() {
-                return Err(MatrixError::StateWithoutEvidence { line, state: "green" });
+                return Err(MatrixError::StateWithoutEvidence {
+                    line,
+                    state: "green",
+                });
             }
             AdapterState::Green {
                 evidence: evidence.to_string(),

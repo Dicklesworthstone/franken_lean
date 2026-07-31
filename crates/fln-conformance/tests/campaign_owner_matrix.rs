@@ -20,8 +20,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use fln_conformance::campaign::{
-    AdapterState, CampaignFamily, MatrixError, OwnerMatrix, all_inv_ids, MATRIX_DOMAINS,
-    OWNER_MATRIX_SCHEMA,
+    AdapterState, CampaignFamily, MATRIX_DOMAINS, MatrixError, OWNER_MATRIX_SCHEMA, OwnerMatrix,
+    all_inv_ids,
 };
 
 fn root() -> PathBuf {
@@ -64,7 +64,11 @@ fn the_committed_matrix_parses_and_validates_clean() {
          kernel-terms x1, olean-read x2, olean-write x2, vm-opcodes x2, \
          cas-manifest x1, server-editor x1"
     );
-    assert_eq!(matrix.invariants.len(), 6, "six invariant campaign bindings");
+    assert_eq!(
+        matrix.invariants.len(),
+        6,
+        "six invariant campaign bindings"
+    );
     let beads = real_bead_ids();
     let errors = matrix.validate(|id| beads.contains(id));
     assert!(
@@ -92,7 +96,7 @@ fn every_declared_domain_is_adapted_and_every_invariant_is_fed() {
             matrix
                 .invariants
                 .iter()
-                .any(|row| row.inv_ids.iter().any(|id| *id == inv_id)),
+                .any(|row| row.inv_ids.contains(&inv_id)),
             "{inv_id} is fed by no campaign row"
         );
     }
@@ -179,7 +183,8 @@ fn a_registered_adapter_cannot_satisfy_but_a_green_one_can() {
         !active.satisfies_downstream_gate("grammar-source", CampaignFamily::Mutation),
         "active is necessary but not sufficient: only green satisfies"
     );
-    let green = OwnerMatrix::parse(&planted("green | run receipt sha256:deadbeef |")).expect("parse");
+    let green =
+        OwnerMatrix::parse(&planted("green | run receipt sha256:deadbeef |")).expect("parse");
     assert!(
         green.satisfies_downstream_gate("grammar-source", CampaignFamily::Mutation),
         "a green adapter with named run evidence satisfies its gate"
@@ -243,7 +248,10 @@ fn unknown_tokens_are_refused_with_their_line() {
     );
 
     let mut text = planted("registered |");
-    text = text.replace("registered |\nadapter kernel-terms", "golden |\nadapter kernel-terms");
+    text = text.replace(
+        "registered |\nadapter kernel-terms",
+        "golden |\nadapter kernel-terms",
+    );
     assert_eq!(
         OwnerMatrix::parse(&text).unwrap_err(),
         MatrixError::UnknownState {
@@ -256,12 +264,12 @@ fn unknown_tokens_are_refused_with_their_line() {
 #[test]
 fn a_missing_schema_or_a_wrong_token_is_refused() {
     let text = planted("registered |");
-    let no_schema = text.replacen(&format!("schema {OWNER_MATRIX_SCHEMA}\n"), "");
+    let no_schema = text.replace(&format!("schema {OWNER_MATRIX_SCHEMA}\n"), "");
     assert!(matches!(
         OwnerMatrix::parse(&no_schema),
         Err(MatrixError::Schema { .. })
     ));
-    let wrong = text.replacen(OWNER_MATRIX_SCHEMA, "fln-campaign-owner-matrix/0");
+    let wrong = text.replace(OWNER_MATRIX_SCHEMA, "fln-campaign-owner-matrix/0");
     assert!(matches!(
         OwnerMatrix::parse(&wrong),
         Err(MatrixError::Schema { .. })
