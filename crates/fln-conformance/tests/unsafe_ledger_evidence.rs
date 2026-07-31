@@ -364,8 +364,10 @@ const PROSE_EVIDENCE_ROWS: usize = 121;
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 180 rows: 1 cites an e2e lane, 59 name a \
-function that exists, 120 are prose. The 60 resolvable ones are enforced; the 120 are a \
+franken_lean-d3-safety-note-unenforced-cdbg). 180 rows: 1 cites an e2e lane, the rest \
+split between symbol-resolved evidence and prose; the exact counts live in the constants \
+above and move only with a named cause (the 2026-07-30 move to 58 symbol-resolved and \
+121 prose is recorded on them). The resolvable ones are enforced; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\
 The trade: a full rewrite of the TCB's paperwork into a citation grammar is a large cost \
 paid against a defect rate currently measured at ZERO — every resolvable row corroborates \

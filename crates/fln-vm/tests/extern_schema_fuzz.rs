@@ -254,7 +254,11 @@ fn mutate(text: &str, rng: &mut XorShift64) -> String {
 /// strictly inside `text[..limit]`, so callers can confine drift to the
 /// hashed region of a contract (everything through `rows-end`).
 fn mutate_within(text: &str, limit: usize, rng: &mut XorShift64) -> String {
-    let limit = limit.min(text.len());
+    // The limit comes from the ORIGINAL text, but lossy mutations can move
+    // every boundary after them (U+FFFD is three bytes), so a stale offset
+    // may land mid-char — floor it to a boundary rather than panic on the
+    // slice (the latent panic a reviewer measured here).
+    let limit = text.floor_char_boundary(limit.min(text.len()));
     match rng.below(10) {
         0 => {
             // Flip one byte inside the limit.
@@ -552,17 +556,26 @@ fn projection_line_law_is_exact() {
         );
     }
 
-    // The terminal contract-root is content: drift one nibble and the
-    // recompute law fires; move a root line earlier and the placement law fires.
+    // The terminal contract-root is content: drift one nibble consistently on
+    // BOTH sides (the projection's template-root and the root row — `rest`
+    // carries the root twice), so the projection law passes and the refusal
+    // must come from the recompute law; move a root line earlier and the
+    // placement law fires instead.
     let last = declared.chars().last().expect("root carries hex digits");
     let flipped = if last == '0' { '1' } else { '0' };
     let drifted_declared = format!("{}{flipped}", &declared[..declared.len() - 1]);
-    let drifted = format!("{head}{rest}contract-root {drifted_declared}\n");
+    let drifted_rest = rest.replace(declared, &drifted_declared);
+    assert_ne!(drifted_rest, rest, "both root spellings must drift");
+    let drifted = format!("{head}{drifted_rest}");
     let result = load::load(&drifted);
     expect_typed(&result, "contract-root nibble drift");
+    let message = result
+        .expect_err("a drifted contract-root must be refused")
+        .message()
+        .to_string();
     assert!(
-        result.is_err(),
-        "a drifted contract-root must be refused: {drifted_declared:?}"
+        message.contains("recompute"),
+        "the recompute law must name itself, got: {message}"
     );
     let misplaced = format!("{head}contract-root fnv1a64:0000000000000000\n{rest}");
     let result = load::load(&misplaced);

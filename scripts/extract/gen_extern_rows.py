@@ -32,8 +32,9 @@ Modes:
 
 Exit taxonomy (census_materialize.sh precedent):
   0 success / no drift
-  1 decided failure (drift, disagreement, invalid artifacts)
-  2 setup or internal fault (usage, unreadable input, malformed shard)
+  1 decided failure (drift, disagreement, unreadable or malformed input,
+    invalid artifacts)
+  2 usage errors and a non-isolated interpreter
   3 inconclusive — no source could supply the untracked shards on this machine
 """
 

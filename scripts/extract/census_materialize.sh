@@ -40,7 +40,15 @@ ENVELOPE="$ROOT/contracts/EXTERN_BUILTIN_ENVIRONMENT.txt"
 HANDOFF="$ROOT/contracts/CONTRACT_HANDOFF.txt"
 SUITE_LOCK="$ROOT/SUITE.lock"
 GENERATOR="$ROOT/scripts/extract/gen_extern_census.sh"
-PUBLICATION_LOCK="/data/tmp/fln-extern-builtin-census.lockfile"
+# The publication lock lives in the machine's shared scratch space when there is one
+# (this box's /data/tmp), else in TMPDIR, else /tmp — a hardcoded /data/tmp dies on
+# hosts without it (measured: the ci.yml census step on a GitHub-hosted runner).
+if [ -d /data/tmp ]; then
+  LOCK_DIR=/data/tmp
+else
+  LOCK_DIR="${TMPDIR:-/tmp}"
+fi
+PUBLICATION_LOCK="$LOCK_DIR/fln-extern-builtin-census.lockfile"
 
 OBSERVED="$ROOT/contracts/builtin_environment.tsv"
 OBSERVED_001="$ROOT/contracts/builtin_environment.001.tsv"
