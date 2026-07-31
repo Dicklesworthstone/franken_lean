@@ -1,0 +1,48 @@
+schema fln-campaign-owner-matrix/1
+# The Tribunal campaign owner matrix (plan §18.2–18.3; bead fln-td9, framework 2 of 6).
+#
+# Two row kinds, pipe-separated, '#' comments:
+#
+#   adapter <domain> | <family> | <owner bead> | <state> [| <evidence>]
+#   invariant <campaign id> | <FL-INV id> [| <FL-INV id> ...]
+#
+# ADAPTER rows make production adapters mandatory on their subsystem owners: a
+# campaign family is not done when the framework exists — it is done when the
+# owning subsystem's adapter is active and green against named evidence. States:
+#   registered  — declared here only. Satisfies NO downstream gate.
+#   active      — wired into the owner's rig; evidence names the wiring.
+#   green       — active and currently passing; evidence names the run.
+# A registered-but-inactive adapter cannot satisfy its downstream gate, and the
+# validator refuses evidence-less active/green rows.
+#
+# INVARIANT rows bind campaign ids to the FL-INV ids they feed (td9's design law):
+# every FL-INV-01..07 is covered, and a campaign run that merely executes without
+# killing its named mutant is a failure, never evidence.
+#
+# Domains are the bead's own seven: grammar-source (Vellum), kernel-terms (the
+# kernel differential rig), olean-read / olean-write (the W2 codecs), vm-opcodes
+# (Golem/FLBC), cas-manifest (W8 Ledger), server-editor (replay/protocol rigs).
+#
+# Today's honest state: every adapter is `registered`. Nothing here is active, and
+# no downstream gate may treat this file as satisfaction. Rows move to active/green
+# only with evidence, and the suite checks both directions.
+
+adapter grammar-source | mutation  | fln-7li          | registered |
+adapter grammar-source | fuzz      | fln-7li          | registered |
+adapter grammar-source | shrink    | fln-7li          | registered |
+adapter kernel-terms   | mutation  | franken_lean-3j8 | registered |
+adapter olean-read     | mutation  | fln-20n          | registered |
+adapter olean-read     | fuzz      | fln-20n          | registered |
+adapter olean-write    | mutation  | franken_lean-0nz | registered |
+adapter olean-write    | fuzz      | franken_lean-0nz | registered |
+adapter vm-opcodes     | mutation  | franken_lean-zoe | registered |
+adapter vm-opcodes     | fuzz      | franken_lean-zoe | registered |
+adapter cas-manifest   | fault-drill | franken_lean-xy6 | registered |
+adapter server-editor  | fault-drill | franken_lean-k18 | registered |
+
+invariant thread-matrix         | FL-INV-01
+invariant facade-perturbation   | FL-INV-03
+invariant codec-corruption      | FL-INV-04
+invariant stale-forged-cache    | FL-INV-05
+invariant engine-admission      | FL-INV-02 | FL-INV-06
+invariant cancellation-resource | FL-INV-07
