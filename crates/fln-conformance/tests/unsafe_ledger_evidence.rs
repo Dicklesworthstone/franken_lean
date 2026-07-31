@@ -348,7 +348,12 @@ const LANE_CITED_ROWS: usize = 1;
 /// through 0192 land the dl* door, the end-to-end plugin test and lean_notify_assert,
 /// each citing symbols its own landing creates; the ledger is 192 rows and the prose
 /// class is unchanged at 121, so the growth is again symbol-side by measured landing.
-const SYMBOL_RESOLVED_ROWS: usize = 70;
+///
+/// 70 -> 77 in the retained FIR/FLBC integration: rows FLN-UL-0193 through 0199
+/// expose the reviewed closure, reference, thunk, and task state transitions needed by
+/// Golem. Each row cites the exact boundary function introduced with it; the ledger is
+/// 199 rows and the prose class remains 121.
+const SYMBOL_RESOLVED_ROWS: usize = 77;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -380,7 +385,10 @@ const SYMBOL_RESOLVED_ROWS: usize = 70;
 /// `export_assert_violation_format_matches_upstream`, `export_lean_notify_assert`,
 /// `dlclose`, `dlerror` and `take_dlerror` — measured by replaying the guard's own
 /// parse over both revisions: 75 -> 82 with zero removals.
-const RESOLVING_CITATION_TOKENS: usize = 82;
+///
+/// 82 -> 89 in the retained FIR/FLBC integration: FLN-UL-0193 through 0199 each add one
+/// resolving boundary symbol and remove none.
+const RESOLVING_CITATION_TOKENS: usize = 89;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
