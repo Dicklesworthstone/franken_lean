@@ -137,6 +137,8 @@ impl std::error::Error for InlineCacheAllocationError {}
 ///
 /// Entries contain only immutable validation metadata. They never retain
 /// registers, closure captures, constructor children, or completed results.
+/// Intrinsic entries bind one generated census row to a typed implementation
+/// plan, so hits perform neither a census scan nor ownership-contract parsing.
 #[derive(Debug)]
 pub struct InlineCaches {
     slots: Vec<Option<InlineCacheEntry>>,
@@ -253,6 +255,40 @@ impl InlineCaches {
         self.slots[index] = Some(InlineCacheEntry::Apply { key, metadata });
     }
 
+    fn intrinsic_hit(
+        &mut self,
+        site: CacheSite,
+        row: &str,
+        argument_ownership: &[ArgumentOwnership],
+        result_ownership: ResultOwnership,
+    ) -> Option<IntrinsicPlan> {
+        let slot_hash = intrinsic_slot_hash(site, row, argument_ownership, result_ownership);
+        let index = self.slot_index(slot_hash)?;
+        self.stats.lookups = self.stats.lookups.saturating_add(1);
+        match self.slots[index] {
+            Some(InlineCacheEntry::Intrinsic { key, plan })
+                if key.matches(site, row, argument_ownership, result_ownership) =>
+            {
+                self.stats.hits = self.stats.hits.saturating_add(1);
+                Some(plan)
+            }
+            _ => {
+                self.stats.misses = self.stats.misses.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    fn record_intrinsic(&mut self, key: IntrinsicCacheKey, plan: IntrinsicPlan) {
+        let Some(index) = self.slot_index(key.slot_hash()) else {
+            return;
+        };
+        if self.slots[index].is_some() {
+            self.stats.replacements = self.stats.replacements.saturating_add(1);
+        }
+        self.slots[index] = Some(InlineCacheEntry::Intrinsic { key, plan });
+    }
+
     fn slot_index(&self, slot_hash: u64) -> Option<usize> {
         if self.slots.is_empty() {
             None
@@ -330,11 +366,124 @@ struct ApplyCacheMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntrinsicCacheKey {
+    site: CacheSite,
+    row: &'static str,
+    argument_count: usize,
+    argument_ownership_hash: u64,
+    result_ownership: ResultOwnership,
+    slot_hash: u64,
+}
+
+impl IntrinsicCacheKey {
+    fn new(
+        site: CacheSite,
+        row: &'static str,
+        argument_ownership: &[ArgumentOwnership],
+        result_ownership: ResultOwnership,
+    ) -> Self {
+        Self {
+            site,
+            row,
+            argument_count: argument_ownership.len(),
+            argument_ownership_hash: ownership_hash(argument_ownership),
+            result_ownership,
+            slot_hash: intrinsic_slot_hash(site, row, argument_ownership, result_ownership),
+        }
+    }
+
+    fn matches(
+        self,
+        site: CacheSite,
+        row: &str,
+        argument_ownership: &[ArgumentOwnership],
+        result_ownership: ResultOwnership,
+    ) -> bool {
+        self.site == site
+            && self.row == row
+            && self.argument_count == argument_ownership.len()
+            && self.argument_ownership_hash == ownership_hash(argument_ownership)
+            && self.result_ownership == result_ownership
+    }
+
+    fn slot_hash(self) -> u64 {
+        self.slot_hash
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntrinsicPlan {
+    row: &'static str,
+    implementation: IntrinsicImplementation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntrinsicImplementation {
+    NatAdd,
+    StringAppend,
+    ArraySize,
+    ArrayGetInternal,
+    ArrayGetBorrowed,
+    ArrayPush,
+    RefNew,
+    RefGet,
+    RefTake,
+    RefSet,
+    RefSwap,
+    RefPtrEq,
+    ThunkPure,
+    ThunkNew,
+    ThunkGet,
+    TaskPure,
+    TaskGet,
+    TaskSpawn,
+    TaskMap,
+    TaskBind,
+    Unsupported,
+}
+
+impl IntrinsicImplementation {
+    fn for_row(row: &str) -> Self {
+        match row {
+            "extern:Nat.add" => Self::NatAdd,
+            "extern:String.append" => Self::StringAppend,
+            "extern:Array.size" => Self::ArraySize,
+            "extern:Array.getInternal" => Self::ArrayGetInternal,
+            "extern:Array.ugetBorrowed" => Self::ArrayGetBorrowed,
+            "extern:Array.push" => Self::ArrayPush,
+            "extern:ST.Prim.mkRef" => Self::RefNew,
+            "extern:ST.Prim.Ref.get" => Self::RefGet,
+            "extern:ST.Prim.Ref.take" => Self::RefTake,
+            "extern:ST.Prim.Ref.set" => Self::RefSet,
+            "extern:ST.Prim.Ref.swap" => Self::RefSwap,
+            "extern:ST.Prim.Ref.ptrEq" => Self::RefPtrEq,
+            "extern:Thunk.pure" => Self::ThunkPure,
+            "extern:Thunk.mk" => Self::ThunkNew,
+            "extern:Thunk.get" => Self::ThunkGet,
+            "extern:Task.pure" => Self::TaskPure,
+            "extern:Task.get" => Self::TaskGet,
+            "extern:Task.spawn" => Self::TaskSpawn,
+            "extern:Task.map" => Self::TaskMap,
+            "extern:Task.bind" => Self::TaskBind,
+            _ => Self::Unsupported,
+        }
+    }
+
+    const fn is_managerless_task(self) -> bool {
+        matches!(self, Self::TaskSpawn | Self::TaskMap | Self::TaskBind)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InlineCacheEntry {
     Ctor(CtorCacheKey),
     Apply {
         key: ApplyCacheKey,
         metadata: ApplyCacheMetadata,
+    },
+    Intrinsic {
+        key: IntrinsicCacheKey,
+        plan: IntrinsicPlan,
     },
 }
 
@@ -347,6 +496,60 @@ fn cache_hash(discriminant: u64, words: &[u64]) -> u64 {
                 .rotate_left(27)
                 .wrapping_mul(0x94d0_49bb_1331_11eb)
         })
+}
+
+fn intrinsic_slot_hash(
+    site: CacheSite,
+    row: &str,
+    argument_ownership: &[ArgumentOwnership],
+    result_ownership: ResultOwnership,
+) -> u64 {
+    cache_hash(
+        3,
+        &[
+            u64::from(site.function.get()),
+            site.pc as u64,
+            stable_text_hash(row),
+            argument_ownership.len() as u64,
+            ownership_hash(argument_ownership),
+            result_ownership_word(result_ownership),
+        ],
+    )
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |state, byte| {
+        (state ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn ownership_hash(ownership: &[ArgumentOwnership]) -> u64 {
+    ownership
+        .iter()
+        .copied()
+        .fold(0x243f_6a88_85a3_08d3, |state, disposition| {
+            (state ^ argument_ownership_word(disposition))
+                .rotate_left(17)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        })
+}
+
+const fn argument_ownership_word(ownership: ArgumentOwnership) -> u64 {
+    match ownership {
+        ArgumentOwnership::Borrowed => 1,
+        ArgumentOwnership::Owned => 2,
+        ArgumentOwnership::Unique => 3,
+        ArgumentOwnership::Scalar => 4,
+    }
+}
+
+const fn result_ownership_word(ownership: ResultOwnership) -> u64 {
+    match ownership {
+        ResultOwnership::Owned => 1,
+        ResultOwnership::Borrowed => 2,
+        ResultOwnership::Scalar => 3,
+        ResultOwnership::RawObject => 4,
+    }
 }
 
 /// A successful return. `value` is the owned Marrow ABI object that occupied
@@ -1032,57 +1235,45 @@ fn run(
                 argument_ownership,
                 result_ownership,
             } => {
-                let expected_arguments = match generated_argument_ownership(&row, args.len()) {
-                    Ok(expected) => expected,
-                    Err(refusal) => {
-                        return Ok(VmExit::Refused {
-                            refusal,
-                            usage: usage(steps, peak_stack_depth),
-                        });
+                let cached_plan = inline_caches.as_deref_mut().and_then(|caches| {
+                    caches.intrinsic_hit(cache_site, &row, &argument_ownership, result_ownership)
+                });
+                let plan = match cached_plan {
+                    Some(plan) => plan,
+                    None => {
+                        let plan = match resolve_intrinsic_plan(
+                            &row,
+                            &argument_ownership,
+                            result_ownership,
+                        ) {
+                            Ok(plan) => plan,
+                            Err(refusal) => {
+                                return Ok(VmExit::Refused {
+                                    refusal,
+                                    usage: usage(steps, peak_stack_depth),
+                                });
+                            }
+                        };
+                        if let Some(caches) = inline_caches.as_deref_mut() {
+                            caches.record_intrinsic(
+                                IntrinsicCacheKey::new(
+                                    cache_site,
+                                    plan.row,
+                                    &argument_ownership,
+                                    result_ownership,
+                                ),
+                                plan,
+                            );
+                        }
+                        plan
                     }
                 };
-                if let Some((argument, (expected, actual))) = expected_arguments
-                    .iter()
-                    .copied()
-                    .zip(argument_ownership.iter().copied())
-                    .enumerate()
-                    .find(|(_, (expected, actual))| expected != actual)
-                {
-                    return Ok(VmExit::Refused {
-                        refusal: VmRefusal::IntrinsicOwnershipMismatch {
-                            row,
-                            argument,
-                            expected,
-                            actual,
-                        },
-                        usage: usage(steps, peak_stack_depth),
-                    });
-                }
-                let expected_result = match generated_result_ownership(&row) {
-                    Ok(expected) => expected,
-                    Err(refusal) => {
-                        return Ok(VmExit::Refused {
-                            refusal,
-                            usage: usage(steps, peak_stack_depth),
-                        });
-                    }
-                };
-                if expected_result != result_ownership {
-                    return Ok(VmExit::Refused {
-                        refusal: VmRefusal::IntrinsicResultOwnershipMismatch {
-                            row,
-                            expected: expected_result,
-                            actual: result_ownership,
-                        },
-                        usage: usage(steps, peak_stack_depth),
-                    });
-                }
                 let values = transfer_intrinsic_arguments(
                     current_frame_mut(&mut stack)?,
                     &args,
                     &argument_ownership,
                 )?;
-                if row == "extern:Thunk.get" {
+                if plan.implementation == IntrinsicImplementation::ThunkGet {
                     let thunk = match delayed_thunk_operand(values) {
                         Ok(thunk) => thunk,
                         Err(refusal) => {
@@ -1094,7 +1285,7 @@ fn run(
                     };
                     if let Some(value) = thunk.evaluated_thunk_value() {
                         let value = match finish_intrinsic_result(
-                            &row,
+                            plan.row,
                             result_ownership,
                             IntrinsicResult::owned(value),
                         ) {
@@ -1127,7 +1318,7 @@ fn run(
                             Ok(PreparedApply::Partial { function, captures }) => {
                                 let value = make_golem_closure(program, function, captures)?;
                                 let value = match finish_intrinsic_result(
-                                    &row,
+                                    plan.row,
                                     result_ownership,
                                     IntrinsicResult::owned(value),
                                 ) {
@@ -1179,16 +1370,17 @@ fn run(
                             }
                         }
                     }
-                } else if is_managerless_task_row(&row) {
-                    let application = match managerless_task_application(&row, values) {
-                        Ok(application) => application,
-                        Err(refusal) => {
-                            return Ok(VmExit::Refused {
-                                refusal,
-                                usage: usage(steps, peak_stack_depth),
-                            });
-                        }
-                    };
+                } else if plan.implementation.is_managerless_task() {
+                    let application =
+                        match managerless_task_application(plan.implementation, plan.row, values) {
+                            Ok(application) => application,
+                            Err(refusal) => {
+                                return Ok(VmExit::Refused {
+                                    refusal,
+                                    usage: usage(steps, peak_stack_depth),
+                                });
+                            }
+                        };
                     match prepare_internal_apply(
                         program,
                         &application.closure,
@@ -1260,10 +1452,10 @@ fn run(
                         }
                     }
                 } else {
-                    match invoke_intrinsic(&row, &values) {
+                    match invoke_intrinsic(plan.implementation, plan.row, &values) {
                         Ok(result) => {
                             let value =
-                                match finish_intrinsic_result(&row, result_ownership, result) {
+                                match finish_intrinsic_result(plan.row, result_ownership, result) {
                                     Ok(value) => value,
                                     Err(refusal) => {
                                         return Ok(VmExit::Refused {
@@ -2082,60 +2274,76 @@ fn clone_registers(
         .collect()
 }
 
-fn generated_argument_ownership(
+fn resolve_intrinsic_plan(
     row: &str,
-    argument_count: usize,
-) -> Result<Vec<ArgumentOwnership>, VmRefusal> {
+    declared_arguments: &[ArgumentOwnership],
+    declared_result: ResultOwnership,
+) -> Result<IntrinsicPlan, VmRefusal> {
     let generated = EXTERN_ROWS
         .iter()
         .find(|generated| generated.id == row)
         .ok_or_else(|| VmRefusal::UnknownIntrinsic {
             row: row.to_string(),
         })?;
-    let parsed = ExternOwnership::parse(generated.ownership)
-        .and_then(|ownership| ownership.argument_ownership(argument_count))
-        .map_err(|error| VmRefusal::IntrinsicOwnershipContract {
-            row: row.to_string(),
-            reason: error.message().to_string(),
-        })?;
-    let mut ownership = Vec::new();
-    ownership.try_reserve_exact(parsed.len()).map_err(|_| {
+    let ownership = ExternOwnership::parse(generated.ownership).map_err(|error| {
         VmRefusal::IntrinsicOwnershipContract {
             row: row.to_string(),
-            reason: format!(
-                "could not reserve {} executable ownership dispositions",
-                parsed.len()
-            ),
+            reason: error.message().to_string(),
         }
     })?;
-    ownership.extend(parsed.into_iter().map(|disposition| match disposition {
-        ContractArgumentOwnership::Borrowed => ArgumentOwnership::Borrowed,
-        ContractArgumentOwnership::Owned => ArgumentOwnership::Owned,
-        ContractArgumentOwnership::Unique => ArgumentOwnership::Unique,
-        ContractArgumentOwnership::Scalar => ArgumentOwnership::Scalar,
-    }));
-    Ok(ownership)
-}
-
-fn generated_result_ownership(row: &str) -> Result<ResultOwnership, VmRefusal> {
-    let generated = EXTERN_ROWS
-        .iter()
-        .find(|generated| generated.id == row)
-        .ok_or_else(|| VmRefusal::UnknownIntrinsic {
-            row: row.to_string(),
-        })?;
-    let ownership = ExternOwnership::parse(generated.ownership)
-        .and_then(|ownership| ownership.result_ownership())
+    let expected_arguments = ownership
+        .argument_ownership(declared_arguments.len())
         .map_err(|error| VmRefusal::IntrinsicOwnershipContract {
             row: row.to_string(),
             reason: error.message().to_string(),
         })?;
-    Ok(match ownership {
+    if let Some((argument, (expected, actual))) = expected_arguments
+        .into_iter()
+        .map(runtime_argument_ownership)
+        .zip(declared_arguments.iter().copied())
+        .enumerate()
+        .find(|(_, (expected, actual))| expected != actual)
+    {
+        return Err(VmRefusal::IntrinsicOwnershipMismatch {
+            row: row.to_string(),
+            argument,
+            expected,
+            actual,
+        });
+    }
+    let expected_result =
+        ownership
+            .result_ownership()
+            .map_err(|error| VmRefusal::IntrinsicOwnershipContract {
+                row: row.to_string(),
+                reason: error.message().to_string(),
+            })?;
+    let expected_result = match expected_result {
         ContractResultOwnership::Owned => ResultOwnership::Owned,
         ContractResultOwnership::Borrowed => ResultOwnership::Borrowed,
         ContractResultOwnership::Scalar => ResultOwnership::Scalar,
         ContractResultOwnership::RawObject => ResultOwnership::RawObject,
+    };
+    if expected_result != declared_result {
+        return Err(VmRefusal::IntrinsicResultOwnershipMismatch {
+            row: row.to_string(),
+            expected: expected_result,
+            actual: declared_result,
+        });
+    }
+    Ok(IntrinsicPlan {
+        row: generated.id,
+        implementation: IntrinsicImplementation::for_row(generated.id),
     })
+}
+
+const fn runtime_argument_ownership(ownership: ContractArgumentOwnership) -> ArgumentOwnership {
+    match ownership {
+        ContractArgumentOwnership::Borrowed => ArgumentOwnership::Borrowed,
+        ContractArgumentOwnership::Owned => ArgumentOwnership::Owned,
+        ContractArgumentOwnership::Unique => ArgumentOwnership::Unique,
+        ContractArgumentOwnership::Scalar => ArgumentOwnership::Scalar,
+    }
 }
 
 fn finish_intrinsic_result(
@@ -2329,10 +2537,13 @@ fn set_register(frame: &mut Frame, register: Register, value: Obj) -> Result<(),
     Ok(())
 }
 
-fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusal> {
-    ensure_intrinsic_row(row)?;
-    match row {
-        "extern:Nat.add" => {
+fn invoke_intrinsic(
+    implementation: IntrinsicImplementation,
+    row: &str,
+    args: &[Obj],
+) -> Result<IntrinsicResult, VmRefusal> {
+    match implementation {
+        IntrinsicImplementation::NatAdd => {
             expect_arity(row, args, 2)?;
             let lhs = nat_value(&args[0], "Nat.add", 0)?;
             let rhs = nat_value(&args[1], "Nat.add", 1)?;
@@ -2346,13 +2557,13 @@ fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusa
             }
             Ok(IntrinsicResult::owned(Obj::mk_nat(sum)))
         }
-        "extern:String.append" => {
+        IntrinsicImplementation::StringAppend => {
             expect_arity(row, args, 2)?;
             let mut lhs = string_value(&args[0], "String.append", 0)?;
             lhs.push_str(&string_value(&args[1], "String.append", 1)?);
             Ok(IntrinsicResult::owned(Obj::mk_string(&lhs)))
         }
-        "extern:Array.size" => {
+        IntrinsicImplementation::ArraySize => {
             expect_arity(row, args, 1)?;
             let (size, _) = array_value(&args[0], "Array.size", 0)?;
             if size > usize::MAX >> 1 {
@@ -2362,7 +2573,7 @@ fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusa
             }
             Ok(IntrinsicResult::raw_object(Obj::mk_nat(size)))
         }
-        "extern:Array.getInternal" => {
+        IntrinsicImplementation::ArrayGetInternal => {
             expect_arity(row, args, 2)?;
             let (size, _) = array_value(&args[0], "Array.getInternal", 0)?;
             let index = nat_value(&args[1], "Array.getInternal", 1)?;
@@ -2371,7 +2582,7 @@ fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusa
             }
             Ok(IntrinsicResult::owned(args[0].array_child(index)))
         }
-        "extern:Array.ugetBorrowed" => {
+        IntrinsicImplementation::ArrayGetBorrowed => {
             expect_arity(row, args, 2)?;
             let (size, _) = array_value(&args[0], "Array.ugetBorrowed", 0)?;
             let index = nat_value(&args[1], "Array.ugetBorrowed", 1)?;
@@ -2382,7 +2593,7 @@ fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusa
                 args[0].array_child(index),
             ))
         }
-        "extern:Array.push" => {
+        IntrinsicImplementation::ArrayPush => {
             expect_arity(row, args, 2)?;
             let (size, _) = array_value(&args[0], "Array.push", 0)?;
             let mut items = Vec::with_capacity(size.saturating_add(1));
@@ -2392,34 +2603,34 @@ fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusa
             items.push(args[1].clone_ref());
             Ok(IntrinsicResult::raw_object(Obj::mk_array(items)))
         }
-        "extern:ST.Prim.mkRef" => {
+        IntrinsicImplementation::RefNew => {
             expect_arity(row, args, 1)?;
             Ok(IntrinsicResult::owned(Obj::mk_ref(args[0].clone_ref())))
         }
-        "extern:ST.Prim.Ref.get" => {
+        IntrinsicImplementation::RefGet => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "ST.Prim.Ref.get", 0, "ST.Ref", ValueKind::Ref)?;
             Ok(IntrinsicResult::owned(args[0].ref_get()))
         }
-        "extern:ST.Prim.Ref.take" => {
+        IntrinsicImplementation::RefTake => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "ST.Prim.Ref.take", 0, "ST.Ref", ValueKind::Ref)?;
             Ok(IntrinsicResult::owned(args[0].ref_take()))
         }
-        "extern:ST.Prim.Ref.set" => {
+        IntrinsicImplementation::RefSet => {
             expect_arity(row, args, 2)?;
             expect_value_kind(&args[0], "ST.Prim.Ref.set", 0, "ST.Ref", ValueKind::Ref)?;
             args[0].ref_set(args[1].clone_ref());
             Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
         }
-        "extern:ST.Prim.Ref.swap" => {
+        IntrinsicImplementation::RefSwap => {
             expect_arity(row, args, 2)?;
             expect_value_kind(&args[0], "ST.Prim.Ref.swap", 0, "ST.Ref", ValueKind::Ref)?;
             Ok(IntrinsicResult::owned(
                 args[0].ref_swap(args[1].clone_ref()),
             ))
         }
-        "extern:ST.Prim.Ref.ptrEq" => {
+        IntrinsicImplementation::RefPtrEq => {
             expect_arity(row, args, 2)?;
             expect_value_kind(&args[0], "ST.Prim.Ref.ptrEq", 0, "ST.Ref", ValueKind::Ref)?;
             expect_value_kind(&args[1], "ST.Prim.Ref.ptrEq", 1, "ST.Ref", ValueKind::Ref)?;
@@ -2427,13 +2638,13 @@ fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusa
                 if args[0].ref_ptr_eq(&args[1]) { 1 } else { 0 },
             )))
         }
-        "extern:Thunk.pure" => {
+        IntrinsicImplementation::ThunkPure => {
             expect_arity(row, args, 1)?;
             Ok(IntrinsicResult::owned(Obj::mk_thunk_value(
                 args[0].clone_ref(),
             )))
         }
-        "extern:Thunk.mk" => {
+        IntrinsicImplementation::ThunkNew => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "Thunk.mk", 0, "Golem closure", ValueKind::Closure)?;
             if args[0].closure_shell_parts().is_none() {
@@ -2443,13 +2654,13 @@ fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusa
                 args[0].clone_ref(),
             )))
         }
-        "extern:Task.pure" => {
+        IntrinsicImplementation::TaskPure => {
             expect_arity(row, args, 1)?;
             Ok(IntrinsicResult::owned(Obj::mk_task_pure(
                 args[0].clone_ref(),
             )))
         }
-        "extern:Task.get" => {
+        IntrinsicImplementation::TaskGet => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "Task.get", 0, "finished Task", ValueKind::Task)?;
             args[0]
@@ -2457,24 +2668,18 @@ fn invoke_intrinsic(row: &str, args: &[Obj]) -> Result<IntrinsicResult, VmRefusa
                 .map(IntrinsicResult::owned)
                 .ok_or(VmRefusal::UnsupportedTaskState)
         }
-        _ => Err(VmRefusal::UnsupportedIntrinsic {
+        IntrinsicImplementation::ThunkGet
+        | IntrinsicImplementation::TaskSpawn
+        | IntrinsicImplementation::TaskMap
+        | IntrinsicImplementation::TaskBind
+        | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }),
     }
 }
 
-fn ensure_intrinsic_row(row: &str) -> Result<(), VmRefusal> {
-    if !EXTERN_ROWS.iter().any(|generated| generated.id == row) {
-        return Err(VmRefusal::UnknownIntrinsic {
-            row: row.to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn delayed_thunk_operand(args: Vec<Obj>) -> Result<Obj, VmRefusal> {
     const ROW: &str = "extern:Thunk.get";
-    ensure_intrinsic_row(ROW)?;
     expect_arity(ROW, &args, 1)?;
     let thunk = args
         .into_iter()
@@ -2498,32 +2703,25 @@ fn cache_thunk_value(thunk: &Obj, value: &Obj) -> Result<(), Stop> {
     )))
 }
 
-fn is_managerless_task_row(row: &str) -> bool {
-    matches!(
-        row,
-        "extern:Task.spawn" | "extern:Task.map" | "extern:Task.bind"
-    )
-}
-
 fn managerless_task_application(
-    row: &str,
+    implementation: IntrinsicImplementation,
+    row: &'static str,
     args: Vec<Obj>,
 ) -> Result<ManagerlessTaskApplication, VmRefusal> {
-    ensure_intrinsic_row(row)?;
-    match row {
-        "extern:Task.spawn" => {
+    match implementation {
+        IntrinsicImplementation::TaskSpawn => {
             let [closure, priority] = exact_owned_args(row, args)?;
             expect_golem_task_closure(&closure, "Task.spawn", 0)?;
             nat_value(&priority, "Task.spawn", 1)?;
             Ok(ManagerlessTaskApplication {
-                row: "extern:Task.spawn",
+                row,
                 closure,
                 argument: Obj::mk_nat(0),
                 argument_ownership: ArgumentOwnership::Scalar,
                 completion: ManagerlessTaskCompletion::WrapPure,
             })
         }
-        "extern:Task.map" => {
+        IntrinsicImplementation::TaskMap => {
             let [closure, task, priority, sync] = exact_owned_args(row, args)?;
             expect_golem_task_closure(&closure, "Task.map", 0)?;
             expect_value_kind(&task, "Task.map", 1, "finished Task", ValueKind::Task)?;
@@ -2533,14 +2731,14 @@ fn managerless_task_application(
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
             Ok(ManagerlessTaskApplication {
-                row: "extern:Task.map",
+                row,
                 closure,
                 argument,
                 argument_ownership: ArgumentOwnership::Owned,
                 completion: ManagerlessTaskCompletion::WrapPure,
             })
         }
-        "extern:Task.bind" => {
+        IntrinsicImplementation::TaskBind => {
             let [task, closure, priority, sync] = exact_owned_args(row, args)?;
             expect_value_kind(&task, "Task.bind", 0, "finished Task", ValueKind::Task)?;
             expect_golem_task_closure(&closure, "Task.bind", 1)?;
@@ -2550,14 +2748,31 @@ fn managerless_task_application(
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
             Ok(ManagerlessTaskApplication {
-                row: "extern:Task.bind",
+                row,
                 closure,
                 argument,
                 argument_ownership: ArgumentOwnership::Owned,
                 completion: ManagerlessTaskCompletion::RequireFinishedTask,
             })
         }
-        _ => Err(VmRefusal::UnsupportedIntrinsic {
+        IntrinsicImplementation::NatAdd
+        | IntrinsicImplementation::StringAppend
+        | IntrinsicImplementation::ArraySize
+        | IntrinsicImplementation::ArrayGetInternal
+        | IntrinsicImplementation::ArrayGetBorrowed
+        | IntrinsicImplementation::ArrayPush
+        | IntrinsicImplementation::RefNew
+        | IntrinsicImplementation::RefGet
+        | IntrinsicImplementation::RefTake
+        | IntrinsicImplementation::RefSet
+        | IntrinsicImplementation::RefSwap
+        | IntrinsicImplementation::RefPtrEq
+        | IntrinsicImplementation::ThunkPure
+        | IntrinsicImplementation::ThunkNew
+        | IntrinsicImplementation::ThunkGet
+        | IntrinsicImplementation::TaskPure
+        | IntrinsicImplementation::TaskGet
+        | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
         }),
     }

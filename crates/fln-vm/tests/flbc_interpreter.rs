@@ -7289,7 +7289,7 @@ fn apply_inline_cache_matches_uncached_execution_and_survives_a_stack_stop() {
     assert_eq!(uncached.value.unbox(), 42);
     drop(uncached);
 
-    for expected_hits in [0, 1] {
+    for expected_hits in [0, 2] {
         let cached = returned(execute_cached(
             &program,
             ExecutionLimits::default(),
@@ -7332,9 +7332,9 @@ fn apply_inline_cache_matches_uncached_execution_and_survives_a_stack_stop() {
     ));
     assert_eq!(recovered.value.unbox(), 42);
     drop(recovered);
-    assert_eq!(caches.stats().lookups, 4);
-    assert_eq!(caches.stats().hits, 3);
-    assert_eq!(caches.stats().misses, 1);
+    assert_eq!(caches.stats().lookups, 7);
+    assert_eq!(caches.stats().hits, 5);
+    assert_eq!(caches.stats().misses, 2);
     assert_eq!(caches.stats().replacements, 0);
 
     let (events, live) = shadow::disable_and_drain();
@@ -7417,14 +7417,12 @@ fn polymorphic_apply_callsite_misses_replaces_and_then_hits_without_drift() {
             1,
             vec![Instruction::Return { src: r(0) }],
         ),
-        function(
+        function_with_callable_result(
             2,
+            vec![ArgumentOwnership::Borrowed, ArgumentOwnership::Borrowed],
+            CallableResultOwnership::Scalar,
             2,
-            3,
-            vec![
-                intrinsic(r(2), "extern:Nat.add", vec![r(0), r(1)]),
-                Instruction::Return { src: r(2) },
-            ],
+            vec![Instruction::Return { src: r(1) }],
         ),
         function_with_callable_result(
             3,
@@ -7444,10 +7442,10 @@ fn polymorphic_apply_callsite_misses_replaces_and_then_hits_without_drift() {
         ),
     ]);
     let context = cache_context(2, 12, Mode::Sound);
-    let mut caches = InlineCaches::try_new(1).expect("one collision slot");
+    let mut caches = InlineCaches::try_new(1).expect("one polymorphic apply slot");
 
     let uncached = returned(execute(&program, ExecutionLimits::default(), None));
-    assert_eq!(uncached.value.unbox(), 42);
+    assert_eq!(uncached.value.unbox(), 2);
     drop(uncached);
     let cached = returned(execute_cached(
         &program,
@@ -7456,7 +7454,7 @@ fn polymorphic_apply_callsite_misses_replaces_and_then_hits_without_drift() {
         context,
         &mut caches,
     ));
-    assert_eq!(cached.value.unbox(), 42);
+    assert_eq!(cached.value.unbox(), 2);
     drop(cached);
 
     assert_eq!(caches.stats().lookups, 3);
@@ -7679,4 +7677,155 @@ fn every_cache_identity_axis_invalidates_and_zero_slots_disable_acceleration() {
     let allocation = InlineCaches::try_new(usize::MAX)
         .expect_err("an impossible slot count is a typed allocation refusal");
     assert_eq!(allocation.requested_slots(), usize::MAX);
+}
+
+#[test]
+fn intrinsic_plan_cache_matches_uncached_and_refused_contracts_never_install() {
+    let _guard = lock();
+    let valid = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 40,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 2,
+            },
+            intrinsic(r(2), "extern:Nat.add", vec![r(0), r(1)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    let context = cache_context(6, 16, Mode::Sound);
+    let mut caches = InlineCaches::try_new(1).expect("one intrinsic-plan slot");
+
+    let uncached = returned(execute(&valid, ExecutionLimits::default(), None));
+    assert_eq!(uncached.value.unbox(), 42);
+    assert_eq!(uncached.usage.steps, 4);
+    for expected_hits in [0, 1] {
+        let cached = returned(execute_cached(
+            &valid,
+            ExecutionLimits::default(),
+            None,
+            context,
+            &mut caches,
+        ));
+        assert_eq!(cached.value.unbox(), uncached.value.unbox());
+        assert_eq!(cached.usage, uncached.usage);
+        assert_eq!(caches.stats().hits, expected_hits);
+    }
+    assert_eq!(caches.stats().lookups, 2);
+    assert_eq!(caches.stats().misses, 1);
+    assert_eq!(caches.stats().replacements, 0);
+
+    let refused = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 40,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 2,
+            },
+            Instruction::Intrinsic {
+                dst: r(2),
+                row: "extern:Nat.add".to_string(),
+                args: vec![r(0), r(1)],
+                argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Borrowed],
+                result_ownership: ResultOwnership::Owned,
+            },
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    for _ in 0..2 {
+        assert!(matches!(
+            execute_cached(
+                &refused,
+                ExecutionLimits::default(),
+                None,
+                context,
+                &mut caches,
+            ),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::IntrinsicOwnershipMismatch {
+                    argument: 0,
+                    expected: ArgumentOwnership::Borrowed,
+                    actual: ArgumentOwnership::Owned,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+    assert_eq!(caches.stats().lookups, 4);
+    assert_eq!(caches.stats().hits, 1);
+    assert_eq!(caches.stats().misses, 3);
+    assert_eq!(
+        caches.stats().replacements,
+        0,
+        "a contract refusal never occupies or replaces the intrinsic-plan slot"
+    );
+    assert_eq!(caches.stats().namespace_invalidations, 1);
+}
+
+#[test]
+fn intrinsic_plan_slot_collisions_are_never_dispatch_authority() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        5,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 40,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 2,
+            },
+            intrinsic(r(2), "extern:Nat.add", vec![r(0), r(1)]),
+            Instruction::Array {
+                dst: r(3),
+                items: vec![r(2)],
+            },
+            intrinsic(r(4), "extern:Array.size", vec![r(3)]),
+            Instruction::Return { src: r(4) },
+        ],
+    )]);
+    let context = cache_context(7, 17, Mode::Sound);
+    let mut caches = InlineCaches::try_new(1).expect("one deliberately colliding plan slot");
+
+    shadow::enable();
+    let uncached = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(uncached.value.unbox(), 1);
+    drop(uncached);
+    for _ in 0..2 {
+        let cached = returned(execute_cached(
+            &program,
+            ExecutionLimits::default(),
+            None,
+            context,
+            &mut caches,
+        ));
+        assert_eq!(cached.value.unbox(), 1);
+        drop(cached);
+    }
+    assert_eq!(caches.stats().lookups, 4);
+    assert_eq!(caches.stats().hits, 0);
+    assert_eq!(caches.stats().misses, 4);
+    assert_eq!(caches.stats().replacements, 3);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "plan collisions retain no Marrow value");
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
 }
