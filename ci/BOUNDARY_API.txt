@@ -76,6 +76,7 @@ row FLN-BX-0049 | crates/fln-unsafe-abi/src/handle.rs | fn stress_mt | (&self, u
 row FLN-BX-0050 | crates/fln-unsafe-abi/src/handle.rs | fn probe_double_release | () | shadow_kills_double_release | scripted misuse, shadows-gated, self-contained
 row FLN-BX-0051 | crates/fln-unsafe-abi/src/handle.rs | fn probe_foreign_pointer | () | shadow_kills_foreign_pointer | scripted misuse, shadows-gated, self-contained
 row FLN-BX-0052 | crates/fln-unsafe-abi/src/handle.rs | fn probe_quarantine_poison | () -> u8 | shadow_quarantine_poisons_headers | scripted probe, shadows-gated
+row FLN-BX-0067 | crates/fln-unsafe-abi/src/handle.rs | fn probe_cold_double_release | () | shadow_kills_cold_double_release | scripted misuse, shadows-gated, self-contained
 
 # ---- bead fln-wgp slice 1: fln-unsafe-region mapping surface + compactor identity ----
 row FLN-BX-0053 | crates/fln-unsafe-abi/src/handle.rs | fn identity_token | (&self) -> usize | region compact sharing tests | opaque dedup key; address-derived, never enters artifacts/digests (CGSE)
