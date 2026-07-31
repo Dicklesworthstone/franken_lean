@@ -420,6 +420,12 @@ pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
         "the hostile-input suite resolves the invoking crate directory at run time so a shared \
          target cannot bake another checkout's fixtures into its byte surgery (fln-abaz)",
     ),
+    (
+        "crates/fln-kernel/tests/admission_laundering.rs",
+        "the laundering suite's serde census reads the invoking crate's own sources at run time, \
+         so a shared target cannot bake another checkout's capability module into the check \
+         (franken_lean-79k)",
+    ),
 ];
 
 /// Reconcile the precise needle against a coarser, independent one, per file.

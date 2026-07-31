@@ -356,7 +356,12 @@ const SYMBOL_RESOLVED_ROWS: usize = 59;
 /// `mk_closure_native`, `mk_closure_fn1`, and the closures-corpus test — all of which now
 /// resolve as boundary-crate functions — so the resolving population grows by the row's
 /// own landing, measured, not silent.
-const RESOLVING_CITATION_TOKENS: usize = 71;
+///
+/// 71 -> 75 at `c8c33d4a` (lean_string_append): the plugin demand list's one export gap
+/// landed `alloc_string_cap`, `export_lean_string_append`,
+/// `export_string_append_matches_upstream_arms` and `string_append_core`, so four more
+/// tokens resolve — growth by measured landing, traced commit-by-commit.
+const RESOLVING_CITATION_TOKENS: usize = 75;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
