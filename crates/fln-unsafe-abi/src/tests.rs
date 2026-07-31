@@ -1065,7 +1065,7 @@ fn export_small_heap_prefix_roundtrip() {
         export_lean_alloc_small, export_lean_free_small, export_lean_inc_heartbeat,
         export_lean_small_mem_size, export_mi_free, export_mi_malloc_small,
     };
-    let before = crate::membrane::heartbeat_value();
+    let before = crate::membrane::get_num_heartbeats();
     // mi twin: size preserved through the prefix, pointer 8-aligned.
     let p = export_mi_malloc_small(24);
     assert!(!p.is_null());
@@ -1079,7 +1079,7 @@ fn export_small_heap_prefix_roundtrip() {
     assert!(!z.is_null());
     export_mi_free(z);
     assert_eq!(
-        crate::membrane::heartbeat_value(),
+        crate::membrane::get_num_heartbeats(),
         before,
         "the raw mimalloc shim is downstream of lean.h's explicit bump"
     );
@@ -1090,7 +1090,7 @@ fn export_small_heap_prefix_roundtrip() {
     assert!(!composed.is_null());
     export_mi_free(composed);
     assert_eq!(
-        crate::membrane::heartbeat_value(),
+        crate::membrane::get_num_heartbeats(),
         before + 1,
         "the distributed lean.h small-allocation path must not double-charge"
     );
@@ -1100,7 +1100,7 @@ fn export_small_heap_prefix_roundtrip() {
     assert_eq!(export_lean_small_mem_size(q), 32);
     export_lean_free_small(q);
     assert_eq!(
-        crate::membrane::heartbeat_value(),
+        crate::membrane::get_num_heartbeats(),
         before + 2,
         "the small-allocator entry point owns exactly one bump"
     );
@@ -1254,30 +1254,57 @@ fn export_panic_fn_balances_ownership_and_returns_default() {
 #[test]
 fn export_heartbeat_is_thread_local_counting() {
     let _g = lock();
-    use crate::export::export_lean_inc_heartbeat;
-    let before = crate::membrane::heartbeat_value();
+    use crate::export::{
+        export_lean_big_uint64_to_nat, export_lean_dec_ref_cold, export_lean_inc_heartbeat,
+        export_lean_io_get_num_heartbeats, export_lean_io_set_heartbeats,
+        export_lean_uint64_of_big_nat,
+    };
+
+    let unit = export_lean_io_set_heartbeats(tagged::boxi(0));
+    assert_eq!(tagged::unbox(unit), 0);
     for _ in 0..5 {
         export_lean_inc_heartbeat();
     }
-    assert_eq!(crate::membrane::heartbeat_value(), before + 5);
+    assert_eq!(crate::membrane::get_num_heartbeats(), 5);
+    assert_eq!(tagged::unbox(export_lean_io_get_num_heartbeats()), 5);
+
     // A fresh thread starts its own counter (LEAN_THREAD_VALUE semantics).
     std::thread::spawn(|| {
-        assert_eq!(crate::membrane::heartbeat_value(), 0);
+        assert_eq!(tagged::unbox(export_lean_io_get_num_heartbeats()), 0);
         export_lean_inc_heartbeat();
-        assert_eq!(crate::membrane::heartbeat_value(), 1);
+        assert_eq!(tagged::unbox(export_lean_io_get_num_heartbeats()), 1);
+        let unit = export_lean_io_set_heartbeats(tagged::boxi(9));
+        assert_eq!(tagged::unbox(unit), 0);
+        assert_eq!(tagged::unbox(export_lean_io_get_num_heartbeats()), 9);
     })
     .join()
     .expect("heartbeat thread");
+    assert_eq!(crate::membrane::get_num_heartbeats(), 5);
+
+    // The u64 boundary takes the heap-Nat arm. The getter snapshots first,
+    // then its returned big Nat is itself one small allocation: MAX wraps to
+    // zero in the live counter while the returned value remains MAX.
+    let maximum = export_lean_big_uint64_to_nat(u64::MAX);
+    let unit = export_lean_io_set_heartbeats(maximum);
+    assert_eq!(tagged::unbox(unit), 0);
+    let snapshot = export_lean_io_get_num_heartbeats();
+    assert!(!tagged::is_scalar(snapshot));
+    assert_eq!(export_lean_uint64_of_big_nat(snapshot), u64::MAX);
+    assert_eq!(crate::membrane::get_num_heartbeats(), 0);
+    export_lean_dec_ref_cold(snapshot);
+
+    let unit = export_lean_io_set_heartbeats(tagged::boxi(0));
+    assert_eq!(tagged::unbox(unit), 0);
 }
 
 #[test]
 fn marrow_small_objects_charge_and_big_objects_do_not() {
     let _g = lock();
-    let before = crate::membrane::heartbeat_value();
+    let before = crate::membrane::get_num_heartbeats();
 
     let small = Obj::mk_ref(Obj::mk_nat(7));
     assert_eq!(
-        crate::membrane::heartbeat_value(),
+        crate::membrane::get_num_heartbeats(),
         before + 1,
         "a Marrow small-object constructor charges one allocation tick"
     );
@@ -1285,7 +1312,7 @@ fn marrow_small_objects_charge_and_big_objects_do_not() {
 
     let big = Obj::mk_array(Vec::new());
     assert_eq!(
-        crate::membrane::heartbeat_value(),
+        crate::membrane::get_num_heartbeats(),
         before + 1,
         "the Reference heartbeat law does not charge a big allocation"
     );

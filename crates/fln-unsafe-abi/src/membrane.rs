@@ -70,15 +70,19 @@ pub(crate) fn add_heartbeats(ticks: u64) {
     HEARTBEAT.with(|heartbeat| heartbeat.set(heartbeat.get().wrapping_add(ticks)));
 }
 
+/// Replace the current runtime thread's allocation-linked heartbeat count.
+pub(crate) fn set_heartbeats(count: u64) {
+    HEARTBEAT.with(|heartbeat| heartbeat.set(count));
+}
+
+/// Read the current runtime thread's allocation-linked heartbeat count.
+pub(crate) fn get_num_heartbeats() -> u64 {
+    HEARTBEAT.with(Cell::get)
+}
+
 /// The counting hook used by both supported small-allocator entry paths.
 pub(crate) fn charge_small_allocation() {
     add_heartbeats(1);
-}
-
-/// Test-only observation of the current runtime thread's counter.
-#[cfg(test)]
-pub(crate) fn heartbeat_value() -> u64 {
-    HEARTBEAT.with(Cell::get)
 }
 
 fn obj_layout(size: usize) -> Layout {

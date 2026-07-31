@@ -27,7 +27,8 @@
 //!
 //! Slice-1 typed restrictions (tracked in `ci/ABI_EXPORT_STATUS.txt`, never
 //! silent): closure application (`lean_apply_*`) — franken_lean-7xe; tasks /
-//! IO (`lean_io_*`, `lean_task_*`) — fln-3gv; bignum arithmetic
+//! general IO (`lean_io_*`, `lean_task_*`) — fln-3gv, except the
+//! allocation-heartbeat getter/setter implemented below; bignum arithmetic
 //! (`lean_nat_big_*`, `lean_int_big_*`) — the fln-bignum shim; panic-path
 //! Lean-buffered stderr and backtrace printing — fln-3gv (messages go to the
 //! process stderr until the IO plane exists).
@@ -382,12 +383,46 @@ pub(crate) extern "C" fn export_lean_free_object(o: *mut LeanObject) {
 
 // ---- heartbeat ---------------------------------------------------------------
 
-/// `lean_inc_heartbeat` (`interrupt.cpp:28`): thread-local counter.
+/// `lean_inc_heartbeat` (`alloc.cpp:493-496`): allocation-linked thread-local
+/// counter, distinct from `interrupt.cpp`'s `check_system` poll counter.
 // UNSAFE-LEDGER: FLN-UL-0079
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_inc_heartbeat")]
 pub(crate) extern "C" fn export_lean_inc_heartbeat() {
     membrane::add_heartbeats(1);
+}
+
+/// `IO.getNumHeartbeats` (`io.cpp:952-955`): snapshot the allocation-linked
+/// counter and return it as an owned Lean `Nat`.
+// UNSAFE-LEDGER: FLN-UL-0200
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_get_num_heartbeats")]
+pub(crate) extern "C" fn export_lean_io_get_num_heartbeats() -> *mut LeanObject {
+    let count = membrane::get_num_heartbeats();
+    if count <= crate::tagged::MAX_SMALL_NAT as u64 {
+        crate::tagged::boxi(count as usize)
+    } else {
+        export_lean_big_uint64_to_nat(count)
+    }
+}
+
+/// `IO.setNumHeartbeats` (`io.cpp:957-962`): consume a Lean `Nat`, install its
+/// low 64 bits as this runtime thread's allocation-linked counter, and return
+/// `Unit`.
+// UNSAFE-LEDGER: FLN-UL-0201
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_set_heartbeats")]
+pub(crate) extern "C" fn export_lean_io_set_heartbeats(count: *mut LeanObject) -> *mut LeanObject {
+    let value = if is_scalar(count) {
+        crate::tagged::unbox(count) as u64
+    } else {
+        export_lean_uint64_of_big_nat(count)
+    };
+    membrane::set_heartbeats(value);
+    // SAFETY: `count` is an owned `Nat` by the generated extern contract;
+    // conversion above only borrowed it, so the wrapper now consumes it.
+    unsafe { dec(count) };
+    crate::tagged::boxi(0)
 }
 
 // ---- reference counting ------------------------------------------------------
