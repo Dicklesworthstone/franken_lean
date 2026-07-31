@@ -121,10 +121,7 @@ fn mutant_a_corrupted_contract_root_is_caught() {
     let mut lines = lines_of(embedded_contract_text());
     let index = root_line_index(&lines);
     let corrupt = |line: &str| -> String {
-        let hash_pos = line
-            .find("fnv1a64:")
-            .expect("fnv1a64-framed")
-            + "fnv1a64:".len();
+        let hash_pos = line.find("fnv1a64:").expect("fnv1a64-framed") + "fnv1a64:".len();
         let digit_pos = line[hash_pos..]
             .find(|c: char| c.is_ascii_hexdigit())
             .expect("hex digits present")

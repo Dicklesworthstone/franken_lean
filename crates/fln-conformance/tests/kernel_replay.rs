@@ -6188,9 +6188,7 @@ fn chosen_set_roots(reference_lib: &Path) -> Vec<(String, PathBuf)> {
     let corpus = std::env::var("FLN_MATHLIB_CORPUS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/data/tmp/mathlib4-corpus"));
-    let pkg = |name: &str| {
-        corpus.join(format!(".lake/packages/{name}/.lake/build/lib/lean"))
-    };
+    let pkg = |name: &str| corpus.join(format!(".lake/packages/{name}/.lake/build/lib/lean"));
     vec![
         ("Init".to_string(), reference_lib.to_path_buf()),
         ("Std".to_string(), reference_lib.to_path_buf()),
@@ -6218,10 +6216,7 @@ fn chosen_module_file(roots: &[(String, PathBuf)], name: &str) -> Option<PathBuf
 /// BFS inventory from the chosen module through decoded import rows, folded
 /// with the same scheme as `inventory_present_oleans` so the two fixture
 /// hashes mean the same thing over their different populations.
-fn closure_inventory(
-    roots: &[(String, PathBuf)],
-    chosen: &str,
-) -> Result<CorpusInventory, String> {
+fn closure_inventory(roots: &[(String, PathBuf)], chosen: &str) -> Result<CorpusInventory, String> {
     let mut modules = BTreeMap::new();
     let mut decoded = 0_u64;
     let mut oracle_skipped = 0_u64;
@@ -6320,10 +6315,7 @@ struct ChosenLegReport {
     wall_ms: u64,
 }
 
-fn run_chosen_leg(
-    inventory: &CorpusInventory,
-    chosen: &str,
-) -> Result<ChosenLegReport, String> {
+fn run_chosen_leg(inventory: &CorpusInventory, chosen: &str) -> Result<ChosenLegReport, String> {
     let started = Instant::now();
     let order = corpus_module_order(inventory)?;
     let order_index = order
@@ -6387,11 +6379,8 @@ fn run_chosen_leg(
                 wall_ms: started.elapsed().as_millis() as u64,
             });
         }
-        let (context, _) = extend_reference_fixture_environment(
-            imported_context,
-            &active_infos,
-            &module.name,
-        )?;
+        let (context, _) =
+            extend_reference_fixture_environment(imported_context, &active_infos, &module.name)?;
         states.insert(
             module.name.clone(),
             CorpusFixtureState {
@@ -6402,7 +6391,9 @@ fn run_chosen_leg(
             },
         );
     }
-    Err(format!("chosen module {chosen} absent from its own closure"))
+    Err(format!(
+        "chosen module {chosen} absent from its own closure"
+    ))
 }
 
 /// The two acceptance-(a) legs beyond Init: a Std module and one defeq-heavy
@@ -6474,7 +6465,11 @@ fn chosen_set_replays_and_witnesses() {
         .and_then(Path::parent)
         .map(|bin| bin.join("bin/leanchecker"))
         .expect("leanchecker beside lean in the pinned toolchain");
-    assert!(checker.is_file(), "leanchecker missing at {}", checker.display());
+    assert!(
+        checker.is_file(),
+        "leanchecker missing at {}",
+        checker.display()
+    );
     let mut witness_rows = Vec::new();
     for report in &reports {
         let out = std::process::Command::new(&checker)

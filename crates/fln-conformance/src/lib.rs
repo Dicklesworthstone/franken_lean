@@ -31,6 +31,9 @@
 //!   the one running it (bead `fln-cross-tree-baked-root-k60n`): the target directory is
 //!   shared across worktrees, so a rig can resolve, measure and report a whole verdict
 //!   about a repository that is not the one under test;
+//! * [`campaign`] — the Tribunal campaign frameworks (bead `fln-td9`): the mutation kill
+//!   ledger model, where a kill is only ever a stated-reason failure, inconclusive is
+//!   never promoted either way, and the denominator cannot shrink without evidence;
 //! * [`poison`] (feature `oracle-fallback-dev`, compiled out of releases) — the
 //!   `ORACLE_FALLBACK` tag that poisons every product of the development-only
 //!   lockstep harness: cache-inadmissible, gate-inert (§18.10).
@@ -41,6 +44,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod campaign;
 pub mod cli_lake_census;
 pub mod corpus;
 pub mod execution;
