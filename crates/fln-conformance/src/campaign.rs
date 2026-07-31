@@ -1364,3 +1364,362 @@ impl FuzzRunner {
         input
     }
 }
+
+// ---------------------------------------------------------------------------
+// Framework 4: the fault boundary registry
+// ---------------------------------------------------------------------------
+
+/// The platform-neutral fault capabilities (td9: "abrupt termination uses a
+/// platform-neutral semantic capability with platform-specific rows rather than
+/// projecting Unix signals onto Windows"). A drill declares one of these; the
+/// platform row is chosen by `target_os`, never by name, so a Unix signal number
+/// cannot be projected onto a platform that does not have it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FaultCapability {
+    /// Kill the process tree with no cleanup opportunity (SIGKILL row on Unix,
+    /// TerminateProcess row on Windows).
+    AbruptTermination,
+    /// Corrupt a byte range of a durable store beneath a reader.
+    CorruptStore,
+    /// Fill the filesystem beneath a writer mid-append.
+    DiskFull,
+    /// Crash the far side of a plugin/native boundary.
+    BoundaryCrash,
+}
+
+impl FaultCapability {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::AbruptTermination => "abrupt-termination",
+            Self::CorruptStore => "corrupt-store",
+            Self::DiskFull => "disk-full",
+            Self::BoundaryCrash => "boundary-crash",
+        }
+    }
+
+    fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "abrupt-termination" => Some(Self::AbruptTermination),
+            "corrupt-store" => Some(Self::CorruptStore),
+            "disk-full" => Some(Self::DiskFull),
+            "boundary-crash" => Some(Self::BoundaryCrash),
+            _ => None,
+        }
+    }
+
+    /// The platform row realizing this capability on the running platform. The row
+    /// is chosen by `target_os` at compile time — the type system, not a string
+    /// comparison — so porting the drill is extending this function, never
+    /// re-interpreting a Unix row somewhere else.
+    pub fn platform_row(self) -> &'static str {
+        #[cfg(target_os = "linux")]
+        {
+            match self {
+                Self::AbruptTermination => "unix:SIGKILL",
+                Self::CorruptStore => "unix:write-range",
+                Self::DiskFull => "unix:ENOSPC",
+                Self::BoundaryCrash => "unix:SIGSEGV-child",
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            match self {
+                Self::AbruptTermination => "unix:SIGKILL",
+                Self::CorruptStore => "unix:write-range",
+                Self::DiskFull => "unix:ENOSPC",
+                Self::BoundaryCrash => "unix:SIGSEGV-child",
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            match self {
+                Self::AbruptTermination => "windows:TerminateProcess",
+                Self::CorruptStore => "windows:WriteFile-range",
+                Self::DiskFull => "windows:ERROR_DISK_FULL",
+                Self::BoundaryCrash => "windows:child-access-violation",
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            match self {
+                Self::AbruptTermination => "unsupported-platform",
+                Self::CorruptStore => "unsupported-platform",
+                Self::DiskFull => "unsupported-platform",
+                Self::BoundaryCrash => "unsupported-platform",
+            }
+        }
+    }
+}
+
+/// One registered faultpoint: a boundary, a capability, and the product-by-product
+/// expected final state vector. The expected vector is the whole point of the type:
+/// td9's law is "expected final state is a product-by-product vector; restart alone
+/// never passes" — a faultpoint that cannot say what the world looks like
+/// afterwards is restart-as-pass in waiting, and the constructor refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultPoint {
+    /// The boundary under test (e.g. `cas-promotion`, `session-store`,
+    /// `plugin-door`, `evidence-finalization`).
+    pub boundary: String,
+    /// The faultpoint's id within its boundary (e.g. `kill-mid-rename`).
+    pub id: String,
+    pub capability: FaultCapability,
+    /// product -> expected final state token (e.g. `cas -> old-or-new-never-torn`).
+    pub expected: BTreeMap<String, String>,
+}
+
+/// Every way a registry or a drill can be refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FaultError {
+    /// A faultpoint was registered twice under one id.
+    DuplicateFaultPoint { id: String },
+    /// A faultpoint with no expected final state. This is the restart-as-pass
+    /// refusal: without a vector, "the process restarted" would pass.
+    MissingExpectedState { id: String },
+    /// A drill claimed a faultpoint the census never registered — the census is
+    /// frozen before the drill, so a claimed-but-unregistered point is the drill
+    /// exceeding its own census.
+    UnregisteredClaim { id: String },
+    /// A drill claimed coverage of a boundary while registered faultpoints of that
+    /// boundary stayed unclaimed — td9's "freeze a complete census before claiming
+    /// every step" law, so a subset cannot read as the whole.
+    IncompleteBoundaryClaim {
+        boundary: String,
+        unclaimed: Vec<String>,
+    },
+    /// An observed final state disagreed with the expected vector, per product.
+    UnexpectedFinalState {
+        id: String,
+        mismatches: Vec<StateMismatch>,
+    },
+}
+
+impl fmt::Display for FaultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateFaultPoint { id } => write!(f, "faultpoint `{id}` registered twice"),
+            Self::MissingExpectedState { id } => write!(
+                f,
+                "faultpoint `{id}` declares no expected final state: without a vector, \
+                 restart alone would pass"
+            ),
+            Self::UnregisteredClaim { id } => write!(
+                f,
+                "drill claimed unregistered faultpoint `{id}`: the census is frozen \
+                 before the drill, not after it"
+            ),
+            Self::IncompleteBoundaryClaim {
+                boundary,
+                unclaimed,
+            } => write!(
+                f,
+                "boundary `{boundary}` claimed with registered faultpoints unclaimed: \
+                 {unclaimed:?}"
+            ),
+            Self::UnexpectedFinalState { id, mismatches } => write!(
+                f,
+                "faultpoint `{id}` ended in an unexpected state: {mismatches:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FaultError {}
+
+/// One product's final-state disagreement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateMismatch {
+    pub product: String,
+    pub expected: String,
+    pub observed: Option<String>,
+}
+
+/// The frozen census. The registry is built once, before any drill; a drill then
+/// claims against it (td9: the census is frozen before the campaign claims every
+/// step, and an incomplete census cannot claim coverage).
+#[derive(Debug, Default)]
+pub struct FaultRegistry {
+    points: BTreeMap<String, FaultPoint>,
+}
+
+impl FaultRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a faultpoint. The expected vector must be non-empty and carry no
+    /// blank states — restart-as-pass is refused at the door.
+    pub fn register(&mut self, point: FaultPoint) -> Result<(), FaultError> {
+        if point.expected.is_empty() || point.expected.values().any(|state| state.trim().is_empty())
+        {
+            return Err(FaultError::MissingExpectedState { id: point.id });
+        }
+        if self.points.contains_key(&point.id) {
+            return Err(FaultError::DuplicateFaultPoint { id: point.id });
+        }
+        self.points.insert(point.id.clone(), point);
+        Ok(())
+    }
+
+    /// Judge a drill's claim: every claimed faultpoint must be registered, and a
+    /// claimed boundary must include every registered faultpoint of that boundary.
+    /// Returns every violation found, not the first.
+    pub fn judge_claim(&self, boundary: &str, claimed: &BTreeMap<String, ()>) -> Vec<FaultError> {
+        let mut errors = Vec::new();
+        for id in claimed.keys() {
+            if !self.points.contains_key(id) {
+                errors.push(FaultError::UnregisteredClaim { id: id.clone() });
+            }
+        }
+        let unclaimed: Vec<String> = self
+            .points
+            .values()
+            .filter(|point| point.boundary == boundary && !claimed.contains_key(&point.id))
+            .map(|point| point.id.clone())
+            .collect();
+        if !unclaimed.is_empty() {
+            errors.push(FaultError::IncompleteBoundaryClaim {
+                boundary: boundary.to_string(),
+                unclaimed,
+            });
+        }
+        errors
+    }
+
+    /// The final-state law: the observed vector must match the expected vector
+    /// product-for-product. A product missing from the observation is a mismatch
+    /// with `observed: None` — "the process restarted" answers no product's
+    /// expected state, and the absence is named rather than averaged.
+    pub fn judge_final_state(
+        &self,
+        id: &str,
+        observed: &BTreeMap<String, String>,
+    ) -> Result<(), FaultError> {
+        let point = self
+            .points
+            .get(id)
+            .ok_or_else(|| FaultError::UnregisteredClaim { id: id.to_string() })?;
+        let mut mismatches = Vec::new();
+        for (product, expected) in &point.expected {
+            match observed.get(product) {
+                Some(actual) if actual == expected => {}
+                Some(actual) => mismatches.push(StateMismatch {
+                    product: product.clone(),
+                    expected: expected.clone(),
+                    observed: Some(actual.clone()),
+                }),
+                None => mismatches.push(StateMismatch {
+                    product: product.clone(),
+                    expected: expected.clone(),
+                    observed: None,
+                }),
+            }
+        }
+        if mismatches.is_empty() {
+            Ok(())
+        } else {
+            Err(FaultError::UnexpectedFinalState {
+                id: id.to_string(),
+                mismatches,
+            })
+        }
+    }
+
+    /// The registered faultpoints of one boundary, in id order (the map is ordered).
+    pub fn boundary_points(&self, boundary: &str) -> Vec<&FaultPoint> {
+        self.points
+            .values()
+            .filter(|point| point.boundary == boundary)
+            .collect()
+    }
+}
+
+/// The fault registry file's schema token.
+pub const FAULT_REGISTRY_SCHEMA: &str = "fln-fault-boundary-registry/1";
+
+impl FaultRegistry {
+    /// Parse a registry file: `schema` first, then
+    /// `fault <boundary> | <id> | <capability> | <product>=<state>[,<product>=<state>...]`
+    /// rows. Structural refusals name their line; the same registration laws as the
+    /// in-memory API apply (no duplicates, no missing or blank expected states).
+    pub fn parse(text: &str) -> Result<Self, FaultError> {
+        let mut registry = Self::new();
+        let mut schema_seen = false;
+        for (index, raw) in text.lines().enumerate() {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if !schema_seen {
+                match trimmed.strip_prefix("schema ") {
+                    Some(token) if token.trim() == FAULT_REGISTRY_SCHEMA => {
+                        schema_seen = true;
+                        continue;
+                    }
+                    _ => {
+                        return Err(FaultError::UnregisteredClaim {
+                            id: format!(
+                                "line {}: the registry must open with `schema {FAULT_REGISTRY_SCHEMA}`, found `{trimmed}`",
+                                index + 1
+                            ),
+                        });
+                    }
+                }
+            }
+            let Some(rest) = trimmed.strip_prefix("fault ") else {
+                return Err(FaultError::UnregisteredClaim {
+                    id: format!("line {}: row kind is not `fault`", index + 1),
+                });
+            };
+            let fields: Vec<&str> = rest.split('|').map(str::trim).collect();
+            if fields.len() != 4 || fields[0].is_empty() || fields[1].is_empty() {
+                return Err(FaultError::UnregisteredClaim {
+                    id: format!(
+                        "line {}: a fault row needs <boundary> | <id> | <capability> | <product>=<state>...",
+                        index + 1
+                    ),
+                });
+            }
+            let capability = FaultCapability::from_token(fields[2]).ok_or_else(|| {
+                FaultError::UnregisteredClaim {
+                    id: format!("line {}: unknown capability `{}`", index + 1, fields[2]),
+                }
+            })?;
+            let mut expected = BTreeMap::new();
+            for pair in fields[3].split(',') {
+                let Some((product, state)) = pair.trim().split_once('=') else {
+                    return Err(FaultError::UnregisteredClaim {
+                        id: format!(
+                            "line {}: expected vector entries are <product>=<state>",
+                            index + 1
+                        ),
+                    });
+                };
+                expected.insert(product.trim().to_string(), state.trim().to_string());
+            }
+            registry.register(FaultPoint {
+                boundary: fields[0].to_string(),
+                id: fields[1].to_string(),
+                capability,
+                expected,
+            })?;
+        }
+        if !schema_seen {
+            return Err(FaultError::UnregisteredClaim {
+                id: "the registry carried no schema line".to_string(),
+            });
+        }
+        Ok(registry)
+    }
+
+    /// How many faultpoints are registered.
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    /// True when the registry is empty — which a guard should read as a broken
+    /// scan, never a clean tree.
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+}

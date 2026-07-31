@@ -1,0 +1,27 @@
+schema fln-fault-boundary-registry/1
+# The frozen fault census (plan §18.2; bead fln-td9, framework 4 of 6).
+#
+# Rows: fault <boundary> | <id> | <capability> | <product>=<expected state>,...
+#
+# The laws this file answers to (fln_conformance::campaign::FaultRegistry):
+#   * the census is frozen before any drill claims a step — a drill claiming an
+#     unregistered faultpoint, or a subset of a boundary's registered points, is
+#     refused with the unclaimed ids named;
+#   * every row carries its product-by-product expected final state — restart
+#     alone never passes (a blank or absent vector is a parse refusal);
+#   * capabilities are platform-neutral; the platform row is chosen by target_os
+#     at compile time, never projected from a Unix signal.
+#
+# The expected-state tokens are the drill's contract: they are what "the process
+# restarted" can never satisfy. Rows are added with their rigs; a row without a
+# rig is registered aspiration and the owning adapter (cas-manifest fault-drill ->
+# franken_lean-xy6, per ci/CAMPAIGN_OWNER_MATRIX.txt) cannot close green on it.
+
+fault cas-promotion          | kill-mid-write      | abrupt-termination | cas=old-or-new-never-torn, receipt=intact-or-absent
+fault cas-promotion          | kill-mid-rename     | abrupt-termination | cas=old-or-new-never-torn, receipt=intact-or-absent
+fault cas-promotion          | corrupt-payload     | corrupt-store      | cas=rejected-with-checksum-fault, environment=unchanged
+fault session-store          | kill-mid-append     | abrupt-termination | store=replays-to-last-checkpoint, index=rebuilt-or-refused
+fault session-store          | corrupt-frame       | corrupt-store      | store=checksum-mismatch-typed, index=not-trusted
+fault plugin-door            | plugin-crash        | boundary-crash     | host=no-process-death, verdict=typed-plugin-crashed
+fault evidence-finalization  | kill-mid-finalize   | abrupt-termination | bundle=complete-or-absent, advertised=never-partial
+fault evidence-finalization  | disk-full-mid-write | disk-full          | bundle=absent, advertised=never-partial
