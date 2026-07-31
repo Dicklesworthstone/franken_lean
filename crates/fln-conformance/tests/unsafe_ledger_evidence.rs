@@ -340,10 +340,15 @@ const LANE_CITED_ROWS: usize = 1;
 /// 59 -> 63 at `c8c33d4a` (lean_string_append): the plugin demand list's one export gap
 /// landed four new rows (FLN-UL-0182 through 0185), all four citing boundary-crate symbols
 /// that now resolve (`alloc_string_cap`, `export_lean_string_append`,
-/// `export_string_append_matches_upstream_arms`, `string_append_core`). The ledger is 185
-/// rows and the prose class is unchanged at 121, so the growth is symbol-side by measured
+/// `export_string_append_matches_upstream_arms`, `string_append_core`). The ledger is
+/// 185 rows and the prose class is unchanged, so growth is symbol-side by measured
 /// landing, not silent prose accretion — traced commit-by-commit.
-const SYMBOL_RESOLVED_ROWS: usize = 63;
+///
+/// 63 -> 70 at `8a78e4fd`/`55d75fc2`/`bc51f0c3` (the G0-3 door work): rows FLN-UL-0186
+/// through 0192 land the dl* door, the end-to-end plugin test and lean_notify_assert,
+/// each citing symbols its own landing creates; the ledger is 192 rows and the prose
+/// class is unchanged at 121, so the growth is again symbol-side by measured landing.
+const SYMBOL_RESOLVED_ROWS: usize = 70;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -368,7 +373,14 @@ const SYMBOL_RESOLVED_ROWS: usize = 63;
 /// landed `alloc_string_cap`, `export_lean_string_append`,
 /// `export_string_append_matches_upstream_arms` and `string_append_core`, so four more
 /// tokens resolve — growth by measured landing, traced commit-by-commit.
-const RESOLVING_CITATION_TOKENS: usize = 75;
+///
+/// 75 -> 82 at `8a78e4fd`/`55d75fc2`/`bc51f0c3` (the G0-3 door work): seven new rows
+/// (FLN-UL-0186 through 0192) cite symbols their own landings create —
+/// `door_loads_a_reference_built_plugin_end_to_end` (five rows),
+/// `export_assert_violation_format_matches_upstream`, `export_lean_notify_assert`,
+/// `dlclose`, `dlerror` and `take_dlerror` — measured by replaying the guard's own
+/// parse over both revisions: 75 -> 82 with zero removals.
+const RESOLVING_CITATION_TOKENS: usize = 82;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///

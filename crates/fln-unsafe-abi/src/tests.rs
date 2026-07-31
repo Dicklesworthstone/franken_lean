@@ -1954,4 +1954,8 @@ fn door_loads_a_reference_built_plugin_end_to_end() {
     }
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance across the whole plugin round trip");
+    // The per-pid workdir is scratch: reclaimed on the passing path (the census's
+    // SELF_CLEANING class; a failed assert leaves it for forensics, which is the
+    // class's own shape, not an accident).
+    let _ = std::fs::remove_dir_all(&work);
 }

@@ -53,6 +53,8 @@ const SELF_CLEANING: &[(&str, &str)] = &[
         "remove_dir",
     ),
     ("crates/fln-rt/tests/region_engine.rs", "remove_dir_all"),
+    // The G0-3 door test's per-pid plugin workdir, reclaimed on the passing path.
+    ("crates/fln-unsafe-abi/src/tests.rs", "remove_dir_all"),
 ];
 
 /// Files whose needle sites materialize nothing: fence probes building synthetic
