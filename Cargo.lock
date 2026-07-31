@@ -41,6 +41,10 @@ dependencies = [
 [[package]]
 name = "fln-comp"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-rt",
+]
 
 [[package]]
 name = "fln-conformance"
@@ -193,7 +197,9 @@ dependencies = [
 name = "fln-vm"
 version = "0.0.0"
 dependencies = [
+ "fln-comp",
  "fln-core",
+ "fln-rt",
 ]
 
 [[package]]

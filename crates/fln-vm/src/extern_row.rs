@@ -251,6 +251,54 @@ pub enum Ownership {
     LlvmCApi,
 }
 
+/// Executable disposition of one generated extern argument.
+///
+/// Raw pointers and result-only ownership classes are deliberately absent:
+/// they do not establish a safe FLBC register transfer.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ArgumentOwnership {
+    Borrowed,
+    Owned,
+    Unique,
+    Scalar,
+}
+
+impl ArgumentOwnership {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Borrowed => "borrowed",
+            Self::Owned => "owned",
+            Self::Unique => "unique",
+            Self::Scalar => "scalar",
+        }
+    }
+}
+
+/// Executable ownership class of one generated extern result.
+///
+/// `RawObject` is intentionally explicit: it records that the C signature does
+/// not itself prove ownership. Golem may execute such a row only through a
+/// reviewed row-specific implementation that returns an internally owned
+/// object; this type never converts a raw pointer.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ResultOwnership {
+    Owned,
+    Borrowed,
+    Scalar,
+    RawObject,
+}
+
+impl ResultOwnership {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owned => "owned",
+            Self::Borrowed => "borrowed",
+            Self::Scalar => "scalar",
+            Self::RawObject => "raw-object",
+        }
+    }
+}
+
 impl Ownership {
     pub fn as_str(&self) -> String {
         match self {
@@ -280,6 +328,147 @@ impl Ownership {
                 "unknown ownership form {other:?}"
             ))),
         }
+    }
+
+    /// Parse the argument half of this generated ownership contract.
+    ///
+    /// The caller supplies the executable FLBC arity rather than the Lean
+    /// telescope arity: erased type parameters do not cross the runtime ABI.
+    pub fn argument_ownership(
+        &self,
+        argument_count: usize,
+    ) -> Result<Vec<ArgumentOwnership>, ContractError> {
+        let ownership = match self {
+            Self::AbiSignature(signature) => parse_abi_argument_ownership(signature)?,
+            Self::DefaultRuleOwnedResult | Self::DefaultRuleBorrowedResult => {
+                repeated_argument_ownership(ArgumentOwnership::Borrowed, argument_count)?
+            }
+            Self::ScalarRule => {
+                repeated_argument_ownership(ArgumentOwnership::Scalar, argument_count)?
+            }
+            Self::LlvmCApi => {
+                return Err(ContractError::new(
+                    "llvm-c-api ownership does not establish executable FLBC argument transfer",
+                ));
+            }
+        };
+        if ownership.len() != argument_count {
+            return Err(ContractError::new(format!(
+                "ownership signature carries {} executable arguments, FLBC carries {argument_count}",
+                ownership.len()
+            )));
+        }
+        Ok(ownership)
+    }
+
+    /// Parse the result half of this generated ownership contract.
+    pub fn result_ownership(&self) -> Result<ResultOwnership, ContractError> {
+        match self {
+            Self::AbiSignature(signature) => parse_abi_result_ownership(signature),
+            Self::DefaultRuleOwnedResult => Ok(ResultOwnership::Owned),
+            Self::DefaultRuleBorrowedResult => Ok(ResultOwnership::Borrowed),
+            Self::ScalarRule => Ok(ResultOwnership::Scalar),
+            Self::LlvmCApi => Err(ContractError::new(
+                "llvm-c-api ownership does not establish executable FLBC result transfer",
+            )),
+        }
+    }
+}
+
+fn repeated_argument_ownership(
+    disposition: ArgumentOwnership,
+    count: usize,
+) -> Result<Vec<ArgumentOwnership>, ContractError> {
+    let mut ownership = Vec::new();
+    ownership.try_reserve_exact(count).map_err(|_| {
+        ContractError::new(format!(
+            "could not reserve {count} generated argument ownership dispositions"
+        ))
+    })?;
+    ownership.resize(count, disposition);
+    Ok(ownership)
+}
+
+fn parse_abi_argument_ownership(signature: &str) -> Result<Vec<ArgumentOwnership>, ContractError> {
+    let (parameters, result) = signature.split_once(" -> ").ok_or_else(|| {
+        ContractError::new(format!(
+            "ABI ownership signature lacks canonical result separator: {signature:?}"
+        ))
+    })?;
+    if result.is_empty() {
+        return Err(ContractError::new(
+            "ABI ownership signature has an empty result class",
+        ));
+    }
+    let parameters = parameters
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))
+        .ok_or_else(|| {
+            ContractError::new(format!(
+                "ABI ownership parameter list is not parenthesized: {parameters:?}"
+            ))
+        })?;
+    if parameters.is_empty() || parameters == "()" {
+        return Ok(Vec::new());
+    }
+
+    let count = parameters.split(", ").count();
+    let mut ownership = Vec::new();
+    ownership.try_reserve_exact(count).map_err(|_| {
+        ContractError::new(format!(
+            "could not reserve {count} ABI argument ownership dispositions"
+        ))
+    })?;
+    for parameter in parameters.split(", ") {
+        if parameter.is_empty() {
+            return Err(ContractError::new(
+                "ABI ownership signature carries an empty parameter",
+            ));
+        }
+        let class = parameter
+            .rsplit_once(": ")
+            .map_or(parameter, |(_, class)| class);
+        let disposition = match class {
+            "borrowed_arg" => ArgumentOwnership::Borrowed,
+            "owned_arg" => ArgumentOwnership::Owned,
+            "unique_arg" => ArgumentOwnership::Unique,
+            "value" => ArgumentOwnership::Scalar,
+            "raw_object" => {
+                return Err(ContractError::new(format!(
+                    "raw_object argument {parameter:?} has no safe FLBC ownership disposition"
+                )));
+            }
+            other => {
+                return Err(ContractError::new(format!(
+                    "unknown ABI argument ownership class {other:?}"
+                )));
+            }
+        };
+        ownership.push(disposition);
+    }
+    Ok(ownership)
+}
+
+fn parse_abi_result_ownership(signature: &str) -> Result<ResultOwnership, ContractError> {
+    let (_, result) = signature.split_once(" -> ").ok_or_else(|| {
+        ContractError::new(format!(
+            "ABI ownership signature lacks canonical result separator: {signature:?}"
+        ))
+    })?;
+    if result.is_empty() {
+        return Err(ContractError::new(
+            "ABI ownership signature has an empty result class",
+        ));
+    }
+    let class = result.rsplit_once(": ").map_or(result, |(_, class)| class);
+    match class {
+        "owned_res" => Ok(ResultOwnership::Owned),
+        "borrowed_res" => Ok(ResultOwnership::Borrowed),
+        "value" => Ok(ResultOwnership::Scalar),
+        "raw_object" => Ok(ResultOwnership::RawObject),
+        other => Err(ContractError::new(format!(
+            "unknown ABI result ownership class {other:?}"
+        ))),
     }
 }
 
@@ -723,4 +912,169 @@ pub fn require_sorted_unique<'a>(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArgumentOwnership, Ownership, ResultOwnership};
+
+    #[test]
+    fn executable_argument_ownership_parses_named_and_bare_abi_classes() {
+        let named = Ownership::parse(
+            "abi((a: owned_arg, i: borrowed_arg, u: unique_arg, n: value) -> raw_object)",
+        )
+        .expect("named ABI ownership signature");
+        assert_eq!(
+            named
+                .argument_ownership(4)
+                .expect("all safe executable ownership classes"),
+            vec![
+                ArgumentOwnership::Owned,
+                ArgumentOwnership::Borrowed,
+                ArgumentOwnership::Unique,
+                ArgumentOwnership::Scalar,
+            ]
+        );
+
+        let bare =
+            Ownership::parse("abi((borrowed_arg, owned_arg, unique_arg, value) -> owned_res)")
+                .expect("bare ABI ownership signature");
+        assert_eq!(
+            bare.argument_ownership(4)
+                .expect("bare classes are executable"),
+            vec![
+                ArgumentOwnership::Borrowed,
+                ArgumentOwnership::Owned,
+                ArgumentOwnership::Unique,
+                ArgumentOwnership::Scalar,
+            ]
+        );
+        assert_eq!(
+            Ownership::parse("abi(() -> owned_res)")
+                .expect("zero-argument ABI signature")
+                .argument_ownership(0)
+                .expect("zero arguments"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn executable_argument_ownership_expands_rules_and_refuses_unsafe_or_drifting_shapes() {
+        assert_eq!(
+            Ownership::DefaultRuleOwnedResult
+                .argument_ownership(3)
+                .expect("the default rule borrows every executable argument"),
+            vec![ArgumentOwnership::Borrowed; 3]
+        );
+        assert_eq!(
+            Ownership::ScalarRule
+                .argument_ownership(2)
+                .expect("the scalar rule classifies every executable argument"),
+            vec![ArgumentOwnership::Scalar; 2]
+        );
+
+        let arity = Ownership::parse("abi((a: owned_arg) -> raw_object)")
+            .expect("well-formed ABI ownership")
+            .argument_ownership(2)
+            .expect_err("FLBC arity drift is not guessed");
+        assert_eq!(
+            arity.message(),
+            "ownership signature carries 1 executable arguments, FLBC carries 2"
+        );
+
+        let raw = Ownership::parse("abi((a: raw_object) -> raw_object)")
+            .expect("well-formed but non-executable ABI ownership")
+            .argument_ownership(1)
+            .expect_err("raw pointers have no safe FLBC transfer");
+        assert_eq!(
+            raw.message(),
+            "raw_object argument \"a: raw_object\" has no safe FLBC ownership disposition"
+        );
+
+        let llvm = Ownership::LlvmCApi
+            .argument_ownership(1)
+            .expect_err("the optional LLVM surface never establishes FLBC transfer");
+        assert_eq!(
+            llvm.message(),
+            "llvm-c-api ownership does not establish executable FLBC argument transfer"
+        );
+    }
+
+    #[test]
+    fn executable_result_ownership_parses_abi_classes_and_rules() {
+        for (signature, expected) in [
+            (
+                "abi((a: borrowed_arg) -> owned_res)",
+                ResultOwnership::Owned,
+            ),
+            (
+                "abi((a: borrowed_arg) -> borrowed_res)",
+                ResultOwnership::Borrowed,
+            ),
+            ("abi((a: value) -> value)", ResultOwnership::Scalar),
+            (
+                "abi((a: owned_arg) -> raw_object)",
+                ResultOwnership::RawObject,
+            ),
+            (
+                "abi((a: borrowed_arg) -> result: owned_res)",
+                ResultOwnership::Owned,
+            ),
+        ] {
+            assert_eq!(
+                Ownership::parse(signature)
+                    .expect("ownership signature")
+                    .result_ownership()
+                    .expect("executable result"),
+                expected
+            );
+        }
+        assert_eq!(
+            Ownership::DefaultRuleOwnedResult
+                .result_ownership()
+                .expect("owned rule"),
+            ResultOwnership::Owned
+        );
+        assert_eq!(
+            Ownership::DefaultRuleBorrowedResult
+                .result_ownership()
+                .expect("borrowed rule"),
+            ResultOwnership::Borrowed
+        );
+        assert_eq!(
+            Ownership::ScalarRule
+                .result_ownership()
+                .expect("scalar rule"),
+            ResultOwnership::Scalar
+        );
+    }
+
+    #[test]
+    fn executable_result_ownership_refuses_unknown_empty_and_llvm_classes() {
+        let unknown = Ownership::parse("abi((a: borrowed_arg) -> mystery)")
+            .expect("well-formed ownership")
+            .result_ownership()
+            .expect_err("unknown result class");
+        assert_eq!(
+            unknown.message(),
+            "unknown ABI result ownership class \"mystery\""
+        );
+
+        let empty = Ownership::parse("abi((a: borrowed_arg) -> )")
+            .expect("well-formed ownership")
+            .result_ownership()
+            .expect_err("empty result class");
+        assert_eq!(
+            empty.message(),
+            "ABI ownership signature has an empty result class"
+        );
+
+        let llvm = Ownership::LlvmCApi
+            .result_ownership()
+            .expect_err("LLVM result ownership is not executable");
+        assert_eq!(
+            llvm.message(),
+            "llvm-c-api ownership does not establish executable FLBC result transfer"
+        );
+    }
 }

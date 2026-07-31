@@ -691,13 +691,12 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         sites: &SITES_GOLEM,
         claim_type: ClaimType::BoundedModel,
         state: ClaimState::Hypothesis,
-        evidence: "crates/fln-elab is still a charter stub, and crates/fln-vm now carries the \
-                   W5 extern row schema and dispatch foundation (franken_lean-pw6t, 066127e6: \
-                   the 954-row generated table, the registry, five suites) but no FLBC \
-                   interpreter or value model — so tactics execute nowhere yet. The Parity \
-                   Ledger's 94 rows are term-plane observables (Lean.Name.hash, \
-                   Lean.Level.normalize, Lean.Expr.data) against the pinned binary — the \
-                   right shape of evidence, and not tactic execution.",
+        evidence: "A retained G0-3 prototype now provides a versioned whole-program FLBC \
+                   validator in fln-comp and an ABI-valued interpreter in fln-vm. Its component \
+                   tests execute validated hand-built bytecode over real Marrow objects; they \
+                   do not compile Lean source or execute tactics. fln-elab remains a 6-line \
+                   charter stub, so the user-visible claim is still a hypothesis rather than \
+                   an observed Golem surface.",
         enforcement: Enforcement::Acknowledged,
     },
     // ---- the empty-referent shape ---------------------------------------------------
@@ -791,7 +790,7 @@ pub const CONCEPT_CENSUS: [ConceptCensus; 3] = [
 /// floor under it.
 ///
 /// [`every_row_cites_a_checkable_fact`]: ../../tests/witness_claim_matrix.rs
-pub const EVIDENCE_CITATIONS: [(&str, Citation); 18] = [
+pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
     // How many rows depend on the disputed definition. The sites pin the two definitions;
     // this pins the population, and it fires the moment ANY row's level moves — which is
     // exactly when "85 of 94, and zero under the plan's reading" stops being true.
@@ -825,6 +824,14 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 18] = [
         Citation::FileAtLeastLines {
             path: "crates/fln-server/src/lib.rs",
             min_lines: 300,
+        },
+    ),
+    (
+        "TACTICS-ON-GOLEM",
+        Citation::OccursExactly {
+            path: "crates/fln-vm/src/interpreter.rs",
+            needle: "pub fn execute(",
+            count: 1,
         },
     ),
     (

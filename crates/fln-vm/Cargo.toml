@@ -6,8 +6,6 @@ license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 
 [dependencies]
-
-[dev-dependencies]
-# The extern dispatch e2e's scratch roots route through the workspace fence
-# (bead franken_lean-pw6t; edge declared in ci/WORKSPACE_GRAPH.txt).
 fln-core = { path = "../fln-core" }
+fln-comp = { path = "../fln-comp" }
+fln-rt = { path = "../fln-rt" }
