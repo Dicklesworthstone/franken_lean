@@ -25,13 +25,15 @@ use crate::extern_row::{
     ArgumentOwnership as ContractArgumentOwnership, Ownership as ExternOwnership,
     ResultOwnership as ContractResultOwnership,
 };
-use crate::extern_table_generated::EXTERN_ROWS;
+use crate::extern_table_generated::{EXTERN_ROW_CONTRACT_ROOT, EXTERN_ROWS};
 use fln_comp::flbc::{
-    ArgumentOwnership, CallableResultOwnership, FunctionId, Instruction, Register, ResultOwnership,
-    ValidatedProgram,
+    ArgumentOwnership, CallableResultOwnership, CodecLimits, FunctionId, Instruction, Register,
+    ResultOwnership, ValidatedProgram, encode_canonical,
 };
 use fln_core::diag::ResourceReason;
+use fln_core::mode::{BuildProfileId, ContentRoot, Mode};
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
+use fln_hash::domain::{Digest, Domain, hash};
 use fln_rt::abi;
 use fln_rt::obj::Obj;
 use std::fmt;
@@ -58,6 +60,293 @@ impl Default for ExecutionLimits {
 pub struct ExecutionUsage {
     pub steps: u64,
     pub peak_stack_depth: u64,
+}
+
+/// Semantic coordinates outside the FLBC artifact that can change dispatch
+/// meaning. Every axis is mandatory and this type intentionally has no
+/// [`Default`] implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionCacheContext {
+    environment_root: ContentRoot,
+    build_profile: BuildProfileId,
+    mode: Mode,
+}
+
+impl ExecutionCacheContext {
+    pub const fn new(
+        environment_root: ContentRoot,
+        build_profile: BuildProfileId,
+        mode: Mode,
+    ) -> Self {
+        Self {
+            environment_root,
+            build_profile,
+            mode,
+        }
+    }
+
+    pub const fn environment_root(self) -> ContentRoot {
+        self.environment_root
+    }
+
+    pub const fn build_profile(self) -> BuildProfileId {
+        self.build_profile
+    }
+
+    pub const fn mode(self) -> Mode {
+        self.mode
+    }
+}
+
+/// Cumulative, non-authoritative observations from one inline-cache instance.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InlineCacheStats {
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub replacements: u64,
+    pub namespace_invalidations: u64,
+    pub identity_fallbacks: u64,
+}
+
+/// Typed refusal to allocate the caller-requested direct-mapped cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InlineCacheAllocationError {
+    requested_slots: usize,
+}
+
+impl InlineCacheAllocationError {
+    pub const fn requested_slots(self) -> usize {
+        self.requested_slots
+    }
+}
+
+impl fmt::Display for InlineCacheAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "could not allocate {} inline-cache slots",
+            self.requested_slots
+        )
+    }
+}
+
+impl std::error::Error for InlineCacheAllocationError {}
+
+/// Bounded direct-mapped dispatch caches.
+///
+/// Entries contain only immutable validation metadata. They never retain
+/// registers, closure captures, constructor children, or completed results.
+#[derive(Debug)]
+pub struct InlineCaches {
+    slots: Vec<Option<InlineCacheEntry>>,
+    namespace: Option<CacheNamespace>,
+    stats: InlineCacheStats,
+    identity_limits: CodecLimits,
+}
+
+impl InlineCaches {
+    pub fn try_new(slot_count: usize) -> Result<Self, InlineCacheAllocationError> {
+        Self::try_new_with_identity_limits(slot_count, CodecLimits::default())
+    }
+
+    pub fn try_new_with_identity_limits(
+        slot_count: usize,
+        identity_limits: CodecLimits,
+    ) -> Result<Self, InlineCacheAllocationError> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(slot_count)
+            .map_err(|_| InlineCacheAllocationError {
+                requested_slots: slot_count,
+            })?;
+        slots.resize(slot_count, None);
+        Ok(Self {
+            slots,
+            namespace: None,
+            stats: InlineCacheStats::default(),
+            identity_limits,
+        })
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub const fn stats(&self) -> InlineCacheStats {
+        self.stats
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    fn begin_namespace(&mut self, namespace: CacheNamespace) {
+        if self.is_disabled() {
+            return;
+        }
+        match self.namespace {
+            None => self.namespace = Some(namespace),
+            Some(current) if current == namespace => {}
+            Some(_) => {
+                self.slots.fill(None);
+                self.namespace = Some(namespace);
+                self.stats.namespace_invalidations =
+                    self.stats.namespace_invalidations.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_identity_fallback(&mut self) {
+        self.stats.identity_fallbacks = self.stats.identity_fallbacks.saturating_add(1);
+    }
+
+    fn ctor_hit(&mut self, key: CtorCacheKey) -> bool {
+        let Some(index) = self.slot_index(key.slot_hash()) else {
+            return false;
+        };
+        self.stats.lookups = self.stats.lookups.saturating_add(1);
+        if self.slots[index] == Some(InlineCacheEntry::Ctor(key)) {
+            self.stats.hits = self.stats.hits.saturating_add(1);
+            true
+        } else {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            false
+        }
+    }
+
+    fn record_ctor(&mut self, key: CtorCacheKey) {
+        let Some(index) = self.slot_index(key.slot_hash()) else {
+            return;
+        };
+        if self.slots[index].is_some() {
+            self.stats.replacements = self.stats.replacements.saturating_add(1);
+        }
+        self.slots[index] = Some(InlineCacheEntry::Ctor(key));
+    }
+
+    fn apply_hit(&mut self, key: ApplyCacheKey) -> Option<ApplyCacheMetadata> {
+        let index = self.slot_index(key.slot_hash())?;
+        self.stats.lookups = self.stats.lookups.saturating_add(1);
+        match self.slots[index] {
+            Some(InlineCacheEntry::Apply {
+                key: stored,
+                metadata,
+            }) if stored == key => {
+                self.stats.hits = self.stats.hits.saturating_add(1);
+                Some(metadata)
+            }
+            _ => {
+                self.stats.misses = self.stats.misses.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    fn record_apply(&mut self, key: ApplyCacheKey, metadata: ApplyCacheMetadata) {
+        let Some(index) = self.slot_index(key.slot_hash()) else {
+            return;
+        };
+        if self.slots[index].is_some() {
+            self.stats.replacements = self.stats.replacements.saturating_add(1);
+        }
+        self.slots[index] = Some(InlineCacheEntry::Apply { key, metadata });
+    }
+
+    fn slot_index(&self, slot_hash: u64) -> Option<usize> {
+        if self.slots.is_empty() {
+            None
+        } else {
+            Some((slot_hash as usize) % self.slots.len())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CacheNamespace {
+    program_root: Digest,
+    schema_version: u16,
+    extern_contract_root: Digest,
+    environment_root: ContentRoot,
+    build_profile: BuildProfileId,
+    mode: Mode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CacheSite {
+    function: FunctionId,
+    pc: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CtorCacheKey {
+    site: CacheSite,
+    actual_tag: u8,
+    actual_fields: usize,
+}
+
+impl CtorCacheKey {
+    fn slot_hash(self) -> u64 {
+        cache_hash(
+            1,
+            &[
+                u64::from(self.site.function.get()),
+                self.site.pc as u64,
+                u64::from(self.actual_tag),
+                self.actual_fields as u64,
+            ],
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ApplyCacheKey {
+    site: CacheSite,
+    function: FunctionId,
+    encoded_arity: u16,
+    capture_count: usize,
+    argument_count: usize,
+}
+
+impl ApplyCacheKey {
+    fn slot_hash(self) -> u64 {
+        cache_hash(
+            2,
+            &[
+                u64::from(self.site.function.get()),
+                self.site.pc as u64,
+                u64::from(self.function.get()),
+                u64::from(self.encoded_arity),
+                self.capture_count as u64,
+                self.argument_count as u64,
+            ],
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ApplyCacheMetadata {
+    required: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineCacheEntry {
+    Ctor(CtorCacheKey),
+    Apply {
+        key: ApplyCacheKey,
+        metadata: ApplyCacheMetadata,
+    },
+}
+
+fn cache_hash(discriminant: u64, words: &[u64]) -> u64 {
+    words
+        .iter()
+        .copied()
+        .fold(0x6a09_e667_f3bc_c909_u64 ^ discriminant, |state, word| {
+            (state ^ word.wrapping_add(0x9e37_79b9_7f4a_7c15))
+                .rotate_left(27)
+                .wrapping_mul(0x94d0_49bb_1331_11eb)
+        })
 }
 
 /// A successful return. `value` is the owned Marrow ABI object that occupied
@@ -439,6 +728,12 @@ struct ApplyPlan {
     required: usize,
 }
 
+struct InspectedClosure {
+    encoded_arity: u16,
+    function: FunctionId,
+    captures: Vec<Obj>,
+}
+
 enum ManagerlessTaskCompletion {
     WrapPure,
     RequireFinishedTask,
@@ -500,17 +795,62 @@ pub fn execute(
     limits: ExecutionLimits,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<VmExit> {
-    match run(program, limits, cancellation) {
+    finish_run(run(program, limits, cancellation, None))
+}
+
+/// Execute through bounded inline caches while preserving [`execute`] as the
+/// uncached semantic path.
+///
+/// If canonical identity construction exceeds the FLBC codec's bounded
+/// resource limits, this function records a fallback and runs uncached. Cache
+/// acceleration can therefore disappear, but it cannot change a VM outcome.
+pub fn execute_cached(
+    program: &ValidatedProgram,
+    limits: ExecutionLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+    context: ExecutionCacheContext,
+    caches: &mut InlineCaches,
+) -> Outcome<VmExit> {
+    if caches.is_disabled() {
+        return execute(program, limits, cancellation);
+    }
+    let Some(namespace) = cache_namespace(program, context, caches.identity_limits) else {
+        caches.record_identity_fallback();
+        return execute(program, limits, cancellation);
+    };
+    caches.begin_namespace(namespace);
+    finish_run(run(program, limits, cancellation, Some(caches)))
+}
+
+fn finish_run(result: Result<VmExit, Stop>) -> Outcome<VmExit> {
+    match result {
         Ok(exit) => Outcome::Complete(exit),
         Err(Stop::Inconclusive(inconclusive)) => Outcome::Inconclusive(inconclusive),
         Err(Stop::InternalFault(fault)) => Outcome::InternalFault(fault),
     }
 }
 
+fn cache_namespace(
+    program: &ValidatedProgram,
+    context: ExecutionCacheContext,
+    limits: CodecLimits,
+) -> Option<CacheNamespace> {
+    let canonical = encode_canonical(program, limits).ok()?;
+    Some(CacheNamespace {
+        program_root: hash(Domain::CacheKey, &canonical),
+        schema_version: program.schema_version(),
+        extern_contract_root: hash(Domain::CacheKey, EXTERN_ROW_CONTRACT_ROOT.as_bytes()),
+        environment_root: context.environment_root(),
+        build_profile: context.build_profile(),
+        mode: context.mode(),
+    })
+}
+
 fn run(
     program: &ValidatedProgram,
     limits: ExecutionLimits,
     cancellation: Option<&dyn CancellationProbe>,
+    mut inline_caches: Option<&mut InlineCaches>,
 ) -> Result<VmExit, Stop> {
     if limits.max_stack_depth < 1 {
         return Err(stack_exhausted(limits.max_stack_depth, 1, "entry frame"));
@@ -556,6 +896,10 @@ fn run(
                 ),
             ))
         })?;
+        let cache_site = CacheSite {
+            function: frame.function,
+            pc: frame.pc,
+        };
         let location = format!("function {} pc {}", frame.function.get(), frame.pc);
 
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -629,7 +973,7 @@ fn run(
                 let projected = {
                     let value = register(current_frame(&stack)?, src)?;
                     let actual = value_kind(value);
-                    if actual != ValueKind::Ctor(expected_tag) {
+                    let ValueKind::Ctor(actual_tag) = actual else {
                         return Ok(VmExit::Refused {
                             refusal: VmRefusal::ConstructorProjectionTag {
                                 expected: expected_tag,
@@ -637,17 +981,39 @@ fn run(
                             },
                             usage: usage(steps, peak_stack_depth),
                         });
-                    }
+                    };
                     let actual_fields = usize::from(value.header().other);
+                    let cache_key = CtorCacheKey {
+                        site: cache_site,
+                        actual_tag,
+                        actual_fields,
+                    };
+                    let cache_hit = inline_caches
+                        .as_deref_mut()
+                        .is_some_and(|caches| caches.ctor_hit(cache_key));
                     let expected_fields = usize::from(expected_fields);
-                    if actual_fields != expected_fields {
-                        return Ok(VmExit::Refused {
-                            refusal: VmRefusal::ConstructorProjectionShape {
-                                expected_fields,
-                                actual_fields,
-                            },
-                            usage: usage(steps, peak_stack_depth),
-                        });
+                    if !cache_hit {
+                        if actual_tag != expected_tag {
+                            return Ok(VmExit::Refused {
+                                refusal: VmRefusal::ConstructorProjectionTag {
+                                    expected: expected_tag,
+                                    actual,
+                                },
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                        if actual_fields != expected_fields {
+                            return Ok(VmExit::Refused {
+                                refusal: VmRefusal::ConstructorProjectionShape {
+                                    expected_fields,
+                                    actual_fields,
+                                },
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                        if let Some(caches) = inline_caches.as_deref_mut() {
+                            caches.record_ctor(cache_key);
+                        }
                     }
                     value.ctor_child(usize::from(field))
                 };
@@ -1017,12 +1383,14 @@ fn run(
                 result_ownership,
             } => {
                 let closure = clone_register(current_frame(&stack)?, closure)?;
-                let plan = match plan_apply(
+                let plan = match plan_cached_apply(
                     program,
                     &closure,
                     args.len(),
-                    Some(&argument_ownership),
-                    Some(result_ownership),
+                    &argument_ownership,
+                    result_ownership,
+                    cache_site,
+                    inline_caches.as_deref_mut(),
                 ) {
                     Ok(plan) => plan,
                     Err(refusal) => {
@@ -1363,6 +1731,67 @@ fn plan_apply(
     argument_ownership: Option<&[ArgumentOwnership]>,
     result_ownership: Option<CallableResultOwnership>,
 ) -> Result<ApplyPlan, VmRefusal> {
+    let inspected = inspect_closure(closure)?;
+    validate_inspected_apply(
+        program,
+        inspected,
+        argument_count,
+        argument_ownership,
+        result_ownership,
+    )
+}
+
+fn plan_cached_apply(
+    program: &ValidatedProgram,
+    closure: &Obj,
+    argument_count: usize,
+    argument_ownership: &[ArgumentOwnership],
+    result_ownership: CallableResultOwnership,
+    site: CacheSite,
+    inline_caches: Option<&mut InlineCaches>,
+) -> Result<ApplyPlan, VmRefusal> {
+    let inspected = inspect_closure(closure)?;
+    let key = ApplyCacheKey {
+        site,
+        function: inspected.function,
+        encoded_arity: inspected.encoded_arity,
+        capture_count: inspected.captures.len(),
+        argument_count,
+    };
+    if let Some(caches) = inline_caches {
+        if let Some(metadata) = caches.apply_hit(key) {
+            return Ok(ApplyPlan {
+                function: inspected.function,
+                captures: inspected.captures,
+                required: metadata.required,
+            });
+        }
+        let plan = validate_inspected_apply(
+            program,
+            inspected,
+            argument_count,
+            Some(argument_ownership),
+            Some(result_ownership),
+        )?;
+        caches.record_apply(
+            key,
+            ApplyCacheMetadata {
+                required: plan.required,
+            },
+        );
+        Ok(plan)
+    } else {
+        validate_inspected_apply(
+            program,
+            inspected,
+            argument_count,
+            Some(argument_ownership),
+            Some(result_ownership),
+        )
+    }
+}
+
+fn inspect_closure(closure: &Obj) -> Result<InspectedClosure, VmRefusal> {
     if value_kind(closure) != ValueKind::Closure {
         return Err(type_mismatch("apply", 0, "Golem closure", closure));
     }
@@ -1382,7 +1811,25 @@ fn plan_apply(
         u32::try_from(target_word.unbox()).map_err(|_| VmRefusal::MalformedClosure {
             reason: "target word is outside the FunctionId range",
         })?;
-    let function = FunctionId::new(raw_function);
+    Ok(InspectedClosure {
+        encoded_arity,
+        function: FunctionId::new(raw_function),
+        captures: fixed.collect(),
+    })
+}
+
+fn validate_inspected_apply(
+    program: &ValidatedProgram,
+    inspected: InspectedClosure,
+    argument_count: usize,
+    argument_ownership: Option<&[ArgumentOwnership]>,
+    result_ownership: Option<CallableResultOwnership>,
+) -> Result<ApplyPlan, VmRefusal> {
+    let InspectedClosure {
+        encoded_arity,
+        function,
+        captures,
+    } = inspected;
     let callee = program
         .function(function)
         .ok_or(VmRefusal::MalformedClosure {
@@ -1394,7 +1841,6 @@ fn plan_apply(
         });
     }
 
-    let captures: Vec<Obj> = fixed.collect();
     if captures.len() >= usize::from(callee.arity) {
         return Err(VmRefusal::MalformedClosure {
             reason: "fixed arguments exhaust the target arity",

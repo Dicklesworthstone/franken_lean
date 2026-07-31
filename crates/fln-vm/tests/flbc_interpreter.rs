@@ -15,6 +15,7 @@ use fln_comp::{fir, ingress};
 use fln_core::diag::ResourceReason;
 use fln_core::expr::{BinderInfo, Expr, Literal};
 use fln_core::level::Level;
+use fln_core::mode::{BuildProfileId, ContentRoot, Mode};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{Authority, InconclusiveCause, Outcome};
@@ -26,7 +27,8 @@ use fln_vm::extern_row::{
 };
 use fln_vm::extern_table_generated::EXTERN_ROWS;
 use fln_vm::interpreter::{
-    CompletedExecution, ExecutionLimits, ValueKind, VmExit, VmRefusal, execute, value_kind,
+    CompletedExecution, ExecutionCacheContext, ExecutionLimits, InlineCaches, ValueKind, VmExit,
+    VmRefusal, execute, execute_cached, value_kind,
 };
 use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard};
@@ -47,6 +49,18 @@ const fn pc(raw: u32) -> Pc {
 
 const fn fid(raw: u32) -> FunctionId {
     FunctionId::new(raw)
+}
+
+const fn cache_context(
+    environment_byte: u8,
+    build_profile: u128,
+    mode: Mode,
+) -> ExecutionCacheContext {
+    ExecutionCacheContext::new(
+        ContentRoot::new([environment_byte; 32]),
+        BuildProfileId::new(build_profile),
+        mode,
+    )
 }
 
 const fn callable_result_ownership(ty: fir::ValueType) -> CallableResultOwnership {
@@ -7222,4 +7236,447 @@ fn a_budget_stop_releases_every_live_register_and_the_next_run_recovers() {
     )]);
     let completed = returned(execute(&recovery, ExecutionLimits::default(), None));
     assert_eq!(completed.value.unbox(), 9);
+}
+
+#[test]
+fn apply_inline_cache_matches_uncached_execution_and_survives_a_stack_stop() {
+    let _guard = lock();
+    let program = validated(vec![
+        function(
+            0,
+            0,
+            4,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: 40,
+                },
+                Instruction::Closure {
+                    dst: r(1),
+                    function: fid(1),
+                    captures: vec![r(0)],
+                    capture_ownership: vec![ArgumentOwnership::Borrowed],
+                },
+                Instruction::Nat {
+                    dst: r(2),
+                    value: 2,
+                },
+                Instruction::Apply {
+                    dst: r(3),
+                    closure: r(1),
+                    args: vec![r(2)],
+                    argument_ownership: vec![ArgumentOwnership::Borrowed],
+                    result_ownership: CallableResultOwnership::Scalar,
+                },
+                Instruction::Return { src: r(3) },
+            ],
+        ),
+        function(
+            1,
+            2,
+            3,
+            vec![
+                intrinsic(r(2), "extern:Nat.add", vec![r(0), r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        ),
+    ]);
+    let context = cache_context(1, 11, Mode::Sound);
+    let mut caches = InlineCaches::try_new(8).expect("bounded cache allocation");
+
+    shadow::enable();
+    let uncached = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(uncached.value.unbox(), 42);
+    drop(uncached);
+
+    for expected_hits in [0, 1] {
+        let cached = returned(execute_cached(
+            &program,
+            ExecutionLimits::default(),
+            None,
+            context,
+            &mut caches,
+        ));
+        assert_eq!(cached.value.unbox(), 42);
+        assert_eq!(cached.usage.steps, 7);
+        drop(cached);
+        assert_eq!(caches.stats().hits, expected_hits);
+    }
+
+    let stopped = execute_cached(
+        &program,
+        ExecutionLimits {
+            max_steps: 20,
+            max_stack_depth: 1,
+        },
+        None,
+        context,
+        &mut caches,
+    );
+    assert!(matches!(
+        stopped,
+        Outcome::Inconclusive(ref inconclusive)
+            if matches!(
+                inconclusive.cause,
+                InconclusiveCause::ResourceExhausted { ref usage }
+                    if usage.reason == ResourceReason::RecursionDepth { limit: 1 }
+            )
+    ));
+
+    let recovered = returned(execute_cached(
+        &program,
+        ExecutionLimits::default(),
+        None,
+        context,
+        &mut caches,
+    ));
+    assert_eq!(recovered.value.unbox(), 42);
+    drop(recovered);
+    assert_eq!(caches.stats().lookups, 4);
+    assert_eq!(caches.stats().hits, 3);
+    assert_eq!(caches.stats().misses, 1);
+    assert_eq!(caches.stats().replacements, 0);
+
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 0,
+        "cache hits and a stopped hit retain no Marrow object"
+    );
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn polymorphic_apply_callsite_misses_replaces_and_then_hits_without_drift() {
+    let _guard = lock();
+    let program = validated(vec![
+        function(
+            0,
+            0,
+            7,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: 40,
+                },
+                Instruction::Closure {
+                    dst: r(1),
+                    function: fid(1),
+                    captures: Vec::new(),
+                    capture_ownership: Vec::new(),
+                },
+                Instruction::Nat {
+                    dst: r(2),
+                    value: 2,
+                },
+                Instruction::Call {
+                    dst: r(3),
+                    function: fid(3),
+                    args: vec![r(1), r(2)],
+                    argument_ownership: vec![
+                        ArgumentOwnership::Borrowed,
+                        ArgumentOwnership::Borrowed,
+                    ],
+                    result_ownership: CallableResultOwnership::Scalar,
+                },
+                Instruction::Closure {
+                    dst: r(4),
+                    function: fid(2),
+                    captures: vec![r(0)],
+                    capture_ownership: vec![ArgumentOwnership::Borrowed],
+                },
+                Instruction::Call {
+                    dst: r(5),
+                    function: fid(3),
+                    args: vec![r(4), r(2)],
+                    argument_ownership: vec![
+                        ArgumentOwnership::Borrowed,
+                        ArgumentOwnership::Borrowed,
+                    ],
+                    result_ownership: CallableResultOwnership::Scalar,
+                },
+                Instruction::Call {
+                    dst: r(6),
+                    function: fid(3),
+                    args: vec![r(4), r(2)],
+                    argument_ownership: vec![
+                        ArgumentOwnership::Borrowed,
+                        ArgumentOwnership::Borrowed,
+                    ],
+                    result_ownership: CallableResultOwnership::Scalar,
+                },
+                Instruction::Return { src: r(6) },
+            ],
+        ),
+        function_with_callable_result(
+            1,
+            vec![ArgumentOwnership::Borrowed],
+            CallableResultOwnership::Scalar,
+            1,
+            vec![Instruction::Return { src: r(0) }],
+        ),
+        function(
+            2,
+            2,
+            3,
+            vec![
+                intrinsic(r(2), "extern:Nat.add", vec![r(0), r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        ),
+        function_with_callable_result(
+            3,
+            vec![ArgumentOwnership::Borrowed, ArgumentOwnership::Borrowed],
+            CallableResultOwnership::Scalar,
+            3,
+            vec![
+                Instruction::Apply {
+                    dst: r(2),
+                    closure: r(0),
+                    args: vec![r(1)],
+                    argument_ownership: vec![ArgumentOwnership::Borrowed],
+                    result_ownership: CallableResultOwnership::Scalar,
+                },
+                Instruction::Return { src: r(2) },
+            ],
+        ),
+    ]);
+    let context = cache_context(2, 12, Mode::Sound);
+    let mut caches = InlineCaches::try_new(1).expect("one collision slot");
+
+    let uncached = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(uncached.value.unbox(), 42);
+    drop(uncached);
+    let cached = returned(execute_cached(
+        &program,
+        ExecutionLimits::default(),
+        None,
+        context,
+        &mut caches,
+    ));
+    assert_eq!(cached.value.unbox(), 42);
+    drop(cached);
+
+    assert_eq!(caches.stats().lookups, 3);
+    assert_eq!(caches.stats().hits, 1);
+    assert_eq!(caches.stats().misses, 2);
+    assert_eq!(caches.stats().replacements, 1);
+}
+
+#[test]
+fn constructor_shape_refusal_does_not_poison_a_valid_cache_entry() {
+    let _guard = lock();
+    let program = validated(vec![
+        function(
+            0,
+            0,
+            7,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "valid".to_string(),
+                },
+                Instruction::Ctor {
+                    dst: r(1),
+                    tag: 7,
+                    fields: vec![r(0)],
+                    scalar_bytes: Vec::new(),
+                },
+                Instruction::Call {
+                    dst: r(2),
+                    function: fid(1),
+                    args: vec![r(1)],
+                    argument_ownership: vec![ArgumentOwnership::Borrowed],
+                    result_ownership: CallableResultOwnership::Owned,
+                },
+                Instruction::String {
+                    dst: r(3),
+                    value: "wrong-a".to_string(),
+                },
+                Instruction::String {
+                    dst: r(4),
+                    value: "wrong-b".to_string(),
+                },
+                Instruction::Ctor {
+                    dst: r(5),
+                    tag: 7,
+                    fields: vec![r(3), r(4)],
+                    scalar_bytes: Vec::new(),
+                },
+                Instruction::Call {
+                    dst: r(6),
+                    function: fid(1),
+                    args: vec![r(5)],
+                    argument_ownership: vec![ArgumentOwnership::Borrowed],
+                    result_ownership: CallableResultOwnership::Owned,
+                },
+                Instruction::Return { src: r(2) },
+            ],
+        ),
+        function_with_callable_result(
+            1,
+            vec![ArgumentOwnership::Borrowed],
+            CallableResultOwnership::Owned,
+            2,
+            vec![
+                Instruction::CtorField {
+                    dst: r(1),
+                    src: r(0),
+                    expected_tag: 7,
+                    expected_fields: 1,
+                    field: 0,
+                },
+                Instruction::Return { src: r(1) },
+            ],
+        ),
+    ]);
+    let context = cache_context(3, 13, Mode::Sound);
+    let mut caches = InlineCaches::try_new(1).expect("one constructor slot");
+
+    shadow::enable();
+    for _ in 0..2 {
+        let refused = execute_cached(
+            &program,
+            ExecutionLimits::default(),
+            None,
+            context,
+            &mut caches,
+        );
+        assert!(matches!(
+            refused,
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::ConstructorProjectionShape {
+                    expected_fields: 1,
+                    actual_fields: 2,
+                },
+                ..
+            })
+        ));
+    }
+    assert_eq!(caches.stats().lookups, 4);
+    assert_eq!(caches.stats().hits, 1);
+    assert_eq!(caches.stats().misses, 3);
+    assert_eq!(
+        caches.stats().replacements,
+        0,
+        "an invalid observed shape is never installed"
+    );
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "constructor cache refusals retain no ABI child");
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn every_cache_identity_axis_invalidates_and_zero_slots_disable_acceleration() {
+    let _guard = lock();
+    let make_program = |value| {
+        validated(vec![
+            function(
+                0,
+                0,
+                3,
+                vec![
+                    Instruction::Closure {
+                        dst: r(0),
+                        function: fid(1),
+                        captures: Vec::new(),
+                        capture_ownership: Vec::new(),
+                    },
+                    Instruction::Nat { dst: r(1), value },
+                    Instruction::Apply {
+                        dst: r(2),
+                        closure: r(0),
+                        args: vec![r(1)],
+                        argument_ownership: vec![ArgumentOwnership::Borrowed],
+                        result_ownership: CallableResultOwnership::Scalar,
+                    },
+                    Instruction::Return { src: r(2) },
+                ],
+            ),
+            function_with_callable_result(
+                1,
+                vec![ArgumentOwnership::Borrowed],
+                CallableResultOwnership::Scalar,
+                1,
+                vec![Instruction::Return { src: r(0) }],
+            ),
+        ])
+    };
+    let first_program = make_program(41);
+    let second_program = make_program(42);
+    let sound = cache_context(4, 14, Mode::Sound);
+    let other_environment = cache_context(5, 14, Mode::Sound);
+    let other_profile = cache_context(5, 15, Mode::Sound);
+    let other_mode = cache_context(5, 15, Mode::Faithful);
+    assert_eq!(sound.environment_root(), ContentRoot::new([4; 32]));
+    assert_eq!(sound.build_profile(), BuildProfileId::new(14));
+    assert_eq!(sound.mode(), Mode::Sound);
+
+    let mut caches = InlineCaches::try_new(4).expect("bounded identity cache");
+    for (program, context, expected) in [
+        (&first_program, sound, 41),
+        (&first_program, sound, 41),
+        (&first_program, other_environment, 41),
+        (&first_program, other_profile, 41),
+        (&first_program, other_mode, 41),
+        (&second_program, other_mode, 42),
+    ] {
+        let completed = returned(execute_cached(
+            program,
+            ExecutionLimits::default(),
+            None,
+            context,
+            &mut caches,
+        ));
+        assert_eq!(completed.value.unbox(), expected);
+    }
+    assert_eq!(caches.stats().lookups, 6);
+    assert_eq!(caches.stats().hits, 1);
+    assert_eq!(caches.stats().misses, 5);
+    assert_eq!(caches.stats().namespace_invalidations, 4);
+
+    let mut disabled = InlineCaches::try_new(0).expect("zero slots disable the cache");
+    let completed = returned(execute_cached(
+        &first_program,
+        ExecutionLimits::default(),
+        None,
+        sound,
+        &mut disabled,
+    ));
+    assert_eq!(completed.value.unbox(), 41);
+    assert_eq!(disabled.slot_count(), 0);
+    assert_eq!(disabled.stats().lookups, 0);
+    assert_eq!(disabled.stats().namespace_invalidations, 0);
+
+    let mut identity_limited = InlineCaches::try_new_with_identity_limits(
+        4,
+        CodecLimits {
+            max_artifact_bytes: 1,
+            ..CodecLimits::default()
+        },
+    )
+    .expect("cache slots fit even when identity work is tightly bounded");
+    let completed = returned(execute_cached(
+        &first_program,
+        ExecutionLimits::default(),
+        None,
+        sound,
+        &mut identity_limited,
+    ));
+    assert_eq!(completed.value.unbox(), 41);
+    assert_eq!(identity_limited.stats().identity_fallbacks, 1);
+    assert_eq!(
+        identity_limited.stats().lookups,
+        0,
+        "failed identity construction runs through the uncached semantic path"
+    );
+
+    let allocation = InlineCaches::try_new(usize::MAX)
+        .expect_err("an impossible slot count is a typed allocation refusal");
+    assert_eq!(allocation.requested_slots(), usize::MAX);
 }

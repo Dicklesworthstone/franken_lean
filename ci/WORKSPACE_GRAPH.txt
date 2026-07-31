@@ -107,6 +107,7 @@ edge fln-comp -> fln-core          # bounded post-elaboration Expr ingress to va
 edge fln-comp -> fln-rt            # FLBC validation binds constructor limits to the generated Marrow ABI contract (franken_lean-o6bl prototype handoff)
 edge fln-vm -> fln-comp            # interpreter accepts only the compiler-owned validated FLBC wrapper (franken_lean-zoe prototype handoff)
 edge fln-vm -> fln-core            # shared FL-INV-07 outcomes plus the extern-dispatch e2e scratch fence (franken_lean-zoe/franken_lean-pw6t)
+edge fln-vm -> fln-hash            # inline-cache namespaces bind canonical FLBC and every semantic execution coordinate (franken_lean-zoe)
 edge fln-vm -> fln-rt              # every live FLBC register is an owned Marrow Obj handle (franken_lean-zoe prototype handoff)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------

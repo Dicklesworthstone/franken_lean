@@ -8,4 +8,5 @@ publish = false
 [dependencies]
 fln-core = { path = "../fln-core" }
 fln-comp = { path = "../fln-comp" }
+fln-hash = { path = "../fln-hash" }
 fln-rt = { path = "../fln-rt" }

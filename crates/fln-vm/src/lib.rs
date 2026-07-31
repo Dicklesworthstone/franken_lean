@@ -4,9 +4,10 @@
 //! `franken_lean-pw6t`): the canonical extern row contract
 //! ([`extern_row`], [`extern_table_generated`], [`load`]) and the intrinsic
 //! registry ([`dispatch`]). A retained G0-3 prototype now also provides a
-//! validated, ABI-valued register interpreter ([`interpreter`]); it prices the
-//! execution membrane without claiming the complete W5 production interpreter,
-//! effects, plugins, or PG-7. The crate map and layering are governed by
+//! validated, ABI-valued register interpreter ([`interpreter`]) with
+//! semantic-identity-bound constructor and closure-shape inline caches; it
+//! prices the execution membrane without claiming the complete W5 production
+//! interpreter, effects, plugins, or PG-7. The crate map and layering are governed by
 //! `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 
 #![forbid(unsafe_code)]
