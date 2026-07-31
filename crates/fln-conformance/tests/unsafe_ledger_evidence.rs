@@ -331,7 +331,12 @@ const LANE_CITED_ROWS: usize = 1;
 /// 59 -> 58 at `c2f6f17a` (franken_lean-npl): FLN-UL-0033's evidence rewrite dropped the
 /// `mpz_view` citation (the function still exists; the row no longer names it), moving the
 /// row from symbol-resolved to prose.
-const SYMBOL_RESOLVED_ROWS: usize = 58;
+///
+/// 58 -> 59 at `7da31744` (the safe apply surface): FLN-UL-0181, the apply row itself,
+/// cites boundary functions that now exist (`mk_closure_native`, `mk_closure_fn1`, the
+/// closures-corpus test), so one prose-free row joins the resolvable class by its own
+/// landing, measured.
+const SYMBOL_RESOLVED_ROWS: usize = 59;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -346,7 +351,12 @@ const SYMBOL_RESOLVED_ROWS: usize = 58;
 /// `mpz_view` citation — the function still exists in fln-unsafe-abi, and the row's checks
 /// stand; what changed is that the row no longer names it. Measured by diffing the two
 /// rows' resolving tokens across the edit.
-const RESOLVING_CITATION_TOKENS: usize = 70;
+///
+/// 70 -> 71 at `7da31744` (the safe apply surface): its own FLN-UL-0181 row cites
+/// `mk_closure_native`, `mk_closure_fn1`, and the closures-corpus test — all of which now
+/// resolve as boundary-crate functions — so the resolving population grows by the row's
+/// own landing, measured, not silent.
+const RESOLVING_CITATION_TOKENS: usize = 71;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
