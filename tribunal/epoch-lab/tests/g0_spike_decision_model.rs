@@ -1778,3 +1778,95 @@ fn the_g05_receipts_hold_their_content_not_merely_their_presence() {
         assert!(probe.contains(fact), "missing {fact}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The seventh row: G0-3, BLOCKED on ApparatusMissing — the schema's honest
+// answer when the evidence is real and the acceptance is not yet reachable.
+// ---------------------------------------------------------------------------
+
+use fln_epoch_lab::g0::g03_decision;
+
+#[test]
+fn the_g03_row_is_blocked_with_an_owner_and_never_counts_as_decided() {
+    let roster = roster();
+    let row = g03_decision(
+        &roster,
+        "CobaltLantern",
+        "prototype FIR/FLBC pipeline absent; membrane evidence recorded on bead franken_lean-7xe",
+    )
+    .expect("G0-3 is on the derived roster");
+    let g = verify(std::slice::from_ref(&row), &roster);
+    // Blocked is NOT decided: it appears in `blocked`, never in ratified or
+    // amended, and it does not clear the gate.
+    assert_eq!(g.blocked, vec!["G0-3".to_string()]);
+    assert!(g.ratified.is_empty() && g.amended.is_empty() && g.no_go.is_empty());
+    assert!(!g.clears());
+    // A Blocked row still owes an owner and a note — an unowned deferral is
+    // its own block.
+    let mut unowned = row.clone();
+    unowned.resolution = fln_epoch_lab::g0::Resolution::Blocked {
+        reason: fln_epoch_lab::g0::BlockedReason::ApparatusMissing,
+        owner: String::new(),
+        note: "x".to_string(),
+    };
+    let g2 = verify(&[unowned], &roster);
+    assert!(
+        g2.blocks.iter().any(|b| b.reason() == "unowned-block"),
+        "an ownerless deferral must block: {:?}",
+        g2.blocks
+    );
+    // And the laundering direction: the same evidence CANNOT be presented as
+    // Ratified, because absent roots refuse it.
+    let mut laundered = row;
+    laundered.resolution =
+        fln_epoch_lab::g0::Resolution::Decided(fln_epoch_lab::g0::Outcome::Ratified);
+    let g3 = verify(&[laundered], &roster);
+    assert!(
+        g3.blocks
+            .iter()
+            .any(|b| b.reason() == "laundered-non-evidence"),
+        "absent roots must refuse a Ratified outcome: {:?}",
+        g3.blocks
+    );
+}
+
+#[test]
+fn the_ledger_holds_six_decided_rows_and_one_written_deferral() {
+    let roster = roster();
+    let rows = vec![
+        g01_decision(&roster, &g01_evidence()).expect("G0-1"),
+        g02_decision(&roster, &g02_evidence()).expect("G0-2"),
+        g03_decision(
+            &roster,
+            "CobaltLantern",
+            "prototype FIR/FLBC pipeline absent",
+        )
+        .expect("G0-3"),
+        g04_decision(&roster, &g04_evidence()).expect("G0-4"),
+        g05_decision(&roster, &g05_evidence()).expect("G0-5"),
+        g06_decision(&roster, &g06_evidence()).expect("G0-6"),
+        g09_decision(&roster, &g09_evidence()).expect("G0-9"),
+    ];
+    let g = verify(&rows, &roster);
+    assert_eq!(
+        g.ratified,
+        vec![
+            "G0-1".to_string(),
+            "G0-2".to_string(),
+            "G0-5".to_string(),
+            "G0-6".to_string()
+        ]
+    );
+    assert_eq!(g.amended, vec!["G0-4".to_string(), "G0-9".to_string()]);
+    assert_eq!(g.blocked, vec!["G0-3".to_string()], "the written deferral");
+    assert_eq!(
+        g.blocks.len(),
+        3,
+        "exactly G0-7/8/10 remain silent: {:?}",
+        g.blocks
+    );
+    for b in &g.blocks {
+        assert_eq!(b.reason(), "missing-decision");
+    }
+    assert!(!g.clears(), "a deferral never clears the gate");
+}

@@ -1210,6 +1210,93 @@ pub fn g05_decision(roster: &[RosterSpike], evidence: &G05Evidence) -> Option<De
     })
 }
 
+/// The G0-3 row is [`Resolution::Blocked`], and the reason is a schema
+/// distinction this vocabulary exists to make: the MEMBRANE claim is
+/// demonstrated, the SPIKE's question is not yet answerable.
+///
+/// What is measured (bead `franken_lean-7xe`, comments 1720-1737): a real
+/// Reference-built plugin binds under `RTLD_NOW` against Marrow's exports,
+/// its initializer returns an ok io-result built on our heap, its exported
+/// functions execute over ABI values (`addFive 37 = 42`), and its
+/// Reference-compiled body calls our own `lean_string_append` wrapper — with
+/// the RC ownership shadow balancing the whole round trip. Four corpus slices
+/// (closures, arrays, strings, ctors) execute natively on CompatHeap values
+/// through the covenant surface with the same instrument green.
+///
+/// What that does NOT satisfy is acceptance (a) AS AMENDED: the bead's own
+/// review amendment requires the executed artifact to be produced from source
+/// by the FrankenLean prototype FIR/FLBC pipeline, with the Reference
+/// permitted only as an isolated Tribunal oracle. That pipeline does not
+/// exist — `fln-elab` is stubbed, there is no FLBC compiler — so every cell
+/// above executes either Reference-compiled code or hand-built ABI values.
+/// Ratifying on that evidence would be exactly the substitution the amendment
+/// forbids, and the amendment was written by a reviewer who anticipated this
+/// temptation.
+///
+/// So the row records `ApparatusMissing` with the owner and the note, which is
+/// the schema's whole point: not answering is a disposition you WRITE DOWN,
+/// never one you achieve by staying quiet — and never one you launder into a
+/// Ratified.
+pub fn g03_decision(roster: &[RosterSpike], owner: &str, note: &str) -> Option<Decision> {
+    let spike = roster.iter().find(|r| r.id == "G0-3")?;
+    Some(Decision {
+        spike: spike.id.clone(),
+        question: spike.question.clone(),
+        resolution: Resolution::Blocked {
+            reason: BlockedReason::ApparatusMissing,
+            owner: owner.to_string(),
+            note: note.to_string(),
+        },
+        claim: ClaimType::BoundedModel,
+        witness: Witness {
+            // The witness is honest about its own state: the spike's evidence
+            // is real and recorded, but the acceptance-(a) fixture (a
+            // prototype-pipeline-produced artifact) has never been produced,
+            // and a Blocked row may say so — `verify` only demands Recorded
+            // roots of Ratified/Amended outcomes, which is why this
+            // distinction is representable at all.
+            evidence_state: EvidenceState::Blocked,
+            fixture_root: WitnessRoot::Absent,
+            generated_contract_root: WitnessRoot::Absent,
+            implementation_root: WitnessRoot::Absent,
+            mutation_root: WitnessRoot::Absent,
+            no_mock_e2e_root: WitnessRoot::Absent,
+            oracle: OracleKind::ReferenceBinary,
+            comparison: ComparisonClass::AcceptanceOnly,
+        },
+        scope: Scope {
+            epoch: "v4.32.0".to_string(),
+            corpus: CorpusFamily::C1,
+            platform: Platform::LinuxX86_64,
+            mode: Mode::Faithful,
+        },
+        resources: Resources {
+            contract_wall_ms: 600_000,
+            contract_rss_bytes: 4 << 30,
+            used_wall_ms: 0,
+            used_rss_bytes: 0,
+        },
+        limitations: "BLOCKED, not failed: the membrane evidence is real (plugin \
+            bind under RTLD_NOW, initializer on our heap, ABI-valued calls, our \
+            lean_string_append serving Reference-compiled code, RC balance green, \
+            four corpus slices native) and is recorded on bead franken_lean-7xe \
+            with its commits. It cannot RATIFY acceptance (a) because the review \
+            amendment requires prototype-FIR/FLBC-produced artifacts and that \
+            pipeline does not exist (fln-elab stubbed, no FLBC compiler). IO/Task \
+            semantics await fln-3gv's effect runtime and the panic-hook seam is \
+            unbuilt, so the corpus's io/tasks/panics cells are unexecuted. The \
+            plugin manifest clause (bytes/hash, initializer DAG, ownership \
+            signatures, trust class) is unwritten: the spike measured the demand \
+            census instead."
+            .to_string(),
+        affected_interfaces: vec![
+            "the single-ABI-value-domain claim (plan section 11.1) — evidence favorable, decision deferred".to_string(),
+            "W5/W6 interface freezes — must not freeze on this spike's evidence alone".to_string(),
+            "franken_lean-sno (inbound door) — consumes the seam this spike proved".to_string(),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod structural {
     use super::*;
