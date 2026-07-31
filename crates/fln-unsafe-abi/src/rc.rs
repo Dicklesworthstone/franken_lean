@@ -345,8 +345,17 @@ unsafe fn del_core(o: *mut LeanObject, todo: &mut Vec<*mut LeanObject>) {
 // UNSAFE-LEDGER: FLN-UL-0043
 #[allow(unsafe_code)]
 pub(crate) unsafe fn dec_ref_cold(o: *mut LeanObject) {
-    // SAFETY: mirrors the upstream cold path exactly; the AcqRel fetch_add
-    // pairs MT decrements so exactly one thread observes -1 and frees.
+    // The cold path is also a public entry point, and it was the only RC
+    // entry that skipped the shadow: a double-release or a foreign pointer
+    // through it recorded nothing and proceeded to free (review finding).
+    // Same law as every sibling: check first, and on a failed check release
+    // nothing.
+    if !shadow::check_rc_target(o as usize, "dec_ref_cold") {
+        return;
+    }
+    // SAFETY: live object; mirrors the upstream cold path exactly; the AcqRel
+    // fetch_add pairs MT decrements so exactly one thread observes -1 and
+    // frees.
     unsafe {
         let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc == 1 || atomic_rc(o).fetch_add(1, Ordering::AcqRel) == -1 {

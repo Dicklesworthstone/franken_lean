@@ -632,6 +632,65 @@ fn shadow_kills_double_release() {
 }
 
 #[test]
+fn shadow_kills_cold_double_release() {
+    let _g = lock();
+    shadow::enable();
+    Obj::probe_cold_double_release();
+    let (events, _) = shadow::disable_and_drain();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::DoubleRelease),
+        "the cold path must detect a double release like every sibling"
+    );
+}
+
+#[test]
+fn ctor_scalar_bounds_refuse_every_escape() {
+    let _g = lock();
+    // One child slot and a 16-byte scalar area: the object extent is
+    // header(8) + slot(8) + 16, so scalar bytes span [8, 24) from obj_cptr.
+    let obj = Obj::mk_ctor(1, vec![Obj::mk_nat(1)], &[0xAB; 16]);
+    // Control first: the valid ends of the area read and write cleanly.
+    obj.ctor_scalar_set_u64(8, 0x1122_3344_5566_7788);
+    obj.ctor_scalar_set_u64(16, 0x8877_6655_4433_2211);
+    assert_eq!(obj.ctor_scalar_u64(8), 0x1122_3344_5566_7788);
+    assert_eq!(obj.ctor_scalar_u64(16), 0x8877_6655_4433_2211);
+
+    for bad in [0usize, 24, 128, usize::MAX - 8] {
+        let read =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| obj.ctor_scalar_u64(bad)));
+        assert!(
+            read.is_err(),
+            "an out-of-area read at {bad} must refuse, not escape"
+        );
+        let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            obj.ctor_scalar_set_u64(bad, 0)
+        }));
+        assert!(
+            write.is_err(),
+            "an out-of-area write at {bad} must refuse, not escape"
+        );
+    }
+}
+
+#[test]
+fn stress_mt_refuses_a_single_threaded_object() {
+    let _g = lock();
+    let st = Obj::mk_ctor(0, vec![], &[]);
+    assert!(st.header().rc > 0, "the fixture is single-threaded");
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| st.stress_mt(2, 8)));
+    let payload = unwound.expect_err("an ST object must refuse the MT storm");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string payload>");
+    assert!(
+        message.contains("MT or persistent"),
+        "the refusal must name the precondition, got: {message}"
+    );
+}
+
+#[test]
 fn shadow_kills_foreign_pointer() {
     let _g = lock();
     shadow::enable();

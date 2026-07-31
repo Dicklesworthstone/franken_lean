@@ -64,6 +64,27 @@ pub struct Obj(*mut LeanObject);
 
 // The single allowance for this module: every method body below manipulates
 // raw membrane objects under the documented linear-ownership invariant.
+
+/// The one law the raw layer's lower-bound `debug_assert` cannot state alone:
+/// a scalar access at `byte_off` of `size` bytes must land inside the ctor's
+/// scalar area, which spans `[other * 8, cs_sz - 8)` measured from `obj_cptr`.
+/// A safe method may never permit an out-of-bounds read or write for any input
+/// (review finding: the tag-only assert left the upper bound open entirely).
+fn assert_scalar_bounds(h: &crate::rc::Header, byte_off: usize, size: usize) {
+    assert!(
+        h.tag <= TAG_MAX_CTOR_TAG,
+        "scalar access on non-ctor tag {}",
+        h.tag
+    );
+    let floor = usize::from(h.other) * 8;
+    let extent = usize::from(h.cs_sz).saturating_sub(8);
+    assert!(
+        byte_off >= floor && byte_off + size <= extent,
+        "scalar access at byte offset {byte_off} with size {size} escapes the \
+         ctor scalar area [{floor}, {extent})"
+    );
+}
+
 // UNSAFE-LEDGER: FLN-UL-0049
 #[allow(unsafe_code)]
 impl Obj {
@@ -316,22 +337,24 @@ impl Obj {
         unsafe { object::ctor_set_tag(self.0, new_tag) };
     }
 
-    /// Write a scalar into the ctor scalar area at `byte_off` past the
-    /// object slots (upstream offset convention: bytes from the slot base).
+    /// Write a scalar into the ctor scalar area at `byte_off`, measured from
+    /// `obj_cptr` (so the area spans `[other * 8, cs_sz - 8)` — the same
+    /// convention the raw layer asserts from below).
     pub fn ctor_scalar_set_u64(&self, byte_off: usize, v: u64) {
         let h = self.header();
-        assert!(h.tag <= TAG_MAX_CTOR_TAG);
-        // SAFETY: offset discipline as in ctor_scalar_u64.
+        assert_scalar_bounds(&h, byte_off, size_of::<u64>());
+        // SAFETY: bounds asserted above; the write lands inside the object's
+        // own scalar area.
         unsafe { object::ctor_set_scalar::<u64>(self.0, byte_off, v) };
     }
 
-    /// Read a scalar from the ctor scalar area at `byte_off` past the object
-    /// slots (upstream offset convention: bytes from the slot base).
+    /// Read a scalar from the ctor scalar area at `byte_off`, measured from
+    /// `obj_cptr` (same convention as [`Self::ctor_scalar_set_u64`]).
     pub fn ctor_scalar_u64(&self, byte_off: usize) -> u64 {
         let h = self.header();
-        assert!(h.tag <= TAG_MAX_CTOR_TAG);
-        // SAFETY: offset discipline asserted in the raw layer (debug) and by
-        // construction here: callers pass offsets within the area they built.
+        assert_scalar_bounds(&h, byte_off, size_of::<u64>());
+        // SAFETY: bounds asserted above; the read lands inside the object's
+        // own scalar area.
         unsafe { object::ctor_get_scalar::<u64>(self.0, byte_off) }
     }
 
@@ -435,11 +458,20 @@ impl Obj {
         }
     }
 
-    /// Balanced multi-threaded inc/dec storm on an MT object; conservation
-    /// is asserted by the caller via `header()`.
+    /// Balanced multi-threaded inc/dec storm on an MT or persistent object;
+    /// conservation is asserted by the caller via `header()`. Racing the RC of
+    /// a single-threaded (`rc > 0`) object is upstream's UB, mirrored or not,
+    /// so the precondition is asserted rather than assumed (review finding).
     pub fn stress_mt(&self, threads: usize, iters: usize) {
         assert!(!self.is_scalar());
-        // SAFETY: the handle keeps the object alive across the scoped storm.
+        let header_rc = self.header().rc;
+        assert!(
+            header_rc <= 0,
+            "stress_mt requires an MT or persistent object (rc <= 0), got rc = {header_rc}"
+        );
+        // SAFETY: the handle keeps the object alive across the scoped storm,
+        // and the precondition above is exactly the one the atomic RC traffic
+        // requires.
         unsafe { rc::mt_stress(self.0, threads, iters) };
     }
 
@@ -462,6 +494,19 @@ impl Obj {
             let o = object::alloc_ref(tagged::boxi(7));
             rc::dec_ref(o); // legitimate release -> quarantine
             rc::dec_ref(o); // fault: double release, must be skipped
+        }
+    }
+
+    /// Deliberately release the same object twice through the COLD path
+    /// directly — the one RC entry that used to skip the shadow entirely.
+    pub fn probe_cold_double_release() {
+        assert!(shadow::enabled(), "misuse probes require shadows");
+        // SAFETY: as probe_double_release; the cold path now checks first, so
+        // the faulty second cold release is intercepted before `del_core`.
+        unsafe {
+            let o = object::alloc_ref(tagged::boxi(7));
+            rc::dec_ref_cold(o); // legitimate release -> quarantine
+            rc::dec_ref_cold(o); // fault: cold double release, must be skipped
         }
     }
 
