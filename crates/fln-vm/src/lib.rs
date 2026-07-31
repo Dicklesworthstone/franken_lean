@@ -13,3 +13,4 @@ pub mod dispatch;
 pub mod extern_row;
 pub mod extern_table_generated;
 pub mod load;
+pub mod parity;
