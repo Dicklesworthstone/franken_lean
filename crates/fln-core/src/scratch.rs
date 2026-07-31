@@ -132,6 +132,9 @@ pub const DERIVE_PREFIX: &str = "fln-derive-";
 /// `crates/fln-vm/tests/extern_dispatch_no_mock_e2e.rs` — the extern dispatch e2e's
 /// mirror-tree roots (bead `franken_lean-pw6t`).
 pub const EXTERN_E2E_PREFIX: &str = "fln-extern-e2e-";
+/// `crates/fln-kernel/tests/admission_laundering.rs` — the compile-fail probe roots
+/// (bead `franken_lean-79k`).
+pub const ADMISSION_PROBE_PREFIX: &str = "fln-admission-probe-";
 
 /// One scratch-root namespace: its prefix, the constant producers name it by, the source
 /// that produces it, and whether that source routes through [`ScratchRoot`].
@@ -226,6 +229,12 @@ pub const SCRATCH_FAMILIES: &[ScratchFamily] = &[
         prefix: EXTERN_E2E_PREFIX,
         constant: "EXTERN_E2E_PREFIX",
         producer: "crates/fln-vm/tests/extern_dispatch_no_mock_e2e.rs",
+        routed: true,
+    },
+    ScratchFamily {
+        prefix: ADMISSION_PROBE_PREFIX,
+        constant: "ADMISSION_PROBE_PREFIX",
+        producer: "crates/fln-kernel/tests/admission_laundering.rs",
         routed: true,
     },
     // --- declared remainders; each one's reason is in the module header. A row here
@@ -587,8 +596,8 @@ mod tests {
              producer"
         );
         assert!(
-            routed >= 12,
-            "at least twelve producers route through ScratchRoot; found {routed}"
+            routed >= 13,
+            "at least thirteen producers route through ScratchRoot; found {routed}"
         );
 
         // Prefixes are distinct, and no prefix is a prefix of another — otherwise one

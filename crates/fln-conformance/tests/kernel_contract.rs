@@ -263,6 +263,122 @@ fn the_contract_parses_resolves_and_covers() {
     );
 }
 
+/// One `git` invocation, with the same panic posture as the anchor guard: no
+/// git means no history to check and the answer is typed, not faked.
+fn git(root: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .expect("git must run for the revision-discipline check");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The revision discipline's judge, split out so planted histories exercise the
+/// same function the live history runs (79k gap 2: a commit touching a rule
+/// statement must touch a linked fixture in the same change).
+fn revision_findings(
+    edits: &[(String, Vec<String>)],
+    fixture_paths: &BTreeSet<String>,
+    introduction: &str,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (sha, files) in edits {
+        if sha == introduction {
+            continue; // the introduction creates the contract and its fixtures together
+        }
+        if !files.iter().any(|f| fixture_paths.contains(f)) {
+            findings.push(format!(
+                "{sha}: touched KERNEL_CONTRACT.md without touching any linked fixture"
+            ));
+        }
+    }
+    findings
+}
+
+#[test]
+fn the_revision_discipline_binds_contract_edits_to_fixtures() {
+    let root = workspace_root();
+    let text = fs::read_to_string(root.join("KERNEL_CONTRACT.md")).expect("contract exists");
+    let (rules, _) = parse_rules(&text);
+    let fixture_paths: BTreeSet<String> = rules
+        .iter()
+        .flat_map(|rule| rule.fixtures.iter().cloned())
+        .collect();
+    assert!(
+        !fixture_paths.is_empty(),
+        "the contract must name real fixture paths for the discipline to bind"
+    );
+
+    // Planted controls through the same judge the live history runs: a
+    // fixtureless edit must be flagged, and a fixture-touching edit must pass.
+    let fake_sha = "deadbeefcafe".to_string();
+    let planted = revision_findings(
+        &[
+            (fake_sha.clone(), vec!["KERNEL_CONTRACT.md".to_string()]),
+            (
+                "cafebead".to_string(),
+                vec![
+                    "KERNEL_CONTRACT.md".to_string(),
+                    "crates/fln-kernel/tests/k1_judgments.rs".to_string(),
+                ],
+            ),
+        ],
+        &fixture_paths,
+        "introduction-sha",
+    );
+    assert!(
+        planted.iter().any(|finding| finding.contains(&fake_sha)),
+        "a fixtureless contract edit must be flagged by the production judge"
+    );
+    assert_eq!(
+        planted.len(),
+        1,
+        "a fixture-touching edit must pass the production judge"
+    );
+
+    // The live history: every post-introduction contract edit carries a linked
+    // fixture, by construction of the introduction exemption.
+    let introduction = git(
+        root,
+        &[
+            "log",
+            "--format=%H",
+            "--reverse",
+            "--",
+            "KERNEL_CONTRACT.md",
+        ],
+    )
+    .lines()
+    .next()
+    .expect("the contract has an introduction commit")
+    .to_string();
+    let log = git(root, &["log", "--format=%H", "--", "KERNEL_CONTRACT.md"]);
+    let edits: Vec<(String, Vec<String>)> = log
+        .lines()
+        .map(|sha| {
+            let files = git(
+                root,
+                &["diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+            )
+            .lines()
+            .map(str::to_string)
+            .collect();
+            (sha.to_string(), files)
+        })
+        .collect();
+    assert!(
+        !edits.is_empty(),
+        "the contract has an edit history the discipline must walk"
+    );
+    let findings = revision_findings(&edits, &fixture_paths, &introduction);
+    assert!(
+        findings.is_empty(),
+        "revision discipline violations:\n{}",
+        findings.join("\n")
+    );
+}
+
 #[test]
 fn kernel_surface_ledger_rows_link_to_existing_rules() {
     let root = workspace_root();
