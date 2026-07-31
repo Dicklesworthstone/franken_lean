@@ -88,10 +88,7 @@ fn a_shrink_reduces_to_a_minimum_with_the_signature_intact() {
         );
     }
     // And the final candidate still fails with the preserved signature.
-    assert!(matches!(
-        toy_oracle(&"X".to_string()),
-        ShrinkVerdict::Failure(_)
-    ));
+    assert!(matches!(toy_oracle("X"), ShrinkVerdict::Failure(_)));
 }
 
 #[test]
