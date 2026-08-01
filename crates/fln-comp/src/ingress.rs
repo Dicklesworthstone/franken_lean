@@ -150,9 +150,6 @@ pub enum IngressError {
         expected: fir::ValueType,
         actual: fir::ValueType,
     },
-    CheckSystemModuleNameNotStatic {
-        name_hash: u64,
-    },
     CheckSystemIntrinsicNameCollision {
         binding: usize,
     },
@@ -478,10 +475,6 @@ impl fmt::Display for IngressError {
             } => write!(
                 formatter,
                 "Lean.Core.checkSystem with observable name hash {name_hash} expects {expected:?}, observed {actual:?}"
-            ),
-            Self::CheckSystemModuleNameNotStatic { name_hash } => write!(
-                formatter,
-                "Lean.Core.checkSystem with observable name hash {name_hash} requires compile-time static module context in this ingress checkpoint"
             ),
             Self::CheckSystemIntrinsicNameCollision { binding } => write!(
                 formatter,
@@ -3806,30 +3799,34 @@ fn lower_body<'a>(
                     })?;
                 argument_ids.extend(arguments.iter().map(|value| value.id));
                 let operation = match target {
-                    CallTarget::CheckSystem { name_hash } => {
+                    CallTarget::CheckSystem { .. } => {
                         let argument = arguments
                             .first()
                             .copied()
                             .ok_or_else(|| malformed("checkSystem argument", 1, arguments.len()))?;
-                        let module_name = static_check_system_module_name(
+                        if let Some(module_name) = static_check_system_module_name(
                             argument,
                             &bindings,
                             parameter_count,
                             binding_len,
-                        )
-                        .ok_or(IngressError::CheckSystemModuleNameNotStatic { name_hash })?;
-                        let module_name = clone_string(module_name)?;
-                        let removed = bindings.pop().ok_or_else(|| {
-                            malformed("checkSystem literal binding", binding_len + 1, 0)
-                        })?;
-                        if removed.id != argument.id {
-                            return Err(malformed(
-                                "checkSystem literal binding id",
-                                usize::try_from(argument.id.get()).unwrap_or(usize::MAX),
-                                usize::try_from(removed.id.get()).unwrap_or(usize::MAX),
-                            ));
+                        ) {
+                            let module_name = clone_string(module_name)?;
+                            let removed = bindings.pop().ok_or_else(|| {
+                                malformed("checkSystem literal binding", binding_len + 1, 0)
+                            })?;
+                            if removed.id != argument.id {
+                                return Err(malformed(
+                                    "checkSystem literal binding id",
+                                    usize::try_from(argument.id.get()).unwrap_or(usize::MAX),
+                                    usize::try_from(removed.id.get()).unwrap_or(usize::MAX),
+                                ));
+                            }
+                            fir::Operation::CheckSystem { module_name }
+                        } else {
+                            fir::Operation::CheckSystemValue {
+                                module_name: argument.id,
+                            }
                         }
-                        fir::Operation::CheckSystem { module_name }
                     }
                     CallTarget::Constructor(binding_index) => {
                         let binding = &catalog.constructors[binding_index];
@@ -4800,7 +4797,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/13 entry=f0\n",
+                "fir/14 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 40\n",
@@ -4889,7 +4886,7 @@ mod tests {
     }
 
     #[test]
-    fn native_check_system_ingress_is_typed_static_and_not_overrideable() {
+    fn native_check_system_ingress_is_typed_and_not_overrideable() {
         let check_name = Name::from_components(["Lean", "Core", "checkSystem"]);
         let check_hash = check_name.hash();
         let source = Expr::app(
@@ -4928,7 +4925,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/13 entry=f0\n",
+                "fir/14 entry=f0\n",
                 "function f0 params=[] ownership=[] result=unit result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:unit = check_system 10:4c616b652e4275696c64\n",
@@ -5002,16 +4999,25 @@ mod tests {
                 [string("Lake"), string(".Build")],
             )],
         );
-        assert_eq!(
-            lower_closed_expr_with_intrinsics(
-                &computed,
-                &[string_append_binding()],
-                IngressLimits::default(),
-            ),
-            Err(IngressError::CheckSystemModuleNameNotStatic {
-                name_hash: check_hash,
-            })
+        let computed_ingress = lower_closed_expr_with_intrinsics(
+            &computed,
+            &[string_append_binding()],
+            IngressLimits::default(),
+        )
+        .expect("a computed String module name enters the dynamic checkpoint");
+        assert!(
+            computed_ingress
+                .fir()
+                .canonical_text()
+                .contains("v3:unit = check_system_value v2\n")
         );
+        let computed_lowered =
+            fir::lower_to_flbc(computed_ingress.fir()).expect("computed checkpoint lowers");
+        assert!(matches!(
+            computed_lowered.functions()[0].code[3],
+            crate::flbc::Instruction::CheckSystemValue { module_name }
+                if module_name == crate::flbc::Register::new(2)
+        ));
 
         let mut intrinsic_override = nat_add_binding();
         intrinsic_override.name = check_name.clone();
@@ -5135,7 +5141,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/13 entry=f0\n",
+                "fir/14 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "intrinsic i1 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
@@ -5193,7 +5199,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/13 entry=f0\n",
+                "fir/14 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "constructor c1 tag=3 fields=[] scalar_bytes=0:\n",
                 "function f0 params=[] ownership=[] result=ctor result_ownership=owned\n",
@@ -5488,7 +5494,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/13 entry=f0\n",
+                "fir/14 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "projection p0 constructor=c0 field=0\n",
                 "projection p1 constructor=c0 field=1\n",
@@ -5742,7 +5748,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/13 entry=f0\n",
+                "fir/14 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
@@ -6329,7 +6335,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/13 entry=f0\n",
+                "fir/14 entry=f0\n",
                 "closure_type s0 params=[string] ownership=[borrowed] result=string result_ownership=owned\n",
                 "intrinsic i0 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=string result_ownership=owned\n",

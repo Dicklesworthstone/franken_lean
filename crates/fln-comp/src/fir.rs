@@ -26,8 +26,9 @@ use std::fmt;
 /// binds dynamic Apply arguments; version 11 binds generated intrinsic result
 /// ownership; version 12 binds Owned-or-Scalar callable results into every
 /// function, closure signature, and dynamic application; version 13 represents
-/// each `Lean.Core.checkSystem` call as an explicit effect checkpoint.
-pub const FIR_SCHEMA_VERSION: u16 = 13;
+/// each `Lean.Core.checkSystem` call as an explicit effect checkpoint; version
+/// 14 carries computed module-name values into that checkpoint.
+pub const FIR_SCHEMA_VERSION: u16 = 14;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,6 +412,11 @@ pub enum Operation {
     CheckSystem {
         module_name: String,
     },
+    /// A `Lean.Core.checkSystem` checkpoint whose diagnostic module name is a
+    /// computed `String` value. The operand is borrowed.
+    CheckSystemValue {
+        module_name: ValueId,
+    },
     Call {
         function: FunctionId,
         args: Vec<ValueId>,
@@ -457,7 +463,8 @@ impl Operation {
             Self::Alias(value)
             | Self::Box(value)
             | Self::Unbox { value, .. }
-            | Self::Project { value, .. } => OperationReads {
+            | Self::Project { value, .. }
+            | Self::CheckSystemValue { module_name: value } => OperationReads {
                 first: Some(*value),
                 rest: empty,
             },
@@ -922,6 +929,11 @@ pub enum ValidationError {
         value: ValueId,
     },
     UnboxOperandType {
+        function: FunctionId,
+        block: BlockId,
+        actual: ValueType,
+    },
+    CheckSystemModuleNameType {
         function: FunctionId,
         block: BlockId,
         actual: ValueType,
@@ -1420,6 +1432,16 @@ impl fmt::Display for ValidationError {
             } => write!(
                 formatter,
                 "function {} block {} unboxes {actual:?} instead of Abi",
+                function.get(),
+                block.get()
+            ),
+            Self::CheckSystemModuleNameType {
+                function,
+                block,
+                actual,
+            } => write!(
+                formatter,
+                "function {} block {} checkSystem module name is {actual:?}, expected String",
                 function.get(),
                 block.get()
             ),
@@ -2558,6 +2580,17 @@ fn infer_operation_type(
         }
         Operation::String(_) => Ok(ValueType::String),
         Operation::CheckSystem { .. } => Ok(ValueType::Unit),
+        Operation::CheckSystemValue { module_name } => {
+            let actual = value_type(function, block, value_types, *module_name)?;
+            match actual {
+                ValueType::String => Ok(ValueType::Unit),
+                actual => Err(ValidationError::CheckSystemModuleNameType {
+                    function: function.id,
+                    block: block.id,
+                    actual,
+                }),
+            }
+        }
         Operation::Alias(value) => value_type(function, block, value_types, *value),
         Operation::Box(value) => {
             let actual = value_type(function, block, value_types, *value)?;
@@ -3407,7 +3440,7 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
 
 const fn lowered_binding_width(binding: &Binding) -> usize {
     match binding.operation {
-        Operation::CheckSystem { .. } => 2,
+        Operation::CheckSystem { .. } | Operation::CheckSystemValue { .. } => 2,
         _ => 1,
     }
 }
@@ -3421,6 +3454,14 @@ fn lower_binding(
         let module_name = clone_string(module_name, "checkSystem module name bytes")?;
         let dst = lower_register(binding.id)?;
         code.push(flbc::Instruction::CheckSystem { module_name });
+        code.push(flbc::Instruction::Nat { dst, value: 0 });
+        return Ok(());
+    }
+    if let Operation::CheckSystemValue { module_name } = &binding.operation {
+        let dst = lower_register(binding.id)?;
+        code.push(flbc::Instruction::CheckSystemValue {
+            module_name: lower_register(*module_name)?,
+        });
         code.push(flbc::Instruction::Nat { dst, value: 0 });
         return Ok(());
     }
@@ -3521,6 +3562,9 @@ fn lower_single_binding(
         }
         Operation::CheckSystem { .. } => Err(LoweringError::InternalInvariant {
             reason: "checkSystem binding bypassed its two-instruction lowering",
+        }),
+        Operation::CheckSystemValue { .. } => Err(LoweringError::InternalInvariant {
+            reason: "dynamic checkSystem binding bypassed its two-instruction lowering",
         }),
         Operation::Call { function, args } => {
             let declaration = function
@@ -3747,6 +3791,9 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
         Operation::CheckSystem { module_name } => {
             output.write_str("check_system ")?;
             write_hex_bytes(output, module_name.as_bytes())
+        }
+        Operation::CheckSystemValue { module_name } => {
+            write!(output, "check_system_value v{}", module_name.get())
         }
         Operation::Call { function, args } => {
             write!(output, "call f{} ", function.get())?;
@@ -4195,6 +4242,38 @@ mod tests {
         )
     }
 
+    fn dynamic_check_system_program() -> Program {
+        Program::new(
+            f(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![Function {
+                id: f(0),
+                parameters: Vec::new(),
+                parameter_ownership: Vec::new(),
+                result: ValueType::Unit,
+                result_ownership: flbc::CallableResultOwnership::Scalar,
+                blocks: vec![Block {
+                    id: b(0),
+                    bindings: vec![
+                        Binding {
+                            id: v(0),
+                            ty: ValueType::String,
+                            operation: Operation::String("Lake.Dynamic".to_string()),
+                        },
+                        Binding {
+                            id: v(1),
+                            ty: ValueType::Unit,
+                            operation: Operation::CheckSystemValue { module_name: v(0) },
+                        },
+                    ],
+                    terminator: Terminator::Return { value: v(1) },
+                }],
+            }],
+        )
+    }
+
     #[test]
     fn every_supported_operation_and_control_form_lowers_to_valid_flbc() {
         let validated = validate(all_operations_program(), ValidationLimits::default())
@@ -4276,6 +4355,42 @@ mod tests {
             lowered_check_system.functions()[0].code[3],
             flbc::Instruction::Jump { target } if target == flbc::Pc::new(4)
         ));
+
+        let dynamic_check_system =
+            validate(dynamic_check_system_program(), ValidationLimits::default())
+                .expect("a computed String module name is valid");
+        assert!(
+            dynamic_check_system
+                .canonical_text()
+                .contains("v1:unit = check_system_value v0\n")
+        );
+        let lowered_dynamic =
+            lower_to_flbc(&dynamic_check_system).expect("dynamic checkSystem lowering succeeds");
+        assert!(matches!(
+            lowered_dynamic.functions()[0].code.as_slice(),
+            [
+                flbc::Instruction::String { dst, .. },
+                flbc::Instruction::CheckSystemValue { module_name },
+                flbc::Instruction::Nat { value: 0, .. },
+                flbc::Instruction::Return { .. },
+            ] if dst == module_name
+        ));
+
+        let mut wrong_dynamic_module_type = dynamic_check_system_program();
+        wrong_dynamic_module_type.functions[0].blocks[0].bindings[0] = Binding {
+            id: v(0),
+            ty: ValueType::Nat,
+            operation: Operation::Nat(0),
+        };
+        assert_eq!(
+            validate(wrong_dynamic_module_type, ValidationLimits::default(),),
+            Err(ValidationError::CheckSystemModuleNameType {
+                function: f(0),
+                block: b(0),
+                actual: ValueType::Nat,
+            })
+        );
+
         let mut wrong_check_system_type = check_system_program();
         wrong_check_system_type.functions[0].blocks[0].bindings[0].ty = ValueType::String;
         assert_eq!(
@@ -4406,7 +4521,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/13 entry=f0\n",
+                "fir/14 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",

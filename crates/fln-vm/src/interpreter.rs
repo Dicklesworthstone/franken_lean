@@ -1126,7 +1126,7 @@ pub fn execute(
 /// Execute with an explicit command-scoped Reference heartbeat option.
 ///
 /// The initial allocation counter is captured on entry, as `CoreM.toIO` does.
-/// Only [`Instruction::CheckSystem`] observes its saturating delta.
+/// Only the two `checkSystem` instruction forms observe its saturating delta.
 pub fn execute_with_heartbeat_limit(
     program: &ValidatedProgram,
     limits: ExecutionLimits,
@@ -1309,12 +1309,24 @@ fn run(
         };
         let location = format!("function {} pc {}", frame.function.get(), frame.pc);
 
-        let check_system_location = if let Instruction::CheckSystem { module_name } = &instruction {
-            Some(format!(
+        let dynamic_check_system_module =
+            if let Instruction::CheckSystemValue { module_name } = &instruction {
+                Some(string_value(
+                    register(frame, *module_name)?,
+                    "Lean.Core.checkSystem",
+                    0,
+                ))
+            } else {
+                None
+            };
+        let check_system_location = match (&instruction, &dynamic_check_system_module) {
+            (Instruction::CheckSystem { module_name }, _) => Some(format!(
                 "{location} Lean.Core.checkSystem module {module_name}"
-            ))
-        } else {
-            None
+            )),
+            (Instruction::CheckSystemValue { .. }, Some(Ok(module_name))) => Some(format!(
+                "{location} Lean.Core.checkSystem module {module_name}"
+            )),
+            _ => None,
         };
         let poll_location = check_system_location.as_deref().unwrap_or(&location);
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -1891,6 +1903,23 @@ fn run(
             }
             Instruction::CheckSystem { .. } => {
                 advance(current_frame_mut(&mut stack)?)?;
+            }
+            Instruction::CheckSystemValue { .. } => {
+                let module_name = dynamic_check_system_module.ok_or_else(|| {
+                    Stop::InternalFault(InternalFault::new(
+                        "FLBC-CHECK-SYSTEM-CONTEXT",
+                        "dynamic checkpoint did not prepare its module operand",
+                    ))
+                })?;
+                match module_name {
+                    Ok(_) => advance(current_frame_mut(&mut stack)?)?,
+                    Err(refusal) => {
+                        return Ok(VmExit::Refused {
+                            refusal,
+                            usage: usage(steps, peak_stack_depth),
+                        });
+                    }
+                }
             }
             Instruction::Return { src } => {
                 let value = take_register(current_frame_mut(&mut stack)?, src)?;

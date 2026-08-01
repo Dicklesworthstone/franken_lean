@@ -23,8 +23,9 @@ use std::fmt;
 /// generated result ownership class of every intrinsic; version 9 binds the
 /// Owned-or-Scalar result contract of every callable function and invocation;
 /// version 10 makes each native `Lean.Core.checkSystem` observation point an
-/// explicit artifact instruction carrying its diagnostic module name.
-pub const FLBC_SCHEMA_VERSION: u16 = 10;
+/// explicit artifact instruction carrying its diagnostic module name; version
+/// 11 also admits a validated register operand for computed module names.
+pub const FLBC_SCHEMA_VERSION: u16 = 11;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
@@ -69,6 +70,7 @@ const OP_RETURN: u8 = 13;
 const OP_PANIC: u8 = 14;
 const OP_CTOR_FIELD: u8 = 15;
 const OP_CHECK_SYSTEM: u8 = 16;
+const OP_CHECK_SYSTEM_VALUE: u8 = 17;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -499,6 +501,11 @@ pub enum Instruction {
     CheckSystem {
         module_name: String,
     },
+    /// Dynamic form of [`Self::CheckSystem`] for a module name computed by the
+    /// source program. The register is borrowed and must contain a `String`.
+    CheckSystemValue {
+        module_name: Register,
+    },
     Return {
         src: Register,
     },
@@ -517,7 +524,8 @@ impl Instruction {
             Self::Copy { src, .. }
             | Self::Move { src, .. }
             | Self::Drop { src }
-            | Self::CtorField { src, .. } => {
+            | Self::CtorField { src, .. }
+            | Self::CheckSystemValue { module_name: src } => {
                 vec![*src]
             }
             Self::Ctor { fields, .. } => fields.clone(),
@@ -553,6 +561,7 @@ impl Instruction {
             | Self::Jump { .. }
             | Self::JumpIfZero { .. }
             | Self::CheckSystem { .. }
+            | Self::CheckSystemValue { .. }
             | Self::Return { .. }
             | Self::Panic { .. } => None,
         }
@@ -2150,6 +2159,10 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.u8(OP_CHECK_SYSTEM)?;
             encoder.string("checkSystem module name", module_name)
         }
+        Instruction::CheckSystemValue { module_name } => {
+            encoder.u8(OP_CHECK_SYSTEM_VALUE)?;
+            encoder.register(*module_name)
+        }
         Instruction::Return { src } => {
             encoder.u8(OP_RETURN)?;
             encoder.register(*src)
@@ -2238,6 +2251,9 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
         }),
         OP_CHECK_SYSTEM => Ok(Instruction::CheckSystem {
             module_name: decoder.string("checkSystem module name")?,
+        }),
+        OP_CHECK_SYSTEM_VALUE => Ok(Instruction::CheckSystemValue {
+            module_name: decoder.register()?,
         }),
         OP_RETURN => Ok(Instruction::Return {
             src: decoder.register()?,
@@ -2834,6 +2850,7 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
             | Instruction::Drop { .. }
             | Instruction::Array { .. }
             | Instruction::CheckSystem { .. }
+            | Instruction::CheckSystemValue { .. }
             | Instruction::Return { .. }
             | Instruction::Panic { .. } => {}
         }
@@ -3293,7 +3310,8 @@ fn ownership_reads<E>(
         Instruction::Copy { src, .. }
         | Instruction::Move { src, .. }
         | Instruction::Drop { src }
-        | Instruction::CtorField { src, .. } => visit(*src)?,
+        | Instruction::CtorField { src, .. }
+        | Instruction::CheckSystemValue { module_name: src } => visit(*src)?,
         Instruction::Ctor { fields, .. } => {
             for register in fields {
                 visit(*register)?;
@@ -3482,6 +3500,7 @@ fn ownership_operand_count(instruction: &Instruction) -> usize {
         | Instruction::Move { .. }
         | Instruction::Drop { .. }
         | Instruction::CtorField { .. }
+        | Instruction::CheckSystemValue { .. }
         | Instruction::JumpIfZero { .. }
         | Instruction::Return { .. }
         | Instruction::Panic { .. } => 1,
@@ -3551,6 +3570,7 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
         | Instruction::Apply { .. }
         | Instruction::Jump { .. }
         | Instruction::JumpIfZero { .. }
+        | Instruction::CheckSystemValue { .. }
         | Instruction::Return { .. }
         | Instruction::Panic { .. } => 0,
     }
@@ -3802,6 +3822,9 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
         },
         Instruction::CheckSystem { module_name } => Instruction::CheckSystem {
             module_name: ownership_clone_string(module_name)?,
+        },
+        Instruction::CheckSystemValue { module_name } => Instruction::CheckSystemValue {
+            module_name: *module_name,
         },
         Instruction::Return { src } => Instruction::Return { src: *src },
         Instruction::Panic { message } => Instruction::Panic { message: *message },
@@ -6520,6 +6543,7 @@ mod codec_tests {
                         Instruction::CheckSystem {
                             module_name: "Every.Opcode".to_string(),
                         },
+                        Instruction::CheckSystemValue { module_name: r(1) },
                         Instruction::Return { src: r(9) },
                     ],
                 ),
@@ -11008,7 +11032,7 @@ mod codec_tests {
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
                 7, 0, // wire version
-                10, 0, // schema version
+                11, 0, // schema version
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id

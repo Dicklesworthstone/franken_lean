@@ -1542,7 +1542,7 @@ fn core_expr_ingress_reaches_canonical_flbc_and_golem_without_host_evaluation() 
 }
 
 #[test]
-fn core_check_system_expr_reaches_the_explicit_golem_checkpoint() {
+fn core_check_system_expr_reaches_static_and_computed_golem_checkpoints() {
     let _guard = lock();
     let source = Expr::app(
         Expr::const_(
@@ -1612,6 +1612,158 @@ fn core_check_system_expr_reaches_the_explicit_golem_checkpoint() {
         cancellation_polls.get(),
         1,
         "the first source-lowered opcode is the diagnostic checkpoint"
+    );
+
+    let string_append = ingress::IntrinsicBinding {
+        name: Name::from_components(["String", "append"]),
+        universe_arity: 0,
+        row: "extern:String.append".to_string(),
+        argument_ownership: contract_argument_ownership("extern:String.append", 2),
+        result_ownership: contract_result_ownership("extern:String.append"),
+        arguments: vec![fir::ValueType::String, fir::ValueType::String],
+        result: fir::ValueType::String,
+        effect: fir::EffectClass::Pure,
+    };
+    let computed_module = Expr::app(
+        Expr::app(
+            Expr::const_(Name::from_components(["String", "append"]), Vec::new()),
+            Expr::lit(Literal::Str("Lake".to_string())),
+        ),
+        Expr::lit(Literal::Str(".Build".to_string())),
+    );
+    let computed_source = Expr::app(
+        Expr::const_(
+            Name::from_components(["Lean", "Core", "checkSystem"]),
+            Vec::new(),
+        ),
+        computed_module,
+    );
+    let computed_ingress = ingress::lower_closed_expr_with_intrinsics(
+        &computed_source,
+        &[string_append],
+        ingress::IngressLimits::default(),
+    )
+    .expect("computed native checkSystem module enters validated FIR");
+    assert_eq!(computed_ingress.work().check_system_calls, 1);
+    assert_eq!(computed_ingress.work().intrinsic_calls, 1);
+    assert_eq!(computed_ingress.work().generated_values, 4);
+    let computed_lowered = fir::lower_to_flbc(computed_ingress.fir())
+        .expect("computed native checkpoint lowers through ordinary FIR");
+    assert!(matches!(
+        computed_lowered.functions()[0].code[3],
+        Instruction::CheckSystemValue { module_name } if module_name == r(2)
+    ));
+    let computed_bytes = encode_canonical(&computed_lowered, CodecLimits::default())
+        .expect("canonical computed FLBC checkpoint");
+    let computed = decode_canonical(&computed_bytes, CodecLimits::default())
+        .expect("independent computed checkpoint validation");
+    let completed = returned(execute_with_heartbeat_limit(
+        &computed,
+        ExecutionLimits::default(),
+        HeartbeatLimit::from_option_units(1),
+        None,
+    ));
+    assert_eq!(completed.value.unbox(), 0);
+    assert_eq!(completed.usage.steps, 6);
+    drop(completed);
+
+    let owned_computed =
+        fir::lower_to_flbc_with_ownership(computed_ingress.fir(), OwnershipLimits::default())
+            .expect("computed checkpoint receives bounded ownership cleanup");
+    let owned_code = &owned_computed.program().functions()[0].code;
+    let dynamic_checkpoint = owned_code
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                Instruction::CheckSystemValue { module_name } if *module_name == r(2)
+            )
+        })
+        .expect("owned FLBC retains the computed checkpoint");
+    assert!(matches!(
+        owned_code.get(dynamic_checkpoint.saturating_add(1)),
+        Some(Instruction::Drop { src }) if *src == r(2)
+    ));
+    let owned_completed = returned(execute(
+        owned_computed.program(),
+        ExecutionLimits::default(),
+        None,
+    ));
+    assert_eq!(owned_completed.value.unbox(), 0);
+    drop(owned_completed);
+
+    let dynamic_polls = Cell::new(0u64);
+    let cancel_dynamic = || {
+        let observed = dynamic_polls.get().saturating_add(1);
+        dynamic_polls.set(observed);
+        observed == 4
+    };
+    let stopped = execute_with_heartbeat_limit(
+        &computed,
+        ExecutionLimits::default(),
+        HeartbeatLimit::from_option_units(1),
+        Some(&cancel_dynamic),
+    );
+    assert!(matches!(
+        stopped,
+        Outcome::Inconclusive(ref inconclusive)
+            if matches!(
+                &inconclusive.cause,
+                InconclusiveCause::Cancelled { at }
+                    if at.text().contains("Lake.Build")
+            )
+    ));
+    assert_eq!(dynamic_polls.get(), 4);
+
+    let wrong_kind = validated(vec![function(
+        0,
+        0,
+        2,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 7,
+            },
+            Instruction::CheckSystemValue { module_name: r(0) },
+            Instruction::Nat {
+                dst: r(1),
+                value: 0,
+            },
+            Instruction::Return { src: r(1) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&wrong_kind, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "Lean.Core.checkSystem",
+                argument: 0,
+                expected: "String",
+                actual: ValueKind::Scalar,
+            },
+            ..
+        })
+    ));
+
+    let wrong_kind_polls = Cell::new(0u64);
+    let cancel_wrong_kind = || {
+        let observed = wrong_kind_polls.get().saturating_add(1);
+        wrong_kind_polls.set(observed);
+        observed == 2
+    };
+    assert!(matches!(
+        execute(
+            &wrong_kind,
+            ExecutionLimits::default(),
+            Some(&cancel_wrong_kind),
+        ),
+        Outcome::Inconclusive(ref inconclusive)
+            if matches!(inconclusive.cause, InconclusiveCause::Cancelled { .. })
+    ));
+    assert_eq!(
+        wrong_kind_polls.get(),
+        2,
+        "cancellation wins over a dynamic module-value refusal"
     );
 }
 
