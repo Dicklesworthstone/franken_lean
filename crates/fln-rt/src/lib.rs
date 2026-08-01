@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod abi;
+pub mod native_heap;
 pub mod region;
 mod region_contract;
 
