@@ -27,8 +27,9 @@ use fln_vm::extern_row::{
 };
 use fln_vm::extern_table_generated::EXTERN_ROWS;
 use fln_vm::interpreter::{
-    CompletedExecution, ExecutionCacheContext, ExecutionLimits, InlineCaches, ValueKind, VmExit,
-    VmRefusal, execute, execute_cached, value_kind,
+    CompletedExecution, ExecutionCacheContext, ExecutionLimits, HeartbeatLimit, InlineCaches,
+    ValueKind, VmExit, VmRefusal, execute, execute_cached, execute_cached_with_heartbeat_limit,
+    execute_with_heartbeat_limit, value_kind,
 };
 use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard};
@@ -6411,6 +6412,159 @@ fn heartbeat_io_intrinsics_share_marrow_state_through_the_u64_boundary() {
         }),
         "heartbeat IO execution preserves the Marrow ownership graph"
     );
+}
+
+#[test]
+fn check_system_observes_the_command_heartbeat_delta_at_its_explicit_opcode() {
+    let _guard = lock();
+    let program = |new_count: u64, module_name: &str| {
+        validated(vec![function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: new_count,
+                },
+                intrinsic(r(1), "extern:IO.setNumHeartbeats", vec![r(0)]),
+                Instruction::CheckSystem {
+                    module_name: module_name.to_string(),
+                },
+                Instruction::Nat {
+                    dst: r(2),
+                    value: 7,
+                },
+                Instruction::Return { src: r(2) },
+            ],
+        )])
+    };
+    let one_option_unit = HeartbeatLimit::from_option_units(1);
+    assert_eq!(one_option_unit.max_option_units(), 1);
+    assert_eq!(one_option_unit.effective_limit(), Some(1_000));
+    assert_eq!(HeartbeatLimit::UNLIMITED.effective_limit(), None);
+    assert_eq!(
+        HeartbeatLimit::from_option_units(u64::MAX).effective_limit(),
+        None,
+        "an option multiplication overflow cannot become a wrapped small limit"
+    );
+
+    heartbeat::set_allocation_heartbeats(700);
+    let exact = program(1_700, "Lake.Build");
+    let bytes = encode_canonical(&exact, CodecLimits::default()).expect("encode checkSystem");
+    let decoded =
+        decode_canonical(&bytes, CodecLimits::default()).expect("decode checkSystem artifact");
+    assert!(matches!(
+        &decoded.function(fid(0)).expect("entry").code[2],
+        Instruction::CheckSystem { module_name } if module_name == "Lake.Build"
+    ));
+    let completed = returned(execute_with_heartbeat_limit(
+        &decoded,
+        ExecutionLimits::default(),
+        one_option_unit,
+        None,
+    ));
+    assert_eq!(completed.value.unbox(), 7);
+    assert_eq!(completed.usage.steps, 5);
+    assert_eq!(completed.usage.system_polls, 5);
+    drop(completed);
+
+    heartbeat::set_allocation_heartbeats(700);
+    let mut caches = InlineCaches::try_new(8).expect("bounded cache");
+    let cached = returned(execute_cached_with_heartbeat_limit(
+        &decoded,
+        ExecutionLimits::default(),
+        one_option_unit,
+        None,
+        cache_context(41, 42, Mode::Sound),
+        &mut caches,
+    ));
+    assert_eq!(cached.value.unbox(), 7);
+    drop(cached);
+
+    heartbeat::set_allocation_heartbeats(700);
+    let exceeded = program(1_701, "Lake.Build");
+    let stopped =
+        execute_with_heartbeat_limit(&exceeded, ExecutionLimits::default(), one_option_unit, None);
+    assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+    let Outcome::Inconclusive(inconclusive) = stopped else {
+        panic!("expected heartbeat exhaustion");
+    };
+    assert!(
+        inconclusive
+            .progress
+            .as_deref()
+            .is_some_and(|progress| progress.text().contains("Lake.Build")),
+        "the explicit module name survives into bounded stop context"
+    );
+    match inconclusive.cause {
+        InconclusiveCause::ResourceExhausted { usage } => {
+            assert!(usage.is_genuine_exhaustion());
+            assert_eq!(usage.allowed, 1_000);
+            assert_eq!(usage.observed, 1_001);
+            assert_eq!(
+                usage.reason,
+                ResourceReason::Heartbeats {
+                    consumed: 1_001,
+                    limit: 1_000,
+                }
+            );
+        }
+        other => panic!("expected heartbeat exhaustion, got {other:?}"),
+    }
+
+    heartbeat::set_allocation_heartbeats(1_700);
+    let rolled_back = returned(execute_with_heartbeat_limit(
+        &program(699, "Rollback.Module"),
+        ExecutionLimits::default(),
+        one_option_unit,
+        None,
+    ));
+    assert_eq!(rolled_back.value.unbox(), 7);
+    drop(rolled_back);
+
+    heartbeat::set_allocation_heartbeats(0);
+    let unlimited = returned(execute_with_heartbeat_limit(
+        &program(1_000_001, "Unlimited.Module"),
+        ExecutionLimits::default(),
+        HeartbeatLimit::UNLIMITED,
+        None,
+    ));
+    assert_eq!(unlimited.value.unbox(), 7);
+    drop(unlimited);
+
+    heartbeat::set_allocation_heartbeats(0);
+    let cancellation_polls = Cell::new(0u64);
+    let cancelled = || {
+        let observed = cancellation_polls.get() + 1;
+        cancellation_polls.set(observed);
+        observed == 3
+    };
+    let cancelled_at_check = execute_with_heartbeat_limit(
+        &program(1_001, "Cancelled.Module"),
+        ExecutionLimits {
+            max_steps: 2,
+            max_stack_depth: 4,
+        },
+        one_option_unit,
+        Some(&cancelled),
+    );
+    assert!(matches!(
+        cancelled_at_check,
+        Outcome::Inconclusive(ref inconclusive)
+            if matches!(
+                &inconclusive.cause,
+                InconclusiveCause::Cancelled { at }
+                    if at.text().contains("Cancelled.Module")
+            )
+    ));
+    assert_eq!(
+        cancellation_polls.get(),
+        3,
+        "checkSystem cancellation wins before heartbeat and step exhaustion"
+    );
+
+    heartbeat::set_allocation_heartbeats(0);
 }
 
 #[test]

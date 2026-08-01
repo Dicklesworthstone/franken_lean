@@ -35,6 +35,7 @@ use fln_comp::flbc::{
 };
 use fln_core::diag::ResourceReason;
 use fln_core::mode::{BuildProfileId, ContentRoot, Mode};
+use fln_core::options::limits::HEARTBEAT_UNIT;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_rt::abi;
@@ -56,6 +57,37 @@ impl Default for ExecutionLimits {
         Self {
             max_steps: 1_000_000,
             max_stack_depth: 1_000,
+        }
+    }
+}
+
+/// The Reference `maxHeartbeats` option for one command, in its public
+/// thousand-heartbeat units.
+///
+/// Zero disables the limit. A multiplication overflow also cannot be
+/// exhausted by the runtime's `u64` counter, so it is represented as an
+/// unbounded effective limit rather than wrapped to a smaller allowance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeartbeatLimit {
+    max_option_units: u64,
+}
+
+impl HeartbeatLimit {
+    pub const UNLIMITED: Self = Self::from_option_units(0);
+
+    pub const fn from_option_units(max_option_units: u64) -> Self {
+        Self { max_option_units }
+    }
+
+    pub const fn max_option_units(self) -> u64 {
+        self.max_option_units
+    }
+
+    pub const fn effective_limit(self) -> Option<u64> {
+        if self.max_option_units == 0 {
+            None
+        } else {
+            self.max_option_units.checked_mul(HEARTBEAT_UNIT)
         }
     }
 }
@@ -886,12 +918,14 @@ impl fmt::Display for VmRefusal {
 
 impl std::error::Error for VmRefusal {}
 
-/// Cooperative cancellation source. Golem samples it before every instruction;
-/// a true observation stops without executing or publishing that instruction.
+/// Cooperative cancellation source. Golem samples it once before every
+/// instruction; a true observation stops without executing or publishing that
+/// instruction.
 ///
 /// This VM scheduling checkpoint is distinct from both allocation-linked
-/// heartbeats and the explicit `Lean.Core.checkSystem` calls that the Native
-/// Mirror will lower through the intrinsic surface.
+/// heartbeats and the explicit `Lean.Core.checkSystem` instruction. At that
+/// instruction, the same poll is the Reference-compatible cancellation half of
+/// `checkSystem`; all other instructions retain the ordinary scheduler poll.
 pub trait CancellationProbe {
     fn is_cancelled(&self) -> bool;
 }
@@ -1012,6 +1046,28 @@ enum Stop {
     InternalFault(InternalFault),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeartbeatContext {
+    initial: u64,
+    effective_limit: Option<u64>,
+}
+
+impl HeartbeatContext {
+    fn snapshot(limit: HeartbeatLimit) -> Self {
+        Self {
+            initial: fln_rt::heartbeat::allocation_heartbeats(),
+            effective_limit: limit.effective_limit(),
+        }
+    }
+
+    fn exhaustion(self) -> Option<(u64, u64)> {
+        let limit = self.effective_limit?;
+        let current = fln_rt::heartbeat::allocation_heartbeats();
+        let consumed = current.saturating_sub(self.initial);
+        (consumed > limit).then_some((consumed, limit))
+    }
+}
+
 /// Execute a validated program. Non-authoritative paths contain no object
 /// result, so a caller cannot accidentally cache a half-run register.
 pub fn execute(
@@ -1019,7 +1075,20 @@ pub fn execute(
     limits: ExecutionLimits,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<VmExit> {
-    finish_run(run(program, limits, cancellation, None))
+    execute_with_heartbeat_limit(program, limits, HeartbeatLimit::UNLIMITED, cancellation)
+}
+
+/// Execute with an explicit command-scoped Reference heartbeat option.
+///
+/// The initial allocation counter is captured on entry, as `CoreM.toIO` does.
+/// Only [`Instruction::CheckSystem`] observes its saturating delta.
+pub fn execute_with_heartbeat_limit(
+    program: &ValidatedProgram,
+    limits: ExecutionLimits,
+    heartbeat_limit: HeartbeatLimit,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<VmExit> {
+    finish_run(run(program, limits, heartbeat_limit, cancellation, None))
 }
 
 /// Execute through bounded inline caches while preserving [`execute`] as the
@@ -1035,15 +1104,41 @@ pub fn execute_cached(
     context: ExecutionCacheContext,
     caches: &mut InlineCaches,
 ) -> Outcome<VmExit> {
+    execute_cached_with_heartbeat_limit(
+        program,
+        limits,
+        HeartbeatLimit::UNLIMITED,
+        cancellation,
+        context,
+        caches,
+    )
+}
+
+/// Cached execution with the same explicit command-scoped heartbeat contract
+/// as [`execute_with_heartbeat_limit`].
+pub fn execute_cached_with_heartbeat_limit(
+    program: &ValidatedProgram,
+    limits: ExecutionLimits,
+    heartbeat_limit: HeartbeatLimit,
+    cancellation: Option<&dyn CancellationProbe>,
+    context: ExecutionCacheContext,
+    caches: &mut InlineCaches,
+) -> Outcome<VmExit> {
     if caches.is_disabled() {
-        return execute(program, limits, cancellation);
+        return execute_with_heartbeat_limit(program, limits, heartbeat_limit, cancellation);
     }
     let Some(namespace) = cache_namespace(program, context, caches.identity_limits) else {
         caches.record_identity_fallback();
-        return execute(program, limits, cancellation);
+        return execute_with_heartbeat_limit(program, limits, heartbeat_limit, cancellation);
     };
     caches.begin_namespace(namespace);
-    finish_run(run(program, limits, cancellation, Some(caches)))
+    finish_run(run(
+        program,
+        limits,
+        heartbeat_limit,
+        cancellation,
+        Some(caches),
+    ))
 }
 
 fn finish_run(result: Result<VmExit, Stop>) -> Outcome<VmExit> {
@@ -1073,9 +1168,11 @@ fn cache_namespace(
 fn run(
     program: &ValidatedProgram,
     limits: ExecutionLimits,
+    heartbeat_limit: HeartbeatLimit,
     cancellation: Option<&dyn CancellationProbe>,
     mut inline_caches: Option<&mut InlineCaches>,
 ) -> Result<VmExit, Stop> {
+    let heartbeat_context = HeartbeatContext::snapshot(heartbeat_limit);
     if limits.max_stack_depth < 1 {
         return Err(stack_exhausted(limits.max_stack_depth, 1, "entry frame"));
     }
@@ -1126,10 +1223,23 @@ fn run(
         };
         let location = format!("function {} pc {}", frame.function.get(), frame.pc);
 
+        let check_system_location = if let Instruction::CheckSystem { module_name } = &instruction {
+            Some(format!(
+                "{location} Lean.Core.checkSystem module {module_name}"
+            ))
+        } else {
+            None
+        };
+        let poll_location = check_system_location.as_deref().unwrap_or(&location);
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Err(Stop::Inconclusive(
-                Inconclusive::cancelled(location.clone()).with_progress(location),
+                Inconclusive::cancelled(poll_location).with_progress(poll_location),
             ));
+        }
+        if let Some(check_location) = check_system_location.as_deref()
+            && let Some((consumed, limit)) = heartbeat_context.exhaustion()
+        {
+            return Err(heartbeat_exhausted(consumed, limit, check_location));
         }
         let observed_steps = steps.checked_add(1).ok_or_else(|| {
             Stop::InternalFault(InternalFault::new(
@@ -1693,6 +1803,9 @@ fn run(
                         ))
                     })?;
             }
+            Instruction::CheckSystem { .. } => {
+                advance(current_frame_mut(&mut stack)?)?;
+            }
             Instruction::Return { src } => {
                 let value = take_register(current_frame_mut(&mut stack)?, src)?;
                 let value =
@@ -2239,6 +2352,17 @@ fn execution_steps_exhausted(allowed: u64, observed: u64, location: &str) -> Sto
             reason: ResourceReason::ExecutionSteps,
             allowed,
             observed,
+        })
+        .with_progress(location),
+    )
+}
+
+fn heartbeat_exhausted(consumed: u64, limit: u64, location: &str) -> Stop {
+    Stop::Inconclusive(
+        Inconclusive::resource(ResourceUsage {
+            reason: ResourceReason::Heartbeats { consumed, limit },
+            allowed: limit,
+            observed: consumed,
         })
         .with_progress(location),
     )

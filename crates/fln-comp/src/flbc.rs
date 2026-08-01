@@ -21,8 +21,10 @@ use std::fmt;
 /// contract; version 6 binds closure captures to the target parameter prefix;
 /// version 7 binds explicit dynamic-application arguments; version 8 binds the
 /// generated result ownership class of every intrinsic; version 9 binds the
-/// Owned-or-Scalar result contract of every callable function and invocation.
-pub const FLBC_SCHEMA_VERSION: u16 = 9;
+/// Owned-or-Scalar result contract of every callable function and invocation;
+/// version 10 makes each native `Lean.Core.checkSystem` observation point an
+/// explicit artifact instruction carrying its diagnostic module name.
+pub const FLBC_SCHEMA_VERSION: u16 = 10;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
@@ -66,6 +68,7 @@ const OP_JUMP_IF_ZERO: u8 = 12;
 const OP_RETURN: u8 = 13;
 const OP_PANIC: u8 = 14;
 const OP_CTOR_FIELD: u8 = 15;
+const OP_CHECK_SYSTEM: u8 = 16;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -490,6 +493,12 @@ pub enum Instruction {
         zero: Pc,
         nonzero: Pc,
     },
+    /// Native Mirror lowering of `Lean.Core.checkSystem`. The module name is
+    /// diagnostic context; Golem samples cancellation and the command's
+    /// allocation-heartbeat delta at this exact instruction.
+    CheckSystem {
+        module_name: String,
+    },
     Return {
         src: Register,
     },
@@ -501,7 +510,10 @@ pub enum Instruction {
 impl Instruction {
     fn read_registers(&self) -> Vec<Register> {
         match self {
-            Self::Nat { .. } | Self::String { .. } | Self::Jump { .. } => Vec::new(),
+            Self::Nat { .. }
+            | Self::String { .. }
+            | Self::Jump { .. }
+            | Self::CheckSystem { .. } => Vec::new(),
             Self::Copy { src, .. }
             | Self::Move { src, .. }
             | Self::Drop { src }
@@ -540,6 +552,7 @@ impl Instruction {
             Self::Drop { .. }
             | Self::Jump { .. }
             | Self::JumpIfZero { .. }
+            | Self::CheckSystem { .. }
             | Self::Return { .. }
             | Self::Panic { .. } => None,
         }
@@ -2133,6 +2146,10 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.u32(zero.get())?;
             encoder.u32(nonzero.get())
         }
+        Instruction::CheckSystem { module_name } => {
+            encoder.u8(OP_CHECK_SYSTEM)?;
+            encoder.string("checkSystem module name", module_name)
+        }
         Instruction::Return { src } => {
             encoder.u8(OP_RETURN)?;
             encoder.register(*src)
@@ -2218,6 +2235,9 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
             cond: decoder.register()?,
             zero: Pc::new(decoder.u32()?),
             nonzero: Pc::new(decoder.u32()?),
+        }),
+        OP_CHECK_SYSTEM => Ok(Instruction::CheckSystem {
+            module_name: decoder.string("checkSystem module name")?,
         }),
         OP_RETURN => Ok(Instruction::Return {
             src: decoder.register()?,
@@ -2813,6 +2833,7 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
             | Instruction::Move { .. }
             | Instruction::Drop { .. }
             | Instruction::Array { .. }
+            | Instruction::CheckSystem { .. }
             | Instruction::Return { .. }
             | Instruction::Panic { .. } => {}
         }
@@ -3265,7 +3286,10 @@ fn ownership_reads<E>(
     mut visit: impl FnMut(Register) -> Result<(), E>,
 ) -> Result<(), E> {
     match instruction {
-        Instruction::Nat { .. } | Instruction::String { .. } | Instruction::Jump { .. } => {}
+        Instruction::Nat { .. }
+        | Instruction::String { .. }
+        | Instruction::Jump { .. }
+        | Instruction::CheckSystem { .. } => {}
         Instruction::Copy { src, .. }
         | Instruction::Move { src, .. }
         | Instruction::Drop { src }
@@ -3450,7 +3474,10 @@ fn scalar_callable_result_count(instruction: &Instruction) -> usize {
 
 fn ownership_operand_count(instruction: &Instruction) -> usize {
     match instruction {
-        Instruction::Nat { .. } | Instruction::String { .. } | Instruction::Jump { .. } => 0,
+        Instruction::Nat { .. }
+        | Instruction::String { .. }
+        | Instruction::Jump { .. }
+        | Instruction::CheckSystem { .. } => 0,
         Instruction::Copy { .. }
         | Instruction::Move { .. }
         | Instruction::Drop { .. }
@@ -3512,6 +3539,7 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
         Instruction::String { value, .. } => value.len(),
         Instruction::Ctor { scalar_bytes, .. } => scalar_bytes.len(),
         Instruction::Intrinsic { row, .. } => row.len(),
+        Instruction::CheckSystem { module_name } => module_name.len(),
         Instruction::Nat { .. }
         | Instruction::Copy { .. }
         | Instruction::Move { .. }
@@ -3771,6 +3799,9 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
             cond: *cond,
             zero: *zero,
             nonzero: *nonzero,
+        },
+        Instruction::CheckSystem { module_name } => Instruction::CheckSystem {
+            module_name: ownership_clone_string(module_name)?,
         },
         Instruction::Return { src } => Instruction::Return { src: *src },
         Instruction::Panic { message } => Instruction::Panic { message: *message },
@@ -6486,6 +6517,9 @@ mod codec_tests {
                             nonzero: pc(13),
                         },
                         Instruction::Jump { target: pc(14) },
+                        Instruction::CheckSystem {
+                            module_name: "Every.Opcode".to_string(),
+                        },
                         Instruction::Return { src: r(9) },
                     ],
                 ),
@@ -10974,7 +11008,7 @@ mod codec_tests {
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
                 7, 0, // wire version
-                9, 0, // schema version
+                10, 0, // schema version
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id
