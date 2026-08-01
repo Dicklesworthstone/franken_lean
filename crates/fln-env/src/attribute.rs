@@ -1166,3 +1166,156 @@ mod increment2_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod named_mutant_tests {
+    //! The bead's named mutants, each killed by a named test: a dropped
+    //! definition, a swapped duplicate law, a hidden root change, a stale
+    //! plan accepted, and payload bytes lost in storage.
+
+    use super::*;
+
+    fn census_text() -> String {
+        let current = std::env::current_dir().expect("current directory");
+        let root = current
+            .ancestors()
+            .find(|candidate| candidate.join("contracts/ATTRIBUTE_STATE_CENSUS.txt").is_file())
+            .expect("the committed census is findable");
+        std::fs::read_to_string(root.join("contracts/ATTRIBUTE_STATE_CENSUS.txt"))
+            .expect("the committed census exists")
+    }
+
+    fn name_of(text: &str) -> Name {
+        Name::str(Name::anonymous(), text)
+    }
+
+    fn state_from(text: &str) -> AttributeState {
+        AttributeState::from_census(text).expect("parses").0
+    }
+
+    fn state() -> AttributeState {
+        state_from(&census_text())
+    }
+
+    #[test]
+    fn mutant_a_dropped_definition_is_an_unknown_dispatch() {
+        // MUTANT: drop the simp row from the census text. The registry must
+        // not hallucinate it: definition is None, and dispatch is a typed
+        // refusal, never a stale registration from memory.
+        let mut text = census_text();
+        text = text
+            .lines()
+            .filter(|line| !line.starts_with("row=attr-simp-simp "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let state = state_from(&text);
+        assert!(state.definition(&name_of("simp")).is_none());
+        assert!(matches!(
+            state.dispatch(&name_of("simp")),
+            Err(AttributeError::UnknownAttribute { .. })
+        ));
+        assert!(matches!(
+            state.assign(Assignment {
+                attribute: name_of("simp"),
+                target: name_of("X.y"),
+                payload: Payload::Unit,
+                kind: AttributeKind::Global,
+                provenance: "test".to_string(),
+            }),
+            Err(AttributeError::UnknownAttribute { .. })
+        ));
+    }
+
+    #[test]
+    fn mutant_a_swapped_duplicate_law_is_caught_by_the_families_own() {
+        // MUTANT: swapping tag's and parametric's duplicate laws. The laws
+        // come from the family, not from a global default, so the swap is
+        // visible: tag is SetNoOp, parametric is Replace, and they differ.
+        assert_eq!(AttributeFamily::Tag.duplicate_law(), DuplicateLaw::SetNoOp);
+        assert_eq!(
+            AttributeFamily::Parametric.duplicate_law(),
+            DuplicateLaw::Replace
+        );
+        assert_ne!(
+            AttributeFamily::Tag.duplicate_law(),
+            AttributeFamily::Parametric.duplicate_law(),
+            "the laws are per-family; a global default would be the mutant"
+        );
+    }
+
+    #[test]
+    fn mutant_a_hidden_root_participation_is_refused_by_the_table() {
+        // MUTANT: let opaque or operational state claim Semantic root
+        // participation. The per-field table holds: Opaque and EnvExtension
+        // are ProvenanceOnly, and unregistered is Neither — a hidden
+        // logical_root coupling cannot be declared.
+        assert_eq!(
+            AttributeFamily::Opaque.root_contribution(),
+            RootContribution::ProvenanceOnly
+        );
+        assert_eq!(
+            AttributeFamily::EnvExtension.root_contribution(),
+            RootContribution::ProvenanceOnly
+        );
+        for family in [
+            AttributeFamily::Core,
+            AttributeFamily::Tag,
+            AttributeFamily::Simp,
+            AttributeFamily::KeyedDecls,
+        ] {
+            assert_eq!(family.root_contribution(), RootContribution::Semantic);
+        }
+    }
+
+    #[test]
+    fn mutant_a_stale_plan_cannot_publish() {
+        // MUTANT: publish a plan without revalidating its base. The plan law
+        // refuses at the digest, and nothing applies.
+        let base = state();
+        let plan = AttributeStatePlan::cut(
+            &base,
+            vec![Assignment {
+                attribute: name_of("simp"),
+                target: name_of("Staleness.probe"),
+                payload: Payload::Unit,
+                kind: AttributeKind::Global,
+                provenance: "test".to_string(),
+            }],
+        );
+        let moved = base
+            .assign(Assignment {
+                attribute: name_of("simp"),
+                target: name_of("Base.moved"),
+                payload: Payload::Unit,
+                kind: AttributeKind::Global,
+                provenance: "test".to_string(),
+            })
+            .expect("the base moved");
+        assert!(matches!(
+            plan.publish(&moved),
+            Err(PlanError::StalePlan { .. })
+        ));
+        assert!(!moved.has_attr(&name_of("simp"), &name_of("Staleness.probe")));
+    }
+
+    #[test]
+    fn mutant_storage_cannot_lose_payload_bytes() {
+        // MUTANT: truncate an opaque payload on store. The stored payload is
+        // the exact bytes given, or the substrate is wrong.
+        let base = state();
+        let bytes: Vec<u8> = (0..255).collect();
+        let assigned = base
+            .assign(Assignment {
+                attribute: name_of("simp"),
+                target: name_of("Payload.probe"),
+                payload: Payload::Opaque(bytes.clone()),
+                kind: AttributeKind::Global,
+                provenance: "test".to_string(),
+            })
+            .expect("assign");
+        let stored = assigned
+            .assignment(&name_of("simp"), &name_of("Payload.probe"))
+            .expect("stored");
+        assert_eq!(stored.payload, Payload::Opaque(bytes));
+    }
+}

@@ -489,6 +489,21 @@ if [ "$LAST_RC" -ne 0 ] || ! grep -q "test result: ok" "$LAST_OUT"; then
 fi
 record_step "$step" "the census guard suite is green"   "exit 0, 'test result: ok'" "$step.out"   pass 0 0 "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 
+# ---- leg 2b: the native substrate against the real census (no-mock substrate e2e)
+step=substrate_registry
+GLOBAL_BEFORE="$(hash_governed)"
+supervise "$step" cargo test -p fln-env attribute
+inspect_supervisor "$step"
+GLOBAL_AFTER="$(hash_governed)"
+if [ "$LAST_RC" -ne 0 ] || ! grep -q "test result: ok" "$LAST_OUT"; then
+  record_failure "$step" "the attribute substrate is green against the real census"
+  set_final fail substrate_red 1
+  finalize 1
+fi
+record_step "$step" "the attribute substrate builds from the real census (registry, branches, plans, mutants)" \
+  "exit 0, 'test result: ok' over 19 substrate cells" "$step.out" \
+  pass 0 0 "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+
 # ---- leg 3: a planted dropped marquee row is refused by the generator's own check
 step=pin_drift_refused
 GLOBAL_BEFORE="$(hash_governed)"

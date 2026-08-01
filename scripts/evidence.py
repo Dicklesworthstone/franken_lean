@@ -309,6 +309,7 @@ E2E_STEP_ORDERS = {
     "attribute_state_census": [
         "regenerate_and_check",
         "guard_suite",
+        "substrate_registry",
         "pin_drift_refused",
         "malformed_row_refused",
         "budget_refusal",
@@ -559,6 +560,7 @@ E2E_STEP_ORDERS = {
         "positive_file",
         "failure_file",
         "recovery_file",
+        "incremental_file",
         "semantic_validation",
         "final_real_recheck",
     ],
@@ -663,7 +665,7 @@ PARSER_CORPUS_CASE_INPUTS = {
 DYNAMIC_PARSER_SEMANTIC_SCHEMA = "fln.e2e.dynamic-parser-semantic"
 DYNAMIC_PARSER_TELEMETRY_SCHEMA = "fln.e2e.dynamic-parser-telemetry"
 DYNAMIC_PARSER_VALIDATION_SCHEMA = "fln.e2e.dynamic-parser-validation/1"
-DYNAMIC_PARSER_SCHEMA_VERSION = 1
+DYNAMIC_PARSER_SCHEMA_VERSION = 2
 DYNAMIC_PARSER_MAX_INPUT_BYTES = 4_096
 DYNAMIC_PARSER_MAX_COMMANDS = 16
 DYNAMIC_PARSER_MAX_REQUESTS = 32
@@ -694,6 +696,23 @@ DYNAMIC_PARSER_CASE_INPUTS = {
             b"register term existing existing\n"
             b"budget 3\n"
             b"batch term tok k0 k1 k2 k3\n"
+        ),
+    ),
+    "incremental": (
+        "inputs/incremental.registry",
+        (
+            b"category-at 0 term\n"
+            b"register-at 0 term x x-base\n"
+            b"register-at 0 term y y-base\n"
+            b"memo 5 term x\n"
+            b"memo 15 term x\n"
+            b"memo 25 term y\n"
+            b"memo 35 term y\n"
+            b"memo 45 term z\n"
+            b"register-at 10 term x x-new\n"
+            b"opaque-at 20 unknown-parser-callback\n"
+            b"remove-at 30 term missing missing\n"
+            b"register-at 30 term z z-new\n"
         ),
     ),
 }
@@ -7868,7 +7887,7 @@ def validate_dynamic_parser_no_mock_evidence(
         if set(paths) != expected_cases:
             raise EvidenceError(
                 "dynamic parser "
-                f"{label} cases differ from the frozen positive/failure/recovery set"
+                f"{label} cases differ from the frozen governed case set"
             )
 
     semantic_fields = {
@@ -7879,10 +7898,13 @@ def validate_dynamic_parser_no_mock_evidence(
         "diagnostics",
         "epoch_after",
         "epoch_before",
+        "epoch_digest_after",
+        "epoch_digest_before",
         "grammar_root_after",
         "grammar_root_before",
         "input_artifact",
         "input_sha256",
+        "incremental",
         "interleaving_claim",
         "lookup_kinds",
         "outcome",
@@ -7912,8 +7934,6 @@ def validate_dynamic_parser_no_mock_evidence(
         "timing_used_as_gate",
         "version",
     }
-    positive_root = "cat term Default\n  lead tok [dynamicTerm]\n"
-    recovery_root = "cat term Default\n  lead existing [existing]\n"
     expectations = {
         "positive": {
             "categories": ["term"],
@@ -7921,8 +7941,23 @@ def validate_dynamic_parser_no_mock_evidence(
             "diagnostics": [],
             "epoch_after": 2,
             "epoch_before": 0,
-            "grammar_root_after": positive_root,
-            "grammar_root_before": "",
+            "epoch_digest_after": (
+                "4db789c5b26d4dbaf56d600e2b8af11b"
+                "0967eff73030b8ff5cbae40750a69ce9"
+            ),
+            "epoch_digest_before": (
+                "47ddc174bcc029de96efe6e2d7546aa7"
+                "e8b9bce1c1ea36980b6900647ec49c17"
+            ),
+            "grammar_root_after_sha256": (
+                "cb8517a2bbd6c852378fbfd1ab8fec0f"
+                "d829d6953daafb4a30e5368f2d7d0eed"
+            ),
+            "grammar_root_before_sha256": (
+                "4696d72c7a41fc7cb5b0b2f107173561"
+                "66a54f2cc29d56c300f397f78c2d6b5d"
+            ),
+            "incremental": None,
             "lookup_kinds": ["dynamicTerm"],
             "outcome": "accepted",
             "production_count_after": 1,
@@ -7944,8 +7979,23 @@ def validate_dynamic_parser_no_mock_evidence(
             ],
             "epoch_after": 0,
             "epoch_before": 0,
-            "grammar_root_after": "",
-            "grammar_root_before": "",
+            "epoch_digest_after": (
+                "47ddc174bcc029de96efe6e2d7546aa7"
+                "e8b9bce1c1ea36980b6900647ec49c17"
+            ),
+            "epoch_digest_before": (
+                "47ddc174bcc029de96efe6e2d7546aa7"
+                "e8b9bce1c1ea36980b6900647ec49c17"
+            ),
+            "grammar_root_after_sha256": (
+                "4696d72c7a41fc7cb5b0b2f107173561"
+                "66a54f2cc29d56c300f397f78c2d6b5d"
+            ),
+            "grammar_root_before_sha256": (
+                "4696d72c7a41fc7cb5b0b2f107173561"
+                "66a54f2cc29d56c300f397f78c2d6b5d"
+            ),
+            "incremental": None,
             "lookup_kinds": [],
             "outcome": "rejected",
             "production_count_after": 0,
@@ -7962,8 +8012,23 @@ def validate_dynamic_parser_no_mock_evidence(
             "diagnostics": [],
             "epoch_after": 2,
             "epoch_before": 2,
-            "grammar_root_after": recovery_root,
-            "grammar_root_before": recovery_root,
+            "epoch_digest_after": (
+                "79d7d967378bb9e8f41ca9a2eaaf8a33"
+                "3782ffb0745d9015ee25747765991f08"
+            ),
+            "epoch_digest_before": (
+                "79d7d967378bb9e8f41ca9a2eaaf8a33"
+                "3782ffb0745d9015ee25747765991f08"
+            ),
+            "grammar_root_after_sha256": (
+                "7c6ef65637c6893d0f2c5fc690b9da0e"
+                "bee60128e162506632e70e77c0d6bdc6"
+            ),
+            "grammar_root_before_sha256": (
+                "7c6ef65637c6893d0f2c5fc690b9da0e"
+                "bee60128e162506632e70e77c0d6bdc6"
+            ),
+            "incremental": None,
             "lookup_kinds": [],
             "outcome": "inconclusive",
             "production_count_after": 1,
@@ -7978,9 +8043,263 @@ def validate_dynamic_parser_no_mock_evidence(
             "observed_commands": 4,
             "observed_requests": 4,
         },
+        "incremental": {
+            "categories": ["term"],
+            "claim_grade": "bounded_model",
+            "diagnostics": [],
+            "epoch_after": 6,
+            "epoch_before": 3,
+            "epoch_digest_after": (
+                "930a66da82838cf4494a164e9519cb451"
+                "27899c8eb3ee2c5894d92e23ab00ebc"
+            ),
+            "epoch_digest_before": (
+                "2ed3015562cd2ebfd75a61669371c115"
+                "b6e8fe59cb56c231ce555361c0808e58"
+            ),
+            "grammar_root_after_sha256": (
+                "50abd66f14e0e6b850f2b57abb57de8e"
+                "6168ac9c4e20f7ff129d3bba634e3757"
+            ),
+            "grammar_root_before_sha256": (
+                "48498d3d88bd4b8efe602982aa1311e4"
+                "8883f0e5377f0b4a037db16bf448208b"
+            ),
+            "incremental": "strict",
+            "lookup_kinds": ["z-new"],
+            "outcome": "accepted",
+            "production_count_after": 4,
+            "production_count_before": 2,
+            "resource_usage": None,
+            "retry_control_completed": False,
+            "store_unchanged": False,
+            "observed_commands": 12,
+            "observed_requests": 0,
+        },
     }
+
+    incremental_fields = {
+        "canonical_digest",
+        "cold_equal_after_opaque",
+        "cold_equal_after_recovery",
+        "cold_equal_after_typed",
+        "component_ids",
+        "distributed_at_barrier",
+        "distributed_before_barrier",
+        "final_values",
+        "initial_epoch",
+        "opaque_barrier",
+        "opaque_cache",
+        "opaque_epoch",
+        "production_count_initial",
+        "production_count_recovery",
+        "recovery_cache",
+        "recovery_epoch",
+        "recovery_succeeded",
+        "refusal_atomic",
+        "refusal_message",
+        "thread_matrix",
+        "typed_cache",
+        "typed_epoch",
+    }
+    epoch_fields = {"digest", "revision"}
+    cache_fields = {
+        "invalidated",
+        "prefix_reused",
+        "promoted",
+        "reasons",
+        "scanned",
+    }
+
+    def exact_epoch(record: Any, *, label: str) -> tuple[int, str]:
+        if not isinstance(record, dict) or set(record) != epoch_fields:
+            raise EvidenceError(f"{label} has a non-canonical epoch shape")
+        revision = exact_non_negative_integer(record, "revision", label=label)
+        digest = record.get("digest")
+        if not isinstance(digest, str) or SHA256_HEX.fullmatch(digest) is None:
+            raise EvidenceError(f"{label} digest is not canonical lowercase hex")
+        return revision, digest
+
+    def exact_cache(
+        record: Any,
+        *,
+        label: str,
+        expected_scanned: int,
+        expected_prefix: int,
+        expected_invalidated: int,
+        expected_promoted: int,
+        expected_reasons: list[str],
+    ) -> None:
+        if not isinstance(record, dict) or set(record) != cache_fields:
+            raise EvidenceError(f"{label} has a non-canonical cache shape")
+        if (
+            exact_non_negative_integer(record, "scanned", label=label)
+            != expected_scanned
+            or exact_non_negative_integer(record, "prefix_reused", label=label)
+            != expected_prefix
+            or exact_non_negative_integer(record, "invalidated", label=label)
+            != expected_invalidated
+            or exact_non_negative_integer(record, "promoted", label=label)
+            != expected_promoted
+            or record.get("reasons") != expected_reasons
+        ):
+            raise EvidenceError(f"{label} exact cone changed")
+
+    def validate_incremental(record: Any) -> dict[str, str]:
+        label = "dynamic parser incremental semantic"
+        expected_canonical_digest = (
+            "764c003accc3a52239b56d26ce2d0918"
+            "2b505589d68b1d19636eae6e7ee59acb"
+        )
+        expected_initial_digest = (
+            "2ed3015562cd2ebfd75a61669371c115"
+            "b6e8fe59cb56c231ce555361c0808e58"
+        )
+        expected_typed_digest = (
+            "4ee25b514e3b6cc1965f852dd920666b"
+            "c3fbdfab85ada378e7efb70b0cc5d373"
+        )
+        expected_recovery_digest = (
+            "930a66da82838cf4494a164e9519cb451"
+            "27899c8eb3ee2c5894d92e23ab00ebc"
+        )
+        if not isinstance(record, dict) or set(record) != incremental_fields:
+            raise EvidenceError(f"{label} has a non-canonical field set")
+        canonical_digest = record.get("canonical_digest")
+        if (
+            not isinstance(canonical_digest, str)
+            or SHA256_HEX.fullmatch(canonical_digest) is None
+        ):
+            raise EvidenceError(
+                "dynamic parser incremental canonical digest is malformed"
+            )
+        initial_revision, initial_digest = exact_epoch(
+            record.get("initial_epoch"), label=f"{label} initial epoch"
+        )
+        typed_revision, typed_digest = exact_epoch(
+            record.get("typed_epoch"), label=f"{label} typed epoch"
+        )
+        opaque_revision, opaque_digest = exact_epoch(
+            record.get("opaque_epoch"), label=f"{label} opaque epoch"
+        )
+        recovery_revision, recovery_digest = exact_epoch(
+            record.get("recovery_epoch"), label=f"{label} recovery epoch"
+        )
+        if (
+            [initial_revision, typed_revision, opaque_revision, recovery_revision]
+            != [3, 4, 5, 6]
+            or canonical_digest != expected_canonical_digest
+            or initial_digest != expected_initial_digest
+            or typed_digest != expected_typed_digest
+            or opaque_digest != expected_typed_digest
+            or recovery_digest != expected_recovery_digest
+        ):
+            raise EvidenceError(
+                "dynamic parser incremental epoch identity law changed"
+            )
+        exact_cache(
+            record.get("typed_cache"),
+            label=f"{label} typed cache",
+            expected_scanned=5,
+            expected_prefix=1,
+            expected_invalidated=1,
+            expected_promoted=3,
+            expected_reasons=["15:changed:syntax:term:x:leading"],
+        )
+        exact_cache(
+            record.get("opaque_cache"),
+            label=f"{label} opaque cache",
+            expected_scanned=9,
+            expected_prefix=1,
+            expected_invalidated=3,
+            expected_promoted=0,
+            expected_reasons=[
+                "25:opaque-suffix-barrier",
+                "35:opaque-suffix-barrier",
+                "45:opaque-suffix-barrier",
+            ],
+        )
+        exact_cache(
+            record.get("recovery_cache"),
+            label=f"{label} recovery cache",
+            expected_scanned=12,
+            expected_prefix=1,
+            expected_invalidated=1,
+            expected_promoted=1,
+            expected_reasons=["45:changed:syntax:term:z:leading"],
+        )
+        if (
+            record.get("cold_equal_after_typed") is not True
+            or record.get("cold_equal_after_opaque") is not True
+            or record.get("cold_equal_after_recovery") is not True
+            or record.get("component_ids")
+            != [
+                "syntax:term:x:leading",
+                "syntax:term:y:leading",
+                "syntax:term:z:leading",
+                "whole-grammar:opaque",
+            ]
+            or record.get("distributed_before_barrier") is not True
+            or record.get("distributed_at_barrier") is not False
+            or exact_non_negative_integer(record, "opaque_barrier", label=label)
+            != 20
+            or exact_non_negative_integer(
+                record, "production_count_initial", label=label
+            )
+            != 2
+            or exact_non_negative_integer(
+                record, "production_count_recovery", label=label
+            )
+            != 4
+            or record.get("recovery_succeeded") is not True
+            or record.get("refusal_atomic") is not True
+            or record.get("refusal_message")
+            != (
+                "no live Leading production `missing` for token `missing` "
+                "in category `term`"
+            )
+            or record.get("final_values")
+            != [
+                {"position": 5, "token": "x", "values": ["x-base"]},
+                {
+                    "position": 15,
+                    "token": "x",
+                    "values": ["x-base", "x-new"],
+                },
+                {"position": 25, "token": "y", "values": ["y-base"]},
+                {"position": 35, "token": "y", "values": ["y-base"]},
+                {"position": 45, "token": "z", "values": ["z-new"]},
+            ]
+            or record.get("thread_matrix")
+            != [
+                {
+                    "canonical_digest": canonical_digest,
+                    "productive": 1,
+                    "threads": 1,
+                },
+                {
+                    "canonical_digest": canonical_digest,
+                    "productive": 8,
+                    "threads": 8,
+                },
+                {
+                    "canonical_digest": canonical_digest,
+                    "productive": 32,
+                    "threads": 32,
+                },
+            ]
+        ):
+            raise EvidenceError(
+                "dynamic parser incremental exact session or thread matrix changed"
+            )
+        return {
+            "canonical_digest": canonical_digest,
+            "initial_digest": initial_digest,
+            "recovery_digest": recovery_digest,
+        }
+
     validation_cases: list[dict[str, Any]] = []
-    for case in ("positive", "failure", "recovery"):
+    for case in DYNAMIC_PARSER_CASE_INPUTS:
         expected_artifact, expected_input = DYNAMIC_PARSER_CASE_INPUTS[case]
         expected = expectations[case]
         input_path = input_paths[case]
@@ -8036,6 +8355,17 @@ def validate_dynamic_parser_no_mock_evidence(
         epoch_before = exact_non_negative_integer(
             semantic, "epoch_before", label=f"dynamic parser {case} semantic"
         )
+        epoch_digest_after = semantic.get("epoch_digest_after")
+        epoch_digest_before = semantic.get("epoch_digest_before")
+        if (
+            not isinstance(epoch_digest_after, str)
+            or SHA256_HEX.fullmatch(epoch_digest_after) is None
+            or not isinstance(epoch_digest_before, str)
+            or SHA256_HEX.fullmatch(epoch_digest_before) is None
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} epoch digest is not canonical lowercase hex"
+            )
         production_count_after = exact_non_negative_integer(
             semantic,
             "production_count_after",
@@ -8071,6 +8401,45 @@ def validate_dynamic_parser_no_mock_evidence(
                 raise EvidenceError(
                     f"dynamic parser {case} resource usage changed"
                 )
+        incremental_details = None
+        if case == "incremental":
+            incremental_details = validate_incremental(
+                semantic.get("incremental")
+            )
+            if (
+                epoch_digest_before != incremental_details["initial_digest"]
+                or epoch_digest_after
+                != incremental_details["recovery_digest"]
+            ):
+                raise EvidenceError(
+                    "dynamic parser incremental top-level epochs do not bind "
+                    "the detailed session"
+                )
+        elif semantic.get("incremental") is not None:
+            raise EvidenceError(
+                f"dynamic parser {case} unexpectedly carries incremental details"
+            )
+        grammar_root_after = semantic.get("grammar_root_after")
+        grammar_root_before = semantic.get("grammar_root_before")
+        if (
+            not isinstance(grammar_root_after, str)
+            or not isinstance(grammar_root_before, str)
+            or len(grammar_root_after.encode()) > 65_536
+            or len(grammar_root_before.encode()) > 65_536
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} grammar root is malformed or unbounded"
+            )
+        roots_match = (
+            hashlib.sha256(grammar_root_after.encode()).hexdigest()
+            == expected["grammar_root_after_sha256"]
+            and hashlib.sha256(grammar_root_before.encode()).hexdigest()
+            == expected["grammar_root_before_sha256"]
+        )
+        epoch_digests_match = (
+            epoch_digest_after == expected["epoch_digest_after"]
+            and epoch_digest_before == expected["epoch_digest_before"]
+        )
         if (
             semantic.get("schema") != DYNAMIC_PARSER_SEMANTIC_SCHEMA
             or semantic.get("run_id") != expected_run_id
@@ -8086,10 +8455,12 @@ def validate_dynamic_parser_no_mock_evidence(
             or semantic.get("diagnostics") != expected["diagnostics"]
             or epoch_after != expected["epoch_after"]
             or epoch_before != expected["epoch_before"]
-            or semantic.get("grammar_root_after")
-            != expected["grammar_root_after"]
-            or semantic.get("grammar_root_before")
-            != expected["grammar_root_before"]
+            or not roots_match
+            or not epoch_digests_match
+            or (
+                case == "incremental"
+                and incremental_details is None
+            )
             or semantic.get("lookup_kinds") != expected["lookup_kinds"]
             or semantic.get("outcome") != expected["outcome"]
             or production_count_after != expected["production_count_after"]
@@ -8176,20 +8547,27 @@ def validate_dynamic_parser_no_mock_evidence(
                 f"dynamic parser {case} telemetry is malformed or out of bounds"
             )
 
-        validation_cases.append(
-            {
-                "case": case,
-                "input_sha256": input_digest,
-                "outcome": expected["outcome"],
-                "semantic_sha256": semantic_digest,
-                "stderr_sha256": stderr_digest,
-                "stdout_sha256": stdout_digest,
-                "telemetry_sha256": telemetry_digest,
-            }
-        )
+        case_report = {
+            "case": case,
+            "input_sha256": input_digest,
+            "outcome": expected["outcome"],
+            "semantic_sha256": semantic_digest,
+            "stderr_sha256": stderr_digest,
+            "stdout_sha256": stdout_digest,
+            "telemetry_sha256": telemetry_digest,
+        }
+        if incremental_details is not None:
+            case_report["incremental_canonical_digest"] = incremental_details[
+                "canonical_digest"
+            ]
+        validation_cases.append(case_report)
 
     return {
         "cases": validation_cases,
+        "incremental_law": (
+            "exact typed cones, opaque suffix invalidation, atomic refusal, "
+            "recovery, and incremental-equals-cold at every retained position"
+        ),
         "interleaving_claim": DYNAMIC_PARSER_INTERLEAVING_CLAIM,
         "resource_law": (
             "budget exhaustion is Inconclusive with an untouched store "
@@ -8197,6 +8575,7 @@ def validate_dynamic_parser_no_mock_evidence(
         ),
         "run_id": expected_run_id,
         "schema": DYNAMIC_PARSER_VALIDATION_SCHEMA,
+        "thread_matrix": [1, 8, 32],
         "typed_refusal": DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC,
         "verdict": "pass",
     }
@@ -28171,7 +28550,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     dynamic_parser.add_argument("--expected-run-id", required=True)
-    for dynamic_parser_case in ("positive", "failure", "recovery"):
+    for dynamic_parser_case in DYNAMIC_PARSER_CASE_INPUTS:
         dynamic_parser.add_argument(
             f"--{dynamic_parser_case}-semantic", required=True
         )
