@@ -205,7 +205,7 @@ const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
     ("never_existed", 15),
     ("commit_unreachable", 0),
     ("present_but_untracked", 9),
-    ("under_target_ephemeral", 6),
+    ("under_target_ephemeral", 8),
     ("existed_then_removed", 0),
 ];
 
@@ -271,9 +271,9 @@ const STRUCTURED_HEADS: &[&str] = &[
 /// without tracked durability does not count." Its acceptance criterion was tightened on
 /// 2026-07-27 from *zero `target/` citations* to **zero untracked citations**, on the
 /// measurement that the original caught 3 of 18 dangling citations and tracked-ness catches
-/// 18 of 18. That criterion is not met today — 150 citations across 48 rows fail it — so what
-/// lands here is the half that can be honest now: the debt is **declared**, and no new member
-/// may join it silently.
+/// 18 of 18. That criterion was not met at this table's `84f35ea6` derivation — 150
+/// citations across 48 rows failed it — so what lands here is the half that can be honest
+/// now: the debt is **declared**, and no new member may join it silently.
 ///
 /// **Why per member and not per class, which is the whole reason this exists beside a census
 /// that already binds the totals.** [`UNRESOLVABLE_CENSUS`] pins each class by equality in
@@ -517,6 +517,13 @@ const UNTRACKED_PATH_CITATION_DEBT: &[(&str, &[&str])] = &[
             "manifest.json",
             "run.ndjson",
             "ubs-inventory.json",
+        ],
+    ),
+    (
+        "franken_lean-9km",
+        &[
+            "target/check/check-20260801T084038Z-1040064",
+            "target/e2e/dynamic-parser-no-mock-20260801T075736Z-470570",
         ],
     ),
     ("franken_lean-9pnc", &["tribunal/epoch-lab/tests"]),
