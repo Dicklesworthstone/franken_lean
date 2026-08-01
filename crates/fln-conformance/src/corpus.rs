@@ -353,11 +353,12 @@ pub const CORPUS_COVERAGE: [CorpusCoverage; 14] = [
     },
     CorpusCoverage {
         schema: "fln.canon.diag",
-        version: 2,
+        version: 3,
         exercise: "round trip and re-encode byte identity over a kernel rejection \
                    carrying a position, an end position, an error name and a caption, \
                    and over a kernel-inconclusive carrying the structural-budget \
-                   resource reason whose tag forced the v1 -> v2 bump",
+                   resource reason whose tag forced the v1 -> v2 bump plus the \
+                   execution-step reason whose tag forced the v2 -> v3 bump",
         run: exercise_diag,
     },
     CorpusCoverage {
@@ -717,6 +718,20 @@ fn exercise_diag(row: &SchemaRow) -> Result<(), String> {
     round_trip(
         &inconclusive,
         "kernel inconclusive under a structural budget",
+    )?;
+
+    // Version 3 added the distinct execution-step tag. A version-only update above
+    // would make the projection join green while leaving the new encoding unexercised.
+    let execution_steps = Diagnostic {
+        value: ErrorValue::KernelInconclusive {
+            decl: Name::from_components(["Corpus", "thm"]),
+            resource: ResourceReason::ExecutionSteps,
+        },
+        ..inconclusive
+    };
+    round_trip(
+        &execution_steps,
+        "kernel inconclusive under an execution-step budget",
     )
 }
 

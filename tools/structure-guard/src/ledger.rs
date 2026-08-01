@@ -1259,7 +1259,8 @@ pub fn expanded_public_items(expanded: &str) -> Vec<PubItem> {
 /// both directions: a needle naming nothing fails, and a capability type named by no needle
 /// fails. Neither direction can be satisfied by editing this list alone.
 ///
-/// `Published` is deliberately absent — see [`ADMISSION_TOKEN_EXCLUSIONS`].
+/// Published-result types are deliberately absent — see
+/// [`ADMISSION_TOKEN_EXCLUSIONS`].
 pub const ADMISSION_TOKENS: &[&str] = &[
     "Admitted",
     "CheckedDecl",
@@ -1274,13 +1275,22 @@ pub const ADMISSION_TOKENS: &[&str] = &[
 /// every `pub` type in the capability module to be either tripwired or listed here, so a new
 /// type forces a decision instead of defaulting to uncovered, and a row naming a type that no
 /// longer exists fails rather than accumulating.
-pub const ADMISSION_TOKEN_EXCLUSIONS: &[(&str, &str)] = &[(
-    "Published",
-    "an outcome REPORT of a publication that already happened, not a right to perform one: \
-     its arms are Committed/DuplicateName/BlockHandoffUnavailable and none can be laundered \
-     into admitting anything. It is also a generic identifier, so tripwiring it would buy no \
-     admission coverage while adding real false-positive risk in boundary code.",
-)];
+pub const ADMISSION_TOKEN_EXCLUSIONS: &[(&str, &str)] = &[
+    (
+        "Published",
+        "an outcome REPORT of a publication attempt, not a right to perform one: its arms are \
+         Committed, DuplicateName, and BlockCommitted, and none contains the private CheckedDecl \
+         seal. It is also a generic identifier, so tripwiring it would buy no admission coverage \
+         while adding real false-positive risk in boundary code.",
+    ),
+    (
+        "BlockPublication",
+        "the immutable RESULT of an already committed checked block: it carries only the final \
+         Environment and published names, never CheckedDecl, Reviewable, or the private seal \
+         required to publish another declaration. Receiving it can observe and extend the \
+         ordinary environment only through a new kernel admission.",
+    ),
+];
 
 pub fn admission_token_sites(text: &str) -> Vec<ExportSite> {
     let mut sites = Vec::new();

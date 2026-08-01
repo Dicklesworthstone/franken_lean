@@ -301,9 +301,6 @@ enum AnchorInventoryRefusal {
         path: String,
     },
     NonUtf8TrackedPath,
-    NonUtf8Blob {
-        path: String,
-    },
     ScopeContractMissing {
         entries: Vec<String>,
     },
@@ -512,8 +509,7 @@ fn classify_anchor(repo: &Path, anchor: &str) -> AnchorReachability {
     }
 }
 
-fn commit_anchor_candidates(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
+fn commit_anchor_candidates_bytes(bytes: &[u8]) -> Vec<String> {
     let mut candidates = Vec::new();
     let mut at = 0usize;
     while at < bytes.len() {
@@ -533,10 +529,18 @@ fn commit_anchor_candidates(text: &str) -> Vec<String> {
             .get(at)
             .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
         if (7..=40).contains(&(at - start)) && !before_is_word && !after_is_word {
-            candidates.push(text[start..at].to_ascii_lowercase());
+            candidates.push(
+                std::str::from_utf8(&bytes[start..at])
+                    .expect("a run of ASCII hexadecimal digits is UTF-8")
+                    .to_ascii_lowercase(),
+            );
         }
     }
     candidates
+}
+
+fn commit_anchor_candidates(text: &str) -> Vec<String> {
+    commit_anchor_candidates_bytes(text.as_bytes())
 }
 
 fn scan_evidence_file(path: &Path) -> Result<Vec<String>, std::io::ErrorKind> {
@@ -578,17 +582,14 @@ fn read_tracked_blob(
     repo: &Path,
     revision: &str,
     path: &str,
-) -> Result<String, AnchorInventoryRefusal> {
+) -> Result<Vec<u8>, AnchorInventoryRefusal> {
     let object = format!("{revision}:{path}");
-    let bytes = successful_git_bytes(
+    successful_git_bytes(
         repo,
         "read-tracked-evidence-blob",
         ["cat-file", "blob", &object],
     )
-    .map_err(AnchorInventoryRefusal::Git)?;
-    String::from_utf8(bytes).map_err(|_| AnchorInventoryRefusal::NonUtf8Blob {
-        path: path.to_string(),
-    })
+    .map_err(AnchorInventoryRefusal::Git)
 }
 
 fn decode_segmented_allowance(
@@ -638,8 +639,8 @@ fn scan_repository_anchor_inventory(
     let tracked_paths = tracked_scope_paths(repo, revision, scope)?;
     let mut candidate_origins: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for path in &tracked_paths {
-        let text = read_tracked_blob(repo, revision, path)?;
-        for candidate in commit_anchor_candidates(&text) {
+        let blob = read_tracked_blob(repo, revision, path)?;
+        for candidate in commit_anchor_candidates_bytes(&blob) {
             candidate_origins
                 .entry(candidate)
                 .or_default()
@@ -1278,6 +1279,19 @@ fn the_checked_in_producer_anchor_is_reachable_from_main() {
     assert!(
         PROVENANCE.contains("superseded"),
         "the old pre-rewrite anchor must remain labeled as superseded history"
+    );
+}
+
+#[test]
+fn binary_blobs_are_scanned_for_ascii_anchors_without_lossy_decoding() {
+    let mut blob = vec![0xff, 0x00];
+    blob.extend_from_slice(PRODUCER_COMMIT.as_bytes());
+    blob.extend_from_slice(&[0x00, 0xfe]);
+
+    assert_eq!(
+        commit_anchor_candidates_bytes(&blob),
+        vec![PRODUCER_COMMIT.to_string()],
+        "a binary tracked artifact remains inside the repository-wide evidence census"
     );
 }
 
