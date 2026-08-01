@@ -282,6 +282,23 @@ impl NativeHeap {
         T: Eq + Send + Sync + 'static,
         K: Hash + Eq + 'static,
     {
+        self.intern_by(value, key, |a, b| a == b)
+    }
+
+    /// Intern with a caller-chosen equality — for value types without
+    /// `PartialEq` (like `Expr`, whose identity discipline is the computed
+    /// hash, upstream's own hash-consing). The equality on a hit is the
+    /// caller's declared one, never an implicit default.
+    pub fn intern_by<T, K>(
+        &mut self,
+        value: T,
+        key: impl Fn(&T) -> K,
+        eq: impl Fn(&T, &T) -> bool,
+    ) -> NativeHandle<T>
+    where
+        T: Send + Sync + 'static,
+        K: Hash + Eq + 'static,
+    {
         assert!(!self.closed, "intern on a closed heap is a caller bug");
         let key_value = key(&value);
         let key_hash = {
@@ -294,7 +311,7 @@ impl NativeHeap {
             let slot = entry.slot;
             if let Slot::Occupied { value: stored, .. } = &self.slots[slot as usize]
                 && let Some(stored) = stored.downcast_ref::<T>()
-                && *stored == value
+                && eq(stored, &value)
             {
                 let generation = match &self.slots[slot as usize] {
                     Slot::Occupied { generation, .. } => *generation,
