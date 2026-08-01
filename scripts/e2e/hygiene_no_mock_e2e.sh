@@ -454,8 +454,7 @@ emit_event --string event run_end --string verdict pass \
   --manifest "$ART_DIR/manifest.json" \
   --digest "$ART_DIR/manifest.digest" \
   --commit "$ART_DIR/bundle.complete.json" \
-  --artifact-root "$ART_DIR" \
-  --output "$ART_DIR/bundle.validation.json"
+  --artifact-root "$ART_DIR" >/dev/null
 
 printf '[hygiene_no_mock_e2e] PASS evidence=%s semantic_root=%s\n' \
   "$ART_DIR" "$SEMANTIC_ROOT" >&2
