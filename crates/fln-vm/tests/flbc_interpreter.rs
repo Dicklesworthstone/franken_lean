@@ -1488,6 +1488,7 @@ fn core_expr_ingress_reaches_canonical_flbc_and_golem_without_host_evaluation() 
             capture_analysis_nodes: 0,
             captured_values: 0,
             elided_capture_slots: 0,
+            check_system_calls: 0,
             intrinsic_calls: 0,
             constructor_calls: 0,
             projection_calls: 0,
@@ -1536,6 +1537,80 @@ fn core_expr_ingress_reaches_canonical_flbc_and_golem_without_host_evaluation() 
                 && event.kind != shadow::EventKind::ForeignPointer
         }),
         "core Expr ingress introduces no shadow ownership defect"
+    );
+}
+
+#[test]
+fn core_check_system_expr_reaches_the_explicit_golem_checkpoint() {
+    let _guard = lock();
+    let source = Expr::app(
+        Expr::const_(
+            Name::from_components(["Lean", "Core", "checkSystem"]),
+            Vec::new(),
+        ),
+        Expr::lit(Literal::Str("Ingress.Module".to_string())),
+    );
+    let ingress = ingress::lower_closed_expr(&source, ingress::IngressLimits::default())
+        .expect("static native checkSystem enters validated FIR");
+    assert_eq!(ingress.work().check_system_calls, 1);
+    assert_eq!(ingress.work().intrinsic_calls, 0);
+    assert_eq!(ingress.work().generated_values, 1);
+
+    let lowered =
+        fir::lower_to_flbc(ingress.fir()).expect("native checkpoint lowers through ordinary FIR");
+    assert_eq!(
+        lowered.functions()[0].code,
+        vec![
+            Instruction::CheckSystem {
+                module_name: "Ingress.Module".to_string(),
+            },
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            Instruction::Return { src: r(0) },
+        ]
+    );
+    let bytes =
+        encode_canonical(&lowered, CodecLimits::default()).expect("canonical FLBC checkpoint");
+    let decoded =
+        decode_canonical(&bytes, CodecLimits::default()).expect("independent FLBC validation");
+    let completed = returned(execute_with_heartbeat_limit(
+        &decoded,
+        ExecutionLimits::default(),
+        HeartbeatLimit::from_option_units(1),
+        None,
+    ));
+    assert_eq!(completed.value.unbox(), 0);
+    assert_eq!(completed.usage.steps, 3);
+    assert_eq!(completed.usage.system_polls, 3);
+    drop(completed);
+
+    let cancellation_polls = Cell::new(0u64);
+    let cancelled = || {
+        cancellation_polls.set(cancellation_polls.get().saturating_add(1));
+        true
+    };
+    let stopped = execute_with_heartbeat_limit(
+        &decoded,
+        ExecutionLimits::default(),
+        HeartbeatLimit::from_option_units(1),
+        Some(&cancelled),
+    );
+    assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+    assert!(matches!(
+        stopped,
+        Outcome::Inconclusive(ref inconclusive)
+            if matches!(
+                &inconclusive.cause,
+                InconclusiveCause::Cancelled { at }
+                    if at.text().contains("Ingress.Module")
+            )
+    ));
+    assert_eq!(
+        cancellation_polls.get(),
+        1,
+        "the first source-lowered opcode is the diagnostic checkpoint"
     );
 }
 

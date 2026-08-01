@@ -5,10 +5,11 @@
 //! annotation carried by [`ExprNode::LetE`]. The executable subset is Nat and
 //! String literals, transparent metadata, let bindings, de Bruijn lookup, and
 //! saturated direct applications of caller-supplied intrinsic and constructor
-//! bindings, declaration-bound structure projections, saturated direct calls
-//! into caller-supplied first-order function bodies, and explicitly typed local
-//! lambda closures with under-, exact, closure-result overapplication, and
-//! acyclic self- or mutually recursive environments.
+//! bindings, the pin-defined `Lean.Core.checkSystem` checkpoint when its module
+//! context is compile-time static, declaration-bound structure projections,
+//! saturated direct calls into caller-supplied first-order function bodies, and
+//! explicitly typed local lambda closures with under-, exact, closure-result
+//! overapplication, and acyclic self- or mutually recursive environments.
 //! Concrete semantic classes crossing an explicitly declared [`fir::ValueType::Abi`]
 //! parameter or result boundary receive an explicit FIR box or unbox operation.
 //! Both preserve the same Marrow object at runtime; no host-value shadow domain
@@ -31,7 +32,7 @@
 
 use crate::fir;
 use fln_core::expr::{Expr, ExprNode, Literal};
-use fln_core::name::Name;
+use fln_core::name::{LeafView, Name};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -133,6 +134,33 @@ pub enum IngressError {
     },
     UnknownConstant {
         name_hash: u64,
+    },
+    CheckSystemUniverseArity {
+        name_hash: u64,
+        expected: usize,
+        actual: usize,
+    },
+    CheckSystemTermArity {
+        name_hash: u64,
+        expected: usize,
+        actual: usize,
+    },
+    CheckSystemArgumentType {
+        name_hash: u64,
+        expected: fir::ValueType,
+        actual: fir::ValueType,
+    },
+    CheckSystemModuleNameNotStatic {
+        name_hash: u64,
+    },
+    CheckSystemIntrinsicNameCollision {
+        binding: usize,
+    },
+    CheckSystemConstructorNameCollision {
+        binding: usize,
+    },
+    CheckSystemFunctionNameCollision {
+        binding: usize,
     },
     IntrinsicUniverseArity {
         name_hash: u64,
@@ -426,6 +454,46 @@ impl fmt::Display for IngressError {
             Self::UnknownConstant { name_hash } => write!(
                 formatter,
                 "core Expr constant with observable name hash {name_hash} is not in the runtime catalogs"
+            ),
+            Self::CheckSystemUniverseArity {
+                name_hash,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "Lean.Core.checkSystem with observable name hash {name_hash} expects {expected} universe arguments, observed {actual}"
+            ),
+            Self::CheckSystemTermArity {
+                name_hash,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "Lean.Core.checkSystem with observable name hash {name_hash} expects {expected} term arguments, observed {actual}"
+            ),
+            Self::CheckSystemArgumentType {
+                name_hash,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "Lean.Core.checkSystem with observable name hash {name_hash} expects {expected:?}, observed {actual:?}"
+            ),
+            Self::CheckSystemModuleNameNotStatic { name_hash } => write!(
+                formatter,
+                "Lean.Core.checkSystem with observable name hash {name_hash} requires compile-time static module context in this ingress checkpoint"
+            ),
+            Self::CheckSystemIntrinsicNameCollision { binding } => write!(
+                formatter,
+                "intrinsic catalog binding {binding} attempts to replace native Lean.Core.checkSystem"
+            ),
+            Self::CheckSystemConstructorNameCollision { binding } => write!(
+                formatter,
+                "constructor catalog binding {binding} attempts to replace native Lean.Core.checkSystem"
+            ),
+            Self::CheckSystemFunctionNameCollision { binding } => write!(
+                formatter,
+                "function catalog binding {binding} attempts to replace native Lean.Core.checkSystem"
             ),
             Self::IntrinsicUniverseArity {
                 name_hash,
@@ -821,6 +889,7 @@ pub struct IngressWork {
     pub capture_analysis_nodes: usize,
     pub captured_values: usize,
     pub elided_capture_slots: usize,
+    pub check_system_calls: usize,
     pub intrinsic_calls: usize,
     pub constructor_calls: usize,
     pub projection_calls: usize,
@@ -1061,10 +1130,13 @@ struct PreparedCatalog<'a> {
 
 #[derive(Clone, Copy)]
 enum CallTarget {
+    CheckSystem { name_hash: u64 },
     Constructor(usize),
     Intrinsic(usize),
     Function(usize),
 }
+
+const CHECK_SYSTEM_ARGUMENTS: [fir::ValueType; 1] = [fir::ValueType::String];
 
 enum Task<'a> {
     Eval(&'a Expr),
@@ -1080,6 +1152,7 @@ enum Task<'a> {
     FinishCall {
         target: CallTarget,
         argument_count: usize,
+        binding_len: usize,
         result_len: usize,
     },
     FinishProjection {
@@ -1389,6 +1462,26 @@ fn singleton<T>(value: T) -> Result<Vec<T>, IngressError> {
     Ok(values)
 }
 
+fn has_string_leaf(name: &Name, expected: &str) -> bool {
+    matches!(name.leaf_view(), LeafView::Str(actual) if actual == expected)
+}
+
+/// Exact generated-partition symbol at the pinned epoch.
+///
+/// This structural comparison avoids trusting the observable hash as identity
+/// and avoids allocating a fresh three-component `Name` for every call.
+fn is_check_system_name(name: &Name) -> bool {
+    if !has_string_leaf(name, "checkSystem") {
+        return false;
+    }
+    let core = name.parent();
+    if !has_string_leaf(&core, "Core") {
+        return false;
+    }
+    let lean = core.parent();
+    has_string_leaf(&lean, "Lean") && lean.parent().is_anonymous()
+}
+
 fn prepare_intrinsics<'a>(
     bindings: &[IntrinsicBinding],
     limits: IngressLimits,
@@ -1417,6 +1510,11 @@ fn prepare_intrinsics<'a>(
         }
         if binding.name.is_anonymous() {
             return Err(IngressError::AnonymousIntrinsicName {
+                binding: source_index,
+            });
+        }
+        if is_check_system_name(&binding.name) {
+            return Err(IngressError::CheckSystemIntrinsicNameCollision {
                 binding: source_index,
             });
         }
@@ -1536,6 +1634,11 @@ fn prepare_constructors(
     for (source_index, binding) in bindings.iter().enumerate() {
         if binding.name.is_anonymous() {
             return Err(IngressError::AnonymousConstructorName {
+                binding: source_index,
+            });
+        }
+        if is_check_system_name(&binding.name) {
+            return Err(IngressError::CheckSystemConstructorNameCollision {
                 binding: source_index,
             });
         }
@@ -2123,6 +2226,11 @@ fn prepare_catalog<'a>(
                 binding: source_index,
             });
         }
+        if is_check_system_name(&binding.name) {
+            return Err(IngressError::CheckSystemFunctionNameCollision {
+                binding: source_index,
+            });
+        }
         if binding.body.has_fvar() {
             return Err(IngressError::FunctionBodyOpenFreeVariable {
                 binding: source_index,
@@ -2247,6 +2355,26 @@ fn resolve_call<'a>(
     catalog: &PreparedCatalog<'_>,
 ) -> Result<ScheduledCall<'a>, IngressError> {
     let name_hash = name.hash();
+    if is_check_system_name(name) {
+        if universe_arity != 0 {
+            return Err(IngressError::CheckSystemUniverseArity {
+                name_hash,
+                expected: 0,
+                actual: universe_arity,
+            });
+        }
+        if arguments.len() != CHECK_SYSTEM_ARGUMENTS.len() {
+            return Err(IngressError::CheckSystemTermArity {
+                name_hash,
+                expected: CHECK_SYSTEM_ARGUMENTS.len(),
+                actual: arguments.len(),
+            });
+        }
+        return Ok(ScheduledCall {
+            target: CallTarget::CheckSystem { name_hash },
+            arguments,
+        });
+    }
     if let Some(binding_index) = catalog.resolve_intrinsic(name) {
         let binding = &catalog.entries[binding_index];
         if universe_arity != binding.universe_arity {
@@ -2318,6 +2446,30 @@ fn malformed(phase: &'static str, expected: usize, observed: usize) -> IngressEr
         phase,
         expected,
         observed,
+    }
+}
+
+fn static_check_system_module_name(
+    argument: CompiledValue,
+    bindings: &[fir::Binding],
+    parameter_count: usize,
+    binding_len: usize,
+) -> Option<&str> {
+    let expected_len = binding_len.checked_add(1)?;
+    if bindings.len() != expected_len {
+        return None;
+    }
+    let expected_value = parameter_count.checked_add(binding_len)?;
+    if usize::try_from(argument.id.get()).ok()? != expected_value {
+        return None;
+    }
+    let binding = bindings.get(binding_len)?;
+    if binding.id != argument.id || binding.ty != fir::ValueType::String {
+        return None;
+    }
+    match &binding.operation {
+        fir::Operation::String(module_name) => Some(module_name),
+        _ => None,
     }
 }
 
@@ -3284,6 +3436,9 @@ fn lower_body<'a>(
                     ExprNode::Const { name, levels } => {
                         let scheduled = resolve_call(name, levels.len(), Vec::new(), catalog)?;
                         match scheduled.target {
+                            CallTarget::CheckSystem { .. } => {
+                                work.check_system_calls = work.check_system_calls.saturating_add(1);
+                            }
                             CallTarget::Constructor(_) => {
                                 work.constructor_calls = work.constructor_calls.saturating_add(1);
                             }
@@ -3299,6 +3454,7 @@ fn lower_body<'a>(
                             Task::FinishCall {
                                 target: scheduled.target,
                                 argument_count: 0,
+                                binding_len: bindings.len(),
                                 result_len: results.len(),
                             },
                             IngressResource::PendingTasks,
@@ -3353,6 +3509,10 @@ fn lower_body<'a>(
                             let scheduled = resolve_call(name, universe_arity, arguments, catalog)?;
                             let argument_count = scheduled.arguments.len();
                             match scheduled.target {
+                                CallTarget::CheckSystem { .. } => {
+                                    work.check_system_calls =
+                                        work.check_system_calls.saturating_add(1);
+                                }
                                 CallTarget::Constructor(_) => {
                                     work.constructor_calls =
                                         work.constructor_calls.saturating_add(1);
@@ -3369,6 +3529,7 @@ fn lower_body<'a>(
                                 Task::FinishCall {
                                     target: scheduled.target,
                                     argument_count,
+                                    binding_len: bindings.len(),
                                     result_len: results.len(),
                                 },
                                 IngressResource::PendingTasks,
@@ -3532,6 +3693,7 @@ fn lower_body<'a>(
             Task::FinishCall {
                 target,
                 argument_count,
+                binding_len,
                 result_len,
             } => {
                 let expected_results = result_len.saturating_add(argument_count);
@@ -3539,6 +3701,11 @@ fn lower_body<'a>(
                     return Err(malformed("call arguments", expected_results, results.len()));
                 }
                 let (name_hash, expected_types, result_type) = match target {
+                    CallTarget::CheckSystem { name_hash } => (
+                        name_hash,
+                        CHECK_SYSTEM_ARGUMENTS.as_slice(),
+                        fir::ValueType::Unit,
+                    ),
                     CallTarget::Constructor(binding_index) => {
                         let binding = catalog.constructors.get(binding_index).ok_or(
                             IngressError::MalformedResultState {
@@ -3601,6 +3768,13 @@ fn lower_body<'a>(
                     )?
                     else {
                         return Err(match target {
+                            CallTarget::CheckSystem { .. } => {
+                                IngressError::CheckSystemArgumentType {
+                                    name_hash,
+                                    expected,
+                                    actual: actual.ty,
+                                }
+                            }
                             CallTarget::Constructor(_) => IngressError::ConstructorArgumentType {
                                 name_hash,
                                 argument,
@@ -3632,6 +3806,31 @@ fn lower_body<'a>(
                     })?;
                 argument_ids.extend(arguments.iter().map(|value| value.id));
                 let operation = match target {
+                    CallTarget::CheckSystem { name_hash } => {
+                        let argument = arguments
+                            .first()
+                            .copied()
+                            .ok_or_else(|| malformed("checkSystem argument", 1, arguments.len()))?;
+                        let module_name = static_check_system_module_name(
+                            argument,
+                            &bindings,
+                            parameter_count,
+                            binding_len,
+                        )
+                        .ok_or(IngressError::CheckSystemModuleNameNotStatic { name_hash })?;
+                        let module_name = clone_string(module_name)?;
+                        let removed = bindings.pop().ok_or_else(|| {
+                            malformed("checkSystem literal binding", binding_len + 1, 0)
+                        })?;
+                        if removed.id != argument.id {
+                            return Err(malformed(
+                                "checkSystem literal binding id",
+                                usize::try_from(argument.id.get()).unwrap_or(usize::MAX),
+                                usize::try_from(removed.id.get()).unwrap_or(usize::MAX),
+                            ));
+                        }
+                        fir::Operation::CheckSystem { module_name }
+                    }
                     CallTarget::Constructor(binding_index) => {
                         let binding = &catalog.constructors[binding_index];
                         fir::Operation::Ctor {
@@ -4041,6 +4240,7 @@ pub fn lower_closed_expr_with_lambdas<'a>(
         capture_analysis_nodes: 0,
         captured_values: 0,
         elided_capture_slots: 0,
+        check_system_calls: 0,
         intrinsic_calls: 0,
         constructor_calls: 0,
         projection_calls: 0,
@@ -4578,6 +4778,7 @@ mod tests {
                 capture_analysis_nodes: 0,
                 captured_values: 0,
                 elided_capture_slots: 0,
+                check_system_calls: 0,
                 intrinsic_calls: 0,
                 constructor_calls: 0,
                 projection_calls: 0,
@@ -4688,6 +4889,171 @@ mod tests {
     }
 
     #[test]
+    fn native_check_system_ingress_is_typed_static_and_not_overrideable() {
+        let check_name = Name::from_components(["Lean", "Core", "checkSystem"]);
+        let check_hash = check_name.hash();
+        let source = Expr::app(
+            Expr::const_(check_name.clone(), Vec::new()),
+            string("Lake.Build"),
+        );
+        let ingress = lower_closed_expr(&source, IngressLimits::default())
+            .expect("the pin-defined static checkSystem call enters FIR");
+        assert_eq!(
+            ingress.work(),
+            IngressWork {
+                visited_nodes: 3,
+                source_bindings: 0,
+                capture_analysis_nodes: 0,
+                captured_values: 0,
+                elided_capture_slots: 0,
+                check_system_calls: 1,
+                intrinsic_calls: 0,
+                constructor_calls: 0,
+                projection_calls: 0,
+                function_calls: 0,
+                lambda_conversions: 0,
+                recursive_self_closures: 0,
+                mutual_group_closures: 0,
+                closure_applications: 0,
+                generated_constructors: 0,
+                generated_projections: 0,
+                generated_closure_types: 0,
+                generated_functions: 1,
+                function_parameters: 0,
+                generated_values: 1,
+                literal_bytes: 10,
+                maximum_context_depth: 0,
+            }
+        );
+        assert_eq!(
+            ingress.fir().canonical_text(),
+            concat!(
+                "fir/13 entry=f0\n",
+                "function f0 params=[] ownership=[] result=unit result_ownership=scalar\n",
+                " block b0\n",
+                "  v0:unit = check_system 10:4c616b652e4275696c64\n",
+                "  return v0\n",
+            )
+        );
+        let lowered =
+            fir::lower_to_flbc(ingress.fir()).expect("the native checkpoint lowers to FLBC");
+        assert_eq!(lowered.functions()[0].code.len(), 3);
+        assert!(matches!(
+            &lowered.functions()[0].code[0],
+            crate::flbc::Instruction::CheckSystem { module_name }
+                if module_name == "Lake.Build"
+        ));
+
+        assert_eq!(
+            lower_closed_expr(
+                &Expr::const_(check_name.clone(), Vec::new()),
+                IngressLimits::default(),
+            ),
+            Err(IngressError::CheckSystemTermArity {
+                name_hash: check_hash,
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            lower_closed_expr(
+                &Expr::app(
+                    Expr::const_(check_name.clone(), vec![Level::zero()]),
+                    string("Lake.Build"),
+                ),
+                IngressLimits::default(),
+            ),
+            Err(IngressError::CheckSystemUniverseArity {
+                name_hash: check_hash,
+                expected: 0,
+                actual: 1,
+            })
+        );
+        assert_eq!(
+            lower_closed_expr(
+                &direct_call(
+                    &["Lean", "Core", "checkSystem"],
+                    [string("Lake"), string("Build")],
+                ),
+                IngressLimits::default(),
+            ),
+            Err(IngressError::CheckSystemTermArity {
+                name_hash: check_hash,
+                expected: 1,
+                actual: 2,
+            })
+        );
+        assert_eq!(
+            lower_closed_expr(
+                &direct_call(&["Lean", "Core", "checkSystem"], [nat(0)]),
+                IngressLimits::default(),
+            ),
+            Err(IngressError::CheckSystemArgumentType {
+                name_hash: check_hash,
+                expected: fir::ValueType::String,
+                actual: fir::ValueType::Nat,
+            })
+        );
+
+        let computed = direct_call(
+            &["Lean", "Core", "checkSystem"],
+            [direct_call(
+                &["String", "append"],
+                [string("Lake"), string(".Build")],
+            )],
+        );
+        assert_eq!(
+            lower_closed_expr_with_intrinsics(
+                &computed,
+                &[string_append_binding()],
+                IngressLimits::default(),
+            ),
+            Err(IngressError::CheckSystemModuleNameNotStatic {
+                name_hash: check_hash,
+            })
+        );
+
+        let mut intrinsic_override = nat_add_binding();
+        intrinsic_override.name = check_name.clone();
+        assert_eq!(
+            lower_closed_expr_with_intrinsics(
+                &nat(0),
+                &[intrinsic_override],
+                IngressLimits::default(),
+            ),
+            Err(IngressError::CheckSystemIntrinsicNameCollision { binding: 0 })
+        );
+        let constructor_override =
+            constructor_binding(&["Lean", "Core", "checkSystem"], 0, Vec::new(), Vec::new());
+        assert_eq!(
+            lower_closed_expr_with_catalogs(
+                &nat(0),
+                &[],
+                &[constructor_override],
+                &[],
+                IngressLimits::default(),
+            ),
+            Err(IngressError::CheckSystemConstructorNameCollision { binding: 0 })
+        );
+        let function_override = function_binding(
+            &["Lean", "Core", "checkSystem"],
+            Vec::new(),
+            fir::ValueType::Nat,
+            nat(0),
+        );
+        assert_eq!(
+            lower_closed_expr_with_catalogs(
+                &nat(0),
+                &[],
+                &[],
+                &[function_override],
+                IngressLimits::default(),
+            ),
+            Err(IngressError::CheckSystemFunctionNameCollision { binding: 0 })
+        );
+    }
+
+    #[test]
     fn every_unsupported_executable_constructor_is_a_typed_refusal() {
         let cases = [
             (Expr::sort(Level::zero()), "sort"),
@@ -4747,6 +5113,7 @@ mod tests {
                 capture_analysis_nodes: 0,
                 captured_values: 0,
                 elided_capture_slots: 0,
+                check_system_calls: 0,
                 intrinsic_calls: 2,
                 constructor_calls: 0,
                 projection_calls: 0,
@@ -4804,6 +5171,7 @@ mod tests {
                 capture_analysis_nodes: 0,
                 captured_values: 0,
                 elided_capture_slots: 0,
+                check_system_calls: 0,
                 intrinsic_calls: 0,
                 constructor_calls: 1,
                 projection_calls: 0,
@@ -5098,6 +5466,7 @@ mod tests {
                 capture_analysis_nodes: 0,
                 captured_values: 0,
                 elided_capture_slots: 0,
+                check_system_calls: 0,
                 intrinsic_calls: 0,
                 constructor_calls: 1,
                 projection_calls: 1,
@@ -5351,6 +5720,7 @@ mod tests {
                 capture_analysis_nodes: 0,
                 captured_values: 0,
                 elided_capture_slots: 0,
+                check_system_calls: 0,
                 intrinsic_calls: 1,
                 constructor_calls: 0,
                 projection_calls: 0,
@@ -5937,6 +6307,7 @@ mod tests {
                 capture_analysis_nodes: 5,
                 captured_values: 1,
                 elided_capture_slots: 0,
+                check_system_calls: 0,
                 intrinsic_calls: 1,
                 constructor_calls: 0,
                 projection_calls: 0,
@@ -7107,6 +7478,7 @@ mod tests {
             capture_analysis_nodes: 0,
             captured_values: 0,
             elided_capture_slots: 0,
+            check_system_calls: 0,
             intrinsic_calls: 0,
             constructor_calls: 0,
             projection_calls: 0,
