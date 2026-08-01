@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# W4 Vellum dynamic-registration no-mock evidence lane. The existing registry
-# suites run as named targets with anti-vacuity floors. An artifact-only driver
-# then applies real retained command files through the public Registry API and
-# distinguishes accepted, rejected, and Inconclusive outcomes. Canonical
-# semantic NDJSON and bounded telemetry stay separate, and scripts/evidence.py
-# independently validates both before bundle commitment.
+# W4 Vellum dynamic-registration and source-recovery no-mock evidence lane.
+# The existing registry suites run as named targets with anti-vacuity floors.
+# Artifact-only drivers apply real retained files through the public Registry
+# and recovery APIs, distinguishing accepted, rejected, repaired-editor, and
+# Inconclusive outcomes. Canonical semantic NDJSON and bounded telemetry stay
+# separate, and scripts/evidence.py validates both before bundle commitment.
 
 set -Eeuo pipefail
 
@@ -35,7 +35,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$ROOT"
 EVIDENCE="$ROOT/scripts/evidence.py"
 SCHEMA="fln.e2e/2"
-BEAD="fln-33gl"
+BEAD="franken_lean-7xw"
 SCENARIO="dynamic_parser_no_mock_e2e"
 RUN_ID="dynamic-parser-no-mock-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
@@ -46,6 +46,7 @@ VENDOR_PATH="vendor/lean4-src"
 VENDOR_BINDING="$ART_DIR/vendor-binding.json"
 DRIVER_DIR="$ART_DIR/real-file-driver"
 DRIVER_BIN="${CARGO_TARGET_DIR:-$ROOT/target/cargo}/e2e-dynamic-parser/debug/fln-dynamic-parser-e2e-driver"
+SOURCE_RECOVERY_BIN="${CARGO_TARGET_DIR:-$ROOT/target/cargo}/e2e-dynamic-parser/debug/fln-source-recovery-e2e-driver"
 BUILD_TARGET="${CARGO_TARGET_DIR:-$ROOT/target/cargo}/e2e-dynamic-parser"
 CAPTURE_BYTES="${FLN_E2E_CAPTURE_BYTES:-262144}"
 OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-16777216}"
@@ -398,6 +399,7 @@ ART_DIR_CLAIMED=1
 mkdir "$ART_DIR/inputs"
 mkdir "$DRIVER_DIR"
 mkdir "$DRIVER_DIR/src"
+mkdir "$DRIVER_DIR/src/bin"
 : > "$HUMAN"
 printf 'category term\nregister term tok dynamicTerm\nlookup term tok\n' \
   > "$ART_DIR/inputs/positive.registry"
@@ -419,6 +421,8 @@ printf '%s\n' \
   'remove-at 30 term missing missing' \
   'register-at 30 term z z-new' \
   > "$ART_DIR/inputs/incremental.registry"
+printf 'def good := 1\ndef broken :=' \
+  > "$ART_DIR/inputs/source_recovery.lean"
 
 cat > "$DRIVER_DIR/Cargo.toml" <<EOF
 [package]
@@ -1766,6 +1770,646 @@ fn main() {
 }
 RS
 
+cat > "$DRIVER_DIR/src/bin/fln-source-recovery-e2e-driver.rs" <<'RS'
+#![forbid(unsafe_code)]
+
+use fln_core::name::Name;
+use fln_core::outcome::Outcome;
+use fln_hash::domain::{Domain, hash};
+use fln_parse::category::LeadingIdentBehavior;
+use fln_parse::recovery::{
+    IncrementalRecoveryRequest, IncrementalRestartReason, NormalizedRecoveryEdit,
+    PublicationRefusal, RecoveryBudget, RecoveryCatalog, RecoveryError, RecoveryMode,
+    RecoverySession, RecoverySpec, ResynchronizationToken, SpeculativeObservation,
+    command_category, nat_definition_recovery_spec, parse_nat_definition_recovering,
+    pinned_parser_categories, reparse_nat_definition_incremental,
+};
+use fln_parse::registry::Registry;
+use fln_syntax::run::LexBudget;
+use fln_syntax::source::{BytePos, ByteSpan};
+use std::env;
+use std::fmt::Write as _;
+use std::fs;
+use std::process;
+use std::thread;
+
+const EXPECTED_SOURCE: &str = "def good := 1\ndef broken :=";
+const MAX_INPUT_BYTES: usize = 4_096;
+const MAX_BOUNDARIES: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceWitness {
+    acceptance_after_equal: bool,
+    acceptance_before_equal: bool,
+    after_authoritative: &'static str,
+    after_boundaries: usize,
+    after_journal: usize,
+    after_markers: usize,
+    after_observations: Vec<&'static str>,
+    before_authoritative: &'static str,
+    before_boundaries: usize,
+    before_journal: usize,
+    before_markers: usize,
+    before_observations: Vec<&'static str>,
+    boundary_reparsed: usize,
+    boundary_reused_prefix: usize,
+    cancellation_inconclusive: bool,
+    canonical_digest: String,
+    catalog_categories: usize,
+    epoch_bound_markers: bool,
+    first_epoch_revision: u64,
+    incremental_equals_full: bool,
+    invalid_utf8_restart: bool,
+    journal_complete: bool,
+    lexical_reused: bool,
+    publication_after: &'static str,
+    publication_before: &'static str,
+    resource_inconclusive: bool,
+    second_epoch_revision: u64,
+    stale_generation_refused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThreadRow {
+    canonical_digest: String,
+    productive: usize,
+    threads: usize,
+}
+
+fn refuse(message: &str) -> ! {
+    eprintln!("source recovery driver setup failure: {message}");
+    process::exit(2);
+}
+
+fn name(text: &str) -> Name {
+    Name::str(Name::anonymous(), text)
+}
+
+fn completed(
+    outcome: Outcome<Result<RecoverySession, RecoveryError>>,
+) -> Result<RecoverySession, String> {
+    match outcome {
+        Outcome::Complete(Ok(session)) => Ok(session),
+        Outcome::Complete(Err(error)) => Err(format!("recovery refused: {error:?}")),
+        Outcome::Inconclusive(stop) => Err(format!("recovery stopped: {stop:?}")),
+        Outcome::InternalFault(fault) => Err(format!("recovery faulted: {fault:?}")),
+    }
+}
+
+fn observations(session: &RecoverySession) -> Result<Vec<&'static str>, String> {
+    let boundaries = session
+        .speculative()
+        .ok_or_else(|| "enabled recovery omitted its boundary map".to_string())?;
+    Ok(boundaries
+        .boundaries()
+        .iter()
+        .map(|boundary| match boundary.observation() {
+            SpeculativeObservation::AcceptedCommandShape => "accepted",
+            SpeculativeObservation::RejectedCommandShape(_) => "rejected",
+        })
+        .collect())
+}
+
+fn exact_catalog_size() -> Result<usize, String> {
+    let categories = pinned_parser_categories()
+        .map_err(|error| format!("category inventory refused: {error:?}"))?;
+    let specifications = categories
+        .iter()
+        .map(|category| {
+            RecoverySpec::new(
+                category.clone(),
+                Name::str(
+                    Name::from_components(["Lean", "Parser", "Recovery"]),
+                    category.to_display_string(),
+                ),
+                vec![ResynchronizationToken::Symbol(";".to_string())],
+            )
+            .map_err(|error| format!("catalog specification refused: {error:?}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    RecoveryCatalog::for_pinned_categories(specifications)
+        .map(|catalog| catalog.len())
+        .map_err(|error| format!("catalog totality refused: {error:?}"))
+}
+
+fn publication_refused(session: &RecoverySession, generation: u64, registry: &Registry) -> bool {
+    matches!(
+        session.publication_candidate(
+            generation,
+            registry.epoch_at_position(BytePos(0)),
+        ),
+        Err(PublicationRefusal::AuthoritativeRejected)
+    )
+}
+
+fn witness_payload(witness: &SourceWitness) -> String {
+    format!(
+        concat!(
+            "fln.source-recovery-witness/1\n",
+            "acceptance={}:{}\n",
+            "authority={}:{}\n",
+            "boundaries={}:{}\n",
+            "journal={}:{}:{}\n",
+            "markers={}:{}:{}\n",
+            "observations={}:{}\n",
+            "damage={}:{}:{}\n",
+            "nonanswers={}:{}:{}:{}\n",
+            "publication={}:{}\n",
+            "epochs={}:{}\n",
+            "catalog={}\n"
+        ),
+        witness.acceptance_before_equal,
+        witness.acceptance_after_equal,
+        witness.before_authoritative,
+        witness.after_authoritative,
+        witness.before_boundaries,
+        witness.after_boundaries,
+        witness.before_journal,
+        witness.after_journal,
+        witness.journal_complete,
+        witness.before_markers,
+        witness.after_markers,
+        witness.epoch_bound_markers,
+        witness.before_observations.join(","),
+        witness.after_observations.join(","),
+        witness.lexical_reused,
+        witness.boundary_reused_prefix,
+        witness.boundary_reparsed,
+        witness.stale_generation_refused,
+        witness.cancellation_inconclusive,
+        witness.resource_inconclusive,
+        witness.invalid_utf8_restart,
+        witness.publication_before,
+        witness.publication_after,
+        witness.first_epoch_revision,
+        witness.second_epoch_revision,
+        witness.catalog_categories,
+    )
+}
+
+fn run_source_session(source: &str) -> Result<SourceWitness, String> {
+    if source != EXPECTED_SOURCE {
+        return Err("source recovery input bytes changed".to_string());
+    }
+    let split = source
+        .find("\ndef")
+        .map(|offset| offset + 1)
+        .ok_or_else(|| "source recovery input has no second command".to_string())?;
+    let mut registry = Registry::new();
+    registry
+        .declare_category_at(
+            BytePos(split),
+            name("recoveryEpochBoundary"),
+            LeadingIdentBehavior::Default,
+        )
+        .map_err(|error| error.message())?;
+    let spec = nat_definition_recovery_spec();
+    if spec.category() != &command_category() {
+        return Err("command recovery specification names the wrong category".to_string());
+    }
+
+    let before_disabled = completed(parse_nat_definition_recovering(
+        source.as_bytes(),
+        7,
+        &registry,
+        &spec,
+        RecoveryMode::Disabled,
+        RecoveryBudget::generous(),
+        None,
+    ))?;
+    let before = completed(parse_nat_definition_recovering(
+        source.as_bytes(),
+        7,
+        &registry,
+        &spec,
+        RecoveryMode::Enabled,
+        RecoveryBudget::generous(),
+        None,
+    ))?;
+    let acceptance_before_equal =
+        before_disabled.authoritative().result() == before.authoritative().result();
+    let before_observations = observations(&before)?;
+    let before_boundaries = before
+        .speculative()
+        .ok_or_else(|| "before boundary map is absent".to_string())?
+        .boundaries();
+    let first_epoch_revision = before_boundaries
+        .first()
+        .ok_or_else(|| "first recovery boundary is absent".to_string())?
+        .epoch()
+        .revision();
+    let second_epoch_revision = before_boundaries
+        .get(1)
+        .ok_or_else(|| "second recovery boundary is absent".to_string())?
+        .epoch()
+        .revision();
+
+    let mut edited = source.as_bytes().to_vec();
+    edited.extend_from_slice(b" 2");
+    let edit = NormalizedRecoveryEdit {
+        base_generation: 7,
+        next_generation: 8,
+        base_registry_epoch: registry.epoch(),
+        replaced: ByteSpan::empty_at(BytePos(source.len())),
+        inserted_len: 2,
+    };
+    let incremental = match reparse_nat_definition_incremental(
+        &before,
+        &edited,
+        IncrementalRecoveryRequest {
+            edit,
+            registry: &registry,
+            spec: &spec,
+            mode: RecoveryMode::Enabled,
+            budget: RecoveryBudget::generous(),
+            cancellation: None,
+        },
+    ) {
+        Outcome::Complete(Ok(incremental)) => incremental,
+        other => return Err(format!("incremental recovery did not complete: {other:?}")),
+    };
+    let after = completed(parse_nat_definition_recovering(
+        &edited,
+        8,
+        &registry,
+        &spec,
+        RecoveryMode::Enabled,
+        RecoveryBudget::generous(),
+        None,
+    ))?;
+    let after_disabled = completed(parse_nat_definition_recovering(
+        &edited,
+        8,
+        &registry,
+        &spec,
+        RecoveryMode::Disabled,
+        RecoveryBudget::generous(),
+        None,
+    ))?;
+    let acceptance_after_equal =
+        after_disabled.authoritative().result() == after.authoritative().result();
+
+    let stale_generation_refused = matches!(
+        reparse_nat_definition_incremental(
+            &before,
+            &edited,
+            IncrementalRecoveryRequest {
+                edit: NormalizedRecoveryEdit {
+                    base_generation: 6,
+                    ..edit
+                },
+                registry: &registry,
+                spec: &spec,
+                mode: RecoveryMode::Enabled,
+                budget: RecoveryBudget::generous(),
+                cancellation: None,
+            },
+        ),
+        Outcome::Complete(Err(RecoveryError::StaleBaseGeneration { .. }))
+    );
+    let cancel_at_publication =
+        |checkpoint| matches!(checkpoint, fln_parse::recovery::RecoveryCheckpoint::BeforePublication { .. });
+    let cancellation_inconclusive = matches!(
+        reparse_nat_definition_incremental(
+            &before,
+            &edited,
+            IncrementalRecoveryRequest {
+                edit,
+                registry: &registry,
+                spec: &spec,
+                mode: RecoveryMode::Enabled,
+                budget: RecoveryBudget::generous(),
+                cancellation: Some(&cancel_at_publication),
+            },
+        ),
+        Outcome::Inconclusive(_)
+    );
+    let resource_inconclusive = matches!(
+        parse_nat_definition_recovering(
+            source.as_bytes(),
+            7,
+            &registry,
+            &spec,
+            RecoveryMode::Enabled,
+            RecoveryBudget {
+                lex: LexBudget {
+                    max_input_bytes: MAX_INPUT_BYTES as u64,
+                    max_events: 0,
+                },
+                ..RecoveryBudget::generous()
+            },
+            None,
+        ),
+        Outcome::Inconclusive(_)
+    );
+    let invalid_utf8_restart = matches!(
+        reparse_nat_definition_incremental(
+            &before,
+            &[0xff],
+            IncrementalRecoveryRequest {
+                edit: NormalizedRecoveryEdit {
+                    base_generation: 7,
+                    next_generation: 8,
+                    base_registry_epoch: registry.epoch(),
+                    replaced: ByteSpan::new(BytePos(0), BytePos(source.len()))
+                        .ok_or_else(|| "whole-source edit is inverted".to_string())?,
+                    inserted_len: 1,
+                },
+                registry: &registry,
+                spec: &spec,
+                mode: RecoveryMode::Enabled,
+                budget: RecoveryBudget::generous(),
+                cancellation: None,
+            },
+        ),
+        Outcome::Complete(Err(RecoveryError::IncrementalRestartRequired(
+            IncrementalRestartReason::NewSourceIsNotUtf8
+        )))
+    );
+
+    let after_observations = observations(&after)?;
+    let before_authoritative = if before.authoritative().accepted() {
+        "accepted"
+    } else {
+        "rejected"
+    };
+    let after_authoritative = if after.authoritative().accepted() {
+        "accepted"
+    } else {
+        "rejected"
+    };
+    let journal_complete = before.journal().iter().all(|entry| {
+        entry.authoritative() == before.authoritative().boundaries()
+            && entry.speculative()
+                == before
+                    .speculative()
+                    .map_or(&[][..], |map| map.boundaries())
+    }) && after.journal().iter().all(|entry| {
+        entry.authoritative() == after.authoritative().boundaries()
+            && entry.speculative()
+                == after
+                    .speculative()
+                    .map_or(&[][..], |map| map.boundaries())
+    });
+    let mut witness = SourceWitness {
+        acceptance_after_equal,
+        acceptance_before_equal,
+        after_authoritative,
+        after_boundaries: after_observations.len(),
+        after_journal: after.journal().len(),
+        after_markers: after.recovered().len(),
+        after_observations,
+        before_authoritative,
+        before_boundaries: before_observations.len(),
+        before_journal: before.journal().len(),
+        before_markers: before.recovered().len(),
+        before_observations,
+        boundary_reparsed: incremental.boundary_damage().reparsed,
+        boundary_reused_prefix: incremental.boundary_damage().reused_prefix,
+        cancellation_inconclusive,
+        canonical_digest: String::new(),
+        catalog_categories: exact_catalog_size()?,
+        epoch_bound_markers: before.recovered().iter().all(|syntax| syntax.is_epoch_bound())
+            && after.recovered().iter().all(|syntax| syntax.is_epoch_bound()),
+        first_epoch_revision,
+        incremental_equals_full: incremental.session() == &after,
+        invalid_utf8_restart,
+        journal_complete,
+        lexical_reused: incremental.lexical_damage().reused_anything(),
+        publication_after: if publication_refused(&after, 8, &registry) {
+            "authoritative_rejected"
+        } else {
+            "unexpected"
+        },
+        publication_before: if publication_refused(&before, 7, &registry) {
+            "authoritative_rejected"
+        } else {
+            "unexpected"
+        },
+        resource_inconclusive,
+        second_epoch_revision,
+        stale_generation_refused,
+    };
+    witness.canonical_digest =
+        hash(Domain::CacheKey, witness_payload(&witness).as_bytes()).to_hex();
+    Ok(witness)
+}
+
+fn witness_is_exact(witness: &SourceWitness) -> bool {
+    witness.acceptance_after_equal
+        && witness.acceptance_before_equal
+        && witness.after_authoritative == "rejected"
+        && witness.after_boundaries == 2
+        && witness.after_journal == 1
+        && witness.after_markers == 0
+        && witness.after_observations == ["accepted", "accepted"]
+        && witness.before_authoritative == "rejected"
+        && witness.before_boundaries == 2
+        && witness.before_journal == 1
+        && witness.before_markers == 1
+        && witness.before_observations == ["accepted", "rejected"]
+        && witness.boundary_reparsed == 1
+        && witness.boundary_reused_prefix == 1
+        && witness.cancellation_inconclusive
+        && witness.catalog_categories == 35
+        && witness.epoch_bound_markers
+        && witness.first_epoch_revision == 0
+        && witness.incremental_equals_full
+        && witness.invalid_utf8_restart
+        && witness.journal_complete
+        && witness.lexical_reused
+        && witness.publication_after == "authoritative_rejected"
+        && witness.publication_before == "authoritative_rejected"
+        && witness.resource_inconclusive
+        && witness.second_epoch_revision == 1
+        && witness.stale_generation_refused
+}
+
+fn json_string(value: &str) -> String {
+    let mut encoded = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => encoded.push_str("\\\""),
+            '\\' => encoded.push_str("\\\\"),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            '\t' => encoded.push_str("\\t"),
+            character if character <= '\u{1f}' => {
+                write!(encoded, "\\u{:04x}", character as u32)
+                    .expect("writing to a String cannot fail");
+            }
+            character => encoded.push(character),
+        }
+    }
+    encoded.push('"');
+    encoded
+}
+
+fn observations_json(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| json_string(value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn thread_matrix_json(matrix: &[ThreadRow]) -> String {
+    matrix
+        .iter()
+        .map(|row| {
+            format!(
+                "{{\"canonical_digest\":{},\"productive\":{},\"threads\":{}}}",
+                json_string(&row.canonical_digest),
+                row.productive,
+                row.threads
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn main() {
+    let arguments = env::args().collect::<Vec<_>>();
+    if arguments.len() != 8 {
+        refuse("expected INPUT INPUT_ARTIFACT INPUT_SHA256 RUN_ID SEMANTIC TELEMETRY");
+    }
+    let input_path = &arguments[1];
+    let input_artifact = &arguments[2];
+    let input_sha256 = &arguments[3];
+    let run_id = &arguments[4];
+    let semantic_path = &arguments[5];
+    let telemetry_path = &arguments[6];
+    let declared_case = &arguments[7];
+    if declared_case != "source_recovery" {
+        refuse("declared case is not source_recovery");
+    }
+    if input_sha256.len() != 64
+        || !input_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        refuse("input digest is not lowercase SHA-256");
+    }
+    let input =
+        fs::read(input_path).unwrap_or_else(|error| refuse(&format!("cannot read input: {error}")));
+    if input.len() > MAX_INPUT_BYTES {
+        refuse("input exceeds the telemetry bound");
+    }
+    let source = std::str::from_utf8(&input)
+        .unwrap_or_else(|error| refuse(&format!("input is not UTF-8: {error}")));
+
+    let mut baseline = None;
+    let mut matrix = Vec::new();
+    for threads in [1usize, 8, 32] {
+        let witnesses = thread::scope(|scope| {
+            let handles = (0..threads)
+                .map(|_| scope.spawn(|| run_source_session(source)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "source recovery worker faulted".to_string())?
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .unwrap_or_else(|error| refuse(&error));
+        let first = witnesses
+            .first()
+            .unwrap_or_else(|| refuse("thread matrix produced no witness"))
+            .clone();
+        if !witness_is_exact(&first) || witnesses.iter().any(|witness| witness != &first) {
+            refuse("source recovery witnesses are not exact and identical");
+        }
+        if baseline.as_ref().is_some_and(|expected| expected != &first) {
+            refuse("source recovery thread matrices disagree");
+        }
+        baseline.get_or_insert_with(|| first.clone());
+        matrix.push(ThreadRow {
+            canonical_digest: first.canonical_digest.clone(),
+            productive: witnesses.len(),
+            threads,
+        });
+    }
+    let witness = baseline.unwrap_or_else(|| refuse("thread matrix produced no baseline"));
+    let semantic = format!(
+        concat!(
+            "{{\"acceptance_after_equal\":{},\"acceptance_before_equal\":{},",
+            "\"after_authoritative\":{},\"after_boundaries\":{},\"after_journal\":{},",
+            "\"after_markers\":{},\"after_observations\":[{}],",
+            "\"before_authoritative\":{},\"before_boundaries\":{},\"before_journal\":{},",
+            "\"before_markers\":{},\"before_observations\":[{}],",
+            "\"boundary_reparsed\":{},\"boundary_reused_prefix\":{},",
+            "\"cancellation_inconclusive\":{},\"canonical_digest\":{},",
+            "\"case\":\"source_recovery\",\"catalog_categories\":{},",
+            "\"data_grade\":\"verified\",\"epoch_bound_markers\":{},",
+            "\"first_epoch_revision\":{},\"incremental_equals_full\":{},",
+            "\"input_artifact\":{},\"input_sha256\":{},\"invalid_utf8_restart\":{},",
+            "\"journal_complete\":{},\"lexical_reused\":{},",
+            "\"publication_after\":{},\"publication_before\":{},",
+            "\"resource_inconclusive\":{},\"run_id\":{},",
+            "\"schema\":\"fln.e2e.source-recovery-semantic\",",
+            "\"second_epoch_revision\":{},\"stale_generation_refused\":{},",
+            "\"status\":\"pass\",\"thread_matrix\":[{}],\"version\":1}}\n"
+        ),
+        witness.acceptance_after_equal,
+        witness.acceptance_before_equal,
+        json_string(witness.after_authoritative),
+        witness.after_boundaries,
+        witness.after_journal,
+        witness.after_markers,
+        observations_json(&witness.after_observations),
+        json_string(witness.before_authoritative),
+        witness.before_boundaries,
+        witness.before_journal,
+        witness.before_markers,
+        observations_json(&witness.before_observations),
+        witness.boundary_reparsed,
+        witness.boundary_reused_prefix,
+        witness.cancellation_inconclusive,
+        json_string(&witness.canonical_digest),
+        witness.catalog_categories,
+        witness.epoch_bound_markers,
+        witness.first_epoch_revision,
+        witness.incremental_equals_full,
+        json_string(input_artifact),
+        json_string(input_sha256),
+        witness.invalid_utf8_restart,
+        witness.journal_complete,
+        witness.lexical_reused,
+        json_string(witness.publication_after),
+        json_string(witness.publication_before),
+        witness.resource_inconclusive,
+        json_string(run_id),
+        witness.second_epoch_revision,
+        witness.stale_generation_refused,
+        thread_matrix_json(&matrix),
+    );
+    let telemetry = format!(
+        concat!(
+            "{{\"after_boundaries\":{},\"before_boundaries\":{},",
+            "\"case\":\"source_recovery\",\"event\":\"phase_resources\",",
+            "\"max_boundaries\":{},\"max_input_bytes\":{},\"max_threads\":32,",
+            "\"observed_input_bytes\":{},\"run_id\":{},",
+            "\"schema\":\"fln.e2e.source-recovery-telemetry\",",
+            "\"thread_runs\":41,\"timing_used_as_gate\":false,\"version\":1}}\n"
+        ),
+        witness.after_boundaries,
+        witness.before_boundaries,
+        MAX_BOUNDARIES,
+        MAX_INPUT_BYTES,
+        input.len(),
+        json_string(run_id),
+    );
+    fs::write(semantic_path, semantic)
+        .unwrap_or_else(|error| refuse(&format!("cannot write semantic evidence: {error}")));
+    fs::write(telemetry_path, telemetry)
+        .unwrap_or_else(|error| refuse(&format!("cannot write telemetry: {error}")));
+    println!("source-recovery-semantic status=pass");
+}
+RS
+
 ACTIVE_STEP=vendor_binding
 "${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" \
   --vendor-path "$VENDOR_PATH" --output "$VENDOR_BINDING" \
@@ -1779,6 +2423,7 @@ emit_event --new-log --string event run_start \
   --string cwd "$ROOT" \
   --append-string claim_ids fln-33gl-dynamic-parser-no-mock \
   --append-string claim_ids franken_lean-9km-grammar-epoch-incremental \
+  --append-string claim_ids franken_lean-7xw-recovery-boundaries \
   --append-string invariant_ids FL-INV-01 \
   --append-string invariant_ids FL-INV-07 \
   --append-string gate_ids W4 \
@@ -1788,7 +2433,7 @@ emit_event --new-log --string event run_start \
   --string platform "$(uname -srm)" --integer thread_count 1 \
   --json-value thread_matrix '[1,8,32]' \
   --json-value host_facts "$HOST_FACTS_JSON" \
-  --string seed dynamic-registration-real-file-v2 \
+  --string seed dynamic-registration-and-source-recovery-real-file-v3 \
   --string cache_state "${FLN_E2E_CACHE_STATE:-uncontrolled}" \
   --string input_root "$INPUT_ROOT" --string vendor_binding vendor-binding.json \
   --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
@@ -2032,6 +2677,8 @@ run_test_step parser_interleaving_dpor 5 \
   cargo test --locked -q -p fln-parse --test parser_interleaving_dpor
 run_test_step dynamic_parser_mutations 11 \
   cargo test --locked -q -p fln-parse --test dynamic_parser_mutations
+run_test_step source_recovery_model 15 \
+  cargo test --locked -q -p fln-parse --test recovery_model
 
 ACTIVE_STEP=build_real_file_driver
 snapshot_before "$ACTIVE_STEP"
@@ -2042,6 +2689,7 @@ inspect_supervisor "$ACTIVE_STEP"
 snapshot_after "$ACTIVE_STEP"
 if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] \
     || [ "$LAST_CHILD_EXIT" != 0 ] || [ ! -x "$DRIVER_BIN" ] \
+    || [ ! -x "$SOURCE_RECOVERY_BIN" ] \
     || [ ! -f "$DRIVER_DIR/Cargo.lock" ]; then
   record_failure "$ACTIVE_STEP" real_file_driver_build_failed
 fi
@@ -2083,6 +2731,34 @@ run_real_file_case failure
 run_real_file_case recovery
 run_real_file_case incremental
 
+run_source_recovery_case() {
+  local step=source_recovery_file
+  local input="$ART_DIR/inputs/source_recovery.lean"
+  local input_artifact="inputs/source_recovery.lean"
+  local digest semantic telemetry
+  digest="$(sha256sum "$input" | cut -d' ' -f1)"
+  semantic="$ART_DIR/source_recovery.semantic.ndjson"
+  telemetry="$ART_DIR/source_recovery.telemetry.ndjson"
+  snapshot_before "$step"
+  note "running real-file Vellum source recovery case"
+  supervise "$step" "$SOURCE_RECOVERY_BIN" "$input" "$input_artifact" \
+    "$digest" "$RUN_ID" "$semantic" "$telemetry" source_recovery
+  inspect_supervisor "$step"
+  snapshot_after "$step"
+  if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] \
+      || [ "$LAST_CHILD_EXIT" != 0 ] || [ ! -s "$semantic" ] \
+      || [ ! -s "$telemetry" ]; then
+    record_failure "$step" real_file_source_recovery_execution_failed
+  fi
+  record_step "$step" \
+    "public-vellum/source-recovery/canonical-semantic-and-telemetry" \
+    "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
+    source_recovery.semantic.ndjson "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
+    "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+}
+
+run_source_recovery_case
+
 ACTIVE_STEP=semantic_validation
 snapshot_before "$ACTIVE_STEP"
 note "independently validating dynamic parser semantics, telemetry, and real inputs"
@@ -2109,6 +2785,11 @@ supervise "$ACTIVE_STEP" "${PYTHON[@]}" "$EVIDENCE" \
   --incremental-input "$ART_DIR/inputs/incremental.registry" \
   --incremental-stdout "$ART_DIR/incremental_file.out" \
   --incremental-stderr "$ART_DIR/incremental_file.err" \
+  --source-recovery-semantic "$ART_DIR/source_recovery.semantic.ndjson" \
+  --source-recovery-telemetry "$ART_DIR/source_recovery.telemetry.ndjson" \
+  --source-recovery-input "$ART_DIR/inputs/source_recovery.lean" \
+  --source-recovery-stdout "$ART_DIR/source_recovery_file.out" \
+  --source-recovery-stderr "$ART_DIR/source_recovery_file.err" \
   --artifact-root "$ART_DIR" --output "$ART_DIR/dynamic-parser.validation.json"
 inspect_supervisor "$ACTIVE_STEP"
 snapshot_after "$ACTIVE_STEP"
@@ -2118,12 +2799,12 @@ if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] \
   record_failure "$ACTIVE_STEP" independent_semantic_validation_failed
 fi
 record_step "$ACTIVE_STEP" \
-  "dynamic-parser-validation/positive-failure-recovery-incremental/pass" \
+  "dynamic-parser-validation/registry-and-source-recovery/pass" \
   "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
   dynamic-parser.validation.json "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
   "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 
-run_test_step final_real_recheck 87 \
+run_test_step final_real_recheck 88 \
   cargo test --locked -q -p fln-parse
 
 ACTIVE_STEP=final_real_recheck

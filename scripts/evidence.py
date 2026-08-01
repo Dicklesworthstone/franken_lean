@@ -556,11 +556,13 @@ E2E_STEP_ORDERS = {
         "grammar_effect_totality",
         "parser_interleaving_dpor",
         "dynamic_parser_mutations",
+        "source_recovery_model",
         "build_real_file_driver",
         "positive_file",
         "failure_file",
         "recovery_file",
         "incremental_file",
+        "source_recovery_file",
         "semantic_validation",
         "final_real_recheck",
     ],
@@ -716,6 +718,14 @@ DYNAMIC_PARSER_CASE_INPUTS = {
         ),
     ),
 }
+SOURCE_RECOVERY_SEMANTIC_SCHEMA = "fln.e2e.source-recovery-semantic"
+SOURCE_RECOVERY_TELEMETRY_SCHEMA = "fln.e2e.source-recovery-telemetry"
+SOURCE_RECOVERY_INPUT = (
+    "inputs/source_recovery.lean",
+    b"def good := 1\ndef broken :=",
+)
+SOURCE_RECOVERY_MAX_BOUNDARIES = 8
+SOURCE_RECOVERY_MAX_THREADS = 32
 
 ENVIRONMENT_COLLISION_SCHEMA = "fln.e2e.environment-collision"
 ENVIRONMENT_COLLISION_VERSION = 2
@@ -7864,6 +7874,153 @@ def validate_parser_corpus_no_mock_evidence(
     }
 
 
+def validate_source_recovery_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+    input_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    artifact_root: Path,
+) -> dict[str, Any]:
+    expected_artifact, expected_input = SOURCE_RECOVERY_INPUT
+    try:
+        actual_artifact = input_path.relative_to(artifact_root).as_posix()
+    except ValueError as error:
+        raise EvidenceError(
+            "source recovery input escapes the artifact root"
+        ) from error
+    if actual_artifact != expected_artifact:
+        raise EvidenceError(
+            f"source recovery input artifact {actual_artifact!r}, "
+            f"expected {expected_artifact!r}"
+        )
+    raw_input, input_size, input_digest = stable_file_facts(
+        input_path, max_bytes=DYNAMIC_PARSER_MAX_INPUT_BYTES
+    )
+    if raw_input != expected_input:
+        raise EvidenceError("source recovery real input bytes changed")
+
+    semantic, semantic_digest = read_canonical_record(
+        semantic_path,
+        label="source recovery semantic evidence",
+        max_bytes=65_536,
+    )
+    telemetry, telemetry_digest = read_canonical_record(
+        telemetry_path,
+        label="source recovery telemetry",
+        max_bytes=4_096,
+    )
+    stdout, _stdout_size, stdout_digest = stable_file_facts(
+        stdout_path, max_bytes=MAX_LOG_BYTES
+    )
+    stderr, _stderr_size, stderr_digest = stable_file_facts(
+        stderr_path, max_bytes=MAX_LOG_BYTES
+    )
+    if stdout != b"source-recovery-semantic status=pass\n":
+        raise EvidenceError("source recovery producer stdout is not exact")
+    if stderr:
+        raise EvidenceError("source recovery producer wrote stderr")
+
+    canonical_digest = semantic.get("canonical_digest")
+    if (
+        not isinstance(canonical_digest, str)
+        or SHA256_HEX.fullmatch(canonical_digest) is None
+    ):
+        raise EvidenceError(
+            "source recovery canonical digest is not lowercase SHA-256"
+        )
+    expected_thread_matrix = [
+        {
+            "canonical_digest": canonical_digest,
+            "productive": 1,
+            "threads": 1,
+        },
+        {
+            "canonical_digest": canonical_digest,
+            "productive": 8,
+            "threads": 8,
+        },
+        {
+            "canonical_digest": canonical_digest,
+            "productive": 32,
+            "threads": 32,
+        },
+    ]
+    expected_semantic = {
+        "acceptance_after_equal": True,
+        "acceptance_before_equal": True,
+        "after_authoritative": "rejected",
+        "after_boundaries": 2,
+        "after_journal": 1,
+        "after_markers": 0,
+        "after_observations": ["accepted", "accepted"],
+        "before_authoritative": "rejected",
+        "before_boundaries": 2,
+        "before_journal": 1,
+        "before_markers": 1,
+        "before_observations": ["accepted", "rejected"],
+        "boundary_reparsed": 1,
+        "boundary_reused_prefix": 1,
+        "cancellation_inconclusive": True,
+        "canonical_digest": canonical_digest,
+        "case": "source_recovery",
+        "catalog_categories": 35,
+        "data_grade": "verified",
+        "epoch_bound_markers": True,
+        "first_epoch_revision": 0,
+        "incremental_equals_full": True,
+        "input_artifact": expected_artifact,
+        "input_sha256": input_digest,
+        "invalid_utf8_restart": True,
+        "journal_complete": True,
+        "lexical_reused": True,
+        "publication_after": "authoritative_rejected",
+        "publication_before": "authoritative_rejected",
+        "resource_inconclusive": True,
+        "run_id": expected_run_id,
+        "schema": SOURCE_RECOVERY_SEMANTIC_SCHEMA,
+        "second_epoch_revision": 1,
+        "stale_generation_refused": True,
+        "status": "pass",
+        "thread_matrix": expected_thread_matrix,
+        "version": 1,
+    }
+    if canonical_json(semantic) != canonical_json(expected_semantic):
+        raise EvidenceError(
+            "source recovery semantics or outcome class changed"
+        )
+
+    expected_telemetry = {
+        "after_boundaries": 2,
+        "before_boundaries": 2,
+        "case": "source_recovery",
+        "event": "phase_resources",
+        "max_boundaries": SOURCE_RECOVERY_MAX_BOUNDARIES,
+        "max_input_bytes": DYNAMIC_PARSER_MAX_INPUT_BYTES,
+        "max_threads": SOURCE_RECOVERY_MAX_THREADS,
+        "observed_input_bytes": input_size,
+        "run_id": expected_run_id,
+        "schema": SOURCE_RECOVERY_TELEMETRY_SCHEMA,
+        "thread_runs": 41,
+        "timing_used_as_gate": False,
+        "version": 1,
+    }
+    if canonical_json(telemetry) != canonical_json(expected_telemetry):
+        raise EvidenceError(
+            "source recovery telemetry is malformed or out of bounds"
+        )
+    return {
+        "canonical_digest": canonical_digest,
+        "input_sha256": input_digest,
+        "semantic_sha256": semantic_digest,
+        "stderr_sha256": stderr_digest,
+        "stdout_sha256": stdout_digest,
+        "telemetry_sha256": telemetry_digest,
+    }
+
+
 def validate_dynamic_parser_no_mock_evidence(
     *,
     expected_run_id: str,
@@ -7872,6 +8029,11 @@ def validate_dynamic_parser_no_mock_evidence(
     input_paths: Mapping[str, Path],
     stdout_paths: Mapping[str, Path],
     stderr_paths: Mapping[str, Path],
+    source_recovery_semantic_path: Path,
+    source_recovery_telemetry_path: Path,
+    source_recovery_input_path: Path,
+    source_recovery_stdout_path: Path,
+    source_recovery_stderr_path: Path,
     artifact_root: Path,
 ) -> dict[str, Any]:
     if not expected_run_id:
@@ -8562,6 +8724,15 @@ def validate_dynamic_parser_no_mock_evidence(
             ]
         validation_cases.append(case_report)
 
+    source_recovery = validate_source_recovery_evidence(
+        expected_run_id=expected_run_id,
+        semantic_path=source_recovery_semantic_path,
+        telemetry_path=source_recovery_telemetry_path,
+        input_path=source_recovery_input_path,
+        stdout_path=source_recovery_stdout_path,
+        stderr_path=source_recovery_stderr_path,
+        artifact_root=artifact_root,
+    )
     return {
         "cases": validation_cases,
         "incremental_law": (
@@ -8575,6 +8746,11 @@ def validate_dynamic_parser_no_mock_evidence(
         ),
         "run_id": expected_run_id,
         "schema": DYNAMIC_PARSER_VALIDATION_SCHEMA,
+        "source_recovery": source_recovery,
+        "source_recovery_law": (
+            "the exact command stream alone controls publication; recovery "
+            "markers are explicit, epoch-bound, and incremental-equals-full"
+        ),
         "thread_matrix": [1, 8, 32],
         "typed_refusal": DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC,
         "verdict": "pass",
@@ -18083,6 +18259,26 @@ def cmd_validate_dynamic_parser_no_mock(args: argparse.Namespace) -> int:
         )
         for case in DYNAMIC_PARSER_CASE_INPUTS
     }
+    source_recovery_semantic_path = artifact(
+        args.source_recovery_semantic,
+        "source recovery semantic evidence",
+    )
+    source_recovery_telemetry_path = artifact(
+        args.source_recovery_telemetry,
+        "source recovery telemetry",
+    )
+    source_recovery_input_path = artifact(
+        args.source_recovery_input,
+        "source recovery input",
+    )
+    source_recovery_stdout_path = artifact(
+        args.source_recovery_stdout,
+        "source recovery stdout",
+    )
+    source_recovery_stderr_path = artifact(
+        args.source_recovery_stderr,
+        "source recovery stderr",
+    )
     report = validate_dynamic_parser_no_mock_evidence(
         expected_run_id=args.expected_run_id,
         semantic_paths=semantic_paths,
@@ -18090,6 +18286,11 @@ def cmd_validate_dynamic_parser_no_mock(args: argparse.Namespace) -> int:
         input_paths=input_paths,
         stdout_paths=stdout_paths,
         stderr_paths=stderr_paths,
+        source_recovery_semantic_path=source_recovery_semantic_path,
+        source_recovery_telemetry_path=source_recovery_telemetry_path,
+        source_recovery_input_path=source_recovery_input_path,
+        source_recovery_stdout_path=source_recovery_stdout_path,
+        source_recovery_stderr_path=source_recovery_stderr_path,
         artifact_root=artifact_root,
     )
     if args.output:
@@ -28566,6 +28767,11 @@ def build_parser() -> argparse.ArgumentParser:
         dynamic_parser.add_argument(
             f"--{dynamic_parser_case}-stderr", required=True
         )
+    dynamic_parser.add_argument("--source-recovery-semantic", required=True)
+    dynamic_parser.add_argument("--source-recovery-telemetry", required=True)
+    dynamic_parser.add_argument("--source-recovery-input", required=True)
+    dynamic_parser.add_argument("--source-recovery-stdout", required=True)
+    dynamic_parser.add_argument("--source-recovery-stderr", required=True)
     dynamic_parser.add_argument("--artifact-root", required=True)
     dynamic_parser.add_argument("--output")
     dynamic_parser.set_defaults(func=cmd_validate_dynamic_parser_no_mock)
