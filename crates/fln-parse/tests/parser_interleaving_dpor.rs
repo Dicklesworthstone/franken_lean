@@ -86,7 +86,9 @@ fn root_for(order: &[(u64, String, String)]) -> GrammarRoot {
     registry
         .apply_batch(build_requests(&term, order))
         .expect("applies");
-    registry.grammar_root(registry.epoch())
+    registry
+        .grammar_root(registry.epoch())
+        .expect("the current epoch belongs to its registry")
 }
 
 /// **The sweep: identical roots for every arrival order, exhaustively for a small batch.**
@@ -197,7 +199,9 @@ fn without_canonicalisation_arrival_order_does_change_the_root() {
                 .add_leading(&term, name(token), production(kind), false)
                 .expect("registers");
         }
-        registry.grammar_root(registry.epoch())
+        registry
+            .grammar_root(registry.epoch())
+            .expect("the current epoch belongs to its registry")
     };
 
     assert_ne!(

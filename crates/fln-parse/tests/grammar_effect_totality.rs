@@ -26,9 +26,15 @@
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
 use fln_core::outcome::{InconclusiveCause, Outcome};
+use fln_hash::domain::Digest;
 use fln_parse::category::LeadingIdentBehavior;
-use fln_parse::registry::{GrammarEpoch, RegisterError, Registry, RegistryBudget, Request};
-use fln_parse::state::Production;
+use fln_parse::registry::{
+    GrammarComponent, GrammarEpoch, GrammarIdentity, GrammarTransition, MemoAdvanceBudget,
+    MemoAdvanceCheckpoint, MemoKey, MemoLookup, ParseDependencies, ParseMemo, ParseProduct,
+    ParserEffect, ParserPosition, RegisterError, Registry, RegistryBudget, Request,
+};
+use fln_parse::state::{ParserDescriptor, Production};
+use fln_syntax::source::BytePos;
 
 fn name(text: &str) -> Name {
     Name::str(Name::anonymous(), text)
@@ -36,6 +42,16 @@ fn name(text: &str) -> Name {
 
 fn production(label: &str) -> Production {
     Production::new(name(label), 0, |_state| {})
+}
+
+fn stable_production(label: &str) -> Production {
+    let kind = name(label);
+    Production::described(
+        kind.clone(),
+        0,
+        ParserDescriptor::stable(kind, 1, b"grammar-effect-totality".to_vec()),
+        |_state| {},
+    )
 }
 
 fn request(index: u64, token: &str, kind: &str, category: &Name) -> Request {
@@ -105,7 +121,8 @@ fn every_effect_answers_for_every_input() {
     assert!(registry.pop_scope().is_err(), "no scope is open");
 
     // Lookups at absurd epochs answer rather than panicking.
-    for epoch in [GrammarEpoch(0), GrammarEpoch(u64::MAX)] {
+    let foreign = GrammarEpoch::from_parts(u64::MAX, Digest([0xa5; 32]));
+    for epoch in [registry.epoch(), foreign] {
         let _ = registry.kinds_at(&term, &name("x"), epoch);
         let _ = registry.grammar_root(epoch);
         let _ = registry.view_at(&term, epoch);
@@ -320,4 +337,323 @@ fn the_budget_boundary_is_exact() {
         .is_some(),
         "one below what the batch needs must stop"
     );
+}
+
+/// Every state-changing surface emits a typed effect, while an unknown surface is explicitly
+/// opaque and establishes the suffix barrier.
+#[test]
+fn every_effect_variant_is_emitted_or_conservatively_opaque() {
+    let (mut registry, term) = term_registry();
+
+    registry
+        .add_leading_at(
+            BytePos(2),
+            &term,
+            name("tok"),
+            stable_production("kind"),
+            false,
+        )
+        .expect("adds syntax");
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::AddsSyntax { .. }))
+            && transition
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ParserEffect::AddsToken { .. }))
+            && !transition.has_opaque_effect()
+    }));
+
+    registry.register_token_parser_at(
+        BytePos(3),
+        name("literal"),
+        ParserDescriptor::stable(name("literal-parser"), 1, b"decimal".to_vec()),
+    );
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::AddsToken { .. }))
+    }));
+
+    registry
+        .set_precedence_at(BytePos(4), &term, name("kind"), 65)
+        .expect("changes precedence");
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::ChangesPrecedence { .. }))
+    }));
+
+    registry.push_scope_at(BytePos(5));
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::OpensScope { .. }))
+    }));
+    registry.pop_scope_at(BytePos(6)).expect("closes scope");
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::ClosesScope { .. }))
+    }));
+
+    registry.register_macro_at(
+        BytePos(7),
+        name("macro"),
+        ParserDescriptor::stable(name("macro"), 1, b"expander".to_vec()),
+    );
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::RegistersMacro { .. }))
+    }));
+
+    registry.set_option_at(BytePos(8), name("parser.option"), "on");
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::ChangesOption { .. }))
+    }));
+
+    let imported = term_registry().0;
+    registry.import_grammar_at(BytePos(9), name("Imported"), imported.identity());
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::ImportsGrammar { .. }))
+    }));
+
+    registry
+        .remove_syntax_at(
+            BytePos(10),
+            &term,
+            &name("tok"),
+            &name("kind"),
+            ParserPosition::Leading,
+        )
+        .expect("removes syntax");
+    assert!(registry.last_transition().is_some_and(|transition| {
+        transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ParserEffect::RemovesSyntax { .. }))
+    }));
+
+    let before_refusal = registry.epoch();
+    assert!(matches!(
+        registry.remove_syntax_at(
+            BytePos(11),
+            &term,
+            &name("missing"),
+            &name("kind"),
+            ParserPosition::Leading,
+        ),
+        Err(RegisterError::ProductionNotFound { .. })
+    ));
+    assert_eq!(
+        registry.epoch(),
+        before_refusal,
+        "a malformed removal is failure-atomic"
+    );
+
+    registry.set_unknown_option_at(BytePos(12), name("future.option"), "unknown");
+    assert!(
+        registry
+            .last_transition()
+            .is_some_and(|transition| transition.has_opaque_effect())
+    );
+    assert_eq!(registry.opaque_suffix_barrier(), Some(BytePos(12)));
+    assert!(!registry.distributed_parse_allowed_at(BytePos(12)));
+}
+
+fn memo_transition_fixture() -> (
+    ParseMemo<&'static str>,
+    GrammarTransition,
+    GrammarIdentity,
+    GrammarIdentity,
+    [MemoKey; 2],
+) {
+    let (mut registry, term) = term_registry();
+    let before_identity = registry.identity().clone();
+    let old_keys = [BytePos(20), BytePos(30)].map(|position| MemoKey {
+        position,
+        category: term.clone(),
+        precedence: 0,
+        epoch: before_identity.epoch(),
+    });
+    let dependencies = ParseDependencies::from_components([GrammarComponent::Syntax {
+        category: term.clone(),
+        token: name("unrelated"),
+        position: ParserPosition::Leading,
+    }]);
+    let mut memo = ParseMemo::new();
+    for (key, value) in old_keys.iter().zip(["first", "second"]) {
+        memo.insert(
+            key.clone(),
+            &before_identity,
+            ParseProduct::new(before_identity.epoch(), dependencies.clone(), value),
+        )
+        .expect("fixture memo insert");
+    }
+
+    registry
+        .add_leading_at(
+            BytePos(10),
+            &term,
+            name("changed"),
+            stable_production("changed-kind"),
+            false,
+        )
+        .expect("fixture transition");
+    let transition = registry
+        .last_transition()
+        .expect("syntax registration emits a transition")
+        .clone();
+    let after_identity = registry.identity().clone();
+    (memo, transition, before_identity, after_identity, old_keys)
+}
+
+fn assert_memo_was_not_advanced(
+    memo: &ParseMemo<&'static str>,
+    before: &GrammarIdentity,
+    after: &GrammarIdentity,
+    old_keys: &[MemoKey; 2],
+) {
+    assert_eq!(memo.len(), old_keys.len());
+    for old_key in old_keys {
+        assert!(matches!(
+            memo.lookup(old_key, before),
+            Ok(MemoLookup::Hit(_))
+        ));
+        let mut after_key = old_key.clone();
+        after_key.epoch = after.epoch();
+        assert!(
+            !matches!(memo.lookup(&after_key, after), Ok(MemoLookup::Hit(_))),
+            "a non-answer must publish no promoted key"
+        );
+    }
+}
+
+/// Memo scanning has an exact resource boundary, reports genuine exhaustion, and can be retried
+/// without repairing partial publication.
+#[test]
+fn memo_advance_budget_is_exact_atomic_and_retryable() {
+    let (mut memo, transition, before, after, old_keys) = memo_transition_fixture();
+    let outcome = memo.advance(
+        &transition,
+        &before,
+        &after,
+        MemoAdvanceBudget { max_entries: 1 },
+        None,
+    );
+    let Outcome::Inconclusive(inconclusive) = outcome else {
+        panic!("one entry below the exact scan boundary must be inconclusive");
+    };
+    let InconclusiveCause::ResourceExhausted { usage } = inconclusive.cause else {
+        panic!("the memo budget stop must be resource exhaustion");
+    };
+    assert_eq!(
+        usage.reason,
+        ResourceReason::StructuralBudget {
+            unit: StructuralUnit::ProducedNodes
+        }
+    );
+    assert_eq!(usage.allowed, 1);
+    assert_eq!(usage.observed, 2);
+    assert_memo_was_not_advanced(&memo, &before, &after, &old_keys);
+
+    let report = memo
+        .advance(
+            &transition,
+            &before,
+            &after,
+            MemoAdvanceBudget { max_entries: 2 },
+            None,
+        )
+        .into_complete()
+        .expect("the exact boundary is authoritative")
+        .expect("the transition identities match");
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.promoted, 2);
+    assert_eq!(report.invalidated, 0);
+    assert_eq!(report.prefix_reused, 0);
+}
+
+/// Cancellation after partial scanning leaves the memo byte-for-byte authoritative at the old
+/// epoch, then a clean retry publishes the complete plan.
+#[test]
+fn memo_advance_mid_scan_cancellation_is_atomic_and_retryable() {
+    let (mut memo, transition, before, after, old_keys) = memo_transition_fixture();
+    let cancel = |checkpoint| {
+        matches!(
+            checkpoint,
+            MemoAdvanceCheckpoint::BeforeEntry { scanned: 1 }
+        )
+    };
+    let outcome = memo.advance(
+        &transition,
+        &before,
+        &after,
+        MemoAdvanceBudget::generous(),
+        Some(&cancel),
+    );
+    let Outcome::Inconclusive(inconclusive) = outcome else {
+        panic!("the sampled cancellation must be inconclusive");
+    };
+    assert!(matches!(
+        inconclusive.cause,
+        InconclusiveCause::Cancelled { .. }
+    ));
+    assert!(inconclusive.diagnostic.is_none());
+    assert_memo_was_not_advanced(&memo, &before, &after, &old_keys);
+
+    let report = memo
+        .advance(
+            &transition,
+            &before,
+            &after,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .expect("the uncancelled retry is authoritative")
+        .expect("the transition identities match");
+    assert_eq!(report.promoted, 2);
+}
+
+/// A final cancellation sample guards publication even when the complete promotion plan already
+/// exists.
+#[test]
+fn memo_advance_prepublication_cancellation_leaks_no_product() {
+    let (mut memo, transition, before, after, old_keys) = memo_transition_fixture();
+    let cancel = |checkpoint| {
+        matches!(
+            checkpoint,
+            MemoAdvanceCheckpoint::BeforePublication { scanned: 2 }
+        )
+    };
+    let outcome = memo.advance(
+        &transition,
+        &before,
+        &after,
+        MemoAdvanceBudget::generous(),
+        Some(&cancel),
+    );
+    let Outcome::Inconclusive(inconclusive) = outcome else {
+        panic!("the final cancellation sample must be inconclusive");
+    };
+    assert!(matches!(
+        inconclusive.cause,
+        InconclusiveCause::Cancelled { .. }
+    ));
+    assert_memo_was_not_advanced(&memo, &before, &after, &old_keys);
 }

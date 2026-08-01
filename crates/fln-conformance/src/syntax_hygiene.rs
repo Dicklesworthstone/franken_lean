@@ -311,7 +311,11 @@ pub struct FixtureRow {
     pub options: String,
     pub category: String,
     pub grammar_phase: String,
-    pub grammar_epoch: GrammarEpoch,
+    /// Historical activation ordinal recorded by the frozen fixture.
+    ///
+    /// The authoritative runtime [`GrammarEpoch`] additionally carries the canonical content
+    /// digest; `grammar_root` independently binds the fixture's complete canonical rows.
+    pub grammar_epoch: u64,
     pub grammar_root: String,
     pub observation: ObservationKind,
     pub disposition: Disposition,
@@ -377,7 +381,6 @@ impl FixtureManifest {
                 .ok_or_else(|| format!("{id}: unsupported family {:?}", fields[1]))?;
             let grammar_epoch = fields[10]
                 .parse::<u64>()
-                .map(GrammarEpoch)
                 .map_err(|_| format!("{id}: malformed grammar epoch {:?}", fields[10]))?;
             if !is_lower_hex(fields[11], 64) {
                 return Err(format!("{id}: malformed grammar root {:?}", fields[11]));
@@ -482,10 +485,14 @@ impl FixtureManifest {
                     row.id, row.grammar_phase
                 ));
             };
-            if *epoch != row.grammar_epoch || root != &row.grammar_root {
+            if epoch.revision() != row.grammar_epoch || root != &row.grammar_root {
                 return Err(format!(
                     "{}: grammar identity drift: manifest epoch={} root={}, derived epoch={} root={}",
-                    row.id, row.grammar_epoch.0, row.grammar_root, epoch.0, root
+                    row.id,
+                    row.grammar_epoch,
+                    row.grammar_root,
+                    epoch.revision(),
+                    root
                 ));
             }
         }
@@ -548,7 +555,7 @@ impl FixtureManifest {
             if row.id != contract.0
                 || row.family != contract.1
                 || row.grammar_phase != contract.2
-                || row.grammar_epoch.0 != contract.3
+                || row.grammar_epoch != contract.3
                 || row.observation != contract.4
                 || row.disposition != contract.5
             {
@@ -1087,7 +1094,13 @@ pub fn grammar_phase_roots() -> BTreeMap<&'static str, (GrammarEpoch, String)> {
 }
 
 fn grammar_root_digest(registry: &Registry, epoch: GrammarEpoch) -> String {
-    fixture_digest(registry.grammar_root(epoch).0.as_bytes())
+    fixture_digest(
+        registry
+            .grammar_root(epoch)
+            .expect("the phase epoch belongs to its registry")
+            .0
+            .as_bytes(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1412,7 +1425,7 @@ pub fn measure_contract_usage(manifest: &FixtureManifest) -> Result<SyntaxContra
         .len() as u64;
     let registrations = grammar_phase_roots()
         .values()
-        .map(|(epoch, _)| epoch.0)
+        .map(|(epoch, _)| epoch.revision())
         .max()
         .unwrap_or(0);
     let trace = stock_trace_contract()?;
@@ -1619,7 +1632,7 @@ fn task_root(row: &FixtureRow, phase: usize) -> Result<String, String> {
                 "{}:{}:{}:{}:{}",
                 row.id,
                 row.family.as_str(),
-                row.grammar_epoch.0,
+                row.grammar_epoch,
                 row.grammar_root,
                 row.comparison.iter().cloned().collect::<Vec<_>>().join(",")
             )

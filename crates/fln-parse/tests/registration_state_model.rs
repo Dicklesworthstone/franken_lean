@@ -32,8 +32,12 @@
 
 use fln_core::name::Name;
 use fln_parse::category::LeadingIdentBehavior;
-use fln_parse::registry::{GrammarEpoch, RegisterError, Registry};
-use fln_parse::state::Production;
+use fln_parse::registry::{
+    GrammarComponent, MemoAdvanceBudget, MemoKey, MemoLookup, ParseDependencies, ParseMemo,
+    ParseProduct, ParserPosition, RegisterError, Registry,
+};
+use fln_parse::state::{ParserDescriptor, Production};
+use fln_syntax::source::BytePos;
 
 fn name(text: &str) -> Name {
     Name::str(Name::anonymous(), text)
@@ -41,6 +45,16 @@ fn name(text: &str) -> Name {
 
 fn production(label: &str) -> Production {
     Production::new(name(label), 0, |_state| {})
+}
+
+fn stable_production(label: &str) -> Production {
+    let kind = name(label);
+    Production::described(
+        kind.clone(),
+        0,
+        ParserDescriptor::stable(kind, 1, b"registration-state-model".to_vec()),
+        |_state| {},
+    )
 }
 
 /// The model: an independent account of what should be live, kept as a plain list so it shares no
@@ -329,10 +343,216 @@ fn a_last_wins_model_disagrees_with_the_registry() {
 #[test]
 fn the_registry_refuses_unreachable_operations() {
     let mut registry = Registry::new();
+    let before = registry.epoch();
     assert_eq!(registry.pop_scope(), Err(RegisterError::NoScopeOpen));
     assert_eq!(
         registry.add_leading(&name("nope"), name("t"), production("p"), false),
         Err(RegisterError::UnknownCategory { name: name("nope") })
     );
-    assert_eq!(registry.epoch(), GrammarEpoch(0), "refusals are inert");
+    assert_eq!(registry.epoch(), before, "refusals are inert");
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EpochEdit {
+    AddX,
+    AddY,
+    PushScope,
+    AddScopedX,
+    PopScope,
+    SetOption,
+}
+
+fn memoized_and_fresh_agree(edits: &[EpochEdit]) -> usize {
+    let mut registry = Registry::new();
+    let term = name("term");
+    registry
+        .declare_category_at(BytePos(0), term.clone(), LeadingIdentBehavior::Default)
+        .expect("declares");
+    let mut memo = ParseMemo::<Vec<Name>>::new();
+    let queries = [
+        (BytePos(5), name("x")),
+        (BytePos(6), name("y")),
+        (BytePos(15), name("x")),
+        (BytePos(16), name("y")),
+        (BytePos(25), name("x")),
+        (BytePos(26), name("y")),
+        (BytePos(35), name("x")),
+        (BytePos(36), name("y")),
+        (BytePos(45), name("x")),
+        (BytePos(46), name("y")),
+    ];
+    let mut comparisons = 0usize;
+
+    let check_all =
+        |registry: &Registry, memo: &mut ParseMemo<Vec<Name>>, comparisons: &mut usize| {
+            for (position, token) in &queries {
+                let epoch = registry.epoch_at_position(*position);
+                let identity = registry
+                    .identity_at(epoch)
+                    .expect("the timeline only names retained epochs")
+                    .clone();
+                let key = MemoKey {
+                    position: *position,
+                    category: term.clone(),
+                    precedence: 0,
+                    epoch,
+                };
+                let fresh = registry.kinds_at(&term, token, epoch);
+                match memo.lookup(&key, &identity).expect("identity matches") {
+                    MemoLookup::Hit(product) => {
+                        assert_eq!(
+                            product.value(),
+                            &fresh,
+                            "memoized and fresh reads diverged at {position:?} for {token:?} \
+                         after {edits:?}"
+                        );
+                    }
+                    MemoLookup::Miss | MemoLookup::CollisionMiss => {
+                        memo.insert(
+                            key,
+                            &identity,
+                            ParseProduct::new(
+                                epoch,
+                                ParseDependencies::from_components([GrammarComponent::Syntax {
+                                    category: term.clone(),
+                                    token: token.clone(),
+                                    position: ParserPosition::Leading,
+                                }]),
+                                fresh,
+                            ),
+                        )
+                        .expect("memo insert");
+                    }
+                }
+                *comparisons += 1;
+            }
+        };
+    check_all(&registry, &mut memo, &mut comparisons);
+
+    for (index, edit) in edits.iter().enumerate() {
+        let activation = BytePos(10 + index * 10);
+        let before = registry.epoch();
+        let before_identity = registry.identity().clone();
+        match edit {
+            EpochEdit::AddX => {
+                registry
+                    .add_leading_at(
+                        activation,
+                        &term,
+                        name("x"),
+                        stable_production(&format!("x{index}")),
+                        false,
+                    )
+                    .expect("adds x");
+            }
+            EpochEdit::AddY => {
+                registry
+                    .add_leading_at(
+                        activation,
+                        &term,
+                        name("y"),
+                        stable_production(&format!("y{index}")),
+                        false,
+                    )
+                    .expect("adds y");
+            }
+            EpochEdit::PushScope => {
+                registry.push_scope_at(activation);
+            }
+            EpochEdit::AddScopedX => {
+                registry
+                    .add_leading_at(
+                        activation,
+                        &term,
+                        name("x"),
+                        stable_production(&format!("local{index}")),
+                        true,
+                    )
+                    .expect("adds scoped x");
+            }
+            EpochEdit::PopScope => {
+                registry.pop_scope_at(activation).expect("pops");
+            }
+            EpochEdit::SetOption => {
+                registry.set_option_at(activation, name("parser.mode"), format!("v{index}"));
+            }
+        }
+        let transition = registry
+            .last_transition()
+            .expect("each edit emits a transition")
+            .clone();
+        assert_eq!(transition.before, before);
+        let after_identity = registry.identity().clone();
+        memo.advance(
+            &transition,
+            &before_identity,
+            &after_identity,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .expect("a generous memo transition completes")
+        .expect("memo transition");
+        check_all(&registry, &mut memo, &mut comparisons);
+    }
+    comparisons
+}
+
+/// Bounded exhaustive property: memoized registry reads equal cold reads after every valid short
+/// edit sequence, including activation boundaries and scope restoration.
+#[test]
+fn memoized_parse_equals_fresh_parse_over_generated_epoch_respecting_edits() {
+    fn walk(
+        prefix: &mut Vec<EpochEdit>,
+        depth: usize,
+        remaining: usize,
+        cases: &mut usize,
+        comparisons: &mut usize,
+    ) {
+        if remaining == 0 {
+            *comparisons += memoized_and_fresh_agree(prefix);
+            *cases += 1;
+            return;
+        }
+        for edit in [
+            EpochEdit::AddX,
+            EpochEdit::AddY,
+            EpochEdit::PushScope,
+            EpochEdit::SetOption,
+        ] {
+            prefix.push(edit);
+            walk(
+                prefix,
+                depth + usize::from(matches!(edit, EpochEdit::PushScope)),
+                remaining - 1,
+                cases,
+                comparisons,
+            );
+            prefix.pop();
+        }
+        if depth > 0 {
+            for edit in [EpochEdit::AddScopedX, EpochEdit::PopScope] {
+                prefix.push(edit);
+                walk(
+                    prefix,
+                    depth - usize::from(matches!(edit, EpochEdit::PopScope)),
+                    remaining - 1,
+                    cases,
+                    comparisons,
+                );
+                prefix.pop();
+            }
+        }
+    }
+
+    let mut cases = 0usize;
+    let mut comparisons = 0usize;
+    for length in 1..=4 {
+        walk(&mut Vec::new(), 0, length, &mut cases, &mut comparisons);
+    }
+    assert!(cases > 400, "only {cases} edit sequences checked");
+    assert!(
+        comparisons > 10_000,
+        "only {comparisons} memo/fresh comparisons checked"
+    );
 }

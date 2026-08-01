@@ -14,10 +14,10 @@ fn grammar_epoch_transition_model() {
     let pre_call = roots.get("pre-call").expect("pre-call phase");
     let post_call = roots.get("post-call").expect("post-call phase");
     let post_matrix = roots.get("post-matrix").expect("post-matrix phase");
-    assert_eq!(builtin.0.0, 4);
+    assert_eq!(builtin.0.revision(), 4);
     assert_eq!(pre_call, builtin, "registration is not retroactive");
-    assert_eq!(post_call.0.0, 5);
-    assert_eq!(post_matrix.0.0, 6);
+    assert_eq!(post_call.0.revision(), 5);
+    assert_eq!(post_matrix.0.revision(), 6);
     assert_ne!(builtin.1, post_call.1);
     assert_ne!(post_call.1, post_matrix.1);
 
@@ -28,7 +28,7 @@ fn grammar_epoch_transition_model() {
             (
                 row.id.as_str(),
                 row.grammar_phase.as_str(),
-                row.grammar_epoch.0,
+                row.grammar_epoch,
             )
         })
         .collect::<Vec<_>>();

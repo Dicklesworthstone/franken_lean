@@ -198,7 +198,7 @@ fn committed_evidence_is_closed_world_and_semantic_telemetry_are_disjoint() {
     );
     assert_eq!(
         fixture_digest(SEMANTIC_EVIDENCE.as_bytes()),
-        "989b0fc54faa664a0ff1b0f901a1ed42c4ce4546b36431559d2fd244470e308e"
+        "3bec418dbc6d37fd2ad11b92cf730ad54676812fc2d4044273b510513e27400c"
     );
 
     let telemetry_lines = TELEMETRY_EVIDENCE.lines().collect::<Vec<_>>();

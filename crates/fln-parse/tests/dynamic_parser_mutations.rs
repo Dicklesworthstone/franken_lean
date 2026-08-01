@@ -30,8 +30,12 @@
 
 use fln_core::name::Name;
 use fln_parse::category::LeadingIdentBehavior;
-use fln_parse::registry::{GrammarEpoch, Registry};
-use fln_parse::state::Production;
+use fln_parse::registry::{
+    GrammarComponent, MemoAdvanceBudget, MemoError, MemoKey, MemoLookup, ParseDependencies,
+    ParseMemo, ParseProduct, ParserPosition, Registry,
+};
+use fln_parse::state::{ParserDescriptor, Production};
+use fln_syntax::source::BytePos;
 
 fn name(text: &str) -> Name {
     Name::str(Name::anonymous(), text)
@@ -39,6 +43,16 @@ fn name(text: &str) -> Name {
 
 fn production(label: &str) -> Production {
     Production::new(name(label), 0, |_state| {})
+}
+
+fn stable_production(label: &str) -> Production {
+    let kind = name(label);
+    Production::described(
+        kind.clone(),
+        0,
+        ParserDescriptor::stable(kind, 1, b"memo-mutation".to_vec()),
+        |_state| {},
+    )
 }
 
 /// What kind of evidence the killing assertion rests on.
@@ -275,6 +289,7 @@ fn mutant_ignoring_scoping_is_killed_by_the_scope_restore_observation() {
 #[test]
 fn mutant_autocreating_a_category_is_killed_by_the_typed_refusal() {
     let mut registry = Registry::new();
+    let before = registry.epoch();
     let missing = name("nosuchcategory");
     assert!(
         registry
@@ -286,7 +301,7 @@ fn mutant_autocreating_a_category_is_killed_by_the_typed_refusal() {
         !registry.has_category(&missing),
         "and the refusal must not have created the category as a side effect"
     );
-    assert_eq!(registry.epoch(), GrammarEpoch(0), "nor advanced the epoch");
+    assert_eq!(registry.epoch(), before, "nor advanced the epoch");
 }
 
 /// **MUTANT: a refused batch applies part of itself.** Killed by OUR atomicity rule, and recorded as
@@ -336,6 +351,248 @@ fn mutant_partial_batch_application_is_killed_by_our_own_atomicity_rule() {
          granularity is the opposite — a failed command does not roll back earlier grammar — so \
          this assertion is graded OurOwnRule rather than counted as a pin kill."
     );
+}
+
+#[test]
+fn mutant_under_invalidation_is_killed_by_the_fresh_parse_control() {
+    let mut registry = Registry::new();
+    let term = name("term");
+    registry
+        .declare_category_at(BytePos(0), term.clone(), LeadingIdentBehavior::Default)
+        .expect("declares");
+    let before = registry.epoch();
+    let before_identity = registry.identity().clone();
+    let key = MemoKey {
+        position: BytePos(20),
+        category: term.clone(),
+        precedence: 0,
+        epoch: before,
+    };
+    let mut memo = ParseMemo::new();
+    memo.insert(
+        key,
+        &before_identity,
+        ParseProduct::new(
+            before,
+            ParseDependencies::from_components([GrammarComponent::Syntax {
+                category: term.clone(),
+                token: name("x"),
+                position: ParserPosition::Leading,
+            }]),
+            Vec::<Name>::new(),
+        ),
+    )
+    .expect("inserts old parse");
+
+    let after = registry
+        .add_leading_at(
+            BytePos(10),
+            &term,
+            name("x"),
+            stable_production("new"),
+            false,
+        )
+        .expect("adds x");
+    let transition = registry.last_transition().expect("emits").clone();
+    let after_identity = registry.identity().clone();
+    memo.advance(
+        &transition,
+        &before_identity,
+        &after_identity,
+        MemoAdvanceBudget::generous(),
+        None,
+    )
+    .into_complete()
+    .expect("a generous memo transition completes")
+    .expect("advances");
+    let after_key = MemoKey {
+        position: BytePos(20),
+        category: term.clone(),
+        precedence: 0,
+        epoch: after,
+    };
+    assert!(matches!(
+        memo.lookup(&after_key, &after_identity),
+        Ok(MemoLookup::Miss)
+    ));
+    assert_eq!(
+        registry.kinds_at(&term, &name("x"), after),
+        vec![name("new")],
+        "the cold control changed, so retaining the empty cached value would be observably stale"
+    );
+}
+
+#[test]
+fn mutant_over_invalidation_is_killed_by_an_unrelated_suffix_hit() {
+    let mut registry = Registry::new();
+    let term = name("term");
+    registry
+        .declare_category_at(BytePos(0), term.clone(), LeadingIdentBehavior::Default)
+        .expect("declares");
+    let before = registry.epoch();
+    let before_identity = registry.identity().clone();
+    let mut memo = ParseMemo::new();
+    memo.insert(
+        MemoKey {
+            position: BytePos(20),
+            category: term.clone(),
+            precedence: 0,
+            epoch: before,
+        },
+        &before_identity,
+        ParseProduct::new(
+            before,
+            ParseDependencies::from_components([GrammarComponent::Syntax {
+                category: term.clone(),
+                token: name("y"),
+                position: ParserPosition::Leading,
+            }]),
+            "unrelated-y",
+        ),
+    )
+    .expect("inserts y");
+    let after = registry
+        .add_leading_at(
+            BytePos(10),
+            &term,
+            name("x"),
+            stable_production("new-x"),
+            false,
+        )
+        .expect("adds x");
+    let transition = registry.last_transition().expect("emits").clone();
+    let after_identity = registry.identity().clone();
+    let report = memo
+        .advance(
+            &transition,
+            &before_identity,
+            &after_identity,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .expect("a generous memo transition completes")
+        .expect("advances");
+    assert_eq!(report.promoted, 1);
+    let key = MemoKey {
+        position: BytePos(20),
+        category: term,
+        precedence: 0,
+        epoch: after,
+    };
+    assert!(matches!(
+        memo.lookup(&key, &after_identity),
+        Ok(MemoLookup::Hit(product)) if *product.value() == "unrelated-y"
+    ));
+}
+
+#[test]
+fn mutant_omitting_epoch_from_the_key_is_killed_before_lookup() {
+    let mut registry = Registry::new();
+    let term = name("term");
+    registry
+        .declare_category_at(BytePos(0), term.clone(), LeadingIdentBehavior::Default)
+        .expect("declares");
+    let before = registry.epoch();
+    let before_identity = registry.identity().clone();
+    let old_key = MemoKey {
+        position: BytePos(20),
+        category: term.clone(),
+        precedence: 0,
+        epoch: before,
+    };
+    let mut memo = ParseMemo::new();
+    memo.insert(
+        old_key.clone(),
+        &before_identity,
+        ParseProduct::new(
+            before,
+            ParseDependencies::from_components([GrammarComponent::Token(name("x"))]),
+            "value",
+        ),
+    )
+    .expect("inserts");
+    let after = registry.set_option_at(BytePos(10), name("parser.mode"), "strict");
+    let transition = registry.last_transition().expect("emits").clone();
+    let after_identity = registry.identity().clone();
+    memo.advance(
+        &transition,
+        &before_identity,
+        &after_identity,
+        MemoAdvanceBudget::generous(),
+        None,
+    )
+    .into_complete()
+    .expect("a generous memo transition completes")
+    .expect("advances");
+
+    assert!(matches!(
+        memo.lookup(&old_key, &after_identity),
+        Err(MemoError::IdentityEpochMismatch { .. })
+    ));
+    let new_key = MemoKey {
+        epoch: after,
+        ..old_key
+    };
+    assert!(matches!(
+        memo.lookup(&new_key, &after_identity),
+        Ok(MemoLookup::Hit(product)) if *product.value() == "value"
+    ));
+}
+
+#[test]
+fn mutant_omitting_the_opaque_barrier_is_killed_in_both_cache_and_scheduler_surfaces() {
+    let mut registry = Registry::new();
+    let term = name("term");
+    registry
+        .declare_category_at(BytePos(0), term.clone(), LeadingIdentBehavior::Default)
+        .expect("declares");
+    let before = registry.epoch();
+    let before_identity = registry.identity().clone();
+    let mut memo = ParseMemo::new();
+    memo.insert(
+        MemoKey {
+            position: BytePos(20),
+            category: term.clone(),
+            precedence: 0,
+            epoch: before,
+        },
+        &before_identity,
+        ParseProduct::new(
+            before,
+            ParseDependencies::from_components([GrammarComponent::Token(name("unrelated"))]),
+            "must-not-cross",
+        ),
+    )
+    .expect("inserts");
+    let after = registry.apply_opaque_effect_at(BytePos(10), name("unknown-parser-effect"));
+    let transition = registry.last_transition().expect("emits").clone();
+    let after_identity = registry.identity().clone();
+    let report = memo
+        .advance(
+            &transition,
+            &before_identity,
+            &after_identity,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .expect("a generous memo transition completes")
+        .expect("advances");
+    assert_eq!(report.invalidated, 1);
+    assert!(!registry.distributed_parse_allowed_at(BytePos(20)));
+    let key = MemoKey {
+        position: BytePos(20),
+        category: term,
+        precedence: 0,
+        epoch: after,
+    };
+    // Opaque effects deliberately add no canonical grammar row, so the digest bucket is shared.
+    // The full epoch identity still has to refuse the cross-epoch hit.
+    assert!(matches!(
+        memo.lookup(&key, &after_identity),
+        Ok(MemoLookup::CollisionMiss)
+    ));
 }
 
 /// The mutant table itself is well formed: no duplicates, every field populated, and the grade

@@ -43,6 +43,7 @@ use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 use fln_hash::canon::Canonical;
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_syntax::source::BytePos;
+use fln_syntax::tree::Syntax;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -62,18 +63,20 @@ pub struct GrammarEpoch {
 }
 
 impl GrammarEpoch {
+    /// Reconstruct an epoch from a decoded canonical artifact.
+    ///
+    /// Registry lookup still validates the pair against complete retained rows, so constructing a
+    /// foreign pair cannot make it authoritative.
+    pub const fn from_parts(revision: u64, digest: Digest) -> GrammarEpoch {
+        GrammarEpoch { revision, digest }
+    }
+
     fn from_root(revision: u64, root: &GrammarRoot) -> GrammarEpoch {
-        GrammarEpoch {
-            revision,
-            digest: hash(Domain::CacheKey, root.0.as_bytes()),
-        }
+        GrammarEpoch::from_parts(revision, hash(Domain::CacheKey, root.0.as_bytes()))
     }
 
     const fn placeholder(revision: u64) -> GrammarEpoch {
-        GrammarEpoch {
-            revision,
-            digest: Digest([0; 32]),
-        }
+        GrammarEpoch::from_parts(revision, Digest([0; 32]))
     }
 
     pub const fn revision(self) -> u64 {
@@ -204,6 +207,9 @@ impl ParserEffect {
     }
 
     fn affected_components(&self, out: &mut BTreeSet<GrammarComponent>) {
+        // A caller that could not earn a narrower read set records WholeGrammar. Any semantic
+        // change must invalidate that conservative dependency.
+        out.insert(GrammarComponent::WholeGrammar);
         match self {
             ParserEffect::AddsCategory { category } => {
                 out.insert(GrammarComponent::Category(category.clone()));
@@ -220,6 +226,7 @@ impl ParserEffect {
                 position,
                 ..
             } => {
+                out.insert(GrammarComponent::Category(category.clone()));
                 out.insert(GrammarComponent::Syntax {
                     category: category.clone(),
                     token: token.clone(),
@@ -280,6 +287,436 @@ impl GrammarTransition {
     }
 }
 
+/// A syntax tree whose every node carries the epoch under which it was recognized.
+///
+/// The sidecar is preorder-aligned with the immutable green tree. This keeps `fln-syntax`
+/// independent of the parser crate while still making the epoch binding total rather than a
+/// root-only annotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochSyntax {
+    syntax: Syntax,
+    node_epochs: Vec<GrammarEpoch>,
+}
+
+impl EpochSyntax {
+    pub fn bind_uniform(syntax: Syntax, epoch: GrammarEpoch) -> EpochSyntax {
+        let mut pending = vec![&syntax];
+        let mut node_count = 0usize;
+        while let Some(node) = pending.pop() {
+            node_count += 1;
+            if let Syntax::Node { args, .. } = node {
+                pending.extend(args.iter().rev());
+            }
+        }
+        EpochSyntax {
+            syntax,
+            node_epochs: vec![epoch; node_count],
+        }
+    }
+
+    pub fn syntax(&self) -> &Syntax {
+        &self.syntax
+    }
+
+    pub fn into_syntax(self) -> Syntax {
+        self.syntax
+    }
+
+    pub fn node_epochs(&self) -> &[GrammarEpoch] {
+        &self.node_epochs
+    }
+
+    pub fn all_nodes_belong_to(&self, epoch: GrammarEpoch) -> bool {
+        !self.node_epochs.is_empty()
+            && self
+                .node_epochs
+                .iter()
+                .all(|node_epoch| *node_epoch == epoch)
+    }
+}
+
+/// The complete set of grammar components read while producing one memoized parse.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParseDependencies {
+    components: BTreeSet<GrammarComponent>,
+}
+
+impl ParseDependencies {
+    pub fn new() -> ParseDependencies {
+        ParseDependencies::default()
+    }
+
+    pub fn insert(&mut self, component: GrammarComponent) -> bool {
+        self.components.insert(component)
+    }
+
+    pub fn from_components(
+        components: impl IntoIterator<Item = GrammarComponent>,
+    ) -> ParseDependencies {
+        ParseDependencies {
+            components: components.into_iter().collect(),
+        }
+    }
+
+    pub fn components(&self) -> &BTreeSet<GrammarComponent> {
+        &self.components
+    }
+
+    fn first_intersection(
+        &self,
+        affected: &BTreeSet<GrammarComponent>,
+    ) -> Option<GrammarComponent> {
+        self.components.intersection(affected).next().cloned()
+    }
+}
+
+/// The full public memo key required by §9.1.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MemoKey {
+    pub position: BytePos,
+    pub category: Name,
+    pub precedence: u32,
+    pub epoch: GrammarEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MemoBucketKey {
+    position: BytePos,
+    category: Name,
+    precedence: u32,
+    digest: Digest,
+}
+
+impl MemoBucketKey {
+    fn of(key: &MemoKey) -> MemoBucketKey {
+        MemoBucketKey {
+            position: key.position,
+            category: key.category.clone(),
+            precedence: key.precedence,
+            digest: key.epoch.digest,
+        }
+    }
+}
+
+/// A parse result that cannot be published under a different grammar epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseProduct<T> {
+    epoch: GrammarEpoch,
+    dependencies: ParseDependencies,
+    value: T,
+}
+
+impl<T> ParseProduct<T> {
+    pub fn new(epoch: GrammarEpoch, dependencies: ParseDependencies, value: T) -> ParseProduct<T> {
+        ParseProduct {
+            epoch,
+            dependencies,
+            value,
+        }
+    }
+
+    pub const fn epoch(&self) -> GrammarEpoch {
+        self.epoch
+    }
+
+    pub fn dependencies(&self) -> &ParseDependencies {
+        &self.dependencies
+    }
+
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn into_value_for(self, expected: GrammarEpoch) -> Result<T, StaleParseProduct> {
+        if self.epoch == expected {
+            Ok(self.value)
+        } else {
+            Err(StaleParseProduct {
+                product_epoch: self.epoch,
+                expected_epoch: expected,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleParseProduct {
+    pub product_epoch: GrammarEpoch,
+    pub expected_epoch: GrammarEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoError {
+    IdentityEpochMismatch {
+        key_epoch: GrammarEpoch,
+        identity_epoch: GrammarEpoch,
+    },
+    ProductEpochMismatch {
+        key_epoch: GrammarEpoch,
+        product_epoch: GrammarEpoch,
+    },
+    TransitionIdentityMismatch {
+        transition_epoch: GrammarEpoch,
+        identity_epoch: GrammarEpoch,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoLookup<'a, T> {
+    Hit(&'a ParseProduct<T>),
+    Miss,
+    /// The digest bucket existed, but complete canonical-row comparison found no identity match.
+    CollisionMiss,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidationReason {
+    Changed(GrammarComponent),
+    OpaqueSuffixBarrier,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoAdvanceReport {
+    pub scanned: u64,
+    pub promoted: usize,
+    pub invalidated: usize,
+    pub prefix_reused: usize,
+    pub reasons: Vec<(MemoKey, InvalidationReason)>,
+}
+
+/// Resource allowance for advancing one memo across a grammar transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoAdvanceBudget {
+    /// Maximum number of existing memo entries the transition may inspect.
+    pub max_entries: u64,
+}
+
+impl MemoAdvanceBudget {
+    pub const fn generous() -> MemoAdvanceBudget {
+        MemoAdvanceBudget {
+            max_entries: u64::MAX,
+        }
+    }
+}
+
+/// Deterministic cancellation points in memo advancement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoAdvanceCheckpoint {
+    /// Before inspecting the next entry. `scanned` entries have already been inspected.
+    BeforeEntry { scanned: u64 },
+    /// After the complete plan is built, immediately before any promoted entry is published.
+    BeforePublication { scanned: u64 },
+}
+
+impl MemoAdvanceCheckpoint {
+    fn progress(self) -> String {
+        match self {
+            MemoAdvanceCheckpoint::BeforeEntry { scanned } => {
+                format!("memo advance before entry {scanned}")
+            }
+            MemoAdvanceCheckpoint::BeforePublication { scanned } => {
+                format!("memo advance before publication after {scanned} entries")
+            }
+        }
+    }
+}
+
+struct MemoEntry<T> {
+    key: MemoKey,
+    identity: GrammarIdentity,
+    product: ParseProduct<T>,
+}
+
+/// Collision-safe parse memoization with exact dependency invalidation.
+///
+/// Digest buckets are an accelerator only. Every hit compares the complete canonical grammar rows,
+/// the full public key, and the product's epoch before returning a value.
+pub struct ParseMemo<T> {
+    buckets: BTreeMap<MemoBucketKey, Vec<MemoEntry<T>>>,
+}
+
+impl<T> ParseMemo<T> {
+    pub fn new() -> ParseMemo<T> {
+        ParseMemo {
+            buckets: BTreeMap::new(),
+        }
+    }
+
+    pub fn insert(
+        &mut self,
+        key: MemoKey,
+        identity: &GrammarIdentity,
+        product: ParseProduct<T>,
+    ) -> Result<(), MemoError> {
+        if key.epoch != identity.epoch {
+            return Err(MemoError::IdentityEpochMismatch {
+                key_epoch: key.epoch,
+                identity_epoch: identity.epoch,
+            });
+        }
+        if key.epoch != product.epoch {
+            return Err(MemoError::ProductEpochMismatch {
+                key_epoch: key.epoch,
+                product_epoch: product.epoch,
+            });
+        }
+        self.upsert(key, identity.clone(), product);
+        Ok(())
+    }
+
+    fn upsert(&mut self, key: MemoKey, identity: GrammarIdentity, product: ParseProduct<T>) {
+        let bucket = self.buckets.entry(MemoBucketKey::of(&key)).or_default();
+        if let Some(entry) = bucket
+            .iter_mut()
+            .find(|entry| entry.key == key && entry.identity.canonical == identity.canonical)
+        {
+            entry.product = product;
+        } else {
+            bucket.push(MemoEntry {
+                key,
+                identity,
+                product,
+            });
+        }
+    }
+
+    pub fn lookup(
+        &self,
+        key: &MemoKey,
+        identity: &GrammarIdentity,
+    ) -> Result<MemoLookup<'_, T>, MemoError> {
+        if key.epoch != identity.epoch {
+            return Err(MemoError::IdentityEpochMismatch {
+                key_epoch: key.epoch,
+                identity_epoch: identity.epoch,
+            });
+        }
+        let Some(bucket) = self.buckets.get(&MemoBucketKey::of(key)) else {
+            return Ok(MemoLookup::Miss);
+        };
+        if let Some(entry) = bucket.iter().find(|entry| {
+            entry.key == *key
+                && entry.identity.canonical == identity.canonical
+                && entry.product.epoch == key.epoch
+        }) {
+            return Ok(MemoLookup::Hit(&entry.product));
+        }
+        Ok(MemoLookup::CollisionMiss)
+    }
+
+    pub fn len(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+}
+
+impl<T> Default for ParseMemo<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Clone> ParseMemo<T> {
+    /// Promote exactly the unaffected entries from `before` into `after`.
+    ///
+    /// The scan is failure-atomic: exhaustion or cancellation returns `Inconclusive` before any
+    /// promoted key is published. Cancellation is sampled before every entry and once more after
+    /// the complete plan is built, so even a last-moment stop cannot leak a computed product.
+    pub fn advance(
+        &mut self,
+        transition: &GrammarTransition,
+        before: &GrammarIdentity,
+        after: &GrammarIdentity,
+        budget: MemoAdvanceBudget,
+        cancellation: Option<&dyn Fn(MemoAdvanceCheckpoint) -> bool>,
+    ) -> Outcome<Result<MemoAdvanceReport, MemoError>> {
+        if transition.before != before.epoch {
+            return Outcome::Complete(Err(MemoError::TransitionIdentityMismatch {
+                transition_epoch: transition.before,
+                identity_epoch: before.epoch,
+            }));
+        }
+        if transition.after != after.epoch {
+            return Outcome::Complete(Err(MemoError::TransitionIdentityMismatch {
+                transition_epoch: transition.after,
+                identity_epoch: after.epoch,
+            }));
+        }
+
+        let affected = transition.affected_components();
+        let opaque = transition.has_opaque_effect();
+        let mut report = MemoAdvanceReport::default();
+        let mut promoted = Vec::new();
+        for bucket in self.buckets.values() {
+            for entry in bucket {
+                let checkpoint = MemoAdvanceCheckpoint::BeforeEntry {
+                    scanned: report.scanned,
+                };
+                if cancellation.is_some_and(|probe| probe(checkpoint)) {
+                    return Outcome::Inconclusive(Inconclusive::cancelled(checkpoint.progress()));
+                }
+                if report.scanned == budget.max_entries {
+                    return exhausted(
+                        StructuralUnit::ProducedNodes,
+                        budget.max_entries,
+                        report.scanned.saturating_add(1),
+                    );
+                }
+                report.scanned += 1;
+                if entry.key.epoch != transition.before
+                    || entry.identity.canonical != before.canonical
+                {
+                    continue;
+                }
+                if entry.key.position < transition.activation {
+                    report.prefix_reused += 1;
+                    // The command was not active here. The existing entry remains under the exact
+                    // epoch that recognized it; relabeling it as `after` would create a stale-hit
+                    // route even though its value is reusable from history.
+                    continue;
+                }
+                let reason = if opaque {
+                    Some(InvalidationReason::OpaqueSuffixBarrier)
+                } else {
+                    entry
+                        .product
+                        .dependencies
+                        .first_intersection(&affected)
+                        .map(InvalidationReason::Changed)
+                };
+                if let Some(reason) = reason {
+                    report.invalidated += 1;
+                    report.reasons.push((entry.key.clone(), reason));
+                    continue;
+                }
+                let mut key = entry.key.clone();
+                key.epoch = transition.after;
+                let product = ParseProduct::new(
+                    transition.after,
+                    entry.product.dependencies.clone(),
+                    entry.product.value.clone(),
+                );
+                promoted.push((key, product));
+                report.promoted += 1;
+            }
+        }
+        let checkpoint = MemoAdvanceCheckpoint::BeforePublication {
+            scanned: report.scanned,
+        };
+        if cancellation.is_some_and(|probe| probe(checkpoint)) {
+            return Outcome::Inconclusive(Inconclusive::cancelled(checkpoint.progress()));
+        }
+        report.reasons.sort_by(|left, right| left.0.cmp(&right.0));
+        for (key, product) in promoted {
+            self.upsert(key, after.clone(), product);
+        }
+        Outcome::Complete(Ok(report))
+    }
+}
+
 /// A scope depth — one `section`/`namespace` level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopeDepth(pub usize);
@@ -303,6 +740,13 @@ pub enum RegisterError {
     DuplicateRequestKey { key: (u64, String) },
     /// `pop_scope` with no scope open — a `end` without a `section`.
     NoScopeOpen,
+    /// An explicit removal did not name a live production.
+    ProductionNotFound {
+        category: Name,
+        token: Name,
+        kind: Name,
+        position: ParserPosition,
+    },
 }
 
 impl RegisterError {
@@ -322,6 +766,17 @@ impl RegisterError {
                 format!("duplicate registry request key ({}, {:?})", key.0, key.1)
             }
             RegisterError::NoScopeOpen => "no open scope to close".to_string(),
+            RegisterError::ProductionNotFound {
+                category,
+                token,
+                kind,
+                position,
+            } => format!(
+                "no live {position:?} production `{}` for token `{}` in category `{}`",
+                kind.to_display_string(),
+                token.to_display_string(),
+                category.to_display_string()
+            ),
         }
     }
 }
@@ -350,10 +805,14 @@ struct Registered {
 
 impl Registered {
     fn is_live_at(&self, epoch: GrammarEpoch) -> bool {
-        self.registered_at <= epoch.revision
+        self.is_live_at_revision(epoch.revision)
+    }
+
+    fn is_live_at_revision(&self, revision: u64) -> bool {
+        self.registered_at <= revision
             && self
                 .retired_at
-                .is_none_or(|retired_at| epoch.revision < retired_at)
+                .is_none_or(|retired_at| revision < retired_at)
     }
 }
 
@@ -368,7 +827,7 @@ pub struct Registry {
     macros: BTreeMap<Name, ParserDescriptor>,
     options: BTreeMap<Name, String>,
     imports: BTreeMap<Name, String>,
-    last_transition: Option<GrammarTransition>,
+    transitions: Vec<GrammarTransition>,
     opaque_suffix_barrier: Option<BytePos>,
     /// Hooks, in registration order. Run in **reverse** — see [`Registry::run_hooks`].
     hooks: Vec<RegisteredHook>,
@@ -396,7 +855,7 @@ impl Registry {
             macros: BTreeMap::new(),
             options: BTreeMap::new(),
             imports: BTreeMap::new(),
-            last_transition: None,
+            transitions: Vec::new(),
             opaque_suffix_barrier: None,
             hooks: Vec::new(),
         };
@@ -433,7 +892,24 @@ impl Registry {
     }
 
     pub fn last_transition(&self) -> Option<&GrammarTransition> {
-        self.last_transition.as_ref()
+        self.transitions.last()
+    }
+
+    /// The grammar active at a source position after applying every transition whose activation is
+    /// at or before that byte.
+    pub fn epoch_at_position(&self, position: BytePos) -> GrammarEpoch {
+        let mut epoch = self.history[0].epoch;
+        for transition in &self.transitions {
+            if transition.activation <= position {
+                epoch = transition.after;
+            }
+        }
+        epoch
+    }
+
+    pub fn identity_at_position(&self, position: BytePos) -> &GrammarIdentity {
+        self.identity_at(self.epoch_at_position(position))
+            .expect("the grammar timeline only contains locally published epochs")
     }
 
     pub const fn opaque_suffix_barrier(&self) -> Option<BytePos> {
@@ -449,28 +925,83 @@ impl Registry {
         self.depth
     }
 
+    fn next_revision(&self) -> u64 {
+        self.epoch
+            .revision
+            .checked_add(1)
+            .expect("a process cannot publish u64::MAX grammar mutations")
+    }
+
+    fn publish_transition(
+        &mut self,
+        before: GrammarEpoch,
+        revision: u64,
+        activation: BytePos,
+        mut effects: Vec<ParserEffect>,
+    ) -> GrammarEpoch {
+        effects.sort();
+        effects.dedup();
+        let root = self.grammar_root_for_revision(revision);
+        let after = GrammarEpoch::from_root(revision, &root);
+        debug_assert_eq!(
+            self.history.len(),
+            usize::try_from(revision).expect("published revisions fit in process memory"),
+            "grammar history is contiguous"
+        );
+        self.history.push(GrammarIdentity::new(after, root));
+        self.epoch = after;
+        if effects.iter().any(ParserEffect::is_opaque) {
+            self.opaque_suffix_barrier = Some(
+                self.opaque_suffix_barrier
+                    .map_or(activation, |existing| existing.min(activation)),
+            );
+        }
+        self.transitions.push(GrammarTransition {
+            before,
+            after,
+            activation,
+            effects,
+        });
+        after
+    }
+
     /// Declare a category. Refuses a duplicate rather than replacing it.
     pub fn declare_category(
         &mut self,
         name: Name,
         behavior: LeadingIdentBehavior,
     ) -> Result<GrammarEpoch, RegisterError> {
+        self.declare_category_at(BytePos(0), name, behavior)
+    }
+
+    /// Declare a category at its exact source activation point.
+    pub fn declare_category_at(
+        &mut self,
+        activation: BytePos,
+        name: Name,
+        behavior: LeadingIdentBehavior,
+    ) -> Result<GrammarEpoch, RegisterError> {
         if self.categories.contains_key(&name) {
             return Err(RegisterError::CategoryExists { name });
         }
-        let epoch = self.epoch.next();
+        let before = self.epoch;
+        let revision = self.next_revision();
         self.categories.insert(
             name.clone(),
             CategoryState {
-                name,
-                registered_at: epoch,
+                name: name.clone(),
+                registered_at: revision,
                 behavior,
                 leading: BTreeMap::new(),
                 trailing: BTreeMap::new(),
             },
         );
-        self.epoch = epoch;
-        Ok(self.epoch)
+        Ok(self.publish_transition(
+            before,
+            revision,
+            activation,
+            vec![ParserEffect::AddsCategory { category: name }],
+        ))
     }
 
     /// Register a leading production under `token` in `category`.
@@ -485,7 +1016,25 @@ impl Registry {
         production: Production,
         scoped: bool,
     ) -> Result<GrammarEpoch, RegisterError> {
-        self.add(category, token, production, scoped, true)
+        self.add_leading_at(BytePos(0), category, token, production, scoped)
+    }
+
+    pub fn add_leading_at(
+        &mut self,
+        activation: BytePos,
+        category: &Name,
+        token: Name,
+        production: Production,
+        scoped: bool,
+    ) -> Result<GrammarEpoch, RegisterError> {
+        self.add(
+            activation,
+            category,
+            token,
+            production,
+            scoped,
+            ParserPosition::Leading,
+        )
     }
 
     /// Register a trailing production. Same appending rule.
@@ -496,53 +1045,104 @@ impl Registry {
         production: Production,
         scoped: bool,
     ) -> Result<GrammarEpoch, RegisterError> {
-        self.add(category, token, production, scoped, false)
+        self.add_trailing_at(BytePos(0), category, token, production, scoped)
     }
 
-    fn add(
+    pub fn add_trailing_at(
         &mut self,
+        activation: BytePos,
         category: &Name,
         token: Name,
         production: Production,
         scoped: bool,
-        leading: bool,
+    ) -> Result<GrammarEpoch, RegisterError> {
+        self.add(
+            activation,
+            category,
+            token,
+            production,
+            scoped,
+            ParserPosition::Trailing,
+        )
+    }
+
+    fn add(
+        &mut self,
+        activation: BytePos,
+        category: &Name,
+        token: Name,
+        production: Production,
+        scoped: bool,
+        position: ParserPosition,
     ) -> Result<GrammarEpoch, RegisterError> {
         if !self.categories.contains_key(category) {
             return Err(RegisterError::UnknownCategory {
                 name: category.clone(),
             });
         }
-        let epoch = self.epoch.next();
+        let before = self.epoch;
+        let revision = self.next_revision();
         let scope = scoped.then_some(self.depth);
         let kind = production.kind.clone();
+        let descriptor = production.descriptor.clone();
+        let token_was_known = self.token_parsers.contains_key(&token)
+            || self.categories.get(category).is_some_and(|state| {
+                state.leading.contains_key(&token) || state.trailing.contains_key(&token)
+            });
         {
             let state = self.categories.get_mut(category).ok_or_else(|| {
                 RegisterError::UnknownCategory {
                     name: category.clone(),
                 }
             })?;
-            let table = if leading {
+            let table = if position == ParserPosition::Leading {
                 &mut state.leading
             } else {
                 &mut state.trailing
             };
-            table.entry(token).or_default().push(Registered {
+            table.entry(token.clone()).or_default().push(Registered {
                 production,
-                registered_at: epoch,
+                registered_at: revision,
                 retired_at: None,
                 scope,
             });
         }
-        self.epoch = epoch;
         self.run_hooks(category, &kind);
-        Ok(epoch)
+        let mut effects = vec![ParserEffect::AddsSyntax {
+            category: category.clone(),
+            token: token.clone(),
+            kind,
+            position,
+        }];
+        if !token_was_known {
+            effects.push(ParserEffect::AddsToken { token });
+        }
+        if let ParserDescriptor::Opaque { id } = descriptor {
+            effects.push(ParserEffect::OpaqueParserEffect { id });
+        }
+        for hook in &self.hooks {
+            if let ParserDescriptor::Opaque { id } = &hook.descriptor {
+                effects.push(ParserEffect::OpaqueParserEffect { id: id.clone() });
+            }
+        }
+        Ok(self.publish_transition(before, revision, activation, effects))
     }
 
     /// Open a scope — `section` or `namespace`.
     pub fn push_scope(&mut self) -> GrammarEpoch {
+        self.push_scope_at(BytePos(0))
+    }
+
+    pub fn push_scope_at(&mut self, activation: BytePos) -> GrammarEpoch {
+        let before = self.epoch;
         self.depth = ScopeDepth(self.depth.0 + 1);
-        self.epoch = self.epoch.next();
-        self.epoch
+        let revision = self.next_revision();
+        self.publish_transition(
+            before,
+            revision,
+            activation,
+            vec![ParserEffect::OpensScope { depth: self.depth }],
+        )
     }
 
     /// Close the innermost scope, retiring exactly the registrations it owns.
@@ -562,25 +1162,39 @@ impl Registry {
     /// Thus the grammar at every earlier epoch remains byte-identical after a later `end`, while
     /// the returned pop epoch observes the restored outer grammar.
     pub fn pop_scope(&mut self) -> Result<GrammarEpoch, RegisterError> {
+        self.pop_scope_at(BytePos(0))
+    }
+
+    pub fn pop_scope_at(&mut self, activation: BytePos) -> Result<GrammarEpoch, RegisterError> {
         if self.depth.0 == 0 {
             return Err(RegisterError::NoScopeOpen);
         }
+        let before = self.epoch;
         let dying = self.depth;
-        let epoch = self.epoch.next();
-        for state in self.categories.values_mut() {
-            for table in [&mut state.leading, &mut state.trailing] {
-                for productions in table.values_mut() {
+        let revision = self.next_revision();
+        let mut effects = vec![ParserEffect::ClosesScope { depth: dying }];
+        for (category, state) in &mut self.categories {
+            for (position, table) in [
+                (ParserPosition::Leading, &mut state.leading),
+                (ParserPosition::Trailing, &mut state.trailing),
+            ] {
+                for (token, productions) in table {
                     for entry in productions {
                         if entry.scope == Some(dying) && entry.retired_at.is_none() {
-                            entry.retired_at = Some(epoch);
+                            entry.retired_at = Some(revision);
+                            effects.push(ParserEffect::RemovesSyntax {
+                                category: category.clone(),
+                                token: token.clone(),
+                                kind: entry.production.kind.clone(),
+                                position,
+                            });
                         }
                     }
                 }
             }
         }
         self.depth = ScopeDepth(self.depth.0 - 1);
-        self.epoch = epoch;
-        Ok(self.epoch)
+        Ok(self.publish_transition(before, revision, activation, effects))
     }
 
     /// Register a hook, called after every production registration.
@@ -595,14 +1209,247 @@ impl Registry {
     /// running fire all of them and report nothing about order. Graded on the bead as
     /// observed-by-reading rather than proved, so nobody reads the green bar as behavioural
     /// evidence.
-    pub fn register_hook(&mut self, hook: impl Fn(&Name, &Name) + Send + Sync + 'static) {
-        self.hooks.push(Box::new(hook));
+    pub fn register_hook(
+        &mut self,
+        hook: impl Fn(&Name, &Name) + Send + Sync + 'static,
+    ) -> GrammarEpoch {
+        let id = Name::str(Name::anonymous(), "opaque-parser-hook");
+        self.register_hook_at(BytePos(0), ParserDescriptor::opaque(id), hook)
+    }
+
+    pub fn register_hook_at(
+        &mut self,
+        activation: BytePos,
+        descriptor: ParserDescriptor,
+        hook: impl Fn(&Name, &Name) + Send + Sync + 'static,
+    ) -> GrammarEpoch {
+        let before = self.epoch;
+        let revision = self.next_revision();
+        let effect_id = match &descriptor {
+            ParserDescriptor::Stable { id, .. } | ParserDescriptor::Opaque { id } => id.clone(),
+        };
+        self.hooks.push(RegisteredHook {
+            descriptor,
+            run: Box::new(hook),
+        });
+        self.publish_transition(
+            before,
+            revision,
+            activation,
+            vec![ParserEffect::OpaqueParserEffect { id: effect_id }],
+        )
     }
 
     fn run_hooks(&self, category: &Name, kind: &Name) {
         for hook in self.hooks.iter().rev() {
-            hook(category, kind);
+            (hook.run)(category, kind);
         }
+    }
+
+    /// Register or replace the canonical descriptor for a token parser.
+    pub fn register_token_parser_at(
+        &mut self,
+        activation: BytePos,
+        token: Name,
+        descriptor: ParserDescriptor,
+    ) -> GrammarEpoch {
+        let before = self.epoch;
+        let revision = self.next_revision();
+        let changed = self.token_parsers.get(&token) != Some(&descriptor);
+        self.token_parsers.insert(token.clone(), descriptor.clone());
+        let mut effects = Vec::new();
+        if changed {
+            effects.push(ParserEffect::AddsToken {
+                token: token.clone(),
+            });
+        }
+        if let ParserDescriptor::Opaque { id } = descriptor {
+            effects.push(ParserEffect::OpaqueParserEffect { id });
+        }
+        self.publish_transition(before, revision, activation, effects)
+    }
+
+    /// Set a parser's explicit precedence row.
+    pub fn set_precedence_at(
+        &mut self,
+        activation: BytePos,
+        category: &Name,
+        parser: Name,
+        precedence: u32,
+    ) -> Result<GrammarEpoch, RegisterError> {
+        if !self.categories.contains_key(category) {
+            return Err(RegisterError::UnknownCategory {
+                name: category.clone(),
+            });
+        }
+        let before = self.epoch;
+        let revision = self.next_revision();
+        let key = (category.clone(), parser.clone());
+        let changed = self.precedences.get(&key).copied() != Some(precedence);
+        self.precedences.insert(key, precedence);
+        let effects = changed
+            .then_some(ParserEffect::ChangesPrecedence {
+                category: category.clone(),
+                parser,
+                precedence,
+            })
+            .into_iter()
+            .collect();
+        Ok(self.publish_transition(before, revision, activation, effects))
+    }
+
+    /// Register or replace a macro descriptor.
+    pub fn register_macro_at(
+        &mut self,
+        activation: BytePos,
+        name: Name,
+        descriptor: ParserDescriptor,
+    ) -> GrammarEpoch {
+        let before = self.epoch;
+        let revision = self.next_revision();
+        let changed = self.macros.get(&name) != Some(&descriptor);
+        self.macros.insert(name.clone(), descriptor.clone());
+        let mut effects = Vec::new();
+        if changed {
+            effects.push(ParserEffect::RegistersMacro { name });
+        }
+        if let ParserDescriptor::Opaque { id } = descriptor {
+            effects.push(ParserEffect::OpaqueParserEffect { id });
+        }
+        self.publish_transition(before, revision, activation, effects)
+    }
+
+    /// Set a known, grammar-relevant option.
+    pub fn set_option_at(
+        &mut self,
+        activation: BytePos,
+        name: Name,
+        canonical_value: impl Into<String>,
+    ) -> GrammarEpoch {
+        self.set_option_with_class_at(activation, name, canonical_value.into(), true)
+    }
+
+    /// Set an option whose parser relevance is unknown.
+    ///
+    /// The value remains part of canonical identity, but the unknown classification additionally
+    /// forces the conservative suffix barrier.
+    pub fn set_unknown_option_at(
+        &mut self,
+        activation: BytePos,
+        name: Name,
+        canonical_value: impl Into<String>,
+    ) -> GrammarEpoch {
+        self.set_option_with_class_at(activation, name, canonical_value.into(), false)
+    }
+
+    fn set_option_with_class_at(
+        &mut self,
+        activation: BytePos,
+        name: Name,
+        canonical_value: String,
+        relevance_known: bool,
+    ) -> GrammarEpoch {
+        let before = self.epoch;
+        let revision = self.next_revision();
+        let changed = self.options.get(&name) != Some(&canonical_value);
+        self.options.insert(name.clone(), canonical_value);
+        let mut effects = Vec::new();
+        if changed {
+            effects.push(ParserEffect::ChangesOption { name: name.clone() });
+        }
+        if !relevance_known {
+            effects.push(ParserEffect::OpaqueParserEffect { id: name });
+        }
+        self.publish_transition(before, revision, activation, effects)
+    }
+
+    /// Bind an imported grammar by its complete canonical rows.
+    pub fn import_grammar_at(
+        &mut self,
+        activation: BytePos,
+        module: Name,
+        identity: &GrammarIdentity,
+    ) -> GrammarEpoch {
+        let before = self.epoch;
+        let revision = self.next_revision();
+        let canonical = identity.canonical().to_string();
+        let changed = self.imports.get(&module) != Some(&canonical);
+        self.imports.insert(module.clone(), canonical);
+        let effects = changed
+            .then_some(ParserEffect::ImportsGrammar { module })
+            .into_iter()
+            .collect();
+        self.publish_transition(before, revision, activation, effects)
+    }
+
+    /// Record an effect whose semantics cannot be summarized more precisely.
+    pub fn apply_opaque_effect_at(&mut self, activation: BytePos, id: Name) -> GrammarEpoch {
+        let before = self.epoch;
+        let revision = self.next_revision();
+        self.publish_transition(
+            before,
+            revision,
+            activation,
+            vec![ParserEffect::OpaqueParserEffect { id }],
+        )
+    }
+
+    /// Retire the newest live production matching this exact semantic key.
+    ///
+    /// Additive shadowing may retain older matches. Removing the newest is a registered
+    /// deterministic tie-break and does not silently erase the entire token bucket.
+    pub fn remove_syntax_at(
+        &mut self,
+        activation: BytePos,
+        category: &Name,
+        token: &Name,
+        kind: &Name,
+        position: ParserPosition,
+    ) -> Result<GrammarEpoch, RegisterError> {
+        if !self.categories.contains_key(category) {
+            return Err(RegisterError::UnknownCategory {
+                name: category.clone(),
+            });
+        }
+        let before = self.epoch;
+        let revision = self.next_revision();
+        let state =
+            self.categories
+                .get_mut(category)
+                .ok_or_else(|| RegisterError::UnknownCategory {
+                    name: category.clone(),
+                })?;
+        let table = if position == ParserPosition::Leading {
+            &mut state.leading
+        } else {
+            &mut state.trailing
+        };
+        let found = table.get_mut(token).and_then(|productions| {
+            productions
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.retired_at.is_none() && entry.production.kind.cmp(kind).is_eq())
+        });
+        let Some(entry) = found else {
+            return Err(RegisterError::ProductionNotFound {
+                category: category.clone(),
+                token: token.clone(),
+                kind: kind.clone(),
+                position,
+            });
+        };
+        entry.retired_at = Some(revision);
+        Ok(self.publish_transition(
+            before,
+            revision,
+            activation,
+            vec![ParserEffect::RemovesSyntax {
+                category: category.clone(),
+                token: token.clone(),
+                kind: kind.clone(),
+                position,
+            }],
+        ))
     }
 
     /// Build the category as of `epoch` — the grammar a parse at that point ran under.
@@ -612,8 +1459,9 @@ impl Registry {
     /// after it. Asking for an old epoch is therefore not a debugging convenience; it is the only
     /// way to replay a parse against the grammar it actually had.
     pub fn view_at(&self, category: &Name, epoch: GrammarEpoch) -> Option<Category> {
+        self.identity_at(epoch)?;
         let state = self.categories.get(category)?;
-        if state.registered_at > epoch {
+        if state.registered_at > epoch.revision {
             return None;
         }
         let mut view = Category::new(state.name.clone(), state.behavior);
@@ -638,10 +1486,13 @@ impl Registry {
     /// The direct form of the additive-shadowing law: two registrations under one token yield two
     /// kinds here, and a registry that replaced would yield one.
     pub fn kinds_at(&self, category: &Name, token: &Name, epoch: GrammarEpoch) -> Vec<Name> {
+        if self.identity_at(epoch).is_none() {
+            return Vec::new();
+        }
         let Some(state) = self.categories.get(category) else {
             return Vec::new();
         };
-        if state.registered_at > epoch {
+        if state.registered_at > epoch.revision {
             return Vec::new();
         }
         state
@@ -688,7 +1539,7 @@ impl std::fmt::Debug for Registry {
     }
 }
 
-/// A canonical projection of the active parser-table fields the current engine can encode.
+/// The complete canonical rows of one active grammar state.
 ///
 /// A *string* rather than a hash, deliberately: when two roots differ the diff should expose the
 /// differing input rather than only a digest. The format is versioned and length-framed, and names
@@ -696,18 +1547,17 @@ impl std::fmt::Debug for Registry {
 /// a record boundary, and a numeric name component cannot imitate a string component.
 ///
 /// Categories and tokens use their defined map orders. Productions remain in **registration
-/// order**, because additive shadowing makes that sequence semantic. Each production also binds
-/// its leading/trailing position, priority, and scope ownership.
+/// order**, because additive shadowing makes that sequence semantic. The rows bind parser
+/// descriptors, leading/trailing position, priority, scope ownership, scope depth, token parsers,
+/// precedence overrides, macros, relevant options, imports, and hook descriptors.
 ///
-/// This is not yet complete registry identity: [`Production::run`] is an opaque closure with no
-/// stable descriptor for its code or captured state, and the current scope-stack depth and hook
-/// identities affect future mutations without changing an active lookup table. A future
-/// content-hashed [`GrammarEpoch`] must add those effect-state descriptors and use the canonical
-/// hash codec rather than treating this diagnostic projection as a durable artifact.
+/// An opaque descriptor is represented honestly in these rows and separately forces the suffix
+/// barrier. Its label is not treated as proof that an unknowable closure is equivalent to another
+/// closure carrying the same label.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GrammarRoot(pub String);
 
-const GRAMMAR_ROOT_SCHEMA: &str = "fln.grammar-root/2;";
+const GRAMMAR_ROOT_SCHEMA: &str = "fln.grammar-root/3;";
 
 fn push_decimal(out: &mut String, value: impl ToString) {
     out.push_str(&value.to_string());
@@ -737,16 +1587,38 @@ fn push_name(out: &mut String, name: &Name) {
     push_hex(out, &name.to_canonical_bytes());
 }
 
+fn push_descriptor(out: &mut String, descriptor: &ParserDescriptor) {
+    out.push('D');
+    match descriptor {
+        ParserDescriptor::Stable {
+            id,
+            version,
+            payload,
+        } => {
+            out.push('S');
+            push_name(out, id);
+            out.push('V');
+            push_decimal(out, *version);
+            out.push('X');
+            push_hex(out, payload);
+        }
+        ParserDescriptor::Opaque { id } => {
+            out.push('O');
+            push_name(out, id);
+        }
+    }
+}
+
 fn push_productions(
     out: &mut String,
     position: char,
     table: &BTreeMap<Name, Vec<Registered>>,
-    epoch: GrammarEpoch,
+    revision: u64,
 ) {
     for (token, productions) in table {
         for (order, entry) in productions
             .iter()
-            .filter(|entry| entry.is_live_at(epoch))
+            .filter(|entry| entry.is_live_at_revision(revision))
             .enumerate()
         {
             out.push('P');
@@ -757,6 +1629,7 @@ fn push_productions(
             push_name(out, &entry.production.kind);
             out.push('R');
             push_decimal(out, entry.production.priority);
+            push_descriptor(out, &entry.production.descriptor);
             out.push('O');
             push_decimal(out, order);
             out.push('S');
@@ -811,11 +1684,21 @@ impl RegistryBudget {
 }
 
 impl Registry {
-    /// The canonical projection of the named, active registry fields as of `epoch`.
-    pub fn grammar_root(&self, epoch: GrammarEpoch) -> GrammarRoot {
+    /// The collision-safe canonical rows recorded for `epoch`.
+    ///
+    /// A foreign epoch or a stale digest at a valid revision returns `None`; it is never silently
+    /// interpreted as the local history entry with the same ordinal.
+    pub fn grammar_root(&self, epoch: GrammarEpoch) -> Option<GrammarRoot> {
+        self.identity_at(epoch)
+            .map(|identity| GrammarRoot(identity.canonical().to_string()))
+    }
+
+    fn grammar_root_for_revision(&self, revision: u64) -> GrammarRoot {
         let mut out = String::from(GRAMMAR_ROOT_SCHEMA);
+        out.push('S');
+        push_decimal(&mut out, self.depth.0);
         for (name, state) in &self.categories {
-            if state.registered_at > epoch {
+            if state.registered_at > revision {
                 continue;
             }
             out.push('C');
@@ -827,9 +1710,39 @@ impl Registry {
                 LeadingIdentBehavior::Both => '2',
             });
             out.push(';');
-            push_productions(&mut out, 'L', &state.leading, epoch);
-            push_productions(&mut out, 'T', &state.trailing, epoch);
+            push_productions(&mut out, 'L', &state.leading, revision);
+            push_productions(&mut out, 'T', &state.trailing, revision);
             out.push_str("E;");
+        }
+        for (token, descriptor) in &self.token_parsers {
+            out.push('T');
+            push_name(&mut out, token);
+            push_descriptor(&mut out, descriptor);
+        }
+        for ((category, parser), precedence) in &self.precedences {
+            out.push('R');
+            push_name(&mut out, category);
+            push_name(&mut out, parser);
+            push_decimal(&mut out, *precedence);
+        }
+        for (name, descriptor) in &self.macros {
+            out.push('M');
+            push_name(&mut out, name);
+            push_descriptor(&mut out, descriptor);
+        }
+        for (name, value) in &self.options {
+            out.push('O');
+            push_name(&mut out, name);
+            push_hex(&mut out, value.as_bytes());
+        }
+        for (module, root) in &self.imports {
+            out.push('I');
+            push_name(&mut out, module);
+            push_hex(&mut out, root.as_bytes());
+        }
+        for hook in &self.hooks {
+            out.push('H');
+            push_descriptor(&mut out, &hook.descriptor);
         }
         GrammarRoot(out)
     }
@@ -954,11 +1867,7 @@ impl Registry {
     }
 }
 
-fn exhausted(
-    unit: StructuralUnit,
-    allowed: u64,
-    observed: u64,
-) -> Outcome<Result<GrammarEpoch, RegisterError>> {
+fn exhausted<T>(unit: StructuralUnit, allowed: u64, observed: u64) -> Outcome<T> {
     Outcome::Inconclusive(Inconclusive::resource(ResourceUsage {
         reason: ResourceReason::StructuralBudget { unit },
         allowed,
@@ -985,6 +1894,16 @@ mod tests {
 
     fn production(label: &str) -> Production {
         Production::new(name(label), 0, |_state| {})
+    }
+
+    fn stable_production(label: &str, payload: &[u8]) -> Production {
+        let kind = name(label);
+        Production::described(
+            kind.clone(),
+            0,
+            ParserDescriptor::stable(kind, 1, payload),
+            |_state| {},
+        )
     }
 
     fn request(key: (u64, &str), category: &Name, token: &str, kind: &str) -> Request {
@@ -1023,7 +1942,9 @@ mod tests {
     fn mutation_state(registry: &Registry) -> (GrammarEpoch, GrammarRoot, u64, u64) {
         (
             registry.epoch(),
-            registry.grammar_root(registry.epoch()),
+            registry
+                .grammar_root(registry.epoch())
+                .expect("the current epoch belongs to its registry"),
             registry.production_count(),
             registry.retained_production_count(),
         )
@@ -1044,7 +1965,9 @@ mod tests {
                 .add_trailing(&term, name("tok"), production, scoped)
                 .expect("registers trailing production");
         }
-        registry.grammar_root(registry.epoch())
+        registry
+            .grammar_root(registry.epoch())
+            .expect("the current epoch belongs to its registry")
     }
 
     #[test]
@@ -1573,8 +2496,8 @@ mod tests {
         // And the refusal is inert: the epoch did not move, so a refused registration leaves no
         // trace for a later lookup to find.
         assert_eq!(
-            registry.epoch(),
-            GrammarEpoch(1),
+            registry.epoch().revision(),
+            1,
             "a refused registration must not advance the epoch"
         );
     }
@@ -1885,17 +2808,19 @@ mod tests {
         let mut registry = Registry::new();
         let term = name("term");
         let before = registry.epoch();
+        let empty_root = registry
+            .grammar_root(before)
+            .expect("the initial epoch belongs to its registry");
         let declared = registry
             .declare_category(term.clone(), LeadingIdentBehavior::Default)
             .expect("declares");
 
         assert!(registry.view_at(&term, before).is_none());
-        let empty_root = GrammarRoot(GRAMMAR_ROOT_SCHEMA.to_string());
-        assert_eq!(registry.grammar_root(before), empty_root);
+        assert_eq!(registry.grammar_root(before), Some(empty_root.clone()));
         assert!(registry.view_at(&term, declared).is_some());
         assert_ne!(
             registry.grammar_root(declared),
-            empty_root,
+            Some(empty_root),
             "the declaration epoch activates the structurally encoded category"
         );
     }
@@ -1973,5 +2898,278 @@ mod tests {
                 .kinds_at(&term, &name("local"), registry.epoch())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn epoch_identity_binds_descriptors_and_restoration_recovers_the_content_digest() {
+        fn built(payload: &[u8]) -> Registry {
+            let mut registry = Registry::new();
+            let term = name("term");
+            registry
+                .declare_category(term.clone(), LeadingIdentBehavior::Default)
+                .expect("declares");
+            registry
+                .add_leading(
+                    &term,
+                    name("tok"),
+                    stable_production("kind", payload),
+                    false,
+                )
+                .expect("registers");
+            registry
+        }
+
+        let left = built(b"same semantic inputs");
+        let right = built(b"same semantic inputs");
+        assert_eq!(
+            left.epoch(),
+            right.epoch(),
+            "same canonical grammar and command history must produce the same epoch"
+        );
+        assert_eq!(left.identity().canonical(), right.identity().canonical());
+
+        let changed = built(b"different captured input");
+        assert_ne!(
+            left.epoch().digest(),
+            changed.epoch().digest(),
+            "a parser descriptor payload is load-bearing grammar identity"
+        );
+
+        let mut restored = built(b"same semantic inputs");
+        let before = restored.epoch();
+        let before_identity = restored.identity().clone();
+        restored.push_scope_at(BytePos(7));
+        restored
+            .add_leading_at(
+                BytePos(8),
+                &name("term"),
+                name("local"),
+                stable_production("local", b"scope"),
+                true,
+            )
+            .expect("registers local syntax");
+        let after = restored.pop_scope_at(BytePos(9)).expect("restores");
+        assert!(after.revision() > before.revision());
+        assert_eq!(
+            after.digest(),
+            before.digest(),
+            "closing a scope restores the exact active canonical grammar"
+        );
+        assert_eq!(
+            restored.identity().canonical(),
+            before_identity.canonical(),
+            "digest equality is backed by complete row equality"
+        );
+    }
+
+    #[test]
+    fn a_digest_collision_cannot_cross_hit_without_complete_row_equality() {
+        let registry = registry_with_term().0;
+        let epoch = registry.epoch();
+        let identity = registry.identity().clone();
+        let key = MemoKey {
+            position: BytePos(3),
+            category: name("term"),
+            precedence: 7,
+            epoch,
+        };
+        let mut memo = ParseMemo::new();
+        memo.insert(
+            key.clone(),
+            &identity,
+            ParseProduct::new(epoch, ParseDependencies::new(), "real"),
+        )
+        .expect("inserts");
+
+        // Same digest and epoch pair, deliberately different complete canonical rows.
+        let collision = GrammarIdentity {
+            epoch,
+            canonical: Arc::from("fln.grammar-root/collision-injection;"),
+        };
+        assert!(matches!(
+            memo.lookup(&key, &collision),
+            Ok(MemoLookup::CollisionMiss)
+        ));
+        assert!(matches!(
+            memo.lookup(&key, &identity),
+            Ok(MemoLookup::Hit(product)) if *product.value() == "real"
+        ));
+    }
+
+    #[test]
+    fn memo_advance_promotes_only_the_exact_unaffected_cone_after_activation() {
+        let (mut registry, term) = registry_with_term();
+        let before = registry.epoch();
+        let before_identity = registry.identity().clone();
+        let changed_component = GrammarComponent::Syntax {
+            category: term.clone(),
+            token: name("new"),
+            position: ParserPosition::Leading,
+        };
+        let unrelated_component = GrammarComponent::Syntax {
+            category: term.clone(),
+            token: name("other"),
+            position: ParserPosition::Leading,
+        };
+        let mut memo = ParseMemo::new();
+        let insert = |memo: &mut ParseMemo<&'static str>,
+                      position,
+                      component,
+                      value|
+         -> Result<(), MemoError> {
+            let key = MemoKey {
+                position: BytePos(position),
+                category: term.clone(),
+                precedence: 0,
+                epoch: before,
+            };
+            memo.insert(
+                key,
+                &before_identity,
+                ParseProduct::new(
+                    before,
+                    ParseDependencies::from_components([component]),
+                    value,
+                ),
+            )
+        };
+        insert(&mut memo, 4, changed_component.clone(), "prefix").expect("prefix");
+        insert(&mut memo, 12, changed_component, "changed suffix").expect("changed");
+        insert(&mut memo, 13, unrelated_component, "unrelated suffix").expect("unrelated");
+
+        let after = registry
+            .add_leading_at(
+                BytePos(10),
+                &term,
+                name("new"),
+                stable_production("new-kind", b"v1"),
+                false,
+            )
+            .expect("registers");
+        let after_identity = registry.identity().clone();
+        let transition = registry
+            .last_transition()
+            .expect("registration emits a transition")
+            .clone();
+        let report = memo
+            .advance(
+                &transition,
+                &before_identity,
+                &after_identity,
+                MemoAdvanceBudget::generous(),
+                None,
+            )
+            .into_complete()
+            .expect("a generous memo transition completes")
+            .expect("advances");
+        assert_eq!(report.promoted, 1);
+        assert_eq!(report.invalidated, 1);
+        assert_eq!(report.prefix_reused, 1);
+
+        let lookup_after = |position| MemoKey {
+            position: BytePos(position),
+            category: term.clone(),
+            precedence: 0,
+            epoch: after,
+        };
+        let prefix = MemoKey {
+            position: BytePos(4),
+            category: term.clone(),
+            precedence: 0,
+            epoch: before,
+        };
+        assert!(matches!(
+            memo.lookup(&prefix, &before_identity),
+            Ok(MemoLookup::Hit(product)) if *product.value() == "prefix"
+        ));
+        assert!(matches!(
+            memo.lookup(&lookup_after(12), &after_identity),
+            Ok(MemoLookup::Miss)
+        ));
+        assert!(matches!(
+            memo.lookup(&lookup_after(13), &after_identity),
+            Ok(MemoLookup::Hit(product)) if *product.value() == "unrelated suffix"
+        ));
+    }
+
+    #[test]
+    fn an_opaque_effect_is_a_suffix_barrier_not_a_whole_file_flush() {
+        let (mut registry, term) = registry_with_term();
+        let before = registry.epoch();
+        let before_identity = registry.identity().clone();
+        let mut memo = ParseMemo::new();
+        for (position, value) in [(4, "prefix"), (12, "suffix")] {
+            let key = MemoKey {
+                position: BytePos(position),
+                category: term.clone(),
+                precedence: 0,
+                epoch: before,
+            };
+            memo.insert(
+                key,
+                &before_identity,
+                ParseProduct::new(
+                    before,
+                    ParseDependencies::from_components([GrammarComponent::Token(name("x"))]),
+                    value,
+                ),
+            )
+            .expect("inserts");
+        }
+
+        let _after = registry.apply_opaque_effect_at(BytePos(10), name("unknown-effect"));
+        let transition = registry.last_transition().expect("emits").clone();
+        let after_identity = registry.identity().clone();
+        let report = memo
+            .advance(
+                &transition,
+                &before_identity,
+                &after_identity,
+                MemoAdvanceBudget::generous(),
+                None,
+            )
+            .into_complete()
+            .expect("a generous memo transition completes")
+            .expect("advances");
+        assert_eq!(report.promoted, 0);
+        assert_eq!(report.invalidated, 1);
+        assert_eq!(report.prefix_reused, 1);
+        assert!(registry.distributed_parse_allowed_at(BytePos(9)));
+        assert!(!registry.distributed_parse_allowed_at(BytePos(10)));
+
+        let prefix = MemoKey {
+            position: BytePos(4),
+            category: term,
+            precedence: 0,
+            epoch: before,
+        };
+        assert!(matches!(
+            memo.lookup(&prefix, &before_identity),
+            Ok(MemoLookup::Hit(product)) if *product.value() == "prefix"
+        ));
+    }
+
+    #[test]
+    fn every_syntax_node_is_epoch_bound_and_a_stale_product_cannot_publish() {
+        let (mut registry, _) = registry_with_term();
+        let epoch = registry.epoch();
+        let syntax = Syntax::node(
+            name("root"),
+            vec![
+                Syntax::Missing,
+                Syntax::node(name("child"), vec![Syntax::Missing]),
+            ],
+        );
+        let bound = EpochSyntax::bind_uniform(syntax, epoch);
+        assert_eq!(bound.node_epochs().len(), 4);
+        assert!(bound.all_nodes_belong_to(epoch));
+
+        let product = ParseProduct::new(epoch, ParseDependencies::new(), bound);
+        let later = registry.set_option_at(BytePos(1), name("parser.mode"), "strict");
+        let stale = product
+            .into_value_for(later)
+            .expect_err("a product from an older epoch cannot publish");
+        assert_eq!(stale.product_epoch, epoch);
+        assert_eq!(stale.expected_epoch, later);
     }
 }
