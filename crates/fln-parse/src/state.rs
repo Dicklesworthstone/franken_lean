@@ -343,8 +343,53 @@ impl ParserState {
 pub const PREC_MESSAGE: &str =
     "unexpected token at this precedence level; consider parenthesizing the term";
 
-/// A production: a function over the state, plus the precedence and priority it was declared
-/// with.
+/// Stable data describing a parser callback.
+///
+/// Rust closures are not serializable, and captured state is not recoverable from a function
+/// pointer. Treating a callback's address or its [`Debug`](std::fmt::Debug) rendering as grammar
+/// identity would therefore make epochs host-dependent or silently collapse distinct grammars.
+/// Callers that can name all semantic inputs use [`ParserDescriptor::Stable`]. The ordinary
+/// [`Production::new`] constructor is deliberately conservative and records an
+/// [`ParserDescriptor::Opaque`] descriptor; registry consumers must then impose the opaque suffix
+/// barrier rather than assuming the callback is safe to memoize or distribute past.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ParserDescriptor {
+    /// A callback whose semantic implementation and captured inputs have a canonical descriptor.
+    Stable {
+        /// Stable parser identity, normally the declaration name.
+        id: Name,
+        /// Descriptor schema version. Changing the meaning of `payload` requires a new version.
+        version: u32,
+        /// Canonical, host-independent semantic inputs. Operational data never belongs here.
+        payload: Vec<u8>,
+    },
+    /// A callback whose full semantic inputs are not available as canonical data.
+    ///
+    /// The id is diagnostic and deterministic; it is not permission to treat two opaque
+    /// callbacks with the same label as equivalent.
+    Opaque { id: Name },
+}
+
+impl ParserDescriptor {
+    pub fn stable(id: Name, version: u32, payload: impl Into<Vec<u8>>) -> ParserDescriptor {
+        ParserDescriptor::Stable {
+            id,
+            version,
+            payload: payload.into(),
+        }
+    }
+
+    pub fn opaque(id: Name) -> ParserDescriptor {
+        ParserDescriptor::Opaque { id }
+    }
+
+    pub const fn is_opaque(&self) -> bool {
+        matches!(self, ParserDescriptor::Opaque { .. })
+    }
+}
+
+/// A production: a function over the state, plus the precedence, priority, and stable parser
+/// descriptor it was declared with.
 ///
 /// A shared closure rather than a trait object with associated types because the engine needs a
 /// *homogeneous list* it can score against each other, which is what `longestMatchFn` consumes.
@@ -359,18 +404,36 @@ pub struct Production {
     pub kind: Name,
     /// Declaration priority — the third and weakest component of the score.
     pub priority: u32,
+    /// Canonical semantic identity when known, otherwise an explicit opaque marker.
+    pub descriptor: ParserDescriptor,
     pub run: Arc<dyn Fn(&mut ParserState) + Send + Sync>,
 }
 
 impl Production {
+    /// Construct a conservatively opaque callback.
+    ///
+    /// Use [`Self::described`] only when every semantic input to the callback is represented by
+    /// the descriptor. Opaque is the safe default: it disables suffix reuse instead of minting a
+    /// false content identity from an unknowable closure.
     pub fn new(
         kind: Name,
         priority: u32,
         run: impl Fn(&mut ParserState) + Send + Sync + 'static,
     ) -> Production {
+        let descriptor = ParserDescriptor::opaque(kind.clone());
+        Production::described(kind, priority, descriptor, run)
+    }
+
+    pub fn described(
+        kind: Name,
+        priority: u32,
+        descriptor: ParserDescriptor,
+        run: impl Fn(&mut ParserState) + Send + Sync + 'static,
+    ) -> Production {
         Production {
             kind,
             priority,
+            descriptor,
             run: Arc::new(run),
         }
     }
@@ -381,6 +444,7 @@ impl std::fmt::Debug for Production {
         f.debug_struct("Production")
             .field("kind", &self.kind.to_display_string())
             .field("priority", &self.priority)
+            .field("descriptor", &self.descriptor)
             .finish_non_exhaustive()
     }
 }

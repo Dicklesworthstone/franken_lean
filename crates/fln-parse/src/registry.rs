@@ -36,28 +36,252 @@
 //! actually ran under rather than the one that exists now.
 
 use crate::category::{Category, LeadingIdentBehavior};
-use crate::state::Production;
+use crate::state::{ParserDescriptor, Production};
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 use fln_hash::canon::Canonical;
-use std::collections::BTreeMap;
+use fln_hash::domain::{Digest, Domain, hash};
+use fln_syntax::source::BytePos;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-/// A point in the registration history — upstream's parser state as of one command.
+/// A content-bound point in the registration history — upstream's parser state as of one command.
 ///
-/// Monotone and totally ordered. Every mutation produces a new epoch, so a parse can record which
-/// grammar it ran under and a later reader can ask for exactly that one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct GrammarEpoch(pub u64);
+/// `revision` preserves the command-order boundary needed to replay a historical executable view.
+/// `digest` is the host-independent content hash of every canonical grammar row active at that
+/// revision. Keeping both is deliberate: a scope close may restore old content at a later command,
+/// while two different revisions must still remain addressable for activation-boundary reasoning.
+///
+/// A digest is only an index. Authority additionally compares the complete canonical rows through
+/// [`GrammarIdentity`], so an injected collision cannot cross-hit a memo entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GrammarEpoch {
+    revision: u64,
+    digest: Digest,
+}
 
 impl GrammarEpoch {
-    fn next(self) -> GrammarEpoch {
-        GrammarEpoch(self.0 + 1)
+    fn from_root(revision: u64, root: &GrammarRoot) -> GrammarEpoch {
+        GrammarEpoch {
+            revision,
+            digest: hash(Domain::CacheKey, root.0.as_bytes()),
+        }
+    }
+
+    const fn placeholder(revision: u64) -> GrammarEpoch {
+        GrammarEpoch {
+            revision,
+            digest: Digest([0; 32]),
+        }
+    }
+
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    pub const fn digest(self) -> Digest {
+        self.digest
+    }
+
+    pub fn content_hex(self) -> String {
+        self.digest.to_hex()
+    }
+}
+
+/// Collision-safe authority for one grammar epoch.
+///
+/// Equality includes the complete canonical rows, not only the digest. The rows are shared because
+/// memo entries and historical views may retain the same immutable identity for a long time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrammarIdentity {
+    epoch: GrammarEpoch,
+    canonical: Arc<str>,
+}
+
+impl GrammarIdentity {
+    fn new(epoch: GrammarEpoch, root: GrammarRoot) -> GrammarIdentity {
+        GrammarIdentity {
+            epoch,
+            canonical: Arc::from(root.0),
+        }
+    }
+
+    pub const fn epoch(&self) -> GrammarEpoch {
+        self.epoch
+    }
+
+    pub fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    pub const fn digest(&self) -> Digest {
+        self.epoch.digest
+    }
+}
+
+/// Whether a production is entered before a term or extends a parsed left-hand side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ParserPosition {
+    Leading,
+    Trailing,
+}
+
+/// One precise grammar input a parse product may have read.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GrammarComponent {
+    Category(Name),
+    Syntax {
+        category: Name,
+        token: Name,
+        position: ParserPosition,
+    },
+    Token(Name),
+    Precedence {
+        category: Name,
+        parser: Name,
+    },
+    Scope,
+    Macro(Name),
+    Option(Name),
+    Import(Name),
+    WholeGrammar,
+}
+
+/// A typed summary of one grammar mutation.
+///
+/// Unknown callback semantics are never guessed. [`Self::OpaqueParserEffect`] is a valid fidelity
+/// outcome, but it invalidates every suffix product and erects a distributed-parse barrier at the
+/// transition's activation point.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ParserEffect {
+    AddsCategory {
+        category: Name,
+    },
+    AddsSyntax {
+        category: Name,
+        token: Name,
+        kind: Name,
+        position: ParserPosition,
+    },
+    AddsToken {
+        token: Name,
+    },
+    ChangesPrecedence {
+        category: Name,
+        parser: Name,
+        precedence: u32,
+    },
+    OpensScope {
+        depth: ScopeDepth,
+    },
+    ClosesScope {
+        depth: ScopeDepth,
+    },
+    RegistersMacro {
+        name: Name,
+    },
+    ChangesOption {
+        name: Name,
+    },
+    ImportsGrammar {
+        module: Name,
+    },
+    RemovesSyntax {
+        category: Name,
+        token: Name,
+        kind: Name,
+        position: ParserPosition,
+    },
+    OpaqueParserEffect {
+        id: Name,
+    },
+}
+
+impl ParserEffect {
+    pub const fn is_opaque(&self) -> bool {
+        matches!(self, ParserEffect::OpaqueParserEffect { .. })
+    }
+
+    fn affected_components(&self, out: &mut BTreeSet<GrammarComponent>) {
+        match self {
+            ParserEffect::AddsCategory { category } => {
+                out.insert(GrammarComponent::Category(category.clone()));
+            }
+            ParserEffect::AddsSyntax {
+                category,
+                token,
+                position,
+                ..
+            }
+            | ParserEffect::RemovesSyntax {
+                category,
+                token,
+                position,
+                ..
+            } => {
+                out.insert(GrammarComponent::Syntax {
+                    category: category.clone(),
+                    token: token.clone(),
+                    position: *position,
+                });
+                out.insert(GrammarComponent::Token(token.clone()));
+            }
+            ParserEffect::AddsToken { token } => {
+                out.insert(GrammarComponent::Token(token.clone()));
+            }
+            ParserEffect::ChangesPrecedence {
+                category, parser, ..
+            } => {
+                out.insert(GrammarComponent::Precedence {
+                    category: category.clone(),
+                    parser: parser.clone(),
+                });
+            }
+            ParserEffect::OpensScope { .. } | ParserEffect::ClosesScope { .. } => {
+                out.insert(GrammarComponent::Scope);
+            }
+            ParserEffect::RegistersMacro { name } => {
+                out.insert(GrammarComponent::Macro(name.clone()));
+            }
+            ParserEffect::ChangesOption { name } => {
+                out.insert(GrammarComponent::Option(name.clone()));
+            }
+            ParserEffect::ImportsGrammar { module } => {
+                out.insert(GrammarComponent::Import(module.clone()));
+            }
+            ParserEffect::OpaqueParserEffect { .. } => {
+                out.insert(GrammarComponent::WholeGrammar);
+            }
+        }
+    }
+}
+
+/// One published, activation-bound grammar change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrammarTransition {
+    pub before: GrammarEpoch,
+    pub after: GrammarEpoch,
+    pub activation: BytePos,
+    pub effects: Vec<ParserEffect>,
+}
+
+impl GrammarTransition {
+    pub fn has_opaque_effect(&self) -> bool {
+        self.effects.iter().any(ParserEffect::is_opaque)
+    }
+
+    pub fn affected_components(&self) -> BTreeSet<GrammarComponent> {
+        let mut affected = BTreeSet::new();
+        for effect in &self.effects {
+            effect.affected_components(&mut affected);
+        }
+        affected
     }
 }
 
 /// A scope depth — one `section`/`namespace` level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopeDepth(pub usize);
 
 /// Why a registration was refused.
