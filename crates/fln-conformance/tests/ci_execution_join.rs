@@ -184,6 +184,7 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
     "franken_lean-ext-observable-fixture-drift-gap-vqnu",
     "fln-0bw5",
     "fln-mandated-mutant-join-unwatched-uagk",
+    "fln-7li",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -202,7 +203,15 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// The guard is surface-granular and cannot see that; these declarations name it. The debt
 /// shrinks the day either row migrates off the surface, or CI runs the surface with the
 /// pin installed.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 6;
+///
+/// 6 -> 7 at fln-7li's close (2026-08-01): the row cites
+/// `reference_parse_tree::actual_pratt_trees_match_every_frozen_reference_tree`, a
+/// pin-FREE test on a surface that also carries one env-gated pin test
+/// (`installed_reference_identity_matches_the_frozen_provenance_or_skips_typed`, which
+/// builds the elan path in code). The cited evidence runs pinless and passes; the
+/// surface-level classification cannot see that. Measured: the pin coordinate lives at
+/// reference_parse_tree.rs:1391, inside the sibling test only.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 7;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
