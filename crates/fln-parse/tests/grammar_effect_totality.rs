@@ -29,9 +29,9 @@ use fln_core::outcome::{InconclusiveCause, Outcome};
 use fln_hash::domain::Digest;
 use fln_parse::category::LeadingIdentBehavior;
 use fln_parse::registry::{
-    GrammarComponent, GrammarEpoch, GrammarIdentity, GrammarTransition, MemoAdvanceBudget,
-    MemoAdvanceCheckpoint, MemoKey, MemoLookup, ParseDependencies, ParseMemo, ParseProduct,
-    ParserEffect, ParserPosition, RegisterError, Registry, RegistryBudget, Request,
+    GrammarComponent, GrammarEpoch, GrammarIdentity, GrammarTransition, InvalidationReason,
+    MemoAdvanceBudget, MemoAdvanceCheckpoint, MemoKey, MemoLookup, ParseDependencies, ParseMemo,
+    ParseProduct, ParserEffect, ParserPosition, RegisterError, Registry, RegistryBudget, Request,
 };
 use fln_parse::state::{ParserDescriptor, Production};
 use fln_syntax::source::BytePos;
@@ -473,6 +473,403 @@ fn every_effect_variant_is_emitted_or_conservatively_opaque() {
     );
     assert_eq!(registry.opaque_suffix_barrier(), Some(BytePos(12)));
     assert!(!registry.distributed_parse_allowed_at(BytePos(12)));
+}
+
+fn assert_exact_component_invalidation(
+    mut registry: Registry,
+    key_category: &Name,
+    affected: GrammarComponent,
+    unaffected: GrammarComponent,
+    mutate: impl FnOnce(&mut Registry),
+) {
+    let before = registry.identity().clone();
+    let affected_key = MemoKey {
+        position: BytePos(20),
+        category: key_category.clone(),
+        precedence: 0,
+        epoch: before.epoch(),
+    };
+    let unaffected_key = MemoKey {
+        position: BytePos(30),
+        category: key_category.clone(),
+        precedence: 0,
+        epoch: before.epoch(),
+    };
+    let mut memo = ParseMemo::new();
+    memo.insert(
+        affected_key.clone(),
+        &before,
+        ParseProduct::new(
+            before.epoch(),
+            ParseDependencies::from_components([affected.clone()]),
+            "affected",
+        ),
+    )
+    .expect("the affected fixture is epoch-consistent");
+    memo.insert(
+        unaffected_key.clone(),
+        &before,
+        ParseProduct::new(
+            before.epoch(),
+            ParseDependencies::from_components([unaffected]),
+            "unaffected",
+        ),
+    )
+    .expect("the control fixture is epoch-consistent");
+
+    mutate(&mut registry);
+    let transition = registry
+        .last_transition()
+        .expect("a matrix mutation publishes one transition")
+        .clone();
+    let after = registry.identity().clone();
+    let report = memo
+        .advance(
+            &transition,
+            &before,
+            &after,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .expect("the matrix advance completes")
+        .expect("the live identities match the transition");
+
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.invalidated, 1);
+    assert_eq!(report.promoted, 1);
+    assert_eq!(report.prefix_reused, 0);
+    assert_eq!(
+        report.reasons,
+        vec![(affected_key.clone(), InvalidationReason::Changed(affected))]
+    );
+
+    let mut affected_after = affected_key;
+    affected_after.epoch = after.epoch();
+    assert!(matches!(
+        memo.lookup(&affected_after, &after),
+        Ok(MemoLookup::Miss | MemoLookup::CollisionMiss)
+    ));
+
+    let mut unaffected_after = unaffected_key;
+    unaffected_after.epoch = after.epoch();
+    let control = memo
+        .lookup(&unaffected_after, &after)
+        .expect("the promoted control lookup is well formed");
+    let MemoLookup::Hit(control) = control else {
+        panic!("an unrelated dependency must be promoted");
+    };
+    assert_eq!(control.value(), &"unaffected");
+    assert_eq!(control.epoch(), after.epoch());
+}
+
+/// Every typed registry surface invalidates its exact dependency and promotes a close near-miss.
+///
+/// This is deliberately a real mutation matrix: the effect producer, dependency intersection,
+/// report reason, and published memo keys are checked as one seam.
+#[test]
+fn every_typed_effect_has_an_exact_memo_invalidation_witness() {
+    let category = name("term");
+    let other_category = name("command");
+    assert_exact_component_invalidation(
+        Registry::new(),
+        &category,
+        GrammarComponent::Category(category.clone()),
+        GrammarComponent::Category(other_category),
+        |registry| {
+            registry
+                .declare_category_at(BytePos(10), category.clone(), LeadingIdentBehavior::Default)
+                .expect("declares the affected category");
+        },
+    );
+
+    let (registry, term) = term_registry();
+    let syntax_token = name("syntax-token");
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Syntax {
+            category: term.clone(),
+            token: syntax_token.clone(),
+            position: ParserPosition::Leading,
+        },
+        GrammarComponent::Syntax {
+            category: term.clone(),
+            token: syntax_token.clone(),
+            position: ParserPosition::Trailing,
+        },
+        |registry| {
+            registry
+                .add_leading_at(
+                    BytePos(10),
+                    &term,
+                    syntax_token,
+                    stable_production("syntax-kind"),
+                    false,
+                )
+                .expect("adds the affected leading syntax");
+        },
+    );
+
+    let (registry, term) = term_registry();
+    let token = name("literal");
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Token(token.clone()),
+        GrammarComponent::Token(name("other-literal")),
+        |registry| {
+            registry.register_token_parser_at(
+                BytePos(10),
+                token,
+                ParserDescriptor::stable(name("literal-parser"), 1, b"decimal-literal".to_vec()),
+            );
+        },
+    );
+
+    let (registry, term) = term_registry();
+    let parser = name("infix-parser");
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Precedence {
+            category: term.clone(),
+            parser: parser.clone(),
+        },
+        GrammarComponent::Precedence {
+            category: term.clone(),
+            parser: name("other-parser"),
+        },
+        |registry| {
+            registry
+                .set_precedence_at(BytePos(10), &term, parser, 65)
+                .expect("sets the affected precedence");
+        },
+    );
+
+    let (registry, term) = term_registry();
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Scope,
+        GrammarComponent::Option(name("scope-control")),
+        |registry| {
+            registry.push_scope_at(BytePos(10));
+        },
+    );
+
+    let (mut registry, term) = term_registry();
+    registry.push_scope_at(BytePos(0));
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Scope,
+        GrammarComponent::Option(name("close-scope-control")),
+        |registry| {
+            registry
+                .pop_scope_at(BytePos(10))
+                .expect("closes the affected scope");
+        },
+    );
+
+    let (registry, term) = term_registry();
+    let macro_name = name("term-macro");
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Macro(macro_name.clone()),
+        GrammarComponent::Macro(name("other-macro")),
+        |registry| {
+            registry.register_macro_at(
+                BytePos(10),
+                macro_name,
+                ParserDescriptor::stable(name("macro-expander"), 1, b"expander".to_vec()),
+            );
+        },
+    );
+
+    let (registry, term) = term_registry();
+    let option = name("parser.option");
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Option(option.clone()),
+        GrammarComponent::Option(name("other.option")),
+        |registry| {
+            registry.set_option_at(BytePos(10), option, "on");
+        },
+    );
+
+    let (registry, term) = term_registry();
+    let imported = term_registry().0.identity().clone();
+    let module = name("Imported");
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Import(module.clone()),
+        GrammarComponent::Import(name("OtherImported")),
+        |registry| {
+            registry.import_grammar_at(BytePos(10), module, &imported);
+        },
+    );
+
+    let (mut registry, term) = term_registry();
+    let removable_token = name("removable");
+    let removable_kind = name("removable-kind");
+    registry
+        .add_leading_at(
+            BytePos(0),
+            &term,
+            removable_token.clone(),
+            stable_production("removable-kind"),
+            false,
+        )
+        .expect("seeds syntax for exact removal");
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Syntax {
+            category: term.clone(),
+            token: removable_token.clone(),
+            position: ParserPosition::Leading,
+        },
+        GrammarComponent::Syntax {
+            category: term.clone(),
+            token: removable_token.clone(),
+            position: ParserPosition::Trailing,
+        },
+        |registry| {
+            registry
+                .remove_syntax_at(
+                    BytePos(10),
+                    &term,
+                    &removable_token,
+                    &removable_kind,
+                    ParserPosition::Leading,
+                )
+                .expect("removes the exact affected syntax");
+        },
+    );
+
+    let (mut registry, term) = term_registry();
+    let shadowed_token = name("shadowed");
+    registry
+        .add_leading_at(
+            BytePos(0),
+            &term,
+            shadowed_token.clone(),
+            stable_production("older-kind"),
+            false,
+        )
+        .expect("seeds the shadowed syntax");
+    assert_exact_component_invalidation(
+        registry,
+        &term,
+        GrammarComponent::Syntax {
+            category: term.clone(),
+            token: shadowed_token.clone(),
+            position: ParserPosition::Leading,
+        },
+        GrammarComponent::Syntax {
+            category: term.clone(),
+            token: shadowed_token.clone(),
+            position: ParserPosition::Trailing,
+        },
+        |registry| {
+            registry
+                .add_leading_at(
+                    BytePos(10),
+                    &term,
+                    shadowed_token,
+                    stable_production("newer-kind"),
+                    false,
+                )
+                .expect("adds the shadowing syntax");
+        },
+    );
+}
+
+/// An opaque effect ignores dependency precision for the suffix, while preserving the historical
+/// prefix under the exact epoch that recognized it.
+#[test]
+fn opaque_effect_invalidates_every_suffix_dependency_and_preserves_the_prefix() {
+    let (mut registry, term) = term_registry();
+    let before = registry.identity().clone();
+    let old_keys = [BytePos(5), BytePos(20), BytePos(30)].map(|position| MemoKey {
+        position,
+        category: term.clone(),
+        precedence: 0,
+        epoch: before.epoch(),
+    });
+    let dependencies = [
+        GrammarComponent::Syntax {
+            category: term.clone(),
+            token: name("prefix"),
+            position: ParserPosition::Leading,
+        },
+        GrammarComponent::Option(name("suffix.option")),
+        GrammarComponent::Macro(name("suffix.macro")),
+    ];
+    let mut memo = ParseMemo::new();
+    for ((key, component), value) in old_keys
+        .iter()
+        .zip(dependencies)
+        .zip(["prefix", "option", "macro"])
+    {
+        memo.insert(
+            key.clone(),
+            &before,
+            ParseProduct::new(
+                before.epoch(),
+                ParseDependencies::from_components([component]),
+                value,
+            ),
+        )
+        .expect("the opaque fixture is epoch-consistent");
+    }
+
+    registry.apply_opaque_effect_at(BytePos(10), name("unknown-parser-callback"));
+    let transition = registry
+        .last_transition()
+        .expect("the opaque mutation publishes a transition")
+        .clone();
+    let after = registry.identity().clone();
+    let report = memo
+        .advance(
+            &transition,
+            &before,
+            &after,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .expect("the opaque advance completes")
+        .expect("the live identities match the transition");
+
+    assert_eq!(report.scanned, 3);
+    assert_eq!(report.prefix_reused, 1);
+    assert_eq!(report.invalidated, 2);
+    assert_eq!(report.promoted, 0);
+    assert_eq!(
+        report.reasons,
+        old_keys[1..]
+            .iter()
+            .cloned()
+            .map(|key| (key, InvalidationReason::OpaqueSuffixBarrier))
+            .collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        memo.lookup(&old_keys[0], &before),
+        Ok(MemoLookup::Hit(_))
+    ));
+    for old_key in &old_keys {
+        let mut after_key = old_key.clone();
+        after_key.epoch = after.epoch();
+        assert!(!matches!(
+            memo.lookup(&after_key, &after),
+            Ok(MemoLookup::Hit(_))
+        ));
+    }
 }
 
 fn memo_transition_fixture() -> (
