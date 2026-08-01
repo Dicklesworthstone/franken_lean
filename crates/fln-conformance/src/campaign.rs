@@ -2159,6 +2159,16 @@ pub enum MatrixVerdict {
     ScheduleDivergence { width_a: usize, width_b: usize },
 }
 
+impl MatrixVerdict {
+    /// The D7 claim class of a matrix verdict (td9: "bounded schedule/model
+    /// exploration is bounded_model"). A matrix verdict never proves an FL-INV
+    /// invariant — it is one bounded exploration of the schedule space, and the
+    /// class travels with the verdict so a consumer cannot upgrade it silently.
+    pub fn claim_class(&self) -> &'static str {
+        "bounded_model"
+    }
+}
+
 /// Every way a matrix run set can be refused before any comparison happens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadMatrixError {
