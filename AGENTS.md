@@ -192,7 +192,7 @@ The standing advice, correct and unchanged, is: when another pane's in-flight ed
 | `evidence.py hash-tree … **--vendor-path V**` | **no** — exit 2 |
 | `evidence.py ubs-inventory`, `evidence.py vendor-binding` | **no** — exit 2 |
 | `scripts/check.sh`, the evidence self-test, `scripts/verify_vendor_tree.sh` | **no** — exit 2 |
-| any `fln.e2e/2` lane — **13 declared fln.e2e/2 lanes**, of which **12 refuse on a measured invocation shape** and **1 whose verdict is unmeasured** | **no**, and this row's *scope* is now derived per commit rather than listed (`the_worktree_refusal_scope_is_derived_from_the_lane_population`), which is the half this table left open. The verdict survives measurement; the reason this row used to give does not. It said `hash-tree --vendor-path` is the first governed step of any such lane. Twelve lanes do refuse, and the witness for all twelve is `vendor-binding`, measured to refuse unconditionally. The sole indeterminate lane, `unsafe_note_clippy.sh`, carries no `--vendor-path` anywhere; it would reach `run_git`, if it does, through `emit --governed-path` / `--producer-binding-root` and `manifest --input-root` — six subcommands in shapes nobody has measured — so it is typed **indeterminate and named here**, not counted as refusing. Note also that the 25 scripts in `scripts/e2e/` and the 13 declared lanes are different sets. Static reachability cannot settle that lane and is used only to prove a *negative*: 15 of the 45 subcommands reach `run_git`, yet `hash-tree` is one of them and exits 0 without `--vendor-path`, so a handler that never reaches it cannot refuse, while one that does may still succeed |
+| any `fln.e2e/2` lane — **14 declared fln.e2e/2 lanes**, of which **13 refuse on a measured invocation shape** and **1 whose verdict is unmeasured** | **no**, and this row's *scope* is now derived per commit rather than listed (`the_worktree_refusal_scope_is_derived_from_the_lane_population`), which is the half this table left open. The verdict survives measurement; the reason this row used to give does not. It said `hash-tree --vendor-path` is the first governed step of any such lane. Thirteen lanes do refuse, and the witness for all thirteen is `vendor-binding`, measured to refuse unconditionally. The sole indeterminate lane, `unsafe_note_clippy.sh`, carries no `--vendor-path` anywhere; it would reach `run_git`, if it does, through `emit --governed-path` / `--producer-binding-root` and `manifest --input-root` — six subcommands in shapes nobody has measured — so it is typed **indeterminate and named here**, not counted as refusing. Note also that the 25 scripts in `scripts/e2e/` and the 13 declared lanes are different sets. Static reachability cannot settle that lane and is used only to prove a *negative*: 15 of the 45 subcommands reach `run_git`, yet `hash-tree` is one of them and exits 0 without `--vendor-path`, so a handler that never reaches it cannot refuse, while one that does may still succeed |
 
 So the evidence surface runs in the **main tree only**. Two consequences worth stating separately, because each has already cost something:
 
@@ -563,11 +563,12 @@ The same correction applies to anything else naming holders by argv — an orche
 
 **Two traps inside that allowance, both measured.** Writing a governed file with **byte-identical content** does not save you: M4's stability check includes `st_mtime_ns` and `st_ctime_ns`, so a no-op rewrite during a governed hash still raises `file changed while being read` (7/8 trials; the 8th is the race, not a reprieve). And "static" means *untouched*, not *unchanged* — a formatter, an editor autosave, or a `cargo` invocation rewriting `Cargo.lock` all count as motion.
 
-**Narrowness is a property of the lane you are running, never of lanes.** Derived per commit from all 26 scripts in `scripts/e2e/` rather than read off one — 98np R1. **Thirteen lanes declare a governed set; thirteen declare none at all** and so cannot raise M2/M3/M4 under any write:
+**Narrowness is a property of the lane you are running, never of lanes.** Derived per commit from all 26 scripts in `scripts/e2e/` rather than read off one — 98np R1. **Fourteen lanes declare a governed set; twelve declare none at all** and so cannot raise M2/M3/M4 under any write:
 
 | governed paths | lane | relative to `check.sh`'s 61 |
 |---|---|---|
 | 40 | `contract_handoff.sh` | 2 outside: `scripts/extract/census_materialize.sh`, `…/validate_extern_builtin_census.py` |
+| 18 | `campaign_frameworks.sh` | contained |
 | 19 | `vellum_naming_no_mock_e2e.sh` | 3 outside: **`AGENTS.md`**, `README.md`, the plan |
 | 18 | `closure_audit.sh`, `structure_gate.sh` | contained |
 | 16 | `diag_goldens.sh` | contained |
@@ -577,7 +578,7 @@ The same correction applies to anything else naming holders by argv — an orche
 | 11 | `g0_4_no_mock_e2e.sh` | contained |
 | 10 | `verdict_schema.sh` | governs bare **`scripts`**, so *any* write under `scripts/` voids it; `check.sh` enumerates individual scripts instead |
 | 8 | `kernel_replay.sh` (`AP6_INPUT_PATHS`) | contained |
-| 0 | the other 13 | no governed set; M1 only |
+| 0 | the other 12 | no governed set; M1 only |
 
 So "an e2e lane's governed set is narrower than `check.sh`'s" is true of `env_snapshots` and **false of three lanes in three different directions**. Two consequences: a `verdict_schema` lane is killed by any pane touching `scripts/`, which is broader than `check.sh` in that dimension; and the twelve zero-governed lanes are protected by **nothing but M1**, which — given that no lane takes the gate lock unless its caller wraps the invocation (bead `franken_lean-gate-lock-producer-optional-o2vz`) — means a mid-lane write to their subject is invisible to every mechanism.
 

@@ -306,6 +306,18 @@ CHECK_SELF_TEST_ORDER = [*CHECK_STAGE_ORDER, "cancel-term"]
 # dispatch, and `contract_roots.rs` binds the pin-dependent lanes to the
 # scheduled/on-demand pin-bearing workflow.
 E2E_STEP_ORDERS = {
+    "campaign_frameworks": [
+        "suite_campaign_owner_matrix",
+        "suite_mutation_kill_ledger_model",
+        "suite_fuzz_seed_replay",
+        "suite_fault_boundary_registry",
+        "suite_shrink_signature_preservation",
+        "suite_no_mock_attestation",
+        "suite_productive_thread_matrix",
+        "conservation",
+        "planted_duplicate_row_refused",
+        "pristine_recovery",
+    ],
     "unsafe_note_clippy": [
         "clippy_report",
         "baseline_match",
