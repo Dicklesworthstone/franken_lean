@@ -572,9 +572,7 @@ impl ExpansionSourceMap {
             if let Some(origins) = self.entries.get(&cursor) {
                 return Some(origins);
             }
-            if cursor.0.pop().is_none() {
-                return None;
-            }
+            cursor.0.pop()?;
         }
     }
 
