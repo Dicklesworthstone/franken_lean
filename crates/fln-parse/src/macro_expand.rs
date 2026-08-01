@@ -883,15 +883,7 @@ impl Expander<'_> {
                 "one-item root fragment was empty",
             ))
         })?;
-        if let Err(error) = validate_source_map(&mapped.syntax, &mapped.source_map) {
-            return Err(ExpansionStop::InternalFault(
-                InternalFault::new(
-                    "FLN-W4-MACRO-SOURCE-MAP-TOTALITY",
-                    "the production expander constructed a non-total source map",
-                )
-                .with_evidence(error.message()),
-            ));
-        }
+        validate_constructed_source_map(&mapped)?;
 
         let checkpoint = MacroExpansionCheckpoint::BeforePublication {
             visited: self.visited,
@@ -1005,6 +997,18 @@ fn validate_source_map(
             mapped_nodes: mapped_paths.len(),
         })
     }
+}
+
+fn validate_constructed_source_map(mapped: &MappedSyntax) -> Result<(), ExpansionStop> {
+    validate_source_map(&mapped.syntax, &mapped.source_map).map_err(|error| {
+        ExpansionStop::InternalFault(
+            InternalFault::new(
+                "FLN-W4-MACRO-SOURCE-MAP-TOTALITY",
+                "the production expander constructed a non-total source map",
+            )
+            .with_evidence(error.message()),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1140,5 +1144,17 @@ mod tests {
             None,
         );
         assert!(matches!(exhausted, Outcome::Inconclusive(_)));
+    }
+
+    #[test]
+    fn a_source_map_drop_mutant_is_an_internal_fault_with_no_product() {
+        let mutant = MappedSyntax {
+            syntax: Syntax::atom(SourceInfo::None, "x"),
+            source_map: ExpansionSourceMap::new(),
+        };
+        assert!(matches!(
+            validate_constructed_source_map(&mutant),
+            Err(ExpansionStop::InternalFault(_))
+        ));
     }
 }
