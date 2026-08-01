@@ -563,9 +563,9 @@ The same correction applies to anything else naming holders by argv — an orche
 
 **Two traps inside that allowance, both measured.** Writing a governed file with **byte-identical content** does not save you: M4's stability check includes `st_mtime_ns` and `st_ctime_ns`, so a no-op rewrite during a governed hash still raises `file changed while being read` (7/8 trials; the 8th is the race, not a reprieve). And "static" means *untouched*, not *unchanged* — a formatter, an editor autosave, or a `cargo` invocation rewriting `Cargo.lock` all count as motion.
 
-**Narrowness is a property of the lane you are running, never of lanes.** Derived per commit from all 28 scripts in `scripts/e2e/` rather than read off one — 98np R1. **Sixteen lanes declare a governed set; twelve declare none at all** and so cannot raise M2/M3/M4 under any write:
+**Narrowness is a property of the lane you are running, never of lanes.** Derived per commit from all 29 scripts in `scripts/e2e/` rather than read off one — 98np R1. **Seventeen lanes declare a governed set; twelve declare none at all** and so cannot raise M2/M3/M4 under any write:
 
-| governed paths | lane | relative to `check.sh`'s 63 |
+| governed paths | lane | relative to `check.sh`'s 64 |
 |---|---|---|
 | 40 | `contract_handoff.sh` | 2 outside: `scripts/extract/census_materialize.sh`, `…/validate_extern_builtin_census.py` |
 | 18 | `campaign_frameworks.sh` | contained |
@@ -573,6 +573,7 @@ The same correction applies to anything else naming holders by argv — an orche
 | 19 | `vellum_naming_no_mock_e2e.sh` | 3 outside: **`AGENTS.md`**, `README.md`, the plan |
 | 18 | `closure_audit.sh`, `structure_gate.sh` | contained |
 | 16 | `diag_goldens.sh` | contained |
+| 15 | `macro_txn_no_mock_e2e.sh` | contained |
 | 14 | `parser_corpus_no_mock_e2e.sh` | contained |
 | 13 | `dynamic_parser_no_mock_e2e.sh`, `env_snapshots.sh`, `hygiene_no_mock_e2e.sh`, `lexer_no_mock_e2e.sh` | contained — `env_snapshots.sh` is the lane every generalisation here was made from |
 | 12 | `unsafe_note_clippy.sh` | contained |
