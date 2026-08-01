@@ -195,7 +195,7 @@ impl Drop for QuotationTemplate {
         // Drain recursive children onto a heap worklist before ordinary drop glue
         // sees them, including when cancellation abandons a partially visited
         // task stack.
-        let mut pending = Vec::<Box<QuotationTemplate>>::new();
+        let mut pending = Vec::<QuotationTemplate>::new();
         detach_template_children(self, &mut pending);
         let mut drained = 0usize;
         while let Some(mut template) = pending.pop() {
@@ -210,14 +210,14 @@ impl Drop for QuotationTemplate {
 
 fn detach_template_children(
     template: &mut QuotationTemplate,
-    pending: &mut Vec<Box<QuotationTemplate>>,
+    pending: &mut Vec<QuotationTemplate>,
 ) {
     match template {
         QuotationTemplate::Node { args, .. } => {
-            pending.extend(std::mem::take(args).into_iter().map(Box::new));
+            pending.extend(std::mem::take(args));
         }
         QuotationTemplate::Nested { body, .. } => {
-            pending.push(std::mem::replace(
+            pending.push(*std::mem::replace(
                 body,
                 Box::new(QuotationTemplate::Literal(Syntax::Missing)),
             ));
