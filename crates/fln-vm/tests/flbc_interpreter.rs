@@ -5554,6 +5554,80 @@ fn evaluated_thunks_and_finished_tasks_round_trip_abi_values() {
 }
 
 #[test]
+fn managerless_io_cancellation_matches_the_finished_task_runtime_subset() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        6,
+        vec![
+            intrinsic(r(0), "extern:IO.checkCanceled", Vec::new()),
+            Instruction::String {
+                dst: r(1),
+                value: "finished".to_string(),
+            },
+            intrinsic(r(2), "extern:Task.pure", vec![r(1)]),
+            intrinsic(r(3), "extern:IO.cancel", vec![r(2)]),
+            intrinsic(r(4), "extern:IO.checkCanceled", Vec::new()),
+            Instruction::Array {
+                dst: r(5),
+                items: vec![r(0), r(2), r(3), r(4)],
+            },
+            Instruction::Return { src: r(5) },
+        ],
+    )]);
+
+    shadow::enable();
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(completed.value.array_view(), (4, 4));
+    assert_eq!(
+        completed.value.array_child(0).unbox(),
+        0,
+        "no scheduled current task means not cancelled"
+    );
+    assert_eq!(value_kind(&completed.value.array_child(1)), ValueKind::Task);
+    assert_eq!(
+        completed.value.array_child(2).unbox(),
+        0,
+        "cancelling an already-finished task is a Unit no-op"
+    );
+    assert_eq!(completed.value.array_child(3).unbox(), 0);
+    drop(completed);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "managerless cancellation retains no ABI object");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "managerless cancellation preserves the Marrow ownership graph"
+    );
+
+    let host_cancelled = || true;
+    let stopped = execute(
+        &validated(vec![function(
+            0,
+            0,
+            1,
+            vec![
+                intrinsic(r(0), "extern:IO.checkCanceled", Vec::new()),
+                Instruction::Return { src: r(0) },
+            ],
+        )]),
+        ExecutionLimits::default(),
+        Some(&host_cancelled),
+    );
+    assert!(
+        matches!(
+            stopped,
+            Outcome::Inconclusive(ref inconclusive)
+                if matches!(inconclusive.cause, InconclusiveCause::Cancelled { .. })
+        ),
+        "host cancellation stops execution instead of masquerading as the task-local Bool"
+    );
+}
+
+#[test]
 fn delayed_thunk_forces_once_and_caches_the_same_abi_value() {
     let _guard = lock();
     let program = validated(vec![
@@ -6497,6 +6571,7 @@ fn pure_effect_intrinsics_refuse_wrong_abi_kinds_without_leaks() {
         ("extern:Thunk.mk", "Thunk.mk", "Golem closure"),
         ("extern:Thunk.get", "Thunk.get", "Thunk"),
         ("extern:Task.get", "Task.get", "finished Task"),
+        ("extern:IO.cancel", "IO.cancel", "Task"),
     ];
 
     shadow::enable();

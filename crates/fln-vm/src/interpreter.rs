@@ -20,9 +20,11 @@
 //! `Task.map`, and `Task.bind` fallbacks use that same continuation machinery
 //! and produce only finished tasks. The allocation-linked
 //! `IO.getNumHeartbeats` / `IO.setNumHeartbeats` rows share Marrow's runtime
-//! counter and preserve arbitrary-`Nat` low-64 semantics. Scheduled tasks,
-//! concurrent thunk forcing, ambient IO, and capability effects remain outside
-//! this slice.
+//! counter and preserve arbitrary-`Nat` low-64 semantics. In this managerless
+//! state, `IO.checkCanceled` observes false and `IO.cancel` is the pinned no-op
+//! on a finished task; host execution cancellation remains a distinct
+//! non-authoritative stop. Scheduled tasks, concurrent thunk forcing, ambient
+//! IO, and capability effects remain outside this slice.
 
 use crate::extern_row::{
     ArgumentOwnership as ContractArgumentOwnership, Ownership as ExternOwnership,
@@ -510,6 +512,8 @@ enum IntrinsicImplementation {
     ArrayGetInternal,
     ArrayGetBorrowed,
     ArrayPush,
+    IoCancel,
+    IoCheckCancelled,
     IoGetNumHeartbeats,
     IoSetNumHeartbeats,
     RefNew,
@@ -538,6 +542,8 @@ impl IntrinsicImplementation {
             "extern:Array.getInternal" => Self::ArrayGetInternal,
             "extern:Array.ugetBorrowed" => Self::ArrayGetBorrowed,
             "extern:Array.push" => Self::ArrayPush,
+            "extern:IO.cancel" => Self::IoCancel,
+            "extern:IO.checkCanceled" => Self::IoCheckCancelled,
             "extern:IO.getNumHeartbeats" => Self::IoGetNumHeartbeats,
             "extern:IO.setNumHeartbeats" => Self::IoSetNumHeartbeats,
             "extern:ST.Prim.mkRef" => Self::RefNew,
@@ -2865,6 +2871,22 @@ fn invoke_intrinsic(
             items.push(args[1].clone_ref());
             Ok(IntrinsicResult::raw_object(Obj::mk_array(items)))
         }
+        IntrinsicImplementation::IoCancel => {
+            expect_arity(row, args, 1)?;
+            expect_value_kind(&args[0], "IO.cancel", 0, "Task", ValueKind::Task)?;
+            if args[0].finished_task_value().is_none() {
+                return Err(VmRefusal::UnsupportedTaskState);
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
+        }
+        IntrinsicImplementation::IoCheckCancelled => {
+            expect_arity(row, args, 0)?;
+            // Golem's managerless execution path has no current scheduled
+            // task. This is the pin's exact non-task-manager observation;
+            // host execution cancellation remains the separate scheduler
+            // probe sampled before every instruction.
+            Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
+        }
         IntrinsicImplementation::IoGetNumHeartbeats => {
             expect_arity(row, args, 0)?;
             Ok(IntrinsicResult::owned(nat_from_u64(
@@ -3035,6 +3057,8 @@ fn managerless_task_application(
         | IntrinsicImplementation::ArrayGetInternal
         | IntrinsicImplementation::ArrayGetBorrowed
         | IntrinsicImplementation::ArrayPush
+        | IntrinsicImplementation::IoCancel
+        | IntrinsicImplementation::IoCheckCancelled
         | IntrinsicImplementation::IoGetNumHeartbeats
         | IntrinsicImplementation::IoSetNumHeartbeats
         | IntrinsicImplementation::RefNew
