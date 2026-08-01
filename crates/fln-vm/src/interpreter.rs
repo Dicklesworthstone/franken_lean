@@ -35,7 +35,11 @@ use fln_comp::flbc::{
 };
 use fln_core::diag::ResourceReason;
 use fln_core::mode::{BuildProfileId, ContentRoot, Mode};
-use fln_core::options::limits::HEARTBEAT_UNIT;
+use fln_core::name::Name;
+use fln_core::options::{
+    Options,
+    limits::{HEARTBEAT_UNIT, MAX_HEARTBEATS_DEFAULT},
+};
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_rt::abi;
@@ -89,6 +93,42 @@ impl HeartbeatLimit {
         } else {
             self.max_option_units.checked_mul(HEARTBEAT_UNIT)
         }
+    }
+}
+
+/// Reference-facing command options captured before one Golem run.
+///
+/// This is distinct from [`ExecutionLimits`]: those are FrankenLean's own
+/// interpreter work ceilings, while this context carries observable command
+/// policy. The first field is the pin-defined `maxHeartbeats` option; future
+/// command-scoped effect capabilities can extend the same explicit boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandExecutionContext {
+    heartbeat_limit: HeartbeatLimit,
+}
+
+impl CommandExecutionContext {
+    /// Compatibility context for callers that have not yet supplied `Options`.
+    pub const UNLIMITED: Self = Self::new(HeartbeatLimit::UNLIMITED);
+
+    pub const fn new(heartbeat_limit: HeartbeatLimit) -> Self {
+        Self { heartbeat_limit }
+    }
+
+    /// Capture the pin-defined `maxHeartbeats` option in thousand-unit form.
+    ///
+    /// [`Options`] preserves Reference first-match lookup and defaults on both
+    /// absence and type mismatch. This method preserves those observables and
+    /// leaves the ×1000 overflow decision to [`HeartbeatLimit`].
+    pub fn from_options(options: &Options) -> Self {
+        let name = Name::str(Name::anonymous(), "maxHeartbeats");
+        Self::new(HeartbeatLimit::from_option_units(
+            options.get_nat(&name, MAX_HEARTBEATS_DEFAULT),
+        ))
+    }
+
+    pub const fn heartbeat_limit(self) -> HeartbeatLimit {
+        self.heartbeat_limit
     }
 }
 
@@ -1075,7 +1115,12 @@ pub fn execute(
     limits: ExecutionLimits,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<VmExit> {
-    execute_with_heartbeat_limit(program, limits, HeartbeatLimit::UNLIMITED, cancellation)
+    execute_with_context(
+        program,
+        limits,
+        CommandExecutionContext::UNLIMITED,
+        cancellation,
+    )
 }
 
 /// Execute with an explicit command-scoped Reference heartbeat option.
@@ -1088,7 +1133,28 @@ pub fn execute_with_heartbeat_limit(
     heartbeat_limit: HeartbeatLimit,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<VmExit> {
-    finish_run(run(program, limits, heartbeat_limit, cancellation, None))
+    execute_with_context(
+        program,
+        limits,
+        CommandExecutionContext::new(heartbeat_limit),
+        cancellation,
+    )
+}
+
+/// Execute with one context captured from the command's observable options.
+pub fn execute_with_context(
+    program: &ValidatedProgram,
+    limits: ExecutionLimits,
+    context: CommandExecutionContext,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<VmExit> {
+    finish_run(run(
+        program,
+        limits,
+        context.heartbeat_limit(),
+        cancellation,
+        None,
+    ))
 }
 
 /// Execute through bounded inline caches while preserving [`execute`] as the
@@ -1124,18 +1190,38 @@ pub fn execute_cached_with_heartbeat_limit(
     context: ExecutionCacheContext,
     caches: &mut InlineCaches,
 ) -> Outcome<VmExit> {
+    execute_cached_with_context(
+        program,
+        limits,
+        CommandExecutionContext::new(heartbeat_limit),
+        cancellation,
+        context,
+        caches,
+    )
+}
+
+/// Cached execution with the same captured command context as
+/// [`execute_with_context`].
+pub fn execute_cached_with_context(
+    program: &ValidatedProgram,
+    limits: ExecutionLimits,
+    command_context: CommandExecutionContext,
+    cancellation: Option<&dyn CancellationProbe>,
+    context: ExecutionCacheContext,
+    caches: &mut InlineCaches,
+) -> Outcome<VmExit> {
     if caches.is_disabled() {
-        return execute_with_heartbeat_limit(program, limits, heartbeat_limit, cancellation);
+        return execute_with_context(program, limits, command_context, cancellation);
     }
     let Some(namespace) = cache_namespace(program, context, caches.identity_limits) else {
         caches.record_identity_fallback();
-        return execute_with_heartbeat_limit(program, limits, heartbeat_limit, cancellation);
+        return execute_with_context(program, limits, command_context, cancellation);
     };
     caches.begin_namespace(namespace);
     finish_run(run(
         program,
         limits,
-        heartbeat_limit,
+        command_context.heartbeat_limit(),
         cancellation,
         Some(caches),
     ))

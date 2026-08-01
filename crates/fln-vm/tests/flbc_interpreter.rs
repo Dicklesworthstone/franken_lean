@@ -17,7 +17,7 @@ use fln_core::expr::{BinderInfo, Expr, Literal};
 use fln_core::level::Level;
 use fln_core::mode::{BuildProfileId, ContentRoot, Mode};
 use fln_core::name::Name;
-use fln_core::options::KVMap;
+use fln_core::options::{DataValue, KVMap, Options, limits::MAX_HEARTBEATS_DEFAULT};
 use fln_core::outcome::{Authority, InconclusiveCause, Outcome};
 use fln_rt::obj::{Obj, shadow};
 use fln_rt::{abi, heartbeat};
@@ -27,8 +27,9 @@ use fln_vm::extern_row::{
 };
 use fln_vm::extern_table_generated::EXTERN_ROWS;
 use fln_vm::interpreter::{
-    CompletedExecution, ExecutionCacheContext, ExecutionLimits, HeartbeatLimit, InlineCaches,
-    ValueKind, VmExit, VmRefusal, execute, execute_cached, execute_cached_with_heartbeat_limit,
+    CommandExecutionContext, CompletedExecution, ExecutionCacheContext, ExecutionLimits,
+    HeartbeatLimit, InlineCaches, ValueKind, VmExit, VmRefusal, execute, execute_cached,
+    execute_cached_with_context, execute_cached_with_heartbeat_limit, execute_with_context,
     execute_with_heartbeat_limit, value_kind,
 };
 use std::cell::Cell;
@@ -6487,6 +6488,118 @@ fn heartbeat_io_intrinsics_share_marrow_state_through_the_u64_boundary() {
         }),
         "heartbeat IO execution preserves the Marrow ownership graph"
     );
+}
+
+#[test]
+fn command_execution_context_captures_options_for_cached_and_uncached_runs() {
+    fn assert_heartbeat_stop(outcome: Outcome<VmExit>) {
+        assert_eq!(outcome.authority(), Authority::NonAuthoritative);
+        let Outcome::Inconclusive(inconclusive) = outcome else {
+            panic!("expected heartbeat exhaustion");
+        };
+        assert!(
+            inconclusive
+                .progress
+                .as_deref()
+                .is_some_and(|progress| progress.text().contains("Options.Module"))
+        );
+        assert!(matches!(
+            inconclusive.cause,
+            InconclusiveCause::ResourceExhausted { usage }
+                if usage.allowed == 1_000
+                    && usage.observed == 1_001
+                    && usage.reason
+                        == ResourceReason::Heartbeats {
+                            consumed: 1_001,
+                            limit: 1_000,
+                        }
+        ));
+    }
+
+    let _guard = lock();
+    let max_heartbeats = Name::from_components(["maxHeartbeats"]);
+    let empty = Options::new();
+    assert_eq!(
+        CommandExecutionContext::from_options(&empty)
+            .heartbeat_limit()
+            .max_option_units(),
+        MAX_HEARTBEATS_DEFAULT
+    );
+
+    let mut wrong_type = Options::new();
+    wrong_type.insert(
+        max_heartbeats.clone(),
+        DataValue::OfString("not-a-Nat".to_string()),
+    );
+    assert_eq!(
+        CommandExecutionContext::from_options(&wrong_type)
+            .heartbeat_limit()
+            .max_option_units(),
+        MAX_HEARTBEATS_DEFAULT,
+        "Options.getNat defaults on type mismatch"
+    );
+
+    let duplicate = Options::from_entries(vec![
+        (max_heartbeats.clone(), DataValue::OfNat(1)),
+        (max_heartbeats.clone(), DataValue::OfNat(2)),
+    ]);
+    let context = CommandExecutionContext::from_options(&duplicate);
+    assert_eq!(context.heartbeat_limit().max_option_units(), 1);
+    assert_eq!(context.heartbeat_limit().effective_limit(), Some(1_000));
+
+    let program = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 1_001,
+            },
+            intrinsic(r(1), "extern:IO.setNumHeartbeats", vec![r(0)]),
+            Instruction::CheckSystem {
+                module_name: "Options.Module".to_string(),
+            },
+            Instruction::Nat {
+                dst: r(2),
+                value: 7,
+            },
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    heartbeat::set_allocation_heartbeats(0);
+    assert_heartbeat_stop(execute_with_context(
+        &program,
+        ExecutionLimits::default(),
+        context,
+        None,
+    ));
+
+    heartbeat::set_allocation_heartbeats(0);
+    let mut caches = InlineCaches::try_new(8).expect("bounded cache");
+    assert_heartbeat_stop(execute_cached_with_context(
+        &program,
+        ExecutionLimits::default(),
+        context,
+        None,
+        cache_context(71, 72, Mode::Sound),
+        &mut caches,
+    ));
+
+    let mut unlimited_options = Options::new();
+    unlimited_options.insert(max_heartbeats, DataValue::OfNat(0));
+    let unlimited = CommandExecutionContext::from_options(&unlimited_options);
+    assert_eq!(unlimited.heartbeat_limit().effective_limit(), None);
+    heartbeat::set_allocation_heartbeats(0);
+    let completed = returned(execute_with_context(
+        &program,
+        ExecutionLimits::default(),
+        unlimited,
+        None,
+    ));
+    assert_eq!(completed.value.unbox(), 7);
+    drop(completed);
+    heartbeat::set_allocation_heartbeats(0);
 }
 
 #[test]
