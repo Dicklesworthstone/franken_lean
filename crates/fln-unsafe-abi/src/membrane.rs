@@ -32,16 +32,20 @@
 //! unwinding toward an ABI boundary (§6.5 panic law). The *exported* C
 //! surface instead mirrors the pin's observable OOM behavior
 //! (`lean_internal_panic_out_of_memory`); see `export.rs`. The owned
-//! calibrated heartbeat hook is installed at the small-allocation seam; the
-//! size-classed backend that replaces `std::alloc` underneath this interface
-//! remains bead fln-8w8 work. The membrane discipline and observable header
-//! facts are already final here.
+//! calibrated heartbeat hook is installed at the small-allocation seam.
+//! Small blocks now pass through bounded thread-local size-class bins: a free
+//! is deferred into the current runtime thread's bin, a same-class allocation
+//! reuses the most recent block, full bins release directly to `std::alloc`,
+//! and thread exit drains every retained block. This is the first owned
+//! allocator layer, not the page backend or the allocator bead's concurrency,
+//! soak, fragmentation, and fuel-parity closure. The membrane discipline and
+//! observable header facts are already final here.
 
 use crate::contract::{MAX_SMALL_OBJECT_SIZE, OBJECT_SIZE_DELTA, TAG_RESERVED};
 use crate::layout::LeanObject;
 use crate::shadow;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// `lean_align` (`lean.h:390-392`) at `OBJECT_SIZE_DELTA` granularity.
 #[inline(always)]
@@ -59,10 +63,94 @@ const OBJ_ALIGN: usize = 8;
 /// one word, so the returned object pointer stays 8-aligned.
 const SMALL_PREFIX: usize = size_of::<usize>();
 
+/// One bin for every 8-byte class accepted by the Reference small-object
+/// boundary, from 8 through 4096 bytes inclusive.
+const SMALL_CLASS_COUNT: usize = MAX_SMALL_OBJECT_SIZE / OBJECT_SIZE_DELTA;
+
+/// A deliberately bounded per-class cache. Free never allocates bookkeeping
+/// memory; the ninth retained block returns directly to the backing allocator.
+const SMALL_BIN_CAPACITY: usize = 8;
+
+struct SmallBins {
+    heads: [*mut u8; SMALL_CLASS_COUNT],
+    lengths: [u8; SMALL_CLASS_COUNT],
+}
+
+// UNSAFE-LEDGER: FLN-UL-0202
+#[allow(unsafe_code)]
+impl SmallBins {
+    const fn new() -> Self {
+        Self {
+            heads: [core::ptr::null_mut(); SMALL_CLASS_COUNT],
+            lengths: [0; SMALL_CLASS_COUNT],
+        }
+    }
+
+    fn pop(&mut self, class: usize) -> Option<*mut u8> {
+        let block = self.heads[class];
+        if block.is_null() {
+            debug_assert_eq!(self.lengths[class], 0);
+            return None;
+        }
+        debug_assert!(self.lengths[class] > 0);
+        // SAFETY: an occupied bin head exclusively owns a freed block for
+        // this class. push stored the next link in the first class word,
+        // which exists even when the caller requested fewer than eight bytes.
+        self.heads[class] = unsafe { block.add(SMALL_PREFIX).cast::<*mut u8>().read() };
+        self.lengths[class] -= 1;
+        Some(block)
+    }
+
+    fn push(&mut self, class: usize, block: *mut u8) -> bool {
+        let length = usize::from(self.lengths[class]);
+        if length == SMALL_BIN_CAPACITY {
+            return false;
+        }
+        // SAFETY: small_free_raw has ended the caller's live access. The
+        // class backing size is at least one pointer word, so its first user
+        // word may hold the private next link until the block is reused.
+        unsafe {
+            block
+                .add(SMALL_PREFIX)
+                .cast::<*mut u8>()
+                .write(self.heads[class]);
+        }
+        self.heads[class] = block;
+        self.lengths[class] = u8::try_from(length + 1).expect("small bin capacity fits u8");
+        true
+    }
+
+    #[cfg(test)]
+    fn depth(&self, class: usize) -> usize {
+        usize::from(self.lengths[class])
+    }
+
+    fn drain(&mut self) {
+        for class in 0..SMALL_CLASS_COUNT {
+            let layout = small_class_layout(class);
+            while let Some(block) = self.pop(class) {
+                // SAFETY: every retained link owns one block allocated with
+                // this class's backing layout and removed from live use by
+                // small_free_raw. Thread-local draining visits it once.
+                unsafe { dealloc(block, layout) };
+            }
+        }
+    }
+}
+
+impl Drop for SmallBins {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
+
 thread_local! {
     /// `g_heartbeat` / `heap::m_heartbeat` at the pin: one counter per
     /// runtime thread, shared by small allocations and explicit bumps.
     static HEARTBEAT: Cell<u64> = const { Cell::new(0) };
+
+    /// Bounded deferred-free bins local to the executing runtime thread.
+    static SMALL_BINS: RefCell<SmallBins> = const { RefCell::new(SmallBins::new()) };
 }
 
 /// Add explicit heartbeat ticks with the pin's wrapping unsigned arithmetic.
@@ -90,11 +178,32 @@ fn obj_layout(size: usize) -> Layout {
     Layout::from_size_align(size, OBJ_ALIGN).expect("object size overflows Layout")
 }
 
-fn small_layout(user_size: usize) -> Layout {
-    let total = user_size
+fn small_class(user_size: usize) -> Option<(usize, usize)> {
+    if user_size == 0 || user_size > MAX_SMALL_OBJECT_SIZE {
+        return None;
+    }
+    let class = (user_size - 1) / OBJECT_SIZE_DELTA;
+    Some((class, (class + 1) * OBJECT_SIZE_DELTA))
+}
+
+fn small_class_layout(class: usize) -> Layout {
+    let class_size = (class + 1) * OBJECT_SIZE_DELTA;
+    let total = class_size
         .checked_add(SMALL_PREFIX)
         .expect("small object size overflows Layout");
     Layout::from_size_align(total, OBJ_ALIGN).expect("small object size overflows Layout")
+}
+
+fn small_layout(user_size: usize) -> Layout {
+    match small_class(user_size) {
+        Some((class, _)) => small_class_layout(class),
+        None => {
+            let total = user_size
+                .checked_add(SMALL_PREFIX)
+                .expect("small object size overflows Layout");
+            Layout::from_size_align(total, OBJ_ALIGN).expect("small object size overflows Layout")
+        }
+    }
 }
 
 /// Raw small-heap allocation: `user_size` bytes behind a hidden size prefix.
@@ -110,9 +219,15 @@ pub(crate) unsafe fn small_alloc_raw(user_size: usize) -> *mut u8 {
     debug_assert!(user_size > 0);
     let layout = small_layout(user_size);
     // SAFETY: layout has non-zero size; the prefix word is in-bounds of the
-    // fresh exclusively-owned block.
+    // fresh or exclusively cached block.
     unsafe {
-        let base = alloc(layout);
+        let cached = small_class(user_size).and_then(|(class, _)| {
+            SMALL_BINS
+                .try_with(|bins| bins.try_borrow_mut().ok()?.pop(class))
+                .ok()
+                .flatten()
+        });
+        let base = cached.unwrap_or_else(|| alloc(layout));
         if base.is_null() {
             return core::ptr::null_mut();
         }
@@ -135,7 +250,17 @@ pub(crate) unsafe fn small_free_raw(p: *mut u8) {
     unsafe {
         let base = p.sub(SMALL_PREFIX);
         let user_size = base.cast::<usize>().read();
-        dealloc(base, small_layout(user_size));
+        let cached = small_class(user_size).is_some_and(|(class, _)| {
+            SMALL_BINS
+                .try_with(|bins| {
+                    bins.try_borrow_mut()
+                        .is_ok_and(|mut bins| bins.push(class, base))
+                })
+                .unwrap_or(false)
+        });
+        if !cached {
+            dealloc(base, small_layout(user_size));
+        }
     }
 }
 
@@ -148,6 +273,29 @@ pub(crate) unsafe fn small_free_raw(p: *mut u8) {
 pub(crate) unsafe fn small_mem_size_raw(p: *mut u8) -> usize {
     // SAFETY: as small_free_raw; read-only.
     unsafe { p.sub(SMALL_PREFIX).cast::<usize>().read() }
+}
+
+#[cfg(test)]
+pub(crate) fn small_class_for_test(user_size: usize) -> Option<(usize, usize)> {
+    small_class(user_size)
+}
+
+#[cfg(test)]
+pub(crate) fn small_bin_capacity_for_test() -> usize {
+    SMALL_BIN_CAPACITY
+}
+
+#[cfg(test)]
+pub(crate) fn small_bin_metadata_bytes_for_test() -> usize {
+    size_of::<SmallBins>()
+}
+
+#[cfg(test)]
+pub(crate) fn small_bin_depth_for_test(user_size: usize) -> usize {
+    let Some((class, _)) = small_class(user_size) else {
+        return 0;
+    };
+    SMALL_BINS.with(|bins| bins.borrow().depth(class))
 }
 
 /// Small-path allocation: `lean_alloc_small_object` under `LEAN_MIMALLOC`

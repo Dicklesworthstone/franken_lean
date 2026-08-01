@@ -1107,6 +1107,99 @@ fn export_small_heap_prefix_roundtrip() {
 }
 
 #[test]
+fn small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable() {
+    let _g = lock();
+    use crate::export::{export_lean_small_mem_size, export_mi_free, export_mi_malloc_small};
+
+    assert_eq!(crate::membrane::small_class_for_test(1), Some((0, 8)));
+    assert_eq!(crate::membrane::small_class_for_test(8), Some((0, 8)));
+    assert_eq!(crate::membrane::small_class_for_test(9), Some((1, 16)));
+    assert_eq!(
+        crate::membrane::small_class_for_test(4096),
+        Some((511, 4096))
+    );
+    assert_eq!(crate::membrane::small_class_for_test(4097), None);
+    assert!(
+        crate::membrane::small_bin_metadata_bytes_for_test() <= 5 * 1024,
+        "intrusive heads keep per-thread allocator metadata bounded"
+    );
+
+    for size in [1usize, 8, 9, 4095, 4096, 4097] {
+        let block = export_mi_malloc_small(size);
+        assert!(!block.is_null());
+        assert_eq!(
+            export_lean_small_mem_size(block),
+            u32::try_from(size).expect("test size fits c_uint"),
+            "the hidden prefix preserves logical size across every class edge"
+        );
+        export_mi_free(block);
+    }
+
+    let capacity = crate::membrane::small_bin_capacity_for_test();
+    let mut held = Vec::new();
+    for _ in 0..capacity + 3 {
+        let block = export_mi_malloc_small(9);
+        assert!(!block.is_null());
+        held.push(block);
+    }
+    assert_eq!(
+        crate::membrane::small_bin_depth_for_test(9),
+        0,
+        "holding more than one full bin drains every prior cached block"
+    );
+
+    let recycled = held.pop().expect("one held class-16 block");
+    let recycled_address = recycled.addr();
+    export_mi_free(recycled);
+    assert_eq!(crate::membrane::small_bin_depth_for_test(9), 1);
+
+    let reused = export_mi_malloc_small(15);
+    assert_eq!(
+        reused.addr(),
+        recycled_address,
+        "same-class allocation reuses the most recently deferred block"
+    );
+    assert_eq!(
+        export_lean_small_mem_size(reused),
+        15,
+        "reuse rewrites the logical-size prefix"
+    );
+    export_mi_free(reused);
+    for block in held {
+        export_mi_free(block);
+    }
+    assert_eq!(
+        crate::membrane::small_bin_depth_for_test(9),
+        capacity,
+        "each thread-local class is bounded exactly"
+    );
+
+    let cross_thread = export_mi_malloc_small(24);
+    assert!(!cross_thread.is_null());
+    let cross_thread_address = cross_thread.expose_provenance();
+    std::thread::spawn(move || {
+        let block =
+            core::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(cross_thread_address);
+        export_mi_free(block);
+        assert_eq!(
+            crate::membrane::small_bin_depth_for_test(24),
+            1,
+            "a foreign-thread release is adopted by the freeing thread"
+        );
+        let reused = export_mi_malloc_small(17);
+        assert_eq!(
+            reused.addr(),
+            cross_thread_address,
+            "the adopting thread owns the next same-class reuse"
+        );
+        assert_eq!(export_lean_small_mem_size(reused), 17);
+        export_mi_free(reused);
+    })
+    .join()
+    .expect("cross-thread small-bin reuse");
+}
+
+#[test]
 fn export_alloc_object_marks_big_path_and_frees() {
     let _g = lock();
     use crate::export::{export_lean_alloc_object, export_lean_free_object};
