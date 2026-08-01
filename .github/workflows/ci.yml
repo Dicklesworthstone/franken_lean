@@ -882,6 +882,39 @@ jobs:
           fi
           exit "$command_rc"
 
+      - name: e2e smoke — Vellum macro transaction contract
+        id: macro_txn_no_mock_e2e
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/macro-txn-no-mock"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/macro_txn_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "macro transaction no-mock lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
       - name: e2e smoke — vellum naming contract
         id: vellum_naming
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
@@ -980,6 +1013,8 @@ jobs:
           DYNAMIC_PARSER_NO_MOCK_EXIT: ${{ steps.dynamic_parser_no_mock_e2e.outputs.command_exit }}
           HYGIENE_NO_MOCK_ARTIFACT: ${{ steps.hygiene_no_mock_e2e.outputs.artifact_path }}
           HYGIENE_NO_MOCK_EXIT: ${{ steps.hygiene_no_mock_e2e.outputs.command_exit }}
+          MACRO_TXN_NO_MOCK_ARTIFACT: ${{ steps.macro_txn_no_mock_e2e.outputs.artifact_path }}
+          MACRO_TXN_NO_MOCK_EXIT: ${{ steps.macro_txn_no_mock_e2e.outputs.command_exit }}
           VELLUM_NAMING_ARTIFACT: ${{ steps.vellum_naming.outputs.artifact_path }}
           VELLUM_NAMING_EXIT: ${{ steps.vellum_naming.outputs.command_exit }}
           VERDICT_SCHEMA_ARTIFACT: ${{ steps.verdict_schema.outputs.artifact_path }}
@@ -1138,6 +1173,13 @@ jobs:
                   os.environ.get("HYGIENE_NO_MOCK_ARTIFACT", ""),
                   os.environ.get("HYGIENE_NO_MOCK_EXIT", ""),
                   e2e_root / "hygiene-no-mock",
+                  True,
+              ),
+              (
+                  "macro_txn_no_mock_e2e",
+                  os.environ.get("MACRO_TXN_NO_MOCK_ARTIFACT", ""),
+                  os.environ.get("MACRO_TXN_NO_MOCK_EXIT", ""),
+                  e2e_root / "macro-txn-no-mock",
                   True,
               ),
               (

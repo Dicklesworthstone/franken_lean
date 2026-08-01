@@ -573,6 +573,11 @@ E2E_STEP_ORDERS = {
         "reference_scope_oracle",
         "semantic_validation",
     ],
+    "macro_txn_no_mock_e2e": [
+        "macro_txn_targets",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
     "g0_4_no_mock_e2e": [
         "syntax_hygiene_contract",
         "pratt_precedence_contract",
@@ -725,6 +730,23 @@ DYNAMIC_PARSER_CASE_INPUTS = {
         ),
     ),
 }
+MACRO_TXN_SEMANTIC_SCHEMA = "fln.e2e.macro-txn-semantic/1"
+MACRO_TXN_TELEMETRY_SCHEMA = "fln.e2e.macro-txn-telemetry/1"
+MACRO_TXN_VALIDATION_SCHEMA = "fln.e2e.macro-txn-validation/1"
+MACRO_TXN_SCENARIOS = (
+    "positive",
+    "memoization",
+    "opaque_reads",
+    "failure",
+    "cancellation",
+    "resource",
+    "internal_fault",
+    "recovery",
+    "quotation_seam",
+    "thread_matrix",
+)
+MACRO_TXN_THREAD_COUNTS = [1, 8, 32]
+MACRO_TXN_PRODUCTIVE_RUNS = sum(MACRO_TXN_THREAD_COUNTS)
 SOURCE_RECOVERY_SEMANTIC_SCHEMA = "fln.e2e.source-recovery-semantic"
 SOURCE_RECOVERY_TELEMETRY_SCHEMA = "fln.e2e.source-recovery-telemetry"
 SOURCE_RECOVERY_INPUT = (
@@ -8760,6 +8782,363 @@ def validate_dynamic_parser_no_mock_evidence(
         ),
         "thread_matrix": [1, 8, 32],
         "typed_refusal": DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC,
+        "verdict": "pass",
+    }
+
+
+def macro_txn_canonical_rows(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+) -> tuple[list[dict[str, Any]], str]:
+    data, _size, digest = stable_file_facts(path, max_bytes=max_bytes)
+    rows: list[dict[str, Any]] = []
+    for number, raw in enumerate(data.splitlines(keepends=True), 1):
+        if not raw.endswith(b"\n"):
+            raise EvidenceError(
+                f"{label} row {number} is not newline terminated"
+            )
+        value = parse_json(raw, subject=f"{label} row {number}")
+        if not isinstance(value, dict):
+            raise EvidenceError(f"{label} row {number} is not an object")
+        if canonical_json(value) != raw:
+            raise EvidenceError(
+                f"{label} row {number} is not canonical JSON"
+            )
+        rows.append(value)
+    if not rows:
+        raise EvidenceError(f"{label} is empty")
+    return rows, digest
+
+
+def validate_macro_txn_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("macro transaction expected run id must be non-empty")
+    semantic, semantic_digest = macro_txn_canonical_rows(
+        semantic_path,
+        label="macro transaction semantic evidence",
+        max_bytes=65_536,
+    )
+    telemetry_rows, telemetry_digest = macro_txn_canonical_rows(
+        telemetry_path,
+        label="macro transaction telemetry",
+        max_bytes=4_096,
+    )
+    if len(semantic) != len(MACRO_TXN_SCENARIOS):
+        raise EvidenceError(
+            "macro transaction semantic row count differs from the frozen scenario set"
+        )
+    if [row.get("sequence") for row in semantic] != list(
+        range(len(MACRO_TXN_SCENARIOS))
+    ):
+        raise EvidenceError(
+            "macro transaction semantic sequence is not total and ordered"
+        )
+    if [row.get("scenario") for row in semantic] != list(
+        MACRO_TXN_SCENARIOS
+    ):
+        raise EvidenceError(
+            "macro transaction semantic scenarios are incomplete or reordered"
+        )
+    if any(
+        row.get("schema") != MACRO_TXN_SEMANTIC_SCHEMA
+        for row in semantic
+    ):
+        raise EvidenceError("macro transaction semantic schema changed")
+    forbidden_semantic_fields = {
+        "absolute_path",
+        "duration_ns",
+        "host",
+        "pid",
+        "positive_operations",
+        "run_id",
+    }
+    if any(forbidden_semantic_fields.intersection(row) for row in semantic):
+        raise EvidenceError(
+            "macro transaction semantic authority contains telemetry"
+        )
+
+    expected_fields = {
+        "positive": {
+            "cacheability",
+            "capability_event_count",
+            "diagnostic_codes",
+            "effect_count",
+            "final_state",
+            "initial_state",
+            "published",
+            "read_count",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged_before_publish",
+            "status",
+            "value",
+        },
+        "memoization": {
+            "cached_equals_fresh",
+            "cached_final_state",
+            "collision_lookup",
+            "exact_lookup",
+            "fresh_final_state",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "stale_file",
+            "stale_iteration",
+            "stale_negative",
+            "stale_option",
+        },
+        "opaque_reads": {
+            "faithful_clock_cacheability",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "sound_clock_outcome",
+            "unknown_cacheability",
+            "unknown_memo_admission",
+        },
+        "failure": {
+            "capability_event",
+            "diagnostic_codes",
+            "error",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged",
+            "status",
+        },
+        "cancellation": {
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged",
+            "status",
+        },
+        "resource": {
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged",
+            "status",
+        },
+        "internal_fault": {
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged",
+            "status",
+        },
+        "recovery": {
+            "final_state",
+            "matches_positive",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+            "value",
+        },
+        "quotation_seam": {
+            "failure_status",
+            "positive_root",
+            "positive_status",
+            "recovery_root",
+            "recovery_status",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged_before_publication",
+        },
+        "thread_matrix": {
+            "productive_runs",
+            "published",
+            "scenario",
+            "schema",
+            "semantic_root",
+            "sequence",
+            "status",
+            "thread_counts",
+        },
+    }
+    for row in semantic:
+        scenario = row["scenario"]
+        if set(row) != expected_fields[scenario]:
+            raise EvidenceError(
+                f"macro transaction {scenario} fields differ from the frozen schema"
+            )
+
+    positive = semantic[0]
+    initial_root = positive.get("initial_state")
+    positive_root = positive.get("final_state")
+    if (
+        not isinstance(initial_root, str)
+        or SHA256_HEX.fullmatch(initial_root) is None
+        or not isinstance(positive_root, str)
+        or SHA256_HEX.fullmatch(positive_root) is None
+        or initial_root == positive_root
+        or positive.get("cacheability") != "cacheable"
+        or positive.get("capability_event_count") != 1
+        or positive.get("diagnostic_codes")
+        != ["nested-visible", "committed"]
+        or positive.get("effect_count") != 4
+        or positive.get("published") is not True
+        or positive.get("read_count") != 9
+        or positive.get("state_unchanged_before_publish") is not True
+        or positive.get("status") != "complete"
+        or positive.get("value") != "expanded:old:false"
+    ):
+        raise EvidenceError(
+            "macro transaction positive publication facts changed"
+        )
+
+    memoization = semantic[1]
+    if (
+        memoization.get("cached_equals_fresh") is not True
+        or memoization.get("cached_final_state") != positive_root
+        or memoization.get("collision_lookup") != "collision_miss"
+        or memoization.get("exact_lookup") != "hit"
+        or memoization.get("fresh_final_state") != positive_root
+        or memoization.get("published") is not True
+        or memoization.get("stale_file") != "stale_read_miss"
+        or memoization.get("stale_iteration") != "stale_read_miss"
+        or memoization.get("stale_negative") != "stale_read_miss"
+        or memoization.get("stale_option") != "stale_read_miss"
+    ):
+        raise EvidenceError(
+            "macro transaction exact memoization law changed"
+        )
+
+    opaque_reads = semantic[2]
+    if (
+        opaque_reads.get("faithful_clock_cacheability") != "uncacheable"
+        or opaque_reads.get("published") is not False
+        or opaque_reads.get("sound_clock_outcome") != "rejected"
+        or opaque_reads.get("unknown_cacheability") != "uncacheable"
+        or opaque_reads.get("unknown_memo_admission") != "refused"
+    ):
+        raise EvidenceError(
+            "macro transaction opaque-read policy changed"
+        )
+
+    failure = semantic[3]
+    if (
+        failure.get("capability_event") != "clock_denied_sound"
+        or failure.get("diagnostic_codes") != ["failure-visible"]
+        or failure.get("error") != "capability_denied_clock_sound"
+        or failure.get("published") is not False
+        or failure.get("state_unchanged") is not True
+        or failure.get("status") != "rejected"
+    ):
+        raise EvidenceError(
+            "macro transaction failure or diagnostic policy changed"
+        )
+
+    expected_negative_status = {
+        "cancellation": "inconclusive",
+        "resource": "inconclusive",
+        "internal_fault": "internal_fault",
+    }
+    for row in semantic[4:7]:
+        if (
+            row.get("status") != expected_negative_status[row["scenario"]]
+            or row.get("published") is not False
+            or row.get("state_unchanged") is not True
+        ):
+            raise EvidenceError(
+                "macro transaction non-authoritative outcome crossed publication"
+            )
+
+    recovery = semantic[7]
+    if (
+        recovery.get("final_state") != positive_root
+        or recovery.get("matches_positive") is not True
+        or recovery.get("published") is not True
+        or recovery.get("status") != "complete"
+        or recovery.get("value") != positive.get("value")
+    ):
+        raise EvidenceError(
+            "macro transaction clean recovery diverged from the positive control"
+        )
+
+    quotation = semantic[8]
+    quotation_root = quotation.get("positive_root")
+    quotation_recovery_root = quotation.get("recovery_root")
+    if (
+        not isinstance(quotation_root, str)
+        or SHA256_HEX.fullmatch(quotation_root) is None
+        or quotation_recovery_root != quotation_root
+        or quotation.get("positive_status") != "complete"
+        or quotation.get("failure_status") != "rejected"
+        or quotation.get("recovery_status") != "complete"
+        or quotation.get("state_unchanged_before_publication") is not True
+    ):
+        raise EvidenceError(
+            "actual quotation transaction seam failed positive, refusal, or recovery"
+        )
+
+    thread_matrix = semantic[9]
+    if (
+        thread_matrix.get("productive_runs")
+        != MACRO_TXN_PRODUCTIVE_RUNS
+        or thread_matrix.get("published") is not True
+        or thread_matrix.get("semantic_root") != positive_root
+        or thread_matrix.get("status") != "complete"
+        or thread_matrix.get("thread_counts") != MACRO_TXN_THREAD_COUNTS
+    ):
+        raise EvidenceError(
+            "macro transaction productive 1/8/32 reduction changed"
+        )
+
+    if len(telemetry_rows) != 1:
+        raise EvidenceError(
+            "macro transaction telemetry row count is not one"
+        )
+    telemetry = telemetry_rows[0]
+    telemetry_fields = {
+        "observed_semantic_rows",
+        "positive_operations",
+        "productive_runs",
+        "run_id",
+        "schema",
+        "thread_counts",
+    }
+    if (
+        set(telemetry) != telemetry_fields
+        or telemetry.get("schema") != MACRO_TXN_TELEMETRY_SCHEMA
+        or telemetry.get("run_id") != expected_run_id
+        or telemetry.get("thread_counts") != MACRO_TXN_THREAD_COUNTS
+        or telemetry.get("productive_runs") != MACRO_TXN_PRODUCTIVE_RUNS
+        or telemetry.get("observed_semantic_rows")
+        != len(MACRO_TXN_SCENARIOS)
+        or telemetry.get("positive_operations") != 17
+    ):
+        raise EvidenceError(
+            "macro transaction telemetry is malformed or not bound to the run"
+        )
+
+    return {
+        "initial_state": initial_root,
+        "productive_runs": MACRO_TXN_PRODUCTIVE_RUNS,
+        "quotation_root": quotation_root,
+        "run_id": expected_run_id,
+        "schema": MACRO_TXN_VALIDATION_SCHEMA,
+        "semantic_root": positive_root,
+        "semantic_sha256": semantic_digest,
+        "telemetry_sha256": telemetry_digest,
+        "thread_counts": MACRO_TXN_THREAD_COUNTS,
         "verdict": "pass",
     }
 
@@ -18312,6 +18691,35 @@ def cmd_validate_dynamic_parser_no_mock(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_macro_txn_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    semantic_path = require_within(
+        Path(args.semantic),
+        artifact_root,
+        label="macro transaction semantic evidence",
+    )
+    telemetry_path = require_within(
+        Path(args.telemetry),
+        artifact_root,
+        label="macro transaction telemetry",
+    )
+    report = validate_macro_txn_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_path=semantic_path,
+        telemetry_path=telemetry_path,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="macro transaction semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_validate_environment_resource_collision(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
     stdout_path = require_within(
@@ -19500,6 +19908,261 @@ def run_fmt_component_admission_self_test(root: Path) -> dict[str, Any]:
     }
 
 
+def run_macro_txn_validator_self_test(root: Path) -> dict[str, Any]:
+    initial_root = "1" * 64
+    semantic_root = "2" * 64
+    quotation_root = "3" * 64
+    records = [
+        {
+            "cacheability": "cacheable",
+            "capability_event_count": 1,
+            "diagnostic_codes": ["nested-visible", "committed"],
+            "effect_count": 4,
+            "final_state": semantic_root,
+            "initial_state": initial_root,
+            "published": True,
+            "read_count": 9,
+            "scenario": "positive",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 0,
+            "state_unchanged_before_publish": True,
+            "status": "complete",
+            "value": "expanded:old:false",
+        },
+        {
+            "cached_equals_fresh": True,
+            "cached_final_state": semantic_root,
+            "collision_lookup": "collision_miss",
+            "exact_lookup": "hit",
+            "fresh_final_state": semantic_root,
+            "published": True,
+            "scenario": "memoization",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 1,
+            "stale_file": "stale_read_miss",
+            "stale_iteration": "stale_read_miss",
+            "stale_negative": "stale_read_miss",
+            "stale_option": "stale_read_miss",
+        },
+        {
+            "faithful_clock_cacheability": "uncacheable",
+            "published": False,
+            "scenario": "opaque_reads",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 2,
+            "sound_clock_outcome": "rejected",
+            "unknown_cacheability": "uncacheable",
+            "unknown_memo_admission": "refused",
+        },
+        {
+            "capability_event": "clock_denied_sound",
+            "diagnostic_codes": ["failure-visible"],
+            "error": "capability_denied_clock_sound",
+            "published": False,
+            "scenario": "failure",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 3,
+            "state_unchanged": True,
+            "status": "rejected",
+        },
+        {
+            "published": False,
+            "scenario": "cancellation",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 4,
+            "state_unchanged": True,
+            "status": "inconclusive",
+        },
+        {
+            "published": False,
+            "scenario": "resource",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 5,
+            "state_unchanged": True,
+            "status": "inconclusive",
+        },
+        {
+            "published": False,
+            "scenario": "internal_fault",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 6,
+            "state_unchanged": True,
+            "status": "internal_fault",
+        },
+        {
+            "final_state": semantic_root,
+            "matches_positive": True,
+            "published": True,
+            "scenario": "recovery",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 7,
+            "status": "complete",
+            "value": "expanded:old:false",
+        },
+        {
+            "failure_status": "rejected",
+            "positive_root": quotation_root,
+            "positive_status": "complete",
+            "recovery_root": quotation_root,
+            "recovery_status": "complete",
+            "scenario": "quotation_seam",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 8,
+            "state_unchanged_before_publication": True,
+        },
+        {
+            "productive_runs": MACRO_TXN_PRODUCTIVE_RUNS,
+            "published": True,
+            "scenario": "thread_matrix",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "semantic_root": semantic_root,
+            "sequence": 9,
+            "status": "complete",
+            "thread_counts": MACRO_TXN_THREAD_COUNTS,
+        },
+    ]
+    telemetry = {
+        "observed_semantic_rows": len(records),
+        "positive_operations": 17,
+        "productive_runs": MACRO_TXN_PRODUCTIVE_RUNS,
+        "run_id": "macro-txn-validator-self-test",
+        "schema": MACRO_TXN_TELEMETRY_SCHEMA,
+        "thread_counts": MACRO_TXN_THREAD_COUNTS,
+    }
+
+    def write_records(
+        path: Path, values: Sequence[Mapping[str, Any]]
+    ) -> None:
+        write_new(path, b"".join(canonical_json(value) for value in values))
+
+    semantic_path = root / "positive.semantic.ndjson"
+    telemetry_path = root / "positive.telemetry.ndjson"
+    write_records(semantic_path, records)
+    write_new(telemetry_path, canonical_json(telemetry))
+    report = validate_macro_txn_no_mock_evidence(
+        expected_run_id="macro-txn-validator-self-test",
+        semantic_path=semantic_path,
+        telemetry_path=telemetry_path,
+    )
+    require(
+        report["verdict"] == "pass"
+        and report["productive_runs"] == MACRO_TXN_PRODUCTIVE_RUNS,
+        "macro transaction positive validator control failed",
+    )
+
+    mutants_killed = 0
+
+    def cloned_records() -> list[dict[str, Any]]:
+        candidate = parse_json(
+            canonical_json(records),
+            subject="macro transaction self-test records",
+        )
+        if not isinstance(candidate, list) or not all(
+            isinstance(record, dict) for record in candidate
+        ):
+            raise EvidenceError(
+                "macro transaction self-test clone is malformed"
+            )
+        return candidate
+
+    def expect_semantic_rejection(
+        label: str,
+        mutate: Callable[[list[dict[str, Any]]], None],
+    ) -> None:
+        nonlocal mutants_killed
+        candidate = cloned_records()
+        mutate(candidate)
+        candidate_path = root / f"{label}.semantic.ndjson"
+        write_records(candidate_path, candidate)
+        try:
+            validate_macro_txn_no_mock_evidence(
+                expected_run_id="macro-txn-validator-self-test",
+                semantic_path=candidate_path,
+                telemetry_path=telemetry_path,
+            )
+        except EvidenceError:
+            mutants_killed += 1
+            return
+        raise EvidenceError(
+            f"macro transaction validator accepted {label} mutation"
+        )
+
+    expect_semantic_rejection("scenario_omission", lambda value: value.pop())
+    expect_semantic_rejection(
+        "collision_cross_hit",
+        lambda value: value[1].__setitem__("collision_lookup", "hit"),
+    )
+    expect_semantic_rejection(
+        "resource_as_rejection",
+        lambda value: value[5].__setitem__("status", "rejected"),
+    )
+    expect_semantic_rejection(
+        "internal_fault_publication",
+        lambda value: value[6].__setitem__("published", True),
+    )
+    expect_semantic_rejection(
+        "recovery_root_drift",
+        lambda value: value[7].__setitem__("final_state", "4" * 64),
+    )
+    expect_semantic_rejection(
+        "semantic_telemetry_leak",
+        lambda value: value[0].__setitem__(
+            "run_id", "macro-txn-validator-self-test"
+        ),
+    )
+    expect_semantic_rejection(
+        "thread_root_drift",
+        lambda value: value[9].__setitem__("semantic_root", "5" * 64),
+    )
+
+    noncanonical_path = root / "noncanonical.semantic.ndjson"
+    write_new(
+        noncanonical_path,
+        b"".join(
+            b" " + canonical_json(record)
+            if index == 0
+            else canonical_json(record)
+            for index, record in enumerate(records)
+        ),
+    )
+    try:
+        validate_macro_txn_no_mock_evidence(
+            expected_run_id="macro-txn-validator-self-test",
+            semantic_path=noncanonical_path,
+            telemetry_path=telemetry_path,
+        )
+    except EvidenceError:
+        mutants_killed += 1
+    else:
+        raise EvidenceError(
+            "macro transaction validator accepted noncanonical NDJSON"
+        )
+
+    telemetry_mutant = dict(telemetry)
+    telemetry_mutant["positive_operations"] = 16
+    telemetry_mutant_path = root / "operation.telemetry.ndjson"
+    write_new(telemetry_mutant_path, canonical_json(telemetry_mutant))
+    try:
+        validate_macro_txn_no_mock_evidence(
+            expected_run_id="macro-txn-validator-self-test",
+            semantic_path=semantic_path,
+            telemetry_path=telemetry_mutant_path,
+        )
+    except EvidenceError:
+        mutants_killed += 1
+    else:
+        raise EvidenceError(
+            "macro transaction validator accepted telemetry operation drift"
+        )
+
+    return {
+        "case": "macro_txn_validator",
+        "mutants_killed": mutants_killed,
+        "ok": True,
+        "positive_cases": len(records),
+    }
+
+
 def run_diagnostic_projection_validator_self_test(
     root: Path,
 ) -> dict[str, Any]:
@@ -19792,6 +20455,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     cases.append(
         run_fmt_component_admission_self_test(
             case_dir("sealed_fmt_component_admission")
+        )
+    )
+    cases.append(
+        run_macro_txn_validator_self_test(
+            case_dir("macro_txn_validator")
         )
     )
     cases.append(
@@ -28782,6 +29450,20 @@ def build_parser() -> argparse.ArgumentParser:
     dynamic_parser.add_argument("--artifact-root", required=True)
     dynamic_parser.add_argument("--output")
     dynamic_parser.set_defaults(func=cmd_validate_dynamic_parser_no_mock)
+
+    macro_txn_parser = subparsers.add_parser(
+        "validate-macro-txn-no-mock",
+        help=(
+            "independently validate macro transaction semantics "
+            "and bounded telemetry"
+        ),
+    )
+    macro_txn_parser.add_argument("--expected-run-id", required=True)
+    macro_txn_parser.add_argument("--semantic", required=True)
+    macro_txn_parser.add_argument("--telemetry", required=True)
+    macro_txn_parser.add_argument("--artifact-root", required=True)
+    macro_txn_parser.add_argument("--output")
+    macro_txn_parser.set_defaults(func=cmd_validate_macro_txn_no_mock)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",
