@@ -405,6 +405,20 @@ printf 'register nosuchcategory zz zz\n' \
   > "$ART_DIR/inputs/failure.registry"
 printf 'category term\nregister term existing existing\nbudget 3\nbatch term tok k0 k1 k2 k3\n' \
   > "$ART_DIR/inputs/recovery.registry"
+printf '%s\n' \
+  'category-at 0 term' \
+  'register-at 0 term x x-base' \
+  'register-at 0 term y y-base' \
+  'memo 5 term x' \
+  'memo 15 term x' \
+  'memo 25 term y' \
+  'memo 35 term y' \
+  'memo 45 term z' \
+  'register-at 10 term x x-new' \
+  'opaque-at 20 unknown-parser-callback' \
+  'remove-at 30 term missing missing' \
+  'register-at 30 term z z-new' \
+  > "$ART_DIR/inputs/incremental.registry"
 
 cat > "$DRIVER_DIR/Cargo.toml" <<EOF
 [package]
@@ -417,7 +431,9 @@ publish = false
 
 [dependencies]
 fln-core = { path = "$ROOT/crates/fln-core" }
+fln-hash = { path = "$ROOT/crates/fln-hash" }
 fln-parse = { path = "$ROOT/crates/fln-parse" }
+fln-syntax = { path = "$ROOT/crates/fln-syntax" }
 EOF
 
 cat > "$DRIVER_DIR/src/main.rs" <<'RS'
@@ -426,20 +442,26 @@ cat > "$DRIVER_DIR/src/main.rs" <<'RS'
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
 use fln_core::outcome::{InconclusiveCause, Outcome};
+use fln_hash::domain::{Domain, hash};
 use fln_parse::category::LeadingIdentBehavior;
-use fln_parse::registry::{RegisterError, Registry, RegistryBudget, Request};
-use fln_parse::state::Production;
+use fln_parse::registry::{
+    GrammarComponent, GrammarEpoch, InvalidationReason, MemoAdvanceBudget, MemoAdvanceReport,
+    MemoKey, MemoLookup, ParseDependencies, ParseMemo, ParseProduct, ParserPosition, RegisterError,
+    Registry, RegistryBudget, Request,
+};
+use fln_parse::state::{ParserDescriptor, Production};
+use fln_syntax::source::BytePos;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::process;
+use std::thread;
 
 const MAX_INPUT_BYTES: usize = 4_096;
 const MAX_COMMANDS: usize = 16;
 const MAX_REQUESTS: usize = 32;
 const MAX_DIAGNOSTICS: usize = 4;
-const INTERLEAVING_CLAIM: &str =
-    "self_differential_support_only_not_FL_INV_01_proof";
+const INTERLEAVING_CLAIM: &str = "self_differential_support_only_not_FL_INV_01_proof";
 
 enum Command {
     Category(String),
@@ -471,14 +493,78 @@ struct ResourceObservation {
     unit: &'static str,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EpochObservation {
+    digest: String,
+    revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CacheObservation {
+    invalidated: usize,
+    prefix_reused: usize,
+    promoted: usize,
+    reasons: Vec<String>,
+    scanned: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FinalValue {
+    position: usize,
+    token: &'static str,
+    values: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IncrementalWitness {
+    canonical_digest: String,
+    cold_equal_after_opaque: bool,
+    cold_equal_after_recovery: bool,
+    cold_equal_after_typed: bool,
+    component_ids: Vec<&'static str>,
+    distributed_at_barrier: bool,
+    distributed_before_barrier: bool,
+    final_values: Vec<FinalValue>,
+    grammar_root_initial: String,
+    grammar_root_recovery: String,
+    initial_epoch: EpochObservation,
+    opaque_barrier: usize,
+    opaque_cache: CacheObservation,
+    opaque_epoch: EpochObservation,
+    production_count_initial: u64,
+    production_count_recovery: u64,
+    recovery_cache: CacheObservation,
+    recovery_epoch: EpochObservation,
+    recovery_succeeded: bool,
+    refusal_atomic: bool,
+    refusal_message: String,
+    typed_cache: CacheObservation,
+    typed_epoch: EpochObservation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThreadObservation {
+    canonical_digest: String,
+    productive: usize,
+    threads: usize,
+}
+
+struct IncrementalObservation {
+    thread_matrix: Vec<ThreadObservation>,
+    witness: IncrementalWitness,
+}
+
 struct Observation {
     categories: Vec<String>,
     commands: usize,
     diagnostics: Vec<Diagnostic>,
     epoch_after: u64,
     epoch_before: u64,
+    epoch_digest_after: String,
+    epoch_digest_before: String,
     grammar_root_after: String,
     grammar_root_before: String,
+    incremental: Option<IncrementalObservation>,
     lookup_kinds: Vec<String>,
     outcome: &'static str,
     production_count_after: u64,
@@ -494,7 +580,13 @@ fn name(text: &str) -> Name {
 }
 
 fn production(label: &str) -> Production {
-    Production::new(name(label), 0, |_state| {})
+    let kind = name(label);
+    Production::described(
+        kind.clone(),
+        0,
+        ParserDescriptor::stable(kind, 1, b"dynamic-parser-no-mock-e2e".to_vec()),
+        |_state| {},
+    )
 }
 
 fn requests(category: &Name, token: &str, kinds: &[String]) -> Vec<Request> {
@@ -504,11 +596,550 @@ fn requests(category: &Name, token: &str, kinds: &[String]) -> Vec<Request> {
         .map(|(index, kind)| Request {
             key: (index as u64, kind.clone()),
             category: category.clone(),
-            token: token.to_string(),
+            token: name(token),
             production: production(kind),
             scoped: false,
         })
         .collect()
+}
+
+const INCREMENTAL_INPUT: &str = concat!(
+    "category-at 0 term\n",
+    "register-at 0 term x x-base\n",
+    "register-at 0 term y y-base\n",
+    "memo 5 term x\n",
+    "memo 15 term x\n",
+    "memo 25 term y\n",
+    "memo 35 term y\n",
+    "memo 45 term z\n",
+    "register-at 10 term x x-new\n",
+    "opaque-at 20 unknown-parser-callback\n",
+    "remove-at 30 term missing missing\n",
+    "register-at 30 term z z-new\n",
+);
+const INCREMENTAL_QUERIES: [(usize, &str); 5] =
+    [(5, "x"), (15, "x"), (25, "y"), (35, "y"), (45, "z")];
+
+fn epoch_observation(epoch: GrammarEpoch) -> EpochObservation {
+    EpochObservation {
+        digest: epoch.content_hex(),
+        revision: epoch.revision(),
+    }
+}
+
+fn memo_key(position: usize, category: &Name, epoch: GrammarEpoch) -> MemoKey {
+    MemoKey {
+        position: BytePos(position),
+        category: category.clone(),
+        precedence: 0,
+        epoch,
+    }
+}
+
+fn syntax_dependencies(category: &Name, token: &Name) -> ParseDependencies {
+    ParseDependencies::from_components([GrammarComponent::Syntax {
+        category: category.clone(),
+        token: token.clone(),
+        position: ParserPosition::Leading,
+    }])
+}
+
+fn insert_fresh(
+    memo: &mut ParseMemo<Vec<Name>>,
+    registry: &Registry,
+    category: &Name,
+    position: usize,
+    token: &str,
+) -> Result<(), String> {
+    let position = BytePos(position);
+    let identity = registry.identity_at_position(position);
+    let key = memo_key(position.0, category, identity.epoch());
+    let token = name(token);
+    let value = registry.kinds_at(category, &token, identity.epoch());
+    memo.insert(
+        key,
+        identity,
+        ParseProduct::new(
+            identity.epoch(),
+            syntax_dependencies(category, &token),
+            value,
+        ),
+    )
+    .map_err(|error| format!("cannot publish fresh memo product: {error:?}"))
+}
+
+fn memo_equals_cold(
+    memo: &ParseMemo<Vec<Name>>,
+    registry: &Registry,
+    category: &Name,
+) -> Result<bool, String> {
+    for (position, token) in INCREMENTAL_QUERIES {
+        let position = BytePos(position);
+        let identity = registry.identity_at_position(position);
+        let key = memo_key(position.0, category, identity.epoch());
+        let expected = registry.kinds_at(category, &name(token), identity.epoch());
+        let lookup = memo
+            .lookup(&key, identity)
+            .map_err(|error| format!("cannot read memo product: {error:?}"))?;
+        let MemoLookup::Hit(product) = lookup else {
+            return Ok(false);
+        };
+        if product.epoch() != identity.epoch() || product.value() != &expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn component_id(component: &GrammarComponent) -> String {
+    let parser_position = |position| match position {
+        ParserPosition::Leading => "leading",
+        ParserPosition::Trailing => "trailing",
+    };
+    match component {
+        GrammarComponent::Category(category) => {
+            format!("category:{}", category.to_display_string())
+        }
+        GrammarComponent::Syntax {
+            category,
+            token,
+            position,
+        } => format!(
+            "syntax:{}:{}:{}",
+            category.to_display_string(),
+            token.to_display_string(),
+            parser_position(*position)
+        ),
+        GrammarComponent::Token(token) => format!("token:{}", token.to_display_string()),
+        GrammarComponent::Precedence { category, parser } => format!(
+            "precedence:{}:{}",
+            category.to_display_string(),
+            parser.to_display_string()
+        ),
+        GrammarComponent::Scope => "scope".to_string(),
+        GrammarComponent::Macro(name) => format!("macro:{}", name.to_display_string()),
+        GrammarComponent::Option(name) => format!("option:{}", name.to_display_string()),
+        GrammarComponent::Import(name) => format!("import:{}", name.to_display_string()),
+        GrammarComponent::WholeGrammar => "whole-grammar".to_string(),
+    }
+}
+
+fn cache_observation(report: MemoAdvanceReport) -> CacheObservation {
+    let reasons = report
+        .reasons
+        .iter()
+        .map(|(key, reason)| match reason {
+            InvalidationReason::Changed(component) => {
+                format!("{}:changed:{}", key.position.0, component_id(component))
+            }
+            InvalidationReason::OpaqueSuffixBarrier => {
+                format!("{}:opaque-suffix-barrier", key.position.0)
+            }
+        })
+        .collect();
+    CacheObservation {
+        invalidated: report.invalidated,
+        prefix_reused: report.prefix_reused,
+        promoted: report.promoted,
+        reasons,
+        scanned: report.scanned,
+    }
+}
+
+fn final_values(
+    memo: &ParseMemo<Vec<Name>>,
+    registry: &Registry,
+    category: &Name,
+) -> Result<Vec<FinalValue>, String> {
+    INCREMENTAL_QUERIES
+        .iter()
+        .map(|(position, token)| {
+            let source_position = BytePos(*position);
+            let identity = registry.identity_at_position(source_position);
+            let key = memo_key(*position, category, identity.epoch());
+            let lookup = memo
+                .lookup(&key, identity)
+                .map_err(|error| format!("cannot read final memo product: {error:?}"))?;
+            let MemoLookup::Hit(product) = lookup else {
+                return Err(format!("final memo product at {position} is absent"));
+            };
+            Ok(FinalValue {
+                position: *position,
+                token,
+                values: product
+                    .value()
+                    .iter()
+                    .map(Name::to_display_string)
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn cache_payload(cache: &CacheObservation) -> String {
+    format!(
+        "{}/{}/{}/{}/{}",
+        cache.scanned,
+        cache.prefix_reused,
+        cache.invalidated,
+        cache.promoted,
+        cache.reasons.join(",")
+    )
+}
+
+fn witness_payload(witness: &IncrementalWitness) -> String {
+    let values = witness
+        .final_values
+        .iter()
+        .map(|value| {
+            format!(
+                "{}:{}={}",
+                value.position,
+                value.token,
+                value.values.join("+")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "fln.dynamic-parser.incremental-witness/1\n",
+            "initial={}:{}\n",
+            "typed={}:{}\n",
+            "opaque={}:{}\n",
+            "recovery={}:{}\n",
+            "typed-cache={}\n",
+            "opaque-cache={}\n",
+            "recovery-cache={}\n",
+            "barrier={}:{}:{}\n",
+            "cold={}:{}:{}\n",
+            "refusal={}:{}\n",
+            "recovery-succeeded={}\n",
+            "components={}\n",
+            "values={}\n",
+            "roots={}:{}\n",
+            "production-counts={}:{}\n"
+        ),
+        witness.initial_epoch.revision,
+        witness.initial_epoch.digest,
+        witness.typed_epoch.revision,
+        witness.typed_epoch.digest,
+        witness.opaque_epoch.revision,
+        witness.opaque_epoch.digest,
+        witness.recovery_epoch.revision,
+        witness.recovery_epoch.digest,
+        cache_payload(&witness.typed_cache),
+        cache_payload(&witness.opaque_cache),
+        cache_payload(&witness.recovery_cache),
+        witness.opaque_barrier,
+        witness.distributed_before_barrier,
+        witness.distributed_at_barrier,
+        witness.cold_equal_after_typed,
+        witness.cold_equal_after_opaque,
+        witness.cold_equal_after_recovery,
+        witness.refusal_atomic,
+        witness.refusal_message,
+        witness.recovery_succeeded,
+        witness.component_ids.join(","),
+        values,
+        witness.grammar_root_initial,
+        witness.grammar_root_recovery,
+        witness.production_count_initial,
+        witness.production_count_recovery,
+    )
+}
+
+fn run_incremental_session() -> Result<IncrementalWitness, String> {
+    let mut registry = Registry::new();
+    let term = name("term");
+    registry
+        .declare_category_at(BytePos(0), term.clone(), LeadingIdentBehavior::Default)
+        .map_err(|error| error.message())?;
+    registry
+        .add_leading_at(BytePos(0), &term, name("x"), production("x-base"), false)
+        .map_err(|error| error.message())?;
+    registry
+        .add_leading_at(BytePos(0), &term, name("y"), production("y-base"), false)
+        .map_err(|error| error.message())?;
+
+    let initial_identity = registry.identity().clone();
+    let grammar_root_initial = registry
+        .grammar_root(initial_identity.epoch())
+        .ok_or_else(|| "initial grammar root is absent".to_string())?
+        .0;
+    let production_count_initial = registry.production_count();
+    let mut memo = ParseMemo::new();
+    for (position, token) in INCREMENTAL_QUERIES {
+        insert_fresh(&mut memo, &registry, &term, position, token)?;
+    }
+
+    registry
+        .add_leading_at(BytePos(10), &term, name("x"), production("x-new"), false)
+        .map_err(|error| error.message())?;
+    let typed_transition = registry
+        .last_transition()
+        .ok_or_else(|| "typed edit published no transition".to_string())?
+        .clone();
+    let typed_identity = registry.identity().clone();
+    let typed_cache = memo
+        .advance(
+            &typed_transition,
+            &initial_identity,
+            &typed_identity,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .map_err(|stop| format!("typed memo advance was non-authoritative: {stop:?}"))?
+        .map_err(|error| format!("typed memo advance failed: {error:?}"))?;
+    insert_fresh(&mut memo, &registry, &term, 15, "x")?;
+    let cold_equal_after_typed = memo_equals_cold(&memo, &registry, &term)?;
+
+    registry.apply_opaque_effect_at(BytePos(20), name("unknown-parser-callback"));
+    let opaque_transition = registry
+        .last_transition()
+        .ok_or_else(|| "opaque edit published no transition".to_string())?
+        .clone();
+    let opaque_identity = registry.identity().clone();
+    let opaque_cache = memo
+        .advance(
+            &opaque_transition,
+            &typed_identity,
+            &opaque_identity,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .map_err(|stop| format!("opaque memo advance was non-authoritative: {stop:?}"))?
+        .map_err(|error| format!("opaque memo advance failed: {error:?}"))?;
+    for (position, token) in [(25, "y"), (35, "y"), (45, "z")] {
+        insert_fresh(&mut memo, &registry, &term, position, token)?;
+    }
+    let cold_equal_after_opaque = memo_equals_cold(&memo, &registry, &term)?;
+
+    let before_refusal = registry.identity().clone();
+    let refusal = registry
+        .remove_syntax_at(
+            BytePos(30),
+            &term,
+            &name("missing"),
+            &name("missing"),
+            ParserPosition::Leading,
+        )
+        .expect_err("the governed removal target is intentionally absent");
+    let refusal_message = refusal.message();
+    let refusal_atomic = registry.identity() == &before_refusal;
+
+    registry
+        .add_leading_at(BytePos(30), &term, name("z"), production("z-new"), false)
+        .map_err(|error| error.message())?;
+    let recovery_transition = registry
+        .last_transition()
+        .ok_or_else(|| "recovery edit published no transition".to_string())?
+        .clone();
+    let recovery_identity = registry.identity().clone();
+    let recovery_cache = memo
+        .advance(
+            &recovery_transition,
+            &opaque_identity,
+            &recovery_identity,
+            MemoAdvanceBudget::generous(),
+            None,
+        )
+        .into_complete()
+        .map_err(|stop| format!("recovery memo advance was non-authoritative: {stop:?}"))?
+        .map_err(|error| format!("recovery memo advance failed: {error:?}"))?;
+    insert_fresh(&mut memo, &registry, &term, 45, "z")?;
+    let cold_equal_after_recovery = memo_equals_cold(&memo, &registry, &term)?;
+    let grammar_root_recovery = registry
+        .grammar_root(recovery_identity.epoch())
+        .ok_or_else(|| "recovery grammar root is absent".to_string())?
+        .0;
+
+    let mut witness = IncrementalWitness {
+        canonical_digest: String::new(),
+        cold_equal_after_opaque,
+        cold_equal_after_recovery,
+        cold_equal_after_typed,
+        component_ids: vec![
+            "syntax:term:x:leading",
+            "syntax:term:y:leading",
+            "syntax:term:z:leading",
+            "whole-grammar:opaque",
+        ],
+        distributed_at_barrier: registry.distributed_parse_allowed_at(BytePos(20)),
+        distributed_before_barrier: registry.distributed_parse_allowed_at(BytePos(19)),
+        final_values: final_values(&memo, &registry, &term)?,
+        grammar_root_initial,
+        grammar_root_recovery,
+        initial_epoch: epoch_observation(initial_identity.epoch()),
+        opaque_barrier: registry
+            .opaque_suffix_barrier()
+            .ok_or_else(|| "opaque edit established no barrier".to_string())?
+            .0,
+        opaque_cache: cache_observation(opaque_cache),
+        opaque_epoch: epoch_observation(opaque_identity.epoch()),
+        production_count_initial,
+        production_count_recovery: registry.production_count(),
+        recovery_cache: cache_observation(recovery_cache),
+        recovery_epoch: epoch_observation(recovery_identity.epoch()),
+        recovery_succeeded: true,
+        refusal_atomic,
+        refusal_message,
+        typed_cache: cache_observation(typed_cache),
+        typed_epoch: epoch_observation(typed_identity.epoch()),
+    };
+    witness.canonical_digest = hash(Domain::Fixture, witness_payload(&witness).as_bytes()).to_hex();
+    Ok(witness)
+}
+
+fn witness_is_exact(witness: &IncrementalWitness) -> bool {
+    witness.initial_epoch.revision == 3
+        && witness.typed_epoch.revision == 4
+        && witness.opaque_epoch.revision == 5
+        && witness.recovery_epoch.revision == 6
+        && witness.initial_epoch.digest != witness.typed_epoch.digest
+        && witness.opaque_epoch.digest == witness.typed_epoch.digest
+        && witness.recovery_epoch.digest != witness.opaque_epoch.digest
+        && witness.typed_cache
+            == (CacheObservation {
+                invalidated: 1,
+                prefix_reused: 1,
+                promoted: 3,
+                reasons: vec!["15:changed:syntax:term:x:leading".to_string()],
+                scanned: 5,
+            })
+        && witness.opaque_cache
+            == (CacheObservation {
+                invalidated: 3,
+                prefix_reused: 1,
+                promoted: 0,
+                reasons: vec![
+                    "25:opaque-suffix-barrier".to_string(),
+                    "35:opaque-suffix-barrier".to_string(),
+                    "45:opaque-suffix-barrier".to_string(),
+                ],
+                scanned: 9,
+            })
+        && witness.recovery_cache
+            == (CacheObservation {
+                invalidated: 1,
+                prefix_reused: 1,
+                promoted: 1,
+                reasons: vec!["45:changed:syntax:term:z:leading".to_string()],
+                scanned: 12,
+            })
+        && witness.cold_equal_after_typed
+        && witness.cold_equal_after_opaque
+        && witness.cold_equal_after_recovery
+        && witness.opaque_barrier == 20
+        && witness.distributed_before_barrier
+        && !witness.distributed_at_barrier
+        && witness.refusal_atomic
+        && witness.recovery_succeeded
+        && witness.production_count_initial == 2
+        && witness.production_count_recovery == 4
+        && witness.final_values
+            == [
+                FinalValue {
+                    position: 5,
+                    token: "x",
+                    values: vec!["x-base".to_string()],
+                },
+                FinalValue {
+                    position: 15,
+                    token: "x",
+                    values: vec!["x-base".to_string(), "x-new".to_string()],
+                },
+                FinalValue {
+                    position: 25,
+                    token: "y",
+                    values: vec!["y-base".to_string()],
+                },
+                FinalValue {
+                    position: 35,
+                    token: "y",
+                    values: vec!["y-base".to_string()],
+                },
+                FinalValue {
+                    position: 45,
+                    token: "z",
+                    values: vec!["z-new".to_string()],
+                },
+            ]
+}
+
+fn observe_incremental(source: &str) -> Result<Observation, String> {
+    if source != INCREMENTAL_INPUT {
+        return Err("incremental input differs from the governed session".to_string());
+    }
+    let mut baseline = None;
+    let mut thread_matrix = Vec::new();
+    for threads in [1usize, 8, 32] {
+        let results = thread::scope(|scope| {
+            let handles = (0..threads)
+                .map(|_| scope.spawn(run_incremental_session))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "incremental worker faulted".to_string())?
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        let first = results
+            .first()
+            .ok_or_else(|| "thread matrix produced no witness".to_string())?
+            .clone();
+        if !witness_is_exact(&first) || results.iter().any(|witness| witness != &first) {
+            return Err(format!(
+                "{threads}-thread incremental witnesses are not exact and identical"
+            ));
+        }
+        if baseline.as_ref().is_some_and(|expected| expected != &first) {
+            return Err(format!(
+                "{threads}-thread witness differs from the one-thread witness"
+            ));
+        }
+        baseline.get_or_insert_with(|| first.clone());
+        thread_matrix.push(ThreadObservation {
+            canonical_digest: first.canonical_digest.clone(),
+            productive: results.len(),
+            threads,
+        });
+    }
+    let witness = baseline.ok_or_else(|| "thread matrix produced no baseline".to_string())?;
+    let lookup_kinds = witness
+        .final_values
+        .last()
+        .ok_or_else(|| "incremental final values are empty".to_string())?
+        .values
+        .clone();
+    Ok(Observation {
+        categories: vec!["term".to_string()],
+        commands: source.lines().count(),
+        diagnostics: Vec::new(),
+        epoch_after: witness.recovery_epoch.revision,
+        epoch_before: witness.initial_epoch.revision,
+        epoch_digest_after: witness.recovery_epoch.digest.clone(),
+        epoch_digest_before: witness.initial_epoch.digest.clone(),
+        grammar_root_after: witness.grammar_root_recovery.clone(),
+        grammar_root_before: witness.grammar_root_initial.clone(),
+        incremental: Some(IncrementalObservation {
+            thread_matrix,
+            witness: witness.clone(),
+        }),
+        lookup_kinds,
+        outcome: "accepted",
+        production_count_after: witness.production_count_recovery,
+        production_count_before: witness.production_count_initial,
+        requests: 0,
+        resource_usage: None,
+        retry_control_completed: false,
+        store_unchanged: false,
+    })
 }
 
 fn parse_commands(source: &str) -> Result<Vec<Command>, String> {
@@ -532,18 +1163,16 @@ fn parse_commands(source: &str) -> Result<Vec<Command>, String> {
                 category: (*category).to_string(),
                 token: (*token).to_string(),
             },
-            ["budget", allowed] => Command::Budget(
-                allowed
-                    .parse::<u64>()
-                    .map_err(|error| format!("invalid budget on line {}: {error}", line_index + 1))?,
-            ),
-            ["batch", category, token, kinds @ ..] if !kinds.is_empty() => {
-                Command::Batch {
-                    category: (*category).to_string(),
-                    token: (*token).to_string(),
-                    kinds: kinds.iter().map(|kind| (*kind).to_string()).collect(),
-                }
+            ["budget", allowed] => {
+                Command::Budget(allowed.parse::<u64>().map_err(|error| {
+                    format!("invalid budget on line {}: {error}", line_index + 1)
+                })?)
             }
+            ["batch", category, token, kinds @ ..] if !kinds.is_empty() => Command::Batch {
+                category: (*category).to_string(),
+                token: (*token).to_string(),
+                kinds: kinds.iter().map(|kind| (*kind).to_string()).collect(),
+            },
             _ => {
                 return Err(format!(
                     "line {} has an unknown command shape",
@@ -581,9 +1210,13 @@ fn observe(source: &str, case: &str) -> Result<Observation, String> {
     let mut resource_usage = None;
     let mut retry_control_completed = false;
     let initial_epoch = registry.epoch();
-    let initial_root = registry.grammar_root(initial_epoch).0;
+    let initial_root = registry
+        .grammar_root(initial_epoch)
+        .ok_or_else(|| "initial grammar root is absent".to_string())?
+        .0;
     let initial_count = registry.production_count();
     let mut epoch_before = initial_epoch;
+    let mut epoch_digest_before = initial_epoch.content_hex();
     let mut grammar_root_before = initial_root;
     let mut production_count_before = initial_count;
 
@@ -593,7 +1226,10 @@ fn observe(source: &str, case: &str) -> Result<Observation, String> {
                 registry
                     .declare_category(name(&category), LeadingIdentBehavior::Default)
                     .map_err(|error| {
-                        format!("category declaration unexpectedly failed: {}", error.message())
+                        format!(
+                            "category declaration unexpectedly failed: {}",
+                            error.message()
+                        )
                     })?;
             }
             Command::Register {
@@ -603,16 +1239,15 @@ fn observe(source: &str, case: &str) -> Result<Observation, String> {
             } => {
                 if case == "failure" {
                     epoch_before = registry.epoch();
-                    grammar_root_before =
-                        registry.grammar_root(epoch_before).0;
+                    epoch_digest_before = epoch_before.content_hex();
+                    grammar_root_before = registry
+                        .grammar_root(epoch_before)
+                        .ok_or_else(|| "failure grammar root is absent".to_string())?
+                        .0;
                     production_count_before = registry.production_count();
                 }
-                match registry.add_leading(
-                    &name(&category),
-                    token,
-                    production(&kind),
-                    false,
-                ) {
+                match registry.add_leading(&name(&category), name(&token), production(&kind), false)
+                {
                     Ok(_) => {}
                     Err(error) => {
                         diagnostics.push(register_diagnostic(error));
@@ -621,8 +1256,11 @@ fn observe(source: &str, case: &str) -> Result<Observation, String> {
                 }
             }
             Command::Lookup { category, token } => {
-                lookup_kinds =
-                    registry.kinds_at(&name(&category), &token, registry.epoch());
+                lookup_kinds = registry
+                    .kinds_at(&name(&category), &name(&token), registry.epoch())
+                    .iter()
+                    .map(Name::to_display_string)
+                    .collect();
                 outcome = if lookup_kinds.is_empty() {
                     "rejected"
                 } else {
@@ -642,11 +1280,14 @@ fn observe(source: &str, case: &str) -> Result<Observation, String> {
                     return Err("request count exceeds the driver bound".to_string());
                 }
                 epoch_before = registry.epoch();
-                grammar_root_before = registry.grammar_root(epoch_before).0;
+                epoch_digest_before = epoch_before.content_hex();
+                grammar_root_before = registry
+                    .grammar_root(epoch_before)
+                    .ok_or_else(|| "pre-batch grammar root is absent".to_string())?
+                    .0;
                 production_count_before = registry.production_count();
-                let allowed = budget.ok_or_else(|| {
-                    "batch command did not follow a budget command".to_string()
-                })?;
+                let allowed = budget
+                    .ok_or_else(|| "batch command did not follow a budget command".to_string())?;
                 let category_name = name(&category);
                 match registry.apply_batch_bounded(
                     requests(&category_name, &token, &kinds),
@@ -690,15 +1331,12 @@ fn observe(source: &str, case: &str) -> Result<Observation, String> {
 
                         let mut control = Registry::new();
                         control
-                            .declare_category(
-                                category_name.clone(),
-                                LeadingIdentBehavior::Default,
-                            )
+                            .declare_category(category_name.clone(), LeadingIdentBehavior::Default)
                             .map_err(|error| error.message())?;
                         control
                             .add_leading(
                                 &category_name,
-                                "existing",
+                                name("existing"),
                                 production("existing"),
                                 false,
                             )
@@ -720,19 +1358,29 @@ fn observe(source: &str, case: &str) -> Result<Observation, String> {
     }
 
     let epoch_after = registry.epoch();
-    let grammar_root_after = registry.grammar_root(epoch_after).0;
+    let grammar_root_after = registry
+        .grammar_root(epoch_after)
+        .ok_or_else(|| "final grammar root is absent".to_string())?
+        .0;
     let production_count_after = registry.production_count();
     let store_unchanged = epoch_before == epoch_after
         && grammar_root_before == grammar_root_after
         && production_count_before == production_count_after;
     Ok(Observation {
-        categories: registry.category_names(),
+        categories: registry
+            .category_names()
+            .iter()
+            .map(Name::to_display_string)
+            .collect(),
         commands: command_count,
         diagnostics,
-        epoch_after: epoch_after.0,
-        epoch_before: epoch_before.0,
+        epoch_after: epoch_after.revision(),
+        epoch_before: epoch_before.revision(),
+        epoch_digest_after: epoch_after.content_hex(),
+        epoch_digest_before,
         grammar_root_after,
         grammar_root_before,
+        incremental: None,
         lookup_kinds,
         outcome,
         production_count_after,
@@ -807,16 +1455,120 @@ fn resource_json(resource: Option<&ResourceObservation>) -> String {
     )
 }
 
+fn epoch_json(epoch: &EpochObservation) -> String {
+    format!(
+        "{{\"digest\":{},\"revision\":{}}}",
+        json_string(&epoch.digest),
+        epoch.revision
+    )
+}
+
+fn cache_json(cache: &CacheObservation) -> String {
+    let reasons = cache
+        .reasons
+        .iter()
+        .map(|reason| json_string(reason))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{\"invalidated\":{},\"prefix_reused\":{},\"promoted\":{},",
+            "\"reasons\":[{}],\"scanned\":{}}}"
+        ),
+        cache.invalidated, cache.prefix_reused, cache.promoted, reasons, cache.scanned
+    )
+}
+
+fn final_values_json(values: &[FinalValue]) -> String {
+    values
+        .iter()
+        .map(|value| {
+            format!(
+                "{{\"position\":{},\"token\":{},\"values\":[{}]}}",
+                value.position,
+                json_string(value.token),
+                strings_json(&value.values)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn thread_matrix_json(matrix: &[ThreadObservation]) -> String {
+    matrix
+        .iter()
+        .map(|row| {
+            format!(
+                "{{\"canonical_digest\":{},\"productive\":{},\"threads\":{}}}",
+                json_string(&row.canonical_digest),
+                row.productive,
+                row.threads
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn incremental_json(incremental: Option<&IncrementalObservation>) -> String {
+    let Some(incremental) = incremental else {
+        return "null".to_string();
+    };
+    let witness = &incremental.witness;
+    let component_ids = witness
+        .component_ids
+        .iter()
+        .map(|component| json_string(component))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{\"canonical_digest\":{},\"cold_equal_after_opaque\":{},",
+            "\"cold_equal_after_recovery\":{},\"cold_equal_after_typed\":{},",
+            "\"component_ids\":[{}],\"distributed_at_barrier\":{},",
+            "\"distributed_before_barrier\":{},\"final_values\":[{}],",
+            "\"initial_epoch\":{},\"opaque_barrier\":{},\"opaque_cache\":{},",
+            "\"opaque_epoch\":{},\"production_count_initial\":{},",
+            "\"production_count_recovery\":{},\"recovery_cache\":{},",
+            "\"recovery_epoch\":{},\"recovery_succeeded\":{},",
+            "\"refusal_atomic\":{},\"refusal_message\":{},\"thread_matrix\":[{}],",
+            "\"typed_cache\":{},\"typed_epoch\":{}}}"
+        ),
+        json_string(&witness.canonical_digest),
+        witness.cold_equal_after_opaque,
+        witness.cold_equal_after_recovery,
+        witness.cold_equal_after_typed,
+        component_ids,
+        witness.distributed_at_barrier,
+        witness.distributed_before_barrier,
+        final_values_json(&witness.final_values),
+        epoch_json(&witness.initial_epoch),
+        witness.opaque_barrier,
+        cache_json(&witness.opaque_cache),
+        epoch_json(&witness.opaque_epoch),
+        witness.production_count_initial,
+        witness.production_count_recovery,
+        cache_json(&witness.recovery_cache),
+        epoch_json(&witness.recovery_epoch),
+        witness.recovery_succeeded,
+        witness.refusal_atomic,
+        json_string(&witness.refusal_message),
+        thread_matrix_json(&incremental.thread_matrix),
+        cache_json(&witness.typed_cache),
+        epoch_json(&witness.typed_epoch),
+    )
+}
+
 fn main() {
     let arguments = env::args().collect::<Vec<_>>();
     if arguments.len() != 8 {
-        refuse(
-            "expected CASE INPUT INPUT_ARTIFACT INPUT_SHA256 RUN_ID SEMANTIC TELEMETRY",
-        );
+        refuse("expected CASE INPUT INPUT_ARTIFACT INPUT_SHA256 RUN_ID SEMANTIC TELEMETRY");
     }
     let case = &arguments[1];
-    if !matches!(case.as_str(), "positive" | "failure" | "recovery") {
-        refuse("case is not positive, failure, or recovery");
+    if !matches!(
+        case.as_str(),
+        "positive" | "failure" | "recovery" | "incremental"
+    ) {
+        refuse("case is not positive, failure, recovery, or incremental");
     }
     let input_path = &arguments[2];
     let input_artifact = &arguments[3];
@@ -831,19 +1583,24 @@ fn main() {
     {
         refuse("input digest is not lowercase SHA-256");
     }
-    let input = fs::read(input_path)
-        .unwrap_or_else(|error| refuse(&format!("cannot read input: {error}")));
+    let input =
+        fs::read(input_path).unwrap_or_else(|error| refuse(&format!("cannot read input: {error}")));
     if input.len() > MAX_INPUT_BYTES {
         refuse("input exceeds the telemetry bound");
     }
     let source = std::str::from_utf8(&input)
         .unwrap_or_else(|error| refuse(&format!("input is not UTF-8: {error}")));
-    let observed = observe(source, case)
-        .unwrap_or_else(|error| refuse(&format!("cannot observe registry: {error}")));
+    let observed = if case == "incremental" {
+        observe_incremental(source)
+    } else {
+        observe(source, case)
+    }
+    .unwrap_or_else(|error| refuse(&format!("cannot observe registry: {error}")));
     let claim_grade = match case.as_str() {
         "positive" => "production_path",
         "failure" => "production_path",
         "recovery" => "bounded_model",
+        "incremental" => "bounded_model",
         _ => unreachable!(),
     };
     let status = match case.as_str() {
@@ -853,9 +1610,8 @@ fn main() {
                 && observed.diagnostics.is_empty()
                 && observed.epoch_before == 0
                 && observed.epoch_after == 2
-                && observed.grammar_root_before.is_empty()
-                && observed.grammar_root_after
-                    == "cat term Default\n  lead tok [dynamicTerm]\n"
+                && observed.epoch_digest_before != observed.epoch_digest_after
+                && observed.grammar_root_before != observed.grammar_root_after
                 && observed.lookup_kinds == ["dynamicTerm"]
                 && observed.production_count_before == 0
                 && observed.production_count_after == 1
@@ -867,13 +1623,12 @@ fn main() {
             observed.outcome == "rejected"
                 && observed.categories.is_empty()
                 && observed.diagnostics.len() == 1
-                && observed.diagnostics[0].message
-                    == "unknown category `nosuchcategory`"
+                && observed.diagnostics[0].message == "unknown category `nosuchcategory`"
                 && observed.diagnostics[0].origin == "register_error"
                 && observed.epoch_before == 0
                 && observed.epoch_after == 0
-                && observed.grammar_root_before.is_empty()
-                && observed.grammar_root_after.is_empty()
+                && observed.epoch_digest_before == observed.epoch_digest_after
+                && observed.grammar_root_before == observed.grammar_root_after
                 && observed.lookup_kinds.is_empty()
                 && observed.production_count_before == 0
                 && observed.production_count_after == 0
@@ -882,25 +1637,57 @@ fn main() {
                 && observed.store_unchanged
         }
         "recovery" => {
-            let expected_root =
-                "cat term Default\n  lead existing [existing]\n";
             observed.outcome == "inconclusive"
                 && observed.categories == ["term"]
                 && observed.diagnostics.is_empty()
                 && observed.epoch_before == 2
                 && observed.epoch_after == 2
-                && observed.grammar_root_before == expected_root
-                && observed.grammar_root_after == expected_root
+                && observed.epoch_digest_before == observed.epoch_digest_after
+                && observed.grammar_root_before == observed.grammar_root_after
                 && observed.lookup_kinds.is_empty()
                 && observed.production_count_before == 1
                 && observed.production_count_after == 1
                 && observed.resource_usage.as_ref().is_some_and(|usage| {
-                    usage.allowed == 3
-                        && usage.observed == 5
-                        && usage.unit == "produced_nodes"
+                    usage.allowed == 3 && usage.observed == 5 && usage.unit == "produced_nodes"
                 })
                 && observed.retry_control_completed
                 && observed.store_unchanged
+        }
+        "incremental" => {
+            observed.outcome == "accepted"
+                && observed.categories == ["term"]
+                && observed.diagnostics.is_empty()
+                && observed.epoch_before == 3
+                && observed.epoch_after == 6
+                && observed.epoch_digest_before != observed.epoch_digest_after
+                && observed.grammar_root_before != observed.grammar_root_after
+                && observed.lookup_kinds == ["z-new"]
+                && observed.production_count_before == 2
+                && observed.production_count_after == 4
+                && observed.resource_usage.is_none()
+                && !observed.retry_control_completed
+                && !observed.store_unchanged
+                && observed.incremental.as_ref().is_some_and(|incremental| {
+                    witness_is_exact(&incremental.witness)
+                        && incremental.thread_matrix
+                            == [
+                                ThreadObservation {
+                                    canonical_digest: incremental.witness.canonical_digest.clone(),
+                                    productive: 1,
+                                    threads: 1,
+                                },
+                                ThreadObservation {
+                                    canonical_digest: incremental.witness.canonical_digest.clone(),
+                                    productive: 8,
+                                    threads: 8,
+                                },
+                                ThreadObservation {
+                                    canonical_digest: incremental.witness.canonical_digest.clone(),
+                                    productive: 32,
+                                    threads: 32,
+                                },
+                            ]
+                })
         }
         _ => false,
     };
@@ -909,13 +1696,15 @@ fn main() {
         concat!(
             "{{\"case\":{},\"categories\":[{}],\"claim_grade\":{},",
             "\"data_grade\":\"verified\",\"diagnostics\":[{}],",
-            "\"epoch_after\":{},\"epoch_before\":{},\"grammar_root_after\":{},",
-            "\"grammar_root_before\":{},\"input_artifact\":{},\"input_sha256\":{},",
-            "\"interleaving_claim\":{},\"lookup_kinds\":[{}],\"outcome\":{},",
+            "\"epoch_after\":{},\"epoch_before\":{},\"epoch_digest_after\":{},",
+            "\"epoch_digest_before\":{},\"grammar_root_after\":{},",
+            "\"grammar_root_before\":{},\"incremental\":{},\"input_artifact\":{},",
+            "\"input_sha256\":{},\"interleaving_claim\":{},\"lookup_kinds\":[{}],",
+            "\"outcome\":{},",
             "\"production_count_after\":{},\"production_count_before\":{},",
             "\"resource_usage\":{},\"retry_control_completed\":{},\"run_id\":{},",
             "\"schema\":\"fln.e2e.dynamic-parser-semantic\",\"status\":{},",
-            "\"store_unchanged\":{},\"version\":1}}\n"
+            "\"store_unchanged\":{},\"version\":2}}\n"
         ),
         json_string(case),
         strings_json(&observed.categories),
@@ -923,8 +1712,11 @@ fn main() {
         diagnostics_json(&observed.diagnostics),
         observed.epoch_after,
         observed.epoch_before,
+        json_string(&observed.epoch_digest_after),
+        json_string(&observed.epoch_digest_before),
         json_string(&observed.grammar_root_after),
         json_string(&observed.grammar_root_before),
+        incremental_json(observed.incremental.as_ref()),
         json_string(input_artifact),
         json_string(input_sha256),
         json_string(INTERLEAVING_CLAIM),
@@ -946,7 +1738,7 @@ fn main() {
             "\"observed_diagnostics\":{},\"observed_input_bytes\":{},",
             "\"observed_requests\":{},\"run_id\":{},",
             "\"schema\":\"fln.e2e.dynamic-parser-telemetry\",",
-            "\"timing_used_as_gate\":false,\"version\":1}}\n"
+            "\"timing_used_as_gate\":false,\"version\":2}}\n"
         ),
         json_string(case),
         MAX_COMMANDS,
@@ -986,6 +1778,8 @@ emit_event --new-log --string event run_start \
   --json-value argv '["scripts/e2e/dynamic_parser_no_mock_e2e.sh"]' \
   --string cwd "$ROOT" \
   --append-string claim_ids fln-33gl-dynamic-parser-no-mock \
+  --append-string claim_ids franken_lean-9km-grammar-epoch-incremental \
+  --append-string invariant_ids FL-INV-01 \
   --append-string invariant_ids FL-INV-07 \
   --append-string gate_ids W4 \
   --string parity_ledger_row not_applicable_dynamic_parser_registration \
@@ -994,11 +1788,11 @@ emit_event --new-log --string event run_start \
   --string platform "$(uname -srm)" --integer thread_count 1 \
   --json-value thread_matrix '[1,8,32]' \
   --json-value host_facts "$HOST_FACTS_JSON" \
-  --string seed dynamic-registration-real-file-v1 \
+  --string seed dynamic-registration-real-file-v2 \
   --string cache_state "${FLN_E2E_CACHE_STATE:-uncontrolled}" \
   --string input_root "$INPUT_ROOT" --string vendor_binding vendor-binding.json \
   --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
-  --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"max_input_bytes\":4096,\"max_commands\":16,\"max_requests\":32,\"max_diagnostics\":4}" \
+  --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"max_input_bytes\":4096,\"max_commands\":16,\"max_requests\":32,\"max_diagnostics\":4,\"max_productive_workers\":32}" \
   || {
     set_final internal_fault early_run_start_emission_failure 2
     exit 2
@@ -1230,13 +2024,13 @@ run_test_step() {
     "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 }
 
-run_test_step registration_state_model 5 \
+run_test_step registration_state_model 6 \
   cargo test --locked -q -p fln-parse --test registration_state_model
-run_test_step grammar_effect_totality 7 \
+run_test_step grammar_effect_totality 13 \
   cargo test --locked -q -p fln-parse --test grammar_effect_totality
 run_test_step parser_interleaving_dpor 5 \
   cargo test --locked -q -p fln-parse --test parser_interleaving_dpor
-run_test_step dynamic_parser_mutations 7 \
+run_test_step dynamic_parser_mutations 11 \
   cargo test --locked -q -p fln-parse --test dynamic_parser_mutations
 
 ACTIVE_STEP=build_real_file_driver
@@ -1287,6 +2081,7 @@ run_real_file_case() {
 run_real_file_case positive
 run_real_file_case failure
 run_real_file_case recovery
+run_real_file_case incremental
 
 ACTIVE_STEP=semantic_validation
 snapshot_before "$ACTIVE_STEP"
@@ -1309,6 +2104,11 @@ supervise "$ACTIVE_STEP" "${PYTHON[@]}" "$EVIDENCE" \
   --recovery-input "$ART_DIR/inputs/recovery.registry" \
   --recovery-stdout "$ART_DIR/recovery_file.out" \
   --recovery-stderr "$ART_DIR/recovery_file.err" \
+  --incremental-semantic "$ART_DIR/incremental.semantic.ndjson" \
+  --incremental-telemetry "$ART_DIR/incremental.telemetry.ndjson" \
+  --incremental-input "$ART_DIR/inputs/incremental.registry" \
+  --incremental-stdout "$ART_DIR/incremental_file.out" \
+  --incremental-stderr "$ART_DIR/incremental_file.err" \
   --artifact-root "$ART_DIR" --output "$ART_DIR/dynamic-parser.validation.json"
 inspect_supervisor "$ACTIVE_STEP"
 snapshot_after "$ACTIVE_STEP"
@@ -1318,12 +2118,12 @@ if [ "$LAST_CLASSIFICATION" != pass ] || [ "$LAST_RC" -ne 0 ] \
   record_failure "$ACTIVE_STEP" independent_semantic_validation_failed
 fi
 record_step "$ACTIVE_STEP" \
-  "dynamic-parser-validation/positive-failure-recovery/pass" \
+  "dynamic-parser-validation/positive-failure-recovery-incremental/pass" \
   "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
   dynamic-parser.validation.json "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
   "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 
-run_test_step final_real_recheck 59 \
+run_test_step final_real_recheck 87 \
   cargo test --locked -q -p fln-parse
 
 ACTIVE_STEP=final_real_recheck
