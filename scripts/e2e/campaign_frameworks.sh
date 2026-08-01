@@ -18,7 +18,13 @@ RUN_ID="campaign-frameworks-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
 ART_DIR="$ART_ROOT/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+# The artifact root is CLAIMED atomically: a RUN_ID collision must refuse, never
+# share one directory between two lanes (evidence_finalization's atomicity law).
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[campaign_frameworks] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 
 SCHEMA="fln-e2e/1"
 BEAD="fln-td9"

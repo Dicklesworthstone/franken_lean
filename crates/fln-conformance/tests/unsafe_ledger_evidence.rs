@@ -353,7 +353,10 @@ const LANE_CITED_ROWS: usize = 1;
 /// expose the reviewed closure, reference, thunk, and task state transitions needed by
 /// Golem. Each row cites the exact boundary function introduced with it; the ledger is
 /// 199 rows and the prose class remains 121.
-const SYMBOL_RESOLVED_ROWS: usize = 77;
+/// 77 -> 80 at `1312dfa2`/`5b9dd3db` (the same landings as the token row above records):
+/// FLN-UL-0193 through 0201's ratchet rows minus their prose members, plus the bins row
+/// FLN-UL-0202, resolve as symbol-resolved; the prose class is unchanged at 121.
+const SYMBOL_RESOLVED_ROWS: usize = 80;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -388,7 +391,11 @@ const SYMBOL_RESOLVED_ROWS: usize = 77;
 ///
 /// 82 -> 89 in the retained FIR/FLBC integration: FLN-UL-0193 through 0199 each add one
 /// resolving boundary symbol and remove none.
-const RESOLVING_CITATION_TOKENS: usize = 89;
+/// 89 -> 92 at `1312dfa2`/`5b9dd3db`: rows FLN-UL-0193 through 0201 (the evidence-ratchet
+/// binding) and FLN-UL-0202 (the bounded small-object bins' own row, citing
+/// `small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable`) each cite symbols their
+/// landings create — measured by replaying the guard's parse across the range.
+const RESOLVING_CITATION_TOKENS: usize = 92;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
