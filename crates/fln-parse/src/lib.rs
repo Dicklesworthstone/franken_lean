@@ -14,6 +14,7 @@
 
 pub mod build;
 pub mod category;
+pub mod macro_expand;
 pub mod pratt;
 pub mod recovery;
 pub mod registry;

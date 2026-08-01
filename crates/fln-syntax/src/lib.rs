@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attach;
+pub mod hygiene;
 pub mod literal;
 pub mod recover;
 pub mod rope;
