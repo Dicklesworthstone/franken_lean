@@ -311,6 +311,7 @@ E2E_STEP_ORDERS = {
         "guard_suite",
         "pin_drift_refused",
         "malformed_row_refused",
+        "budget_refusal",
         "pristine_recovery",
     ],
     "campaign_frameworks": [

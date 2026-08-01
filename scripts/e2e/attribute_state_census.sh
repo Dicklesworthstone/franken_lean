@@ -532,13 +532,41 @@ if ! grep -q "missing field\|not key=value" "$LAST_OUT" && ! grep -q "missing fi
 fi
 record_step "$step" "a malformed row is refused with the shape named"   "classification fail, refusal names the malformed shape" "$step.err"   fail 1 101 "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 
+# ---- leg 4b: a source beyond the byte budget is a typed refusal with exact usage
+step=budget_refusal
+GLOBAL_BEFORE="$(hash_governed)"
+SCRATCH="$ART_DIR/scratch-vendor"
+mkdir -p "$SCRATCH/src/Lean"
+"${PYTHON[@]}" - "$SCRATCH/src/Lean/Big.lean" <<'PY'
+import pathlib, sys
+# 8 bytes per pad line; 600k lines is 4.8MB, over the 4MB input budget.
+pathlib.Path(sys.argv[1]).write_text("def filler := 1\n" + "-- pad\n" * 600_000, encoding="utf-8")
+PY
+supervise "$step" --semantic-failure-exit 2 "${PYTHON[@]}" "$ROOT/$GEN" \
+  --vendor-path "$SCRATCH" --output "$ART_DIR/budget-out.txt"
+inspect_supervisor "$step"
+GLOBAL_AFTER="$(hash_governed)"
+if [ "$LAST_CLASSIFICATION" != "fail" ]; then
+  record_failure "$step" "an oversized source is a typed budget refusal"
+  set_final fail budget_not_enforced 1
+  finalize 1
+fi
+if ! grep -q "budget refusal" "$LAST_ERR" && ! grep -q "budget refusal" "$LAST_OUT"; then
+  record_failure "$step" "the refusal names the budget with exact usage"
+  set_final fail budget_reason_wrong 1
+  finalize 1
+fi
+record_step "$step" "a source beyond the byte budget is refused with exact usage" \
+  "classification fail, budget refusal with the byte count" "$step.err" \
+  fail 1 2 "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
+
 # ---- leg 5: pristine recovery — byte-exact, verified, and the generator's check green
 step=pristine_recovery
 GLOBAL_BEFORE="$(hash_governed)"
 # shellcheck disable=SC2016
 supervise "$step" bash -c \
-  'cmp -s "$1" "$2" && exec "${3}" "${4}" --check' \
-  _ "$ART_DIR/ATTRIBUTE_STATE_CENSUS.pristine" "$CENSUS" "${PYTHON[*]}" "$ROOT/$GEN"
+  'cmp -s "$1" "$2" && shift 2 && exec "$@" --check' \
+  _ "$ART_DIR/ATTRIBUTE_STATE_CENSUS.pristine" "$CENSUS" "${PYTHON[@]}" "$ROOT/$GEN"
 inspect_supervisor "$step"
 GLOBAL_AFTER="$(hash_governed)"
 if [ "$LAST_RC" -ne 0 ]; then

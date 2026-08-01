@@ -31,6 +31,38 @@ SCAN_ROOTS = ["src/Init", "src/Lean", "src/Std"]
 OUTPUT = ROOT / "contracts" / "ATTRIBUTE_STATE_CENSUS.txt"
 SCHEMA = "fln-attribute-state-census/1"
 
+# The extraction budgets (the bead's zero/exact/one-over law: every budget is
+# checked, and meeting one is a typed refusal with exact usage, never an
+# unbounded run and never a silent truncation).
+MAX_INPUT_FILE_BYTES = 4_000_000      # a vendor .lean file beyond this is a typed refusal
+MAX_RECORD_DEPTH = 512                # brace nesting beyond this is a typed refusal
+MAX_ROWS = 10_000                     # a census beyond this means the scan broke
+MAX_OUTPUT_BYTES = 8_000_000          # output beyond this means the encoder broke
+
+import os
+import signal
+
+_CANCELLED = {"flag": None}
+
+
+def _on_signal(signum, _frame):
+    _CANCELLED["flag"] = signum
+
+
+def check_cancelled(stage: str) -> None:
+    """The fixed cancellation observation points: file boundaries, family
+    boundaries, and before publication. Cancellation is typed, and nothing
+    partial ever publishes (the write is atomic)."""
+    if _CANCELLED["flag"] is not None:
+        raise CancelledGeneration(stage, _CANCELLED["flag"])
+
+
+class CancelledGeneration(Exception):
+    def __init__(self, stage: str, signum: int):
+        self.stage = stage
+        self.signum = signum
+        super().__init__(f"cancelled at {stage} by signal {signum}")
+
 ATTR_IMPL_MODULE = "src/Lean/Attributes.lean"
 
 # The application-time lattice, with the default the pin declares in
@@ -264,11 +296,26 @@ def encode(text: str) -> str:
     )
 
 
-def iter_sources():
+def iter_sources(vendor: Path):
     for scan_root in SCAN_ROOTS:
-        root = VENDOR / scan_root
+        root = vendor / scan_root
         for path in sorted(root.rglob("*.lean")):
             yield path
+
+
+def read_bounded(path: Path) -> str:
+    """Read one source file inside its byte budget; beyond it is a typed
+    refusal with exact usage, never a silent truncation."""
+    size = path.stat().st_size
+    if size > MAX_INPUT_FILE_BYTES:
+        raise BudgetExceeded(
+            f"{path}: {size} bytes exceeds the input file budget of {MAX_INPUT_FILE_BYTES}"
+        )
+    return path.read_text(encoding="utf-8")
+
+
+class BudgetExceeded(Exception):
+    pass
 
 
 def rel(path: Path) -> str:
@@ -323,6 +370,10 @@ def match_braces(text: str, start: int, open_ch: str = "{", close_ch: str = "}")
                 in_string = True
             elif ch == open_ch:
                 depth += 1
+                if depth > MAX_RECORD_DEPTH:
+                    raise ValueError(
+                        f"record nesting beyond the depth budget of {MAX_RECORD_DEPTH}"
+                    )
             elif ch == close_ch:
                 depth -= 1
                 if depth == 0:
@@ -434,14 +485,15 @@ def extract_epoch() -> str:
     raise SystemExit("SUITE.lock carries no reference epoch row")
 
 
-def extract() -> tuple[list, list, int]:
+def extract(vendor: Path) -> tuple[list, list, int]:
     rows: list[Row] = []
     problems: list[str] = []
     machinery = 0
     epoch = extract_epoch()
-    for path in iter_sources():
-        module = rel(path)
-        raw = path.read_text(encoding="utf-8")
+    for path in iter_sources(vendor):
+        check_cancelled("source-walk")
+        module = path.relative_to(vendor).as_posix()
+        raw = read_bounded(path)
         text = strip_comments(raw)
         for pattern, family in [
             ("registerTagAttribute", "tag"),
@@ -889,9 +941,29 @@ def main() -> int:
         "--output",
         help="write to this path instead of the committed census (the lane's non-destructive leg)",
     )
+    parser.add_argument(
+        "--vendor-path",
+        help="read pinned sources from this tree instead of vendor/lean4-src (the truncated-input leg)",
+    )
     args = parser.parse_args()
 
-    rows, problems, machinery = extract()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, _on_signal)
+
+    vendor = Path(args.vendor_path) if args.vendor_path else VENDOR
+
+    try:
+        rows, problems, machinery = extract(vendor)
+    except CancelledGeneration as cancelled:
+        print(
+            f"attribute-census: CANCELLED at {cancelled.stage} by signal {cancelled.signum}; "
+            "nothing partial published (the write is atomic)",
+            file=sys.stderr,
+        )
+        return 130 if cancelled.signum == signal.SIGINT else 143
+    except BudgetExceeded as exceeded:
+        print(f"attribute-census: budget refusal — {exceeded}", file=sys.stderr)
+        return 2
     if problems:
         for problem in problems:
             print(f"attribute-census: {problem}", file=sys.stderr)
@@ -952,7 +1024,21 @@ def main() -> int:
         ("evidence-anchor", "parameterized"),
     ]
     fallback = " ".join(f"{key}={encode(value)}" for key, value in fallback_fields)
+    check_cancelled("pre-publication")
     text = "\n".join(header + body + [fallback]) + "\n"
+    if len(text.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        print(
+            f"attribute-census: budget refusal — the output exceeds {MAX_OUTPUT_BYTES} bytes "
+            f"({len(text.encode('utf-8'))} used; the encoder broke or the scan exploded)",
+            file=sys.stderr,
+        )
+        return 2
+    if len(rows) > MAX_ROWS:
+        print(
+            f"attribute-census: budget refusal — {len(rows)} rows exceeds the row budget of {MAX_ROWS}",
+            file=sys.stderr,
+        )
+        return 2
     root_hash = fnv1a64(text.encode("utf-8"))
     text += f"census-root {root_hash}\n"
 
@@ -967,13 +1053,23 @@ def main() -> int:
         print(f"attribute-census: OK ({len(rows)} rows, root {root_hash})")
         return 0
 
+    def publish(path: Path) -> None:
+        """The atomic write: a sibling temp file, fsync, then rename. A crash
+        anywhere before the rename leaves the committed file untouched —
+        that is the clean-retry law, and the lane's cancellation leg proves it."""
+        tmp = path.with_suffix(path.suffix + ".candidate")
+        tmp.write_text(text, encoding="utf-8")
+        with open(tmp, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+
     if args.output:
         output_path = Path(args.output)
-        output_path.write_text(text, encoding="utf-8")
+        publish(output_path)
         print(f"attribute-census: wrote {output_path} ({len(rows)} rows, root {root_hash})")
         return 0
 
-    OUTPUT.write_text(text, encoding="utf-8")
+    publish(OUTPUT)
     print(f"attribute-census: wrote {OUTPUT} ({len(rows)} rows, root {root_hash})")
     return 0
 

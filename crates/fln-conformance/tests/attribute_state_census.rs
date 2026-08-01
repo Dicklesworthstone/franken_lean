@@ -271,3 +271,166 @@ fn every_handler_class_is_declared_and_never_optimistic() {
         "not every core registration is data-only (the extractor would be mislabeling)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The hardening laws: truncated inputs, budgets, cancellation, atomicity
+// ---------------------------------------------------------------------------
+
+/// A minimal vendor tree the truncated-input cells can corrupt without
+/// touching the pin: one file with a well-formed registration, one cut
+/// mid-record.
+fn scratch_vendor(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "fln-attr-census-scratch-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    let lean_dir = dir.join("src/Lean");
+    fs::create_dir_all(&lean_dir).expect("create scratch vendor");
+    fs::write(
+        lean_dir.join("Good.lean"),
+        "def helper := 1\nbuiltin_initialize x : TagAttribute ← registerTagAttribute `good \"good attr\"\n",
+    )
+    .expect("write good source");
+    dir
+}
+
+fn run_generator(vendor: &std::path::Path) -> std::process::Output {
+    let root = root();
+    let output_path = std::env::temp_dir().join(format!(
+        "fln-attr-census-out-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&output_path);
+    std::process::Command::new("python3")
+        .args([
+            "-I",
+            "-S",
+            "scripts/extract/gen_attribute_state_census.py",
+            "--vendor-path",
+        ])
+        .arg(vendor)
+        .arg("--output")
+        .arg(&output_path)
+        .current_dir(&root)
+        .output()
+        .expect("the census generator must run")
+}
+
+#[test]
+fn a_truncated_input_is_a_typed_refusal_never_a_silent_census() {
+    let vendor = scratch_vendor("trunc");
+    // A well-formed tree generates.
+    let good = run_generator(&vendor);
+    assert!(
+        good.status.success(),
+        "control: the well-formed scratch tree generates: {}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    // Truncate the source mid-record: the extractor must refuse typed
+    // (unbalanced braces is a named generation failure), never emit a census
+    // that silently lost the row.
+    fs::write(
+        vendor.join("src/Lean/Good.lean"),
+        "builtin_initialize x : TagAttribute ← registerEnvExtension {\n  name := `broken\n",
+    )
+    .expect("write truncated source");
+    let bad = run_generator(&vendor);
+    assert!(
+        !bad.status.success(),
+        "a truncated source fails generation"
+    );
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        stderr.contains("unbalanced braces") || stderr.contains("unclassified"),
+        "the refusal is typed, not a silent census: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&vendor);
+}
+
+#[test]
+fn cancellation_is_typed_and_nothing_partial_publishes() {
+    let vendor = scratch_vendor("cancel");
+    // Enough well-formed sources that the generation has a window to cancel in.
+    for index in 0..40 {
+        fs::write(
+            vendor.join("src/Lean").join(format!("F{index}.lean")),
+            format!("builtin_initialize x{index} : TagAttribute ← registerTagAttribute `good{index} \"g\"\n"),
+        )
+        .expect("write source");
+    }
+    let committed = root().join("contracts/ATTRIBUTE_STATE_CENSUS.txt");
+    let committed_bytes = fs::read(&committed).expect("committed census reads");
+    let mut child = std::process::Command::new("python3")
+        .args([
+            "-I",
+            "-S",
+            "scripts/extract/gen_attribute_state_census.py",
+            "--vendor-path",
+        ])
+        .arg(&vendor)
+        .arg("--output")
+        .arg(std::env::temp_dir().join("fln-attr-census-cancel-out"))
+        .current_dir(root())
+        .spawn()
+        .expect("spawn generator");
+    // Cancel promptly; the fixed observation points are per-file. The signal
+    // goes through /bin/kill (the house drill pattern — no libc dependency).
+    let _ = std::process::Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status();
+    let status = child.wait().expect("wait");
+    let after = fs::read(&committed).expect("committed census reads after");
+    assert_eq!(
+        committed_bytes, after,
+        "the committed file is byte-identical after a cancelled generation"
+    );
+    if let Some(code) = status.code() {
+        assert!(
+            code == 130 || code == 0,
+            "cancellation is typed (130) or completed before the signal landed (0): {code}"
+        );
+    }
+    // The output file either does not exist (cancelled before publish) or is
+    // complete (publish is atomic): a partial file is the forbidden shape.
+    let out = std::env::temp_dir().join("fln-attr-census-cancel-out");
+    if out.exists() {
+        let text = fs::read_to_string(&out).expect("the published output reads");
+        assert!(
+            text.ends_with("census-root fnv1a64:") || text.contains("census-root "),
+            "a published output is complete (atomic publish), never partial"
+        );
+    }
+    let _ = fs::remove_dir_all(&vendor);
+    let _ = fs::remove_file(&out);
+}
+
+#[test]
+fn a_leftover_candidate_is_stale_evidence_not_a_generation() {
+    // The .candidate sibling is the atomic write's temp name: a leftover one
+    // (a crashed run) must not read as a valid census, and a fresh
+    // generation must succeed — the clean-retry law.
+    let committed = root().join("contracts/ATTRIBUTE_STATE_CENSUS.txt");
+    let candidate = root().join("contracts/ATTRIBUTE_STATE_CENSUS.txt.candidate");
+    let committed_bytes = fs::read(&committed).expect("committed reads");
+    fs::write(&candidate, "row=stale-leftover\n").expect("plant a stale candidate");
+    let rerun = std::process::Command::new("python3")
+        .args([
+            "-I",
+            "-S",
+            "scripts/extract/gen_attribute_state_census.py",
+            "--check",
+        ])
+        .current_dir(root())
+        .output()
+        .expect("the check runs");
+    assert!(
+        rerun.status.success(),
+        "a stale candidate does not poison the check: {}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    let after = fs::read(&committed).expect("committed reads after");
+    assert_eq!(committed_bytes, after, "the committed file is untouched");
+    let _ = fs::remove_file(&candidate);
+}
