@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attribute;
 pub mod constants;
 pub mod decl_closure;
 pub mod effective_imports;

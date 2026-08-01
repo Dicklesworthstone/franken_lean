@@ -857,8 +857,13 @@ def parse_helper_call(pattern, family, module, line, tail, epoch, rows):
     if family == "tag":
         validate_match = re.match(r"\s*fun\s+_\s*=>\s*pure\s*\(\)", rest[descr_match.end():] if descr_match else "")
         validate = "pure ()" if validate_match else "custom validate (row-anchored)"
-    handler_class = "data-only" if family in ("tag", "label", "simp") and not validate.startswith("custom") else (
-        "data-only" if family in ("tag", "label", "simp") else "requires-handler-provisional"
+    # The handler-class lattice, per the bead's never-mislabeled law: tag and
+    # label families insert into persistent sets with a pure default validate,
+    # so their DEFAULT is data-only; every other family's add handler invokes
+    # Lean code (simp/simproc/sym-simp run Meta checks), and the conservative
+    # default for anything unproven is provisional, never data-only.
+    handler_class = "data-only" if family in ("tag", "label") and not validate.startswith("custom") else (
+        "data-only" if family in ("tag", "label") else "requires-handler"
     )
     return Row(
         row_id=f"attr-{family}-{name.replace('.', '-')}",
