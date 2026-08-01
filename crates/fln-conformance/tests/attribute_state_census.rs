@@ -101,9 +101,9 @@ fn the_census_parses_under_its_schema_with_every_field() {
     );
     for row in &rows {
         for field in REQUIRED_FIELDS {
-            let value = row.get(field).unwrap_or_else(|| {
-                panic!("row {} is missing field {field}", row["row"])
-            });
+            let value = row
+                .get(field)
+                .unwrap_or_else(|| panic!("row {} is missing field {field}", row["row"]));
             assert!(
                 !value.trim().is_empty(),
                 "row {} has an empty {field}",
@@ -211,10 +211,7 @@ fn planted_drift_is_refused() {
     // A stale root line is visible to the regeneration check (the file's own
     // trailing root must equal the content hash — checked by the generator,
     // never reimplemented here).
-    let root_line = text
-        .lines()
-        .last()
-        .expect("the census root line exists");
+    let root_line = text.lines().last().expect("the census root line exists");
     assert!(
         root_line.starts_with("census-root fnv1a64:"),
         "the file carries its trailing root"
@@ -297,10 +294,8 @@ fn scratch_vendor(tag: &str) -> PathBuf {
 
 fn run_generator(vendor: &std::path::Path) -> std::process::Output {
     let root = root();
-    let output_path = std::env::temp_dir().join(format!(
-        "fln-attr-census-out-{}",
-        std::process::id()
-    ));
+    let output_path =
+        std::env::temp_dir().join(format!("fln-attr-census-out-{}", std::process::id()));
     let _ = fs::remove_file(&output_path);
     std::process::Command::new("python3")
         .args([
@@ -336,10 +331,7 @@ fn a_truncated_input_is_a_typed_refusal_never_a_silent_census() {
     )
     .expect("write truncated source");
     let bad = run_generator(&vendor);
-    assert!(
-        !bad.status.success(),
-        "a truncated source fails generation"
-    );
+    assert!(!bad.status.success(), "a truncated source fails generation");
     let stderr = String::from_utf8_lossy(&bad.stderr);
     assert!(
         stderr.contains("unbalanced braces") || stderr.contains("unclassified"),

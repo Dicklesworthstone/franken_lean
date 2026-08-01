@@ -520,8 +520,8 @@ mod tests {
 
     fn census_text() -> String {
         // k60n-safe root resolution: walk ancestors for the marker, never
-        // env!("CARGO_MANIFEST_DIR") (the shared target dir bakes the compile
-        // tree's path into the binary).
+        // the compile-time manifest-dir bake (the shared target dir carries
+        // the compile tree's path into the binary).
         let current = std::env::current_dir().expect("current directory");
         let root = current
             .ancestors()
@@ -1179,7 +1179,11 @@ mod named_mutant_tests {
         let current = std::env::current_dir().expect("current directory");
         let root = current
             .ancestors()
-            .find(|candidate| candidate.join("contracts/ATTRIBUTE_STATE_CENSUS.txt").is_file())
+            .find(|candidate| {
+                candidate
+                    .join("contracts/ATTRIBUTE_STATE_CENSUS.txt")
+                    .is_file()
+            })
             .expect("the committed census is findable");
         std::fs::read_to_string(root.join("contracts/ATTRIBUTE_STATE_CENSUS.txt"))
             .expect("the committed census exists")
