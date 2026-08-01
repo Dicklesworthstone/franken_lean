@@ -40,8 +40,8 @@
 //! * **Universe judgments.** [`fln_core::level::Level::is_equiv`],
 //!   `normalize`, `normalize_fixpoint`, `is_zero`. These are not helpers; they
 //!   *are* judgments of the type theory, and `fln-kernel` returns their result
-//!   directly as its verdict — `tc.rs:949` answers KR-303 sort definitional
-//!   equality with `lt.is_equiv(ls)`, and `tc.rs:896`/`1224`/`1889` decide
+//!   directly as its verdict — `tc.rs:950` answers KR-303 sort definitional
+//!   equality with `lt.is_equiv(ls)`, and `tc.rs:897`/`1225`/`1890` decide
 //!   "is this a Prop?" (the KR-974 theorem check) with
 //!   `level.is_equiv(&Level::zero())`. A checker that calls `is_equiv` does not
 //!   check universe equivalence at all. `imax`/`max` fixpoint normalization is
@@ -51,9 +51,9 @@
 //!   `loose_bvar_range`, `has_fvar`, `has_expr_mvar`, `has_level_mvar`,
 //!   `has_level_param`, `approx_depth`. These are precomputed answers that the
 //!   kernel *skips work* on: `instantiate` returns early when
-//!   `loose_bvar_range() <= k` (`tc.rs:176`), and `abstract_fvar`,
+//!   `loose_bvar_range() <= k` (`tc.rs:177`), and `abstract_fvar`,
 //!   `abstract_shifted` and `abstract_replace_value` all return early when
-//!   `!has_fvar()` (`tc.rs:1645`/`1707`/`1779`). An under-reporting flag makes
+//!   `!has_fvar()` (`tc.rs:1646`/`1708`/`1780`). An under-reporting flag makes
 //!   substitution silently skip a subterm that needed rewriting. Shared, both
 //!   engines skip the same subterm and agree for the same wrong reason.
 //! * **Hashing that feeds a decision.** [`fln_core::lean_hash`] and the
@@ -136,7 +136,7 @@
 //!
 //! This section previously said two prohibitions were missing. **One of them has
 //! landed**, and the paragraph outlived it — which is the defect this crate's own
-//! matrix row was corrected for once already (`witness.rs:535`, where
+//! matrix row was corrected for once already (`witness.rs:538`, where
 //! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
 //! throughout). So the state is measured here rather than remembered, at
 //! `53a5e3ec`:
@@ -275,18 +275,18 @@
 //! that the prose reading the site is sound.
 //!
 //! ```text
-//! cite crates/fln-kernel/src/tc.rs:949 :: lt.is_equiv(ls)
-//! cite crates/fln-kernel/src/tc.rs:896 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
-//! cite crates/fln-kernel/src/tc.rs:1224 :: ExprNode::Sort { level } @@ fn is_prop
-//! cite crates/fln-kernel/src/tc.rs:1889 :: ExprNode::Sort { level } @@ fn infer_proj
-//! cite crates/fln-kernel/src/tc.rs:176 :: e.loose_bvar_range() <= k
-//! cite crates/fln-kernel/src/tc.rs:1645 :: !e.has_fvar() @@ fn abstract_fvar
-//! cite crates/fln-kernel/src/tc.rs:1707 :: !e.has_fvar() @@ fn abstract_shifted
-//! cite crates/fln-kernel/src/tc.rs:1779 :: !e.has_fvar() @@ fn replace_fvar
+//! cite crates/fln-kernel/src/tc.rs:950 :: lt.is_equiv(ls)
+//! cite crates/fln-kernel/src/tc.rs:897 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
+//! cite crates/fln-kernel/src/tc.rs:1225 :: ExprNode::Sort { level } @@ fn is_prop
+//! cite crates/fln-kernel/src/tc.rs:1890 :: ExprNode::Sort { level } @@ fn infer_proj
+//! cite crates/fln-kernel/src/tc.rs:177 :: e.loose_bvar_range() <= k
+//! cite crates/fln-kernel/src/tc.rs:1646 :: !e.has_fvar() @@ fn abstract_fvar
+//! cite crates/fln-kernel/src/tc.rs:1708 :: !e.has_fvar() @@ fn abstract_shifted
+//! cite crates/fln-kernel/src/tc.rs:1780 :: !e.has_fvar() @@ fn replace_fvar
 //! cite crates/fln-hash/src/canon.rs:1075 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:573 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
-//! cite crates/fln-conformance/src/witness.rs:535 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite crates/fln-conformance/src/witness.rs:538 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:1113 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1296 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1306 :: fn every_semantic_item_is_refused_inside_fln_checker
@@ -303,7 +303,8 @@
 //! **The registry rotted twice while this paragraph stood, and repairing only the row that
 //! shouted would have left the build red.** Re-derived at `ef5af198`, every row rather than the
 //! loud one: `witness.rs:496 (historical)` became 535 (`f1a2b899`, then `d2cb11ae` — both `kl4h`
-//! commits, so this charter was rotted by the pane that maintains it), and
+//! commits, so this charter was rotted by the pane that maintains it), then 538 when the
+//! adjacent consensus row recorded fln-5720's seed caller; and
 //! `checks.rs:1023 (historical)` became 1068 (`0f2ae0ba`). The test asserts *inside* its loop,
 //! so it reports the **first** mismatch only and a green after one repair would have been the
 //! next red. `0f2ae0ba` is the same commit AGENTS.md records as drifting its own four

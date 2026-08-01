@@ -74,6 +74,14 @@ version = "0.0.0"
 [[package]]
 name = "fln-elab"
 version = "0.0.0"
+dependencies = [
+ "fln-bignum",
+ "fln-core",
+ "fln-env",
+ "fln-kernel",
+ "fln-parse",
+ "fln-syntax",
+]
 
 [[package]]
 name = "fln-env"
@@ -142,6 +150,7 @@ dependencies = [
 name = "fln-rt"
 version = "0.0.0"
 dependencies = [
+ "fln-core",
  "fln-unsafe-abi",
  "fln-unsafe-region",
 ]

@@ -299,51 +299,11 @@ pub fn check_nat_definition_source(
 mod tests {
     use super::*;
     use fln_core::expr::{ExprNode, NatLit};
-    use fln_core::level::Level;
-    use fln_env::constants::AxiomVal;
-    use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
-    use fln_env::pmap::CollisionBudget;
-    use fln_kernel::capability::{Published, admit};
-    use fln_kernel::council::{Council, CouncilOutcome, convene};
     use fln_kernel::verdict::RejectClass;
+    use seed::bootstrap_nat_environment;
 
     fn nat_environment() -> Environment {
-        let name = Name::str(Name::anonymous(), "Nat");
-        let axiom = AxiomVal {
-            base: ConstantVal {
-                name,
-                level_params: Vec::new(),
-                type_: Expr::sort(Level::one()),
-            },
-            is_unsafe: false,
-        };
-        let base = Environment::new();
-        let admitted = match admit(&base, Declaration::Axiom(axiom), Budget::DEFAULT) {
-            Outcome::Complete(admitted) => admitted,
-            Outcome::Inconclusive(_) => panic!("the small Nat fixture was inconclusive"),
-            Outcome::InternalFault(fault) => {
-                panic!("the small Nat fixture faulted: {fault:?}")
-            }
-        };
-        let checked = match convene(&Council::nobody_was_asked(), admitted) {
-            CouncilOutcome::Agreed(checked) => checked,
-            CouncilOutcome::KernelRejected { class, .. } => {
-                panic!("the kernel rejected the small Nat fixture: {class:?}")
-            }
-            CouncilOutcome::Halted(halt) => {
-                panic!("an empty fixture council halted: {}", halt.summary())
-            }
-        };
-        match checked.publish(
-            DeclarationBudget::default(),
-            CollisionBudget::default(),
-            None,
-        ) {
-            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
-                publication,
-            ))) => publication.environment,
-            other => panic!("the checked Nat fixture did not publish: {other:?}"),
-        }
+        bootstrap_nat_environment(Budget::DEFAULT).expect("the small Nat fixture must publish")
     }
 
     #[test]

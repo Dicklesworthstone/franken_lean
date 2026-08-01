@@ -524,11 +524,14 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    the non-Clone CheckedDecl back, so halting is not a flag anyone can ignore; \
                    and there is no quorum, no tally and no seat count anywhere in the module, \
                    so agreement is required rather than counted. What the sentence still \
-                   promises beyond the tree: `convene` has NO production caller — every call \
-                   site is in tests/consensus_seat.rs — because there is no publication path \
-                   to halt yet (fln-elab is a stub). The mechanism exists; the running \
-                   behaviour the wording describes does not. Also still absent: the canonical \
-                   Judgment type plan §8.3c specifies as the substrate of consensus.",
+                   promises beyond the tree: `convene` now has one bounded production caller, \
+                   fln-elab's seed environment builder, where it admits the opaque Nat fixture \
+                   before the first literal-definition test. That proves the capability route \
+                   executes, but it is not an elaboration transaction, carries no independent \
+                   witness seat, and never publishes the user declaration. The mechanism and \
+                   one bring-up caller exist; the running consensus behaviour the wording \
+                   describes does not. Also still absent: the canonical Judgment type plan \
+                   §8.3c specifies as the substrate of consensus.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -682,10 +685,12 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         claim_type: ClaimType::Invariant,
         state: ClaimState::Targeted,
         evidence: "The thread matrix genuinely runs (fln-syntax lexer_thread_matrix, \
-                   env_snapshots.sh, kernel_replay.sh, verdict_schema.sh) — but the claim's \
-                   SUBJECT does not exist: 'same environment' needs an elaborator \
-                   (crates/fln-elab is a stub) and 'same artifacts' needs a writer. OBSERVED \
-                   for the four tested subsystems, TARGETED as written.",
+                   env_snapshots.sh, kernel_replay.sh, verdict_schema.sh). fln-elab now has one \
+                   bounded, single-threaded source-to-kernel seam for a natural-literal \
+                   definition, but neither that seam nor an artifact writer participates in a \
+                   schedule matrix. OBSERVED for the four tested subsystems and the seed's \
+                   sequential result only; TARGETED as written for elaborated environments and \
+                   artifacts.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -694,11 +699,12 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
         claim_type: ClaimType::BoundedModel,
         state: ClaimState::Hypothesis,
         evidence: "A retained G0-3 prototype now provides a versioned whole-program FLBC \
-                   validator in fln-comp and an ABI-valued interpreter in fln-vm. Its component \
-                   tests execute validated hand-built bytecode over real Marrow objects; they \
-                   do not compile Lean source or execute tactics. fln-elab remains a 6-line \
-                   charter stub, so the user-visible claim is still a hypothesis rather than \
-                   an observed Golem surface.",
+                   validator in fln-comp and an ABI-valued interpreter in fln-vm. fln-elab now \
+                   parses and kernel-checks one natural-literal definition, but that declaration \
+                   is not lowered to FIR/FLBC and the seed exposes no term elaboration, tactic \
+                   state, Meta API, or Native Mirror calls. The VM component tests still execute \
+                   validated hand-built bytecode over real Marrow objects rather than compiled \
+                   Lean tactics, so the user-visible claim remains a hypothesis.",
         enforcement: Enforcement::Acknowledged,
     },
     // ---- the empty-referent shape ---------------------------------------------------
@@ -838,9 +844,10 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
     ),
     (
         "TACTICS-ON-GOLEM",
-        Citation::FileAtMostLines {
+        Citation::OccursExactly {
             path: "crates/fln-elab/src/lib.rs",
-            max_lines: 10,
+            needle: "pub fn check_nat_definition_source",
+            count: 1,
         },
     ),
     (

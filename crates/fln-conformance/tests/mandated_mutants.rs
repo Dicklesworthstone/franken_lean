@@ -12,21 +12,24 @@
 //!
 //! That gap has a shape and a direction. The two names that do **not** apply yet —
 //! `leaked transaction assignment` (Athanor's `ElabTxn`) and `stale cache hit accepted`
-//! (the Ledger) — are the dangerous ones, because `fln-elab` and `fln-ledger` are
-//! charter-only stubs today. When they land, the reminder to seed their mutants has to
-//! *already exist* or it never fires. That is bead
+//! (the Ledger) — are the dangerous ones. The Ledger remains a charter-only stub;
+//! `fln-5720` has now landed a bounded elaboration seam while explicitly deferring
+//! `ElabTxn`. A deferral therefore expires on the first production construct that can
+//! actually carry the named defect, not on unrelated growth elsewhere in its crate.
+//! When that construct lands, the reminder to seed its mutant has to *already exist* or
+//! it never fires. That is bead
 //! `fln-term-plane-population-differential-wv4u`'s R4 applied here: the enforcement law
 //! lands **with** the rig rather than after it.
 //!
 //! # How the two directions work
 //!
 //! A name is accounted for if it is **marked** by a `MANDATED MUTANT` comment, or if it is
-//! **declared not-yet-seeded** against a crate that still says `Stub crate: charter only.`
-//! in its root. Both halves are checked both ways:
+//! **declared not-yet-seeded** against an absent, explicit production trigger. Both halves
+//! are checked both ways:
 //!
 //! * a name that is neither marked nor declared fails — the list cannot grow silently;
-//! * a declared name whose crate has **stopped being a stub** fails, which is the reminder
-//!   firing at exactly the moment the subsystem arrives;
+//! * a declared name whose trigger is now present fails, which is the reminder firing at
+//!   the first point where the named mutant is plantable;
 //! * a declared name that has since been marked fails, so the remainder shrinks with the
 //!   repair instead of outliving it.
 //!
@@ -88,16 +91,52 @@ const MARKER: &str = "MANDATED MUTANT (AGENTS testing policy: \"";
 /// MANDATED MUTANT (AGENTS testing policy: "decoy-sentinel-never-a-real-mandated-name")
 const DECOY_SENTINEL: &str = "decoy-sentinel-never-a-real-mandated-name";
 
-/// Names whose subsystem does not exist yet, each against the crate that must still be a
-/// stub for the excuse to hold. When that crate stops being a stub, this entry fails and the
-/// person landing the subsystem is told to seed the mutant — which is the entire point.
-const NOT_YET_SEEDED: [(&str, &str); 2] = [
-    ("leaked transaction assignment", "fln-elab"),
-    ("stale cache hit accepted", "fln-ledger"),
-];
-
 /// The sentence in a crate root that declares it unimplemented.
 const STUB_DECLARATION: &str = "Stub crate: charter only.";
+
+/// The first production state at which a named defect can be planted honestly.
+#[derive(Clone, Copy)]
+enum SeedTrigger {
+    /// Any implementation replaces the whole-crate stub declaration.
+    CrateImplementation,
+    /// A partial crate may exist first; the named construct is the relevant boundary.
+    ///
+    /// This is deliberately fail-closed source containment: prose that quotes the exact
+    /// declaration spelling also expires the deferral. Once the construct exists, the
+    /// exemption must disappear rather than grow a Rust parser of its own.
+    ProductionNeedle(&'static str),
+}
+
+impl SeedTrigger {
+    fn is_present(self, source: &str) -> bool {
+        match self {
+            SeedTrigger::CrateImplementation => !source.contains(STUB_DECLARATION),
+            SeedTrigger::ProductionNeedle(needle) => source.contains(needle),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DeferredMutant {
+    name: &'static str,
+    krate: &'static str,
+    trigger: SeedTrigger,
+}
+
+/// Names whose production state cannot yet carry the defect. Each entry expires
+/// automatically when its declared trigger appears.
+const NOT_YET_SEEDED: [DeferredMutant; 2] = [
+    DeferredMutant {
+        name: "leaked transaction assignment",
+        krate: "fln-elab",
+        trigger: SeedTrigger::ProductionNeedle("struct ElabTxn"),
+    },
+    DeferredMutant {
+        name: "stale cache hit accepted",
+        krate: "fln-ledger",
+        trigger: SeedTrigger::CrateImplementation,
+    },
+];
 
 // ---------------------------------------------------------------------------
 // Deriving the obligation from AGENTS.md, never transcribing it
@@ -197,10 +236,24 @@ fn agents_md() -> String {
 }
 
 /// Whether `krate` still declares itself unimplemented.
-fn is_stub(root: &std::path::Path, krate: &str) -> bool {
-    std::fs::read_to_string(root.join("crates").join(krate).join("src/lib.rs"))
-        .map(|source| source.contains(STUB_DECLARATION))
-        .unwrap_or(false)
+fn crate_source(root: &std::path::Path, krate: &str) -> Option<String> {
+    std::fs::read_to_string(root.join("crates").join(krate).join("src/lib.rs")).ok()
+}
+
+fn deferral_still_applies(root: &std::path::Path, deferred: DeferredMutant) -> bool {
+    crate_source(root, deferred.krate).is_some_and(|source| !deferred.trigger.is_present(&source))
+}
+
+fn trigger_description(deferred: DeferredMutant) -> String {
+    match deferred.trigger {
+        SeedTrigger::CrateImplementation => format!(
+            "`{}` stops declaring itself with `{STUB_DECLARATION}`",
+            deferred.krate
+        ),
+        SeedTrigger::ProductionNeedle(needle) => {
+            format!("`{}` contains production text `{needle}`", deferred.krate)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +261,7 @@ fn is_stub(root: &std::path::Path, krate: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Every name §18 mandates is either killed by a marked test or declared not-yet-seeded
-/// against a crate that is still a stub — and the declaration expires by itself.
+/// against a still-absent production trigger — and the declaration expires by itself.
 #[test]
 fn every_mandated_mutant_is_killed_by_a_marked_test_or_declared_not_yet_seeded() {
     let root = workspace_root();
@@ -226,26 +279,31 @@ fn every_mandated_mutant_is_killed_by_a_marked_test_or_declared_not_yet_seeded()
 
     for name in &names {
         let is_marked = marked.contains(&name.as_str());
-        let declared = NOT_YET_SEEDED.iter().find(|(n, _)| n == name);
+        let declared = NOT_YET_SEEDED
+            .iter()
+            .copied()
+            .find(|deferred| deferred.name == name);
         match (is_marked, declared) {
             (true, None) => {}
-            (false, Some((_, krate))) if is_stub(&root, krate) => {}
-            (false, Some((_, krate))) => failures.push(format!(
-                "`{name}` is declared not-yet-seeded because `{krate}` was a stub, and \
-                 `{krate}` is no longer a stub. THIS IS THE REMINDER: the subsystem has \
-                 landed, so seed the mutant, give it a test carrying the {MARKER}{name}\") \
-                 marker, and drop this entry from NOT_YET_SEEDED"
+            (false, Some(deferred)) if deferral_still_applies(&root, deferred) => {}
+            (false, Some(deferred)) => failures.push(format!(
+                "`{name}` is declared not-yet-seeded until {}, and that trigger is now \
+                 present. THIS IS THE REMINDER: the named defect is plantable, so seed the \
+                 mutant, give it a test carrying the {MARKER}{name}\") marker, and drop \
+                 this entry from NOT_YET_SEEDED",
+                trigger_description(deferred)
             )),
-            (true, Some((_, krate))) => failures.push(format!(
+            (true, Some(deferred)) => failures.push(format!(
                 "`{name}` is BOTH marked by a test and still declared not-yet-seeded against \
-                 `{krate}` — the declaration outlived the defect it recorded and must be \
-                 removed, or the remainder stops shrinking"
+                 `{}` — the declaration outlived the defect it recorded and must be \
+                 removed, or the remainder stops shrinking",
+                deferred.krate
             )),
             (false, None) => failures.push(format!(
                 "`{name}` is mandated by AGENTS.md §18 and nothing accounts for it: no test \
                  carries the {MARKER}{name}\") marker, and it is not declared not-yet-seeded. \
-                 Either seed and mark it, or declare it against the stub crate whose absence \
-                 excuses it"
+                 Either seed and mark it, or declare the absent production trigger that \
+                 makes the defect unplantable"
             )),
         }
     }
@@ -260,8 +318,9 @@ fn every_mandated_mutant_is_killed_by_a_marked_test_or_declared_not_yet_seeded()
 
     println!(
         "mandated_mutants: {} of {} §18 names killed by a marked test; {} declared \
-         not-yet-seeded against stub crates. Declarations expire automatically when their \
-         crate stops being a stub. This counts MARKERS, not kills - that three of three \
+         not-yet-seeded against absent production triggers. Declarations expire \
+         automatically when their trigger appears. This counts MARKERS, not kills - that \
+         three of three \
          applicable mutants actually die was established by planting them, and is not \
          re-established by this run.",
         names.len() - NOT_YET_SEEDED.len(),
@@ -464,9 +523,10 @@ struct Plant {
 /// The three mandated mutants that can be planted today.
 ///
 /// The two absent names are not omissions: `leaked transaction assignment` and
-/// `stale cache hit accepted` are in [`NOT_YET_SEEDED`] because their subsystems are
-/// charter-only stubs, and `no_plant_exists_for_a_name_that_cannot_be_seeded_yet` refuses a
-/// recipe for either — a plant against a stub could only ever be theatre.
+/// `stale cache hit accepted` are in [`NOT_YET_SEEDED`] because the first production
+/// construct that can carry each defect is absent, and
+/// `no_plant_exists_for_a_name_that_cannot_be_seeded_yet` refuses a recipe for either —
+/// a plant against unrelated partial implementation would be theatre.
 const PLANTS: &[Plant] = &[
     Plant {
         name: "skipped positivity check",
@@ -748,17 +808,36 @@ fn plants_and_markers_are_joined_in_both_directions() {
     assert!(failures.is_empty(), "{}", failures.join("\n  "));
 }
 
-/// A name excused by a stub crate must not also carry a recipe.
+/// A name excused by an absent production trigger must not also carry a recipe.
 #[test]
 fn no_plant_exists_for_a_name_that_cannot_be_seeded_yet() {
-    for (name, krate) in NOT_YET_SEEDED {
+    for deferred in NOT_YET_SEEDED {
         assert!(
-            !PLANTS.iter().any(|p| p.name == name),
-            "`{name}` is declared not-yet-seeded against `{krate}` and yet has a plant. One \
+            !PLANTS.iter().any(|p| p.name == deferred.name),
+            "`{}` is declared not-yet-seeded against `{}` and yet has a plant. One \
              of the two is false: either the subsystem landed (drop the declaration) or the \
-             recipe mutates something that is not the defect §18 names"
+             recipe mutates something that is not the defect §18 names",
+            deferred.name,
+            deferred.krate
         );
     }
+}
+
+#[test]
+fn deferrals_expire_on_their_declared_production_trigger() {
+    let transaction = NOT_YET_SEEDED[0].trigger;
+    assert!(
+        !transaction.is_present("pub fn check_source() {}"),
+        "an unrelated bounded elaboration seam cannot carry a leaked ElabTxn assignment"
+    );
+    assert!(
+        transaction.is_present("pub struct ElabTxn {}"),
+        "the planned transaction type must expire the deferral"
+    );
+
+    let ledger = NOT_YET_SEEDED[1].trigger;
+    assert!(!ledger.is_present(STUB_DECLARATION));
+    assert!(ledger.is_present("pub struct Ledger {}"));
 }
 
 /// The extractor, tested directly — otherwise the retention digest could be silently
