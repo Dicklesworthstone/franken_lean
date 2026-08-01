@@ -100,6 +100,7 @@ dependencies = [
 name = "fln-rt"
 version = "0.0.0"
 dependencies = [
+ "fln-core",
  "fln-unsafe-abi",
  "fln-unsafe-region",
 ]
