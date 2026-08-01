@@ -330,22 +330,30 @@ impl RegisterError {
 /// the declaration a parser attribute was applied to.
 type Hook = Box<dyn Fn(&Name, &Name) + Send + Sync>;
 
+struct RegisteredHook {
+    descriptor: ParserDescriptor,
+    run: Hook,
+}
+
 /// One registered production, with the epoch it appeared at and the scope that owns it.
 struct Registered {
     production: Production,
     /// The epoch at which this became visible. A lookup at epoch `e` includes it when
     /// `registered_at <= e` — which is the interleaving law.
-    registered_at: GrammarEpoch,
+    registered_at: u64,
     /// The first epoch at which this is no longer visible. Scope exit retires a registration
     /// instead of deleting it so older epoch views remain stable and executable.
-    retired_at: Option<GrammarEpoch>,
+    retired_at: Option<u64>,
     /// `None` for a global registration; `Some(depth)` for one retired with its scope.
     scope: Option<ScopeDepth>,
 }
 
 impl Registered {
     fn is_live_at(&self, epoch: GrammarEpoch) -> bool {
-        self.registered_at <= epoch && self.retired_at.is_none_or(|retired_at| epoch < retired_at)
+        self.registered_at <= epoch.revision
+            && self
+                .retired_at
+                .is_none_or(|retired_at| epoch.revision < retired_at)
     }
 }
 
@@ -353,15 +361,23 @@ impl Registered {
 pub struct Registry {
     categories: BTreeMap<Name, CategoryState>,
     epoch: GrammarEpoch,
+    history: Vec<GrammarIdentity>,
     depth: ScopeDepth,
+    token_parsers: BTreeMap<Name, ParserDescriptor>,
+    precedences: BTreeMap<(Name, Name), u32>,
+    macros: BTreeMap<Name, ParserDescriptor>,
+    options: BTreeMap<Name, String>,
+    imports: BTreeMap<Name, String>,
+    last_transition: Option<GrammarTransition>,
+    opaque_suffix_barrier: Option<BytePos>,
     /// Hooks, in registration order. Run in **reverse** — see [`Registry::run_hooks`].
-    hooks: Vec<Hook>,
+    hooks: Vec<RegisteredHook>,
 }
 
 struct CategoryState {
     name: Name,
     /// The first epoch at which the category exists.
-    registered_at: GrammarEpoch,
+    registered_at: u64,
     behavior: LeadingIdentBehavior,
     /// Append-only, per token. See the module docs: shadowing is additive.
     leading: BTreeMap<Name, Vec<Registered>>,
@@ -370,16 +386,63 @@ struct CategoryState {
 
 impl Registry {
     pub fn new() -> Registry {
-        Registry {
+        let mut registry = Registry {
             categories: BTreeMap::new(),
-            epoch: GrammarEpoch(0),
+            epoch: GrammarEpoch::placeholder(0),
+            history: Vec::new(),
             depth: ScopeDepth(0),
+            token_parsers: BTreeMap::new(),
+            precedences: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            options: BTreeMap::new(),
+            imports: BTreeMap::new(),
+            last_transition: None,
+            opaque_suffix_barrier: None,
             hooks: Vec::new(),
-        }
+        };
+        let root = registry.grammar_root_for_revision(0);
+        registry.epoch = GrammarEpoch::from_root(0, &root);
+        registry
+            .history
+            .push(GrammarIdentity::new(registry.epoch, root));
+        registry
     }
 
     pub fn epoch(&self) -> GrammarEpoch {
         self.epoch
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.epoch.revision
+    }
+
+    pub fn identity(&self) -> &GrammarIdentity {
+        self.history
+            .last()
+            .expect("a registry always retains its initial grammar identity")
+    }
+
+    /// Resolve an epoch only when both its revision and content digest match this registry.
+    ///
+    /// A foreign epoch with the same revision is not a historical view of this registry.
+    pub fn identity_at(&self, epoch: GrammarEpoch) -> Option<&GrammarIdentity> {
+        let index = usize::try_from(epoch.revision).ok()?;
+        self.history
+            .get(index)
+            .filter(|identity| identity.epoch == epoch)
+    }
+
+    pub fn last_transition(&self) -> Option<&GrammarTransition> {
+        self.last_transition.as_ref()
+    }
+
+    pub const fn opaque_suffix_barrier(&self) -> Option<BytePos> {
+        self.opaque_suffix_barrier
+    }
+
+    pub fn distributed_parse_allowed_at(&self, position: BytePos) -> bool {
+        self.opaque_suffix_barrier
+            .is_none_or(|barrier| position < barrier)
     }
 
     pub fn scope_depth(&self) -> ScopeDepth {
