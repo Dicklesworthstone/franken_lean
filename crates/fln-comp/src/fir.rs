@@ -25,8 +25,9 @@ use std::fmt;
 /// version 9 binds closure captures to the target parameter prefix; version 10
 /// binds dynamic Apply arguments; version 11 binds generated intrinsic result
 /// ownership; version 12 binds Owned-or-Scalar callable results into every
-/// function, closure signature, and dynamic application.
-pub const FIR_SCHEMA_VERSION: u16 = 12;
+/// function, closure signature, and dynamic application; version 13 represents
+/// each `Lean.Core.checkSystem` call as an explicit effect checkpoint.
+pub const FIR_SCHEMA_VERSION: u16 = 13;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -402,6 +403,14 @@ pub enum Operation {
         intrinsic: IntrinsicId,
         args: Vec<ValueId>,
     },
+    /// The effect checkpoint defined by `Lean.Core.checkSystem`.
+    ///
+    /// The module name is semantic diagnostic context. The operation produces
+    /// Unit and lowers to the explicit FLBC checkpoint followed by its scalar
+    /// Unit value, so a stop cannot publish the binding.
+    CheckSystem {
+        module_name: String,
+    },
     Call {
         function: FunctionId,
         args: Vec<ValueId>,
@@ -437,7 +446,11 @@ impl Operation {
     fn reads(&self) -> OperationReads<'_> {
         let empty = [].iter();
         match self {
-            Self::Unit | Self::Bool(_) | Self::Nat(_) | Self::String(_) => OperationReads {
+            Self::Unit
+            | Self::Bool(_)
+            | Self::Nat(_)
+            | Self::String(_)
+            | Self::CheckSystem { .. } => OperationReads {
                 first: None,
                 rest: empty,
             },
@@ -493,6 +506,7 @@ impl Operation {
     fn literal_bytes(&self) -> usize {
         match self {
             Self::String(value) => value.len(),
+            Self::CheckSystem { module_name } => module_name.len(),
             _ => 0,
         }
     }
@@ -2543,6 +2557,7 @@ fn infer_operation_type(
             Ok(ValueType::Nat)
         }
         Operation::String(_) => Ok(ValueType::String),
+        Operation::CheckSystem { .. } => Ok(ValueType::Unit),
         Operation::Alias(value) => value_type(function, block, value_types, *value),
         Operation::Box(value) => {
             let actual = value_type(function, block, value_types, *value)?;
@@ -3310,13 +3325,24 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
             observed: usize::MAX,
         },
     )?;
-    let instruction_count =
-        binding_count
-            .checked_add(function.blocks.len())
-            .ok_or(LoweringError::WidthOverflow {
-                field: "instruction count",
-                observed: usize::MAX,
-            })?;
+    let lowered_binding_count = function
+        .blocks
+        .iter()
+        .try_fold(0usize, |total, block| {
+            block.bindings.iter().try_fold(total, |total, binding| {
+                total.checked_add(lowered_binding_width(binding))
+            })
+        })
+        .ok_or(LoweringError::WidthOverflow {
+            field: "instruction count",
+            observed: usize::MAX,
+        })?;
+    let instruction_count = lowered_binding_count
+        .checked_add(function.blocks.len())
+        .ok_or(LoweringError::WidthOverflow {
+            field: "instruction count",
+            observed: usize::MAX,
+        })?;
     let arity =
         u16::try_from(function.parameters.len()).map_err(|_| LoweringError::WidthOverflow {
             field: "arity",
@@ -3342,13 +3368,18 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
                 observed: offset,
             })?,
         );
-        offset =
-            offset
-                .checked_add(block.bindings.len() + 1)
-                .ok_or(LoweringError::WidthOverflow {
+        for binding in &block.bindings {
+            offset = offset.checked_add(lowered_binding_width(binding)).ok_or(
+                LoweringError::WidthOverflow {
                     field: "program counter",
                     observed: usize::MAX,
-                })?;
+                },
+            )?;
+        }
+        offset = offset.checked_add(1).ok_or(LoweringError::WidthOverflow {
+            field: "program counter",
+            observed: usize::MAX,
+        })?;
     }
 
     let mut code = Vec::new();
@@ -3359,7 +3390,7 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
         })?;
     for block in &function.blocks {
         for binding in &block.bindings {
-            code.push(lower_binding(program, binding)?);
+            lower_binding(program, binding, &mut code)?;
         }
         code.push(lower_terminator(&block.terminator, &block_starts)?);
     }
@@ -3374,7 +3405,33 @@ fn lower_function(program: &Program, function: &Function) -> Result<flbc::Functi
     })
 }
 
-fn lower_binding(program: &Program, binding: &Binding) -> Result<flbc::Instruction, LoweringError> {
+const fn lowered_binding_width(binding: &Binding) -> usize {
+    match binding.operation {
+        Operation::CheckSystem { .. } => 2,
+        _ => 1,
+    }
+}
+
+fn lower_binding(
+    program: &Program,
+    binding: &Binding,
+    code: &mut Vec<flbc::Instruction>,
+) -> Result<(), LoweringError> {
+    if let Operation::CheckSystem { module_name } = &binding.operation {
+        let module_name = clone_string(module_name, "checkSystem module name bytes")?;
+        let dst = lower_register(binding.id)?;
+        code.push(flbc::Instruction::CheckSystem { module_name });
+        code.push(flbc::Instruction::Nat { dst, value: 0 });
+        return Ok(());
+    }
+    code.push(lower_single_binding(program, binding)?);
+    Ok(())
+}
+
+fn lower_single_binding(
+    program: &Program,
+    binding: &Binding,
+) -> Result<flbc::Instruction, LoweringError> {
     let dst = lower_register(binding.id)?;
     match &binding.operation {
         Operation::Unit => Ok(flbc::Instruction::Nat { dst, value: 0 }),
@@ -3462,6 +3519,9 @@ fn lower_binding(program: &Program, binding: &Binding) -> Result<flbc::Instructi
                 result_ownership: declaration.result_ownership,
             })
         }
+        Operation::CheckSystem { .. } => Err(LoweringError::InternalInvariant {
+            reason: "checkSystem binding bypassed its two-instruction lowering",
+        }),
         Operation::Call { function, args } => {
             let declaration = function
                 .index()
@@ -3683,6 +3743,10 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
         Operation::Intrinsic { intrinsic, args } => {
             write!(output, "intrinsic i{} ", intrinsic.get())?;
             write_values(output, args)
+        }
+        Operation::CheckSystem { module_name } => {
+            output.write_str("check_system ")?;
+            write_hex_bytes(output, module_name.as_bytes())
         }
         Operation::Call { function, args } => {
             write!(output, "call f{} ", function.get())?;
@@ -4086,6 +4150,51 @@ mod tests {
         )
     }
 
+    fn check_system_program() -> Program {
+        Program::new(
+            f(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![Function {
+                id: f(0),
+                parameters: Vec::new(),
+                parameter_ownership: Vec::new(),
+                result: ValueType::Nat,
+                result_ownership: flbc::CallableResultOwnership::Scalar,
+                blocks: vec![
+                    Block {
+                        id: b(0),
+                        bindings: vec![
+                            Binding {
+                                id: v(0),
+                                ty: ValueType::Unit,
+                                operation: Operation::CheckSystem {
+                                    module_name: "Lake.Build".to_string(),
+                                },
+                            },
+                            Binding {
+                                id: v(1),
+                                ty: ValueType::Nat,
+                                operation: Operation::Nat(0),
+                            },
+                        ],
+                        terminator: Terminator::Jump { target: b(1) },
+                    },
+                    Block {
+                        id: b(1),
+                        bindings: vec![Binding {
+                            id: v(2),
+                            ty: ValueType::Nat,
+                            operation: Operation::Nat(7),
+                        }],
+                        terminator: Terminator::Return { value: v(2) },
+                    },
+                ],
+            }],
+        )
+    }
+
     #[test]
     fn every_supported_operation_and_control_form_lowers_to_valid_flbc() {
         let validated = validate(all_operations_program(), ValidationLimits::default())
@@ -4141,6 +4250,44 @@ mod tests {
             &lowered.functions()[0].code[12],
             flbc::Instruction::Apply { args, .. } if args.len() == 1
         ));
+
+        let check_system = validate(check_system_program(), ValidationLimits::default())
+            .expect("typed checkSystem is valid");
+        assert!(
+            check_system
+                .canonical_text()
+                .contains("v0:unit = check_system 10:4c616b652e4275696c64\n")
+        );
+        let lowered_check_system =
+            lower_to_flbc(&check_system).expect("checkSystem lowering succeeds");
+        assert_eq!(lowered_check_system.functions()[0].code.len(), 6);
+        assert!(matches!(
+            &lowered_check_system.functions()[0].code[0],
+            flbc::Instruction::CheckSystem { module_name } if module_name == "Lake.Build"
+        ));
+        assert!(matches!(
+            lowered_check_system.functions()[0].code[1],
+            flbc::Instruction::Nat {
+                dst,
+                value: 0,
+            } if dst == flbc::Register::new(0)
+        ));
+        assert!(matches!(
+            lowered_check_system.functions()[0].code[3],
+            flbc::Instruction::Jump { target } if target == flbc::Pc::new(4)
+        ));
+        let mut wrong_check_system_type = check_system_program();
+        wrong_check_system_type.functions[0].blocks[0].bindings[0].ty = ValueType::String;
+        assert_eq!(
+            validate(wrong_check_system_type, ValidationLimits::default()),
+            Err(ValidationError::BindingType {
+                function: f(0),
+                block: b(0),
+                value: v(0),
+                declared: ValueType::String,
+                inferred: ValueType::Unit,
+            })
+        );
 
         let branch = validate(branch_program(), ValidationLimits::default())
             .expect("the branch fixture is valid");
@@ -4259,7 +4406,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/12 entry=f0\n",
+                "fir/13 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",
