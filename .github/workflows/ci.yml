@@ -552,6 +552,39 @@ jobs:
           fi
           exit "$command_rc"
 
+      - name: e2e smoke — attribute state census
+        id: attribute_state_census
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/attribute-state-census"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/attribute_state_census.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "attribute state census lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
       - name: e2e smoke — bidirectional unsafe-note Clippy census
         id: unsafe_note_clippy
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
@@ -900,6 +933,8 @@ jobs:
           CONTRACT_HANDOFF_EXIT: ${{ steps.contract_handoff.outputs.command_exit }}
           CAMPAIGN_ARTIFACT: ${{ steps.campaign_frameworks.outputs.artifact_path }}
           CAMPAIGN_EXIT: ${{ steps.campaign_frameworks.outputs.command_exit }}
+          ATTRIBUTE_CENSUS_ARTIFACT: ${{ steps.attribute_state_census.outputs.artifact_path }}
+          ATTRIBUTE_CENSUS_EXIT: ${{ steps.attribute_state_census.outputs.command_exit }}
           ENV_SNAPSHOTS_ARTIFACT: ${{ steps.environment_collision.outputs.parent_artifact_path }}
           ENVIRONMENT_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.artifact_path }}
           ENVIRONMENT_RESOURCE_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.resource_artifact_path }}
@@ -942,6 +977,7 @@ jobs:
                   "structure-gate",
                   "closure-audit",
                   "campaign-frameworks",
+                  "attribute-state-census",
                   "unsafe-note-clippy",
                   "contract-handoff",
                   # env_snapshots is the sole parent bundle at this shared root;
@@ -996,6 +1032,13 @@ jobs:
                   os.environ.get("CAMPAIGN_ARTIFACT", ""),
                   os.environ.get("CAMPAIGN_EXIT", ""),
                   e2e_root / "campaign-frameworks",
+                  True,
+              ),
+              (
+                  "attribute_state_census",
+                  os.environ.get("ATTRIBUTE_CENSUS_ARTIFACT", ""),
+                  os.environ.get("ATTRIBUTE_CENSUS_EXIT", ""),
+                  e2e_root / "attribute-state-census",
                   True,
               ),
               (

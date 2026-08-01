@@ -204,12 +204,13 @@ INPUT_PATHS=(
   scripts/e2e/structural_gate.sh scripts/e2e/core_observables.sh
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh
   scripts/e2e/env_snapshots.sh scripts/e2e/bignum_vectors.sh
-  scripts/e2e/campaign_frameworks.sh
+  scripts/e2e/campaign_frameworks.sh scripts/e2e/attribute_state_census.sh
   scripts/extract/gen_core_fixtures.sh scripts/extract/gen_core_fixtures.lean
   scripts/extract/gen_core_ext_fixtures.sh scripts/extract/gen_core_ext_fixtures.lean
   scripts/extract/convert_blake3_vectors.py scripts/extract/gen_bignum_vectors.py
   scripts/extract/gen_abi_contract.py scripts/extract/gen_olean_contract.py
   scripts/extract/gen_lsp_wire_census.py scripts/extract/gen_cli_lake_census.py
+  scripts/extract/gen_attribute_state_census.py
   scripts/extract/gen_public_surface_contract.py
   scripts/extract/gen_extern_census.sh scripts/extract/gen_extern_census.lean
   scripts/e2e/contract_drift.sh scripts/e2e/contract_handoff.sh
@@ -1619,7 +1620,7 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/lib/gate_lock.sh \
   scripts/extract/gen_core_ext_fixtures.sh \
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh \
   scripts/e2e/env_snapshots.sh scripts/e2e/bignum_vectors.sh \
-  scripts/e2e/campaign_frameworks.sh \
+  scripts/e2e/campaign_frameworks.sh scripts/e2e/attribute_state_census.sh \
   scripts/e2e/contract_drift.sh scripts/e2e/contract_handoff.sh \
   scripts/e2e/olean_resurrection.sh \
   scripts/extract/gen_extern_census.sh scripts/extract/census_materialize.sh \
