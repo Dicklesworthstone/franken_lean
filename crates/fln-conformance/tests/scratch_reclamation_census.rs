@@ -55,6 +55,11 @@ const SELF_CLEANING: &[(&str, &str)] = &[
     ("crates/fln-rt/tests/region_engine.rs", "remove_dir_all"),
     // The G0-3 door test's per-pid plugin workdir, reclaimed on the passing path.
     ("crates/fln-unsafe-abi/src/tests.rs", "remove_dir_all"),
+    // The attribute census cells' scratch vendor trees, reclaimed per cell.
+    (
+        "crates/fln-conformance/tests/attribute_state_census.rs",
+        "remove_dir_all",
+    ),
 ];
 
 /// Files whose needle sites materialize nothing: fence probes building synthetic

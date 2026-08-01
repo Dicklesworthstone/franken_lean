@@ -185,6 +185,7 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-0bw5",
     "fln-mandated-mutant-join-unwatched-uagk",
     "fln-7li",
+    "fln-lld",
 ];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
@@ -211,7 +212,14 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// builds the elan path in code). The cited evidence runs pinless and passes; the
 /// surface-level classification cannot see that. Measured: the pin coordinate lives at
 /// reference_parse_tree.rs:1391, inside the sibling test only.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 7;
+///
+/// 7 -> 8 at fln-lld's close (2026-08-01): the row's remaining fln-unsafe-abi
+/// citations (layout mirrors, RC balance, the shadow kills, replay) are pin-FREE tests
+/// on the same surface as the pin-gated door test (`crates/fln-unsafe-abi/src/tests.rs`,
+/// code-level `.elan/toolchains` at the door test only). The direct door-test citation
+/// was REMOVED from the row in the same change (that one was the pin-gated test itself,
+/// correctly not declarable); these siblings run pinless and pass. Measured.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 8;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
