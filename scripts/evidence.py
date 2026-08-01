@@ -566,6 +566,13 @@ E2E_STEP_ORDERS = {
         "semantic_validation",
         "final_real_recheck",
     ],
+    "hygiene_no_mock_e2e": [
+        "hygiene_targets",
+        "internal_fault_nonpublication",
+        "reference_version",
+        "reference_scope_oracle",
+        "semantic_validation",
+    ],
     "g0_4_no_mock_e2e": [
         "syntax_hygiene_contract",
         "pratt_precedence_contract",
