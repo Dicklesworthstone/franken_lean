@@ -65,6 +65,11 @@ pub const SCHEMA_SHADOW_TELEMETRY_NDJSON: SchemaId = SchemaId {
     name: "fln.canon.shadow-telemetry-ndjson",
     version: 1,
 };
+/// Candidate-only declaration certificate envelope (plan §8.6; OQ-8).
+pub const SCHEMA_DECLARATION_CERTIFICATE: SchemaId = SchemaId {
+    name: "fln.canon.declaration-certificate",
+    version: 1,
+};
 
 /// The crate that defines a durable format's codec.
 ///
@@ -135,7 +140,7 @@ pub struct SchemaRow {
 ///
 /// Adding a durable format means adding a row here. That is the point: the registry is
 /// the reviewed inventory the conformance corpus is meant to be a projection of.
-pub const SCHEMA_REGISTRY: [SchemaRow; 14] = [
+pub const SCHEMA_REGISTRY: [SchemaRow; 15] = [
     SchemaRow {
         id: SCHEMA_NAME,
         owner: SchemaOwner::Hash,
@@ -180,6 +185,11 @@ pub const SCHEMA_REGISTRY: [SchemaRow; 14] = [
         id: SCHEMA_SHADOW_TELEMETRY_NDJSON,
         owner: SchemaOwner::Hash,
         covers: "the separate canonical operational NDJSON projection of a shadow publication",
+    },
+    SchemaRow {
+        id: SCHEMA_DECLARATION_CERTIFICATE,
+        owner: SchemaOwner::Hash,
+        covers: "a bounded, candidate-only declaration certificate with a shared term DAG",
     },
     SchemaRow {
         id: SchemaId {
@@ -450,6 +460,16 @@ impl<'a> CanonReader<'a> {
 
     fn err(&self, what: &'static str) -> CanonError {
         CanonError { at: self.at, what }
+    }
+
+    /// Build a codec-local refusal at the current byte offset.
+    ///
+    /// Durable formats implemented beside this module need to reject semantic tag
+    /// combinations without exposing the reader's cursor or manufacturing a false
+    /// offset. The method stays crate-private so external codecs cannot bypass their
+    /// own schema boundary.
+    pub(crate) fn reject(&self, what: &'static str) -> CanonError {
+        self.err(what)
     }
 
     /// Record the first trip and return the sentinel that unwinds the decode. The
@@ -1797,6 +1817,10 @@ mod tests {
                 SCHEMA_SHADOW_TELEMETRY_NDJSON,
                 "fln.canon.shadow-telemetry-ndjson",
             ),
+            (
+                SCHEMA_DECLARATION_CERTIFICATE,
+                "fln.canon.declaration-certificate",
+            ),
         ] {
             assert_eq!(constant.name, expected);
             let row = registered(constant.name)
@@ -1814,7 +1838,7 @@ mod tests {
             .filter(|row| row.owner == SchemaOwner::Hash)
             .count();
         assert_eq!(
-            hash_rows, 9,
+            hash_rows, 10,
             "fln-hash owns a schema the constant join above does not cover"
         );
     }

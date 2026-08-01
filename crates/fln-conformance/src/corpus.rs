@@ -67,9 +67,14 @@ use fln_env::provenance::{
     ModuleProvenanceManifest, PayloadTransparency, ProvenanceCompleteness,
 };
 use fln_hash::canon::{
-    CanonWriter, Canonical, SCHEMA_KVMAP_SET, SCHEMA_REGISTRY, SCHEMA_SHADOW_CELL,
-    SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON, SchemaId, SchemaRow,
-    kvmap_canonical_set_bytes,
+    CanonWriter, Canonical, SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_KVMAP_SET, SCHEMA_REGISTRY,
+    SCHEMA_SHADOW_CELL, SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON, SchemaId,
+    SchemaRow, kvmap_canonical_set_bytes,
+};
+use fln_hash::certificate::{
+    CertificateBindingV1, CertificateExtensionV1, CertificateJudgmentV1, ClaimedResultV1,
+    ConsensusPolicyV1, DeclarationCertificateV1, DeclarationKindV1, FuelProfileV1, NatHintResultV1,
+    NatOperationV1, ReductionHintV1, TermDagV1, TermNodeId, TermNodeV1,
 };
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 use fln_hash::shadow::{
@@ -312,7 +317,7 @@ pub fn projection_root(descriptors: &[CorpusDescriptor<'_>]) -> Digest {
 ///
 /// One row per `SCHEMA_REGISTRY` row, joined in both directions by [`project`]. The
 /// order matches the registry's for readability only — the join does not depend on it.
-pub const CORPUS_COVERAGE: [CorpusCoverage; 14] = [
+pub const CORPUS_COVERAGE: [CorpusCoverage; 15] = [
     CorpusCoverage {
         schema: "fln.canon.name",
         version: 1,
@@ -385,6 +390,15 @@ pub const CORPUS_COVERAGE: [CorpusCoverage; 14] = [
                    and latency observations, recover both independently, and prove \
                    telemetry moves only its own and the outer publication root",
         run: exercise_shadow_telemetry_ndjson,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.declaration-certificate",
+        version: 1,
+        exercise: "construct, encode, decode and byte-identically re-encode a \
+                   candidate-only theorem certificate binding every producer, \
+                   environment, policy and fuel root around a shared term DAG, one \
+                   literal-reduction hint and one advisory extension",
+        run: exercise_declaration_certificate,
     },
     CorpusCoverage {
         schema: "fln.env.module-provenance",
@@ -905,6 +919,94 @@ fn exercise_shadow_telemetry_ndjson(row: &SchemaRow) -> Result<(), String> {
     }
     recover_shadow(&first)?;
     recover_shadow(&second)
+}
+
+fn exercise_declaration_certificate(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_DECLARATION_CERTIFICATE)?;
+
+    let term_dag = TermDagV1 {
+        nodes: vec![
+            TermNodeV1::Sort {
+                level: Level::zero(),
+            },
+            TermNodeV1::NatLiteral {
+                value: NatLit::from_u64(3),
+            },
+        ],
+    };
+    let binding = CertificateBindingV1 {
+        epoch: EpochId::new(1),
+        mode: Mode::Sound,
+        reproducibility: ReproducibilityProfile::Certified,
+        build_profile: BuildProfileId::new(2),
+        consensus_policy: ConsensusPolicyV1::Paranoid,
+        environment_root: ContentRoot::new([1; 32]),
+        dependency_roots: vec![ContentRoot::new([2; 32])],
+        declaration_root: ContentRoot::new([3; 32]),
+        term_root: term_dag.content_root(),
+        kernel_build_root: ContentRoot::new([4; 32]),
+        checker_build_root: ContentRoot::new([5; 32]),
+        policy_root: ContentRoot::new([6; 32]),
+        engine_id: "fln-kernel-corpus".to_string(),
+        engine_version: 1,
+        fuel: FuelProfileV1 {
+            profile_id: 7,
+            heartbeats: 8,
+            recursion_depth: 9,
+            reduction_steps: 10,
+            expanded_weight: 11,
+            allocation_bytes: 12,
+        },
+    };
+    let certificate = ok(
+        DeclarationCertificateV1::new(
+            binding,
+            CertificateJudgmentV1::CheckDeclaration {
+                name: Name::from_components(["Corpus", "certificateWitness"]),
+                kind: DeclarationKindV1::Theorem,
+                type_node: TermNodeId::new(0),
+                value_node: Some(TermNodeId::new(1)),
+            },
+            ClaimedResultV1::Accepted,
+            term_dag,
+            vec![ReductionHintV1::NatOperation {
+                operation: NatOperationV1::Add,
+                inputs: [NatLit::from_u64(1), NatLit::from_u64(2)],
+                result: NatHintResultV1::Nat(NatLit::from_u64(3)),
+            }],
+            vec![CertificateExtensionV1::advisory(
+                1,
+                b"corpus-preserved".to_vec(),
+            )],
+        ),
+        "construct declaration certificate",
+    )?;
+    let bytes = ok(
+        certificate.to_canonical_bytes(),
+        "encode declaration certificate",
+    )?;
+    if !bytes.starts_with(&schema_prefix(SCHEMA_DECLARATION_CERTIFICATE)) {
+        return Err(
+            "declaration certificate does not carry its registered schema header".to_string(),
+        );
+    }
+    let decoded = DeclarationCertificateV1::from_canonical_bytes(&bytes)
+        .into_complete()
+        .map_err(|outcome| format!("declaration certificate decode did not complete: {outcome:?}"))?
+        .map_err(|error| format!("declaration certificate decode refused: {error:?}"))?;
+    if decoded != certificate {
+        return Err("decoded declaration certificate differs from its source".to_string());
+    }
+    if ok(
+        decoded.to_canonical_bytes(),
+        "re-encode declaration certificate",
+    )? != bytes
+    {
+        return Err(
+            "re-encoded declaration certificate is not byte-identical to its source".to_string(),
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

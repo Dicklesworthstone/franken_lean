@@ -23,6 +23,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: checkout pinned lean4export source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: leanprover/lean4export
+          ref: 4e7915201d3f9f04470d9eae002fa695f7cdc589
+          path: target/ci-tools/lean4export
+          persist-credentials: false
+
+      - name: checkout pinned nanoda source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ammkrn/nanoda_lib
+          ref: ddfac2bf5a7b56cb46e141494427ff3dd55963c7
+          path: target/ci-tools/nanoda
+          persist-credentials: false
+
       - name: install pinned elan
         shell: bash
         run: |
@@ -86,6 +102,48 @@ jobs:
           toolchain_root="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG"
           test -x "$toolchain_root/bin/lean"
           "$toolchain_root/bin/lean" --version
+
+      - name: build pinned certificate-format witness tools
+        shell: bash
+        run: |
+          lean4export_root="$GITHUB_WORKSPACE/target/ci-tools/lean4export"
+          nanoda_root="$GITHUB_WORKSPACE/target/ci-tools/nanoda"
+          lean4export_revision="4e7915201d3f9f04470d9eae002fa695f7cdc589"
+          nanoda_revision="ddfac2bf5a7b56cb46e141494427ff3dd55963c7"
+          actual_lean4export="$(
+            git -C "$lean4export_root" rev-parse --verify 'HEAD^{commit}'
+          )"
+          actual_nanoda="$(
+            git -C "$nanoda_root" rev-parse --verify 'HEAD^{commit}'
+          )"
+          if [[ "$actual_lean4export" != "$lean4export_revision" ]]; then
+            echo "lean4export checkout mismatch" >&2
+            exit 2
+          fi
+          if [[ "$actual_nanoda" != "$nanoda_revision" ]]; then
+            echo "nanoda checkout mismatch" >&2
+            exit 2
+          fi
+
+          (
+            cd "$lean4export_root"
+            lake build
+          )
+          nanoda_target="$RUNNER_TEMP/fln-nanoda-target"
+          cargo build --release --locked \
+            --manifest-path "$nanoda_root/Cargo.toml" \
+            --target-dir "$nanoda_target" \
+            --bin nanoda_bin
+          lean4export_bin="$lean4export_root/.lake/build/bin/lean4export"
+          nanoda_bin="$nanoda_target/release/nanoda_bin"
+          test -x "$lean4export_bin"
+          test -x "$nanoda_bin"
+          {
+            printf 'FLN_LEAN4EXPORT_ROOT=%s\n' "$lean4export_root"
+            printf 'FLN_LEAN4EXPORT_BIN=%s\n' "$lean4export_bin"
+            printf 'FLN_NANODA_ROOT=%s\n' "$nanoda_root"
+            printf 'FLN_NANODA_BIN=%s\n' "$nanoda_bin"
+          } >> "$GITHUB_ENV"
 
       - name: expose the toolchain/vendor identity joins
         shell: bash
@@ -216,6 +274,29 @@ jobs:
           # WHAT THIS DOES NOT ESTABLISH: that the suites checked their subject CORRECTLY.
           # It proves that the registered assertion-bearing bodies executed and did not
           # silently skip; the soundness of the assertions remains their own obligation.
+
+      - name: run the certificate-format independent-checker lane
+        shell: bash
+        run: |
+          step_root="target/e2e/contract-drift-certificate-format-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$step_root"
+          FLN_E2E_ART_ROOT="$PWD/$step_root" \
+            FLN_E2E_CACHE_STATE="github-actions-contract-drift" \
+            ./scripts/e2e/certificate_format_no_mock_e2e.sh
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          if (( ${#bundles[@]} != 1 )); then
+            echo "certificate-format lane published ${#bundles[@]} bundles; expected one" >&2
+            exit 2
+          fi
+          artifact="${bundles[0]}"
+          python3 -I -S scripts/evidence.py validate-bundle \
+            --art-dir "$artifact" \
+            --manifest "$artifact/manifest.json" \
+            --digest "$artifact/manifest.digest" \
+            --commit "$artifact/bundle.complete.json" \
+            --artifact-root "$artifact"
 
       - name: run the G0-4 syntax and hygiene no-mock lane
         shell: bash

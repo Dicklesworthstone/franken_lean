@@ -315,6 +315,17 @@ E2E_STEP_ORDERS = {
         "budget_refusal",
         "pristine_recovery",
     ],
+    "certificate_format_no_mock_e2e": [
+        "bind_external_tools",
+        "compile_witness",
+        "export_positive",
+        "check_positive",
+        "check_failure",
+        "check_recovery",
+        "codec_suites",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
     "campaign_frameworks": [
         "suite_campaign_owner_matrix",
         "suite_mutation_kill_ledger_model",
@@ -747,6 +758,26 @@ MACRO_TXN_SCENARIOS = (
 )
 MACRO_TXN_THREAD_COUNTS = [1, 8, 32]
 MACRO_TXN_PRODUCTIVE_RUNS = sum(MACRO_TXN_THREAD_COUNTS)
+CERTIFICATE_FORMAT_SEMANTIC_SCHEMA = "fln.e2e.certificate-format-semantic/1"
+CERTIFICATE_FORMAT_TELEMETRY_SCHEMA = "fln.e2e.certificate-format-telemetry/1"
+CERTIFICATE_FORMAT_VALIDATION_SCHEMA = "fln.e2e.certificate-format-validation/1"
+CERTIFICATE_FORMAT_SCENARIOS = (
+    "pin_binding",
+    "positive",
+    "failure",
+    "recovery",
+    "codec",
+    "nonpublication",
+)
+CERTIFICATE_FORMAT_LEAN4EXPORT_REVISION = "4e7915201d3f9f04470d9eae002fa695f7cdc589"
+CERTIFICATE_FORMAT_NANODA_REVISION = "ddfac2bf5a7b56cb46e141494427ff3dd55963c7"
+CERTIFICATE_FORMAT_REFERENCE_REVISION = "8c9756b28d64dab099da31a4c09229a9e6a2ef35"
+CERTIFICATE_FORMAT_EXPORT_VERSION = "3.1.0"
+CERTIFICATE_FORMAT_EXPORT_ROWS = 642
+CERTIFICATE_FORMAT_CHECKED_DECLARATIONS = 39
+CERTIFICATE_FORMAT_MAX_EXPORT_BYTES = 1_048_576
+CERTIFICATE_FORMAT_MAX_SEMANTIC_BYTES = 65_536
+CERTIFICATE_FORMAT_MAX_TELEMETRY_BYTES = 8_192
 SOURCE_RECOVERY_SEMANTIC_SCHEMA = "fln.e2e.source-recovery-semantic"
 SOURCE_RECOVERY_TELEMETRY_SCHEMA = "fln.e2e.source-recovery-telemetry"
 SOURCE_RECOVERY_INPUT = (
@@ -8379,11 +8410,11 @@ def validate_dynamic_parser_no_mock_evidence(
         if (
             [initial_revision, typed_revision, opaque_revision, recovery_revision]
             != [3, 4, 5, 6]
-            or canonical_digest != expected_canonical_digest
-            or initial_digest != expected_initial_digest
-            or typed_digest != expected_typed_digest
-            or opaque_digest != expected_typed_digest
-            or recovery_digest != expected_recovery_digest
+            or canonical_digest != expected_canonical_digest  # ubs:ignore — public evidence digest.
+            or initial_digest != expected_initial_digest  # ubs:ignore — public evidence digest.
+            or typed_digest != expected_typed_digest  # ubs:ignore — public evidence digest.
+            or opaque_digest != expected_typed_digest  # ubs:ignore — public evidence digest.
+            or recovery_digest != expected_recovery_digest  # ubs:ignore — public evidence digest.
         ):
             raise EvidenceError(
                 "dynamic parser incremental epoch identity law changed"
@@ -8598,8 +8629,8 @@ def validate_dynamic_parser_no_mock_evidence(
                 semantic.get("incremental")
             )
             if (
-                epoch_digest_before != incremental_details["initial_digest"]
-                or epoch_digest_after
+                epoch_digest_before != incremental_details["initial_digest"]  # ubs:ignore — public epoch digest.
+                or epoch_digest_after  # ubs:ignore — public epoch digest.
                 != incremental_details["recovery_digest"]
             ):
                 raise EvidenceError(
@@ -8622,14 +8653,14 @@ def validate_dynamic_parser_no_mock_evidence(
                 f"dynamic parser {case} grammar root is malformed or unbounded"
             )
         roots_match = (
-            hashlib.sha256(grammar_root_after.encode()).hexdigest()
+            hashlib.sha256(grammar_root_after.encode()).hexdigest()  # ubs:ignore — public content digest.
             == expected["grammar_root_after_sha256"]
-            and hashlib.sha256(grammar_root_before.encode()).hexdigest()
+            and hashlib.sha256(grammar_root_before.encode()).hexdigest()  # ubs:ignore — public content digest.
             == expected["grammar_root_before_sha256"]
         )
         epoch_digests_match = (
-            epoch_digest_after == expected["epoch_digest_after"]
-            and epoch_digest_before == expected["epoch_digest_before"]
+            epoch_digest_after == expected["epoch_digest_after"]  # ubs:ignore — public epoch digest.
+            and epoch_digest_before == expected["epoch_digest_before"]  # ubs:ignore — public epoch digest.
         )
         if (
             semantic.get("schema") != DYNAMIC_PARSER_SEMANTIC_SCHEMA
@@ -8847,7 +8878,7 @@ def validate_macro_txn_no_mock_evidence(
             "macro transaction semantic scenarios are incomplete or reordered"
         )
     if any(
-        row.get("schema") != MACRO_TXN_SEMANTIC_SCHEMA
+        row.get("schema") != MACRO_TXN_SEMANTIC_SCHEMA  # ubs:ignore — public schema identity.
         for row in semantic
     ):
         raise EvidenceError("macro transaction semantic schema changed")
@@ -9091,12 +9122,12 @@ def validate_macro_txn_no_mock_evidence(
 
     thread_matrix = semantic[9]
     if (
-        thread_matrix.get("productive_runs")
+        thread_matrix.get("productive_runs")  # ubs:ignore — public run count.
         != MACRO_TXN_PRODUCTIVE_RUNS
         or thread_matrix.get("published") is not True
         or thread_matrix.get("semantic_root") != positive_root
         or thread_matrix.get("status") != "complete"
-        or thread_matrix.get("thread_counts") != MACRO_TXN_THREAD_COUNTS
+        or thread_matrix.get("thread_counts") != MACRO_TXN_THREAD_COUNTS  # ubs:ignore — public thread set.
     ):
         raise EvidenceError(
             "macro transaction productive 1/8/32 reduction changed"
@@ -9117,10 +9148,10 @@ def validate_macro_txn_no_mock_evidence(
     }
     if (
         set(telemetry) != telemetry_fields
-        or telemetry.get("schema") != MACRO_TXN_TELEMETRY_SCHEMA
+        or telemetry.get("schema") != MACRO_TXN_TELEMETRY_SCHEMA  # ubs:ignore — public schema identity.
         or telemetry.get("run_id") != expected_run_id
-        or telemetry.get("thread_counts") != MACRO_TXN_THREAD_COUNTS
-        or telemetry.get("productive_runs") != MACRO_TXN_PRODUCTIVE_RUNS
+        or telemetry.get("thread_counts") != MACRO_TXN_THREAD_COUNTS  # ubs:ignore — public thread set.
+        or telemetry.get("productive_runs") != MACRO_TXN_PRODUCTIVE_RUNS  # ubs:ignore — public run count.
         or telemetry.get("observed_semantic_rows")
         != len(MACRO_TXN_SCENARIOS)
         or telemetry.get("positive_operations") != 17
@@ -9139,6 +9170,475 @@ def validate_macro_txn_no_mock_evidence(
         "semantic_sha256": semantic_digest,
         "telemetry_sha256": telemetry_digest,
         "thread_counts": MACRO_TXN_THREAD_COUNTS,
+        "verdict": "pass",
+    }
+
+
+def validate_certificate_format_export(path: Path) -> dict[str, Any]:
+    data, size, digest = stable_file_facts(
+        path,
+        max_bytes=CERTIFICATE_FORMAT_MAX_EXPORT_BYTES,
+    )
+    raw_rows = data.splitlines(keepends=True)
+    if len(raw_rows) != CERTIFICATE_FORMAT_EXPORT_ROWS:
+        raise EvidenceError(
+            "certificate-format export row count differs from the pinned witness"
+        )
+    rows: list[dict[str, Any]] = []
+    for number, raw in enumerate(raw_rows, 1):
+        if not raw.endswith(b"\n"):
+            raise EvidenceError(
+                f"certificate-format export row {number} is not newline terminated"
+            )
+        row = parse_json(
+            raw,
+            subject=f"certificate-format export row {number}",
+        )
+        if not isinstance(row, dict):
+            raise EvidenceError(
+                f"certificate-format export row {number} is not an object"
+            )
+        if canonical_json(row) != raw:
+            raise EvidenceError(
+                f"certificate-format export row {number} is not canonical JSON"
+            )
+        rows.append(row)
+
+    expected_meta = {
+        "exporter": {
+            "name": "lean4export",
+            "version": CERTIFICATE_FORMAT_EXPORT_VERSION,
+        },
+        "format": {"version": CERTIFICATE_FORMAT_EXPORT_VERSION},
+        "lean": {
+            "githash": CERTIFICATE_FORMAT_REFERENCE_REVISION,
+            "version": "4.32.0",
+        },
+    }
+    if rows[0] != {"meta": expected_meta}:
+        raise EvidenceError(
+            "certificate-format export metadata differs from the pinned toolchain"
+        )
+
+    names: dict[int, str] = {0: ""}
+    for number, row in enumerate(rows[1:], 2):
+        name_id = row.get("in")
+        if type(name_id) is not int or name_id < 1:
+            continue
+        if "str" in row:
+            component = row["str"]
+            expected = {"pre", "str"}
+            if not isinstance(component, dict) or set(component) != expected:
+                raise EvidenceError(
+                    f"certificate-format export string name row {number} is malformed"
+                )
+            predecessor = component["pre"]
+            leaf = component["str"]
+        elif "num" in row:
+            component = row["num"]
+            expected = {"i", "pre"}
+            if not isinstance(component, dict) or set(component) != expected:
+                raise EvidenceError(
+                    f"certificate-format export numeric name row {number} is malformed"
+                )
+            predecessor = component["pre"]
+            leaf = str(component["i"])
+        else:
+            continue
+        if (
+            type(predecessor) is not int
+            or predecessor not in names
+            or not isinstance(leaf, str)
+            or not leaf
+            or name_id in names
+        ):
+            raise EvidenceError(
+                f"certificate-format export name row {number} is not dependency ordered"
+            )
+        prefix = names[predecessor]
+        names[name_id] = f"{prefix}.{leaf}" if prefix else leaf
+
+    witness_rows = []
+    for row in rows:
+        theorem = row.get("thm")
+        if not isinstance(theorem, dict):
+            continue
+        name_id = theorem.get("name")
+        if type(name_id) is int and names.get(name_id) == (
+            "certificate_witness_add_zero"
+        ):
+            witness_rows.append(row)
+    if len(witness_rows) != 1 or rows[-1] != witness_rows[0]:
+        raise EvidenceError(
+            "certificate-format export does not end in exactly one witness theorem"
+        )
+
+    return {
+        "bytes": size,
+        "rows": len(rows),
+        "sha256": digest,
+        "witness": "certificate_witness_add_zero",
+    }
+
+
+def validate_certificate_format_process(
+    path: Path,
+    *,
+    stage_id: str,
+    classification: str,
+    wrapper_exit: int,
+    child_exit: int,
+) -> None:
+    record = read_json_object(path)
+    validate_supervisor_object(path, 1, record, expected_stage_id=stage_id)
+    if (
+        record.get("classification") != classification
+        or record.get("wrapper_exit") != wrapper_exit
+        or record.get("child_exit") != child_exit
+        or record.get("child_signal") is not None
+        or record.get("cancel_signal") is not None
+        or record.get("stdout", {}).get("truncated") is not False
+        or record.get("stderr", {}).get("truncated") is not False
+    ):
+        raise EvidenceError(f"certificate-format {stage_id} supervisor outcome changed")
+
+
+def validate_certificate_format_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+    export_path: Path,
+    corrupt_export_path: Path,
+    process_artifacts: Mapping[str, Path] | None = None,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("certificate-format expected run id must be non-empty")
+    semantic, semantic_digest = macro_txn_canonical_rows(
+        semantic_path,
+        label="certificate-format semantic evidence",
+        max_bytes=CERTIFICATE_FORMAT_MAX_SEMANTIC_BYTES,
+    )
+    telemetry_rows, telemetry_digest = macro_txn_canonical_rows(
+        telemetry_path,
+        label="certificate-format telemetry",
+        max_bytes=CERTIFICATE_FORMAT_MAX_TELEMETRY_BYTES,
+    )
+    if (
+        len(semantic) != len(CERTIFICATE_FORMAT_SCENARIOS)
+        or [row.get("sequence") for row in semantic]
+        != list(range(len(CERTIFICATE_FORMAT_SCENARIOS)))
+        or [row.get("scenario") for row in semantic]
+        != list(CERTIFICATE_FORMAT_SCENARIOS)
+    ):
+        raise EvidenceError(
+            "certificate-format semantic scenarios are incomplete or reordered"
+        )
+    if any(row.get("schema") != CERTIFICATE_FORMAT_SEMANTIC_SCHEMA for row in semantic):
+        raise EvidenceError("certificate-format semantic schema changed")
+    forbidden_semantic_fields = {
+        "absolute_path",
+        "duration_ns",
+        "host",
+        "pid",
+        "run_id",
+        "wall_time",
+    }
+    if any(forbidden_semantic_fields.intersection(row) for row in semantic):
+        raise EvidenceError("certificate-format semantic authority contains telemetry")
+
+    expected_fields = {
+        "pin_binding": {
+            "export_format",
+            "lean4export_revision",
+            "nanoda_revision",
+            "reference_revision",
+            "reference_version",
+            "scenario",
+            "schema",
+            "sequence",
+        },
+        "positive": {
+            "authority",
+            "checked_declarations",
+            "checker_exit",
+            "export_rows",
+            "export_sha256",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "failure": {
+            "authority",
+            "checker_exit",
+            "corrupt_sha256",
+            "positive_sha256",
+            "published",
+            "reason",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "recovery": {
+            "authority",
+            "checked_declarations",
+            "checker_exit",
+            "export_sha256",
+            "matches_positive",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "codec": {
+            "arbitrary_cases",
+            "authority",
+            "named_tests",
+            "productive_workers",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+            "thread_counts",
+        },
+        "nonpublication": {
+            "actions",
+            "authority",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "states",
+            "status",
+        },
+    }
+    for row in semantic:
+        if set(row) != expected_fields[row["scenario"]]:
+            raise EvidenceError(
+                f"certificate-format {row['scenario']} fields differ "
+                "from the frozen schema"
+            )
+
+    pin = semantic[0]
+    if (
+        pin.get("export_format") != CERTIFICATE_FORMAT_EXPORT_VERSION
+        or pin.get("lean4export_revision") != CERTIFICATE_FORMAT_LEAN4EXPORT_REVISION
+        or pin.get("nanoda_revision") != CERTIFICATE_FORMAT_NANODA_REVISION
+        or pin.get("reference_revision") != CERTIFICATE_FORMAT_REFERENCE_REVISION
+        or pin.get("reference_version") != "v4.32.0"
+    ):
+        raise EvidenceError("certificate-format external pin binding changed")
+
+    export = validate_certificate_format_export(export_path)
+    corrupt_data, corrupt_size, corrupt_digest = stable_file_facts(
+        corrupt_export_path,
+        max_bytes=CERTIFICATE_FORMAT_MAX_EXPORT_BYTES,
+    )
+    export_data, _export_size, _export_digest = stable_file_facts(
+        export_path,
+        max_bytes=CERTIFICATE_FORMAT_MAX_EXPORT_BYTES,
+    )
+    if corrupt_data != export_data + b"not-json\n":
+        raise EvidenceError(
+            "certificate-format negative export is not the one-variable malformed copy"
+        )
+
+    positive = semantic[1]
+    if (
+        positive.get("authority") is not False
+        or positive.get("checked_declarations")
+        != CERTIFICATE_FORMAT_CHECKED_DECLARATIONS
+        or positive.get("checker_exit") != 0
+        or positive.get("export_rows") != CERTIFICATE_FORMAT_EXPORT_ROWS
+        or positive.get("export_sha256") != export["sha256"]
+        or positive.get("published") is not False
+        or positive.get("status") != "complete"
+    ):
+        raise EvidenceError("certificate-format positive witness facts changed")
+
+    failure = semantic[2]
+    if (
+        failure.get("authority") is not False
+        or failure.get("checker_exit") != 1
+        or failure.get("corrupt_sha256") != corrupt_digest  # ubs:ignore — public corruption-fixture digest.
+        or failure.get("positive_sha256") != export["sha256"]
+        or failure.get("published") is not False
+        or failure.get("reason") != "malformed_ndjson"
+        or failure.get("status") != "refused"
+    ):
+        raise EvidenceError("certificate-format malformed refusal facts changed")
+
+    recovery = semantic[3]
+    if (
+        recovery.get("authority") is not False
+        or recovery.get("checked_declarations")
+        != CERTIFICATE_FORMAT_CHECKED_DECLARATIONS
+        or recovery.get("checker_exit") != 0
+        or recovery.get("export_sha256") != export["sha256"]
+        or recovery.get("matches_positive") is not True
+        or recovery.get("published") is not False
+        or recovery.get("status") != "complete"
+    ):
+        raise EvidenceError("certificate-format recovery diverged from positive")
+
+    codec = semantic[4]
+    if (
+        codec.get("arbitrary_cases") != 10_000
+        or codec.get("authority") is not False
+        or codec.get("named_tests") != 19
+        or codec.get("productive_workers") != 41
+        or codec.get("status") != "complete"
+        or codec.get("thread_counts") != [1, 8, 32]
+    ):
+        raise EvidenceError("certificate-format codec evidence floor changed")
+
+    nonpublication = semantic[5]
+    if (
+        nonpublication.get("actions")
+        != [
+            "recompute",
+            "recompute",
+            "quarantine_and_recompute_independently",
+        ]
+        or nonpublication.get("authority") is not False
+        or nonpublication.get("published") is not False
+        or nonpublication.get("states")
+        != ["cancelled", "resource_limited", "internal_fault"]
+        or nonpublication.get("status") != "complete"
+    ):
+        raise EvidenceError("certificate-format nonpublication policy changed")
+
+    if len(telemetry_rows) != 1:
+        raise EvidenceError("certificate-format telemetry row count is not one")
+    telemetry = telemetry_rows[0]
+    telemetry_fields = {
+        "artifact_bytes",
+        "durations_ns",
+        "host",
+        "process_exits",
+        "run_id",
+        "schema",
+    }
+    expected_exits = {
+        "codec": 0,
+        "failure": 1,
+        "positive": 0,
+        "recovery": 0,
+    }
+    if (
+        set(telemetry) != telemetry_fields
+        or telemetry.get("schema") != CERTIFICATE_FORMAT_TELEMETRY_SCHEMA
+        or telemetry.get("run_id") != expected_run_id
+        or telemetry.get("artifact_bytes")
+        != {"corrupt": corrupt_size, "positive": export["bytes"]}
+        or telemetry.get("process_exits") != expected_exits
+        or not isinstance(telemetry.get("host"), dict)
+        or set(telemetry["host"]) != {"machine", "system"}
+        or not all(
+            isinstance(item, str) and item for item in telemetry["host"].values()
+        )
+        or not isinstance(telemetry.get("durations_ns"), dict)
+        or set(telemetry["durations_ns"]) != set(expected_exits)
+        or any(
+            type(value) is not int or value <= 0 or value > 3_600_000_000_000
+            for value in telemetry["durations_ns"].values()
+        )
+    ):
+        raise EvidenceError(
+            "certificate-format telemetry is malformed or semantically entangled"
+        )
+
+    if process_artifacts is not None:
+        expected_process_artifacts = {
+            "codec_metadata",
+            "codec_stdout",
+            "failure_metadata",
+            "failure_stderr",
+            "positive_metadata",
+            "positive_stdout",
+            "recovery_metadata",
+            "recovery_stdout",
+        }
+        if set(process_artifacts) != expected_process_artifacts:
+            raise EvidenceError("certificate-format process artifact set is incomplete")
+        validate_certificate_format_process(
+            process_artifacts["positive_metadata"],
+            stage_id="check_positive",
+            classification="pass",
+            wrapper_exit=0,
+            child_exit=0,
+        )
+        validate_certificate_format_process(
+            process_artifacts["failure_metadata"],
+            stage_id="check_failure",
+            classification="fail",
+            wrapper_exit=1,
+            child_exit=1,
+        )
+        validate_certificate_format_process(
+            process_artifacts["recovery_metadata"],
+            stage_id="check_recovery",
+            classification="pass",
+            wrapper_exit=0,
+            child_exit=0,
+        )
+        validate_certificate_format_process(
+            process_artifacts["codec_metadata"],
+            stage_id="codec_suites",
+            classification="pass",
+            wrapper_exit=0,
+            child_exit=0,
+        )
+        expected_success = (
+            f"Checked {CERTIFICATE_FORMAT_CHECKED_DECLARATIONS} "
+            "declarations with no errors\n"
+        ).encode()
+        positive_stdout, _size, _digest = stable_file_facts(
+            process_artifacts["positive_stdout"],
+            max_bytes=4_096,
+        )
+        recovery_stdout, _size, _digest = stable_file_facts(
+            process_artifacts["recovery_stdout"],
+            max_bytes=4_096,
+        )
+        failure_stderr, _size, _digest = stable_file_facts(
+            process_artifacts["failure_stderr"],
+            max_bytes=4_096,
+        )
+        codec_stdout, _size, _digest = stable_file_facts(
+            process_artifacts["codec_stdout"],
+            max_bytes=65_536,
+        )
+        if positive_stdout != expected_success or recovery_stdout != expected_success:
+            raise EvidenceError(
+                "certificate-format external checker non-vacuity floor changed"
+            )
+        if not failure_stderr.startswith(b"Error: expected ident"):
+            raise EvidenceError(
+                "certificate-format malformed export failed for an unexpected reason"
+            )
+        if (
+            codec_stdout.count(b"test result: ok.") != 4
+            or b"4 passed; 0 failed" not in codec_stdout
+            or b"5 passed; 0 failed" not in codec_stdout
+            or b"6 passed; 0 failed" not in codec_stdout
+        ):
+            raise EvidenceError(
+                "certificate-format named codec suites did not meet their floors"
+            )
+
+    return {
+        "checked_declarations": CERTIFICATE_FORMAT_CHECKED_DECLARATIONS,
+        "export_rows": CERTIFICATE_FORMAT_EXPORT_ROWS,
+        "export_sha256": export["sha256"],
+        "run_id": expected_run_id,
+        "schema": CERTIFICATE_FORMAT_VALIDATION_SCHEMA,
+        "semantic_sha256": semantic_digest,
+        "telemetry_sha256": telemetry_digest,
         "verdict": "pass",
     }
 
@@ -18720,6 +19220,76 @@ def cmd_validate_macro_txn_no_mock(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_certificate_format_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    report = validate_certificate_format_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_path=artifact(
+            args.semantic,
+            "certificate-format semantic evidence",
+        ),
+        telemetry_path=artifact(
+            args.telemetry,
+            "certificate-format telemetry",
+        ),
+        export_path=artifact(
+            args.export,
+            "certificate-format positive export",
+        ),
+        corrupt_export_path=artifact(
+            args.corrupt_export,
+            "certificate-format corrupt export",
+        ),
+        process_artifacts={
+            "codec_metadata": artifact(
+                args.codec_metadata,
+                "certificate-format codec metadata",
+            ),
+            "codec_stdout": artifact(
+                args.codec_stdout,
+                "certificate-format codec stdout",
+            ),
+            "failure_metadata": artifact(
+                args.failure_metadata,
+                "certificate-format failure metadata",
+            ),
+            "failure_stderr": artifact(
+                args.failure_stderr,
+                "certificate-format failure stderr",
+            ),
+            "positive_metadata": artifact(
+                args.positive_metadata,
+                "certificate-format positive metadata",
+            ),
+            "positive_stdout": artifact(
+                args.positive_stdout,
+                "certificate-format positive stdout",
+            ),
+            "recovery_metadata": artifact(
+                args.recovery_metadata,
+                "certificate-format recovery metadata",
+            ),
+            "recovery_stdout": artifact(
+                args.recovery_stdout,
+                "certificate-format recovery stdout",
+            ),
+        },
+    )
+    if args.output:
+        output = artifact(
+            args.output,
+            "certificate-format semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_validate_environment_resource_collision(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
     stdout_path = require_within(
@@ -20045,8 +20615,8 @@ def run_macro_txn_validator_self_test(root: Path) -> dict[str, Any]:
         telemetry_path=telemetry_path,
     )
     require(
-        report["verdict"] == "pass"
-        and report["productive_runs"] == MACRO_TXN_PRODUCTIVE_RUNS,
+        report["verdict"] == "pass"  # ubs:ignore — public validator verdict.
+        and report["productive_runs"] == MACRO_TXN_PRODUCTIVE_RUNS,  # ubs:ignore — public run count.
         "macro transaction positive validator control failed",
     )
 
@@ -20158,6 +20728,261 @@ def run_macro_txn_validator_self_test(root: Path) -> dict[str, Any]:
     return {
         "case": "macro_txn_validator",
         "mutants_killed": mutants_killed,
+        "ok": True,
+        "positive_cases": len(records),
+    }
+
+
+def run_certificate_format_validator_self_test(
+    root: Path,
+) -> dict[str, Any]:
+    export_rows: list[dict[str, Any]] = [
+        {
+            "meta": {
+                "exporter": {
+                    "name": "lean4export",
+                    "version": CERTIFICATE_FORMAT_EXPORT_VERSION,
+                },
+                "format": {"version": CERTIFICATE_FORMAT_EXPORT_VERSION},
+                "lean": {
+                    "githash": CERTIFICATE_FORMAT_REFERENCE_REVISION,
+                    "version": "4.32.0",
+                },
+            }
+        }
+    ]
+    for name_id in range(1, 40):
+        leaf = (
+            "certificate_witness_add_zero"
+            if name_id == 39
+            else f"declaration_{name_id}"
+        )
+        export_rows.append({"in": name_id, "str": {"pre": 0, "str": leaf}})
+    for name_id in range(1, 39):
+        export_rows.append(
+            {
+                "axiom": {
+                    "all": [name_id],
+                    "isUnsafe": False,
+                    "levelParams": [],
+                    "name": name_id,
+                    "type": 0,
+                }
+            }
+        )
+    expression_rows = CERTIFICATE_FORMAT_EXPORT_ROWS - len(export_rows) - 1
+    for expr_id in range(expression_rows):
+        export_rows.append({"bvar": 0, "ie": expr_id})
+    export_rows.append(
+        {
+            "thm": {
+                "all": [39],
+                "levelParams": [],
+                "name": 39,
+                "type": 0,
+                "value": 0,
+            }
+        }
+    )
+    require(
+        len(export_rows) == CERTIFICATE_FORMAT_EXPORT_ROWS,
+        "certificate-format self-test export row floor is inconsistent",
+    )
+
+    export_data = b"".join(canonical_json(row) for row in export_rows)
+    corrupt_data = export_data + b"not-json\n"
+    export_path = root / "positive.export.ndjson"
+    corrupt_export_path = root / "corrupt.export.ndjson"
+    write_new(export_path, export_data)
+    write_new(corrupt_export_path, corrupt_data)
+    export_digest = hashlib.sha256(export_data).hexdigest()
+    corrupt_digest = hashlib.sha256(corrupt_data).hexdigest()
+
+    records = [
+        {
+            "export_format": CERTIFICATE_FORMAT_EXPORT_VERSION,
+            "lean4export_revision": CERTIFICATE_FORMAT_LEAN4EXPORT_REVISION,
+            "nanoda_revision": CERTIFICATE_FORMAT_NANODA_REVISION,
+            "reference_revision": CERTIFICATE_FORMAT_REFERENCE_REVISION,
+            "reference_version": "v4.32.0",
+            "scenario": "pin_binding",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 0,
+        },
+        {
+            "authority": False,
+            "checked_declarations": CERTIFICATE_FORMAT_CHECKED_DECLARATIONS,
+            "checker_exit": 0,
+            "export_rows": CERTIFICATE_FORMAT_EXPORT_ROWS,
+            "export_sha256": export_digest,
+            "published": False,
+            "scenario": "positive",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 1,
+            "status": "complete",
+        },
+        {
+            "authority": False,
+            "checker_exit": 1,
+            "corrupt_sha256": corrupt_digest,
+            "positive_sha256": export_digest,
+            "published": False,
+            "reason": "malformed_ndjson",
+            "scenario": "failure",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 2,
+            "status": "refused",
+        },
+        {
+            "authority": False,
+            "checked_declarations": CERTIFICATE_FORMAT_CHECKED_DECLARATIONS,
+            "checker_exit": 0,
+            "export_sha256": export_digest,
+            "matches_positive": True,
+            "published": False,
+            "scenario": "recovery",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 3,
+            "status": "complete",
+        },
+        {
+            "arbitrary_cases": 10_000,
+            "authority": False,
+            "named_tests": 19,
+            "productive_workers": 41,
+            "scenario": "codec",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 4,
+            "status": "complete",
+            "thread_counts": [1, 8, 32],
+        },
+        {
+            "actions": [
+                "recompute",
+                "recompute",
+                "quarantine_and_recompute_independently",
+            ],
+            "authority": False,
+            "published": False,
+            "scenario": "nonpublication",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 5,
+            "states": [
+                "cancelled",
+                "resource_limited",
+                "internal_fault",
+            ],
+            "status": "complete",
+        },
+    ]
+    telemetry = {
+        "artifact_bytes": {
+            "corrupt": len(corrupt_data),
+            "positive": len(export_data),
+        },
+        "durations_ns": {
+            "codec": 1,
+            "failure": 1,
+            "positive": 1,
+            "recovery": 1,
+        },
+        "host": {"machine": "self-test", "system": "self-test"},
+        "process_exits": {
+            "codec": 0,
+            "failure": 1,
+            "positive": 0,
+            "recovery": 0,
+        },
+        "run_id": "certificate-format-validator-self-test",
+        "schema": CERTIFICATE_FORMAT_TELEMETRY_SCHEMA,
+    }
+
+    def write_records(
+        path: Path,
+        values: Sequence[Mapping[str, Any]],
+    ) -> None:
+        write_new(path, b"".join(canonical_json(value) for value in values))
+
+    semantic_path = root / "positive.semantic.ndjson"
+    telemetry_path = root / "positive.telemetry.ndjson"
+    write_records(semantic_path, records)
+    write_new(telemetry_path, canonical_json(telemetry))
+    report = validate_certificate_format_no_mock_evidence(
+        expected_run_id="certificate-format-validator-self-test",
+        semantic_path=semantic_path,
+        telemetry_path=telemetry_path,
+        export_path=export_path,
+        corrupt_export_path=corrupt_export_path,
+    )
+    require(
+        report["verdict"] == "pass"
+        and report["export_rows"] == CERTIFICATE_FORMAT_EXPORT_ROWS,
+        "certificate-format positive validator control failed",
+    )
+
+    rejected_cells = 0
+    missing = [dict(row) for row in records]
+    missing[1].pop("authority")
+    missing_path = root / "missing-field.semantic.ndjson"
+    write_records(missing_path, missing)
+    try:
+        validate_certificate_format_no_mock_evidence(
+            expected_run_id="certificate-format-validator-self-test",
+            semantic_path=missing_path,
+            telemetry_path=telemetry_path,
+            export_path=export_path,
+            corrupt_export_path=corrupt_export_path,
+        )
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError(
+            "certificate-format validator accepted a missing semantic field"
+        )
+
+    noncanonical_path = root / "noncanonical.semantic.ndjson"
+    write_new(
+        noncanonical_path,
+        b" "
+        + canonical_json(records[0])
+        + b"".join(canonical_json(row) for row in records[1:]),
+    )
+    try:
+        validate_certificate_format_no_mock_evidence(
+            expected_run_id="certificate-format-validator-self-test",
+            semantic_path=noncanonical_path,
+            telemetry_path=telemetry_path,
+            export_path=export_path,
+            corrupt_export_path=corrupt_export_path,
+        )
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError("certificate-format validator accepted noncanonical NDJSON")
+
+    telemetry_drift = dict(telemetry)
+    telemetry_drift["process_exits"] = dict(telemetry["process_exits"])
+    telemetry_drift["process_exits"]["failure"] = 0
+    telemetry_drift_path = root / "drift.telemetry.ndjson"
+    write_new(telemetry_drift_path, canonical_json(telemetry_drift))
+    try:
+        validate_certificate_format_no_mock_evidence(
+            expected_run_id="certificate-format-validator-self-test",
+            semantic_path=semantic_path,
+            telemetry_path=telemetry_drift_path,
+            export_path=export_path,
+            corrupt_export_path=corrupt_export_path,
+        )
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError(
+            "certificate-format validator accepted telemetry exit drift"
+        )
+
+    return {
+        "case": "certificate_format_validator",
+        "negative_cells_rejected": rejected_cells,
         "ok": True,
         "positive_cases": len(records),
     }
@@ -20460,6 +21285,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     cases.append(
         run_macro_txn_validator_self_test(
             case_dir("macro_txn_validator")
+        )
+    )
+    cases.append(
+        run_certificate_format_validator_self_test(
+            case_dir("certificate_format_validator")
         )
     )
     cases.append(
@@ -29464,6 +30294,30 @@ def build_parser() -> argparse.ArgumentParser:
     macro_txn_parser.add_argument("--artifact-root", required=True)
     macro_txn_parser.add_argument("--output")
     macro_txn_parser.set_defaults(func=cmd_validate_macro_txn_no_mock)
+
+    certificate_format_parser = subparsers.add_parser(
+        "validate-certificate-format-no-mock",
+        help=(
+            "independently validate certificate-format external-checker "
+            "semantics and bounded telemetry"
+        ),
+    )
+    certificate_format_parser.add_argument("--expected-run-id", required=True)
+    certificate_format_parser.add_argument("--semantic", required=True)
+    certificate_format_parser.add_argument("--telemetry", required=True)
+    certificate_format_parser.add_argument("--export", required=True)
+    certificate_format_parser.add_argument("--corrupt-export", required=True)
+    certificate_format_parser.add_argument("--positive-metadata", required=True)
+    certificate_format_parser.add_argument("--positive-stdout", required=True)
+    certificate_format_parser.add_argument("--failure-metadata", required=True)
+    certificate_format_parser.add_argument("--failure-stderr", required=True)
+    certificate_format_parser.add_argument("--recovery-metadata", required=True)
+    certificate_format_parser.add_argument("--recovery-stdout", required=True)
+    certificate_format_parser.add_argument("--codec-metadata", required=True)
+    certificate_format_parser.add_argument("--codec-stdout", required=True)
+    certificate_format_parser.add_argument("--artifact-root", required=True)
+    certificate_format_parser.add_argument("--output")
+    certificate_format_parser.set_defaults(func=cmd_validate_certificate_format_no_mock)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",

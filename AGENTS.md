@@ -192,7 +192,7 @@ The standing advice, correct and unchanged, is: when another pane's in-flight ed
 | `evidence.py hash-tree … **--vendor-path V**` | **no** — exit 2 |
 | `evidence.py ubs-inventory`, `evidence.py vendor-binding` | **no** — exit 2 |
 | `scripts/check.sh`, the evidence self-test, `scripts/verify_vendor_tree.sh` | **no** — exit 2 |
-| any `fln.e2e/2` lane — **17 declared fln.e2e/2 lanes**, of which **16 refuse on a measured invocation shape** and **1 whose verdict is unmeasured** | **no**, and this row's *scope* is now derived per commit rather than listed (`the_worktree_refusal_scope_is_derived_from_the_lane_population`), which is the half this table left open. The verdict survives measurement; the reason this row used to give does not. It said `hash-tree --vendor-path` is the first governed step of any such lane. Sixteen lanes do refuse, and the witness for all sixteen is `vendor-binding`, measured to refuse unconditionally. The sole indeterminate lane, `unsafe_note_clippy.sh`, carries no `--vendor-path` anywhere; it would reach `run_git`, if it does, through `emit --governed-path` / `--producer-binding-root` and `manifest --input-root` — six subcommands in shapes nobody has measured — so it is typed **indeterminate and named here**, not counted as refusing. Note also that the 29 scripts in `scripts/e2e/` and the 17 declared lanes are different sets. Static reachability cannot settle that lane and is used only to prove a *negative*: 15 of the 45 subcommands reach `run_git`, yet `hash-tree` is one of them and exits 0 without `--vendor-path`, so a handler that never reaches it cannot refuse, while one that does may still succeed |
+| any `fln.e2e/2` lane — **18 declared fln.e2e/2 lanes**, of which **17 refuse on a measured invocation shape** and **1 whose verdict is unmeasured** | **no**, and this row's *scope* is now derived per commit rather than listed (`the_worktree_refusal_scope_is_derived_from_the_lane_population`), which is the half this table left open. The verdict survives measurement; the reason this row used to give does not. It said `hash-tree --vendor-path` is the first governed step of any such lane. Seventeen lanes do refuse, and the witness for all seventeen is `vendor-binding`, measured to refuse unconditionally. The sole indeterminate lane, `unsafe_note_clippy.sh`, carries no `--vendor-path` anywhere; it would reach `run_git`, if it does, through `emit --governed-path` / `--producer-binding-root` and `manifest --input-root` — six subcommands in shapes nobody has measured — so it is typed **indeterminate and named here**, not counted as refusing. Note also that the 30 scripts in `scripts/e2e/` and the 18 declared lanes are different sets. Static reachability cannot settle that lane and is used only to prove a *negative*: 15 of the 45 subcommands reach `run_git`, yet `hash-tree` is one of them and exits 0 without `--vendor-path`, so a handler that never reaches it cannot refuse, while one that does may still succeed |
 
 So the evidence surface runs in the **main tree only**. Two consequences worth stating separately, because each has already cost something:
 
@@ -507,11 +507,11 @@ about intent; it simply could not be checked.
 
 | # | mechanism | where | scope | measured |
 |---|---|---|---|---|
-| **M1** | `repository_state() -> (head, tree)` sampled **three times**, with `scan_index_and_worktree()` between samples | `repository_state` is defined inside `verify_vendor_binding` at `scripts/evidence.py:15906`; reached by every `hash-tree --vendor-path` and by `vendor-binding` | the **`HEAD` commit, repo-wide** — plus content **scoped to `vendor/lean4-src`** | a commit landing in the sample window: **12/12 killed**, `Reference repository state changed during verification`. Continuous churn of a tracked file **outside** `vendor/`: **12/12 passed**. Untracked creation outside `vendor/`: **12/12 passed** |
+| **M1** | `repository_state() -> (head, tree)` sampled **three times**, with `scan_index_and_worktree()` between samples | `repository_state` is defined inside `verify_vendor_binding` at `scripts/evidence.py:16406`; reached by every `hash-tree --vendor-path` and by `vendor-binding` | the **`HEAD` commit, repo-wide** — plus content **scoped to `vendor/lean4-src`** | a commit landing in the sample window: **12/12 killed**, `Reference repository state changed during verification`. Continuous churn of a tracked file **outside** `vendor/`: **12/12 passed**. Untracked creation outside `vendor/`: **12/12 passed** |
 | **M2** | governed root, **start vs end** | `scripts/check.sh` → `final_workspace_changed`, exit 3 | that lane's `INPUT_PATHS` | root moves for an in-set write, not for an out-of-set one; a write **reverted before finalization is invisible** |
 | **M3** | governed root at **every step boundary** vs run start | `require_unchanged` in the lane script → `governed_inputs_changed`, exit 3 | that lane's `INPUT_PATHS` | same content semantics as M2, caught a step earlier instead of at the end |
 | **M4** | `stable_file_facts` `fstat`s each governed file **before and after reading it** | `scripts/evidence.py` → `file changed while being read`; `check.sh` names it `governed_input_mutation_during_initial_hash` | the paths being hashed | churn of a **governed** file during the hash: **8/8 killed**. Churn of an ungoverned file: **8/8 passed** |
-| **M5** | `stable_symlink_facts` — M4's sibling for a governed **symlink**: `lstat` rather than `fstat`, and it hashes the link's **target string**, not the target's bytes | `scripts/evidence.py:1966` → `canonical link changed type`, `symlink changed while being read` | the governed symlinks being hashed | **retargeting a symlink moves the governed root with no file content edited anywhere** — the one write shape M2/M3/M4 all read as "nothing changed". Measured by cc_1 in `76298969`; the row above is that measurement plus the code, and I have re-derived only that the function exists and which refusals it raises |
+| **M5** | `stable_symlink_facts` — M4's sibling for a governed **symlink**: `lstat` rather than `fstat`, and it hashes the link's **target string**, not the target's bytes | `scripts/evidence.py:1997` → `canonical link changed type`, `symlink changed while being read` | the governed symlinks being hashed | **retargeting a symlink moves the governed root with no file content edited anywhere** — the one write shape M2/M3/M4 all read as "nothing changed". Measured by cc_1 in `76298969`; the row above is that measurement plus the code, and I have re-derived only that the function exists and which refusals it raises |
 
 **The sentence this section used to carry — that the freeze "asserts that the whole repository held still" — is false, and the correction makes the rule sharper, not weaker.** M1's *content* check is scoped to the pinned Reference tree; only `rev-parse HEAD` is repo-wide. What is genuinely path-agnostic is **committing**: a commit of anything, anywhere — `.beads/`, `ci/`, `AGENTS.md`, a file no lane governs — moves `HEAD` and kills any lane in its sample window. Both casualties recorded below were commits, which is exactly why the old wording predicted them correctly while naming the wrong cause. Note also what M2/M3 and M4/M5 divide between them: M2 and M3 compare content at **instants**, so transient drift slips between them, while M4 and M5 are the ones watching an **interval**.
 
@@ -563,9 +563,9 @@ The same correction applies to anything else naming holders by argv — an orche
 
 **Two traps inside that allowance, both measured.** Writing a governed file with **byte-identical content** does not save you: M4's stability check includes `st_mtime_ns` and `st_ctime_ns`, so a no-op rewrite during a governed hash still raises `file changed while being read` (7/8 trials; the 8th is the race, not a reprieve). And "static" means *untouched*, not *unchanged* — a formatter, an editor autosave, or a `cargo` invocation rewriting `Cargo.lock` all count as motion.
 
-**Narrowness is a property of the lane you are running, never of lanes.** Derived per commit from all 29 scripts in `scripts/e2e/` rather than read off one — 98np R1. **Seventeen lanes declare a governed set; twelve declare none at all** and so cannot raise M2/M3/M4 under any write:
+**Narrowness is a property of the lane you are running, never of lanes.** Derived per commit from all 30 scripts in `scripts/e2e/` rather than read off one — 98np R1. **Eighteen lanes declare a governed set; twelve declare none at all** and so cannot raise M2/M3/M4 under any write:
 
-| governed paths | lane | relative to `check.sh`'s 64 |
+| governed paths | lane | relative to `check.sh`'s 65 |
 |---|---|---|
 | 40 | `contract_handoff.sh` | 2 outside: `scripts/extract/census_materialize.sh`, `…/validate_extern_builtin_census.py` |
 | 18 | `campaign_frameworks.sh` | contained |
@@ -575,7 +575,7 @@ The same correction applies to anything else naming holders by argv — an orche
 | 16 | `diag_goldens.sh` | contained |
 | 15 | `macro_txn_no_mock_e2e.sh` | contained |
 | 14 | `parser_corpus_no_mock_e2e.sh` | contained |
-| 13 | `dynamic_parser_no_mock_e2e.sh`, `env_snapshots.sh`, `hygiene_no_mock_e2e.sh`, `lexer_no_mock_e2e.sh` | contained — `env_snapshots.sh` is the lane every generalisation here was made from |
+| 13 | `certificate_format_no_mock_e2e.sh`, `dynamic_parser_no_mock_e2e.sh`, `env_snapshots.sh`, `hygiene_no_mock_e2e.sh`, `lexer_no_mock_e2e.sh` | contained — `env_snapshots.sh` is the lane every generalisation here was made from |
 | 12 | `unsafe_note_clippy.sh` | contained |
 | 11 | `g0_4_no_mock_e2e.sh` | contained |
 | 10 | `verdict_schema.sh` | governs bare **`scripts`**, so *any* write under `scripts/` voids it; `check.sh` enumerates individual scripts instead |
@@ -1046,8 +1046,8 @@ cite tools/structure-guard/tests/seeded.rs:253 :: fn prohibited_transitive_path_
 cite ci/BOUNDARY_API.txt:13 :: no-admission ground
 cite scripts/check.sh:197 :: INPUT_PATHS=(
 cite scripts/e2e/vellum_naming_no_mock_e2e.sh:83 :: INPUT_PATHS=(
-cite scripts/evidence.py:1966 :: def stable_symlink_facts
-cite scripts/evidence.py:15906 :: def repository_state
+cite scripts/evidence.py:1997 :: def stable_symlink_facts
+cite scripts/evidence.py:16406 :: def repository_state
 ```
 
 `crates/fln-conformance/tests/agents_enforcement_census.rs` **fails the build** on any disagreement, in both directions plus conservation: every row's cited region must still contain its named construct; every `path:line` in the prose must have a row, so a new citation cannot be added unbound; and every row must be cited by the prose, so a row cannot outlive the sentence it served. A citation that deliberately names a **past** state is marked `(historical)` and excluded — which is how the `ApiRow` range in D3's paragraph, describing that struct before field 4 was retained, stays in the narrative without claiming to be current.
