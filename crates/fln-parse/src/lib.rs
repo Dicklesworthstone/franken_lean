@@ -15,6 +15,7 @@
 pub mod build;
 pub mod category;
 pub mod pratt;
+pub mod recovery;
 pub mod registry;
 pub mod state;
 
