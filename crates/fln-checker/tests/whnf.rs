@@ -2,14 +2,19 @@
 
 use std::process::Command;
 
+use fln_checker::environment::{
+    Definition, DefinitionEntry, DefinitionEnvironment, DefinitionSafety, EnvironmentBudget,
+    EnvironmentOutcome, ReducibilityHint,
+};
+use fln_checker::instantiate::InstantiationRefusal;
 use fln_checker::term::{TermBudget, TermLimit, TermStop};
 use fln_checker::whnf::{
     FreeBinding, ProjectionRule, WhnfBudget, WhnfContext, WhnfLimit, WhnfOutcome, WhnfPhase,
     WhnfRefusal, WhnfResult, WhnfStop, whnf, whnf_with,
 };
 use fln_checker::wire::{
-    DecodeBudget, DecodeOutcome, ExprId, ExprNode, NamePart, WireExpr, WireName, decode_expr,
-    decode_name,
+    DecodeBudget, DecodeOutcome, ExprId, ExprNode, LevelNode, NamePart, WireExpr, WireName,
+    decode_expr, decode_name,
 };
 use fln_core::expr::{BinderInfo, Expr, FVarId};
 use fln_core::level::Level;
@@ -180,7 +185,39 @@ fn projection_context(parameter_count: usize) -> WhnfContext {
             checker_name("GeneratedConstructor"),
             parameter_count,
         )],
+        DefinitionEnvironment::empty(),
     )
+}
+
+fn definition_entry(
+    name: impl Into<String>,
+    level_parameters: Vec<WireName>,
+    value: WireExpr,
+    hint: ReducibilityHint,
+    safety: DefinitionSafety,
+) -> DefinitionEntry {
+    DefinitionEntry::new(
+        checker_name(name),
+        Definition::new(
+            level_parameters,
+            decoded(&Expr::sort(Level::zero())),
+            value,
+            hint,
+            safety,
+            Vec::new(),
+        ),
+    )
+}
+
+fn definition_environment(entries: Vec<DefinitionEntry>) -> DefinitionEnvironment {
+    match DefinitionEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+        EnvironmentOutcome::Complete { environment, .. } => environment,
+        other => panic!("test definition environment did not build: {other:?}"),
+    }
+}
+
+fn definition_context(entries: Vec<DefinitionEntry>) -> WhnfContext {
+    WhnfContext::new(Vec::new(), Vec::new(), definition_environment(entries))
 }
 
 fn constructor(arguments: impl IntoIterator<Item = Expr>) -> Expr {
@@ -198,6 +235,7 @@ fn generated_eager_whnf_matches_the_frozen_model() {
             decoded(&constant("generated_free_value")),
         )],
         projection_context(1).projection_rules().to_vec(),
+        DefinitionEnvironment::empty(),
     );
     for index in 0..CASES {
         let left_name = format!("left_{index}");
@@ -419,6 +457,7 @@ fn stuck_constants_never_delta_unfold() {
             decoded(&constant("wrong_delta_result")),
         )],
         Vec::new(),
+        DefinitionEnvironment::empty(),
     );
     let result = complete(whnf(&constant_term, &context, WhnfBudget::unlimited()));
     assert_eq!(output_model(&result), Frozen::Constant("opaque".to_owned()));
@@ -437,6 +476,331 @@ fn stuck_constants_never_delta_unfold() {
 }
 
 #[test]
+fn safe_definitions_unfold_for_every_hint_while_non_safe_rows_stay_stuck() {
+    let context = definition_context(vec![
+        definition_entry(
+            "safe_opaque",
+            Vec::new(),
+            decoded(&constant("opaque_target")),
+            ReducibilityHint::Opaque,
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "safe_abbrev",
+            Vec::new(),
+            decoded(&constant("abbrev_target")),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "safe_regular",
+            Vec::new(),
+            decoded(&constant("regular_target")),
+            ReducibilityHint::Regular(41),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "unsafe_row",
+            Vec::new(),
+            decoded(&constant("must_not_escape")),
+            ReducibilityHint::Regular(7),
+            DefinitionSafety::Unsafe,
+        ),
+        definition_entry(
+            "partial_row",
+            Vec::new(),
+            decoded(&constant("must_not_escape")),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Partial,
+        ),
+    ]);
+
+    for (name, expected) in [
+        ("safe_opaque", "opaque_target"),
+        ("safe_abbrev", "abbrev_target"),
+        ("safe_regular", "regular_target"),
+    ] {
+        let result = complete(whnf(
+            &decoded(&constant(name)),
+            &context,
+            WhnfBudget::unlimited(),
+        ));
+        assert_eq!(output_model(&result), Frozen::Constant(expected.to_owned()));
+        assert_eq!(result.reductions, 1);
+    }
+
+    for name in ["unsafe_row", "partial_row", "absent_row"] {
+        let result = complete(whnf(
+            &decoded(&constant(name)),
+            &context,
+            WhnfBudget::unlimited(),
+        ));
+        assert_eq!(output_model(&result), Frozen::Constant(name.to_owned()));
+        assert_eq!(result.reductions, 0);
+    }
+}
+
+#[test]
+fn polymorphic_delta_instantiates_ordered_universe_parameters_exactly() {
+    let u = checker_name("u");
+    let v = checker_name("v");
+    let value = decoded(&Expr::const_(
+        primary_name("UniverseWitness"),
+        vec![
+            Level::param(primary_name("u")),
+            Level::param(primary_name("v")),
+        ],
+    ));
+    let context = definition_context(vec![definition_entry(
+        "poly",
+        vec![u, v],
+        value,
+        ReducibilityHint::Regular(3),
+        DefinitionSafety::Safe,
+    )]);
+    let input = decoded(&Expr::const_(
+        primary_name("poly"),
+        vec![Level::one(), Level::zero()],
+    ));
+    let result = complete(whnf(&input, &context, WhnfBudget::unlimited()));
+    let ExprNode::Constant { name, levels } = result
+        .term
+        .node(result.term.root())
+        .expect("delta result root exists")
+    else {
+        panic!("polymorphic definition did not expose its constant body");
+    };
+    assert_eq!(model_name(name), "UniverseWitness");
+    assert_eq!(levels.len(), 2);
+    let LevelNode::Succ(zero) = result.term.level(levels[0]).expect("first level exists") else {
+        panic!("the first universe parameter did not receive Level::one");
+    };
+    assert!(matches!(result.term.level(*zero), Some(LevelNode::Zero)));
+    assert!(matches!(
+        result.term.level(levels[1]),
+        Some(LevelNode::Zero)
+    ));
+    assert_eq!(result.reductions, 1);
+
+    assert!(matches!(
+        whnf(
+            &decoded(&constant("poly")),
+            &context,
+            WhnfBudget::unlimited(),
+        ),
+        WhnfOutcome::Refused(WhnfRefusal::DefinitionInstantiation {
+            refusal: InstantiationRefusal::ArityMismatch {
+                parameters: 2,
+                values: 0,
+            },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn delta_preserves_application_order_and_continues_beta_and_projection() {
+    let choose_left = Expr::lam(
+        primary_name("left"),
+        Expr::sort(Level::zero()),
+        Expr::lam(
+            primary_name("right"),
+            Expr::sort(Level::zero()),
+            Expr::bvar(1).expect("outer binder is in scope"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let environment = definition_environment(vec![
+        definition_entry(
+            "choose_left",
+            Vec::new(),
+            decoded(&choose_left),
+            ReducibilityHint::Regular(2),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "packed",
+            Vec::new(),
+            decoded(&constructor([
+                constant("parameter"),
+                constant("selected_field"),
+            ])),
+            ReducibilityHint::Opaque,
+            DefinitionSafety::Safe,
+        ),
+    ]);
+    let context = WhnfContext::new(
+        Vec::new(),
+        vec![ProjectionRule::new(
+            checker_name("GeneratedStructure"),
+            checker_name("GeneratedConstructor"),
+            1,
+        )],
+        environment,
+    );
+
+    let application = Expr::app(
+        Expr::app(constant("choose_left"), constant("left_argument")),
+        constant("right_argument"),
+    );
+    let application_result = complete(whnf(
+        &decoded(&application),
+        &context,
+        WhnfBudget::unlimited(),
+    ));
+    assert_eq!(
+        output_model(&application_result),
+        Frozen::Constant("left_argument".to_owned())
+    );
+    assert_eq!(application_result.reductions, 2);
+
+    let projection = Expr::proj(primary_name("GeneratedStructure"), 0, constant("packed"));
+    let projection_result = complete(whnf(
+        &decoded(&projection),
+        &context,
+        WhnfBudget::unlimited(),
+    ));
+    assert_eq!(
+        output_model(&projection_result),
+        Frozen::Constant("selected_field".to_owned())
+    );
+    assert_eq!(projection_result.reductions, 2);
+}
+
+#[test]
+fn generated_safe_definition_delta_matches_frozen_targets() {
+    const CASES: usize = 320;
+    let entries = (0..CASES)
+        .map(|index| {
+            definition_entry(
+                format!("generated_definition_{index}"),
+                Vec::new(),
+                decoded(&constant(format!("generated_target_{index}"))),
+                match index % 3 {
+                    0 => ReducibilityHint::Opaque,
+                    1 => ReducibilityHint::Abbrev,
+                    _ => ReducibilityHint::Regular(index as u32),
+                },
+                DefinitionSafety::Safe,
+            )
+        })
+        .collect();
+    let context = definition_context(entries);
+    for index in 0..CASES {
+        let result = complete(whnf(
+            &decoded(&constant(format!("generated_definition_{index}"))),
+            &context,
+            WhnfBudget::unlimited(),
+        ));
+        assert_eq!(
+            output_model(&result),
+            Frozen::Constant(format!("generated_target_{index}"))
+        );
+        assert_eq!(result.reductions, 1);
+    }
+}
+
+#[test]
+fn delta_resources_cancellation_and_recursion_are_typed_and_recoverable() {
+    let large_value = decoded(&Expr::app(
+        constant("materialized_target"),
+        constant("materialized_argument"),
+    ));
+    let context = definition_context(vec![
+        definition_entry(
+            "large",
+            Vec::new(),
+            large_value,
+            ReducibilityHint::Regular(1),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "loop",
+            Vec::new(),
+            decoded(&constant("loop")),
+            ReducibilityHint::Regular(1),
+            DefinitionSafety::Safe,
+        ),
+    ]);
+    let large = decoded(&constant("large"));
+
+    assert!(matches!(
+        whnf(
+            &large,
+            &context,
+            WhnfBudget::new(
+                u64::MAX,
+                u64::MAX,
+                TermBudget::unlimited().with_max_arena_nodes(1),
+            ),
+        ),
+        WhnfOutcome::Inconclusive(WhnfStop::DefinitionInstantiation {
+            stop: TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: 1,
+                observed: 2,
+                ..
+            },
+            completed_reductions: 1,
+            ..
+        })
+    ));
+
+    let mut saw_delta_cancellation = false;
+    for cancel_at in 1_u64..=64 {
+        let mut polls = 0_u64;
+        let interrupted = whnf_with(&large, &context, WhnfBudget::unlimited(), || {
+            polls = polls.saturating_add(1);
+            polls >= cancel_at
+        });
+        if matches!(
+            interrupted,
+            WhnfOutcome::Inconclusive(WhnfStop::DefinitionInstantiation {
+                stop: TermStop::Cancelled { .. },
+                ..
+            })
+        ) {
+            saw_delta_cancellation = true;
+            break;
+        }
+    }
+    assert!(
+        saw_delta_cancellation,
+        "a cancellation poll must be observable inside definition instantiation"
+    );
+
+    let recovered = complete(whnf(&large, &context, WhnfBudget::unlimited()));
+    assert_eq!(
+        output_model(&recovered),
+        apply(
+            Frozen::Constant("materialized_target".to_owned()),
+            Frozen::Constant("materialized_argument".to_owned()),
+        )
+    );
+
+    assert!(matches!(
+        whnf(
+            &decoded(&constant("loop")),
+            &context,
+            WhnfBudget::new(100, 7, TermBudget::unlimited()),
+        ),
+        WhnfOutcome::Inconclusive(WhnfStop::Resource {
+            limit: WhnfLimit::Reductions,
+            allowed: 7,
+            observed: 8,
+            completed_reductions: 7,
+            ..
+        })
+    ));
+    assert_eq!(
+        whnf(&large, &context, WhnfBudget::unlimited()),
+        WhnfOutcome::Complete(recovered),
+        "a recursive resource stop cannot poison the immutable environment"
+    );
+}
+
+#[test]
 fn duplicate_context_rows_and_free_cycles_are_refused() {
     let input = decoded(&constant("input"));
     let duplicate_free = WhnfContext::new(
@@ -445,6 +809,7 @@ fn duplicate_context_rows_and_free_cycles_are_refused() {
             FreeBinding::new(checker_name("x"), decoded(&constant("second"))),
         ],
         Vec::new(),
+        DefinitionEnvironment::empty(),
     );
     assert_eq!(
         whnf(&input, &duplicate_free, WhnfBudget::unlimited()),
@@ -460,6 +825,7 @@ fn duplicate_context_rows_and_free_cycles_are_refused() {
             ProjectionRule::new(checker_name("S"), checker_name("MkS"), 0),
             ProjectionRule::new(checker_name("S"), checker_name("OtherMkS"), 2),
         ],
+        DefinitionEnvironment::empty(),
     );
     assert_eq!(
         whnf(&input, &duplicate_projection, WhnfBudget::unlimited()),
@@ -481,6 +847,7 @@ fn duplicate_context_rows_and_free_cycles_are_refused() {
             ),
         ],
         Vec::new(),
+        DefinitionEnvironment::empty(),
     );
     let free_x = decoded(&Expr::fvar(FVarId(primary_name("x"))));
     assert_eq!(
@@ -724,6 +1091,88 @@ fn deep_wrapper_reduction_fits_a_64k_stack() {
     assert!(
         output.status.success(),
         "bounded-stack child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn deep_delta_child() -> Result<(), String> {
+    const DEPTH: usize = 50_000;
+    let names: Vec<_> = (0..=DEPTH)
+        .map(|index| format!("deep_definition_{index}"))
+        .collect();
+    let type_ = decoded(&Expr::sort(Level::zero()));
+    let entries = (0..DEPTH)
+        .map(|index| {
+            DefinitionEntry::new(
+                checker_name(names[index].clone()),
+                Definition::new(
+                    Vec::new(),
+                    type_.clone(),
+                    decoded(&constant(names[index + 1].clone())),
+                    ReducibilityHint::Regular(index as u32),
+                    DefinitionSafety::Safe,
+                    Vec::new(),
+                ),
+            )
+        })
+        .collect();
+    let environment = match DefinitionEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+        EnvironmentOutcome::Complete { environment, .. } => environment,
+        other => return Err(format!("deep definition environment failed: {other:?}")),
+    };
+    let context = WhnfContext::new(Vec::new(), Vec::new(), environment);
+    let result = match whnf(
+        &decoded(&constant(names[0].clone())),
+        &context,
+        WhnfBudget::unlimited(),
+    ) {
+        WhnfOutcome::Complete(result) => result,
+        other => return Err(format!("deep definition chain did not complete: {other:?}")),
+    };
+    if result.reductions != DEPTH as u64 {
+        return Err(format!(
+            "deep delta reduction count drifted: {}",
+            result.reductions
+        ));
+    }
+    let Some(ExprNode::Constant { name, levels }) = result.term.node(result.term.root()) else {
+        return Err("deep delta result is not a constant".to_owned());
+    };
+    if model_name(name) != names[DEPTH] || !levels.is_empty() {
+        return Err("deep delta result is not the terminal definition name".to_owned());
+    }
+    Ok(())
+}
+
+#[test]
+fn deep_safe_definition_chain_fits_a_64k_stack() {
+    const CHILD_ENV: &str = "FLN_CHECKER_DELTA_DEEP_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let result = std::thread::Builder::new()
+            .name("fln-checker-delta-deep".to_owned())
+            .stack_size(64 * 1024)
+            .spawn(deep_delta_child)
+            .expect("spawn bounded-stack delta child thread")
+            .join()
+            .expect("bounded-stack delta child thread did not panic");
+        result.expect("bounded-stack safe-definition delta reduction");
+        return;
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = Command::new(executable)
+        .env(CHILD_ENV, "1")
+        .args([
+            "--exact",
+            "deep_safe_definition_chain_fits_a_64k_stack",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run bounded-stack delta child process");
+    assert!(
+        output.status.success(),
+        "bounded-stack delta child failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

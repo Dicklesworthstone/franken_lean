@@ -3,11 +3,12 @@
 //! The implementation begins with the parts that must not be retrofitted after
 //! performance pressure appears: a versioned deterministic sampling policy, a
 //! checker-owned canonical-wire decoder, eager universe semantics, and independent
-//! term facts plus capture-avoiding rewrites. Pure eager weak-head reduction,
-//! resource-counted quick equality, environment-free slow conversion, and an
-//! immutable checker-owned definition environment now sit above those foundations;
-//! delta reduction, environment-sensitive conversion, and declaration checking
-//! remain on `franken_lean-gii`. The crate map and layering are governed by
+//! term facts plus capture-avoiding rewrites. Eager weak-head reduction now
+//! consumes an immutable checker-owned definition environment and unfolds only
+//! safe definitions with independently instantiated universes. Resource-counted
+//! quick equality and slow conversion consume that eager normalizer, so safe
+//! aliases already participate in conversion; the remaining equality rules and
+//! declaration checking stay on `franken_lean-gii`. The crate map and layering are governed by
 //! `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first

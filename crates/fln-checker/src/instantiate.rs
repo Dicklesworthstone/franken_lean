@@ -156,9 +156,41 @@ enum LevelPlan {
     Replacement(usize),
 }
 
+#[derive(Clone, Copy)]
+enum ReplacementValues<'a> {
+    Separate(&'a [WireLevel]),
+    ArenaRoots {
+        nodes: &'a [LevelNode],
+        roots: &'a [LevelId],
+    },
+}
+
+impl<'a> ReplacementValues<'a> {
+    fn len(self) -> usize {
+        match self {
+            ReplacementValues::Separate(values) => values.len(),
+            ReplacementValues::ArenaRoots { roots, .. } => roots.len(),
+        }
+    }
+
+    fn root(self, index: usize) -> Option<LevelId> {
+        match self {
+            ReplacementValues::Separate(values) => values.get(index).map(WireLevel::root),
+            ReplacementValues::ArenaRoots { roots, .. } => roots.get(index).copied(),
+        }
+    }
+
+    fn nodes(self, index: usize) -> Option<&'a [LevelNode]> {
+        match self {
+            ReplacementValues::Separate(values) => values.get(index).map(|value| value.nodes()),
+            ReplacementValues::ArenaRoots { nodes, roots } => roots.get(index).map(|_| nodes),
+        }
+    }
+}
+
 struct Instantiator<'a, 'c> {
     parameters: BTreeMap<&'a WireName, usize>,
-    values: &'a [WireLevel],
+    values: ReplacementValues<'a>,
     control: Control<'c>,
     levels: Vec<LevelNode>,
     replacement_maps: Vec<Option<Vec<LevelId>>>,
@@ -167,7 +199,7 @@ struct Instantiator<'a, 'c> {
 impl<'a, 'c> Instantiator<'a, 'c> {
     fn prepare(
         parameters: &'a [WireName],
-        values: &'a [WireLevel],
+        values: ReplacementValues<'a>,
         budget: TermBudget,
         cancelled: &'c mut dyn FnMut() -> bool,
     ) -> Result<Result<Instantiator<'a, 'c>, InstantiationRefusal>, Halt> {
@@ -232,16 +264,24 @@ impl<'a, 'c> Instantiator<'a, 'c> {
         Ok(id)
     }
 
-    fn replacement(&self, index: usize) -> Result<&WireLevel, Halt> {
+    fn replacement_root(&self, index: usize) -> Result<LevelId, Halt> {
         self.values
-            .get(index)
+            .root(index)
+            .ok_or(Halt::Fault(InstantiationFault::MissingReplacement {
+                index,
+            }))
+    }
+
+    fn replacement_nodes(&self, index: usize) -> Result<&'a [LevelNode], Halt> {
+        self.values
+            .nodes(index)
             .ok_or(Halt::Fault(InstantiationFault::MissingReplacement {
                 index,
             }))
     }
 
     fn copy_replacement(&mut self, value_index: usize) -> Result<LevelId, Halt> {
-        let root = self.replacement(value_index)?.root();
+        let root = self.replacement_root(value_index)?;
         if let Some(mapping) = self
             .replacement_maps
             .get(value_index)
@@ -256,14 +296,13 @@ impl<'a, 'c> Instantiator<'a, 'c> {
         }
 
         let input = InstantiationInput::Replacement { index: value_index };
-        let source_len = self.replacement(value_index)?.nodes().len();
+        let source_len = self.replacement_nodes(value_index)?.len();
         let mut mapping = Vec::new();
         for index in 0..source_len {
             self.control.step(index)?;
             let (plan, units) = {
                 let node = self
-                    .replacement(value_index)?
-                    .nodes()
+                    .replacement_nodes(value_index)?
                     .get(index)
                     .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
                         input,
@@ -288,42 +327,47 @@ impl<'a, 'c> Instantiator<'a, 'c> {
                 (plan, level_owned_units(node))
             };
             self.control.output(units, index)?;
-            let node =
-                match plan {
-                    LevelPlan::Ready(node) => node,
-                    LevelPlan::Parameter => {
-                        let LevelNode::Parameter(name) =
-                            self.replacement(value_index)?.nodes().get(index).ok_or(
-                                Halt::Fault(InstantiationFault::MissingLevel { input, index }),
-                            )?
-                        else {
-                            return Err(Halt::Fault(InstantiationFault::MissingLevel {
-                                input,
-                                index,
-                            }));
-                        };
-                        LevelNode::Parameter(name.clone())
-                    }
-                    LevelPlan::Meta => {
-                        let LevelNode::Meta(name) =
-                            self.replacement(value_index)?.nodes().get(index).ok_or(
-                                Halt::Fault(InstantiationFault::MissingLevel { input, index }),
-                            )?
-                        else {
-                            return Err(Halt::Fault(InstantiationFault::MissingLevel {
-                                input,
-                                index,
-                            }));
-                        };
-                        LevelNode::Meta(name.clone())
-                    }
-                    LevelPlan::Replacement(_) => {
+            let node = match plan {
+                LevelPlan::Ready(node) => node,
+                LevelPlan::Parameter => {
+                    let LevelNode::Parameter(name) = self
+                        .replacement_nodes(value_index)?
+                        .get(index)
+                        .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
+                            input,
+                            index,
+                        }))?
+                    else {
                         return Err(Halt::Fault(InstantiationFault::MissingLevel {
                             input,
                             index,
                         }));
-                    }
-                };
+                    };
+                    LevelNode::Parameter(name.clone())
+                }
+                LevelPlan::Meta => {
+                    let LevelNode::Meta(name) = self
+                        .replacement_nodes(value_index)?
+                        .get(index)
+                        .ok_or(Halt::Fault(InstantiationFault::MissingLevel {
+                            input,
+                            index,
+                        }))?
+                    else {
+                        return Err(Halt::Fault(InstantiationFault::MissingLevel {
+                            input,
+                            index,
+                        }));
+                    };
+                    LevelNode::Meta(name.clone())
+                }
+                LevelPlan::Replacement(_) => {
+                    return Err(Halt::Fault(InstantiationFault::MissingLevel {
+                        input,
+                        index,
+                    }));
+                }
+            };
             let id = self.push_level(node, index)?;
             mapping.push(id);
         }
@@ -551,7 +595,12 @@ pub fn instantiate_level_parameters_with(
     budget: TermBudget,
     mut cancelled: impl FnMut() -> bool,
 ) -> InstantiationOutcome<WireLevel> {
-    let mut instantiator = match Instantiator::prepare(parameters, values, budget, &mut cancelled) {
+    let mut instantiator = match Instantiator::prepare(
+        parameters,
+        ReplacementValues::Separate(values),
+        budget,
+        &mut cancelled,
+    ) {
         Ok(Ok(instantiator)) => instantiator,
         Ok(Err(refusal)) => return InstantiationOutcome::Refused(refusal),
         Err(halt) => return halted(halt),
@@ -588,7 +637,43 @@ pub fn instantiate_term_parameters_with(
     budget: TermBudget,
     mut cancelled: impl FnMut() -> bool,
 ) -> InstantiationOutcome<WireExpr> {
-    let mut instantiator = match Instantiator::prepare(parameters, values, budget, &mut cancelled) {
+    instantiate_term_from_values_with(
+        term,
+        parameters,
+        ReplacementValues::Separate(values),
+        budget,
+        &mut cancelled,
+    )
+}
+
+pub(crate) fn instantiate_term_parameters_from_level_roots_with(
+    term: &WireExpr,
+    parameters: &[WireName],
+    source_levels: &[LevelNode],
+    roots: &[LevelId],
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InstantiationOutcome<WireExpr> {
+    instantiate_term_from_values_with(
+        term,
+        parameters,
+        ReplacementValues::ArenaRoots {
+            nodes: source_levels,
+            roots,
+        },
+        budget,
+        cancelled,
+    )
+}
+
+fn instantiate_term_from_values_with(
+    term: &WireExpr,
+    parameters: &[WireName],
+    values: ReplacementValues<'_>,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InstantiationOutcome<WireExpr> {
+    let mut instantiator = match Instantiator::prepare(parameters, values, budget, cancelled) {
         Ok(Ok(instantiator)) => instantiator,
         Ok(Err(refusal)) => return InstantiationOutcome::Refused(refusal),
         Err(halt) => return halted(halt),

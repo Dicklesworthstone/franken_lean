@@ -1,15 +1,20 @@
-//! Eager pure weak-head reduction over checker-owned flat arenas.
+//! Eager weak-head reduction over checker-owned flat arenas.
 //!
 //! This module deliberately does not share the primary kernel normalizer. It
-//! implements the environment-free portion of KR-201 through KR-204 with flat
-//! arena cursors and explicit heap frames: metadata stripping, beta, let-zeta,
-//! supplied let-bound free unfolding, and explicit-constructor projection.
-//! Constants remain opaque, and recursors, native extensions, numeric/string
-//! acceleration, and delta unfolding are outside this layer.
+//! implements the eager checker portion of KR-200 through KR-204 with flat arena
+//! cursors and explicit heap frames: safe-definition delta, metadata stripping,
+//! beta, let-zeta, supplied let-bound free unfolding, and explicit-constructor
+//! projection. Unsafe and partial definitions stay stuck. Recursors, native
+//! extensions, and numeric/string acceleration remain outside this layer.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use crate::environment::DefinitionEnvironment;
+use crate::instantiate::{
+    InstantiationFault, InstantiationOutcome, InstantiationRefusal,
+    instantiate_term_parameters_from_level_roots_with,
+};
 use crate::term::{
     TermBudget, TermFault, TermLimit, TermOutcome, TermStop, copy_subterm_with,
     substitute_bound_subterms_with,
@@ -76,16 +81,19 @@ impl ProjectionRule {
 pub struct WhnfContext {
     free_bindings: Vec<FreeBinding>,
     projection_rules: Vec<ProjectionRule>,
+    definitions: DefinitionEnvironment,
 }
 
 impl WhnfContext {
     pub fn new(
         free_bindings: Vec<FreeBinding>,
         projection_rules: Vec<ProjectionRule>,
+        definitions: DefinitionEnvironment,
     ) -> WhnfContext {
         WhnfContext {
             free_bindings,
             projection_rules,
+            definitions,
         }
     }
 
@@ -95,6 +103,10 @@ impl WhnfContext {
 
     pub fn projection_rules(&self) -> &[ProjectionRule] {
         &self.projection_rules
+    }
+
+    pub fn definitions(&self) -> &DefinitionEnvironment {
+        &self.definitions
     }
 }
 
@@ -158,6 +170,10 @@ pub enum WhnfRefusal {
         parameter_count: usize,
         field_index: u64,
     },
+    DefinitionInstantiation {
+        at: usize,
+        refusal: InstantiationRefusal,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +194,12 @@ pub enum WhnfStop {
     },
     Materialization {
         phase: WhnfPhase,
+        stop: TermStop,
+        completed_steps: u64,
+        completed_reductions: u64,
+    },
+    DefinitionInstantiation {
+        at: usize,
         stop: TermStop,
         completed_steps: u64,
         completed_reductions: u64,
@@ -207,6 +229,10 @@ pub enum WhnfFault {
         input: usize,
         parent: usize,
         child: usize,
+    },
+    DefinitionInstantiation {
+        at: usize,
+        fault: InstantiationFault,
     },
 }
 
@@ -375,6 +401,7 @@ enum HeadAction {
     Metadata(ExprId),
     Let { value: ExprId, body: ExprId },
     Free(Option<usize>),
+    Constant,
     Apply,
     Projection { expression: ExprId },
     Stuck,
@@ -647,6 +674,70 @@ impl<'a, 'c> Reducer<'a, 'c> {
         Ok(arguments.get(target).cloned())
     }
 
+    fn unfold_definition(&mut self, current: &Cursor) -> Result<Option<Cursor>, Halt> {
+        let (name, levels) = match self.node(current)? {
+            ExprNode::Constant { name, levels } => (name, levels),
+            _ => {
+                return Err(Halt::Fault(WhnfFault::MissingExpression {
+                    input: 0,
+                    index: current.root.index(),
+                }));
+            }
+        };
+        let Some(definition) = self.context.source.definitions().find(name) else {
+            return Ok(None);
+        };
+        if !definition.is_delta_unfoldable() {
+            return Ok(None);
+        }
+        if definition.level_parameters().len() != levels.len() {
+            return Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
+                at: current.root.index(),
+                refusal: InstantiationRefusal::ArityMismatch {
+                    parameters: definition.level_parameters().len(),
+                    values: levels.len(),
+                },
+            }));
+        }
+
+        self.control
+            .reduction(current.root.index(), self.cancelled)?;
+        let result = instantiate_term_parameters_from_level_roots_with(
+            definition.value(),
+            definition.level_parameters(),
+            current.arena.levels(),
+            levels,
+            self.control.budget.materialization,
+            self.cancelled,
+        );
+        match result {
+            InstantiationOutcome::Complete(term) => Ok(Some(Cursor {
+                root: term.root(),
+                arena: Arc::new(term),
+            })),
+            InstantiationOutcome::Refused(refusal) => {
+                Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
+                    at: current.root.index(),
+                    refusal,
+                }))
+            }
+            InstantiationOutcome::Inconclusive(stop) => {
+                Err(Halt::Stop(WhnfStop::DefinitionInstantiation {
+                    at: current.root.index(),
+                    stop,
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                }))
+            }
+            InstantiationOutcome::InternalFault(fault) => {
+                Err(Halt::Fault(WhnfFault::DefinitionInstantiation {
+                    at: current.root.index(),
+                    fault,
+                }))
+            }
+        }
+    }
+
     fn head_action(&self, current: &Cursor) -> Result<HeadAction, Halt> {
         let node = self.node(current)?;
         match node {
@@ -665,6 +756,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             ExprNode::Free { name } => Ok(HeadAction::Free(
                 self.context.free_bindings.get(name).copied(),
             )),
+            ExprNode::Constant { .. } => Ok(HeadAction::Constant),
             ExprNode::Apply { .. } => Ok(HeadAction::Apply),
             ExprNode::Projection { expression, .. } => {
                 Self::validate_child(current.root, *expression)?;
@@ -675,7 +767,6 @@ impl<'a, 'c> Reducer<'a, 'c> {
             ExprNode::Bound { .. }
             | ExprNode::Meta { .. }
             | ExprNode::Sort { .. }
-            | ExprNode::Constant { .. }
             | ExprNode::Lambda { .. }
             | ExprNode::Forall { .. }
             | ExprNode::NatLiteral { .. }
@@ -738,6 +829,12 @@ impl<'a, 'c> Reducer<'a, 'c> {
                         arena: Arc::new(term),
                     };
                     continue;
+                }
+                HeadAction::Constant => {
+                    if let Some(unfolded) = self.unfold_definition(&current)? {
+                        current = unfolded;
+                        continue;
+                    }
                 }
                 HeadAction::Apply => {
                     let (head, mut arguments) = self.peel_application(&current)?;
