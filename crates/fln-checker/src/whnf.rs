@@ -408,8 +408,20 @@ impl<'a, 'c> Reducer<'a, 'c> {
         Ok(())
     }
 
-    fn materialize(&mut self, cursor: &Cursor, phase: WhnfPhase) -> Result<Cursor, Halt> {
-        self.materialize_term(&cursor.arena, cursor.root, phase)
+    fn materialize_wire(
+        &mut self,
+        term: &WireExpr,
+        root: ExprId,
+        phase: WhnfPhase,
+    ) -> Result<WireExpr, Halt> {
+        self.control.step(root.index(), self.cancelled)?;
+        let result = copy_subterm_with(
+            term,
+            root,
+            self.control.budget.materialization,
+            self.cancelled,
+        );
+        self.control.term_halt(phase, result)
     }
 
     fn materialize_term(
@@ -418,14 +430,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
         root: ExprId,
         phase: WhnfPhase,
     ) -> Result<Cursor, Halt> {
-        self.control.step(root.index(), self.cancelled)?;
-        let result = copy_subterm_with(
-            term,
-            root,
-            self.control.budget.materialization,
-            self.cancelled,
-        );
-        let term = self.control.term_halt(phase, result)?;
+        let term = self.materialize_wire(term, root, phase)?;
         let root = term.root();
         Ok(Cursor {
             arena: Arc::new(term),
@@ -793,9 +798,9 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }
             }
 
-            current = self.materialize(&current, WhnfPhase::Final)?;
+            let term = self.materialize_wire(&current.arena, current.root, WhnfPhase::Final)?;
             return Ok(WhnfResult {
-                term: Arc::try_unwrap(current.arena).unwrap_or_else(|arena| (*arena).clone()),
+                term,
                 reductions: self.control.reductions,
             });
         }
@@ -975,14 +980,12 @@ impl<'c> Composer<'c> {
     }
 
     fn push_expression(&mut self, node: ExprNode, units: u64, at: usize) -> Result<ExprId, Halt> {
-        self.control
-            .step(at)
-            .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?;
+        self.control.step(at).map_err(|halt| self.map_halt(halt))?;
         self.control
             .output(units, at)
-            .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?;
+            .map_err(|halt| self.map_halt(halt))?;
         self.push_expression_charged(node, at)
-            .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))
+            .map_err(|halt| self.map_halt(halt))
     }
 
     fn push_expression_charged(
@@ -1011,34 +1014,34 @@ impl<'c> Composer<'c> {
         for (index, node) in source.levels().iter().enumerate() {
             self.control
                 .step(index)
-                .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?;
+                .map_err(|halt| self.map_halt(halt))?;
             let mapped = match node {
                 LevelNode::Zero => LevelNode::Zero,
                 LevelNode::Succ(child) => LevelNode::Succ(
                     Self::prior_level(&level_mapping, input, index, *child)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                        .map_err(|halt| self.map_halt(halt))?,
                 ),
                 LevelNode::Max(left, right) => LevelNode::Max(
                     Self::prior_level(&level_mapping, input, index, *left)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                        .map_err(|halt| self.map_halt(halt))?,
                     Self::prior_level(&level_mapping, input, index, *right)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                        .map_err(|halt| self.map_halt(halt))?,
                 ),
                 LevelNode::IMax(left, right) => LevelNode::IMax(
                     Self::prior_level(&level_mapping, input, index, *left)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                        .map_err(|halt| self.map_halt(halt))?,
                     Self::prior_level(&level_mapping, input, index, *right)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                        .map_err(|halt| self.map_halt(halt))?,
                 ),
                 LevelNode::Parameter(name) => LevelNode::Parameter(name.clone()),
                 LevelNode::Meta(name) => LevelNode::Meta(name.clone()),
             };
             self.control
                 .output(level_owned_units(node), index)
-                .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?;
+                .map_err(|halt| self.map_halt(halt))?;
             let id = self
                 .push_level(mapped, index)
-                .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?;
+                .map_err(|halt| self.map_halt(halt))?;
             level_mapping.push(id);
         }
 
@@ -1046,10 +1049,10 @@ impl<'c> Composer<'c> {
         for (index, node) in source.nodes().iter().enumerate() {
             self.control
                 .step(index)
-                .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?;
+                .map_err(|halt| self.map_halt(halt))?;
             self.control
                 .output(expression_owned_units(node), index)
-                .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?;
+                .map_err(|halt| self.map_halt(halt))?;
             let map_expr = |child| Self::prior_expression(&expression_mapping, input, index, child);
             let mapped = match node {
                 ExprNode::Bound { index } => ExprNode::Bound { index: *index },
@@ -1080,10 +1083,8 @@ impl<'c> Composer<'c> {
                     }
                 }
                 ExprNode::Apply { function, argument } => ExprNode::Apply {
-                    function: map_expr(*function)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
-                    argument: map_expr(*argument)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                    function: map_expr(*function).map_err(|halt| self.map_halt(halt))?,
+                    argument: map_expr(*argument).map_err(|halt| self.map_halt(halt))?,
                 },
                 ExprNode::Lambda {
                     binder_name,
@@ -1092,10 +1093,8 @@ impl<'c> Composer<'c> {
                     style,
                 } => ExprNode::Lambda {
                     binder_name: binder_name.clone(),
-                    binder_type: map_expr(*binder_type)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
-                    body: map_expr(*body)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                    binder_type: map_expr(*binder_type).map_err(|halt| self.map_halt(halt))?,
+                    body: map_expr(*body).map_err(|halt| self.map_halt(halt))?,
                     style: *style,
                 },
                 ExprNode::Forall {
@@ -1105,10 +1104,8 @@ impl<'c> Composer<'c> {
                     style,
                 } => ExprNode::Forall {
                     binder_name: binder_name.clone(),
-                    binder_type: map_expr(*binder_type)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
-                    body: map_expr(*body)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                    binder_type: map_expr(*binder_type).map_err(|halt| self.map_halt(halt))?,
+                    body: map_expr(*body).map_err(|halt| self.map_halt(halt))?,
                     style: *style,
                 },
                 ExprNode::Let {
@@ -1119,12 +1116,9 @@ impl<'c> Composer<'c> {
                     non_dependent,
                 } => ExprNode::Let {
                     declaration_name: declaration_name.clone(),
-                    type_: map_expr(*type_)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
-                    value: map_expr(*value)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
-                    body: map_expr(*body)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                    type_: map_expr(*type_).map_err(|halt| self.map_halt(halt))?,
+                    value: map_expr(*value).map_err(|halt| self.map_halt(halt))?,
+                    body: map_expr(*body).map_err(|halt| self.map_halt(halt))?,
                     non_dependent: *non_dependent,
                 },
                 ExprNode::NatLiteral { limbs_le } => ExprNode::NatLiteral {
@@ -1136,8 +1130,7 @@ impl<'c> Composer<'c> {
                     expression,
                 } => ExprNode::Metadata {
                     entries: entries.clone(),
-                    expression: map_expr(*expression)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                    expression: map_expr(*expression).map_err(|halt| self.map_halt(halt))?,
                 },
                 ExprNode::Projection {
                     structure_name,
@@ -1146,13 +1139,12 @@ impl<'c> Composer<'c> {
                 } => ExprNode::Projection {
                     structure_name: structure_name.clone(),
                     index: *index,
-                    expression: map_expr(*expression)
-                        .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?,
+                    expression: map_expr(*expression).map_err(|halt| self.map_halt(halt))?,
                 },
             };
             let id = self
                 .push_expression_charged(mapped, index)
-                .map_err(|halt| self.map_halt(WhnfPhase::RebuildApplication, halt))?;
+                .map_err(|halt| self.map_halt(halt))?;
             expression_mapping.push(id);
         }
 
@@ -1165,13 +1157,13 @@ impl<'c> Composer<'c> {
             }))
     }
 
-    fn map_halt(&self, phase: WhnfPhase, halt: ComposeHalt) -> Halt {
+    fn map_halt(&self, halt: ComposeHalt) -> Halt {
         match halt {
             ComposeHalt::Stop(stop) => Halt::Stop(WhnfStop::Materialization {
-                phase,
+                phase: self.phase,
                 stop,
-                completed_steps: 0,
-                completed_reductions: 0,
+                completed_steps: self.outer_steps,
+                completed_reductions: self.outer_reductions,
             }),
             ComposeHalt::Fault(fault) => Halt::Fault(fault),
         }
