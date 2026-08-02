@@ -530,11 +530,20 @@ fn normal_equal(
     Ok(true)
 }
 
-fn wire_equal(left: &WireLevel, right: &WireLevel) -> Result<bool, UniverseError> {
-    let mut pending = vec![(left.root(), right.root())];
+fn wire_equal(
+    left_nodes: &[LevelNode],
+    left_root: LevelId,
+    right_nodes: &[LevelNode],
+    right_root: LevelId,
+) -> Result<bool, UniverseError> {
+    let mut pending = vec![(left_root, right_root)];
     while let Some((left_id, right_id)) = pending.pop() {
-        let left_node = left.node(left_id).ok_or(UniverseError::InvalidArena)?;
-        let right_node = right.node(right_id).ok_or(UniverseError::InvalidArena)?;
+        let left_node = left_nodes
+            .get(left_id.index())
+            .ok_or(UniverseError::InvalidArena)?;
+        let right_node = right_nodes
+            .get(right_id.index())
+            .ok_or(UniverseError::InvalidArena)?;
         match (left_node, right_node) {
             (LevelNode::Zero, LevelNode::Zero) => {}
             (LevelNode::Succ(left), LevelNode::Succ(right)) => pending.push((*left, *right)),
@@ -552,6 +561,20 @@ fn wire_equal(left: &WireLevel, right: &WireLevel) -> Result<bool, UniverseError
     Ok(true)
 }
 
+pub(crate) fn level_roots_equal(
+    left_nodes: &[LevelNode],
+    left_root: LevelId,
+    right_nodes: &[LevelNode],
+    right_root: LevelId,
+) -> Result<bool, UniverseError> {
+    if wire_equal(left_nodes, left_root, right_nodes, right_root)? {
+        return Ok(true);
+    }
+    let left = Normalizer::new(left_nodes).run(left_root)?;
+    let right = Normalizer::new(right_nodes).run(right_root)?;
+    Ok(left.structurally_equals(&right))
+}
+
 /// Compute the checker-owned one-pass KR-500 form.
 pub fn normalize(level: &WireLevel) -> Result<NormalizedLevel, UniverseError> {
     Normalizer::new(level.nodes()).run(level.root())
@@ -559,10 +582,5 @@ pub fn normalize(level: &WireLevel) -> Result<NormalizedLevel, UniverseError> {
 
 /// KR-501: structural equality first, then equality of one-pass forms.
 pub fn levels_equal(left: &WireLevel, right: &WireLevel) -> Result<bool, UniverseError> {
-    if wire_equal(left, right)? {
-        return Ok(true);
-    }
-    let left = normalize(left)?;
-    let right = normalize(right)?;
-    Ok(left.structurally_equals(&right))
+    level_roots_equal(left.nodes(), left.root(), right.nodes(), right.root())
 }
