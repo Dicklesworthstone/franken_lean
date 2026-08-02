@@ -6,10 +6,11 @@
 //! term facts plus capture-avoiding rewrites. Public weak-head reduction eagerly
 //! unfolds safe definitions from an immutable checker-owned environment with
 //! independently instantiated universes. Slow conversion instead takes no-delta
-//! weak heads and selects one definition step by recorded height, giving the
-//! checker a deliberately separate KR-307/KR-309 strategy. The remaining equality
-//! rules and declaration checking stay on `franken_lean-gii`. The crate map and
-//! layering are governed by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
+//! weak heads, peels KR-308 Nat successor offsets without unary literal expansion,
+//! and selects one definition step by recorded height, giving the checker a
+//! deliberately separate KR-307/KR-309 strategy. General Nat arithmetic, the
+//! remaining equality rules, and declaration checking stay on `franken_lean-gii`.
+//! The crate map and layering are governed by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first
 //!

@@ -4,11 +4,11 @@
 //! treats metadata as transparent, ignores binder presentation, and compares
 //! `Sort` levels with this checker's independent universe relation. Deferred
 //! pairs continue through a slow worklist that first takes a no-delta weak head,
-//! then unfolds safe definition heads one step at a time in descending
-//! definitional-height order. Typing, eta, proof irrelevance, recursors, native
-//! computation, and literal expansion still produce a typed deferral. A
-//! deferral is not a rejection and this module is not a declaration-admission
-//! authority.
+//! checks KR-308 Nat successor offsets, then unfolds safe definition heads one
+//! step at a time in descending definitional-height order. General Nat
+//! arithmetic, typing, eta, proof irrelevance, recursors, native computation,
+//! and String expansion still produce a typed deferral. A deferral is not a
+//! rejection and this module is not a declaration-admission authority.
 
 use std::collections::BTreeSet;
 
@@ -18,7 +18,8 @@ use crate::whnf::{
     whnf_delta_step_at_with,
 };
 use crate::wire::{
-    ExprId, ExprNode, WireExpr, expression_owned_units, level_owned_units, usize_units,
+    ExprId, ExprNode, NamePart, WireExpr, WireName, expression_owned_units, level_owned_units,
+    usize_units,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +213,8 @@ pub struct DefEqProgress {
     pub whnf_steps: u64,
     pub whnf_reductions: u64,
     pub delta_unfolds: u64,
+    pub nat_offset_steps: u64,
+    pub nat_offset_limb_steps: u64,
     pub materialized_arena_nodes: u64,
     pub materialized_owned_units: u64,
 }
@@ -235,6 +238,10 @@ pub enum DefEqMismatch {
         right: DefEqLocation,
     },
     StringLiterals {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
+    NatOffsets {
         left: DefEqLocation,
         right: DefEqLocation,
     },
@@ -278,6 +285,9 @@ pub enum DefEqFault {
         left: DefEqLocation,
         right: DefEqLocation,
         error: UniverseError,
+    },
+    NonCanonicalNatLiteral {
+        location: DefEqLocation,
     },
     Whnf {
         side: DefEqSide,
@@ -736,6 +746,11 @@ struct SlowControl {
     polls: u64,
 }
 
+struct OffsetMaterialization {
+    arena_nodes: u64,
+    owned_units: u64,
+}
+
 impl SlowControl {
     fn new(budget: DefEqBudget, quick_comparisons: u64) -> SlowControl {
         SlowControl {
@@ -772,6 +787,58 @@ impl SlowControl {
         }
         self.progress.slow_comparisons = observed;
         Ok(())
+    }
+
+    fn nat_offset_step(&mut self) {
+        self.progress.nat_offset_steps = self.progress.nat_offset_steps.saturating_add(1);
+    }
+
+    fn nat_offset_limb(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<(), SlowHalt> {
+        self.comparison(cancelled)?;
+        self.progress.nat_offset_limb_steps = self.progress.nat_offset_limb_steps.saturating_add(1);
+        Ok(())
+    }
+
+    fn prepare_offset_materialization(
+        &mut self,
+        arena_nodes: u64,
+        owned_units: u64,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<OffsetMaterialization, SlowHalt> {
+        self.poll(cancelled)?;
+        let observed_nodes = self
+            .progress
+            .materialized_arena_nodes
+            .saturating_add(arena_nodes);
+        if observed_nodes > self.budget.max_materialized_arena_nodes {
+            return Err(SlowHalt::Stop(Box::new(DefEqStop::Resource {
+                limit: DefEqLimit::MaterializedArenaNodes,
+                allowed: self.budget.max_materialized_arena_nodes,
+                observed: observed_nodes,
+                progress: self.progress,
+            })));
+        }
+        let observed_units = self
+            .progress
+            .materialized_owned_units
+            .saturating_add(owned_units);
+        if observed_units > self.budget.max_materialized_owned_units {
+            return Err(SlowHalt::Stop(Box::new(DefEqStop::Resource {
+                limit: DefEqLimit::MaterializedOwnedUnits,
+                allowed: self.budget.max_materialized_owned_units,
+                observed: observed_units,
+                progress: self.progress,
+            })));
+        }
+        Ok(OffsetMaterialization {
+            arena_nodes: observed_nodes,
+            owned_units: observed_units,
+        })
+    }
+
+    fn commit_offset_materialization(&mut self, admission: OffsetMaterialization) {
+        self.progress.materialized_arena_nodes = admission.arena_nodes;
+        self.progress.materialized_owned_units = admission.owned_units;
     }
 
     fn begin_normalization(
@@ -1210,6 +1277,262 @@ fn compare_pair(
     }
 }
 
+fn wire_name_is_two(name: &WireName, namespace: &str, leaf: &str) -> bool {
+    matches!(
+        name.parts(),
+        [NamePart::Text(actual_namespace), NamePart::Text(actual_leaf)]
+            if actual_namespace == namespace && actual_leaf == leaf
+    )
+}
+
+#[derive(Clone, Copy)]
+enum NatOffsetShape {
+    Zero,
+    Successor(NatPredecessor),
+    Other,
+}
+
+#[derive(Clone, Copy)]
+enum NatPredecessor {
+    Symbolic(DefEqTerm),
+    Literal(DefEqTerm),
+}
+
+enum NatOffsetAction {
+    NoMatch,
+    Equal,
+    NotEqual(DefEqMismatch),
+    Peel(DefEqTerm, DefEqTerm),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NatOffsetContext {
+    Fresh,
+    PairedPeel,
+}
+
+fn nat_offset_shape(
+    reference: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<NatOffsetShape, SlowHalt> {
+    control.comparison(cancelled)?;
+    let term = sources.source(reference)?;
+    let node = term
+        .node(reference.root)
+        .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+            location: reference.location(),
+        }))?;
+    match node {
+        ExprNode::NatLiteral { limbs_le } => {
+            if limbs_le.is_empty() {
+                Ok(NatOffsetShape::Zero)
+            } else if limbs_le.last() == Some(&0) {
+                Err(SlowHalt::Fault(DefEqFault::NonCanonicalNatLiteral {
+                    location: reference.location(),
+                }))
+            } else {
+                Ok(NatOffsetShape::Successor(NatPredecessor::Literal(
+                    reference,
+                )))
+            }
+        }
+        ExprNode::Constant { name, levels }
+            if levels.is_empty() && wire_name_is_two(name, "Nat", "zero") =>
+        {
+            Ok(NatOffsetShape::Zero)
+        }
+        ExprNode::Apply { function, argument } => {
+            let function_reference = child(reference, *function)?;
+            let function_node =
+                term.node(*function)
+                    .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                        location: function_reference.location(),
+                    }))?;
+            if matches!(
+                function_node,
+                ExprNode::Constant { name, levels }
+                    if levels.is_empty() && wire_name_is_two(name, "Nat", "succ")
+            ) {
+                Ok(NatOffsetShape::Successor(NatPredecessor::Symbolic(child(
+                    reference, *argument,
+                )?)))
+            } else {
+                Ok(NatOffsetShape::Other)
+            }
+        }
+        ExprNode::Bound { .. }
+        | ExprNode::Free { .. }
+        | ExprNode::Meta { .. }
+        | ExprNode::Sort { .. }
+        | ExprNode::Constant { .. }
+        | ExprNode::Lambda { .. }
+        | ExprNode::Forall { .. }
+        | ExprNode::Let { .. }
+        | ExprNode::StringLiteral(_)
+        | ExprNode::Metadata { .. }
+        | ExprNode::Projection { .. } => Ok(NatOffsetShape::Other),
+    }
+}
+
+fn materialize_nat_literal_predecessor(
+    reference: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<WireExpr, SlowHalt> {
+    let term = sources.source(reference)?;
+    let node = term
+        .node(reference.root)
+        .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+            location: reference.location(),
+        }))?;
+    let ExprNode::NatLiteral { limbs_le } = node else {
+        return Err(SlowHalt::Fault(DefEqFault::NonCanonicalNatLiteral {
+            location: reference.location(),
+        }));
+    };
+    if limbs_le.is_empty() || limbs_le.last() == Some(&0) {
+        return Err(SlowHalt::Fault(DefEqFault::NonCanonicalNatLiteral {
+            location: reference.location(),
+        }));
+    }
+
+    let mut first_nonzero = None;
+    for (index, limb) in limbs_le.iter().enumerate() {
+        control.nat_offset_limb(cancelled)?;
+        if *limb != 0 {
+            first_nonzero = Some(index);
+            break;
+        }
+    }
+    let first_nonzero =
+        first_nonzero.ok_or(SlowHalt::Fault(DefEqFault::NonCanonicalNatLiteral {
+            location: reference.location(),
+        }))?;
+    let last = limbs_le.len() - 1;
+    let output_len = if first_nonzero == last && limbs_le[last] == 1 {
+        last
+    } else {
+        limbs_le.len()
+    };
+    let admission = control.prepare_offset_materialization(
+        1,
+        1_u64.saturating_add(usize_units(output_len)),
+        cancelled,
+    )?;
+
+    let mut predecessor = Vec::with_capacity(output_len);
+    for (index, limb) in limbs_le.iter().copied().take(output_len).enumerate() {
+        control.nat_offset_limb(cancelled)?;
+        predecessor.push(if index < first_nonzero {
+            u64::MAX
+        } else if index == first_nonzero {
+            limb - 1
+        } else {
+            limb
+        });
+    }
+    let root =
+        ExprId::from_index(0).ok_or(SlowHalt::Fault(DefEqFault::NonCanonicalNatLiteral {
+            location: reference.location(),
+        }))?;
+    control.commit_offset_materialization(admission);
+    Ok(WireExpr::from_parts(
+        vec![ExprNode::NatLiteral {
+            limbs_le: predecessor,
+        }],
+        Vec::new(),
+        root,
+    ))
+}
+
+fn resolve_nat_predecessor(
+    predecessor: NatPredecessor,
+    side: DefEqSide,
+    left: &WireExpr,
+    right: &WireExpr,
+    generated: &mut Vec<WireExpr>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<DefEqTerm, SlowHalt> {
+    match predecessor {
+        NatPredecessor::Symbolic(reference) => Ok(reference),
+        NatPredecessor::Literal(reference) => {
+            let predecessor = materialize_nat_literal_predecessor(
+                reference,
+                TermSources::new(left, right, generated),
+                control,
+                cancelled,
+            )?;
+            Ok(retain_generated(generated, side, predecessor))
+        }
+    }
+}
+
+fn nat_offset_action(
+    references: (DefEqTerm, DefEqTerm),
+    left: &WireExpr,
+    right: &WireExpr,
+    generated: &mut Vec<WireExpr>,
+    offset_context: NatOffsetContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<NatOffsetAction, SlowHalt> {
+    let (left_reference, right_reference) = references;
+    let left_shape = nat_offset_shape(
+        left_reference,
+        TermSources::new(left, right, generated),
+        control,
+        cancelled,
+    )?;
+    let right_shape = nat_offset_shape(
+        right_reference,
+        TermSources::new(left, right, generated),
+        control,
+        cancelled,
+    )?;
+    match (left_shape, right_shape) {
+        (NatOffsetShape::Zero, NatOffsetShape::Zero) => Ok(NatOffsetAction::Equal),
+        (NatOffsetShape::Zero, NatOffsetShape::Successor(_))
+        | (NatOffsetShape::Successor(_), NatOffsetShape::Zero)
+            if offset_context == NatOffsetContext::PairedPeel =>
+        {
+            Ok(NatOffsetAction::NotEqual(DefEqMismatch::NatOffsets {
+                left: left_reference.location(),
+                right: right_reference.location(),
+            }))
+        }
+        (
+            NatOffsetShape::Successor(left_predecessor),
+            NatOffsetShape::Successor(right_predecessor),
+        ) => {
+            control.nat_offset_step();
+            let next_left = resolve_nat_predecessor(
+                left_predecessor,
+                DefEqSide::Left,
+                left,
+                right,
+                generated,
+                control,
+                cancelled,
+            )?;
+            let next_right = resolve_nat_predecessor(
+                right_predecessor,
+                DefEqSide::Right,
+                left,
+                right,
+                generated,
+                control,
+                cancelled,
+            )?;
+            Ok(NatOffsetAction::Peel(next_left, next_right))
+        }
+        _ => Ok(NatOffsetAction::NoMatch),
+    }
+}
+
 fn definition_height(
     reference: DefEqTerm,
     sources: TermSources<'_>,
@@ -1323,25 +1646,28 @@ fn run_slow(
     let mut pending = vec![(
         DefEqTerm::original(DefEqSide::Left, left.root()),
         DefEqTerm::original(DefEqSide::Right, right.root()),
+        NatOffsetContext::Fresh,
     )];
     let mut seen = BTreeSet::new();
 
-    while let Some((left_reference, right_reference)) = pending.pop() {
-        if !seen.insert((left_reference, right_reference)) {
+    while let Some((left_reference, right_reference, offset_context)) = pending.pop() {
+        if !seen.insert((left_reference, right_reference, offset_context)) {
             continue;
         }
         control.comparison(cancelled)?;
         match compare_pair(left_reference, right_reference, left, right, &generated)? {
             PairAction::Done => {}
-            PairAction::Push1(pair) => pending.push(pair),
+            PairAction::Push1((next_left, next_right)) => {
+                pending.push((next_left, next_right, offset_context));
+            }
             PairAction::Push2(first, second) => {
-                pending.push(second);
-                pending.push(first);
+                pending.push((second.0, second.1, offset_context));
+                pending.push((first.0, first.1, offset_context));
             }
             PairAction::Push3(first, second, third) => {
-                pending.push(third);
-                pending.push(second);
-                pending.push(first);
+                pending.push((third.0, third.1, offset_context));
+                pending.push((second.0, second.1, offset_context));
+                pending.push((first.0, first.1, offset_context));
             }
             PairAction::NotEqual(mismatch) => {
                 return Ok(DefEqOutcome::NotEqual {
@@ -1350,6 +1676,29 @@ fn run_slow(
                 });
             }
             PairAction::Normalize(need) => {
+                match nat_offset_action(
+                    (left_reference, right_reference),
+                    left,
+                    right,
+                    &mut generated,
+                    offset_context,
+                    &mut control,
+                    cancelled,
+                )? {
+                    NatOffsetAction::NoMatch => {}
+                    NatOffsetAction::Equal => continue,
+                    NatOffsetAction::NotEqual(mismatch) => {
+                        return Ok(DefEqOutcome::NotEqual {
+                            mismatch,
+                            progress: control.progress,
+                        });
+                    }
+                    NatOffsetAction::Peel(next_left, next_right) => {
+                        pending.push((next_left, next_right, NatOffsetContext::PairedPeel));
+                        continue;
+                    }
+                }
+
                 let left_result = normalize(
                     left_reference,
                     TermSources::new(left, right, &generated),
@@ -1379,7 +1728,7 @@ fn run_slow(
                     } else {
                         right_reference
                     };
-                    pending.push((next_left, next_right));
+                    pending.push((next_left, next_right, offset_context));
                     continue;
                 }
 
@@ -1447,7 +1796,7 @@ fn run_slow(
                     }
                     next_right = retain_generated(&mut generated, DefEqSide::Right, result.term);
                 }
-                pending.push((next_left, next_right));
+                pending.push((next_left, next_right, offset_context));
             }
         }
     }
@@ -1586,6 +1935,39 @@ mod tests {
                     child: 0,
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn a_noncanonical_private_nat_literal_faults_before_offset_materialization() {
+        let root = ExprId::from_index(0).expect("zero expression index");
+        let noncanonical = WireExpr::from_parts(
+            vec![ExprNode::NatLiteral { limbs_le: vec![0] }],
+            Vec::new(),
+            root,
+        );
+        let other = WireExpr::from_parts(
+            vec![ExprNode::Constant {
+                name: WireName::default(),
+                levels: Vec::new(),
+            }],
+            Vec::new(),
+            root,
+        );
+        assert_eq!(
+            def_eq(
+                &noncanonical,
+                &other,
+                &WhnfContext::default(),
+                DefEqBudget::unlimited(),
+            ),
+            DefEqOutcome::InternalFault(DefEqFault::NonCanonicalNatLiteral {
+                location: DefEqLocation {
+                    side: DefEqSide::Left,
+                    generation: 0,
+                    index: 0,
+                },
+            })
         );
     }
 }

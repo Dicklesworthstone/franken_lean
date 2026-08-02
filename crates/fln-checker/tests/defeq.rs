@@ -32,6 +32,26 @@ fn constant(component: impl Into<String>) -> Expr {
     Expr::const_(name(component), Vec::new())
 }
 
+fn qualified(namespace: &str, leaf: &str) -> Name {
+    Name::str(Name::str(Name::anonymous(), namespace), leaf)
+}
+
+fn nat_zero() -> Expr {
+    Expr::const_(qualified("Nat", "zero"), Vec::new())
+}
+
+fn nat_succ(value: Expr) -> Expr {
+    Expr::app(Expr::const_(qualified("Nat", "succ"), Vec::new()), value)
+}
+
+fn nat_literal(value: u64) -> Expr {
+    Expr::lit(Literal::Nat(NatLit::from_u64(value)))
+}
+
+fn nat_limbs(limbs_le: Vec<u64>) -> Expr {
+    Expr::lit(Literal::Nat(NatLit::from_limbs_le(limbs_le)))
+}
+
 fn decoded(expression: &Expr) -> WireExpr {
     match decode_expr(&expression.to_canonical_bytes(), DecodeBudget::unlimited()) {
         DecodeOutcome::Complete(Ok(value)) => value,
@@ -239,7 +259,7 @@ fn pure_conversion_preserves_pending_siblings_across_beta_reduction() {
     let right = decoded(&Expr::app(function, argument));
     let progress = slow_equal(&left, &right, &WhnfContext::default());
     assert_eq!(progress.quick_comparisons, 2);
-    assert_eq!(progress.slow_comparisons, 5);
+    assert_eq!(progress.slow_comparisons, 9);
     assert_eq!(progress.normalizations, 4);
     assert_eq!(progress.whnf_reductions, 2);
     assert_eq!(progress.materialized_arena_nodes, 4);
@@ -687,6 +707,250 @@ fn lazy_delta_resources_cancellation_and_recursion_are_typed_and_recoverable() {
 }
 
 #[test]
+fn nat_offsets_close_zero_successors_and_a_terminal_mismatch_exactly() {
+    let context = WhnfContext::default();
+    let zero = decoded(&nat_zero());
+    let literal_zero = decoded(&nat_literal(0));
+    let zero_progress = slow_equal(&zero, &literal_zero, &context);
+    assert_eq!(zero_progress.nat_offset_steps, 0);
+    assert_eq!(zero_progress.materialized_arena_nodes, 0);
+
+    for (left, right) in [
+        (nat_literal(1), nat_succ(nat_zero())),
+        (nat_succ(nat_zero()), nat_literal(1)),
+        (nat_succ(nat_literal(4)), nat_literal(5)),
+        (nat_literal(5), nat_succ(nat_literal(4))),
+    ] {
+        let progress = slow_equal(&decoded(&left), &decoded(&right), &context);
+        assert_eq!(progress.nat_offset_steps, 1);
+        assert_eq!(progress.materialized_arena_nodes, 1);
+    }
+
+    assert!(matches!(
+        def_eq(
+            &decoded(&nat_literal(2)),
+            &decoded(&nat_succ(nat_zero())),
+            &context,
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::NotEqual {
+            mismatch: DefEqMismatch::NatOffsets { .. },
+            progress: fln_checker::defeq::DefEqProgress {
+                nat_offset_steps: 1,
+                ..
+            },
+        }
+    ));
+    assert!(matches!(
+        def_eq(
+            &decoded(&nat_zero()),
+            &decoded(&nat_succ(constant("arbitrary_predecessor"))),
+            &context,
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Deferred { .. }
+    ));
+}
+
+#[test]
+fn generated_nat_offset_orientations_match_their_direct_predecessors() {
+    const CASES: usize = 320;
+    for index in 0..CASES {
+        let predecessor = (index as u64).saturating_mul(1_000_003).saturating_add(17);
+        let literal = nat_literal(predecessor.saturating_add(1));
+        let successor = nat_succ(nat_literal(predecessor));
+        let (left, right) = if index % 2 == 0 {
+            (literal, successor)
+        } else {
+            (successor, literal)
+        };
+        let progress = slow_equal(&decoded(&left), &decoded(&right), &WhnfContext::default());
+        assert_eq!(
+            progress.nat_offset_steps, 1,
+            "generated offset orientation drifted at case {index}"
+        );
+    }
+}
+
+#[test]
+fn nat_offset_large_limbs_are_direct_and_shape_guards_do_not_fire() {
+    let huge = nat_limbs(vec![0, 1]);
+    let huge_predecessor = nat_limbs(vec![u64::MAX]);
+    let progress = slow_equal(
+        &decoded(&huge),
+        &decoded(&nat_succ(huge_predecessor)),
+        &WhnfContext::default(),
+    );
+    assert_eq!(progress.nat_offset_steps, 1);
+    assert_eq!(progress.nat_offset_limb_steps, 3);
+    assert_eq!(progress.materialized_arena_nodes, 1);
+    assert_eq!(progress.materialized_owned_units, 2);
+
+    let zero_with_level = Expr::const_(qualified("Nat", "zero"), vec![Level::zero()]);
+    let succ_with_level = Expr::app(
+        Expr::const_(qualified("Nat", "succ"), vec![Level::zero()]),
+        nat_zero(),
+    );
+    let over_applied = Expr::app(nat_succ(nat_zero()), constant("extra"));
+    for guarded in [
+        zero_with_level,
+        succ_with_level,
+        over_applied,
+        constant("Nat.zero"),
+    ] {
+        assert!(matches!(
+            def_eq(
+                &decoded(&guarded),
+                &decoded(&nat_literal(0)),
+                &WhnfContext::default(),
+                DefEqBudget::unlimited(),
+            ),
+            DefEqOutcome::Deferred { .. }
+        ));
+    }
+}
+
+#[test]
+fn delta_exposed_nat_offsets_rerun_before_the_next_definition_step() {
+    let context = definition_context(vec![
+        definition_entry(
+            "two",
+            decoded(&nat_literal(2)),
+            ReducibilityHint::Regular(8),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "zero_alias",
+            decoded(&nat_literal(0)),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+    ]);
+
+    let two = slow_equal(
+        &decoded(&constant("two")),
+        &decoded(&nat_succ(nat_succ(nat_zero()))),
+        &context,
+    );
+    assert_eq!(two.delta_unfolds, 1);
+    assert_eq!(two.nat_offset_steps, 2);
+
+    let zero = slow_equal(
+        &decoded(&constant("zero_alias")),
+        &decoded(&nat_zero()),
+        &context,
+    );
+    assert_eq!(zero.delta_unfolds, 1);
+    assert_eq!(zero.nat_offset_steps, 0);
+}
+
+#[test]
+fn nat_offset_materialization_resources_cancellation_and_recovery_are_exact() {
+    const LIMBS: usize = 64;
+    let mut value_limbs = vec![0; LIMBS];
+    value_limbs[LIMBS - 1] = 1;
+    let predecessor_limbs = vec![u64::MAX; LIMBS - 1];
+    let value = decoded(&nat_limbs(value_limbs));
+    let successor = decoded(&nat_succ(nat_limbs(predecessor_limbs)));
+
+    let budget = |nodes, owned| {
+        DefEqBudget::new(
+            QuickDefEqBudget::unlimited(),
+            u64::MAX,
+            u64::MAX,
+            nodes,
+            owned,
+            WhnfBudget::unlimited(),
+        )
+    };
+    assert!(matches!(
+        def_eq(
+            &value,
+            &successor,
+            &WhnfContext::default(),
+            budget(0, u64::MAX),
+        ),
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::MaterializedArenaNodes,
+            allowed: 0,
+            observed: 1,
+            progress: fln_checker::defeq::DefEqProgress {
+                materialized_arena_nodes: 0,
+                materialized_owned_units: 0,
+                ..
+            },
+        })
+    ));
+    assert!(matches!(
+        def_eq(
+            &value,
+            &successor,
+            &WhnfContext::default(),
+            budget(u64::MAX, LIMBS as u64 - 1),
+        ),
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::MaterializedOwnedUnits,
+            allowed,
+            observed,
+            progress: fln_checker::defeq::DefEqProgress {
+                materialized_arena_nodes: 0,
+                materialized_owned_units: 0,
+                ..
+            },
+        }) if allowed == LIMBS as u64 - 1 && observed == LIMBS as u64
+    ));
+
+    let exact = match def_eq(
+        &value,
+        &successor,
+        &WhnfContext::default(),
+        budget(1, LIMBS as u64),
+    ) {
+        DefEqOutcome::Equal(progress) => progress,
+        other => panic!("exact Nat offset materialization budget did not pass: {other:?}"),
+    };
+    assert_eq!(exact.materialized_arena_nodes, 1);
+    assert_eq!(exact.materialized_owned_units, LIMBS as u64);
+
+    let mut saw_copy_cancellation = false;
+    for cancel_at in 1_u64..=512 {
+        let mut polls = 0_u64;
+        let interrupted = def_eq_with(
+            &value,
+            &successor,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+            || {
+                polls = polls.saturating_add(1);
+                polls >= cancel_at
+            },
+        );
+        if matches!(
+            interrupted,
+            DefEqOutcome::Inconclusive(DefEqStop::Cancelled {
+                progress: fln_checker::defeq::DefEqProgress {
+                    nat_offset_limb_steps,
+                    materialized_arena_nodes: 0,
+                    materialized_owned_units: 0,
+                    ..
+                },
+                ..
+            }) if nat_offset_limb_steps > LIMBS as u64
+        ) {
+            saw_copy_cancellation = true;
+            break;
+        }
+    }
+    assert!(
+        saw_copy_cancellation,
+        "cancellation must be observable after predecessor copying begins"
+    );
+    let recovered = slow_equal(&value, &successor, &WhnfContext::default());
+    assert_eq!(recovered.materialized_arena_nodes, 1);
+    assert_eq!(recovered.materialized_owned_units, LIMBS as u64);
+}
+
+#[test]
 fn rigid_negative_can_be_discovered_after_pure_reduction() {
     let one = Expr::lit(Literal::Nat(NatLit::from_u64(1)));
     let two = Expr::lit(Literal::Nat(NatLit::from_u64(2)));
@@ -1042,7 +1306,7 @@ fn deep_slow_child() -> Result<(), String> {
         DefEqOutcome::Equal(progress)
             if progress.quick_comparisons == 1
                 && progress.slow_comparisons
-                    == DEPTH.saturating_mul(2).saturating_add(2) as u64
+                    == DEPTH.saturating_mul(2).saturating_add(4) as u64
                 && progress.normalizations == 2
                 && progress.whnf_reductions == 1
                 && progress.materialized_arena_nodes
@@ -1117,7 +1381,7 @@ fn deep_lazy_delta_child() -> Result<(), String> {
         DefEqOutcome::Equal(progress)
             if progress.quick_comparisons == 1
                 && progress.slow_comparisons
-                    == DEPTH.saturating_mul(3).saturating_add(1) as u64
+                    == DEPTH.saturating_mul(5).saturating_add(1) as u64
                 && progress.normalizations == DEPTH.saturating_mul(3) as u64
                 && progress.whnf_reductions == DEPTH as u64
                 && progress.delta_unfolds == DEPTH as u64
@@ -1157,6 +1421,96 @@ fn deep_lazy_delta_conversion_fits_a_64k_stack() {
     assert!(
         output.status.success(),
         "bounded-stack lazy-delta child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn write_nat_constant(writer: &mut CanonWriter, leaf: &str) {
+    writer.u8(4);
+    writer.u64(2);
+    writer.u8(1);
+    writer.str("Nat");
+    writer.u8(1);
+    writer.str(leaf);
+    writer.u64(0);
+}
+
+fn deep_nat_successors(depth: usize) -> Result<WireExpr, String> {
+    let mut writer = CanonWriter::new();
+    writer.schema(SCHEMA_EXPR);
+    for _ in 0..depth {
+        writer.u8(5);
+        write_nat_constant(&mut writer, "succ");
+    }
+    write_nat_constant(&mut writer, "zero");
+    match decode_expr(&writer.into_bytes(), DecodeBudget::unlimited()) {
+        DecodeOutcome::Complete(Ok(value)) => Ok(value),
+        other => Err(format!(
+            "deep Nat successor expression did not decode: {other:?}"
+        )),
+    }
+}
+
+fn deep_nat_offset_child() -> Result<(), String> {
+    const DEPTH: usize = 50_000;
+    let left = deep_nat_successors(DEPTH)?;
+    let right = decoded(&nat_literal(DEPTH as u64));
+    match def_eq(
+        &left,
+        &right,
+        &WhnfContext::default(),
+        DefEqBudget::unlimited(),
+    ) {
+        DefEqOutcome::Equal(progress)
+            if progress.quick_comparisons == 1
+                && progress.slow_comparisons
+                    == DEPTH.saturating_mul(5).saturating_add(2) as u64
+                && progress.normalizations == 0
+                && progress.whnf_steps == 0
+                && progress.whnf_reductions == 0
+                && progress.delta_unfolds == 0
+                && progress.nat_offset_steps == DEPTH as u64
+                && progress.nat_offset_limb_steps
+                    == DEPTH.saturating_mul(2).saturating_sub(1) as u64
+                && progress.materialized_arena_nodes == DEPTH as u64
+                && progress.materialized_owned_units
+                    == DEPTH.saturating_mul(2).saturating_sub(1) as u64 =>
+        {
+            Ok(())
+        }
+        other => Err(format!("deep Nat offset conversion drifted: {other:?}")),
+    }
+}
+
+#[test]
+fn deep_nat_offset_conversion_fits_a_64k_stack() {
+    const CHILD_ENV: &str = "FLN_CHECKER_NAT_OFFSET_DEEP_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let result = std::thread::Builder::new()
+            .name("fln-checker-nat-offset-deep".to_owned())
+            .stack_size(64 * 1024)
+            .spawn(deep_nat_offset_child)
+            .expect("spawn bounded-stack Nat offset child thread")
+            .join()
+            .expect("bounded-stack Nat offset child thread did not panic");
+        result.expect("bounded-stack Nat offset conversion");
+        return;
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = Command::new(executable)
+        .env(CHILD_ENV, "1")
+        .args([
+            "--exact",
+            "deep_nat_offset_conversion_fits_a_64k_stack",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run bounded-stack Nat offset child process");
+    assert!(
+        output.status.success(),
+        "bounded-stack Nat offset child failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
