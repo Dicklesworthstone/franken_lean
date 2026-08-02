@@ -58,7 +58,9 @@ const SEEDED_REMAINDER: &[(&str, &str)] = &[
     ),
     (
         "franken_lean-83r",
-        "stage0 gauntlet; 8 landed subjects, likely next done-but-open close",
+        "adjudicated: multi-slice epic, slices 1-5 landed (stage0 executes on Marrow \
+         incl. the 5-TU module DAG); runtime-suite half legitimately open on \
+         fln-3gv's IO plane",
     ),
     (
         "franken_lean-d17i",
