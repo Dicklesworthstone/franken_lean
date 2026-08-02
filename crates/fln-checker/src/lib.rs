@@ -327,4 +327,5 @@ pub mod instantiate;
 pub mod policy;
 pub mod term;
 pub mod universe;
+pub mod whnf;
 pub mod wire;

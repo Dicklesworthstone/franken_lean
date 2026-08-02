@@ -478,7 +478,8 @@ enum Task {
 
 struct Transformer<'a, 'c> {
     subject: &'a WireExpr,
-    replacement: Option<&'a WireExpr>,
+    subject_root: ExprId,
+    replacement: Option<(&'a WireExpr, ExprId)>,
     operation: Operation<'a>,
     control: Control<'c>,
     nodes: Vec<ExprNode>,
@@ -492,13 +493,18 @@ impl<'a, 'c> Transformer<'a, 'c> {
     fn input(&self, input: TermInput) -> Result<&'a WireExpr, Halt> {
         match input {
             TermInput::Subject => Ok(self.subject),
-            TermInput::Replacement => {
-                self.replacement
-                    .ok_or(Halt::Fault(TermFault::MissingExpression {
-                        input,
-                        index: 0,
-                    }))
-            }
+            TermInput::Replacement => self.replacement.map(|(term, _)| term).ok_or(Halt::Fault(
+                TermFault::MissingExpression { input, index: 0 },
+            )),
+        }
+    }
+
+    fn root(&self, input: TermInput) -> Result<ExprId, Halt> {
+        match input {
+            TermInput::Subject => Ok(self.subject_root),
+            TermInput::Replacement => self.replacement.map(|(_, root)| root).ok_or(Halt::Fault(
+                TermFault::MissingExpression { input, index: 0 },
+            )),
         }
     }
 
@@ -717,10 +723,9 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     let sought = u64::from(target).saturating_add(scope);
                     match u64::from(index).cmp(&sought) {
                         std::cmp::Ordering::Equal => {
-                            let replacement = self.input(TermInput::Replacement)?;
                             self.tasks.push(Task::Visit {
                                 input: TermInput::Replacement,
-                                id: replacement.root(),
+                                id: self.root(TermInput::Replacement)?,
                                 mode: Mode::Raise {
                                     amount: scope,
                                     cutoff: 0,
@@ -824,10 +829,9 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     );
                 }
                 FreeAction::Replace { scope } => {
-                    let replacement = self.input(TermInput::Replacement)?;
                     self.tasks.push(Task::Visit {
                         input: TermInput::Replacement,
-                        id: replacement.root(),
+                        id: self.root(TermInput::Replacement)?,
                         mode: Mode::Raise {
                             amount: scope,
                             cutoff: 0,
@@ -1060,7 +1064,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
     fn run(mut self, root_mode: Mode) -> Result<WireExpr, Halt> {
         self.tasks.push(Task::Visit {
             input: TermInput::Subject,
-            id: self.subject.root(),
+            id: self.subject_root,
             mode: root_mode,
         });
         while let Some(task) = self.tasks.pop() {
@@ -1087,8 +1091,29 @@ fn transform_with(
     budget: TermBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> TermOutcome<WireExpr> {
+    transform_subterms_with(
+        subject,
+        subject.root(),
+        replacement.map(|term| (term, term.root())),
+        operation,
+        root_mode,
+        budget,
+        cancelled,
+    )
+}
+
+fn transform_subterms_with(
+    subject: &WireExpr,
+    subject_root: ExprId,
+    replacement: Option<(&WireExpr, ExprId)>,
+    operation: Operation<'_>,
+    root_mode: Mode,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<WireExpr> {
     let transformer = Transformer {
         subject,
+        subject_root,
         replacement,
         operation,
         control: Control::new(budget, cancelled),
@@ -1099,6 +1124,43 @@ fn transform_with(
         tasks: Vec::new(),
     };
     outcome(transformer.run(root_mode))
+}
+
+pub(crate) fn copy_subterm_with(
+    term: &WireExpr,
+    root: ExprId,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<WireExpr> {
+    transform_subterms_with(
+        term,
+        root,
+        None,
+        Operation::Raise,
+        Mode::Rewrite { scope: 0 },
+        budget,
+        cancelled,
+    )
+}
+
+pub(crate) fn substitute_bound_subterms_with(
+    term: &WireExpr,
+    root: ExprId,
+    index: u32,
+    replacement: &WireExpr,
+    replacement_root: ExprId,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<WireExpr> {
+    transform_subterms_with(
+        term,
+        root,
+        Some((replacement, replacement_root)),
+        Operation::Bound { target: index },
+        Mode::Rewrite { scope: 0 },
+        budget,
+        cancelled,
+    )
 }
 
 /// Raise every external bound index at or above `cutoff` by `amount`.
