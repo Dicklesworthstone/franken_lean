@@ -23,13 +23,23 @@ Output: NDJSON, schema fln-facade-resistance/1, sorted by (bucket, name).
 """
 
 import argparse
+import json
 import os
 import re
 import sys
 from collections import Counter
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ENV = os.path.join(REPO, "contracts", "builtin_environment.tsv")
+# The environment census is SHARDED (fln-census-out-of-git-2ya9): three
+# observation shards, dot-numbered BEFORE the extension. Reading only the first
+# silently manufactured 122 phantom orphans once — names present in shards 001
+# and 002 scored "no constant row". The completeness check below makes a missing
+# shard a refusal, never a quiet under-join.
+ENV_SHARDS = [
+    os.path.join(REPO, "contracts", "builtin_environment.tsv"),
+    os.path.join(REPO, "contracts", "builtin_environment.001.tsv"),
+    os.path.join(REPO, "contracts", "builtin_environment.002.tsv"),
+]
 PARTITION = os.path.join(REPO, "contracts", "builtin_partition.tsv")
 SCHEMA = "fln-facade-resistance/1"
 
@@ -72,13 +82,38 @@ def scan_demand(corpus_dir):
             if not f.endswith(".lean"):
                 continue
             files += 1
-            text = open(os.path.join(dirpath, f), encoding="utf-8", errors="replace").read()
+            with open(os.path.join(dirpath, f), encoding="utf-8", errors="replace") as sfh:
+                text = sfh.read()
             for m in rx.finditer(text):
                 demanded.add(f"Lean.{m.group(1)}")
     if files == 0:
         raise SystemExit(f"REFUSE: no .lean files under {corpus_dir} — an empty scan "
                          "would report an empty demand, which reads as no dependence")
     return files, demanded
+
+
+def load_exact_demand(path):
+    """Symbol rows of fln-facade-demand-exact/1: dotted name -> carried structural
+    census key (raw probe form). The key is carried, never re-derived from the
+    dotted name, which collapses numeric components into strings."""
+    exact = {}
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(
+                    f"REFUSE: {path}:{lineno} is not JSON ({exc})") from exc
+            if row.get("kind") == "symbol":
+                if "census_key" not in row:
+                    raise SystemExit(
+                        f"REFUSE: {path}:{lineno} symbol row carries no census_key "
+                        "— regenerate the exact-demand artifact first")
+                exact[row["name"]] = '"' + row["census_key"].replace('"', '\\"') + '"'
+    if not exact:
+        raise SystemExit(f"REFUSE: no symbol rows in {path} — an empty exact demand "
+                         "would silently shrink the union to the lexical scan")
+    return exact
 
 
 def bucket_of(row):
@@ -94,11 +129,30 @@ def bucket_of(row):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", required=True, help="a real tactic-source tree")
+    ap.add_argument("--exact-demand",
+                    help="fln-facade-demand-exact/1 NDJSON; when given, the demand "
+                         "is the UNION of the lexical scan and the exact elaborated "
+                         "set, each symbol row carrying its provenance")
     ap.add_argument("--out")
     args = ap.parse_args()
 
     files, demanded = scan_demand(args.corpus)
-    keys = {key_of(n): n for n in demanded}
+    exact = load_exact_demand(args.exact_demand) if args.exact_demand else {}
+    provenance = {}
+    keys = {}
+    for n in demanded:
+        keys[key_of(n)] = n
+        provenance[n] = "lexical"
+    for n, cell in exact.items():
+        if n in provenance and key_of(n) != cell:
+            # Two spellings of one key would join the same name twice and count
+            # it in two rows; a dotted name that does not round-trip means the
+            # "both" classification itself is unsound for this symbol.
+            raise SystemExit(f"REFUSE: {n} is in both demand sources but its "
+                             f"carried key {cell!r} differs from the derived "
+                             f"{key_of(n)!r}")
+        keys[cell] = n
+        provenance[n] = "both" if n in provenance else "exact"
 
     toolchain = set()
     with open(PARTITION, encoding="utf-8", errors="replace") as fh:
@@ -110,13 +164,22 @@ def main():
                 toolchain.add(cols[1])
 
     rows = {}
-    with open(ENV, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            if not line.startswith("observed\t"):
-                continue
-            cols = line.rstrip("\n").split("\t")[1:]
-            if cols and cols[0] in toolchain:
-                rows[cols[0]] = {k: unquote(v) for k, v in zip(COLS, cols)}
+    declared = observed = 0
+    for shard in ENV_SHARDS:
+        with open(shard, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("constant_count\t"):
+                    declared = max(declared, int(line.split("\t")[1]))
+                if not line.startswith("observed\t"):
+                    continue
+                observed += 1
+                cols = line.rstrip("\n").split("\t")[1:]
+                if cols and cols[0] in toolchain:
+                    rows[cols[0]] = {k: unquote(v) for k, v in zip(COLS, cols)}
+    if observed != declared:
+        raise SystemExit(f"REFUSE: {observed} observed rows across {len(ENV_SHARDS)} "
+                         f"shards against a declared constant_count of {declared} — "
+                         "a partial census turns shard boundaries into fake orphans")
     if not rows:
         raise SystemExit("REFUSE: empty census join — the row prefix or key form is "
                          "wrong, and an empty resistance list reads as no resistance")
@@ -143,7 +206,8 @@ def main():
     for bucket, name, row in out:
         lines.append(
             f'{{"schema":"{SCHEMA}","kind":"symbol","bucket":"{bucket}",'
-            f'"name":"{name}","safety":"{row.get("safety")}",'
+            f'"name":"{name}","provenance":"{provenance[name]}",'
+            f'"safety":"{row.get("safety")}",'
             f'"effect":"{row.get("effect")}",'
             f'"extern":{"true" if row.get("extern") not in ("", "-") else "false"}}}'
         )
@@ -154,7 +218,8 @@ def main():
         )
     lines.append(
         f'{{"schema":"{SCHEMA}","kind":"summary","tactic_files":{files},'
-        f'"demanded_names":{len(demanded)},"toolchain_api":{len(toolchain)},'
+        f'"demanded_names":{len(demanded)},"exact_demanded":{len(exact)},'
+        f'"union_demanded":{len(provenance)},"toolchain_api":{len(toolchain)},'
         f'"joined":{len(rows)},"orphans":{len(orphans)},'
         f'"resisting":{sum(counts[b] for b in ("R-EXTERN", "R-UNSAFE", "R-EFFECT"))},'
         f'"unresisting":{counts["R-NONE"]}}}'
@@ -169,6 +234,7 @@ def main():
         sys.stdout.write(text)
     print(
         f"facade-resistance: files={files} demanded={len(demanded)} "
+        f"exact={len(exact)} union={len(provenance)} "
         f"toolchain={len(toolchain)} joined={len(rows)} orphans={len(orphans)} "
         + " ".join(f"{b}={counts[b]}" for b, _, _ in RATCHET),
         file=sys.stderr,

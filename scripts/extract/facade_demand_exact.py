@@ -258,7 +258,11 @@ def main():
         if cls is None:
             census_missing.append(name)
         elif cls == "toolchain-api":
-            demand[name] = {"def_module": defmod, "used_by": sorted(used_by)}
+            # census_key is the probe's structural encoding (component kinds, /s
+            # vs /n) — carried so no consumer ever re-derives it from the dotted
+            # display name, which collapses numeric components into strings.
+            demand[name] = {"def_module": defmod, "census_key": key,
+                            "used_by": sorted(used_by)}
         else:
             counts[f"toolchain-{cls}"] = counts.get(f"toolchain-{cls}", 0) + 1
     if not demand:
