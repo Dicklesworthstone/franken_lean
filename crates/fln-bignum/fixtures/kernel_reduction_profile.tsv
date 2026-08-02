@@ -1,13 +1,13 @@
 # fln-bignum kernel-reduction profile
-schema	fln.bignum-kernel-reduction-profile/1
+schema	fln.bignum-kernel-reduction-profile/2
 claim_class	benchmark
 reference	leanprover/lean4	v4.32.0	8c9756b28d64dab099da31a4c09229a9e6a2ef35
 corpus	leanprover-community/mathlib4	v4.32.0	81a5d257c8e410db227a6665ed08f64fea08e997
 rustc	1.99.0-nightly	77cf889bc178ddb44d6a1c78e5a820b5abb31d8d
 host	Linux-x86_64	AMD_EPYC_7282_16-Core_Processor	64-logical-cpus
 artifact	target/e2e/bignum-threshold-calibration-20260730T000003Z/report-high-width.log
-source	crates/fln-kernel/tests/k1_judgments.rs	bf3f1a241c47fb36749ab70a0a2b6c89b301bfebb6fb4a472cd1423b971cef15	fnv1a64:86f44f5978ec00af	exact-KR-313-kernel-reduction-table
-source	tribunal/fixtures/c4/probe_export.c	ed68226881833b5a309175a9c13177845bd132e269d8e098643f45a7278a4588	fnv1a64:63c04c35aa264cb3	real-C-ABI-Nat-slice
+source	crates/fln-kernel/tests/k1_judgments.rs	bf3f1a241c47fb36749ab70a0a2b6c89b301bfebb6fb4a472cd1423b971cef15	d462b0d8fb8f9242dfdc595c1cec550de28969a480e80d0ce6883433a79bd83b	kr313-operation-test-body-v1
+source	tribunal/fixtures/c4/probe_export.c	ed68226881833b5a309175a9c13177845bd132e269d8e098643f45a7278a4588	df9c42da38f94b124c5bd43a5f78cf9cfe838926a702771e6c54b2bcc71c4818	c4-nat-slice-v1
 population	bounded-bootstrap-kernel-and-C4-fixtures
 observation	k1-max-input-limbs	1
 observation	c4-max-input-limbs	2

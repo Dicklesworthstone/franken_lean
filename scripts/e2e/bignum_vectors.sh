@@ -5,9 +5,10 @@
 # Real-path, no-mock: the golden corpus is drift-checked against its generator
 # (CPython ground truth, Lean Nat semantics), the real suite runs (5 725 vectors +
 # models), the C4 stage0 gauntlet runs the same arithmetic-heavy C probe against
-# Marrow and the pinned Reference runtime, then a division-by-zero law defect is
-# seeded in an isolated overlay and the vectors must discriminate it before a
-# pristine recovery. The fln-msou profile/source/threshold joins and
+# Marrow and the pinned Reference runtime, then nine named arithmetic/ABI-view
+# defects are seeded one at a time in an isolated overlay. Each cell must fail
+# through its registered discriminating test (a compile failure is not a kill)
+# before one pristine recovery. The fln-msou profile/source/threshold joins and
 # schoolbook/Karatsuba/Toom boundary equivalence run inside the real suite.
 # NDJSON under target/e2e/; fixtures retained.
 
@@ -73,7 +74,8 @@ emit drift passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"drift.lo
 note "binding the threshold profile to the KR-313 and C4 fixture bytes"
 profile="$ROOT/crates/fln-bignum/fixtures/kernel_reduction_profile.tsv"
 source_count=0
-while IFS=$'\t' read -r kind source expected_sha _; do
+full_source_drifts=0
+while IFS=$'\t' read -r kind source measured_sha expected_projection projection_kind; do
   [ "$kind" = "source" ] || continue
   source_count=$((source_count + 1))
   if [ ! -f "$ROOT/$source" ]; then
@@ -82,9 +84,44 @@ while IFS=$'\t' read -r kind source expected_sha _; do
     exit 1
   fi
   actual_sha="$(sha256sum "$ROOT/$source" | awk '{print $1}')"
-  if [ "$actual_sha" != "$expected_sha" ]; then
-    emit profile_binding failed "\"detail\":\"profile source hash drifted\",\"source\":\"$source\""
-    note "FAIL: profile source hash drifted: $source"
+  if [ "$actual_sha" != "$measured_sha" ]; then
+    full_source_drifts=$((full_source_drifts + 1))
+  fi
+  set +e
+  actual_projection="$(
+    "${PYTHON[@]}" - "$ROOT/$source" "$projection_kind" <<'EOF'
+import hashlib
+import sys
+
+source_path, projection_kind = sys.argv[1:]
+data = open(source_path, "rb").read()
+markers = {
+    "kr313-operation-test-body-v1": (
+        b"fn kr313_the_pin_operation_table_computes_literal_results() {",
+        b"#[test]\nfn kr313_comparisons_produce_bool_constants()",
+    ),
+    "c4-nat-slice-v1": (
+        b"/* ---- slice 3: bignum-backed Nat families */",
+        b"/* ---- slice 3: Name equality",
+    ),
+}
+try:
+    start_marker, end_marker = markers[projection_kind]
+except KeyError:
+    sys.exit(4)
+if data.count(start_marker) != 1 or data.count(end_marker) != 1:
+    sys.exit(3)
+start = data.index(start_marker)
+end = data.index(end_marker, start + len(start_marker))
+print(hashlib.sha256(data[start:end]).hexdigest())
+EOF
+  )"
+  projection_rc=$?
+  set -e
+  if [ "$projection_rc" -ne 0 ] || [ "$actual_projection" != "$expected_projection" ]; then
+    emit profile_binding failed \
+      "\"detail\":\"profile semantic projection drifted\",\"source\":\"$source\",\"projection\":\"$projection_kind\""
+    note "FAIL: profile semantic projection drifted: $source ($projection_kind)"
     exit 1
   fi
 done < "$profile"
@@ -93,7 +130,8 @@ if [ "$source_count" -ne 2 ]; then
   note "FAIL: threshold profile must bind exactly two fixture sources"
   exit 1
 fi
-emit profile_binding passed "\"sources\":2,\"profile\":\"crates/fln-bignum/fixtures/kernel_reduction_profile.tsv\""
+emit profile_binding passed \
+  "\"sources\":2,\"semantic_projections\":2,\"full_source_drifts\":$full_source_drifts,\"profile\":\"crates/fln-bignum/fixtures/kernel_reduction_profile.tsv\""
 
 # ---- step 3: the real suite ------------------------------------------------------------
 note "running the bignum + ABI consumer suites"
@@ -140,7 +178,7 @@ if [ "$marrow_nat_facts" -ne 28 ] || [ "$reference_nat_facts" -ne 28 ] \
 fi
 emit c4_gauntlet passed "\"facts\":28,\"artifact\":\"c4.log\""
 
-# ---- step 5: seeded mutant must be killed ----------------------------------------------
+# ---- step 5: every named production mutant must be killed -------------------------------
 OVERLAY="$ART_DIR/overlay"
 mkdir -p "$OVERLAY/crates/fln-kernel/tests" "$OVERLAY/tribunal/fixtures/c4"
 for crate in fln-core fln-bignum; do
@@ -156,51 +194,159 @@ resolver = "3"
 members = ["crates/fln-core", "crates/fln-bignum"]
 EOF
 cp "$ROOT/rust-toolchain.toml" "$OVERLAY/rust-toolchain.toml"
-# The mutant: break Lean's div-by-zero law (a real Nat-semantics bug class) by
-# making x/0 = x instead of 0. Applied to the shared owned/borrowed division
-# helper so both surfaces are exercised by the same discriminating suite.
-if ! grep -Fq "fn div_rem_limbs" "$OVERLAY/crates/fln-bignum/src/nat.rs"; then
-  emit seeded_mutant failed "\"detail\":\"div implementation not found for seeding\""
-  note "FAIL: could not locate the div implementation to seed"
-  exit 1
-fi
-"${PYTHON[@]}" - "$OVERLAY/crates/fln-bignum/src/nat.rs" <<'EOF'
+
+seed_mutation() {
+  local mutation_id="$1"
+  cp "$ROOT/crates/fln-bignum/src/nat.rs" \
+    "$OVERLAY/crates/fln-bignum/src/nat.rs"
+  "${PYTHON[@]}" - "$OVERLAY/crates/fln-bignum/src/nat.rs" "$mutation_id" <<'EOF'
 import sys
-p = sys.argv[1]
-s = open(p).read()
-# Strip the div-by-zero guard from div_rem: x/0 stops being 0 (KR-313 violation).
-marker = "fn div_rem_limbs(dividend: &[u64], divisor: &[u64])"
-start = s.find(marker)
-if start < 0:
+
+source_path, mutation_id = sys.argv[1:]
+source = open(source_path).read()
+cells = {
+    "carry_drop": (
+        "fn add_limbs(",
+        "fn sub_limbs(",
+        "    if carry != 0 {\n        out.push(carry as u64);\n    }\n",
+        "    if false && carry != 0 {\n        out.push(carry as u64);\n    }\n",
+    ),
+    "borrow_drop": (
+        "fn sub_in_place(",
+        "#[cfg(test)]\nfn shl1_in_place(",
+        "        borrow = u64::from(o1 || o2);\n",
+        "        borrow = u64::from(o1 && o2);\n",
+    ),
+    "normalization_single_pop": (
+        "fn normalize(",
+        "fn normalized_len(",
+        "    while limbs.last() == Some(&0) {\n",
+        "    if limbs.last() == Some(&0) {\n",
+    ),
+    "division_zero_guard_drop": (
+        "fn div_rem_limbs(",
+        "fn trailing_zero_bits_limbs(",
+        "    if divisor.is_empty() || cmp_limbs(dividend, divisor) == Ordering::Less {\n",
+        "    if cmp_limbs(dividend, divisor) == Ordering::Less {\n",
+    ),
+    "threshold_off_by_one": (
+        "fn mul_algorithm(",
+        "fn add_shifted_limbs(",
+        "    if shorter < KARATSUBA_THRESHOLD || longer > shorter.saturating_mul(2) {\n",
+        "    if shorter <= KARATSUBA_THRESHOLD || longer > shorter.saturating_mul(2) {\n",
+    ),
+    "signed_product_flip": (
+        "    fn mul(&self, other: &SignedLimbs)",
+        "    fn mul_small(&self, factor: u64)",
+        "            negative: self.negative ^ other.negative,\n",
+        "            negative: self.negative == other.negative,\n",
+    ),
+    "abi_view_origin_shift": (
+        "    pub fn limbs_le(self) -> &'a [u64]",
+        "    /// Materialize an owned value",
+        "        self.limbs\n",
+        (
+            "        if self.limbs.is_empty() {\n"
+            "            self.limbs\n"
+            "        } else {\n"
+            "            &self.limbs[1..]\n"
+            "        }\n"
+        ),
+    ),
+    "decimal_validation_drop": (
+        "    pub fn from_decimal(s: &str)",
+        "    /// The normalized little-endian limbs",
+        "            if !byte.is_ascii_digit() {\n",
+        "            if byte == b'_' {\n",
+    ),
+    "shift_limb_boundary": (
+        "    pub fn checked_shl(&self, bits: u64)",
+        "    /// `self >> bits`",
+        "        let limb_shift = u128::from(bits / 64);\n",
+        "        let limb_shift = u128::from(bits.saturating_sub(1) / 64);\n",
+    ),
+}
+try:
+    start_marker, end_marker, old, new = cells[mutation_id]
+except KeyError:
+    sys.exit(4)
+start = source.find(start_marker)
+end = source.find(end_marker, start + len(start_marker))
+if start < 0 or end < 0:
     sys.exit(3)
-prefix, production = s[:start], s[start:]
-mutated_production = production.replace(
-    "if divisor.is_empty() || cmp_limbs(dividend, divisor) == Ordering::Less {",
-    "if cmp_limbs(dividend, divisor) == Ordering::Less {",
-    1,
-)
-if mutated_production == production:
+region = source[start:end]
+if region.count(old) != 1:
     sys.exit(3)
-mutated = prefix + mutated_production
-open(p, "w").write(mutated)
+mutated = source[:start] + region.replace(old, new, 1) + source[end:]
+with open(source_path, "w") as stream:
+    stream.write(mutated)
 EOF
-mutation_rc=$?
-if [ "$mutation_rc" -ne 0 ]; then
-  emit seeded_mutant failed "\"detail\":\"mutation seed was a no-op (rc=$mutation_rc)\""
-  note "FAIL: mutation seed did not apply"
-  exit 1
-fi
-set +e
-( cd "$OVERLAY" && CARGO_TARGET_DIR="$OVERLAY/target" cargo test -q -p fln-bignum ) \
-  > "$ART_DIR/mutant.log" 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 0 ]; then
-  emit seeded_mutant failed "\"expected_exit\":\"nonzero\",\"actual_exit\":0,\"artifact\":\"mutant.log\""
-  note "FAIL: the div-by-zero-law mutant SURVIVED the suite"
-  exit 1
-fi
-emit seeded_mutant passed "\"expected_exit\":\"nonzero\",\"actual_exit\":$rc,\"detected\":\"div-by-zero-law mutant killed\",\"artifact\":\"mutant.log\""
+}
+
+run_mutation_cell() {
+  local mutation_id="$1"
+  local target_kind="$2"
+  local test_name="$3"
+  local artifact="mutant-$mutation_id.log"
+  local -a cargo_args=()
+  case "$target_kind" in
+    lib) cargo_args=(--lib "$test_name") ;;
+    properties) cargo_args=(--test properties "$test_name") ;;
+    *)
+      emit "mutant_$mutation_id" failed \
+        "\"detail\":\"unknown test target\",\"target\":\"$target_kind\""
+      exit 2
+      ;;
+  esac
+
+  note "seeding $mutation_id; expecting $test_name to discriminate it"
+  set +e
+  seed_mutation "$mutation_id"
+  mutation_rc=$?
+  set -e
+  if [ "$mutation_rc" -ne 0 ]; then
+    emit "mutant_$mutation_id" failed \
+      "\"detail\":\"mutation seed was a no-op\",\"seed_exit\":$mutation_rc"
+    note "FAIL: $mutation_id seed did not apply"
+    exit 1
+  fi
+
+  set +e
+  ( cd "$OVERLAY" && CARGO_TARGET_DIR="$OVERLAY/target" \
+      cargo test -p fln-bignum "${cargo_args[@]}" -- --exact ) \
+    > "$ART_DIR/$artifact" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    emit "mutant_$mutation_id" failed \
+      "\"expected_exit\":\"nonzero\",\"actual_exit\":0,\"artifact\":\"$artifact\""
+    note "FAIL: $mutation_id survived $test_name"
+    exit 1
+  fi
+  if ! grep -F "test $test_name" "$ART_DIR/$artifact" | grep -Fq "FAILED"; then
+    emit "mutant_$mutation_id" failed \
+      "\"detail\":\"registered test did not fail\",\"actual_exit\":$rc,\"artifact\":\"$artifact\""
+    note "FAIL: $mutation_id stopped for a reason other than $test_name"
+    exit 1
+  fi
+  emit "mutant_$mutation_id" passed \
+    "\"expected_exit\":\"nonzero\",\"actual_exit\":$rc,\"test\":\"$test_name\",\"artifact\":\"$artifact\""
+}
+
+run_mutation_cell carry_drop lib nat::tests::u128_model_agreement
+run_mutation_cell borrow_drop properties \
+  truncated_subtraction_saturates_at_zero_and_never_wraps
+run_mutation_cell normalization_single_pop lib nat::tests::edge_laws
+run_mutation_cell division_zero_guard_drop lib \
+  nat::tests::knuth_d_matches_the_bitwise_model_and_reconstructs_the_dividend
+run_mutation_cell threshold_off_by_one lib \
+  nat::tests::multiplication_crossovers_are_pinned_and_both_sides_are_equivalent
+run_mutation_cell signed_product_flip lib \
+  nat::tests::toom3_signed_evaluations_and_carry_chains_match_schoolbook
+run_mutation_cell abi_view_origin_shift properties \
+  borrowed_limb_views_alias_storage_and_match_owned_arithmetic
+run_mutation_cell decimal_validation_drop lib nat::tests::edge_laws
+run_mutation_cell shift_limb_boundary lib nat::tests::edge_laws
 
 # ---- step 6: recovery — pristine overlay passes ----------------------------------------
 cp "$ROOT/crates/fln-bignum/src/nat.rs" "$OVERLAY/crates/fln-bignum/src/nat.rs"

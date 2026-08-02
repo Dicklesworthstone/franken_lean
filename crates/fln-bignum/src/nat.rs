@@ -1151,7 +1151,7 @@ mod tests {
     fn kernel_reduction_profile_binds_thresholds_and_crossover_samples() {
         use std::collections::BTreeMap;
 
-        let mut source_rows = 0usize;
+        let mut source_projections = BTreeMap::new();
         let mut decisions = BTreeMap::new();
         let mut samples = BTreeMap::new();
         let mut saw_schema = false;
@@ -1163,11 +1163,36 @@ mod tests {
             }
             let fields: Vec<&str> = line.split('\t').collect();
             match fields.as_slice() {
-                ["schema", "fln.bignum-kernel-reduction-profile/1"] => {
+                ["schema", "fln.bignum-kernel-reduction-profile/2"] => {
                     saw_schema = true;
                 }
-                ["source", _, _, _, _] => {
-                    source_rows += 1;
+                [
+                    "source",
+                    source,
+                    measured_sha,
+                    projection_sha,
+                    projection_kind,
+                ] => {
+                    assert!(
+                        measured_sha.len() == 64
+                            && measured_sha
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                        "measured source digest is not lowercase SHA-256"
+                    );
+                    assert!(
+                        projection_sha.len() == 64
+                            && projection_sha
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                        "semantic projection digest is not lowercase SHA-256"
+                    );
+                    assert!(
+                        source_projections
+                            .insert(*source, *projection_kind)
+                            .is_none(),
+                        "duplicate profile source"
+                    );
                 }
                 ["population", "bounded-bootstrap-kernel-and-C4-fixtures"] => {
                     saw_population = true;
@@ -1210,7 +1235,17 @@ mod tests {
         }
 
         assert!(saw_schema && saw_population && saw_limitation);
-        assert_eq!(source_rows, 2, "profile source-row floor");
+        assert_eq!(
+            source_projections,
+            BTreeMap::from([
+                (
+                    "crates/fln-kernel/tests/k1_judgments.rs",
+                    "kr313-operation-test-body-v1"
+                ),
+                ("tribunal/fixtures/c4/probe_export.c", "c4-nat-slice-v1"),
+            ]),
+            "profile source projections"
+        );
         assert_eq!(
             decisions.get("karatsuba-threshold-limbs"),
             Some(&KARATSUBA_THRESHOLD)
