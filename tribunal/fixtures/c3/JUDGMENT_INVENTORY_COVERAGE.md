@@ -45,7 +45,7 @@ declarations are counted separately per FL-INV-07.
 | KR-102 | Free variables | P S M C3 | k1_judgments::kr102_free_variables_are_telescope_bound_or_rejected | — | implemented-and-covered |
 | KR-103 | Metavariables are rejected | P S M (negative: olean declarations carry no metas; admission refuses them) | k1_judgments::kr103_metavariables_are_a_typed_rejection | — | implemented-and-covered |
 | KR-104 | Sort | P S M C3 | k1_judgments::kr104_kr972_a_sort_typed_axiom_is_admitted; k1_judgments::kr140_undefined_level_params_are_rejected | — | implemented-and-covered |
-| KR-105 | Constants | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
+| KR-105 | Constants | P S M C3 | k1_judgments::kr105_universe_arity_is_checked; k1_judgments::kr105_unknown_constants_are_rejected; k1_judgments::kr140_undefined_level_params_are_rejected; k1_judgments::kr973_kr975_kr976_nonsafe_definitions_check_and_safe_references_are_gated | — | implemented-and-covered |
 | KR-106 | Application | P S M C3 | k1_judgments::kr106_application_type_mismatch; k1_judgments::kr107_kr108_the_polymorphic_identity_function_checks | — | implemented-and-covered |
 | KR-107 | Lambda | P S M C3 | k1_judgments::kr107_kr108_the_polymorphic_identity_function_checks; k1_judgments::kr107_binder_domain_that_is_not_a_type_is_rejected | — | implemented-and-covered |
 | KR-108 | Dependent function types — the imax rule | P S M C3 | k1_judgments::kr107_kr108_the_polymorphic_identity_function_checks; k1_judgments::kr108_kr500_prop_impredicativity_via_imax | — | implemented-and-covered |
@@ -60,7 +60,7 @@ declarations are counted separately per FL-INV-07.
 | KR-204 | Projection reduction | P S M C3 | k1_judgments::kr204_projection_of_a_constructor_reduces_to_the_field; k1_judgments::kr112_kr204_parameterized_structure_projection; k1_judgments::kr314_projection_expands_string_literal_scrutinees | — | implemented-and-covered |
 | KR-205 | Recursor dispatch | P S M C3 | k1_judgments::kr316_iota_selects_the_matching_rule_per_constructor; k1_judgments::kr317_k_conversion_refuses_a_major_whose_index_does_not_match_the_constructor; k1_judgments::kr955_quot_lift_and_ind_compute | — | implemented-and-covered |
 | KR-300 | Resource hook and quick equality | P S M C3 | k1_judgments::fl_inv_07_exhaustion_is_inconclusive_never_rejected; k1_judgments::fl_inv_01_kernel_verdicts_are_deterministic | budget_parity::the_calibrated_budgets_callers_actually_use_are_accepted | implemented-and-covered |
-| KR-301 | Quick structural/hash equality | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
+| KR-301 | Quick structural/hash equality | P S M C3 | k1_judgments::kr301_structural_equality_closes_at_the_one_step_boundary; k1_judgments::kr301_distinct_literals_are_decisively_not_defeq | — | implemented-and-covered |
 | KR-302 | Binder congruence | P S M C3 | k1_judgments::kr302_binder_congruence_compares_the_domain_not_only_the_body; k1_judgments::kr302_binder_congruence_discovered_by_delta | — | implemented-and-covered |
 | KR-303 | Level equality | P S M C3 | k1_judgments::kr303_sorts_are_defeq_iff_their_levels_are_equivalent; k1_judgments::kr303_sort_equivalence_discovered_by_delta; k1_judgments::kr303_sort_equivalence_discovered_by_beta | — | implemented-and-covered |
 | KR-304 | The decide shortcut | P S M C3 | k1_judgments::kr301_distinct_literals_are_decisively_not_defeq; k1_judgments::kr313_comparisons_produce_bool_constants | — | implemented-and-covered |
@@ -70,7 +70,7 @@ declarations are counted separately per FL-INV-07.
 | KR-308 | Nat successor offsets | P S M C3 | k1_judgments::kr313_offset_closes_literal_vs_constructor_forms | — | implemented-and-covered |
 | KR-309 | Delta ordering by definitional height | P S M C3 | k1_judgments::kr200_kr309_delta_unfolds_definitions; k1_judgments::kr303_sort_equivalence_discovered_by_delta | — | implemented-and-covered |
 | KR-310 | Post-delta syntactic closure | P S M C3 | k1_judgments::kr310_same_constant_defeq_iff_levels_are_equivalent; k1_judgments::kr310_projection_congruence_on_stuck_scrutinees; k1_judgments::kr313_offset_closes_literal_vs_constructor_forms | — | implemented-and-covered |
-| KR-311 | Application congruence | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
+| KR-311 | Application congruence | P S M C3 | k1_judgments::kr311_application_congruence_checks_heads_and_arguments; k1_judgments::kr202_over_applied_lambda_beta_reduces_and_reapplies | — | implemented-and-covered |
 | KR-312 | Eta — functions and structures | P S M C3 | k1_judgments::kr312_function_eta; k1_judgments::kr903_structure_eta_in_defeq_both_directions | — | implemented-and-covered |
 | KR-313 | Nat literal acceleration — the exact operation set | P S M C3 (7 literal-family rejects triaged here 07-23, all converted by the KR-313/314 work) | k1_judgments::kr313_the_pin_operation_table_computes_literal_results; k1_judgments::kr313_comparisons_produce_bool_constants; k1_judgments::kr313_nat_zero_and_reduced_arguments_are_literal_operands; k1_judgments::kr313_pow_honors_the_reduce_pow_max_exp_cap; k1_judgments::kr313_no_nat_blt_at_this_pin; k1_judgments::kr313_dispatch_requires_bare_heads_and_exact_arity; k1_judgments::kr313_offset_closes_literal_vs_constructor_forms; k1_judgments::kr313_delta_exposed_literals_decide_in_lazy_delta | — | implemented-and-covered |
 | KR-314 | String literal rules | P S M C3 | k1_judgments::kr314_string_literal_defeq_its_oflist_spine; k1_judgments::kr314_projection_expands_string_literal_scrutinees; k1_judgments::kr314_string_recursor_fires_on_a_literal_major | — | implemented-and-covered |
@@ -85,10 +85,10 @@ declarations are counted separately per FL-INV-07.
 | KR-404 | Diagnostics are never limits | P S M C3 (typed Inconclusive outcomes observed in the census) | k1_judgments::fl_inv_07_exhaustion_is_inconclusive_never_rejected; k1_judgments::fl_inv_07_iota_chain_exhaustion_is_inconclusive_never_rejected; k1_judgments::fl_inv_07_oversized_shift_results_are_typed_exhaustion | — | implemented-and-covered |
 | KR-500 | Level normalization, including imax collapse | P S M C3 | k1_judgments::kr108_kr500_prop_impredicativity_via_imax; k1_judgments::kr303_sorts_are_defeq_iff_their_levels_are_equivalent | — | implemented-and-covered |
 | KR-501 | Level equivalence | P S M C3 | k1_judgments::kr303_sorts_are_defeq_iff_their_levels_are_equivalent; k1_judgments::kr310_same_constant_defeq_iff_levels_are_equivalent | — | implemented-and-covered |
-| KR-600 | Block preliminaries | P S M C3 (mutual blocks across all three legs) | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
-| KR-601 | Shared parameters across a mutual block | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
-| KR-602 | One universe per mutual block | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
-| KR-603 | Constructor validity | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
+| KR-600 | Block preliminaries | P S M C3 (mutual blocks across all three legs) | k1_judgments::kr600_block_preconditions_reject_empty_and_colliding_names; k1_judgments::kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration | — | implemented-and-covered |
+| KR-601 | Shared parameters across a mutual block | P S M C3 | k1_judgments::kr601_mutual_block_parameters_must_match | — | implemented-and-covered |
+| KR-602 | One universe per mutual block | P S M C3 | k1_judgments::kr602_mutual_results_share_one_universe_and_end_in_sorts | — | implemented-and-covered |
+| KR-603 | Constructor validity | P S M C3 | k1_judgments::kr603_constructor_metadata_and_return_type_are_cross_checked; k1_judgments::kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration | — | implemented-and-covered |
 | KR-604 | Field universes — the Prop exception | P S M C3 | k1_judgments::kr604_oversized_constructor_fields_are_rejected; k1_judgments::kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration | — | implemented-and-covered |
 | KR-605 | Valid recursive occurrence shape | P S M C3 | k1_judgments::kr605_indices_may_not_mention_the_block; k1_judgments::kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration | — | implemented-and-covered |
 | KR-606 | Strict positivity | P S M C3 (positive: every replayed inductive validates; the mandated-mutant lane plants its skip) | k1_judgments::kr606_negative_occurrences_are_rejected; k1_judgments::kr608_positivity_is_enforced_through_the_translation | — | implemented-and-covered |
@@ -96,7 +96,7 @@ declarations are counted separately per FL-INV-07.
 | KR-608 | Nested inductives compile to mutual blocks | P S M C3 (nested blocks admitted under the FULL ruleset — franken_lean-8ce) | k1_judgments::kr608_nested_block_admits_with_byte_exact_translated_regeneration; k1_judgments::kr608_decoded_nested_recursors_are_never_trusted; k1_judgments::kr608_random_nested_shapes_agree_with_the_independent_model | — | implemented-and-covered |
 | KR-700 | When elimination is restricted to Prop | P S M C3 | k1_judgments::kr700_restricted_elimination_and_kr317_k_flags_are_regenerated; k1_judgments::kr700_a_restricted_block_admits_with_prop_elimination | — | implemented-and-covered |
 | KR-701 | The subsingleton criterion | P S M C3 | k1_judgments::kr701_a_single_constructor_prop_carrying_data_is_elimination_restricted; k1_judgments::kr700_a_restricted_block_admits_with_prop_elimination | — | implemented-and-covered |
-| KR-702 | The elimination level | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
+| KR-702 | The elimination level | P S M C3 | k1_judgments::kr700_a_restricted_block_admits_with_prop_elimination; k1_judgments::kr317_a_k_target_block_admits_with_k_true | — | implemented-and-covered |
 | KR-800 | Motives and major premise | P S M C3 | k1_judgments::kr802_decoded_recursor_arity_observables_are_cross_checked; k1_judgments::kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration | — | implemented-and-covered |
 | KR-801 | Minor premises with induction hypotheses | P S M C3 | k1_judgments::kr316_iota_applies_constructor_fields_and_the_inductive_hypothesis | — | implemented-and-covered |
 | KR-802 | The recursor type | P S M C3 | k1_judgments::kr802_decoded_recursor_arity_observables_are_cross_checked; k1_judgments::kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration | — | implemented-and-covered |
@@ -106,10 +106,10 @@ declarations are counted separately per FL-INV-07.
 | KR-902 | Projection computation | P S M C3 | k1_judgments::kr204_projection_of_a_constructor_reduces_to_the_field; k1_judgments::kr112_kr204_parameterized_structure_projection; k1_judgments::kr314_projection_expands_string_literal_scrutinees | — | implemented-and-covered |
 | KR-903 | Structure eta coherence | P S M C3 (the typeclass-structure casesOn/recOn/noConfusionType family triaged to fln-d4x's KR-903 hypothesis, converted) | k1_judgments::kr903_structure_eta_in_defeq_both_directions; k1_judgments::kr316_structure_eta_coercion_fires_the_recursor_on_an_opaque_major | — | implemented-and-covered |
 | KR-950 | Initialization requires Eq | P S M C3 | k1_judgments::kr95x_quotient_initialization_requires_the_exact_eq_shape; k1_judgments::kr950_quotient_init_checks_the_eq_constructor_not_only_the_eq_type | — | implemented-and-covered |
-| KR-951 | Quot | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
-| KR-952 | Quot.mk | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
-| KR-953 | Quot.lift | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
-| KR-954 | Quot.ind | P S M C3 | — | — | implemented-but-uncovered owner=franken_lean-bc7 — externally replayed only; a discriminating public-authority fixture is required |
+| KR-951 | Quot | P S M C3 | k1_judgments::kr951_kr952_kr953_kr954_quotient_rows_are_checked_individually | — | implemented-and-covered |
+| KR-952 | Quot.mk | P S M C3 | k1_judgments::kr951_kr952_kr953_kr954_quotient_rows_are_checked_individually | — | implemented-and-covered |
+| KR-953 | Quot.lift | P S M C3 | k1_judgments::kr951_kr952_kr953_kr954_quotient_rows_are_checked_individually | — | implemented-and-covered |
+| KR-954 | Quot.ind | P S M C3 | k1_judgments::kr951_kr952_kr953_kr954_quotient_rows_are_checked_individually | — | implemented-and-covered |
 | KR-955 | Quot computation | P S M C3 (converted by fln-5p2's KR-955) | k1_judgments::kr955_quot_lift_and_ind_compute; k1_judgments::kr955_quot_computation_preserves_trailing_args_and_requires_a_saturated_mk | — | implemented-and-covered |
 | KR-970 | One name, one constant | P S M C3 (the one-name law asserted on every admission) | k1_judgments::kr970_the_one_name_one_constant_law | — | implemented-and-covered |
 | KR-971 | Distinct level parameters | P S M C3 | k1_judgments::kr971_duplicate_level_params_are_rejected | — | implemented-and-covered |
@@ -137,10 +137,9 @@ declarations are counted separately per FL-INV-07.
    pre-classified family. No verdict here is implicit: each is
    `fln_kernel::check` over real Reference declarations. Leanchecker re-runs the
    same Reference implementation and is not an independent witness.
-2. **Twelve implemented-but-uncovered rows** remain explicit rather than
-   inheriting coverage from whole-ruleset replay. Seventy-three implemented
-   rows now name exact test functions; no prose label such as "test anchors"
-   counts as a fixture. **One not-yet-implemented row** (KR-318) remains visible
-   as a named production follow-up.
+2. **Zero implemented-but-uncovered rows** remain. Eighty-five implemented rows
+   name exact test functions; no prose label such as "test anchors" counts as a
+   fixture. **One not-yet-implemented row** (KR-318) remains visible as a named
+   production follow-up and is not reported as passing.
 3. The C0 column cites the fixture files; the per-test anchors are greppable
    (`grep -n "KR-313" crates/fln-kernel/tests/k1_judgments.rs`).

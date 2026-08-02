@@ -272,6 +272,30 @@ fn kr105_universe_arity_is_checked() {
 }
 
 #[test]
+fn kr105_unknown_constants_are_rejected() {
+    let missing = Expr::const_(n("Missing"), vec![]);
+    let verdict = check(&Environment::new(), &axiom("bad", missing), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::UnknownConstant),
+        "a constant absent from the environment must be a typed rejection"
+    );
+
+    // CONTROL: the same declaration shape admits when the referenced constant
+    // is present with a sort-typed declaration.
+    let env = admit(&Environment::new(), &axiom("Present", sort1()));
+    let verdict = check(
+        &env,
+        &axiom("good", Expr::const_(n("Present"), vec![])),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "a present constant with the right universe arity must type; got {verdict:?}"
+    );
+}
+
+#[test]
 fn kr107_kr108_the_polymorphic_identity_function_checks() {
     // def id : ∀ (α : Sort 1) (x : α), α := fun (α : Sort 1) (x : α) => x
     let ty = Expr::forall_e(
@@ -3646,6 +3670,86 @@ fn kr301_distinct_literals_are_decisively_not_defeq() {
 }
 
 #[test]
+fn kr301_structural_equality_closes_at_the_one_step_boundary() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let env = admit(&env, &axiom("B", sort1()));
+    let a = Expr::const_(n("A"), vec![]);
+    let b = Expr::const_(n("B"), vec![]);
+    let one_step = Budget::DEFAULT.narrowed(1, Budget::DEFAULT.depth);
+
+    let same = check_def_eq(&env, &[], &a, &a, one_step);
+    assert!(
+        same.is_accepted(),
+        "structural equality must close immediately after the counted entry hook; got {same:?}"
+    );
+
+    // CONTROL: the one-step ceiling is genuinely tight. A non-identical pair
+    // cannot enter normalization and therefore yields typed exhaustion rather
+    // than being blanket-accepted.
+    let distinct = check_def_eq(&env, &[], &a, &b, one_step);
+    assert!(
+        distinct.is_inconclusive(),
+        "a distinct pair must not pass the structural fast path; got {distinct:?}"
+    );
+}
+
+#[test]
+fn kr311_application_congruence_checks_heads_and_arguments() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_ty = Expr::const_(n("A"), vec![]);
+    let env = admit(&env, &axiom("a", a_ty.clone()));
+    let env = admit(&env, &axiom("b", a_ty.clone()));
+    let arrow = Expr::forall_e(n("_"), a_ty.clone(), a_ty, BinderInfo::Default);
+    let env = admit(&env, &axiom("f", arrow.clone()));
+    let env = admit(&env, &axiom("g", arrow));
+    let a = Expr::const_(n("a"), vec![]);
+    let b = Expr::const_(n("b"), vec![]);
+    let f = Expr::const_(n("f"), vec![]);
+    let g = Expr::const_(n("g"), vec![]);
+
+    let id = Expr::lam(
+        n("x"),
+        Expr::const_(n("A"), vec![]),
+        Expr::bvar(0).expect("packs"),
+        BinderInfo::Default,
+    );
+    let beta_a = Expr::app(id, a.clone());
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &Expr::app(f.clone(), beta_a),
+            &Expr::app(f.clone(), a.clone()),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "application congruence must close defeq arguments after reduction"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::app(f.clone(), a.clone()),
+            &Expr::app(g, a.clone()),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "application congruence must compare the function head"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::app(f.clone(), a),
+            &Expr::app(f, b),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "application congruence must compare every argument"
+    );
+}
+
+#[test]
 fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
     // A shiftLeft whose RESULT would dwarf the step budget converts to typed
     // Inconclusive BEFORE any allocation — never a rejection, never an
@@ -4420,6 +4524,206 @@ fn kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration() {
 }
 
 #[test]
+fn kr600_block_preconditions_reject_empty_and_colliding_names() {
+    let empty = block_decl(vec![], vec![], vec![]);
+    let verdict = check(&Environment::new(), &empty, Budget::DEFAULT);
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("empty inductive block"),
+        "the empty-block precondition must be explicit; got {}",
+        reject_message(&verdict)
+    );
+
+    let (types, ctors, recursors) = mynat_block();
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: cval(n("MyNat"), vec![], sort1()),
+            is_unsafe: false,
+        }),
+    );
+    let verdict = check(
+        &env,
+        &block_decl(types.clone(), ctors.clone(), recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::AlreadyDeclared),
+        "an inductive type name must be fresh"
+    );
+
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: cval(nn("MyNat", "rec"), vec![], sort1()),
+            is_unsafe: false,
+        }),
+    );
+    let verdict = check(
+        &env,
+        &block_decl(types.clone(), ctors.clone(), recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::AlreadyDeclared),
+        "an inductive recursor name must be fresh"
+    );
+
+    assert!(
+        check(
+            &Environment::new(),
+            &block_decl(types, ctors, recursors),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "the exact block must remain a positive control"
+    );
+}
+
+#[test]
+fn kr601_mutual_block_parameters_must_match() {
+    let names = vec![n("Left"), n("Right")];
+    let row = |name: &str, parameter_type: Expr| InductiveVal {
+        base: cval(
+            n(name),
+            vec![],
+            Expr::forall_e(n("p"), parameter_type, sort1(), BinderInfo::Default),
+        ),
+        num_params: 1,
+        num_indices: 0,
+        all: names.clone(),
+        ctors: vec![],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mismatched = block_decl(
+        vec![row("Left", sort1()), row("Right", prop())],
+        vec![],
+        vec![],
+    );
+    let verdict = check(&Environment::new(), &mismatched, Budget::DEFAULT);
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("parameters of all inductive datatypes must match"),
+        "the rejection must come from the shared-parameter judgment; got {}",
+        reject_message(&verdict)
+    );
+
+    let matching = block_decl(
+        vec![row("Left", sort1()), row("Right", sort1())],
+        vec![],
+        vec![],
+    );
+    let verdict = check(&Environment::new(), &matching, Budget::DEFAULT);
+    assert!(
+        !reject_message(&verdict).contains("parameters of all inductive datatypes must match"),
+        "matching parameter telescopes must pass KR-601 before later decoded-row checks"
+    );
+}
+
+#[test]
+fn kr602_mutual_results_share_one_universe_and_end_in_sorts() {
+    let names = vec![n("Left"), n("Right")];
+    let row = |name: &str, type_: Expr| InductiveVal {
+        base: cval(n(name), vec![], type_),
+        num_params: 0,
+        num_indices: 0,
+        all: names.clone(),
+        ctors: vec![],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mismatched = block_decl(
+        vec![row("Left", sort1()), row("Right", prop())],
+        vec![],
+        vec![],
+    );
+    let verdict = check(&Environment::new(), &mismatched, Budget::DEFAULT);
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("must live in the same universe"),
+        "the rejection must come from the one-universe judgment; got {}",
+        reject_message(&verdict)
+    );
+
+    let env = admit(&Environment::new(), &axiom("Carrier", sort1()));
+    let non_sort = block_decl(
+        vec![row("Left", Expr::const_(n("Carrier"), vec![]))],
+        vec![],
+        vec![],
+    );
+    let verdict = check(&env, &non_sort, Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::SortExpected),
+        "an inductive type must end in a sort"
+    );
+}
+
+#[test]
+fn kr603_constructor_metadata_and_return_type_are_cross_checked() {
+    let (types, ctors, recursors) = mynat_block();
+
+    let mut wrong_index = ctors.clone();
+    wrong_index[0].cidx = 1;
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types.clone(), wrong_index, recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("constructor observables mismatch"),
+        "constructor indices are decoded evidence, never authority; got {}",
+        reject_message(&verdict)
+    );
+
+    let mut wrong_order = ctors.clone();
+    wrong_order.swap(0, 1);
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types.clone(), wrong_order, recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("decoded ctor order mismatch"),
+        "constructor order must match the parent row; got {}",
+        reject_message(&verdict)
+    );
+
+    let mut wrong_return = ctors.clone();
+    wrong_return[0].base.type_ = sort1();
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types.clone(), wrong_return, recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("invalid return type"),
+        "a constructor must return its declared inductive; got {}",
+        reject_message(&verdict)
+    );
+
+    assert!(
+        check(
+            &Environment::new(),
+            &block_decl(types, ctors, recursors),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "the exact constructor rows must remain a positive control"
+    );
+}
+
+#[test]
 fn kr606_negative_occurrences_are_rejected() {
     // MANDATED MUTANT (AGENTS testing policy: "skipped positivity check"):
     // `Bad.mk : (Bad → Bad) → Bad` places the block in a Π DOMAIN — the
@@ -5036,6 +5340,261 @@ fn kr607_decoded_flags_are_cross_checked() {
     );
 }
 
+fn eq_environment_with_refl(refl_type: Expr) -> Environment {
+    let u = n("u");
+    let level = Level::param(u.clone());
+    let bv = |index: u32| Expr::bvar(index).expect("packs");
+    let eq_type = Expr::forall_e(
+        n("α"),
+        Expr::sort(level.clone()),
+        Expr::forall_e(
+            n("a"),
+            bv(0),
+            Expr::forall_e(n("b"), bv(1), prop(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let eq = ConstantInfo::Induct(InductiveVal {
+        base: cval(n("Eq"), vec![u.clone()], eq_type),
+        num_params: 1,
+        num_indices: 2,
+        all: vec![n("Eq")],
+        ctors: vec![nn("Eq", "refl")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    });
+    let refl = ConstantInfo::Ctor(ConstructorVal {
+        base: cval(nn("Eq", "refl"), vec![u], refl_type),
+        induct: n("Eq"),
+        cidx: 0,
+        num_params: 1,
+        num_fields: 1,
+        is_unsafe: false,
+    });
+    add_info(&add_info(&Environment::new(), eq), refl)
+}
+
+fn exact_eq_environment() -> Environment {
+    let level = Level::param(n("u"));
+    let bv = |index: u32| Expr::bvar(index).expect("packs");
+    let refl_type = Expr::forall_e(
+        n("α"),
+        Expr::sort(level.clone()),
+        Expr::forall_e(
+            n("a"),
+            bv(0),
+            Expr::app(
+                Expr::app(Expr::app(Expr::const_(n("Eq"), vec![level]), bv(1)), bv(0)),
+                bv(0),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    eq_environment_with_refl(refl_type)
+}
+
+fn exact_quotient_rows() -> Vec<QuotVal> {
+    let arrow = |domain: Expr, codomain: Expr| {
+        Expr::forall_e(n("a"), domain, codomain, BinderInfo::Default)
+    };
+    let pi = |name: &str, info: BinderInfo, type_: Expr, body: Expr| {
+        Expr::forall_e(n(name), type_, body, info)
+    };
+    let quot = n("Quot");
+    let u_name = n("u");
+    let v_name = n("v");
+    let u = Level::param(u_name.clone());
+    let v = Level::param(v_name.clone());
+    let bv = |index: u32| Expr::bvar(index).expect("packs");
+
+    let quot_type = pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        arrow(arrow(bv(0), arrow(bv(1), prop())), Expr::sort(u.clone())),
+    );
+    let quot_app = |alpha: Expr, relation: Expr| {
+        Expr::app(
+            Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), alpha),
+            relation,
+        )
+    };
+    let quot_mk_type = pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        pi(
+            "r",
+            BinderInfo::Default,
+            arrow(bv(0), arrow(bv(1), prop())),
+            pi("a", BinderInfo::Default, bv(1), quot_app(bv(2), bv(1))),
+        ),
+    );
+
+    let eq_name = n("Eq");
+    let soundness = pi(
+        "a",
+        BinderInfo::Default,
+        bv(3),
+        pi(
+            "b",
+            BinderInfo::Default,
+            bv(4),
+            arrow(
+                Expr::app(Expr::app(bv(4), bv(1)), bv(0)),
+                Expr::app(
+                    Expr::app(
+                        Expr::app(Expr::const_(eq_name, vec![v.clone()]), bv(4)),
+                        Expr::app(bv(3), bv(2)),
+                    ),
+                    Expr::app(bv(3), bv(1)),
+                ),
+            ),
+        ),
+    );
+    let quot_lift_type = pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        pi(
+            "r",
+            BinderInfo::Implicit,
+            arrow(bv(0), arrow(bv(1), prop())),
+            pi(
+                "β",
+                BinderInfo::Implicit,
+                Expr::sort(v.clone()),
+                pi(
+                    "f",
+                    BinderInfo::Default,
+                    arrow(bv(2), bv(1)),
+                    arrow(
+                        soundness,
+                        arrow(
+                            Expr::app(
+                                Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), bv(4)),
+                                bv(3),
+                            ),
+                            bv(3),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    );
+
+    let quot_mk = nn("Quot", "mk");
+    let quot_ind_type = pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        pi(
+            "r",
+            BinderInfo::Implicit,
+            arrow(bv(0), arrow(bv(1), prop())),
+            pi(
+                "β",
+                BinderInfo::Implicit,
+                arrow(
+                    Expr::app(
+                        Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), bv(1)),
+                        bv(0),
+                    ),
+                    prop(),
+                ),
+                pi(
+                    "mk",
+                    BinderInfo::Default,
+                    pi(
+                        "a",
+                        BinderInfo::Default,
+                        bv(2),
+                        Expr::app(
+                            bv(1),
+                            Expr::app(
+                                Expr::app(
+                                    Expr::app(
+                                        Expr::const_(quot_mk.clone(), vec![u.clone()]),
+                                        bv(3),
+                                    ),
+                                    bv(2),
+                                ),
+                                bv(0),
+                            ),
+                        ),
+                    ),
+                    pi(
+                        "q",
+                        BinderInfo::Default,
+                        Expr::app(
+                            Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), bv(3)),
+                            bv(2),
+                        ),
+                        Expr::app(bv(2), bv(0)),
+                    ),
+                ),
+            ),
+        ),
+    );
+
+    vec![
+        QuotVal {
+            base: cval(quot, vec![u_name.clone()], quot_type),
+            kind: QuotKind::Type,
+        },
+        QuotVal {
+            base: cval(quot_mk, vec![u_name.clone()], quot_mk_type),
+            kind: QuotKind::Ctor,
+        },
+        QuotVal {
+            base: cval(
+                nn("Quot", "lift"),
+                vec![u_name.clone(), v_name],
+                quot_lift_type,
+            ),
+            kind: QuotKind::Lift,
+        },
+        QuotVal {
+            base: cval(nn("Quot", "ind"), vec![u_name], quot_ind_type),
+            kind: QuotKind::Ind,
+        },
+    ]
+}
+
+#[test]
+fn kr951_kr952_kr953_kr954_quotient_rows_are_checked_individually() {
+    let env = exact_eq_environment();
+    let rows = exact_quotient_rows();
+    let verdict = check(&env, &Declaration::Quotient(rows.clone()), Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "the exact Quot, Quot.mk, Quot.lift, and Quot.ind rows must initialize; got {verdict:?}"
+    );
+
+    for (index, rule) in ["KR-951", "KR-952", "KR-953", "KR-954"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut corrupted = rows.clone();
+        corrupted[index].base.type_ = sort1();
+        let verdict = check(&env, &Declaration::Quotient(corrupted), Budget::DEFAULT);
+        assert_eq!(
+            reject_class(&verdict),
+            Some(RejectClass::BlockMismatch),
+            "{rule}: a decoded quotient type must not override the pin-derived row"
+        );
+        assert!(
+            reject_message(&verdict).contains("type diverges"),
+            "{rule}: the first divergence must identify the corrupt row; got {}",
+            reject_message(&verdict)
+        );
+    }
+}
+
 #[test]
 fn kr95x_quotient_initialization_requires_the_exact_eq_shape() {
     // KR-950: without the expected `Eq`, quotient initialization rejects.
@@ -5068,41 +5627,6 @@ fn kr950_quotient_init_checks_the_eq_constructor_not_only_the_eq_type() {
     let lvl = Level::param(u.clone());
     let bv = |i: u32| Expr::bvar(i).expect("packs");
 
-    // Eq : forall {a : Sort u}, a -> a -> Prop  (exactly the pinned shape)
-    let eq_ty = Expr::forall_e(
-        n("α"),
-        Expr::sort(lvl.clone()),
-        Expr::forall_e(
-            n("a"),
-            bv(0),
-            Expr::forall_e(n("b"), bv(1), prop(), BinderInfo::Default),
-            BinderInfo::Default,
-        ),
-        BinderInfo::Implicit,
-    );
-    let eq_info = |refl_ty: Expr| {
-        let ind = ConstantInfo::Induct(InductiveVal {
-            base: cval(n("Eq"), vec![u.clone()], eq_ty.clone()),
-            num_params: 1,
-            num_indices: 2,
-            all: vec![n("Eq")],
-            ctors: vec![nn("Eq", "refl")],
-            num_nested: 0,
-            is_rec: false,
-            is_unsafe: false,
-            is_reflexive: false,
-        });
-        let ctor = ConstantInfo::Ctor(ConstructorVal {
-            base: cval(nn("Eq", "refl"), vec![u.clone()], refl_ty),
-            induct: n("Eq"),
-            cidx: 0,
-            num_params: 1,
-            num_fields: 1,
-            is_unsafe: false,
-        });
-        add_info(&add_info(&Environment::new(), ind), ctor)
-    };
-
     // A "refl" that is NOT reflexive: forall {a} (x y : a), Eq a x y — it
     // relates two DIFFERENT values, so it proves everything equal.
     let bad_refl = Expr::forall_e(
@@ -5128,7 +5652,7 @@ fn kr950_quotient_init_checks_the_eq_constructor_not_only_the_eq_type() {
         BinderInfo::Implicit,
     );
     let verdict = check(
-        &eq_info(bad_refl),
+        &eq_environment_with_refl(bad_refl),
         &Declaration::Quotient(vec![]),
         Budget::DEFAULT,
     );
@@ -5142,22 +5666,8 @@ fn kr950_quotient_init_checks_the_eq_constructor_not_only_the_eq_type() {
     // CONTROL: with the correct refl the run gets PAST this check — it then
     // fails on the absent quotient declarations instead. Without this the test
     // could pass for any reason at all.
-    let good_refl = Expr::forall_e(
-        n("α"),
-        Expr::sort(lvl.clone()),
-        Expr::forall_e(
-            n("a"),
-            bv(0),
-            Expr::app(
-                Expr::app(Expr::app(Expr::const_(n("Eq"), vec![lvl]), bv(1)), bv(0)),
-                bv(0),
-            ),
-            BinderInfo::Default,
-        ),
-        BinderInfo::Implicit,
-    );
     let control = check(
-        &eq_info(good_refl),
+        &exact_eq_environment(),
         &Declaration::Quotient(vec![]),
         Budget::DEFAULT,
     );

@@ -547,6 +547,18 @@ fn coverage_findings(
     findings
 }
 
+fn coverage_closure_findings(rows: &[CoverageRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| row.status.starts_with("implemented-but-uncovered owner="))
+        .map(|row| {
+            format!(
+                "{}: implemented rule remains uncovered at the terminal inventory join",
+                row.id
+            )
+        })
+        .collect()
+}
+
 fn rules_push_anchor(rule: &mut Rule, anchor: &str, lineno: usize, problems: &mut Vec<String>) {
     // `<path>:<line> (<function>) expect="<token>"` — function is informative,
     // path/line/token are checked.
@@ -631,6 +643,7 @@ fn the_judgment_inventory_matches_the_contract_exactly() {
     };
     let findings = findings
         .into_iter()
+        .chain(coverage_closure_findings(&rows))
         .chain(test_reference_findings(&rows, root))
         .collect::<Vec<_>>();
     assert!(
@@ -726,7 +739,7 @@ fn the_judgment_inventory_join_rejects_missing_duplicate_drift_and_vacuity() {
             &coverage_findings(core::slice::from_ref(&rule), &[vacuous], &tracked_owners),
             "no public fixture"
         ),
-        "an implemented-but-uncovered row must fail"
+        "an implemented-and-covered row without evidence must fail"
     );
 
     let mut untyped = row.clone();
@@ -786,6 +799,13 @@ fn the_judgment_inventory_join_rejects_missing_duplicate_drift_and_vacuity() {
         )
         .is_empty(),
         "an implemented gap may stay explicit while its external replay remains visible"
+    );
+    assert!(
+        has(
+            &coverage_closure_findings(core::slice::from_ref(&uncovered)),
+            "remains uncovered"
+        ),
+        "the terminal inventory join must fail while an implemented gap remains"
     );
 
     let mut generic_fixture = row.clone();
