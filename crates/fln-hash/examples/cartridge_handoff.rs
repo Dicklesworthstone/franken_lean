@@ -21,7 +21,7 @@ use fln_hash::cartridge::{
     AttachmentRoleV1, CartridgeArchiveV1, CartridgeBuilderV1, CartridgeDecodeBudgetsV1,
     CartridgeExtensionV1, CartridgeIndexV1, CartridgeObjectKindV1, CartridgeStreamDecoderV1,
     CartridgeTransportStateV1, DefeqTransparencyV1, ObjectPortabilityV1, ObjectRequirementV1,
-    WarmDefeqBindingV1, WarmDefeqCacheV1, WarmDefeqEntryV1, WarmDefeqQueryV1,
+    WarmDefeqBindingV1, WarmDefeqCacheV1, WarmDefeqContextV1, WarmDefeqEntryV1, WarmDefeqQueryV1,
 };
 use fln_hash::certificate::{
     CertificateBindingV1, CertificateExtensionV1, CertificateJudgmentV1, ClaimedResultV1,
@@ -463,11 +463,13 @@ fn validate_complete(bytes: &[u8], archive: &CartridgeArchiveV1) -> Result<usize
         }
     }
 
+    let mut resource_contract_root = None;
     for object in &archive.manifest.objects {
-        let object_bytes = archive
-            .assemble_object(object.id)
-            .map_err(|error| format!("assemble {:?} object: {error:?}", object.kind))?
-            .ok_or_else(|| format!("complete transport lacks {:?} bytes", object.kind))?;
+        let object_bytes = complete(
+            archive.assemble_object(object.id, MAX_FILE_BYTES),
+            &format!("assemble {:?} object", object.kind),
+        )?
+        .ok_or_else(|| format!("complete transport lacks {:?} bytes", object.kind))?;
         if object.kind == CartridgeObjectKindV1::Certificate {
             complete(
                 DeclarationCertificateV1::from_canonical_bytes_budgeted(
@@ -477,16 +479,35 @@ fn validate_complete(bytes: &[u8], archive: &CartridgeArchiveV1) -> Result<usize
                 "decode nested declaration certificate",
             )?;
         }
+        if object.kind == CartridgeObjectKindV1::ResourceContract
+            && resource_contract_root
+                .replace(content_root(Domain::Receipt, &object_bytes))
+                .is_some()
+        {
+            return Err("handoff contains more than one resource contract".to_string());
+        }
     }
-    let report = complete(
-        archive
-            .validate_present_warm_caches(DecodeBudget::new(bytes.len() as u64, MAX_DECODE_NODES)),
-        "validate present warm caches",
-    )?;
-    if report.missing != 0 {
-        return Err("complete cartridge reports a missing warm-cache attachment".to_string());
+    let context = WarmDefeqContextV1 {
+        epoch: archive.manifest.epoch,
+        mode: Mode::Sound,
+        environment_root: archive.manifest.environment_root,
+        kernel_build_root: content_root(Domain::Receipt, b"fln-kernel-cartridge-handoff-v1"),
+        checker_build_root: content_root(Domain::Receipt, b"fln-checker-cartridge-handoff-v1"),
+        policy_root: content_root(Domain::Receipt, b"fln-cartridge-policy-v1"),
+        fuel_profile_root: resource_contract_root
+            .ok_or_else(|| "handoff lacks its resource contract".to_string())?,
+    };
+    let report = archive
+        .classify_present_warm_caches(
+            &context,
+            DecodeBudget::new(bytes.len() as u64, MAX_DECODE_NODES),
+            MAX_FILE_BYTES,
+        )
+        .map_err(|error| format!("classify present warm caches: {error:?}"))?;
+    if report.decisions.is_empty() {
+        return Err("complete cartridge has no warm-cache attachment decision".to_string());
     }
-    Ok(report.validated)
+    Ok(report.replayable())
 }
 
 fn verify(file: &Path) -> Result<(), String> {
@@ -558,10 +579,11 @@ fn extract(file: &Path, directory: &Path) -> Result<(), String> {
             .map_err(|error| format!("encode extracted manifest: {error:?}"))?,
     )?;
     for (index, object) in archive.manifest.objects.iter().enumerate() {
-        let object_bytes = archive
-            .assemble_object(object.id)
-            .map_err(|error| format!("assemble {:?} object: {error:?}", object.kind))?
-            .ok_or_else(|| format!("complete transport lacks {:?} bytes", object.kind))?;
+        let object_bytes = complete(
+            archive.assemble_object(object.id, MAX_FILE_BYTES),
+            &format!("assemble {:?} object", object.kind),
+        )?
+        .ok_or_else(|| format!("complete transport lacks {:?} bytes", object.kind))?;
         let name = format!(
             "{index:02}-{}-{}.bin",
             kind_name(object.kind),

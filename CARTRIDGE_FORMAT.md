@@ -100,6 +100,12 @@ therefore have different identities. Frame ids do not include an object id, allo
 identical chunks to be shared across objects without changing either object's
 identity.
 
+The deterministic builder treats repeated declarations of the same typed object as
+one semantic request: `required` dominates `optional`, and the narrowest compatible
+portability wins independent of insertion order. Two incompatible platform targets,
+or a digest collision whose kind or bytes differ, fail closed as a conflicting object
+declaration. The first caller can never silently choose the manifest.
+
 ## Manifest
 
 The top-level canonical manifest order is:
@@ -179,6 +185,11 @@ then validates the nested manifest, then constructs the archive.
 and one-byte chunks. It publishes no archive while buffering. Cancellation and a
 buffer limit return `Inconclusive`; only `finish` can publish a decoded value.
 
+Object assembly receives an explicit byte allowance and checks the manifest's complete
+logical length before allocation. This matters even when the archive itself is small:
+many references to one shared frame can describe a much larger logical object. A
+length beyond the allowance is `Inconclusive(ResourceExhausted)`, never malformedness.
+
 `CartridgeStagerV1` starts from a validated manifest. `stage` checks declaration,
 length, and digest before mutating its frame map. A corrupt or duplicate frame leaves
 the previous staging state unchanged. `finalize_sealed` succeeds only when all
@@ -186,7 +197,9 @@ required frames are present; optional frames may remain absent.
 
 `CartridgeIndexV1` parses canonical archive framing and records payload offsets it
 observed. An indexed read rechecks its bounds and frame digest. The index is derived
-and disposable; it is not part of manifest identity and carries no authority.
+and disposable; it is not part of manifest identity and carries no authority. Its
+second framing pass runs under the same explicit outer decode budget rather than
+silently reparsing hostile bytes without a meter.
 
 ## Warm defeq-cache payload
 
@@ -218,6 +231,20 @@ reductions. A consumer must match all nine binding coordinates, replay the trace
 against the attached certificate terms, and independently confirm the defeq result
 before using the hint.
 
+The seven non-attachment coordinates are supplied through
+`WarmDefeqContextV1` by the consumer. Receipt and certificate identities come from the
+manifest attachment, and the certificate match searches for that exact attached
+object rather than accepting whichever certificate sorts first. Constructing this
+context from the cache being judged would be tautological and does not satisfy the
+API contract.
+
+`classify_present_warm_caches` keeps optional-cache health separate from cartridge
+validity. Unsupported, malformed, stale, absent, cancelled, or resource-limited cache
+data yields a `VerifyWithoutCache` decision; an internal fault yields
+`QuarantineAndVerifyIndependently`. Only corruption of the outer content-addressed
+object graph rejects the transport. A caller may consume only `ReplayHints` rows, and
+even those remain subject to reduction replay.
+
 The executable OQ-13 action table is:
 
 | State | Action |
@@ -235,6 +262,7 @@ required verification closure.
 Schema v1 checks these format limits before allocation:
 
 - 1,048,576 objects;
+- 1,048,576 root receipts;
 - 1,048,576 chunk descriptors;
 - 1,048,576 chunks per object;
 - 1,048,576 attachments;

@@ -1549,9 +1549,11 @@ impl CartridgeIndexV1 {
             Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
             Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
         };
-        let chunks = match locate_frames(bytes) {
-            Ok(chunks) => chunks,
-            Err(refusal) => return Outcome::Complete(Err(refusal)),
+        let chunks = match locate_frames(bytes, budgets.archive) {
+            Outcome::Complete(Ok(chunks)) => chunks,
+            Outcome::Complete(Err(refusal)) => return Outcome::Complete(Err(refusal)),
+            Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
         };
         Outcome::Complete(Ok(CartridgeIndexV1 {
             manifest_root: match archive.manifest_root() {
@@ -1590,30 +1592,39 @@ impl CartridgeIndexV1 {
     }
 }
 
-fn locate_frames(bytes: &[u8]) -> Result<Vec<ChunkLocatorV1>, CartridgeRefusalV1> {
-    let mut reader = CanonReader::new(bytes);
-    reader
-        .expect_schema(SCHEMA_CARTRIDGE_ARCHIVE)
-        .map_err(CartridgeRefusalV1::Malformed)?;
-    let _manifest = reader.bytes().map_err(CartridgeRefusalV1::Malformed)?;
-    let count = read_count(
+fn locate_frames(
+    bytes: &[u8],
+    budget: DecodeBudget,
+) -> Outcome<Result<Vec<ChunkLocatorV1>, CartridgeRefusalV1>> {
+    let mut reader = CanonReader::with_budget(bytes, budget);
+    macro_rules! read {
+        ($expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => return decode_error(&reader, error),
+            }
+        };
+    }
+    read!(reader.expect_schema(SCHEMA_CARTRIDGE_ARCHIVE));
+    let _manifest = read!(reader.bytes());
+    read!(reader.charge_node());
+    let count = read!(read_count(
         &mut reader,
         MAX_CARTRIDGE_CHUNKS_V1,
         "too many cartridge frames",
-    )
-    .map_err(CartridgeRefusalV1::Malformed)?;
+    ));
     let mut chunks = Vec::with_capacity(count);
     for _ in 0..count {
-        let id = read_chunk_id(&mut reader).map_err(CartridgeRefusalV1::Malformed)?;
-        let payload = reader.bytes().map_err(CartridgeRefusalV1::Malformed)?;
+        read!(reader.charge_node());
+        let id = read!(read_chunk_id(&mut reader));
+        let payload = read!(reader.bytes());
         chunks.push(ChunkLocatorV1 {
             id,
             payload_offset: reader.offset().saturating_sub(payload.len()),
             len: payload.len(),
         });
     }
-    reader.finish().map_err(CartridgeRefusalV1::Malformed)?;
-    Ok(chunks)
+    finish_decoded(reader, chunks, |_| Ok(()))
 }
 
 #[derive(Debug, Clone)]
