@@ -897,6 +897,13 @@ struct Composer<'c> {
     outer_reductions: u64,
     levels: Vec<LevelNode>,
     expressions: Vec<ExprNode>,
+    sources: Vec<SourceCopy>,
+}
+
+struct SourceCopy {
+    arena: Arc<WireExpr>,
+    levels: Vec<Option<LevelId>>,
+    expressions: Vec<Option<ExprId>>,
 }
 
 impl<'c> Composer<'c> {
@@ -914,11 +921,12 @@ impl<'c> Composer<'c> {
             outer_reductions,
             levels: Vec::new(),
             expressions: Vec::new(),
+            sources: Vec::new(),
         }
     }
 
     fn prior_level(
-        mapping: &[LevelId],
+        mapping: &[Option<LevelId>],
         input: usize,
         parent: usize,
         child: LevelId,
@@ -933,6 +941,7 @@ impl<'c> Composer<'c> {
         mapping
             .get(child.index())
             .copied()
+            .flatten()
             .ok_or(ComposeHalt::Fault(WhnfFault::MissingLevel {
                 input,
                 index: child.index(),
@@ -940,7 +949,7 @@ impl<'c> Composer<'c> {
     }
 
     fn prior_expression(
-        mapping: &[ExprId],
+        mapping: &[Option<ExprId>],
         input: usize,
         parent: usize,
         child: ExprId,
@@ -957,6 +966,7 @@ impl<'c> Composer<'c> {
         mapping
             .get(child.index())
             .copied()
+            .flatten()
             .ok_or(ComposeHalt::Fault(WhnfFault::MissingExpression {
                 input,
                 index: child.index(),
@@ -1008,74 +1018,204 @@ impl<'c> Composer<'c> {
         Ok(id)
     }
 
-    fn copy_cursor(&mut self, cursor: &Cursor, input: usize) -> Result<ExprId, Halt> {
-        let source = &cursor.arena;
-        let mut level_mapping = Vec::new();
-        for (index, node) in source.levels().iter().enumerate() {
+    fn source_index(&mut self, arena: &Arc<WireExpr>) -> usize {
+        if let Some(index) = self
+            .sources
+            .iter()
+            .position(|source| Arc::ptr_eq(&source.arena, arena))
+        {
+            return index;
+        }
+        let index = self.sources.len();
+        self.sources.push(SourceCopy {
+            arena: Arc::clone(arena),
+            levels: vec![None; arena.levels().len()],
+            expressions: vec![None; arena.nodes().len()],
+        });
+        index
+    }
+
+    fn copy_level_root(
+        &mut self,
+        source_index: usize,
+        root: LevelId,
+        input: usize,
+    ) -> Result<LevelId, Halt> {
+        let source = Arc::clone(&self.sources[source_index].arena);
+        let mut work = vec![(root, false)];
+        while let Some((level_id, built)) = work.pop() {
+            let index = level_id.index();
+            if self.sources[source_index]
+                .levels
+                .get(index)
+                .copied()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+            let node = source
+                .levels()
+                .get(index)
+                .ok_or(Halt::Fault(WhnfFault::MissingLevel { input, index }))?;
+            if !built {
+                self.control
+                    .step(index)
+                    .map_err(|halt| self.map_halt(halt))?;
+                work.push((level_id, true));
+                match node {
+                    LevelNode::Succ(child) => {
+                        if child.index() >= index {
+                            return Err(Halt::Fault(WhnfFault::NonBackwardLevelReference {
+                                input,
+                                parent: index,
+                                child: child.index(),
+                            }));
+                        }
+                        work.push((*child, false));
+                    }
+                    LevelNode::Max(left, right) | LevelNode::IMax(left, right) => {
+                        for child in [right, left] {
+                            if child.index() >= index {
+                                return Err(Halt::Fault(WhnfFault::NonBackwardLevelReference {
+                                    input,
+                                    parent: index,
+                                    child: child.index(),
+                                }));
+                            }
+                            work.push((*child, false));
+                        }
+                    }
+                    LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_) => {}
+                }
+                continue;
+            }
             self.control
-                .step(index)
+                .output(level_owned_units(node), index)
                 .map_err(|halt| self.map_halt(halt))?;
+            let mapping = &self.sources[source_index].levels;
             let mapped = match node {
                 LevelNode::Zero => LevelNode::Zero,
                 LevelNode::Succ(child) => LevelNode::Succ(
-                    Self::prior_level(&level_mapping, input, index, *child)
+                    Self::prior_level(mapping, input, index, *child)
                         .map_err(|halt| self.map_halt(halt))?,
                 ),
                 LevelNode::Max(left, right) => LevelNode::Max(
-                    Self::prior_level(&level_mapping, input, index, *left)
+                    Self::prior_level(mapping, input, index, *left)
                         .map_err(|halt| self.map_halt(halt))?,
-                    Self::prior_level(&level_mapping, input, index, *right)
+                    Self::prior_level(mapping, input, index, *right)
                         .map_err(|halt| self.map_halt(halt))?,
                 ),
                 LevelNode::IMax(left, right) => LevelNode::IMax(
-                    Self::prior_level(&level_mapping, input, index, *left)
+                    Self::prior_level(mapping, input, index, *left)
                         .map_err(|halt| self.map_halt(halt))?,
-                    Self::prior_level(&level_mapping, input, index, *right)
+                    Self::prior_level(mapping, input, index, *right)
                         .map_err(|halt| self.map_halt(halt))?,
                 ),
                 LevelNode::Parameter(name) => LevelNode::Parameter(name.clone()),
                 LevelNode::Meta(name) => LevelNode::Meta(name.clone()),
             };
-            self.control
-                .output(level_owned_units(node), index)
-                .map_err(|halt| self.map_halt(halt))?;
-            let id = self
+            let copied = self
                 .push_level(mapped, index)
                 .map_err(|halt| self.map_halt(halt))?;
-            level_mapping.push(id);
+            self.sources[source_index].levels[index] = Some(copied);
         }
+        self.sources[source_index]
+            .levels
+            .get(root.index())
+            .copied()
+            .flatten()
+            .ok_or(Halt::Fault(WhnfFault::MissingLevel {
+                input,
+                index: root.index(),
+            }))
+    }
 
-        let mut expression_mapping = Vec::new();
-        for (index, node) in source.nodes().iter().enumerate() {
-            self.control
-                .step(index)
-                .map_err(|halt| self.map_halt(halt))?;
+    fn copy_cursor(&mut self, cursor: &Cursor, input: usize) -> Result<ExprId, Halt> {
+        let source_index = self.source_index(&cursor.arena);
+        let source = Arc::clone(&self.sources[source_index].arena);
+        let mut work = vec![(cursor.root, false)];
+        while let Some((expression_id, built)) = work.pop() {
+            let index = expression_id.index();
+            if self.sources[source_index]
+                .expressions
+                .get(index)
+                .copied()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+            let node = source
+                .node(expression_id)
+                .ok_or(Halt::Fault(WhnfFault::MissingExpression { input, index }))?;
+            if !built {
+                self.control
+                    .step(index)
+                    .map_err(|halt| self.map_halt(halt))?;
+                work.push((expression_id, true));
+                let mut push_child = |child: ExprId| -> Result<(), Halt> {
+                    if child.index() >= index {
+                        return Err(Halt::Fault(WhnfFault::NonBackwardExpressionReference {
+                            input,
+                            parent: index,
+                            child: child.index(),
+                        }));
+                    }
+                    work.push((child, false));
+                    Ok(())
+                };
+                match node {
+                    ExprNode::Apply { function, argument } => {
+                        push_child(*argument)?;
+                        push_child(*function)?;
+                    }
+                    ExprNode::Lambda {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::Forall {
+                        binder_type, body, ..
+                    } => {
+                        push_child(*body)?;
+                        push_child(*binder_type)?;
+                    }
+                    ExprNode::Let {
+                        type_, value, body, ..
+                    } => {
+                        push_child(*body)?;
+                        push_child(*value)?;
+                        push_child(*type_)?;
+                    }
+                    ExprNode::Metadata { expression, .. }
+                    | ExprNode::Projection { expression, .. } => {
+                        push_child(*expression)?;
+                    }
+                    ExprNode::Bound { .. }
+                    | ExprNode::Free { .. }
+                    | ExprNode::Meta { .. }
+                    | ExprNode::Sort { .. }
+                    | ExprNode::Constant { .. }
+                    | ExprNode::NatLiteral { .. }
+                    | ExprNode::StringLiteral(_) => {}
+                }
+                continue;
+            }
             self.control
                 .output(expression_owned_units(node), index)
                 .map_err(|halt| self.map_halt(halt))?;
-            let map_expr = |child| Self::prior_expression(&expression_mapping, input, index, child);
+            let expression_mapping = &self.sources[source_index].expressions;
+            let map_expr = |child| Self::prior_expression(expression_mapping, input, index, child);
             let mapped = match node {
                 ExprNode::Bound { index } => ExprNode::Bound { index: *index },
                 ExprNode::Free { name } => ExprNode::Free { name: name.clone() },
                 ExprNode::Meta { name } => ExprNode::Meta { name: name.clone() },
                 ExprNode::Sort { level } => ExprNode::Sort {
-                    level: level_mapping
-                        .get(level.index())
-                        .copied()
-                        .ok_or(Halt::Fault(WhnfFault::MissingLevel {
-                            input,
-                            index: level.index(),
-                        }))?,
+                    level: self.copy_level_root(source_index, *level, input)?,
                 },
                 ExprNode::Constant { name, levels } => {
                     let mut mapped_levels = Vec::new();
                     for level in levels {
-                        mapped_levels.push(level_mapping.get(level.index()).copied().ok_or(
-                            Halt::Fault(WhnfFault::MissingLevel {
-                                input,
-                                index: level.index(),
-                            }),
-                        )?);
+                        mapped_levels.push(self.copy_level_root(source_index, *level, input)?);
                     }
                     ExprNode::Constant {
                         name: name.clone(),
@@ -1145,12 +1285,14 @@ impl<'c> Composer<'c> {
             let id = self
                 .push_expression_charged(mapped, index)
                 .map_err(|halt| self.map_halt(halt))?;
-            expression_mapping.push(id);
+            self.sources[source_index].expressions[index] = Some(id);
         }
 
-        expression_mapping
+        self.sources[source_index]
+            .expressions
             .get(cursor.root.index())
             .copied()
+            .flatten()
             .ok_or(Halt::Fault(WhnfFault::MissingExpression {
                 input,
                 index: cursor.root.index(),

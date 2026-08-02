@@ -545,6 +545,23 @@ fn resource_and_cancellation_are_typed_nonanswers_with_exact_recovery() {
     ));
 
     let stuck_application = decoded(&Expr::app(constant("function"), constant("argument")));
+    let compact = whnf(
+        &stuck_application,
+        &WhnfContext::default(),
+        WhnfBudget::new(
+            u64::MAX,
+            u64::MAX,
+            TermBudget::unlimited().with_max_arena_nodes(3),
+        ),
+    );
+    assert!(matches!(
+        compact,
+        WhnfOutcome::Complete(WhnfResult {
+            reductions: 0,
+            ref term,
+            ..
+        }) if term.nodes().len() == 3
+    ));
     assert!(matches!(
         whnf(
             &stuck_application,
@@ -552,20 +569,20 @@ fn resource_and_cancellation_are_typed_nonanswers_with_exact_recovery() {
             WhnfBudget::new(
                 u64::MAX,
                 u64::MAX,
-                TermBudget::unlimited().with_max_arena_nodes(3),
+                TermBudget::unlimited().with_max_arena_nodes(2),
             ),
         ),
         WhnfOutcome::Inconclusive(WhnfStop::Materialization {
-            phase: WhnfPhase::RebuildApplication,
+            phase: WhnfPhase::Initial,
             stop: TermStop::Resource {
                 limit: TermLimit::ArenaNodes,
-                allowed: 3,
-                observed: 4,
+                allowed: 2,
+                observed: 3,
                 ..
             },
-            completed_steps,
             completed_reductions: 0,
-        }) if completed_steps > 0
+            ..
+        })
     ));
 
     assert!(matches!(
@@ -641,6 +658,40 @@ fn deep_child() -> Result<(), String> {
         )
     {
         return Err("deep weak head was not the terminal bound variable".to_owned());
+    }
+
+    let mut writer = CanonWriter::new();
+    writer.schema(SCHEMA_EXPR);
+    for _ in 0..DEPTH {
+        writer.u8(5);
+    }
+    writer.u8(0);
+    writer.u32(0);
+    for _ in 0..DEPTH {
+        writer.u8(0);
+        writer.u32(1);
+    }
+    let term = match decode_expr(&writer.into_bytes(), DecodeBudget::unlimited()) {
+        DecodeOutcome::Complete(Ok(value)) => value,
+        _ => return Err("deep primary-shaped application spine did not decode".to_owned()),
+    };
+    let result = match whnf(&term, &WhnfContext::default(), WhnfBudget::unlimited()) {
+        WhnfOutcome::Complete(value) => value,
+        _ => return Err("deep stuck application did not complete".to_owned()),
+    };
+    if result.reductions != 0 {
+        return Err(format!(
+            "stuck application reduction count drifted: {}",
+            result.reductions
+        ));
+    }
+    if result.term.nodes().len() != DEPTH.saturating_mul(2).saturating_add(1)
+        || !matches!(
+            result.term.node(result.term.root()),
+            Some(ExprNode::Apply { .. })
+        )
+    {
+        return Err("deep stuck application was not rebuilt compactly".to_owned());
     }
     Ok(())
 }
