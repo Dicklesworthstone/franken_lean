@@ -18,9 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fln_core::diag::ResourceReason;
 use fln_core::mode::{ContentRoot, EpochId, Mode};
-use fln_core::outcome::{
-    Inconclusive, InconclusiveCause, InternalFault, Outcome, ResourceUsage,
-};
+use fln_core::outcome::{Inconclusive, InconclusiveCause, InternalFault, Outcome, ResourceUsage};
 
 use crate::canon::{
     CanonError, CanonReader, CanonWriter, DecodeBudget, SCHEMA_CARTRIDGE_ARCHIVE,
@@ -1322,9 +1320,7 @@ impl CartridgeArchiveV1 {
                                 cache.binding.classify_against(&expected)
                             }
                         }
-                        Outcome::Complete(Err(refusal)) => {
-                            warm_cache_refusal_state(&refusal)
-                        }
+                        Outcome::Complete(Err(refusal)) => warm_cache_refusal_state(&refusal),
                         Outcome::Inconclusive(stop) => match stop.cause {
                             InconclusiveCause::Cancelled { .. } => WarmCacheStateV1::Cancelled,
                             InconclusiveCause::ResourceExhausted { .. } => {
@@ -1387,9 +1383,7 @@ fn warm_cache_refusal_state(refusal: &CartridgeRefusalV1) -> WarmCacheStateV1 {
         | CartridgeRefusalV1::MissingObject { .. }
         | CartridgeRefusalV1::MissingChunk { .. }
         | CartridgeRefusalV1::DuplicateFrame { .. }
-        | CartridgeRefusalV1::ConflictingObjectDeclaration { .. } => {
-            WarmCacheStateV1::Malformed
-        }
+        | CartridgeRefusalV1::ConflictingObjectDeclaration { .. } => WarmCacheStateV1::Malformed,
     }
 }
 
@@ -1637,6 +1631,7 @@ pub struct CartridgeBuilderV1 {
     environment_root: ContentRoot,
     chunk_size: usize,
     objects: BTreeMap<CartridgeObjectIdV1, BuilderObjectV1>,
+    conflicting_objects: BTreeSet<CartridgeObjectIdV1>,
     root_receipts: BTreeSet<CartridgeObjectIdV1>,
     attachments: BTreeSet<ReceiptAttachmentV1>,
     extensions: Vec<CartridgeExtensionV1>,
@@ -1649,6 +1644,7 @@ impl CartridgeBuilderV1 {
             environment_root,
             chunk_size: 64 * 1024,
             objects: BTreeMap::new(),
+            conflicting_objects: BTreeSet::new(),
             root_receipts: BTreeSet::new(),
             attachments: BTreeSet::new(),
             extensions: Vec::new(),
@@ -1675,12 +1671,31 @@ impl CartridgeBuilderV1 {
     ) -> CartridgeObjectIdV1 {
         let bytes = bytes.into();
         let id = cartridge_object_id(kind, &bytes);
-        self.objects.entry(id).or_insert(BuilderObjectV1 {
-            kind,
-            requirement,
-            portability,
-            bytes,
-        });
+        if let Some(existing) = self.objects.get_mut(&id) {
+            if existing.kind != kind || existing.bytes != bytes {
+                self.conflicting_objects.insert(id);
+                return id;
+            }
+            if requirement == ObjectRequirementV1::Required {
+                existing.requirement = ObjectRequirementV1::Required;
+            }
+            match merge_portability(&existing.portability, &portability) {
+                Some(merged) => existing.portability = merged,
+                None => {
+                    self.conflicting_objects.insert(id);
+                }
+            }
+        } else {
+            self.objects.insert(
+                id,
+                BuilderObjectV1 {
+                    kind,
+                    requirement,
+                    portability,
+                    bytes,
+                },
+            );
+        }
         id
     }
 
@@ -1709,6 +1724,9 @@ impl CartridgeBuilderV1 {
     pub fn build(self) -> Result<CartridgeArchiveV1, CartridgeRefusalV1> {
         if self.chunk_size == 0 {
             return invalid(CartridgeRuleV1::InvalidChunkSize, 0);
+        }
+        if let Some(object) = self.conflicting_objects.first() {
+            return Err(CartridgeRefusalV1::ConflictingObjectDeclaration { object: *object });
         }
         let mut frames: BTreeMap<CartridgeChunkIdV1, Vec<u8>> = BTreeMap::new();
         let mut objects = Vec::with_capacity(self.objects.len());
@@ -1767,6 +1785,33 @@ impl CartridgeBuilderV1 {
                 .map(|(id, bytes)| CartridgeFrameV1 { id, bytes })
                 .collect(),
         )
+    }
+}
+
+fn merge_portability(
+    left: &ObjectPortabilityV1,
+    right: &ObjectPortabilityV1,
+) -> Option<ObjectPortabilityV1> {
+    match (left, right) {
+        (ObjectPortabilityV1::Portable, other) | (other, ObjectPortabilityV1::Portable) => {
+            Some(other.clone())
+        }
+        (ObjectPortabilityV1::EpochBound, ObjectPortabilityV1::EpochBound) => {
+            Some(ObjectPortabilityV1::EpochBound)
+        }
+        (ObjectPortabilityV1::EpochBound, platform @ ObjectPortabilityV1::PlatformBound { .. })
+        | (platform @ ObjectPortabilityV1::PlatformBound { .. }, ObjectPortabilityV1::EpochBound) => {
+            Some(platform.clone())
+        }
+        (
+            ObjectPortabilityV1::PlatformBound { target: left },
+            ObjectPortabilityV1::PlatformBound { target: right },
+        ) if left == right => Some(ObjectPortabilityV1::PlatformBound {
+            target: left.clone(),
+        }),
+        (ObjectPortabilityV1::PlatformBound { .. }, ObjectPortabilityV1::PlatformBound { .. }) => {
+            None
+        }
     }
 }
 
