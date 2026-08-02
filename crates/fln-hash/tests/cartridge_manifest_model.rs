@@ -9,7 +9,8 @@ use fln_hash::cartridge::{
     AttachmentRoleV1, CartridgeArchiveV1, CartridgeBuilderV1, CartridgeDecodeBudgetsV1,
     CartridgeFrameV1, CartridgeIndexV1, CartridgeObjectKindV1, CartridgeRefusalV1, CartridgeRuleV1,
     CartridgeStagerV1, CartridgeTransportStateV1, DefeqTransparencyV1, ObjectPortabilityV1,
-    ObjectRequirementV1, WarmDefeqBindingV1, WarmDefeqCacheV1, WarmDefeqEntryV1, WarmDefeqQueryV1,
+    ObjectRequirementV1, WarmDefeqBindingV1, WarmDefeqCacheV1, WarmDefeqContextV1,
+    WarmDefeqEntryV1, WarmDefeqQueryV1,
 };
 
 fn root(byte: u8) -> ContentRoot {
@@ -120,6 +121,18 @@ fn complete<T: std::fmt::Debug>(outcome: Outcome<Result<T, CartridgeRefusalV1>>)
     }
 }
 
+fn warm_context() -> WarmDefeqContextV1 {
+    WarmDefeqContextV1 {
+        epoch: EpochId::new(4_032_000),
+        mode: Mode::Sound,
+        environment_root: root(1),
+        kernel_build_root: root(2),
+        checker_build_root: root(3),
+        policy_root: root(4),
+        fuel_profile_root: root(5),
+    }
+}
+
 #[test]
 fn thin_partial_sealed_and_complete_share_one_manifest_identity() {
     let complete_archive = full_archive();
@@ -200,6 +213,20 @@ fn canonical_archive_round_trip_and_derived_random_access_are_exact() {
             frame.bytes
         );
     }
+
+    let object = archive
+        .manifest
+        .objects
+        .iter()
+        .max_by_key(|object| object.len)
+        .expect("object");
+    assert!(complete(archive.assemble_object(object.id, object.len)).is_some());
+    if object.len > 0 {
+        assert!(matches!(
+            archive.assemble_object(object.id, object.len - 1),
+            Outcome::Inconclusive(_)
+        ));
+    }
 }
 
 #[test]
@@ -242,10 +269,16 @@ fn staging_is_failure_atomic_and_recovers_exactly() {
 #[test]
 fn nested_warm_cache_binding_is_validated_without_becoming_required() {
     let archive = full_archive();
-    let report =
-        complete(archive.validate_present_warm_caches(DecodeBudget::new(u64::MAX, u64::MAX)));
-    assert_eq!(report.validated, 1);
-    assert_eq!(report.missing, 0);
+    let report = archive
+        .classify_present_warm_caches(
+            &warm_context(),
+            DecodeBudget::new(u64::MAX, u64::MAX),
+            u64::MAX,
+        )
+        .expect("classify present cache");
+    assert_eq!(report.replayable(), 1);
+    assert_eq!(report.missing(), 0);
+    assert_eq!(report.bypassed(), 0);
 
     let required = archive.manifest.required_chunk_ids();
     let sealed_frames: Vec<_> = archive
@@ -256,10 +289,135 @@ fn nested_warm_cache_binding_is_validated_without_becoming_required() {
         .collect();
     let sealed =
         CartridgeArchiveV1::new(archive.manifest.clone(), sealed_frames).expect("sealed archive");
-    let report =
-        complete(sealed.validate_present_warm_caches(DecodeBudget::new(u64::MAX, u64::MAX)));
-    assert_eq!(report.validated, 0);
-    assert_eq!(report.missing, 1);
+    let report = sealed
+        .classify_present_warm_caches(
+            &warm_context(),
+            DecodeBudget::new(u64::MAX, u64::MAX),
+            u64::MAX,
+        )
+        .expect("classify absent cache");
+    assert_eq!(report.replayable(), 0);
+    assert_eq!(report.missing(), 1);
+    assert_eq!(report.bypassed(), 1);
+}
+
+#[test]
+fn duplicate_object_metadata_is_commutative_and_nonroot_attachments_are_refused() {
+    fn duplicate_archive(reverse: bool) -> CartridgeArchiveV1 {
+        let mut builder = CartridgeBuilderV1::new(EpochId::new(4_032_000), root(1));
+        let receipt = builder.add_object(
+            CartridgeObjectKindV1::Receipt,
+            ObjectRequirementV1::Required,
+            ObjectPortabilityV1::EpochBound,
+            b"duplicate-receipt".to_vec(),
+        );
+        let certificate = builder.add_object(
+            CartridgeObjectKindV1::Certificate,
+            ObjectRequirementV1::Required,
+            ObjectPortabilityV1::EpochBound,
+            b"duplicate-certificate".to_vec(),
+        );
+        let rows = if reverse {
+            [
+                (
+                    ObjectRequirementV1::Required,
+                    ObjectPortabilityV1::EpochBound,
+                ),
+                (ObjectRequirementV1::Optional, ObjectPortabilityV1::Portable),
+            ]
+        } else {
+            [
+                (ObjectRequirementV1::Optional, ObjectPortabilityV1::Portable),
+                (
+                    ObjectRequirementV1::Required,
+                    ObjectPortabilityV1::EpochBound,
+                ),
+            ]
+        };
+        let mut fixture = None;
+        for (requirement, portability) in rows {
+            fixture = Some(builder.add_object(
+                CartridgeObjectKindV1::Fixture,
+                requirement,
+                portability,
+                b"duplicate-fixture".to_vec(),
+            ));
+        }
+        builder.add_root_receipt(receipt);
+        builder.attach(receipt, AttachmentRoleV1::Certificate, certificate);
+        builder.attach(
+            receipt,
+            AttachmentRoleV1::Fixture,
+            fixture.expect("fixture id"),
+        );
+        builder.build().expect("commutative duplicate merge")
+    }
+
+    let forward = duplicate_archive(false);
+    let reverse = duplicate_archive(true);
+    assert_eq!(
+        forward.manifest.to_canonical_bytes().unwrap(),
+        reverse.manifest.to_canonical_bytes().unwrap(),
+    );
+    let fixture = forward
+        .manifest
+        .objects
+        .iter()
+        .find(|object| object.kind == CartridgeObjectKindV1::Fixture)
+        .expect("fixture");
+    assert_eq!(fixture.requirement, ObjectRequirementV1::Required);
+    assert_eq!(fixture.portability, ObjectPortabilityV1::EpochBound);
+
+    let mut conflicting = CartridgeBuilderV1::new(EpochId::new(4_032_000), root(1));
+    conflicting.add_object(
+        CartridgeObjectKindV1::Fixture,
+        ObjectRequirementV1::Optional,
+        ObjectPortabilityV1::PlatformBound {
+            target: "aarch64-apple-darwin".to_string(),
+        },
+        b"conflicting-fixture".to_vec(),
+    );
+    conflicting.add_object(
+        CartridgeObjectKindV1::Fixture,
+        ObjectRequirementV1::Optional,
+        ObjectPortabilityV1::PlatformBound {
+            target: "x86_64-unknown-linux-gnu".to_string(),
+        },
+        b"conflicting-fixture".to_vec(),
+    );
+    assert!(matches!(
+        conflicting.build(),
+        Err(CartridgeRefusalV1::ConflictingObjectDeclaration { .. })
+    ));
+
+    let mut nonroot = CartridgeBuilderV1::new(EpochId::new(4_032_000), root(1));
+    let root_receipt = nonroot.add_object(
+        CartridgeObjectKindV1::Receipt,
+        ObjectRequirementV1::Required,
+        ObjectPortabilityV1::EpochBound,
+        b"root-receipt".to_vec(),
+    );
+    let other_receipt = nonroot.add_object(
+        CartridgeObjectKindV1::Receipt,
+        ObjectRequirementV1::Required,
+        ObjectPortabilityV1::EpochBound,
+        b"nonroot-receipt".to_vec(),
+    );
+    let certificate = nonroot.add_object(
+        CartridgeObjectKindV1::Certificate,
+        ObjectRequirementV1::Required,
+        ObjectPortabilityV1::EpochBound,
+        b"nonroot-certificate".to_vec(),
+    );
+    nonroot.add_root_receipt(root_receipt);
+    nonroot.attach(other_receipt, AttachmentRoleV1::Certificate, certificate);
+    assert!(matches!(
+        nonroot.build(),
+        Err(CartridgeRefusalV1::InvalidStructure {
+            rule: CartridgeRuleV1::AttachmentReceiptNotRoot,
+            ..
+        })
+    ));
 }
 
 #[test]

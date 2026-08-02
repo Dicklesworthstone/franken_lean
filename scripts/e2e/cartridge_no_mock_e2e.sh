@@ -471,7 +471,7 @@ PACK_FRAMES="$("${PYTHON[@]}" -c \
   --artifact-root "$ART_DIR" \
   --string schema "$SEMANTIC_SCHEMA" --integer sequence 5 \
   --string scenario codec --integer arbitrary_cases 10000 \
-  --boolean authority false --integer named_tests 23 \
+  --boolean authority false --integer named_tests 24 \
   --integer productive_workers 41 --string status complete \
   --json-value thread_counts '[1,8,32]' --integer version_cases 65536
 "${PYTHON[@]}" "$EVIDENCE" emit --file "$SEMANTIC" \
