@@ -67,6 +67,19 @@ static lean_object *probe_str_size(lean_object *s) {
     lean_dec(s);
     return r;
 }
+/* fln-3gv slice 3 targets: spawn body, identity map, and the bind target
+ * that returns a captured (still-unfinished) task — the re-arm shape. */
+static lean_object *probe_forty_two(lean_object *w) {
+    (void)w;
+    return lean_box(42);
+}
+static lean_object *probe_ident(lean_object *x) {
+    return x;
+}
+static lean_object *probe_return_task(lean_object *t, lean_object *v) {
+    lean_dec(v);
+    return t;
+}
 
 static void facts_mode(void) {
     /* ---- ctor through the inline small path (mi_malloc_small underneath) */
@@ -362,9 +375,86 @@ static void facts_mode(void) {
     fact("option.get_or_block.str_rc", got->m_rc);
     fact("option.get_or_block.str_size", (long long)lean_string_size(got) - 1);
     lean_dec(got);
+
+    /* ---- fln-3gv slice 3: the task manager goes live. Everything below
+     * runs AFTER lean_init_task_manager_using(2): both runtimes schedule on
+     * real workers now, so only get-forced points and sync-ordering
+     * guarantees are probed — never the transient state of a queued task. */
+    lean_init_task_manager_using(2);
+    /* spawn + get across a worker */
+    lean_object *spc = lean_alloc_closure((void *)probe_forty_two, 1, 0);
+    lean_object *sp = lean_task_spawn(spc, lean_box(0));
+    fact("mgr.spawn.get", (long long)lean_unbox(lean_task_get_own(sp)));
+    /* the promise lifecycle */
+    lean_object *pr = lean_io_promise_new();
+    lean_object *prt = lean_io_promise_result_opt(pr);
+    fact("mgr.promise.state_unresolved", lean_io_get_task_state(prt));
+    lean_dec(lean_io_promise_resolve(lean_box(5), pr));
+    fact("mgr.promise.state_resolved", lean_io_get_task_state(prt));
+    lean_object *rsome = lean_task_get(prt); /* borrowed some(5) */
+    fact("mgr.promise.some_tag", lean_ptr_tag(rsome));
+    fact("mgr.promise.value", (long long)lean_unbox(lean_ctor_get(rsome, 0)));
+    /* 3gv-M3's discriminator: resolve_core marks the published value MT */
+    fact("mgr.promise.resolved_value_is_mt", rsome->m_rc < 0);
+    lean_inc(rsome);
+    fact("mgr.promise.get_or_block",
+         (long long)lean_unbox(lean_option_get_or_block(rsome)));
+    lean_dec(lean_io_promise_resolve(lean_box(9), pr));
+    fact("mgr.promise.first_resolve_wins",
+         (long long)lean_unbox(lean_ctor_get(lean_task_get(prt), 0)));
+    lean_dec(prt);
+    lean_dec(pr);
+    /* sync := true dependent of an UNFINISHED promise task: Waiting before,
+     * finished INLINE by the time resolve returns (the CancelToken.onSet
+     * ordering law, enqueue_core's LEAN_SYNC_PRIO arm) */
+    lean_object *pr2 = lean_io_promise_new();
+    lean_object *prt2 = lean_io_promise_result_opt(pr2);
+    lean_object *fid = lean_alloc_closure((void *)probe_ident, 1, 0);
+    lean_object *m = lean_task_map(fid, prt2, lean_box(0), 1);
+    fact("mgr.sync_dep.state_before", lean_io_get_task_state(m));
+    lean_dec(lean_io_promise_resolve(lean_box(3), pr2));
+    fact("mgr.sync_dep.state_after_resolve", lean_io_get_task_state(m));
+    fact("mgr.sync_dep.value",
+         (long long)lean_unbox(lean_ctor_get(lean_task_get(m), 0)));
+    lean_dec(m);
+    lean_dec(pr2);
+    /* dropping an unresolved promise publishes none */
+    lean_object *pr3 = lean_io_promise_new();
+    lean_object *prt3 = lean_io_promise_result_opt(pr3);
+    lean_dec(pr3);
+    fact("mgr.promise.dropped_state", lean_io_get_task_state(prt3));
+    fact("mgr.promise.dropped_is_none", lean_is_scalar(lean_task_get(prt3)));
+    lean_dec(prt3);
+    /* bind through the re-arm path, deterministic under sync: the outer
+     * resolve runs bind_fn1 inline, f returns a still-unfinished task, the
+     * bound task re-arms Waiting on it; the inner resolve finishes it */
+    lean_object *pr4 = lean_io_promise_new();
+    lean_object *prt4 = lean_io_promise_result_opt(pr4);
+    lean_object *pr5 = lean_io_promise_new();
+    lean_object *prt5 = lean_io_promise_result_opt(pr5);
+    lean_object *fb = lean_alloc_closure((void *)probe_return_task, 2, 1);
+    lean_closure_set(fb, 0, prt5);
+    lean_object *bnd = lean_task_bind(prt4, fb, lean_box(0), 1);
+    lean_dec(lean_io_promise_resolve(lean_box(2), pr4));
+    fact("mgr.bind.rearmed_state", lean_io_get_task_state(bnd));
+    lean_dec(lean_io_promise_resolve(lean_box(8), pr5));
+    fact("mgr.bind.value",
+         (long long)lean_unbox(lean_ctor_get(lean_task_get(bnd), 0)));
+    lean_dec(bnd);
+    lean_dec(pr4);
+    lean_dec(pr5);
+    /* off-task cancellation probe answers false in both runtimes */
+    fact("mgr.check_canceled.off_task", lean_io_check_canceled_core());
+    lean_finalize_task_manager(); /* both runtimes drain and join here */
 }
 
 int main(int argc, char **argv) {
+    /* Line-buffered facts: a mutant that HANGS mid-run (a real divergence
+     * class — 83r-M1 deadlocks the promise drop-to-none cell) is killed by
+     * the drill's timeout, and every fact emitted before the hang must
+     * already be on disk. Identical in both runtimes; flush timing only,
+     * never bytes. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc > 1 && strcmp(argv[1], "panic-internal") == 0) {
         lean_internal_panic("gauntlet-boom");
         return 99; /* unreachable: both runtimes terminate */
