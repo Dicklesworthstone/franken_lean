@@ -18,7 +18,7 @@ use crate::layout::{
     LeanThunkObject,
 };
 use crate::membrane;
-use crate::rc::{self, init_st_header};
+use crate::rc::{self, init_mt_header, init_st_header};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
@@ -750,8 +750,8 @@ pub(crate) unsafe fn alloc_thunk_closure(closure: *mut LeanObject) -> *mut LeanO
 /// Finished-task constructor (`Task.pure` state machine entry,
 /// `lean.h:250-295`): `m_value = v`, `m_imp = NULL`. Carries the exported
 /// `lean_task_pure` and every managerless-eager `task_map_core` result
-/// (fln-3gv slice 2); live scheduled tasks arrive with the manager plane
-/// (fln-3gv, next slice).
+/// (fln-3gv slice 2); scheduled tasks are `alloc_task_scheduled` below
+/// (fln-3gv slice 3).
 ///
 /// # Safety
 /// Caller owns the result; `v` reference is consumed.
@@ -773,6 +773,81 @@ pub(crate) unsafe fn alloc_task_pure(v: *mut LeanObject) -> *mut LeanObject {
     }
     membrane::note_alloc(o, membrane::align_obj_size(sz), TAG_TASK);
     o
+}
+
+/// Scheduled-task constructor (`alloc_task(c, prio, keep_alive)`,
+/// `object.cpp:1132-1146` + `lean_set_task_header`): the closure is marked
+/// multi-threaded FIRST, the header is born MT (`m_rc = -1`), and
+/// `keep_alive` mints the self-referencing token. The imp block lives on the
+/// Rust heap (`Box`) — a disclosed mechanism deviation (task_manager.rs
+/// module doc): it never crosses the membrane as an object. `m_cs_sz` keeps
+/// the membrane's size prefix (deviation from the pin's zeroing, unread by
+/// conforming code).
+///
+/// # Safety
+/// Caller owns the result token(s); `closure` reference is consumed.
+// UNSAFE-LEDGER: FLN-UL-0241
+#[allow(unsafe_code)]
+pub(crate) unsafe fn alloc_task_scheduled(
+    closure: *mut LeanObject,
+    prio: u32,
+    keep_alive: bool,
+) -> *mut LeanObject {
+    // SAFETY: fresh exclusive block; every field initialized before any
+    // publication; mark_mt precedes reachability from the task exactly as
+    // the pin's alloc_task does.
+    unsafe {
+        if !closure.is_null() && !crate::tagged::is_scalar(closure) {
+            rc::mark_mt(closure);
+        }
+        let sz = size_of::<LeanTaskObject>();
+        let o = membrane::alloc_small(sz);
+        init_mt_header(o, TAG_TASK, 0);
+        let t = o.cast::<LeanTaskObject>();
+        (&raw mut (*t).m_value).write(AtomicPtr::new(core::ptr::null_mut()));
+        let imp = Box::into_raw(Box::new(crate::layout::LeanTaskImp {
+            m_closure: closure,
+            m_head_dep: core::ptr::null_mut(),
+            m_next_dep: core::ptr::null_mut(),
+            m_prio: prio,
+            m_canceled: 0,
+            m_keep_alive: u8::from(keep_alive),
+            m_deleted: 0,
+        }));
+        (&raw mut (*t).m_imp).write(imp);
+        membrane::note_alloc(o, membrane::align_obj_size(sz), TAG_TASK);
+        if keep_alive {
+            rc::inc_ref_n(o, 1);
+        }
+        o
+    }
+}
+
+/// Promise constructor (`lean_promise_new`'s allocation half,
+/// `object.cpp:1280-1291`): an ST promise object owning one Promised task
+/// (MT header, `m_value = NULL`, imp with a null closure — state 1).
+///
+/// # Safety
+/// Caller owns the result.
+// UNSAFE-LEDGER: FLN-UL-0242
+#[allow(unsafe_code)]
+pub(crate) unsafe fn alloc_promise() -> *mut LeanObject {
+    // SAFETY: two fresh exclusive blocks, fields initialized before
+    // publication; the promise takes ownership of the task's one token.
+    unsafe {
+        let task = alloc_task_scheduled(core::ptr::null_mut(), 0, false);
+        let sz = size_of::<crate::layout::LeanPromiseObject>();
+        let o = membrane::alloc_small(sz);
+        init_st_header(o, crate::contract::TAG_PROMISE, 0);
+        let p = o.cast::<crate::layout::LeanPromiseObject>();
+        (&raw mut (*p).m_result).write(task.cast::<crate::layout::LeanTaskObject>());
+        membrane::note_alloc(
+            o,
+            membrane::align_obj_size(sz),
+            crate::contract::TAG_PROMISE,
+        );
+        o
+    }
 }
 
 /// Task salient fields `(m_value, m_imp)`.

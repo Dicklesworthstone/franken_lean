@@ -104,11 +104,11 @@ pub(crate) struct LeanThunkObject {
 }
 
 /// `lean_task_imp` — per-task execution data (`lean.h:234-243`), released
-/// when the task terminates. Marrow never allocates one: only Finished
-/// tasks (`m_imp == NULL`, `m_value != NULL`) are constructible — the
-/// fln-3gv slice-2 state family answers for them and refuses typed on
-/// `m_imp != NULL`; scheduled tasks arrive with the manager plane
-/// (fln-3gv, next slice).
+/// when the task terminates. Allocated by the manager slice (fln-3gv
+/// slice 3) as a Rust-heap `Box` — a disclosed mechanism deviation
+/// (`task_manager.rs` module doc): the imp never crosses the membrane as
+/// an object, and its fields are mutated only under the manager lock or
+/// before publication, per the pin's state machine.
 #[repr(C)]
 pub(crate) struct LeanTaskImp {
     pub(crate) m_closure: *mut LeanObject,

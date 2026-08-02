@@ -29,10 +29,13 @@
 //! outbound linking artifacts) stay with beads franken_lean-sno / fln-kok.
 //!
 //! Slice-1 typed restrictions (tracked, never silent):
-//! * scheduled tasks/promises (`m_imp != NULL`) — bead fln-3gv (effects on
-//!   asupersync). The fln-3gv slice-2 promise/task-state family serves the
-//!   pin's managerless envelope over Finished tasks only; unfinished-task
-//!   and promise arms refuse typed (`export.rs` slice-2 banner);
+//! * the task plane is LIVE as of fln-3gv slice 3: `task_manager.rs` ports
+//!   the pin's manager (workers, promises, sync-inline execution) and the
+//!   slice-2 state family carries both arms — manager-served, and the pin's
+//!   own managerless envelope with typed refusals where the pin has UB.
+//!   Still excluded: the `io.cpp` wrapper family (as_task/map_task/
+//!   bind_task/wait/wait_any/cancel/check_canceled) and `wait_any_core` —
+//!   fln-3gv next slice;
 //! * forcing thunks / applying closures / external `m_foreach` traversal —
 //!   bead franken_lean-7xe (Golem apply machinery);
 //! * compacted-region loading — bead fln-wgp; the size-classed allocator
@@ -73,6 +76,7 @@ mod object;
 pub mod rc;
 pub mod shadow;
 mod tagged;
+mod task_manager;
 
 /// Read this runtime thread's allocation-linked heartbeat counter.
 ///

@@ -79,6 +79,24 @@ pub(crate) unsafe fn init_st_header(o: *mut LeanObject, tag: u8, other: u8) {
     }
 }
 
+/// The multi-threaded header (`lean_set_task_header`, `object.cpp:1125-1130`):
+/// born with one MT token (`m_rc = -1`). `m_cs_sz` keeps the membrane's size
+/// prefix — the disclosed deviation from the pin's zeroing (task_manager.rs
+/// module doc).
+///
+/// # Safety
+/// Exclusive access to a fresh allocation.
+// UNSAFE-LEDGER: FLN-UL-0243
+#[allow(unsafe_code)]
+pub(crate) unsafe fn init_mt_header(o: *mut LeanObject, tag: u8, other: u8) {
+    // SAFETY: exclusive access to a fresh allocation.
+    unsafe {
+        (&raw mut (*o).m_rc).write(-1);
+        (&raw mut (*o).m_other).write(other);
+        (&raw mut (*o).m_tag).write(tag);
+    }
+}
+
 /// `lean_get_rc_mt_addr` (`lean.h:552-554`): the atomic view of `m_rc`.
 ///
 /// EVERY read of `m_rc` goes through here as a `Relaxed` load, including the
@@ -302,21 +320,42 @@ unsafe fn del_core(o: *mut LeanObject, todo: &mut Vec<*mut LeanObject>) {
                 membrane::release_with_size(o, sz, "del.ref");
             }
             t if t == TAG_TASK => {
-                let (v, imp) = object::task_fields(o);
-                debug_assert!(
-                    imp.is_null(),
-                    "scheduled tasks require fln-3gv (deactivate_task)"
-                );
-                if !imp.is_null() {
-                    shadow::on_traversal_skip(TAG_TASK, "del.task.imp");
+                if let Some(mgr) = crate::task_manager::manager() {
+                    // `deactivate_task` (object.cpp:1025-1037,1115-1121):
+                    // finished tasks release value + block; unfinished ones
+                    // are stripped and left Deactivated for the manager's
+                    // own transitions to free. The manager pushes exactly
+                    // the references this teardown owes to the todo stack.
+                    mgr.deactivate_for_teardown(
+                        crate::task_manager::TaskPtr(o.cast()),
+                        &mut |child| dec_child(child, todo),
+                    );
+                } else {
+                    let (v, imp) = object::task_fields(o);
+                    debug_assert!(
+                        imp.is_null(),
+                        "scheduled tasks cannot exist without the task manager"
+                    );
+                    if !imp.is_null() {
+                        shadow::on_traversal_skip(TAG_TASK, "del.task.imp");
+                    }
+                    if !v.is_null() {
+                        dec_child(v, todo);
+                    }
+                    membrane::release_with_size(o, sz, "del.task");
                 }
-                if !v.is_null() {
-                    dec_child(v, todo);
-                }
-                membrane::release_with_size(o, sz, "del.task");
             }
             t if t == TAG_PROMISE => {
                 let r = (&raw const (*o.cast::<LeanPromiseObject>()).m_result).read();
+                if let Some(mgr) = crate::task_manager::manager() {
+                    // `deactivate_promise` (object.cpp:1314-1318): dropping
+                    // an unresolved promise resolves its task to `none`
+                    // (box 0) and wakes every waiter, then releases the
+                    // promise's task token.
+                    if !r.is_null() {
+                        mgr.resolve(crate::task_manager::TaskPtr(r), crate::tagged::boxi(0));
+                    }
+                }
                 if !r.is_null() {
                     dec_child(r.cast::<LeanObject>(), todo);
                 }
@@ -461,8 +500,21 @@ unsafe fn push_children(
                 shadow::on_traversal_skip(TAG_EXTERNAL, op);
             }
             t if t == TAG_TASK => {
-                let (v, imp) = object::task_fields(o);
-                debug_assert!(imp.is_null(), "scheduled tasks require fln-3gv");
+                // The pin's traversal FORCES a task (`lean_task_get`,
+                // object.cpp:589/664): marking blocks until the task is
+                // finished, then walks its value.
+                let (mut v, imp) = object::task_fields(o);
+                if v.is_null() {
+                    if let Some(mgr) = crate::task_manager::manager() {
+                        mgr.wait_for(crate::task_manager::TaskPtr(o.cast()));
+                        v = object::task_fields(o).0;
+                    } else {
+                        debug_assert!(
+                            imp.is_null(),
+                            "scheduled tasks cannot exist without the task manager"
+                        );
+                    }
+                }
                 if !v.is_null() {
                     todo.push(v);
                 }

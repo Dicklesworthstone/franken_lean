@@ -26,11 +26,12 @@
 //! `RawPlatform` in the export-status ledger).
 //!
 //! Slice-1 typed restrictions (tracked in `ci/ABI_EXPORT_STATUS.txt`, never
-//! silent): closure application (`lean_apply_*`) — franken_lean-7xe; tasks /
-//! general IO (`lean_io_*`, `lean_task_*`) — fln-3gv, except the
-//! allocation-heartbeat getter/setter and the slice-2 promise/task-state
-//! family (the pin's managerless envelope; see the slice-2 banner below)
-//! implemented in this file; bignum arithmetic
+//! silent): closure application (`lean_apply_*`) — franken_lean-7xe; the
+//! task plane is LIVE (fln-3gv slices 2-3: the state family, the promise
+//! family, and the manager — `task_manager.rs`), with the `io.cpp` wrapper
+//! family (as_task/map_task/bind_task/wait/wait_any + the cancel wrappers)
+//! and `wait_any_core` still fln-3gv's next slice; general IO
+//! (`lean_io_*` beyond those) — fln-3gv; bignum arithmetic
 //! (`lean_nat_big_*`, `lean_int_big_*`) — the fln-bignum shim; panic-path
 //! Lean-buffered stderr and backtrace printing — fln-3gv (messages go to the
 //! process stderr until the IO plane exists).
@@ -75,7 +76,7 @@ fn internal_panic_impl(msg: &str) -> ! {
 /// routes non-fatal messages through the Lean IO stderr buffer
 /// (`io_eprintln`) and can print a backtrace; both need the fln-3gv IO
 /// plane, so every message goes to the process stderr here.
-fn panic_impl(msg: &[u8]) {
+pub(crate) fn panic_impl(msg: &[u8]) {
     if PANIC_MESSAGES.load(Ordering::Relaxed) {
         let mut err = std::io::stderr().lock();
         let _ = err.write_all(msg);
@@ -1835,7 +1836,7 @@ unsafe fn fix_args(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObjec
 /// references are yielded to the application.
 // UNSAFE-LEDGER: FLN-UL-0164
 #[allow(unsafe_code)]
-unsafe fn apply_core(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObject {
+pub(crate) unsafe fn apply_core(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObject {
     // SAFETY: mirrors the generated arms; every branch settles ownership
     // exactly as annotated inline.
     unsafe {
@@ -2541,14 +2542,15 @@ pub(crate) extern "C" fn export_lean_system_platform_emscripten(_w: *mut LeanObj
 // pin's own panic (io.cpp:1627-1639), and `io_promise_new` REFUSES with a
 // named internal panic (object.cpp:1272-1278) — the mode every compiled
 // Lean binary runs its `initialize` blocks in (EmitC.lean:1112-1128).
-// Marrow serves exactly that envelope; the manager plane (scheduled tasks,
-// Promised-state promises, `lean_init_task_manager`) is the next slice's
-// seam. Deviation disclosed: where the pin's managerless arm is a
-// null-deref on `g_task_manager` (`task_get` on an unfinished task,
-// `get_task_state` with `m_imp != NULL`, promise resolve / result_opt),
-// Marrow refuses typed per the §6.5 panic law instead of reproducing UB —
-// unreachable through conforming managerless code, since no unfinished
-// task and no promise is constructible here.
+// Marrow serves exactly that envelope — and, as of slice 3, the manager
+// arms beside it (`task_manager.rs`): each function below branches on the
+// live manager exactly where the pin branches on `g_task_manager`.
+// Deviation disclosed: where the pin's managerless arm is a null-deref on
+// `g_task_manager` (`task_get` on an unfinished task, `get_task_state`
+// with `m_imp != NULL`, promise resolve / result_opt), Marrow refuses
+// typed per the §6.5 panic law instead of reproducing UB — unreachable
+// through conforming managerless code, since no unfinished task and no
+// promise is constructible without the manager.
 // ===================================================================
 
 /// Typed refusal for the arms the pin serves through `g_task_manager` —
@@ -2577,9 +2579,9 @@ pub(crate) extern "C" fn export_lean_task_pure(a: *mut LeanObject) -> *mut LeanO
 }
 
 /// `lean_task_get` (`object.cpp:1187-1203`): borrowed task in, BORROWED
-/// value out (`b_lean_obj_res`, census). The pin's unfinished arm calls
-/// `g_task_manager->wait_for` with no null check; that arm refuses typed
-/// here (see the banner).
+/// value out (`b_lean_obj_res`, census). The unfinished arm blocks through
+/// the manager's `wait_for` (slice 3); without a manager — where the pin
+/// null-derefs — it refuses typed (see the banner).
 // UNSAFE-LEDGER: FLN-UL-0219
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_task_get")]
@@ -2588,17 +2590,24 @@ pub(crate) extern "C" fn export_lean_task_get(t: *mut LeanObject) -> *mut LeanOb
     // the pin's `_Atomic` read, and the returned reference stays borrowed.
     unsafe {
         let (v, _) = object::task_fields(t);
-        if v.is_null() {
-            task_manager_refusal("`Task.get` on an unfinished task");
+        if !v.is_null() {
+            return v;
         }
-        v
+        if let Some(mgr) = crate::task_manager::manager() {
+            mgr.wait_for(crate::task_manager::TaskPtr(t.cast()));
+            let (v, _) = object::task_fields(t);
+            debug_assert!(!v.is_null());
+            return v;
+        }
+        task_manager_refusal("`Task.get` on an unfinished task");
     }
 }
 
-/// `lean_task_map_core` (`object.cpp:1175-1185`): the managerless arm
-/// verbatim — `lean_task_pure(apply_1(f, lean_task_get_own(t)))`, with
-/// `prio`, `sync` and `keep_alive` all silently ignored exactly as the pin
-/// ignores them there. `lean_task_get_own` is the lean.h inline
+/// `lean_task_map_core` (`object.cpp:1166-1185`): eager when there is no
+/// manager OR when `sync` finds the input already finished — the pin's
+/// exact condition — with `prio`/`keep_alive` silently ignored on that arm;
+/// otherwise a Waiting task carrying `task_map_fn` joins the dependency
+/// graph via `add_dep`. `lean_task_get_own` is the lean.h inline
 /// (get, then inc, then dec; lean.h:1328-1334), expanded here with the
 /// pin's scalar-checked inc/dec.
 // UNSAFE-LEDGER: FLN-UL-0220
@@ -2607,35 +2616,48 @@ pub(crate) extern "C" fn export_lean_task_get(t: *mut LeanObject) -> *mut LeanOb
 pub(crate) extern "C" fn export_lean_task_map_core(
     f: *mut LeanObject,
     t: *mut LeanObject,
-    _prio: c_uint,
-    _sync: bool,
-    _keep_alive: bool,
+    prio: c_uint,
+    sync: bool,
+    keep_alive: bool,
 ) -> *mut LeanObject {
-    // SAFETY: f and t are consumed; the value leaves the finished task under
-    // the pin's scalar-checked get_own discipline, so ownership balances on
-    // the one live (managerless-eager) arm.
+    use crate::task_manager::{self, LEAN_SYNC_PRIO, TaskPtr};
+    // SAFETY: f and t are consumed on both arms; the eager arm follows the
+    // pin's scalar-checked get_own discipline, the manager arm hands both
+    // references to the mark_mt'd map closure.
     unsafe {
         let (v, _) = object::task_fields(t);
-        if v.is_null() {
-            task_manager_refusal("`Task.map` on an unfinished task");
+        let mgr = task_manager::manager();
+        if mgr.is_none() || (sync && !v.is_null()) {
+            if v.is_null() {
+                task_manager_refusal("`Task.map` on an unfinished task");
+            }
+            if !is_scalar(v) {
+                rc::inc_ref_n(v, 1);
+            }
+            if !is_scalar(t) {
+                rc::dec_ref(t); // 3gv-M2 anchor: map_core releases its consumed task
+            }
+            let r = apply_core(f, &[v]);
+            return object::alloc_task_pure(r);
         }
-        if !is_scalar(v) {
-            rc::inc_ref_n(v, 1);
-        }
-        if !is_scalar(t) {
-            rc::dec_ref(t); // 3gv-M2 anchor: map_core releases its consumed task
-        }
-        let r = apply_core(f, &[v]);
-        object::alloc_task_pure(r)
+        let mgr = mgr.expect("manager arm");
+        let c = object::alloc_closure(task_manager::task_map_fn as *mut c_void, 3, 2);
+        object::closure_set(c, 0, f);
+        object::closure_set(c, 1, t);
+        let new_task =
+            object::alloc_task_scheduled(c, if sync { LEAN_SYNC_PRIO } else { prio }, keep_alive);
+        mgr.add_dep(TaskPtr(t.cast()), TaskPtr(new_task.cast()));
+        new_task
     }
 }
 
 /// `lean_io_get_task_state` (`io.cpp:1579-1581` over `_core`,
 /// `object.cpp:1260-1265`; extern census `IO.getTaskState`): Finished
 /// (`m_imp == NULL`) answers 2 before the manager is ever consulted; the
-/// `m_imp != NULL` arm is manager-served in the pin and refuses typed
-/// here. The `_core` census symbol itself stays Unsupported — nothing in
-/// stage0 demands it; this wrapper inlines its body.
+/// `m_imp != NULL` arm takes the manager's locked read (0 waiting/queued,
+/// 1 running/promised), and without a manager — where the pin null-derefs —
+/// refuses typed. The `_core` census symbol itself stays Unsupported —
+/// nothing in stage0 demands it; this wrapper inlines its body.
 // UNSAFE-LEDGER: FLN-UL-0221
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_io_get_task_state")]
@@ -2648,16 +2670,24 @@ pub(crate) extern "C" fn export_lean_io_get_task_state(t: *mut LeanObject) -> u8
             return 2; // finished — the pin's pre-manager fast path
         }
     }
+    if let Some(mgr) = crate::task_manager::manager() {
+        return mgr.get_task_state(crate::task_manager::TaskPtr(t.cast()));
+    }
     task_manager_refusal("`IO.getTaskState` on an unfinished task")
 }
 
 /// `lean_io_promise_new` (`object.cpp:1271-1292, 1298-1301`; extern census
-/// `IO.Promise.new`): before the task manager runs, the pin REFUSES with
-/// this exact internal panic — reproduced verbatim, message and exit path.
+/// `IO.Promise.new`): with the manager running, an ST promise object owning
+/// one Promised task; before it runs, the pin REFUSES with this exact
+/// internal panic — reproduced verbatim, message and exit path.
 // UNSAFE-LEDGER: FLN-UL-0222
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_io_promise_new")]
 pub(crate) extern "C" fn export_lean_io_promise_new() -> *mut LeanObject {
+    if crate::task_manager::manager().is_some() {
+        // SAFETY: the allocator owns header/field init for both objects.
+        return unsafe { object::alloc_promise() };
+    }
     internal_panic_impl(concat!(
         "`IO.Promise.new` called before the task manager is running; this typically ",
         "happens when called (directly or transitively, e.g. via `IO.CancelToken.new`) ",
@@ -2666,30 +2696,53 @@ pub(crate) extern "C" fn export_lean_io_promise_new() -> *mut LeanObject {
 }
 
 /// `lean_io_promise_resolve` (`object.cpp:1294-1296, 1303-1306`; extern
-/// census `IO.Promise.resolve`): manager-served in the pin. No promise is
-/// constructible here (`lean_io_promise_new` refuses per the pin), so any
-/// call is unreachable through conforming code and refuses typed.
+/// census `IO.Promise.resolve`): resolve the promise's task to
+/// `some value` — first call wins, the second value is silently dropped —
+/// returning unit. Without a manager — where the pin null-derefs — a typed
+/// refusal (no promise is constructible there anyway).
 // UNSAFE-LEDGER: FLN-UL-0223
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_io_promise_resolve")]
 pub(crate) extern "C" fn export_lean_io_promise_resolve(
-    _value: *mut LeanObject,
-    _promise: *mut LeanObject,
+    value: *mut LeanObject,
+    promise: *mut LeanObject,
 ) -> *mut LeanObject {
+    if let Some(mgr) = crate::task_manager::manager() {
+        // SAFETY: promise is a live (borrowed) promise object; the value is
+        // consumed into the `some` cell exactly as mk_option_some does.
+        unsafe {
+            let some = object::alloc_ctor(1, 1, 0);
+            object::ctor_set(some, 0, value);
+            let r =
+                (&raw const (*promise.cast::<crate::layout::LeanPromiseObject>()).m_result).read();
+            mgr.resolve(crate::task_manager::TaskPtr(r), some);
+        }
+        return crate::tagged::boxi(0);
+    }
     task_manager_refusal("`IO.Promise.resolve`")
 }
 
 /// `lean_io_promise_result_opt` (`object.cpp:1308-1312`; extern census
-/// `IO.Promise.result?`): pure in the pin (one `inc_ref` of the promise's
-/// result task), but its precondition — a live promise — is unsatisfiable
-/// here, so the arm is unreachable and refuses typed rather than reading a
-/// nonexistent object.
+/// `IO.Promise.result?`): one `inc_ref` of the promise's result task —
+/// pure, exactly the pin's body. Without a manager — where no promise can
+/// exist — a typed refusal rather than a read of a nonexistent object.
 // UNSAFE-LEDGER: FLN-UL-0224
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_io_promise_result_opt")]
 pub(crate) extern "C" fn export_lean_io_promise_result_opt(
-    _promise: *mut LeanObject,
+    promise: *mut LeanObject,
 ) -> *mut LeanObject {
+    if crate::task_manager::manager().is_some() {
+        // SAFETY: promise is a live (borrowed) promise; the task's MT rc
+        // takes one more token.
+        unsafe {
+            let r =
+                (&raw const (*promise.cast::<crate::layout::LeanPromiseObject>()).m_result).read();
+            let t = r.cast::<LeanObject>();
+            rc::inc_ref_n(t, 1);
+            return t;
+        }
+    }
     task_manager_refusal("`IO.Promise.result?`")
 }
 
@@ -2722,4 +2775,139 @@ pub(crate) extern "C" fn export_lean_option_get_or_block(o: *mut LeanObject) -> 
         rc::dec_ref(o);
         v
     }
+}
+
+// ===================================================================
+// fln-3gv slice 3: the task manager goes live — init/finalize, spawn and
+// bind cores, cancellation. The manager itself is `task_manager.rs` (the
+// literal object.cpp:727-1113 port; design + asupersync pricing in
+// bead-comments fln-3gv:1847/:1852). The slice-2 state family above gained
+// its manager arms in place; the pre-manager else-arms are unchanged and
+// remain the pin's own managerless behavior.
+// ===================================================================
+
+/// `lean_init_task_manager` (`object.cpp:1083-1085`): `LEAN_NUM_THREADS`
+/// else hardware concurrency.
+// UNSAFE-LEDGER: FLN-UL-0244
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_init_task_manager")]
+pub(crate) extern "C" fn export_lean_init_task_manager() {
+    crate::task_manager::init_using(crate::task_manager::default_num_workers());
+}
+
+/// `lean_init_task_manager_using` (`object.cpp:1065-1072`): zero workers
+/// installs NO manager, exactly as upstream.
+// UNSAFE-LEDGER: FLN-UL-0245
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_init_task_manager_using")]
+pub(crate) extern "C" fn export_lean_init_task_manager_using(num_workers: c_uint) {
+    crate::task_manager::init_using(num_workers);
+}
+
+/// `lean_finalize_task_manager` (`object.cpp:1092-1097`): drain, join, drop.
+// UNSAFE-LEDGER: FLN-UL-0246
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_finalize_task_manager")]
+pub(crate) extern "C" fn export_lean_finalize_task_manager() {
+    crate::task_manager::finalize();
+}
+
+/// `lean_task_spawn_core` (`object.cpp:1152-1160`): enqueue a Queued task
+/// through the manager; without one, the pin's eager arm verbatim.
+// UNSAFE-LEDGER: FLN-UL-0247
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_task_spawn_core")]
+pub(crate) extern "C" fn export_lean_task_spawn_core(
+    c: *mut LeanObject,
+    prio: c_uint,
+    keep_alive: bool,
+) -> *mut LeanObject {
+    use crate::task_manager::{self, TaskPtr};
+    // SAFETY: c is consumed on both arms — into the scheduled task, or by
+    // the eager apply.
+    unsafe {
+        if let Some(mgr) = task_manager::manager() {
+            let t = object::alloc_task_scheduled(c, prio, keep_alive);
+            mgr.enqueue(TaskPtr(t.cast()));
+            t
+        } else {
+            let r = apply_core(c, &[crate::tagged::boxi(0)]);
+            object::alloc_task_pure(r)
+        }
+    }
+}
+
+/// `lean_task_bind_core` (`object.cpp:1234-1244`): a Waiting task carrying
+/// `task_bind_fn1` joins the graph; the eager arm — no manager, or `sync`
+/// with a finished input — is `apply_1(f, get_own(x))` returning whatever
+/// task `f` made, exactly as the pin (no re-wrap).
+// UNSAFE-LEDGER: FLN-UL-0248
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_task_bind_core")]
+pub(crate) extern "C" fn export_lean_task_bind_core(
+    x: *mut LeanObject,
+    f: *mut LeanObject,
+    prio: c_uint,
+    sync: bool,
+    keep_alive: bool,
+) -> *mut LeanObject {
+    use crate::task_manager::{self, LEAN_SYNC_PRIO, TaskPtr};
+    // SAFETY: x and f are consumed on both arms; the manager arm hands both
+    // to the mark_mt'd bind closure.
+    unsafe {
+        let (v, _) = object::task_fields(x);
+        let mgr = task_manager::manager();
+        if mgr.is_none() || (sync && !v.is_null()) {
+            if v.is_null() {
+                task_manager_refusal("`Task.bind` on an unfinished task");
+            }
+            if !is_scalar(v) {
+                rc::inc_ref_n(v, 1);
+            }
+            if !is_scalar(x) {
+                rc::dec_ref(x);
+            }
+            return apply_core(f, &[v]);
+        }
+        let mgr = mgr.expect("manager arm");
+        let c = object::alloc_closure(task_manager::task_bind_fn1 as *mut c_void, 3, 2);
+        object::closure_set(c, 0, x);
+        object::closure_set(c, 1, f);
+        let new_task =
+            object::alloc_task_scheduled(c, if sync { LEAN_SYNC_PRIO } else { prio }, keep_alive);
+        mgr.add_dep(TaskPtr(x.cast()), TaskPtr(new_task.cast()));
+        new_task
+    }
+}
+
+/// `lean_io_check_canceled_core` (`object.cpp:1246-1252`): the current
+/// task's cancellation flag, or the manager's shutdown; `false` off-worker
+/// and managerless — the pin's own answers.
+// UNSAFE-LEDGER: FLN-UL-0249
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_check_canceled_core")]
+pub(crate) extern "C" fn export_lean_io_check_canceled_core() -> bool {
+    crate::task_manager::manager().is_some_and(crate::task_manager::Manager::check_canceled_current)
+}
+
+/// `lean_io_cancel_core` (`object.cpp:1254-1258`): finished tasks are a
+/// no-op before the manager is consulted; unfinished ones set the flag
+/// under the lock. Managerless — where the pin null-derefs — the finished
+/// arm still answers and the unreachable arm refuses typed.
+// UNSAFE-LEDGER: FLN-UL-0250
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_cancel_core")]
+pub(crate) extern "C" fn export_lean_io_cancel_core(t: *mut LeanObject) {
+    // SAFETY: t is a live (borrowed) task.
+    unsafe {
+        let (v, _) = object::task_fields(t);
+        if !v.is_null() {
+            return;
+        }
+    }
+    if let Some(mgr) = crate::task_manager::manager() {
+        mgr.cancel(crate::task_manager::TaskPtr(t.cast()));
+        return;
+    }
+    task_manager_refusal("`IO.cancel` on an unfinished task")
 }

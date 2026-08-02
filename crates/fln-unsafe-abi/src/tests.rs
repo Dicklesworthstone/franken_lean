@@ -2420,6 +2420,26 @@ mod task_state_targets {
     pub(crate) extern "C" fn ident(x: *mut LeanObject) -> *mut LeanObject {
         x
     }
+
+    /// Spawn target `fun _ => 42` under the boxed convention.
+    pub(crate) extern "C" fn forty_two(_w: *mut LeanObject) -> *mut LeanObject {
+        crate::tagged::boxi(42)
+    }
+
+    /// Bind target `fun v => t_captured`: releases the owned input value and
+    /// returns the captured task, exercising the re-arm arm.
+    // UNSAFE-LEDGER: FLN-UL-0251
+    #[allow(unsafe_code)]
+    pub(crate) extern "C" fn return_captured_task(
+        t: *mut LeanObject,
+        v: *mut LeanObject,
+    ) -> *mut LeanObject {
+        if !crate::tagged::is_scalar(v) {
+            // SAFETY: v is the owned input value this closure consumes.
+            unsafe { crate::rc::dec_ref(v) };
+        }
+        t
+    }
 }
 
 #[test]
@@ -2509,6 +2529,165 @@ fn export_task_promise_state_family_matches_upstream_arms() {
             "getOrBlock! steals the value out of the consumed some cell"
         );
         crate::rc::dec_ref(r);
+    }
+    let _ = shadow::disable_and_drain();
+}
+
+#[test]
+fn export_task_manager_family_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_finalize_task_manager, export_lean_init_task_manager_using,
+        export_lean_io_get_task_state, export_lean_io_promise_new, export_lean_io_promise_resolve,
+        export_lean_io_promise_result_opt, export_lean_task_bind_core, export_lean_task_get,
+        export_lean_task_map_core, export_lean_task_spawn_core,
+    };
+    shadow::enable();
+    /// Finalize on every exit path, so a failing assertion cannot leak a
+    /// live manager into the other cells (the manager is process-global and
+    /// flips the rc teardown arms).
+    struct Fin;
+    impl Drop for Fin {
+        fn drop(&mut self) {
+            export_lean_finalize_task_manager();
+        }
+    }
+    // SAFETY: every object is allocated and settled here; the manager arms
+    // of object.cpp:727-1312 are exercised end to end with the shadow
+    // oracle watching, and the sync-priority cells pin the pin's
+    // inline-execution ordering guarantees.
+    // UNSAFE-LEDGER: FLN-UL-0252
+    #[allow(unsafe_code)]
+    unsafe {
+        export_lean_init_task_manager_using(2);
+        let _fin = Fin;
+
+        // spawn + get: Queued -> Running -> Finished on a pooled worker;
+        // get blocks until the value is published (object.cpp:1152-1160,
+        // 1187-1203).
+        let c = crate::object::alloc_closure(
+            task_state_targets::forty_two as *mut core::ffi::c_void,
+            1,
+            0,
+        );
+        let t = export_lean_task_spawn_core(c, 0, false);
+        let v = export_lean_task_get(t);
+        assert_eq!(
+            crate::tagged::unbox(v),
+            42,
+            "spawned closure ran on a worker and get returned its value"
+        );
+        assert_eq!(export_lean_io_get_task_state(t), 2, "finished after get");
+        crate::rc::dec_ref(t);
+
+        // The promise lifecycle: Promised (state 1) -> resolve publishes
+        // some(value), marked multi-threaded, first call wins
+        // (object.cpp:960-972, 1271-1312).
+        let p = export_lean_io_promise_new();
+        let rt = export_lean_io_promise_result_opt(p);
+        assert_eq!(
+            export_lean_io_get_task_state(rt),
+            1,
+            "an unresolved promise's task reports running (closure-less imp)"
+        );
+        let s = crate::object::mk_string_unchecked(b"gamma", 5);
+        let unit = export_lean_io_promise_resolve(s, p);
+        assert!(crate::tagged::is_scalar(unit), "resolve returns unit");
+        assert_eq!(export_lean_io_get_task_state(rt), 2, "resolved is finished");
+        let some_v = export_lean_task_get(rt);
+        assert_eq!(
+            crate::object::ctor_get(some_v, 0),
+            s,
+            "the resolved payload is some(value) around the exact object"
+        );
+        assert!(
+            (&raw const (*some_v).m_rc).read() < 0,
+            "resolve_core marked the published value multi-threaded (object.cpp:893)"
+        );
+        let s2 = crate::object::mk_string_unchecked(b"delta", 5);
+        export_lean_io_promise_resolve(s2, p);
+        assert_eq!(
+            export_lean_task_get(rt),
+            some_v,
+            "the second resolve is silently dropped — only the first has an effect"
+        );
+        crate::rc::dec_ref(rt);
+        crate::rc::dec_ref(p);
+
+        // sync := true on an UNFINISHED promise task: the dependent joins
+        // the graph Waiting (state 0), and resolve runs it INLINE before
+        // returning — the ordering CancelToken.onSet relies on
+        // (enqueue_core's LEAN_SYNC_PRIO arm, object.cpp:758-763).
+        let p2 = export_lean_io_promise_new();
+        let rt2 = export_lean_io_promise_result_opt(p2);
+        let fident =
+            crate::object::alloc_closure(task_state_targets::ident as *mut core::ffi::c_void, 1, 0);
+        let mapped = export_lean_task_map_core(fident, rt2, 0, true, false);
+        assert_eq!(
+            export_lean_io_get_task_state(mapped),
+            0,
+            "a sync dependent of an unresolved promise is Waiting (closure present)"
+        );
+        export_lean_io_promise_resolve(crate::tagged::boxi(9), p2);
+        assert_eq!(
+            export_lean_io_get_task_state(mapped),
+            2,
+            "the sync dependent ran inline during resolve, before it returned"
+        );
+        let got = export_lean_task_get(mapped);
+        assert_eq!(
+            crate::tagged::unbox(crate::object::ctor_get(got, 0)),
+            9,
+            "identity map over some(9)"
+        );
+        crate::rc::dec_ref(mapped);
+        crate::rc::dec_ref(p2);
+
+        // Dropping an unresolved promise resolves its task to none
+        // (deactivate_promise, object.cpp:1314-1318).
+        let p3 = export_lean_io_promise_new();
+        let rt3 = export_lean_io_promise_result_opt(p3);
+        crate::rc::dec_ref(p3);
+        assert_eq!(export_lean_io_get_task_state(rt3), 2);
+        assert!(
+            crate::tagged::is_scalar(export_lean_task_get(rt3)),
+            "a dropped unresolved promise publishes none"
+        );
+        crate::rc::dec_ref(rt3);
+
+        // bind through the RE-ARM path, made deterministic with sync:
+        // resolve(p4) runs bind_fn1 inline, f returns p5's still-unfinished
+        // task, so the bound task re-arms on it (run_task's NULL-sentinel
+        // arm, object.cpp:874-885); resolve(p5) then finishes it inline.
+        let p4 = export_lean_io_promise_new();
+        let rt4 = export_lean_io_promise_result_opt(p4);
+        let p5 = export_lean_io_promise_new();
+        let rt5 = export_lean_io_promise_result_opt(p5);
+        let fbind = crate::object::alloc_closure(
+            task_state_targets::return_captured_task as *mut core::ffi::c_void,
+            2,
+            1,
+        );
+        crate::object::closure_set(fbind, 0, rt5);
+        let bound = export_lean_task_bind_core(rt4, fbind, 0, true, false);
+        export_lean_io_promise_resolve(crate::tagged::boxi(1), p4);
+        assert_eq!(
+            export_lean_io_get_task_state(bound),
+            0,
+            "after the outer resolve the bound task is re-armed Waiting on the nested one (its continuation closure is installed)"
+        );
+        export_lean_io_promise_resolve(crate::tagged::boxi(7), p5);
+        let bv = export_lean_task_get(bound);
+        assert_eq!(
+            crate::tagged::unbox(crate::object::ctor_get(bv, 0)),
+            7,
+            "the re-armed bind carries the nested task's published value"
+        );
+        crate::rc::dec_ref(bound);
+        crate::rc::dec_ref(p4);
+        crate::rc::dec_ref(p5);
+
+        drop(_fin); // join the workers before the shadow drain
     }
     let _ = shadow::disable_and_drain();
 }
