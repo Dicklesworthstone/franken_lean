@@ -30,7 +30,9 @@
 //!
 //! Slice-1 typed restrictions (tracked, never silent):
 //! * scheduled tasks/promises (`m_imp != NULL`) — bead fln-3gv (effects on
-//!   asupersync);
+//!   asupersync). The fln-3gv slice-2 promise/task-state family serves the
+//!   pin's managerless envelope over Finished tasks only; unfinished-task
+//!   and promise arms refuse typed (`export.rs` slice-2 banner);
 //! * forcing thunks / applying closures / external `m_foreach` traversal —
 //!   bead franken_lean-7xe (Golem apply machinery);
 //! * compacted-region loading — bead fln-wgp; the size-classed allocator

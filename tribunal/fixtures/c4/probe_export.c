@@ -18,7 +18,11 @@
  * exit-on-panic lean_panic_fn (expect exit 1, message on stderr — the
  * exit path writes to the PROCESS stderr in both runtimes, so the
  * Lean-IO-buffer restriction of the non-exiting path never enters the
- * differential).
+ * differential); "panic-promise-new" = lean_io_promise_new before any task
+ * manager runs (expect exit 1, the pin's named INTERNAL PANIC — both
+ * runtimes refuse identically, fln-3gv slice 2); "panic-get-or-block-none" =
+ * exit-on-panic lean_option_get_or_block(none) (expect exit 1, the pin's
+ * "PANIC: Promise.result!: …" line).
  */
 
 #include <lean/lean.h>
@@ -44,6 +48,25 @@ extern uint8_t lean_st_ref_ptr_eq(lean_object *ref1, lean_object *ref2);
 extern uint8_t lean_system_platform_windows(lean_object *w);
 extern uint8_t lean_system_platform_osx(lean_object *w);
 extern uint8_t lean_system_platform_emscripten(lean_object *w);
+
+/* fln-3gv slice 2 externs (extern-census class): the promise/task-state
+ * wrappers the runtime exports outside lean.h, declared here exactly as
+ * generated C declares them (stage0 Init/System/Promise.c:16-25). */
+extern lean_object *lean_io_promise_new();
+extern lean_object *lean_io_promise_resolve(lean_object *value, lean_object *promise);
+extern lean_object *lean_io_promise_result_opt(lean_object *promise);
+extern uint8_t lean_io_get_task_state(lean_object *t);
+extern lean_object *lean_option_get_or_block(lean_object *opt);
+
+/* Apply targets for the task facts, closured exactly as generated C does. */
+static lean_object *probe_double(lean_object *x) {
+    return lean_box(lean_unbox(x) * 2);
+}
+static lean_object *probe_str_size(lean_object *s) {
+    lean_object *r = lean_box(lean_string_size(s));
+    lean_dec(s);
+    return r;
+}
 
 static void facts_mode(void) {
     /* ---- ctor through the inline small path (mi_malloc_small underneath) */
@@ -288,6 +311,57 @@ static void facts_mode(void) {
     fact("platform.windows", lean_system_platform_windows(lean_box(0)));
     fact("platform.osx", lean_system_platform_osx(lean_box(0)));
     fact("platform.emscripten", lean_system_platform_emscripten(lean_box(0)));
+
+    /* ---- fln-3gv slice 2: the promise/task-state family (managerless
+     * envelope — no lean_init_task_manager anywhere in this probe, so the
+     * Reference serves every fact below through its own explicit
+     * !g_task_manager arms: object.cpp:1162/1176/1187/1260, io.cpp:1627) */
+    lean_object *tp = lean_task_pure(lean_box(21));
+    fact("task.pure.state", lean_io_get_task_state(tp));
+    fact("task.pure.rc", tp->m_rc);
+    fact("task.pure.get", (long long)lean_unbox(lean_task_get(tp)));
+    fact("task.pure.rc_after_get", tp->m_rc); /* get borrows */
+    lean_object *fdouble = lean_alloc_closure((void *)probe_double, 1, 0);
+    lean_object *tm = lean_task_map(fdouble, tp, lean_box(0), 0); /* consumes tp */
+    fact("task.map.state", lean_io_get_task_state(tm));
+    fact("task.map.get", (long long)lean_unbox(lean_task_get(tm)));
+    fact("task.map.rc", tm->m_rc);
+    lean_dec(tm);
+    /* sync := true on an already-finished input is the same eager arm */
+    lean_object *tp2 = lean_task_pure(lean_box(21));
+    lean_object *fdouble2 = lean_alloc_closure((void *)probe_double, 1, 0);
+    lean_object *tm2 = lean_task_map(fdouble2, tp2, lean_box(0), 1);
+    fact("task.map.sync.get", (long long)lean_unbox(lean_task_get(tm2)));
+    lean_dec(tm2);
+    /* a heap payload rides get_own's scalar-checked inc/dec (the slice-1
+     * differential's lesson class) */
+    lean_object *ts = lean_task_pure(lean_mk_string("tasked"));
+    lean_object *fsize = lean_alloc_closure((void *)probe_str_size, 1, 0);
+    lean_object *tm3 = lean_task_map(fsize, ts, lean_box(0), 0);
+    fact("task.map.str_size", (long long)lean_unbox(lean_task_get(tm3)));
+    lean_dec(tm3);
+    /* a SHARED source task: map's eager arm releases exactly one token
+     * (mutant 3gv-M2's discriminator: a dropped release leaves this at 2) */
+    lean_object *tshared = lean_task_pure(lean_box(5));
+    lean_inc(tshared);
+    lean_object *fdouble3 = lean_alloc_closure((void *)probe_double, 1, 0);
+    lean_object *tm4 = lean_task_map(fdouble3, tshared, lean_box(0), 0);
+    fact("task.map.shared_src_rc", tshared->m_rc);
+    fact("task.map.shared.get", (long long)lean_unbox(lean_task_get(tm4)));
+    lean_dec(tshared);
+    lean_dec(tm4);
+    /* option_get_or_block's some arm: scalar payload, then a heap payload
+     * whose steal must leave exactly one token */
+    lean_object *someb = lean_alloc_ctor(1, 1, 0);
+    lean_ctor_set(someb, 0, lean_box(77));
+    fact("option.get_or_block.some", (long long)lean_unbox(lean_option_get_or_block(someb)));
+    lean_object *ssv = lean_mk_string("resolved");
+    lean_object *some2 = lean_alloc_ctor(1, 1, 0);
+    lean_ctor_set(some2, 0, ssv);
+    lean_object *got = lean_option_get_or_block(some2);
+    fact("option.get_or_block.str_rc", got->m_rc);
+    fact("option.get_or_block.str_size", (long long)lean_string_size(got) - 1);
+    lean_dec(got);
 }
 
 int main(int argc, char **argv) {
@@ -298,6 +372,15 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "panic-fn") == 0) {
         lean_set_exit_on_panic(true);
         lean_panic_fn(lean_box(0), lean_mk_string("gauntlet-panic-msg"));
+        return 99; /* unreachable: exit-on-panic terminates with 1 */
+    }
+    if (argc > 1 && strcmp(argv[1], "panic-promise-new") == 0) {
+        lean_io_promise_new();
+        return 99; /* unreachable: both runtimes refuse pre-manager (fln-3gv slice 2) */
+    }
+    if (argc > 1 && strcmp(argv[1], "panic-get-or-block-none") == 0) {
+        lean_set_exit_on_panic(true);
+        lean_option_get_or_block(lean_box(0));
         return 99; /* unreachable: exit-on-panic terminates with 1 */
     }
     facts_mode();

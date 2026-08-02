@@ -218,9 +218,9 @@ row lean_string_utf8_next_fast_cold | Unsupported | franken_lean-83r | census (f
 row lean_string_utf8_prev | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_utf8_set | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | exclusive ASCII in-place else rebuild, codepoint length preserved (object.cpp:2423-2448)
 row lean_task_bind_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
-row lean_task_get | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
-row lean_task_map_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
-row lean_task_pure | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_task_get | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export task/promise state suite; stage0 gauntlet lane | Finished arm borrows m_value (object.cpp:1187-1203); unfinished arm refuses typed where the pin null-derefs the absent manager (fln-3gv slice 2, managerless envelope)
+row lean_task_map_core | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export task/promise state suite; stage0 gauntlet lane | the managerless-eager arm verbatim: task_pure(apply_1(f, get_own(t))), prio/sync/keep_alive ignored as the pin ignores them (object.cpp:1175-1185)
+row lean_task_pure | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export task/promise state suite; stage0 gauntlet lane | Finished ST task, value deliberately not marked mt (object.cpp:1162-1164)
 row lean_task_spawn_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_thunk_get_core | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_uint16_of_big_nat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | low-16 truncation (object.cpp:1809-1811)
@@ -248,3 +248,8 @@ extern lean_system_platform_osx | CompatWrapper | crates/fln-unsafe-abi/src/expo
 extern lean_system_platform_emscripten | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet platform facts | compile-time target fact, 0 on the certified linux targets (platform.cpp:36-42)
 extern lean_string_from_utf8_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export byte-array roundtrip test; gauntlet differential | consumes the byte array; bug-compatible utf8_n_strlen count
 extern lean_string_to_utf8 | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export byte-array roundtrip test; gauntlet differential | borrowed string to fresh sarray of m_size-1 bytes
+extern lean_io_get_task_state | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export task/promise state suite; stage0 gauntlet lane | m_imp == NULL answers 2 pre-manager (object.cpp:1260-1265 via io.cpp:1579-1581; extern census IO.getTaskState); unfinished arm refuses typed
+extern lean_io_promise_new | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet panic lane; stage0 demand audit | the pin's pre-manager INTERNAL PANIC verbatim, message and exit path (object.cpp:1272-1278; extern census IO.Promise.new); never fabricates a value
+extern lean_io_promise_resolve | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stage0 demand audit; refusal arm unreachable through conforming code | typed refusal: no promise constructible managerless, the pin null-derefs (object.cpp:1294-1296; extern census IO.Promise.resolve)
+extern lean_io_promise_result_opt | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stage0 demand audit; refusal arm unreachable through conforming code | typed refusal: precondition (a live promise) unsatisfiable managerless (object.cpp:1308-1312; extern census IO.Promise.result?)
+extern lean_option_get_or_block | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export task/promise state suite; gauntlet panic lane | some-arm steal per option_ref; none is the pin's PANIC then forever-sleep (io.cpp:1627-1639; extern census Option.getOrBlock!)

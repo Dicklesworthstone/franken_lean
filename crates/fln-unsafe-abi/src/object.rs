@@ -748,8 +748,10 @@ pub(crate) unsafe fn alloc_thunk_closure(closure: *mut LeanObject) -> *mut LeanO
 }
 
 /// Finished-task constructor (`Task.pure` state machine entry,
-/// `lean.h:250-295`): `m_value = v`, `m_imp = NULL`. Live scheduled tasks
-/// arrive with the asupersync effects bead (fln-3gv).
+/// `lean.h:250-295`): `m_value = v`, `m_imp = NULL`. Carries the exported
+/// `lean_task_pure` and every managerless-eager `task_map_core` result
+/// (fln-3gv slice 2); live scheduled tasks arrive with the manager plane
+/// (fln-3gv, next slice).
 ///
 /// # Safety
 /// Caller owns the result; `v` reference is consumed.

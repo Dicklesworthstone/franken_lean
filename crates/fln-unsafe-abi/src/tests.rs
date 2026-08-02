@@ -2410,3 +2410,105 @@ fn export_string_utf8_get_set_match_upstream_arms() {
     }
     let _ = shadow::disable_and_drain();
 }
+
+/// fln-3gv slice 2 apply targets — safe bodies only; ownership passthrough
+/// carries the non-scalar arm without touching rc.
+mod task_state_targets {
+    use crate::layout::LeanObject;
+
+    /// `id` under the boxed convention: consumes `x` by returning it.
+    pub(crate) extern "C" fn ident(x: *mut LeanObject) -> *mut LeanObject {
+        x
+    }
+}
+
+#[test]
+fn export_task_promise_state_family_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_io_get_task_state, export_lean_option_get_or_block, export_lean_task_get,
+        export_lean_task_map_core, export_lean_task_pure,
+    };
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the family's live
+    // (managerless) arms — object.cpp:1162/1176-eager/1187-finished,
+    // io.cpp:1627-some — are exercised with the shadow oracle watching the
+    // ownership balance. The refusal arms terminate the process by design
+    // and belong to the gauntlet's panic-parity lane, not to in-process
+    // cells.
+    // UNSAFE-LEDGER: FLN-UL-0226
+    #[allow(unsafe_code)]
+    unsafe {
+        // Task.pure over a scalar: Finished at birth, single-threaded header,
+        // borrowed get, state 2 before any manager is consulted.
+        let t = export_lean_task_pure(crate::tagged::boxi(21));
+        assert_eq!(
+            export_lean_io_get_task_state(t),
+            2,
+            "Task.pure is born Finished (m_imp == NULL answers 2, object.cpp:1260-1263)"
+        );
+        assert!(
+            (&raw const (*t).m_rc).read() > 0,
+            "Task.pure is born single-threaded (alloc_task's lean_set_st_header arm)"
+        );
+        let v = export_lean_task_get(t);
+        assert_eq!(
+            crate::tagged::unbox(v),
+            21,
+            "task_get returns m_value borrowed"
+        );
+        let v2 = export_lean_task_get(t);
+        assert_eq!(v, v2, "task_get does not consume the task or the value");
+
+        // map_core's managerless-eager arm over a scalar payload:
+        // task_pure(apply_1(f, get_own(t))) with f = (· * 2).
+        let double =
+            crate::object::alloc_closure(corpus_targets::double as *mut core::ffi::c_void, 1, 0);
+        let t2 = export_lean_task_map_core(double, t, 0, false, false);
+        assert_eq!(
+            export_lean_io_get_task_state(t2),
+            2,
+            "the eager arm funnels through task_pure, so the result is Finished"
+        );
+        assert_eq!(
+            crate::tagged::unbox(export_lean_task_get(t2)),
+            42,
+            "map_core applied f eagerly on the calling thread (object.cpp:1176)"
+        );
+        crate::rc::dec_ref(t2);
+
+        // map_core over a NON-scalar payload — the arm class whose scalar
+        // guards the slice-1 differential had to teach us; here the value
+        // rides through get_own's inc/dec with the shadow oracle watching.
+        // sync and keep_alive are both silently ignored on this arm,
+        // exactly as the pin ignores them (object.cpp:1175-1178).
+        let s = crate::object::mk_string_unchecked(b"alpha", 5);
+        let ts = export_lean_task_pure(s);
+        let ident =
+            crate::object::alloc_closure(task_state_targets::ident as *mut core::ffi::c_void, 1, 0);
+        let t3 = export_lean_task_map_core(ident, ts, 0, true, true);
+        let out = export_lean_task_get(t3);
+        assert_eq!(
+            out, s,
+            "identity map hands the same object through the eager arm"
+        );
+        assert!(
+            (&raw const (*out).m_rc).read() > 0,
+            "the eager arm never marks the value multi-threaded (task_pure's deliberate exception)"
+        );
+        crate::rc::dec_ref(t3);
+
+        // option_get_or_block's `some` arm: the value is stolen out of the
+        // consumed cell (io.cpp:1627-1631's option_ref discipline).
+        let s2 = crate::object::mk_string_unchecked(b"beta", 4);
+        let some = crate::object::alloc_ctor(1, 1, 0);
+        crate::object::ctor_set(some, 0, s2);
+        let r = export_lean_option_get_or_block(some);
+        assert_eq!(
+            r, s2,
+            "getOrBlock! steals the value out of the consumed some cell"
+        );
+        crate::rc::dec_ref(r);
+    }
+    let _ = shadow::disable_and_drain();
+}

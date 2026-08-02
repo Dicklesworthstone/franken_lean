@@ -104,9 +104,11 @@ pub(crate) struct LeanThunkObject {
 }
 
 /// `lean_task_imp` — per-task execution data (`lean.h:234-243`), released
-/// when the task terminates. Slice-1 Marrow never allocates one: task
-/// scheduling rides asupersync in bead fln-3gv; until then only Finished
-/// tasks (`m_imp == NULL`, `m_value != NULL`) are constructible.
+/// when the task terminates. Marrow never allocates one: only Finished
+/// tasks (`m_imp == NULL`, `m_value != NULL`) are constructible — the
+/// fln-3gv slice-2 state family answers for them and refuses typed on
+/// `m_imp != NULL`; scheduled tasks arrive with the manager plane
+/// (fln-3gv, next slice).
 #[repr(C)]
 pub(crate) struct LeanTaskImp {
     pub(crate) m_closure: *mut LeanObject,

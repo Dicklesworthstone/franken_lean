@@ -132,6 +132,12 @@ STAGE0_TUS+=("Init/Coe.c" "Init/Notation.c" "Init/Tactics.c")
 # fln-3gv slice 1: the effect plane's pure-substrate TUs — their demands
 # are fully exported as of the ST-ref/platform/utf8 slice.
 STAGE0_TUS+=("Init/System/ST.c" "Init/System/IOError.c" "Init/System/Platform.c")
+# fln-3gv slice 2: the promise/task-state TUs. Measured before landing
+# (D2 gcc, stage0 lean.h): their union adds 8 lean_* demands — the promise
+# trio, io_get_task_state, option_get_or_block, task_map_core, task_pure,
+# task_get — every one exported by the slice-2 family; CancelToken.c's
+# l_BaseIO_chainTask___redArg is a stage0-TU symbol, not a runtime demand.
+STAGE0_TUS+=("Init/System/Promise.c" "Init/System/CancelToken.c")
 if [ "${FLN_E2E_DEEP:-0}" = "1" ]; then
     STAGE0_TUS+=("Init/Core.c")
 fi
@@ -300,7 +306,7 @@ fi
 # between its own runs), so the comparison is rc + first stderr line — the
 # deterministic contract; the restriction is typed in ABI_EXPORT_STATUS.txt.
 note "lane 7: panic parity (exit codes + message lines)"
-for mode in panic-internal panic-fn; do
+for mode in panic-internal panic-fn panic-promise-new panic-get-or-block-none; do
     set +e
     "$ART_DIR/probe_marrow" "$mode" >/dev/null 2>"$ART_DIR/${mode}_marrow.err"; rc_m=$?
     "$ART_DIR/probe_reference" "$mode" >/dev/null 2>"$ART_DIR/${mode}_reference.err"; rc_r=$?
@@ -354,6 +360,47 @@ if [ "$real_sha_before" != "$real_sha_after" ]; then
     fail mutant_isolation "\"detail\":\"the REAL tree changed during the drill\""
 fi
 emit mutant_drill passed "\"mutant\":\"83r-M1\",\"discriminator\":\"rc.child.after_parent_death\",\"real_tree_sha_stable\":true"
+
+# ---- lane 8b: named mutant 3gv-M2 ---------------------------------------------
+# Ownership-convention perturbation through the slice-2 task plane:
+# task_map_core's eager arm stops releasing its consumed task. Planted in a
+# SECOND copy; the differential must catch it (task.map.shared_src_rc flips
+# 1 -> 2) and the REAL tree must stay byte-identical.
+note "lane 8b: mutant drill 3gv-M2 (map_core's task release dropped in a copy)"
+MUT2_WS="$ART_DIR/mutant-ws-m2"
+mkdir -p "$MUT2_WS"
+cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT2_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT2_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-core" "$MUT2_WS/fln-core"
+cp "$ROOT/rust-toolchain.toml" "$MUT2_WS/"
+printf '\n[workspace]\n' >>"$MUT2_WS/fln-unsafe-abi/Cargo.toml"
+real_sha_before_m2=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if ! sed -i 's|rc::dec_ref(t); // 3gv-M2 anchor: map_core releases its consumed task|let _ = t; // 3gv-M2: task release dropped|' "$MUT2_WS/fln-unsafe-abi/src/export.rs" \
+    || ! grep -q "3gv-M2: task release dropped" "$MUT2_WS/fln-unsafe-abi/src/export.rs"; then
+    fail mutant_plant_m2 "\"detail\":\"mutation did not apply to the copy\""
+fi
+if ! (cd "$MUT2_WS/fln-unsafe-abi" && CARGO_TARGET_DIR="$MUT2_WS/target" cargo rustc --offline -q --crate-type staticlib --release) >"$ART_DIR/mutant2_build.log" 2>&1; then
+    fail mutant_build_m2 "\"artifact\":\"mutant2_build.log\""
+fi
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$PROBE_SRC" "$MUT2_WS/target/release/libfln_unsafe_abi.a" -lpthread -ldl -lm \
+    -o "$ART_DIR/probe_mutant2" >"$ART_DIR/gcc_mutant2.log" 2>&1; then
+    fail mutant_link_m2 "\"artifact\":\"gcc_mutant2.log\""
+fi
+set +e
+"$ART_DIR/probe_mutant2" >"$ART_DIR/facts_mutant2.ndjson" 2>"$ART_DIR/probe_mutant2.err"
+set -e
+if diff -q "$ART_DIR/facts_reference.ndjson" "$ART_DIR/facts_mutant2.ndjson" >/dev/null 2>&1; then
+    fail mutant_drill_m2 "\"detail\":\"3gv-M2 SURVIVED — the gauntlet does not discriminate the task plane's ownership convention\""
+fi
+if ! grep -q '"probe":"task.map.shared_src_rc","value":2' "$ART_DIR/facts_mutant2.ndjson"; then
+    fail mutant_drill_m2 "\"detail\":\"mutant diverged but not on the designed discriminator\",\"artifact\":\"facts_mutant2.ndjson\""
+fi
+real_sha_after_m2=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if [ "$real_sha_before_m2" != "$real_sha_after_m2" ]; then
+    fail mutant_isolation_m2 "\"detail\":\"the REAL tree changed during the drill\""
+fi
+emit mutant_drill passed "\"mutant\":\"3gv-M2\",\"discriminator\":\"task.map.shared_src_rc\",\"real_tree_sha_stable\":true"
 
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS — artifacts in $ART_DIR"
