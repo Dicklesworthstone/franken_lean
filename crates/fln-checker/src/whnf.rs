@@ -213,6 +213,7 @@ pub enum WhnfFault {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhnfResult {
     pub term: WireExpr,
+    pub steps: u64,
     pub reductions: u64,
 }
 
@@ -682,8 +683,8 @@ impl<'a, 'c> Reducer<'a, 'c> {
         }
     }
 
-    fn run(mut self, input: &WireExpr) -> Result<WhnfResult, Halt> {
-        let mut current = self.materialize_term(input, input.root(), WhnfPhase::Initial)?;
+    fn run(mut self, input: &WireExpr, root: ExprId) -> Result<WhnfResult, Halt> {
+        let mut current = self.materialize_term(input, root, WhnfPhase::Initial)?;
         let mut pending_arguments = VecDeque::new();
         let mut projections = Vec::new();
 
@@ -801,6 +802,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             let term = self.materialize_wire(&current.arena, current.root, WhnfPhase::Final)?;
             return Ok(WhnfResult {
                 term,
+                steps: self.control.steps,
                 reductions: self.control.reductions,
             });
         }
@@ -1326,8 +1328,18 @@ pub fn whnf_with(
     budget: WhnfBudget,
     mut cancelled: impl FnMut() -> bool,
 ) -> WhnfOutcome {
+    whnf_at_with(term, term.root(), context, budget, &mut cancelled)
+}
+
+pub(crate) fn whnf_at_with(
+    term: &WireExpr,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfOutcome {
     let mut control = Control::new(budget);
-    let prepared = match PreparedContext::prepare(context, &mut control, &mut cancelled) {
+    let prepared = match PreparedContext::prepare(context, &mut control, cancelled) {
         Ok(prepared) => prepared,
         Err(halt) => {
             return outcome(Err(halt));
@@ -1336,10 +1348,10 @@ pub fn whnf_with(
     let reducer = Reducer {
         context: prepared,
         control,
-        cancelled: &mut cancelled,
+        cancelled,
         unfolded_bindings: BTreeSet::new(),
     };
-    outcome(reducer.run(term))
+    outcome(reducer.run(term, root))
 }
 
 #[cfg(test)]
