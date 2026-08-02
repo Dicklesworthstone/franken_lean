@@ -13,7 +13,6 @@ use crate::numeric::{
     self, NatBudget, NatComparison, NatFault, NatOperation, NatOutcome, NatProgress, NatRefusal,
     NatStop, NatValue,
 };
-use crate::term::TermBudget;
 use crate::whnf::{
     WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_core_at_with,
     whnf_delta_step_at_with,
@@ -1129,10 +1128,6 @@ fn execute_frame(frame: &mut EvalFrame, control: &mut Control<'_>) -> Result<Exe
 
 fn bool_name(value: bool, control: &mut Control<'_>) -> Result<WireName, Halt> {
     let leaf = if value { "true" } else { "false" };
-    let units = 2_u64
-        .saturating_add(usize_units("Bool".len()))
-        .saturating_add(usize_units(leaf.len()));
-    control.output(units, 0)?;
     let mut parts = Vec::new();
     parts.try_reserve_exact(2).map_err(|_| {
         Halt::stop(NatReductionStop::AllocationFailed {
@@ -1161,21 +1156,28 @@ fn output_term(
     operation: NatReductionOperation,
     control: &mut Control<'_>,
 ) -> Result<WireExpr, Halt> {
-    let node = match executed {
-        Executed::Natural(value) => {
-            let units = 1_u64.saturating_add(usize_units(value.limbs_le().len()));
-            control.output(units, 0)?;
-            ExprNode::NatLiteral {
-                limbs_le: value.into_limbs_le(),
-            }
-        }
+    let owned_units = match &executed {
+        Executed::Natural(value) => 1_u64.saturating_add(usize_units(value.limbs_le().len())),
         Executed::Boolean(value) => {
-            control.output(1, 0)?;
-            ExprNode::Constant {
-                name: bool_name(value, control)?,
-                levels: Vec::new(),
-            }
+            let leaf = if *value { "true" } else { "false" };
+            3_u64
+                .saturating_add(usize_units("Bool".len()))
+                .saturating_add(usize_units(leaf.len()))
         }
+        Executed::PowCap(_) => {
+            return Err(Halt::Fault(NatReductionFault::ValueStack { operation }));
+        }
+    };
+    control.output(owned_units, 0)?;
+    let admission = control.prepare_materialization(1, owned_units, 0)?;
+    let node = match executed {
+        Executed::Natural(value) => ExprNode::NatLiteral {
+            limbs_le: value.into_limbs_le(),
+        },
+        Executed::Boolean(value) => ExprNode::Constant {
+            name: bool_name(value, control)?,
+            levels: Vec::new(),
+        },
         Executed::PowCap(_) => {
             return Err(Halt::Fault(NatReductionFault::ValueStack { operation }));
         }
@@ -1192,6 +1194,7 @@ fn output_term(
     let root = ExprId::from_index(0).ok_or(Halt::stop(NatReductionStop::OutputSizeOverflow {
         progress: control.progress,
     }))?;
+    control.commit_materialization(admission);
     Ok(WireExpr::from_parts(nodes, Vec::new(), root))
 }
 
