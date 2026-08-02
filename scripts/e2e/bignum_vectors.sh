@@ -10,11 +10,14 @@
 # through its registered discriminating test (a compile failure is not a kill)
 # before one pristine recovery. The fln-msou profile/source/threshold joins and
 # schoolbook/Karatsuba/Toom boundary equivalence run inside the real suite.
-# NDJSON under target/e2e/; fixtures retained.
+# The default entry point wraps the real lane in a producer-bound fln.e2e/2
+# bundle. `FLN_BIGNUM_INNER=1` is private recursion used only by that wrapper:
+# its legacy stream is retained as bounded telemetry, while canonical arithmetic
+# facts are projected into a separately validated semantic stream.
 
-set -euo pipefail
+set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PYTHON_BIN="$(command -v python3 || true)"
 [ -n "$PYTHON_BIN" ] || {
   echo "[bignum_vectors] setup failure: python3 is required" >&2
@@ -31,8 +34,470 @@ if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
     "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
   exit 2
 fi
+
+run_outer() {
+  for required_command in bash cargo git setsid sha256sum; do
+    command -v "$required_command" >/dev/null 2>&1 || {
+      printf '[bignum_vectors] setup failure: %s is required\n' \
+        "$required_command" >&2
+      exit 2
+    }
+  done
+
+  local evidence="$ROOT/scripts/evidence.py"
+  local schema="fln.e2e/2"
+  local semantic_schema="fln.e2e.bignum-semantic/1"
+  local telemetry_schema="fln.e2e.bignum-telemetry/1"
+  local bead="${FLN_BIGNUM_BEAD:-franken_lean-npl}"
+  local scenario="bignum_vectors"
+  local run_id
+  run_id="bignum-no-mock-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  local art_root="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
+  local art_dir="$art_root/$run_id"
+  local log="$art_dir/run.ndjson"
+  local semantic="$art_dir/semantic.ndjson"
+  local telemetry="$art_dir/telemetry.ndjson"
+  local inner_root="$art_dir/inner"
+  local vendor_path="vendor/lean4-src"
+  local vendor_binding="$art_dir/vendor-binding.json"
+  local build_target="${FLN_E2E_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-$ROOT/target_local}}"
+  local capture_bytes="${FLN_E2E_CAPTURE_BYTES:-1048576}"
+  local output_budget_bytes="${FLN_E2E_OUTPUT_BUDGET_BYTES:-16777216}"
+  local timeout_ms="${FLN_E2E_TIMEOUT_MS:-900000}"
+  local grace_ms="${FLN_E2E_KILL_GRACE_MS:-2000}"
+  local start_ns
+  local seq=0
+  local input_root
+  local subject_root
+  local inner_dir
+  local final_root
+  local semantic_root
+  local end_ns
+  local -a hash_args=()
+  local -a governed_args=()
+  local -a subject_hash_args=()
+  local -a inner_candidates=()
+  local -a input_paths=(
+    Cargo.toml
+    Cargo.lock
+    SUITE.lock
+    rust-toolchain.toml
+    ci/VERIFICATION_MANIFEST.jsonl
+    ci/ABI_EXPORT_STATUS.txt
+    crates/fln-core
+    crates/fln-bignum
+    crates/fln-rt
+    crates/fln-unsafe-abi
+    crates/fln-kernel/tests/k1_judgments.rs
+    tribunal/fixtures/c4
+    scripts/e2e/bignum_vectors.sh
+    scripts/e2e/marrow_stage0_gauntlet.sh
+    scripts/evidence.py
+    scripts/extract/gen_bignum_vectors.py
+    scripts/lib/gate_lock.sh
+    vendor/NOTICE
+  )
+  local -a subject_paths=(
+    crates/fln-bignum/fixtures/kernel_reduction_profile.tsv
+    crates/fln-bignum/fixtures/nat_vectors.txt
+    crates/fln-bignum/src
+    crates/fln-bignum/tests
+    crates/fln-unsafe-abi/src
+  )
+
+  for input_path in "${input_paths[@]}"; do
+    hash_args+=(--path "$input_path")
+    governed_args+=(--governed-path "$input_path")
+  done
+  for subject_path in "${subject_paths[@]}"; do
+    subject_hash_args+=(--path "$subject_path")
+  done
+
+  # shellcheck source=scripts/lib/gate_lock.sh
+  # shellcheck disable=SC1091
+  . "$ROOT/scripts/lib/gate_lock.sh"
+  trap 'fln_gate_release_note "bignum_vectors"' EXIT
+  fln_gate_acquire "$scenario"
+
+  mkdir -p "$art_root"
+  if ! mkdir "$art_dir" 2>/dev/null; then
+    printf '[bignum_vectors] setup failure: artifact path is not fresh: %s\n' \
+      "$art_dir" >&2
+    exit 2
+  fi
+  mkdir "$inner_root"
+
+  "${PYTHON[@]}" "$evidence" vendor-binding --root "$ROOT" \
+    --vendor-path "$vendor_path" --output "$vendor_binding" \
+    --artifact-root "$art_dir" || {
+      printf '[bignum_vectors] setup failure: cannot bind vendored Reference\n' >&2
+      exit 2
+    }
+  input_root="$(
+    "${PYTHON[@]}" "$evidence" hash-tree --root "$ROOT" \
+      "${hash_args[@]}" --vendor-path "$vendor_path"
+  )" || {
+    printf '[bignum_vectors] setup failure: cannot hash governed inputs\n' >&2
+    exit 2
+  }
+  subject_root="$(
+    "${PYTHON[@]}" "$evidence" hash-tree --root "$ROOT" \
+      "${subject_hash_args[@]}"
+  )" || {
+    printf '[bignum_vectors] setup failure: cannot hash subject inputs\n' >&2
+    exit 2
+  }
+  start_ns="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
+
+  emit_event() {
+    local sequence="$seq"
+    seq=$((seq + 1))
+    "${PYTHON[@]}" "$evidence" emit --file "$log" \
+      --artifact-root "$art_dir" \
+      --string schema "$schema" --string run_id "$run_id" \
+      --string bead "$bead" --string scenario "$scenario" \
+      --integer sequence "$sequence" \
+      --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
+      --string wall_time_utc "$(date -u -Is)" "$@"
+  }
+
+  emit_event --new-log --string event run_start \
+    --json-value argv '["scripts/e2e/bignum_vectors.sh"]' \
+    --string cwd "$ROOT" \
+    --append-string claim_ids FLN-NPL-OWNED-BIGNUM-KERNEL-GRADE \
+    --append-string claim_ids FLN-MSOU-SUBQUADRATIC-BIGNUM-ALGORITHMS \
+    --append-string invariant_ids FL-INV-07 \
+    --append-string gate_ids W3 --append-string gate_ids PG-K \
+    --string parity_ledger_row not_applicable_bignum_component_bounded_model \
+    --string epoch v4.32.0 --string mode sound \
+    --string profile e2e --string platform "$(uname -srm)" \
+    --integer thread_count 1 --string seed bignum-vectors-v1 \
+    --string cache_state "${FLN_E2E_CACHE_STATE:-uncontrolled}" \
+    --string input_root "$input_root" --string subject_root "$subject_root" \
+    --string vendor_binding vendor-binding.json \
+    --producer-binding-root "$ROOT" "${governed_args[@]}" \
+    --json-value host_facts "$(
+      "${PYTHON[@]}" -c \
+        'import json,platform; print(json.dumps({"machine":platform.machine(),"python":platform.python_version(),"release":platform.release(),"system":platform.system()},sort_keys=True,separators=(",",":")))'
+    )" \
+    --json-value budgets \
+      "{\"capture_bytes_per_stream\":$capture_bytes,\"output_budget_bytes\":$output_budget_bytes,\"step_timeout_ms\":$timeout_ms,\"kill_grace_ms\":$grace_ms}"
+
+  check_input_root() {
+    local step="$1"
+    local current_root
+    current_root="$(
+      "${PYTHON[@]}" "$evidence" hash-tree --root "$ROOT" \
+        "${hash_args[@]}" --vendor-path "$vendor_path"
+    )" || {
+      printf '[bignum_vectors] internal fault: cannot hash %s final inputs\n' \
+        "$step" >&2
+      exit 2
+    }
+    if [ "$current_root" != "$input_root" ]; then
+      printf '[bignum_vectors] inconclusive: governed inputs changed in %s\n' \
+        "$step" >&2
+      exit 3
+    fi
+  }
+
+  run_step() {
+    local step="$1"
+    shift
+    local metadata="$art_dir/$step.meta.json"
+    local stdout="$art_dir/$step.out"
+    local stderr="$art_dir/$step.err"
+    local readiness="$art_dir/$step.ready.json"
+    local validation="$art_dir/$step.validation.json"
+    local wrapper_rc=0
+
+    printf '[bignum_vectors] running %s\n' "$step" >&2
+    setsid -- "${PYTHON[@]}" "$evidence" run --cwd "$ROOT" \
+      --metadata "$metadata" --stdout "$stdout" --stderr "$stderr" \
+      --readiness "$readiness" --artifact-root "$art_dir" \
+      --capture-bytes "$capture_bytes" \
+      --output-budget-bytes "$output_budget_bytes" \
+      --timeout-ms "$timeout_ms" --grace-ms "$grace_ms" \
+      --stage-id "$step" -- "$@" || wrapper_rc=$?
+    "${PYTHON[@]}" "$evidence" validate-supervisor --file "$metadata" \
+      --expected-stage-id "$step" --artifact-root "$art_dir" \
+      --output "$validation" || {
+        printf '[bignum_vectors] internal fault: invalid supervisor envelope for %s\n' \
+          "$step" >&2
+        exit 2
+      }
+    if [ "$wrapper_rc" -ne 0 ]; then
+      printf '[bignum_vectors] refused: %s exited %s; logs=%s\n' \
+        "$step" "$wrapper_rc" "$art_dir" >&2
+      exit "$wrapper_rc"
+    fi
+    check_input_root "$step"
+    emit_event --string event step --string step_id "$step" \
+      --string assertion pass --string expected exit_zero \
+      --string actual pass --string input_root "$input_root" \
+      --string final_state "$input_root" \
+      --string validation_artifact "$step.validation.json" \
+      --string expected_supervisor_classification pass \
+      --integer expected_wrapper_exit 0 --integer expected_child_exit 0 \
+      --string subject_root "$subject_root" \
+      --string subject_final_state "$subject_root" \
+      --json-file supervisor "$metadata"
+  }
+
+  run_step bignum_lane env \
+    FLN_BIGNUM_INNER=1 \
+    FLN_BIGNUM_INNER_ART_ROOT="$inner_root" \
+    FLN_E2E_CARGO_TARGET_DIR="$build_target" \
+    bash scripts/e2e/bignum_vectors.sh
+
+  mapfile -d '' -t inner_candidates < <(
+    find "$inner_root" -mindepth 1 -maxdepth 1 -type d -print0
+  )
+  if ((${#inner_candidates[@]} != 1)); then
+    printf '[bignum_vectors] internal fault: inner lane published %d roots\n' \
+      "${#inner_candidates[@]}" >&2
+    exit 2
+  fi
+  inner_dir="${inner_candidates[0]}"
+
+  "${PYTHON[@]}" - \
+    "$inner_dir" "$semantic" "$telemetry" "$run_id" \
+    "$semantic_schema" "$telemetry_schema" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+inner = pathlib.Path(sys.argv[1])
+semantic_path = pathlib.Path(sys.argv[2])
+telemetry_path = pathlib.Path(sys.argv[3])
+run_id, semantic_schema, telemetry_schema = sys.argv[4:]
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def records(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+inner_records = records(inner / "run.ndjson")
+by_step = {row["step"]: row for row in inner_records}
+mutations = [
+    ("carry_drop", "nat::tests::u128_model_agreement"),
+    ("borrow_drop", "truncated_subtraction_saturates_at_zero_and_never_wraps"),
+    ("normalization_single_pop", "nat::tests::edge_laws"),
+    (
+        "division_zero_guard_drop",
+        "nat::tests::knuth_d_matches_the_bitwise_model_and_reconstructs_the_dividend",
+    ),
+    (
+        "threshold_off_by_one",
+        "nat::tests::multiplication_crossovers_are_pinned_and_both_sides_are_equivalent",
+    ),
+    (
+        "signed_product_flip",
+        "nat::tests::toom3_signed_evaluations_and_carry_chains_match_schoolbook",
+    ),
+    (
+        "abi_view_origin_shift",
+        "borrowed_limb_views_alias_storage_and_match_owned_arithmetic",
+    ),
+    ("decimal_validation_drop", "nat::tests::edge_laws"),
+    ("shift_limb_boundary", "nat::tests::edge_laws"),
+]
+fixture = inner / "vector-fixture.txt"
+vector_count = sum(
+    1
+    for line in fixture.read_text(encoding="utf-8").splitlines()
+    if "|" in line and not line.startswith("#")
+)
+profile_rows = [
+    line.split("\t")
+    for line in (inner / "profile.snapshot.tsv")
+    .read_text(encoding="utf-8")
+    .splitlines()
+    if line.startswith("source\t")
+]
+projections = [
+    {"kind": row[4], "sha256": row[3]}
+    for row in profile_rows
+]
+c4_facts = inner / "c4-facts-marrow.ndjson"
+facts_digest = digest(c4_facts)
+semantic = [
+    {
+        "fixture_sha256": digest(fixture),
+        "scenario": "vector_corpus",
+        "schema": semantic_schema,
+        "sequence": 0,
+        "status": "matched",
+        "vectors": vector_count,
+    },
+    {
+        "projections": projections,
+        "scenario": "profile_binding",
+        "schema": semantic_schema,
+        "sequence": 1,
+        "sources": len(profile_rows),
+        "status": "matched",
+    },
+    {
+        "packages": ["fln-bignum", "fln-rt", "fln-unsafe-abi"],
+        "scenario": "consumer_suites",
+        "schema": semantic_schema,
+        "sequence": 2,
+        "status": "passed",
+    },
+    {
+        "fact_sha256": facts_digest,
+        "nat_facts": sum(
+            1
+            for line in c4_facts.read_text(encoding="utf-8").splitlines()
+            if '"probe":"nat.' in line
+        ),
+        "scenario": "c4_differential",
+        "schema": semantic_schema,
+        "sequence": 3,
+        "status": "matched",
+    },
+]
+for mutation, test in mutations:
+    semantic.append(
+        {
+            "mutation": mutation,
+            "published": False,
+            "scenario": "mutation",
+            "schema": semantic_schema,
+            "sequence": len(semantic),
+            "status": "killed",
+            "test": test,
+        }
+    )
+semantic.append(
+    {
+        "matches_positive": True,
+        "scenario": "recovery",
+        "schema": semantic_schema,
+        "sequence": len(semantic),
+        "status": "passed",
+    }
+)
+semantic_bytes = b"".join(
+    (
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    for row in semantic
+)
+semantic_path.write_bytes(semantic_bytes)
+telemetry = {
+    "elapsed_ms_by_step": {
+        row["step"]: row["elapsed_ms"]
+        for row in inner_records
+        if "elapsed_ms" in row
+    },
+    "full_source_drifts": by_step["profile_binding"]["full_source_drifts"],
+    "host": by_step["run_start"]["host"],
+    "inner_run_id": by_step["run_start"]["run_id"],
+    "inner_run_sha256": digest(inner / "run.ndjson"),
+    "mutation_process_exits": {
+        mutation: by_step[f"mutant_{mutation}"]["actual_exit"]
+        for mutation, _test in mutations
+    },
+    "run_id": run_id,
+    "schema": telemetry_schema,
+    "semantic_sha256": hashlib.sha256(semantic_bytes).hexdigest(),
+}
+telemetry_path.write_text(
+    json.dumps(telemetry, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+
+  run_step semantic_validation \
+    "${PYTHON[@]}" "$evidence" validate-bignum-no-mock \
+      --expected-run-id "$run_id" \
+      --semantic "$semantic" --telemetry "$telemetry" \
+      --inner-log "$inner_dir/run.ndjson" \
+      --inner-root "$inner_dir" \
+      --lane-metadata "$art_dir/bignum_lane.meta.json" \
+      --artifact-root "$art_dir" \
+      --output "$art_dir/semantic.validation.json"
+
+  run_step final_real_recheck env CARGO_TARGET_DIR="$build_target" \
+    cargo test --locked -q -p fln-bignum -p fln-unsafe-abi -p fln-rt
+
+  final_root="$(
+    "${PYTHON[@]}" "$evidence" hash-tree --root "$ROOT" \
+      "${hash_args[@]}" --vendor-path "$vendor_path"
+  )" || {
+    printf '[bignum_vectors] internal fault: cannot hash final inputs\n' >&2
+    exit 2
+  }
+  if [ "$final_root" != "$input_root" ]; then
+    printf '[bignum_vectors] inconclusive: governed inputs changed\n' >&2
+    exit 3
+  fi
+  semantic_root="$(
+    "${PYTHON[@]}" -c \
+      'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["semantic_sha256"])' \
+      "$art_dir/semantic.validation.json"
+  )"
+  end_ns="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
+
+  emit_event --string event run_end --string verdict pass \
+    --string reason_code bignum_vectors_mutants_refused_and_recovered \
+    --integer process_exit 0 --string active_step final_real_recheck \
+    --integer duration_ns "$((end_ns - start_ns))" \
+    --string cleanup_status retained_by_policy \
+    --string final_state "$final_root" --string logical_root "$final_root" \
+    --string receipt_root "$semantic_root" --string first_divergence none \
+    --string evidence_manifest manifest.json \
+    --string bundle_commit bundle.complete.json \
+    --string evidence_state pending_bundle_commit
+
+  "${PYTHON[@]}" "$evidence" validate-run --file "$log" \
+    --schema "$schema" --expected-verdict pass --artifact-root "$art_dir" \
+    --output "$art_dir/run.validation.json"
+  "${PYTHON[@]}" "$evidence" manifest --art-dir "$art_dir" \
+    --output "$art_dir/manifest.json" \
+    --digest-output "$art_dir/manifest.digest" \
+    --run-id "$run_id" --bead "$bead" --scenario "$scenario" \
+    --verdict pass --input-root "$input_root" --final-root "$final_root"
+  "${PYTHON[@]}" "$evidence" validate-manifest --art-dir "$art_dir" \
+    --manifest "$art_dir/manifest.json" --digest "$art_dir/manifest.digest" \
+    --offline
+  "${PYTHON[@]}" "$evidence" complete-bundle --art-dir "$art_dir" \
+    --manifest "$art_dir/manifest.json" \
+    --digest "$art_dir/manifest.digest" \
+    --output "$art_dir/bundle.complete.json" \
+    --governed-root "$ROOT" "${governed_args[@]}" \
+    --expected-root "$final_root" --vendor-path "$vendor_path"
+  "${PYTHON[@]}" "$evidence" adopt-bundle --art-dir "$art_dir" \
+    --manifest "$art_dir/manifest.json" \
+    --digest "$art_dir/manifest.digest" \
+    --commit "$art_dir/bundle.complete.json" \
+    --artifact-root "$art_dir" >/dev/null
+  "${PYTHON[@]}" "$evidence" validate-bundle --art-dir "$art_dir" \
+    --manifest "$art_dir/manifest.json" \
+    --digest "$art_dir/manifest.digest" \
+    --commit "$art_dir/bundle.complete.json" \
+    --artifact-root "$art_dir" >/dev/null
+
+  printf '[bignum_vectors] PASS evidence=%s semantic_root=%s\n' \
+    "$art_dir" "$semantic_root" >&2
+}
+
+if [ "${FLN_BIGNUM_INNER:-0}" != "1" ]; then
+  run_outer "$@"
+  exit 0
+fi
+
 RUN_ID="bignum-vectors-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-ART_DIR="$ROOT/target/e2e/$RUN_ID"
+ART_ROOT="${FLN_BIGNUM_INNER_ART_ROOT:-$ROOT/target/e2e}"
+ART_DIR="$ART_ROOT/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
 BUILD_TARGET="${FLN_E2E_CARGO_TARGET_DIR:-$ROOT/target_local}"
 mkdir -p "$(dirname "$ART_DIR")"
@@ -69,10 +534,15 @@ if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
 emit drift passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"drift.log\""
+cp "$ROOT/crates/fln-bignum/fixtures/nat_vectors.txt" \
+  "$ART_DIR/vector-fixture.txt"
+cp "$ROOT/crates/fln-bignum/src/nat.rs" \
+  "$ART_DIR/nat-source-pristine.rs"
 
 # ---- step 2: the threshold profile is bound to its real fixture sources ----------------
 note "binding the threshold profile to the KR-313 and C4 fixture bytes"
 profile="$ROOT/crates/fln-bignum/fixtures/kernel_reduction_profile.tsv"
+cp "$profile" "$ART_DIR/profile.snapshot.tsv"
 source_count=0
 full_source_drifts=0
 while IFS=$'\t' read -r kind source measured_sha expected_projection projection_kind; do
@@ -83,6 +553,7 @@ while IFS=$'\t' read -r kind source measured_sha expected_projection projection_
     note "FAIL: profile source is missing: $source"
     exit 1
   fi
+  cp "$ROOT/$source" "$ART_DIR/profile-source-$source_count.bin"
   actual_sha="$(sha256sum "$ROOT/$source" | awk '{print $1}')"
   if [ "$actual_sha" != "$measured_sha" ]; then
     full_source_drifts=$((full_source_drifts + 1))
@@ -173,9 +644,12 @@ reference_nat_facts="$(grep -c '"probe":"nat\.' "$c4_dir/facts_reference.ndjson"
 if [ "$marrow_nat_facts" -ne 28 ] || [ "$reference_nat_facts" -ne 28 ] \
     || ! cmp -s "$c4_dir/facts_marrow.ndjson" "$c4_dir/facts_reference.ndjson"; then
   emit c4_gauntlet failed "\"detail\":\"Nat fact population or full differential drifted\",\"artifact\":\"c4.log\""
-  note "FAIL: C4 Nat facts drifted"
-  exit 1
+    note "FAIL: C4 Nat facts drifted"
+    exit 1
 fi
+cp "$c4_dir/run.ndjson" "$ART_DIR/c4-run.ndjson"
+cp "$c4_dir/facts_marrow.ndjson" "$ART_DIR/c4-facts-marrow.ndjson"
+cp "$c4_dir/facts_reference.ndjson" "$ART_DIR/c4-facts-reference.ndjson"
 emit c4_gauntlet passed "\"facts\":28,\"artifact\":\"c4.log\""
 
 # ---- step 5: every named production mutant must be killed -------------------------------

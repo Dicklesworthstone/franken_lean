@@ -342,6 +342,11 @@ E2E_STEP_ORDERS = {
         "semantic_validation",
         "final_real_recheck",
     ],
+    "bignum_vectors": [
+        "bignum_lane",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
     "campaign_frameworks": [
         "suite_campaign_owner_matrix",
         "suite_mutation_kill_ledger_model",
@@ -817,6 +822,54 @@ CARTRIDGE_MAX_SEMANTIC_BYTES = 65_536
 CARTRIDGE_MAX_TELEMETRY_BYTES = 8_192
 CARTRIDGE_MAX_EXTRACTED_FILES = 16
 CARTRIDGE_MAX_EXTRACTED_BYTES = 128 * 1024 * 1024
+BIGNUM_SEMANTIC_SCHEMA = "fln.e2e.bignum-semantic/1"
+BIGNUM_TELEMETRY_SCHEMA = "fln.e2e.bignum-telemetry/1"
+BIGNUM_VALIDATION_SCHEMA = "fln.e2e.bignum-validation/1"
+BIGNUM_VECTOR_COUNT = 5_725
+BIGNUM_C4_NAT_FACTS = 28
+BIGNUM_MUTATIONS = (
+    ("carry_drop", "nat::tests::u128_model_agreement"),
+    (
+        "borrow_drop",
+        "truncated_subtraction_saturates_at_zero_and_never_wraps",
+    ),
+    ("normalization_single_pop", "nat::tests::edge_laws"),
+    (
+        "division_zero_guard_drop",
+        "nat::tests::knuth_d_matches_the_bitwise_model_and_reconstructs_the_dividend",
+    ),
+    (
+        "threshold_off_by_one",
+        "nat::tests::multiplication_crossovers_are_pinned_and_both_sides_are_equivalent",
+    ),
+    (
+        "signed_product_flip",
+        "nat::tests::toom3_signed_evaluations_and_carry_chains_match_schoolbook",
+    ),
+    (
+        "abi_view_origin_shift",
+        "borrowed_limb_views_alias_storage_and_match_owned_arithmetic",
+    ),
+    ("decimal_validation_drop", "nat::tests::edge_laws"),
+    ("shift_limb_boundary", "nat::tests::edge_laws"),
+)
+BIGNUM_PROFILE_SOURCES = (
+    (
+        "crates/fln-kernel/tests/k1_judgments.rs",
+        "kr313-operation-test-body-v1",
+        b"fn kr313_the_pin_operation_table_computes_literal_results() {",
+        b"#[test]\nfn kr313_comparisons_produce_bool_constants()",
+    ),
+    (
+        "tribunal/fixtures/c4/probe_export.c",
+        "c4-nat-slice-v1",
+        b"/* ---- slice 3: bignum-backed Nat families */",
+        b"/* ---- slice 3: Name equality",
+    ),
+)
+BIGNUM_MAX_SEMANTIC_BYTES = 65_536
+BIGNUM_MAX_TELEMETRY_BYTES = 16_384
+BIGNUM_MAX_FIXTURE_BYTES = 32 * 1024 * 1024
 SOURCE_RECOVERY_SEMANTIC_SCHEMA = "fln.e2e.source-recovery-semantic"
 SOURCE_RECOVERY_TELEMETRY_SCHEMA = "fln.e2e.source-recovery-telemetry"
 SOURCE_RECOVERY_INPUT = (
@@ -10311,6 +10364,462 @@ def validate_cartridge_no_mock_evidence(
         "schema": CARTRIDGE_VALIDATION_SCHEMA,
         "semantic_sha256": semantic_digest,
         "telemetry_sha256": telemetry_digest,
+        "verdict": "pass",
+    }
+
+
+def validate_bignum_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+    inner_log_path: Path,
+    inner_root: Path,
+    lane_metadata_path: Path,
+    artifact_root: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("bignum expected run id must be non-empty")
+    if inner_root.is_symlink() or not inner_root.is_dir():
+        raise EvidenceError("bignum inner artifact root is not a real directory")
+    validate_certificate_format_process(
+        lane_metadata_path,
+        stage_id="bignum_lane",
+        classification="pass",
+        wrapper_exit=0,
+        child_exit=0,
+    )
+
+    semantic, semantic_digest = macro_txn_canonical_rows(
+        semantic_path,
+        label="bignum semantic evidence",
+        max_bytes=BIGNUM_MAX_SEMANTIC_BYTES,
+    )
+    telemetry, telemetry_digest = read_canonical_record(
+        telemetry_path,
+        label="bignum telemetry",
+        max_bytes=BIGNUM_MAX_TELEMETRY_BYTES,
+    )
+    expected_scenarios = [
+        "vector_corpus",
+        "profile_binding",
+        "consumer_suites",
+        "c4_differential",
+        *(["mutation"] * len(BIGNUM_MUTATIONS)),
+        "recovery",
+    ]
+    if (
+        len(semantic) != len(expected_scenarios)
+        or [row.get("sequence") for row in semantic]
+        != list(range(len(expected_scenarios)))
+        or [row.get("scenario") for row in semantic] != expected_scenarios
+        or any(row.get("schema") != BIGNUM_SEMANTIC_SCHEMA for row in semantic)
+    ):
+        raise EvidenceError(
+            "bignum semantic scenarios are incomplete, reordered, or misversioned"
+        )
+    forbidden_semantic_fields = {
+        "absolute_path",
+        "duration",
+        "elapsed",
+        "host",
+        "pid",
+        "process_exit",
+        "run_id",
+        "wall_time",
+    }
+    if any(forbidden_semantic_fields.intersection(row) for row in semantic):
+        raise EvidenceError("bignum semantic authority contains telemetry")
+
+    inner_records, inner_digest = load_ndjson_snapshot(inner_log_path)
+    expected_inner_steps = [
+        "run_start",
+        "drift",
+        "profile_binding",
+        "suite",
+        "c4_gauntlet",
+        *[f"mutant_{mutation}" for mutation, _test in BIGNUM_MUTATIONS],
+        "recovery",
+        "run_end",
+    ]
+    if (
+        [record.get("step") for record in inner_records] != expected_inner_steps
+        or any(record.get("schema") != "fln-e2e/1" for record in inner_records)
+        or any(
+            record.get("run_id") != inner_records[0].get("run_id")
+            or record.get("bead") != "franken_lean-npl"
+            or record.get("scenario") != "bignum_vectors"
+            for record in inner_records
+        )
+        or inner_records[0].get("status") != "started"
+        or any(record.get("status") != "passed" for record in inner_records[1:])
+        or inner_records[-1].get("verdict") != "pass"
+    ):
+        raise EvidenceError("bignum retained inner lane is incomplete or failed")
+    inner_by_step = {str(record["step"]): record for record in inner_records}
+    if len(inner_by_step) != len(inner_records):
+        raise EvidenceError("bignum retained inner lane has duplicate step ids")
+
+    vector_path = require_within(
+        inner_root / "vector-fixture.txt",
+        artifact_root,
+        label="bignum vector fixture snapshot",
+    )
+    vector_data, _vector_bytes, vector_digest = stable_file_facts(
+        vector_path,
+        max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+    )
+    try:
+        vector_text = vector_data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError("bignum vector fixture is not UTF-8") from error
+    vector_lines = vector_text.splitlines()
+    vector_count = sum(
+        "|" in line and not line.startswith("#") for line in vector_lines
+    )
+    if (
+        "schema fln-bignum-vectors/1" not in vector_lines
+        or vector_count != BIGNUM_VECTOR_COUNT
+    ):
+        raise EvidenceError("bignum vector fixture schema or population changed")
+    vector_row = semantic[0]
+    if (
+        set(vector_row)
+        != {
+            "fixture_sha256",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+            "vectors",
+        }
+        or vector_row.get("fixture_sha256") != vector_digest
+        or vector_row.get("status") != "matched"
+        or vector_row.get("vectors") != BIGNUM_VECTOR_COUNT
+    ):
+        raise EvidenceError("bignum vector semantic row changed")
+
+    profile_path = require_within(
+        inner_root / "profile.snapshot.tsv",
+        artifact_root,
+        label="bignum threshold profile snapshot",
+    )
+    profile_data, _profile_bytes, _profile_digest = stable_file_facts(
+        profile_path,
+        max_bytes=65_536,
+    )
+    try:
+        profile_lines = profile_data.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise EvidenceError("bignum threshold profile is not UTF-8") from error
+    if "schema\tfln.bignum-kernel-reduction-profile/2" not in profile_lines:
+        raise EvidenceError("bignum threshold profile schema changed")
+    source_rows = [
+        line.split("\t") for line in profile_lines if line.startswith("source\t")
+    ]
+    if len(source_rows) != len(BIGNUM_PROFILE_SOURCES) or any(
+        len(row) != 5 for row in source_rows
+    ):
+        raise EvidenceError("bignum threshold profile source inventory changed")
+    projection_facts: list[dict[str, str]] = []
+    full_source_drifts = 0
+    for index, (row, expected) in enumerate(
+        zip(source_rows, BIGNUM_PROFILE_SOURCES, strict=True),
+        1,
+    ):
+        _kind, source, measured_sha, projection_sha, projection_kind = row
+        expected_source, expected_kind, start_marker, end_marker = expected
+        if (
+            source != expected_source
+            or projection_kind != expected_kind
+            or SHA256_HEX.fullmatch(measured_sha) is None
+            or SHA256_HEX.fullmatch(projection_sha) is None
+        ):
+            raise EvidenceError("bignum threshold profile source row changed")
+        source_path = require_within(
+            inner_root / f"profile-source-{index}.bin",
+            artifact_root,
+            label=f"bignum profile source {index}",
+        )
+        source_data, _source_bytes, source_digest = stable_file_facts(
+            source_path,
+            max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+        )
+        if source_digest != measured_sha:
+            full_source_drifts += 1
+        if source_data.count(start_marker) != 1 or source_data.count(end_marker) != 1:
+            raise EvidenceError(
+                f"bignum profile projection markers changed for {projection_kind}"
+            )
+        start = source_data.index(start_marker)
+        end = source_data.index(end_marker, start + len(start_marker))
+        actual_projection = hashlib.sha256(source_data[start:end]).hexdigest()
+        if actual_projection != projection_sha:
+            raise EvidenceError(
+                f"bignum profile semantic projection drifted for {projection_kind}"
+            )
+        projection_facts.append(
+            {"kind": projection_kind, "sha256": projection_sha}
+        )
+    profile_row = semantic[1]
+    if (
+        set(profile_row)
+        != {
+            "projections",
+            "scenario",
+            "schema",
+            "sequence",
+            "sources",
+            "status",
+        }
+        or profile_row.get("projections") != projection_facts
+        or profile_row.get("sources") != len(BIGNUM_PROFILE_SOURCES)
+        or profile_row.get("status") != "matched"
+        or inner_by_step["profile_binding"].get("semantic_projections")
+        != len(BIGNUM_PROFILE_SOURCES)
+        or inner_by_step["profile_binding"].get("full_source_drifts")
+        != full_source_drifts
+    ):
+        raise EvidenceError("bignum profile semantic row or retained join changed")
+
+    suite_row = semantic[2]
+    if (
+        suite_row
+        != {
+            "packages": ["fln-bignum", "fln-rt", "fln-unsafe-abi"],
+            "scenario": "consumer_suites",
+            "schema": BIGNUM_SEMANTIC_SCHEMA,
+            "sequence": 2,
+            "status": "passed",
+        }
+    ):
+        raise EvidenceError("bignum consumer-suite semantic row changed")
+    suite_path = require_within(
+        inner_root / "suite.log",
+        artifact_root,
+        label="bignum consumer suite log",
+    )
+    suite_data, _suite_bytes, _suite_digest = stable_file_facts(
+        suite_path,
+        max_bytes=MAX_LOG_BYTES,
+    )
+    if (
+        suite_data.count(b"test result: ok.") < 10
+        or b"15 passed; 0 failed" not in suite_data
+        or b"13 passed; 0 failed" not in suite_data
+        or b"52 passed; 0 failed" not in suite_data
+        or b"test result: FAILED." in suite_data
+    ):
+        raise EvidenceError("bignum consumer suites did not meet their floors")
+
+    c4_run_path = require_within(
+        inner_root / "c4-run.ndjson",
+        artifact_root,
+        label="bignum C4 retained run",
+    )
+    c4_records, _c4_run_digest = load_ndjson_snapshot(c4_run_path)
+    if (
+        any(
+            record.get("schema") != "fln-e2e/1"
+            or record.get("scenario") != "marrow_stage0_gauntlet"
+            for record in c4_records
+        )
+        or c4_records[-1].get("step") != "run_end"
+        or c4_records[-1].get("status") != "passed"
+        or not any(
+            record.get("step") == "fact_differential"
+            and record.get("status") == "passed"
+            for record in c4_records
+        )
+    ):
+        raise EvidenceError("bignum C4 retained lane is incomplete or skipped")
+    marrow_path = require_within(
+        inner_root / "c4-facts-marrow.ndjson",
+        artifact_root,
+        label="bignum Marrow C4 facts",
+    )
+    reference_path = require_within(
+        inner_root / "c4-facts-reference.ndjson",
+        artifact_root,
+        label="bignum Reference C4 facts",
+    )
+    marrow_data, _marrow_bytes, marrow_digest = stable_file_facts(
+        marrow_path,
+        max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+    )
+    reference_data, _reference_bytes, reference_digest = stable_file_facts(
+        reference_path,
+        max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+    )
+    marrow_nat_facts = sum(
+        b'"probe":"nat.' in line for line in marrow_data.splitlines()
+    )
+    reference_nat_facts = sum(
+        b'"probe":"nat.' in line for line in reference_data.splitlines()
+    )
+    if (
+        marrow_data != reference_data
+        or marrow_digest != reference_digest
+        or marrow_nat_facts != BIGNUM_C4_NAT_FACTS
+        or reference_nat_facts != BIGNUM_C4_NAT_FACTS
+    ):
+        raise EvidenceError("bignum C4 Nat fact differential changed")
+    c4_row = semantic[3]
+    if (
+        c4_row
+        != {
+            "fact_sha256": marrow_digest,
+            "nat_facts": BIGNUM_C4_NAT_FACTS,
+            "scenario": "c4_differential",
+            "schema": BIGNUM_SEMANTIC_SCHEMA,
+            "sequence": 3,
+            "status": "matched",
+        }
+    ):
+        raise EvidenceError("bignum C4 semantic row changed")
+
+    mutation_exits: dict[str, int] = {}
+    for offset, (mutation, test) in enumerate(BIGNUM_MUTATIONS, 4):
+        row = semantic[offset]
+        expected_row = {
+            "mutation": mutation,
+            "published": False,
+            "scenario": "mutation",
+            "schema": BIGNUM_SEMANTIC_SCHEMA,
+            "sequence": offset,
+            "status": "killed",
+            "test": test,
+        }
+        if row != expected_row:
+            raise EvidenceError(f"bignum {mutation} semantic row changed")
+        inner_row = inner_by_step[f"mutant_{mutation}"]
+        actual_exit = inner_row.get("actual_exit")
+        if (
+            inner_row.get("expected_exit") != "nonzero"
+            or type(actual_exit) is not int
+            or actual_exit <= 0
+            or inner_row.get("test") != test
+            or inner_row.get("artifact") != f"mutant-{mutation}.log"
+        ):
+            raise EvidenceError(
+                f"bignum {mutation} was not killed by its registered test"
+            )
+        mutation_path = require_within(
+            inner_root / f"mutant-{mutation}.log",
+            artifact_root,
+            label=f"bignum {mutation} mutation log",
+        )
+        mutation_data, _mutation_bytes, _mutation_digest = stable_file_facts(
+            mutation_path,
+            max_bytes=MAX_LOG_BYTES,
+        )
+        expected_line = f"test {test} ... FAILED".encode()
+        if (
+            expected_line not in mutation_data
+            or b"test result: FAILED." not in mutation_data
+        ):
+            raise EvidenceError(
+                f"bignum {mutation} stopped before its registered test failed"
+            )
+        mutation_exits[mutation] = actual_exit
+
+    recovery_row = semantic[-1]
+    if (
+        recovery_row
+        != {
+            "matches_positive": True,
+            "scenario": "recovery",
+            "schema": BIGNUM_SEMANTIC_SCHEMA,
+            "sequence": len(semantic) - 1,
+            "status": "passed",
+        }
+    ):
+        raise EvidenceError("bignum recovery semantic row changed")
+    recovery_path = require_within(
+        inner_root / "recovered.log",
+        artifact_root,
+        label="bignum recovery log",
+    )
+    recovery_data, _recovery_bytes, _recovery_digest = stable_file_facts(
+        recovery_path,
+        max_bytes=MAX_LOG_BYTES,
+    )
+    pristine_path = require_within(
+        inner_root / "nat-source-pristine.rs",
+        artifact_root,
+        label="bignum pristine source snapshot",
+    )
+    recovered_source_path = require_within(
+        inner_root / "overlay/crates/fln-bignum/src/nat.rs",
+        artifact_root,
+        label="bignum recovered overlay source",
+    )
+    pristine_data, _pristine_bytes, pristine_digest = stable_file_facts(
+        pristine_path,
+        max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+    )
+    recovered_source_data, _recovered_bytes, recovered_source_digest = (
+        stable_file_facts(
+            recovered_source_path,
+            max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+        )
+    )
+    if (
+        recovery_data.count(b"test result: ok.") < 2
+        or b"15 passed; 0 failed" not in recovery_data
+        or b"13 passed; 0 failed" not in recovery_data
+        or b"test result: FAILED." in recovery_data
+        or recovered_source_data != pristine_data
+        or recovered_source_digest != pristine_digest
+    ):
+        raise EvidenceError("bignum pristine recovery is incomplete")
+
+    expected_telemetry_fields = {
+        "elapsed_ms_by_step",
+        "full_source_drifts",
+        "host",
+        "inner_run_id",
+        "inner_run_sha256",
+        "mutation_process_exits",
+        "run_id",
+        "schema",
+        "semantic_sha256",
+    }
+    expected_elapsed = {
+        str(record["step"]): record["elapsed_ms"]
+        for record in inner_records
+        if "elapsed_ms" in record
+    }
+    elapsed_values = list(expected_elapsed.values())
+    if (
+        set(telemetry) != expected_telemetry_fields
+        or telemetry.get("schema") != BIGNUM_TELEMETRY_SCHEMA
+        or telemetry.get("run_id") != expected_run_id
+        or telemetry.get("inner_run_id") != inner_records[0].get("run_id")
+        or telemetry.get("inner_run_sha256") != inner_digest
+        or telemetry.get("semantic_sha256") != semantic_digest
+        or telemetry.get("host") != inner_records[0].get("host")
+        or telemetry.get("full_source_drifts") != full_source_drifts
+        or telemetry.get("mutation_process_exits") != mutation_exits
+        or telemetry.get("elapsed_ms_by_step") != expected_elapsed
+        or not isinstance(telemetry.get("host"), str)
+        or not telemetry["host"]
+        or any(type(value) is not int or value < 0 for value in elapsed_values)
+        or elapsed_values != sorted(elapsed_values)
+    ):
+        raise EvidenceError(
+            "bignum telemetry is malformed, stale, or semantically entangled"
+        )
+
+    return {
+        "c4_nat_facts": BIGNUM_C4_NAT_FACTS,
+        "inner_run_sha256": inner_digest,
+        "mutation_cells": len(BIGNUM_MUTATIONS),
+        "run_id": expected_run_id,
+        "schema": BIGNUM_VALIDATION_SCHEMA,
+        "semantic_sha256": semantic_digest,
+        "telemetry_sha256": telemetry_digest,
+        "vectors": BIGNUM_VECTOR_COUNT,
         "verdict": "pass",
     }
 
@@ -20081,6 +20590,47 @@ def cmd_validate_cartridge_no_mock(args: argparse.Namespace) -> int:
         output = artifact(
             args.output,
             "cartridge semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_bignum_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    report = validate_bignum_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_path=artifact(
+            args.semantic,
+            "bignum semantic evidence",
+        ),
+        telemetry_path=artifact(
+            args.telemetry,
+            "bignum telemetry",
+        ),
+        inner_log_path=artifact(
+            args.inner_log,
+            "bignum retained inner run",
+        ),
+        inner_root=artifact(
+            args.inner_root,
+            "bignum retained inner root",
+        ),
+        lane_metadata_path=artifact(
+            args.lane_metadata,
+            "bignum lane supervisor metadata",
+        ),
+        artifact_root=artifact_root,
+    )
+    if args.output:
+        output = artifact(
+            args.output,
+            "bignum semantic validation",
         )
         write_new(output, canonical_json(report))
     else:
@@ -31271,6 +31821,23 @@ def build_parser() -> argparse.ArgumentParser:
     cartridge_parser.add_argument("--artifact-root", required=True)
     cartridge_parser.add_argument("--output")
     cartridge_parser.set_defaults(func=cmd_validate_cartridge_no_mock)
+
+    bignum_parser = subparsers.add_parser(
+        "validate-bignum-no-mock",
+        help=(
+            "independently validate bignum vectors, semantic profile "
+            "projections, C4 facts, mutation kills, and pristine recovery"
+        ),
+    )
+    bignum_parser.add_argument("--expected-run-id", required=True)
+    bignum_parser.add_argument("--semantic", required=True)
+    bignum_parser.add_argument("--telemetry", required=True)
+    bignum_parser.add_argument("--inner-log", required=True)
+    bignum_parser.add_argument("--inner-root", required=True)
+    bignum_parser.add_argument("--lane-metadata", required=True)
+    bignum_parser.add_argument("--artifact-root", required=True)
+    bignum_parser.add_argument("--output")
+    bignum_parser.set_defaults(func=cmd_validate_bignum_no_mock)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",
