@@ -1375,7 +1375,7 @@ KERNEL_ADMISSION_TESTS = (
     "admission_fault_matrix_is_typed_and_atomic",
 )
 KERNEL_ADMISSION_TARGET_PASSED = 14
-KERNEL_ADMISSION_TARGET_IGNORED = 2
+KERNEL_ADMISSION_TARGET_IGNORED = 3
 KERNEL_ADMISSION_BUDGET_STEPS = 10_000_000
 KERNEL_ADMISSION_BUDGET_DEPTH = 4_096
 # The pinned Init.Prelude verdict census (beads franken_lean-irm +
@@ -29136,17 +29136,27 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             + b"test result: ok. 2 passed; 0 failed; 0 ignored; "
             b"0 measured; 0 filtered out; finished in 0.01s\n"
         ),
-        expected_message="exact full-target 14-pass/2-ignore summary",
+        expected_message=(
+            f"exact full-target {KERNEL_ADMISSION_TARGET_PASSED}-pass/"
+            f"{KERNEL_ADMISSION_TARGET_IGNORED}-ignore summary"
+        ),
     )
 
     expect_admission_rejection(
         "malformed kernel-admission row",
         "admission_malformed",
         stdout_bytes=(
-            b"running 16 tests\n"
+            (
+                f"running "
+                f"{KERNEL_ADMISSION_TARGET_PASSED + KERNEL_ADMISSION_TARGET_IGNORED} "
+                f"tests\n"
+            ).encode("ascii")
             + b'{"schema":"' + KERNEL_ADMISSION_SCHEMA.encode() + b'", not-json\n'
-            + b"test result: ok. 14 passed; 0 failed; 2 ignored; "
-            b"0 measured; 0 filtered out; finished in 0.01s\n"
+            + (
+                f"test result: ok. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
+                f"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
+                f"0 measured; 0 filtered out; finished in 0.01s\n"
+            ).encode("ascii")
         ),
     )
 
