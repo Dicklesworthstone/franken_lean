@@ -6,6 +6,10 @@
 //! * **coverage** — every rule names at least one fixture, or an explicit stub whose
 //!   owner is a **real, tracked bead** — no silently unevidenced rule, no phantom
 //!   owner;
+//! * **terminal inventory join** — the bounded coverage matrix names every contract
+//!   rule exactly once, in contract order, with the exact title and a typed evidence
+//!   state; an implemented row cannot silently become uncovered and a not-yet-
+//!   implemented row must name its production owner and policy;
 //! * **ledger linkage** — every Parity-Ledger row on the `kernel` surface must name
 //!   an existing rule id as its symbol — a dangling link fails.
 //!
@@ -30,7 +34,7 @@ use fln_conformance::ownership::{
     OwnershipFailure, OwnershipFailureClass, OwnershipLimits, OwnershipSourceMode,
     OwnershipSourceState, OwnershipUsage, SOURCE_RELATIVE_PATH, load_kernel_contract_ownership,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -40,6 +44,7 @@ use std::sync::OnceLock;
 /// The pinned Reference source tree. Every kernel-rule anchor must live here: a rule
 /// "anchored" to our own code or anything outside the pin proves nothing.
 const PIN_TREE_PREFIX: &str = "vendor/lean4-src/";
+const JUDGMENT_COVERAGE_RELATIVE_PATH: &str = "tribunal/fixtures/c3/JUDGMENT_INVENTORY_COVERAGE.md";
 
 fn workspace_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -150,9 +155,10 @@ fn validate_with_ownership(
     failures
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Rule {
     id: String,
+    title: String,
     heading_line: usize,
     anchors: Vec<(usize, String)>,
     fixtures: Vec<String>,
@@ -168,8 +174,13 @@ fn parse_rules(text: &str) -> (Vec<Rule>, Vec<String>) {
             if let Some(id) = rest.split_whitespace().next()
                 && id.starts_with("KR-")
             {
+                let title = rest
+                    .split_once('·')
+                    .map(|(_, title)| title.trim().to_string())
+                    .unwrap_or_default();
                 rules.push(Rule {
                     id: id.to_string(),
+                    title,
                     heading_line: lineno,
                     ..Rule::default()
                 });
@@ -201,6 +212,339 @@ fn parse_rules(text: &str) -> (Vec<Rule>, Vec<String>) {
         }
     }
     (rules, problems)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoverageRow {
+    id: String,
+    title: String,
+    real_module: String,
+    fixture: String,
+    model: String,
+    status: String,
+    line: usize,
+}
+
+fn parse_coverage_rows(text: &str) -> (Vec<CoverageRow>, Vec<String>) {
+    let mut rows = Vec::new();
+    let mut problems = Vec::new();
+    for (index, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if !line.starts_with("| KR-") {
+            continue;
+        }
+        let Some(cells) = line
+            .strip_prefix('|')
+            .and_then(|line| line.strip_suffix('|'))
+        else {
+            problems.push(format!(
+                "line {}: coverage row must start and end with `|`",
+                index + 1
+            ));
+            continue;
+        };
+        let cells: Vec<&str> = cells.split('|').map(str::trim).collect();
+        if cells.len() != 6 {
+            problems.push(format!(
+                "line {}: coverage row has {} columns, expected 6",
+                index + 1,
+                cells.len()
+            ));
+            continue;
+        }
+        let id = cells[0];
+        if id.len() != 6
+            || !id.starts_with("KR-")
+            || !id.as_bytes()[3..].iter().all(u8::is_ascii_digit)
+        {
+            problems.push(format!(
+                "line {}: malformed coverage rule id `{id}`",
+                index + 1
+            ));
+            continue;
+        }
+        rows.push(CoverageRow {
+            id: id.to_string(),
+            title: cells[1].to_string(),
+            real_module: cells[2].to_string(),
+            fixture: cells[3].to_string(),
+            model: cells[4].to_string(),
+            status: cells[5].to_string(),
+            line: index + 1,
+        });
+    }
+    (rows, problems)
+}
+
+fn is_evidence_cell(value: &str) -> bool {
+    !value.is_empty() && value != "—"
+}
+
+fn required_coverage_owners(rows: &[CoverageRow]) -> BTreeSet<String> {
+    const OWNED_STATES: [&str; 2] = [
+        "implemented-but-uncovered owner=",
+        "not-yet-implemented owner=",
+    ];
+    rows.iter()
+        .filter_map(|row| {
+            OWNED_STATES.iter().find_map(|prefix| {
+                row.status
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.split_once(" — "))
+                    .map(|(owner, _)| owner.to_string())
+            })
+        })
+        .collect()
+}
+
+fn validate_owned_coverage_state(
+    row: &CoverageRow,
+    prefix: &str,
+    tracked_owners: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    let Some(rest) = row.status.strip_prefix(prefix) else {
+        return findings;
+    };
+    let Some((owner, policy)) = rest.split_once(" — ") else {
+        findings.push(format!(
+            "{}: `{}` status must name `owner=<bead> — <policy>`",
+            row.id,
+            prefix.trim_end_matches(" owner=")
+        ));
+        return findings;
+    };
+    if owner.is_empty() || policy.is_empty() {
+        findings.push(format!(
+            "{}: owned coverage status has an empty owner or policy",
+            row.id
+        ));
+    } else if !tracked_owners.contains(owner) {
+        findings.push(format!(
+            "{}: coverage owner `{owner}` is not a tracked bead",
+            row.id
+        ));
+    }
+    findings
+}
+
+fn validate_coverage_status(row: &CoverageRow, tracked_owners: &BTreeSet<String>) -> Vec<String> {
+    let mut findings = Vec::new();
+    let has_real_module = is_evidence_cell(&row.real_module);
+    let has_public_fixture = is_evidence_cell(&row.fixture) || is_evidence_cell(&row.model);
+    let has_any_evidence = has_real_module || has_public_fixture;
+    match row.status.as_str() {
+        "implemented-and-covered" => {
+            if !has_public_fixture {
+                findings.push(format!(
+                    "{}: status `{}` has no public fixture or model cell",
+                    row.id, row.status
+                ));
+            }
+        }
+        "structurally-enforced" => {
+            if !has_public_fixture {
+                findings.push(format!(
+                    "{}: structurally-enforced row has no named enforcement fixture",
+                    row.id
+                ));
+            }
+        }
+        status => {
+            if status.starts_with("implemented-but-uncovered owner=") {
+                findings.extend(validate_owned_coverage_state(
+                    row,
+                    "implemented-but-uncovered owner=",
+                    tracked_owners,
+                ));
+                if is_evidence_cell(&row.fixture) {
+                    findings.push(format!(
+                        "{}: implemented-but-uncovered row must not name a C0 fixture",
+                        row.id
+                    ));
+                }
+                return findings;
+            }
+            if status.starts_with("not-yet-implemented owner=") {
+                findings.extend(validate_owned_coverage_state(
+                    row,
+                    "not-yet-implemented owner=",
+                    tracked_owners,
+                ));
+                if has_any_evidence {
+                    findings.push(format!(
+                        "{}: not-yet-implemented row must not claim exercised evidence",
+                        row.id
+                    ));
+                }
+                return findings;
+            }
+            if status.starts_with("implemented-but-uncovered")
+                || status.starts_with("not-yet-implemented")
+            {
+                findings.push(format!(
+                    "{}: unsupported coverage status `{status}`",
+                    row.id
+                ));
+                return findings;
+            }
+            findings.push(format!(
+                "{}: unsupported coverage status `{status}`",
+                row.id
+            ));
+        }
+    }
+    findings
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestReference {
+    target: String,
+    test: String,
+}
+
+fn is_rust_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn parse_test_references(
+    row: &CoverageRow,
+    label: &str,
+    value: &str,
+) -> (Vec<TestReference>, Vec<String>) {
+    if !is_evidence_cell(value) {
+        return (Vec::new(), Vec::new());
+    }
+    let mut references = Vec::new();
+    let mut findings = Vec::new();
+    for raw in value.split(';') {
+        let reference = raw.trim();
+        let Some((target, test)) = reference.split_once("::") else {
+            findings.push(format!(
+                "{}: {label} reference `{reference}` must be `<test-target>::<test-name>`",
+                row.id
+            ));
+            continue;
+        };
+        if test.contains("::") || !is_rust_identifier(target) || !is_rust_identifier(test) {
+            findings.push(format!(
+                "{}: malformed {label} test reference `{reference}`",
+                row.id
+            ));
+            continue;
+        }
+        references.push(TestReference {
+            target: target.to_string(),
+            test: test.to_string(),
+        });
+    }
+    (references, findings)
+}
+
+fn test_functions(source: &str) -> BTreeSet<String> {
+    let mut tests = BTreeSet::new();
+    let mut has_test_attribute = false;
+    for line in source.lines() {
+        let line = line.trim();
+        if line == "#[test]" {
+            has_test_attribute = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("fn ") {
+            if has_test_attribute
+                && let Some((name, _)) = rest.split_once('(')
+                && is_rust_identifier(name)
+            {
+                tests.insert(name.to_string());
+            }
+            has_test_attribute = false;
+        } else if !line.is_empty() && !line.starts_with("#[") && !line.starts_with("//") {
+            has_test_attribute = false;
+        }
+    }
+    tests
+}
+
+fn test_reference_findings(rows: &[CoverageRow], root: &Path) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut registry: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
+    for row in rows {
+        for (label, value) in [("C0", row.fixture.as_str()), ("model", row.model.as_str())] {
+            let (references, parse_findings) = parse_test_references(row, label, value);
+            findings.extend(parse_findings);
+            for reference in references {
+                let tests = registry.entry(reference.target.clone()).or_insert_with(|| {
+                    let path =
+                        root.join(format!("crates/fln-kernel/tests/{}.rs", reference.target));
+                    fs::read_to_string(path)
+                        .ok()
+                        .map(|source| test_functions(&source))
+                });
+                let Some(tests) = tests else {
+                    findings.push(format!(
+                        "{}: {label} target `{}` does not exist under crates/fln-kernel/tests",
+                        row.id, reference.target
+                    ));
+                    continue;
+                };
+                if !tests.contains(&reference.test) {
+                    findings.push(format!(
+                        "{}: {label} test `{}::{}` does not exist or is not #[test]",
+                        row.id, reference.target, reference.test
+                    ));
+                }
+            }
+        }
+    }
+    findings
+}
+
+fn coverage_findings(
+    rules: &[Rule],
+    rows: &[CoverageRow],
+    tracked_owners: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut by_id: BTreeMap<&str, &CoverageRow> = BTreeMap::new();
+    for row in rows {
+        if let Some(first) = by_id.insert(row.id.as_str(), row) {
+            findings.push(format!(
+                "{}: duplicate coverage rows at lines {} and {}",
+                row.id, first.line, row.line
+            ));
+        }
+        findings.extend(validate_coverage_status(row, tracked_owners));
+    }
+
+    let rule_ids: BTreeSet<&str> = rules.iter().map(|rule| rule.id.as_str()).collect();
+    for rule in rules {
+        let Some(row) = by_id.get(rule.id.as_str()) else {
+            findings.push(format!("{}: missing from judgment coverage", rule.id));
+            continue;
+        };
+        if row.title != rule.title {
+            findings.push(format!(
+                "{}: coverage title drifted — contract `{}`, coverage `{}`",
+                rule.id, rule.title, row.title
+            ));
+        }
+    }
+    for row in rows {
+        if !rule_ids.contains(row.id.as_str()) {
+            findings.push(format!("{}: coverage row has no contract rule", row.id));
+        }
+    }
+
+    let contract_order: Vec<&str> = rules.iter().map(|rule| rule.id.as_str()).collect();
+    let coverage_order: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    if contract_order != coverage_order {
+        findings.push("judgment coverage order differs from KERNEL_CONTRACT.md".to_string());
+    }
+    findings
 }
 
 fn rules_push_anchor(rule: &mut Rule, anchor: &str, lineno: usize, problems: &mut Vec<String>) {
@@ -236,6 +580,232 @@ fn rules_push_anchor(rule: &mut Rule, anchor: &str, lineno: usize, problems: &mu
         return;
     };
     rule.anchors.push((cited_line, format!("{path}|{token}")));
+}
+
+#[test]
+fn the_judgment_inventory_test_references_resolve() {
+    let root = workspace_root();
+    let coverage =
+        fs::read_to_string(root.join(JUDGMENT_COVERAGE_RELATIVE_PATH)).expect("coverage exists");
+    let (rows, problems) = parse_coverage_rows(&coverage);
+    assert!(
+        problems.is_empty(),
+        "coverage parse problems:\n{}",
+        problems.join("\n")
+    );
+    let findings = test_reference_findings(&rows, root);
+    assert!(
+        findings.is_empty(),
+        "{} judgment-inventory test-reference finding(s):\n{}",
+        findings.len(),
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn the_judgment_inventory_matches_the_contract_exactly() {
+    let root = workspace_root();
+    let contract = fs::read_to_string(root.join("KERNEL_CONTRACT.md")).expect("contract exists");
+    let coverage =
+        fs::read_to_string(root.join(JUDGMENT_COVERAGE_RELATIVE_PATH)).expect("coverage exists");
+    let (rules, contract_problems) = parse_rules(&contract);
+    let (rows, coverage_problems) = parse_coverage_rows(&coverage);
+    assert!(
+        contract_problems.is_empty() && coverage_problems.is_empty(),
+        "inventory parse problems:\n{}",
+        contract_problems
+            .into_iter()
+            .chain(coverage_problems)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let required_owners = required_coverage_owners(&rows);
+    let findings = match load_kernel_contract_ownership(
+        root,
+        &required_owners,
+        OwnershipSourceMode::RequireSource,
+        OwnershipLimits::default(),
+    ) {
+        Ok(evidence) => coverage_findings(&rules, &rows, evidence.owners()),
+        Err(error) => vec![error.diagnostic()],
+    };
+    let findings = findings
+        .into_iter()
+        .chain(test_reference_findings(&rows, root))
+        .collect::<Vec<_>>();
+    assert!(
+        findings.is_empty(),
+        "{} judgment-inventory finding(s):\n{}",
+        findings.len(),
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn the_judgment_inventory_join_rejects_missing_duplicate_drift_and_vacuity() {
+    let rule = Rule {
+        id: "KR-100".to_string(),
+        title: "One rule".to_string(),
+        ..Rule::default()
+    };
+    let row = CoverageRow {
+        id: rule.id.clone(),
+        title: rule.title.clone(),
+        real_module: "—".to_string(),
+        fixture: "named_public_authority_test".to_string(),
+        model: "—".to_string(),
+        status: "implemented-and-covered".to_string(),
+        line: 10,
+    };
+    let tracked_owners = BTreeSet::from(["franken_lean-zht".to_string()]);
+    assert!(
+        coverage_findings(
+            core::slice::from_ref(&rule),
+            core::slice::from_ref(&row),
+            &tracked_owners
+        )
+        .is_empty(),
+        "the positive control must pass"
+    );
+
+    let has =
+        |findings: &[String], needle: &str| findings.iter().any(|finding| finding.contains(needle));
+    assert!(
+        has(
+            &coverage_findings(core::slice::from_ref(&rule), &[], &tracked_owners),
+            "missing"
+        ),
+        "a missing rule row must fail"
+    );
+    assert!(
+        has(
+            &coverage_findings(
+                core::slice::from_ref(&rule),
+                &[row.clone(), row.clone()],
+                &tracked_owners
+            ),
+            "duplicate"
+        ),
+        "a duplicate rule row must fail"
+    );
+
+    let mut extra = row.clone();
+    extra.id = "KR-999".to_string();
+    assert!(
+        has(
+            &coverage_findings(
+                core::slice::from_ref(&rule),
+                &[row.clone(), extra],
+                &tracked_owners
+            ),
+            "no contract rule"
+        ),
+        "an extra rule row must fail"
+    );
+
+    let mut title_drift = row.clone();
+    title_drift.title = "A different rule".to_string();
+    assert!(
+        has(
+            &coverage_findings(
+                core::slice::from_ref(&rule),
+                &[title_drift],
+                &tracked_owners
+            ),
+            "title drifted"
+        ),
+        "a stale title must fail"
+    );
+
+    let mut vacuous = row.clone();
+    vacuous.real_module = "—".to_string();
+    vacuous.fixture = "—".to_string();
+    vacuous.model = "—".to_string();
+    assert!(
+        has(
+            &coverage_findings(core::slice::from_ref(&rule), &[vacuous], &tracked_owners),
+            "no public fixture"
+        ),
+        "an implemented-but-uncovered row must fail"
+    );
+
+    let mut untyped = row.clone();
+    untyped.status = "**BLOCKER: later**".to_string();
+    assert!(
+        has(
+            &coverage_findings(core::slice::from_ref(&rule), &[untyped], &tracked_owners),
+            "unsupported coverage status"
+        ),
+        "a prose-only status must fail"
+    );
+
+    let not_implemented = CoverageRow {
+        real_module: "—".to_string(),
+        fixture: "—".to_string(),
+        model: "—".to_string(),
+        status: "not-yet-implemented owner=franken_lean-zht — scheduled production slice"
+            .to_string(),
+        ..row.clone()
+    };
+    assert!(
+        coverage_findings(
+            core::slice::from_ref(&rule),
+            core::slice::from_ref(&not_implemented),
+            &tracked_owners
+        )
+        .is_empty(),
+        "a typed, owned not-yet-implemented row is honest and valid"
+    );
+
+    let phantom = CoverageRow {
+        status:
+            "not-yet-implemented owner=franken_lean-nonexistent-ZZZ — invented ownership must fail"
+                .to_string(),
+        ..not_implemented.clone()
+    };
+    assert!(
+        has(
+            &coverage_findings(core::slice::from_ref(&rule), &[phantom], &tracked_owners),
+            "not a tracked bead"
+        ),
+        "an owned gap must not accept a phantom production owner"
+    );
+
+    let uncovered = CoverageRow {
+        real_module: "P S M C3".to_string(),
+        fixture: "—".to_string(),
+        status: "implemented-but-uncovered owner=franken_lean-zht — external replay is not a discriminating public fixture"
+            .to_string(),
+        ..row.clone()
+    };
+    assert!(
+        coverage_findings(
+            core::slice::from_ref(&rule),
+            core::slice::from_ref(&uncovered),
+            &tracked_owners
+        )
+        .is_empty(),
+        "an implemented gap may stay explicit while its external replay remains visible"
+    );
+
+    let mut generic_fixture = row.clone();
+    generic_fixture.fixture = "k1_judgments (two anchors)".to_string();
+    assert!(
+        !parse_test_references(&generic_fixture, "C0", &generic_fixture.fixture)
+            .1
+            .is_empty(),
+        "a prose fixture label must not masquerade as a bound test"
+    );
+
+    let mut missing_test = row;
+    missing_test.fixture = "k1_judgments::definitely_not_a_real_test".to_string();
+    assert!(
+        has(
+            &test_reference_findings(core::slice::from_ref(&missing_test), workspace_root()),
+            "does not exist"
+        ),
+        "a stale canonical test reference must fail against the real test target"
+    );
 }
 
 #[test]
