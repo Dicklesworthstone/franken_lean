@@ -70,6 +70,22 @@ pub const SCHEMA_DECLARATION_CERTIFICATE: SchemaId = SchemaId {
     name: "fln.canon.declaration-certificate",
     version: 1,
 };
+/// Optional receipt-attached warm definitional-equality replay hints (plan §8.6;
+/// OQ-13). The cache is candidate data and never an authority surface.
+pub const SCHEMA_WARM_DEFEQ_CACHE: SchemaId = SchemaId {
+    name: "fln.canon.warm-defeq-cache",
+    version: 1,
+};
+/// Logical identity of a certificate cartridge, shared by thin and sealed transport.
+pub const SCHEMA_CARTRIDGE_MANIFEST: SchemaId = SchemaId {
+    name: "fln.canon.cartridge-manifest",
+    version: 1,
+};
+/// Canonical transport envelope carrying a cartridge manifest and any staged frames.
+pub const SCHEMA_CARTRIDGE_ARCHIVE: SchemaId = SchemaId {
+    name: "fln.canon.cartridge-archive",
+    version: 1,
+};
 
 /// The crate that defines a durable format's codec.
 ///
@@ -140,7 +156,7 @@ pub struct SchemaRow {
 ///
 /// Adding a durable format means adding a row here. That is the point: the registry is
 /// the reviewed inventory the conformance corpus is meant to be a projection of.
-pub const SCHEMA_REGISTRY: [SchemaRow; 15] = [
+pub const SCHEMA_REGISTRY: [SchemaRow; 18] = [
     SchemaRow {
         id: SCHEMA_NAME,
         owner: SchemaOwner::Hash,
@@ -190,6 +206,21 @@ pub const SCHEMA_REGISTRY: [SchemaRow; 15] = [
         id: SCHEMA_DECLARATION_CERTIFICATE,
         owner: SchemaOwner::Hash,
         covers: "a bounded, candidate-only declaration certificate with a shared term DAG",
+    },
+    SchemaRow {
+        id: SCHEMA_WARM_DEFEQ_CACHE,
+        owner: SchemaOwner::Hash,
+        covers: "optional receipt-attached definitional-equality replay hints",
+    },
+    SchemaRow {
+        id: SCHEMA_CARTRIDGE_MANIFEST,
+        owner: SchemaOwner::Hash,
+        covers: "the transport-independent logical manifest of a certificate cartridge",
+    },
+    SchemaRow {
+        id: SCHEMA_CARTRIDGE_ARCHIVE,
+        owner: SchemaOwner::Hash,
+        covers: "a canonical thin, partial, sealed, or complete cartridge transport",
     },
     SchemaRow {
         id: SchemaId {
@@ -456,6 +487,13 @@ impl<'a> CanonReader<'a> {
     /// The stop record, if this reader's budget ran out.
     pub fn exhausted(&self) -> Option<Exhausted> {
         self.exhausted
+    }
+
+    /// Current byte offset for sibling codecs that derive random-access locators from
+    /// validated canonical framing. Kept crate-private so external codecs cannot use
+    /// the cursor to bypass their schema boundary.
+    pub(crate) const fn offset(&self) -> usize {
+        self.at
     }
 
     fn err(&self, what: &'static str) -> CanonError {
@@ -1821,6 +1859,9 @@ mod tests {
                 SCHEMA_DECLARATION_CERTIFICATE,
                 "fln.canon.declaration-certificate",
             ),
+            (SCHEMA_WARM_DEFEQ_CACHE, "fln.canon.warm-defeq-cache"),
+            (SCHEMA_CARTRIDGE_MANIFEST, "fln.canon.cartridge-manifest"),
+            (SCHEMA_CARTRIDGE_ARCHIVE, "fln.canon.cartridge-archive"),
         ] {
             assert_eq!(constant.name, expected);
             let row = registered(constant.name)
@@ -1838,7 +1879,7 @@ mod tests {
             .filter(|row| row.owner == SchemaOwner::Hash)
             .count();
         assert_eq!(
-            hash_rows, 10,
+            hash_rows, 13,
             "fln-hash owns a schema the constant join above does not cover"
         );
     }

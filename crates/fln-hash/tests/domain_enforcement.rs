@@ -441,10 +441,17 @@ fn blanking_a_string_preserves_the_length_of_the_line() {
 /// The frozen public module surface of fln-hash. `blake3` is deliberately absent:
 /// publishing it would hand every external consumer an unregistered hash and reduce
 /// the registry to a naming convention. Adding a module here is a reviewed act.
-// `certificate` and `shadow` are reviewed candidate/codec surfaces. They hash only
-// through the public domain registry and do not re-export or name the crate-private
-// BLAKE3 core.
-const PUBLIC_MODULES: [&str; 5] = ["canon", "certificate", "domain", "root", "shadow"];
+// `cartridge`, `certificate`, and `shadow` are reviewed candidate/codec surfaces.
+// They hash only through the public domain registry and do not re-export or name the
+// crate-private BLAKE3 core.
+const PUBLIC_MODULES: [&str; 6] = [
+    "canon",
+    "cartridge",
+    "certificate",
+    "domain",
+    "root",
+    "shadow",
+];
 
 /// The modules a crate root declares, each paired with whether it is reachable from
 /// *outside* the crate. Only `pub mod` is: `pub(crate)`, `pub(super)`, and

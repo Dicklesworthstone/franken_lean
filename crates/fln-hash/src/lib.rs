@@ -26,6 +26,7 @@
 
 pub(crate) mod blake3;
 pub mod canon;
+pub mod cartridge;
 pub mod certificate;
 pub mod domain;
 pub mod root;
