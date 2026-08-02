@@ -323,6 +323,7 @@
 //! registry exists to prevent.
 #![forbid(unsafe_code)]
 
+pub mod instantiate;
 pub mod policy;
 pub mod term;
 pub mod universe;

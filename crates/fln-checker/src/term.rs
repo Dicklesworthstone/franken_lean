@@ -7,8 +7,8 @@
 //! occurrence, not merely of the arena slot.
 
 use crate::wire::{
-    ExprId, ExprNode, LevelId, LevelNode, MAX_BVAR_INDEX, MetadataValue, NamePart, WireExpr,
-    WireName,
+    ExprId, ExprNode, LevelId, LevelNode, MAX_BVAR_INDEX, MetadataValue, WireExpr, WireName,
+    expression_owned_units, level_owned_units, usize_units,
 };
 
 /// Exact root facts used by checker traversal and pruning.
@@ -40,6 +40,7 @@ pub enum TermLimit {
 pub struct TermBudget {
     pub max_steps: u64,
     pub max_output_units: u64,
+    pub max_arena_nodes: u64,
 }
 
 impl TermBudget {
@@ -47,7 +48,13 @@ impl TermBudget {
         TermBudget {
             max_steps,
             max_output_units,
+            max_arena_nodes: u32::MAX as u64,
         }
+    }
+
+    pub const fn with_max_arena_nodes(mut self, max_arena_nodes: u64) -> TermBudget {
+        self.max_arena_nodes = max_arena_nodes;
+        self
     }
 
     pub const fn unlimited() -> TermBudget {
@@ -200,11 +207,18 @@ impl<'a> Control<'a> {
     fn arena_nodes(&self, observed: u64, at: usize) -> Halt {
         Halt::Stop(TermStop::Resource {
             limit: TermLimit::ArenaNodes,
-            allowed: u64::from(u32::MAX),
+            allowed: self.budget.max_arena_nodes.min(u64::from(u32::MAX)),
             observed,
             at,
             completed_steps: self.steps,
         })
+    }
+
+    fn admit_arena_node(&self, observed: u64, at: usize) -> Result<(), Halt> {
+        if observed > self.budget.max_arena_nodes.min(u64::from(u32::MAX)) {
+            return Err(self.arena_nodes(observed, at));
+        }
+        Ok(())
     }
 }
 
@@ -462,64 +476,6 @@ enum Task {
     Build(Frame),
 }
 
-fn usize_units(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn name_units(name: &WireName) -> u64 {
-    name.parts().iter().fold(0u64, |units, part| {
-        let payload = match part {
-            NamePart::Numeric { .. } => 0,
-            NamePart::Text(text) => usize_units(text.len()),
-        };
-        units.saturating_add(1).saturating_add(payload)
-    })
-}
-
-fn metadata_value_units(value: &MetadataValue) -> u64 {
-    match value {
-        MetadataValue::Text(text) => usize_units(text.len()),
-        MetadataValue::Name(name) => name_units(name),
-        MetadataValue::Bool(_)
-        | MetadataValue::Nat(_)
-        | MetadataValue::Int(_)
-        | MetadataValue::Syntax(_) => 0,
-    }
-}
-
-fn expression_units(node: &ExprNode) -> u64 {
-    let payload = match node {
-        ExprNode::Bound { .. } | ExprNode::Sort { .. } | ExprNode::Apply { .. } => 0,
-        ExprNode::Free { name } | ExprNode::Meta { name } => name_units(name),
-        ExprNode::Constant { name, levels } => {
-            name_units(name).saturating_add(usize_units(levels.len()))
-        }
-        ExprNode::Lambda { binder_name, .. } | ExprNode::Forall { binder_name, .. } => {
-            name_units(binder_name)
-        }
-        ExprNode::Let {
-            declaration_name, ..
-        } => name_units(declaration_name),
-        ExprNode::NatLiteral { limbs_le } => usize_units(limbs_le.len()),
-        ExprNode::StringLiteral(text) => usize_units(text.len()),
-        ExprNode::Metadata { entries, .. } => entries.iter().fold(0u64, |units, (name, value)| {
-            units
-                .saturating_add(1)
-                .saturating_add(name_units(name))
-                .saturating_add(metadata_value_units(value))
-        }),
-        ExprNode::Projection { structure_name, .. } => name_units(structure_name),
-    };
-    1u64.saturating_add(payload)
-}
-
-fn level_units(node: &LevelNode) -> u64 {
-    1u64.saturating_add(match node {
-        LevelNode::Parameter(name) | LevelNode::Meta(name) => name_units(name),
-        LevelNode::Zero | LevelNode::Succ(_) | LevelNode::Max(_, _) | LevelNode::IMax(_, _) => 0,
-    })
-}
-
 struct Transformer<'a, 'c> {
     subject: &'a WireExpr,
     replacement: Option<&'a WireExpr>,
@@ -610,6 +566,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
 
     fn push_reserved(&mut self, node: ExprNode, at: usize) -> Result<ExprId, Halt> {
         let observed = usize_units(self.nodes.len()).saturating_add(1);
+        self.control.admit_arena_node(observed, at)?;
         let id = ExprId::from_index(self.nodes.len())
             .ok_or_else(|| self.control.arena_nodes(observed, at))?;
         self.nodes.push(node);
@@ -617,7 +574,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
     }
 
     fn emit(&mut self, node: ExprNode, at: usize) -> Result<(), Halt> {
-        self.control.output(expression_units(&node), at)?;
+        self.control.output(expression_owned_units(&node), at)?;
         self.retain_reserved(node, at)
     }
 
@@ -670,7 +627,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     LevelNode::Parameter(_) => LevelPlan::Parameter,
                     LevelNode::Meta(_) => LevelPlan::Meta,
                 };
-                (plan, level_units(node))
+                (plan, level_owned_units(node))
             };
             self.control.output(output_units, index)?;
             let mapped = match plan {
@@ -699,6 +656,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
                 }
             };
             let observed = usize_units(self.levels.len()).saturating_add(1);
+            self.control.admit_arena_node(observed, index)?;
             let id = LevelId::from_index(self.levels.len())
                 .ok_or_else(|| self.control.arena_nodes(observed, index))?;
             self.levels.push(mapped);
@@ -844,7 +802,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
         if let Some(action) = free_action {
             match action {
                 FreeAction::Retain => {
-                    let output_units = expression_units(self.expression(input, id)?);
+                    let output_units = expression_owned_units(self.expression(input, id)?);
                     self.control.output(output_units, id.index())?;
                     let ExprNode::Free { name } = self.expression(input, id)? else {
                         return Err(Halt::Fault(TermFault::MissingExpression {
@@ -880,7 +838,7 @@ impl<'a, 'c> Transformer<'a, 'c> {
             }
         }
 
-        let output_units = expression_units(self.expression(input, id)?);
+        let output_units = expression_owned_units(self.expression(input, id)?);
         self.control.output(output_units, id.index())?;
         let node = self.expression(input, id)?.clone();
         match node {

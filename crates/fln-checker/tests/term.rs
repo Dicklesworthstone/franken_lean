@@ -754,6 +754,20 @@ fn resource_and_cancellation_are_typed_nonanswers_with_exact_recovery() {
             ..
         })
     ));
+    assert!(matches!(
+        substitute_free(
+            &term,
+            &checker_name("x"),
+            &replacement,
+            TermBudget::unlimited().with_max_arena_nodes(1),
+        ),
+        TermOutcome::Inconclusive(TermStop::Resource {
+            limit: TermLimit::ArenaNodes,
+            allowed: 1,
+            observed: 2,
+            ..
+        })
+    ));
 
     let mut polls = 0;
     assert!(matches!(

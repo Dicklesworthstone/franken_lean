@@ -149,6 +149,10 @@ impl WireLevel {
     pub fn node(&self, id: LevelId) -> Option<&LevelNode> {
         self.nodes.get(id.index())
     }
+
+    pub(crate) fn from_parts(nodes: Vec<LevelNode>, root: LevelId) -> WireLevel {
+        WireLevel { nodes, root }
+    }
 }
 
 /// Index into a [`WireExpr`] term arena.
@@ -238,6 +242,64 @@ pub enum ExprNode {
         index: u64,
         expression: ExprId,
     },
+}
+
+pub(crate) fn usize_units(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn name_owned_units(name: &WireName) -> u64 {
+    name.parts().iter().fold(0u64, |units, part| {
+        let payload = match part {
+            NamePart::Numeric { .. } => 0,
+            NamePart::Text(text) => usize_units(text.len()),
+        };
+        units.saturating_add(1).saturating_add(payload)
+    })
+}
+
+fn metadata_owned_units(value: &MetadataValue) -> u64 {
+    match value {
+        MetadataValue::Text(text) => usize_units(text.len()),
+        MetadataValue::Name(name) => name_owned_units(name),
+        MetadataValue::Bool(_)
+        | MetadataValue::Nat(_)
+        | MetadataValue::Int(_)
+        | MetadataValue::Syntax(_) => 0,
+    }
+}
+
+pub(crate) fn level_owned_units(node: &LevelNode) -> u64 {
+    1u64.saturating_add(match node {
+        LevelNode::Parameter(name) | LevelNode::Meta(name) => name_owned_units(name),
+        LevelNode::Zero | LevelNode::Succ(_) | LevelNode::Max(_, _) | LevelNode::IMax(_, _) => 0,
+    })
+}
+
+pub(crate) fn expression_owned_units(node: &ExprNode) -> u64 {
+    let payload = match node {
+        ExprNode::Bound { .. } | ExprNode::Sort { .. } | ExprNode::Apply { .. } => 0,
+        ExprNode::Free { name } | ExprNode::Meta { name } => name_owned_units(name),
+        ExprNode::Constant { name, levels } => {
+            name_owned_units(name).saturating_add(usize_units(levels.len()))
+        }
+        ExprNode::Lambda { binder_name, .. } | ExprNode::Forall { binder_name, .. } => {
+            name_owned_units(binder_name)
+        }
+        ExprNode::Let {
+            declaration_name, ..
+        } => name_owned_units(declaration_name),
+        ExprNode::NatLiteral { limbs_le } => usize_units(limbs_le.len()),
+        ExprNode::StringLiteral(text) => usize_units(text.len()),
+        ExprNode::Metadata { entries, .. } => entries.iter().fold(0u64, |units, (name, value)| {
+            units
+                .saturating_add(1)
+                .saturating_add(name_owned_units(name))
+                .saturating_add(metadata_owned_units(value))
+        }),
+        ExprNode::Projection { structure_name, .. } => name_owned_units(structure_name),
+    };
+    1u64.saturating_add(payload)
 }
 
 /// One independently decoded expression and all levels embedded in it.
