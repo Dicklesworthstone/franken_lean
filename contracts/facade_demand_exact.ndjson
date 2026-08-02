@@ -1,0 +1,408 @@
+{"bound": "exact demand of the curated set only \u2014 a floor on corpus-wide demand, never a census of it; hidden bodies contribute types only", "census_missing": [], "claim_class": "bounded_model", "corpus_commit": "81a5d257c8e410db227a6665ed08f64fea08e997", "counts": {"corpus-internal": 372, "local": 0, "toolchain-library-code": 283, "toolchain-user-facing-data": 294}, "covered_by_stubs": 21, "curated_modules": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Lean.Environment", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"], "decl_bodies_unavailable": {"opaque": 16, "thm": 50}, "decls": 521, "distinct_used_constants": 1356, "gone": [], "kind": "summary", "pin": "v4.32.0", "schema": "fln-facade-demand-exact/1", "stubs_not_demanded_here": 149, "toolchain_api_demanded": 407, "uncovered": 386}
+{"coverage": "covered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.Core.CoreM", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "covered", "def_module": "Lean.Server.InfoUtils", "kind": "symbol", "name": "Lean.Elab.InfoTree.foldInfo", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "covered", "def_module": "Lean.Elab.Tactic.RCases", "kind": "symbol", "name": "Lean.Elab.Tactic.RCases.rcases", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "covered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.evalTactic", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Tactic.Lift"]}
+{"coverage": "covered", "def_module": "Lean.Elab.Tactic.Simp", "kind": "symbol", "name": "Lean.Elab.Tactic.mkSimpOnly", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "covered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.run", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "covered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.TacticInfo.goalsAfter", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "covered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.TacticInfo.goalsBefore", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "covered", "def_module": "Lean.Elab.Exception", "kind": "symbol", "name": "Lean.Elab.throwUnsupportedSyntax", "used_by": ["Mathlib.Tactic.Lift", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "covered", "def_module": "Lean.Linter.Deprecated", "kind": "symbol", "name": "Lean.Linter.deprecatedAttr", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "covered", "def_module": "Lean.Linter.Init", "kind": "symbol", "name": "Lean.Linter.logLint", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "covered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.MetaM", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "covered", "def_module": "Lean.Meta.Tactic.Simp.Attr", "kind": "symbol", "name": "Lean.Meta.Simp.Context.mkDefault", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "covered", "def_module": "Lean.Meta.Tactic.Simp.Simproc", "kind": "symbol", "name": "Lean.Meta.Simp.getSimprocs", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "covered", "def_module": "Lean.Meta.Tactic.TryThis", "kind": "symbol", "name": "Lean.Meta.Tactic.TryThis.addSuggestion", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "covered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.inferType", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "covered", "def_module": "Lean.Meta.Tactic.Simp.Main", "kind": "symbol", "name": "Lean.Meta.simpGoal", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "covered", "def_module": "Lean.Meta.Transform", "kind": "symbol", "name": "Lean.Meta.transform", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "covered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.withMCtx", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "covered", "def_module": "Lean.Data.Name", "kind": "symbol", "name": "Lean.Name.cmp", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "covered", "def_module": "Lean.Data.NameMap.Basic", "kind": "symbol", "name": "Lean.NameMap", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Init.Data.Array.Basic", "kind": "symbol", "name": "Array.mapM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Array.mkEmpty", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Array.push", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Data.Array.Basic", "kind": "symbol", "name": "Array.replicate", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Init.Data.Array.Set", "kind": "symbol", "name": "Array.set!", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Array.size", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Dynamic", "kind": "symbol", "name": "Dynamic.get?", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Init.Dynamic", "kind": "symbol", "name": "Dynamic.typeName", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Init.Control.Except", "kind": "symbol", "name": "ExceptT.instMonad", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.System.IO", "kind": "symbol", "name": "IO.instMonadLiftSTRealWorldBaseIO", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.System.IO", "kind": "symbol", "name": "IO.ofExcept", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Data.Int.Basic", "kind": "symbol", "name": "Int.negSucc", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Init.Data.Int.Basic", "kind": "symbol", "name": "Int.ofNat", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.AsyncConstantInfo.kind", "used_by": ["Mathlib.Lean.Environment"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.AsyncConstantInfo.toConstantVal", "used_by": ["Mathlib.Lean.Environment"]}
+{"coverage": "uncovered", "def_module": "Lean.Attributes", "kind": "symbol", "name": "Lean.AttrM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.AxiomVal.isUnsafe", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.BinderInfo.ctorIdx", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.BinderInfo.isInstImplicit", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstantInfo.casesOn", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstantInfo.ctorIdx", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstantInfo.levelParams", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstantInfo.toConstantVal", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.ConstantKind.ctorIdx", "used_by": ["Mathlib.Lean.Environment"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstantVal.levelParams", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstantVal.name", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstantVal.type", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstructorVal.cidx", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstructorVal.induct", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstructorVal.isUnsafe", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstructorVal.numFields", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.ConstructorVal.numParams", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.Core.instAddMessageContextCoreM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.Core.instMonadCoreM", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.Core.instMonadEnvCoreM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.Core.instMonadLiftIOCoreM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.Core.instMonadQuotationCoreM", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.Core.instMonadRefCoreM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.Core.mkFreshUserName", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.DeclarationRange", "kind": "symbol", "name": "Lean.DeclarationRange.endPos", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.DeclarationRange", "kind": "symbol", "name": "Lean.DeclarationRange.pos", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.DeclarationRange", "kind": "symbol", "name": "Lean.DeclarationRanges.range", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.DeclarationRange", "kind": "symbol", "name": "Lean.DeclarationRanges.selectionRange", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.DefinitionVal.all", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.DefinitionVal.hints", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.DefinitionVal.safety", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.DefinitionVal.toConstantVal", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.DefinitionVal.value", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.CommandElabM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.Context.fileMap", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.State.env", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.State.messages", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.State.ngen", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.addLinter", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instAddMessageContextCommandElabM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadCommandElabM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadEnvCommandElabM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadExceptOfExceptionCommandElabM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadInfoTreeCommandElabM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadLogCommandElabM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadOptionsCommandElabM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadQuotationCommandElabM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadRefCommandElabM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.instMonadResolveNameCommandElabM", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Command", "kind": "symbol", "name": "Lean.Elab.Command.liftCoreM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.ContextInfo._sizeOf_inst", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.ContextInfo.parentDecl?", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Main", "kind": "symbol", "name": "Lean.Elab.ContextInfo.runMetaM", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.CustomInfo.stx", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.CustomInfo.value", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.ElabInfo.stx", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.Info.ctorIdx", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Server.InfoUtils", "kind": "symbol", "name": "Lean.Elab.Info.stx", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Main", "kind": "symbol", "name": "Lean.Elab.Info.updateContext?", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.InfoState.enabled", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.InfoTree.casesOn", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Server.InfoUtils", "kind": "symbol", "name": "Lean.Elab.InfoTree.collectNodesBottomUp", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.InfoTree.ctorIdx", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Server.InfoUtils", "kind": "symbol", "name": "Lean.Elab.InfoTree.foldInfoTree", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Server.InfoUtils", "kind": "symbol", "name": "Lean.Elab.InfoTree.visitM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.MonadInfoTree.getInfoState", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Util", "kind": "symbol", "name": "Lean.Elab.MonadMacroAdapter.toMonadQuotation", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Main", "kind": "symbol", "name": "Lean.Elab.PartialContextInfo.mergeIntoOuter?", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.PartialTermInfo.expectedType?", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.PartialTermInfo.lctx", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.Tactic", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.TacticM", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.ElabTerm", "kind": "symbol", "name": "Lean.Elab.Tactic.elabTerm", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.ElabTerm", "kind": "symbol", "name": "Lean.Elab.Tactic.elabTermEnsuringType", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.getGoals", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.getMainGoal", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.instMonadTacticM", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.pruneSolvedGoals", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.replaceMainGoal", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.setGoals", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Tactic.Basic", "kind": "symbol", "name": "Lean.Elab.Tactic.withMainContext", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.TacticInfo._sizeOf_inst", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.TacticInfo.mctxAfter", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.TacticInfo.mctxBefore", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.TacticInfo.toElabInfo", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Term.TermElabM", "kind": "symbol", "name": "Lean.Elab.Term.FixedTermElabRef", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Term.TermElabM", "kind": "symbol", "name": "Lean.Elab.Term.TermElabM", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Term.TermElabM", "kind": "symbol", "name": "Lean.Elab.Term.TermElabM.run'", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Term.TermElabM", "kind": "symbol", "name": "Lean.Elab.Term.elabType", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Term.TermElabM", "kind": "symbol", "name": "Lean.Elab.Term.instMonadMacroAdapterTermElabM", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.Term.TermElabM", "kind": "symbol", "name": "Lean.Elab.Term.instMonadTermElabM", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.SyntheticMVars", "kind": "symbol", "name": "Lean.Elab.Term.withSynthesize", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.TermInfo.expectedType?", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.TermInfo.lctx", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Main", "kind": "symbol", "name": "Lean.Elab.getInfoTrees", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Elab.InfoTree.Types", "kind": "symbol", "name": "Lean.Elab.instInhabitedInfoTree", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.EnvExtension.asyncMode", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.Environment.evalConst", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.Environment.evalConstCheck", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.Environment.findAsync?", "used_by": ["Mathlib.Lean.Environment"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.Environment.getModuleIdxFor?", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Exception", "kind": "symbol", "name": "Lean.Exception.toMessageData", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.app", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.Recognizers", "kind": "symbol", "name": "Lean.Expr.app4?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.appArg!", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.below", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.beta", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.betaRev", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.brecOn", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.bvar", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.cleanupAnnotations", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.const", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.constName!", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.consumeMData", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.ctorIdx", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.Recognizers", "kind": "symbol", "name": "Lean.Expr.eq?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.FindExpr", "kind": "symbol", "name": "Lean.Expr.find?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.forallE", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.fvar", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.fvarId!", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.getAppArgs", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.getAppFn", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.getAppFn'", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.getAppNumArgs", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.getAppNumArgs'", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.getArg!", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.getRevArg!", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.hasExprMVar", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.hasLooseBVar", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.Recognizers", "kind": "symbol", "name": "Lean.Expr.heq?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.Recognizers", "kind": "symbol", "name": "Lean.Expr.iff?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.instBEq", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.isApp", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.isConst", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.isConstOf", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.isFVar", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.isProp", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.lam", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.letE", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.lit", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.mdata", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.mvar", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.mvarId!", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.Recognizers", "kind": "symbol", "name": "Lean.Expr.ne?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.Recognizers", "kind": "symbol", "name": "Lean.Expr.not?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.proj", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.rawNatLit?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.Expr.sort", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.FVarId.getUserName", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.FVarId.name", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Position", "kind": "symbol", "name": "Lean.FileMap.ofPosition", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Position", "kind": "symbol", "name": "Lean.FileMap.toPosition", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Compiler.IR.CompilerM", "kind": "symbol", "name": "Lean.IR.getSorryDep", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.ImportM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.ImportM.Context.casesOn", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.all", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.ctors", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.isRec", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.isReflexive", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.isUnsafe", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.numIndices", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.numNested", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.numParams", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.InductiveVal.toConstantVal", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.KVMap", "kind": "symbol", "name": "Lean.KVMap.instValueBool", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Level", "kind": "symbol", "name": "Lean.LMVarId", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Level", "kind": "symbol", "name": "Lean.Level.dec", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Level", "kind": "symbol", "name": "Lean.Level.zero", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Linter.Deprecated", "kind": "symbol", "name": "Lean.Linter.DeprecationEntry.since?", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Linter.Init", "kind": "symbol", "name": "Lean.Linter.getLinterOptions", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Linter.Init", "kind": "symbol", "name": "Lean.Linter.getLinterValue", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Linter.Deprecated", "kind": "symbol", "name": "Lean.Linter.instInhabitedDeprecationEntry", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.LocalContext.find?", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.LocalContext.findFromUserName?", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.LocalContext.getFVarIds", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.LocalContext.instForInLocalDeclOfMonad", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.LocalDecl.fvarId", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.LocalDecl.userName", "used_by": ["Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.MData", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.MVarId._sizeOf_inst", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Tactic.Util", "kind": "symbol", "name": "Lean.MVarId.getType", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.MVarId.name", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.MVarIdMap", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "uncovered", "def_module": "Lean.EnvExtension", "kind": "symbol", "name": "Lean.MapDeclarationExtension.toPersistentEnvExtension", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.MessageData.andList", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.MessageData.instAppend", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.MessageData.nil", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.MessageData.note", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.MessageData.ofConstName", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.MessageData.ofFormat", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.MessageData.ofSyntax", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.MessageLog.hasErrors", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Tactic.Simp.Rewrite", "kind": "symbol", "name": "Lean.Meta.Simp.Discharge", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Tactic.Simp.Types", "kind": "symbol", "name": "Lean.Meta.Simp.Stats.usedTheorems", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Tactic.Simp.Types", "kind": "symbol", "name": "Lean.Meta.Simp.UsedSimps.map", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.TryThis", "kind": "symbol", "name": "Lean.Meta.Tactic.TryThis.SuggestionStyle", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.TryThis", "kind": "symbol", "name": "Lean.Meta.Tactic.TryThis.TryThisInfo.suggestion", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.TryThis", "kind": "symbol", "name": "Lean.Meta.Tactic.TryThis.instTypeNameTryThisInfo", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.forallTelescopeReducing", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.instAddMessageContextMetaM", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.instAlternativeMetaM", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Tactic.Simp.SimpTheorems", "kind": "symbol", "name": "Lean.Meta.instBEqOrigin", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Tactic.Simp.SimpTheorems", "kind": "symbol", "name": "Lean.Meta.instHashableOrigin", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.instMonadEnvMetaM", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.instMonadLCtxMetaM", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.instMonadMCtxMetaM", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.instMonadMetaM", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Match.MatcherInfo", "kind": "symbol", "name": "Lean.Meta.isMatcher", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.InferType", "kind": "symbol", "name": "Lean.Meta.isProof", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.AppBuilder", "kind": "symbol", "name": "Lean.Meta.mkAppM", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.AppBuilder", "kind": "symbol", "name": "Lean.Meta.mkAppOptM", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.mkForallFVars", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.mkFreshExprMVar", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.mkFreshLevelMVar", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.mkLambdaFVars", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Sorry", "kind": "symbol", "name": "Lean.Meta.mkSorry", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.SynthInstance", "kind": "symbol", "name": "Lean.Meta.synthInstance", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.whnf", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.withLocalDeclD", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Meta.Basic", "kind": "symbol", "name": "Lean.Meta.withReducible", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.MetavarContext._sizeOf_inst", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.MetavarContext.decls", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.MetavarContext.findDecl?", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.MetavarDecl.lctx", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.MetavarDecl.type", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.ModuleIdx", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.MonadEnv.getEnv", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Position", "kind": "symbol", "name": "Lean.MonadFileMap.getFileMap", "used_by": ["Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.MonadLCtx.getLCtx", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Log", "kind": "symbol", "name": "Lean.MonadLog.toMonadFileMap", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Options", "kind": "symbol", "name": "Lean.MonadOptions.getOptions", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.ResolveName", "kind": "symbol", "name": "Lean.MonadResolveName.getCurrNamespace", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Lean.Name.anonymous", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Lean.Name.casesOn", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Name", "kind": "symbol", "name": "Lean.Name.components", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Name", "kind": "symbol", "name": "Lean.Name.componentsRev", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Name", "kind": "symbol", "name": "Lean.Name.isInternalDetail", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Lean.Name.num", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Lean.Name.str", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Name", "kind": "symbol", "name": "Lean.Name.updatePrefix", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.NameMap.Basic", "kind": "symbol", "name": "Lean.NameMap.instEmptyCollection", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.NameMap.Basic", "kind": "symbol", "name": "Lean.NameMap.instForInProdNameOfMonad", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.NameMap.Basic", "kind": "symbol", "name": "Lean.NameMap.instInhabited", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.OLeanEntries.uniform", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.OpaqueVal.all", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.OpaqueVal.isUnsafe", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.OpaqueVal.toConstantVal", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.OpaqueVal.value", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Options", "kind": "symbol", "name": "Lean.Option._sizeOf_inst", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Options", "kind": "symbol", "name": "Lean.Option.name", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Options", "kind": "symbol", "name": "Lean.Option.register", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Options", "kind": "symbol", "name": "Lean.Options.instEmptyCollection", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Attributes", "kind": "symbol", "name": "Lean.ParametricAttribute.getParam?", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentArray", "kind": "symbol", "name": "Lean.PersistentArray.branching", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentArray", "kind": "symbol", "name": "Lean.PersistentArray.findSomeM?", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentArray", "kind": "symbol", "name": "Lean.PersistentArray.foldl", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentArray", "kind": "symbol", "name": "Lean.PersistentArray.initShift", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentArray", "kind": "symbol", "name": "Lean.PersistentArray.instForInOfMonad", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentArray", "kind": "symbol", "name": "Lean.PersistentArray.instGetElemNatLtSizeOfInhabited", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentArray", "kind": "symbol", "name": "Lean.PersistentArray.size", "used_by": ["Mathlib.Lean.Elab.InfoTree"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.PersistentEnvExtension.addEntry", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.PersistentEnvExtension.getState", "used_by": ["Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.PersistentEnvExtension.toEnvExtension", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentHashMap", "kind": "symbol", "name": "Lean.PersistentHashMap.find?", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentHashMap", "kind": "symbol", "name": "Lean.PersistentHashMap.findD", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentHashMap", "kind": "symbol", "name": "Lean.PersistentHashMap.isEmpty", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.PersistentHashMap", "kind": "symbol", "name": "Lean.PersistentHashMap.mkEmptyEntriesArray", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Data.Position", "kind": "symbol", "name": "Lean.Position.line", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.ProjFns", "kind": "symbol", "name": "Lean.ProjectionFunctionInfo.ctorName", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.ProjFns", "kind": "symbol", "name": "Lean.ProjectionFunctionInfo.i", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.ProjFns", "kind": "symbol", "name": "Lean.ProjectionFunctionInfo.numParams", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.QuotVal.kind", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.RecursorVal.all", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.RecursorVal.isUnsafe", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.RecursorVal.k", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.RecursorVal.numIndices", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.RecursorVal.numMinors", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.RecursorVal.numMotives", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.RecursorVal.numParams", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.RecursorVal.rules", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.ReplayFn", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.StructureInfo.fieldNames", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Syntax", "kind": "symbol", "name": "Lean.Syntax.getAtomVal", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Syntax", "kind": "symbol", "name": "Lean.Syntax.getRange?", "used_by": ["Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Syntax", "kind": "symbol", "name": "Lean.Syntax.instInhabitedRange", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Syntax", "kind": "symbol", "name": "Lean.Syntax.ofRange", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Syntax", "kind": "symbol", "name": "Lean.Syntax.reprint", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Lean.TSyntaxArray.mk", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Lean.TSyntaxArray.raw", "used_by": ["Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.TheoremVal.all", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.TheoremVal.toConstantVal", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.TheoremVal.value", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.ToMessageData.toMessageData", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.DeclarationRange", "kind": "symbol", "name": "Lean.declRangeExt", "used_by": ["Mathlib.Tactic.DeclarationNames"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.findField?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.MonadEnv", "kind": "symbol", "name": "Lean.getConstInfo", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.getPathToBaseStructure?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.getProjFnForField?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.ProjFns", "kind": "symbol", "name": "Lean.getProjectionFnInfo?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.getStructureFields", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.getStructureInfo?", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.indentExpr", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Exception", "kind": "symbol", "name": "Lean.instAddErrorMessageContextOfAddMessageContextOfMonad", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.instAddMessageContextOfMonadLift", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Attributes", "kind": "symbol", "name": "Lean.instBEqAttributeKind", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.instBEqFVarId", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Level", "kind": "symbol", "name": "Lean.instBEqLevelMVarId", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.instBEqMVarId", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.instEmptyCollectionMVarIdMap", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.instHashableFVarId", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Level", "kind": "symbol", "name": "Lean.instHashableLevelMVarId", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.instHashableMVarId", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Declaration", "kind": "symbol", "name": "Lean.instInhabitedDeclaration", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.instInhabitedFVarId", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.instInhabitedLocalDecl", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.instInhabitedMetavarDecl", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.instInhabitedStructureInfo", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.CoreM", "kind": "symbol", "name": "Lean.instMonadExceptOfExceptionCoreM", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.LocalContext", "kind": "symbol", "name": "Lean.instMonadLCtxOfMonadLift", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Attributes", "kind": "symbol", "name": "Lean.instMonadLiftImportMAttrM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.instMonadMCtxOfMonadLift", "used_by": ["Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.instToMessageDataExpr", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.instToMessageDataMessageData", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.instToMessageDataName", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.instToMessageDataOfToFormat", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.instToMessageDataString", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Message", "kind": "symbol", "name": "Lean.instToMessageDataTSyntax", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.instantiateMVarDeclMVars", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta"]}
+{"coverage": "uncovered", "def_module": "Lean.MetavarContext", "kind": "symbol", "name": "Lean.instantiateMVars", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift"]}
+{"coverage": "uncovered", "def_module": "Lean.AuxRecursor", "kind": "symbol", "name": "Lean.isAuxRecursor", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.AuxRecursor", "kind": "symbol", "name": "Lean.isNoConfusion", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.PrivateName", "kind": "symbol", "name": "Lean.isPrivateName", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.MonadEnv", "kind": "symbol", "name": "Lean.isRec", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.isStructure", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Structure", "kind": "symbol", "name": "Lean.isSubobjectField?", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Log", "kind": "symbol", "name": "Lean.logInfoAt", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Lean.Log", "kind": "symbol", "name": "Lean.logWarning", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Log", "kind": "symbol", "name": "Lean.logWarningAt", "used_by": ["Mathlib.Tactic.DeclarationNames", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.mkApp", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.mkApp3", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.mkAppN", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.mkConst", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.MonadEnv", "kind": "symbol", "name": "Lean.mkConstWithLevelParams", "used_by": ["Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.mkNot", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.mkRawNatLit", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Expr", "kind": "symbol", "name": "Lean.mkSort", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.Profile", "kind": "symbol", "name": "Lean.profileitM", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Attributes", "kind": "symbol", "name": "Lean.registerBuiltinAttribute", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Environment", "kind": "symbol", "name": "Lean.registerPersistentEnvExtension", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.MonadEnv", "kind": "symbol", "name": "Lean.setEnv", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Exception", "kind": "symbol", "name": "Lean.throwError", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Util.Heartbeats", "kind": "symbol", "name": "Lean.withHeartbeats", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Lean.Linter.Basic", "kind": "symbol", "name": "Lean.withSetOptionIn", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Nat.ble", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Nat.decEq", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Nat.decLe", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Nat.decLt", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Init.Data.Nat.Bitwise.Basic", "kind": "symbol", "name": "Nat.land", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Lean.Environment", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "Nat.pred", "used_by": ["Mathlib.Lean.Expr.Basic"]}
+{"coverage": "uncovered", "def_module": "Init.Data.Nat.Bitwise.Basic", "kind": "symbol", "name": "Nat.shiftRight", "used_by": ["Mathlib.Lean.Elab.InfoTree", "Mathlib.Lean.Environment", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "ReaderT.instApplicativeOfMonad", "used_by": ["Mathlib.Lean.Elab.Tactic.Meta", "Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "ReaderT.instMonad", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "ReaderT.instMonadExceptOf", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.Lint"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "ReaderT.instMonadFunctor", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "ReaderT.instMonadLift", "used_by": ["Mathlib.Lean.Expr.Basic", "Mathlib.Tactic.Lift", "Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Data.UInt.BasicAux", "kind": "symbol", "name": "USize.toNat", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Init.Util", "kind": "symbol", "name": "dbgTrace", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
+{"coverage": "uncovered", "def_module": "Init.System.IO", "kind": "symbol", "name": "instMonadEIO", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.Linter.Lint", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.System.IO", "kind": "symbol", "name": "instMonadLiftBaseIOEIO", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter", "Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "instMonadReaderOfReaderTOfMonad", "used_by": ["Mathlib.Tactic.TacticAnalysis"]}
+{"coverage": "uncovered", "def_module": "Init.Prelude", "kind": "symbol", "name": "mixHash", "used_by": ["Mathlib.Tactic.Linter.FlexibleLinter"]}
