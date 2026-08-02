@@ -1,18 +1,23 @@
-//! Resource-counted quick definitional equality over checker-owned arenas.
+//! Resource-counted definitional equality over checker-owned arenas.
 //!
-//! This is deliberately only the KR-300 through KR-303 front end. It proves
-//! reflexive structural congruence, treats metadata as transparent, ignores
-//! binder presentation, and compares `Sort` levels with this checker's
-//! independent universe relation. It returns a typed deferral whenever a
-//! conclusion could depend on weak-head reduction, delta, eta, proof
-//! irrelevance, recursors, native computation, literal expansion, or typing
-//! information. A deferral is not a rejection and this module is not a
-//! declaration-admission authority.
+//! The KR-300 through KR-303 quick front end proves structural congruence,
+//! treats metadata as transparent, ignores binder presentation, and compares
+//! `Sort` levels with this checker's independent universe relation. Deferred
+//! pairs can continue through an environment-free slow worklist that invokes
+//! the checker-owned eager WHNF only where structural comparison is stuck.
+//! Delta, typing, eta, proof irrelevance, recursors, native computation, and
+//! literal expansion still produce a typed deferral. A deferral is not a
+//! rejection and this module is not a declaration-admission authority.
 
 use std::collections::BTreeSet;
 
 use crate::universe::{UniverseError, level_roots_equal};
-use crate::wire::{ExprId, ExprNode, WireExpr, usize_units};
+use crate::whnf::{
+    WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_at_with,
+};
+use crate::wire::{
+    ExprId, ExprNode, WireExpr, expression_owned_units, level_owned_units, usize_units,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuickDefEqBudget {
@@ -127,6 +132,174 @@ pub enum QuickDefEqOutcome {
     },
     Inconclusive(QuickDefEqStop),
     InternalFault(QuickDefEqFault),
+}
+
+/// Aggregate bounds for one environment-free conversion query.
+///
+/// The quick and WHNF budgets retain their own meanings. The slow bounds apply
+/// across the entire query rather than resetting for each stuck subterm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefEqBudget {
+    pub quick: QuickDefEqBudget,
+    pub max_slow_comparisons: u64,
+    pub max_normalizations: u64,
+    pub max_materialized_arena_nodes: u64,
+    pub max_materialized_owned_units: u64,
+    pub whnf: WhnfBudget,
+}
+
+impl DefEqBudget {
+    pub const fn new(
+        quick: QuickDefEqBudget,
+        max_slow_comparisons: u64,
+        max_normalizations: u64,
+        max_materialized_arena_nodes: u64,
+        max_materialized_owned_units: u64,
+        whnf: WhnfBudget,
+    ) -> DefEqBudget {
+        DefEqBudget {
+            quick,
+            max_slow_comparisons,
+            max_normalizations,
+            max_materialized_arena_nodes,
+            max_materialized_owned_units,
+            whnf,
+        }
+    }
+
+    pub const fn unlimited() -> DefEqBudget {
+        DefEqBudget::new(
+            QuickDefEqBudget::unlimited(),
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            WhnfBudget::unlimited(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefEqLimit {
+    SlowComparisons,
+    Normalizations,
+    MaterializedArenaNodes,
+    MaterializedOwnedUnits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DefEqSide {
+    Left,
+    Right,
+}
+
+/// A diagnostic location in an original arena (`generation == 0`) or in a
+/// materialized WHNF result (`generation > 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefEqLocation {
+    pub side: DefEqSide,
+    pub generation: u64,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DefEqProgress {
+    pub quick_comparisons: u64,
+    pub slow_comparisons: u64,
+    pub normalizations: u64,
+    pub whnf_steps: u64,
+    pub whnf_reductions: u64,
+    pub materialized_arena_nodes: u64,
+    pub materialized_owned_units: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefEqDeferred {
+    pub left: DefEqLocation,
+    pub right: DefEqLocation,
+    pub left_class: ExpressionClass,
+    pub right_class: ExpressionClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefEqMismatch {
+    SortLevels {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
+    NatLiterals {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
+    StringLiterals {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefEqStop {
+    Quick(QuickDefEqStop),
+    Resource {
+        limit: DefEqLimit,
+        allowed: u64,
+        observed: u64,
+        progress: DefEqProgress,
+    },
+    Cancelled {
+        polls: u64,
+        progress: DefEqProgress,
+    },
+    Whnf {
+        side: DefEqSide,
+        stop: WhnfStop,
+        progress: DefEqProgress,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefEqFault {
+    Quick(QuickDefEqFault),
+    MissingGeneratedArena {
+        side: DefEqSide,
+        generation: u64,
+    },
+    MissingExpression {
+        location: DefEqLocation,
+    },
+    NonBackwardExpressionReference {
+        parent: DefEqLocation,
+        child: usize,
+    },
+    Universe {
+        left: DefEqLocation,
+        right: DefEqLocation,
+        error: UniverseError,
+    },
+    Whnf {
+        side: DefEqSide,
+        fault: WhnfFault,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefEqOutcome {
+    Equal(DefEqProgress),
+    NotEqual {
+        mismatch: DefEqMismatch,
+        progress: DefEqProgress,
+    },
+    Deferred {
+        need: DefEqDeferred,
+        progress: DefEqProgress,
+    },
+    Refused {
+        side: DefEqSide,
+        refusal: WhnfRefusal,
+        progress: DefEqProgress,
+    },
+    Inconclusive(DefEqStop),
+    InternalFault(DefEqFault),
 }
 
 enum Halt {
@@ -505,6 +678,730 @@ pub fn quick_def_eq_with(
     outcome(run(left, right, budget, &mut cancelled))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DefEqSource {
+    Original(DefEqSide),
+    Generated { index: usize, side: DefEqSide },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DefEqTerm {
+    source: DefEqSource,
+    root: ExprId,
+}
+
+impl DefEqTerm {
+    const fn original(side: DefEqSide, root: ExprId) -> DefEqTerm {
+        DefEqTerm {
+            source: DefEqSource::Original(side),
+            root,
+        }
+    }
+
+    const fn side(self) -> DefEqSide {
+        match self.source {
+            DefEqSource::Original(side) | DefEqSource::Generated { side, .. } => side,
+        }
+    }
+
+    fn location(self) -> DefEqLocation {
+        let generation = match self.source {
+            DefEqSource::Original(_) => 0,
+            DefEqSource::Generated { index, .. } => usize_units(index).saturating_add(1),
+        };
+        DefEqLocation {
+            side: self.side(),
+            generation,
+            index: self.root.index(),
+        }
+    }
+}
+
+enum SlowHalt {
+    Stop(Box<DefEqStop>),
+    Refusal {
+        side: DefEqSide,
+        refusal: WhnfRefusal,
+        progress: DefEqProgress,
+    },
+    Fault(DefEqFault),
+}
+
+struct SlowControl {
+    budget: DefEqBudget,
+    progress: DefEqProgress,
+    polls: u64,
+}
+
+impl SlowControl {
+    fn new(budget: DefEqBudget, quick_comparisons: u64) -> SlowControl {
+        SlowControl {
+            budget,
+            progress: DefEqProgress {
+                quick_comparisons,
+                ..DefEqProgress::default()
+            },
+            polls: 0,
+        }
+    }
+
+    fn poll(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<(), SlowHalt> {
+        self.polls = self.polls.saturating_add(1);
+        if cancelled() {
+            return Err(SlowHalt::Stop(Box::new(DefEqStop::Cancelled {
+                polls: self.polls,
+                progress: self.progress,
+            })));
+        }
+        Ok(())
+    }
+
+    fn comparison(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<(), SlowHalt> {
+        self.poll(cancelled)?;
+        let observed = self.progress.slow_comparisons.saturating_add(1);
+        if observed > self.budget.max_slow_comparisons {
+            return Err(SlowHalt::Stop(Box::new(DefEqStop::Resource {
+                limit: DefEqLimit::SlowComparisons,
+                allowed: self.budget.max_slow_comparisons,
+                observed,
+                progress: self.progress,
+            })));
+        }
+        self.progress.slow_comparisons = observed;
+        Ok(())
+    }
+
+    fn begin_normalization(
+        &mut self,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<WhnfBudget, SlowHalt> {
+        self.poll(cancelled)?;
+        let observed = self.progress.normalizations.saturating_add(1);
+        if observed > self.budget.max_normalizations {
+            return Err(SlowHalt::Stop(Box::new(DefEqStop::Resource {
+                limit: DefEqLimit::Normalizations,
+                allowed: self.budget.max_normalizations,
+                observed,
+                progress: self.progress,
+            })));
+        }
+        self.progress.normalizations = observed;
+        Ok(WhnfBudget::new(
+            self.budget
+                .whnf
+                .max_steps
+                .saturating_sub(self.progress.whnf_steps),
+            self.budget
+                .whnf
+                .max_reductions
+                .saturating_sub(self.progress.whnf_reductions),
+            self.budget.whnf.materialization,
+        ))
+    }
+
+    fn absorb_whnf(
+        &mut self,
+        result: &crate::whnf::WhnfResult,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<(), SlowHalt> {
+        self.progress.whnf_steps = self.progress.whnf_steps.saturating_add(result.steps);
+        self.progress.whnf_reductions = self
+            .progress
+            .whnf_reductions
+            .saturating_add(result.reductions);
+        self.poll(cancelled)?;
+        let produced = usize_units(result.term.nodes().len())
+            .saturating_add(usize_units(result.term.levels().len()));
+        let observed = self
+            .progress
+            .materialized_arena_nodes
+            .saturating_add(produced);
+        if observed > self.budget.max_materialized_arena_nodes {
+            return Err(SlowHalt::Stop(Box::new(DefEqStop::Resource {
+                limit: DefEqLimit::MaterializedArenaNodes,
+                allowed: self.budget.max_materialized_arena_nodes,
+                observed,
+                progress: self.progress,
+            })));
+        }
+        self.progress.materialized_arena_nodes = observed;
+        let produced_units = result
+            .term
+            .nodes()
+            .iter()
+            .fold(0_u64, |units, node| {
+                units.saturating_add(expression_owned_units(node))
+            })
+            .saturating_add(result.term.levels().iter().fold(0_u64, |units, node| {
+                units.saturating_add(level_owned_units(node))
+            }));
+        let observed = self
+            .progress
+            .materialized_owned_units
+            .saturating_add(produced_units);
+        if observed > self.budget.max_materialized_owned_units {
+            return Err(SlowHalt::Stop(Box::new(DefEqStop::Resource {
+                limit: DefEqLimit::MaterializedOwnedUnits,
+                allowed: self.budget.max_materialized_owned_units,
+                observed,
+                progress: self.progress,
+            })));
+        }
+        self.progress.materialized_owned_units = observed;
+        Ok(())
+    }
+}
+
+fn source_term<'a>(
+    reference: DefEqTerm,
+    left: &'a WireExpr,
+    right: &'a WireExpr,
+    generated: &'a [WireExpr],
+) -> Result<&'a WireExpr, SlowHalt> {
+    match reference.source {
+        DefEqSource::Original(DefEqSide::Left) => Ok(left),
+        DefEqSource::Original(DefEqSide::Right) => Ok(right),
+        DefEqSource::Generated { index, side } => {
+            generated
+                .get(index)
+                .ok_or(SlowHalt::Fault(DefEqFault::MissingGeneratedArena {
+                    side,
+                    generation: usize_units(index).saturating_add(1),
+                }))
+        }
+    }
+}
+
+fn slow_node<'a>(
+    reference: DefEqTerm,
+    left: &'a WireExpr,
+    right: &'a WireExpr,
+    generated: &'a [WireExpr],
+) -> Result<(&'a WireExpr, &'a ExprNode), SlowHalt> {
+    let term = source_term(reference, left, right, generated)?;
+    let node = term
+        .node(reference.root)
+        .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+            location: reference.location(),
+        }))?;
+    Ok((term, node))
+}
+
+fn child(parent: DefEqTerm, child: ExprId) -> Result<DefEqTerm, SlowHalt> {
+    if child.index() >= parent.root.index() {
+        return Err(SlowHalt::Fault(
+            DefEqFault::NonBackwardExpressionReference {
+                parent: parent.location(),
+                child: child.index(),
+            },
+        ));
+    }
+    Ok(DefEqTerm {
+        source: parent.source,
+        root: child,
+    })
+}
+
+enum PairAction {
+    Done,
+    Push1((DefEqTerm, DefEqTerm)),
+    Push2((DefEqTerm, DefEqTerm), (DefEqTerm, DefEqTerm)),
+    Push3(
+        (DefEqTerm, DefEqTerm),
+        (DefEqTerm, DefEqTerm),
+        (DefEqTerm, DefEqTerm),
+    ),
+    NotEqual(DefEqMismatch),
+    Normalize(DefEqDeferred),
+}
+
+fn defer_pair(
+    left: DefEqTerm,
+    right: DefEqTerm,
+    left_node: &ExprNode,
+    right_node: &ExprNode,
+) -> PairAction {
+    PairAction::Normalize(DefEqDeferred {
+        left: left.location(),
+        right: right.location(),
+        left_class: expression_class(left_node),
+        right_class: expression_class(right_node),
+    })
+}
+
+fn compare_pair(
+    left_reference: DefEqTerm,
+    right_reference: DefEqTerm,
+    left: &WireExpr,
+    right: &WireExpr,
+    generated: &[WireExpr],
+) -> Result<PairAction, SlowHalt> {
+    let (left_term, left_node) = slow_node(left_reference, left, right, generated)?;
+    let (right_term, right_node) = slow_node(right_reference, left, right, generated)?;
+
+    match (left_node, right_node) {
+        (
+            ExprNode::Metadata {
+                expression: left_expression,
+                ..
+            },
+            ExprNode::Metadata {
+                expression: right_expression,
+                ..
+            },
+        ) => {
+            return Ok(PairAction::Push1((
+                child(left_reference, *left_expression)?,
+                child(right_reference, *right_expression)?,
+            )));
+        }
+        (
+            ExprNode::Metadata {
+                expression: left_expression,
+                ..
+            },
+            _,
+        ) => {
+            return Ok(PairAction::Push1((
+                child(left_reference, *left_expression)?,
+                right_reference,
+            )));
+        }
+        (
+            _,
+            ExprNode::Metadata {
+                expression: right_expression,
+                ..
+            },
+        ) => {
+            return Ok(PairAction::Push1((
+                left_reference,
+                child(right_reference, *right_expression)?,
+            )));
+        }
+        _ => {}
+    }
+
+    match (left_node, right_node) {
+        (ExprNode::Bound { index: left }, ExprNode::Bound { index: right }) if left == right => {
+            Ok(PairAction::Done)
+        }
+        (ExprNode::Free { name: left }, ExprNode::Free { name: right }) if left == right => {
+            Ok(PairAction::Done)
+        }
+        (ExprNode::Meta { name: left }, ExprNode::Meta { name: right }) if left == right => {
+            Ok(PairAction::Done)
+        }
+        (ExprNode::Sort { level: left_level }, ExprNode::Sort { level: right_level }) => {
+            let equal = level_roots_equal(
+                left_term.levels(),
+                *left_level,
+                right_term.levels(),
+                *right_level,
+            )
+            .map_err(|error| {
+                SlowHalt::Fault(DefEqFault::Universe {
+                    left: left_reference.location(),
+                    right: right_reference.location(),
+                    error,
+                })
+            })?;
+            if equal {
+                Ok(PairAction::Done)
+            } else {
+                Ok(PairAction::NotEqual(DefEqMismatch::SortLevels {
+                    left: left_reference.location(),
+                    right: right_reference.location(),
+                }))
+            }
+        }
+        (
+            ExprNode::Constant {
+                name: left_name,
+                levels: left_levels,
+            },
+            ExprNode::Constant {
+                name: right_name,
+                levels: right_levels,
+            },
+        ) if left_name == right_name && left_levels.len() == right_levels.len() => {
+            for (left_level, right_level) in left_levels.iter().zip(right_levels) {
+                let equal = level_roots_equal(
+                    left_term.levels(),
+                    *left_level,
+                    right_term.levels(),
+                    *right_level,
+                )
+                .map_err(|error| {
+                    SlowHalt::Fault(DefEqFault::Universe {
+                        left: left_reference.location(),
+                        right: right_reference.location(),
+                        error,
+                    })
+                })?;
+                if !equal {
+                    return Ok(defer_pair(
+                        left_reference,
+                        right_reference,
+                        left_node,
+                        right_node,
+                    ));
+                }
+            }
+            Ok(PairAction::Done)
+        }
+        (
+            ExprNode::Apply {
+                function: left_function,
+                argument: left_argument,
+            },
+            ExprNode::Apply {
+                function: right_function,
+                argument: right_argument,
+            },
+        ) => Ok(PairAction::Push2(
+            (
+                child(left_reference, *left_function)?,
+                child(right_reference, *right_function)?,
+            ),
+            (
+                child(left_reference, *left_argument)?,
+                child(right_reference, *right_argument)?,
+            ),
+        )),
+        (
+            ExprNode::Lambda {
+                binder_type: left_type,
+                body: left_body,
+                ..
+            },
+            ExprNode::Lambda {
+                binder_type: right_type,
+                body: right_body,
+                ..
+            },
+        )
+        | (
+            ExprNode::Forall {
+                binder_type: left_type,
+                body: left_body,
+                ..
+            },
+            ExprNode::Forall {
+                binder_type: right_type,
+                body: right_body,
+                ..
+            },
+        ) => Ok(PairAction::Push2(
+            (
+                child(left_reference, *left_type)?,
+                child(right_reference, *right_type)?,
+            ),
+            (
+                child(left_reference, *left_body)?,
+                child(right_reference, *right_body)?,
+            ),
+        )),
+        (
+            ExprNode::Let {
+                type_: left_type,
+                value: left_value,
+                body: left_body,
+                ..
+            },
+            ExprNode::Let {
+                type_: right_type,
+                value: right_value,
+                body: right_body,
+                ..
+            },
+        ) => Ok(PairAction::Push3(
+            (
+                child(left_reference, *left_type)?,
+                child(right_reference, *right_type)?,
+            ),
+            (
+                child(left_reference, *left_value)?,
+                child(right_reference, *right_value)?,
+            ),
+            (
+                child(left_reference, *left_body)?,
+                child(right_reference, *right_body)?,
+            ),
+        )),
+        (
+            ExprNode::NatLiteral {
+                limbs_le: left_limbs,
+            },
+            ExprNode::NatLiteral {
+                limbs_le: right_limbs,
+            },
+        ) => {
+            if left_limbs == right_limbs {
+                Ok(PairAction::Done)
+            } else {
+                Ok(PairAction::NotEqual(DefEqMismatch::NatLiterals {
+                    left: left_reference.location(),
+                    right: right_reference.location(),
+                }))
+            }
+        }
+        (ExprNode::StringLiteral(left_value), ExprNode::StringLiteral(right_value)) => {
+            if left_value == right_value {
+                Ok(PairAction::Done)
+            } else {
+                Ok(PairAction::NotEqual(DefEqMismatch::StringLiterals {
+                    left: left_reference.location(),
+                    right: right_reference.location(),
+                }))
+            }
+        }
+        (
+            ExprNode::Projection {
+                structure_name: left_structure,
+                index: left_index,
+                expression: left_expression,
+            },
+            ExprNode::Projection {
+                structure_name: right_structure,
+                index: right_index,
+                expression: right_expression,
+            },
+        ) if left_structure == right_structure && left_index == right_index => {
+            Ok(PairAction::Push1((
+                child(left_reference, *left_expression)?,
+                child(right_reference, *right_expression)?,
+            )))
+        }
+        _ => Ok(defer_pair(
+            left_reference,
+            right_reference,
+            left_node,
+            right_node,
+        )),
+    }
+}
+
+fn normalize(
+    reference: DefEqTerm,
+    left: &WireExpr,
+    right: &WireExpr,
+    generated: &[WireExpr],
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<crate::whnf::WhnfResult, SlowHalt> {
+    let budget = control.begin_normalization(cancelled)?;
+    let term = source_term(reference, left, right, generated)?;
+    match whnf_at_with(term, reference.root, context, budget, cancelled) {
+        WhnfOutcome::Complete(result) => {
+            control.absorb_whnf(&result, cancelled)?;
+            Ok(result)
+        }
+        WhnfOutcome::Refused(refusal) => Err(SlowHalt::Refusal {
+            side: reference.side(),
+            refusal,
+            progress: control.progress,
+        }),
+        WhnfOutcome::Inconclusive(stop) => Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
+            side: reference.side(),
+            stop,
+            progress: control.progress,
+        }))),
+        WhnfOutcome::InternalFault(fault) => Err(SlowHalt::Fault(DefEqFault::Whnf {
+            side: reference.side(),
+            fault,
+        })),
+    }
+}
+
+fn retain_generated(generated: &mut Vec<WireExpr>, side: DefEqSide, term: WireExpr) -> DefEqTerm {
+    let root = term.root();
+    let index = generated.len();
+    generated.push(term);
+    DefEqTerm {
+        source: DefEqSource::Generated { index, side },
+        root,
+    }
+}
+
+fn run_slow(
+    left: &WireExpr,
+    right: &WireExpr,
+    context: &WhnfContext,
+    budget: DefEqBudget,
+    quick_comparisons: u64,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<DefEqOutcome, SlowHalt> {
+    let mut control = SlowControl::new(budget, quick_comparisons);
+    let mut generated = Vec::new();
+    let mut pending = vec![(
+        DefEqTerm::original(DefEqSide::Left, left.root()),
+        DefEqTerm::original(DefEqSide::Right, right.root()),
+    )];
+    let mut seen = BTreeSet::new();
+
+    while let Some((left_reference, right_reference)) = pending.pop() {
+        if !seen.insert((left_reference, right_reference)) {
+            continue;
+        }
+        control.comparison(cancelled)?;
+        match compare_pair(left_reference, right_reference, left, right, &generated)? {
+            PairAction::Done => {}
+            PairAction::Push1(pair) => pending.push(pair),
+            PairAction::Push2(first, second) => {
+                pending.push(second);
+                pending.push(first);
+            }
+            PairAction::Push3(first, second, third) => {
+                pending.push(third);
+                pending.push(second);
+                pending.push(first);
+            }
+            PairAction::NotEqual(mismatch) => {
+                return Ok(DefEqOutcome::NotEqual {
+                    mismatch,
+                    progress: control.progress,
+                });
+            }
+            PairAction::Normalize(need) => {
+                let left_result = normalize(
+                    left_reference,
+                    left,
+                    right,
+                    &generated,
+                    context,
+                    &mut control,
+                    cancelled,
+                )?;
+                let right_result = normalize(
+                    right_reference,
+                    left,
+                    right,
+                    &generated,
+                    context,
+                    &mut control,
+                    cancelled,
+                )?;
+                let left_changed = left_result.reductions != 0;
+                let right_changed = right_result.reductions != 0;
+                if !left_changed && !right_changed {
+                    return Ok(DefEqOutcome::Deferred {
+                        need,
+                        progress: control.progress,
+                    });
+                }
+                let next_left = if left_changed {
+                    retain_generated(&mut generated, DefEqSide::Left, left_result.term)
+                } else {
+                    left_reference
+                };
+                let next_right = if right_changed {
+                    retain_generated(&mut generated, DefEqSide::Right, right_result.term)
+                } else {
+                    right_reference
+                };
+                pending.push((next_left, next_right));
+            }
+        }
+    }
+
+    Ok(DefEqOutcome::Equal(control.progress))
+}
+
+fn slow_outcome(result: Result<DefEqOutcome, SlowHalt>) -> DefEqOutcome {
+    match result {
+        Ok(outcome) => outcome,
+        Err(SlowHalt::Stop(stop)) => DefEqOutcome::Inconclusive(*stop),
+        Err(SlowHalt::Refusal {
+            side,
+            refusal,
+            progress,
+        }) => DefEqOutcome::Refused {
+            side,
+            refusal,
+            progress,
+        },
+        Err(SlowHalt::Fault(fault)) => DefEqOutcome::InternalFault(fault),
+    }
+}
+
+fn original_location(side: DefEqSide, index: usize) -> DefEqLocation {
+    DefEqLocation {
+        side,
+        generation: 0,
+        index,
+    }
+}
+
+fn map_quick_mismatch(mismatch: QuickDefEqMismatch) -> DefEqMismatch {
+    match mismatch {
+        QuickDefEqMismatch::SortLevels { left, right } => DefEqMismatch::SortLevels {
+            left: original_location(DefEqSide::Left, left),
+            right: original_location(DefEqSide::Right, right),
+        },
+        QuickDefEqMismatch::NatLiterals { left, right } => DefEqMismatch::NatLiterals {
+            left: original_location(DefEqSide::Left, left),
+            right: original_location(DefEqSide::Right, right),
+        },
+        QuickDefEqMismatch::StringLiterals { left, right } => DefEqMismatch::StringLiterals {
+            left: original_location(DefEqSide::Left, left),
+            right: original_location(DefEqSide::Right, right),
+        },
+    }
+}
+
+/// Run the counted quick phase followed by environment-free slow conversion.
+pub fn def_eq(
+    left: &WireExpr,
+    right: &WireExpr,
+    context: &WhnfContext,
+    budget: DefEqBudget,
+) -> DefEqOutcome {
+    def_eq_with(left, right, context, budget, || false)
+}
+
+/// Run pure conversion with cooperative cancellation shared by every phase.
+pub fn def_eq_with(
+    left: &WireExpr,
+    right: &WireExpr,
+    context: &WhnfContext,
+    budget: DefEqBudget,
+    mut cancelled: impl FnMut() -> bool,
+) -> DefEqOutcome {
+    match quick_def_eq_with(left, right, budget.quick, &mut cancelled) {
+        QuickDefEqOutcome::Equal(result) => DefEqOutcome::Equal(DefEqProgress {
+            quick_comparisons: result.comparisons,
+            ..DefEqProgress::default()
+        }),
+        QuickDefEqOutcome::NotEqual {
+            mismatch,
+            completed_comparisons,
+        } => DefEqOutcome::NotEqual {
+            mismatch: map_quick_mismatch(mismatch),
+            progress: DefEqProgress {
+                quick_comparisons: completed_comparisons,
+                ..DefEqProgress::default()
+            },
+        },
+        QuickDefEqOutcome::Deferred {
+            completed_comparisons,
+            ..
+        } => slow_outcome(run_slow(
+            left,
+            right,
+            context,
+            budget,
+            completed_comparisons,
+            &mut cancelled,
+        )),
+        QuickDefEqOutcome::Inconclusive(stop) => DefEqOutcome::Inconclusive(DefEqStop::Quick(stop)),
+        QuickDefEqOutcome::InternalFault(fault) => {
+            DefEqOutcome::InternalFault(DefEqFault::Quick(fault))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +1425,21 @@ mod tests {
                 parent: 0,
                 child: 0,
             })
+        );
+        assert_eq!(
+            def_eq(
+                &term,
+                &term,
+                &WhnfContext::default(),
+                DefEqBudget::unlimited(),
+            ),
+            DefEqOutcome::InternalFault(DefEqFault::Quick(
+                QuickDefEqFault::NonBackwardExpressionReference {
+                    side: QuickDefEqSide::Left,
+                    parent: 0,
+                    child: 0,
+                }
+            ))
         );
     }
 }
