@@ -6,9 +6,11 @@
 //! pairs continue through a slow worklist that first takes a no-delta weak head,
 //! checks KR-308 Nat successor offsets, applies closed-pair KR-313 Nat reduction,
 //! then unfolds safe definition heads one step at a time in descending
-//! definitional-height order. Typing, eta, proof irrelevance, recursors, native
-//! computation, and String expansion still produce a typed deferral. A deferral
-//! is not a rejection and this module is not a declaration-admission authority.
+//! definitional-height order. At the exact `String.ofList` comparison gate,
+//! Unicode String literals expand through the checker-owned KR-314 reducer.
+//! Typing, eta, proof irrelevance, recursors, and native computation still
+//! produce a typed deferral. A deferral is not a rejection and this module is
+//! not a declaration-admission authority.
 
 use std::collections::BTreeSet;
 
@@ -17,6 +19,10 @@ use crate::nat_reduce::{
     NatReductionRefusal, NatReductionStop, is_potential_nat_reduction, reduce_nat_at_with,
 };
 use crate::numeric::NatBudget;
+use crate::string_reduce::{
+    StringExpansionBudget, StringExpansionFault, StringExpansionOutcome, StringExpansionProgress,
+    StringExpansionStop, expand_string_literal_with,
+};
 use crate::universe::{UniverseError, level_roots_equal};
 use crate::whnf::{
     WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_core_at_with,
@@ -155,6 +161,7 @@ pub struct DefEqBudget {
     pub max_materialized_owned_units: u64,
     pub whnf: WhnfBudget,
     pub nat: NatReductionBudget,
+    pub string: StringExpansionBudget,
 }
 
 impl DefEqBudget {
@@ -183,11 +190,22 @@ impl DefEqBudget {
                 whnf,
                 NatBudget::new(max_slow_comparisons, max_materialized_owned_units),
             ),
+            string: StringExpansionBudget::new(
+                max_slow_comparisons,
+                max_materialized_arena_nodes,
+                max_materialized_arena_nodes,
+                max_materialized_owned_units,
+            ),
         }
     }
 
     pub const fn with_nat(mut self, nat: NatReductionBudget) -> DefEqBudget {
         self.nat = nat;
+        self
+    }
+
+    pub const fn with_string(mut self, string: StringExpansionBudget) -> DefEqBudget {
+        self.string = string;
         self
     }
 
@@ -243,6 +261,11 @@ pub struct DefEqProgress {
     pub nat_numeric_materialized_limbs: u64,
     pub nat_reductions: u64,
     pub nat_output_units: u64,
+    pub string_steps: u64,
+    pub string_code_points: u64,
+    pub string_generated_arenas: u64,
+    pub string_arena_nodes: u64,
+    pub string_owned_units: u64,
     pub materialized_arena_nodes: u64,
     pub materialized_owned_units: u64,
 }
@@ -273,6 +296,10 @@ pub enum DefEqMismatch {
         left: DefEqLocation,
         right: DefEqLocation,
     },
+    StringExpansion {
+        left: DefEqLocation,
+        right: DefEqLocation,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +323,11 @@ pub enum DefEqStop {
     NatReduction {
         side: DefEqSide,
         stop: NatReductionStop,
+        progress: DefEqProgress,
+    },
+    StringExpansion {
+        side: DefEqSide,
+        stop: StringExpansionStop,
         progress: DefEqProgress,
     },
 }
@@ -329,6 +361,10 @@ pub enum DefEqFault {
     NatReduction {
         side: DefEqSide,
         fault: NatReductionFault,
+    },
+    StringExpansion {
+        side: DefEqSide,
+        fault: StringExpansionFault,
     },
 }
 
@@ -878,6 +914,59 @@ impl SlowControl {
         self.progress.materialized_owned_units = admission.owned_units;
     }
 
+    fn remaining_string_budget(&self) -> StringExpansionBudget {
+        let mut budget = self.budget.string;
+        budget.max_steps = budget.max_steps.saturating_sub(self.progress.string_steps);
+        budget.max_code_points = budget
+            .max_code_points
+            .saturating_sub(self.progress.string_code_points);
+        budget.max_arena_nodes = budget
+            .max_arena_nodes
+            .saturating_sub(self.progress.string_arena_nodes)
+            .min(
+                self.budget
+                    .max_materialized_arena_nodes
+                    .saturating_sub(self.progress.materialized_arena_nodes),
+            );
+        budget.max_owned_units = budget
+            .max_owned_units
+            .saturating_sub(self.progress.string_owned_units)
+            .min(
+                self.budget
+                    .max_materialized_owned_units
+                    .saturating_sub(self.progress.materialized_owned_units),
+            );
+        budget
+    }
+
+    fn absorb_string(&mut self, progress: StringExpansionProgress) {
+        self.progress.string_steps = self.progress.string_steps.saturating_add(progress.steps);
+        self.progress.string_code_points = self
+            .progress
+            .string_code_points
+            .saturating_add(progress.code_points);
+        self.progress.string_generated_arenas = self
+            .progress
+            .string_generated_arenas
+            .saturating_add(progress.generated_arenas);
+        self.progress.string_arena_nodes = self
+            .progress
+            .string_arena_nodes
+            .saturating_add(progress.arena_nodes);
+        self.progress.string_owned_units = self
+            .progress
+            .string_owned_units
+            .saturating_add(progress.owned_units);
+        self.progress.materialized_arena_nodes = self
+            .progress
+            .materialized_arena_nodes
+            .saturating_add(progress.arena_nodes);
+        self.progress.materialized_owned_units = self
+            .progress
+            .materialized_owned_units
+            .saturating_add(progress.owned_units);
+    }
+
     fn begin_normalization(
         &mut self,
         cancelled: &mut dyn FnMut() -> bool,
@@ -903,7 +992,8 @@ impl SlowControl {
                 .max_reductions
                 .saturating_sub(self.progress.whnf_reductions),
             self.budget.whnf.materialization,
-        ))
+        )
+        .with_string(self.remaining_string_budget()))
     }
 
     fn absorb_whnf(
@@ -911,6 +1001,7 @@ impl SlowControl {
         result: &crate::whnf::WhnfResult,
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<(), SlowHalt> {
+        self.absorb_string(result.string_progress);
         self.progress.whnf_steps = self.progress.whnf_steps.saturating_add(result.steps);
         self.progress.whnf_reductions = self
             .progress
@@ -1454,6 +1545,12 @@ enum NatOffsetContext {
     PairedPeel,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StringComparisonContext {
+    Ordinary,
+    MatchedExpansion,
+}
+
 fn nat_offset_shape(
     reference: DefEqTerm,
     sources: TermSources<'_>,
@@ -1826,6 +1923,105 @@ fn reduce_nat_candidate(
     }
 }
 
+fn string_literal_value<'a>(
+    reference: DefEqTerm,
+    sources: TermSources<'a>,
+) -> Result<Option<&'a str>, SlowHalt> {
+    let term = sources.source(reference)?;
+    let node = term
+        .node(reference.root)
+        .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+            location: reference.location(),
+        }))?;
+    Ok(match node {
+        ExprNode::StringLiteral(value) => Some(value.as_str()),
+        _ => None,
+    })
+}
+
+fn is_exact_string_of_list(
+    reference: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, SlowHalt> {
+    control.comparison(cancelled)?;
+    let term = sources.source(reference)?;
+    let node = term
+        .node(reference.root)
+        .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+            location: reference.location(),
+        }))?;
+    let ExprNode::Apply { function, argument } = node else {
+        return Ok(false);
+    };
+    let function_reference = child(reference, *function)?;
+    let _ = child(reference, *argument)?;
+    control.comparison(cancelled)?;
+    let function_node =
+        term.node(*function)
+            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: function_reference.location(),
+            }))?;
+    Ok(matches!(
+        function_node,
+        ExprNode::Constant { name, levels }
+            if levels.is_empty() && wire_name_is_two(name, "String", "ofList")
+    ))
+}
+
+fn expand_string_candidate(
+    reference: DefEqTerm,
+    value: &str,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<WireExpr, SlowHalt> {
+    let budget = control.remaining_string_budget();
+    match expand_string_literal_with(value, budget, cancelled) {
+        StringExpansionOutcome::Expanded(result) => {
+            control.absorb_string(result.progress);
+            Ok(result.term)
+        }
+        StringExpansionOutcome::Inconclusive(stop) => {
+            control.absorb_string(stop.progress());
+            Err(SlowHalt::Stop(Box::new(DefEqStop::StringExpansion {
+                side: reference.side(),
+                stop,
+                progress: control.progress,
+            })))
+        }
+        StringExpansionOutcome::InternalFault { fault, progress } => {
+            control.absorb_string(progress);
+            Err(SlowHalt::Fault(DefEqFault::StringExpansion {
+                side: reference.side(),
+                fault,
+            }))
+        }
+    }
+}
+
+fn string_expansion(
+    left_reference: DefEqTerm,
+    right_reference: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Option<(DefEqSide, WireExpr)>, SlowHalt> {
+    if let Some(value) = string_literal_value(left_reference, sources)?
+        && is_exact_string_of_list(right_reference, sources, control, cancelled)?
+    {
+        let term = expand_string_candidate(left_reference, value, control, cancelled)?;
+        return Ok(Some((DefEqSide::Left, term)));
+    }
+    if let Some(value) = string_literal_value(right_reference, sources)?
+        && is_exact_string_of_list(left_reference, sources, control, cancelled)?
+    {
+        let term = expand_string_candidate(right_reference, value, control, cancelled)?;
+        return Ok(Some((DefEqSide::Right, term)));
+    }
+    Ok(None)
+}
+
 fn retain_generated(generated: &mut Vec<WireExpr>, side: DefEqSide, term: WireExpr) -> DefEqTerm {
     let root = term.root();
     let index = generated.len();
@@ -1833,6 +2029,25 @@ fn retain_generated(generated: &mut Vec<WireExpr>, side: DefEqSide, term: WireEx
     DefEqTerm {
         source: DefEqSource::Generated { index, side },
         root,
+    }
+}
+
+fn unresolved_pair(
+    need: DefEqDeferred,
+    left: DefEqTerm,
+    right: DefEqTerm,
+    string_context: StringComparisonContext,
+    progress: DefEqProgress,
+) -> DefEqOutcome {
+    match string_context {
+        StringComparisonContext::Ordinary => DefEqOutcome::Deferred { need, progress },
+        StringComparisonContext::MatchedExpansion => DefEqOutcome::NotEqual {
+            mismatch: DefEqMismatch::StringExpansion {
+                left: left.location(),
+                right: right.location(),
+            },
+            progress,
+        },
     }
 }
 
@@ -1850,27 +2065,35 @@ fn run_slow(
         DefEqTerm::original(DefEqSide::Left, left.root()),
         DefEqTerm::original(DefEqSide::Right, right.root()),
         NatOffsetContext::Fresh,
+        StringComparisonContext::Ordinary,
     )];
     let mut seen = BTreeSet::new();
 
-    while let Some((left_reference, right_reference, offset_context)) = pending.pop() {
-        if !seen.insert((left_reference, right_reference, offset_context)) {
+    while let Some((left_reference, right_reference, offset_context, string_context)) =
+        pending.pop()
+    {
+        if !seen.insert((
+            left_reference,
+            right_reference,
+            offset_context,
+            string_context,
+        )) {
             continue;
         }
         control.comparison(cancelled)?;
         match compare_pair(left_reference, right_reference, left, right, &generated)? {
             PairAction::Done => {}
             PairAction::Push1((next_left, next_right)) => {
-                pending.push((next_left, next_right, offset_context));
+                pending.push((next_left, next_right, offset_context, string_context));
             }
             PairAction::Push2(first, second) => {
-                pending.push((second.0, second.1, offset_context));
-                pending.push((first.0, first.1, offset_context));
+                pending.push((second.0, second.1, offset_context, string_context));
+                pending.push((first.0, first.1, offset_context, string_context));
             }
             PairAction::Push3(first, second, third) => {
-                pending.push((third.0, third.1, offset_context));
-                pending.push((second.0, second.1, offset_context));
-                pending.push((first.0, first.1, offset_context));
+                pending.push((third.0, third.1, offset_context, string_context));
+                pending.push((second.0, second.1, offset_context, string_context));
+                pending.push((first.0, first.1, offset_context, string_context));
             }
             PairAction::NotEqual(mismatch) => {
                 return Ok(DefEqOutcome::NotEqual {
@@ -1897,7 +2120,12 @@ fn run_slow(
                         });
                     }
                     NatOffsetAction::Peel(next_left, next_right) => {
-                        pending.push((next_left, next_right, NatOffsetContext::PairedPeel));
+                        pending.push((
+                            next_left,
+                            next_right,
+                            NatOffsetContext::PairedPeel,
+                            string_context,
+                        ));
                         continue;
                     }
                 }
@@ -1931,7 +2159,38 @@ fn run_slow(
                     } else {
                         right_reference
                     };
-                    pending.push((next_left, next_right, offset_context));
+                    pending.push((next_left, next_right, offset_context, string_context));
+                    continue;
+                }
+
+                if let Some((side, term)) = string_expansion(
+                    left_reference,
+                    right_reference,
+                    TermSources::new(left, right, &generated),
+                    &mut control,
+                    cancelled,
+                )? {
+                    match side {
+                        DefEqSide::Left => {
+                            let next_left = retain_generated(&mut generated, DefEqSide::Left, term);
+                            pending.push((
+                                next_left,
+                                right_reference,
+                                offset_context,
+                                StringComparisonContext::MatchedExpansion,
+                            ));
+                        }
+                        DefEqSide::Right => {
+                            let next_right =
+                                retain_generated(&mut generated, DefEqSide::Right, term);
+                            pending.push((
+                                left_reference,
+                                next_right,
+                                offset_context,
+                                StringComparisonContext::MatchedExpansion,
+                            ));
+                        }
+                    }
                     continue;
                 }
 
@@ -1983,7 +2242,7 @@ fn run_slow(
                         )?
                     {
                         let next_left = retain_generated(&mut generated, DefEqSide::Left, term);
-                        pending.push((next_left, right_reference, offset_context));
+                        pending.push((next_left, right_reference, offset_context, string_context));
                         continue;
                     }
                     if right_is_nat
@@ -1997,7 +2256,7 @@ fn run_slow(
                         )?
                     {
                         let next_right = retain_generated(&mut generated, DefEqSide::Right, term);
-                        pending.push((left_reference, next_right, offset_context));
+                        pending.push((left_reference, next_right, offset_context, string_context));
                         continue;
                     }
                 }
@@ -2024,10 +2283,13 @@ fn run_slow(
                 };
                 let (unfold_left, unfold_right) = match (left_height, right_height) {
                     (None, None) => {
-                        return Ok(DefEqOutcome::Deferred {
+                        return Ok(unresolved_pair(
                             need,
-                            progress: control.progress,
-                        });
+                            left_reference,
+                            right_reference,
+                            string_context,
+                            control.progress,
+                        ));
                     }
                     (Some(_), None) => (true, false),
                     (None, Some(_)) => (false, true),
@@ -2048,10 +2310,13 @@ fn run_slow(
                         cancelled,
                     )?;
                     if result.delta_reductions == 0 {
-                        return Ok(DefEqOutcome::Deferred {
+                        return Ok(unresolved_pair(
                             need,
-                            progress: control.progress,
-                        });
+                            left_reference,
+                            right_reference,
+                            string_context,
+                            control.progress,
+                        ));
                     }
                     next_left = retain_generated(&mut generated, DefEqSide::Left, result.term);
                 }
@@ -2065,14 +2330,17 @@ fn run_slow(
                         cancelled,
                     )?;
                     if result.delta_reductions == 0 {
-                        return Ok(DefEqOutcome::Deferred {
+                        return Ok(unresolved_pair(
                             need,
-                            progress: control.progress,
-                        });
+                            left_reference,
+                            right_reference,
+                            string_context,
+                            control.progress,
+                        ));
                     }
                     next_right = retain_generated(&mut generated, DefEqSide::Right, result.term);
                 }
-                pending.push((next_left, next_right, offset_context));
+                pending.push((next_left, next_right, offset_context, string_context));
             }
         }
     }

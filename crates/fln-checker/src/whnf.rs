@@ -15,12 +15,16 @@ use crate::instantiate::{
     InstantiationFault, InstantiationOutcome, InstantiationRefusal,
     instantiate_term_parameters_from_level_roots_with,
 };
+use crate::string_reduce::{
+    StringExpansionBudget, StringExpansionFault, StringExpansionOutcome, StringExpansionProgress,
+    StringExpansionStop, expand_string_literal_with,
+};
 use crate::term::{
     TermBudget, TermFault, TermLimit, TermOutcome, TermStop, copy_subterm_with,
     substitute_bound_subterms_with,
 };
 use crate::wire::{
-    ExprId, ExprNode, LevelId, LevelNode, WireExpr, WireName, expression_owned_units,
+    ExprId, ExprNode, LevelId, LevelNode, NamePart, WireExpr, WireName, expression_owned_units,
     level_owned_units, usize_units,
 };
 
@@ -115,6 +119,7 @@ pub struct WhnfBudget {
     pub max_steps: u64,
     pub max_reductions: u64,
     pub materialization: TermBudget,
+    pub string: StringExpansionBudget,
 }
 
 impl WhnfBudget {
@@ -127,7 +132,18 @@ impl WhnfBudget {
             max_steps,
             max_reductions,
             materialization,
+            string: StringExpansionBudget::new(
+                max_steps,
+                materialization.max_steps,
+                materialization.max_arena_nodes,
+                materialization.max_output_units,
+            ),
         }
+    }
+
+    pub const fn with_string(mut self, string: StringExpansionBudget) -> WhnfBudget {
+        self.string = string;
+        self
     }
 
     pub const fn unlimited() -> WhnfBudget {
@@ -204,6 +220,12 @@ pub enum WhnfStop {
         completed_steps: u64,
         completed_reductions: u64,
     },
+    StringExpansion {
+        at: usize,
+        stop: StringExpansionStop,
+        completed_steps: u64,
+        completed_reductions: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +256,10 @@ pub enum WhnfFault {
         at: usize,
         fault: InstantiationFault,
     },
+    StringExpansion {
+        at: usize,
+        fault: StringExpansionFault,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +268,7 @@ pub struct WhnfResult {
     pub steps: u64,
     pub reductions: u64,
     pub delta_reductions: u64,
+    pub string_progress: StringExpansionProgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,6 +449,8 @@ struct Reducer<'a, 'c> {
     unfolded_bindings: BTreeSet<usize>,
     delta_mode: DeltaMode,
     delta_reductions: u64,
+    string_progress: StringExpansionProgress,
+    force_string_delta: bool,
 }
 
 impl<'a, 'c> Reducer<'a, 'c> {
@@ -444,6 +473,81 @@ impl<'a, 'c> Reducer<'a, 'c> {
             }));
         }
         Ok(())
+    }
+
+    fn remaining_string_budget(&self) -> StringExpansionBudget {
+        let mut budget = self.control.budget.string;
+        budget.max_steps = budget.max_steps.saturating_sub(self.string_progress.steps);
+        budget.max_code_points = budget
+            .max_code_points
+            .saturating_sub(self.string_progress.code_points);
+        budget.max_arena_nodes = budget
+            .max_arena_nodes
+            .saturating_sub(self.string_progress.arena_nodes);
+        budget.max_owned_units = budget
+            .max_owned_units
+            .saturating_sub(self.string_progress.owned_units);
+        budget
+    }
+
+    fn absorb_string(&mut self, progress: StringExpansionProgress) {
+        self.string_progress.steps = self.string_progress.steps.saturating_add(progress.steps);
+        self.string_progress.code_points = self
+            .string_progress
+            .code_points
+            .saturating_add(progress.code_points);
+        self.string_progress.generated_arenas = self
+            .string_progress
+            .generated_arenas
+            .saturating_add(progress.generated_arenas);
+        self.string_progress.arena_nodes = self
+            .string_progress
+            .arena_nodes
+            .saturating_add(progress.arena_nodes);
+        self.string_progress.owned_units = self
+            .string_progress
+            .owned_units
+            .saturating_add(progress.owned_units);
+    }
+
+    fn expand_string(&mut self, value: &str, at: usize) -> Result<Cursor, Halt> {
+        let budget = self.remaining_string_budget();
+        match expand_string_literal_with(value, budget, &mut self.cancelled) {
+            StringExpansionOutcome::Expanded(result) => {
+                self.absorb_string(result.progress);
+                let root = result.term.root();
+                Ok(Cursor {
+                    arena: Arc::new(result.term),
+                    root,
+                })
+            }
+            StringExpansionOutcome::Inconclusive(stop) => {
+                self.absorb_string(stop.progress());
+                Err(Halt::Stop(WhnfStop::StringExpansion {
+                    at,
+                    stop,
+                    completed_steps: self.control.steps,
+                    completed_reductions: self.control.reductions,
+                }))
+            }
+            StringExpansionOutcome::InternalFault { fault, progress } => {
+                self.absorb_string(progress);
+                Err(Halt::Fault(WhnfFault::StringExpansion { at, fault }))
+            }
+        }
+    }
+
+    fn projection_requests_string(&self, frame: &ProjectionFrame) -> Result<bool, Halt> {
+        let ExprNode::Projection { structure_name, .. } = self.node(&frame.projection)? else {
+            return Err(Halt::Fault(WhnfFault::MissingExpression {
+                input: 0,
+                index: frame.projection.root.index(),
+            }));
+        };
+        Ok(matches!(
+            structure_name.parts(),
+            [NamePart::Text(name)] if name == "String"
+        ))
     }
 
     fn materialize_wire(
@@ -841,12 +945,17 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     continue;
                 }
                 HeadAction::Constant => {
-                    let may_unfold = match self.delta_mode {
-                        DeltaMode::Eager => true,
-                        DeltaMode::Disabled => false,
-                        DeltaMode::Once => self.delta_reductions == 0,
-                    };
+                    let forced = self.force_string_delta;
+                    let may_unfold = forced
+                        || match self.delta_mode {
+                            DeltaMode::Eager => true,
+                            DeltaMode::Disabled => false,
+                            DeltaMode::Once => self.delta_reductions == 0,
+                        };
                     if may_unfold && let Some(unfolded) = self.unfold_definition(&current)? {
+                        if forced {
+                            self.force_string_delta = false;
+                        }
                         self.delta_reductions = self.delta_reductions.saturating_add(1);
                         current = unfolded;
                         continue;
@@ -870,7 +979,28 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     };
                     continue;
                 }
-                HeadAction::Free(None) | HeadAction::Stuck => {}
+                HeadAction::Stuck => {
+                    let expanded = {
+                        let value = match self.node(&current)? {
+                            ExprNode::StringLiteral(value) => Some(value.as_str()),
+                            _ => None,
+                        };
+                        match (value, projections.last()) {
+                            (Some(value), Some(frame))
+                                if self.projection_requests_string(frame)? =>
+                            {
+                                Some(self.expand_string(value, current.root.index())?)
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(expanded) = expanded {
+                        current = expanded;
+                        self.force_string_delta = true;
+                        continue;
+                    }
+                }
+                HeadAction::Free(None) => {}
             }
 
             if !pending_arguments.is_empty()
@@ -918,6 +1048,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 steps: self.control.steps,
                 reductions: self.control.reductions,
                 delta_reductions: self.delta_reductions,
+                string_progress: self.string_progress,
             });
         }
     }
@@ -1497,6 +1628,8 @@ fn whnf_at_mode_with(
         unfolded_bindings: BTreeSet::new(),
         delta_mode,
         delta_reductions: 0,
+        string_progress: StringExpansionProgress::default(),
+        force_string_delta: false,
     };
     outcome(reducer.run(term, root))
 }

@@ -336,6 +336,7 @@ pub mod instantiate;
 pub mod nat_reduce;
 pub mod numeric;
 pub mod policy;
+pub mod string_reduce;
 pub mod term;
 pub mod universe;
 pub mod whnf;
