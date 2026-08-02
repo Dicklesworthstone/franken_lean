@@ -521,7 +521,12 @@ fn fifty_thousand_code_points_fit_a_64k_stack() {
 
 #[test]
 fn production_expansion_has_no_primary_semantic_path() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Resolve the invoking tree at run time. A shared target directory may
+    // otherwise reuse a test binary whose compile-time path names another
+    // checkout and silently inspect the wrong production source (k60n).
+    let root = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("cargo identifies the invoking checker crate");
     let source = std::fs::read_to_string(root.join("src/string_reduce.rs"))
         .expect("read production String reducer");
     for forbidden in [

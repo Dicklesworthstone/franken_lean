@@ -400,6 +400,12 @@ impl NeedleDrift {
 /// Checked in **both** directions: an entry that no longer diverges is refused as stale.
 pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
     (
+        "crates/fln-checker/tests/string_reduce.rs",
+        "the KR-314 independence census reads the invoking checker source at run time so a \
+         shared target cannot bake another checkout's production reducer into the check \
+         (franken_lean-gii.13)",
+    ),
+    (
         "crates/fln-conformance/src/tree_identity.rs",
         "this module: needle fragments, the run-time read in manifest_dir_of, the failure prose \
          naming the repair, and the decoy's own format string",
