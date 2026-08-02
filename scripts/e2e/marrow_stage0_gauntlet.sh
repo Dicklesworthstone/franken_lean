@@ -124,6 +124,11 @@ fi
 # ecosystem ships), the pin's shipped config.h. Every demanded lean_*/mi_*
 # symbol must be classified by the status ledger; unknown symbols fail.
 STAGE0_TUS=("Init/Prelude.c" "Init/SizeOf.c" "Init/Data/Nat/Basic.c")
+# Slice 5: Init/SizeOf's initializer-import closure, so lane 6c can link and
+# execute the full module DAG (SizeOf -> {Notation, Tactics} -> Notation ->
+# Coe -> Prelude). Measured before landing: their union demands 13 lean_*/mi_*
+# symbols, every one already exported.
+STAGE0_TUS+=("Init/Coe.c" "Init/Notation.c" "Init/Tactics.c")
 if [ "${FLN_E2E_DEEP:-0}" = "1" ]; then
     STAGE0_TUS+=("Init/Core.c")
 fi
@@ -243,6 +248,47 @@ if diff -u "$ART_DIR/facts_stage0_reference.ndjson" "$ART_DIR/facts_stage0_marro
     emit stage0_exec_differential passed "\"facts\":$(wc -l <"$ART_DIR/facts_stage0_marrow.ndjson"),\"artifact\":\"stage0_facts.diff\""
 else
     fail stage0_exec_differential "\"artifact\":\"stage0_facts.diff\""
+fi
+
+# ---- lane 6c: stage0 module-DAG EXECUTION (slice 5) ----------------------------
+# Five real translation units — Init/SizeOf's full initializer-import closure
+# (a diamond: SizeOf -> {Notation, Tactics}, Tactics -> Notation, Notation ->
+# Coe -> Prelude) — linked together against Marrow and EXECUTED: the chain
+# driver initializes the DAG root, re-initializes both the root and a leaf
+# (the generated once-guards must short-circuit), applies a SizeOf-instance
+# closure over scalar and bignum operands, and feeds the result to Prelude's
+# generated decidable equality. The same driver + the SAME five .o files
+# against libleanshared must emit byte-identical facts.
+note "lane 6c: stage0 module DAG (5 TUs) EXECUTES against Marrow (and the Reference)"
+CHAIN_DRIVER_SRC="$ROOT/tribunal/fixtures/c4/stage0_chain_driver.c"
+chain_driver_sha=$(sha256sum "$CHAIN_DRIVER_SRC" | cut -d' ' -f1)
+CHAIN_OBJS=("$ART_DIR/Init_Prelude.c.o" "$ART_DIR/Init_Coe.c.o" \
+    "$ART_DIR/Init_Notation.c.o" "$ART_DIR/Init_Tactics.c.o" \
+    "$ART_DIR/Init_SizeOf.c.o")
+for obj in "${CHAIN_OBJS[@]}"; do
+    [ -f "$obj" ] || fail chain_exec_setup "\"detail\":\"lane-4 object missing: $(basename "$obj")\""
+done
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$CHAIN_DRIVER_SRC" "${CHAIN_OBJS[@]}" "$STATICLIB" -lpthread -ldl -lm \
+    -o "$ART_DIR/chain_marrow" >"$ART_DIR/gcc_chain_marrow.log" 2>&1; then
+    fail chain_exec_link "\"artifact\":\"gcc_chain_marrow.log\""
+fi
+if ! "$ART_DIR/chain_marrow" >"$ART_DIR/facts_chain_marrow.ndjson" 2>"$ART_DIR/chain_marrow.err"; then
+    fail chain_exec_run "\"artifact\":\"chain_marrow.err\""
+fi
+emit chain_exec_marrow passed "\"facts\":$(wc -l <"$ART_DIR/facts_chain_marrow.ndjson"),\"driver_sha256\":\"$chain_driver_sha\",\"objects\":${#CHAIN_OBJS[@]}"
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$CHAIN_DRIVER_SRC" "${CHAIN_OBJS[@]}" -L "$ELAN_TC/lib/lean" -lleanshared -Wl,-rpath,"$ELAN_TC/lib/lean" \
+    -o "$ART_DIR/chain_reference" >"$ART_DIR/gcc_chain_reference.log" 2>&1; then
+    fail chain_exec_ref_link "\"artifact\":\"gcc_chain_reference.log\""
+fi
+if ! "$ART_DIR/chain_reference" >"$ART_DIR/facts_chain_reference.ndjson" 2>"$ART_DIR/chain_reference.err"; then
+    fail chain_exec_ref_run "\"artifact\":\"chain_reference.err\""
+fi
+if diff -u "$ART_DIR/facts_chain_reference.ndjson" "$ART_DIR/facts_chain_marrow.ndjson" >"$ART_DIR/chain_facts.diff"; then
+    emit chain_exec_differential passed "\"facts\":$(wc -l <"$ART_DIR/facts_chain_marrow.ndjson"),\"artifact\":\"chain_facts.diff\""
+else
+    fail chain_exec_differential "\"artifact\":\"chain_facts.diff\""
 fi
 
 # ---- lane 7: panic parity ------------------------------------------------------
