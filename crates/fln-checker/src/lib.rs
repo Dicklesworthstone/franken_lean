@@ -1,21 +1,23 @@
 //! **fln-checker** — the independent kernel checker — deliberately different algorithms, its own decoder, WASM-clean; a consensus council member, never an authority (plan §8.3b).
 //!
-//! Stub crate: charter only. Implementation arrives with its workstream beads
-//! (`franken_lean-gii`); the crate map and layering are governed by
-//! `WORKSPACE_GRAPH.txt` (bead fln-8mj).
+//! The implementation begins with the parts that must not be retrofitted after
+//! performance pressure appears: a versioned deterministic sampling policy, a
+//! checker-owned canonical-wire decoder, and eager universe semantics. Declaration
+//! checking remains on `franken_lean-gii`; the crate map and layering are governed
+//! by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first
 //!
 //! `franken_lean-gii` requires this crate to share "only reviewed data schemas"
 //! with `fln-kernel`. That phrase decides what "independent" means, so it is
-//! written down here, **before** any implementation exists, rather than being
-//! back-derived from whatever the first implementation happened to do.
+//! preserved from the charter written **before** implementation began, rather than
+//! being back-derived from whatever the first implementation happened to do.
 //!
 //! ## What the build already enforces
 //!
 //! `ci/WORKSPACE_GRAPH.txt` prohibits `fln-checker ->* fln-kernel`,
-//! `fln-olean`, `fln-rt` and `fln-unsafe-*`, and allows only `fln-core`,
-//! `fln-hash` and `fln-bignum`. Note `fln-kernel` may depend on `fln-env` and
+//! `fln-olean`, `fln-rt` and `fln-unsafe-*`, and allows only `fln-core` and
+//! `fln-hash`. Note `fln-kernel` may depend on `fln-env` and
 //! this crate may **not**: the checker brings its own environment and name
 //! resolution as well as its own decoder. So the two obvious fake
 //! independences — a wrapper over `fln-olean`'s decoder, or anything reusing
@@ -107,13 +109,12 @@
 //! sum is a wrong verdict in the same way a wrong universe comparison is. Two
 //! engines sharing one arithmetic implementation do not check arithmetic.
 //!
-//! This resolves the contradiction recorded below in favour of `gii`:
-//! `WORKSPACE_GRAPH.txt` permits `fln-checker -> fln-bignum`, and `gii`'s REVIEW
-//! AMENDMENT forbids sharing its semantic path. **The bead is right and the
-//! graph is too permissive.** The checker wants a deliberately simple, slow,
+//! This resolved the contradiction recorded below in favour of `gii`: the graph
+//! once permitted `fln-checker -> fln-bignum`, while `gii`'s REVIEW AMENDMENT
+//! forbade sharing its semantic path. The checker wants a deliberately simple, slow,
 //! obviously-correct numeric implementation of its own — which is also why
-//! `gii` asks for "deliberately simple" rather than "fast". Tightening the
-//! graph is `ci/`-owned and belongs to whoever owns that file, not here.
+//! `gii` asks for "deliberately simple" rather than "fast". The current graph
+//! tightening is recorded in the re-measurement below.
 //!
 //! ### SCHEMA — shared on purpose
 //!
@@ -136,14 +137,14 @@
 //!
 //! This section previously said two prohibitions were missing. **One of them has
 //! landed**, and the paragraph outlived it — which is the defect this crate's own
-//! matrix row was corrected for once already (`witness.rs:538`, where
+//! matrix row was corrected for once already (`witness.rs:539`, where
 //! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
 //! throughout). So the state is measured here rather than remembered, at
 //! `53a5e3ec`:
 //!
 //! 1. **DONE.** `fln-checker -> fln-bignum` is no longer permitted.
-//!    `WORKSPACE_GRAPH.txt:113` reads
-//!    `allow-direct fln-checker = fln-core, fln-hash`. `gii`'s REVIEW AMENDMENT
+//!    The `allow-direct fln-checker` declaration reads `fln-core, fln-hash`.
+//!    `gii`'s REVIEW AMENDMENT
 //!    is satisfied, so the checker must bring its own arithmetic. Note the old
 //!    text cited `WORKSPACE_GRAPH.txt:110`, which is now *fln-kernel's*
 //!    allowlist: a line-number citation moved under the claim, so cite the
@@ -188,10 +189,10 @@
 //!   remainder is any size but three. **A remainder that is counted is a remainder
 //!   somebody has to argue for; this bullet used to be the sentence "that half
 //!   remains a document", and it was false.**
-//! * **VACUOUS TODAY, deliberately.** There is no checking code here, so
-//!   `FLN-STRUCT-037` currently refuses nothing. It was installed before the
-//!   implementation on purpose: the boundary is cheapest to hold before the first
-//!   line that would cross it exists.
+//! * **LIVE AGAINST REAL CODE.** The foundation modules now contain policy, wire, and
+//!   universe algorithms. `FLN-STRUCT-037` scans those production sources, so the
+//!   boundary is no longer exercised only by planted fixtures. The checker still has
+//!   no declaration-admission authority and cannot acquire one through this crate.
 //!
 //! Nobody should read the existence of this section as evidence that the whole
 //! boundary holds; read the two bullets above for which half does.
@@ -286,7 +287,7 @@
 //! cite crates/fln-hash/src/canon.rs:1133 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:631 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
-//! cite crates/fln-conformance/src/witness.rs:538 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite crates/fln-conformance/src/witness.rs:539 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:1113 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1296 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1306 :: fn every_semantic_item_is_refused_inside_fln_checker
@@ -320,3 +321,7 @@
 //! the assumption that produced the plausible-looking `witness.rs:479 (historical)` this
 //! registry exists to prevent.
 #![forbid(unsafe_code)]
+
+pub mod policy;
+pub mod universe;
+pub mod wire;

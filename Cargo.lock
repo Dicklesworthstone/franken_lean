@@ -30,6 +30,10 @@ dependencies = [
 [[package]]
 name = "fln-checker"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-hash",
+]
 
 [[package]]
 name = "fln-cli"

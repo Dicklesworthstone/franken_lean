@@ -9,8 +9,9 @@
 //!
 //! # Why this is the first test this crate has
 //!
-//! `fln-checker` is a charter-only stub: its implementation arrives with `franken_lean-gii`.
-//! But the charter is not inert prose — it is the constitutional statement of what
+//! `fln-checker` began as a charter-only stub; its implementation now arrives in
+//! bounded `franken_lean-gii` foundation slices. The charter is not inert prose — it
+//! is the constitutional statement of what
 //! "independent" means for the second engine of the dual-engine claim, written deliberately
 //! *before* any implementation so it cannot be back-derived from whatever the first one
 //! happened to do. Its authority rests on 33 line numbers across six files in five crates that
