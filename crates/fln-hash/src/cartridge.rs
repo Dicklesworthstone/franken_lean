@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fln_core::diag::ResourceReason;
 use fln_core::mode::{ContentRoot, EpochId, Mode};
-use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
+use fln_core::outcome::{
+    Inconclusive, InconclusiveCause, InternalFault, Outcome, ResourceUsage,
+};
 
 use crate::canon::{
     CanonError, CanonReader, CanonWriter, DecodeBudget, SCHEMA_CARTRIDGE_ARCHIVE,
@@ -267,6 +269,33 @@ pub struct WarmDefeqBindingV1 {
     pub fuel_profile_root: ContentRoot,
 }
 
+/// Consumer-owned coordinates required before a warm cache can supply replay hints.
+///
+/// Receipt and certificate identities come from the attachment being classified.
+/// Everything in this type comes from the verifying process, never from the cache
+/// being judged; deriving it from the cache would make the comparison tautological.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmDefeqContextV1 {
+    pub epoch: EpochId,
+    pub mode: Mode,
+    pub environment_root: ContentRoot,
+    pub kernel_build_root: ContentRoot,
+    pub checker_build_root: ContentRoot,
+    pub policy_root: ContentRoot,
+    pub fuel_profile_root: ContentRoot,
+}
+
+impl WarmDefeqBindingV1 {
+    /// Classify all nine binding coordinates as one indivisible replay-hint key.
+    pub fn classify_against(&self, expected: &WarmDefeqBindingV1) -> WarmCacheStateV1 {
+        if self == expected {
+            WarmCacheStateV1::CurrentAndBound
+        } else {
+            WarmCacheStateV1::BindingMismatch
+        }
+    }
+}
+
 /// OQ-13 v1 warm-cache payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WarmDefeqCacheV1 {
@@ -282,8 +311,10 @@ pub enum CartridgeRuleV1 {
     TooManyChunks,
     TooManyObjectChunks,
     TooManyAttachments,
+    TooManyRootReceipts,
     TooManyWarmEntries,
     TooManyTraceRoots,
+    TooManyExtensions,
     EmptyRootReceipts,
     RootReceiptsNotStrictlySorted,
     ObjectsNotStrictlySorted,
@@ -307,6 +338,7 @@ pub enum CartridgeRuleV1 {
     RootReceiptOptional,
     MissingAttachmentReceipt,
     AttachmentReceiptWrongKind,
+    AttachmentReceiptNotRoot,
     MissingAttachedObject,
     AttachmentRoleKindMismatch,
     WarmCacheAttachmentCount,
@@ -336,7 +368,7 @@ pub enum CartridgeRefusalV1 {
     MissingObject { object: CartridgeObjectIdV1 },
     MissingChunk { chunk: CartridgeChunkIdV1 },
     DuplicateFrame { chunk: CartridgeChunkIdV1 },
-    WarmCacheBindingMismatch { cache: CartridgeObjectIdV1 },
+    ConflictingObjectDeclaration { object: CartridgeObjectIdV1 },
 }
 
 pub type WarmDefeqDecodeOutcomeV1 = Outcome<Result<WarmDefeqCacheV1, CartridgeRefusalV1>>;
@@ -534,6 +566,53 @@ pub const fn warm_cache_action(state: WarmCacheStateV1) -> WarmCacheActionV1 {
         | WarmCacheStateV1::ReplayFailed
         | WarmCacheStateV1::UnknownCriticalExtension => WarmCacheActionV1::VerifyWithoutCache,
         WarmCacheStateV1::InternalFault => WarmCacheActionV1::QuarantineAndVerifyIndependently,
+    }
+}
+
+/// One typed, non-authoritative decision about an optional warm-cache attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarmCacheDecisionV1 {
+    pub cache_object: CartridgeObjectIdV1,
+    pub state: WarmCacheStateV1,
+    pub action: WarmCacheActionV1,
+}
+
+/// Decisions remain diagnostic data; callers may use only entries whose action is
+/// [`WarmCacheActionV1::ReplayHints`], and must still replay those hints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmCacheAttachmentReportV1 {
+    pub decisions: Vec<WarmCacheDecisionV1>,
+}
+
+impl WarmCacheAttachmentReportV1 {
+    pub fn replayable(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|decision| decision.action == WarmCacheActionV1::ReplayHints)
+            .count()
+    }
+
+    pub fn missing(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|decision| decision.state == WarmCacheStateV1::Absent)
+            .count()
+    }
+
+    pub fn bypassed(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|decision| decision.action == WarmCacheActionV1::VerifyWithoutCache)
+            .count()
+    }
+
+    pub fn quarantined(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|decision| {
+                decision.action == WarmCacheActionV1::QuarantineAndVerifyIndependently
+            })
+            .count()
     }
 }
 
@@ -780,6 +859,12 @@ impl CartridgeManifestV1 {
         if self.attachments.len() > MAX_ATTACHMENTS_V1 {
             return invalid(CartridgeRuleV1::TooManyAttachments, self.attachments.len());
         }
+        if self.root_receipts.len() > MAX_CARTRIDGE_OBJECTS_V1 {
+            return invalid(
+                CartridgeRuleV1::TooManyRootReceipts,
+                self.root_receipts.len(),
+            );
+        }
         if self.root_receipts.is_empty() {
             return invalid(CartridgeRuleV1::EmptyRootReceipts, 0);
         }
@@ -824,6 +909,13 @@ impl CartridgeManifestV1 {
             };
             if receipt.kind != CartridgeObjectKindV1::Receipt {
                 return invalid(CartridgeRuleV1::AttachmentReceiptWrongKind, index);
+            }
+            if self
+                .root_receipts
+                .binary_search(&attachment.receipt)
+                .is_err()
+            {
+                return invalid(CartridgeRuleV1::AttachmentReceiptNotRoot, index);
             }
             let Some(object) = self.object(attachment.object) else {
                 return invalid(CartridgeRuleV1::MissingAttachedObject, index);
@@ -1128,36 +1220,70 @@ impl CartridgeArchiveV1 {
     }
 
     /// Reassemble one object after checking every frame and the whole-object identity.
-    /// Missing frames are a completed partial-transport fact, represented as `Ok(None)`.
+    ///
+    /// Missing frames are a completed partial-transport fact (`Complete(Ok(None))`).
+    /// The declared logical length is checked against the caller's memory allowance
+    /// before allocation, so repeated references to one small shared frame cannot
+    /// expand into an unbounded object behind a compact archive.
     pub fn assemble_object(
         &self,
         id: CartridgeObjectIdV1,
-    ) -> Result<Option<Vec<u8>>, CartridgeRefusalV1> {
+        max_object_bytes: u64,
+    ) -> Outcome<Result<Option<Vec<u8>>, CartridgeRefusalV1>> {
         let Some(object) = self.manifest.object(id) else {
-            return Err(CartridgeRefusalV1::MissingObject { object: id });
+            return Outcome::Complete(Err(CartridgeRefusalV1::MissingObject { object: id }));
         };
-        let mut bytes = Vec::new();
+        let allowed = max_object_bytes.min(isize::MAX as u64);
+        if object.len > allowed {
+            return Outcome::Inconclusive(
+                Inconclusive::resource(ResourceUsage {
+                    reason: ResourceReason::Memory {
+                        limit_bytes: allowed,
+                    },
+                    allowed,
+                    observed: object.len,
+                })
+                .with_progress(format!("assemble cartridge object {}", object.id.digest())),
+            );
+        }
+        let capacity = match usize::try_from(object.len) {
+            Ok(capacity) => capacity,
+            Err(_) => {
+                return Outcome::InternalFault(
+                    InternalFault::new(
+                        "FL-INV-07",
+                        "a cartridge object within the address-space limit did not fit usize",
+                    )
+                    .with_evidence("fln_hash::cartridge::CartridgeArchiveV1::assemble_object"),
+                );
+            }
+        };
+        let mut bytes = Vec::with_capacity(capacity);
         for chunk_ref in &object.chunks {
             let Some(frame) = self.frame(chunk_ref.id) else {
-                return Ok(None);
+                return Outcome::Complete(Ok(None));
             };
             bytes.extend_from_slice(&frame.bytes);
         }
         if cartridge_object_id(object.kind, &bytes) != object.id {
-            return invalid(CartridgeRuleV1::ObjectDigestMismatch, 0);
+            return Outcome::Complete(invalid(CartridgeRuleV1::ObjectDigestMismatch, 0));
         }
-        Ok(Some(bytes))
+        Outcome::Complete(Ok(Some(bytes)))
     }
 
-    /// Decode and bind every present OQ-13 cache. Missing optional cache frames are
-    /// counted, not promoted to a transport rejection.
-    pub fn validate_present_warm_caches(
+    /// Classify every optional OQ-13 cache against consumer-owned coordinates.
+    ///
+    /// A stale, malformed, unsupported, cancelled, or resource-limited cache is a
+    /// decision to verify without hints, not a cartridge rejection. Only a failure
+    /// of the outer content-addressed object graph remains a transport refusal.
+    pub fn classify_present_warm_caches(
         &self,
+        context: &WarmDefeqContextV1,
         budget: DecodeBudget,
-    ) -> Outcome<Result<WarmCacheAttachmentReportV1, CartridgeRefusalV1>> {
+        max_cache_bytes: u64,
+    ) -> Result<WarmCacheAttachmentReportV1, CartridgeRefusalV1> {
         let mut report = WarmCacheAttachmentReportV1 {
-            validated: 0,
-            missing: 0,
+            decisions: Vec::new(),
         };
         for attachment in self
             .manifest
@@ -1165,40 +1291,74 @@ impl CartridgeArchiveV1 {
             .iter()
             .filter(|attachment| attachment.role == AttachmentRoleV1::WarmDefeqCache)
         {
-            let Some(bytes) = (match self.assemble_object(attachment.object) {
-                Ok(bytes) => bytes,
-                Err(refusal) => return Outcome::Complete(Err(refusal)),
-            }) else {
-                report.missing += 1;
-                continue;
+            let assembled = self.assemble_object(attachment.object, max_cache_bytes);
+            let state = match assembled {
+                Outcome::Complete(Ok(Some(bytes))) => {
+                    match WarmDefeqCacheV1::from_canonical_bytes_budgeted(&bytes, budget) {
+                        Outcome::Complete(Ok(cache)) => {
+                            let certificate_is_attached =
+                                self.manifest.attachments.iter().any(|candidate| {
+                                    candidate.receipt == attachment.receipt
+                                        && candidate.role == AttachmentRoleV1::Certificate
+                                        && candidate.object == cache.binding.certificate_object
+                                });
+                            let expected = WarmDefeqBindingV1 {
+                                receipt_object: attachment.receipt,
+                                certificate_object: cache.binding.certificate_object,
+                                epoch: context.epoch,
+                                mode: context.mode,
+                                environment_root: context.environment_root,
+                                kernel_build_root: context.kernel_build_root,
+                                checker_build_root: context.checker_build_root,
+                                policy_root: context.policy_root,
+                                fuel_profile_root: context.fuel_profile_root,
+                            };
+                            if !certificate_is_attached
+                                || context.epoch != self.manifest.epoch
+                                || context.environment_root != self.manifest.environment_root
+                            {
+                                WarmCacheStateV1::BindingMismatch
+                            } else {
+                                cache.binding.classify_against(&expected)
+                            }
+                        }
+                        Outcome::Complete(Err(refusal)) => {
+                            warm_cache_refusal_state(&refusal)
+                        }
+                        Outcome::Inconclusive(stop) => match stop.cause {
+                            InconclusiveCause::Cancelled { .. } => WarmCacheStateV1::Cancelled,
+                            InconclusiveCause::ResourceExhausted { .. } => {
+                                WarmCacheStateV1::ResourceLimited
+                            }
+                            InconclusiveCause::DependencyUnavailable { .. }
+                            | InconclusiveCause::AuthorityIncomplete { .. } => {
+                                WarmCacheStateV1::InternalFault
+                            }
+                        },
+                        Outcome::InternalFault(_) => WarmCacheStateV1::InternalFault,
+                    }
+                }
+                Outcome::Complete(Ok(None)) => WarmCacheStateV1::Absent,
+                Outcome::Complete(Err(refusal)) => return Err(refusal),
+                Outcome::Inconclusive(stop) => match stop.cause {
+                    InconclusiveCause::Cancelled { .. } => WarmCacheStateV1::Cancelled,
+                    InconclusiveCause::ResourceExhausted { .. } => {
+                        WarmCacheStateV1::ResourceLimited
+                    }
+                    InconclusiveCause::DependencyUnavailable { .. }
+                    | InconclusiveCause::AuthorityIncomplete { .. } => {
+                        WarmCacheStateV1::InternalFault
+                    }
+                },
+                Outcome::InternalFault(_) => WarmCacheStateV1::InternalFault,
             };
-            let cache = match WarmDefeqCacheV1::from_canonical_bytes_budgeted(&bytes, budget) {
-                Outcome::Complete(Ok(cache)) => cache,
-                Outcome::Complete(Err(refusal)) => return Outcome::Complete(Err(refusal)),
-                Outcome::Inconclusive(stop) => return Outcome::Inconclusive(stop),
-                Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
-            };
-            let certificate = self
-                .manifest
-                .attachments
-                .iter()
-                .find(|candidate| {
-                    candidate.receipt == attachment.receipt
-                        && candidate.role == AttachmentRoleV1::Certificate
-                })
-                .map(|candidate| candidate.object);
-            if cache.binding.receipt_object != attachment.receipt
-                || certificate != Some(cache.binding.certificate_object)
-                || cache.binding.epoch != self.manifest.epoch
-                || cache.binding.environment_root != self.manifest.environment_root
-            {
-                return Outcome::Complete(Err(CartridgeRefusalV1::WarmCacheBindingMismatch {
-                    cache: attachment.object,
-                }));
-            }
-            report.validated += 1;
+            report.decisions.push(WarmCacheDecisionV1 {
+                cache_object: attachment.object,
+                state,
+                action: warm_cache_action(state),
+            });
         }
-        Outcome::Complete(Ok(report))
+        Ok(report)
     }
 
     fn validate(&self) -> Result<(), CartridgeRefusalV1> {
@@ -1213,10 +1373,24 @@ impl CartridgeArchiveV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WarmCacheAttachmentReportV1 {
-    pub validated: usize,
-    pub missing: usize,
+fn warm_cache_refusal_state(refusal: &CartridgeRefusalV1) -> WarmCacheStateV1 {
+    match refusal {
+        CartridgeRefusalV1::UnsupportedVersion { .. } => WarmCacheStateV1::UnsupportedVersion,
+        CartridgeRefusalV1::InvalidStructure {
+            rule: CartridgeRuleV1::UnknownCriticalExtension,
+            ..
+        } => WarmCacheStateV1::UnknownCriticalExtension,
+        CartridgeRefusalV1::SchemaNameMismatch { .. }
+        | CartridgeRefusalV1::Malformed(_)
+        | CartridgeRefusalV1::InvalidStructure { .. }
+        | CartridgeRefusalV1::PortabilityMismatch { .. }
+        | CartridgeRefusalV1::MissingObject { .. }
+        | CartridgeRefusalV1::MissingChunk { .. }
+        | CartridgeRefusalV1::DuplicateFrame { .. }
+        | CartridgeRefusalV1::ConflictingObjectDeclaration { .. } => {
+            WarmCacheStateV1::Malformed
+        }
+    }
 }
 
 fn validate_frame(
@@ -1626,7 +1800,7 @@ fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
 
 fn validate_extensions(extensions: &[CartridgeExtensionV1]) -> Result<(), CartridgeRefusalV1> {
     if extensions.len() > MAX_EXTENSIONS_V1 {
-        return invalid(CartridgeRuleV1::TooManyAttachments, extensions.len());
+        return invalid(CartridgeRuleV1::TooManyExtensions, extensions.len());
     }
     if !extensions.windows(2).all(|pair| pair[0].id < pair[1].id) {
         return invalid(CartridgeRuleV1::ExtensionsNotStrictlySorted, 0);
