@@ -241,6 +241,7 @@ pub struct WhnfResult {
     pub term: WireExpr,
     pub steps: u64,
     pub reductions: u64,
+    pub delta_reductions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,6 +398,13 @@ struct ProjectionFrame {
     outer_arguments: VecDeque<Cursor>,
 }
 
+#[derive(Clone, Copy)]
+enum DeltaMode {
+    Eager,
+    Disabled,
+    Once,
+}
+
 enum HeadAction {
     Metadata(ExprId),
     Let { value: ExprId, body: ExprId },
@@ -412,6 +420,8 @@ struct Reducer<'a, 'c> {
     control: Control,
     cancelled: &'c mut dyn FnMut() -> bool,
     unfolded_bindings: BTreeSet<usize>,
+    delta_mode: DeltaMode,
+    delta_reductions: u64,
 }
 
 impl<'a, 'c> Reducer<'a, 'c> {
@@ -831,7 +841,13 @@ impl<'a, 'c> Reducer<'a, 'c> {
                     continue;
                 }
                 HeadAction::Constant => {
-                    if let Some(unfolded) = self.unfold_definition(&current)? {
+                    let may_unfold = match self.delta_mode {
+                        DeltaMode::Eager => true,
+                        DeltaMode::Disabled => false,
+                        DeltaMode::Once => self.delta_reductions == 0,
+                    };
+                    if may_unfold && let Some(unfolded) = self.unfold_definition(&current)? {
+                        self.delta_reductions = self.delta_reductions.saturating_add(1);
                         current = unfolded;
                         continue;
                     }
@@ -901,6 +917,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 term,
                 steps: self.control.steps,
                 reductions: self.control.reductions,
+                delta_reductions: self.delta_reductions,
             });
         }
     }
@@ -1435,6 +1452,37 @@ pub(crate) fn whnf_at_with(
     budget: WhnfBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> WhnfOutcome {
+    whnf_at_mode_with(term, root, context, budget, DeltaMode::Eager, cancelled)
+}
+
+pub(crate) fn whnf_core_at_with(
+    term: &WireExpr,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfOutcome {
+    whnf_at_mode_with(term, root, context, budget, DeltaMode::Disabled, cancelled)
+}
+
+pub(crate) fn whnf_delta_step_at_with(
+    term: &WireExpr,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfOutcome {
+    whnf_at_mode_with(term, root, context, budget, DeltaMode::Once, cancelled)
+}
+
+fn whnf_at_mode_with(
+    term: &WireExpr,
+    root: ExprId,
+    context: &WhnfContext,
+    budget: WhnfBudget,
+    delta_mode: DeltaMode,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> WhnfOutcome {
     let mut control = Control::new(budget);
     let prepared = match PreparedContext::prepare(context, &mut control, cancelled) {
         Ok(prepared) => prepared,
@@ -1447,6 +1495,8 @@ pub(crate) fn whnf_at_with(
         control,
         cancelled,
         unfolded_bindings: BTreeSet::new(),
+        delta_mode,
+        delta_reductions: 0,
     };
     outcome(reducer.run(term, root))
 }

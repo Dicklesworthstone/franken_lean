@@ -3,17 +3,19 @@
 //! The KR-300 through KR-303 quick front end proves structural congruence,
 //! treats metadata as transparent, ignores binder presentation, and compares
 //! `Sort` levels with this checker's independent universe relation. Deferred
-//! pairs can continue through an environment-free slow worklist that invokes
-//! the checker-owned eager WHNF only where structural comparison is stuck.
-//! Delta, typing, eta, proof irrelevance, recursors, native computation, and
-//! literal expansion still produce a typed deferral. A deferral is not a
-//! rejection and this module is not a declaration-admission authority.
+//! pairs continue through a slow worklist that first takes a no-delta weak head,
+//! then unfolds safe definition heads one step at a time in descending
+//! definitional-height order. Typing, eta, proof irrelevance, recursors, native
+//! computation, and literal expansion still produce a typed deferral. A
+//! deferral is not a rejection and this module is not a declaration-admission
+//! authority.
 
 use std::collections::BTreeSet;
 
 use crate::universe::{UniverseError, level_roots_equal};
 use crate::whnf::{
-    WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_at_with,
+    WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_core_at_with,
+    whnf_delta_step_at_with,
 };
 use crate::wire::{
     ExprId, ExprNode, WireExpr, expression_owned_units, level_owned_units, usize_units,
@@ -134,7 +136,7 @@ pub enum QuickDefEqOutcome {
     InternalFault(QuickDefEqFault),
 }
 
-/// Aggregate bounds for one environment-free conversion query.
+/// Aggregate bounds for one conversion query.
 ///
 /// The quick and WHNF budgets retain their own meanings. The slow bounds apply
 /// across the entire query rather than resetting for each stuck subterm.
@@ -209,6 +211,7 @@ pub struct DefEqProgress {
     pub normalizations: u64,
     pub whnf_steps: u64,
     pub whnf_reductions: u64,
+    pub delta_unfolds: u64,
     pub materialized_arena_nodes: u64,
     pub materialized_owned_units: u64,
 }
@@ -809,6 +812,10 @@ impl SlowControl {
             .progress
             .whnf_reductions
             .saturating_add(result.reductions);
+        self.progress.delta_unfolds = self
+            .progress
+            .delta_unfolds
+            .saturating_add(result.delta_reductions);
         self.poll(cancelled)?;
         let produced = usize_units(result.term.nodes().len())
             .saturating_add(usize_units(result.term.levels().len()));
@@ -869,6 +876,27 @@ fn source_term<'a>(
                     generation: usize_units(index).saturating_add(1),
                 }))
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TermSources<'a> {
+    left: &'a WireExpr,
+    right: &'a WireExpr,
+    generated: &'a [WireExpr],
+}
+
+impl<'a> TermSources<'a> {
+    fn new(left: &'a WireExpr, right: &'a WireExpr, generated: &'a [WireExpr]) -> TermSources<'a> {
+        TermSources {
+            left,
+            right,
+            generated,
+        }
+    }
+
+    fn source(self, reference: DefEqTerm) -> Result<&'a WireExpr, SlowHalt> {
+        source_term(reference, self.left, self.right, self.generated)
     }
 }
 
@@ -1182,18 +1210,75 @@ fn compare_pair(
     }
 }
 
+fn definition_height(
+    reference: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Option<u32>, SlowHalt> {
+    let term = sources.source(reference)?;
+    let mut current = reference;
+    loop {
+        control.comparison(cancelled)?;
+        let node =
+            term.node(current.root)
+                .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                    location: current.location(),
+                }))?;
+        match node {
+            ExprNode::Apply { function, .. } => {
+                current = child(current, *function)?;
+            }
+            ExprNode::Metadata { expression, .. } => {
+                current = child(current, *expression)?;
+            }
+            ExprNode::Constant { name, .. } => {
+                return Ok(context
+                    .definitions()
+                    .find(name)
+                    .filter(|definition| definition.is_delta_unfoldable())
+                    .map(|definition| definition.hint().delta_height()));
+            }
+            ExprNode::Bound { .. }
+            | ExprNode::Free { .. }
+            | ExprNode::Meta { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Lambda { .. }
+            | ExprNode::Forall { .. }
+            | ExprNode::Let { .. }
+            | ExprNode::NatLiteral { .. }
+            | ExprNode::StringLiteral(_)
+            | ExprNode::Projection { .. } => return Ok(None),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NormalizationMode {
+    Core,
+    DeltaStep,
+}
+
 fn normalize(
     reference: DefEqTerm,
-    left: &WireExpr,
-    right: &WireExpr,
-    generated: &[WireExpr],
+    sources: TermSources<'_>,
     context: &WhnfContext,
+    mode: NormalizationMode,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<crate::whnf::WhnfResult, SlowHalt> {
     let budget = control.begin_normalization(cancelled)?;
-    let term = source_term(reference, left, right, generated)?;
-    match whnf_at_with(term, reference.root, context, budget, cancelled) {
+    let term = sources.source(reference)?;
+    let outcome = match mode {
+        NormalizationMode::Core => {
+            whnf_core_at_with(term, reference.root, context, budget, cancelled)
+        }
+        NormalizationMode::DeltaStep => {
+            whnf_delta_step_at_with(term, reference.root, context, budget, cancelled)
+        }
+    };
+    match outcome {
         WhnfOutcome::Complete(result) => {
             control.absorb_whnf(&result, cancelled)?;
             Ok(result)
@@ -1267,40 +1352,101 @@ fn run_slow(
             PairAction::Normalize(need) => {
                 let left_result = normalize(
                     left_reference,
-                    left,
-                    right,
-                    &generated,
+                    TermSources::new(left, right, &generated),
                     context,
+                    NormalizationMode::Core,
                     &mut control,
                     cancelled,
                 )?;
                 let right_result = normalize(
                     right_reference,
-                    left,
-                    right,
-                    &generated,
+                    TermSources::new(left, right, &generated),
                     context,
+                    NormalizationMode::Core,
                     &mut control,
                     cancelled,
                 )?;
                 let left_changed = left_result.reductions != 0;
                 let right_changed = right_result.reductions != 0;
-                if !left_changed && !right_changed {
-                    return Ok(DefEqOutcome::Deferred {
-                        need,
-                        progress: control.progress,
-                    });
+                if left_changed || right_changed {
+                    let next_left = if left_changed {
+                        retain_generated(&mut generated, DefEqSide::Left, left_result.term)
+                    } else {
+                        left_reference
+                    };
+                    let next_right = if right_changed {
+                        retain_generated(&mut generated, DefEqSide::Right, right_result.term)
+                    } else {
+                        right_reference
+                    };
+                    pending.push((next_left, next_right));
+                    continue;
                 }
-                let next_left = if left_changed {
-                    retain_generated(&mut generated, DefEqSide::Left, left_result.term)
-                } else {
-                    left_reference
+
+                let left_height = definition_height(
+                    left_reference,
+                    TermSources::new(left, right, &generated),
+                    context,
+                    &mut control,
+                    cancelled,
+                )?;
+                let right_height = definition_height(
+                    right_reference,
+                    TermSources::new(left, right, &generated),
+                    context,
+                    &mut control,
+                    cancelled,
+                )?;
+                let (unfold_left, unfold_right) = match (left_height, right_height) {
+                    (None, None) => {
+                        return Ok(DefEqOutcome::Deferred {
+                            need,
+                            progress: control.progress,
+                        });
+                    }
+                    (Some(_), None) => (true, false),
+                    (None, Some(_)) => (false, true),
+                    (Some(left_height), Some(right_height)) => {
+                        (left_height >= right_height, right_height >= left_height)
+                    }
                 };
-                let next_right = if right_changed {
-                    retain_generated(&mut generated, DefEqSide::Right, right_result.term)
-                } else {
-                    right_reference
-                };
+
+                let mut next_left = left_reference;
+                let mut next_right = right_reference;
+                if unfold_left {
+                    let result = normalize(
+                        left_reference,
+                        TermSources::new(left, right, &generated),
+                        context,
+                        NormalizationMode::DeltaStep,
+                        &mut control,
+                        cancelled,
+                    )?;
+                    if result.delta_reductions == 0 {
+                        return Ok(DefEqOutcome::Deferred {
+                            need,
+                            progress: control.progress,
+                        });
+                    }
+                    next_left = retain_generated(&mut generated, DefEqSide::Left, result.term);
+                }
+                if unfold_right {
+                    let result = normalize(
+                        right_reference,
+                        TermSources::new(left, right, &generated),
+                        context,
+                        NormalizationMode::DeltaStep,
+                        &mut control,
+                        cancelled,
+                    )?;
+                    if result.delta_reductions == 0 {
+                        return Ok(DefEqOutcome::Deferred {
+                            need,
+                            progress: control.progress,
+                        });
+                    }
+                    next_right = retain_generated(&mut generated, DefEqSide::Right, result.term);
+                }
                 pending.push((next_left, next_right));
             }
         }
@@ -1351,7 +1497,7 @@ fn map_quick_mismatch(mismatch: QuickDefEqMismatch) -> DefEqMismatch {
     }
 }
 
-/// Run the counted quick phase followed by environment-free slow conversion.
+/// Run the counted quick phase followed by height-ordered slow conversion.
 pub fn def_eq(
     left: &WireExpr,
     right: &WireExpr,
@@ -1361,7 +1507,7 @@ pub fn def_eq(
     def_eq_with(left, right, context, budget, || false)
 }
 
-/// Run pure conversion with cooperative cancellation shared by every phase.
+/// Run conversion with cooperative cancellation shared by every phase.
 pub fn def_eq_with(
     left: &WireExpr,
     right: &WireExpr,

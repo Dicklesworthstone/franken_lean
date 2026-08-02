@@ -67,6 +67,33 @@ fn slow_equal(
     }
 }
 
+fn definition_entry(
+    definition_name: impl Into<String>,
+    value: WireExpr,
+    hint: ReducibilityHint,
+    safety: DefinitionSafety,
+) -> DefinitionEntry {
+    DefinitionEntry::new(
+        checker_name(definition_name),
+        Definition::new(
+            Vec::new(),
+            decoded(&Expr::sort(Level::zero())),
+            value,
+            hint,
+            safety,
+            Vec::new(),
+        ),
+    )
+}
+
+fn definition_context(entries: Vec<DefinitionEntry>) -> WhnfContext {
+    let environment = match DefinitionEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+        EnvironmentOutcome::Complete { environment, .. } => environment,
+        other => panic!("definition environment did not build: {other:?}"),
+    };
+    WhnfContext::new(Vec::new(), Vec::new(), environment)
+}
+
 fn equal(left: &WireExpr, right: &WireExpr) -> QuickDefEqResult {
     match quick_def_eq(left, right, QuickDefEqBudget::unlimited()) {
         QuickDefEqOutcome::Equal(result) => result,
@@ -441,6 +468,222 @@ fn eager_safe_definition_delta_is_visible_to_slow_conversion() {
             },
         }
     ));
+}
+
+#[test]
+fn lazy_delta_orders_by_height_and_unfolds_both_sides_only_on_a_tie() {
+    let context = definition_context(vec![
+        definition_entry(
+            "short",
+            decoded(&constant("terminal")),
+            ReducibilityHint::Regular(1),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "tall",
+            decoded(&constant("short")),
+            ReducibilityHint::Regular(10),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "equal_left",
+            decoded(&constant("terminal")),
+            ReducibilityHint::Regular(4),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "equal_right",
+            decoded(&constant("terminal")),
+            ReducibilityHint::Regular(4),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "opaque",
+            decoded(&constant("terminal")),
+            ReducibilityHint::Opaque,
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "regular_to_opaque",
+            decoded(&constant("opaque")),
+            ReducibilityHint::Regular(9),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "abbrev_to_short",
+            decoded(&constant("short")),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Safe,
+        ),
+    ]);
+
+    for (left, right) in [
+        ("tall", "short"),
+        ("regular_to_opaque", "opaque"),
+        ("abbrev_to_short", "short"),
+    ] {
+        let progress = slow_equal(
+            &decoded(&constant(left)),
+            &decoded(&constant(right)),
+            &context,
+        );
+        assert_eq!(
+            progress.delta_unfolds, 1,
+            "the greater-height side must close {left} against {right} in one delta step"
+        );
+    }
+
+    let tied = slow_equal(
+        &decoded(&constant("equal_left")),
+        &decoded(&constant("equal_right")),
+        &context,
+    );
+    assert_eq!(
+        tied.delta_unfolds, 2,
+        "equal heights must unfold both safe definition heads"
+    );
+}
+
+#[test]
+fn generated_height_permutations_close_by_unfolding_only_the_taller_alias() {
+    const CASES: usize = 320;
+    let mut entries = Vec::new();
+    for index in 0..CASES {
+        let lower = format!("generated_lower_{index}");
+        let higher = format!("generated_higher_{index}");
+        let terminal = format!("generated_terminal_{index}");
+        let lower_height = (index % 23) as u32;
+        entries.push(definition_entry(
+            lower.clone(),
+            decoded(&constant(terminal)),
+            ReducibilityHint::Regular(lower_height),
+            DefinitionSafety::Safe,
+        ));
+        entries.push(definition_entry(
+            higher,
+            decoded(&constant(lower)),
+            if index % 7 == 0 {
+                ReducibilityHint::Abbrev
+            } else {
+                ReducibilityHint::Regular(lower_height.saturating_add(1))
+            },
+            DefinitionSafety::Safe,
+        ));
+    }
+    let context = definition_context(entries);
+    for index in 0..CASES {
+        let progress = slow_equal(
+            &decoded(&constant(format!("generated_higher_{index}"))),
+            &decoded(&constant(format!("generated_lower_{index}"))),
+            &context,
+        );
+        assert_eq!(
+            progress.delta_unfolds, 1,
+            "generated height ordering drifted at case {index}"
+        );
+    }
+}
+
+#[test]
+fn lazy_delta_finds_safe_definition_heads_under_application_spines() {
+    let context = definition_context(vec![definition_entry(
+        "apply_identity",
+        decoded(&identity()),
+        ReducibilityHint::Opaque,
+        DefinitionSafety::Safe,
+    )]);
+    let payload = decoded(&constant("application_payload"));
+    let application = decoded(&Expr::app(
+        constant("apply_identity"),
+        constant("application_payload"),
+    ));
+    let progress = slow_equal(&application, &payload, &context);
+    assert_eq!(progress.delta_unfolds, 1);
+    assert!(
+        progress.whnf_reductions >= 2,
+        "one delta step must continue through the exposed beta redex"
+    );
+}
+
+#[test]
+fn lazy_delta_resources_cancellation_and_recursion_are_typed_and_recoverable() {
+    let context = definition_context(vec![
+        definition_entry(
+            "loop",
+            decoded(&constant("loop")),
+            ReducibilityHint::Regular(5),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "short",
+            decoded(&constant("terminal")),
+            ReducibilityHint::Regular(1),
+            DefinitionSafety::Safe,
+        ),
+        definition_entry(
+            "tall",
+            decoded(&constant("short")),
+            ReducibilityHint::Regular(10),
+            DefinitionSafety::Safe,
+        ),
+    ]);
+    let loop_term = decoded(&constant("loop"));
+    let terminal = decoded(&constant("terminal"));
+    assert!(matches!(
+        def_eq(
+            &loop_term,
+            &terminal,
+            &context,
+            DefEqBudget::new(
+                QuickDefEqBudget::unlimited(),
+                u64::MAX,
+                8,
+                u64::MAX,
+                u64::MAX,
+                WhnfBudget::unlimited(),
+            ),
+        ),
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::Normalizations,
+            allowed: 8,
+            observed: 9,
+            progress: fln_checker::defeq::DefEqProgress {
+                delta_unfolds: 2,
+                ..
+            },
+        })
+    ));
+
+    let tall = decoded(&constant("tall"));
+    let short = decoded(&constant("short"));
+    let mut saw_delta_cancellation = false;
+    for cancel_at in 1_u64..=128 {
+        let mut polls = 0_u64;
+        let interrupted = def_eq_with(&tall, &short, &context, DefEqBudget::unlimited(), || {
+            polls = polls.saturating_add(1);
+            polls >= cancel_at
+        });
+        if matches!(
+            interrupted,
+            DefEqOutcome::Inconclusive(DefEqStop::Whnf {
+                stop: WhnfStop::DefinitionInstantiation {
+                    stop: fln_checker::term::TermStop::Cancelled { .. },
+                    ..
+                },
+                ..
+            })
+        ) {
+            saw_delta_cancellation = true;
+            break;
+        }
+    }
+    assert!(
+        saw_delta_cancellation,
+        "cancellation must be observable inside a selected lazy-delta step"
+    );
+
+    let recovered = slow_equal(&tall, &short, &context);
+    assert_eq!(recovered.delta_unfolds, 1);
 }
 
 #[test]
@@ -839,6 +1082,81 @@ fn deep_pure_conversion_fits_a_64k_stack() {
     assert!(
         output.status.success(),
         "bounded-stack child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn deep_lazy_delta_child() -> Result<(), String> {
+    const DEPTH: usize = 50_000;
+    let names: Vec<_> = (0..=DEPTH)
+        .map(|index| format!("deep_lazy_definition_{index}"))
+        .collect();
+    let type_ = decoded(&Expr::sort(Level::zero()));
+    let entries = (0..DEPTH)
+        .map(|index| {
+            DefinitionEntry::new(
+                checker_name(names[index].clone()),
+                Definition::new(
+                    Vec::new(),
+                    type_.clone(),
+                    decoded(&constant(names[index + 1].clone())),
+                    ReducibilityHint::Regular(
+                        u32::try_from(DEPTH - index).expect("depth fits u32"),
+                    ),
+                    DefinitionSafety::Safe,
+                    Vec::new(),
+                ),
+            )
+        })
+        .collect();
+    let context = definition_context(entries);
+    let left = decoded(&constant(names[0].clone()));
+    let right = decoded(&constant(names[DEPTH].clone()));
+    match def_eq(&left, &right, &context, DefEqBudget::unlimited()) {
+        DefEqOutcome::Equal(progress)
+            if progress.quick_comparisons == 1
+                && progress.slow_comparisons
+                    == DEPTH.saturating_mul(3).saturating_add(1) as u64
+                && progress.normalizations == DEPTH.saturating_mul(3) as u64
+                && progress.whnf_reductions == DEPTH as u64
+                && progress.delta_unfolds == DEPTH as u64
+                && progress.materialized_arena_nodes == DEPTH.saturating_mul(3) as u64 =>
+        {
+            Ok(())
+        }
+        other => Err(format!("deep lazy-delta conversion drifted: {other:?}")),
+    }
+}
+
+#[test]
+fn deep_lazy_delta_conversion_fits_a_64k_stack() {
+    const CHILD_ENV: &str = "FLN_CHECKER_LAZY_DELTA_DEEP_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let result = std::thread::Builder::new()
+            .name("fln-checker-lazy-delta-deep".to_owned())
+            .stack_size(64 * 1024)
+            .spawn(deep_lazy_delta_child)
+            .expect("spawn bounded-stack lazy-delta child thread")
+            .join()
+            .expect("bounded-stack lazy-delta child thread did not panic");
+        result.expect("bounded-stack lazy-delta conversion");
+        return;
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = Command::new(executable)
+        .env(CHILD_ENV, "1")
+        .args([
+            "--exact",
+            "deep_lazy_delta_conversion_fits_a_64k_stack",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run bounded-stack lazy-delta child process");
+    assert!(
+        output.status.success(),
+        "bounded-stack lazy-delta child failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
