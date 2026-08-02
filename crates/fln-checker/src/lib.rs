@@ -2,9 +2,10 @@
 //!
 //! The implementation begins with the parts that must not be retrofitted after
 //! performance pressure appears: a versioned deterministic sampling policy, a
-//! checker-owned canonical-wire decoder, and eager universe semantics. Declaration
-//! checking remains on `franken_lean-gii`; the crate map and layering are governed
-//! by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
+//! checker-owned canonical-wire decoder, eager universe semantics, and independent
+//! term facts plus capture-avoiding rewrites. Declaration checking remains on
+//! `franken_lean-gii`; the crate map and layering are governed by
+//! `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first
 //!
@@ -189,8 +190,8 @@
 //!   remainder is any size but three. **A remainder that is counted is a remainder
 //!   somebody has to argue for; this bullet used to be the sentence "that half
 //!   remains a document", and it was false.**
-//! * **LIVE AGAINST REAL CODE.** The foundation modules now contain policy, wire, and
-//!   universe algorithms. `FLN-STRUCT-037` scans those production sources, so the
+//! * **LIVE AGAINST REAL CODE.** The foundation modules now contain policy, wire,
+//!   universe, and term algorithms. `FLN-STRUCT-037` scans those production sources, so the
 //!   boundary is no longer exercised only by planted fixtures. The checker still has
 //!   no declaration-admission authority and cannot acquire one through this crate.
 //!
@@ -323,5 +324,6 @@
 #![forbid(unsafe_code)]
 
 pub mod policy;
+pub mod term;
 pub mod universe;
 pub mod wire;

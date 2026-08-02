@@ -324,14 +324,34 @@ fn schema_tag_canonicality_and_trailing_bytes_are_refused_independently() {
         Some(MalformedKind::UnknownMetadataTag(255))
     );
 
-    let mut bound = CanonWriter::new();
-    bound.schema(SCHEMA_EXPR);
-    bound.u8(0);
-    bound.u32(1 << 20);
-    assert_eq!(
-        malformed(decode_expr(&bound.into_bytes(), DecodeBudget::unlimited())),
-        Some(MalformedKind::BoundIndex)
+    let mut last_valid_bound = CanonWriter::new();
+    last_valid_bound.schema(SCHEMA_EXPR);
+    last_valid_bound.u8(0);
+    last_valid_bound.u32((1 << 20) - 2);
+    let last_valid = complete(decode_expr(
+        &last_valid_bound.into_bytes(),
+        DecodeBudget::unlimited(),
+    ))
+    .expect("the last index whose index-plus-one fits must decode");
+    assert!(
+        matches!(
+            last_valid.node(last_valid.root()),
+            Some(ExprNode::Bound { index }) if *index == (1 << 20) - 2
+        ),
+        "the boundary success must decode the intended bound node"
     );
+
+    for index in [(1 << 20) - 1, 1 << 20] {
+        let mut bound = CanonWriter::new();
+        bound.schema(SCHEMA_EXPR);
+        bound.u8(0);
+        bound.u32(index);
+        assert_eq!(
+            malformed(decode_expr(&bound.into_bytes(), DecodeBudget::unlimited())),
+            Some(MalformedKind::BoundIndex),
+            "index {index} exceeds the packed index-plus-one covenant"
+        );
+    }
 }
 
 #[test]

@@ -8,7 +8,9 @@
 use fln_hash::canon::{SCHEMA_EXPR, SCHEMA_LEVEL, SCHEMA_NAME, SchemaId};
 
 const MAX_LEVEL_DEPTH: u32 = 16_777_215;
-const MAX_BVAR_INDEX: u32 = (1 << 20) - 1;
+// The packed covenant stores `index + 1` in 20 bits, so the largest index is
+// one below the largest representable span.
+pub(crate) const MAX_BVAR_INDEX: u32 = (1 << 20) - 2;
 
 const NAME_ANON: u8 = 0;
 const NAME_STR: u8 = 1;
@@ -111,6 +113,10 @@ impl LevelId {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
+
+    pub(crate) fn from_index(index: usize) -> Option<LevelId> {
+        (index < u32::MAX as usize).then_some(LevelId(index as u32))
+    }
 }
 
 /// Checker-owned universe node. Child references always point backward in the arena.
@@ -152,6 +158,10 @@ pub struct ExprId(u32);
 impl ExprId {
     pub const fn index(self) -> usize {
         self.0 as usize
+    }
+
+    pub(crate) fn from_index(index: usize) -> Option<ExprId> {
+        (index < u32::MAX as usize).then_some(ExprId(index as u32))
     }
 }
 
@@ -257,6 +267,18 @@ impl WireExpr {
 
     pub fn level(&self, id: LevelId) -> Option<&LevelNode> {
         self.levels.get(id.index())
+    }
+
+    pub(crate) fn from_parts(
+        nodes: Vec<ExprNode>,
+        levels: Vec<LevelNode>,
+        root: ExprId,
+    ) -> WireExpr {
+        WireExpr {
+            nodes,
+            levels,
+            root,
+        }
     }
 }
 
