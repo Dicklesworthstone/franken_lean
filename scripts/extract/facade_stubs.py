@@ -70,6 +70,10 @@ def demanded_symbols():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--plan",
+                    help="also emit the dependency-ordered facade closure plan "
+                         "(fln-facade-closure-plan/1) — acceptance (d)'s letter, "
+                         "handed to the production census bead franken_lean-epx")
     args = ap.parse_args()
 
     lean, tag = pinned_lean()
@@ -91,8 +95,11 @@ def main():
         "        (fun o => (o.setBool `pp.fullNames true).setBool `pp.explicit true)\n"
         "        (Meta.ppExpr info.type))\n"
         "      let lvls := \",\".intercalate (info.levelParams.map toString)\n"
+        "      let deps := \",\".intercalate\n"
+        "        ((info.type.getUsedConstants.map toString).toList)\n"
         "      IO.println s!\"TYPE\\t{n}\\t{lvls}\\t{fmt}\"\n"
         "      IO.println s!\"TYPEX\\t{n}\\t{lvls}\\t{fmtx}\"\n"
+        "      IO.println s!\"DEPS\\t{n}\\t{deps}\"\n"
         "    | none => IO.println s!\"MISSING\\t{n}\"\n"
     )
     work = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"fln-l8f-stubs-{os.getpid()}")
@@ -111,7 +118,7 @@ def main():
     # when emitted verbatim). Continuations are exactly the lines that open
     # neither marker, and joining them here is robust to any pp width — more so
     # than setting a format option the probe would have to keep matching.
-    types, typesx, levels, missing = {}, {}, {}, []
+    types, typesx, levels, deps, missing = {}, {}, {}, {}, []
     current = None
     for line in proc.stdout.splitlines():
         if line.startswith("TYPE\t"):
@@ -123,6 +130,10 @@ def main():
             _, name, lvls, ty = line.split("\t", 3)
             typesx[name] = ty
             current = (typesx, name)
+        elif line.startswith("DEPS\t"):
+            _, name, dep_csv = line.split("\t", 2)
+            deps[name] = [d for d in dep_csv.split(",") if d]
+            current = None
         elif line.startswith("MISSING\t"):
             missing.append(line.split("\t", 1)[1])
             current = None
@@ -212,9 +223,60 @@ def main():
                 f"{(proc.stdout + proc.stderr)[:1500]}")
         explicit_for = failing
     os.replace(candidate, args.out)
+
+    plan_note = ""
+    if args.plan:
+        # Acceptance (d)'s letter: a VERSIONED, DEPENDENCY-ORDERED closure plan.
+        # The ratchet buckets give the coarse order; this orders each stub after
+        # every demanded symbol its TYPE references. Wave-based Kahn with a
+        # declared tie-break (bucket rank, then name) so the order is
+        # deterministic; a dependency cycle is emitted as disclosed residue,
+        # never silently linearized.
+        emitted_names = [row["name"] for row in rows if row["name"] in types]
+        demand_set = set(emitted_names)
+        bucket_of_name = {row["name"]: row["bucket"] for row in rows}
+        undeps = [n for n in emitted_names if n not in deps]
+        if undeps:
+            raise SystemExit(f"REFUSE: no DEPS record for {undeps[:5]} — the plan "
+                             "would silently omit edges")
+        edges = {n: sorted({d for d in deps[n] if d in demand_set and d != n})
+                 for n in emitted_names}
+        bucket_rank = {"R-NONE": 0, "R-EFFECT": 1, "R-UNSAFE": 2, "R-EXTERN": 3}
+        tie = lambda n: (bucket_rank.get(bucket_of_name[n], 99), n)
+        remaining = dict(edges)
+        order = []
+        while remaining:
+            ready = sorted((n for n, e in remaining.items()
+                            if not any(d in remaining for d in e)), key=tie)
+            if not ready:
+                break
+            for n in ready:
+                order.append(n)
+                del remaining[n]
+        plan_schema = "fln-facade-closure-plan/1"
+        plan_rows = [{"schema": plan_schema, "kind": "summary",
+                      "steps": len(order), "cyclic_residue": len(remaining),
+                      "stub_surface": len(emitted_names),
+                      "handed_to": "franken_lean-epx", "pin": tag,
+                      "tie_break": "bucket-rank-then-name"}]
+        for i, n in enumerate(order, 1):
+            plan_rows.append({"schema": plan_schema, "kind": "step", "order": i,
+                              "name": n, "bucket": bucket_of_name[n],
+                              "depends_on": edges[n]})
+        for n in sorted(remaining, key=tie):
+            plan_rows.append({"schema": plan_schema, "kind": "cyclic-residue",
+                              "name": n, "bucket": bucket_of_name[n],
+                              "in_cycle_deps": [d for d in edges[n] if d in remaining]})
+        tmp = args.plan + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for r in plan_rows:
+                fh.write(json.dumps(r, sort_keys=True) + "\n")
+        os.replace(tmp, args.plan)
+        plan_note = f" plan_steps={len(order)} cyclic_residue={len(remaining)}"
+
     print(
         f"facade-stubs: demanded={len(rows)} typed={emitted} missing={len(missing)} "
-        f"elaborated=yes explicit_fallback={len(explicit_for)} pin={tag}",
+        f"elaborated=yes explicit_fallback={len(explicit_for)} pin={tag}{plan_note}",
         file=sys.stderr,
     )
 
