@@ -18,6 +18,35 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+
+# Extractor-visible governance declarations. build_gate_governed_sets derives
+# every lane's governed set from top-level `*INPUT_PATHS=(` forms, and the
+# ci-execution-join scenario binding requires a `…SCENARIO=` assignment; the
+# original lowercase `local` forms inside the run function were invisible to
+# both, which scored this lane a broken scan (0 governed paths, governance
+# referenced) and a weakly bound scenario. The run body consumes these
+# verbatim — values unchanged, declaration shape only.
+SCENARIO="bignum_vectors"
+INPUT_PATHS=(
+  Cargo.toml
+  Cargo.lock
+  SUITE.lock
+  rust-toolchain.toml
+  ci/VERIFICATION_MANIFEST.jsonl
+  ci/ABI_EXPORT_STATUS.txt
+  crates/fln-core
+  crates/fln-bignum
+  crates/fln-rt
+  crates/fln-unsafe-abi
+  crates/fln-kernel/tests/k1_judgments.rs
+  tribunal/fixtures/c4
+  scripts/e2e/bignum_vectors.sh
+  scripts/e2e/marrow_stage0_gauntlet.sh
+  scripts/evidence.py
+  scripts/extract/gen_bignum_vectors.py
+  scripts/lib/gate_lock.sh
+  vendor/NOTICE
+)
 PYTHON_BIN="$(command -v python3 || true)"
 [ -n "$PYTHON_BIN" ] || {
   echo "[bignum_vectors] setup failure: python3 is required" >&2
@@ -49,7 +78,7 @@ run_outer() {
   local semantic_schema="fln.e2e.bignum-semantic/1"
   local telemetry_schema="fln.e2e.bignum-telemetry/1"
   local bead="${FLN_BIGNUM_BEAD:-franken_lean-npl}"
-  local scenario="bignum_vectors"
+  local scenario="$SCENARIO"
   local run_id
   run_id="bignum-no-mock-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   local art_root="${FLN_E2E_ART_ROOT:-$ROOT/target/e2e}"
@@ -77,26 +106,7 @@ run_outer() {
   local -a governed_args=()
   local -a subject_hash_args=()
   local -a inner_candidates=()
-  local -a input_paths=(
-    Cargo.toml
-    Cargo.lock
-    SUITE.lock
-    rust-toolchain.toml
-    ci/VERIFICATION_MANIFEST.jsonl
-    ci/ABI_EXPORT_STATUS.txt
-    crates/fln-core
-    crates/fln-bignum
-    crates/fln-rt
-    crates/fln-unsafe-abi
-    crates/fln-kernel/tests/k1_judgments.rs
-    tribunal/fixtures/c4
-    scripts/e2e/bignum_vectors.sh
-    scripts/e2e/marrow_stage0_gauntlet.sh
-    scripts/evidence.py
-    scripts/extract/gen_bignum_vectors.py
-    scripts/lib/gate_lock.sh
-    vendor/NOTICE
-  )
+  local -a input_paths=("${INPUT_PATHS[@]}")
   local -a subject_paths=(
     crates/fln-bignum/fixtures/kernel_reduction_profile.tsv
     crates/fln-bignum/fixtures/nat_vectors.txt
