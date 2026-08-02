@@ -298,6 +298,29 @@ jobs:
             --commit "$artifact/bundle.complete.json" \
             --artifact-root "$artifact"
 
+      - name: run the certificate-cartridge no-mock lane
+        shell: bash
+        run: |
+          step_root="target/e2e/contract-drift-cartridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$step_root"
+          FLN_E2E_ART_ROOT="$PWD/$step_root" \
+            FLN_E2E_CACHE_STATE="github-actions-contract-drift" \
+            ./scripts/e2e/cartridge_no_mock_e2e.sh
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          if (( ${#bundles[@]} != 1 )); then
+            echo "certificate-cartridge lane published ${#bundles[@]} bundles; expected one" >&2
+            exit 2
+          fi
+          artifact="${bundles[0]}"
+          python3 -I -S scripts/evidence.py validate-bundle \
+            --art-dir "$artifact" \
+            --manifest "$artifact/manifest.json" \
+            --digest "$artifact/manifest.digest" \
+            --commit "$artifact/bundle.complete.json" \
+            --artifact-root "$artifact"
+
       - name: run the G0-4 syntax and hygiene no-mock lane
         shell: bash
         run: |

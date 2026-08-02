@@ -326,6 +326,22 @@ E2E_STEP_ORDERS = {
         "semantic_validation",
         "final_real_recheck",
     ],
+    "cartridge_no_mock_e2e": [
+        "bind_external_tools",
+        "compile_witness",
+        "export_positive",
+        "check_positive",
+        "build_handoff",
+        "transport_states",
+        "verify_positive",
+        "extract_positive",
+        "extract_failure",
+        "verify_recovery",
+        "extract_recovery",
+        "codec_suites",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
     "campaign_frameworks": [
         "suite_campaign_owner_matrix",
         "suite_mutation_kill_ledger_model",
@@ -778,6 +794,29 @@ CERTIFICATE_FORMAT_CHECKED_DECLARATIONS = 39
 CERTIFICATE_FORMAT_MAX_EXPORT_BYTES = 1_048_576
 CERTIFICATE_FORMAT_MAX_SEMANTIC_BYTES = 65_536
 CERTIFICATE_FORMAT_MAX_TELEMETRY_BYTES = 8_192
+CARTRIDGE_SEMANTIC_SCHEMA = "fln.e2e.cartridge-semantic/1"
+CARTRIDGE_TELEMETRY_SCHEMA = "fln.e2e.cartridge-telemetry/1"
+CARTRIDGE_VALIDATION_SCHEMA = "fln.e2e.cartridge-validation/1"
+CARTRIDGE_SCENARIOS = (
+    "pin_binding",
+    "positive",
+    "populations",
+    "failure",
+    "recovery",
+    "codec",
+    "nonpublication",
+)
+CARTRIDGE_OBJECTS = 9
+CARTRIDGE_NAMED_TESTS = 23
+CARTRIDGE_ARBITRARY_CASES = 10_000
+CARTRIDGE_VERSION_CASES = 65_536
+CARTRIDGE_THREAD_COUNTS = [1, 8, 32]
+CARTRIDGE_PRODUCTIVE_WORKERS = sum(CARTRIDGE_THREAD_COUNTS)
+CARTRIDGE_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+CARTRIDGE_MAX_SEMANTIC_BYTES = 65_536
+CARTRIDGE_MAX_TELEMETRY_BYTES = 8_192
+CARTRIDGE_MAX_EXTRACTED_FILES = 16
+CARTRIDGE_MAX_EXTRACTED_BYTES = 128 * 1024 * 1024
 SOURCE_RECOVERY_SEMANTIC_SCHEMA = "fln.e2e.source-recovery-semantic"
 SOURCE_RECOVERY_TELEMETRY_SCHEMA = "fln.e2e.source-recovery-telemetry"
 SOURCE_RECOVERY_INPUT = (
@@ -9637,6 +9676,639 @@ def validate_certificate_format_no_mock_evidence(
         "export_sha256": export["sha256"],
         "run_id": expected_run_id,
         "schema": CERTIFICATE_FORMAT_VALIDATION_SCHEMA,
+        "semantic_sha256": semantic_digest,
+        "telemetry_sha256": telemetry_digest,
+        "verdict": "pass",
+    }
+
+
+def cartridge_extract_tree(path: Path) -> dict[str, Any]:
+    absolute = lexical_absolute(path)
+    try:
+        mode = absolute.lstat().st_mode
+    except FileNotFoundError as error:
+        raise EvidenceError(
+            f"cartridge extraction directory is absent: {absolute}"
+        ) from error
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise EvidenceError(
+            f"cartridge extraction is not one real directory: {absolute}"
+        )
+    entries = sorted(
+        absolute.iterdir(),
+        key=lambda item: item.name.encode("utf-8"),
+    )
+    if len(entries) > CARTRIDGE_MAX_EXTRACTED_FILES:
+        raise EvidenceError("cartridge extraction file count exceeds its bound")
+    digest = hashlib.sha256(b"fln.cartridge-extraction/1\0")
+    total_bytes = 0
+    names: list[str] = []
+    for entry in entries:
+        entry_mode = entry.lstat().st_mode
+        if stat.S_ISLNK(entry_mode) or not stat.S_ISREG(entry_mode):
+            raise EvidenceError(f"cartridge extraction contains a non-file: {entry}")
+        data, size, _sha256 = stable_file_facts(
+            entry,
+            max_bytes=CARTRIDGE_MAX_ARCHIVE_BYTES,
+        )
+        total_bytes += size
+        if total_bytes > CARTRIDGE_MAX_EXTRACTED_BYTES:
+            raise EvidenceError("cartridge extraction bytes exceed their bound")
+        name = entry.name
+        names.append(name)
+        name_bytes = name.encode("utf-8")
+        digest.update(len(name_bytes).to_bytes(8, "little"))
+        digest.update(name_bytes)
+        digest.update(size.to_bytes(8, "little"))
+        digest.update(data)
+
+    object_pattern = re.compile(
+        r"[0-9]{2}-(declaration|dependency|receipt|certificate|fixture|schema|"
+        r"resource-contract|witness|warm-defeq-cache)-[0-9a-f]{64}\.bin"
+    )
+    object_kinds: list[str] = []
+    for name in names:
+        if name == "manifest.bin":
+            continue
+        match = object_pattern.fullmatch(name)
+        if match is None:
+            raise EvidenceError(
+                f"cartridge extraction filename is not canonical: {name}"
+            )
+        object_kinds.append(match.group(1))
+    expected_kinds = sorted(
+        [
+            "certificate",
+            "declaration",
+            "dependency",
+            "fixture",
+            "receipt",
+            "resource-contract",
+            "schema",
+            "warm-defeq-cache",
+            "witness",
+        ]
+    )
+    if names.count("manifest.bin") != 1 or sorted(object_kinds) != expected_kinds:
+        raise EvidenceError(
+            "cartridge extraction does not contain the exact v1 object inventory"
+        )
+    return {
+        "bytes": total_bytes,
+        "files": len(entries),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def require_cartridge_absent(path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise EvidenceError("failed cartridge extraction published filesystem state")
+
+
+def validate_cartridge_summary(
+    row: Mapping[str, Any],
+    *,
+    state: str,
+    archive_digest: bool,
+) -> None:
+    fields = {
+        "authority",
+        "frames",
+        "manifest_root",
+        "missing_optional",
+        "missing_required",
+        "objects",
+        "schema",
+        "state",
+    }
+    if archive_digest:
+        fields.add("archive_digest")
+    if (
+        set(row) != fields
+        or row.get("authority") is not False
+        or type(row.get("frames")) is not int
+        or row.get("frames", -1) < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("manifest_root")))
+        or type(row.get("missing_optional")) is not int
+        or row.get("missing_optional", -1) < 0
+        or type(row.get("missing_required")) is not int
+        or row.get("missing_required", -1) < 0
+        or row.get("objects") != CARTRIDGE_OBJECTS
+        or row.get("schema") != "fln.cartridge-handoff/1"
+        or row.get("state") != state
+        or (
+            archive_digest
+            and not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(row.get("archive_digest")),
+            )
+        )
+    ):
+        raise EvidenceError(f"cartridge {state} summary changed")
+
+
+def validate_cartridge_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+    archive_path: Path,
+    corrupt_archive_path: Path,
+    export_path: Path,
+    positive_extract_path: Path,
+    failure_extract_path: Path,
+    recovery_extract_path: Path,
+    process_artifacts: Mapping[str, Path],
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("cartridge expected run id must be non-empty")
+    semantic, semantic_digest = macro_txn_canonical_rows(
+        semantic_path,
+        label="cartridge semantic evidence",
+        max_bytes=CARTRIDGE_MAX_SEMANTIC_BYTES,
+    )
+    telemetry_rows, telemetry_digest = macro_txn_canonical_rows(
+        telemetry_path,
+        label="cartridge telemetry",
+        max_bytes=CARTRIDGE_MAX_TELEMETRY_BYTES,
+    )
+    if (
+        len(semantic) != len(CARTRIDGE_SCENARIOS)
+        or [row.get("sequence") for row in semantic]
+        != list(range(len(CARTRIDGE_SCENARIOS)))
+        or [row.get("scenario") for row in semantic] != list(CARTRIDGE_SCENARIOS)
+    ):
+        raise EvidenceError("cartridge semantic scenarios are incomplete or reordered")
+    if any(row.get("schema") != CARTRIDGE_SEMANTIC_SCHEMA for row in semantic):
+        raise EvidenceError("cartridge semantic schema changed")
+    forbidden_semantic_fields = {
+        "absolute_path",
+        "artifact_bytes",
+        "duration_ns",
+        "host",
+        "pid",
+        "process_exits",
+        "run_id",
+        "wall_time",
+    }
+    if any(forbidden_semantic_fields.intersection(row) for row in semantic):
+        raise EvidenceError("cartridge semantic authority contains telemetry")
+
+    expected_fields = {
+        "pin_binding": {
+            "export_format",
+            "lean4export_revision",
+            "nanoda_revision",
+            "reference_revision",
+            "reference_version",
+            "scenario",
+            "schema",
+            "sequence",
+        },
+        "positive": {
+            "archive_digest",
+            "archive_sha256",
+            "authority",
+            "checked_declarations",
+            "export_rows",
+            "export_sha256",
+            "frames",
+            "manifest_root",
+            "objects",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state",
+            "status",
+            "warm_caches",
+        },
+        "populations": {
+            "authority",
+            "manifest_root",
+            "scenario",
+            "schema",
+            "sequence",
+            "shared_manifest_identity",
+            "states",
+            "status",
+        },
+        "failure": {
+            "archive_sha256",
+            "authority",
+            "changed_bits",
+            "changed_bytes",
+            "corrupt_sha256",
+            "published",
+            "reason",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "recovery": {
+            "archive_digest",
+            "archive_sha256",
+            "authority",
+            "extracted_files",
+            "manifest_root",
+            "matches_positive",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "codec": {
+            "arbitrary_cases",
+            "authority",
+            "named_tests",
+            "productive_workers",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+            "thread_counts",
+            "version_cases",
+        },
+        "nonpublication": {
+            "actions",
+            "authority",
+            "failure_output_absent",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "states",
+            "status",
+        },
+    }
+    for row in semantic:
+        if set(row) != expected_fields[row["scenario"]]:
+            raise EvidenceError(
+                f"cartridge {row['scenario']} fields differ from the frozen schema"
+            )
+
+    pin = semantic[0]
+    if (
+        pin.get("export_format") != CERTIFICATE_FORMAT_EXPORT_VERSION
+        or pin.get("lean4export_revision") != CERTIFICATE_FORMAT_LEAN4EXPORT_REVISION
+        or pin.get("nanoda_revision") != CERTIFICATE_FORMAT_NANODA_REVISION
+        or pin.get("reference_revision") != CERTIFICATE_FORMAT_REFERENCE_REVISION
+        or pin.get("reference_version") != "v4.32.0"
+    ):
+        raise EvidenceError("cartridge external pin binding changed")
+
+    export = validate_certificate_format_export(export_path)
+    archive_data, archive_size, archive_sha256 = stable_file_facts(
+        archive_path,
+        max_bytes=CARTRIDGE_MAX_ARCHIVE_BYTES,
+    )
+    corrupt_data, corrupt_size, corrupt_sha256 = stable_file_facts(
+        corrupt_archive_path,
+        max_bytes=CARTRIDGE_MAX_ARCHIVE_BYTES,
+    )
+    if corrupt_size != archive_size:
+        raise EvidenceError("cartridge corrupt copy changed length")
+    changed = [
+        (left, right)
+        for left, right in zip(archive_data, corrupt_data, strict=True)
+        if left != right
+    ]
+    if len(changed) != 1:
+        raise EvidenceError("cartridge corrupt copy is not one changed byte")
+    changed_bits = (changed[0][0] ^ changed[0][1]).bit_count()
+    if changed_bits != 1:
+        raise EvidenceError("cartridge corrupt copy is not one changed bit")
+
+    expected_process_artifacts = {
+        "build_metadata",
+        "build_stdout",
+        "checker_metadata",
+        "checker_stdout",
+        "codec_metadata",
+        "codec_stdout",
+        "failure_metadata",
+        "failure_stderr",
+        "population_metadata",
+        "population_stdout",
+        "positive_extract_metadata",
+        "positive_extract_stdout",
+        "positive_metadata",
+        "positive_stdout",
+        "recovery_extract_metadata",
+        "recovery_extract_stdout",
+        "recovery_metadata",
+        "recovery_stdout",
+    }
+    if set(process_artifacts) != expected_process_artifacts:
+        raise EvidenceError("cartridge process artifact set is incomplete")
+    for key, stage_id, classification, wrapper_exit, child_exit in [
+        ("build_metadata", "build_handoff", "pass", 0, 0),
+        ("checker_metadata", "check_positive", "pass", 0, 0),
+        ("population_metadata", "transport_states", "pass", 0, 0),
+        ("positive_metadata", "verify_positive", "pass", 0, 0),
+        ("positive_extract_metadata", "extract_positive", "pass", 0, 0),
+        ("failure_metadata", "extract_failure", "fail", 1, 1),
+        ("recovery_metadata", "verify_recovery", "pass", 0, 0),
+        ("recovery_extract_metadata", "extract_recovery", "pass", 0, 0),
+        ("codec_metadata", "codec_suites", "pass", 0, 0),
+    ]:
+        validate_certificate_format_process(
+            process_artifacts[key],
+            stage_id=stage_id,
+            classification=classification,
+            wrapper_exit=wrapper_exit,
+            child_exit=child_exit,
+        )
+
+    build_rows, _digest = macro_txn_canonical_rows(
+        process_artifacts["build_stdout"],
+        label="cartridge build stdout",
+        max_bytes=16_384,
+    )
+    if len(build_rows) != 2:
+        raise EvidenceError("cartridge build did not emit two canonical summaries")
+    certificate_summary, pack_summary = build_rows
+    if (
+        set(certificate_summary)
+        != {"authority", "bytes", "certificate_digest", "schema"}
+        or certificate_summary.get("authority") is not False
+        or type(certificate_summary.get("bytes")) is not int
+        or certificate_summary.get("bytes", 0) <= 0
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(certificate_summary.get("certificate_digest")),
+        )
+        or certificate_summary.get("schema") != "fln.cartridge-handoff/1"
+    ):
+        raise EvidenceError("cartridge certificate summary changed")
+    validate_cartridge_summary(
+        pack_summary,
+        state="complete",
+        archive_digest=True,
+    )
+    if (
+        pack_summary.get("missing_optional") != 0
+        or pack_summary.get("missing_required") != 0
+        or pack_summary.get("frames", 0) <= 0
+    ):
+        raise EvidenceError("packed cartridge is not complete and populated")
+
+    positive_rows, _digest = macro_txn_canonical_rows(
+        process_artifacts["positive_stdout"],
+        label="cartridge positive stdout",
+        max_bytes=4_096,
+    )
+    recovery_rows, _digest = macro_txn_canonical_rows(
+        process_artifacts["recovery_stdout"],
+        label="cartridge recovery stdout",
+        max_bytes=4_096,
+    )
+    if len(positive_rows) != 1 or recovery_rows != positive_rows:
+        raise EvidenceError("cartridge recovery summary diverged from positive")
+    positive_summary = positive_rows[0]
+    positive_fields = {
+        "archive_digest",
+        "authority",
+        "frames",
+        "manifest_root",
+        "objects",
+        "schema",
+        "state",
+        "warm_caches",
+    }
+    if (
+        set(positive_summary) != positive_fields
+        or positive_summary.get("authority") is not False
+        or positive_summary.get("archive_digest") != pack_summary.get("archive_digest")
+        or positive_summary.get("frames") != pack_summary.get("frames")
+        or positive_summary.get("manifest_root") != pack_summary.get("manifest_root")
+        or positive_summary.get("objects") != CARTRIDGE_OBJECTS
+        or positive_summary.get("schema") != "fln.cartridge-handoff/1"
+        or positive_summary.get("state") != "complete"
+        or positive_summary.get("warm_caches") != 1
+    ):
+        raise EvidenceError("cartridge positive verification facts changed")
+
+    population_rows, _digest = macro_txn_canonical_rows(
+        process_artifacts["population_stdout"],
+        label="cartridge population stdout",
+        max_bytes=16_384,
+    )
+    expected_states = ["thin", "partial", "sealed", "complete"]
+    if len(population_rows) != len(expected_states):
+        raise EvidenceError("cartridge population row count changed")
+    for state, row in zip(expected_states, population_rows, strict=True):
+        validate_cartridge_summary(row, state=state, archive_digest=False)
+        if row.get("manifest_root") != pack_summary.get("manifest_root"):
+            raise EvidenceError(
+                "cartridge transport population moved the manifest root"
+            )
+    if (
+        population_rows[0].get("frames") != 0
+        or population_rows[0].get("missing_required", 0) <= 0
+        or population_rows[1].get("frames", 0) <= 0
+        or population_rows[1].get("missing_required", 0) <= 0
+        or population_rows[2].get("missing_required") != 0
+        or population_rows[2].get("missing_optional", 0) <= 0
+        or population_rows[3].get("missing_required") != 0
+        or population_rows[3].get("missing_optional") != 0
+    ):
+        raise EvidenceError("cartridge population completeness facts changed")
+
+    positive_extract = cartridge_extract_tree(positive_extract_path)
+    recovery_extract = cartridge_extract_tree(recovery_extract_path)
+    if positive_extract != recovery_extract:
+        raise EvidenceError("cartridge recovered extraction differs from positive")
+    require_cartridge_absent(failure_extract_path)
+    for key in ("positive_extract_stdout", "recovery_extract_stdout"):
+        rows, _digest = macro_txn_canonical_rows(
+            process_artifacts[key],
+            label=f"cartridge {key}",
+            max_bytes=4_096,
+        )
+        if len(rows) != 1 or rows[0] != {
+            "files": 10,
+            "objects": CARTRIDGE_OBJECTS,
+            "schema": "fln.cartridge-handoff/1",
+            "state": "extracted",
+            "warm_caches": 1,
+        }:
+            raise EvidenceError("cartridge extraction summary changed")
+
+    checker_stdout, _size, _digest = stable_file_facts(
+        process_artifacts["checker_stdout"],
+        max_bytes=4_096,
+    )
+    expected_checker_stdout = (
+        f"Checked {CERTIFICATE_FORMAT_CHECKED_DECLARATIONS} "
+        "declarations with no errors\n"
+    ).encode()
+    if checker_stdout != expected_checker_stdout:
+        raise EvidenceError("cartridge external checker floor changed")
+    failure_stderr, _size, _digest = stable_file_facts(
+        process_artifacts["failure_stderr"],
+        max_bytes=16_384,
+    )
+    if not failure_stderr.startswith(b"cartridge_handoff: "):
+        raise EvidenceError(
+            "cartridge corrupt extraction failed for an unexpected reason"
+        )
+    codec_stdout, _size, _digest = stable_file_facts(
+        process_artifacts["codec_stdout"],
+        max_bytes=128 * 1024,
+    )
+    if (
+        codec_stdout.count(b"test result: ok.") != 4
+        or b"6 passed; 0 failed" not in codec_stdout
+        or b"4 passed; 0 failed" not in codec_stdout
+        or b"7 passed; 0 failed" not in codec_stdout
+    ):
+        raise EvidenceError("cartridge named codec suites did not meet their floors")
+
+    positive = semantic[1]
+    if (
+        positive.get("archive_digest") != pack_summary["archive_digest"]
+        or positive.get("archive_sha256") != archive_sha256
+        or positive.get("authority") is not False
+        or positive.get("checked_declarations")
+        != CERTIFICATE_FORMAT_CHECKED_DECLARATIONS
+        or positive.get("export_rows") != export["rows"]
+        or positive.get("export_sha256") != export["sha256"]
+        or positive.get("frames") != pack_summary["frames"]
+        or positive.get("manifest_root") != pack_summary["manifest_root"]
+        or positive.get("objects") != CARTRIDGE_OBJECTS
+        or positive.get("published") is not False
+        or positive.get("state") != "complete"
+        or positive.get("status") != "complete"
+        or positive.get("warm_caches") != 1
+    ):
+        raise EvidenceError("cartridge positive semantic facts changed")
+
+    populations = semantic[2]
+    if (
+        populations.get("authority") is not False
+        or populations.get("manifest_root") != pack_summary["manifest_root"]
+        or populations.get("shared_manifest_identity") is not True
+        or populations.get("states") != expected_states
+        or populations.get("status") != "complete"
+    ):
+        raise EvidenceError("cartridge population semantic facts changed")
+
+    failure = semantic[3]
+    if (
+        failure.get("archive_sha256") != archive_sha256
+        or failure.get("authority") is not False
+        or failure.get("changed_bits") != changed_bits
+        or failure.get("changed_bytes") != len(changed)
+        or failure.get("corrupt_sha256") != corrupt_sha256
+        or failure.get("published") is not False
+        or failure.get("reason") != "frame_corruption"
+        or failure.get("status") != "refused"
+    ):
+        raise EvidenceError("cartridge corrupt refusal facts changed")
+
+    recovery = semantic[4]
+    if (
+        recovery.get("archive_digest") != pack_summary["archive_digest"]
+        or recovery.get("archive_sha256") != archive_sha256
+        or recovery.get("authority") is not False
+        or recovery.get("extracted_files") != positive_extract["files"]
+        or recovery.get("manifest_root") != pack_summary["manifest_root"]
+        or recovery.get("matches_positive") is not True
+        or recovery.get("published") is not False
+        or recovery.get("status") != "complete"
+    ):
+        raise EvidenceError("cartridge recovery semantic facts changed")
+
+    codec = semantic[5]
+    if (
+        codec.get("arbitrary_cases") != CARTRIDGE_ARBITRARY_CASES
+        or codec.get("authority") is not False
+        or codec.get("named_tests") != CARTRIDGE_NAMED_TESTS
+        or codec.get("productive_workers") != CARTRIDGE_PRODUCTIVE_WORKERS
+        or codec.get("status") != "complete"
+        or codec.get("thread_counts") != CARTRIDGE_THREAD_COUNTS
+        or codec.get("version_cases") != CARTRIDGE_VERSION_CASES
+    ):
+        raise EvidenceError("cartridge codec evidence floor changed")
+
+    nonpublication = semantic[6]
+    if (
+        nonpublication.get("actions")
+        != [
+            "verify_without_cache",
+            "verify_without_cache",
+            "quarantine_and_verify_independently",
+        ]
+        or nonpublication.get("authority") is not False
+        or nonpublication.get("failure_output_absent") is not True
+        or nonpublication.get("published") is not False
+        or nonpublication.get("states")
+        != ["cancelled", "resource_limited", "internal_fault"]
+        or nonpublication.get("status") != "complete"
+    ):
+        raise EvidenceError("cartridge nonpublication policy changed")
+
+    if len(telemetry_rows) != 1:
+        raise EvidenceError("cartridge telemetry row count is not one")
+    telemetry = telemetry_rows[0]
+    expected_exits = {
+        "checker": 0,
+        "codec": 0,
+        "failure": 1,
+        "positive": 0,
+        "positive_extract": 0,
+        "recovery": 0,
+        "recovery_extract": 0,
+        "transport": 0,
+    }
+    if (
+        set(telemetry)
+        != {
+            "artifact_bytes",
+            "durations_ns",
+            "host",
+            "process_exits",
+            "run_id",
+            "schema",
+        }
+        or telemetry.get("schema") != CARTRIDGE_TELEMETRY_SCHEMA
+        or telemetry.get("run_id") != expected_run_id
+        or telemetry.get("artifact_bytes")
+        != {
+            "archive": archive_size,
+            "corrupt": corrupt_size,
+            "export": export["bytes"],
+        }
+        or telemetry.get("process_exits") != expected_exits
+        or not isinstance(telemetry.get("host"), dict)
+        or set(telemetry["host"]) != {"machine", "system"}
+        or not all(
+            isinstance(value, str) and value for value in telemetry["host"].values()
+        )
+        or not isinstance(telemetry.get("durations_ns"), dict)
+        or set(telemetry["durations_ns"]) != set(expected_exits)
+        or any(
+            type(value) is not int or value <= 0 or value > 3_600_000_000_000
+            for value in telemetry["durations_ns"].values()
+        )
+    ):
+        raise EvidenceError(
+            "cartridge telemetry is malformed or semantically entangled"
+        )
+
+    return {
+        "archive_sha256": archive_sha256,
+        "corrupt_sha256": corrupt_sha256,
+        "extraction_sha256": positive_extract["sha256"],
+        "manifest_root": pack_summary["manifest_root"],
+        "run_id": expected_run_id,
+        "schema": CARTRIDGE_VALIDATION_SCHEMA,
         "semantic_sha256": semantic_digest,
         "telemetry_sha256": telemetry_digest,
         "verdict": "pass",
@@ -19290,6 +19962,132 @@ def cmd_validate_certificate_format_no_mock(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_cartridge_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    report = validate_cartridge_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_path=artifact(
+            args.semantic,
+            "cartridge semantic evidence",
+        ),
+        telemetry_path=artifact(
+            args.telemetry,
+            "cartridge telemetry",
+        ),
+        archive_path=artifact(
+            args.archive,
+            "cartridge positive archive",
+        ),
+        corrupt_archive_path=artifact(
+            args.corrupt_archive,
+            "cartridge corrupt archive",
+        ),
+        export_path=artifact(
+            args.export,
+            "cartridge positive export",
+        ),
+        positive_extract_path=artifact(
+            args.positive_extract,
+            "cartridge positive extraction",
+        ),
+        failure_extract_path=artifact(
+            args.failure_extract,
+            "cartridge failed extraction",
+        ),
+        recovery_extract_path=artifact(
+            args.recovery_extract,
+            "cartridge recovery extraction",
+        ),
+        process_artifacts={
+            "build_metadata": artifact(
+                args.build_metadata,
+                "cartridge build metadata",
+            ),
+            "build_stdout": artifact(
+                args.build_stdout,
+                "cartridge build stdout",
+            ),
+            "checker_metadata": artifact(
+                args.checker_metadata,
+                "cartridge checker metadata",
+            ),
+            "checker_stdout": artifact(
+                args.checker_stdout,
+                "cartridge checker stdout",
+            ),
+            "codec_metadata": artifact(
+                args.codec_metadata,
+                "cartridge codec metadata",
+            ),
+            "codec_stdout": artifact(
+                args.codec_stdout,
+                "cartridge codec stdout",
+            ),
+            "failure_metadata": artifact(
+                args.failure_metadata,
+                "cartridge failure metadata",
+            ),
+            "failure_stderr": artifact(
+                args.failure_stderr,
+                "cartridge failure stderr",
+            ),
+            "population_metadata": artifact(
+                args.population_metadata,
+                "cartridge population metadata",
+            ),
+            "population_stdout": artifact(
+                args.population_stdout,
+                "cartridge population stdout",
+            ),
+            "positive_extract_metadata": artifact(
+                args.positive_extract_metadata,
+                "cartridge positive extraction metadata",
+            ),
+            "positive_extract_stdout": artifact(
+                args.positive_extract_stdout,
+                "cartridge positive extraction stdout",
+            ),
+            "positive_metadata": artifact(
+                args.positive_metadata,
+                "cartridge positive metadata",
+            ),
+            "positive_stdout": artifact(
+                args.positive_stdout,
+                "cartridge positive stdout",
+            ),
+            "recovery_extract_metadata": artifact(
+                args.recovery_extract_metadata,
+                "cartridge recovery extraction metadata",
+            ),
+            "recovery_extract_stdout": artifact(
+                args.recovery_extract_stdout,
+                "cartridge recovery extraction stdout",
+            ),
+            "recovery_metadata": artifact(
+                args.recovery_metadata,
+                "cartridge recovery metadata",
+            ),
+            "recovery_stdout": artifact(
+                args.recovery_stdout,
+                "cartridge recovery stdout",
+            ),
+        },
+    )
+    if args.output:
+        output = artifact(
+            args.output,
+            "cartridge semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_validate_environment_resource_collision(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
     stdout_path = require_within(
@@ -20988,6 +21786,122 @@ def run_certificate_format_validator_self_test(
     }
 
 
+def run_cartridge_validator_self_test(root: Path) -> dict[str, Any]:
+    object_kinds = [
+        "declaration",
+        "dependency",
+        "receipt",
+        "certificate",
+        "fixture",
+        "schema",
+        "resource-contract",
+        "witness",
+        "warm-defeq-cache",
+    ]
+
+    def build_extract(
+        name: str,
+        *,
+        kinds: Sequence[str] = object_kinds,
+        extra_name: str | None = None,
+    ) -> Path:
+        extract = root / name
+        extract.mkdir()
+        write_new(extract / "manifest.bin", b"manifest")
+        for index, kind in enumerate(kinds):
+            object_id = hashlib.sha256(f"{index}:{kind}".encode()).hexdigest()
+            write_new(
+                extract / f"{index:02d}-{kind}-{object_id}.bin",
+                f"object:{kind}".encode(),
+            )
+        if extra_name is not None:
+            write_new(extract / extra_name, b"extra")
+        return extract
+
+    positive_path = build_extract("positive")
+    recovery_path = build_extract("recovery")
+    positive = cartridge_extract_tree(positive_path)
+    recovery = cartridge_extract_tree(recovery_path)
+    require(
+        positive == recovery and positive["files"] == 10,
+        "cartridge extraction positive control is not exact",
+    )
+
+    rejected_cells = 0
+
+    missing_path = build_extract(
+        "missing-kind",
+        kinds=object_kinds[:-1],
+    )
+    try:
+        cartridge_extract_tree(missing_path)
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError(
+            "cartridge extraction validator accepted a missing object kind"
+        )
+
+    noncanonical_path = build_extract(
+        "noncanonical-name",
+        extra_name="unexpected.bin",
+    )
+    try:
+        cartridge_extract_tree(noncanonical_path)
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError(
+            "cartridge extraction validator accepted a noncanonical filename"
+        )
+
+    absent_path = root / "failed-extraction"
+    require_cartridge_absent(absent_path)
+    published_path = build_extract("published-after-failure")
+    try:
+        require_cartridge_absent(published_path)
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError("cartridge validator accepted failure output publication")
+
+    summary = {
+        "archive_digest": "1" * 64,
+        "authority": False,
+        "frames": 9,
+        "manifest_root": "2" * 64,
+        "missing_optional": 0,
+        "missing_required": 0,
+        "objects": CARTRIDGE_OBJECTS,
+        "schema": "fln.cartridge-handoff/1",
+        "state": "complete",
+    }
+    validate_cartridge_summary(
+        summary,
+        state="complete",
+        archive_digest=True,
+    )
+    authority_mutant = dict(summary)
+    authority_mutant["authority"] = True
+    try:
+        validate_cartridge_summary(
+            authority_mutant,
+            state="complete",
+            archive_digest=True,
+        )
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError("cartridge summary validator accepted authority promotion")
+
+    return {
+        "case": "cartridge_validator",
+        "negative_cells_rejected": rejected_cells,
+        "ok": True,
+        "positive_files": positive["files"],
+    }
+
+
 def run_diagnostic_projection_validator_self_test(
     root: Path,
 ) -> dict[str, Any]:
@@ -21292,6 +22206,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             case_dir("certificate_format_validator")
         )
     )
+    cases.append(run_cartridge_validator_self_test(case_dir("cartridge_validator")))
     cases.append(
         run_diagnostic_projection_validator_self_test(
             case_dir("diagnostic_projection_validator")
@@ -30318,6 +31233,44 @@ def build_parser() -> argparse.ArgumentParser:
     certificate_format_parser.add_argument("--artifact-root", required=True)
     certificate_format_parser.add_argument("--output")
     certificate_format_parser.set_defaults(func=cmd_validate_certificate_format_no_mock)
+
+    cartridge_parser = subparsers.add_parser(
+        "validate-cartridge-no-mock",
+        help=(
+            "independently validate cartridge transport, extraction, "
+            "recovery, semantic evidence, and bounded telemetry"
+        ),
+    )
+    cartridge_parser.add_argument("--expected-run-id", required=True)
+    cartridge_parser.add_argument("--semantic", required=True)
+    cartridge_parser.add_argument("--telemetry", required=True)
+    cartridge_parser.add_argument("--archive", required=True)
+    cartridge_parser.add_argument("--corrupt-archive", required=True)
+    cartridge_parser.add_argument("--export", required=True)
+    cartridge_parser.add_argument("--positive-extract", required=True)
+    cartridge_parser.add_argument("--failure-extract", required=True)
+    cartridge_parser.add_argument("--recovery-extract", required=True)
+    cartridge_parser.add_argument("--build-metadata", required=True)
+    cartridge_parser.add_argument("--build-stdout", required=True)
+    cartridge_parser.add_argument("--checker-metadata", required=True)
+    cartridge_parser.add_argument("--checker-stdout", required=True)
+    cartridge_parser.add_argument("--codec-metadata", required=True)
+    cartridge_parser.add_argument("--codec-stdout", required=True)
+    cartridge_parser.add_argument("--failure-metadata", required=True)
+    cartridge_parser.add_argument("--failure-stderr", required=True)
+    cartridge_parser.add_argument("--population-metadata", required=True)
+    cartridge_parser.add_argument("--population-stdout", required=True)
+    cartridge_parser.add_argument("--positive-extract-metadata", required=True)
+    cartridge_parser.add_argument("--positive-extract-stdout", required=True)
+    cartridge_parser.add_argument("--positive-metadata", required=True)
+    cartridge_parser.add_argument("--positive-stdout", required=True)
+    cartridge_parser.add_argument("--recovery-extract-metadata", required=True)
+    cartridge_parser.add_argument("--recovery-extract-stdout", required=True)
+    cartridge_parser.add_argument("--recovery-metadata", required=True)
+    cartridge_parser.add_argument("--recovery-stdout", required=True)
+    cartridge_parser.add_argument("--artifact-root", required=True)
+    cartridge_parser.add_argument("--output")
+    cartridge_parser.set_defaults(func=cmd_validate_cartridge_no_mock)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",

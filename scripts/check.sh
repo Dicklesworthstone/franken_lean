@@ -219,6 +219,7 @@ INPUT_PATHS=(
   scripts/e2e/parser_corpus_no_mock_e2e.sh
   scripts/e2e/dynamic_parser_no_mock_e2e.sh
   scripts/e2e/macro_txn_no_mock_e2e.sh
+  scripts/e2e/cartridge_no_mock_e2e.sh
   scripts/e2e/certificate_format_no_mock_e2e.sh
   scripts/e2e/g0_4_no_mock_e2e.sh
   scripts/e2e/vellum_naming_no_mock_e2e.sh
@@ -1631,6 +1632,7 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/lib/gate_lock.sh \
   scripts/e2e/dynamic_parser_no_mock_e2e.sh \
   scripts/e2e/hygiene_no_mock_e2e.sh \
   scripts/e2e/macro_txn_no_mock_e2e.sh \
+  scripts/e2e/cartridge_no_mock_e2e.sh \
   scripts/e2e/certificate_format_no_mock_e2e.sh \
   scripts/e2e/g0_4_no_mock_e2e.sh \
   scripts/e2e/vellum_naming_no_mock_e2e.sh \

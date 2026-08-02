@@ -67,9 +67,16 @@ use fln_env::provenance::{
     ModuleProvenanceManifest, PayloadTransparency, ProvenanceCompleteness,
 };
 use fln_hash::canon::{
-    CanonWriter, Canonical, SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_KVMAP_SET, SCHEMA_REGISTRY,
-    SCHEMA_SHADOW_CELL, SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON, SchemaId,
-    SchemaRow, kvmap_canonical_set_bytes,
+    CanonWriter, Canonical, SCHEMA_CARTRIDGE_ARCHIVE, SCHEMA_CARTRIDGE_MANIFEST,
+    SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_KVMAP_SET, SCHEMA_REGISTRY, SCHEMA_SHADOW_CELL,
+    SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON, SCHEMA_WARM_DEFEQ_CACHE,
+    SchemaId, SchemaRow, kvmap_canonical_set_bytes,
+};
+use fln_hash::cartridge::{
+    AttachmentRoleV1, CartridgeArchiveV1, CartridgeBuilderV1, CartridgeDecodeBudgetsV1,
+    CartridgeExtensionV1, CartridgeIndexV1, CartridgeManifestV1, CartridgeObjectIdV1,
+    CartridgeObjectKindV1, CartridgeTransportStateV1, DefeqTransparencyV1, ObjectPortabilityV1,
+    ObjectRequirementV1, WarmDefeqBindingV1, WarmDefeqCacheV1, WarmDefeqEntryV1, WarmDefeqQueryV1,
 };
 use fln_hash::certificate::{
     CertificateBindingV1, CertificateExtensionV1, CertificateJudgmentV1, ClaimedResultV1,
@@ -317,7 +324,7 @@ pub fn projection_root(descriptors: &[CorpusDescriptor<'_>]) -> Digest {
 ///
 /// One row per `SCHEMA_REGISTRY` row, joined in both directions by [`project`]. The
 /// order matches the registry's for readability only — the join does not depend on it.
-pub const CORPUS_COVERAGE: [CorpusCoverage; 15] = [
+pub const CORPUS_COVERAGE: [CorpusCoverage; 18] = [
     CorpusCoverage {
         schema: "fln.canon.name",
         version: 1,
@@ -399,6 +406,31 @@ pub const CORPUS_COVERAGE: [CorpusCoverage; 15] = [
                    environment, policy and fuel root around a shared term DAG, one \
                    literal-reduction hint and one advisory extension",
         run: exercise_declaration_certificate,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.warm-defeq-cache",
+        version: 1,
+        exercise: "construct, encode, decode and byte-identically re-encode an optional \
+                   OQ-13 replay-hint attachment binding its receipt, certificate, \
+                   epoch, mode, environment, producer, policy and fuel coordinates, \
+                   with checked reduction traces and one advisory extension",
+        run: exercise_warm_defeq_cache,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.cartridge-manifest",
+        version: 1,
+        exercise: "construct, encode, decode and byte-identically re-encode a logical \
+                   cartridge manifest with required and optional objects, receipt \
+                   attachments, chunk closure and portability, preserving its root",
+        run: exercise_cartridge_manifest,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.cartridge-archive",
+        version: 1,
+        exercise: "round trip byte-identically the thin, partial, sealed and complete \
+                   transports of one manifest, preserve their shared logical root, \
+                   and derive exact random access from complete archive bytes",
+        run: exercise_cartridge_archive,
     },
     CorpusCoverage {
         schema: "fln.env.module-provenance",
@@ -1005,6 +1037,263 @@ fn exercise_declaration_certificate(row: &SchemaRow) -> Result<(), String> {
         return Err(
             "re-encoded declaration certificate is not byte-identical to its source".to_string(),
         );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Certificate cartridges and OQ-13 replay hints (fln-hash)
+// ---------------------------------------------------------------------------
+
+fn cartridge_root(seed: u8) -> ContentRoot {
+    ContentRoot::new([seed; 32])
+}
+
+fn cartridge_warm_cache(
+    receipt: CartridgeObjectIdV1,
+    certificate: CartridgeObjectIdV1,
+) -> Result<WarmDefeqCacheV1, String> {
+    ok(
+        WarmDefeqCacheV1::new(
+            WarmDefeqBindingV1 {
+                receipt_object: receipt,
+                certificate_object: certificate,
+                epoch: EpochId::new(4_032_000),
+                mode: Mode::Sound,
+                environment_root: cartridge_root(40),
+                kernel_build_root: cartridge_root(41),
+                checker_build_root: cartridge_root(42),
+                policy_root: cartridge_root(43),
+                fuel_profile_root: cartridge_root(44),
+            },
+            vec![WarmDefeqEntryV1 {
+                query: WarmDefeqQueryV1 {
+                    left_term_root: cartridge_root(50),
+                    right_term_root: cartridge_root(51),
+                    expected_type_root: Some(cartridge_root(52)),
+                    transparency: DefeqTransparencyV1::Semireducible,
+                },
+                normal_form_root: cartridge_root(53),
+                left_trace: vec![cartridge_root(50), cartridge_root(53)],
+                right_trace: vec![cartridge_root(51), cartridge_root(53)],
+            }],
+            vec![CartridgeExtensionV1::advisory(
+                1,
+                b"corpus-preserved".to_vec(),
+            )],
+        ),
+        "construct warm definitional-equality cache",
+    )
+}
+
+fn cartridge_archive() -> Result<CartridgeArchiveV1, String> {
+    let epoch = EpochId::new(4_032_000);
+    let environment_root = cartridge_root(40);
+    let mut builder = ok(
+        CartridgeBuilderV1::new(epoch, environment_root).with_chunk_size(5),
+        "set cartridge chunk size",
+    )?;
+    let receipt = builder.add_object(
+        CartridgeObjectKindV1::Receipt,
+        ObjectRequirementV1::Required,
+        ObjectPortabilityV1::EpochBound,
+        b"corpus-receipt-v1".to_vec(),
+    );
+    let certificate = builder.add_object(
+        CartridgeObjectKindV1::Certificate,
+        ObjectRequirementV1::Required,
+        ObjectPortabilityV1::EpochBound,
+        b"corpus-certificate-v1".to_vec(),
+    );
+    let schema = builder.add_object(
+        CartridgeObjectKindV1::Schema,
+        ObjectRequirementV1::Required,
+        ObjectPortabilityV1::Portable,
+        b"corpus-schema-v1".to_vec(),
+    );
+    let fixture = builder.add_object(
+        CartridgeObjectKindV1::Fixture,
+        ObjectRequirementV1::Optional,
+        ObjectPortabilityV1::Portable,
+        b"corpus-fixture-v1".to_vec(),
+    );
+    let resource_contract = builder.add_object(
+        CartridgeObjectKindV1::ResourceContract,
+        ObjectRequirementV1::Required,
+        ObjectPortabilityV1::Portable,
+        b"corpus-resource-contract-v1".to_vec(),
+    );
+    let warm_cache = cartridge_warm_cache(receipt, certificate)?;
+    let warm_cache = builder.add_object(
+        CartridgeObjectKindV1::WarmDefeqCache,
+        ObjectRequirementV1::Optional,
+        ObjectPortabilityV1::EpochBound,
+        ok(
+            warm_cache.to_canonical_bytes(),
+            "encode cartridge warm cache",
+        )?,
+    );
+
+    builder.add_root_receipt(receipt);
+    for (role, object) in [
+        (AttachmentRoleV1::Certificate, certificate),
+        (AttachmentRoleV1::Schema, schema),
+        (AttachmentRoleV1::Fixture, fixture),
+        (AttachmentRoleV1::ResourceContract, resource_contract),
+        (AttachmentRoleV1::WarmDefeqCache, warm_cache),
+    ] {
+        builder.attach(receipt, role, object);
+    }
+    ok(builder.build(), "build complete cartridge")
+}
+
+fn exercise_warm_defeq_cache(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_WARM_DEFEQ_CACHE)?;
+    let cache = cartridge_warm_cache(
+        CartridgeObjectIdV1::new(Digest([60; 32])),
+        CartridgeObjectIdV1::new(Digest([61; 32])),
+    )?;
+    let bytes = ok(cache.to_canonical_bytes(), "encode warm defeq cache")?;
+    if !bytes.starts_with(&schema_prefix(SCHEMA_WARM_DEFEQ_CACHE)) {
+        return Err("warm defeq cache does not carry its registered schema header".to_string());
+    }
+    let decoded = WarmDefeqCacheV1::from_canonical_bytes(&bytes)
+        .into_complete()
+        .map_err(|outcome| format!("warm defeq cache decode did not complete: {outcome:?}"))?
+        .map_err(|error| format!("warm defeq cache decode refused: {error:?}"))?;
+    if decoded != cache {
+        return Err("decoded warm defeq cache differs from its source".to_string());
+    }
+    if ok(decoded.to_canonical_bytes(), "re-encode warm defeq cache")? != bytes {
+        return Err("re-encoded warm defeq cache is not byte-identical".to_string());
+    }
+    Ok(())
+}
+
+fn exercise_cartridge_manifest(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_CARTRIDGE_MANIFEST)?;
+    let archive = cartridge_archive()?;
+    let manifest = archive.manifest.clone();
+    let root = ok(manifest.manifest_root(), "derive cartridge manifest root")?;
+    let bytes = ok(manifest.to_canonical_bytes(), "encode cartridge manifest")?;
+    if !bytes.starts_with(&schema_prefix(SCHEMA_CARTRIDGE_MANIFEST)) {
+        return Err("cartridge manifest does not carry its registered schema header".to_string());
+    }
+    let decoded = CartridgeManifestV1::from_canonical_bytes(&bytes)
+        .into_complete()
+        .map_err(|outcome| format!("cartridge manifest decode did not complete: {outcome:?}"))?
+        .map_err(|error| format!("cartridge manifest decode refused: {error:?}"))?;
+    if decoded != manifest {
+        return Err("decoded cartridge manifest differs from its source".to_string());
+    }
+    if ok(decoded.to_canonical_bytes(), "re-encode cartridge manifest")? != bytes {
+        return Err("re-encoded cartridge manifest is not byte-identical".to_string());
+    }
+    if ok(decoded.manifest_root(), "re-derive cartridge manifest root")? != root {
+        return Err("cartridge manifest root moved across its round trip".to_string());
+    }
+    let thin = ok(
+        CartridgeArchiveV1::thin(decoded),
+        "construct thin cartridge",
+    )?;
+    if thin.transport_state() != CartridgeTransportStateV1::Thin
+        || ok(thin.manifest_root(), "derive thin cartridge root")? != root
+    {
+        return Err("thin transport did not preserve the logical manifest identity".to_string());
+    }
+    Ok(())
+}
+
+fn exercise_cartridge_archive(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_CARTRIDGE_ARCHIVE)?;
+    let complete = cartridge_archive()?;
+    let root = ok(complete.manifest_root(), "derive complete cartridge root")?;
+    let thin = ok(
+        CartridgeArchiveV1::thin(complete.manifest.clone()),
+        "construct thin cartridge",
+    )?;
+    let required = complete.manifest.required_chunk_ids();
+    let sealed_frames = complete
+        .frames
+        .iter()
+        .filter(|frame| required.contains(&frame.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let sealed = ok(
+        CartridgeArchiveV1::new(complete.manifest.clone(), sealed_frames.clone()),
+        "construct sealed cartridge",
+    )?;
+    let mut partial_frames = sealed_frames;
+    partial_frames
+        .pop()
+        .ok_or_else(|| "cartridge fixture has no required frame to omit".to_string())?;
+    let partial = ok(
+        CartridgeArchiveV1::new(complete.manifest.clone(), partial_frames),
+        "construct partial cartridge",
+    )?;
+
+    if thin.transport_state() != CartridgeTransportStateV1::Thin
+        || !matches!(
+            partial.transport_state(),
+            CartridgeTransportStateV1::Partial { .. }
+        )
+        || !matches!(
+            sealed.transport_state(),
+            CartridgeTransportStateV1::Sealed { .. }
+        )
+        || complete.transport_state() != CartridgeTransportStateV1::Complete
+    {
+        return Err("cartridge fixture does not witness all four transport states".to_string());
+    }
+
+    for (label, archive) in [
+        ("thin", thin),
+        ("partial", partial),
+        ("sealed", sealed),
+        ("complete", complete.clone()),
+    ] {
+        if ok(archive.manifest_root(), "derive cartridge variant root")? != root {
+            return Err(format!("{label} cartridge moved the logical manifest root"));
+        }
+        let bytes = ok(archive.to_canonical_bytes(), "encode cartridge archive")?;
+        if !bytes.starts_with(&schema_prefix(SCHEMA_CARTRIDGE_ARCHIVE)) {
+            return Err(format!(
+                "{label} cartridge does not carry its registered schema header"
+            ));
+        }
+        let decoded = CartridgeArchiveV1::from_canonical_bytes(&bytes)
+            .into_complete()
+            .map_err(|outcome| format!("{label} cartridge decode did not complete: {outcome:?}"))?
+            .map_err(|error| format!("{label} cartridge decode refused: {error:?}"))?;
+        if decoded != archive {
+            return Err(format!("{label} decoded cartridge differs from its source"));
+        }
+        if ok(decoded.to_canonical_bytes(), "re-encode cartridge archive")? != bytes {
+            return Err(format!(
+                "{label} re-encoded cartridge is not byte-identical"
+            ));
+        }
+    }
+
+    let complete_bytes = ok(complete.to_canonical_bytes(), "encode indexed cartridge")?;
+    let index = CartridgeIndexV1::from_canonical_bytes(
+        &complete_bytes,
+        CartridgeDecodeBudgetsV1::unlimited(),
+    )
+    .into_complete()
+    .map_err(|outcome| format!("cartridge index derivation did not complete: {outcome:?}"))?
+    .map_err(|error| format!("cartridge index derivation refused: {error:?}"))?;
+    if index.manifest_root != root || index.chunks.len() != complete.frames.len() {
+        return Err("derived cartridge index does not cover the complete transport".to_string());
+    }
+    for frame in &complete.frames {
+        if ok(
+            index.read_chunk(&complete_bytes, frame.id),
+            "read indexed cartridge frame",
+        )? != frame.bytes
+        {
+            return Err("derived cartridge index returned different frame bytes".to_string());
+        }
     }
     Ok(())
 }
