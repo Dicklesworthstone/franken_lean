@@ -636,7 +636,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 field_index,
             })
         })?;
-        let target = rule.parameter_count.checked_add(field).ok_or_else(|| {
+        let target = rule.parameter_count.checked_add(field).ok_or({
             Halt::Refusal(WhnfRefusal::ProjectionIndexOverflow {
                 rule: rule_index,
                 parameter_count: rule.parameter_count,
