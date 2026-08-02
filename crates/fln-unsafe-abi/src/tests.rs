@@ -2440,6 +2440,21 @@ mod task_state_targets {
         }
         t
     }
+
+    /// `fun a => pure (a * 2)` under the compiled BaseIO convention (bare
+    /// result, world token ignored).
+    pub(crate) extern "C" fn io_double(a: *mut LeanObject, _w: *mut LeanObject) -> *mut LeanObject {
+        crate::tagged::boxi(crate::tagged::unbox(a) * 2)
+    }
+
+    /// `fun a => pure (Task.pure (a + 1))` — the bindTask target returning
+    /// a task, through the safe export wrapper.
+    pub(crate) extern "C" fn io_task_succ(
+        a: *mut LeanObject,
+        _w: *mut LeanObject,
+    ) -> *mut LeanObject {
+        crate::export::export_lean_task_pure(crate::tagged::boxi(crate::tagged::unbox(a) + 1))
+    }
 }
 
 #[test]
@@ -2688,6 +2703,131 @@ fn export_task_manager_family_matches_upstream_arms() {
         crate::rc::dec_ref(p5);
 
         drop(_fin); // join the workers before the shadow drain
+    }
+    let _ = shadow::disable_and_drain();
+}
+
+#[test]
+fn export_io_task_wrapper_family_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_finalize_task_manager, export_lean_init_task_manager_using,
+        export_lean_io_as_task, export_lean_io_bind_task, export_lean_io_cancel,
+        export_lean_io_check_canceled, export_lean_io_get_task_state, export_lean_io_map_task,
+        export_lean_io_promise_new, export_lean_io_promise_result_opt, export_lean_io_wait,
+        export_lean_io_wait_any, export_lean_io_wait_any_core, export_lean_task_pure,
+    };
+    shadow::enable();
+    struct Fin;
+    impl Drop for Fin {
+        fn drop(&mut self) {
+            export_lean_finalize_task_manager();
+        }
+    }
+    // SAFETY: every object is allocated and settled here; the io.cpp wrapper
+    // family (io.cpp:1534-1592) is exercised over the live manager and the
+    // managerless finished-scan arm, with the shadow oracle watching.
+    // UNSAFE-LEDGER: FLN-UL-0264
+    #[allow(unsafe_code)]
+    unsafe {
+        export_lean_init_task_manager_using(2);
+        let _fin = Fin;
+
+        // asTask: the BaseIO action's bare result becomes the task value;
+        // keep_alive means the task runs even if its reference is dropped.
+        let act = crate::object::alloc_closure(
+            task_state_targets::forty_two as *mut core::ffi::c_void,
+            1,
+            0,
+        );
+        let t1 = export_lean_io_as_task(act, crate::tagged::boxi(0));
+        assert_eq!(
+            crate::tagged::unbox(export_lean_io_wait(t1)),
+            42,
+            "asTask ran the action on a worker; wait consumed the task"
+        );
+
+        // mapTask: f applied to the value and the world token, bare result.
+        let f2 = crate::object::alloc_closure(
+            task_state_targets::io_double as *mut core::ffi::c_void,
+            2,
+            0,
+        );
+        let t2 = export_lean_io_map_task(
+            f2,
+            export_lean_task_pure(crate::tagged::boxi(21)),
+            crate::tagged::boxi(0),
+            0,
+        );
+        assert_eq!(
+            crate::tagged::unbox(export_lean_io_wait(t2)),
+            42,
+            "mapTask applied f through io_bind_task_fn"
+        );
+
+        // bindTask: f returns a Task; the bound task continues as it.
+        let f3 = crate::object::alloc_closure(
+            task_state_targets::io_task_succ as *mut core::ffi::c_void,
+            2,
+            0,
+        );
+        let t3 = export_lean_io_bind_task(
+            export_lean_task_pure(crate::tagged::boxi(5)),
+            f3,
+            crate::tagged::boxi(0),
+            0,
+        );
+        assert_eq!(
+            crate::tagged::unbox(export_lean_io_wait(t3)),
+            6,
+            "bindTask continued as f's task"
+        );
+
+        // waitAny: the first FINISHED member in list order — the unresolved
+        // promise task is skipped, the pure task answers.
+        let pw = export_lean_io_promise_new();
+        let pwt = export_lean_io_promise_result_opt(pw);
+        let fin3 = export_lean_task_pure(crate::tagged::boxi(3));
+        let nil = crate::tagged::boxi(0);
+        let l2 = crate::object::alloc_ctor(1, 2, 0);
+        crate::object::ctor_set(l2, 0, fin3);
+        crate::object::ctor_set(l2, 1, nil);
+        let l1 = crate::object::alloc_ctor(1, 2, 0);
+        crate::object::ctor_set(l1, 0, pwt);
+        crate::object::ctor_set(l1, 1, l2);
+        assert_eq!(
+            crate::tagged::unbox(export_lean_io_wait_any(l1)),
+            3,
+            "waitAny returns the first finished member's value in list order"
+        );
+        crate::rc::dec_ref(l1);
+        crate::rc::dec_ref(pw);
+
+        // cancel wrapper on a finished task is a unit no-op; the check
+        // wrapper answers false off-task.
+        let fc = export_lean_task_pure(crate::tagged::boxi(1));
+        assert!(crate::tagged::is_scalar(export_lean_io_cancel(fc)));
+        assert_eq!(
+            export_lean_io_get_task_state(fc),
+            2,
+            "cancel of a finished task is the pin's pre-manager no-op"
+        );
+        crate::rc::dec_ref(fc);
+        assert_eq!(export_lean_io_check_canceled(), 0, "false off-task");
+
+        drop(_fin); // join the workers, then exercise the managerless arm
+        let lone = export_lean_task_pure(crate::tagged::boxi(4));
+        let nil2 = crate::tagged::boxi(0);
+        let l3 = crate::object::alloc_ctor(1, 2, 0);
+        crate::object::ctor_set(l3, 0, lone);
+        crate::object::ctor_set(l3, 1, nil2);
+        let w = export_lean_io_wait_any_core(l3);
+        assert_eq!(
+            crate::tagged::unbox(crate::object::task_fields(w).0),
+            4,
+            "managerless wait_any_core still answers from the finished scan"
+        );
+        crate::rc::dec_ref(l3);
     }
     let _ = shadow::disable_and_drain();
 }

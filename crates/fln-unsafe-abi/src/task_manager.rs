@@ -565,6 +565,26 @@ impl Manager {
         }
     }
 
+    /// `wait_any` (`object.cpp:1014-1023`): scan-then-block on the finished
+    /// condvar; every completion wakes every waiter, each of whom rescans
+    /// its whole list (the pin's own thundering-herd design).
+    pub(crate) fn wait_any(&self, task_list: *mut LeanObject) -> Option<*mut LeanObject> {
+        if let Some(t) = wait_any_check(task_list) {
+            return Some(t);
+        }
+        let mut g = lock_state(&self.state);
+        loop {
+            if let Some(t) = wait_any_check(task_list) {
+                drop(g);
+                return Some(t);
+            }
+            g = self
+                .task_finished_cv
+                .wait(g)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
     /// `cancel` (`object.cpp:1039-1043`).
     pub(crate) fn cancel(&self, t: TaskPtr) {
         let g = lock_state(&self.state);
@@ -698,6 +718,27 @@ fn worker_main(me: MgrRef) {
     }
     g.idle_std_workers -= 1;
     drop(g);
+}
+
+/// `wait_any_check` (`object.cpp:919-929`): the first FINISHED member in
+/// list order, borrowed, or None. Callable managerless — the scan touches
+/// no manager state.
+// UNSAFE-LEDGER: FLN-UL-0253
+#[allow(unsafe_code)]
+pub(crate) fn wait_any_check(task_list: *mut LeanObject) -> Option<*mut LeanObject> {
+    // SAFETY: task_list is a live (borrowed) List (Task α): cons cells are
+    // 2-field ctors, nil is a scalar, every head is a live task.
+    unsafe {
+        let mut it = task_list;
+        while !is_scalar(it) {
+            let head = object::ctor_get(it, 0);
+            if !value(TaskPtr(head.cast::<LeanTaskObject>())).is_null() {
+                return Some(head);
+            }
+            it = object::ctor_get(it, 1);
+        }
+        None
+    }
 }
 
 /// The `MgrRef` deref, funneled once.

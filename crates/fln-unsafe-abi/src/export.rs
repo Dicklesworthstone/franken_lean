@@ -2911,3 +2911,174 @@ pub(crate) extern "C" fn export_lean_io_cancel_core(t: *mut LeanObject) {
     }
     task_manager_refusal("`IO.cancel` on an unfinished task")
 }
+
+// ===================================================================
+// fln-3gv slice 3b: the io.cpp wrapper family over the live cores
+// (io.cpp:1534-1592). At this pin a compiled BaseIO result IS the bare
+// value (the world is erased and the error arm is impossible), so the
+// task-body closures apply the action/function to the world token and
+// return the result unchanged — exactly what the pin's object_ref dance
+// nets to. All three task builders pass keep_alive = true, the pin's own
+// IO-vs-Task distinction.
+// ===================================================================
+
+/// `lean_io_as_task_fn` (`io.cpp:1535-1538`): apply the BaseIO action to
+/// the world token; the bare result is the task's value.
+// UNSAFE-LEDGER: FLN-UL-0254
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn io_as_task_fn(
+    act: *mut LeanObject,
+    _w: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: act is the owned BaseIO action; apply consumes it and yields
+    // the owned bare result.
+    unsafe { apply_core(act, &[crate::tagged::boxi(0)]) }
+}
+
+/// `lean_io_bind_task_fn` (`io.cpp:1548-1551`): apply `f` to the task's
+/// value and the world token; serves both mapTask (bare β out) and
+/// bindTask (a Task β out), exactly as the pin reuses it.
+// UNSAFE-LEDGER: FLN-UL-0255
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn io_bind_task_fn(
+    f: *mut LeanObject,
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: f and a are owned; apply consumes both and yields the owned
+    // result.
+    unsafe { apply_core(f, &[a, crate::tagged::boxi(0)]) }
+}
+
+/// `lean_io_as_task` (`io.cpp:1541-1546`; extern census `BaseIO.asTask`):
+/// spawn the action's closure with `keep_alive = true` — an IO task runs
+/// even if its last reference is dropped.
+// UNSAFE-LEDGER: FLN-UL-0256
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_as_task")]
+pub(crate) extern "C" fn export_lean_io_as_task(
+    act: *mut LeanObject,
+    prio: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: act is consumed into the closure; the boxed prio is unboxed
+    // exactly as the pin does.
+    unsafe {
+        let c = object::alloc_closure(io_as_task_fn as *mut c_void, 2, 1);
+        object::closure_set(c, 0, act);
+        export_lean_task_spawn_core(c, crate::tagged::unbox(prio) as c_uint, true)
+    }
+}
+
+/// `lean_io_map_task` (`io.cpp:1554-1559`; extern census `BaseIO.mapTask`).
+// UNSAFE-LEDGER: FLN-UL-0257
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_map_task")]
+pub(crate) extern "C" fn export_lean_io_map_task(
+    f: *mut LeanObject,
+    t: *mut LeanObject,
+    prio: *mut LeanObject,
+    sync: u8,
+) -> *mut LeanObject {
+    // SAFETY: f is consumed into the closure, t into map_core.
+    unsafe {
+        let c = object::alloc_closure(io_bind_task_fn as *mut c_void, 2, 1);
+        object::closure_set(c, 0, f);
+        export_lean_task_map_core(c, t, crate::tagged::unbox(prio) as c_uint, sync != 0, true)
+    }
+}
+
+/// `lean_io_bind_task` (`io.cpp:1562-1567`; extern census
+/// `BaseIO.bindTask`).
+// UNSAFE-LEDGER: FLN-UL-0258
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_bind_task")]
+pub(crate) extern "C" fn export_lean_io_bind_task(
+    t: *mut LeanObject,
+    f: *mut LeanObject,
+    prio: *mut LeanObject,
+    sync: u8,
+) -> *mut LeanObject {
+    // SAFETY: f is consumed into the closure, t into bind_core.
+    unsafe {
+        let c = object::alloc_closure(io_bind_task_fn as *mut c_void, 2, 1);
+        object::closure_set(c, 0, f);
+        export_lean_task_bind_core(t, c, crate::tagged::unbox(prio) as c_uint, sync != 0, true)
+    }
+}
+
+/// `lean_io_check_canceled` (`io.cpp:1570-1572`; extern census
+/// `IO.checkCanceled`).
+// UNSAFE-LEDGER: FLN-UL-0259
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_check_canceled")]
+pub(crate) extern "C" fn export_lean_io_check_canceled() -> u8 {
+    u8::from(export_lean_io_check_canceled_core())
+}
+
+/// `lean_io_cancel` (`io.cpp:1574-1577`; extern census `IO.cancel`).
+// UNSAFE-LEDGER: FLN-UL-0260
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_cancel")]
+pub(crate) extern "C" fn export_lean_io_cancel(t: *mut LeanObject) -> *mut LeanObject {
+    export_lean_io_cancel_core(t);
+    crate::tagged::boxi(0)
+}
+
+/// `lean_io_wait` (`io.cpp:1583-1585`; extern census `IO.wait`):
+/// `lean_task_get_own` — get (blocking through the manager where needed),
+/// then the scalar-checked inc/dec of the lean.h inline.
+// UNSAFE-LEDGER: FLN-UL-0261
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_wait")]
+pub(crate) extern "C" fn export_lean_io_wait(t: *mut LeanObject) -> *mut LeanObject {
+    let v = export_lean_task_get(t);
+    // SAFETY: v is the borrowed published value; t is the consumed task.
+    unsafe {
+        if !is_scalar(v) {
+            rc::inc_ref_n(v, 1);
+        }
+        if !is_scalar(t) {
+            rc::dec_ref(t);
+        }
+    }
+    v
+}
+
+/// `lean_io_wait_any_core` (`object.cpp:1267-1269` over `wait_any`,
+/// `object.cpp:919-929, 1014-1023`): the first FINISHED member in list
+/// order, borrowed; block-and-rescan through the manager until one
+/// appears. Managerless — where the pin null-derefs unconditionally — the
+/// finished-scan still answers and the empty-handed arm refuses typed.
+// UNSAFE-LEDGER: FLN-UL-0262
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_wait_any_core")]
+pub(crate) extern "C" fn export_lean_io_wait_any_core(
+    task_list: *mut LeanObject,
+) -> *mut LeanObject {
+    if let Some(mgr) = crate::task_manager::manager() {
+        return mgr
+            .wait_any(task_list)
+            .expect("wait_any blocks until a member finishes");
+    }
+    if let Some(t) = crate::task_manager::wait_any_check(task_list) {
+        return t;
+    }
+    task_manager_refusal("`IO.waitAny` with no finished member")
+}
+
+/// `lean_io_wait_any` (`io.cpp:1587-1592`; extern census `IO.waitAny`):
+/// wait_any_core, then the winner's value duplicated out.
+// UNSAFE-LEDGER: FLN-UL-0263
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_wait_any")]
+pub(crate) extern "C" fn export_lean_io_wait_any(task_list: *mut LeanObject) -> *mut LeanObject {
+    let t = export_lean_io_wait_any_core(task_list);
+    let v = export_lean_task_get(t);
+    // SAFETY: v is the borrowed published value of a finished task; one
+    // token is minted for the caller (the pin's lean_inc).
+    unsafe {
+        if !is_scalar(v) {
+            rc::inc_ref_n(v, 1);
+        }
+    }
+    v
+}

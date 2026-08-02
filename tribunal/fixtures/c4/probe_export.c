@@ -58,6 +58,16 @@ extern lean_object *lean_io_promise_result_opt(lean_object *promise);
 extern uint8_t lean_io_get_task_state(lean_object *t);
 extern lean_object *lean_option_get_or_block(lean_object *opt);
 
+/* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
+ * family, declared exactly as stage0 Init/System/IO.c declares them. */
+extern lean_object *lean_io_as_task(lean_object *act, lean_object *prio);
+extern lean_object *lean_io_map_task(lean_object *f, lean_object *t, lean_object *prio, uint8_t sync);
+extern lean_object *lean_io_bind_task(lean_object *t, lean_object *f, lean_object *prio, uint8_t sync);
+extern uint8_t lean_io_check_canceled();
+extern lean_object *lean_io_cancel(lean_object *t);
+extern lean_object *lean_io_wait(lean_object *t);
+extern lean_object *lean_io_wait_any(lean_object *task_list);
+
 /* Apply targets for the task facts, closured exactly as generated C does. */
 static lean_object *probe_double(lean_object *x) {
     return lean_box(lean_unbox(x) * 2);
@@ -79,6 +89,15 @@ static lean_object *probe_ident(lean_object *x) {
 static lean_object *probe_return_task(lean_object *t, lean_object *v) {
     lean_dec(v);
     return t;
+}
+/* slice 3b targets under the compiled BaseIO convention (bare results). */
+static lean_object *probe_double_io(lean_object *a, lean_object *w) {
+    (void)w;
+    return lean_box(lean_unbox(a) * 2);
+}
+static lean_object *probe_task_succ(lean_object *a, lean_object *w) {
+    (void)w;
+    return lean_task_pure(lean_box(lean_unbox(a) + 1));
 }
 
 static void facts_mode(void) {
@@ -445,6 +464,40 @@ static void facts_mode(void) {
     lean_dec(pr5);
     /* off-task cancellation probe answers false in both runtimes */
     fact("mgr.check_canceled.off_task", lean_io_check_canceled_core());
+
+    /* ---- fln-3gv slice 3b: the io.cpp wrapper family over the live
+     * cores. BaseIO results are bare values at this pin. */
+    lean_object *act = lean_alloc_closure((void *)probe_forty_two, 1, 0);
+    lean_object *iot = lean_io_as_task(act, lean_box(0));
+    fact("iow.as_task.wait", (long long)lean_unbox(lean_io_wait(iot)));
+    lean_object *mt2 = lean_io_map_task(
+        lean_alloc_closure((void *)probe_double_io, 2, 0),
+        lean_task_pure(lean_box(21)), lean_box(0), 0);
+    fact("iow.map_task.wait", (long long)lean_unbox(lean_io_wait(mt2)));
+    lean_object *bt2 = lean_io_bind_task(
+        lean_task_pure(lean_box(5)),
+        lean_alloc_closure((void *)probe_task_succ, 2, 0), lean_box(0), 0);
+    fact("iow.bind_task.wait", (long long)lean_unbox(lean_io_wait(bt2)));
+    /* waitAny answers with the first FINISHED member in list order */
+    lean_object *anyp = lean_io_promise_new();
+    lean_object *anypt = lean_io_promise_result_opt(anyp);
+    lean_object *fin3 = lean_task_pure(lean_box(3));
+    lean_object *wl2 = lean_alloc_ctor(1, 2, 0);
+    lean_ctor_set(wl2, 0, fin3);
+    lean_ctor_set(wl2, 1, lean_box(0));
+    lean_object *wl1 = lean_alloc_ctor(1, 2, 0);
+    lean_ctor_set(wl1, 0, anypt);
+    lean_ctor_set(wl1, 1, wl2);
+    fact("iow.wait_any.first_finished", (long long)lean_unbox(lean_io_wait_any(wl1)));
+    lean_dec(wl1);
+    lean_dec(anyp);
+    /* the cancel wrapper's finished no-op, and the check wrapper off-task */
+    lean_object *fc = lean_task_pure(lean_box(1));
+    lean_dec(lean_io_cancel(fc));
+    fact("iow.cancel.finished_state", lean_io_get_task_state(fc));
+    lean_dec(fc);
+    fact("iow.check_canceled", lean_io_check_canceled());
+
     lean_finalize_task_manager(); /* both runtimes drain and join here */
 }
 
