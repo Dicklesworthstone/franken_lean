@@ -18,8 +18,8 @@ use fln_checker::whnf::{
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, WireExpr, WireName, decode_expr, decode_name,
 };
-use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, NatLit};
-use fln_core::level::Level;
+use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
+use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_hash::canon::{CanonWriter, Canonical, SCHEMA_EXPR};
@@ -73,6 +73,61 @@ fn identity() -> Expr {
         Expr::sort(Level::zero()),
         Expr::bvar(0).expect("identity bound variable"),
         BinderInfo::Default,
+    )
+}
+
+fn eta(function: Expr) -> Expr {
+    Expr::lam(
+        name("eta"),
+        Expr::sort(Level::zero()),
+        Expr::app(function, Expr::bvar(0).expect("eta argument")),
+        BinderInfo::Default,
+    )
+}
+
+fn eta_all_wire_variants() -> Expr {
+    let binder = name("eta_all_variants");
+    let type_ = Expr::sort(Level::param(name("eta_type_level")));
+    let locals = Expr::app(
+        Expr::app(
+            Expr::bvar(0).expect("nested bound variable"),
+            Expr::fvar(FVarId(name("eta_free"))),
+        ),
+        Expr::mvar(MVarId(name("eta_meta"))),
+    );
+    let constants = Expr::app(
+        Expr::const_(
+            name("EtaConstant"),
+            vec![
+                Level::param(name("eta_constant_level")),
+                Level::mvar(LMVarId(name("eta_level_meta"))),
+            ],
+        ),
+        Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![3, 5]))),
+    );
+    let body = Expr::app(
+        Expr::app(constants, locals),
+        Expr::lit(Literal::Str("eta-string".to_owned())),
+    );
+    let lambda = Expr::lam(
+        binder.clone(),
+        type_.clone(),
+        body,
+        BinderInfo::StrictImplicit,
+    );
+    let forall = Expr::forall_e(
+        binder.clone(),
+        type_.clone(),
+        lambda,
+        BinderInfo::InstImplicit,
+    );
+    let let_expression = Expr::let_e(binder.clone(), type_, nat_literal(1), forall, true);
+    Expr::app(
+        constant("EtaOpaqueHolder"),
+        Expr::mdata(
+            KVMap::new(),
+            Expr::proj(name("EtaStructure"), 7, let_expression),
+        ),
     )
 }
 
@@ -707,6 +762,314 @@ fn lazy_delta_resources_cancellation_and_recursion_are_typed_and_recoverable() {
 }
 
 #[test]
+fn exact_function_eta_is_symmetric_and_shifts_outer_bounds() {
+    let function = decoded(&constant("eta_function"));
+    let contracted = decoded(&eta(constant("eta_function")));
+    let left_progress = slow_equal(&contracted, &function, &WhnfContext::default());
+    let right_progress = slow_equal(&function, &contracted, &WhnfContext::default());
+    assert_eq!(left_progress, right_progress);
+    assert!(left_progress.slow_comparisons > 0);
+    assert_eq!(left_progress.delta_unfolds, 0);
+
+    let shifted = decoded(&Expr::lam(
+        name("shifted"),
+        Expr::sort(Level::zero()),
+        Expr::app(
+            Expr::bvar(1).expect("outer variable under eta binder"),
+            Expr::bvar(0).expect("eta argument"),
+        ),
+        BinderInfo::Default,
+    ));
+    let outside = decoded(&Expr::bvar(0).expect("outer variable"));
+    assert!(matches!(
+        def_eq(
+            &shifted,
+            &outside,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
+fn eta_virtual_binder_tracks_nested_scope_names_styles_and_universes() {
+    let universe = parameter("eta_u");
+    let equivalent = Level::max(universe.clone(), Level::zero()).expect("shallow equivalent level");
+    let inside_nested = Expr::lam(
+        name("inside_name"),
+        Expr::sort(universe.clone()),
+        Expr::app(
+            Expr::bvar(0).expect("nested local"),
+            Expr::bvar(2).expect("outer variable beyond eta binder"),
+        ),
+        BinderInfo::Default,
+    );
+    let outside_nested = Expr::lam(
+        name("outside_name"),
+        Expr::sort(equivalent.clone()),
+        Expr::app(
+            Expr::bvar(0).expect("nested local"),
+            Expr::bvar(1).expect("outer variable"),
+        ),
+        BinderInfo::Implicit,
+    );
+    let inside_function = Expr::app(Expr::const_(name("EtaWrap"), vec![universe]), inside_nested);
+    let outside_function = Expr::app(
+        Expr::const_(name("EtaWrap"), vec![equivalent]),
+        outside_nested,
+    );
+    let progress = slow_equal(
+        &decoded(&eta(inside_function)),
+        &decoded(&outside_function),
+        &WhnfContext::default(),
+    );
+    assert!(progress.slow_comparisons > 10);
+
+    let dependent_function = Expr::app(
+        constant("EtaWrap"),
+        Expr::lam(
+            name("nested"),
+            Expr::sort(Level::zero()),
+            Expr::bvar(1).expect("consumed eta binder"),
+            BinderInfo::Default,
+        ),
+    );
+    let independent_function = Expr::app(
+        constant("EtaWrap"),
+        Expr::lam(
+            name("nested"),
+            Expr::sort(Level::zero()),
+            Expr::bvar(0).expect("nested local"),
+            BinderInfo::Default,
+        ),
+    );
+    assert!(matches!(
+        def_eq(
+            &decoded(&eta(dependent_function)),
+            &decoded(&independent_function),
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Deferred {
+            need: fln_checker::defeq::DefEqDeferred {
+                left_class: ExpressionClass::Lambda,
+                right_class: ExpressionClass::Apply,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn eta_virtual_binder_covers_every_checker_wire_constructor() {
+    let function = eta_all_wire_variants();
+    let progress = slow_equal(
+        &decoded(&eta(function.clone())),
+        &decoded(&function),
+        &WhnfContext::default(),
+    );
+    assert!(progress.slow_comparisons > 20);
+    assert_eq!(progress.delta_unfolds, 0);
+}
+
+#[test]
+fn eta_gate_misses_and_structural_mismatches_remain_deferred() {
+    let function = constant("eta_gate_function");
+    let cases = [
+        (
+            Expr::lam(
+                name("wrong_body"),
+                Expr::sort(Level::zero()),
+                function.clone(),
+                BinderInfo::Default,
+            ),
+            function.clone(),
+        ),
+        (
+            Expr::lam(
+                name("wrong_argument"),
+                Expr::sort(Level::zero()),
+                Expr::app(function.clone(), Expr::bvar(1).expect("non-eta argument")),
+                BinderInfo::Default,
+            ),
+            function.clone(),
+        ),
+        (
+            Expr::lam(
+                name("metadata_argument"),
+                Expr::sort(Level::zero()),
+                Expr::app(
+                    function.clone(),
+                    Expr::mdata(
+                        KVMap::new(),
+                        Expr::bvar(0).expect("metadata-wrapped eta argument"),
+                    ),
+                ),
+                BinderInfo::Default,
+            ),
+            function.clone(),
+        ),
+        (eta(function), constant("different_function")),
+    ];
+
+    for (index, (left, right)) in cases.into_iter().enumerate() {
+        assert!(
+            matches!(
+                def_eq(
+                    &decoded(&left),
+                    &decoded(&right),
+                    &WhnfContext::default(),
+                    DefEqBudget::unlimited(),
+                ),
+                DefEqOutcome::Deferred { .. }
+            ),
+            "eta gate miss {index} became decisive"
+        );
+    }
+}
+
+#[test]
+fn eta_comparison_limits_cancellation_and_recovery_are_exact() {
+    let mut function = constant("eta_budget_head");
+    for index in 0..64 {
+        function = Expr::app(function, constant(format!("eta_budget_{index}")));
+    }
+    let contracted = decoded(&eta(function.clone()));
+    let outside = decoded(&function);
+    let full = slow_equal(&contracted, &outside, &WhnfContext::default());
+
+    let wrong_argument = decoded(&Expr::lam(
+        name("wrong_argument"),
+        Expr::sort(Level::zero()),
+        Expr::app(
+            function,
+            Expr::bvar(1).expect("non-eta argument for comparison floor"),
+        ),
+        BinderInfo::Default,
+    ));
+    let prefix = match def_eq(
+        &wrong_argument,
+        &outside,
+        &WhnfContext::default(),
+        DefEqBudget::unlimited(),
+    ) {
+        DefEqOutcome::Deferred { progress, .. } => progress,
+        other => panic!("wrong eta argument did not defer: {other:?}"),
+    };
+    assert!(full.slow_comparisons > prefix.slow_comparisons);
+
+    let budget = |max_slow_comparisons| {
+        DefEqBudget::new(
+            QuickDefEqBudget::unlimited(),
+            max_slow_comparisons,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            WhnfBudget::unlimited(),
+        )
+    };
+    let allowed = full.slow_comparisons - 1;
+    assert!(matches!(
+        def_eq(
+            &contracted,
+            &outside,
+            &WhnfContext::default(),
+            budget(allowed),
+        ),
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::SlowComparisons,
+            allowed: actual_allowed,
+            observed,
+            progress,
+        }) if actual_allowed == allowed
+            && observed == allowed + 1
+            && progress.slow_comparisons == allowed
+    ));
+    assert_eq!(
+        match def_eq(
+            &contracted,
+            &outside,
+            &WhnfContext::default(),
+            budget(full.slow_comparisons),
+        ) {
+            DefEqOutcome::Equal(progress) => progress,
+            other => panic!("exact eta comparison budget did not pass: {other:?}"),
+        },
+        full
+    );
+
+    let mut saw_eta_cancellation = false;
+    for cancel_at in 1_u64..=4_096 {
+        let mut polls = 0_u64;
+        let interrupted = def_eq_with(
+            &contracted,
+            &outside,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+            || {
+                polls = polls.saturating_add(1);
+                polls >= cancel_at
+            },
+        );
+        if matches!(
+            interrupted,
+            DefEqOutcome::Inconclusive(DefEqStop::Cancelled { progress, .. })
+                if progress.slow_comparisons > prefix.slow_comparisons
+                    && progress.slow_comparisons < full.slow_comparisons
+        ) {
+            saw_eta_cancellation = true;
+            break;
+        }
+    }
+    assert!(
+        saw_eta_cancellation,
+        "cancellation never reached the virtual-binder comparison"
+    );
+    assert_eq!(
+        slow_equal(&contracted, &outside, &WhnfContext::default()),
+        full
+    );
+}
+
+#[test]
+fn eta_virtual_bound_index_has_an_exact_intrinsic_boundary() {
+    const MAX_INDEX: u32 = (1 << 20) - 2;
+    let contracted = decoded(&eta(
+        Expr::bvar(MAX_INDEX).expect("last checker-owned bound index")
+    ));
+    let exact_outside =
+        decoded(&Expr::bvar(MAX_INDEX - 1).expect("last shiftable checker-owned bound index"));
+    assert!(matches!(
+        def_eq(
+            &contracted,
+            &exact_outside,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Equal(_)
+    ));
+
+    let overflowing_outside =
+        decoded(&Expr::bvar(MAX_INDEX).expect("last checker-owned bound index"));
+    assert!(matches!(
+        def_eq(
+            &contracted,
+            &overflowing_outside,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Inconclusive(DefEqStop::Resource {
+            limit: DefEqLimit::BoundIndex,
+            allowed,
+            observed,
+            ..
+        }) if allowed == u64::from(MAX_INDEX) && observed == allowed + 1
+    ));
+}
+
+#[test]
 fn nat_offsets_close_zero_successors_and_a_terminal_mismatch_exactly() {
     let context = WhnfContext::default();
     let zero = decoded(&nat_zero());
@@ -1243,6 +1606,115 @@ fn deep_application(depth: usize) -> Result<WireExpr, String> {
         DecodeOutcome::Complete(Ok(value)) => Ok(value),
         other => Err(format!("deep expression did not decode: {other:?}")),
     }
+}
+
+fn write_sort_zero(writer: &mut CanonWriter) {
+    writer.u8(3);
+    writer.u8(0);
+}
+
+fn write_anonymous_lambda_prefix(writer: &mut CanonWriter) {
+    writer.u8(6);
+    writer.u64(0);
+    write_sort_zero(writer);
+}
+
+fn write_simple_constant(writer: &mut CanonWriter, component: &str) {
+    writer.u8(4);
+    writer.u64(1);
+    writer.u8(1);
+    writer.str(component);
+    writer.u64(0);
+}
+
+fn write_deep_eta_function(writer: &mut CanonWriter, depth: usize) {
+    writer.u8(5);
+    write_simple_constant(writer, "DeepEtaWrap");
+    for _ in 0..depth {
+        write_anonymous_lambda_prefix(writer);
+    }
+    writer.u8(0);
+    writer.u32(0);
+    for _ in 0..depth {
+        writer.u8(0);
+    }
+}
+
+fn deep_eta_terms(depth: usize) -> Result<(WireExpr, WireExpr), String> {
+    let mut contracted = CanonWriter::new();
+    contracted.schema(SCHEMA_EXPR);
+    write_anonymous_lambda_prefix(&mut contracted);
+    contracted.u8(5);
+    write_deep_eta_function(&mut contracted, depth);
+    contracted.u8(0);
+    contracted.u32(0);
+    contracted.u8(0);
+
+    let mut outside = CanonWriter::new();
+    outside.schema(SCHEMA_EXPR);
+    write_deep_eta_function(&mut outside, depth);
+
+    let decode = |bytes: Vec<u8>| match decode_expr(&bytes, DecodeBudget::unlimited()) {
+        DecodeOutcome::Complete(Ok(value)) => Ok(value),
+        other => Err(format!("deep eta expression did not decode: {other:?}")),
+    };
+    Ok((
+        decode(contracted.into_bytes())?,
+        decode(outside.into_bytes())?,
+    ))
+}
+
+fn deep_eta_child() -> Result<(), String> {
+    const DEPTH: usize = 50_000;
+    let (contracted, outside) = deep_eta_terms(DEPTH)?;
+    match def_eq(
+        &contracted,
+        &outside,
+        &WhnfContext::default(),
+        DefEqBudget::unlimited(),
+    ) {
+        DefEqOutcome::Equal(progress)
+            if progress.quick_comparisons == 1
+                && progress.slow_comparisons >= DEPTH.saturating_mul(2) as u64
+                && progress.delta_unfolds == 0 =>
+        {
+            Ok(())
+        }
+        other => Err(format!("deep eta conversion drifted: {other:?}")),
+    }
+}
+
+#[test]
+fn deep_exact_function_eta_fits_a_64k_stack() {
+    const CHILD_ENV: &str = "FLN_CHECKER_EXACT_ETA_DEEP_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let result = std::thread::Builder::new()
+            .name("fln-checker-exact-eta-deep".to_owned())
+            .stack_size(64 * 1024)
+            .spawn(deep_eta_child)
+            .expect("spawn bounded-stack eta child thread")
+            .join()
+            .expect("bounded-stack eta child thread did not panic");
+        result.expect("bounded-stack exact eta conversion");
+        return;
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = Command::new(executable)
+        .env(CHILD_ENV, "1")
+        .args([
+            "--exact",
+            "deep_exact_function_eta_fits_a_64k_stack",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run bounded-stack eta child process");
+    assert!(
+        output.status.success(),
+        "bounded-stack eta child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn deep_child() -> Result<(), String> {

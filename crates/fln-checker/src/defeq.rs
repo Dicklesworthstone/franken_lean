@@ -8,9 +8,11 @@
 //! then unfolds safe definition heads one step at a time in descending
 //! definitional-height order. At the exact `String.ofList` comparison gate,
 //! Unicode String literals expand through the checker-owned KR-314 reducer.
-//! Typing, eta, proof irrelevance, recursors, and native computation still
-//! produce a typed deferral. A deferral is not a rejection and this module is
-//! not a declaration-admission authority.
+//! Once both heads are stable, the exact `fun x => f x` KR-312 subset contracts
+//! through a virtual binder when `f` does not depend on `x`. Pi-driven eta,
+//! typing, proof irrelevance, recursors, and native computation still produce
+//! a typed deferral. A deferral is not a rejection and this module is not a
+//! declaration-admission authority.
 
 use std::collections::BTreeSet;
 
@@ -29,8 +31,8 @@ use crate::whnf::{
     whnf_delta_step_at_with,
 };
 use crate::wire::{
-    ExprId, ExprNode, NamePart, WireExpr, WireName, expression_owned_units, level_owned_units,
-    usize_units,
+    ExprId, ExprNode, MAX_BVAR_INDEX, NamePart, WireExpr, WireName, expression_owned_units,
+    level_owned_units, usize_units,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +226,7 @@ impl DefEqBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefEqLimit {
     SlowComparisons,
+    BoundIndex,
     Normalizations,
     MaterializedArenaNodes,
     MaterializedOwnedUnits,
@@ -860,6 +863,15 @@ impl SlowControl {
         }
         self.progress.slow_comparisons = observed;
         Ok(())
+    }
+
+    fn bound_index(&self, observed: u64) -> SlowHalt {
+        SlowHalt::Stop(Box::new(DefEqStop::Resource {
+            limit: DefEqLimit::BoundIndex,
+            allowed: u64::from(MAX_BVAR_INDEX),
+            observed,
+            progress: self.progress,
+        }))
     }
 
     fn nat_offset_step(&mut self) {
@@ -2022,6 +2034,384 @@ fn string_expansion(
     Ok(None)
 }
 
+fn virtual_binder_bound_equal(
+    inside_index: u32,
+    outside_index: u32,
+    cutoff: u64,
+    control: &SlowControl,
+) -> Result<bool, SlowHalt> {
+    let outside = u64::from(outside_index);
+    if outside < cutoff {
+        return Ok(inside_index == outside_index);
+    }
+    let observed = outside.saturating_add(1);
+    if observed > u64::from(MAX_BVAR_INDEX) {
+        return Err(control.bound_index(observed));
+    }
+    Ok(u64::from(inside_index) == observed)
+}
+
+fn eta_structurally_equal(
+    inside: DefEqTerm,
+    outside: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, SlowHalt> {
+    let mut pending = vec![(inside, outside, 0_u64)];
+    let mut seen = BTreeSet::new();
+
+    while let Some((inside_reference, outside_reference, cutoff)) = pending.pop() {
+        if !seen.insert((inside_reference, outside_reference, cutoff)) {
+            continue;
+        }
+        control.comparison(cancelled)?;
+        let inside_term = sources.source(inside_reference)?;
+        let inside_node = inside_term
+            .node(inside_reference.root)
+            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: inside_reference.location(),
+            }))?;
+        let outside_term = sources.source(outside_reference)?;
+        let outside_node = outside_term
+            .node(outside_reference.root)
+            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: outside_reference.location(),
+            }))?;
+
+        match (inside_node, outside_node) {
+            (
+                ExprNode::Metadata {
+                    expression: inside_expression,
+                    ..
+                },
+                ExprNode::Metadata {
+                    expression: outside_expression,
+                    ..
+                },
+            ) => {
+                pending.push((
+                    child(inside_reference, *inside_expression)?,
+                    child(outside_reference, *outside_expression)?,
+                    cutoff,
+                ));
+                continue;
+            }
+            (
+                ExprNode::Metadata {
+                    expression: inside_expression,
+                    ..
+                },
+                _,
+            ) => {
+                pending.push((
+                    child(inside_reference, *inside_expression)?,
+                    outside_reference,
+                    cutoff,
+                ));
+                continue;
+            }
+            (
+                _,
+                ExprNode::Metadata {
+                    expression: outside_expression,
+                    ..
+                },
+            ) => {
+                pending.push((
+                    inside_reference,
+                    child(outside_reference, *outside_expression)?,
+                    cutoff,
+                ));
+                continue;
+            }
+            _ => {}
+        }
+
+        match (inside_node, outside_node) {
+            (
+                ExprNode::Bound {
+                    index: inside_index,
+                },
+                ExprNode::Bound {
+                    index: outside_index,
+                },
+            ) => {
+                if !virtual_binder_bound_equal(*inside_index, *outside_index, cutoff, control)? {
+                    return Ok(false);
+                }
+            }
+            (ExprNode::Free { name: inside }, ExprNode::Free { name: outside })
+            | (ExprNode::Meta { name: inside }, ExprNode::Meta { name: outside }) => {
+                if inside != outside {
+                    return Ok(false);
+                }
+            }
+            (
+                ExprNode::Sort {
+                    level: inside_level,
+                },
+                ExprNode::Sort {
+                    level: outside_level,
+                },
+            ) => {
+                if !level_roots_equal(
+                    inside_term.levels(),
+                    *inside_level,
+                    outside_term.levels(),
+                    *outside_level,
+                )
+                .map_err(|error| {
+                    SlowHalt::Fault(DefEqFault::Universe {
+                        left: inside_reference.location(),
+                        right: outside_reference.location(),
+                        error,
+                    })
+                })? {
+                    return Ok(false);
+                }
+            }
+            (
+                ExprNode::Constant {
+                    name: inside_name,
+                    levels: inside_levels,
+                },
+                ExprNode::Constant {
+                    name: outside_name,
+                    levels: outside_levels,
+                },
+            ) => {
+                if inside_name != outside_name || inside_levels.len() != outside_levels.len() {
+                    return Ok(false);
+                }
+                for (inside_level, outside_level) in inside_levels.iter().zip(outside_levels) {
+                    if !level_roots_equal(
+                        inside_term.levels(),
+                        *inside_level,
+                        outside_term.levels(),
+                        *outside_level,
+                    )
+                    .map_err(|error| {
+                        SlowHalt::Fault(DefEqFault::Universe {
+                            left: inside_reference.location(),
+                            right: outside_reference.location(),
+                            error,
+                        })
+                    })? {
+                        return Ok(false);
+                    }
+                }
+            }
+            (
+                ExprNode::Apply {
+                    function: inside_function,
+                    argument: inside_argument,
+                },
+                ExprNode::Apply {
+                    function: outside_function,
+                    argument: outside_argument,
+                },
+            ) => {
+                pending.push((
+                    child(inside_reference, *inside_argument)?,
+                    child(outside_reference, *outside_argument)?,
+                    cutoff,
+                ));
+                pending.push((
+                    child(inside_reference, *inside_function)?,
+                    child(outside_reference, *outside_function)?,
+                    cutoff,
+                ));
+            }
+            (
+                ExprNode::Lambda {
+                    binder_type: inside_type,
+                    body: inside_body,
+                    ..
+                },
+                ExprNode::Lambda {
+                    binder_type: outside_type,
+                    body: outside_body,
+                    ..
+                },
+            )
+            | (
+                ExprNode::Forall {
+                    binder_type: inside_type,
+                    body: inside_body,
+                    ..
+                },
+                ExprNode::Forall {
+                    binder_type: outside_type,
+                    body: outside_body,
+                    ..
+                },
+            ) => {
+                pending.push((
+                    child(inside_reference, *inside_body)?,
+                    child(outside_reference, *outside_body)?,
+                    cutoff.saturating_add(1),
+                ));
+                pending.push((
+                    child(inside_reference, *inside_type)?,
+                    child(outside_reference, *outside_type)?,
+                    cutoff,
+                ));
+            }
+            (
+                ExprNode::Let {
+                    type_: inside_type,
+                    value: inside_value,
+                    body: inside_body,
+                    ..
+                },
+                ExprNode::Let {
+                    type_: outside_type,
+                    value: outside_value,
+                    body: outside_body,
+                    ..
+                },
+            ) => {
+                pending.push((
+                    child(inside_reference, *inside_body)?,
+                    child(outside_reference, *outside_body)?,
+                    cutoff.saturating_add(1),
+                ));
+                pending.push((
+                    child(inside_reference, *inside_value)?,
+                    child(outside_reference, *outside_value)?,
+                    cutoff,
+                ));
+                pending.push((
+                    child(inside_reference, *inside_type)?,
+                    child(outside_reference, *outside_type)?,
+                    cutoff,
+                ));
+            }
+            (
+                ExprNode::NatLiteral {
+                    limbs_le: inside_limbs,
+                },
+                ExprNode::NatLiteral {
+                    limbs_le: outside_limbs,
+                },
+            ) => {
+                if inside_limbs != outside_limbs {
+                    return Ok(false);
+                }
+            }
+            (ExprNode::StringLiteral(inside), ExprNode::StringLiteral(outside)) => {
+                if inside != outside {
+                    return Ok(false);
+                }
+            }
+            (
+                ExprNode::Projection {
+                    structure_name: inside_structure,
+                    index: inside_index,
+                    expression: inside_expression,
+                },
+                ExprNode::Projection {
+                    structure_name: outside_structure,
+                    index: outside_index,
+                    expression: outside_expression,
+                },
+            ) => {
+                if inside_structure != outside_structure || inside_index != outside_index {
+                    return Ok(false);
+                }
+                pending.push((
+                    child(inside_reference, *inside_expression)?,
+                    child(outside_reference, *outside_expression)?,
+                    cutoff,
+                ));
+            }
+            _ => return Ok(false),
+        }
+    }
+
+    Ok(true)
+}
+
+fn eta_candidate(
+    lambda: DefEqTerm,
+    body: ExprId,
+    outside: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, SlowHalt> {
+    let body_reference = child(lambda, body)?;
+    control.comparison(cancelled)?;
+    let term = sources.source(body_reference)?;
+    let body_node = term
+        .node(body)
+        .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+            location: body_reference.location(),
+        }))?;
+    let ExprNode::Apply { function, argument } = body_node else {
+        return Ok(false);
+    };
+    let function_reference = child(body_reference, *function)?;
+    let argument_reference = child(body_reference, *argument)?;
+    control.comparison(cancelled)?;
+    let argument_node =
+        term.node(*argument)
+            .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+                location: argument_reference.location(),
+            }))?;
+    if !matches!(argument_node, ExprNode::Bound { index: 0 }) {
+        return Ok(false);
+    }
+    eta_structurally_equal(function_reference, outside, sources, control, cancelled)
+}
+
+fn exact_function_eta(
+    left_reference: DefEqTerm,
+    right_reference: DefEqTerm,
+    sources: TermSources<'_>,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, SlowHalt> {
+    control.comparison(cancelled)?;
+    let left_term = sources.source(left_reference)?;
+    let left_node = left_term.node(left_reference.root).ok_or(SlowHalt::Fault(
+        DefEqFault::MissingExpression {
+            location: left_reference.location(),
+        },
+    ))?;
+    let right_term = sources.source(right_reference)?;
+    let right_node = right_term
+        .node(right_reference.root)
+        .ok_or(SlowHalt::Fault(DefEqFault::MissingExpression {
+            location: right_reference.location(),
+        }))?;
+
+    match (left_node, right_node) {
+        (ExprNode::Lambda { body, .. }, node) if !matches!(node, ExprNode::Lambda { .. }) => {
+            eta_candidate(
+                left_reference,
+                *body,
+                right_reference,
+                sources,
+                control,
+                cancelled,
+            )
+        }
+        (node, ExprNode::Lambda { body, .. }) if !matches!(node, ExprNode::Lambda { .. }) => {
+            eta_candidate(
+                right_reference,
+                *body,
+                left_reference,
+                sources,
+                control,
+                cancelled,
+            )
+        }
+        _ => Ok(false),
+    }
+}
+
 fn retain_generated(generated: &mut Vec<WireExpr>, side: DefEqSide, term: WireExpr) -> DefEqTerm {
     let root = term.root();
     let index = generated.len();
@@ -2283,6 +2673,15 @@ fn run_slow(
                 };
                 let (unfold_left, unfold_right) = match (left_height, right_height) {
                     (None, None) => {
+                        if exact_function_eta(
+                            left_reference,
+                            right_reference,
+                            TermSources::new(left, right, &generated),
+                            &mut control,
+                            cancelled,
+                        )? {
+                            continue;
+                        }
                         return Ok(unresolved_pair(
                             need,
                             left_reference,
