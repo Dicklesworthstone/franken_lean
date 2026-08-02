@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":426,"projection_hash":"c9334eee401cfbc8b2b449c30516293cf783dab23465725368f2f57d5c0eb116"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":427,"projection_hash":"a27f13da03d26e1354d5bcf0a6166db5949613c33dddf82ca14b56ed91841114"}
 {"id":"fln-0bw5"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
@@ -305,6 +305,7 @@
 {"id":"franken_lean-gate-lock-producer-optional-o2vz"}
 {"id":"franken_lean-gii"}
 {"id":"franken_lean-gii.1"}
+{"id":"franken_lean-gii.2"}
 {"id":"franken_lean-golem-runtime-integration-pbe"}
 {"id":"franken_lean-h40t"}
 {"id":"franken_lean-h4o1"}
