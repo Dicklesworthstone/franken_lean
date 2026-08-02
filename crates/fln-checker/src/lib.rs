@@ -4,9 +4,10 @@
 //! performance pressure appears: a versioned deterministic sampling policy, a
 //! checker-owned canonical-wire decoder, eager universe semantics, and independent
 //! term facts plus capture-avoiding rewrites. Pure eager weak-head reduction,
-//! resource-counted quick equality, and environment-free slow conversion now sit
-//! above those foundations; environment-sensitive conversion and declaration
-//! checking remain on `franken_lean-gii`. The crate map and layering are governed by
+//! resource-counted quick equality, environment-free slow conversion, and an
+//! immutable checker-owned definition environment now sit above those foundations;
+//! delta reduction, environment-sensitive conversion, and declaration checking
+//! remain on `franken_lean-gii`. The crate map and layering are governed by
 //! `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first
@@ -326,6 +327,7 @@
 #![forbid(unsafe_code)]
 
 pub mod defeq;
+pub mod environment;
 pub mod instantiate;
 pub mod policy;
 pub mod term;
