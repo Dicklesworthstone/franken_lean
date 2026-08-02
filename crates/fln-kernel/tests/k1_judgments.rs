@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use fln_core::diag::ResourceReason;
-use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
+use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
@@ -209,6 +209,38 @@ fn kr100_loose_bvars_are_a_typed_rejection() {
     let loose = Expr::bvar(0).expect("packs");
     let verdict = check(&env, &axiom("A", loose), Budget::DEFAULT);
     assert_eq!(reject_class(&verdict), Some(RejectClass::LooseBVar));
+}
+
+#[test]
+fn kr102_free_variables_are_telescope_bound_or_rejected() {
+    // A caller-supplied fvar has no local declaration and must never acquire a
+    // type by name coincidence or defaulting.
+    let unknown = Expr::fvar(FVarId(n("x")));
+    let verdict = check(&Environment::new(), &axiom("bad", unknown), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::UnknownFVar),
+        "an fvar outside the kernel's local telescope must be a typed rejection"
+    );
+
+    // CONTROL: public binders are opened to fresh fvars internally and those
+    // locals do type correctly. This arm keeps the test discriminating rather
+    // than accepting a blanket refusal of every fvar.
+    let identity = defn(
+        "id",
+        Expr::forall_e(n("A"), sort1(), sort1(), BinderInfo::Default),
+        Expr::lam(
+            n("A"),
+            sort1(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+    );
+    let verdict = check(&Environment::new(), &identity, Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "a fresh fvar introduced by a valid binder telescope must type; got {verdict:?}"
+    );
 }
 
 #[test]
@@ -5350,11 +5382,11 @@ fn kr977_mutual_definition_shape_is_nonempty_uniform_and_nonsafe() {
 }
 
 #[test]
-fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
+fn kr973_kr975_kr976_nonsafe_definitions_check_and_safe_references_are_gated() {
     // Pin add_definition/add_mutual semantics: a PARTIAL definition may
     // reference itself (header → add → body in the scratch env); a SAFE
     // definition may reference neither partial nor unsafe declarations
-    // (KR-973), while an UNSAFE definition may reference unsafe ones.
+    // (KR-976/KR-975), while an UNSAFE definition may reference unsafe ones.
     let env = admit(&Environment::new(), &axiom("A", sort1()));
     let a = || Expr::const_(n("A"), vec![]);
     let mk_defn = |name: &str, safety: DefinitionSafety, value: Expr| {
@@ -5414,7 +5446,7 @@ fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
         "safe definitions cannot be self-recursive"
     );
     // Admit the partial def, then: a SAFE definition referencing it rejects
-    // (KR-973), an UNSAFE definition referencing an unsafe one admits.
+    // (KR-976), an UNSAFE definition referencing an unsafe one admits.
     let env = add_info(
         &env,
         ConstantInfo::Defn(DefinitionVal {
@@ -5437,7 +5469,7 @@ fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
     assert_eq!(
         reject_class(&check(&env, &safe_uses_partial, Budget::DEFAULT)),
         Some(RejectClass::SafetyViolation),
-        "a safe definition must not reference a partial one (KR-973)"
+        "a safe definition must not reference a partial one (KR-976)"
     );
     let unsafe_id = mk_defn(
         "unsafeId",
@@ -5484,7 +5516,7 @@ fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
             Budget::DEFAULT
         )),
         Some(RejectClass::SafetyViolation),
-        "a safe definition must not reference an unsafe one (KR-973)"
+        "a safe definition must not reference an unsafe one (KR-975)"
     );
     let uses_unsafe = mk_defn(
         "unsafeUsesUnsafe",
