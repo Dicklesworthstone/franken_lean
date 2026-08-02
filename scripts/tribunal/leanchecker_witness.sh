@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# leanchecker_witness.sh — the FOREIGN kernel witness for the G0-2 differential
+# leanchecker_witness.sh — the Reference-kernel oracle for the G0-2 differential
 # (bead franken_lean-z6c; plan §8.3b, §18.1 "kernel verdicts diffed against
 # lean4checker"; §8.7 standing kernel differential rig seed).
 #
-# The Oracle-Only Law (D8): `leanchecker` is the pinned Reference's independent
-# kernel-replay tool; it participates here ONLY as a differential oracle inside
-# the Tribunal, re-verifying that the C3 fixture modules type-check under the
-# reference C++ kernel RIGHT NOW — a re-runnable confirmation, not merely "the
-# olean exists". It is a dev/test lane, never a FrankenLean release component.
+# The Oracle-Only Law (D8): `leanchecker` re-executes the pinned Reference
+# kernel. It participates here ONLY as ReferenceKernelOracle inside the
+# Tribunal, re-verifying that the C3 fixture modules type-check under that same
+# implementation RIGHT NOW — a re-runnable confirmation, not merely "the olean
+# exists", and not an independent opinion. It is a dev/test lane, never a
+# FrankenLean release component.
 #
 # This grounds the z6c kernel-replay premise (kernel_replay.rs: "the Reference
-# accepted every declaration in this module") in an independent binary rather
-# than in the artifact's mere existence. Lanes:
+# accepted every declaration in this module") in a fresh Reference-kernel
+# execution rather than in the artifact's mere existence. Lanes:
 #   1. oracle provenance — leanchecker + lean located and commit-verified;
 #   2. witness verdicts — leanchecker replays each C3 module through the
 #      reference kernel; every one must be Accepted (exit 0, no exception);
@@ -59,10 +60,10 @@ LEAN="$TC/bin/lean"
 LIB="$TC/lib/lean"
 
 if [ ! -x "$CHECKER" ] || [ ! -x "$LEAN" ] || [ ! -d "$LIB" ]; then
-  # Typed, honest skip: the foreign witness is a real external binary; without
+  # Typed, honest skip: the Reference oracle is a real external binary; without
   # the pinned toolchain this lane cannot run. The z6c decoder/replay suites
   # still stand on their own (kernel_replay.sh).
-  emit provenance skipped "\"reason\":\"reference_toolchain_absent\",\"limitation\":\"L0: foreign-witness differential unverified on this host\""
+  emit provenance skipped "\"reason\":\"reference_toolchain_absent\",\"authority\":\"ReferenceKernelOracle\",\"limitation\":\"L0: Reference-kernel differential unverified on this host\""
   note "SKIP: pinned leanchecker/lean not installed (typed limitation)"
   emit run_end skipped "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
   exit 0
@@ -74,7 +75,7 @@ if ! grep -q "$PIN_COMMIT" <<<"$VERSION"; then
   note "FAIL: toolchain commit does not match SUITE.lock pin"
   exit 1
 fi
-emit provenance passed "\"oracle\":\"$VERSION\",\"checker\":\"leanchecker\",\"pin_tag\":\"$PIN_TAG\""
+emit provenance passed "\"oracle\":\"$VERSION\",\"checker\":\"leanchecker\",\"authority\":\"ReferenceKernelOracle\",\"pin_tag\":\"$PIN_TAG\""
 note "oracle: $VERSION (leanchecker)"
 
 export PATH="$TC/bin:$PATH"
@@ -119,12 +120,12 @@ for module in "${!C3_MODULES[@]}"; do
   verdict="$(witness "$module" "witness_${module//./_}")"
   if [ "$verdict" != "accepted" ]; then
     emit witness failed "\"module\":\"$module\",\"verdict\":\"$verdict\",\"artifact\":\"witness_${module//./_}.err\""
-    note "FAIL: foreign witness REJECTED $module — the replay premise is violated"
+    note "FAIL: Reference kernel oracle REJECTED $module — the replay premise is violated"
     exit 1
   fi
   witnessed=$((witnessed + 1))
-  emit witness passed "\"module\":\"$module\",\"verdict\":\"accepted\",\"fixture\":\"$fixture\",\"fixture_matches_pin\":true,\"claim\":\"kernel-witness-agreement\",\"parity_ledger_row\":\"not_applicable_foreign_kernel_witness\""
-  note "witness: $module accepted by the reference kernel (leanchecker), fixture matches pin"
+  emit witness passed "\"module\":\"$module\",\"verdict\":\"accepted\",\"fixture\":\"$fixture\",\"fixture_matches_pin\":true,\"authority\":\"ReferenceKernelOracle\",\"claim\":\"reference-kernel-oracle-agreement\",\"parity_ledger_row\":\"not_applicable_reference_kernel_oracle\""
+  note "oracle: $module accepted by the Reference kernel (leanchecker), fixture matches pin"
 done
 emit witnesses passed "\"count\":$witnessed,\"all\":\"accepted\""
 
@@ -140,4 +141,4 @@ emit discriminate passed "\"module\":\"Init.__fln_no_such_module__\",\"verdict\"
 note "control: nonexistent module correctly reported rejected"
 
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\",\"witnessed\":$witnessed"
-note "PASS: foreign-witness differential green ($witnessed modules independently re-verified)"
+note "PASS: Reference-kernel differential green ($witnessed modules re-verified)"

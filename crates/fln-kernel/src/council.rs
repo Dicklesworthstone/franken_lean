@@ -79,15 +79,26 @@
 //!   exists so a reader can tell them apart, never so that one of them can be
 //!   waived.
 //!
+//! # Witness origin is part of the record
+//!
+//! A second process is not necessarily a second implementation. In particular,
+//! the pinned `leanchecker` binary re-executes the Reference kernel; it is a
+//! [`SeatOrigin::ReferenceKernelOracle`], not an
+//! [`SeatOrigin::IndependentImplementation`]. [`Seat`] therefore carries its
+//! origin as a required enum rather than leaving readers to infer independence
+//! from an executable name. The origin is evidence metadata, never a trust
+//! weight: every non-answer or disagreement still halts.
+//!
 //! # Zero I/O, deliberately
 //!
 //! `fln-kernel` is zero-I/O by covenant (§8.1), so this module cannot read a
 //! witness's output. It takes seat verdicts as **values**. Feeding it the real
-//! foreign witness — `scripts/tribunal/leanchecker_witness.sh`, which already
-//! runs in `scripts/check.sh` and emits `"verdict":"accepted"` / `"rejected"`
-//! per module with an anti-rubber-stamp discriminate lane — is a job for a
-//! layer that is allowed to do I/O. [`SeatVerdict`] is shaped to accept exactly
-//! that vocabulary, including its third case: the witness that did not run.
+//! Reference-kernel-oracle lane —
+//! `scripts/tribunal/leanchecker_witness.sh`, which already runs in
+//! `scripts/check.sh` and emits `"verdict":"accepted"` / `"rejected"` per
+//! module with an anti-rubber-stamp discriminate lane — is a job for a layer
+//! that is allowed to do I/O. [`SeatVerdict`] is shaped to accept exactly that
+//! vocabulary, including its third case: the witness that did not run.
 //!
 //! # What this does NOT claim
 //!
@@ -119,6 +130,46 @@ impl SeatId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Which implementation or fixture produced a seat verdict.
+///
+/// This classification prevents a process boundary from being mistaken for an
+/// implementation boundary. It grants no authority and changes no veto
+/// semantics: all seat origins are ordinary evidence and none can manufacture
+/// a checked declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatOrigin {
+    /// Another FrankenLean checking engine, such as the planned K2.
+    FrankenLeanEngine,
+    /// A semantic implementation independent of both the primary FrankenLean
+    /// kernel and the pinned Reference kernel.
+    IndependentImplementation,
+    /// A re-execution of the pinned Reference kernel. `leanchecker` has this
+    /// origin: it is a second execution, never a second opinion of the
+    /// Reference implementation.
+    ReferenceKernelOracle,
+    /// A deliberately synthetic verdict used to exercise the council policy.
+    SyntheticFixture,
+}
+
+impl SeatOrigin {
+    /// Stable evidence vocabulary for logs and adapters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SeatOrigin::FrankenLeanEngine => "frankenlean_engine",
+            SeatOrigin::IndependentImplementation => "independent_implementation",
+            SeatOrigin::ReferenceKernelOracle => "reference_kernel_oracle",
+            SeatOrigin::SyntheticFixture => "synthetic_fixture",
+        }
+    }
+
+    /// Whether this origin supplies a genuinely independent semantic opinion.
+    ///
+    /// In particular, a Reference-kernel replay is deliberately false here.
+    pub const fn is_independent_implementation(self) -> bool {
+        matches!(self, SeatOrigin::IndependentImplementation)
     }
 }
 
@@ -190,15 +241,23 @@ pub enum SeatVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seat {
     pub id: SeatId,
+    /// What produced this verdict. See [`SeatOrigin`].
+    pub origin: SeatOrigin,
     /// What the seat answered under. See [`SeatBounds`].
     pub bounds: SeatBounds,
     pub verdict: SeatVerdict,
 }
 
 impl Seat {
-    pub fn new(id: impl Into<String>, bounds: SeatBounds, verdict: SeatVerdict) -> Seat {
+    pub fn new(
+        id: impl Into<String>,
+        origin: SeatOrigin,
+        bounds: SeatBounds,
+        verdict: SeatVerdict,
+    ) -> Seat {
         Seat {
             id: SeatId::new(id),
+            origin,
             bounds,
             verdict,
         }
@@ -286,6 +345,24 @@ impl Council {
 
     pub fn seats(&self) -> &[Seat] {
         &self.seats
+    }
+
+    /// Whether any seat is backed by a genuinely independent semantic
+    /// implementation.
+    ///
+    /// This is evidence inventory only; it deliberately exposes no count that
+    /// could become a quorum primitive.
+    pub fn has_independent_implementation(&self) -> bool {
+        self.seats
+            .iter()
+            .any(|seat| seat.origin.is_independent_implementation())
+    }
+
+    /// Whether any seat re-executes the pinned Reference kernel.
+    pub fn has_reference_kernel_oracle(&self) -> bool {
+        self.seats
+            .iter()
+            .any(|seat| matches!(seat.origin, SeatOrigin::ReferenceKernelOracle))
     }
 
     /// Every seat that did not agree, in the order they were supplied.
@@ -393,7 +470,11 @@ impl Halt {
                     _ => format!("ran out of {}", bound.describe()),
                 },
             };
-            parts.push(format!("{}={what}", seat.id.as_str()));
+            parts.push(format!(
+                "{}[{}]={what}",
+                seat.id.as_str(),
+                seat.origin.as_str()
+            ));
         }
         format!(
             "publication halted (kernel_accepted={}); {}",

@@ -31,7 +31,8 @@ use fln_env::pmap::CollisionBudget;
 use fln_kernel::Declaration;
 use fln_kernel::capability::{Admitted, Published, admit};
 use fln_kernel::council::{
-    Council, CouncilOutcome, Incomparability, ObjectionKind, Seat, SeatBounds, SeatVerdict, convene,
+    Council, CouncilOutcome, Incomparability, ObjectionKind, Seat, SeatBounds, SeatOrigin,
+    SeatVerdict, convene,
 };
 use fln_kernel::verdict::{
     Bound, Budget, ComparabilityDefect, EngineId, ExecConfig, Profile, StackMeasurement,
@@ -139,9 +140,25 @@ fn measured_in_the_other_profile(engine: &'static str) -> SeatBounds {
     ))
 }
 
-/// The real foreign witness: a subprocess with no bound this process derived.
-fn foreign_witness() -> SeatBounds {
+/// An external process with no bound this process derived.
+fn unmeasured_subprocess() -> SeatBounds {
     SeatBounds::not_established("subprocess witness; wall clock only")
+}
+
+fn synthetic_seat(id: &'static str, bounds: SeatBounds, verdict: SeatVerdict) -> Seat {
+    Seat::new(id, SeatOrigin::SyntheticFixture, bounds, verdict)
+}
+
+fn engine_seat(id: &'static str, bounds: SeatBounds, verdict: SeatVerdict) -> Seat {
+    Seat::new(id, SeatOrigin::FrankenLeanEngine, bounds, verdict)
+}
+
+fn independent_seat(id: &'static str, bounds: SeatBounds, verdict: SeatVerdict) -> Seat {
+    Seat::new(id, SeatOrigin::IndependentImplementation, bounds, verdict)
+}
+
+fn reference_oracle_seat(id: &'static str, bounds: SeatBounds, verdict: SeatVerdict) -> Seat {
+    Seat::new(id, SeatOrigin::ReferenceKernelOracle, bounds, verdict)
 }
 
 // ---------------------------------------------------------------------------
@@ -169,8 +186,8 @@ fn foreign_witness() -> SeatBounds {
 fn a_forged_seat_agreeing_about_a_rejected_declaration_publishes_nothing() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new("forged-a", foreign_witness(), SeatVerdict::Agrees),
-        Seat::new("forged-b", foreign_witness(), SeatVerdict::Agrees),
+        synthetic_seat("forged-a", unmeasured_subprocess(), SeatVerdict::Agrees),
+        synthetic_seat("forged-b", unmeasured_subprocess(), SeatVerdict::Agrees),
     ]);
 
     match convene(&council, admitted(&env, bad_axiom("Forged"))) {
@@ -199,14 +216,14 @@ fn a_forged_seat_agreeing_about_a_rejected_declaration_publishes_nothing() {
 fn one_dissenting_seat_halts_publication_and_is_never_outvoted() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
-        Seat::new("engine-k3", measured_here("test/k3"), SeatVerdict::Agrees),
-        Seat::new("fln-checker", foreign_witness(), SeatVerdict::Agrees),
-        Seat::new(
+        engine_seat("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
+        engine_seat("engine-k3", measured_here("test/k3"), SeatVerdict::Agrees),
+        independent_seat("fln-checker", unmeasured_subprocess(), SeatVerdict::Agrees),
+        reference_oracle_seat(
             "leanchecker",
-            foreign_witness(),
+            unmeasured_subprocess(),
             SeatVerdict::Disagrees {
-                detail: "foreign witness rejects at KR-303".into(),
+                detail: "Reference kernel oracle rejects at KR-303".into(),
             },
         ),
     ]);
@@ -226,9 +243,17 @@ fn one_dissenting_seat_halts_publication_and_is_never_outvoted() {
     );
     assert_eq!(halt.objections.len(), 1);
     assert_eq!(halt.objections[0].id.as_str(), "leanchecker");
+    assert_eq!(halt.objections[0].origin, SeatOrigin::ReferenceKernelOracle);
     assert!(
-        halt.summary().contains("foreign witness rejects at KR-303"),
+        halt.summary()
+            .contains("Reference kernel oracle rejects at KR-303"),
         "the dissent's reason must survive onto the halt: {}",
+        halt.summary()
+    );
+    assert!(
+        halt.summary()
+            .contains("leanchecker[reference_kernel_oracle]"),
+        "the halt summary must retain the origin classification: {}",
         halt.summary()
     );
     assert!(
@@ -238,6 +263,41 @@ fn one_dissenting_seat_halts_publication_and_is_never_outvoted() {
     assert!(
         env.find(&n("Contested")).is_none(),
         "a halted declaration must not reach the environment"
+    );
+}
+
+/// Running the Reference kernel in a second process is a second execution, not
+/// a second semantic implementation.
+///
+/// The planted defect this catches is collapsing both origins into one
+/// "external witness" bucket and then counting `leanchecker` as independent.
+#[test]
+fn reference_kernel_reexecution_does_not_count_as_an_independent_implementation() {
+    let council = Council::of(vec![
+        reference_oracle_seat("leanchecker", unmeasured_subprocess(), SeatVerdict::Agrees),
+        independent_seat("fln-checker", unmeasured_subprocess(), SeatVerdict::Agrees),
+    ]);
+
+    assert!(council.has_reference_kernel_oracle());
+    assert!(council.has_independent_implementation());
+    assert!(
+        !council.seats()[0].origin.is_independent_implementation(),
+        "ReferenceKernelOracle must never supply independent corroboration"
+    );
+    assert!(
+        council.seats()[1].origin.is_independent_implementation(),
+        "the independent checker control keeps the test discriminating"
+    );
+
+    let reference_only = Council::of(vec![reference_oracle_seat(
+        "leanchecker",
+        unmeasured_subprocess(),
+        SeatVerdict::Agrees,
+    )]);
+    assert!(reference_only.has_reference_kernel_oracle());
+    assert!(
+        !reference_only.has_independent_implementation(),
+        "a Reference-only council has zero independent implementations"
     );
 }
 
@@ -257,10 +317,10 @@ fn an_absent_or_errored_seat_halts_rather_than_abstaining_into_a_pass() {
         "lane skipped",
     ] {
         let council = Council::of(vec![
-            Seat::new("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
-            Seat::new(
+            engine_seat("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
+            reference_oracle_seat(
                 "leanchecker",
-                foreign_witness(),
+                unmeasured_subprocess(),
                 SeatVerdict::NoAnswer {
                     reason: reason.into(),
                 },
@@ -293,17 +353,21 @@ fn an_absent_or_errored_seat_halts_rather_than_abstaining_into_a_pass() {
 fn every_objection_is_retained_in_order_with_its_reason() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new(
+        synthetic_seat(
             "first-objector",
-            foreign_witness(),
+            unmeasured_subprocess(),
             SeatVerdict::Disagrees {
                 detail: "rejects at KR-303".into(),
             },
         ),
-        Seat::new("agreeing-seat", foreign_witness(), SeatVerdict::Agrees),
-        Seat::new(
+        synthetic_seat(
+            "agreeing-seat",
+            unmeasured_subprocess(),
+            SeatVerdict::Agrees,
+        ),
+        synthetic_seat(
             "second-objector",
-            foreign_witness(),
+            unmeasured_subprocess(),
             SeatVerdict::NoAnswer {
                 reason: "timed out".into(),
             },
@@ -351,8 +415,8 @@ fn a_budget_induced_stop_halts_and_is_typed_as_exhaustion_not_agreement() {
         Bound::Other("wall clock".into()),
     ] {
         let council = Council::of(vec![
-            Seat::new("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
-            Seat::new(
+            engine_seat("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
+            engine_seat(
                 "engine-k3",
                 measured_here("test/k3"),
                 SeatVerdict::Exhausted {
@@ -404,7 +468,7 @@ fn a_budget_induced_stop_halts_and_is_typed_as_exhaustion_not_agreement() {
 #[test]
 fn a_stop_under_an_incomparable_bound_is_refused_rather_than_read() {
     let env = Environment::new();
-    let council = Council::of(vec![Seat::new(
+    let council = Council::of(vec![engine_seat(
         "engine-k2",
         measured_in_the_other_profile("test/k2"),
         SeatVerdict::Exhausted {
@@ -456,9 +520,9 @@ fn a_stop_under_an_incomparable_bound_is_refused_rather_than_read() {
 #[test]
 fn a_seat_that_declared_no_bound_cannot_have_its_stop_compared() {
     let env = Environment::new();
-    let council = Council::of(vec![Seat::new(
+    let council = Council::of(vec![reference_oracle_seat(
         "leanchecker",
-        foreign_witness(),
+        unmeasured_subprocess(),
         SeatVerdict::Exhausted {
             bound: Bound::Other("30s wall clock".into()),
         },
@@ -488,7 +552,7 @@ fn a_seat_that_declared_no_bound_cannot_have_its_stop_compared() {
 #[test]
 fn a_seat_holding_the_kernels_own_bound_is_not_an_independent_witness() {
     let env = Environment::new();
-    let council = Council::of(vec![Seat::new(
+    let council = Council::of(vec![engine_seat(
         "k1-again",
         SeatBounds::Derived(Budget::DEFAULT),
         SeatVerdict::Exhausted {
@@ -516,7 +580,7 @@ fn a_seat_holding_the_kernels_own_bound_is_not_an_independent_witness() {
 #[test]
 fn the_halt_records_the_kernels_own_bound() {
     let env = Environment::new();
-    let council = Council::of(vec![Seat::new(
+    let council = Council::of(vec![engine_seat(
         "engine-k2",
         measured_here("test/k2"),
         SeatVerdict::Exhausted {
@@ -545,7 +609,8 @@ fn the_halt_records_the_kernels_own_bound() {
 /// Unanimous agreement publishes. A veto that blocks everything is as useless
 /// as one that blocks nothing.
 ///
-/// Note the seats: one with a derived bound, one a foreign witness with none.
+/// Note the seats: one with a derived bound, one Reference-kernel oracle with
+/// none.
 /// A completed check is a completed check under any bound — a budget can stop a
 /// check but cannot make one finish falsely — so requiring comparability in
 /// order to *agree* would have locked out the only real witnesses we have.
@@ -553,8 +618,8 @@ fn the_halt_records_the_kernels_own_bound() {
 fn a_unanimous_council_publishes() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
-        Seat::new("leanchecker", foreign_witness(), SeatVerdict::Agrees),
+        engine_seat("engine-k2", measured_here("test/k2"), SeatVerdict::Agrees),
+        reference_oracle_seat("leanchecker", unmeasured_subprocess(), SeatVerdict::Agrees),
     ]);
 
     let checked = match convene(&council, admitted(&env, good_axiom("Agreed"))) {
@@ -572,7 +637,7 @@ fn a_unanimous_council_publishes() {
 #[test]
 fn an_incomparable_bound_does_not_prevent_a_completed_agreement() {
     let env = Environment::new();
-    let council = Council::of(vec![Seat::new(
+    let council = Council::of(vec![engine_seat(
         "engine-k2",
         measured_in_the_other_profile("test/k2"),
         SeatVerdict::Agrees,
@@ -609,9 +674,9 @@ fn an_empty_council_is_named_rather_than_defaulted() {
 fn seats_cannot_overturn_a_kernel_rejection() {
     let env = Environment::new();
     let council = Council::of(vec![
-        Seat::new("a", foreign_witness(), SeatVerdict::Agrees),
-        Seat::new("b", foreign_witness(), SeatVerdict::Agrees),
-        Seat::new("c", foreign_witness(), SeatVerdict::Agrees),
+        synthetic_seat("a", unmeasured_subprocess(), SeatVerdict::Agrees),
+        synthetic_seat("b", unmeasured_subprocess(), SeatVerdict::Agrees),
+        synthetic_seat("c", unmeasured_subprocess(), SeatVerdict::Agrees),
     ]);
     match convene(&council, admitted(&env, bad_axiom("Overruled"))) {
         CouncilOutcome::KernelRejected { .. } => {}

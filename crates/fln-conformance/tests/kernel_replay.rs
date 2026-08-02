@@ -6170,7 +6170,7 @@ fn the_width_comparator_names_the_pair_and_the_unit_that_diverged() {
 // ---------------------------------------------------------------------------
 // G0-2 acceptance (a): the chosen module set — a Std module and a defeq-heavy
 // mathlib file — replayed through the one authority with verdicts diffed
-// against the foreign witness (bead franken_lean-z6c).
+// against the ReferenceKernelOracle (bead franken_lean-z6c).
 //
 // The legs reuse the corpus machinery but cost their import CLOSURE, never
 // the whole corpus: a BFS inventory from the chosen module over the
@@ -6403,6 +6403,93 @@ fn run_chosen_leg(inventory: &CorpusInventory, chosen: &str) -> Result<ChosenLeg
     ))
 }
 
+fn validate_leanchecker_authority_contract(script: &str, findings: &str) -> Result<(), String> {
+    for required in [
+        "ReferenceKernelOracle",
+        r#"\"authority\":\"ReferenceKernelOracle\""#,
+        "reference-kernel-oracle-agreement",
+        "not_applicable_reference_kernel_oracle",
+    ] {
+        if !script.contains(required) {
+            return Err(format!(
+                "leanchecker lane lacks required authority token {required:?}"
+            ));
+        }
+    }
+    for forbidden in [
+        "FOREIGN kernel witness",
+        "independent binary",
+        "independent kernel-replay tool",
+        "kernel-witness-agreement",
+        "not_applicable_foreign_kernel_witness",
+        "foreign-witness differential green",
+    ] {
+        if script.contains(forbidden) {
+            return Err(format!(
+                "leanchecker lane revives independent-witness claim {forbidden:?}"
+            ));
+        }
+    }
+
+    let normalized_findings = findings.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        "The Reference-kernel oracle differential",
+        "ReferenceKernelOracle",
+        "a second execution, not a second independent opinion",
+        "does **not** satisfy the independent-witness leg",
+    ] {
+        if !normalized_findings.contains(required) {
+            return Err(format!(
+                "kernel replay findings lack required authority statement {required:?}"
+            ));
+        }
+    }
+    for forbidden in [
+        "The foreign-witness differential",
+        "Reference's own independent",
+        "independent binary re-confirms",
+        "independent foreign kernel",
+    ] {
+        if normalized_findings.contains(forbidden) {
+            return Err(format!(
+                "kernel replay findings revive independent-witness claim {forbidden:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `leanchecker` executes the pinned Reference kernel. A process boundary must
+/// never be promoted into an implementation-independence claim.
+#[test]
+fn leanchecker_lane_is_bound_to_reference_kernel_oracle_authority() {
+    let root = fln_conformance::checked_manifest_dir!().join("../..");
+    let script = std::fs::read_to_string(root.join("scripts/tribunal/leanchecker_witness.sh"))
+        .expect("read leanchecker lane");
+    let findings =
+        std::fs::read_to_string(root.join("tribunal/fixtures/c3/KERNEL_REPLAY_FINDINGS.md"))
+            .expect("read kernel replay findings");
+
+    validate_leanchecker_authority_contract(&script, &findings)
+        .expect("live lane and findings must preserve ReferenceKernelOracle authority");
+
+    let authority_mutant = script.replace("ReferenceKernelOracle", "ForeignIndependent");
+    assert!(
+        validate_leanchecker_authority_contract(&authority_mutant, &findings).is_err(),
+        "an authority mutant must not retain independent corroboration"
+    );
+
+    let prose_mutant = findings.replacen(
+        "a second execution, not a second independent opinion",
+        "an independent opinion",
+        1,
+    );
+    assert!(
+        validate_leanchecker_authority_contract(&script, &prose_mutant).is_err(),
+        "a findings mutant must not upgrade re-execution into independence"
+    );
+}
+
 /// The two acceptance-(a) legs beyond Init: a Std module and one defeq-heavy
 /// mathlib file, each replayed through the one authority and diffed against
 /// the pinned leanchecker as the ReferenceKernelOracle witness (the review
@@ -6458,10 +6545,12 @@ fn chosen_set_replays_and_witnesses() {
         );
         reports.push(report);
     }
-    // The foreign-witness differential: the pinned leanchecker replays each
-    // chosen module through the Reference C++ kernel over the same provisioned
-    // oleans (LEAN_PATH = every chosen-set root), and its verdict MUST be
-    // acceptance — the Reference accepted these modules when it wrote them.
+    // The ReferenceKernelOracle differential: the pinned leanchecker replays
+    // each chosen module through the Reference C++ kernel over the same
+    // provisioned oleans (LEAN_PATH = every chosen-set root), and its verdict
+    // MUST be acceptance — the Reference accepted these modules when it wrote
+    // them. This is a second execution of that implementation, not an
+    // independent witness.
     let lean_path = roots
         .iter()
         .map(|(_, root)| root.display().to_string())
@@ -6497,7 +6586,7 @@ fn chosen_set_replays_and_witnesses() {
         );
         assert!(
             accepted,
-            "foreign witness rejected {}: {stderr}",
+            "Reference kernel oracle rejected {}: {stderr}",
             report.module
         );
         witness_rows.push((report.module.clone(), accepted));

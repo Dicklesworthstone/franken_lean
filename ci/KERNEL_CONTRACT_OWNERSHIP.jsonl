@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":424,"projection_hash":"345827c44f445bfb54626cb21aa3abad6e47fa4e493459a477f8772a077fdd20"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":425,"projection_hash":"47449e825cf1471f4b5e810775ac8785cdc53a7a3fc74485f4a2d6b2835e6835"}
 {"id":"fln-0bw5"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
@@ -215,6 +215,7 @@
 {"id":"franken_lean-4nv"}
 {"id":"franken_lean-4o3n"}
 {"id":"franken_lean-4o9"}
+{"id":"franken_lean-4snn"}
 {"id":"franken_lean-4xsz"}
 {"id":"franken_lean-51v5"}
 {"id":"franken_lean-53v"}

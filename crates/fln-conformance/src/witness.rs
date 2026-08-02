@@ -387,11 +387,12 @@ const SITES_BENCH_APPARATUS: [ClaimSite; 1] = [site(
 /// Seven of them have rows below. Exactly one is `Supported` — the ≤ 12 KLOC covenant is
 /// real and CI-enforced — so the matrix does not imply the whole B3 sentence is unsupported.
 ///
-/// Corrected 2026-07-25 (bead `franken_lean-4o3n`): this note said TWO sub-claims were
-/// `Supported`, counting the foreign-kernel witness. That witness genuinely runs
-/// (`scripts/tribunal/leanchecker_witness.sh`, wired into `scripts/check.sh`) — and it has no
-/// row here, so it is UNGOVERNED, not supported. A true clause with no row is exactly what a
-/// decomposition is supposed to make visible, and calling it supported hid it.
+/// Corrected 2026-08-02 (bead `franken_lean-4snn`): this note said TWO sub-claims were
+/// `Supported`, counting `leanchecker` as a foreign-kernel witness. The lane genuinely runs
+/// (`scripts/tribunal/leanchecker_witness.sh`, wired into `scripts/check.sh`), but it
+/// re-executes the pinned Reference kernel and is therefore `ReferenceKernelOracle`, not an
+/// independent implementation. The closed `fln-hfch` verification-manifest row records that
+/// authority boundary. Calling the lane a foreign witness hid the missing independent opinion.
 pub const CLAIM_MATRIX: [ClaimRow; 18] = [
     // ---- the term itself, before any row that uses it -------------------------------
     ClaimRow {
@@ -547,9 +548,12 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    ->* fln-rt, ->* fln-unsafe-*. What the claim still promises beyond the tree \
                    is a second CHECKING ENGINE: what exists is the independence boundary and \
                    the data schema, not an implementation that decides verdicts. The \
-                   foreign-witness half genuinely runs \
-                   (scripts/tribunal/leanchecker_witness.sh, called from scripts/check.sh) and \
-                   has NO row in this matrix. Corrected 2026-07-25 (franken_lean-4o3n) from \
+                   Reference-kernel-oracle lane genuinely runs \
+                   (scripts/tribunal/leanchecker_witness.sh, called from scripts/check.sh), \
+                   but it re-executes the Reference implementation and therefore does NOT \
+                   satisfy the foreign-independent-witness half. The authority classification \
+                   is recorded by the fln-hfch verification-manifest row. Corrected 2026-07-25 \
+                   (franken_lean-4o3n) from \
                    'a separate, Supported row', which named a row that has never existed: \
                    B3-KERNEL-LOC-COVENANT is the only Supported row here.",
         enforcement: Enforcement::Acknowledged,
