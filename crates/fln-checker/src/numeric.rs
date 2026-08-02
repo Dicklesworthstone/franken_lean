@@ -52,6 +52,10 @@ impl NatValue {
         &self.limbs_le
     }
 
+    pub(crate) fn into_limbs_le(self) -> Vec<u64> {
+        self.limbs_le
+    }
+
     pub fn is_zero(&self) -> bool {
         self.limbs_le.is_empty()
     }

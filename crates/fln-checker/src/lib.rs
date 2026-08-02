@@ -8,11 +8,11 @@
 //! independently instantiated universes. Slow conversion instead takes no-delta
 //! weak heads, peels KR-308 Nat successor offsets without unary literal expansion,
 //! and selects one definition step by recorded height, giving the checker a
-//! deliberately separate KR-307/KR-309 strategy. A checker-owned numeric module
-//! now supplies independently resource-counted arbitrary-precision Nat
-//! operations; expression recognition and KR-313 dispatch remain open, as do the
-//! remaining equality rules and declaration checking. The crate map and layering
-//! are governed by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
+//! deliberately separate KR-307/KR-309 strategy. Checker-owned numeric and
+//! expression-reduction modules now supply independently resource-counted
+//! arbitrary-precision Nat operations and the KR-313 dispatch table; the
+//! remaining equality rules and declaration checking remain open. The crate map
+//! and layering are governed by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first
 //!
@@ -333,6 +333,7 @@
 pub mod defeq;
 pub mod environment;
 pub mod instantiate;
+pub mod nat_reduce;
 pub mod numeric;
 pub mod policy;
 pub mod term;

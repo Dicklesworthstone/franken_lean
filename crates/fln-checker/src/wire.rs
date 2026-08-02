@@ -66,6 +66,10 @@ impl WireName {
     pub fn is_anonymous(&self) -> bool {
         self.parts.is_empty()
     }
+
+    pub(crate) fn from_parts(parts: Vec<NamePart>) -> WireName {
+        WireName { parts }
+    }
 }
 
 /// Lean's `Name.lt`: compare outer leaf constructors before prefixes, but compare
