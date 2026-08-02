@@ -4393,3 +4393,116 @@ fn a_gate_whose_registration_cannot_be_located_refuses() {
          stale reading: {findings:?}"
     );
 }
+
+/// Bead `franken_lean-bt75`: a sealed build root is per-run cold-build state that no
+/// later run reuses, and unpruned roots accumulated 284G in one day and filled the
+/// disk twice on 2026-08-01. `check.sh` now prunes any sibling sealed root whose
+/// embedded pid is dead, before the evidence envelope opens.
+///
+/// Exercised against the real script, no mock: each cell pre-claims the artifact
+/// directory, so the run stops at its ownership linearization point ("evidence
+/// directory already claimed", exit 2) — which sits after the prune call, so a run
+/// that printed that refusal has already traversed the prune. Cells, one variable
+/// each: a dead-pid root is pruned; a live-pid root survives; a sibling whose suffix
+/// is not a pid survives; and under `FLN_CHECK_KEEP_SEALED_ROOTS=1` the same
+/// dead-pid shape survives — the control that makes the first cell attributable to
+/// the prune rather than to any other effect of the run. The fixture lives under the
+/// workspace `target/` (the `diag_render` scratch precedent, but reclaimed on the
+/// passing path) so the scratch census's `temp_dir` walk stays clean.
+#[test]
+fn dead_sealed_build_roots_are_pruned_before_the_envelope_opens() {
+    let root = fln_conformance::checked_workspace_root!();
+    let script = root.join("scripts/check.sh");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let fixture = root.join(format!(
+        "target/bt75-prune-fixture-{}-{nonce}",
+        std::process::id()
+    ));
+
+    // A pid that is measured dead, not guessed: spawn-and-reap. Linux allocates pids
+    // sequentially, so reuse inside this test's window is not a live concern.
+    let dead_pid = {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawning `true` must work");
+        let pid = child.id();
+        child.wait().expect("`true` must be reapable");
+        pid
+    };
+    let live_pid = std::process::id();
+
+    let run_cell = |cell: &str, keep: bool, roots: &[String]| -> (i32, String, PathBuf) {
+        let parent = fixture.join(cell).join("sealed");
+        for name in roots {
+            fs::create_dir_all(parent.join(name).join("target/debug"))
+                .expect("planted sealed root must be creatable");
+        }
+        let claimed = fixture.join(cell).join("claimed");
+        fs::create_dir_all(&claimed).expect("pre-claimed artifact dir must be creatable");
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg(&script)
+            .env("FLN_CHECK_SEALED_BUILD_ROOT", &parent)
+            .env("FLN_CHECK_ART_DIR", &claimed);
+        if keep {
+            command.env("FLN_CHECK_KEEP_SEALED_ROOTS", "1");
+        }
+        let output = command.output().expect("check.sh must be launchable");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            parent,
+        )
+    };
+
+    let dead_name = format!("check-20260801T000000Z-{dead_pid}");
+    let live_name = format!("check-20260801T000001Z-{live_pid}");
+    let word_name = "check-20260801T000002Z-notapid".to_owned();
+
+    let (code, stderr, parent) = run_cell(
+        "prune",
+        false,
+        &[dead_name.clone(), live_name.clone(), word_name.clone()],
+    );
+    assert_eq!(
+        code, 2,
+        "the pre-claimed artifact directory must stop the run typed: {stderr}"
+    );
+    assert!(
+        stderr.contains("evidence directory already claimed"),
+        "the run must reach its ownership refusal — without this control a crash before \
+         the prune would score every cell vacuously: {stderr}"
+    );
+    assert!(
+        !parent.join(&dead_name).exists(),
+        "a sealed root whose embedded pid is dead must be pruned"
+    );
+    assert!(
+        parent.join(&live_name).exists(),
+        "a sealed root whose embedded pid is alive must survive"
+    );
+    assert!(
+        parent.join(&word_name).exists(),
+        "a sibling whose suffix is not a pid must survive"
+    );
+
+    let (code, stderr, parent) = run_cell("keep", true, std::slice::from_ref(&dead_name));
+    assert_eq!(
+        code, 2,
+        "the keep cell must stop at the same refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains("evidence directory already claimed"),
+        "the keep cell must reach the same refusal: {stderr}"
+    );
+    assert!(
+        parent.join(&dead_name).exists(),
+        "FLN_CHECK_KEEP_SEALED_ROOTS=1 must retain even a dead-pid root — the control \
+         separating the prune from every other effect of the run"
+    );
+
+    fs::remove_dir_all(&fixture).expect("the fixture reclaims on the passing path");
+}

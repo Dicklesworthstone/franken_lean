@@ -894,6 +894,34 @@ trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
 trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
 
+# Sealed build roots are per-run cold-build state (~8G each) that no later run
+# ever reuses; unpruned they filled the disk twice on 2026-08-01 (bead
+# franken_lean-bt75). A root is prunable only when the pid embedded in its
+# RUN_ID is dead, so a live concurrent run's root is never touched; pid reuse
+# merely defers that prune to a later run. Retained bundles under ART_ROOT name
+# sealed paths as fact strings and nothing re-reads the tree, so pruning
+# invalidates no published evidence. Best-effort by design: a failed prune is
+# space hygiene lost, never a run obligation, and it runs before the evidence
+# envelope opens so it adds no step to the finalizer state machine.
+prune_dead_sealed_build_roots() {
+  local parent="${FLN_CHECK_SEALED_BUILD_ROOT:-$REPO/target/sealed}"
+  if [ ! -d "$parent" ]; then return 0; fi
+  local root name pid
+  for root in "$parent"/check-*-*; do
+    if [ ! -d "$root" ]; then continue; fi
+    name="${root##*/}"
+    if [ "$name" = "$RUN_ID" ]; then continue; fi
+    pid="${name##*-}"
+    case "$pid" in '' | *[!0-9]*) continue ;; esac
+    if [ -d "/proc/$pid" ]; then continue; fi
+    rm -rf -- "$root" 2>/dev/null || true
+  done
+  return 0
+}
+if [ "${FLN_CHECK_KEEP_SEALED_ROOTS:-0}" != 1 ]; then
+  prune_dead_sealed_build_roots
+fi
+
 # The evidence envelope starts at fresh artifact-directory acceptance: from
 # here every step runs under the terminal/finalizer state machine and any
 # fault still finalizes a typed durable partial bundle
