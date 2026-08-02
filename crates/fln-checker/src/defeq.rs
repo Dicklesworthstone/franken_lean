@@ -4,14 +4,19 @@
 //! treats metadata as transparent, ignores binder presentation, and compares
 //! `Sort` levels with this checker's independent universe relation. Deferred
 //! pairs continue through a slow worklist that first takes a no-delta weak head,
-//! checks KR-308 Nat successor offsets, then unfolds safe definition heads one
-//! step at a time in descending definitional-height order. General Nat
-//! arithmetic, typing, eta, proof irrelevance, recursors, native computation,
-//! and String expansion still produce a typed deferral. A deferral is not a
-//! rejection and this module is not a declaration-admission authority.
+//! checks KR-308 Nat successor offsets, applies closed-pair KR-313 Nat reduction,
+//! then unfolds safe definition heads one step at a time in descending
+//! definitional-height order. Typing, eta, proof irrelevance, recursors, native
+//! computation, and String expansion still produce a typed deferral. A deferral
+//! is not a rejection and this module is not a declaration-admission authority.
 
 use std::collections::BTreeSet;
 
+use crate::nat_reduce::{
+    NatReductionBudget, NatReductionFault, NatReductionOutcome, NatReductionProgress,
+    NatReductionRefusal, NatReductionStop, is_potential_nat_reduction, reduce_nat_at_with,
+};
+use crate::numeric::NatBudget;
 use crate::universe::{UniverseError, level_roots_equal};
 use crate::whnf::{
     WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_core_at_with,
@@ -149,6 +154,7 @@ pub struct DefEqBudget {
     pub max_materialized_arena_nodes: u64,
     pub max_materialized_owned_units: u64,
     pub whnf: WhnfBudget,
+    pub nat: NatReductionBudget,
 }
 
 impl DefEqBudget {
@@ -167,7 +173,22 @@ impl DefEqBudget {
             max_materialized_arena_nodes,
             max_materialized_owned_units,
             whnf,
+            nat: NatReductionBudget::new(
+                max_slow_comparisons,
+                max_materialized_arena_nodes,
+                max_normalizations,
+                max_materialized_arena_nodes,
+                max_materialized_owned_units,
+                max_materialized_owned_units,
+                whnf,
+                NatBudget::new(max_slow_comparisons, max_materialized_owned_units),
+            ),
         }
+    }
+
+    pub const fn with_nat(mut self, nat: NatReductionBudget) -> DefEqBudget {
+        self.nat = nat;
+        self
     }
 
     pub const fn unlimited() -> DefEqBudget {
@@ -215,6 +236,13 @@ pub struct DefEqProgress {
     pub delta_unfolds: u64,
     pub nat_offset_steps: u64,
     pub nat_offset_limb_steps: u64,
+    pub nat_reduction_steps: u64,
+    pub nat_work_items: u64,
+    pub nat_generated_arenas: u64,
+    pub nat_numeric_steps: u64,
+    pub nat_numeric_materialized_limbs: u64,
+    pub nat_reductions: u64,
+    pub nat_output_units: u64,
     pub materialized_arena_nodes: u64,
     pub materialized_owned_units: u64,
 }
@@ -265,6 +293,11 @@ pub enum DefEqStop {
         stop: WhnfStop,
         progress: DefEqProgress,
     },
+    NatReduction {
+        side: DefEqSide,
+        stop: NatReductionStop,
+        progress: DefEqProgress,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +325,10 @@ pub enum DefEqFault {
     Whnf {
         side: DefEqSide,
         fault: WhnfFault,
+    },
+    NatReduction {
+        side: DefEqSide,
+        fault: NatReductionFault,
     },
 }
 
@@ -734,8 +771,8 @@ enum SlowHalt {
     Stop(Box<DefEqStop>),
     Refusal {
         side: DefEqSide,
-        refusal: WhnfRefusal,
-        progress: DefEqProgress,
+        refusal: Box<WhnfRefusal>,
+        progress: Box<DefEqProgress>,
     },
     Fault(DefEqFault),
 }
@@ -923,6 +960,112 @@ impl SlowControl {
         }
         self.progress.materialized_owned_units = observed;
         Ok(())
+    }
+
+    fn remaining_nat_budget(&self) -> NatReductionBudget {
+        let mut budget = self.budget.nat;
+        budget.max_steps = budget
+            .max_steps
+            .saturating_sub(self.progress.nat_reduction_steps);
+        budget.max_work_items = budget
+            .max_work_items
+            .saturating_sub(self.progress.nat_work_items);
+        budget.max_generated_arenas = budget
+            .max_generated_arenas
+            .saturating_sub(self.progress.nat_generated_arenas)
+            .min(
+                self.budget
+                    .max_normalizations
+                    .saturating_sub(self.progress.normalizations),
+            );
+        budget.max_materialized_arena_nodes = budget
+            .max_materialized_arena_nodes
+            .saturating_sub(self.progress.materialized_arena_nodes)
+            .min(
+                self.budget
+                    .max_materialized_arena_nodes
+                    .saturating_sub(self.progress.materialized_arena_nodes),
+            );
+        budget.max_materialized_owned_units = budget
+            .max_materialized_owned_units
+            .saturating_sub(self.progress.materialized_owned_units)
+            .min(
+                self.budget
+                    .max_materialized_owned_units
+                    .saturating_sub(self.progress.materialized_owned_units),
+            );
+        budget.max_output_units = budget
+            .max_output_units
+            .saturating_sub(self.progress.nat_output_units);
+        budget.whnf.max_steps = budget
+            .whnf
+            .max_steps
+            .saturating_sub(self.progress.whnf_steps);
+        budget.whnf.max_reductions = budget
+            .whnf
+            .max_reductions
+            .saturating_sub(self.progress.whnf_reductions);
+        budget.numeric.max_steps = budget
+            .numeric
+            .max_steps
+            .saturating_sub(self.progress.nat_numeric_steps);
+        budget.numeric.max_materialized_limbs = budget
+            .numeric
+            .max_materialized_limbs
+            .saturating_sub(self.progress.nat_numeric_materialized_limbs);
+        budget
+    }
+
+    fn absorb_nat(&mut self, progress: NatReductionProgress) {
+        self.progress.nat_reduction_steps = self
+            .progress
+            .nat_reduction_steps
+            .saturating_add(progress.steps);
+        self.progress.nat_work_items = self
+            .progress
+            .nat_work_items
+            .saturating_add(progress.work_items);
+        self.progress.nat_generated_arenas = self
+            .progress
+            .nat_generated_arenas
+            .saturating_add(progress.generated_arenas);
+        self.progress.normalizations = self
+            .progress
+            .normalizations
+            .saturating_add(progress.generated_arenas);
+        self.progress.whnf_steps = self.progress.whnf_steps.saturating_add(progress.whnf_steps);
+        self.progress.whnf_reductions = self
+            .progress
+            .whnf_reductions
+            .saturating_add(progress.whnf_reductions);
+        self.progress.delta_unfolds = self
+            .progress
+            .delta_unfolds
+            .saturating_add(progress.delta_unfolds);
+        self.progress.nat_numeric_steps = self
+            .progress
+            .nat_numeric_steps
+            .saturating_add(progress.numeric_steps);
+        self.progress.nat_numeric_materialized_limbs = self
+            .progress
+            .nat_numeric_materialized_limbs
+            .saturating_add(progress.numeric_materialized_limbs);
+        self.progress.nat_reductions = self
+            .progress
+            .nat_reductions
+            .saturating_add(progress.numeric_reductions);
+        self.progress.materialized_arena_nodes = self
+            .progress
+            .materialized_arena_nodes
+            .saturating_add(progress.materialized_arena_nodes);
+        self.progress.materialized_owned_units = self
+            .progress
+            .materialized_owned_units
+            .saturating_add(progress.materialized_owned_units);
+        self.progress.nat_output_units = self
+            .progress
+            .nat_output_units
+            .saturating_add(progress.output_units);
     }
 }
 
@@ -1608,8 +1751,8 @@ fn normalize(
         }
         WhnfOutcome::Refused(refusal) => Err(SlowHalt::Refusal {
             side: reference.side(),
-            refusal,
-            progress: control.progress,
+            refusal: Box::new(refusal),
+            progress: Box::new(control.progress),
         }),
         WhnfOutcome::Inconclusive(stop) => Err(SlowHalt::Stop(Box::new(DefEqStop::Whnf {
             side: reference.side(),
@@ -1620,6 +1763,66 @@ fn normalize(
             side: reference.side(),
             fault,
         })),
+    }
+}
+
+fn reduce_nat_candidate(
+    reference: DefEqTerm,
+    companion_reference: DefEqTerm,
+    sources: TermSources<'_>,
+    context: &WhnfContext,
+    control: &mut SlowControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Option<WireExpr>, SlowHalt> {
+    let candidate = sources.source(reference)?;
+    if !is_potential_nat_reduction(candidate, reference.root) {
+        return Ok(None);
+    }
+    let companion = sources.source(companion_reference)?;
+    let budget = control.remaining_nat_budget();
+    match reduce_nat_at_with(
+        candidate,
+        reference.root,
+        companion,
+        companion_reference.root,
+        context,
+        budget,
+        cancelled,
+    ) {
+        NatReductionOutcome::Reduced(result) => {
+            control.absorb_nat(result.progress);
+            Ok(Some(result.term))
+        }
+        NatReductionOutcome::NotReduced { progress, .. } => {
+            control.absorb_nat(progress);
+            Ok(None)
+        }
+        NatReductionOutcome::Refused {
+            refusal: NatReductionRefusal::Whnf { refusal, .. },
+            progress,
+        } => {
+            control.absorb_nat(progress);
+            Err(SlowHalt::Refusal {
+                side: reference.side(),
+                refusal: Box::new(refusal),
+                progress: Box::new(control.progress),
+            })
+        }
+        NatReductionOutcome::Inconclusive(stop) => {
+            let progress = stop.progress();
+            control.absorb_nat(progress);
+            Err(SlowHalt::Stop(Box::new(DefEqStop::NatReduction {
+                side: reference.side(),
+                stop,
+                progress: control.progress,
+            })))
+        }
+        NatReductionOutcome::InternalFault(fault) => {
+            Err(SlowHalt::Fault(DefEqFault::NatReduction {
+                side: reference.side(),
+                fault,
+            }))
+        }
     }
 }
 
@@ -1732,20 +1935,93 @@ fn run_slow(
                     continue;
                 }
 
-                let left_height = definition_height(
-                    left_reference,
-                    TermSources::new(left, right, &generated),
-                    context,
-                    &mut control,
-                    cancelled,
-                )?;
-                let right_height = definition_height(
-                    right_reference,
-                    TermSources::new(left, right, &generated),
-                    context,
-                    &mut control,
-                    cancelled,
-                )?;
+                let left_is_nat = {
+                    let term = TermSources::new(left, right, &generated).source(left_reference)?;
+                    is_potential_nat_reduction(term, left_reference.root)
+                };
+                let right_is_nat = {
+                    let term = TermSources::new(left, right, &generated).source(right_reference)?;
+                    is_potential_nat_reduction(term, right_reference.root)
+                };
+                let mut left_height_cache = None;
+                let mut right_height_cache = None;
+                let mut unfold_before_nat = false;
+                if left_is_nat || right_is_nat {
+                    if !left_is_nat {
+                        let height = definition_height(
+                            left_reference,
+                            TermSources::new(left, right, &generated),
+                            context,
+                            &mut control,
+                            cancelled,
+                        )?;
+                        unfold_before_nat |= height.is_some();
+                        left_height_cache = Some(height);
+                    }
+                    if !right_is_nat {
+                        let height = definition_height(
+                            right_reference,
+                            TermSources::new(left, right, &generated),
+                            context,
+                            &mut control,
+                            cancelled,
+                        )?;
+                        unfold_before_nat |= height.is_some();
+                        right_height_cache = Some(height);
+                    }
+                }
+
+                if !unfold_before_nat {
+                    if left_is_nat
+                        && let Some(term) = reduce_nat_candidate(
+                            left_reference,
+                            right_reference,
+                            TermSources::new(left, right, &generated),
+                            context,
+                            &mut control,
+                            cancelled,
+                        )?
+                    {
+                        let next_left = retain_generated(&mut generated, DefEqSide::Left, term);
+                        pending.push((next_left, right_reference, offset_context));
+                        continue;
+                    }
+                    if right_is_nat
+                        && let Some(term) = reduce_nat_candidate(
+                            right_reference,
+                            left_reference,
+                            TermSources::new(left, right, &generated),
+                            context,
+                            &mut control,
+                            cancelled,
+                        )?
+                    {
+                        let next_right = retain_generated(&mut generated, DefEqSide::Right, term);
+                        pending.push((left_reference, next_right, offset_context));
+                        continue;
+                    }
+                }
+
+                let left_height = match left_height_cache {
+                    Some(height) => height,
+                    None => definition_height(
+                        left_reference,
+                        TermSources::new(left, right, &generated),
+                        context,
+                        &mut control,
+                        cancelled,
+                    )?,
+                };
+                let right_height = match right_height_cache {
+                    Some(height) => height,
+                    None => definition_height(
+                        right_reference,
+                        TermSources::new(left, right, &generated),
+                        context,
+                        &mut control,
+                        cancelled,
+                    )?,
+                };
                 let (unfold_left, unfold_right) = match (left_height, right_height) {
                     (None, None) => {
                         return Ok(DefEqOutcome::Deferred {
@@ -1814,8 +2090,8 @@ fn slow_outcome(result: Result<DefEqOutcome, SlowHalt>) -> DefEqOutcome {
             progress,
         }) => DefEqOutcome::Refused {
             side,
-            refusal,
-            progress,
+            refusal: *refusal,
+            progress: *progress,
         },
         Err(SlowHalt::Fault(fault)) => DefEqOutcome::InternalFault(fault),
     }
