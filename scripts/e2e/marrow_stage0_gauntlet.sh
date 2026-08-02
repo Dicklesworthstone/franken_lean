@@ -129,6 +129,9 @@ STAGE0_TUS=("Init/Prelude.c" "Init/SizeOf.c" "Init/Data/Nat/Basic.c")
 # Coe -> Prelude). Measured before landing: their union demands 13 lean_*/mi_*
 # symbols, every one already exported.
 STAGE0_TUS+=("Init/Coe.c" "Init/Notation.c" "Init/Tactics.c")
+# fln-3gv slice 1: the effect plane's pure-substrate TUs — their demands
+# are fully exported as of the ST-ref/platform/utf8 slice.
+STAGE0_TUS+=("Init/System/ST.c" "Init/System/IOError.c" "Init/System/Platform.c")
 if [ "${FLN_E2E_DEEP:-0}" = "1" ]; then
     STAGE0_TUS+=("Init/Core.c")
 fi

@@ -195,11 +195,11 @@ row lean_set_panic_messages | CompatWrapper | crates/fln-unsafe-abi/src/export.r
 row lean_slice_dec_lt | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_slice_hash | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_small_mem_size | RawPlatform | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | prefix word readback
-row lean_st_mk_ref | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_st_ref_get | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_st_mk_ref | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | fresh ST cell over the ledgered alloc_ref twin (io.cpp:1423-1428)
+row lean_st_ref_get | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | MT exchange-dup-restore / ST fast path, token-balanced (io.cpp:1447-1472)
 row lean_st_ref_reset | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_st_ref_set | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_st_ref_swap | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_st_ref_set | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | consumes value, mark_mt before MT publication, returns unit (io.cpp:1492-1510)
+row lean_st_ref_swap | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | returns old token; null ST slot is the pin's internal panic verbatim (io.cpp:1512-1527)
 row lean_string_append | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export string suites (tests.rs export_*); the G0-3 plugin import census demands it | s1 owned with upstream's exclusive/shared arms and capacity laws (object.cpp:2084-2105 via string_append_core), s2 borrowed
 row lean_string_compare | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_data | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | next_utf8 decode incl. invalid-byte fallback; consumes via dec_ref exactly as upstream
@@ -211,12 +211,12 @@ row lean_string_mk | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | expor
 row lean_string_of_usize | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export nat/name suites (tests.rs export_*); stage0 gauntlet differential | decimal ASCII string (object.cpp:2456-2458)
 row lean_string_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_utf8_extract | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_string_utf8_get | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_get | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | bounds-checked scalar decode; every failure is the default char 'A' (object.cpp:2219-2245)
 row lean_string_utf8_get_fast_cold | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_utf8_next | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_utf8_next_fast_cold | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_utf8_prev | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_string_utf8_set | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_set | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | exclusive ASCII in-place else rebuild, codepoint length preserved (object.cpp:2423-2448)
 row lean_task_bind_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_task_get | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_task_map_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
@@ -241,5 +241,10 @@ extern lean_io_get_num_heartbeats | CompatWrapper | crates/fln-unsafe-abi/src/ex
 extern lean_io_set_heartbeats | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export heartbeat-state suite; pinned runtime body audit | consumes a Nat, installs its low 64 bits thread-locally, returns Unit (io.cpp:957-962)
 extern lean_sorry | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet panic lane; stage0 demand audit | INTERNAL PANIC per the pin; never fabricates a value (object.cpp:208-211)
 extern lean_system_platform_nbits | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export platform test; gauntlet differential | boxed 64 on the certified targets (platform.cpp:12-18)
+extern lean_st_ref_take | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export st_ref suites; stage0 gauntlet lane | slot token moves out, slot null until paired set (io.cpp:1474-1488; extern census ST.Prim.Ref.take)
+extern lean_st_ref_ptr_eq | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export st_ref suites; stage0 gauntlet lane | cell identity, never value equality (io.cpp:1530-1532)
+extern lean_system_platform_windows | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet platform facts | compile-time target fact, 0 on the certified linux targets (platform.cpp:20-26)
+extern lean_system_platform_osx | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet platform facts | compile-time target fact, 0 on the certified linux targets (platform.cpp:28-34)
+extern lean_system_platform_emscripten | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet platform facts | compile-time target fact, 0 on the certified linux targets (platform.cpp:36-42)
 extern lean_string_from_utf8_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export byte-array roundtrip test; gauntlet differential | consumes the byte array; bug-compatible utf8_n_strlen count
 extern lean_string_to_utf8 | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export byte-array roundtrip test; gauntlet differential | borrowed string to fresh sarray of m_size-1 bytes

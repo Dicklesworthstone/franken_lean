@@ -2292,3 +2292,121 @@ fn door_loads_a_reference_built_plugin_end_to_end() {
     // class's own shape, not an accident).
     let _ = std::fs::remove_dir_all(&work);
 }
+
+#[test]
+fn export_st_ref_family_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_st_mk_ref, export_lean_st_ref_get, export_lean_st_ref_ptr_eq,
+        export_lean_st_ref_set, export_lean_st_ref_swap, export_lean_st_ref_take,
+    };
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the ref exports'
+    // ownership contracts (io.cpp:1423-1532) are exercised token-for-token,
+    // and `lock()` serialises the heap-observing tests.
+    // UNSAFE-LEDGER: FLN-UL-0216
+    #[allow(unsafe_code)]
+    unsafe {
+        // ST fast path: mk consumes, get duplicates, set displaces + releases.
+        let v1 = crate::object::mk_string_unchecked(b"alpha", 5);
+        let cell = export_lean_st_mk_ref(v1);
+        let got = export_lean_st_ref_get(cell);
+        assert_eq!(got, v1, "ST get returns the stored object identity");
+        crate::rc::dec_ref(got);
+        let v2 = crate::object::mk_string_unchecked(b"beta", 4);
+        let unit = export_lean_st_ref_set(cell, v2);
+        assert_eq!(crate::tagged::unbox(unit), 0, "set returns box(0)");
+        // swap returns the old token and installs the new value.
+        let v3 = crate::object::mk_string_unchecked(b"gamma", 5);
+        let old = export_lean_st_ref_swap(cell, v3);
+        let (_, _, _, old_bytes) = crate::object::string_fields(old);
+        assert_eq!(&old_bytes[..4], b"beta", "swap yields the displaced value");
+        crate::rc::dec_ref(old);
+        // take moves the token out and leaves the slot null until re-set.
+        let taken = export_lean_st_ref_take(cell);
+        let (_, _, _, taken_bytes) = crate::object::string_fields(taken);
+        assert_eq!(&taken_bytes[..5], b"gamma");
+        let refill = crate::object::mk_string_unchecked(b"delta", 5);
+        let unit2 = export_lean_st_ref_set(cell, refill);
+        assert_eq!(crate::tagged::unbox(unit2), 0);
+        crate::rc::dec_ref(taken);
+        // identity, never value equality.
+        let other_v = crate::object::mk_string_unchecked(b"delta", 5);
+        let other = export_lean_st_mk_ref(other_v);
+        assert_eq!(export_lean_st_ref_ptr_eq(cell, cell), 1);
+        assert_eq!(
+            export_lean_st_ref_ptr_eq(cell, other),
+            0,
+            "equal values in distinct cells are not ptr-equal"
+        );
+        // The maybe-mt arm: a PERSISTENT cell must take the atomic path and
+        // mark stored values multi-threaded (io.cpp's global-Ref law). The
+        // observable: the value stored into a persistent cell leaves the ST
+        // rc regime (m_rc no longer positive after mark_mt).
+        crate::rc::mark_persistent(other);
+        let mt_v = crate::object::mk_string_unchecked(b"epsilon", 7);
+        let unit3 = export_lean_st_ref_set(other, mt_v);
+        assert_eq!(crate::tagged::unbox(unit3), 0);
+        let back = export_lean_st_ref_get(other);
+        let (_, _, _, back_bytes) = crate::object::string_fields(back);
+        assert_eq!(
+            &back_bytes[..7],
+            b"epsilon",
+            "persistent-cell get round-trips"
+        );
+        assert!(
+            (&raw const (*back).m_rc).read() < 0,
+            "a value stored into a persistent cell is marked multi-threaded"
+        );
+        crate::rc::dec_ref(back);
+        crate::rc::dec_ref(cell);
+        // `other` is persistent: never counted, deliberately not dec'd.
+    }
+    let _ = shadow::disable_and_drain();
+}
+
+#[test]
+fn export_string_utf8_get_set_match_upstream_arms() {
+    let _g = lock();
+    use crate::export::{export_lean_string_utf8_get, export_lean_string_utf8_set};
+    shadow::enable();
+    // SAFETY: strings allocated and settled here; get borrows, set consumes,
+    // per lean.h:1229/1255.
+    // UNSAFE-LEDGER: FLN-UL-0217
+    #[allow(unsafe_code)]
+    unsafe {
+        // h(0x68) é(0xC3 0xA9) l l o — the same vector family the hash and
+        // lossy suites pin.
+        let s = crate::object::mk_string_unchecked(b"h\xc3\xa9llo", 5);
+        let get =
+            |st: *mut LeanObject, i: usize| export_lean_string_utf8_get(st, crate::tagged::boxi(i));
+        assert_eq!(get(s, 0), u32::from(b'h'));
+        assert_eq!(get(s, 1), 0xE9, "two-byte scalar decodes at its first byte");
+        assert_eq!(
+            get(s, 2),
+            u32::from('A'),
+            "continuation byte is the default char"
+        );
+        assert_eq!(get(s, 3), u32::from(b'l'));
+        assert_eq!(
+            get(s, 99),
+            u32::from('A'),
+            "out of range is the default char"
+        );
+        // Exclusive ASCII-over-ASCII: in place, identity preserved.
+        let s2 = export_lean_string_utf8_set(s, crate::tagged::boxi(0), u32::from(b'H'));
+        assert_eq!(s2, s, "exclusive ASCII set writes in place");
+        assert_eq!(get(s2, 0), u32::from(b'H'));
+        // Multi-byte replacement rebuilds; codepoint length is preserved.
+        let s3 = export_lean_string_utf8_set(s2, crate::tagged::boxi(1), 0x2603 /* SNOWMAN */);
+        let (size3, _, len3, bytes3) = crate::object::string_fields(s3);
+        assert_eq!(&bytes3[..size3 - 1], b"H\xe2\x98\x83llo");
+        assert_eq!(len3, 5, "codepoint count survives the rebuild");
+        assert_eq!(get(s3, 1), 0x2603);
+        // Non-first-byte target returns the string unchanged.
+        let s4 = export_lean_string_utf8_set(s3, crate::tagged::boxi(2), u32::from(b'x'));
+        assert_eq!(s4, s3, "a continuation-byte index is a no-op");
+        crate::rc::dec_ref(s4);
+    }
+    let _ = shadow::disable_and_drain();
+}

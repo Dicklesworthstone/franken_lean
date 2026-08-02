@@ -36,6 +36,15 @@ static long long bytesum(const char *p, size_t n) {
     return s;
 }
 
+/* fln-3gv slice 1 externs the pin's lean.h does not declare (extern-census
+ * class, like lean_sorry): declared here exactly as generated C declares
+ * them. */
+extern lean_object *lean_st_ref_take(lean_object *ref);
+extern uint8_t lean_st_ref_ptr_eq(lean_object *ref1, lean_object *ref2);
+extern uint8_t lean_system_platform_windows(lean_object *w);
+extern uint8_t lean_system_platform_osx(lean_object *w);
+extern uint8_t lean_system_platform_emscripten(lean_object *w);
+
 static void facts_mode(void) {
     /* ---- ctor through the inline small path (mi_malloc_small underneath) */
     lean_object *o = lean_alloc_ctor(2, 2, 8);
@@ -246,6 +255,39 @@ static void facts_mode(void) {
     fact("string_mk.roundtrip_eq", lean_string_eq(sm, sm2));
     lean_dec(sm);
     lean_dec(sm2);
+
+    /* ---- fln-3gv slice 1: ST refs, utf8 get/set, platform ---- */
+    lean_object *cell = lean_st_mk_ref(lean_box(11));
+    fact("st_ref.get0", (long long)lean_unbox(lean_st_ref_get(cell)));
+    lean_dec(lean_st_ref_set(cell, lean_box(22)));
+    fact("st_ref.swap_old", (long long)lean_unbox(lean_st_ref_swap(cell, lean_box(33))));
+    fact("st_ref.taken", (long long)lean_unbox(lean_st_ref_take(cell)));
+    lean_dec(lean_st_ref_set(cell, lean_box(44)));
+    fact("st_ref.ptr_eq_self", lean_st_ref_ptr_eq(cell, cell));
+    lean_object *cell2 = lean_st_mk_ref(lean_box(44));
+    fact("st_ref.ptr_eq_other", lean_st_ref_ptr_eq(cell, cell2));
+    lean_object *sv = lean_mk_string("refcell");
+    lean_dec(lean_st_ref_set(cell, sv));
+    lean_object *sg = lean_st_ref_get(cell);
+    fact("st_ref.str_size", (long long)lean_string_size(sg) - 1);
+    lean_dec(sg);
+    lean_dec(cell);
+    lean_dec(cell2);
+    lean_object *u8s = lean_mk_string("h\xc3\xa9llo");
+    fact("utf8.get0", lean_string_utf8_get(u8s, lean_box(0)));
+    fact("utf8.get1", lean_string_utf8_get(u8s, lean_box(1)));
+    fact("utf8.get_cont", lean_string_utf8_get(u8s, lean_box(2)));
+    fact("utf8.get_oob", lean_string_utf8_get(u8s, lean_box(99)));
+    u8s = lean_string_utf8_set(u8s, lean_box(0), 'H');
+    fact("utf8.set_ascii_get0", lean_string_utf8_get(u8s, lean_box(0)));
+    u8s = lean_string_utf8_set(u8s, lean_box(1), 0x2603);
+    fact("utf8.set_multi_get1", lean_string_utf8_get(u8s, lean_box(1)));
+    fact("utf8.after_set_size", (long long)lean_string_size(u8s) - 1);
+    fact("utf8.after_set_len", (long long)lean_string_len(u8s));
+    lean_dec(u8s);
+    fact("platform.windows", lean_system_platform_windows(lean_box(0)));
+    fact("platform.osx", lean_system_platform_osx(lean_box(0)));
+    fact("platform.emscripten", lean_system_platform_emscripten(lean_box(0)));
 }
 
 int main(int argc, char **argv) {

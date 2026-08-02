@@ -2206,3 +2206,323 @@ pub(crate) extern "C" fn export_lean_string_to_utf8(s: *mut LeanObject) -> *mut 
         r
     }
 }
+
+// ===================================================================
+// fln-3gv slice 1: the ST ref-cell plane + platform/error-string leaves.
+//
+// The effect plane's pure substrate — no threads, no event loop. The ST ref
+// family is `IO.Ref`'s carrier: the pin serves every access through a
+// single-threaded plain path unless the cell is multi-threaded or persistent
+// (`ref_maybe_mt`, io.cpp:1445), in which case the value slot is an atomic
+// with exchange discipline and stored values are marked multi-threaded.
+// Deviation disclosed in mechanism, not observables: the ST branches below go
+// through the same `AtomicPtr` slot with `Relaxed` ordering instead of plain
+// loads/stores — indistinguishable single-threaded, and it keeps one access
+// path per slot (`AtomicPtr<T>` is layout-identical to `*mut T`, the same
+// fact the thunk/task layouts already rely on).
+// ===================================================================
+
+/// `ref_maybe_mt` (`io.cpp:1445`): the cell is multi-threaded (`m_rc < 0`) or
+/// persistent (`m_rc == 0`); mirrors `lean_is_mt` / `lean_is_persistent`'s
+/// own plain header reads (`lean.h`).
+// UNSAFE-LEDGER: FLN-UL-0203
+#[allow(unsafe_code)]
+unsafe fn ref_maybe_mt(r: *mut LeanObject) -> bool {
+    // SAFETY: r is a live object per every caller's contract; the rc word is
+    // read plainly exactly as the pin's own inline predicates read it.
+    unsafe { (&raw const (*r).m_rc).read() <= 0 }
+}
+
+/// The ref value slot viewed atomically (`mt_ref_val_addr`, io.cpp:1430-1432).
+// UNSAFE-LEDGER: FLN-UL-0204
+#[allow(unsafe_code)]
+unsafe fn ref_val_slot<'a>(r: *mut LeanObject) -> &'a core::sync::atomic::AtomicPtr<LeanObject> {
+    // SAFETY: r is a live ref object; `AtomicPtr<LeanObject>` is
+    // layout-identical to the `*mut LeanObject` slot it overlays.
+    unsafe {
+        &*(&raw mut (*r.cast::<crate::layout::LeanRefObject>()).m_value)
+            .cast::<core::sync::atomic::AtomicPtr<LeanObject>>()
+    }
+}
+
+/// `lean_st_mk_ref` (`io.cpp:1423-1428`): a fresh single-threaded ref cell
+/// owning `a`.
+// UNSAFE-LEDGER: FLN-UL-0205
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_mk_ref")]
+pub(crate) extern "C" fn export_lean_st_mk_ref(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: `a` is consumed into the cell; alloc_ref owns header init.
+    unsafe { object::alloc_ref(a) }
+}
+
+/// `lean_st_ref_get` (`io.cpp:1447-1472`): borrowed cell, owned value out.
+/// The MT arm takes the RC token by exchange, duplicates it, and puts one
+/// token back, decrementing any value another thread wrote in the window.
+// UNSAFE-LEDGER: FLN-UL-0206
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_get")]
+pub(crate) extern "C" fn export_lean_st_ref_get(r: *mut LeanObject) -> *mut LeanObject {
+    use core::sync::atomic::Ordering;
+    // SAFETY: r is a live ref (borrowed); values leaving the slot follow the
+    // pin's exchange discipline exactly, so ownership is balanced on every
+    // path including the racing-writer arm.
+    unsafe {
+        let slot = ref_val_slot(r);
+        if ref_maybe_mt(r) {
+            loop {
+                let val = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if !val.is_null() {
+                    if !crate::tagged::is_scalar(val) {
+                        rc::inc_ref_n(val, 1);
+                    }
+                    let tmp = slot.swap(val, Ordering::SeqCst);
+                    if !tmp.is_null() && !crate::tagged::is_scalar(tmp) {
+                        rc::dec_ref(tmp);
+                    }
+                    return val;
+                }
+            }
+        } else {
+            let val = slot.load(Ordering::Relaxed);
+            if !crate::tagged::is_scalar(val) {
+                rc::inc_ref_n(val, 1);
+            }
+            val
+        }
+    }
+}
+
+/// `lean_st_ref_take` (`io.cpp:1474-1488`): borrowed cell, the value moves
+/// out and the slot is left null until the paired `set`.
+// UNSAFE-LEDGER: FLN-UL-0207
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_take")]
+pub(crate) extern "C" fn export_lean_st_ref_take(r: *mut LeanObject) -> *mut LeanObject {
+    use core::sync::atomic::Ordering;
+    // SAFETY: r live ref; ownership of the slot's token transfers to the
+    // caller on both arms.
+    unsafe {
+        let slot = ref_val_slot(r);
+        if ref_maybe_mt(r) {
+            loop {
+                let val = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if !val.is_null() {
+                    return val;
+                }
+            }
+        } else {
+            let val = slot.load(Ordering::Relaxed);
+            slot.store(core::ptr::null_mut(), Ordering::Relaxed);
+            val
+        }
+    }
+}
+
+/// `lean_st_ref_set` (`io.cpp:1492-1510`): consumes `a`; the MT arm marks the
+/// stored value multi-threaded first (an ST graph must never be reachable
+/// from an MT object); returns the unit `box(0)`.
+// UNSAFE-LEDGER: FLN-UL-0208
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_set")]
+pub(crate) extern "C" fn export_lean_st_ref_set(
+    r: *mut LeanObject,
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    use core::sync::atomic::Ordering;
+    // SAFETY: r live ref (borrowed), a consumed; the displaced value's token
+    // is released on both arms exactly as the pin does.
+    unsafe {
+        let slot = ref_val_slot(r);
+        if ref_maybe_mt(r) {
+            if !crate::tagged::is_scalar(a) {
+                rc::mark_mt(a);
+            }
+            let old = slot.swap(a, Ordering::SeqCst);
+            if !old.is_null() && !crate::tagged::is_scalar(old) {
+                rc::dec_ref(old);
+            }
+        } else {
+            let old = slot.load(Ordering::Relaxed);
+            if !old.is_null() && !crate::tagged::is_scalar(old) {
+                rc::dec_ref(old);
+            }
+            slot.store(a, Ordering::Relaxed);
+        }
+    }
+    crate::tagged::boxi(0)
+}
+
+/// `lean_st_ref_swap` (`io.cpp:1512-1527`): consumes `a`, returns the old
+/// value; a null ST slot is the pin's `lean_internal_panic("null reference
+/// read")`, reproduced verbatim.
+// UNSAFE-LEDGER: FLN-UL-0209
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_swap")]
+pub(crate) extern "C" fn export_lean_st_ref_swap(
+    r: *mut LeanObject,
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    use core::sync::atomic::Ordering;
+    // SAFETY: r live ref (borrowed), a consumed, old token returned owned.
+    unsafe {
+        let slot = ref_val_slot(r);
+        if ref_maybe_mt(r) {
+            if !crate::tagged::is_scalar(a) {
+                rc::mark_mt(a);
+            }
+            loop {
+                let old = slot.swap(a, Ordering::SeqCst);
+                if !old.is_null() {
+                    return old;
+                }
+            }
+        } else {
+            let old = slot.load(Ordering::Relaxed);
+            if old.is_null() {
+                internal_panic_impl("null reference read");
+            }
+            slot.store(a, Ordering::Relaxed);
+            old
+        }
+    }
+}
+
+/// `lean_st_ref_ptr_eq` (`io.cpp:1530-1532`): cell identity, not value
+/// equality.
+// UNSAFE-LEDGER: FLN-UL-0212
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_ptr_eq")]
+pub(crate) extern "C" fn export_lean_st_ref_ptr_eq(r1: *mut LeanObject, r2: *mut LeanObject) -> u8 {
+    u8::from(core::ptr::eq(r1, r2))
+}
+
+/// `lean_string_utf8_get` (`object.cpp:2219-2245` + `_fast_cold`): decode the
+/// scalar at byte position `i`; every out-of-range, non-scalar-index or
+/// invalid-encoding case is the pin's `lean_char_default_value()` = `'A'`.
+// UNSAFE-LEDGER: FLN-UL-0210
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_get")]
+pub(crate) extern "C" fn export_lean_string_utf8_get(
+    s: *mut LeanObject,
+    i0: *mut LeanObject,
+) -> u32 {
+    const DEFAULT: u32 = 'A' as u32;
+    if !crate::tagged::is_scalar(i0) {
+        return DEFAULT;
+    }
+    let i = crate::tagged::unbox(i0);
+    // SAFETY: s is a live (borrowed) string; reads below stay inside the
+    // m_size-bounded content prefix.
+    unsafe {
+        let (size, data) = string_size_and_data(s);
+        let size = size.saturating_sub(1);
+        if i >= size {
+            return DEFAULT;
+        }
+        let bytes = core::slice::from_raw_parts(data, size);
+        let c = u32::from(bytes[i]);
+        if c < 0x80 {
+            return c;
+        }
+        if (c & 0xe0) == 0xc0 && i + 1 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let r = ((c & 0x1f) << 6) | (c1 & 0x3f);
+            if r >= 0x80 {
+                return r;
+            }
+        }
+        if (c & 0xf0) == 0xe0 && i + 2 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let c2 = u32::from(bytes[i + 2]);
+            let r = ((c & 0x0f) << 12) | ((c1 & 0x3f) << 6) | (c2 & 0x3f);
+            if r >= 0x800 && !(0xD800..=0xDFFF).contains(&r) {
+                return r;
+            }
+        }
+        if (c & 0xf8) == 0xf0 && i + 3 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let c2 = u32::from(bytes[i + 2]);
+            let c3 = u32::from(bytes[i + 3]);
+            let r = ((c & 0x07) << 18) | ((c1 & 0x3f) << 12) | ((c2 & 0x3f) << 6) | (c3 & 0x3f);
+            if (0x10000..=0x10FFFF).contains(&r) {
+                return r;
+            }
+        }
+        DEFAULT
+    }
+}
+
+/// `lean_string_utf8_set` (`object.cpp:2423-2448`): out-of-range or
+/// non-scalar index returns `s` unchanged; exclusive ASCII-over-ASCII writes
+/// in place; a non-first-byte position returns `s`; otherwise rebuild with
+/// the replacement scalar, codepoint length unchanged.
+// UNSAFE-LEDGER: FLN-UL-0211
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_set")]
+pub(crate) extern "C" fn export_lean_string_utf8_set(
+    s: *mut LeanObject,
+    i0: *mut LeanObject,
+    c: u32,
+) -> *mut LeanObject {
+    if !crate::tagged::is_scalar(i0) {
+        return s;
+    }
+    let i = crate::tagged::unbox(i0);
+    // SAFETY: s owned by this call; all reads/writes stay inside its content
+    // bytes; the rebuild path releases s exactly once.
+    unsafe {
+        let (size, data) = string_size_and_data(s);
+        let sz = size.saturating_sub(1);
+        if i >= sz {
+            return s;
+        }
+        let first = *data.add(i);
+        if is_exclusive(s) && first < 128 && c < 128 {
+            let w = data as *mut u8;
+            w.add(i).write(c as u8);
+            return s;
+        }
+        if (first & 0xC0) == 0x80 {
+            return s;
+        }
+        let bytes = core::slice::from_raw_parts(data, sz);
+        let old_char_size = match bytes[i] {
+            b if b < 0x80 => 1,
+            b if (b & 0xe0) == 0xc0 => 2,
+            b if (b & 0xf0) == 0xe0 => 3,
+            b if (b & 0xf8) == 0xf0 => 4,
+            _ => 1,
+        };
+        let mut rebuilt = Vec::with_capacity(sz + 4);
+        rebuilt.extend_from_slice(&bytes[..i]);
+        push_unicode_scalar(&mut rebuilt, c);
+        rebuilt.extend_from_slice(&bytes[(i + old_char_size).min(sz)..]);
+        let (_, _, len, _) = object::string_fields(s);
+        rc::dec_ref(s);
+        object::mk_string_unchecked(&rebuilt, len)
+    }
+}
+
+/// `lean_system_platform_windows` (`platform.cpp:20-26`).
+// UNSAFE-LEDGER: FLN-UL-0213
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_system_platform_windows")]
+pub(crate) extern "C" fn export_lean_system_platform_windows(_w: *mut LeanObject) -> u8 {
+    u8::from(cfg!(target_os = "windows"))
+}
+
+/// `lean_system_platform_osx` (`platform.cpp:28-34`).
+// UNSAFE-LEDGER: FLN-UL-0214
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_system_platform_osx")]
+pub(crate) extern "C" fn export_lean_system_platform_osx(_w: *mut LeanObject) -> u8 {
+    u8::from(cfg!(target_os = "macos"))
+}
+
+/// `lean_system_platform_emscripten` (`platform.cpp:36-42`).
+// UNSAFE-LEDGER: FLN-UL-0215
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_system_platform_emscripten")]
+pub(crate) extern "C" fn export_lean_system_platform_emscripten(_w: *mut LeanObject) -> u8 {
+    u8::from(cfg!(target_os = "emscripten"))
+}
