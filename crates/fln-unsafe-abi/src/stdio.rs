@@ -596,7 +596,10 @@ pub(crate) unsafe fn prim_handle_read(h: *mut LeanObject, nbytes: usize) -> *mut
 /// `h` and `buf` are borrowed and live; caller owns the io_result.
 // UNSAFE-LEDGER: FLN-UL-0315
 #[allow(unsafe_code)]
-pub(crate) unsafe fn prim_handle_write(h: *mut LeanObject, buf: *mut LeanObject) -> *mut LeanObject {
+pub(crate) unsafe fn prim_handle_write(
+    h: *mut LeanObject,
+    buf: *mut LeanObject,
+) -> *mut LeanObject {
     // SAFETY: live objects per contract; fwrite reads exactly n salient
     // bytes from the live array's data base.
     unsafe {
