@@ -68,6 +68,8 @@ extern void lean_initialize_runtime_module(void);
 extern lean_object *lean_get_stdout(void);
 extern lean_object *lean_get_set_stdout(lean_object *h);
 extern lean_object *lean_io_prim_handle_mk(lean_object *filename, uint8_t mode);
+extern lean_object *lean_io_prim_handle_put_str(lean_object *h, lean_object *s);
+extern lean_object *lean_io_prim_handle_read(lean_object *h, size_t nbytes);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -638,6 +640,58 @@ static void facts_mode(void) {
         fact("corpus.io_println.bytes", iop_n);
         fact("corpus.io_println.bytesum", iop_sum);
     }
+
+    /* ---- fln-3gv slice 5b: the io_file.lean corpus roundtrip through the
+     * read/write prims (crates/fln-vm/fixtures/g03/io_file.lean; the
+     * pinned runtime observable is "read back: roundtrip payload
+     * FORALL (20 chars)"). writeFile's shape: mk(write)+putStr+drop, the
+     * drop's fclose publishing; readFile's: mk(read)+read, plus the pin's
+     * EOF arm (io.cpp:598-601). */
+    char iof_path[128];
+    snprintf(iof_path, sizeof iof_path, "/tmp/fln-g03-file-%lld",
+             (long long)getpid());
+    remove(iof_path);
+    lean_object *iof_fname = lean_mk_string(iof_path);
+    lean_object *iof_wres = lean_io_prim_handle_mk(iof_fname, 1);
+    fact("corpus.io_file.wmk_ok", lean_ptr_tag(iof_wres) == 0);
+    lean_object *iof_wh = lean_ctor_get(iof_wres, 0);
+    lean_inc(iof_wh);
+    lean_dec(iof_wres);
+    lean_object *iof_content = lean_mk_string("roundtrip payload \xE2\x88\x80\n");
+    lean_object *iof_pres = lean_io_prim_handle_put_str(iof_wh, iof_content);
+    fact("corpus.io_file.put_ok", lean_ptr_tag(iof_pres) == 0);
+    lean_dec(iof_pres);
+    lean_dec(iof_content);
+    lean_dec(iof_wh); /* the finalizer's fclose publishes the bytes */
+    lean_object *iof_rres = lean_io_prim_handle_mk(iof_fname, 0);
+    fact("corpus.io_file.rmk_ok", lean_ptr_tag(iof_rres) == 0);
+    lean_object *iof_rh = lean_ctor_get(iof_rres, 0);
+    lean_inc(iof_rh);
+    lean_dec(iof_rres);
+    lean_dec(iof_fname);
+    lean_object *iof_chunk = lean_io_prim_handle_read(iof_rh, 1024);
+    fact("corpus.io_file.read_ok", lean_ptr_tag(iof_chunk) == 0);
+    lean_object *iof_ba = lean_ctor_get(iof_chunk, 0);
+    {
+        long long iof_n = (long long)lean_sarray_size(iof_ba);
+        uint8_t *iof_p = lean_sarray_cptr(iof_ba);
+        long long iof_sum = 0, iof_chars = 0;
+        for (long long i = 0; i < iof_n; i++) {
+            iof_sum += iof_p[i];
+            iof_chars += (iof_p[i] & 0xC0) != 0x80; /* non-continuation */
+        }
+        fact("corpus.io_file.bytes", iof_n);
+        fact("corpus.io_file.bytesum", iof_sum);
+        fact("corpus.io_file.chars", iof_chars);
+    }
+    lean_object *iof_eof = lean_io_prim_handle_read(iof_rh, 1024);
+    fact("corpus.io_file.eof_ok", lean_ptr_tag(iof_eof) == 0);
+    fact("corpus.io_file.eof_size",
+         (long long)lean_sarray_size(lean_ctor_get(iof_eof, 0)));
+    lean_dec(iof_eof);
+    lean_dec(iof_chunk);
+    lean_dec(iof_rh);
+    remove(iof_path);
 }
 
 int main(int argc, char **argv) {
