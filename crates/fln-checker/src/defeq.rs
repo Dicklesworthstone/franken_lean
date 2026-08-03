@@ -1810,9 +1810,9 @@ fn definition_height(
             }
             ExprNode::Constant { name, .. } => {
                 return Ok(context
-                    .definitions()
+                    .constants()
                     .find(name)
-                    .filter(|definition| definition.is_delta_unfoldable())
+                    .and_then(|constant| constant.delta_body())
                     .map(|definition| definition.hint().delta_height()));
             }
             ExprNode::Bound { .. }

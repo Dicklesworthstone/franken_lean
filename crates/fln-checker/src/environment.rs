@@ -1,10 +1,10 @@
-//! Immutable definition environment for the independent checker.
+//! Immutable constant environment for the independent checker.
 //!
 //! This is intentionally not an adapter over `fln-env`. It preserves the
-//! definition fields needed by later checker-owned delta reduction while using a
-//! separate immutable map, separate validation, and separate resource taxonomy.
-//! Construction is failure-atomic: only a completely validated environment is
-//! published.
+//! common declaration header needed by checker-owned typing and the optional
+//! definition body needed by delta reduction while using a separate immutable
+//! map, separate validation, and separate resource taxonomy. Construction is
+//! failure-atomic: only a completely validated environment is published.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,9 +35,30 @@ impl ReducibilityHint {
     }
 }
 
-/// Safety is schema, not an admission decision. Later reduction may unfold only
-/// `Safe` definitions; retaining all three forms here prevents the environment
-/// boundary from erasing that distinction.
+/// The declaration family carried by one constant header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstantKind {
+    Axiom,
+    Theorem,
+    Opaque,
+    Definition,
+    Inductive,
+    Constructor,
+    Recursor,
+    Quotient,
+}
+
+/// Unsafe quarantine is common declaration metadata, independent of whether a
+/// constant has a definition body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstantSafety {
+    Safe,
+    Unsafe,
+}
+
+/// Definition safety is schema, not an admission decision. Delta reduction may
+/// unfold only `Safe` bodies belonging to a safe constant; retaining all three
+/// forms prevents the environment boundary from erasing that distinction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefinitionSafety {
     Unsafe,
@@ -45,42 +66,28 @@ pub enum DefinitionSafety {
     Partial,
 }
 
-/// Definition payload stored under one canonical name.
+/// Optional definition-specific payload stored behind the common header.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Definition {
-    level_parameters: Vec<WireName>,
-    type_: WireExpr,
+pub struct DefinitionBody {
     value: WireExpr,
     hint: ReducibilityHint,
     safety: DefinitionSafety,
     mutual: Vec<WireName>,
 }
 
-impl Definition {
+impl DefinitionBody {
     pub fn new(
-        level_parameters: Vec<WireName>,
-        type_: WireExpr,
         value: WireExpr,
         hint: ReducibilityHint,
         safety: DefinitionSafety,
         mutual: Vec<WireName>,
-    ) -> Definition {
-        Definition {
-            level_parameters,
-            type_,
+    ) -> DefinitionBody {
+        DefinitionBody {
             value,
             hint,
             safety,
             mutual,
         }
-    }
-
-    pub fn level_parameters(&self) -> &[WireName] {
-        &self.level_parameters
-    }
-
-    pub fn type_(&self) -> &WireExpr {
-        &self.type_
     }
 
     pub fn value(&self) -> &WireExpr {
@@ -98,72 +105,153 @@ impl Definition {
     pub fn mutual(&self) -> &[WireName] {
         &self.mutual
     }
+}
 
-    pub const fn is_delta_unfoldable(&self) -> bool {
-        matches!(self.safety, DefinitionSafety::Safe)
+/// One constant declaration. Typing and reduction share this header; only a
+/// definition may carry a body, and header-only declarations never receive a
+/// fabricated value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantDeclaration {
+    level_parameters: Vec<WireName>,
+    type_: WireExpr,
+    kind: ConstantKind,
+    safety: ConstantSafety,
+    definition: Option<DefinitionBody>,
+}
+
+impl ConstantDeclaration {
+    pub fn header(
+        level_parameters: Vec<WireName>,
+        type_: WireExpr,
+        kind: ConstantKind,
+        safety: ConstantSafety,
+    ) -> ConstantDeclaration {
+        ConstantDeclaration {
+            level_parameters,
+            type_,
+            kind,
+            safety,
+            definition: None,
+        }
+    }
+
+    pub fn definition(
+        level_parameters: Vec<WireName>,
+        type_: WireExpr,
+        safety: ConstantSafety,
+        definition: DefinitionBody,
+    ) -> ConstantDeclaration {
+        ConstantDeclaration {
+            level_parameters,
+            type_,
+            kind: ConstantKind::Definition,
+            safety,
+            definition: Some(definition),
+        }
+    }
+
+    pub fn level_parameters(&self) -> &[WireName] {
+        &self.level_parameters
+    }
+
+    pub fn type_(&self) -> &WireExpr {
+        &self.type_
+    }
+
+    pub const fn kind(&self) -> ConstantKind {
+        self.kind
+    }
+
+    pub const fn safety(&self) -> ConstantSafety {
+        self.safety
+    }
+
+    pub fn definition_body(&self) -> Option<&DefinitionBody> {
+        self.definition.as_ref()
+    }
+
+    /// Return the body only when every schema dimension permits delta
+    /// reduction. This keeps callers from forgetting the common unsafe flag.
+    pub fn delta_body(&self) -> Option<&DefinitionBody> {
+        if self.kind == ConstantKind::Definition
+            && self.safety == ConstantSafety::Safe
+            && matches!(
+                self.definition.as_ref().map(DefinitionBody::safety),
+                Some(DefinitionSafety::Safe)
+            )
+        {
+            self.definition.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub fn is_delta_unfoldable(&self) -> bool {
+        self.delta_body().is_some()
     }
 }
 
 /// One input row. The name becomes the immutable map key on successful build.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefinitionEntry {
+pub struct ConstantEntry {
     name: WireName,
-    definition: Definition,
+    declaration: ConstantDeclaration,
 }
 
-impl DefinitionEntry {
-    pub fn new(name: WireName, definition: Definition) -> DefinitionEntry {
-        DefinitionEntry { name, definition }
+impl ConstantEntry {
+    pub fn new(name: WireName, declaration: ConstantDeclaration) -> ConstantEntry {
+        ConstantEntry { name, declaration }
     }
 
     pub fn name(&self) -> &WireName {
         &self.name
     }
 
-    pub fn definition(&self) -> &Definition {
-        &self.definition
+    pub fn declaration(&self) -> &ConstantDeclaration {
+        &self.declaration
     }
 
-    fn into_parts(self) -> (WireName, Definition) {
-        (self.name, self.definition)
+    fn into_parts(self) -> (WireName, ConstantDeclaration) {
+        (self.name, self.declaration)
     }
 }
 
-/// Persistent, deterministic name resolution for checker-owned definitions.
+/// Persistent, deterministic name resolution for checker-owned constants.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DefinitionEnvironment {
-    definitions: Arc<BTreeMap<WireName, Definition>>,
+pub struct ConstantEnvironment {
+    constants: Arc<BTreeMap<WireName, ConstantDeclaration>>,
 }
 
-impl DefinitionEnvironment {
-    pub fn empty() -> DefinitionEnvironment {
-        DefinitionEnvironment::default()
+impl ConstantEnvironment {
+    pub fn empty() -> ConstantEnvironment {
+        ConstantEnvironment::default()
     }
 
     pub fn len(&self) -> usize {
-        self.definitions.len()
+        self.constants.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.definitions.is_empty()
+        self.constants.is_empty()
     }
 
-    pub fn find(&self, name: &WireName) -> Option<&Definition> {
-        self.definitions.get(name)
+    pub fn find(&self, name: &WireName) -> Option<&ConstantDeclaration> {
+        self.constants.get(name)
     }
 
-    pub fn definitions(
+    pub fn constants(
         &self,
-    ) -> impl ExactSizeIterator<Item = (&WireName, &Definition)> + DoubleEndedIterator {
-        self.definitions.iter()
+    ) -> impl ExactSizeIterator<Item = (&WireName, &ConstantDeclaration)> + DoubleEndedIterator
+    {
+        self.constants.iter()
     }
 
-    pub fn build(entries: Vec<DefinitionEntry>, budget: EnvironmentBudget) -> EnvironmentOutcome {
+    pub fn build(entries: Vec<ConstantEntry>, budget: EnvironmentBudget) -> EnvironmentOutcome {
         Self::build_with(entries, budget, || false)
     }
 
     pub fn build_with(
-        entries: Vec<DefinitionEntry>,
+        entries: Vec<ConstantEntry>,
         budget: EnvironmentBudget,
         mut cancelled: impl FnMut() -> bool,
     ) -> EnvironmentOutcome {
@@ -175,7 +263,7 @@ impl DefinitionEnvironment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvironmentBudget {
     pub max_steps: u64,
-    pub max_definitions: u64,
+    pub max_constants: u64,
     pub max_level_parameters: u64,
     pub max_mutual_members: u64,
     pub max_arena_nodes: u64,
@@ -185,7 +273,7 @@ pub struct EnvironmentBudget {
 impl EnvironmentBudget {
     pub const fn new(
         max_steps: u64,
-        max_definitions: u64,
+        max_constants: u64,
         max_level_parameters: u64,
         max_mutual_members: u64,
         max_arena_nodes: u64,
@@ -193,7 +281,7 @@ impl EnvironmentBudget {
     ) -> EnvironmentBudget {
         EnvironmentBudget {
             max_steps,
-            max_definitions,
+            max_constants,
             max_level_parameters,
             max_mutual_members,
             max_arena_nodes,
@@ -210,7 +298,7 @@ impl EnvironmentBudget {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EnvironmentProgress {
     pub steps: u64,
-    pub definitions: u64,
+    pub constants: u64,
     pub level_parameters: u64,
     pub mutual_members: u64,
     pub arena_nodes: u64,
@@ -220,7 +308,7 @@ pub struct EnvironmentProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvironmentLimit {
     Steps,
-    Definitions,
+    Constants,
     LevelParameters,
     MutualMembers,
     ArenaNodes,
@@ -240,7 +328,7 @@ pub enum EnvironmentField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvironmentPosition {
-    pub definition: usize,
+    pub constant: usize,
     pub field: EnvironmentField,
     pub index: usize,
 }
@@ -263,11 +351,11 @@ pub enum EnvironmentStop {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentRefusal {
-    DuplicateDefinition {
+    DuplicateConstant {
         name: WireName,
     },
     DuplicateLevelParameter {
-        definition: usize,
+        constant: usize,
         first: usize,
         second: usize,
     },
@@ -282,23 +370,23 @@ pub enum EnvironmentTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentFault {
     MissingExpression {
-        definition: usize,
+        constant: usize,
         term: EnvironmentTerm,
         index: usize,
     },
     NonBackwardExpressionReference {
-        definition: usize,
+        constant: usize,
         term: EnvironmentTerm,
         parent: usize,
         child: usize,
     },
     MissingLevel {
-        definition: usize,
+        constant: usize,
         term: EnvironmentTerm,
         index: usize,
     },
     NonBackwardLevelReference {
-        definition: usize,
+        constant: usize,
         term: EnvironmentTerm,
         parent: usize,
         child: usize,
@@ -308,7 +396,7 @@ pub enum EnvironmentFault {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentOutcome {
     Complete {
-        environment: DefinitionEnvironment,
+        environment: ConstantEnvironment,
         progress: EnvironmentProgress,
     },
     Refused {
@@ -387,11 +475,11 @@ impl<'a> Control<'a> {
         Ok(())
     }
 
-    fn definition(&mut self, at: EnvironmentPosition) -> Result<(), EnvironmentStop> {
-        self.progress.definitions = self.admit(
-            EnvironmentLimit::Definitions,
-            self.budget.max_definitions,
-            self.progress.definitions,
+    fn constant(&mut self, at: EnvironmentPosition) -> Result<(), EnvironmentStop> {
+        self.progress.constants = self.admit(
+            EnvironmentLimit::Constants,
+            self.budget.max_constants,
+            self.progress.constants,
             at,
         )?;
         Ok(())
@@ -497,9 +585,9 @@ fn field(term: EnvironmentTerm, levels: bool) -> EnvironmentField {
     }
 }
 
-fn missing_level(definition: usize, term: EnvironmentTerm, index: usize) -> Halt {
+fn missing_level(constant: usize, term: EnvironmentTerm, index: usize) -> Halt {
     Halt::Fault(EnvironmentFault::MissingLevel {
-        definition,
+        constant,
         term,
         index,
     })
@@ -507,28 +595,28 @@ fn missing_level(definition: usize, term: EnvironmentTerm, index: usize) -> Halt
 
 fn validate_level_child(
     levels: &[LevelNode],
-    definition: usize,
+    constant: usize,
     term: EnvironmentTerm,
     parent: usize,
     child: LevelId,
 ) -> Result<(), Halt> {
     if child.index() >= parent {
         return Err(Halt::Fault(EnvironmentFault::NonBackwardLevelReference {
-            definition,
+            constant,
             term,
             parent,
             child: child.index(),
         }));
     }
     if levels.get(child.index()).is_none() {
-        return Err(missing_level(definition, term, child.index()));
+        return Err(missing_level(constant, term, child.index()));
     }
     Ok(())
 }
 
 fn validate_expression_child(
     nodes: &[ExprNode],
-    definition: usize,
+    constant: usize,
     term: EnvironmentTerm,
     parent: usize,
     child: ExprId,
@@ -536,7 +624,7 @@ fn validate_expression_child(
     if child.index() >= parent {
         return Err(Halt::Fault(
             EnvironmentFault::NonBackwardExpressionReference {
-                definition,
+                constant,
                 term,
                 parent,
                 child: child.index(),
@@ -545,7 +633,7 @@ fn validate_expression_child(
     }
     if nodes.get(child.index()).is_none() {
         return Err(Halt::Fault(EnvironmentFault::MissingExpression {
-            definition,
+            constant,
             term,
             index: child.index(),
         }));
@@ -555,13 +643,13 @@ fn validate_expression_child(
 
 fn validate_term(
     control: &mut Control<'_>,
-    definition: usize,
+    constant: usize,
     term_kind: EnvironmentTerm,
     term: &WireExpr,
 ) -> Result<(), Halt> {
     if term.node(term.root()).is_none() {
         return Err(Halt::Fault(EnvironmentFault::MissingExpression {
-            definition,
+            constant,
             term: term_kind,
             index: term.root().index(),
         }));
@@ -569,7 +657,7 @@ fn validate_term(
 
     for (index, node) in term.levels().iter().enumerate() {
         let at = EnvironmentPosition {
-            definition,
+            constant,
             field: field(term_kind, true),
             index,
         };
@@ -579,13 +667,13 @@ fn validate_term(
             .owned_units(level_owned_units(node), at)
             .map_err(Halt::Stop)?;
         for child in level_children(node) {
-            validate_level_child(term.levels(), definition, term_kind, index, child)?;
+            validate_level_child(term.levels(), constant, term_kind, index, child)?;
         }
     }
 
     for (index, node) in term.nodes().iter().enumerate() {
         let at = EnvironmentPosition {
-            definition,
+            constant,
             field: field(term_kind, false),
             index,
         };
@@ -595,18 +683,18 @@ fn validate_term(
             .owned_units(expression_owned_units(node), at)
             .map_err(Halt::Stop)?;
         for child in expression_children(node) {
-            validate_expression_child(term.nodes(), definition, term_kind, index, child)?;
+            validate_expression_child(term.nodes(), constant, term_kind, index, child)?;
         }
         match node {
             ExprNode::Sort { level } => {
                 if term.level(*level).is_none() {
-                    return Err(missing_level(definition, term_kind, level.index()));
+                    return Err(missing_level(constant, term_kind, level.index()));
                 }
             }
             ExprNode::Constant { levels, .. } => {
                 for level in levels {
                     if term.level(*level).is_none() {
-                        return Err(missing_level(definition, term_kind, level.index()));
+                        return Err(missing_level(constant, term_kind, level.index()));
                     }
                 }
             }
@@ -627,33 +715,33 @@ fn validate_term(
 }
 
 fn build_environment(
-    entries: Vec<DefinitionEntry>,
+    entries: Vec<ConstantEntry>,
     budget: EnvironmentBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> EnvironmentOutcome {
     let mut control = Control::new(budget, cancelled);
-    let mut definitions = BTreeMap::new();
+    let mut constants = BTreeMap::new();
     let mut duplicates = BTreeSet::new();
 
     for (input, entry) in entries.into_iter().enumerate() {
         let at = EnvironmentPosition {
-            definition: input,
+            constant: input,
             field: EnvironmentField::Name,
             index: 0,
         };
         if let Err(stop) = control.step(at) {
             return EnvironmentOutcome::Inconclusive(stop);
         }
-        if let Err(stop) = control.definition(at) {
+        if let Err(stop) = control.constant(at) {
             return EnvironmentOutcome::Inconclusive(stop);
         }
-        let (name, definition) = entry.into_parts();
+        let (name, declaration) = entry.into_parts();
         if let Err(stop) = control.owned_units(name_owned_units(&name), at) {
             return EnvironmentOutcome::Inconclusive(stop);
         }
-        match definitions.entry(name) {
+        match constants.entry(name) {
             Entry::Vacant(entry) => {
-                entry.insert(definition);
+                entry.insert(declaration);
             }
             Entry::Occupied(entry) => {
                 duplicates.insert(entry.key().clone());
@@ -663,16 +751,16 @@ fn build_environment(
 
     if let Some(name) = duplicates.into_iter().next() {
         return EnvironmentOutcome::Refused {
-            refusal: EnvironmentRefusal::DuplicateDefinition { name },
+            refusal: EnvironmentRefusal::DuplicateConstant { name },
             progress: control.progress,
         };
     }
 
-    for (definition_index, definition) in definitions.values().enumerate() {
+    for (constant_index, declaration) in constants.values().enumerate() {
         let mut parameters = BTreeMap::new();
-        for (parameter_index, parameter) in definition.level_parameters.iter().enumerate() {
+        for (parameter_index, parameter) in declaration.level_parameters.iter().enumerate() {
             let at = EnvironmentPosition {
-                definition: definition_index,
+                constant: constant_index,
                 field: EnvironmentField::LevelParameter,
                 index: parameter_index,
             };
@@ -688,7 +776,7 @@ fn build_environment(
             if let Some(first) = parameters.insert(parameter, parameter_index) {
                 return EnvironmentOutcome::Refused {
                     refusal: EnvironmentRefusal::DuplicateLevelParameter {
-                        definition: definition_index,
+                        constant: constant_index,
                         first,
                         second: parameter_index,
                     },
@@ -697,28 +785,45 @@ fn build_environment(
             }
         }
 
-        for (member_index, member) in definition.mutual.iter().enumerate() {
-            let at = EnvironmentPosition {
-                definition: definition_index,
-                field: EnvironmentField::MutualMember,
-                index: member_index,
+        if let Err(halt) = validate_term(
+            &mut control,
+            constant_index,
+            EnvironmentTerm::Type,
+            &declaration.type_,
+        ) {
+            return match halt {
+                Halt::Stop(stop) => EnvironmentOutcome::Inconclusive(stop),
+                Halt::Fault(fault) => EnvironmentOutcome::InternalFault {
+                    fault,
+                    progress: control.progress,
+                },
             };
-            if let Err(stop) = control.step(at) {
-                return EnvironmentOutcome::Inconclusive(stop);
-            }
-            if let Err(stop) = control.mutual_member(at) {
-                return EnvironmentOutcome::Inconclusive(stop);
-            }
-            if let Err(stop) = control.owned_units(name_owned_units(member), at) {
-                return EnvironmentOutcome::Inconclusive(stop);
-            }
         }
 
-        for (term_kind, term) in [
-            (EnvironmentTerm::Type, &definition.type_),
-            (EnvironmentTerm::Value, &definition.value),
-        ] {
-            if let Err(halt) = validate_term(&mut control, definition_index, term_kind, term) {
+        if let Some(definition) = declaration.definition.as_ref() {
+            for (member_index, member) in definition.mutual.iter().enumerate() {
+                let at = EnvironmentPosition {
+                    constant: constant_index,
+                    field: EnvironmentField::MutualMember,
+                    index: member_index,
+                };
+                if let Err(stop) = control.step(at) {
+                    return EnvironmentOutcome::Inconclusive(stop);
+                }
+                if let Err(stop) = control.mutual_member(at) {
+                    return EnvironmentOutcome::Inconclusive(stop);
+                }
+                if let Err(stop) = control.owned_units(name_owned_units(member), at) {
+                    return EnvironmentOutcome::Inconclusive(stop);
+                }
+            }
+
+            if let Err(halt) = validate_term(
+                &mut control,
+                constant_index,
+                EnvironmentTerm::Value,
+                &definition.value,
+            ) {
                 return match halt {
                     Halt::Stop(stop) => EnvironmentOutcome::Inconclusive(stop),
                     Halt::Fault(fault) => EnvironmentOutcome::InternalFault {
@@ -731,8 +836,8 @@ fn build_environment(
     }
 
     EnvironmentOutcome::Complete {
-        environment: DefinitionEnvironment {
-            definitions: Arc::new(definitions),
+        environment: ConstantEnvironment {
+            constants: Arc::new(constants),
         },
         progress: control.progress,
     }
@@ -751,22 +856,25 @@ mod tests {
         )
     }
 
-    fn entry(value: WireExpr) -> DefinitionEntry {
-        DefinitionEntry::new(
+    fn entry(value: WireExpr) -> ConstantEntry {
+        ConstantEntry::new(
             WireName::default(),
-            Definition::new(
+            ConstantDeclaration::definition(
                 Vec::new(),
                 leaf(),
-                value,
-                ReducibilityHint::Regular(0),
-                DefinitionSafety::Safe,
-                Vec::new(),
+                ConstantSafety::Safe,
+                DefinitionBody::new(
+                    value,
+                    ReducibilityHint::Regular(0),
+                    DefinitionSafety::Safe,
+                    Vec::new(),
+                ),
             ),
         )
     }
 
     #[test]
-    fn private_arena_corruption_is_an_internal_fault_and_recovery_is_exact() {
+    fn private_type_and_value_corruption_are_distinct_faults_and_recovery_is_exact() {
         let root = ExprId::from_index(0).expect("zero is a valid expression index");
         let broken = WireExpr::from_parts(
             vec![ExprNode::Apply {
@@ -776,11 +884,32 @@ mod tests {
             Vec::new(),
             root,
         );
+        let broken_type = ConstantEntry::new(
+            WireName::default(),
+            ConstantDeclaration::header(
+                Vec::new(),
+                broken.clone(),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        );
         assert!(matches!(
-            DefinitionEnvironment::build(vec![entry(broken)], EnvironmentBudget::unlimited()),
+            ConstantEnvironment::build(vec![broken_type], EnvironmentBudget::unlimited()),
             EnvironmentOutcome::InternalFault {
                 fault: EnvironmentFault::NonBackwardExpressionReference {
-                    definition: 0,
+                    constant: 0,
+                    term: EnvironmentTerm::Type,
+                    parent: 0,
+                    child: 0,
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            ConstantEnvironment::build(vec![entry(broken)], EnvironmentBudget::unlimited()),
+            EnvironmentOutcome::InternalFault {
+                fault: EnvironmentFault::NonBackwardExpressionReference {
+                    constant: 0,
                     term: EnvironmentTerm::Value,
                     parent: 0,
                     child: 0,
@@ -789,7 +918,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            DefinitionEnvironment::build(vec![entry(leaf())], EnvironmentBudget::unlimited()),
+            ConstantEnvironment::build(vec![entry(leaf())], EnvironmentBudget::unlimited()),
             EnvironmentOutcome::Complete { .. }
         ));
     }

@@ -3,8 +3,8 @@
 use std::process::Command;
 
 use fln_checker::environment::{
-    Definition, DefinitionEntry, DefinitionEnvironment, DefinitionSafety, EnvironmentBudget,
-    EnvironmentOutcome, ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
+    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
 };
 use fln_checker::instantiate::InstantiationRefusal;
 use fln_checker::term::{TermBudget, TermLimit, TermStop};
@@ -185,7 +185,26 @@ fn projection_context(parameter_count: usize) -> WhnfContext {
             checker_name("GeneratedConstructor"),
             parameter_count,
         )],
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
+    )
+}
+
+fn definition_entry_with_constant_safety(
+    name: impl Into<String>,
+    level_parameters: Vec<WireName>,
+    value: WireExpr,
+    hint: ReducibilityHint,
+    constant_safety: ConstantSafety,
+    safety: DefinitionSafety,
+) -> ConstantEntry {
+    ConstantEntry::new(
+        checker_name(name),
+        ConstantDeclaration::definition(
+            level_parameters,
+            decoded(&Expr::sort(Level::zero())),
+            constant_safety,
+            DefinitionBody::new(value, hint, safety, Vec::new()),
+        ),
     )
 }
 
@@ -195,29 +214,46 @@ fn definition_entry(
     value: WireExpr,
     hint: ReducibilityHint,
     safety: DefinitionSafety,
-) -> DefinitionEntry {
-    DefinitionEntry::new(
+) -> ConstantEntry {
+    definition_entry_with_constant_safety(
+        name,
+        level_parameters,
+        value,
+        hint,
+        if safety == DefinitionSafety::Unsafe {
+            ConstantSafety::Unsafe
+        } else {
+            ConstantSafety::Safe
+        },
+        safety,
+    )
+}
+
+fn header_entry(
+    name: impl Into<String>,
+    kind: ConstantKind,
+    safety: ConstantSafety,
+) -> ConstantEntry {
+    ConstantEntry::new(
         checker_name(name),
-        Definition::new(
-            level_parameters,
-            decoded(&Expr::sort(Level::zero())),
-            value,
-            hint,
-            safety,
+        ConstantDeclaration::header(
             Vec::new(),
+            decoded(&Expr::sort(Level::zero())),
+            kind,
+            safety,
         ),
     )
 }
 
-fn definition_environment(entries: Vec<DefinitionEntry>) -> DefinitionEnvironment {
-    match DefinitionEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+fn constant_environment(entries: Vec<ConstantEntry>) -> ConstantEnvironment {
+    match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
         EnvironmentOutcome::Complete { environment, .. } => environment,
-        other => panic!("test definition environment did not build: {other:?}"),
+        other => panic!("test constant environment did not build: {other:?}"),
     }
 }
 
-fn definition_context(entries: Vec<DefinitionEntry>) -> WhnfContext {
-    WhnfContext::new(Vec::new(), Vec::new(), definition_environment(entries))
+fn definition_context(entries: Vec<ConstantEntry>) -> WhnfContext {
+    WhnfContext::new(Vec::new(), Vec::new(), constant_environment(entries))
 }
 
 fn constructor(arguments: impl IntoIterator<Item = Expr>) -> Expr {
@@ -235,7 +271,7 @@ fn generated_eager_whnf_matches_the_frozen_model() {
             decoded(&constant("generated_free_value")),
         )],
         projection_context(1).projection_rules().to_vec(),
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     for index in 0..CASES {
         let left_name = format!("left_{index}");
@@ -457,7 +493,7 @@ fn stuck_constants_never_delta_unfold() {
             decoded(&constant("wrong_delta_result")),
         )],
         Vec::new(),
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     let result = complete(whnf(&constant_term, &context, WhnfBudget::unlimited()));
     assert_eq!(output_model(&result), Frozen::Constant("opaque".to_owned()));
@@ -476,7 +512,7 @@ fn stuck_constants_never_delta_unfold() {
 }
 
 #[test]
-fn safe_definitions_unfold_for_every_hint_while_non_safe_rows_stay_stuck() {
+fn only_safe_definition_bodies_unfold_while_every_header_only_kind_stays_stuck() {
     let context = definition_context(vec![
         definition_entry(
             "safe_opaque",
@@ -513,6 +549,30 @@ fn safe_definitions_unfold_for_every_hint_while_non_safe_rows_stay_stuck() {
             ReducibilityHint::Abbrev,
             DefinitionSafety::Partial,
         ),
+        definition_entry_with_constant_safety(
+            "unsafe_constant_safe_body",
+            Vec::new(),
+            decoded(&constant("must_not_escape")),
+            ReducibilityHint::Regular(9),
+            ConstantSafety::Unsafe,
+            DefinitionSafety::Safe,
+        ),
+        header_entry("axiom", ConstantKind::Axiom, ConstantSafety::Safe),
+        header_entry("theorem", ConstantKind::Theorem, ConstantSafety::Safe),
+        header_entry("opaque", ConstantKind::Opaque, ConstantSafety::Safe),
+        header_entry(
+            "header_definition",
+            ConstantKind::Definition,
+            ConstantSafety::Safe,
+        ),
+        header_entry("inductive", ConstantKind::Inductive, ConstantSafety::Safe),
+        header_entry(
+            "constructor",
+            ConstantKind::Constructor,
+            ConstantSafety::Safe,
+        ),
+        header_entry("recursor", ConstantKind::Recursor, ConstantSafety::Safe),
+        header_entry("quotient", ConstantKind::Quotient, ConstantSafety::Unsafe),
     ]);
 
     for (name, expected) in [
@@ -529,7 +589,20 @@ fn safe_definitions_unfold_for_every_hint_while_non_safe_rows_stay_stuck() {
         assert_eq!(result.reductions, 1);
     }
 
-    for name in ["unsafe_row", "partial_row", "absent_row"] {
+    for name in [
+        "unsafe_row",
+        "partial_row",
+        "unsafe_constant_safe_body",
+        "axiom",
+        "theorem",
+        "opaque",
+        "header_definition",
+        "inductive",
+        "constructor",
+        "recursor",
+        "quotient",
+        "absent_row",
+    ] {
         let result = complete(whnf(
             &decoded(&constant(name)),
             &context,
@@ -611,7 +684,7 @@ fn delta_preserves_application_order_and_continues_beta_and_projection() {
         ),
         BinderInfo::Default,
     );
-    let environment = definition_environment(vec![
+    let environment = constant_environment(vec![
         definition_entry(
             "choose_left",
             Vec::new(),
@@ -809,7 +882,7 @@ fn duplicate_context_rows_and_free_cycles_are_refused() {
             FreeBinding::new(checker_name("x"), decoded(&constant("second"))),
         ],
         Vec::new(),
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     assert_eq!(
         whnf(&input, &duplicate_free, WhnfBudget::unlimited()),
@@ -825,7 +898,7 @@ fn duplicate_context_rows_and_free_cycles_are_refused() {
             ProjectionRule::new(checker_name("S"), checker_name("MkS"), 0),
             ProjectionRule::new(checker_name("S"), checker_name("OtherMkS"), 2),
         ],
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     assert_eq!(
         whnf(&input, &duplicate_projection, WhnfBudget::unlimited()),
@@ -847,7 +920,7 @@ fn duplicate_context_rows_and_free_cycles_are_refused() {
             ),
         ],
         Vec::new(),
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     let free_x = decoded(&Expr::fvar(FVarId(primary_name("x"))));
     assert_eq!(
@@ -1104,22 +1177,25 @@ fn deep_delta_child() -> Result<(), String> {
     let type_ = decoded(&Expr::sort(Level::zero()));
     let entries = (0..DEPTH)
         .map(|index| {
-            DefinitionEntry::new(
+            ConstantEntry::new(
                 checker_name(names[index].clone()),
-                Definition::new(
+                ConstantDeclaration::definition(
                     Vec::new(),
                     type_.clone(),
-                    decoded(&constant(names[index + 1].clone())),
-                    ReducibilityHint::Regular(index as u32),
-                    DefinitionSafety::Safe,
-                    Vec::new(),
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        decoded(&constant(names[index + 1].clone())),
+                        ReducibilityHint::Regular(index as u32),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
+                    ),
                 ),
             )
         })
         .collect();
-    let environment = match DefinitionEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+    let environment = match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
         EnvironmentOutcome::Complete { environment, .. } => environment,
-        other => return Err(format!("deep definition environment failed: {other:?}")),
+        other => return Err(format!("deep constant environment failed: {other:?}")),
     };
     let context = WhnfContext::new(Vec::new(), Vec::new(), environment);
     let result = match whnf(

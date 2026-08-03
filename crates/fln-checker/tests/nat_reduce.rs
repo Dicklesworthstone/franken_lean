@@ -4,8 +4,8 @@ use std::process::Command;
 
 use fln_checker::defeq::{DefEqBudget, DefEqOutcome, DefEqStop, def_eq, def_eq_with};
 use fln_checker::environment::{
-    Definition, DefinitionEntry, DefinitionEnvironment, DefinitionSafety, EnvironmentBudget,
-    EnvironmentOutcome, ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, DefinitionBody,
+    DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
 };
 use fln_checker::nat_reduce::{
     NatNotReduced, NatReductionBudget, NatReductionInput, NatReductionLimit, NatReductionOperation,
@@ -120,26 +120,29 @@ fn output_bool(term: &WireExpr) -> bool {
     }
 }
 
-fn definition_environment(entries: Vec<DefinitionEntry>) -> DefinitionEnvironment {
-    match DefinitionEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+fn constant_environment(entries: Vec<ConstantEntry>) -> ConstantEnvironment {
+    match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
         EnvironmentOutcome::Complete { environment, .. } => environment,
-        other => panic!("definition environment did not build: {other:?}"),
+        other => panic!("constant environment did not build: {other:?}"),
     }
 }
 
 fn definition_context(name: &Name, value: Expr) -> WhnfContext {
-    let entry = DefinitionEntry::new(
+    let entry = ConstantEntry::new(
         checker_name(name),
-        Definition::new(
+        ConstantDeclaration::definition(
             Vec::new(),
             decoded(&Expr::sort(Level::zero())),
-            decoded(&value),
-            ReducibilityHint::Regular(3),
-            DefinitionSafety::Safe,
-            Vec::new(),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                decoded(&value),
+                ReducibilityHint::Regular(3),
+                DefinitionSafety::Safe,
+                Vec::new(),
+            ),
         ),
     );
-    WhnfContext::new(Vec::new(), Vec::new(), definition_environment(vec![entry]))
+    WhnfContext::new(Vec::new(), Vec::new(), constant_environment(vec![entry]))
 }
 
 #[test]

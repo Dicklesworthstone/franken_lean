@@ -3,9 +3,9 @@
 use std::process::Command;
 
 use fln_checker::environment::{
-    Definition, DefinitionEntry, DefinitionEnvironment, DefinitionSafety, EnvironmentBudget,
-    EnvironmentLimit, EnvironmentOutcome, EnvironmentProgress, EnvironmentRefusal, EnvironmentStop,
-    ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
+    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentField, EnvironmentLimit,
+    EnvironmentOutcome, EnvironmentProgress, EnvironmentRefusal, EnvironmentStop, ReducibilityHint,
 };
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, NamePart, WireExpr, WireName, decode_expr, decode_name,
@@ -46,14 +46,37 @@ fn entry(
     hint: ReducibilityHint,
     safety: DefinitionSafety,
     mutual: Vec<WireName>,
-) -> DefinitionEntry {
-    DefinitionEntry::new(
+) -> ConstantEntry {
+    let constant_safety = if safety == DefinitionSafety::Unsafe {
+        ConstantSafety::Unsafe
+    } else {
+        ConstantSafety::Safe
+    };
+    ConstantEntry::new(
         checker_name(name),
-        Definition::new(level_parameters, type_, value, hint, safety, mutual),
+        ConstantDeclaration::definition(
+            level_parameters,
+            type_,
+            constant_safety,
+            DefinitionBody::new(value, hint, safety, mutual),
+        ),
     )
 }
 
-fn simple_entry(name: &str, value: u64) -> DefinitionEntry {
+fn header_entry(
+    name: &str,
+    level_parameters: Vec<WireName>,
+    type_: WireExpr,
+    kind: ConstantKind,
+    safety: ConstantSafety,
+) -> ConstantEntry {
+    ConstantEntry::new(
+        checker_name(name),
+        ConstantDeclaration::header(level_parameters, type_, kind, safety),
+    )
+}
+
+fn simple_entry(name: &str, value: u64) -> ConstantEntry {
     entry(
         name,
         Vec::new(),
@@ -65,7 +88,7 @@ fn simple_entry(name: &str, value: u64) -> DefinitionEntry {
     )
 }
 
-fn complete(outcome: EnvironmentOutcome) -> (DefinitionEnvironment, EnvironmentProgress) {
+fn complete(outcome: EnvironmentOutcome) -> (ConstantEnvironment, EnvironmentProgress) {
     match outcome {
         EnvironmentOutcome::Complete {
             environment,
@@ -94,8 +117,8 @@ fn display_name(name: &WireName) -> String {
 }
 
 #[test]
-fn definition_schema_retains_hints_safety_types_values_and_mutual_membership() {
-    let rows = vec![
+fn constant_schema_retains_common_headers_and_optional_definition_bodies() {
+    let mut rows = vec![
         entry(
             "abbrev_safe",
             vec![checker_name("u")],
@@ -106,13 +129,13 @@ fn definition_schema_retains_hints_safety_types_values_and_mutual_membership() {
             vec![checker_name("abbrev_safe"), checker_name("regular_unsafe")],
         ),
         entry(
-            "opaque_partial",
+            "partial_definition",
             Vec::new(),
             leaf(2),
             leaf(3),
             ReducibilityHint::Opaque,
             DefinitionSafety::Partial,
-            vec![checker_name("opaque_partial")],
+            vec![checker_name("partial_definition")],
         ),
         entry(
             "regular_unsafe",
@@ -124,7 +147,35 @@ fn definition_schema_retains_hints_safety_types_values_and_mutual_membership() {
             vec![checker_name("abbrev_safe"), checker_name("regular_unsafe")],
         ),
     ];
-    let (environment, _) = complete(DefinitionEnvironment::build(
+    let header_kinds = [
+        ("axiom", ConstantKind::Axiom),
+        ("theorem", ConstantKind::Theorem),
+        ("opaque", ConstantKind::Opaque),
+        ("header_definition", ConstantKind::Definition),
+        ("inductive", ConstantKind::Inductive),
+        ("constructor", ConstantKind::Constructor),
+        ("recursor", ConstantKind::Recursor),
+        ("quotient", ConstantKind::Quotient),
+    ];
+    rows.extend(
+        header_kinds
+            .iter()
+            .enumerate()
+            .map(|(index, (name, kind))| {
+                header_entry(
+                    name,
+                    vec![checker_name(format!("u_{index}"))],
+                    leaf(10 + index as u64),
+                    *kind,
+                    if index & 1 == 0 {
+                        ConstantSafety::Safe
+                    } else {
+                        ConstantSafety::Unsafe
+                    },
+                )
+            }),
+    );
+    let (environment, _) = complete(ConstantEnvironment::build(
         rows,
         EnvironmentBudget::unlimited(),
     ));
@@ -132,29 +183,136 @@ fn definition_schema_retains_hints_safety_types_values_and_mutual_membership() {
     let abbrev = environment
         .find(&checker_name("abbrev_safe"))
         .expect("abbreviation remains addressable");
-    assert_eq!(abbrev.hint(), ReducibilityHint::Abbrev);
-    assert_eq!(abbrev.hint().delta_height(), u32::MAX);
-    assert_eq!(abbrev.safety(), DefinitionSafety::Safe);
+    assert_eq!(abbrev.kind(), ConstantKind::Definition);
+    assert_eq!(abbrev.safety(), ConstantSafety::Safe);
     assert!(abbrev.is_delta_unfoldable());
     assert_eq!(abbrev.level_parameters(), &[checker_name("u")]);
-    assert_eq!(abbrev.mutual().len(), 2);
+    let abbrev_body = abbrev
+        .definition_body()
+        .expect("definition body is retained");
+    assert_eq!(abbrev_body.hint(), ReducibilityHint::Abbrev);
+    assert_eq!(abbrev_body.hint().delta_height(), u32::MAX);
+    assert_eq!(abbrev_body.safety(), DefinitionSafety::Safe);
+    assert_eq!(abbrev_body.mutual().len(), 2);
 
-    let opaque = environment
-        .find(&checker_name("opaque_partial"))
-        .expect("opaque-hint definition remains addressable");
-    assert_eq!(opaque.hint(), ReducibilityHint::Opaque);
-    assert_eq!(opaque.hint().delta_height(), 0);
-    assert_eq!(opaque.safety(), DefinitionSafety::Partial);
-    assert!(!opaque.is_delta_unfoldable());
+    let partial = environment
+        .find(&checker_name("partial_definition"))
+        .expect("partial definition remains addressable");
+    let partial_body = partial
+        .definition_body()
+        .expect("partial definition body is retained");
+    assert_eq!(partial_body.hint(), ReducibilityHint::Opaque);
+    assert_eq!(partial_body.hint().delta_height(), 0);
+    assert_eq!(partial_body.safety(), DefinitionSafety::Partial);
+    assert!(!partial.is_delta_unfoldable());
 
     let regular = environment
         .find(&checker_name("regular_unsafe"))
         .expect("regular definition remains addressable");
-    assert_eq!(regular.hint(), ReducibilityHint::Regular(17));
-    assert_eq!(regular.hint().delta_height(), 17);
-    assert_eq!(regular.safety(), DefinitionSafety::Unsafe);
+    let regular_body = regular
+        .definition_body()
+        .expect("unsafe definition body is retained");
+    assert_eq!(regular.safety(), ConstantSafety::Unsafe);
+    assert_eq!(regular_body.hint(), ReducibilityHint::Regular(17));
+    assert_eq!(regular_body.hint().delta_height(), 17);
+    assert_eq!(regular_body.safety(), DefinitionSafety::Unsafe);
     assert_eq!(regular.type_(), &leaf(4));
-    assert_eq!(regular.value(), &leaf(5));
+    assert_eq!(regular_body.value(), &leaf(5));
+    assert!(regular.delta_body().is_none());
+
+    for (index, (name, kind)) in header_kinds.iter().enumerate() {
+        let header = environment
+            .find(&checker_name(*name))
+            .expect("header-only constant remains addressable");
+        assert_eq!(header.kind(), *kind);
+        assert_eq!(
+            header.level_parameters(),
+            &[checker_name(format!("u_{index}"))]
+        );
+        assert_eq!(header.type_(), &leaf(10 + index as u64));
+        assert_eq!(
+            header.safety(),
+            if index & 1 == 0 {
+                ConstantSafety::Safe
+            } else {
+                ConstantSafety::Unsafe
+            }
+        );
+        assert!(header.definition_body().is_none());
+        assert!(header.delta_body().is_none());
+    }
+}
+
+#[test]
+fn header_only_rows_never_charge_or_traverse_a_definition_value() {
+    let parameter = checker_name("u");
+    let header = header_entry(
+        "shared",
+        vec![parameter.clone()],
+        leaf(0),
+        ConstantKind::Axiom,
+        ConstantSafety::Safe,
+    );
+    let definition = entry(
+        "shared",
+        vec![parameter],
+        leaf(0),
+        leaf(1),
+        ReducibilityHint::Regular(1),
+        DefinitionSafety::Safe,
+        vec![checker_name("shared")],
+    );
+    let (_, header_progress) = complete(ConstantEnvironment::build(
+        vec![header.clone()],
+        EnvironmentBudget::unlimited(),
+    ));
+    let (_, definition_progress) = complete(ConstantEnvironment::build(
+        vec![definition.clone()],
+        EnvironmentBudget::unlimited(),
+    ));
+
+    assert_eq!(header_progress.constants, definition_progress.constants);
+    assert_eq!(
+        header_progress.level_parameters,
+        definition_progress.level_parameters
+    );
+    assert_eq!(header_progress.mutual_members, 0);
+    assert_eq!(definition_progress.mutual_members, 1);
+    assert!(definition_progress.arena_nodes > header_progress.arena_nodes);
+    assert!(definition_progress.owned_units > header_progress.owned_units);
+    complete(ConstantEnvironment::build(
+        vec![header],
+        exact_budget(header_progress),
+    ));
+
+    assert!(matches!(
+        ConstantEnvironment::build(
+            vec![definition.clone()],
+            EnvironmentBudget {
+                max_mutual_members: 0,
+                ..exact_budget(definition_progress)
+            },
+        ),
+        EnvironmentOutcome::Inconclusive(EnvironmentStop::Resource {
+            limit: EnvironmentLimit::MutualMembers,
+            at,
+            ..
+        }) if at.field == EnvironmentField::MutualMember
+    ));
+    assert!(matches!(
+        ConstantEnvironment::build(
+            vec![definition],
+            EnvironmentBudget {
+                max_arena_nodes: header_progress.arena_nodes,
+                ..exact_budget(definition_progress)
+            },
+        ),
+        EnvironmentOutcome::Inconclusive(EnvironmentStop::Resource {
+            limit: EnvironmentLimit::ArenaNodes,
+            at,
+            ..
+        }) if at.field == EnvironmentField::ValueExpression
+    ));
 }
 
 #[test]
@@ -166,11 +324,11 @@ fn permutation_independent_builds_compare_equal_and_iterate_canonically() {
     ];
     let mut reversed = rows.clone();
     reversed.reverse();
-    let (forward, forward_progress) = complete(DefinitionEnvironment::build(
+    let (forward, forward_progress) = complete(ConstantEnvironment::build(
         rows,
         EnvironmentBudget::unlimited(),
     ));
-    let (backward, backward_progress) = complete(DefinitionEnvironment::build(
+    let (backward, backward_progress) = complete(ConstantEnvironment::build(
         reversed,
         EnvironmentBudget::unlimited(),
     ));
@@ -178,7 +336,7 @@ fn permutation_independent_builds_compare_equal_and_iterate_canonically() {
     assert_eq!(forward_progress, backward_progress);
     assert_eq!(
         forward
-            .definitions()
+            .constants()
             .map(|(name, _)| display_name(name))
             .collect::<Vec<_>>(),
         ["alpha", "middle", "zeta"]
@@ -196,23 +354,21 @@ fn duplicate_names_and_level_parameters_refuse_deterministically_then_recover() 
         DefinitionSafety::Safe,
         Vec::new(),
     );
-    let duplicate_b = entry(
+    let duplicate_b = header_entry(
         "duplicate",
         Vec::new(),
         leaf(2),
-        leaf(3),
-        ReducibilityHint::Abbrev,
-        DefinitionSafety::Partial,
-        Vec::new(),
+        ConstantKind::Axiom,
+        ConstantSafety::Safe,
     );
     for rows in [
         vec![duplicate_a.clone(), duplicate_b.clone()],
         vec![duplicate_b, duplicate_a],
     ] {
         assert!(matches!(
-            DefinitionEnvironment::build(rows, EnvironmentBudget::unlimited()),
+            ConstantEnvironment::build(rows, EnvironmentBudget::unlimited()),
             EnvironmentOutcome::Refused {
-                refusal: EnvironmentRefusal::DuplicateDefinition { ref name },
+                refusal: EnvironmentRefusal::DuplicateConstant { ref name },
                 ..
             } if name == &checker_name("duplicate")
         ));
@@ -228,10 +384,10 @@ fn duplicate_names_and_level_parameters_refuse_deterministically_then_recover() 
         Vec::new(),
     );
     assert!(matches!(
-        DefinitionEnvironment::build(vec![duplicate_parameter], EnvironmentBudget::unlimited()),
+        ConstantEnvironment::build(vec![duplicate_parameter], EnvironmentBudget::unlimited()),
         EnvironmentOutcome::Refused {
             refusal: EnvironmentRefusal::DuplicateLevelParameter {
-                definition: 0,
+                constant: 0,
                 first: 0,
                 second: 1,
             },
@@ -239,14 +395,14 @@ fn duplicate_names_and_level_parameters_refuse_deterministically_then_recover() 
         }
     ));
 
-    let (recovered, _) = complete(DefinitionEnvironment::build(
+    let (recovered, _) = complete(ConstantEnvironment::build(
         vec![simple_entry("recovered", 9)],
         EnvironmentBudget::unlimited(),
     ));
     assert!(recovered.find(&checker_name("recovered")).is_some());
 }
 
-fn bounded_fixture() -> Vec<DefinitionEntry> {
+fn bounded_fixture() -> Vec<ConstantEntry> {
     vec![
         entry(
             "alpha",
@@ -269,13 +425,20 @@ fn bounded_fixture() -> Vec<DefinitionEntry> {
             DefinitionSafety::Partial,
             vec![checker_name("alpha"), checker_name("beta")],
         ),
+        header_entry(
+            "gamma",
+            vec![checker_name("w")],
+            decoded(&Expr::sort(Level::param(primary_name("w")))),
+            ConstantKind::Axiom,
+            ConstantSafety::Unsafe,
+        ),
     ]
 }
 
 fn exact_budget(progress: EnvironmentProgress) -> EnvironmentBudget {
     EnvironmentBudget::new(
         progress.steps,
-        progress.definitions,
+        progress.constants,
         progress.level_parameters,
         progress.mutual_members,
         progress.arena_nodes,
@@ -285,7 +448,7 @@ fn exact_budget(progress: EnvironmentProgress) -> EnvironmentBudget {
 
 fn expect_limit(budget: EnvironmentBudget, expected: EnvironmentLimit) {
     assert!(matches!(
-        DefinitionEnvironment::build(bounded_fixture(), budget),
+        ConstantEnvironment::build(bounded_fixture(), budget),
         EnvironmentOutcome::Inconclusive(EnvironmentStop::Resource {
             limit,
             ..
@@ -295,12 +458,12 @@ fn expect_limit(budget: EnvironmentBudget, expected: EnvironmentLimit) {
 
 #[test]
 fn exact_aggregate_resource_boundaries_pass_and_each_one_less_stops_typed() {
-    let (_, progress) = complete(DefinitionEnvironment::build(
+    let (_, progress) = complete(ConstantEnvironment::build(
         bounded_fixture(),
         EnvironmentBudget::unlimited(),
     ));
     let exact = exact_budget(progress);
-    let (_, exact_progress) = complete(DefinitionEnvironment::build(bounded_fixture(), exact));
+    let (_, exact_progress) = complete(ConstantEnvironment::build(bounded_fixture(), exact));
     assert_eq!(exact_progress, progress);
 
     expect_limit(
@@ -312,10 +475,10 @@ fn exact_aggregate_resource_boundaries_pass_and_each_one_less_stops_typed() {
     );
     expect_limit(
         EnvironmentBudget {
-            max_definitions: exact.max_definitions - 1,
+            max_constants: exact.max_constants - 1,
             ..exact
         },
-        EnvironmentLimit::Definitions,
+        EnvironmentLimit::Constants,
     );
     expect_limit(
         EnvironmentBudget {
@@ -349,12 +512,12 @@ fn exact_aggregate_resource_boundaries_pass_and_each_one_less_stops_typed() {
 
 #[test]
 fn generated_permutations_preserve_environment_identity_and_schema() {
-    let base = (0..11)
+    let base = (0usize..11)
         .map(|index| {
             let hint = match index % 3 {
                 0 => ReducibilityHint::Opaque,
                 1 => ReducibilityHint::Abbrev,
-                _ => ReducibilityHint::Regular(index),
+                _ => ReducibilityHint::Regular(index as u32),
             };
             let safety = match index % 3 {
                 0 => DefinitionSafety::Unsafe,
@@ -362,18 +525,36 @@ fn generated_permutations_preserve_environment_identity_and_schema() {
                 _ => DefinitionSafety::Partial,
             };
             let name = format!("generated_{index:02}");
-            entry(
-                &name,
-                vec![checker_name(format!("u_{index}"))],
-                leaf(index as u64),
-                leaf((index + 1) as u64),
-                hint,
-                safety,
-                vec![checker_name(&name)],
-            )
+            if index % 4 == 0 {
+                header_entry(
+                    &name,
+                    vec![checker_name(format!("u_{index}"))],
+                    leaf(index as u64),
+                    [
+                        ConstantKind::Axiom,
+                        ConstantKind::Inductive,
+                        ConstantKind::Recursor,
+                    ][index / 4],
+                    if index & 1 == 0 {
+                        ConstantSafety::Safe
+                    } else {
+                        ConstantSafety::Unsafe
+                    },
+                )
+            } else {
+                entry(
+                    &name,
+                    vec![checker_name(format!("u_{index}"))],
+                    leaf(index as u64),
+                    leaf((index + 1) as u64),
+                    hint,
+                    safety,
+                    vec![checker_name(&name)],
+                )
+            }
         })
         .collect::<Vec<_>>();
-    let (expected, expected_progress) = complete(DefinitionEnvironment::build(
+    let (expected, expected_progress) = complete(ConstantEnvironment::build(
         base.clone(),
         EnvironmentBudget::unlimited(),
     ));
@@ -385,7 +566,7 @@ fn generated_permutations_preserve_environment_identity_and_schema() {
         if seed & 1 == 1 {
             rows.reverse();
         }
-        let (actual, progress) = complete(DefinitionEnvironment::build(
+        let (actual, progress) = complete(ConstantEnvironment::build(
             rows,
             EnvironmentBudget::unlimited(),
         ));
@@ -397,23 +578,20 @@ fn generated_permutations_preserve_environment_identity_and_schema() {
 #[test]
 fn cancellation_is_a_failure_atomic_nonanswer_and_the_next_build_recovers() {
     let mut polls = 0u64;
-    let stopped = DefinitionEnvironment::build_with(
-        bounded_fixture(),
-        EnvironmentBudget::unlimited(),
-        || {
+    let stopped =
+        ConstantEnvironment::build_with(bounded_fixture(), EnvironmentBudget::unlimited(), || {
             polls = polls.saturating_add(1);
             polls == 5
-        },
-    );
+        });
     assert!(matches!(
         stopped,
         EnvironmentOutcome::Inconclusive(EnvironmentStop::Cancelled { .. })
     ));
-    let (recovered, _) = complete(DefinitionEnvironment::build(
+    let (recovered, _) = complete(ConstantEnvironment::build(
         bounded_fixture(),
         EnvironmentBudget::unlimited(),
     ));
-    assert_eq!(recovered.len(), 2);
+    assert_eq!(recovered.len(), 3);
 }
 
 fn deep_application() -> Result<WireExpr, String> {
@@ -436,43 +614,46 @@ fn deep_application() -> Result<WireExpr, String> {
 }
 
 fn deep_environment_child() -> Result<(), String> {
-    const DEFINITIONS: usize = 50_000;
+    const CONSTANTS: usize = 50_000;
     let type_ = leaf(0);
     let value = leaf(1);
     let deep = deep_application()?;
-    let mut rows = Vec::with_capacity(DEFINITIONS);
-    for index in 0..DEFINITIONS {
+    let mut rows = Vec::with_capacity(CONSTANTS);
+    for index in 0..CONSTANTS {
         let name = checker_name(format!("large_{index:05}"));
-        rows.push(DefinitionEntry::new(
+        rows.push(ConstantEntry::new(
             name.clone(),
-            Definition::new(
+            ConstantDeclaration::definition(
                 Vec::new(),
                 type_.clone(),
-                if index == 0 {
-                    deep.clone()
-                } else {
-                    value.clone()
-                },
-                ReducibilityHint::Regular(index as u32),
-                DefinitionSafety::Safe,
-                vec![name],
+                ConstantSafety::Safe,
+                DefinitionBody::new(
+                    if index == 0 {
+                        deep.clone()
+                    } else {
+                        value.clone()
+                    },
+                    ReducibilityHint::Regular(index as u32),
+                    DefinitionSafety::Safe,
+                    vec![name],
+                ),
             ),
         ));
     }
-    let (environment, progress) = complete(DefinitionEnvironment::build(
+    let (environment, progress) = complete(ConstantEnvironment::build(
         rows,
         EnvironmentBudget::unlimited(),
     ));
-    if environment.len() != DEFINITIONS {
+    if environment.len() != CONSTANTS {
         return Err(format!(
-            "large environment retained {} definitions",
+            "large environment retained {} constants",
             environment.len()
         ));
     }
-    if progress.definitions != DEFINITIONS as u64 {
+    if progress.constants != CONSTANTS as u64 {
         return Err(format!(
-            "large environment counted {} definitions",
-            progress.definitions
+            "large environment counted {} constants",
+            progress.constants
         ));
     }
     if progress.arena_nodes < 150_000 {
@@ -485,7 +666,7 @@ fn deep_environment_child() -> Result<(), String> {
 }
 
 #[test]
-fn fifty_thousand_definitions_and_a_deep_payload_fit_a_64k_stack() {
+fn fifty_thousand_constants_and_a_deep_definition_body_fit_a_64k_stack() {
     const CHILD_ENV: &str = "FLN_CHECKER_ENVIRONMENT_DEEP_CHILD";
     if std::env::var_os(CHILD_ENV).is_some() {
         let result = std::thread::Builder::new()
@@ -504,7 +685,7 @@ fn fifty_thousand_definitions_and_a_deep_payload_fit_a_64k_stack() {
         .env(CHILD_ENV, "1")
         .args([
             "--exact",
-            "fifty_thousand_definitions_and_a_deep_payload_fit_a_64k_stack",
+            "fifty_thousand_constants_and_a_deep_definition_body_fit_a_64k_stack",
             "--nocapture",
         ])
         .output()

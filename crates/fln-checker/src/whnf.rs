@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use crate::environment::DefinitionEnvironment;
+use crate::environment::ConstantEnvironment;
 use crate::instantiate::{
     InstantiationFault, InstantiationOutcome, InstantiationRefusal,
     instantiate_term_parameters_from_level_roots_with,
@@ -85,19 +85,19 @@ impl ProjectionRule {
 pub struct WhnfContext {
     free_bindings: Vec<FreeBinding>,
     projection_rules: Vec<ProjectionRule>,
-    definitions: DefinitionEnvironment,
+    constants: ConstantEnvironment,
 }
 
 impl WhnfContext {
     pub fn new(
         free_bindings: Vec<FreeBinding>,
         projection_rules: Vec<ProjectionRule>,
-        definitions: DefinitionEnvironment,
+        constants: ConstantEnvironment,
     ) -> WhnfContext {
         WhnfContext {
             free_bindings,
             projection_rules,
-            definitions,
+            constants,
         }
     }
 
@@ -109,8 +109,8 @@ impl WhnfContext {
         &self.projection_rules
     }
 
-    pub fn definitions(&self) -> &DefinitionEnvironment {
-        &self.definitions
+    pub fn constants(&self) -> &ConstantEnvironment {
+        &self.constants
     }
 }
 
@@ -798,17 +798,17 @@ impl<'a, 'c> Reducer<'a, 'c> {
                 }));
             }
         };
-        let Some(definition) = self.context.source.definitions().find(name) else {
+        let Some(constant) = self.context.source.constants().find(name) else {
             return Ok(None);
         };
-        if !definition.is_delta_unfoldable() {
+        let Some(definition) = constant.delta_body() else {
             return Ok(None);
-        }
-        if definition.level_parameters().len() != levels.len() {
+        };
+        if constant.level_parameters().len() != levels.len() {
             return Err(Halt::Refusal(WhnfRefusal::DefinitionInstantiation {
                 at: current.root.index(),
                 refusal: InstantiationRefusal::ArityMismatch {
-                    parameters: definition.level_parameters().len(),
+                    parameters: constant.level_parameters().len(),
                     values: levels.len(),
                 },
             }));
@@ -818,7 +818,7 @@ impl<'a, 'c> Reducer<'a, 'c> {
             .reduction(current.root.index(), self.cancelled)?;
         let result = instantiate_term_parameters_from_level_roots_with(
             definition.value(),
-            definition.level_parameters(),
+            constant.level_parameters(),
             current.arena.levels(),
             levels,
             self.control.budget.materialization,

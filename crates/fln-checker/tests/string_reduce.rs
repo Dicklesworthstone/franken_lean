@@ -4,8 +4,8 @@ use std::process::Command;
 
 use fln_checker::defeq::{DefEqBudget, DefEqMismatch, DefEqOutcome, DefEqStop, def_eq};
 use fln_checker::environment::{
-    Definition, DefinitionEntry, DefinitionEnvironment, DefinitionSafety, EnvironmentBudget,
-    EnvironmentOutcome, ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, DefinitionBody,
+    DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
 };
 use fln_checker::string_reduce::{
     StringExpansionBudget, StringExpansionLimit, StringExpansionOutcome, StringExpansionStop,
@@ -168,22 +168,25 @@ fn string_context() -> WhnfContext {
         ),
         BinderInfo::Default,
     );
-    let entry = DefinitionEntry::new(
+    let entry = ConstantEntry::new(
         checker_name(&qualified("String", "ofList")),
-        Definition::new(
+        ConstantDeclaration::definition(
             Vec::new(),
             decoded(&Expr::sort(Level::zero())),
-            decoded(&value),
-            ReducibilityHint::Regular(1),
-            DefinitionSafety::Safe,
-            Vec::new(),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                decoded(&value),
+                ReducibilityHint::Regular(1),
+                DefinitionSafety::Safe,
+                Vec::new(),
+            ),
         ),
     );
-    let environment =
-        match DefinitionEnvironment::build(vec![entry], EnvironmentBudget::unlimited()) {
-            EnvironmentOutcome::Complete { environment, .. } => environment,
-            other => panic!("String definition environment did not build: {other:?}"),
-        };
+    let environment = match ConstantEnvironment::build(vec![entry], EnvironmentBudget::unlimited())
+    {
+        EnvironmentOutcome::Complete { environment, .. } => environment,
+        other => panic!("String constant environment did not build: {other:?}"),
+    };
     WhnfContext::new(
         Vec::new(),
         vec![ProjectionRule::new(

@@ -8,8 +8,8 @@ use fln_checker::defeq::{
     QuickDefEqResult, QuickDefEqStop, def_eq, def_eq_with, quick_def_eq, quick_def_eq_with,
 };
 use fln_checker::environment::{
-    Definition, DefinitionEntry, DefinitionEnvironment, DefinitionSafety, EnvironmentBudget,
-    EnvironmentOutcome, ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, DefinitionBody,
+    DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
 };
 use fln_checker::term::TermBudget;
 use fln_checker::whnf::{
@@ -147,24 +147,26 @@ fn definition_entry(
     value: WireExpr,
     hint: ReducibilityHint,
     safety: DefinitionSafety,
-) -> DefinitionEntry {
-    DefinitionEntry::new(
+) -> ConstantEntry {
+    ConstantEntry::new(
         checker_name(definition_name),
-        Definition::new(
+        ConstantDeclaration::definition(
             Vec::new(),
             decoded(&Expr::sort(Level::zero())),
-            value,
-            hint,
-            safety,
-            Vec::new(),
+            if safety == DefinitionSafety::Unsafe {
+                ConstantSafety::Unsafe
+            } else {
+                ConstantSafety::Safe
+            },
+            DefinitionBody::new(value, hint, safety, Vec::new()),
         ),
     )
 }
 
-fn definition_context(entries: Vec<DefinitionEntry>) -> WhnfContext {
-    let environment = match DefinitionEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+fn definition_context(entries: Vec<ConstantEntry>) -> WhnfContext {
+    let environment = match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
         EnvironmentOutcome::Complete { environment, .. } => environment,
-        other => panic!("definition environment did not build: {other:?}"),
+        other => panic!("constant environment did not build: {other:?}"),
     };
     WhnfContext::new(Vec::new(), Vec::new(), environment)
 }
@@ -344,7 +346,7 @@ fn pure_conversion_closes_zeta_free_binding_and_registered_projection() {
             free_value.clone(),
         )],
         Vec::new(),
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     let free_progress = slow_equal(&free, &free_value, &free_context);
     assert_eq!(free_progress.whnf_reductions, 1);
@@ -362,7 +364,7 @@ fn pure_conversion_closes_zeta_free_binding_and_registered_projection() {
             checker_name("MkS"),
             1,
         )],
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     let projection_progress = slow_equal(&projection, &field, &projection_context);
     assert_eq!(projection_progress.whnf_reductions, 1);
@@ -398,7 +400,7 @@ fn generated_pure_reductions_match_their_frozen_targets() {
                             decoded(&payload),
                         )],
                         Vec::new(),
-                        DefinitionEnvironment::empty(),
+                        ConstantEnvironment::empty(),
                     ),
                 )
             }
@@ -421,7 +423,7 @@ fn generated_pure_reductions_match_their_frozen_targets() {
                         checker_name("GeneratedConstructor"),
                         1,
                     )],
-                    DefinitionEnvironment::empty(),
+                    ConstantEnvironment::empty(),
                 ),
             ),
             _ => unreachable!("modulo four"),
@@ -485,34 +487,23 @@ fn stable_environment_sensitive_pairs_remain_deferred_after_pure_whnf() {
 
 #[test]
 fn eager_safe_definition_delta_is_visible_to_slow_conversion() {
-    let type_ = decoded(&Expr::sort(Level::zero()));
     let entries = vec![
-        DefinitionEntry::new(
-            checker_name("safe_alias"),
-            Definition::new(
-                Vec::new(),
-                type_.clone(),
-                decoded(&constant("target")),
-                ReducibilityHint::Opaque,
-                DefinitionSafety::Safe,
-                Vec::new(),
-            ),
+        definition_entry(
+            "safe_alias",
+            decoded(&constant("target")),
+            ReducibilityHint::Opaque,
+            DefinitionSafety::Safe,
         ),
-        DefinitionEntry::new(
-            checker_name("unsafe_alias"),
-            Definition::new(
-                Vec::new(),
-                type_,
-                decoded(&constant("target")),
-                ReducibilityHint::Abbrev,
-                DefinitionSafety::Unsafe,
-                Vec::new(),
-            ),
+        definition_entry(
+            "unsafe_alias",
+            decoded(&constant("target")),
+            ReducibilityHint::Abbrev,
+            DefinitionSafety::Unsafe,
         ),
     ];
-    let environment = match DefinitionEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+    let environment = match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
         EnvironmentOutcome::Complete { environment, .. } => environment,
-        other => panic!("definition environment did not build: {other:?}"),
+        other => panic!("constant environment did not build: {other:?}"),
     };
     let context = WhnfContext::new(Vec::new(), Vec::new(), environment);
 
@@ -1485,7 +1476,7 @@ fn slow_resources_refusals_and_cancellation_are_typed_and_recoverable() {
             FreeBinding::new(checker_name("x"), decoded(&constant("second"))),
         ],
         Vec::new(),
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     let free = decoded(&Expr::fvar(FVarId(name("x"))));
     assert!(matches!(
@@ -1772,7 +1763,7 @@ fn deep_slow_child() -> Result<(), String> {
     let context = WhnfContext::new(
         vec![FreeBinding::new(checker_name("deep_free"), binding_value)],
         Vec::new(),
-        DefinitionEnvironment::empty(),
+        ConstantEnvironment::empty(),
     );
     match def_eq(&left, &right, &context, DefEqBudget::unlimited()) {
         DefEqOutcome::Equal(progress)
@@ -1831,17 +1822,20 @@ fn deep_lazy_delta_child() -> Result<(), String> {
     let type_ = decoded(&Expr::sort(Level::zero()));
     let entries = (0..DEPTH)
         .map(|index| {
-            DefinitionEntry::new(
+            ConstantEntry::new(
                 checker_name(names[index].clone()),
-                Definition::new(
+                ConstantDeclaration::definition(
                     Vec::new(),
                     type_.clone(),
-                    decoded(&constant(names[index + 1].clone())),
-                    ReducibilityHint::Regular(
-                        u32::try_from(DEPTH - index).expect("depth fits u32"),
+                    ConstantSafety::Safe,
+                    DefinitionBody::new(
+                        decoded(&constant(names[index + 1].clone())),
+                        ReducibilityHint::Regular(
+                            u32::try_from(DEPTH - index).expect("depth fits u32"),
+                        ),
+                        DefinitionSafety::Safe,
+                        Vec::new(),
                     ),
-                    DefinitionSafety::Safe,
-                    Vec::new(),
                 ),
             )
         })
