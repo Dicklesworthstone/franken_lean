@@ -3174,6 +3174,33 @@ pub(crate) extern "C" fn export_lean_io_prim_handle_flush(h: *mut LeanObject) ->
     unsafe { crate::stdio::prim_handle_flush(h) }
 }
 
+/// `lean_io_prim_handle_read` (`io.cpp:584-607`; extern census
+/// `IO.FS.Handle.read`): borrowed handle + byte count to an io_result
+/// ByteArray, with the pin's EOF and zero-read arms.
+// UNSAFE-LEDGER: FLN-UL-0318
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_read")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_read(
+    h: *mut LeanObject,
+    nbytes: usize,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_read(h, nbytes) }
+}
+
+/// `lean_io_prim_handle_write` (`io.cpp:609-618`; extern census
+/// `IO.FS.Handle.write`).
+// UNSAFE-LEDGER: FLN-UL-0319
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_write")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_write(
+    h: *mut LeanObject,
+    buf: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: both borrowed and live per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_write(h, buf) }
+}
+
 /// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
 /// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
 // UNSAFE-LEDGER: FLN-UL-0302

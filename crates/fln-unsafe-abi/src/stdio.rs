@@ -20,10 +20,11 @@
 //!   observable distinguishes the two. SIGPIPE is ignored at that seed —
 //!   the pin's disposition (`io.cpp:1654-1656`), installed before any stdio
 //!   write our streams can produce.
-//! - **Unported stream fields refuse typed.** `read`/`write`/`getLine` close
-//!   over prims a later slice ports; until then they refuse via the §6.5
-//!   panic law rather than fabricate (the pin serves them — a disclosed
-//!   restriction, named in their extern rows, never a silent divergence).
+//! - **The one unported stream field refuses typed.** `getLine` closes over
+//!   a prim a later slice ports; until then it refuses via the §6.5 panic
+//!   law rather than fabricate (the pin serves it — a disclosed
+//!   restriction, named in its extern row, never a silent divergence).
+//!   `read` and `write` went live in slice 5b over their ported prims.
 //! - **Thread-current semantics are the pin's exactly**: each thread's
 //!   current streams seed from the PROCESS-initial trio, never from the
 //!   spawning thread's current set (`MK_THREAD_LOCAL_GET`, io.cpp:115-117),
@@ -53,6 +54,9 @@ unsafe extern "C" {
     fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int;
     fn fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
     fn fwrite(ptr: *const c_void, size: usize, n: usize, f: *mut c_void) -> usize;
+    fn fread(ptr: *mut c_void, size: usize, n: usize, f: *mut c_void) -> usize;
+    fn feof(f: *mut c_void) -> c_int;
+    fn clearerr(f: *mut c_void);
     fn fflush(f: *mut c_void) -> c_int;
     fn fclose(f: *mut c_void) -> c_int;
     fn fileno(f: *mut c_void) -> c_int;
@@ -541,6 +545,72 @@ pub(crate) unsafe fn prim_handle_put_str(
     }
 }
 
+/// `lean_io_prim_handle_read` (`io.cpp:584-607`), arm-for-arm: the
+/// overflow pre-check decodes ENOMEM; a zero-byte read answers ok before
+/// touching fread (the pin cites lean4#12138); a short read with EOF set
+/// clears the flag and answers the partial buffer; anything else decodes
+/// errno after releasing the buffer.
+///
+/// # Safety
+/// `h` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0314
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_handle_read(h: *mut LeanObject, nbytes: usize) -> *mut LeanObject {
+    if nbytes
+        .checked_add(size_of::<crate::layout::LeanSarrayObject>())
+        .is_none()
+    {
+        // SAFETY: fresh error objects only.
+        unsafe {
+            return io_result_mk_error(decode_io_error(ENOMEM, core::ptr::null_mut()));
+        }
+    }
+    // SAFETY: the sarray is freshly allocated with capacity nbytes; fread
+    // writes at most that many bytes into its data base; m_size is set to
+    // exactly the bytes written before the object escapes.
+    unsafe {
+        let fp = io_get_handle(h);
+        let res = object::alloc_sarray(1, 0, nbytes);
+        if nbytes == 0 {
+            return io_result_mk_ok(res);
+        }
+        let (_, _, _, data) = object::sarray_fields(res);
+        let n = fread(data.cast::<c_void>(), 1, nbytes, fp);
+        if n > 0 {
+            (&raw mut (*res.cast::<crate::layout::LeanSarrayObject>()).m_size).write(n);
+            io_result_mk_ok(res)
+        } else if feof(fp) != 0 {
+            clearerr(fp);
+            io_result_mk_ok(res)
+        } else {
+            rc::dec_ref(res);
+            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        }
+    }
+}
+
+/// `lean_io_prim_handle_write` (`io.cpp:609-618`): fwrite of the byte
+/// array's salient bytes; a short write decodes errno.
+///
+/// # Safety
+/// `h` and `buf` are borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0315
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_handle_write(h: *mut LeanObject, buf: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live objects per contract; fwrite reads exactly n salient
+    // bytes from the live array's data base.
+    unsafe {
+        let fp = io_get_handle(h);
+        let (_, n, _, data) = object::sarray_fields(buf);
+        let m = fwrite(data.cast::<c_void>(), 1, n, fp);
+        if m == n {
+            io_result_mk_ok(tagged::boxi(0))
+        } else {
+            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        }
+    }
+}
+
 /// `lean_io_prim_handle_flush` (`io.cpp:550-556`).
 ///
 /// # Safety
@@ -622,26 +692,48 @@ extern "C" fn stream_is_tty_fn(h: *mut LeanObject, _w: *mut LeanObject) -> *mut 
 fn stream_unported_refusal(what: &str) -> ! {
     let text = format!(
         "stdio plane: FS.Stream.{what} closes over a handle prim not yet \
-         ported (bead fln-3gv slice 5a serves mk/putStr/flush/isTty; \
-         read/write/getLine are the next stdio slice)"
+         ported (bead fln-3gv serves mk/putStr/flush/isTty/read/write; \
+         getLine is a later stdio slice)"
     );
     crate::export::internal_panic_impl(&text)
 }
 
+/// `read` field body: `Handle.read h` applied to (a boxed USize, world).
+/// At this pin `lean_box_usize` is ALWAYS a 0-field ctor carrying the
+/// usize scalar (`lean.h:2889-2897`) — never a tagged scalar.
+// UNSAFE-LEDGER: FLN-UL-0316
+#[allow(unsafe_code)]
 extern "C" fn stream_read_fn(
-    _h: *mut LeanObject,
-    _sz: *mut LeanObject,
+    h: *mut LeanObject,
+    sz: *mut LeanObject,
     _w: *mut LeanObject,
 ) -> *mut LeanObject {
-    stream_unported_refusal("read")
+    // SAFETY: h and sz arrive owned; the prim borrows h; the USize box is
+    // read then released.
+    unsafe {
+        let n = object::ctor_get_scalar::<usize>(sz, 0);
+        rc::dec_ref(sz);
+        let r = prim_handle_read(h, n);
+        rc::dec_ref(h);
+        r
+    }
 }
 
+/// `write` field body: `Handle.write h` applied to (a ByteArray, world).
+// UNSAFE-LEDGER: FLN-UL-0317
+#[allow(unsafe_code)]
 extern "C" fn stream_write_fn(
-    _h: *mut LeanObject,
-    _ba: *mut LeanObject,
+    h: *mut LeanObject,
+    ba: *mut LeanObject,
     _w: *mut LeanObject,
 ) -> *mut LeanObject {
-    stream_unported_refusal("write")
+    // SAFETY: h and ba arrive owned; the prim borrows both.
+    unsafe {
+        let r = prim_handle_write(h, ba);
+        rc::dec_ref(h);
+        rc::dec_ref(ba);
+        r
+    }
 }
 
 extern "C" fn stream_get_line_fn(_h: *mut LeanObject, _w: *mut LeanObject) -> *mut LeanObject {

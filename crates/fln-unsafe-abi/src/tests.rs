@@ -3122,3 +3122,111 @@ fn export_stdio_reproduces_the_io_println_corpus_slice_with_swap_capture() {
         "io_println.lean's observables equal the pinned oracle bytes"
     );
 }
+
+#[test]
+fn export_stdio_reproduces_the_io_file_corpus_slice_with_roundtrip() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_io_prim_handle_mk, export_lean_io_prim_handle_put_str,
+        export_lean_io_prim_handle_read,
+    };
+
+    // The pinned oracle: io_file.lean.expected's LAST line is the runtime
+    // observable; the lines above it are ELABORATOR diagnostics (a
+    // String.trim deprecation warning) an ABI cell cannot and must not
+    // fabricate — bound here to the runtime line only, disclosed.
+    let expected =
+        std::fs::read_to_string(g03_fixture("io_file.lean.expected")).expect("pinned oracle");
+    let lines: Vec<&str> = expected.lines().collect();
+    assert!(
+        lines[0].starts_with("# exit=0 "),
+        "the pinned Reference run exited 0"
+    );
+    let runtime_line = *lines.last().expect("runtime observable");
+    assert!(
+        runtime_line.starts_with("read back: "),
+        "the last oracle line is the runtime observable"
+    );
+
+    crate::stdio::initialize_streams();
+    let scratch = std::env::temp_dir().join(format!("fln-g03-file-{}", std::process::id()));
+    let scratch_str = scratch.to_str().expect("temp path is UTF-8").to_string();
+    // io_file.lean:2's payload, byte-exact.
+    let payload = "roundtrip payload \u{2200}\n";
+
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the corpus file's
+    // write-then-read roundtrip runs through the exports exactly as the
+    // compiled writeFile/readFile would drive them, with the shadow oracle
+    // watching.
+    // UNSAFE-LEDGER: FLN-UL-0320
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+
+        // io_file.lean:2 — `IO.FS.writeFile`: Handle.mk (write) + putStr +
+        // drop; the drop's finalizer fcloses, which is what publishes the
+        // bytes (writeFile never flushes explicitly).
+        let fname = mk(&scratch_str);
+        let wr = export_lean_io_prim_handle_mk(fname, 1);
+        assert_eq!((&raw const (*wr).m_tag).read(), 0, "write-handle mk ok");
+        let wh = crate::object::ctor_get(wr, 0);
+        crate::rc::inc_ref_n(wh, 1);
+        crate::rc::dec_ref(wr);
+        let content = mk(payload);
+        let pres = export_lean_io_prim_handle_put_str(wh, content);
+        assert_eq!((&raw const (*pres).m_tag).read(), 0, "putStr ok");
+        crate::rc::dec_ref(pres);
+        crate::rc::dec_ref(content);
+        crate::rc::dec_ref(wh); // finalizer fcloses — the publish point
+
+        // io_file.lean:3 — `IO.FS.readFile`: Handle.mk (read) + the read
+        // loop; one 1024-byte chunk holds the whole payload, and a second
+        // read exercises the pin's EOF arm (empty array, ok).
+        let fname2 = mk(&scratch_str);
+        let rr = export_lean_io_prim_handle_mk(fname2, 0);
+        assert_eq!((&raw const (*rr).m_tag).read(), 0, "read-handle mk ok");
+        let rh = crate::object::ctor_get(rr, 0);
+        crate::rc::inc_ref_n(rh, 1);
+        crate::rc::dec_ref(rr);
+        crate::rc::dec_ref(fname2);
+        let chunk = export_lean_io_prim_handle_read(rh, 1024);
+        assert_eq!((&raw const (*chunk).m_tag).read(), 0, "read ok");
+        let ba = crate::object::ctor_get(chunk, 0);
+        let (_, n, _, data) = crate::object::sarray_fields(ba);
+        assert_eq!(n, payload.len(), "the whole payload in one chunk");
+        let bytes = core::slice::from_raw_parts(data, n).to_vec();
+        let eof = export_lean_io_prim_handle_read(rh, 1024);
+        assert_eq!((&raw const (*eof).m_tag).read(), 0, "EOF arm answers ok");
+        let eba = crate::object::ctor_get(eof, 0);
+        assert_eq!(
+            crate::object::sarray_fields(eba).1,
+            0,
+            "EOF yields the empty array (io.cpp:598-601)"
+        );
+        crate::rc::dec_ref(eof);
+        crate::rc::dec_ref(chunk);
+        crate::rc::dec_ref(rh);
+        crate::rc::dec_ref(fname);
+
+        // io_file.lean:4 — the content String's accounting and the
+        // observable: readFile validates UTF-8 (cell-side via str), trim
+        // drops the trailing newline (pure library logic), length counts
+        // CHARS including the newline.
+        let content_str = core::str::from_utf8(&bytes).expect("valid UTF-8 roundtrip");
+        assert_eq!(content_str, payload, "byte-exact roundtrip");
+        let trimmed = content_str.trim_end_matches('\n');
+        let computed = format!(
+            "read back: {} ({} chars)",
+            trimmed,
+            content_str.chars().count()
+        );
+        assert_eq!(
+            computed, runtime_line,
+            "io_file.lean:4's observable equals the pinned oracle's runtime line"
+        );
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the io_file cell");
+    std::fs::remove_file(&scratch).ok();
+}
