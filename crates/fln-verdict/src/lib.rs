@@ -2633,26 +2633,73 @@ mod verdict_checker_no_mock_e2e {
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
 
-    fn socket_stream(bytes: Vec<u8>) -> (UnixStream, std::thread::JoinHandle<()>) {
+    fn socket_stream(bytes: Vec<u8>) -> (UnixStream, std::thread::JoinHandle<std::io::Result<()>>) {
         let (reader, mut writer) = UnixStream::pair().expect("kernel stream pair");
         let handle = std::thread::spawn(move || {
             for chunk in bytes.chunks(3) {
-                writer.write_all(chunk).expect("stream chunk");
+                writer.write_all(chunk)?;
             }
-            writer
-                .shutdown(Shutdown::Write)
-                .expect("stream write shutdown");
+            writer.shutdown(Shutdown::Write)
         });
         (reader, handle)
+    }
+
+    fn writer_state_is_compatible(
+        state: &std::io::Result<()>,
+        allow_refusal_early_close: bool,
+    ) -> bool {
+        state.is_ok()
+            || (allow_refusal_early_close
+                && state
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe))
+    }
+
+    fn assert_writer_state(
+        label: &str,
+        state: &std::io::Result<()>,
+        allow_refusal_early_close: bool,
+    ) {
+        assert!(
+            writer_state_is_compatible(state, allow_refusal_early_close),
+            "{label} writer must finish cleanly{}; observed {state:?}",
+            if allow_refusal_early_close {
+                " or observe BrokenPipe after a typed proof refusal"
+            } else {
+                ""
+            }
+        );
     }
 
     fn run_over_kernel_streams(cnf: Vec<u8>, proof: Vec<u8>) -> ProofCheckOutcome {
         let (cnf_reader, cnf_writer) = socket_stream(cnf);
         let (proof_reader, proof_writer) = socket_stream(proof);
         let outcome = check_unsat_streams(cnf_reader, proof_reader, ProofCheckLimits::default());
-        cnf_writer.join().expect("CNF writer final state");
-        proof_writer.join().expect("proof writer final state");
+        let cnf_state = cnf_writer.join().expect("CNF writer thread did not panic");
+        let proof_state = proof_writer
+            .join()
+            .expect("proof writer thread did not panic");
+        assert_writer_state("CNF", &cnf_state, false);
+        assert_writer_state(
+            "proof",
+            &proof_state,
+            matches!(outcome, ProofCheckOutcome::Refused(_)),
+        );
         outcome
+    }
+
+    #[test]
+    fn writer_early_close_is_permitted_only_for_a_broken_pipe_after_refusal() {
+        let complete = Ok(());
+        let broken_pipe = Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        let connection_reset = Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+
+        assert!(writer_state_is_compatible(&complete, false));
+        assert!(writer_state_is_compatible(&complete, true));
+        assert!(!writer_state_is_compatible(&broken_pipe, false));
+        assert!(writer_state_is_compatible(&broken_pipe, true));
+        assert!(!writer_state_is_compatible(&connection_reset, false));
+        assert!(!writer_state_is_compatible(&connection_reset, true));
     }
 
     #[test]
