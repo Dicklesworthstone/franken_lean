@@ -10,9 +10,11 @@
 //! and selects one definition step by recorded height, giving the checker a
 //! deliberately separate KR-307/KR-309 strategy. Checker-owned numeric and
 //! expression-reduction modules now supply independently resource-counted
-//! arbitrary-precision Nat operations and the KR-313 dispatch table; the
-//! remaining equality rules and declaration checking remain open. The crate map
-//! and layering are governed by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
+//! arbitrary-precision Nat operations and the KR-313 dispatch table. Leaf
+//! inference covers KR-100 through KR-105 plus iterative metadata transparency;
+//! application, binders, literals, projections, the remaining equality rules,
+//! and declaration checking remain open. The crate map and layering are governed
+//! by `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first
 //!
@@ -332,6 +334,7 @@
 
 pub mod defeq;
 pub mod environment;
+pub mod infer;
 pub mod instantiate;
 pub mod nat_reduce;
 pub mod numeric;
