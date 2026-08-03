@@ -368,7 +368,9 @@ const LANE_CITED_ROWS: usize = 1;
 /// eleven slice-3b rows are prose.
 /// 86 -> 88 at `f882dd60`: both corpus rows, FLN-UL-0265 and FLN-UL-0266, cite the exact
 /// task-plane corpus test added with them.
-const SYMBOL_RESOLVED_ROWS: usize = 88;
+/// 88 -> 89 at `16512624` (the stdio plane): FLN-UL-0311 cites the exact io_println
+/// swap-capture cell added with it; the slice's other 43 rows are prose.
+const SYMBOL_RESOLVED_ROWS: usize = 89;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -414,7 +416,9 @@ const SYMBOL_RESOLVED_ROWS: usize = 88;
 /// Replaying the classifier at every one of those commits found no removal from a
 /// pre-existing row. The apparent extra 26 tokens from `closure` and `manager` were plain
 /// English collisions and are deliberately excluded by the explicit-single-word rule.
-const RESOLVING_CITATION_TOKENS: usize = 100;
+/// 100 -> 101 at `16512624`: the io_println cell's citation on FLN-UL-0311 is the one new
+/// resolving token; no pre-existing row lost one across the edit.
+const RESOLVING_CITATION_TOKENS: usize = 101;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -433,7 +437,10 @@ const RESOLVING_CITATION_TOKENS: usize = 100;
 /// `f882dd60` adds only the two symbol-resolved corpus rows, so prose stays 177. The 24
 /// task-manager rows remain here because an evidence phrase containing the ordinary word
 /// "manager" is not a citation to a same-named helper.
-const PROSE_EVIDENCE_ROWS: usize = 177;
+/// 177 -> 220 at `16512624`: the stdio plane's 43 prose rows — the platform seam, handle
+/// class, error decoder, prims, stream fields, thread-current trio, init twin, and the
+/// mark-walk closure targets — land as suite-phrase prose exactly as the task manager's did.
+const PROSE_EVIDENCE_ROWS: usize = 220;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
