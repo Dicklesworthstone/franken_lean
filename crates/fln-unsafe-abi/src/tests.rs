@@ -1982,6 +1982,17 @@ mod corpus_targets {
     ) -> *mut LeanObject {
         tagged::boxi(tagged::unbox(x) * tagged::unbox(y) + tagged::unbox(z))
     }
+
+    /// `fun _ => 6 * 7` — tasks.lean's `Task.spawn` body (the unit argument
+    /// is the boxed scalar the manager applies).
+    pub(crate) extern "C" fn six_times_seven(_u: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(6 * 7)
+    }
+
+    /// `(· + 1)` — tasks.lean's `Task.map` body.
+    pub(crate) extern "C" fn succ(x: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(x) + 1)
+    }
 }
 
 #[test]
@@ -2188,8 +2199,7 @@ fn door_loads_a_reference_built_plugin_end_to_end() {
         eprintln!("SKIP: pinned Reference toolchain not installed");
         return;
     }
-    let plug_lean =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fln-vm/fixtures/g03/plug.lean");
+    let plug_lean = g03_fixture("plug.lean");
     let work = std::env::temp_dir().join(format!("fln-g03-door-{}", std::process::id()));
     std::fs::create_dir_all(&work).expect("workdir");
     std::fs::copy(&plug_lean, work.join("plug.lean")).expect("fixture copy");
@@ -2454,6 +2464,44 @@ mod task_state_targets {
         _w: *mut LeanObject,
     ) -> *mut LeanObject {
         crate::export::export_lean_task_pure(crate::tagged::boxi(crate::tagged::unbox(a) + 1))
+    }
+
+    /// Wrap a value as `Except.ok` (ctor index 1) — the shape an `IO.asTask`
+    /// action's compiled `toBaseIO` composition publishes as its bare
+    /// BaseIO result at this pin.
+    // UNSAFE-LEDGER: FLN-UL-0265
+    #[allow(unsafe_code)]
+    pub(crate) fn mk_except_ok(v: *mut LeanObject) -> *mut LeanObject {
+        // SAFETY: a fresh 1-field ctor is allocated and its single slot
+        // initialized with the consumed `v` before the object escapes.
+        unsafe {
+            let r = crate::object::alloc_ctor(1, 1, 0);
+            crate::object::ctor_set(r, 0, v);
+            r
+        }
+    }
+
+    /// `pure (a + b)` seen through `IO.asTask`: the action computes on the
+    /// worker and publishes `Except.ok (a + b)` (tasks.lean line 2's shape).
+    pub(crate) extern "C" fn except_ok_add(
+        a: *mut LeanObject,
+        b: *mut LeanObject,
+        _w: *mut LeanObject,
+    ) -> *mut LeanObject {
+        mk_except_ok(crate::tagged::boxi(
+            crate::tagged::unbox(a) + crate::tagged::unbox(b),
+        ))
+    }
+
+    /// `pure (a * b)` seen through `IO.asTask` (tasks.lean line 3's shape).
+    pub(crate) extern "C" fn except_ok_mul(
+        a: *mut LeanObject,
+        b: *mut LeanObject,
+        _w: *mut LeanObject,
+    ) -> *mut LeanObject {
+        mk_except_ok(crate::tagged::boxi(
+            crate::tagged::unbox(a) * crate::tagged::unbox(b),
+        ))
     }
 }
 
@@ -2830,4 +2878,140 @@ fn export_io_task_wrapper_family_matches_upstream_arms() {
         crate::rc::dec_ref(l3);
     }
     let _ = shadow::disable_and_drain();
+}
+
+/// The G0-3 parity-corpus fixture directory (fln-vm's committed corpus),
+/// resolved from this crate's manifest location — the file's single raw
+/// manifest-dir site, declared in tree_identity's residue at count 1.
+fn g03_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../fln-vm/fixtures/g03")
+        .join(name)
+}
+
+// ---------------------------------------------------------------------------
+// fln-3gv slice 4: the G0-3 tasks.lean corpus cell on the LIVE task plane —
+// the io/tasks residue franken_lean-7xe recorded as waiting on this bead's
+// effect runtime (7xe comment 1739: "the io/tasks/panics cells, which need
+// fln-3gv's effect runtime"). The corpus observables are computed through
+// the exports exactly as the compiled file would call them, and bound
+// byte-for-byte to the committed .expected oracle so the cell cannot drift
+// from the fixture it claims to reproduce.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_task_plane_reproduces_the_tasks_corpus_slice_with_rc_balance() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_finalize_task_manager, export_lean_init_task_manager_using,
+        export_lean_io_as_task, export_lean_io_wait, export_lean_task_map_core,
+        export_lean_task_spawn_core,
+    };
+
+    // The pinned oracle first: fixtures/g03/tasks.lean.expected carries the
+    // Reference's own double-run output, byte-deterministic. Reading it here
+    // binds this cell's computed observables to those bytes — the join is
+    // the committed file, never a transcribed constant.
+    let expected =
+        std::fs::read_to_string(g03_fixture("tasks.lean.expected")).expect("pinned oracle");
+    let lines: Vec<&str> = expected.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "one header line + the two corpus observables"
+    );
+    assert!(
+        lines[0].starts_with("# exit=0 "),
+        "the pinned Reference run exited 0"
+    );
+
+    shadow::enable();
+    struct Fin;
+    impl Drop for Fin {
+        fn drop(&mut self) {
+            export_lean_finalize_task_manager();
+        }
+    }
+    // SAFETY: every object is allocated and settled here; the corpus file's
+    // task plane (asTask/get, spawn/map/get) runs over the live manager with
+    // the shadow oracle watching, and the manager is finalized on every exit
+    // path (Fin guard) so worker-side frees complete before the drain.
+    // UNSAFE-LEDGER: FLN-UL-0266
+    #[allow(unsafe_code)]
+    unsafe {
+        export_lean_init_task_manager_using(2);
+        let _fin = Fin;
+
+        // tasks.lean:2-3 — `let t1 <- IO.asTask (pure (2 + 3) : IO Nat)`,
+        // `let t2 <- IO.asTask (pure (10 * 4) : IO Nat)`: each compiled
+        // action computes ON A WORKER and publishes the Except.ok shape.
+        let a1 = crate::object::alloc_closure(
+            task_state_targets::except_ok_add as *mut core::ffi::c_void,
+            3,
+            2,
+        );
+        crate::object::closure_set(a1, 0, crate::tagged::boxi(2));
+        crate::object::closure_set(a1, 1, crate::tagged::boxi(3));
+        let t1 = export_lean_io_as_task(a1, crate::tagged::boxi(0));
+        let a2 = crate::object::alloc_closure(
+            task_state_targets::except_ok_mul as *mut core::ffi::c_void,
+            3,
+            2,
+        );
+        crate::object::closure_set(a2, 0, crate::tagged::boxi(10));
+        crate::object::closure_set(a2, 1, crate::tagged::boxi(4));
+        let t2 = export_lean_io_as_task(a2, crate::tagged::boxi(0));
+
+        // tasks.lean:4-5 — `IO.ofExcept t?.get`: `Task.get` is the lean.h
+        // `lean_task_get_own` inline, whose body is exactly `lean_io_wait`'s
+        // at this pin; ofExcept's ok-arm takes field 0 of the Except ctor.
+        let e1 = export_lean_io_wait(t1);
+        let e2 = export_lean_io_wait(t2);
+        assert_eq!(
+            (&raw const (*e1).m_tag).read(),
+            1,
+            "the published action result is Except.ok (ctor index 1)"
+        );
+        let a = crate::tagged::unbox(crate::object::ctor_get(e1, 0));
+        let b = crate::tagged::unbox(crate::object::ctor_get(e2, 0));
+
+        // tasks.lean:6 — `IO.println s!"sum {a + b}"`, against the oracle.
+        assert_eq!(
+            format!("sum {}", a + b),
+            lines[1],
+            "tasks.lean:6's observable equals the pinned oracle bytes"
+        );
+        crate::rc::dec_ref(e1);
+        crate::rc::dec_ref(e2);
+
+        // tasks.lean:7 — `Task.spawn (fun _ => 6 * 7) |>.map (· + 1)`:
+        // spawn is the lean.h inline over spawn_core (keep_alive=false),
+        // map the inline over map_core (sync=false, keep_alive=false).
+        let sp = export_lean_task_spawn_core(
+            crate::object::alloc_closure(
+                corpus_targets::six_times_seven as *mut core::ffi::c_void,
+                1,
+                0,
+            ),
+            0,
+            false,
+        );
+        let ch = export_lean_task_map_core(
+            crate::object::alloc_closure(corpus_targets::succ as *mut core::ffi::c_void, 1, 0),
+            sp,
+            0,
+            false,
+            false,
+        );
+        let chained = crate::tagged::unbox(export_lean_io_wait(ch));
+
+        // tasks.lean:8 — `IO.println s!"chained {chained.get}"`.
+        assert_eq!(
+            format!("chained {chained}"),
+            lines[2],
+            "tasks.lean:8's observable equals the pinned oracle bytes"
+        );
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the tasks-corpus cell");
 }

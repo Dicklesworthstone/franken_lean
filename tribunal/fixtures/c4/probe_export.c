@@ -99,6 +99,30 @@ static lean_object *probe_task_succ(lean_object *a, lean_object *w) {
     (void)w;
     return lean_task_pure(lean_box(lean_unbox(a) + 1));
 }
+/* fln-3gv slice 4 targets: the tasks.lean corpus bodies
+ * (crates/fln-vm/fixtures/g03/tasks.lean). The asTask actions compute on
+ * the worker and publish the compiled toBaseIO shape — a bare Except.ok
+ * ctor (index 1). */
+static lean_object *probe_corpus_except_ok(lean_object *v) {
+    lean_object *r = lean_alloc_ctor(1, 1, 0);
+    lean_ctor_set(r, 0, v);
+    return r;
+}
+static lean_object *probe_corpus_add(lean_object *a, lean_object *b, lean_object *w) {
+    (void)w;
+    return probe_corpus_except_ok(lean_box(lean_unbox(a) + lean_unbox(b)));
+}
+static lean_object *probe_corpus_mul(lean_object *a, lean_object *b, lean_object *w) {
+    (void)w;
+    return probe_corpus_except_ok(lean_box(lean_unbox(a) * lean_unbox(b)));
+}
+static lean_object *probe_corpus_six_seven(lean_object *u) {
+    (void)u;
+    return lean_box(6 * 7);
+}
+static lean_object *probe_corpus_succ(lean_object *x) {
+    return lean_box(lean_unbox(x) + 1);
+}
 
 static void facts_mode(void) {
     /* ---- ctor through the inline small path (mi_malloc_small underneath) */
@@ -497,6 +521,37 @@ static void facts_mode(void) {
     fact("iow.cancel.finished_state", lean_io_get_task_state(fc));
     lean_dec(fc);
     fact("iow.check_canceled", lean_io_check_canceled());
+
+    /* ---- fln-3gv slice 4: the G0-3 tasks.lean corpus observables
+     * (crates/fln-vm/fixtures/g03/tasks.lean), computed through the live
+     * manager on BOTH runtimes — the io/tasks residue franken_lean-7xe
+     * recorded as waiting on the effect runtime. The pinned oracle bytes
+     * are "sum 45" / "chained 43" (tasks.lean.expected). */
+    lean_object *ca1 = lean_alloc_closure((void *)probe_corpus_add, 3, 2);
+    lean_closure_set(ca1, 0, lean_box(2));
+    lean_closure_set(ca1, 1, lean_box(3));
+    lean_object *ct1 = lean_io_as_task(ca1, lean_box(0));
+    lean_object *ca2 = lean_alloc_closure((void *)probe_corpus_mul, 3, 2);
+    lean_closure_set(ca2, 0, lean_box(10));
+    lean_closure_set(ca2, 1, lean_box(4));
+    lean_object *ct2 = lean_io_as_task(ca2, lean_box(0));
+    /* tasks.lean:4-5 — Task.get is the lean_task_get_own inline; ofExcept's
+     * ok-arm takes field 0 of the Except.ok ctor (index 1). */
+    lean_object *ce1 = lean_task_get_own(ct1);
+    lean_object *ce2 = lean_task_get_own(ct2);
+    fact("corpus.tasks.ok_tag", lean_ptr_tag(ce1));
+    fact("corpus.tasks.sum",
+         (long long)lean_unbox(lean_ctor_get(ce1, 0)) +
+             (long long)lean_unbox(lean_ctor_get(ce2, 0)));
+    lean_dec(ce1);
+    lean_dec(ce2);
+    /* tasks.lean:7-8 — Task.spawn (fun _ => 6 * 7) |>.map (+1) |>.get */
+    lean_object *csp = lean_task_spawn(
+        lean_alloc_closure((void *)probe_corpus_six_seven, 1, 0), lean_box(0));
+    lean_object *cch = lean_task_map(
+        lean_alloc_closure((void *)probe_corpus_succ, 1, 0), csp, lean_box(0),
+        false);
+    fact("corpus.tasks.chained", (long long)lean_unbox(lean_task_get_own(cch)));
 
     lean_finalize_task_manager(); /* both runtimes drain and join here */
 }
