@@ -343,6 +343,10 @@ fn a_truncated_input_is_a_typed_refusal_never_a_silent_census() {
 #[test]
 fn cancellation_is_typed_and_nothing_partial_publishes() {
     let vendor = scratch_vendor("cancel");
+    // Keep both the final output and publish's `.candidate` sibling inside this
+    // process's scratch root. A process-global temp name lets concurrent Cargo
+    // test binaries replace or reclaim one another's cancellation evidence.
+    let out = vendor.join("cancelled-census-output");
     // Enough well-formed sources that the generation has a window to cancel in.
     for index in 0..40 {
         fs::write(
@@ -362,7 +366,7 @@ fn cancellation_is_typed_and_nothing_partial_publishes() {
         ])
         .arg(&vendor)
         .arg("--output")
-        .arg(std::env::temp_dir().join("fln-attr-census-cancel-out"))
+        .arg(&out)
         .current_dir(root())
         .spawn()
         .expect("spawn generator");
@@ -386,7 +390,6 @@ fn cancellation_is_typed_and_nothing_partial_publishes() {
     }
     // The output file either does not exist (cancelled before publish) or is
     // complete (publish is atomic): a partial file is the forbidden shape.
-    let out = std::env::temp_dir().join("fln-attr-census-cancel-out");
     if out.exists() {
         let text = fs::read_to_string(&out).expect("the published output reads");
         assert!(
@@ -395,7 +398,6 @@ fn cancellation_is_typed_and_nothing_partial_publishes() {
         );
     }
     let _ = fs::remove_dir_all(&vendor);
-    let _ = fs::remove_file(&out);
 }
 
 #[test]
