@@ -30,10 +30,20 @@ fn primary_name(component: impl Into<String>) -> Name {
 
 fn checker_name(component: impl Into<String>) -> WireName {
     let name = primary_name(component);
+    checker_name_value(&name)
+}
+
+fn checker_name_value(name: &Name) -> WireName {
     match decode_name(&name.to_canonical_bytes(), DecodeBudget::unlimited()) {
         DecodeOutcome::Complete(Ok(value)) => value,
         other => panic!("primary-produced name did not decode: {other:?}"),
     }
+}
+
+fn checker_local_candidate(index: u64) -> (Name, WireName) {
+    let name = Name::num(primary_name("_fln_checker_local"), index);
+    let wire = checker_name_value(&name);
+    (name, wire)
 }
 
 fn decoded(expression: &Expr) -> WireExpr {
@@ -611,15 +621,6 @@ fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requi
     let sort_zero = Expr::sort(Level::zero());
     let cases = vec![
         (
-            Expr::lam(
-                Name::anonymous(),
-                sort_zero.clone(),
-                sort_zero.clone(),
-                BinderInfo::Default,
-            ),
-            InferenceDeferred::Lambda,
-        ),
-        (
             Expr::forall_e(
                 Name::anonymous(),
                 sort_zero.clone(),
@@ -668,6 +669,651 @@ fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requi
             ));
         }
     }
+}
+
+#[test]
+fn lambda_telescope_infers_dependent_types_and_preserves_every_binder_style() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let styles = [
+        BinderInfo::Default,
+        BinderInfo::Implicit,
+        BinderInfo::StrictImplicit,
+        BinderInfo::InstImplicit,
+    ];
+    for style in styles {
+        let lambda = Expr::lam(
+            primary_name("A"),
+            sort_one.clone(),
+            Expr::lam(
+                primary_name("x"),
+                Expr::bvar(0).expect("outer lambda binder"),
+                Expr::bvar(0).expect("inner lambda binder"),
+                style,
+            ),
+            style,
+        );
+        let expected = Expr::forall_e(
+            primary_name("A"),
+            sort_one.clone(),
+            Expr::forall_e(
+                primary_name("x"),
+                Expr::bvar(0).expect("outer forall binder"),
+                Expr::bvar(1).expect("outer binder below inner forall"),
+                style,
+            ),
+            style,
+        );
+        for mode in [
+            InferenceMode::InferOnly,
+            InferenceMode::Checking {
+                declaration_safety: ConstantSafety::Safe,
+            },
+        ] {
+            let checking = matches!(mode, InferenceMode::Checking { .. });
+            let result = complete(infer(
+                &decoded(&lambda),
+                &InferenceContext::empty(ConstantEnvironment::empty()),
+                mode,
+                InferenceBudget::unlimited(),
+            ));
+            assert_eq!(result.type_, decoded(&expected));
+            assert_eq!(result.progress.lambda_binders, 2);
+            assert_eq!(result.progress.lambda_body_queries, 1);
+            assert_eq!(
+                result.progress.lambda_domain_queries,
+                u64::from(checking) * 2
+            );
+            assert_eq!(result.progress.binder_sort_checks, u64::from(checking) * 2);
+        }
+    }
+
+    let nondependent = Expr::lam(
+        primary_name("x"),
+        sort_zero.clone(),
+        sort_zero.clone(),
+        BinderInfo::Default,
+    );
+    let expected = Expr::forall_e(
+        primary_name("x"),
+        sort_zero.clone(),
+        Expr::sort(Level::one()),
+        BinderInfo::Default,
+    );
+    assert_eq!(
+        complete(infer(
+            &decoded(&nondependent),
+            &InferenceContext::empty(ConstantEnvironment::empty()),
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+        ))
+        .type_,
+        decoded(&expected)
+    );
+}
+
+#[test]
+fn lambda_locals_avoid_context_and_constant_free_names_with_repeated_display_names() {
+    let (candidate_zero, candidate_zero_wire) = checker_local_candidate(0);
+    let (candidate_one, _) = checker_local_candidate(1);
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let context = built_context(
+        vec![LocalDeclaration::assumption(
+            candidate_zero_wire,
+            decoded(&sort_zero),
+        )],
+        Vec::new(),
+        vec![header(
+            "CarriesFreeName",
+            Vec::new(),
+            decoded(&Expr::fvar(FVarId(candidate_one))),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        )],
+    );
+    let repeated = primary_name("same");
+    let lambda = Expr::lam(
+        repeated.clone(),
+        sort_one.clone(),
+        Expr::lam(
+            repeated.clone(),
+            Expr::bvar(0).expect("outer repeated-name binder"),
+            Expr::bvar(0).expect("inner repeated-name binder"),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Default,
+    );
+    let expected = Expr::forall_e(
+        repeated.clone(),
+        sort_one,
+        Expr::forall_e(
+            repeated,
+            Expr::bvar(0).expect("outer repeated-name forall"),
+            Expr::bvar(1).expect("outer repeated-name body type"),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Default,
+    );
+    let result = complete(infer(
+        &decoded(&lambda),
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(result.type_, decoded(&expected));
+    assert_eq!(
+        result.progress.local_identity_candidates, 4,
+        "two adversarially reserved candidates must be skipped before allocating two locals"
+    );
+    assert_eq!(result.progress.lambda_binders, 2);
+    assert_ne!(candidate_zero, primary_name("same"));
+}
+
+#[test]
+fn lambda_domain_validation_is_mode_exact_and_uses_checker_whnf() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let missing = Expr::fvar(FVarId(primary_name("missingDomain")));
+    let missing_lambda = Expr::lam(
+        primary_name("x"),
+        missing.clone(),
+        Expr::bvar(0).expect("missing-domain binder"),
+        BinderInfo::Default,
+    );
+    let empty = InferenceContext::empty(ConstantEnvironment::empty());
+    assert!(matches!(
+        infer(
+            &decoded(&missing_lambda),
+            &empty,
+            InferenceMode::Checking {
+                declaration_safety: ConstantSafety::Safe,
+            },
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Refused {
+            refusal: InferenceRefusal::UnknownFreeVariable { name },
+            ..
+        } if name == checker_name("missingDomain")
+    ));
+    let skipped = complete(infer(
+        &decoded(&missing_lambda),
+        &empty,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(
+        skipped.type_,
+        decoded(&Expr::forall_e(
+            primary_name("x"),
+            missing.clone(),
+            missing,
+            BinderInfo::Default,
+        ))
+    );
+    assert_eq!(skipped.progress.lambda_domain_queries, 0);
+    assert_eq!(skipped.progress.binder_sort_checks, 0);
+
+    let a = Expr::fvar(FVarId(primary_name("A")));
+    let datum = Expr::fvar(FVarId(primary_name("datum")));
+    let invalid_context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("A"), decoded(&sort_zero)),
+            LocalDeclaration::assumption(checker_name("datum"), decoded(&a)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let invalid = Expr::lam(
+        primary_name("x"),
+        datum,
+        Expr::bvar(0).expect("invalid-domain binder"),
+        BinderInfo::Default,
+    );
+    assert!(matches!(
+        infer(
+            &decoded(&invalid),
+            &invalid_context,
+            InferenceMode::Checking {
+                declaration_safety: ConstantSafety::Safe,
+            },
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Refused {
+            refusal: InferenceRefusal::BinderTypeExpected { binder: 0 },
+            ..
+        }
+    ));
+
+    let sort_alias = Expr::const_(primary_name("SortAlias"), Vec::new());
+    let type_constant = Expr::const_(primary_name("T"), Vec::new());
+    let reducible_context = built_context(
+        Vec::new(),
+        Vec::new(),
+        vec![
+            definition_with_body(
+                "SortAlias",
+                decoded(&sort_one),
+                decoded(&sort_zero),
+                ConstantSafety::Safe,
+                DefinitionSafety::Safe,
+                0,
+            ),
+            header(
+                "T",
+                Vec::new(),
+                decoded(&sort_alias),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        ],
+    );
+    let reducible = Expr::lam(
+        primary_name("x"),
+        type_constant.clone(),
+        Expr::bvar(0).expect("reducible-domain binder"),
+        BinderInfo::Default,
+    );
+    let reduced = complete(infer(
+        &decoded(&reducible),
+        &reducible_context,
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(
+        reduced.type_,
+        decoded(&Expr::forall_e(
+            primary_name("x"),
+            type_constant.clone(),
+            type_constant,
+            BinderInfo::Default,
+        ))
+    );
+    assert_eq!(reduced.progress.binder_sort_checks, 1);
+
+    let structure_name = primary_name("OverflowStructure");
+    let constructor_name = primary_name("OverflowConstructor");
+    let overflow_type = Expr::proj(
+        structure_name.clone(),
+        u64::MAX,
+        Expr::app(
+            Expr::const_(constructor_name.clone(), Vec::new()),
+            sort_zero.clone(),
+        ),
+    );
+    let overflow_context = InferenceContext::new_with_projection_rules(
+        Vec::new(),
+        Vec::new(),
+        vec![ProjectionRule::new(
+            checker_name_value(&structure_name),
+            checker_name_value(&constructor_name),
+            usize::MAX,
+        )],
+        environment(vec![header(
+            "OverflowType",
+            Vec::new(),
+            decoded(&overflow_type),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        )]),
+    )
+    .expect("unique overflow projection context");
+    let overflow = Expr::lam(
+        primary_name("x"),
+        Expr::const_(primary_name("OverflowType"), Vec::new()),
+        Expr::bvar(0).expect("overflow-domain binder"),
+        BinderInfo::Default,
+    );
+    assert!(matches!(
+        infer(
+            &decoded(&overflow),
+            &overflow_context,
+            InferenceMode::Checking {
+                declaration_safety: ConstantSafety::Safe,
+            },
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Refused {
+            refusal: InferenceRefusal::BinderReductionRefusal {
+                binder: 0,
+                refusal: fln_checker::whnf::WhnfRefusal::ProjectionIndexOverflow { .. },
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn lambda_cheap_head_beta_fires_only_for_the_two_exact_safe_shapes() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let f = Expr::fvar(FVarId(primary_name("f")));
+    let a = Expr::fvar(FVarId(primary_name("A")));
+    let function_type = Expr::forall_e(
+        Name::anonymous(),
+        sort_one.clone(),
+        sort_one.clone(),
+        BinderInfo::Default,
+    );
+    let direct_binder = Expr::app(
+        Expr::lam(
+            primary_name("z"),
+            sort_one.clone(),
+            Expr::bvar(0).expect("cheap-beta direct binder"),
+            BinderInfo::Default,
+        ),
+        sort_zero.clone(),
+    );
+    let closed_residual = Expr::app(
+        Expr::lam(
+            primary_name("z"),
+            sort_one.clone(),
+            sort_zero.clone(),
+            BinderInfo::Default,
+        ),
+        sort_one.clone(),
+    );
+    let over_applied = Expr::app(
+        Expr::app(
+            Expr::lam(
+                primary_name("h"),
+                function_type.clone(),
+                Expr::bvar(0).expect("cheap-beta function binder"),
+                BinderInfo::Default,
+            ),
+            f.clone(),
+        ),
+        a.clone(),
+    );
+    let complex_residual = Expr::app(
+        Expr::lam(
+            primary_name("z"),
+            sort_one.clone(),
+            Expr::app(f.clone(), Expr::bvar(0).expect("complex residual binder")),
+            BinderInfo::Default,
+        ),
+        a.clone(),
+    );
+    let non_lambda_head = Expr::app(f.clone(), a.clone());
+    let cases = [
+        ("direct binder", direct_binder, sort_zero.clone()),
+        ("closed residual", closed_residual, sort_zero.clone()),
+        (
+            "over application",
+            over_applied,
+            Expr::app(f.clone(), a.clone()),
+        ),
+        (
+            "complex loose residual",
+            complex_residual.clone(),
+            complex_residual,
+        ),
+        ("non-lambda head", non_lambda_head.clone(), non_lambda_head),
+    ];
+
+    for (label, body_type, expected_body_type) in cases {
+        let context = built_context(
+            vec![
+                LocalDeclaration::assumption(checker_name("y"), decoded(&body_type)),
+                LocalDeclaration::assumption(checker_name("f"), decoded(&function_type)),
+                LocalDeclaration::assumption(checker_name("A"), decoded(&sort_one)),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        let lambda = Expr::lam(
+            primary_name("outer"),
+            sort_zero.clone(),
+            Expr::fvar(FVarId(primary_name("y"))),
+            BinderInfo::Default,
+        );
+        let result = complete(infer(
+            &decoded(&lambda),
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+        ));
+        assert_eq!(
+            result.type_,
+            decoded(&Expr::forall_e(
+                primary_name("outer"),
+                sort_zero.clone(),
+                expected_body_type,
+                BinderInfo::Default,
+            )),
+            "cheap-beta result drifted for {label}"
+        );
+        assert!(result.progress.cheap_beta_steps > 0);
+    }
+}
+
+#[test]
+fn lambda_heads_compose_with_nested_application_continuations() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let identity = Expr::lam(
+        primary_name("A"),
+        sort_one.clone(),
+        Expr::lam(
+            primary_name("x"),
+            Expr::bvar(0).expect("application outer lambda binder"),
+            Expr::bvar(0).expect("application inner lambda binder"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let application = Expr::app(
+        Expr::app(identity, sort_zero.clone()),
+        Expr::fvar(FVarId(primary_name("proof"))),
+    );
+    let context = built_context(
+        vec![LocalDeclaration::assumption(
+            checker_name("proof"),
+            decoded(&sort_zero),
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+    let result = complete(infer(
+        &decoded(&application),
+        &context,
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(sort_model(&result.type_), LevelModel::Zero);
+    assert_eq!(result.progress.lambda_binders, 2);
+    assert_eq!(result.progress.application_arguments, 2);
+    assert_eq!(result.progress.defeq_queries, 2);
+}
+
+#[test]
+fn lambda_resources_cancellation_and_recovery_remain_typed_and_failure_atomic() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let body_type = Expr::app(
+        Expr::lam(
+            primary_name("z"),
+            sort_one.clone(),
+            Expr::bvar(0).expect("resource cheap-beta binder"),
+            BinderInfo::Default,
+        ),
+        sort_zero.clone(),
+    );
+    let context = built_context(
+        vec![LocalDeclaration::assumption(
+            checker_name("body"),
+            decoded(&body_type),
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+    let lambda = decoded(&Expr::lam(
+        primary_name("A"),
+        sort_one,
+        Expr::lam(
+            primary_name("x"),
+            Expr::bvar(0).expect("resource outer binder"),
+            Expr::fvar(FVarId(primary_name("body"))),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Default,
+    ));
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+    let baseline = complete(infer(&lambda, &context, mode, InferenceBudget::unlimited()));
+    let exact_steps = baseline.progress.steps;
+    assert!(exact_steps > 1);
+    assert!(matches!(
+        infer(
+            &lambda,
+            &context,
+            mode,
+            InferenceBudget::new(
+                exact_steps - 1,
+                u64::MAX,
+                TermBudget::unlimited(),
+                TermBudget::unlimited(),
+            ),
+        ),
+        InferenceOutcome::Inconclusive(InferenceStop::Resource {
+            limit: InferenceLimit::Steps,
+            allowed,
+            observed,
+            phase: InferencePhase::CheapBeta | InferencePhase::LambdaBody,
+            ..
+        }) if observed == allowed + 1 && observed == exact_steps
+    ));
+    assert_eq!(
+        complete(infer(
+            &lambda,
+            &context,
+            mode,
+            InferenceBudget::new(
+                exact_steps,
+                u64::MAX,
+                TermBudget::unlimited(),
+                TermBudget::unlimited(),
+            ),
+        ))
+        .type_,
+        baseline.type_
+    );
+
+    let mut materialization_limited = InferenceBudget::unlimited();
+    materialization_limited.materialization =
+        TermBudget::new(0, u64::MAX).with_max_arena_nodes(u64::MAX);
+    assert!(matches!(
+        infer(&lambda, &context, mode, materialization_limited,),
+        InferenceOutcome::Inconclusive(InferenceStop::Materialization {
+            phase: InferencePhase::LambdaDomain,
+            stop: TermStop::Resource {
+                limit: TermLimit::Steps,
+                allowed: 0,
+                observed: 1,
+                ..
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        infer(
+            &lambda,
+            &context,
+            mode,
+            InferenceBudget::unlimited().with_whnf(WhnfBudget::new(
+                0,
+                u64::MAX,
+                TermBudget::unlimited(),
+            )),
+        ),
+        InferenceOutcome::Inconclusive(InferenceStop::BinderWhnf {
+            binder: 0,
+            stop,
+            ..
+        }) if matches!(
+            *stop,
+            WhnfStop::Resource {
+                allowed: 0,
+                observed: 1,
+                ..
+            }
+        )
+    ));
+
+    let mut saw_local_identity = false;
+    let mut saw_telescope = false;
+    let mut saw_domain = false;
+    let mut saw_binder_sort = false;
+    let mut saw_body = false;
+    let mut saw_cheap_beta = false;
+    let mut saw_nested_inspection = false;
+    let mut saw_nested_binder_whnf = false;
+    let mut saw_pi_materialization = false;
+    let mut completed = false;
+    for cancellation_poll in 1..2048 {
+        let mut polls = 0usize;
+        let outcome = infer_with(
+            &lambda,
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+            || {
+                polls = polls.saturating_add(1);
+                polls == cancellation_poll
+            },
+        );
+        match outcome {
+            InferenceOutcome::Inconclusive(InferenceStop::Cancelled { phase, .. }) => match phase {
+                InferencePhase::LocalIdentity => saw_local_identity = true,
+                InferencePhase::LambdaTelescope => saw_telescope = true,
+                InferencePhase::LambdaDomain => saw_domain = true,
+                InferencePhase::BinderSort => saw_binder_sort = true,
+                InferencePhase::LambdaBody => saw_body = true,
+                InferencePhase::CheapBeta => saw_cheap_beta = true,
+                _ => {}
+            },
+            InferenceOutcome::Inconclusive(InferenceStop::Inspection {
+                stop: TermStop::Cancelled { .. },
+                ..
+            }) => saw_nested_inspection = true,
+            InferenceOutcome::Inconclusive(InferenceStop::BinderWhnf { stop, .. })
+                if matches!(*stop, WhnfStop::Cancelled { .. }) =>
+            {
+                saw_nested_binder_whnf = true;
+            }
+            InferenceOutcome::Inconclusive(InferenceStop::Materialization {
+                phase: InferencePhase::PiAbstraction,
+                stop: TermStop::Cancelled { .. },
+                ..
+            }) => saw_pi_materialization = true,
+            InferenceOutcome::Inconclusive(_) => {}
+            InferenceOutcome::Complete(result) => {
+                assert_eq!(result.type_, baseline.type_);
+                completed = true;
+                break;
+            }
+            other => panic!("lambda cancellation became a semantic answer: {other:?}"),
+        }
+    }
+    assert!(completed);
+    assert!(saw_local_identity);
+    assert!(saw_telescope);
+    assert!(saw_domain);
+    assert!(saw_binder_sort);
+    assert!(saw_body);
+    assert!(saw_cheap_beta);
+    assert!(saw_nested_inspection);
+    assert!(saw_nested_binder_whnf);
+    assert!(saw_pi_materialization);
+    assert_eq!(
+        complete(infer(&lambda, &context, mode, InferenceBudget::unlimited(),)).type_,
+        baseline.type_
+    );
 }
 
 #[test]
@@ -918,21 +1564,25 @@ fn application_outcomes_separate_function_mismatch_conversion_and_nested_rules()
         Expr::bvar(0).expect("lambda binder"),
         BinderInfo::Default,
     );
-    assert!(matches!(
-        infer(
-            &decoded(&Expr::app(
-                Expr::fvar(FVarId(primary_name("f"))),
-                nested_lambda,
-            )),
-            &mismatch_context,
-            mode,
-            InferenceBudget::unlimited(),
+    let nested_outcome = infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("f"))),
+            nested_lambda,
+        )),
+        &mismatch_context,
+        mode,
+        InferenceBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            nested_outcome,
+            InferenceOutcome::Deferred {
+                requirement: InferenceDeferred::ApplicationConversion { argument: 0, .. },
+                ..
+            }
         ),
-        InferenceOutcome::Deferred {
-            requirement: InferenceDeferred::Lambda,
-            ..
-        }
-    ));
+        "nested lambda outcome drifted: {nested_outcome:?}"
+    );
 }
 
 #[test]
@@ -1732,7 +2382,14 @@ fn cancellation_reaches_each_phase_without_partial_output_and_cleanly_recovers()
                 | InferencePhase::ApplicationDomain
                 | InferencePhase::ArgumentType
                 | InferencePhase::DomainComparison
-                | InferencePhase::Codomain => {
+                | InferencePhase::Codomain
+                | InferencePhase::LocalIdentity
+                | InferencePhase::LambdaTelescope
+                | InferencePhase::LambdaDomain
+                | InferencePhase::BinderSort
+                | InferencePhase::LambdaBody
+                | InferencePhase::CheapBeta
+                | InferencePhase::PiAbstraction => {
                     panic!("nested work surfaced as an outer cancellation phase")
                 }
             },
@@ -1766,6 +2423,118 @@ fn cancellation_reaches_each_phase_without_partial_output_and_cleanly_recovers()
         ))
         .type_,
         baseline.type_
+    );
+}
+
+fn deep_lambda_telescope_child() -> Result<(), String> {
+    const BINDERS: usize = 50_000;
+    let mut writer = CanonWriter::new();
+    writer.schema(SCHEMA_EXPR);
+    for _ in 0..BINDERS {
+        writer.u8(6);
+        writer.u64(0);
+        writer.u8(3);
+        writer.u8(0);
+    }
+    writer.u8(0);
+    writer.u32(0);
+    for _ in 0..BINDERS {
+        writer.u8(0);
+    }
+    let term = match decode_expr(&writer.into_bytes(), DecodeBudget::unlimited()) {
+        DecodeOutcome::Complete(Ok(value)) => value,
+        other => return Err(format!("deep lambda bytes did not decode: {other:?}")),
+    };
+    let result = match infer(
+        &term,
+        &InferenceContext::empty(ConstantEnvironment::empty()),
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ) {
+        InferenceOutcome::Complete(result) => result,
+        other => return Err(format!("deep lambda inference failed: {other:?}")),
+    };
+    if result.progress.lambda_binders != BINDERS as u64
+        || result.progress.lambda_domain_queries != 0
+        || result.progress.lambda_body_queries != 1
+    {
+        return Err(format!(
+            "deep lambda progress drifted: binders={}, domains={}, bodies={}",
+            result.progress.lambda_binders,
+            result.progress.lambda_domain_queries,
+            result.progress.lambda_body_queries
+        ));
+    }
+    if result
+        .type_
+        .nodes()
+        .iter()
+        .any(|node| matches!(node, ExprNode::Free { .. }))
+    {
+        return Err("deep lambda result leaked a query-local free name".to_owned());
+    }
+    let mut cursor = result.type_.root();
+    let mut forall_count = 0usize;
+    loop {
+        match result.type_.node(cursor) {
+            Some(ExprNode::Forall {
+                binder_name,
+                binder_type,
+                body,
+                style,
+            }) => {
+                if !binder_name.is_anonymous()
+                    || *style != fln_checker::wire::BinderStyle::Default
+                    || !matches!(result.type_.node(*binder_type), Some(ExprNode::Sort { .. }))
+                {
+                    return Err(format!("deep lambda forall drifted at {forall_count}"));
+                }
+                forall_count = forall_count.saturating_add(1);
+                cursor = *body;
+            }
+            Some(ExprNode::Sort { .. }) => break,
+            Some(_) => return Err(format!("deep lambda terminal drifted at {forall_count}")),
+            None => return Err(format!("deep lambda body missing at {forall_count}")),
+        }
+    }
+    if forall_count != BINDERS {
+        return Err(format!(
+            "deep lambda forall count drifted: expected {BINDERS}, got {forall_count}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn fifty_thousand_binder_lambda_telescope_fits_a_64k_stack() {
+    const CHILD_ENV: &str = "FLN_CHECKER_INFER_DEEP_LAMBDA_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let result = std::thread::Builder::new()
+            .name("fln-checker-infer-lambda-deep".to_owned())
+            .stack_size(64 * 1024)
+            .spawn(deep_lambda_telescope_child)
+            .expect("spawn bounded-stack lambda child")
+            .join()
+            .expect("bounded-stack lambda child did not panic");
+        result.expect("bounded-stack lambda work");
+        return;
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = Command::new(executable)
+        .env(CHILD_ENV, "1")
+        .args([
+            "--exact",
+            "fifty_thousand_binder_lambda_telescope_fits_a_64k_stack",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run bounded-stack lambda child process");
+    assert!(
+        output.status.success(),
+        "bounded-stack lambda child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

@@ -252,7 +252,7 @@ pub(crate) fn usize_units(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-fn name_owned_units(name: &WireName) -> u64 {
+pub(crate) fn name_owned_units(name: &WireName) -> u64 {
     name.parts().iter().fold(0u64, |units, part| {
         let payload = match part {
             NamePart::Numeric { .. } => 0,

@@ -11,11 +11,15 @@
 //! deliberately separate KR-307/KR-309 strategy. Checker-owned numeric and
 //! expression-reduction modules now supply independently resource-counted
 //! arbitrary-precision Nat operations and the KR-313 dispatch table. Inference
-//! covers KR-100 through KR-106 plus iterative metadata transparency: application
-//! spines use explicit heap continuations, checking queries share one immutable
-//! reduction/conversion context, and infer-only queries do not type arguments.
-//! Binders, literals, projections, the remaining equality rules, and declaration
-//! checking remain open. The crate map and layering are governed by
+//! covers KR-100 through KR-107 plus iterative metadata transparency: application
+//! spines and lambda telescopes use explicit heap continuations, checking queries
+//! share one immutable reduction/conversion context, and infer-only queries do not
+//! type arguments or binder domains. Lambda-local identities are deterministic and
+//! capture-safe, checking forces each domain type through checker-owned WHNF to a
+//! sort, and the inferred body type receives KR-107's exact cheap head-beta step
+//! before dependent Pi rebuilding. Pi expressions as inputs, lets, literals,
+//! projections, the remaining equality rules, and declaration checking remain
+//! open. The crate map and layering are governed by
 //! `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first

@@ -2,9 +2,9 @@
 //!
 //! This is the independent checker's typing dispatcher. It implements the
 //! closed-term precondition, the leaf rules KR-100 through KR-105, iterative
-//! KR-111 metadata transparency, and worklist-driven KR-106 application
-//! inference. Later rule families are named by [`InferenceDeferred`] instead of
-//! being misreported as rejection.
+//! KR-111 metadata transparency, worklist-driven KR-106 application inference,
+//! and stack-safe KR-107 lambda-telescope inference. Later rule families are
+//! named by [`InferenceDeferred`] instead of being misreported as rejection.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -19,16 +19,17 @@ use crate::instantiate::{
     instantiate_term_parameters_from_level_roots_with,
 };
 use crate::term::{
-    TermBudget, TermFault, TermInput, TermLimit, TermOutcome, TermStop, copy_subterm_with,
-    inspect_with, substitute_bound_subterms_with,
+    TermBudget, TermFault, TermInput, TermLimit, TermOutcome, TermStop,
+    abstract_free_telescope_with, copy_compact_subterm_with, copy_subterm_with, inspect_with,
+    substitute_bound_subterms_with,
 };
 use crate::whnf::{
     FreeBinding, ProjectionRule, WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal,
     WhnfStop, whnf_with,
 };
 use crate::wire::{
-    ExprId, ExprNode, LevelId, LevelNode, NamePart, WireExpr, WireName, expression_owned_units,
-    level_owned_units, usize_units,
+    BinderStyle, ExprId, ExprNode, LevelId, LevelNode, MAX_BVAR_INDEX, NamePart, WireExpr,
+    WireName, expression_owned_units, level_owned_units, name_owned_units, usize_units,
 };
 
 /// One checker-owned local declaration.
@@ -302,6 +303,14 @@ pub struct InferenceProgress {
     pub whnf_queries: u64,
     pub defeq_queries: u64,
     pub eager_argument_checks: u64,
+    pub reserved_free_names: u64,
+    pub local_identity_candidates: u64,
+    pub lambda_telescope_nodes: u64,
+    pub lambda_binders: u64,
+    pub lambda_domain_queries: u64,
+    pub lambda_body_queries: u64,
+    pub binder_sort_checks: u64,
+    pub cheap_beta_steps: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +335,13 @@ pub enum InferencePhase {
     ArgumentType,
     DomainComparison,
     Codomain,
+    LocalIdentity,
+    LambdaTelescope,
+    LambdaDomain,
+    BinderSort,
+    LambdaBody,
+    CheapBeta,
+    PiAbstraction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +377,11 @@ pub enum InferenceStop {
     DefEq {
         argument: usize,
         stop: Box<DefEqStop>,
+        progress: InferenceProgress,
+    },
+    BinderWhnf {
+        binder: usize,
+        stop: Box<WhnfStop>,
         progress: InferenceProgress,
     },
 }
@@ -407,6 +428,13 @@ pub enum InferenceRefusal {
         side: DefEqSide,
         refusal: WhnfRefusal,
     },
+    BinderTypeExpected {
+        binder: usize,
+    },
+    BinderReductionRefusal {
+        binder: usize,
+        refusal: WhnfRefusal,
+    },
 }
 
 /// Rule families deliberately outside this child.
@@ -416,7 +444,6 @@ pub enum InferenceDeferred {
         argument: usize,
         need: DefEqDeferred,
     },
-    Lambda,
     Forall,
     Let,
     NatLiteral,
@@ -458,6 +485,17 @@ pub enum InferenceFault {
     DefEq {
         argument: usize,
         fault: DefEqFault,
+    },
+    BinderWhnf {
+        binder: usize,
+        fault: WhnfFault,
+    },
+    FreshLocalIdentityExhausted,
+    ScopedLocalCollision {
+        name: WireName,
+    },
+    MissingScopedLocal {
+        name: WireName,
     },
     MissingGeneratedArena {
         generation: usize,
@@ -511,15 +549,15 @@ impl Control {
         cancelled: &mut dyn FnMut() -> bool,
         phase: InferencePhase,
         at: usize,
-    ) -> Result<(), InferenceStop> {
+    ) -> Result<(), Box<InferenceStop>> {
         self.polls = self.polls.saturating_add(1);
         if cancelled() {
-            return Err(InferenceStop::Cancelled {
+            return Err(Box::new(InferenceStop::Cancelled {
                 phase,
                 at,
                 polls: self.polls,
                 progress: self.progress,
-            });
+            }));
         }
         Ok(())
     }
@@ -529,34 +567,34 @@ impl Control {
         cancelled: &mut dyn FnMut() -> bool,
         phase: InferencePhase,
         at: usize,
-    ) -> Result<(), InferenceStop> {
+    ) -> Result<(), Box<InferenceStop>> {
         self.poll(cancelled, phase, at)?;
         let observed = self.progress.steps.saturating_add(1);
         if observed > self.budget.max_steps {
-            return Err(InferenceStop::Resource {
+            return Err(Box::new(InferenceStop::Resource {
                 limit: InferenceLimit::Steps,
                 allowed: self.budget.max_steps,
                 observed,
                 phase,
                 at,
                 progress: self.progress,
-            });
+            }));
         }
         self.progress.steps = observed;
         Ok(())
     }
 
-    fn level_node(&mut self, at: usize) -> Result<(), InferenceStop> {
+    fn level_node(&mut self, at: usize) -> Result<(), Box<InferenceStop>> {
         let observed = self.progress.level_nodes.saturating_add(1);
         if observed > self.budget.max_level_nodes {
-            return Err(InferenceStop::Resource {
+            return Err(Box::new(InferenceStop::Resource {
                 limit: InferenceLimit::LevelNodes,
                 allowed: self.budget.max_level_nodes,
                 observed,
                 phase: InferencePhase::UniverseValidation,
                 at,
                 progress: self.progress,
-            });
+            }));
         }
         self.progress.level_nodes = observed;
         Ok(())
@@ -566,8 +604,14 @@ impl Control {
 enum LeafHalt {
     Refused(InferenceRefusal),
     Deferred(InferenceDeferred),
-    Stop(InferenceStop),
+    Stop(Box<InferenceStop>),
     Fault(InferenceFault),
+}
+
+impl LeafHalt {
+    fn stop(stop: impl Into<Box<InferenceStop>>) -> LeafHalt {
+        LeafHalt::Stop(stop.into())
+    }
 }
 
 fn finish(result: Result<WireExpr, LeafHalt>, progress: InferenceProgress) -> InferenceOutcome {
@@ -578,7 +622,7 @@ fn finish(result: Result<WireExpr, LeafHalt>, progress: InferenceProgress) -> In
             requirement,
             progress,
         },
-        Err(LeafHalt::Stop(stop)) => InferenceOutcome::Inconclusive(stop),
+        Err(LeafHalt::Stop(stop)) => InferenceOutcome::Inconclusive(*stop),
         Err(LeafHalt::Fault(fault)) => InferenceOutcome::InternalFault { fault, progress },
     }
 }
@@ -599,8 +643,8 @@ fn validate_level_roots(
             }
             control
                 .step(cancelled, InferencePhase::UniverseValidation, id.index())
-                .map_err(LeafHalt::Stop)?;
-            control.level_node(id.index()).map_err(LeafHalt::Stop)?;
+                .map_err(LeafHalt::stop)?;
+            control.level_node(id.index()).map_err(LeafHalt::stop)?;
             visited.insert(id.index());
             let node = term
                 .level(id)
@@ -843,7 +887,7 @@ fn map_materialization(
 ) -> Result<WireExpr, LeafHalt> {
     match outcome {
         TermOutcome::Complete(term) => Ok(term),
-        TermOutcome::Inconclusive(stop) => Err(LeafHalt::Stop(InferenceStop::Materialization {
+        TermOutcome::Inconclusive(stop) => Err(LeafHalt::stop(InferenceStop::Materialization {
             phase,
             stop,
             progress,
@@ -854,6 +898,387 @@ fn map_materialization(
                 fault,
             }))
         }
+    }
+}
+
+fn map_assembly<T>(
+    result: Result<T, MaterializeHalt>,
+    phase: InferencePhase,
+    progress: InferenceProgress,
+) -> Result<T, LeafHalt> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(MaterializeHalt::Stop(stop)) => Err(LeafHalt::stop(InferenceStop::Materialization {
+            phase,
+            stop,
+            progress,
+        })),
+        Err(MaterializeHalt::Fault(fault)) => {
+            Err(LeafHalt::Fault(InferenceFault::Materialization {
+                phase,
+                fault,
+            }))
+        }
+    }
+}
+
+fn materialize_free(
+    name: &WireName,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<WireExpr> {
+    let mut control = MaterializationControl::new(budget, cancelled);
+    if let Err(halt) = control.step(0) {
+        return materialize_halted(halt);
+    }
+    let output_units = 1u64.saturating_add(name_owned_units(name));
+    if let Err(halt) = control.output(output_units, 0) {
+        return materialize_halted(halt);
+    }
+    if let Err(halt) = control.arena_node(1, 0) {
+        return materialize_halted(halt);
+    }
+    let Some(root) = ExprId::from_index(0) else {
+        return TermOutcome::Inconclusive(TermStop::Resource {
+            limit: TermLimit::ArenaNodes,
+            allowed: budget.max_arena_nodes.min(u64::from(u32::MAX)),
+            observed: 1,
+            at: 0,
+            completed_steps: control.steps,
+        });
+    };
+    TermOutcome::Complete(WireExpr::from_parts(
+        vec![ExprNode::Free { name: name.clone() }],
+        Vec::new(),
+        root,
+    ))
+}
+
+struct ArenaAssembler<'a> {
+    control: MaterializationControl<'a>,
+    nodes: Vec<ExprNode>,
+    levels: Vec<LevelNode>,
+}
+
+impl<'a> ArenaAssembler<'a> {
+    fn new(budget: TermBudget, cancelled: &'a mut dyn FnMut() -> bool) -> ArenaAssembler<'a> {
+        ArenaAssembler {
+            control: MaterializationControl::new(budget, cancelled),
+            nodes: Vec::new(),
+            levels: Vec::new(),
+        }
+    }
+
+    fn total_nodes(&self, additional: u64) -> u64 {
+        usize_units(self.levels.len())
+            .saturating_add(usize_units(self.nodes.len()))
+            .saturating_add(additional)
+    }
+
+    fn mapped_level(
+        source: &WireExpr,
+        parent: usize,
+        child: LevelId,
+        offset: usize,
+        at: usize,
+        control: &MaterializationControl<'_>,
+    ) -> Result<LevelId, MaterializeHalt> {
+        if child.index() >= parent {
+            return Err(MaterializeHalt::Fault(
+                TermFault::NonBackwardLevelReference {
+                    input: TermInput::Subject,
+                    parent,
+                    child: child.index(),
+                },
+            ));
+        }
+        if source.level(child).is_none() {
+            return Err(MaterializeHalt::Fault(TermFault::MissingLevel {
+                input: TermInput::Subject,
+                index: child.index(),
+            }));
+        }
+        let mapped = offset.saturating_add(child.index());
+        LevelId::from_index(mapped).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: usize_units(mapped).saturating_add(1),
+                at,
+                completed_steps: control.steps,
+            })
+        })
+    }
+
+    fn mapped_level_root(
+        source: &WireExpr,
+        child: LevelId,
+        offset: usize,
+        at: usize,
+        control: &MaterializationControl<'_>,
+    ) -> Result<LevelId, MaterializeHalt> {
+        if source.level(child).is_none() {
+            return Err(MaterializeHalt::Fault(TermFault::MissingLevel {
+                input: TermInput::Subject,
+                index: child.index(),
+            }));
+        }
+        let mapped = offset.saturating_add(child.index());
+        LevelId::from_index(mapped).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: usize_units(mapped).saturating_add(1),
+                at,
+                completed_steps: control.steps,
+            })
+        })
+    }
+
+    fn mapped_expression(
+        source: &WireExpr,
+        parent: usize,
+        child: ExprId,
+        offset: usize,
+        at: usize,
+        control: &MaterializationControl<'_>,
+    ) -> Result<ExprId, MaterializeHalt> {
+        if child.index() >= parent {
+            return Err(MaterializeHalt::Fault(
+                TermFault::NonBackwardExpressionReference {
+                    input: TermInput::Subject,
+                    parent,
+                    child: child.index(),
+                },
+            ));
+        }
+        if source.node(child).is_none() {
+            return Err(MaterializeHalt::Fault(TermFault::MissingExpression {
+                input: TermInput::Subject,
+                index: child.index(),
+            }));
+        }
+        let mapped = offset.saturating_add(child.index());
+        ExprId::from_index(mapped).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: usize_units(mapped).saturating_add(1),
+                at,
+                completed_steps: control.steps,
+            })
+        })
+    }
+
+    fn append(&mut self, source: &WireExpr) -> Result<ExprId, MaterializeHalt> {
+        let level_offset = self.levels.len();
+        for (index, node) in source.levels().iter().enumerate() {
+            let at = self.levels.len();
+            self.control.step(at)?;
+            self.control.output(level_owned_units(node), at)?;
+            let mapped = match node {
+                LevelNode::Zero => LevelNode::Zero,
+                LevelNode::Succ(child) => LevelNode::Succ(Self::mapped_level(
+                    source,
+                    index,
+                    *child,
+                    level_offset,
+                    at,
+                    &self.control,
+                )?),
+                LevelNode::Max(left, right) => LevelNode::Max(
+                    Self::mapped_level(source, index, *left, level_offset, at, &self.control)?,
+                    Self::mapped_level(source, index, *right, level_offset, at, &self.control)?,
+                ),
+                LevelNode::IMax(left, right) => LevelNode::IMax(
+                    Self::mapped_level(source, index, *left, level_offset, at, &self.control)?,
+                    Self::mapped_level(source, index, *right, level_offset, at, &self.control)?,
+                ),
+                LevelNode::Parameter(name) => LevelNode::Parameter(name.clone()),
+                LevelNode::Meta(name) => LevelNode::Meta(name.clone()),
+            };
+            self.control.arena_node(self.total_nodes(1), at)?;
+            if LevelId::from_index(self.levels.len()).is_none() {
+                return Err(MaterializeHalt::Stop(TermStop::Resource {
+                    limit: TermLimit::ArenaNodes,
+                    allowed: self.control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                    observed: self.total_nodes(1),
+                    at,
+                    completed_steps: self.control.steps,
+                }));
+            }
+            self.levels.push(mapped);
+        }
+
+        let expression_offset = self.nodes.len();
+        for (index, node) in source.nodes().iter().enumerate() {
+            let at = self.nodes.len();
+            self.control.step(at)?;
+            self.control.output(expression_owned_units(node), at)?;
+            let map_expression = |child| {
+                Self::mapped_expression(source, index, child, expression_offset, at, &self.control)
+            };
+            let map_level =
+                |level| Self::mapped_level_root(source, level, level_offset, at, &self.control);
+            let mapped = match node {
+                ExprNode::Bound { index } => ExprNode::Bound { index: *index },
+                ExprNode::Free { name } => ExprNode::Free { name: name.clone() },
+                ExprNode::Meta { name } => ExprNode::Meta { name: name.clone() },
+                ExprNode::Sort { level } => ExprNode::Sort {
+                    level: map_level(*level)?,
+                },
+                ExprNode::Constant { name, levels } => ExprNode::Constant {
+                    name: name.clone(),
+                    levels: levels
+                        .iter()
+                        .map(|level| map_level(*level))
+                        .collect::<Result<Vec<_>, _>>()?,
+                },
+                ExprNode::Apply { function, argument } => ExprNode::Apply {
+                    function: map_expression(*function)?,
+                    argument: map_expression(*argument)?,
+                },
+                ExprNode::Lambda {
+                    binder_name,
+                    binder_type,
+                    body,
+                    style,
+                } => ExprNode::Lambda {
+                    binder_name: binder_name.clone(),
+                    binder_type: map_expression(*binder_type)?,
+                    body: map_expression(*body)?,
+                    style: *style,
+                },
+                ExprNode::Forall {
+                    binder_name,
+                    binder_type,
+                    body,
+                    style,
+                } => ExprNode::Forall {
+                    binder_name: binder_name.clone(),
+                    binder_type: map_expression(*binder_type)?,
+                    body: map_expression(*body)?,
+                    style: *style,
+                },
+                ExprNode::Let {
+                    declaration_name,
+                    type_,
+                    value,
+                    body,
+                    non_dependent,
+                } => ExprNode::Let {
+                    declaration_name: declaration_name.clone(),
+                    type_: map_expression(*type_)?,
+                    value: map_expression(*value)?,
+                    body: map_expression(*body)?,
+                    non_dependent: *non_dependent,
+                },
+                ExprNode::NatLiteral { limbs_le } => ExprNode::NatLiteral {
+                    limbs_le: limbs_le.clone(),
+                },
+                ExprNode::StringLiteral(text) => ExprNode::StringLiteral(text.clone()),
+                ExprNode::Metadata {
+                    entries,
+                    expression,
+                } => ExprNode::Metadata {
+                    entries: entries.clone(),
+                    expression: map_expression(*expression)?,
+                },
+                ExprNode::Projection {
+                    structure_name,
+                    index,
+                    expression,
+                } => ExprNode::Projection {
+                    structure_name: structure_name.clone(),
+                    index: *index,
+                    expression: map_expression(*expression)?,
+                },
+            };
+            self.control.arena_node(self.total_nodes(1), at)?;
+            if ExprId::from_index(self.nodes.len()).is_none() {
+                return Err(MaterializeHalt::Stop(TermStop::Resource {
+                    limit: TermLimit::ArenaNodes,
+                    allowed: self.control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                    observed: self.total_nodes(1),
+                    at,
+                    completed_steps: self.control.steps,
+                }));
+            }
+            self.nodes.push(mapped);
+        }
+
+        if source.node(source.root()).is_none() {
+            return Err(MaterializeHalt::Fault(TermFault::MissingExpression {
+                input: TermInput::Subject,
+                index: source.root().index(),
+            }));
+        }
+        let mapped_root = expression_offset.saturating_add(source.root().index());
+        ExprId::from_index(mapped_root).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: self.control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: usize_units(mapped_root).saturating_add(1),
+                at: mapped_root,
+                completed_steps: self.control.steps,
+            })
+        })
+    }
+
+    fn push_apply(
+        &mut self,
+        function: ExprId,
+        argument: ExprId,
+    ) -> Result<ExprId, MaterializeHalt> {
+        let at = self.nodes.len();
+        self.control.step(at)?;
+        self.control.output(1, at)?;
+        self.control.arena_node(self.total_nodes(1), at)?;
+        let id = ExprId::from_index(self.nodes.len()).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: self.control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: self.total_nodes(1),
+                at,
+                completed_steps: self.control.steps,
+            })
+        })?;
+        self.nodes.push(ExprNode::Apply { function, argument });
+        Ok(id)
+    }
+
+    fn push_forall(
+        &mut self,
+        binder_name: &WireName,
+        style: BinderStyle,
+        binder_type: ExprId,
+        body: ExprId,
+    ) -> Result<ExprId, MaterializeHalt> {
+        let at = self.nodes.len();
+        self.control.step(at)?;
+        self.control
+            .output(1u64.saturating_add(name_owned_units(binder_name)), at)?;
+        self.control.arena_node(self.total_nodes(1), at)?;
+        let id = ExprId::from_index(self.nodes.len()).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: self.control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: self.total_nodes(1),
+                at,
+                completed_steps: self.control.steps,
+            })
+        })?;
+        self.nodes.push(ExprNode::Forall {
+            binder_name: binder_name.clone(),
+            binder_type,
+            body,
+            style,
+        });
+        Ok(id)
+    }
+
+    fn finish(self, root: ExprId) -> WireExpr {
+        WireExpr::from_parts(self.nodes, self.levels, root)
     }
 }
 
@@ -869,11 +1294,36 @@ struct TermReference {
     root: ExprId,
 }
 
+struct LambdaBinderSource {
+    display_name: WireName,
+    style: BinderStyle,
+    domain: TermReference,
+}
+
+struct LambdaBinder {
+    display_name: WireName,
+    style: BinderStyle,
+    local_name: WireName,
+    local_reference: TermReference,
+    domain: Arc<WireExpr>,
+}
+
+struct LambdaState {
+    sources: Vec<LambdaBinderSource>,
+    body: TermReference,
+    binders: Vec<LambdaBinder>,
+    next: usize,
+}
+
 enum Dispatch {
     Type(WireExpr),
     Application {
         head: TermReference,
         arguments: Vec<TermReference>,
+    },
+    Lambda {
+        binders: Vec<LambdaBinderSource>,
+        body: TermReference,
     },
 }
 
@@ -888,6 +1338,15 @@ enum Continuation {
         domain: WireExpr,
         argument: TermReference,
         conversion: ConversionMode,
+    },
+    LambdaDomain {
+        state: Box<LambdaState>,
+        domain: Arc<WireExpr>,
+        local_name: WireName,
+        local_reference: TermReference,
+    },
+    LambdaBody {
+        state: Box<LambdaState>,
     },
 }
 
@@ -916,26 +1375,39 @@ enum ConversionMode {
 
 fn inference_arena<'a>(
     input: &'a WireExpr,
-    generated: &'a [WireExpr],
+    generated: &'a [Arc<WireExpr>],
     source: ArenaSource,
 ) -> Result<&'a WireExpr, LeafHalt> {
     match source {
         ArenaSource::Input => Ok(input),
-        ArenaSource::Generated(generation) => generated.get(generation).ok_or(LeafHalt::Fault(
-            InferenceFault::MissingGeneratedArena { generation },
-        )),
+        ArenaSource::Generated(generation) => {
+            generated
+                .get(generation)
+                .map(Arc::as_ref)
+                .ok_or(LeafHalt::Fault(InferenceFault::MissingGeneratedArena {
+                    generation,
+                }))
+        }
     }
+}
+
+struct DispatchScope<'a> {
+    context: &'a InferenceContext,
+    scoped_locals: &'a BTreeMap<WireName, Arc<WireExpr>>,
+    mode: InferenceMode,
 }
 
 fn dispatch_reference(
     input: &WireExpr,
-    generated: &[WireExpr],
+    generated: &[Arc<WireExpr>],
     reference: TermReference,
-    context: &InferenceContext,
-    mode: InferenceMode,
+    scope: DispatchScope<'_>,
     control: &mut Control,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Dispatch, LeafHalt> {
+    let context = scope.context;
+    let scoped_locals = scope.scoped_locals;
+    let mode = scope.mode;
     let term = inference_arena(input, generated, reference.source)?;
     control
         .step(
@@ -943,12 +1415,12 @@ fn dispatch_reference(
             InferencePhase::Precondition,
             reference.root.index(),
         )
-        .map_err(LeafHalt::Stop)?;
+        .map_err(LeafHalt::stop)?;
 
     let facts = match inspect_with(term, control.budget.inspection, &mut *cancelled) {
         TermOutcome::Complete(facts) => facts,
         TermOutcome::Inconclusive(stop) => {
-            return Err(LeafHalt::Stop(InferenceStop::Inspection {
+            return Err(LeafHalt::stop(InferenceStop::Inspection {
                 stop,
                 progress: control.progress,
             }));
@@ -975,14 +1447,14 @@ fn dispatch_reference(
         };
         control
             .step(cancelled, InferencePhase::Metadata, root.index())
-            .map_err(LeafHalt::Stop)?;
+            .map_err(LeafHalt::stop)?;
         control.progress.metadata_layers = control.progress.metadata_layers.saturating_add(1);
         root = *expression;
     }
 
     control
         .step(cancelled, InferencePhase::Dispatch, root.index())
-        .map_err(LeafHalt::Stop)?;
+        .map_err(LeafHalt::stop)?;
     let node = term
         .node(root)
         .ok_or(LeafHalt::Fault(InferenceFault::MissingExpression {
@@ -993,13 +1465,17 @@ fn dispatch_reference(
             external_bound_span: index.saturating_add(1),
         })),
         ExprNode::Free { name } => {
-            let local = context.local(name).ok_or_else(|| {
-                LeafHalt::Refused(InferenceRefusal::UnknownFreeVariable { name: name.clone() })
-            })?;
+            let local_type = scoped_locals
+                .get(name)
+                .map(Arc::as_ref)
+                .or_else(|| context.local(name).map(LocalDeclaration::type_))
+                .ok_or_else(|| {
+                    LeafHalt::Refused(InferenceRefusal::UnknownFreeVariable { name: name.clone() })
+                })?;
             map_materialization(
                 copy_subterm_with(
-                    local.type_(),
-                    local.type_().root(),
+                    local_type,
+                    local_type.root(),
                     control.budget.materialization,
                     cancelled,
                 ),
@@ -1069,7 +1545,7 @@ fn dispatch_reference(
                     },
                 )),
                 InstantiationOutcome::Inconclusive(stop) => {
-                    Err(LeafHalt::Stop(InferenceStop::Materialization {
+                    Err(LeafHalt::stop(InferenceStop::Materialization {
                         phase: InferencePhase::ConstantType,
                         stop,
                         progress: control.progress,
@@ -1097,7 +1573,7 @@ fn dispatch_reference(
                 };
                 control
                     .step(cancelled, InferencePhase::ApplicationSpine, cursor.index())
-                    .map_err(LeafHalt::Stop)?;
+                    .map_err(LeafHalt::stop)?;
                 control.progress.application_spine_nodes =
                     control.progress.application_spine_nodes.saturating_add(1);
                 arguments.push(TermReference {
@@ -1115,7 +1591,61 @@ fn dispatch_reference(
                 arguments,
             })
         }
-        ExprNode::Lambda { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Lambda)),
+        ExprNode::Lambda { .. } => {
+            let mut cursor = root;
+            let mut binders = Vec::new();
+            loop {
+                let current = term.node(cursor).ok_or(LeafHalt::Fault(
+                    InferenceFault::MissingExpression {
+                        index: cursor.index(),
+                    },
+                ))?;
+                let ExprNode::Lambda {
+                    binder_name,
+                    binder_type,
+                    body,
+                    style,
+                } = current
+                else {
+                    break;
+                };
+                control
+                    .step(cancelled, InferencePhase::LambdaTelescope, cursor.index())
+                    .map_err(LeafHalt::stop)?;
+                control.progress.lambda_telescope_nodes =
+                    control.progress.lambda_telescope_nodes.saturating_add(1);
+                control.progress.lambda_binders = control.progress.lambda_binders.saturating_add(1);
+                binders.push(LambdaBinderSource {
+                    display_name: binder_name.clone(),
+                    style: *style,
+                    domain: TermReference {
+                        source: reference.source,
+                        root: *binder_type,
+                    },
+                });
+                cursor = *body;
+            }
+            if binders.len() > MAX_BVAR_INDEX as usize + 1 {
+                return Err(LeafHalt::stop(InferenceStop::Materialization {
+                    phase: InferencePhase::LambdaTelescope,
+                    stop: TermStop::Resource {
+                        limit: TermLimit::BoundIndex,
+                        allowed: u64::from(MAX_BVAR_INDEX).saturating_add(1),
+                        observed: usize_units(binders.len()),
+                        at: cursor.index(),
+                        completed_steps: control.progress.steps,
+                    },
+                    progress: control.progress,
+                }));
+            }
+            Ok(Dispatch::Lambda {
+                binders,
+                body: TermReference {
+                    source: reference.source,
+                    root: cursor,
+                },
+            })
+        }
         ExprNode::Forall { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Forall)),
         ExprNode::Let { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Let)),
         ExprNode::NatLiteral { .. } => Err(LeafHalt::Deferred(InferenceDeferred::NatLiteral)),
@@ -1133,11 +1663,592 @@ struct InferenceEngine<'a> {
     mode: InferenceMode,
     control: &'a mut Control,
     cancelled: &'a mut dyn FnMut() -> bool,
-    generated: Vec<WireExpr>,
+    generated: Vec<Arc<WireExpr>>,
+    scoped_locals: BTreeMap<WireName, Arc<WireExpr>>,
+    reserved_names: Option<BTreeSet<WireName>>,
+    next_local_identity: u64,
     continuations: Vec<Continuation>,
 }
 
+enum LambdaSchedule {
+    Query {
+        continuation: Continuation,
+        reference: TermReference,
+    },
+}
+
+fn reserve_free_names_in_term(
+    term: &WireExpr,
+    names: &mut BTreeSet<WireName>,
+    control: &mut Control,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(), LeafHalt> {
+    for (index, node) in term.nodes().iter().enumerate() {
+        control
+            .step(cancelled, InferencePhase::LocalIdentity, index)
+            .map_err(LeafHalt::stop)?;
+        let ExprNode::Free { name } = node else {
+            continue;
+        };
+        if names.insert(name.clone()) {
+            control.progress.reserved_free_names =
+                control.progress.reserved_free_names.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
 impl<'a> InferenceEngine<'a> {
+    fn initialize_reserved_names(&mut self) -> Result<(), LeafHalt> {
+        if self.reserved_names.is_some() {
+            return Ok(());
+        }
+
+        let mut names = BTreeSet::new();
+        reserve_free_names_in_term(self.input, &mut names, self.control, self.cancelled)?;
+        for local in self.context.locals() {
+            self.control
+                .step(self.cancelled, InferencePhase::LocalIdentity, names.len())
+                .map_err(LeafHalt::stop)?;
+            if names.insert(local.name().clone()) {
+                self.control.progress.reserved_free_names =
+                    self.control.progress.reserved_free_names.saturating_add(1);
+            }
+            reserve_free_names_in_term(local.type_(), &mut names, self.control, self.cancelled)?;
+            if let Some(value) = local.value() {
+                reserve_free_names_in_term(value, &mut names, self.control, self.cancelled)?;
+            }
+        }
+        for (name, declaration) in self.context.constants().constants() {
+            self.control
+                .step(self.cancelled, InferencePhase::LocalIdentity, names.len())
+                .map_err(LeafHalt::stop)?;
+            if names.insert(name.clone()) {
+                self.control.progress.reserved_free_names =
+                    self.control.progress.reserved_free_names.saturating_add(1);
+            }
+            reserve_free_names_in_term(
+                declaration.type_(),
+                &mut names,
+                self.control,
+                self.cancelled,
+            )?;
+            if let Some(definition) = declaration.definition_body() {
+                reserve_free_names_in_term(
+                    definition.value(),
+                    &mut names,
+                    self.control,
+                    self.cancelled,
+                )?;
+            }
+        }
+        self.reserved_names = Some(names);
+        Ok(())
+    }
+
+    fn fresh_local_name(&mut self) -> Result<WireName, LeafHalt> {
+        self.initialize_reserved_names()?;
+        loop {
+            self.control
+                .step(
+                    self.cancelled,
+                    InferencePhase::LocalIdentity,
+                    usize::try_from(self.next_local_identity).unwrap_or(usize::MAX),
+                )
+                .map_err(LeafHalt::stop)?;
+            self.control.progress.local_identity_candidates = self
+                .control
+                .progress
+                .local_identity_candidates
+                .saturating_add(1);
+            let candidate = WireName::from_parts(vec![
+                NamePart::Text("_fln_checker_local".to_owned()),
+                NamePart::Numeric {
+                    value: self.next_local_identity,
+                    overflowed: false,
+                },
+            ]);
+            self.next_local_identity = self
+                .next_local_identity
+                .checked_add(1)
+                .ok_or(LeafHalt::Fault(InferenceFault::FreshLocalIdentityExhausted))?;
+            let names = self
+                .reserved_names
+                .as_mut()
+                .ok_or(LeafHalt::Fault(InferenceFault::FreshLocalIdentityExhausted))?;
+            if names.insert(candidate.clone()) {
+                self.control.progress.reserved_free_names =
+                    self.control.progress.reserved_free_names.saturating_add(1);
+                return Ok(candidate);
+            }
+        }
+    }
+
+    fn store_generated(&mut self, term: Arc<WireExpr>) -> TermReference {
+        let generation = self.generated.len();
+        let root = term.root();
+        self.generated.push(term);
+        TermReference {
+            source: ArenaSource::Generated(generation),
+            root,
+        }
+    }
+
+    fn materialize_free_reference(&mut self, name: &WireName) -> Result<TermReference, LeafHalt> {
+        let term = map_materialization(
+            materialize_free(name, self.control.budget.materialization, self.cancelled),
+            InferencePhase::LocalIdentity,
+            self.control.progress,
+        )?;
+        Ok(self.store_generated(Arc::new(term)))
+    }
+
+    fn materialize_lambda_subterm(
+        &mut self,
+        reference: TermReference,
+        binders: &[LambdaBinder],
+        phase: InferencePhase,
+    ) -> Result<WireExpr, LeafHalt> {
+        let source = inference_arena(self.input, &self.generated, reference.source)?;
+        let mut result = map_materialization(
+            copy_compact_subterm_with(
+                source,
+                reference.root,
+                self.control.budget.materialization,
+                self.cancelled,
+            ),
+            phase,
+            self.control.progress,
+        )?;
+        let external_bound_span = match inspect_with(
+            &result,
+            self.control.budget.inspection,
+            &mut *self.cancelled,
+        ) {
+            TermOutcome::Complete(facts) => facts.external_bound_span,
+            TermOutcome::Inconclusive(stop) => {
+                return Err(LeafHalt::stop(InferenceStop::Inspection {
+                    stop,
+                    progress: self.control.progress,
+                }));
+            }
+            TermOutcome::InternalFault(fault) => {
+                return Err(LeafHalt::Fault(InferenceFault::Inspection(fault)));
+            }
+        };
+        let needed = usize::try_from(external_bound_span).map_err(|_| {
+            LeafHalt::Fault(InferenceFault::LooseBoundVariables {
+                external_bound_span,
+            })
+        })?;
+        if needed > binders.len() {
+            return Err(LeafHalt::Fault(InferenceFault::LooseBoundVariables {
+                external_bound_span,
+            }));
+        }
+
+        let first = binders.len() - needed;
+        for binder in binders[first..].iter().rev() {
+            let replacement =
+                inference_arena(self.input, &self.generated, binder.local_reference.source)?;
+            let root = result.root();
+            result = map_materialization(
+                substitute_bound_subterms_with(
+                    &result,
+                    root,
+                    0,
+                    replacement,
+                    binder.local_reference.root,
+                    self.control.budget.materialization,
+                    self.cancelled,
+                ),
+                phase,
+                self.control.progress,
+            )?;
+        }
+        Ok(result)
+    }
+
+    fn install_lambda_binder(
+        &mut self,
+        state: &mut LambdaState,
+        domain: Arc<WireExpr>,
+        local_name: WireName,
+        local_reference: TermReference,
+    ) -> Result<(), LeafHalt> {
+        let source = state
+            .sources
+            .get(state.next)
+            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        if self
+            .scoped_locals
+            .insert(local_name.clone(), Arc::clone(&domain))
+            .is_some()
+        {
+            return Err(LeafHalt::Fault(InferenceFault::ScopedLocalCollision {
+                name: local_name,
+            }));
+        }
+        state.binders.push(LambdaBinder {
+            display_name: source.display_name.clone(),
+            style: source.style,
+            local_name,
+            local_reference,
+            domain,
+        });
+        state.next = state.next.saturating_add(1);
+        Ok(())
+    }
+
+    fn schedule_lambda(&mut self, mut state: Box<LambdaState>) -> Result<LambdaSchedule, LeafHalt> {
+        while state.next < state.sources.len() {
+            let source = state
+                .sources
+                .get(state.next)
+                .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+            self.control
+                .step(
+                    self.cancelled,
+                    InferencePhase::LambdaDomain,
+                    source.domain.root.index(),
+                )
+                .map_err(LeafHalt::stop)?;
+            let domain = Arc::new(self.materialize_lambda_subterm(
+                source.domain,
+                &state.binders,
+                InferencePhase::LambdaDomain,
+            )?);
+            let domain_reference = self.store_generated(Arc::clone(&domain));
+            let local_name = self.fresh_local_name()?;
+            let local_reference = self.materialize_free_reference(&local_name)?;
+
+            if self.mode.is_checking() {
+                self.control.progress.lambda_domain_queries = self
+                    .control
+                    .progress
+                    .lambda_domain_queries
+                    .saturating_add(1);
+                return Ok(LambdaSchedule::Query {
+                    continuation: Continuation::LambdaDomain {
+                        state,
+                        domain,
+                        local_name,
+                        local_reference,
+                    },
+                    reference: domain_reference,
+                });
+            }
+
+            self.install_lambda_binder(&mut state, domain, local_name, local_reference)?;
+        }
+
+        self.control
+            .step(
+                self.cancelled,
+                InferencePhase::LambdaBody,
+                state.body.root.index(),
+            )
+            .map_err(LeafHalt::stop)?;
+        let body = Arc::new(self.materialize_lambda_subterm(
+            state.body,
+            &state.binders,
+            InferencePhase::LambdaBody,
+        )?);
+        let reference = self.store_generated(body);
+        self.control.progress.lambda_body_queries =
+            self.control.progress.lambda_body_queries.saturating_add(1);
+        Ok(LambdaSchedule::Query {
+            continuation: Continuation::LambdaBody { state },
+            reference,
+        })
+    }
+
+    fn ensure_binder_sort(
+        &mut self,
+        binder: usize,
+        inferred_type: &WireExpr,
+    ) -> Result<(), LeafHalt> {
+        self.control
+            .step(self.cancelled, InferencePhase::BinderSort, binder)
+            .map_err(LeafHalt::stop)?;
+        self.control.progress.binder_sort_checks =
+            self.control.progress.binder_sort_checks.saturating_add(1);
+        self.control.progress.whnf_queries = self.control.progress.whnf_queries.saturating_add(1);
+        let reduced = match whnf_with(
+            inferred_type,
+            self.context.reduction(),
+            self.control.budget.whnf,
+            &mut *self.cancelled,
+        ) {
+            WhnfOutcome::Complete(result) => result.term,
+            WhnfOutcome::Refused(refusal) => {
+                return Err(LeafHalt::Refused(
+                    InferenceRefusal::BinderReductionRefusal { binder, refusal },
+                ));
+            }
+            WhnfOutcome::Inconclusive(stop) => {
+                return Err(LeafHalt::stop(InferenceStop::BinderWhnf {
+                    binder,
+                    stop: Box::new(stop),
+                    progress: self.control.progress,
+                }));
+            }
+            WhnfOutcome::InternalFault(fault) => {
+                return Err(LeafHalt::Fault(InferenceFault::BinderWhnf {
+                    binder,
+                    fault,
+                }));
+            }
+        };
+        if matches!(reduced.node(reduced.root()), Some(ExprNode::Sort { .. })) {
+            Ok(())
+        } else {
+            Err(LeafHalt::Refused(InferenceRefusal::BinderTypeExpected {
+                binder,
+            }))
+        }
+    }
+
+    fn copy_cheap_beta_subterm(
+        &mut self,
+        term: &WireExpr,
+        root: ExprId,
+    ) -> Result<WireExpr, LeafHalt> {
+        map_materialization(
+            copy_compact_subterm_with(
+                term,
+                root,
+                self.control.budget.materialization,
+                self.cancelled,
+            ),
+            InferencePhase::CheapBeta,
+            self.control.progress,
+        )
+    }
+
+    fn cheap_beta_reduce(&mut self, term: WireExpr) -> Result<WireExpr, LeafHalt> {
+        if !matches!(term.node(term.root()), Some(ExprNode::Apply { .. })) {
+            return Ok(term);
+        }
+
+        let mut head = term.root();
+        let mut arguments = Vec::new();
+        loop {
+            let node =
+                term.node(head)
+                    .ok_or(LeafHalt::Fault(InferenceFault::MissingExpression {
+                        index: head.index(),
+                    }))?;
+            let ExprNode::Apply { function, argument } = node else {
+                break;
+            };
+            self.control
+                .step(self.cancelled, InferencePhase::CheapBeta, head.index())
+                .map_err(LeafHalt::stop)?;
+            self.control.progress.cheap_beta_steps =
+                self.control.progress.cheap_beta_steps.saturating_add(1);
+            arguments.push(*argument);
+            head = *function;
+        }
+        arguments.reverse();
+
+        let mut consumed = 0usize;
+        while consumed < arguments.len() {
+            let node =
+                term.node(head)
+                    .ok_or(LeafHalt::Fault(InferenceFault::MissingExpression {
+                        index: head.index(),
+                    }))?;
+            let ExprNode::Lambda { body, .. } = node else {
+                break;
+            };
+            self.control
+                .step(self.cancelled, InferencePhase::CheapBeta, head.index())
+                .map_err(LeafHalt::stop)?;
+            self.control.progress.cheap_beta_steps =
+                self.control.progress.cheap_beta_steps.saturating_add(1);
+            head = *body;
+            consumed = consumed.saturating_add(1);
+        }
+        if consumed == 0 {
+            return Ok(term);
+        }
+
+        let selected = match term.node(head) {
+            Some(ExprNode::Bound { index })
+                if usize::try_from(*index)
+                    .ok()
+                    .is_some_and(|index| index < consumed) =>
+            {
+                let index = usize::try_from(*index).map_err(|_| {
+                    LeafHalt::Fault(InferenceFault::LooseBoundVariables {
+                        external_bound_span: index.saturating_add(1),
+                    })
+                })?;
+                let argument = consumed - 1 - index;
+                self.copy_cheap_beta_subterm(
+                    &term,
+                    *arguments
+                        .get(argument)
+                        .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?,
+                )?
+            }
+            Some(ExprNode::Bound { .. }) => return Ok(term),
+            Some(_) => {
+                let candidate = self.copy_cheap_beta_subterm(&term, head)?;
+                let facts = match inspect_with(
+                    &candidate,
+                    self.control.budget.inspection,
+                    &mut *self.cancelled,
+                ) {
+                    TermOutcome::Complete(facts) => facts,
+                    TermOutcome::Inconclusive(stop) => {
+                        return Err(LeafHalt::stop(InferenceStop::Inspection {
+                            stop,
+                            progress: self.control.progress,
+                        }));
+                    }
+                    TermOutcome::InternalFault(fault) => {
+                        return Err(LeafHalt::Fault(InferenceFault::Inspection(fault)));
+                    }
+                };
+                if facts.external_bound_span != 0 {
+                    return Ok(term);
+                }
+                candidate
+            }
+            None => {
+                return Err(LeafHalt::Fault(InferenceFault::MissingExpression {
+                    index: head.index(),
+                }));
+            }
+        };
+
+        if consumed == arguments.len() {
+            return Ok(selected);
+        }
+        let mut residual_arguments = Vec::with_capacity(arguments.len() - consumed);
+        for argument in &arguments[consumed..] {
+            residual_arguments.push(self.copy_cheap_beta_subterm(&term, *argument)?);
+        }
+        let progress = self.control.progress;
+        let mut assembler =
+            ArenaAssembler::new(self.control.budget.materialization, &mut *self.cancelled);
+        let mut root = map_assembly(
+            assembler.append(&selected),
+            InferencePhase::CheapBeta,
+            progress,
+        )?;
+        for compact in &residual_arguments {
+            let argument_root = map_assembly(
+                assembler.append(compact),
+                InferencePhase::CheapBeta,
+                progress,
+            )?;
+            root = map_assembly(
+                assembler.push_apply(root, argument_root),
+                InferencePhase::CheapBeta,
+                progress,
+            )?;
+        }
+        Ok(assembler.finish(root))
+    }
+
+    fn complete_lambda(
+        &mut self,
+        state: LambdaState,
+        body_type: WireExpr,
+    ) -> Result<WireExpr, LeafHalt> {
+        let body_type = self.cheap_beta_reduce(body_type)?;
+        for binder in state.binders.iter().rev() {
+            if self.scoped_locals.remove(&binder.local_name).is_none() {
+                return Err(LeafHalt::Fault(InferenceFault::MissingScopedLocal {
+                    name: binder.local_name.clone(),
+                }));
+            }
+        }
+
+        let binder_count = u32::try_from(state.binders.len()).map_err(|_| {
+            LeafHalt::stop(InferenceStop::Materialization {
+                phase: InferencePhase::PiAbstraction,
+                stop: TermStop::Resource {
+                    limit: TermLimit::BoundIndex,
+                    allowed: u64::from(MAX_BVAR_INDEX).saturating_add(1),
+                    observed: usize_units(state.binders.len()),
+                    at: state.binders.len(),
+                    completed_steps: self.control.progress.steps,
+                },
+                progress: self.control.progress,
+            })
+        })?;
+        let mut ordinals = BTreeMap::new();
+        for (index, binder) in state.binders.iter().enumerate() {
+            let ordinal = u32::try_from(index)
+                .map_err(|_| LeafHalt::Fault(InferenceFault::FreshLocalIdentityExhausted))?;
+            if ordinals
+                .insert(binder.local_name.clone(), ordinal)
+                .is_some()
+            {
+                return Err(LeafHalt::Fault(InferenceFault::ScopedLocalCollision {
+                    name: binder.local_name.clone(),
+                }));
+            }
+        }
+
+        let body = map_materialization(
+            abstract_free_telescope_with(
+                &body_type,
+                &ordinals,
+                binder_count,
+                self.control.budget.materialization,
+                self.cancelled,
+            ),
+            InferencePhase::PiAbstraction,
+            self.control.progress,
+        )?;
+        let mut domains = Vec::with_capacity(state.binders.len());
+        for (index, binder) in state.binders.iter().enumerate() {
+            let active = u32::try_from(index)
+                .map_err(|_| LeafHalt::Fault(InferenceFault::FreshLocalIdentityExhausted))?;
+            domains.push(map_materialization(
+                abstract_free_telescope_with(
+                    &binder.domain,
+                    &ordinals,
+                    active,
+                    self.control.budget.materialization,
+                    self.cancelled,
+                ),
+                InferencePhase::PiAbstraction,
+                self.control.progress,
+            )?);
+        }
+
+        let progress = self.control.progress;
+        let mut assembler =
+            ArenaAssembler::new(self.control.budget.materialization, &mut *self.cancelled);
+        let mut domain_roots = Vec::with_capacity(domains.len());
+        for domain in &domains {
+            domain_roots.push(map_assembly(
+                assembler.append(domain),
+                InferencePhase::PiAbstraction,
+                progress,
+            )?);
+        }
+        let mut root = map_assembly(
+            assembler.append(&body),
+            InferencePhase::PiAbstraction,
+            progress,
+        )?;
+        for (binder, domain_root) in state.binders.iter().zip(domain_roots).rev() {
+            root = map_assembly(
+                assembler.push_forall(&binder.display_name, binder.style, domain_root, root),
+                InferencePhase::PiAbstraction,
+                progress,
+            )?;
+        }
+        Ok(assembler.finish(root))
+    }
+
     fn materialize_reference(
         &mut self,
         reference: TermReference,
@@ -1156,7 +2267,7 @@ impl<'a> InferenceEngine<'a> {
                 InferencePhase::ApplicationTerm,
                 reference.root.index(),
             )
-            .map_err(LeafHalt::Stop)?;
+            .map_err(LeafHalt::stop)?;
         let result = {
             let arena = inference_arena(self.input, &self.generated, reference.source)?;
             copy_subterm_with(
@@ -1173,7 +2284,7 @@ impl<'a> InferenceEngine<'a> {
         )?;
         let generation = self.generated.len();
         let root = term.root();
-        self.generated.push(term);
+        self.generated.push(Arc::new(term));
         Ok(TermReference {
             source: ArenaSource::Generated(generation),
             root,
@@ -1203,7 +2314,7 @@ impl<'a> InferenceEngine<'a> {
         ) {
             TermOutcome::Complete(facts) => facts.external_bound_span,
             TermOutcome::Inconclusive(stop) => {
-                return Err(LeafHalt::Stop(InferenceStop::Inspection {
+                return Err(LeafHalt::stop(InferenceStop::Inspection {
                     stop,
                     progress: self.control.progress,
                 }));
@@ -1256,7 +2367,7 @@ impl<'a> InferenceEngine<'a> {
                 InferencePhase::FunctionType,
                 function.root.index(),
             )
-            .map_err(LeafHalt::Stop)?;
+            .map_err(LeafHalt::stop)?;
         if !matches!(
             function.term.node(function.root),
             Some(ExprNode::Forall { .. })
@@ -1282,7 +2393,7 @@ impl<'a> InferenceEngine<'a> {
                     }));
                 }
                 WhnfOutcome::Inconclusive(stop) => {
-                    return Err(LeafHalt::Stop(InferenceStop::Whnf {
+                    return Err(LeafHalt::stop(InferenceStop::Whnf {
                         argument,
                         stop: Box::new(stop),
                         progress: self.control.progress,
@@ -1345,7 +2456,7 @@ impl<'a> InferenceEngine<'a> {
                     InferencePhase::DomainComparison,
                     cursor.index(),
                 )
-                .map_err(LeafHalt::Stop)?;
+                .map_err(LeafHalt::stop)?;
             arity = arity.saturating_add(1);
             if arity > 2 {
                 return Ok(ConversionMode::Ordinary);
@@ -1381,7 +2492,7 @@ impl<'a> InferenceEngine<'a> {
                     InferencePhase::ApplicationSpine,
                     argument.root.index(),
                 )
-                .map_err(LeafHalt::Stop)?;
+                .map_err(LeafHalt::stop)?;
             self.control.progress.application_arguments = self
                 .control
                 .progress
@@ -1411,7 +2522,7 @@ impl<'a> InferenceEngine<'a> {
                 InferencePhase::ArgumentType,
                 argument.root.index(),
             )
-            .map_err(LeafHalt::Stop)?;
+            .map_err(LeafHalt::stop)?;
         self.control.progress.application_arguments = self
             .control
             .progress
@@ -1450,7 +2561,7 @@ impl<'a> InferenceEngine<'a> {
     ) -> Result<(), LeafHalt> {
         self.control
             .step(self.cancelled, InferencePhase::DomainComparison, argument)
-            .map_err(LeafHalt::Stop)?;
+            .map_err(LeafHalt::stop)?;
         self.control.progress.defeq_queries = self.control.progress.defeq_queries.saturating_add(1);
         // The current independent conversion engine has no eager-sensitive
         // native or open-pair reduction rule. Carry the marker as query-local
@@ -1480,7 +2591,7 @@ impl<'a> InferenceEngine<'a> {
                     refusal,
                 }))
             }
-            DefEqOutcome::Inconclusive(stop) => Err(LeafHalt::Stop(InferenceStop::DefEq {
+            DefEqOutcome::Inconclusive(stop) => Err(LeafHalt::stop(InferenceStop::DefEq {
                 argument,
                 stop: Box::new(stop),
                 progress: self.control.progress,
@@ -1505,8 +2616,11 @@ impl<'a> InferenceEngine<'a> {
                     self.input,
                     &self.generated,
                     reference,
-                    self.context,
-                    self.mode,
+                    DispatchScope {
+                        context: self.context,
+                        scoped_locals: &self.scoped_locals,
+                        mode: self.mode,
+                    },
                     self.control,
                     self.cancelled,
                 )? {
@@ -1515,6 +2629,20 @@ impl<'a> InferenceEngine<'a> {
                         self.continuations
                             .push(Continuation::ApplicationHead { arguments });
                         current = Some(head);
+                    }
+                    Dispatch::Lambda { binders, body } => {
+                        let state = Box::new(LambdaState {
+                            sources: binders,
+                            body,
+                            binders: Vec::new(),
+                            next: 0,
+                        });
+                        let LambdaSchedule::Query {
+                            continuation,
+                            reference,
+                        } = self.schedule_lambda(state)?;
+                        self.continuations.push(continuation);
+                        current = Some(reference);
                     }
                 }
                 continue;
@@ -1566,6 +2694,24 @@ impl<'a> InferenceEngine<'a> {
                         current = Some(argument);
                     }
                 }
+                Continuation::LambdaDomain {
+                    mut state,
+                    domain,
+                    local_name,
+                    local_reference,
+                } => {
+                    self.ensure_binder_sort(state.next, &value)?;
+                    self.install_lambda_binder(&mut state, domain, local_name, local_reference)?;
+                    let LambdaSchedule::Query {
+                        continuation,
+                        reference,
+                    } = self.schedule_lambda(state)?;
+                    self.continuations.push(continuation);
+                    current = Some(reference);
+                }
+                Continuation::LambdaBody { state } => {
+                    inferred = Some(self.complete_lambda(*state, value)?);
+                }
             }
         }
     }
@@ -1595,6 +2741,9 @@ pub fn infer_with(
         control: &mut control,
         cancelled: &mut cancelled,
         generated: Vec::new(),
+        scoped_locals: BTreeMap::new(),
+        reserved_names: None,
+        next_local_identity: 0,
         continuations: Vec::new(),
     }
     .run();
@@ -1623,6 +2772,107 @@ mod tests {
                 }),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn private_malformed_lambda_child_is_an_internal_fault_and_recovery_is_clean() {
+        let domain = ExprId::from_index(0).expect("zero expression index exists");
+        let body = ExprId::from_index(7).expect("small expression index exists");
+        let root = ExprId::from_index(1).expect("one expression index exists");
+        let broken = WireExpr::from_parts(
+            vec![
+                ExprNode::NatLiteral {
+                    limbs_le: Vec::new(),
+                },
+                ExprNode::Lambda {
+                    binder_name: WireName::default(),
+                    binder_type: domain,
+                    body,
+                    style: BinderStyle::Default,
+                },
+            ],
+            Vec::new(),
+            root,
+        );
+        let context = InferenceContext::empty(ConstantEnvironment::empty());
+        assert!(matches!(
+            infer(
+                &broken,
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::InternalFault {
+                fault: InferenceFault::Inspection(TermFault::NonBackwardExpressionReference {
+                    input: TermInput::Subject,
+                    parent: 1,
+                    child: 7,
+                }),
+                ..
+            }
+        ));
+
+        let zero = LevelId::from_index(0).expect("zero level index exists");
+        let healthy_root = ExprId::from_index(0).expect("zero expression index exists");
+        let healthy = WireExpr::from_parts(
+            vec![ExprNode::Sort { level: zero }],
+            vec![LevelNode::Zero],
+            healthy_root,
+        );
+        assert!(matches!(
+            infer(
+                &healthy,
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn private_lambda_compacts_shared_level_dependencies_in_dependency_order() {
+        let zero = LevelId::from_index(0).expect("zero level index exists");
+        let one = LevelId::from_index(1).expect("one level index exists");
+        let two = LevelId::from_index(2).expect("two level index exists");
+        let maximum = LevelId::from_index(3).expect("three level index exists");
+        let domain = ExprId::from_index(0).expect("zero expression index exists");
+        let body = ExprId::from_index(1).expect("one expression index exists");
+        let root = ExprId::from_index(2).expect("two expression index exists");
+        let lambda = WireExpr::from_parts(
+            vec![
+                ExprNode::Sort { level: maximum },
+                ExprNode::Bound { index: 0 },
+                ExprNode::Lambda {
+                    binder_name: WireName::default(),
+                    binder_type: domain,
+                    body,
+                    style: BinderStyle::Default,
+                },
+            ],
+            vec![
+                LevelNode::Zero,
+                LevelNode::Succ(zero),
+                LevelNode::Succ(one),
+                LevelNode::Max(two, one),
+            ],
+            root,
+        );
+        assert!(matches!(
+            infer(
+                &lambda,
+                &InferenceContext::empty(ConstantEnvironment::empty()),
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Complete(InferenceResult {
+                progress: InferenceProgress {
+                    lambda_binders: 1,
+                    ..
+                },
+                ..
+            })
         ));
     }
 }

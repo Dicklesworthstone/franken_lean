@@ -6,6 +6,8 @@
 //! share one node beneath different binder depths, and scope is a property of the
 //! occurrence, not merely of the arena slot.
 
+use std::collections::BTreeMap;
+
 use crate::wire::{
     ExprId, ExprNode, LevelId, LevelNode, MAX_BVAR_INDEX, MetadataValue, WireExpr, WireName,
     expression_owned_units, level_owned_units, usize_units,
@@ -424,22 +426,34 @@ enum Mode {
 #[derive(Debug, Clone, Copy)]
 enum Operation<'a> {
     Raise,
-    Bound { target: u32 },
-    Close { name: &'a WireName },
-    Free { name: &'a WireName },
+    Bound {
+        target: u32,
+    },
+    Close {
+        name: &'a WireName,
+    },
+    CloseMany {
+        ordinals: &'a BTreeMap<WireName, u32>,
+        binder_count: u32,
+    },
+    Free {
+        name: &'a WireName,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransformPlan<'a> {
+    replacement: Option<(&'a WireExpr, ExprId)>,
+    operation: Operation<'a>,
+    root_mode: Mode,
+    compact_levels: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum FreeAction {
     Retain,
-    Close { scope: u64 },
+    Close { index: u64 },
     Replace { scope: u64 },
-}
-
-enum LevelPlan {
-    Ready(LevelNode),
-    Parameter,
-    Meta,
 }
 
 #[derive(Debug, Clone)]
@@ -485,6 +499,8 @@ struct Transformer<'a, 'c> {
     nodes: Vec<ExprNode>,
     levels: Vec<LevelNode>,
     level_maps: [Option<Vec<LevelId>>; 2],
+    compact_level_maps: [BTreeMap<usize, LevelId>; 2],
+    compact_levels: bool,
     values: Vec<ExprId>,
     tasks: Vec<Task>,
 }
@@ -591,6 +607,9 @@ impl<'a, 'c> Transformer<'a, 'c> {
     }
 
     fn mapped_level(&mut self, input: TermInput, id: LevelId) -> Result<LevelId, Halt> {
+        if self.compact_levels {
+            return self.ensure_compact_level(input, id);
+        }
         self.ensure_levels(input)?;
         self.level_maps[Self::map_index(input)]
             .as_ref()
@@ -611,55 +630,28 @@ impl<'a, 'c> Transformer<'a, 'c> {
         let mut mapping = Vec::new();
         for index in 0..source_len {
             self.control.step(index)?;
-            let (plan, output_units) = {
-                let node = self
-                    .input(input)?
-                    .levels()
-                    .get(index)
-                    .ok_or(Halt::Fault(TermFault::MissingLevel { input, index }))?;
-                let plan = match node {
-                    LevelNode::Zero => LevelPlan::Ready(LevelNode::Zero),
-                    LevelNode::Succ(child) => LevelPlan::Ready(LevelNode::Succ(
-                        Self::mapped_prior_level(&mapping, input, index, *child)?,
-                    )),
-                    LevelNode::Max(left, right) => LevelPlan::Ready(LevelNode::Max(
-                        Self::mapped_prior_level(&mapping, input, index, *left)?,
-                        Self::mapped_prior_level(&mapping, input, index, *right)?,
-                    )),
-                    LevelNode::IMax(left, right) => LevelPlan::Ready(LevelNode::IMax(
-                        Self::mapped_prior_level(&mapping, input, index, *left)?,
-                        Self::mapped_prior_level(&mapping, input, index, *right)?,
-                    )),
-                    LevelNode::Parameter(_) => LevelPlan::Parameter,
-                    LevelNode::Meta(_) => LevelPlan::Meta,
-                };
-                (plan, level_owned_units(node))
-            };
-            self.control.output(output_units, index)?;
-            let mapped = match plan {
-                LevelPlan::Ready(node) => node,
-                LevelPlan::Parameter => {
-                    let LevelNode::Parameter(name) = self
-                        .input(input)?
-                        .levels()
-                        .get(index)
-                        .ok_or(Halt::Fault(TermFault::MissingLevel { input, index }))?
-                    else {
-                        return Err(Halt::Fault(TermFault::MissingLevel { input, index }));
-                    };
-                    LevelNode::Parameter(name.clone())
+            let node = self
+                .input(input)?
+                .levels()
+                .get(index)
+                .ok_or(Halt::Fault(TermFault::MissingLevel { input, index }))?
+                .clone();
+            self.control.output(level_owned_units(&node), index)?;
+            let mapped = match node {
+                LevelNode::Zero => LevelNode::Zero,
+                LevelNode::Succ(child) => {
+                    LevelNode::Succ(Self::mapped_prior_level(&mapping, input, index, child)?)
                 }
-                LevelPlan::Meta => {
-                    let LevelNode::Meta(name) = self
-                        .input(input)?
-                        .levels()
-                        .get(index)
-                        .ok_or(Halt::Fault(TermFault::MissingLevel { input, index }))?
-                    else {
-                        return Err(Halt::Fault(TermFault::MissingLevel { input, index }));
-                    };
-                    LevelNode::Meta(name.clone())
-                }
+                LevelNode::Max(left, right) => LevelNode::Max(
+                    Self::mapped_prior_level(&mapping, input, index, left)?,
+                    Self::mapped_prior_level(&mapping, input, index, right)?,
+                ),
+                LevelNode::IMax(left, right) => LevelNode::IMax(
+                    Self::mapped_prior_level(&mapping, input, index, left)?,
+                    Self::mapped_prior_level(&mapping, input, index, right)?,
+                ),
+                LevelNode::Parameter(name) => LevelNode::Parameter(name),
+                LevelNode::Meta(name) => LevelNode::Meta(name),
             };
             let observed = usize_units(self.levels.len()).saturating_add(1);
             self.control.admit_arena_node(observed, index)?;
@@ -670,6 +662,121 @@ impl<'a, 'c> Transformer<'a, 'c> {
         }
         self.level_maps[map_index] = Some(mapping);
         Ok(())
+    }
+
+    fn ensure_compact_level(&mut self, input: TermInput, root: LevelId) -> Result<LevelId, Halt> {
+        let map_index = Self::map_index(input);
+        if let Some(mapped) = self.compact_level_maps[map_index].get(&root.index()) {
+            return Ok(*mapped);
+        }
+        if self.input(input)?.level(root).is_none() {
+            return Err(Halt::Fault(TermFault::MissingLevel {
+                input,
+                index: root.index(),
+            }));
+        }
+
+        let mut stack = vec![(root, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if self.compact_level_maps[map_index].contains_key(&id.index()) {
+                continue;
+            }
+            let node = self
+                .input(input)?
+                .level(id)
+                .ok_or(Halt::Fault(TermFault::MissingLevel {
+                    input,
+                    index: id.index(),
+                }))?
+                .clone();
+            let children = match &node {
+                LevelNode::Succ(child) => vec![*child],
+                LevelNode::Max(left, right) | LevelNode::IMax(left, right) => {
+                    vec![*left, *right]
+                }
+                LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_) => Vec::new(),
+            };
+            for child in &children {
+                if child.index() >= id.index() {
+                    return Err(Halt::Fault(TermFault::NonBackwardLevelReference {
+                        input,
+                        parent: id.index(),
+                        child: child.index(),
+                    }));
+                }
+                if self.input(input)?.level(*child).is_none() {
+                    return Err(Halt::Fault(TermFault::MissingLevel {
+                        input,
+                        index: child.index(),
+                    }));
+                }
+            }
+            if !expanded {
+                stack.push((id, true));
+                for child in children.into_iter().rev() {
+                    if !self.compact_level_maps[map_index].contains_key(&child.index()) {
+                        stack.push((child, false));
+                    }
+                }
+                continue;
+            }
+
+            self.control.step(id.index())?;
+            self.control.output(level_owned_units(&node), id.index())?;
+            let mapped_node = match node {
+                LevelNode::Zero => LevelNode::Zero,
+                LevelNode::Succ(child) => LevelNode::Succ(Self::mapped_compact_level(
+                    &self.compact_level_maps[map_index],
+                    input,
+                    id.index(),
+                    child,
+                )?),
+                LevelNode::Max(left, right) => LevelNode::Max(
+                    Self::mapped_compact_level(
+                        &self.compact_level_maps[map_index],
+                        input,
+                        id.index(),
+                        left,
+                    )?,
+                    Self::mapped_compact_level(
+                        &self.compact_level_maps[map_index],
+                        input,
+                        id.index(),
+                        right,
+                    )?,
+                ),
+                LevelNode::IMax(left, right) => LevelNode::IMax(
+                    Self::mapped_compact_level(
+                        &self.compact_level_maps[map_index],
+                        input,
+                        id.index(),
+                        left,
+                    )?,
+                    Self::mapped_compact_level(
+                        &self.compact_level_maps[map_index],
+                        input,
+                        id.index(),
+                        right,
+                    )?,
+                ),
+                LevelNode::Parameter(name) => LevelNode::Parameter(name),
+                LevelNode::Meta(name) => LevelNode::Meta(name),
+            };
+            let observed = usize_units(self.levels.len()).saturating_add(1);
+            self.control.admit_arena_node(observed, id.index())?;
+            let mapped = LevelId::from_index(self.levels.len())
+                .ok_or_else(|| self.control.arena_nodes(observed, id.index()))?;
+            self.levels.push(mapped_node);
+            self.compact_level_maps[map_index].insert(id.index(), mapped);
+        }
+
+        self.compact_level_maps[map_index]
+            .get(&root.index())
+            .copied()
+            .ok_or(Halt::Fault(TermFault::MissingLevel {
+                input,
+                index: root.index(),
+            }))
     }
 
     fn mapped_prior_level(
@@ -687,6 +794,28 @@ impl<'a, 'c> Transformer<'a, 'c> {
         }
         mapping
             .get(child.index())
+            .copied()
+            .ok_or(Halt::Fault(TermFault::MissingLevel {
+                input,
+                index: child.index(),
+            }))
+    }
+
+    fn mapped_compact_level(
+        mapping: &BTreeMap<usize, LevelId>,
+        input: TermInput,
+        parent: usize,
+        child: LevelId,
+    ) -> Result<LevelId, Halt> {
+        if child.index() >= parent {
+            return Err(Halt::Fault(TermFault::NonBackwardLevelReference {
+                input,
+                parent,
+                child: child.index(),
+            }));
+        }
+        mapping
+            .get(&child.index())
             .copied()
             .ok_or(Halt::Fault(TermFault::MissingLevel {
                 input,
@@ -743,6 +872,11 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     let index = Self::raised(index, 1, scope, at, &self.control)?;
                     self.emit(ExprNode::Bound { index }, at)
                 }
+                Operation::CloseMany { binder_count, .. } => {
+                    let index =
+                        Self::raised(index, u64::from(binder_count), scope, at, &self.control)?;
+                    self.emit(ExprNode::Bound { index }, at)
+                }
                 Operation::Free { .. } => self.emit(ExprNode::Bound { index }, at),
             },
         }
@@ -779,8 +913,19 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     Mode::Raise { .. } => FreeAction::Retain,
                     Mode::Rewrite { scope } => match self.operation {
                         Operation::Close { name: target } if name == target => {
-                            FreeAction::Close { scope }
+                            FreeAction::Close { index: scope }
                         }
+                        Operation::CloseMany {
+                            ordinals,
+                            binder_count,
+                        } => match ordinals.get(name) {
+                            Some(ordinal) if *ordinal < binder_count => {
+                                let index =
+                                    u64::from(binder_count - 1 - *ordinal).saturating_add(scope);
+                                FreeAction::Close { index }
+                            }
+                            Some(_) | None => FreeAction::Retain,
+                        },
                         Operation::Free { name: target } if name == target => {
                             FreeAction::Replace { scope }
                         }
@@ -817,13 +962,13 @@ impl<'a, 'c> Transformer<'a, 'c> {
                     };
                     return self.retain_reserved(ExprNode::Free { name: name.clone() }, id.index());
                 }
-                FreeAction::Close { scope } => {
-                    if scope > u64::from(MAX_BVAR_INDEX) {
-                        return Err(self.control.bound_index(scope, id.index()));
+                FreeAction::Close { index } => {
+                    if index > u64::from(MAX_BVAR_INDEX) {
+                        return Err(self.control.bound_index(index, id.index()));
                     }
                     return self.emit(
                         ExprNode::Bound {
-                            index: scope as u32,
+                            index: index as u32,
                         },
                         id.index(),
                     );
@@ -1094,9 +1239,12 @@ fn transform_with(
     transform_subterms_with(
         subject,
         subject.root(),
-        replacement.map(|term| (term, term.root())),
-        operation,
-        root_mode,
+        TransformPlan {
+            replacement: replacement.map(|term| (term, term.root())),
+            operation,
+            root_mode,
+            compact_levels: false,
+        },
         budget,
         cancelled,
     )
@@ -1105,25 +1253,25 @@ fn transform_with(
 fn transform_subterms_with(
     subject: &WireExpr,
     subject_root: ExprId,
-    replacement: Option<(&WireExpr, ExprId)>,
-    operation: Operation<'_>,
-    root_mode: Mode,
+    plan: TransformPlan<'_>,
     budget: TermBudget,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> TermOutcome<WireExpr> {
     let transformer = Transformer {
         subject,
         subject_root,
-        replacement,
-        operation,
+        replacement: plan.replacement,
+        operation: plan.operation,
         control: Control::new(budget, cancelled),
         nodes: Vec::new(),
         levels: Vec::new(),
         level_maps: [None, None],
+        compact_level_maps: [BTreeMap::new(), BTreeMap::new()],
+        compact_levels: plan.compact_levels,
         values: Vec::new(),
         tasks: Vec::new(),
     };
-    outcome(transformer.run(root_mode))
+    outcome(transformer.run(plan.root_mode))
 }
 
 pub(crate) fn copy_subterm_with(
@@ -1135,9 +1283,32 @@ pub(crate) fn copy_subterm_with(
     transform_subterms_with(
         term,
         root,
-        None,
-        Operation::Raise,
-        Mode::Rewrite { scope: 0 },
+        TransformPlan {
+            replacement: None,
+            operation: Operation::Raise,
+            root_mode: Mode::Rewrite { scope: 0 },
+            compact_levels: false,
+        },
+        budget,
+        cancelled,
+    )
+}
+
+pub(crate) fn copy_compact_subterm_with(
+    term: &WireExpr,
+    root: ExprId,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<WireExpr> {
+    transform_subterms_with(
+        term,
+        root,
+        TransformPlan {
+            replacement: None,
+            operation: Operation::Raise,
+            root_mode: Mode::Rewrite { scope: 0 },
+            compact_levels: true,
+        },
         budget,
         cancelled,
     )
@@ -1155,9 +1326,12 @@ pub(crate) fn substitute_bound_subterms_with(
     transform_subterms_with(
         term,
         root,
-        Some((replacement, replacement_root)),
-        Operation::Bound { target: index },
-        Mode::Rewrite { scope: 0 },
+        TransformPlan {
+            replacement: Some((replacement, replacement_root)),
+            operation: Operation::Bound { target: index },
+            root_mode: Mode::Rewrite { scope: 0 },
+            compact_levels: false,
+        },
         budget,
         cancelled,
     )
@@ -1246,6 +1420,34 @@ pub fn abstract_free_with(
         Mode::Rewrite { scope: 0 },
         budget,
         &mut cancelled,
+    )
+}
+
+/// Close a term over an ordered telescope of query-local free names in one
+/// occurrence walk.
+///
+/// `ordinals` records each name's outer-to-inner binder position. A prefix of
+/// `binder_count` entries is in scope at the term root, so ordinal `0` becomes
+/// bound index `binder_count - 1` and the last active ordinal becomes index
+/// zero. Existing external bound variables are raised by the whole prefix at
+/// once. Names whose ordinal is outside the active prefix remain free.
+pub(crate) fn abstract_free_telescope_with(
+    term: &WireExpr,
+    ordinals: &BTreeMap<WireName, u32>,
+    binder_count: u32,
+    budget: TermBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> TermOutcome<WireExpr> {
+    transform_with(
+        term,
+        None,
+        Operation::CloseMany {
+            ordinals,
+            binder_count,
+        },
+        Mode::Rewrite { scope: 0 },
+        budget,
+        cancelled,
     )
 }
 
