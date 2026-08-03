@@ -370,7 +370,10 @@ const LANE_CITED_ROWS: usize = 1;
 /// task-plane corpus test added with them.
 /// 88 -> 89 at `16512624` (the stdio plane): FLN-UL-0311 cites the exact io_println
 /// swap-capture cell added with it; the slice's other 43 rows are prose.
-const SYMBOL_RESOLVED_ROWS: usize = 89;
+/// 89 -> 90 in the read/write-prims slice (fln-3gv 5b, landed with this movement):
+/// FLN-UL-0320 cites the exact io_file roundtrip cell added with it; the slice's other
+/// six rows are prose.
+const SYMBOL_RESOLVED_ROWS: usize = 90;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -418,7 +421,9 @@ const SYMBOL_RESOLVED_ROWS: usize = 89;
 /// English collisions and are deliberately excluded by the explicit-single-word rule.
 /// 100 -> 101 at `16512624`: the io_println cell's citation on FLN-UL-0311 is the one new
 /// resolving token; no pre-existing row lost one across the edit.
-const RESOLVING_CITATION_TOKENS: usize = 101;
+/// 101 -> 102 in the read/write-prims slice: FLN-UL-0320's io_file cell citation, again
+/// with no removal from any pre-existing row.
+const RESOLVING_CITATION_TOKENS: usize = 102;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -440,7 +445,9 @@ const RESOLVING_CITATION_TOKENS: usize = 101;
 /// 177 -> 220 at `16512624`: the stdio plane's 43 prose rows — the platform seam, handle
 /// class, error decoder, prims, stream fields, thread-current trio, init twin, and the
 /// mark-walk closure targets — land as suite-phrase prose exactly as the task manager's did.
-const PROSE_EVIDENCE_ROWS: usize = 220;
+/// 220 -> 226 in the read/write-prims slice: six prose rows (the two prims, the two live
+/// stream fields, and the two export attributes).
+const PROSE_EVIDENCE_ROWS: usize = 226;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
