@@ -666,7 +666,7 @@ fn deep_environment_child() -> Result<(), String> {
 }
 
 #[test]
-fn fifty_thousand_constants_and_a_deep_definition_body_fit_a_64k_stack() {
+fn fifty_thousand_definitions_and_a_deep_payload_fit_a_64k_stack() {
     const CHILD_ENV: &str = "FLN_CHECKER_ENVIRONMENT_DEEP_CHILD";
     if std::env::var_os(CHILD_ENV).is_some() {
         let result = std::thread::Builder::new()

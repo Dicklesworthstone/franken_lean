@@ -512,7 +512,7 @@ fn stuck_constants_never_delta_unfold() {
 }
 
 #[test]
-fn only_safe_definition_bodies_unfold_while_every_header_only_kind_stays_stuck() {
+fn safe_definitions_unfold_for_every_hint_while_non_safe_rows_stay_stuck() {
     let context = definition_context(vec![
         definition_entry(
             "safe_opaque",
