@@ -11,9 +11,9 @@
 //! parse time. `tools/structure-guard/src/ledger.rs` validates all six fields as non-empty
 //! and then constructs `LedgerRow { id, path }`, keeping two. The invariant, the evidence,
 //! the fallback and the no-claim boundary are checked for *the presence of text* and thrown
-//! away, so nothing downstream can ask whether any of them is still true. That is roughly
-//! 180 rows times four statements about what unsafe code does and why it is sound, joined to
-//! nothing.
+//! away, so nothing downstream can ask whether any of them is still true. At the current
+//! ledger frontier that is 266 rows times four statements about what unsafe code does and
+//! why it is sound, joined to nothing.
 //!
 //! # What this suite checks, which is one slice of that
 //!
@@ -356,16 +356,28 @@ const LANE_CITED_ROWS: usize = 1;
 /// 77 -> 80 at `1312dfa2`/`5b9dd3db` (the same landings as the token row above records):
 /// FLN-UL-0193 through 0201's ratchet rows minus their prose members, plus the bins row
 /// FLN-UL-0202, resolve as symbol-resolved; the prose class is unchanged at 121.
-const SYMBOL_RESOLVED_ROWS: usize = 80;
+///
+/// 80 -> 82 at `2f4a3b18`: FLN-UL-0216 and FLN-UL-0217 cite the exact ST-ref and UTF-8
+/// boundary test functions added with them; the other 13 slice-1 rows are prose.
+/// 82 -> 83 at `c7a95255`: FLN-UL-0226 cites the exact task/promise boundary test; its
+/// other eight slice-2 rows are prose.
+/// 83 -> 85 at `f3a0c5c9`: FLN-UL-0251 and FLN-UL-0252 cite the exact task-manager test.
+/// FLN-UL-0227 through 0250 say "manager" in ordinary prose and remain prose: the unrelated
+/// helper named `manager` is not evidence for those rows.
+/// 85 -> 86 at `eb6cf3c9`: FLN-UL-0264 cites the exact IO-wrapper boundary test; the other
+/// eleven slice-3b rows are prose.
+/// 86 -> 88 at `f882dd60`: both corpus rows, FLN-UL-0265 and FLN-UL-0266, cite the exact
+/// task-plane corpus test added with them.
+const SYMBOL_RESOLVED_ROWS: usize = 88;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
-/// Pinned SEPARATELY from the row count because the row count cannot see individual
-/// citation rot: `FLN-UL-0007` cites two symbols, so renaming one leaves the row
+/// Pinned SEPARATELY from the row count because the row count cannot see an isolated
+/// citation loss: `FLN-UL-0007` cites two symbols, so renaming one leaves the row
 /// symbol-resolved and the class totals unmoved. A planted rename survived exactly that way
-/// before this constant existed. Counting tokens makes each citation individually
-/// accountable — the difference between "this row still cites something real" and "every
-/// symbol this row names still exists".
+/// before this constant existed. Counting tokens makes an isolated loss observable. This is
+/// still a population ratchet, not an identity binding: a simultaneous gain can offset a
+/// loss, so every intentional movement is audited row-by-row before this number changes.
 ///
 /// 71 -> 70 at `c2f6f17a` (franken_lean-npl): the FLN-UL-0033 evidence rewrite dropped the
 /// `mpz_view` citation — the function still exists in fln-unsafe-abi, and the row's checks
@@ -395,7 +407,14 @@ const SYMBOL_RESOLVED_ROWS: usize = 80;
 /// binding) and FLN-UL-0202 (the bounded small-object bins' own row, citing
 /// `small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable`) each cite symbols their
 /// landings create — measured by replaying the guard's parse across the range.
-const RESOLVING_CITATION_TOKENS: usize = 92;
+///
+/// 92 -> 94 at `2f4a3b18`, 94 -> 95 at `c7a95255`, 95 -> 97 at `f3a0c5c9`,
+/// 97 -> 98 at `eb6cf3c9`, and 98 -> 100 at `f882dd60`: the exact function citations named
+/// on the symbol-row history above add two, one, two, one, and two tokens respectively.
+/// Replaying the classifier at every one of those commits found no removal from a
+/// pre-existing row. The apparent extra 26 tokens from `closure` and `manager` were plain
+/// English collisions and are deliberately excluded by the explicit-single-word rule.
+const RESOLVING_CITATION_TOKENS: usize = 100;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -408,23 +427,28 @@ const RESOLVING_CITATION_TOKENS: usize = 92;
 /// 120 -> 121 at `c2f6f17a` (franken_lean-npl): FLN-UL-0033 moved here from symbol-resolved
 /// when its evidence stopped naming `mpz_view` — a citation removal by the row's own author,
 /// measured, not silent.
-const PROSE_EVIDENCE_ROWS: usize = 121;
+///
+/// 121 -> 134 at `2f4a3b18`, 134 -> 142 at `c7a95255`, 142 -> 166 at `f3a0c5c9`,
+/// and 166 -> 177 at `eb6cf3c9`: those landings add 13, eight, 24, and eleven prose rows.
+/// `f882dd60` adds only the two symbol-resolved corpus rows, so prose stays 177. The 24
+/// task-manager rows remain here because an evidence phrase containing the ordinary word
+/// "manager" is not a citation to a same-named helper.
+const PROSE_EVIDENCE_ROWS: usize = 177;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 180 rows: 1 cites an e2e lane, the rest \
-split between symbol-resolved evidence and prose; the exact counts live in the constants \
-above and move only with a named cause (the 2026-07-30 move to 58 symbol-resolved and \
-121 prose is recorded on them). The resolvable ones are enforced; the prose is a \
+franken_lean-d3-safety-note-unenforced-cdbg). 266 rows: 1 cites an e2e lane, 88 carry \
+symbol-resolved evidence, and 177 remain prose; 100 individual tokens resolve. The exact \
+counts live in the constants above and move only with a named, commit-anchored cause. The \
+resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\
-The trade: a full rewrite of the TCB's paperwork into a citation grammar is a large cost \
-paid against a defect rate currently measured at ZERO — every resolvable row corroborates \
-its invariant. Option (a), the rewrite, stays available and is strictly easier once the \
-count is visible. What is bought here is that the remainder cannot GROW unnoticed.\n\
+The trade: a full rewrite of the TCB's paperwork into a citation grammar is a large cost. \
+Option (a), the rewrite, stays available and is strictly easier once the count is visible. \
+What is bought here is that the remainder cannot GROW unnoticed.\n\
 What this does NOT establish: nothing verifies that a prose invariant is TRUE, or that a \
 resolvable citation's test actually exercises the invariant it is cited for. The ratchet \
-only says a citation that resolved still resolves.";
+only holds the declared resolving population; it does not bind citation identities.";
 
 /// Every evidence field's class, decided the same way on every run.
 ///
@@ -435,6 +459,39 @@ only says a citation that resolved still resolves.";
 /// found the vectors, and this suite would have taught everyone it cries wolf. So nothing
 /// here asserts that a prose citation OUGHT to resolve; it only counts, and holds the rows
 /// that already do.
+///
+/// There is one extra disambiguation rule. An underscored function name is identifier-like
+/// enough to resolve unquoted under the ledger's existing convention. A single-component
+/// name such as `manager` or `closure` is also ordinary English, so it resolves only when
+/// the evidence field writes it explicitly as inline code. This keeps a newly added helper
+/// from silently converting unrelated old prose into purported evidence.
+fn resolving_function_citations<'a>(
+    evidence: &'a str,
+    fn_names: &BTreeSet<String>,
+) -> BTreeSet<&'a str> {
+    let explicit_plain_names: BTreeSet<&str> = evidence
+        .split('`')
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            (index % 2 == 1
+                && candidate.len() >= 7
+                && candidate
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'))
+            .then_some(candidate)
+        })
+        .collect();
+
+    evidence
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|token| {
+            token.len() >= 7
+                && fn_names.contains(*token)
+                && (token.contains('_') || explicit_plain_names.contains(*token))
+        })
+        .collect()
+}
+
 fn classify(
     rows: &[Row],
     lanes: &[String],
@@ -442,11 +499,7 @@ fn classify(
 ) -> (usize, usize, usize, usize) {
     let (mut lane, mut symbol, mut prose, mut tokens) = (0, 0, 0, 0);
     for row in rows {
-        let resolving: BTreeSet<&str> = row
-            .evidence
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .filter(|t| t.len() >= 7 && fn_names.contains(*t))
-            .collect();
+        let resolving = resolving_function_citations(&row.evidence, fn_names);
         tokens += resolving.len();
         if lanes.iter().any(|l| row.evidence.contains(l.as_str())) {
             lane += 1;
@@ -490,6 +543,39 @@ fn boundary_fn_names(root: &Path) -> BTreeSet<String> {
     names
 }
 
+#[test]
+fn ordinary_prose_does_not_resolve_through_a_plain_name_collision() {
+    let fn_names = BTreeSet::from(["closure".to_string(), "manager".to_string()]);
+    let evidence = "string/array/closure facts; export task manager suite";
+
+    assert!(
+        resolving_function_citations(evidence, &fn_names).is_empty(),
+        "ordinary English must not become machine-resolved evidence merely because a later \
+         boundary helper has the same single-component name"
+    );
+}
+
+#[test]
+fn underscored_and_explicit_plain_function_citations_resolve_exactly() {
+    let fn_names = BTreeSet::from([
+        "export_task_manager_family_matches_upstream_arms".to_string(),
+        "manager".to_string(),
+        "managerial".to_string(),
+    ]);
+    let evidence = "export_task_manager_family_matches_upstream_arms; exact `manager`; \
+                    managerial prose";
+
+    assert_eq!(
+        resolving_function_citations(evidence, &fn_names),
+        BTreeSet::from([
+            "export_task_manager_family_matches_upstream_arms",
+            "manager",
+        ]),
+        "underscored names retain the ledger's existing convention, while an ordinary \
+         single-component name needs exact inline-code syntax"
+    );
+}
+
 /// The remainder is a number this run reports, and it cannot move without saying so.
 #[test]
 fn the_unsafe_ledger_evidence_remainder_is_counted_not_merely_disclosed() {
@@ -515,9 +601,10 @@ fn the_unsafe_ledger_evidence_remainder_is_counted_not_merely_disclosed() {
     assert_eq!(
         tokens, RESOLVING_CITATION_TOKENS,
         "{tokens} citation tokens resolve, against the declared \
-         {RESOLVING_CITATION_TOKENS}. Every named symbol is individually accountable: a \
-         renamed or deleted test drops this count even when its row still cites something \
-         else and the class totals below do not move.\n\n{EVIDENCE_REMAINDER_REASON}"
+         {RESOLVING_CITATION_TOKENS}. An isolated renamed or deleted function drops this \
+         count even when its row still cites something else and the class totals below do \
+         not move; intentional population changes require a row-by-row audit.\n\n\
+         {EVIDENCE_REMAINDER_REASON}"
     );
     assert_eq!(
         (lane, symbol, prose),
