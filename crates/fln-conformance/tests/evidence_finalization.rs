@@ -4409,6 +4409,13 @@ fn a_gate_whose_registration_cannot_be_located_refuses() {
 /// the prune rather than to any other effect of the run. The fixture lives under the
 /// workspace `target/` (the `diag_render` scratch precedent, but reclaimed on the
 /// passing path) so the scratch census's `temp_dir` walk stays clean.
+///
+/// The real script is a nested test-control consumer, not a second quality lane:
+/// `FLN_CHECK_PLANT=evidence-self-test` is an existing typed mode that cannot publish an
+/// ordinary pass, and it prevents this child from re-acquiring the parent lane's gate after
+/// the sealed Cargo supervisor closes inherited descriptors. `FLN_GATE_WAIT_S=1` is the
+/// deletion control: if the planted discriminator stops bypassing acquisition, the cell
+/// refuses promptly instead of waiting the production 2,400-second contention bound.
 #[test]
 fn dead_sealed_build_roots_are_pruned_before_the_envelope_opens() {
     let root = fln_conformance::checked_workspace_root!();
@@ -4446,7 +4453,9 @@ fn dead_sealed_build_roots_are_pruned_before_the_envelope_opens() {
         command
             .arg(&script)
             .env("FLN_CHECK_SEALED_BUILD_ROOT", &parent)
-            .env("FLN_CHECK_ART_DIR", &claimed);
+            .env("FLN_CHECK_ART_DIR", &claimed)
+            .env("FLN_CHECK_PLANT", "evidence-self-test")
+            .env("FLN_GATE_WAIT_S", "1");
         if keep {
             command.env("FLN_CHECK_KEEP_SEALED_ROOTS", "1");
         }
