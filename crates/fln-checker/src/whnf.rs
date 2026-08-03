@@ -31,11 +31,18 @@ use crate::wire::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreeBinding {
     name: WireName,
-    value: WireExpr,
+    value: Arc<WireExpr>,
 }
 
 impl FreeBinding {
     pub fn new(name: WireName, value: WireExpr) -> FreeBinding {
+        FreeBinding {
+            name,
+            value: Arc::new(value),
+        }
+    }
+
+    pub(crate) fn from_shared(name: WireName, value: Arc<WireExpr>) -> FreeBinding {
         FreeBinding { name, value }
     }
 

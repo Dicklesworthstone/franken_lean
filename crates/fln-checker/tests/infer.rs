@@ -2,6 +2,7 @@
 
 use std::process::Command;
 
+use fln_checker::defeq::{DefEqBudget, DefEqStop, QuickDefEqBudget, QuickDefEqStop};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
     DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
@@ -12,6 +13,7 @@ use fln_checker::infer::{
     InferenceResult, InferenceStop, LocalDeclaration, infer, infer_with,
 };
 use fln_checker::term::{TermBudget, TermLimit, TermStop};
+use fln_checker::whnf::{ProjectionRule, WhnfBudget, WhnfStop};
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, ExprNode, LevelId, LevelNode, WireExpr, WireName, decode_expr,
     decode_name,
@@ -64,6 +66,24 @@ fn definition(
     safety: ConstantSafety,
     body_safety: DefinitionSafety,
 ) -> ConstantEntry {
+    definition_with_body(
+        name,
+        type_,
+        decoded(&Expr::lit(Literal::Nat(NatLit::from_u64(0)))),
+        safety,
+        body_safety,
+        0,
+    )
+}
+
+fn definition_with_body(
+    name: &str,
+    type_: WireExpr,
+    body: WireExpr,
+    safety: ConstantSafety,
+    body_safety: DefinitionSafety,
+    height: u32,
+) -> ConstantEntry {
     ConstantEntry::new(
         checker_name(name),
         ConstantDeclaration::definition(
@@ -71,8 +91,8 @@ fn definition(
             type_,
             safety,
             DefinitionBody::new(
-                decoded(&Expr::lit(Literal::Nat(NatLit::from_u64(0)))),
-                ReducibilityHint::Regular(0),
+                body,
+                ReducibilityHint::Regular(height),
                 body_safety,
                 Vec::new(),
             ),
@@ -591,10 +611,6 @@ fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requi
     let sort_zero = Expr::sort(Level::zero());
     let cases = vec![
         (
-            Expr::app(sort_zero.clone(), sort_zero.clone()),
-            InferenceDeferred::Application,
-        ),
-        (
             Expr::lam(
                 Name::anonymous(),
                 sort_zero.clone(),
@@ -652,6 +668,699 @@ fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requi
             ));
         }
     }
+}
+
+#[test]
+fn application_checking_instantiates_dependent_and_nondependent_codomains() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let type_term = Expr::fvar(FVarId(primary_name("A")));
+    let value_term = Expr::fvar(FVarId(primary_name("x")));
+    let dependent_type = Expr::forall_e(
+        primary_name("A"),
+        sort_one.clone(),
+        Expr::forall_e(
+            primary_name("x"),
+            Expr::bvar(0).expect("outer binder"),
+            Expr::bvar(1).expect("outer binder below inner binder"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let nondependent_type = Expr::forall_e(
+        Name::anonymous(),
+        sort_zero.clone(),
+        sort_one.clone(),
+        BinderInfo::Default,
+    );
+    let context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("A"), decoded(&sort_one)),
+            LocalDeclaration::assumption(checker_name("x"), decoded(&type_term)),
+            LocalDeclaration::assumption(checker_name("p"), decoded(&sort_zero)),
+            LocalDeclaration::assumption(checker_name("dependent"), decoded(&dependent_type)),
+            LocalDeclaration::assumption(checker_name("nondependent"), decoded(&nondependent_type)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+
+    let dependent_application = decoded(&Expr::app(
+        Expr::app(
+            Expr::fvar(FVarId(primary_name("dependent"))),
+            type_term.clone(),
+        ),
+        value_term,
+    ));
+    let dependent = complete(infer(
+        &dependent_application,
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(dependent.type_, decoded(&type_term));
+    assert_eq!(dependent.progress.application_spine_nodes, 2);
+    assert_eq!(dependent.progress.application_arguments, 2);
+    assert_eq!(dependent.progress.defeq_queries, 2);
+
+    let nondependent = complete(infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("nondependent"))),
+            Expr::fvar(FVarId(primary_name("p"))),
+        )),
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(
+        sort_model(&nondependent.type_),
+        LevelModel::Succ(Box::new(LevelModel::Zero))
+    );
+}
+
+#[test]
+fn infer_only_peels_the_spine_without_inferring_or_converting_arguments() {
+    let sort_one = Expr::sort(Level::one());
+    let dependent_type = Expr::forall_e(
+        primary_name("A"),
+        sort_one,
+        Expr::forall_e(
+            primary_name("x"),
+            Expr::bvar(0).expect("outer binder"),
+            Expr::bvar(1).expect("outer binder below inner binder"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let context = built_context(
+        vec![LocalDeclaration::assumption(
+            checker_name("dependent"),
+            decoded(&dependent_type),
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+    let skipped_meta = Expr::mvar(MVarId(primary_name("skippedType")));
+    let application = decoded(&Expr::app(
+        Expr::app(
+            Expr::fvar(FVarId(primary_name("dependent"))),
+            skipped_meta.clone(),
+        ),
+        Expr::fvar(FVarId(primary_name("missingArgument"))),
+    ));
+
+    let result = complete(infer(
+        &application,
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(result.type_, decoded(&skipped_meta));
+    assert_eq!(result.progress.application_arguments, 2);
+    assert_eq!(result.progress.defeq_queries, 0);
+    assert_eq!(result.progress.whnf_queries, 0);
+    assert!(matches!(
+        infer(
+            &application,
+            &context,
+            InferenceMode::Checking {
+                declaration_safety: ConstantSafety::Safe,
+            },
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Refused {
+            refusal: InferenceRefusal::ExpressionMetavariable,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn application_outcomes_separate_function_mismatch_conversion_and_nested_rules() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+
+    let nonfunction_context = built_context(
+        vec![LocalDeclaration::assumption(
+            checker_name("x"),
+            decoded(&sort_zero),
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(matches!(
+        infer(
+            &decoded(&Expr::app(
+                Expr::fvar(FVarId(primary_name("x"))),
+                Expr::fvar(FVarId(primary_name("x"))),
+            )),
+            &nonfunction_context,
+            mode,
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Refused {
+            refusal: InferenceRefusal::FunctionExpected { argument: 0 },
+            ..
+        }
+    ));
+    assert!(matches!(
+        infer(
+            &decoded(&Expr::app(
+                Expr::fvar(FVarId(primary_name("x"))),
+                Expr::fvar(FVarId(primary_name("x"))),
+            )),
+            &nonfunction_context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Refused {
+            refusal: InferenceRefusal::FunctionExpected { argument: 0 },
+            ..
+        }
+    ));
+
+    let function_type = Expr::forall_e(
+        Name::anonymous(),
+        sort_zero.clone(),
+        sort_zero.clone(),
+        BinderInfo::Default,
+    );
+    let mismatch_context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("f"), decoded(&function_type)),
+            LocalDeclaration::assumption(checker_name("A"), decoded(&sort_one)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(matches!(
+        infer(
+            &decoded(&Expr::app(
+                Expr::fvar(FVarId(primary_name("f"))),
+                Expr::fvar(FVarId(primary_name("A"))),
+            )),
+            &mismatch_context,
+            mode,
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Refused {
+            refusal: InferenceRefusal::ApplicationTypeMismatch { argument: 0, .. },
+            ..
+        }
+    ));
+
+    let expected = Expr::fvar(FVarId(primary_name("Expected")));
+    let actual = Expr::fvar(FVarId(primary_name("Actual")));
+    let deferred_function_type = Expr::forall_e(
+        Name::anonymous(),
+        expected.clone(),
+        expected,
+        BinderInfo::Default,
+    );
+    let deferred_context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("Expected"), decoded(&sort_zero)),
+            LocalDeclaration::assumption(checker_name("Actual"), decoded(&sort_zero)),
+            LocalDeclaration::assumption(checker_name("value"), decoded(&actual)),
+            LocalDeclaration::assumption(
+                checker_name("deferredFunction"),
+                decoded(&deferred_function_type),
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(matches!(
+        infer(
+            &decoded(&Expr::app(
+                Expr::fvar(FVarId(primary_name("deferredFunction"))),
+                Expr::fvar(FVarId(primary_name("value"))),
+            )),
+            &deferred_context,
+            mode,
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Deferred {
+            requirement: InferenceDeferred::ApplicationConversion { argument: 0, .. },
+            ..
+        }
+    ));
+
+    let nested_lambda = Expr::lam(
+        Name::anonymous(),
+        sort_zero.clone(),
+        Expr::bvar(0).expect("lambda binder"),
+        BinderInfo::Default,
+    );
+    assert!(matches!(
+        infer(
+            &decoded(&Expr::app(
+                Expr::fvar(FVarId(primary_name("f"))),
+                nested_lambda,
+            )),
+            &mismatch_context,
+            mode,
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Deferred {
+            requirement: InferenceDeferred::Lambda,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn application_whnf_uses_safe_definitions_shared_lets_and_validated_projections() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let function_type = Expr::forall_e(
+        Name::anonymous(),
+        sort_zero.clone(),
+        sort_zero.clone(),
+        BinderInfo::Default,
+    );
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+    let definition_context = built_context(
+        vec![LocalDeclaration::assumption(
+            checker_name("x"),
+            decoded(&sort_zero),
+        )],
+        Vec::new(),
+        vec![
+            definition_with_body(
+                "FunctionAlias",
+                decoded(&sort_one),
+                decoded(&function_type),
+                ConstantSafety::Safe,
+                DefinitionSafety::Safe,
+                1,
+            ),
+            header(
+                "aliasedFunction",
+                Vec::new(),
+                decoded(&Expr::const_(primary_name("FunctionAlias"), Vec::new())),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        ],
+    );
+    let definition_result = complete(infer(
+        &decoded(&Expr::app(
+            Expr::const_(primary_name("aliasedFunction"), Vec::new()),
+            Expr::fvar(FVarId(primary_name("x"))),
+        )),
+        &definition_context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(sort_model(&definition_result.type_), LevelModel::Zero);
+    assert_eq!(definition_result.progress.whnf_queries, 1);
+
+    let local_alias = Expr::fvar(FVarId(primary_name("LocalFunctionAlias")));
+    let local_context = built_context(
+        vec![
+            LocalDeclaration::definition(
+                checker_name("LocalFunctionAlias"),
+                decoded(&sort_one),
+                decoded(&function_type),
+            ),
+            LocalDeclaration::assumption(checker_name("localFunction"), decoded(&local_alias)),
+            LocalDeclaration::assumption(checker_name("x"), decoded(&sort_zero)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let local_result = complete(infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("localFunction"))),
+            Expr::fvar(FVarId(primary_name("x"))),
+        )),
+        &local_context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(sort_model(&local_result.type_), LevelModel::Zero);
+    assert_eq!(local_result.progress.whnf_queries, 1);
+
+    let local_infer_only = complete(infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("localFunction"))),
+            Expr::mvar(MVarId(primary_name("skippedArgument"))),
+        )),
+        &local_context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(sort_model(&local_infer_only.type_), LevelModel::Zero);
+    assert_eq!(local_infer_only.progress.whnf_queries, 1);
+    assert_eq!(local_infer_only.progress.defeq_queries, 0);
+
+    let first = ProjectionRule::new(checker_name("S"), checker_name("MkS"), 0);
+    let second = ProjectionRule::new(checker_name("S"), checker_name("OtherMkS"), 2);
+    assert_eq!(
+        InferenceContext::new_with_projection_rules(
+            Vec::new(),
+            Vec::new(),
+            vec![first.clone(), second],
+            ConstantEnvironment::empty(),
+        ),
+        Err(InferenceContextRefusal::DuplicateProjectionRule {
+            structure_name: checker_name("S"),
+            first: 0,
+            second: 1,
+        })
+    );
+    let recovered = InferenceContext::new_with_projection_rules(
+        Vec::new(),
+        Vec::new(),
+        vec![first],
+        ConstantEnvironment::empty(),
+    )
+    .expect("a unique projection context recovers after refusal");
+    assert_eq!(recovered.projection_rules().len(), 1);
+}
+
+#[test]
+fn eager_reduce_recognition_is_exact_and_query_local() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let type_term = Expr::fvar(FVarId(primary_name("A")));
+    let identity_type = Expr::forall_e(
+        primary_name("A"),
+        sort_one.clone(),
+        Expr::forall_e(
+            primary_name("x"),
+            Expr::bvar(0).expect("outer binder"),
+            Expr::bvar(1).expect("outer binder below inner binder"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let instantiated_identity_type = Expr::forall_e(
+        primary_name("x"),
+        type_term.clone(),
+        type_term.clone(),
+        BinderInfo::Default,
+    );
+    let accept_type = Expr::forall_e(
+        primary_name("x"),
+        type_term.clone(),
+        type_term.clone(),
+        BinderInfo::Default,
+    );
+    let accept_function_type = Expr::forall_e(
+        primary_name("f"),
+        instantiated_identity_type,
+        sort_zero,
+        BinderInfo::Default,
+    );
+    let context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("A"), decoded(&sort_one)),
+            LocalDeclaration::assumption(checker_name("x"), decoded(&type_term)),
+            LocalDeclaration::assumption(checker_name("accept"), decoded(&accept_type)),
+            LocalDeclaration::assumption(
+                checker_name("acceptFunction"),
+                decoded(&accept_function_type),
+            ),
+        ],
+        Vec::new(),
+        vec![header(
+            "eagerReduce",
+            Vec::new(),
+            decoded(&identity_type),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        )],
+    );
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+    let eager_argument = Expr::app(
+        Expr::app(
+            Expr::const_(primary_name("eagerReduce"), Vec::new()),
+            type_term.clone(),
+        ),
+        Expr::fvar(FVarId(primary_name("x"))),
+    );
+
+    let eager = complete(infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("accept"))),
+            eager_argument.clone(),
+        )),
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(eager.progress.eager_argument_checks, 1);
+
+    let next_plain_query = complete(infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("accept"))),
+            Expr::fvar(FVarId(primary_name("x"))),
+        )),
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(next_plain_query.progress.eager_argument_checks, 0);
+
+    let one_argument_near_miss = complete(infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("acceptFunction"))),
+            Expr::app(
+                Expr::const_(primary_name("eagerReduce"), Vec::new()),
+                type_term.clone(),
+            ),
+        )),
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(one_argument_near_miss.progress.eager_argument_checks, 0);
+
+    let metadata_near_miss = complete(infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("accept"))),
+            Expr::mdata(KVMap::new(), eager_argument),
+        )),
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(metadata_near_miss.progress.eager_argument_checks, 0);
+}
+
+#[test]
+fn nested_applications_use_heap_continuations() {
+    let sort_zero = Expr::sort(Level::zero());
+    let function_type = Expr::forall_e(
+        Name::anonymous(),
+        sort_zero.clone(),
+        sort_zero.clone(),
+        BinderInfo::Default,
+    );
+    let context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("f"), decoded(&function_type)),
+            LocalDeclaration::assumption(checker_name("g"), decoded(&function_type)),
+            LocalDeclaration::assumption(checker_name("x"), decoded(&sort_zero)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let result = complete(infer(
+        &decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("f"))),
+            Expr::app(
+                Expr::fvar(FVarId(primary_name("g"))),
+                Expr::fvar(FVarId(primary_name("x"))),
+            ),
+        )),
+        &context,
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(sort_model(&result.type_), LevelModel::Zero);
+    assert_eq!(result.progress.application_spine_nodes, 2);
+    assert_eq!(result.progress.application_arguments, 2);
+    assert_eq!(result.progress.defeq_queries, 2);
+}
+
+#[test]
+fn application_nested_resources_and_cancellation_are_typed_and_recover_cleanly() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let function_type = Expr::forall_e(
+        Name::anonymous(),
+        sort_zero.clone(),
+        sort_zero.clone(),
+        BinderInfo::Default,
+    );
+    let alias = Expr::fvar(FVarId(primary_name("FunctionAlias")));
+    let context = built_context(
+        vec![
+            LocalDeclaration::definition(
+                checker_name("FunctionAlias"),
+                decoded(&sort_one),
+                decoded(&function_type),
+            ),
+            LocalDeclaration::assumption(checker_name("f"), decoded(&alias)),
+            LocalDeclaration::assumption(checker_name("x"), decoded(&sort_zero)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let application = decoded(&Expr::app(
+        Expr::fvar(FVarId(primary_name("f"))),
+        Expr::fvar(FVarId(primary_name("x"))),
+    ));
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+    let baseline = complete(infer(
+        &application,
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+
+    assert!(matches!(
+        infer(
+            &application,
+            &context,
+            mode,
+            InferenceBudget::new(
+                u64::MAX,
+                u64::MAX,
+                TermBudget::unlimited(),
+                TermBudget::new(0, u64::MAX),
+            ),
+        ),
+        InferenceOutcome::Inconclusive(InferenceStop::Materialization {
+            phase: InferencePhase::ApplicationTerm,
+            stop: TermStop::Resource { .. },
+            ..
+        })
+    ));
+
+    let whnf_stop = infer(
+        &application,
+        &context,
+        mode,
+        InferenceBudget::unlimited().with_whnf(WhnfBudget::new(
+            0,
+            u64::MAX,
+            TermBudget::unlimited(),
+        )),
+    );
+    assert!(matches!(
+        whnf_stop,
+        InferenceOutcome::Inconclusive(InferenceStop::Whnf {
+            argument: 0,
+            stop,
+            ..
+        }) if matches!(stop.as_ref(), WhnfStop::Resource { .. })
+    ));
+
+    let defeq_stop = infer(
+        &application,
+        &context,
+        mode,
+        InferenceBudget::unlimited().with_defeq(DefEqBudget::new(
+            QuickDefEqBudget::new(0, u64::MAX),
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            WhnfBudget::unlimited(),
+        )),
+    );
+    assert!(matches!(
+        defeq_stop,
+        InferenceOutcome::Inconclusive(InferenceStop::DefEq {
+            argument: 0,
+            stop,
+            ..
+        }) if matches!(
+            stop.as_ref(),
+            DefEqStop::Quick(QuickDefEqStop::Resource { .. })
+        )
+    ));
+
+    let mut saw_application_phase = false;
+    let mut saw_inspection = false;
+    let mut saw_materialization = false;
+    let mut saw_whnf = false;
+    let mut saw_defeq = false;
+    for cancellation_poll in 1..512 {
+        let mut polls = 0usize;
+        let outcome = infer_with(
+            &application,
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+            || {
+                polls += 1;
+                polls == cancellation_poll
+            },
+        );
+        match outcome {
+            InferenceOutcome::Inconclusive(InferenceStop::Cancelled { phase, .. }) => {
+                saw_application_phase |= matches!(
+                    phase,
+                    InferencePhase::ApplicationTerm
+                        | InferencePhase::ApplicationSpine
+                        | InferencePhase::FunctionType
+                        | InferencePhase::ApplicationDomain
+                        | InferencePhase::ArgumentType
+                        | InferencePhase::DomainComparison
+                        | InferencePhase::Codomain
+                );
+            }
+            InferenceOutcome::Inconclusive(InferenceStop::Inspection {
+                stop: TermStop::Cancelled { .. },
+                ..
+            }) => saw_inspection = true,
+            InferenceOutcome::Inconclusive(InferenceStop::Materialization {
+                stop: TermStop::Cancelled { .. },
+                ..
+            }) => saw_materialization = true,
+            InferenceOutcome::Inconclusive(InferenceStop::Whnf { .. }) => saw_whnf = true,
+            InferenceOutcome::Inconclusive(InferenceStop::DefEq { .. }) => saw_defeq = true,
+            InferenceOutcome::Complete(result) => {
+                assert_eq!(result.type_, baseline.type_);
+                break;
+            }
+            other => panic!("application cancellation became a semantic answer: {other:?}"),
+        }
+    }
+    assert!(saw_application_phase);
+    assert!(saw_inspection);
+    assert!(saw_materialization);
+    assert!(saw_whnf);
+    assert!(saw_defeq);
+    assert_eq!(
+        complete(infer(
+            &application,
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+        ))
+        .type_,
+        baseline.type_
+    );
 }
 
 #[test]
@@ -1016,7 +1725,14 @@ fn cancellation_reaches_each_phase_without_partial_output_and_cleanly_recovers()
                 InferencePhase::UniverseValidation => saw_universe = true,
                 InferencePhase::LocalType
                 | InferencePhase::SortType
-                | InferencePhase::ConstantType => {
+                | InferencePhase::ConstantType
+                | InferencePhase::ApplicationTerm
+                | InferencePhase::ApplicationSpine
+                | InferencePhase::FunctionType
+                | InferencePhase::ApplicationDomain
+                | InferencePhase::ArgumentType
+                | InferencePhase::DomainComparison
+                | InferencePhase::Codomain => {
                     panic!("nested work surfaced as an outer cancellation phase")
                 }
             },
@@ -1116,6 +1832,91 @@ fn deep_metadata_transparency_fits_a_64k_stack() {
     assert!(
         output.status.success(),
         "bounded-stack inference child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn deep_application_child() -> Result<(), String> {
+    const ARGUMENTS: usize = 50_000;
+    let sort_zero = Expr::sort(Level::zero());
+    let mut function_type = sort_zero.clone();
+    for _ in 0..ARGUMENTS {
+        function_type = Expr::forall_e(
+            Name::anonymous(),
+            sort_zero.clone(),
+            function_type,
+            BinderInfo::Default,
+        );
+    }
+
+    let argument = Expr::fvar(FVarId(primary_name("x")));
+    let mut application = Expr::fvar(FVarId(primary_name("f")));
+    for _ in 0..ARGUMENTS {
+        application = Expr::app(application, argument.clone());
+    }
+    let context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("f"), decoded(&function_type)),
+            LocalDeclaration::assumption(checker_name("x"), decoded(&sort_zero)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let result = match infer(
+        &decoded(&application),
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ) {
+        InferenceOutcome::Complete(result) => result,
+        other => return Err(format!("deep application inference failed: {other:?}")),
+    };
+    if result.progress.application_spine_nodes != ARGUMENTS as u64
+        || result.progress.application_arguments != ARGUMENTS as u64
+    {
+        return Err(format!(
+            "application progress drifted: spine={}, arguments={}",
+            result.progress.application_spine_nodes, result.progress.application_arguments
+        ));
+    }
+    if result.progress.defeq_queries != 0 {
+        return Err("infer-only deep application ran domain conversion".to_owned());
+    }
+    if sort_model(&result.type_) != LevelModel::Zero {
+        return Err("deep application inferred the wrong codomain".to_owned());
+    }
+    Ok(())
+}
+
+#[test]
+fn fifty_thousand_argument_spine_fits_a_64k_stack() {
+    const CHILD_ENV: &str = "FLN_CHECKER_INFER_DEEP_APPLICATION_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let result = std::thread::Builder::new()
+            .name("fln-checker-infer-application-deep".to_owned())
+            .stack_size(64 * 1024)
+            .spawn(deep_application_child)
+            .expect("spawn bounded-stack application child")
+            .join()
+            .expect("bounded-stack application child did not panic");
+        result.expect("bounded-stack application work");
+        return;
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = Command::new(executable)
+        .env(CHILD_ENV, "1")
+        .args([
+            "--exact",
+            "fifty_thousand_argument_spine_fits_a_64k_stack",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run bounded-stack application child process");
+    assert!(
+        output.status.success(),
+        "bounded-stack application child failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

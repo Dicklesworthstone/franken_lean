@@ -1,13 +1,18 @@
-//! Resource-counted leaf inference over checker-owned terms.
+//! Resource-counted inference over checker-owned terms.
 //!
-//! This is the independent checker's first typing dispatcher. It implements the
-//! closed-term precondition and the leaf rules KR-100 through KR-105, together
-//! with iterative KR-111 metadata transparency. Later rule families are named by
-//! [`InferenceDeferred`] instead of being misreported as rejection.
+//! This is the independent checker's typing dispatcher. It implements the
+//! closed-term precondition, the leaf rules KR-100 through KR-105, iterative
+//! KR-111 metadata transparency, and worklist-driven KR-106 application
+//! inference. Later rule families are named by [`InferenceDeferred`] instead of
+//! being misreported as rejection.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::defeq::{
+    DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
+    QuickDefEqBudget, def_eq_with,
+};
 use crate::environment::{ConstantEnvironment, ConstantSafety, DefinitionSafety};
 use crate::instantiate::{
     InstantiationFault, InstantiationOutcome, InstantiationRefusal,
@@ -15,10 +20,14 @@ use crate::instantiate::{
 };
 use crate::term::{
     TermBudget, TermFault, TermInput, TermLimit, TermOutcome, TermStop, copy_subterm_with,
-    inspect_with,
+    inspect_with, substitute_bound_subterms_with,
+};
+use crate::whnf::{
+    FreeBinding, ProjectionRule, WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal,
+    WhnfStop, whnf_with,
 };
 use crate::wire::{
-    ExprId, ExprNode, LevelId, LevelNode, WireExpr, WireName, expression_owned_units,
+    ExprId, ExprNode, LevelId, LevelNode, NamePart, WireExpr, WireName, expression_owned_units,
     level_owned_units, usize_units,
 };
 
@@ -30,7 +39,7 @@ use crate::wire::{
 pub struct LocalDeclaration {
     name: WireName,
     type_: WireExpr,
-    value: Option<WireExpr>,
+    value: Option<Arc<WireExpr>>,
 }
 
 impl LocalDeclaration {
@@ -46,7 +55,7 @@ impl LocalDeclaration {
         LocalDeclaration {
             name,
             type_,
-            value: Some(value),
+            value: Some(Arc::new(value)),
         }
     }
 
@@ -59,7 +68,7 @@ impl LocalDeclaration {
     }
 
     pub fn value(&self) -> Option<&WireExpr> {
-        self.value.as_ref()
+        self.value.as_deref()
     }
 }
 
@@ -76,6 +85,11 @@ pub enum InferenceContextRefusal {
         first: usize,
         second: usize,
     },
+    DuplicateProjectionRule {
+        structure_name: WireName,
+        first: usize,
+        second: usize,
+    },
 }
 
 /// Immutable local and constant lookup state for independent inference.
@@ -85,13 +99,22 @@ pub struct InferenceContext {
     local_indexes: Arc<BTreeMap<WireName, usize>>,
     level_parameters: Arc<Vec<WireName>>,
     level_parameter_set: Arc<BTreeSet<WireName>>,
-    constants: ConstantEnvironment,
+    reduction: Arc<WhnfContext>,
 }
 
 impl InferenceContext {
     pub fn new(
         locals: Vec<LocalDeclaration>,
         level_parameters: Vec<WireName>,
+        constants: ConstantEnvironment,
+    ) -> Result<InferenceContext, InferenceContextRefusal> {
+        Self::new_with_projection_rules(locals, level_parameters, Vec::new(), constants)
+    }
+
+    pub fn new_with_projection_rules(
+        locals: Vec<LocalDeclaration>,
+        level_parameters: Vec<WireName>,
+        projection_rules: Vec<ProjectionRule>,
         constants: ConstantEnvironment,
     ) -> Result<InferenceContext, InferenceContextRefusal> {
         let mut local_indexes = BTreeMap::new();
@@ -118,12 +141,34 @@ impl InferenceContext {
             level_parameter_set.insert(parameter.clone());
         }
 
+        let mut projection_indexes = BTreeMap::new();
+        for (index, rule) in projection_rules.iter().enumerate() {
+            if let Some(first) = projection_indexes.insert(rule.structure_name().clone(), index) {
+                return Err(InferenceContextRefusal::DuplicateProjectionRule {
+                    structure_name: rule.structure_name().clone(),
+                    first,
+                    second: index,
+                });
+            }
+        }
+
+        let free_bindings = locals
+            .iter()
+            .filter_map(|local| {
+                local
+                    .value
+                    .as_ref()
+                    .map(|value| FreeBinding::from_shared(local.name().clone(), Arc::clone(value)))
+            })
+            .collect();
+        let reduction = Arc::new(WhnfContext::new(free_bindings, projection_rules, constants));
+
         Ok(InferenceContext {
             locals: Arc::new(locals),
             local_indexes: Arc::new(local_indexes),
             level_parameters: Arc::new(level_parameters),
             level_parameter_set: Arc::new(level_parameter_set),
-            constants,
+            reduction,
         })
     }
 
@@ -133,7 +178,7 @@ impl InferenceContext {
             local_indexes: Arc::new(BTreeMap::new()),
             level_parameters: Arc::new(Vec::new()),
             level_parameter_set: Arc::new(BTreeSet::new()),
-            constants,
+            reduction: Arc::new(WhnfContext::new(Vec::new(), Vec::new(), constants)),
         }
     }
 
@@ -146,7 +191,11 @@ impl InferenceContext {
     }
 
     pub fn constants(&self) -> &ConstantEnvironment {
-        &self.constants
+        self.reduction.constants()
+    }
+
+    pub fn projection_rules(&self) -> &[ProjectionRule] {
+        self.reduction.projection_rules()
     }
 
     fn local(&self, name: &WireName) -> Option<&LocalDeclaration> {
@@ -157,6 +206,10 @@ impl InferenceContext {
 
     fn declares_level_parameter(&self, name: &WireName) -> bool {
         self.level_parameter_set.contains(name)
+    }
+
+    fn reduction(&self) -> &WhnfContext {
+        &self.reduction
     }
 }
 
@@ -190,6 +243,8 @@ pub struct InferenceBudget {
     pub max_level_nodes: u64,
     pub inspection: TermBudget,
     pub materialization: TermBudget,
+    pub whnf: WhnfBudget,
+    pub defeq: DefEqBudget,
 }
 
 impl InferenceBudget {
@@ -199,12 +254,32 @@ impl InferenceBudget {
         inspection: TermBudget,
         materialization: TermBudget,
     ) -> InferenceBudget {
+        let whnf = WhnfBudget::new(max_steps, max_steps, materialization);
         InferenceBudget {
             max_steps,
             max_level_nodes,
             inspection,
             materialization,
+            whnf,
+            defeq: DefEqBudget::new(
+                QuickDefEqBudget::new(max_steps, max_level_nodes),
+                max_steps,
+                max_steps,
+                materialization.max_arena_nodes,
+                materialization.max_output_units,
+                whnf,
+            ),
         }
+    }
+
+    pub const fn with_whnf(mut self, whnf: WhnfBudget) -> InferenceBudget {
+        self.whnf = whnf;
+        self
+    }
+
+    pub const fn with_defeq(mut self, defeq: DefEqBudget) -> InferenceBudget {
+        self.defeq = defeq;
+        self
     }
 
     pub const fn unlimited() -> InferenceBudget {
@@ -222,6 +297,11 @@ pub struct InferenceProgress {
     pub steps: u64,
     pub level_nodes: u64,
     pub metadata_layers: u64,
+    pub application_spine_nodes: u64,
+    pub application_arguments: u64,
+    pub whnf_queries: u64,
+    pub defeq_queries: u64,
+    pub eager_argument_checks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +319,13 @@ pub enum InferencePhase {
     LocalType,
     SortType,
     ConstantType,
+    ApplicationTerm,
+    ApplicationSpine,
+    FunctionType,
+    ApplicationDomain,
+    ArgumentType,
+    DomainComparison,
+    Codomain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +351,16 @@ pub enum InferenceStop {
     Materialization {
         phase: InferencePhase,
         stop: TermStop,
+        progress: InferenceProgress,
+    },
+    Whnf {
+        argument: usize,
+        stop: Box<WhnfStop>,
+        progress: InferenceProgress,
+    },
+    DefEq {
+        argument: usize,
+        stop: Box<DefEqStop>,
         progress: InferenceProgress,
     },
 }
@@ -294,12 +391,31 @@ pub enum InferenceRefusal {
     PartialConstant {
         name: WireName,
     },
+    FunctionExpected {
+        argument: usize,
+    },
+    ApplicationTypeMismatch {
+        argument: usize,
+        mismatch: DefEqMismatch,
+    },
+    ReductionRefusal {
+        argument: usize,
+        refusal: WhnfRefusal,
+    },
+    ConversionRefusal {
+        argument: usize,
+        side: DefEqSide,
+        refusal: WhnfRefusal,
+    },
 }
 
 /// Rule families deliberately outside this child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceDeferred {
-    Application,
+    ApplicationConversion {
+        argument: usize,
+        need: DefEqDeferred,
+    },
     Lambda,
     Forall,
     Let,
@@ -335,6 +451,18 @@ pub enum InferenceFault {
         name: WireName,
         refusal: InstantiationRefusal,
     },
+    Whnf {
+        argument: usize,
+        fault: WhnfFault,
+    },
+    DefEq {
+        argument: usize,
+        fault: DefEqFault,
+    },
+    MissingGeneratedArena {
+        generation: usize,
+    },
+    EmptyWorklist,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,15 +857,92 @@ fn map_materialization(
     }
 }
 
-fn infer_inner(
-    term: &WireExpr,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArenaSource {
+    Input,
+    Generated(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TermReference {
+    source: ArenaSource,
+    root: ExprId,
+}
+
+enum Dispatch {
+    Type(WireExpr),
+    Application {
+        head: TermReference,
+        arguments: Vec<TermReference>,
+    },
+}
+
+enum Continuation {
+    ApplicationHead {
+        arguments: Vec<TermReference>,
+    },
+    ApplicationArgument {
+        arguments: Vec<TermReference>,
+        index: usize,
+        function: FunctionState,
+        domain: WireExpr,
+        argument: TermReference,
+        conversion: ConversionMode,
+    },
+}
+
+struct FunctionState {
+    term: WireExpr,
+    root: ExprId,
+    instantiations: Vec<TermReference>,
+}
+
+impl FunctionState {
+    fn new(term: WireExpr) -> FunctionState {
+        let root = term.root();
+        FunctionState {
+            term,
+            root,
+            instantiations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConversionMode {
+    Ordinary,
+    EagerReduce,
+}
+
+fn inference_arena<'a>(
+    input: &'a WireExpr,
+    generated: &'a [WireExpr],
+    source: ArenaSource,
+) -> Result<&'a WireExpr, LeafHalt> {
+    match source {
+        ArenaSource::Input => Ok(input),
+        ArenaSource::Generated(generation) => generated.get(generation).ok_or(LeafHalt::Fault(
+            InferenceFault::MissingGeneratedArena { generation },
+        )),
+    }
+}
+
+fn dispatch_reference(
+    input: &WireExpr,
+    generated: &[WireExpr],
+    reference: TermReference,
     context: &InferenceContext,
     mode: InferenceMode,
     control: &mut Control,
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<WireExpr, LeafHalt> {
+) -> Result<Dispatch, LeafHalt> {
+    let term = inference_arena(input, generated, reference.source)?;
     control
-        .step(cancelled, InferencePhase::Precondition, term.root().index())
+        .step(
+            cancelled,
+            InferencePhase::Precondition,
+            reference.root.index(),
+        )
         .map_err(LeafHalt::Stop)?;
 
     let facts = match inspect_with(term, control.budget.inspection, &mut *cancelled) {
@@ -757,11 +962,8 @@ fn infer_inner(
             external_bound_span: facts.external_bound_span,
         }));
     }
-    if facts.contains_expression_meta {
-        return Err(LeafHalt::Refused(InferenceRefusal::ExpressionMetavariable));
-    }
 
-    let mut root = term.root();
+    let mut root = reference.root;
     loop {
         let node = term
             .node(root)
@@ -804,6 +1006,7 @@ fn infer_inner(
                 InferencePhase::LocalType,
                 control.progress,
             )
+            .map(Dispatch::Type)
         }
         ExprNode::Meta { .. } => Err(LeafHalt::Refused(InferenceRefusal::ExpressionMetavariable)),
         ExprNode::Sort { level } => {
@@ -815,6 +1018,7 @@ fn infer_inner(
                 InferencePhase::SortType,
                 control.progress,
             )
+            .map(Dispatch::Type)
         }
         ExprNode::Constant { name, levels } => {
             let declaration = context.constants().find(name).ok_or_else(|| {
@@ -857,7 +1061,7 @@ fn infer_inner(
                 control.budget.materialization,
                 cancelled,
             ) {
-                InstantiationOutcome::Complete(type_) => Ok(type_),
+                InstantiationOutcome::Complete(type_) => Ok(Dispatch::Type(type_)),
                 InstantiationOutcome::Refused(refusal) => Err(LeafHalt::Fault(
                     InferenceFault::ConstantInstantiationRefusal {
                         name: name.clone(),
@@ -879,7 +1083,38 @@ fn infer_inner(
                 }
             }
         }
-        ExprNode::Apply { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Application)),
+        ExprNode::Apply { .. } => {
+            let mut cursor = root;
+            let mut arguments = Vec::new();
+            loop {
+                let current = term.node(cursor).ok_or(LeafHalt::Fault(
+                    InferenceFault::MissingExpression {
+                        index: cursor.index(),
+                    },
+                ))?;
+                let ExprNode::Apply { function, argument } = current else {
+                    break;
+                };
+                control
+                    .step(cancelled, InferencePhase::ApplicationSpine, cursor.index())
+                    .map_err(LeafHalt::Stop)?;
+                control.progress.application_spine_nodes =
+                    control.progress.application_spine_nodes.saturating_add(1);
+                arguments.push(TermReference {
+                    source: reference.source,
+                    root: *argument,
+                });
+                cursor = *function;
+            }
+            arguments.reverse();
+            Ok(Dispatch::Application {
+                head: TermReference {
+                    source: reference.source,
+                    root: cursor,
+                },
+                arguments,
+            })
+        }
         ExprNode::Lambda { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Lambda)),
         ExprNode::Forall { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Forall)),
         ExprNode::Let { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Let)),
@@ -889,6 +1124,450 @@ fn infer_inner(
         ExprNode::Metadata { .. } => Err(LeafHalt::Fault(InferenceFault::ResidualMetadata {
             index: root.index(),
         })),
+    }
+}
+
+struct InferenceEngine<'a> {
+    input: &'a WireExpr,
+    context: &'a InferenceContext,
+    mode: InferenceMode,
+    control: &'a mut Control,
+    cancelled: &'a mut dyn FnMut() -> bool,
+    generated: Vec<WireExpr>,
+    continuations: Vec<Continuation>,
+}
+
+impl<'a> InferenceEngine<'a> {
+    fn materialize_reference(
+        &mut self,
+        reference: TermReference,
+    ) -> Result<TermReference, LeafHalt> {
+        let already_root = {
+            let arena = inference_arena(self.input, &self.generated, reference.source)?;
+            arena.root() == reference.root
+        };
+        if already_root {
+            return Ok(reference);
+        }
+
+        self.control
+            .step(
+                self.cancelled,
+                InferencePhase::ApplicationTerm,
+                reference.root.index(),
+            )
+            .map_err(LeafHalt::Stop)?;
+        let result = {
+            let arena = inference_arena(self.input, &self.generated, reference.source)?;
+            copy_subterm_with(
+                arena,
+                reference.root,
+                self.control.budget.materialization,
+                self.cancelled,
+            )
+        };
+        let term = map_materialization(
+            result,
+            InferencePhase::ApplicationTerm,
+            self.control.progress,
+        )?;
+        let generation = self.generated.len();
+        let root = term.root();
+        self.generated.push(term);
+        Ok(TermReference {
+            source: ArenaSource::Generated(generation),
+            root,
+        })
+    }
+
+    fn materialize_function_subterm(
+        &mut self,
+        function: &FunctionState,
+        root: ExprId,
+        phase: InferencePhase,
+    ) -> Result<WireExpr, LeafHalt> {
+        let mut result = map_materialization(
+            copy_subterm_with(
+                &function.term,
+                root,
+                self.control.budget.materialization,
+                self.cancelled,
+            ),
+            phase,
+            self.control.progress,
+        )?;
+        let external_bound_span = match inspect_with(
+            &result,
+            self.control.budget.inspection,
+            &mut *self.cancelled,
+        ) {
+            TermOutcome::Complete(facts) => facts.external_bound_span,
+            TermOutcome::Inconclusive(stop) => {
+                return Err(LeafHalt::Stop(InferenceStop::Inspection {
+                    stop,
+                    progress: self.control.progress,
+                }));
+            }
+            TermOutcome::InternalFault(fault) => {
+                return Err(LeafHalt::Fault(InferenceFault::Inspection(fault)));
+            }
+        };
+        let needed = usize::try_from(external_bound_span).map_err(|_| {
+            LeafHalt::Fault(InferenceFault::LooseBoundVariables {
+                external_bound_span,
+            })
+        })?;
+        if needed > function.instantiations.len() {
+            return Err(LeafHalt::Fault(InferenceFault::LooseBoundVariables {
+                external_bound_span,
+            }));
+        }
+
+        let first = function.instantiations.len() - needed;
+        for replacement in function.instantiations[first..].iter().rev() {
+            let replacement_term =
+                inference_arena(self.input, &self.generated, replacement.source)?;
+            let result_root = result.root();
+            result = map_materialization(
+                substitute_bound_subterms_with(
+                    &result,
+                    result_root,
+                    0,
+                    replacement_term,
+                    replacement.root,
+                    self.control.budget.materialization,
+                    self.cancelled,
+                ),
+                phase,
+                self.control.progress,
+            )?;
+        }
+        Ok(result)
+    }
+
+    fn ensure_pi(
+        &mut self,
+        mut function: FunctionState,
+        argument: usize,
+    ) -> Result<FunctionState, LeafHalt> {
+        self.control
+            .step(
+                self.cancelled,
+                InferencePhase::FunctionType,
+                function.root.index(),
+            )
+            .map_err(LeafHalt::Stop)?;
+        if !matches!(
+            function.term.node(function.root),
+            Some(ExprNode::Forall { .. })
+        ) {
+            self.control.progress.whnf_queries =
+                self.control.progress.whnf_queries.saturating_add(1);
+            let instantiated = self.materialize_function_subterm(
+                &function,
+                function.root,
+                InferencePhase::FunctionType,
+            )?;
+            let function_type = match whnf_with(
+                &instantiated,
+                self.context.reduction(),
+                self.control.budget.whnf,
+                &mut *self.cancelled,
+            ) {
+                WhnfOutcome::Complete(result) => result.term,
+                WhnfOutcome::Refused(refusal) => {
+                    return Err(LeafHalt::Refused(InferenceRefusal::ReductionRefusal {
+                        argument,
+                        refusal,
+                    }));
+                }
+                WhnfOutcome::Inconclusive(stop) => {
+                    return Err(LeafHalt::Stop(InferenceStop::Whnf {
+                        argument,
+                        stop: Box::new(stop),
+                        progress: self.control.progress,
+                    }));
+                }
+                WhnfOutcome::InternalFault(fault) => {
+                    return Err(LeafHalt::Fault(InferenceFault::Whnf { argument, fault }));
+                }
+            };
+            function = FunctionState::new(function_type);
+        }
+        if matches!(
+            function.term.node(function.root),
+            Some(ExprNode::Forall { .. })
+        ) {
+            Ok(function)
+        } else {
+            Err(LeafHalt::Refused(InferenceRefusal::FunctionExpected {
+                argument,
+            }))
+        }
+    }
+
+    fn pi_parts(function: &FunctionState) -> Result<(ExprId, ExprId), LeafHalt> {
+        match function.term.node(function.root) {
+            Some(ExprNode::Forall {
+                binder_type, body, ..
+            }) => Ok((*binder_type, *body)),
+            Some(_) => Err(LeafHalt::Fault(InferenceFault::EmptyWorklist)),
+            None => Err(LeafHalt::Fault(InferenceFault::MissingExpression {
+                index: function.root.index(),
+            })),
+        }
+    }
+
+    fn copy_domain(
+        &mut self,
+        function: &FunctionState,
+        domain: ExprId,
+    ) -> Result<WireExpr, LeafHalt> {
+        self.materialize_function_subterm(function, domain, InferencePhase::ApplicationDomain)
+    }
+
+    fn conversion_mode(&mut self, argument: TermReference) -> Result<ConversionMode, LeafHalt> {
+        let term = inference_arena(self.input, &self.generated, argument.source)?;
+        let mut cursor = argument.root;
+        let mut arity = 0usize;
+        loop {
+            let node =
+                term.node(cursor)
+                    .ok_or(LeafHalt::Fault(InferenceFault::MissingExpression {
+                        index: cursor.index(),
+                    }))?;
+            let ExprNode::Apply { function, .. } = node else {
+                break;
+            };
+            self.control
+                .step(
+                    self.cancelled,
+                    InferencePhase::DomainComparison,
+                    cursor.index(),
+                )
+                .map_err(LeafHalt::Stop)?;
+            arity = arity.saturating_add(1);
+            if arity > 2 {
+                return Ok(ConversionMode::Ordinary);
+            }
+            cursor = *function;
+        }
+        let eager = arity == 2
+            && matches!(
+                term.node(cursor),
+                Some(ExprNode::Constant { name, .. })
+                    if matches!(
+                        name.parts(),
+                        [NamePart::Text(component)] if component == "eagerReduce"
+                    )
+            );
+        Ok(if eager {
+            ConversionMode::EagerReduce
+        } else {
+            ConversionMode::Ordinary
+        })
+    }
+
+    fn infer_only_application(
+        &mut self,
+        function_type: WireExpr,
+        arguments: &[TermReference],
+    ) -> Result<WireExpr, LeafHalt> {
+        let mut function = FunctionState::new(function_type);
+        for (index, argument) in arguments.iter().copied().enumerate() {
+            self.control
+                .step(
+                    self.cancelled,
+                    InferencePhase::ApplicationSpine,
+                    argument.root.index(),
+                )
+                .map_err(LeafHalt::Stop)?;
+            self.control.progress.application_arguments = self
+                .control
+                .progress
+                .application_arguments
+                .saturating_add(1);
+            function = self.ensure_pi(function, index)?;
+            let (_, body) = Self::pi_parts(&function)?;
+            function.root = body;
+            function.instantiations.push(argument);
+        }
+        self.materialize_function_subterm(&function, function.root, InferencePhase::Codomain)
+    }
+
+    fn schedule_checking_argument(
+        &mut self,
+        function: FunctionState,
+        arguments: Vec<TermReference>,
+        index: usize,
+    ) -> Result<(Continuation, TermReference), LeafHalt> {
+        let argument = arguments
+            .get(index)
+            .copied()
+            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        self.control
+            .step(
+                self.cancelled,
+                InferencePhase::ArgumentType,
+                argument.root.index(),
+            )
+            .map_err(LeafHalt::Stop)?;
+        self.control.progress.application_arguments = self
+            .control
+            .progress
+            .application_arguments
+            .saturating_add(1);
+        let function = self.ensure_pi(function, index)?;
+        let (domain_root, _) = Self::pi_parts(&function)?;
+        let domain = self.copy_domain(&function, domain_root)?;
+        let conversion = self.conversion_mode(argument)?;
+        if conversion == ConversionMode::EagerReduce {
+            self.control.progress.eager_argument_checks = self
+                .control
+                .progress
+                .eager_argument_checks
+                .saturating_add(1);
+        }
+        Ok((
+            Continuation::ApplicationArgument {
+                arguments,
+                index,
+                function,
+                domain,
+                argument,
+                conversion,
+            },
+            argument,
+        ))
+    }
+
+    fn compare_domain(
+        &mut self,
+        argument: usize,
+        conversion: ConversionMode,
+        actual: &WireExpr,
+        expected: &WireExpr,
+    ) -> Result<(), LeafHalt> {
+        self.control
+            .step(self.cancelled, InferencePhase::DomainComparison, argument)
+            .map_err(LeafHalt::Stop)?;
+        self.control.progress.defeq_queries = self.control.progress.defeq_queries.saturating_add(1);
+        // The current independent conversion engine has no eager-sensitive
+        // native or open-pair reduction rule. Carry the marker as query-local
+        // state so adding such a rule cannot require mutable context state or
+        // leak into the next conversion query.
+        let outcome = match conversion {
+            ConversionMode::Ordinary | ConversionMode::EagerReduce => def_eq_with(
+                actual,
+                expected,
+                self.context.reduction(),
+                self.control.budget.defeq,
+                &mut *self.cancelled,
+            ),
+        };
+        match outcome {
+            DefEqOutcome::Equal(_) => Ok(()),
+            DefEqOutcome::NotEqual { mismatch, .. } => Err(LeafHalt::Refused(
+                InferenceRefusal::ApplicationTypeMismatch { argument, mismatch },
+            )),
+            DefEqOutcome::Deferred { need, .. } => Err(LeafHalt::Deferred(
+                InferenceDeferred::ApplicationConversion { argument, need },
+            )),
+            DefEqOutcome::Refused { side, refusal, .. } => {
+                Err(LeafHalt::Refused(InferenceRefusal::ConversionRefusal {
+                    argument,
+                    side,
+                    refusal,
+                }))
+            }
+            DefEqOutcome::Inconclusive(stop) => Err(LeafHalt::Stop(InferenceStop::DefEq {
+                argument,
+                stop: Box::new(stop),
+                progress: self.control.progress,
+            })),
+            DefEqOutcome::InternalFault(fault) => {
+                Err(LeafHalt::Fault(InferenceFault::DefEq { argument, fault }))
+            }
+        }
+    }
+
+    fn run(&mut self) -> Result<WireExpr, LeafHalt> {
+        let mut current = Some(TermReference {
+            source: ArenaSource::Input,
+            root: self.input.root(),
+        });
+        let mut inferred = None;
+
+        loop {
+            if let Some(reference) = current.take() {
+                let reference = self.materialize_reference(reference)?;
+                match dispatch_reference(
+                    self.input,
+                    &self.generated,
+                    reference,
+                    self.context,
+                    self.mode,
+                    self.control,
+                    self.cancelled,
+                )? {
+                    Dispatch::Type(type_) => inferred = Some(type_),
+                    Dispatch::Application { head, arguments } => {
+                        self.continuations
+                            .push(Continuation::ApplicationHead { arguments });
+                        current = Some(head);
+                    }
+                }
+                continue;
+            }
+
+            let value = inferred
+                .take()
+                .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+            let Some(continuation) = self.continuations.pop() else {
+                return Ok(value);
+            };
+            match continuation {
+                Continuation::ApplicationHead { arguments } => {
+                    if self.mode == InferenceMode::InferOnly {
+                        inferred = Some(self.infer_only_application(value, &arguments)?);
+                    } else {
+                        let (continuation, argument) = self.schedule_checking_argument(
+                            FunctionState::new(value),
+                            arguments,
+                            0,
+                        )?;
+                        self.continuations.push(continuation);
+                        current = Some(argument);
+                    }
+                }
+                Continuation::ApplicationArgument {
+                    arguments,
+                    index,
+                    mut function,
+                    domain,
+                    argument,
+                    conversion,
+                } => {
+                    self.compare_domain(index, conversion, &value, &domain)?;
+                    let (_, body) = Self::pi_parts(&function)?;
+                    function.root = body;
+                    function.instantiations.push(argument);
+                    let next = index.saturating_add(1);
+                    if next == arguments.len() {
+                        inferred = Some(self.materialize_function_subterm(
+                            &function,
+                            function.root,
+                            InferencePhase::Codomain,
+                        )?);
+                    } else {
+                        let (continuation, argument) =
+                            self.schedule_checking_argument(function, arguments, next)?;
+                        self.continuations.push(continuation);
+                        current = Some(argument);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -909,7 +1588,16 @@ pub fn infer_with(
     mut cancelled: impl FnMut() -> bool,
 ) -> InferenceOutcome {
     let mut control = Control::new(budget);
-    let result = infer_inner(term, context, mode, &mut control, &mut cancelled);
+    let result = InferenceEngine {
+        input: term,
+        context,
+        mode,
+        control: &mut control,
+        cancelled: &mut cancelled,
+        generated: Vec::new(),
+        continuations: Vec::new(),
+    }
+    .run();
     finish(result, control.progress)
 }
 
