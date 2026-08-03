@@ -467,9 +467,32 @@ pub(crate) unsafe fn mark_mt(o: *mut LeanObject) {
     }
 }
 
+/// `mark_persistent_fn` (`object.cpp:542-545`): the closure target the
+/// external arm hands to a class's `m_foreach`.
+// UNSAFE-LEDGER: FLN-UL-0312
+#[allow(unsafe_code)]
+extern "C" fn mark_persistent_fn(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: o is a live child the foreach yields; marking never frees.
+    unsafe {
+        mark_persistent(o);
+    }
+    crate::tagged::boxi(0)
+}
+
+/// `mark_mt_fn` (`object.cpp:625-628`): the mt-walk sibling.
+// UNSAFE-LEDGER: FLN-UL-0313
+#[allow(unsafe_code)]
+extern "C" fn mark_mt_fn(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: o is a live child the foreach yields; marking never frees.
+    unsafe {
+        mark_mt(o);
+    }
+    crate::tagged::boxi(0)
+}
+
 /// Shared child-traversal for the mark walks (the category switches of
-/// `object.cpp:571-617` / `646-681` minus the external/task arms the slice
-/// cannot run).
+/// `object.cpp:571-617` / `646-681`; the external arm applies the class's
+/// `m_foreach` with the op's marking closure, the pin's own mechanism).
 ///
 /// # Safety
 /// `o` live object with header `h`; `todo` receives borrowed child pointers.
@@ -493,11 +516,25 @@ unsafe fn push_children(
         match h.tag {
             t if t == TAG_SCALAR_ARRAY || t == TAG_STRING || t == TAG_MPZ => {}
             t if t == TAG_EXTERNAL => {
-                debug_assert!(
-                    false,
-                    "external traversal requires apply machinery (franken_lean-7xe)"
-                );
-                shadow::on_traversal_skip(TAG_EXTERNAL, op);
+                // The pin's arm exactly (object.cpp:582-587 persistent,
+                // 663-668 mt): the class's m_foreach applies a marking
+                // closure per boxed child. Implementable since 83r slice
+                // 4's apply machinery landed — this closes the slice-1
+                // restriction (franken_lean-7xe) that used to refuse here;
+                // an unknown op still refuses rather than guessing a walk.
+                let target: *mut core::ffi::c_void = match op {
+                    "mark_persistent" => mark_persistent_fn as *mut core::ffi::c_void,
+                    "mark_mt" => mark_mt_fn as *mut core::ffi::c_void,
+                    _ => {
+                        debug_assert!(false, "external traversal under unknown op {op}");
+                        shadow::on_traversal_skip(TAG_EXTERNAL, op);
+                        return;
+                    }
+                };
+                let (class, data) = object::external_fields(o);
+                let f = object::alloc_closure(target, 1, 0);
+                ((*class).m_foreach)(data, f);
+                dec_ref(f);
             }
             t if t == TAG_TASK => {
                 // The pin's traversal FORCES a task (`lean_task_get`,

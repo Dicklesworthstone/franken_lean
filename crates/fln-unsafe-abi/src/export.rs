@@ -61,7 +61,7 @@ fn should_abort_on_panic() -> bool {
 
 /// `lean_internal_panic`'s body (`object.cpp:91-95`): message to the process
 /// stderr, then abort (env) or `exit(1)`.
-fn internal_panic_impl(msg: &str) -> ! {
+pub(crate) fn internal_panic_impl(msg: &str) -> ! {
     let mut err = std::io::stderr().lock();
     let _ = writeln!(err, "INTERNAL PANIC: {msg}");
     let _ = err.flush();
@@ -3081,4 +3081,133 @@ pub(crate) extern "C" fn export_lean_io_wait_any(task_list: *mut LeanObject) -> 
         }
     }
     v
+}
+
+// ================================================================ stdio
+// fln-3gv slice 5a (design comment 1856): the stdio plane — the
+// thread-current stream trio, the Handle prims the println path drives,
+// and the native Stream.ofHandle. Signatures match io.cpp exactly; the
+// mechanism deviations are disclosed in stdio.rs's module doc.
+
+/// `lean_get_stdin` (`io.cpp:119-121`; extern census `IO.getStdin`).
+// UNSAFE-LEDGER: FLN-UL-0304
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_stdin")]
+pub(crate) extern "C" fn export_lean_get_stdin() -> *mut LeanObject {
+    crate::stdio::get_stdin()
+}
+
+/// `lean_get_stdout` (`io.cpp:124-126`; extern census `IO.getStdout`).
+// UNSAFE-LEDGER: FLN-UL-0305
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_stdout")]
+pub(crate) extern "C" fn export_lean_get_stdout() -> *mut LeanObject {
+    crate::stdio::get_stdout()
+}
+
+/// `lean_get_stderr` (`io.cpp:129-131`; extern census `IO.getStderr`).
+// UNSAFE-LEDGER: FLN-UL-0306
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_stderr")]
+pub(crate) extern "C" fn export_lean_get_stderr() -> *mut LeanObject {
+    crate::stdio::get_stderr()
+}
+
+/// `lean_get_set_stdin` (`io.cpp:134-139`; extern census `IO.setStdin`).
+// UNSAFE-LEDGER: FLN-UL-0307
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_set_stdin")]
+pub(crate) extern "C" fn export_lean_get_set_stdin(h: *mut LeanObject) -> *mut LeanObject {
+    crate::stdio::get_set_stdin(h)
+}
+
+/// `lean_get_set_stdout` (`io.cpp:142-147`; extern census `IO.setStdout`).
+// UNSAFE-LEDGER: FLN-UL-0308
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_set_stdout")]
+pub(crate) extern "C" fn export_lean_get_set_stdout(h: *mut LeanObject) -> *mut LeanObject {
+    crate::stdio::get_set_stdout(h)
+}
+
+/// `lean_get_set_stderr` (`io.cpp:150-155`; extern census `IO.setStderr`).
+// UNSAFE-LEDGER: FLN-UL-0309
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_set_stderr")]
+pub(crate) extern "C" fn export_lean_get_set_stderr(h: *mut LeanObject) -> *mut LeanObject {
+    crate::stdio::get_set_stderr(h)
+}
+
+/// `lean_io_prim_handle_mk` (`io.cpp:385-418`; extern census
+/// `IO.FS.Handle.mk`): borrowed filename + mode byte to an io_result
+/// Handle.
+// UNSAFE-LEDGER: FLN-UL-0299
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_mk")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_mk(
+    filename: *mut LeanObject,
+    mode: u8,
+) -> *mut LeanObject {
+    // SAFETY: filename is borrowed and live per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_mk(filename, mode) }
+}
+
+/// `lean_io_prim_handle_put_str` (`io.cpp:661-670`; extern census
+/// `IO.FS.Handle.putStr`).
+// UNSAFE-LEDGER: FLN-UL-0300
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_put_str")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_put_str(
+    h: *mut LeanObject,
+    s: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: both borrowed and live per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_put_str(h, s) }
+}
+
+/// `lean_io_prim_handle_flush` (`io.cpp:550-556`; extern census
+/// `IO.FS.Handle.flush`).
+// UNSAFE-LEDGER: FLN-UL-0301
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_flush")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_flush(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_flush(h) }
+}
+
+/// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
+/// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
+// UNSAFE-LEDGER: FLN-UL-0302
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_is_tty")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_is_tty(h: *mut LeanObject) -> u8 {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_is_tty(h) }
+}
+
+/// `lean_stream_of_handle` (`Init/System/IO.lean:1683`,
+/// `@[export lean_stream_of_handle]`; consumed by the pin's own
+/// `initialize_io`, io.cpp:109/1647-1652): the six-field `FS.Stream` over a
+/// consumed Handle — served NATIVELY here because the pin's definition is
+/// compiled Lean the staticlib does not carry (the B2 Native-Mirror arm at
+/// spike depth, disclosed in stdio.rs).
+// UNSAFE-LEDGER: FLN-UL-0303
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_stream_of_handle")]
+pub(crate) extern "C" fn export_lean_stream_of_handle(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: h is consumed into the stream's closures.
+    unsafe { crate::stdio::stream_of_handle(h) }
+}
+
+/// `lean_initialize_runtime_module` (`init_module.cpp:19-29`; the entry
+/// every generated main stub calls before module initializers): the pin
+/// initializes alloc/debug/object/io/thread/mutex/process/stack/libuv; in
+/// Marrow every one of those planes is static or lazily seeded, so the
+/// twin's eager half is exactly the io stream trio — the one plane whose
+/// pin-side init has an observable (the SIGPIPE disposition and the
+/// process-initial streams).
+// UNSAFE-LEDGER: FLN-UL-0310
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_initialize_runtime_module")]
+pub(crate) extern "C" fn export_lean_initialize_runtime_module() {
+    crate::stdio::initialize_streams();
 }

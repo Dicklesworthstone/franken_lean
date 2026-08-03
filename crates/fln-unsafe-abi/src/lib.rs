@@ -75,6 +75,7 @@ mod membrane;
 mod object;
 pub mod rc;
 pub mod shadow;
+mod stdio;
 mod tagged;
 mod task_manager;
 

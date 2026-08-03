@@ -3015,3 +3015,110 @@ fn export_task_plane_reproduces_the_tasks_corpus_slice_with_rc_balance() {
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance across the tasks-corpus cell");
 }
+
+#[test]
+fn export_stdio_reproduces_the_io_println_corpus_slice_with_swap_capture() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_apply_1, export_lean_apply_2, export_lean_get_set_stdout,
+        export_lean_get_stdout, export_lean_io_prim_handle_mk, export_lean_stream_of_handle,
+        export_lean_string_append,
+    };
+
+    // The pinned oracle: io_println.lean.expected — an exit=0 header plus
+    // the three corpus observables, compared as BYTES at the end.
+    let expected =
+        std::fs::read_to_string(g03_fixture("io_println.lean.expected")).expect("pinned oracle");
+    let lines: Vec<&str> = expected.lines().collect();
+    assert_eq!(lines.len(), 4, "one header line + three corpus observables");
+    assert!(
+        lines[0].starts_with("# exit=0 "),
+        "the pinned Reference run exited 0"
+    );
+    let body = format!("{}\n{}\n{}\n", lines[1], lines[2], lines[3]);
+
+    // Seed the process-initial trio BEFORE the shadow window: those three
+    // streams are persistent and immortal (the pin's initialize_io half),
+    // so their one-time allocations must not enter this cell's balance.
+    crate::stdio::initialize_streams();
+
+    let capture = std::env::temp_dir().join(format!("fln-g03-println-{}", std::process::id()));
+    let capture_str = capture.to_str().expect("temp path is UTF-8").to_string();
+
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the corpus file's
+    // println path runs through the exports over the pin's own capture seam
+    // (a stream over a temp-file handle installed via get_set_stdout, the
+    // withStdout shape), with the shadow oracle watching.
+    // UNSAFE-LEDGER: FLN-UL-0311
+    #[allow(unsafe_code)]
+    unsafe {
+        // io_println's implicit Handle.mk: mode 1 is the pin's
+        // O_WRONLY|O_CREAT|O_TRUNC write arm (io.cpp:398).
+        let fname =
+            crate::object::mk_string_unchecked(capture_str.as_bytes(), capture_str.chars().count());
+        let r = export_lean_io_prim_handle_mk(fname, 1);
+        assert_eq!(
+            (&raw const (*r).m_tag).read(),
+            0,
+            "handle_mk answered the io_result ok arm"
+        );
+        let h = crate::object::ctor_get(r, 0);
+        crate::rc::inc_ref_n(h, 1);
+        crate::rc::dec_ref(r);
+        crate::rc::dec_ref(fname);
+
+        // The capture seam: our stream becomes this thread's stdout.
+        let stream = export_lean_stream_of_handle(h);
+        let old = export_lean_get_set_stdout(stream);
+
+        // (Both closures inherit this block's unsafe context.)
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        // Each println is getStdout >>= putStr on the CURRENT stream —
+        // fetched per line exactly as the compiled file does; cur is a
+        // fresh reference, put duplicated out of it and consumed by the
+        // apply along with s and the world token.
+        let put_line = |s: *mut crate::layout::LeanObject| {
+            let cur = export_lean_get_stdout();
+            let put = crate::object::ctor_get(cur, 4);
+            crate::rc::inc_ref_n(put, 1);
+            let res = export_lean_apply_2(put, s, crate::tagged::boxi(0));
+            assert_eq!((&raw const (*res).m_tag).read(), 0, "putStr ok");
+            crate::rc::dec_ref(res);
+            crate::rc::dec_ref(cur);
+        };
+        // io_println.lean:2 — a plain literal.
+        put_line(mk("first\n"));
+        // io_println.lean:3 — s!"second {1 + 1}": the interpolation's
+        // compiled shape is the live append arm (s1 owned, s2 borrowed).
+        let two = mk("2\n");
+        let second = export_lean_string_append(mk("second "), two);
+        crate::rc::dec_ref(two);
+        put_line(second);
+        // io_println.lean:4 — a plain literal.
+        put_line(mk("third\n"));
+
+        // Flush through the stream's own flush field (field 0), then
+        // restore the initial stdout and drop the capture stream — the
+        // handle's finalizer fcloses the FILE*.
+        let cur = export_lean_get_stdout();
+        let fl = crate::object::ctor_get(cur, 0);
+        crate::rc::inc_ref_n(fl, 1);
+        let fres = export_lean_apply_1(fl, crate::tagged::boxi(0));
+        assert_eq!((&raw const (*fres).m_tag).read(), 0, "flush ok");
+        crate::rc::dec_ref(fres);
+        crate::rc::dec_ref(cur);
+        let mine = export_lean_get_set_stdout(old);
+        crate::rc::dec_ref(mine);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the io_println cell");
+
+    // The observable: the captured bytes equal the pinned oracle body.
+    let got = std::fs::read_to_string(&capture).expect("captured output");
+    std::fs::remove_file(&capture).ok();
+    assert_eq!(
+        got, body,
+        "io_println.lean's observables equal the pinned oracle bytes"
+    );
+}

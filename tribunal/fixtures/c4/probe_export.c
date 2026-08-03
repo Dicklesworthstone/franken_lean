@@ -28,6 +28,7 @@
 #include <lean/lean.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static void fact(const char *probe, long long value) {
     printf("{\"schema\":\"fln-83r-gauntlet-probe/1\",\"probe\":\"%s\",\"value\":%lld}\n",
@@ -57,6 +58,17 @@ extern lean_object *lean_io_promise_resolve(lean_object *value, lean_object *pro
 extern lean_object *lean_io_promise_result_opt(lean_object *promise);
 extern uint8_t lean_io_get_task_state(lean_object *t);
 extern lean_object *lean_option_get_or_block(lean_object *opt);
+
+/* fln-3gv slice 5a externs (extern-census class): the runtime init entry
+ * every generated main stub calls (init_module.cpp:19), and the stdio
+ * plane — the stream trio, the handle prims the println path drives, and
+ * the Lean-@[export]ed stream ctor, declared exactly as stage0
+ * Init/System/IO.c declares them. */
+extern void lean_initialize_runtime_module(void);
+extern lean_object *lean_get_stdout(void);
+extern lean_object *lean_get_set_stdout(lean_object *h);
+extern lean_object *lean_io_prim_handle_mk(lean_object *filename, uint8_t mode);
+extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
  * family, declared exactly as stage0 Init/System/IO.c declares them. */
@@ -125,6 +137,11 @@ static lean_object *probe_corpus_succ(lean_object *x) {
 }
 
 static void facts_mode(void) {
+    /* Both runtimes initialize as a generated main would (fln-3gv slice
+     * 5a): the Reference's stream globals are built in initialize_io, and
+     * Marrow's twin seeds its trio + the SIGPIPE disposition here. */
+    lean_initialize_runtime_module();
+
     /* ---- ctor through the inline small path (mi_malloc_small underneath) */
     lean_object *o = lean_alloc_ctor(2, 2, 8);
     lean_ctor_set(o, 0, lean_box(41));
@@ -554,6 +571,73 @@ static void facts_mode(void) {
     fact("corpus.tasks.chained", (long long)lean_unbox(lean_task_get_own(cch)));
 
     lean_finalize_task_manager(); /* both runtimes drain and join here */
+
+    /* ---- fln-3gv slice 5a: the io_println.lean corpus observables
+     * through the swap-capture seam (crates/fln-vm/fixtures/g03/
+     * io_println.lean; pinned oracle "first\n" "second 2\n" "third\n").
+     * A stream over a temp-file handle becomes this thread's stdout via
+     * lean_get_set_stdout — the withStdout shape — and each println is
+     * getStdout>>putStr on the CURRENT stream, exactly as compiled code
+     * runs it; the captured bytes are the differential facts. */
+    char iop_path[128];
+    snprintf(iop_path, sizeof iop_path, "/tmp/fln-g03-println-%lld",
+             (long long)getpid());
+    remove(iop_path);
+    lean_object *iop_fname = lean_mk_string(iop_path);
+    lean_object *iop_res = lean_io_prim_handle_mk(iop_fname, 1);
+    fact("corpus.io_println.mk_ok", lean_ptr_tag(iop_res) == 0);
+    lean_object *iop_h = lean_ctor_get(iop_res, 0);
+    lean_inc(iop_h);
+    lean_dec(iop_res);
+    lean_dec(iop_fname);
+    lean_object *iop_old = lean_get_set_stdout(lean_stream_of_handle(iop_h));
+    long long iop_ok = 0;
+    for (int li = 0; li < 3; li++) {
+        lean_object *cur = lean_get_stdout();
+        lean_object *put = lean_ctor_get(cur, 4); /* putStr, field 4 */
+        lean_inc(put);
+        lean_object *s;
+        if (li == 1) {
+            /* s!"second {1 + 1}": the interpolation's compiled shape is
+             * the live append arm (s1 owned, s2 borrowed). */
+            lean_object *two = lean_mk_string("2\n");
+            s = lean_string_append(lean_mk_string("second "), two);
+            lean_dec(two);
+        } else {
+            s = lean_mk_string(li == 0 ? "first\n" : "third\n");
+        }
+        lean_object *res = lean_apply_2(put, s, lean_box(0));
+        iop_ok += lean_ptr_tag(res) == 0;
+        lean_dec(res);
+        lean_dec(cur);
+    }
+    fact("corpus.io_println.put_ok", iop_ok);
+    { /* flush through the stream's own flush field (field 0) */
+        lean_object *cur = lean_get_stdout();
+        lean_object *fl = lean_ctor_get(cur, 0);
+        lean_inc(fl);
+        lean_object *res = lean_apply_1(fl, lean_box(0));
+        fact("corpus.io_println.flush_ok", lean_ptr_tag(res) == 0);
+        lean_dec(res);
+        lean_dec(cur);
+    }
+    /* restore the initial stdout; dropping ours fcloses the FILE* */
+    lean_dec(lean_get_set_stdout(iop_old));
+    {
+        FILE *rf = fopen(iop_path, "rb");
+        long long iop_n = 0, iop_sum = 0;
+        int ch;
+        while (rf && (ch = fgetc(rf)) != EOF) {
+            iop_n++;
+            iop_sum += ch;
+        }
+        if (rf) {
+            fclose(rf);
+        }
+        remove(iop_path);
+        fact("corpus.io_println.bytes", iop_n);
+        fact("corpus.io_println.bytesum", iop_sum);
+    }
 }
 
 int main(int argc, char **argv) {

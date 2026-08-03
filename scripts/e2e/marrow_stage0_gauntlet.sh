@@ -142,6 +142,11 @@ STAGE0_TUS+=("Init/System/Promise.c" "Init/System/CancelToken.c")
 # adds task_spawn_core and task_bind_core (its map/get/pure demands are
 # already in the union) — both exported by the manager slice.
 STAGE0_TUS+=("Init/Task.c")
+# fln-3gv slice 5a: the stdio/fs/process/env demand surface — every one of
+# IO.c's 105 lean_* demands is now classified in the status ledger (11 stdio
+# symbols live, the fs/process/env families declared Unsupported), so the
+# audit holds the whole surface without linking the TU anywhere.
+STAGE0_TUS+=("Init/System/IO.c")
 if [ "${FLN_E2E_DEEP:-0}" = "1" ]; then
     STAGE0_TUS+=("Init/Core.c")
 fi

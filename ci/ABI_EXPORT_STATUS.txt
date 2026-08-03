@@ -127,8 +127,8 @@ row lean_io_mark_end_initialization | Unsupported | fln-3gv | census (fln-rt::ab
 row lean_io_result_show_error | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
 row lean_io_wait_any_core | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export io wrapper suite; stage0 gauntlet lane | first finished member in list order, block-and-rescan through the manager (object.cpp:1267-1269, 1014-1023); managerless finished-scan answers, empty-handed refuses typed
 row lean_isize_of_big_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_mark_mt | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | iterative graph walk; external traversal restriction tracked (7xe)
-row lean_mark_persistent | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | iterative graph walk; external traversal restriction tracked (7xe)
+row lean_mark_mt | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | iterative graph walk; the external arm applies m_foreach with the marking closure (7xe restriction closed, fln-3gv slice 5a)
+row lean_mark_persistent | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | iterative graph walk; the external arm applies m_foreach with the marking closure (7xe restriction closed, fln-3gv slice 5a)
 row lean_mk_array | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_mk_ascii_string_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:2022-2025
 row lean_mk_io_error_already_exists | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
@@ -260,3 +260,62 @@ extern lean_io_check_canceled | CompatWrapper | crates/fln-unsafe-abi/src/export
 extern lean_io_cancel | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export io wrapper suite; stage0 gauntlet lane | cancel_core then unit (io.cpp:1574-1577; extern census IO.cancel)
 extern lean_io_wait | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export io wrapper suite; stage0 gauntlet lane | task_get_own: blocking get then the inline's scalar-checked inc/dec (io.cpp:1583-1585; extern census IO.wait)
 extern lean_io_wait_any | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export io wrapper suite; stage0 gauntlet lane | wait_any_core then the winner's value duplicated out (io.cpp:1587-1592; extern census IO.waitAny)
+extern lean_get_stdin | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream trio suites; stage0 IO.c demand audit | this thread's current stdin stream, duplicated out (io.cpp:119-121; fln-3gv slice 5a)
+extern lean_get_stdout | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream trio suites; gauntlet corpus facts; stage0 IO.c demand audit | this thread's current stdout stream, duplicated out (io.cpp:124-126)
+extern lean_get_stderr | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream trio suites; stage0 IO.c demand audit | this thread's current stderr stream, duplicated out (io.cpp:129-131)
+extern lean_get_set_stdin | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream trio suites; stage0 IO.c demand audit | steal old, install new, return old (io.cpp:134-139)
+extern lean_get_set_stdout | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream trio suites; gauntlet corpus facts; stage0 IO.c demand audit | steal old, install new, return old — the withStdout capture seam (io.cpp:142-147)
+extern lean_get_set_stderr | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream trio suites; stage0 IO.c demand audit | steal old, install new, return old (io.cpp:150-155)
+extern lean_io_prim_handle_mk | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | mode flags + O_CLOEXEC, embedded-NUL refusal, open/fdopen (io.cpp:385-418)
+extern lean_io_prim_handle_put_str | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | fwrite sans NUL; short write decodes errno (io.cpp:661-670)
+extern lean_io_prim_handle_flush | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | fflush; failure decodes errno (io.cpp:550-556)
+extern lean_io_prim_handle_is_tty | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; stage0 IO.c demand audit | isatty on the fd, errors ignored per the pin (io.cpp:516-531)
+extern lean_stream_of_handle | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream cell suites; gauntlet corpus facts | the pin's LEAN-COMPILED Stream.ofHandle served natively (B2 Native-Mirror arm; Init/System/IO.lean:1683) — when stage0 IO.c joins a LINK lane its own definition collides and ours must yield, disclosed in design comment 1856's successor
+extern lean_io_prim_handle_read | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice; the native stream's read field refuses typed until then
+extern lean_io_prim_handle_write | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice; the native stream's write field refuses typed until then
+extern lean_io_prim_handle_get_line | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice; the native stream's getLine field refuses typed until then
+extern lean_io_prim_handle_rewind | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
+extern lean_io_prim_handle_truncate | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
+extern lean_io_prim_handle_lock | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
+extern lean_io_prim_handle_try_lock | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
+extern lean_io_prim_handle_unlock | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
+extern lean_chmod | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice (ordinary syscalls, no D2 involvement)
+extern lean_io_create_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_create_tempdir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_create_tempfile | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_current_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_hard_link | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_metadata | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_read_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_realpath | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_remove_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_remove_file | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_rename | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_symlink_metadata | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_app_path | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_process_spawn | Unsupported | fln-3gv | stage0 IO.c demand audit | process family — the D2 subprocess seam, designed before implemented, routed when reached
+extern lean_io_process_child_wait | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
+extern lean_io_process_child_try_wait | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
+extern lean_io_process_child_kill | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
+extern lean_io_process_child_pid | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
+extern lean_io_process_child_take_stdin | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
+extern lean_io_process_get_pid | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
+extern lean_io_process_get_current_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
+extern lean_io_process_set_current_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
+extern lean_io_getenv | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_exit | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_force_exit | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_initializing | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_get_random_bytes | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_get_tid | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_mono_ms_now | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family (timer seam), later slice
+extern lean_io_mono_nanos_now | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family (timer seam), later slice
+extern lean_io_error_to_string | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_allocprof | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_timeit | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_runtime_forget | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_runtime_mark_multi_threaded | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice (the mark_mt core is live; this is its Runtime.* extern skin)
+extern lean_runtime_mark_persistent | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice (the mark_persistent core is live; this is its Runtime.* extern skin)
+extern lean_string_validate_utf8 | Unsupported | fln-3gv | stage0 IO.c demand audit | string family, later slice
+extern lean_byte_array_copy_slice | Unsupported | fln-3gv | stage0 IO.c demand audit | byte-array family, later slice
+extern lean_initialize_runtime_module | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream trio suites; gauntlet corpus facts | the generated-main init entry (init_module.cpp:19-29); Marrow's eager half is the io stream trio + SIGPIPE disposition, every other pin plane static or lazily seeded
