@@ -150,6 +150,32 @@ fn candidate_receipt_join_refuses_stale_or_mixed_roots() {
 }
 
 #[test]
+fn candidate_receipt_ndjson_is_strict_and_canonical() {
+    let receipt = complete_receipt(LockChange::Upgrade);
+    let ndjson = receipt.to_ndjson().expect("complete receipt renders");
+    assert_eq!(
+        CandidateReceipt::from_ndjson(&ndjson).expect("canonical receipt parses"),
+        receipt
+    );
+
+    let reordered = ndjson.replacen(
+        r#"{"schema":"fln-suite-upgrade-candidate/1","candidate_id""#,
+        r#"{"candidate_id":"suite-upgrade-fixture","schema""#,
+        1,
+    );
+    assert!(
+        CandidateReceipt::from_ndjson(&reordered).is_err(),
+        "a reordered receipt must not be canonical"
+    );
+
+    let missing_newline = ndjson.trim_end_matches('\n');
+    assert!(
+        CandidateReceipt::from_ndjson(missing_newline).is_err(),
+        "a receipt without final newline must refuse"
+    );
+}
+
+#[test]
 fn lock_delta_contract_join() {
     let required = [
         "closure_delta",

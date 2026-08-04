@@ -187,6 +187,23 @@ impl LockChange {
             Self::PathCommitTreeChecksum => "path-commit-tree-checksum",
         }
     }
+
+    fn parse_label(value: &str) -> Result<Self, String> {
+        match value {
+            "addition" => Ok(Self::Addition),
+            "removal" => Ok(Self::Removal),
+            "upgrade" => Ok(Self::Upgrade),
+            "downgrade" => Ok(Self::Downgrade),
+            "retarget" => Ok(Self::Retarget),
+            "nightly" => Ok(Self::Nightly),
+            "target-feature" => Ok(Self::TargetFeature),
+            "profile" => Ok(Self::Profile),
+            "reference" => Ok(Self::Reference),
+            "corpus" => Ok(Self::Corpus),
+            "path-commit-tree-checksum" => Ok(Self::PathCommitTreeChecksum),
+            _ => Err(format!("unknown candidate receipt change kind `{value}`")),
+        }
+    }
 }
 
 /// The identity-bearing half of a candidate's retained evidence. A `true`
@@ -245,6 +262,54 @@ impl CandidateReceipt {
         }
         Ok(())
     }
+
+    /// One canonical, schema-versioned NDJSON record. The eventual shared E2E
+    /// emits this receipt alongside its richer run log; parsing it back makes a
+    /// reordered or partial record non-authoritative before its identities can
+    /// join the candidate.
+    pub fn to_ndjson(&self) -> Result<String, String> {
+        self.validate()?;
+        Ok(format!(
+            concat!(
+                r#"{{"schema":"fln-suite-upgrade-candidate/1","candidate_id":"{}","change":"{}","old_lock_root":"{}","candidate_lock_root":"{}","closure_root":"{}","contract_and_census_root":"{}","tribunal_root":"{}","migration_root":"{}","rollback_root":"{}","external_evidence_root":"{}","final_current_lock_root":"{}"}}"#,
+                "\n"
+            ),
+            self.candidate_id,
+            self.change.label(),
+            self.old_lock_root,
+            self.candidate_lock_root,
+            self.closure_root,
+            self.contract_and_census_root,
+            self.tribunal_root,
+            self.migration_root,
+            self.rollback_root,
+            self.external_evidence_root,
+            self.final_current_lock_root,
+        ))
+    }
+
+    pub fn from_ndjson(text: &str) -> Result<Self, String> {
+        let values = parse_canonical_receipt_ndjson(text)?;
+        let change = LockChange::parse_label(&values[2])?;
+        let receipt = Self {
+            candidate_id: values[1].clone(),
+            change,
+            old_lock_root: values[3].clone(),
+            candidate_lock_root: values[4].clone(),
+            closure_root: values[5].clone(),
+            contract_and_census_root: values[6].clone(),
+            tribunal_root: values[7].clone(),
+            migration_root: values[8].clone(),
+            rollback_root: values[9].clone(),
+            external_evidence_root: values[10].clone(),
+            final_current_lock_root: values[11].clone(),
+        };
+        receipt.validate()?;
+        if receipt.to_ndjson()? != text {
+            return Err("candidate receipt NDJSON is parseable but not canonical".to_string());
+        }
+        Ok(receipt)
+    }
 }
 
 fn is_canonical_root(value: &str) -> bool {
@@ -252,6 +317,76 @@ fn is_canonical_root(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn parse_canonical_receipt_ndjson(text: &str) -> Result<Vec<String>, String> {
+    const KEYS: [&str; 12] = [
+        "schema",
+        "candidate_id",
+        "change",
+        "old_lock_root",
+        "candidate_lock_root",
+        "closure_root",
+        "contract_and_census_root",
+        "tribunal_root",
+        "migration_root",
+        "rollback_root",
+        "external_evidence_root",
+        "final_current_lock_root",
+    ];
+    if !text.ends_with('\n') || text[..text.len() - 1].contains('\n') {
+        return Err(
+            "candidate receipt must be exactly one newline-terminated NDJSON row".to_string(),
+        );
+    }
+    let mut remaining = &text[..text.len() - 1];
+    remaining = remaining
+        .strip_prefix('{')
+        .ok_or_else(|| "candidate receipt row must start with `{`".to_string())?;
+    let mut values = Vec::with_capacity(KEYS.len());
+    for (index, expected_key) in KEYS.iter().enumerate() {
+        let (key, after_key) = take_json_string(remaining)?;
+        if key != *expected_key {
+            return Err(format!(
+                "candidate receipt field {index} is `{key}`, expected `{expected_key}`"
+            ));
+        }
+        let after_colon = after_key
+            .strip_prefix(':')
+            .ok_or_else(|| format!("candidate receipt field `{expected_key}` lacks `:`"))?;
+        let (value, after_value) = take_json_string(after_colon)?;
+        values.push(value);
+        remaining = if index + 1 == KEYS.len() {
+            after_value
+                .strip_prefix('}')
+                .ok_or_else(|| "candidate receipt row lacks closing `}`".to_string())?
+        } else {
+            after_value
+                .strip_prefix(',')
+                .ok_or_else(|| format!("candidate receipt field `{expected_key}` lacks `,`"))?
+        };
+    }
+    if !remaining.is_empty() {
+        return Err("candidate receipt row has trailing bytes".to_string());
+    }
+    if values[0] != "fln-suite-upgrade-candidate/1" {
+        return Err(format!("unknown candidate receipt schema `{}`", values[0]));
+    }
+    Ok(values)
+}
+
+fn take_json_string(input: &str) -> Result<(String, &str), String> {
+    let input = input
+        .strip_prefix('"')
+        .ok_or_else(|| "candidate receipt field is not a JSON string".to_string())?;
+    let Some(end) = input.find('"') else {
+        return Err("candidate receipt has an unterminated JSON string".to_string());
+    };
+    let value = &input[..end];
+    if value.contains('\\') || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err("candidate receipt strings must be unescaped canonical ASCII".to_string());
+    }
+    Ok((value.to_string(), &input[end + 1..]))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
