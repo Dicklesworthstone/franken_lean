@@ -2307,6 +2307,7 @@ fn export_string_append_matches_upstream_arms() {
 
 #[test]
 fn export_assert_violation_format_matches_upstream() {
+    let _g = lock();
     // debug.cpp:48-55 byte-for-byte: four lines, each newline-terminated, the
     // condition bare on its own line. The abort half is the crash path and is
     // deliberately not crossed in-process; the format is the testable half.
