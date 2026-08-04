@@ -696,6 +696,11 @@ struct Derivation {
     /// member directory → the package name its manifest **declares**. Read, never inferred
     /// from the directory name, which merely happens to match for all 33 members today.
     packages: BTreeMap<String, String>,
+    /// Packages OUTSIDE the root workspace whose tests `scripts/check.sh` nonetheless runs,
+    /// via `cargo test --manifest-path <dir>/Cargo.toml`. Derived from check.sh, never listed:
+    /// admission is exactly "some check.sh stage runs this package's tests", so deleting that
+    /// stage makes citations to it unbound again, which is the correct direction.
+    ci_manifest_packages: BTreeSet<String>,
     /// `(where, reason)` for everything that makes the layout-derived target set incomplete:
     /// a manifest override, a directory-style target, a stem collision, a `#[path]` attribute.
     granularity_preconditions: Vec<(String, String)>,
@@ -704,6 +709,59 @@ struct Derivation {
 fn read(root: &Path, relative: &str) -> String {
     fs::read_to_string(root.join(relative))
         .unwrap_or_else(|error| fixture_panic!("{relative} must be readable: {error}"))
+}
+
+/// The package name a manifest **declares**. One definition, read by every site that needs it —
+/// a second copy of this parse is `imuu`'s defect shape, and this file already has two callers.
+fn package_name(manifest: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("name")?.trim_start();
+        let value = rest.strip_prefix('=')?.trim();
+        value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .map(str::to_string)
+    })
+}
+
+/// Packages that live outside the root workspace but whose tests `scripts/check.sh` runs
+/// through an explicit `--manifest-path`.
+///
+/// `tribunal/epoch-lab` is a nested workspace, so the root `members` globs never reach it and
+/// `cargo test --workspace` never builds it — yet `scripts/check.sh` runs
+/// `cargo test --locked --manifest-path tribunal/epoch-lab/Cargo.toml` as its own stage. Before
+/// this existed, a coverage row citing `test:fln-epoch-lab::…` was reported `granularity-unbound`
+/// for naming a package "no workspace member declares", which was true and beside the point: the
+/// citation denoted a real function that CI really runs. The guard was short, not the row.
+///
+/// Admission is **derived from what check.sh actually invokes**, never from a walk for manifests
+/// and never from a list of names. A package earns entry only while some `cargo test` line names
+/// its manifest; delete that stage and citations to it go unbound again, which is correct — a
+/// test nothing runs cannot carry a row's claim. A filesystem walk would instead admit every
+/// nested package whether or not anything executes it, which is the weakening this avoids.
+fn ci_manifest_packages(check_sh: &str, root: &Path) -> BTreeSet<String> {
+    let mut packages = BTreeSet::new();
+    for statement in check_sh.split("run_stage ") {
+        if !statement.contains("cargo test") {
+            continue;
+        }
+        let Some((_, rest)) = statement.split_once("--manifest-path") else {
+            continue;
+        };
+        let Some(relative) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if !relative.ends_with("Cargo.toml") {
+            continue;
+        }
+        let Ok(manifest) = fs::read_to_string(root.join(relative)) else {
+            continue;
+        };
+        if let Some(name) = package_name(&manifest) {
+            packages.insert(name);
+        }
+    }
+    packages
 }
 
 /// Resolve the root manifest's `members` globs against the tree.
@@ -878,6 +936,7 @@ fn derive(root: &Path) -> Derivation {
 
     let check_sh = read(root, "scripts/check.sh");
     let check_sh_workspace = check_sh_reaches_workspace(&check_sh);
+    let ci_manifest_packages = ci_manifest_packages(&check_sh, root);
     let e2e_keys = e2e_scenario_keys(&read(root, "scripts/evidence.py"));
 
     // The tracker decides terminal state; coverage rows never declare it.
@@ -974,21 +1033,11 @@ fn derive(root: &Path) -> Derivation {
     let mut cfg_gated_modules: BTreeSet<(String, String, String)> = BTreeSet::new();
     for member in &members {
         let manifest = read(root, &format!("{member}/Cargo.toml"));
-        let name = manifest
-            .lines()
-            .find_map(|line| {
-                let rest = line.trim().strip_prefix("name")?.trim_start();
-                let value = rest.strip_prefix('=')?.trim();
-                value
-                    .strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| {
-                fixture_panic!(
-                    "scan: {member}/Cargo.toml declares no package name this reader can find"
-                )
-            });
+        let name = package_name(&manifest).unwrap_or_else(|| {
+            fixture_panic!(
+                "scan: {member}/Cargo.toml declares no package name this reader can find"
+            )
+        });
         for reason in autodiscovery_overrides(&manifest) {
             preconditions.push((format!("{member}/Cargo.toml"), reason.to_string()));
         }
@@ -1192,6 +1241,7 @@ fn derive(root: &Path) -> Derivation {
         pin_reaching,
         jobs,
         check_sh_workspace,
+        ci_manifest_packages,
         check_sh,
         own_source: read(root, "crates/fln-conformance/tests/ci_execution_join.rs"),
         rows,
@@ -1414,12 +1464,23 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                 ));
                 continue;
             };
-            if !d.packages.values().any(|name| name == package) {
+            let outside_but_run = d.ci_manifest_packages.contains(package);
+            if !d.packages.values().any(|name| name == package) && !outside_but_run {
                 findings.push(format!(
                     "granularity-unbound: terminal row {} cites {artifact:?}, but no workspace \
-                     member declares the package name {package:?}.",
+                     member declares the package name {package:?}, and no `scripts/check.sh` \
+                     stage runs `cargo test --manifest-path` against a manifest declaring it. \
+                     A package nothing builds and nothing runs cannot carry this row's claim.",
                     row.bead
                 ));
+                continue;
+            }
+            if outside_but_run {
+                // Outside the root workspace, so the layout maps below (targets, lib_tests)
+                // never walked it and cannot resolve the function. Admission stops at the
+                // package: check.sh runs its tests, which is what the row needs, and claiming
+                // to have resolved the FUNCTION here would be a green taken from a walk that
+                // never happened.
                 continue;
             }
             if target == "lib" {
@@ -3764,6 +3825,88 @@ fn granularity_mutant_a_citation_naming_no_such_function_cannot_leave_the_popula
         .push("test:fln-conformance::kernel_replay::no_such_function".to_string());
     let findings = granularity_findings(&d);
     assert!(fires(&findings, "granularity-unbound"), "{findings:?}");
+}
+
+/// The control for the nested-workspace admission: `fln-epoch-lab` really is derived, so the
+/// two cells below are about the rule rather than about a set that was empty all along.
+#[test]
+fn the_check_sh_manifest_packages_are_derived_and_not_empty() {
+    let d = derive(&root());
+    assert!(
+        d.ci_manifest_packages.contains("fln-epoch-lab"),
+        "scripts/check.sh runs `cargo test --manifest-path tribunal/epoch-lab/Cargo.toml`, so \
+         its package must be derived; got {:?}",
+        d.ci_manifest_packages
+    );
+    // Not a walk for manifests: a nested package nothing runs must NOT appear. Without this the
+    // admission would be "any manifest on disk", which is the weakening the derivation avoids.
+    assert!(
+        !d.ci_manifest_packages
+            .contains("kernel-ownership-publisher"),
+        "tools/structure-guard/kernel-ownership-publisher is outside the root globs too, but no \
+         check.sh `cargo test` stage names its manifest, so it must not be admitted: {:?}",
+        d.ci_manifest_packages
+    );
+}
+
+/// A citation into a package outside the root workspace resolves **only** while check.sh runs
+/// its tests. This is the repair for the false `granularity-unbound` on `franken_lean-8g7q`.
+#[test]
+fn granularity_control_a_package_check_sh_runs_by_manifest_path_is_bound() {
+    let mut d = derive(&root());
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine
+        .push("test:fln-epoch-lab::derived_input_provenance::any_name_at_all".to_string());
+    let findings = granularity_findings(&d);
+    // Scoped to THIS citation rather than to an empty findings list. The live tree may carry
+    // unrelated findings from other panes' rows, and a control asserting global cleanliness
+    // fails for their reasons — which is how a passing guard gets read as a broken one.
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.starts_with("granularity-unbound") && f.contains("fln-epoch-lab")),
+        "a package whose tests check.sh runs by --manifest-path must not be reported unbound: \
+         {findings:?}"
+    );
+}
+
+/// Gut it: drop the derived set and the same citation must go unbound again. Without this the
+/// cell above could pass because nothing ever fires, and the admission would be untested.
+#[test]
+fn granularity_mutant_dropping_the_manifest_path_admission_unbinds_the_citation_again() {
+    let mut d = derive(&root());
+    d.ci_manifest_packages.clear();
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine
+        .push("test:fln-epoch-lab::derived_input_provenance::any_name_at_all".to_string());
+    let findings = granularity_findings(&d);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("granularity-unbound") && f.contains("fln-epoch-lab")),
+        "with the admission emptied the citation must be unbound again: {findings:?}"
+    );
+}
+
+/// And the guard is not weakened for packages nothing runs: an invented package stays unbound
+/// whether or not the admission set exists.
+#[test]
+fn granularity_mutant_a_package_no_stage_runs_is_still_unbound() {
+    let mut d = derive(&root());
+    let row = a_coarse_row(&mut d);
+    row.coarse.clear();
+    row.fine
+        .push("test:fln-not-a-package-anywhere::some_target::some_fn".to_string());
+    let findings = granularity_findings(&d);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.starts_with("granularity-unbound")
+                && f.contains("fln-not-a-package-anywhere")),
+        "{findings:?}"
+    );
 }
 
 #[test]
