@@ -79,13 +79,29 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
     "tools",
 ];
 
-/// Exact backup-only anchor identities reviewed after the 2026-07-25 history rewrite.
+/// Exact backup-only anchor identities reviewed after the 2026-07-25 history rewrite, and after
+/// the 2026-08-04T00:12Z rebase onto `origin/main`.
 ///
 /// Every hex run is at most five characters so this declaration cannot satisfy the scanner it
 /// governs. [`decode_segmented_allowance`] removes the separators and refuses malformed rows.
 /// Exact-set equality, not this population count, is the law; the count is retained as an
 /// independently reviewed anti-vacuity witness and must shrink with a repaired row.
-const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 168;
+///
+/// **This population GREW once, 168 -> 172, and the reason is the whole justification.** The
+/// 2026-08-04 rebase replayed five commits and left every original dangling — unlike 2026-07-25,
+/// no backup ref retains them. Anchors that rebase orphaned inside *mutable* evidence were
+/// repaired to their content-identical main twins instead of declared: `franken_lean-gii.19`'s
+/// coverage row moved to `cd758687…` at `d138c6e5`, which is why no manifest token appears here.
+/// The four added entries are the ones no repair can reach, because they sit in **immutable bead
+/// comments** — `franken_lean-gii.19` comment 1880 and `franken_lean-j8h` comment 1879. Declaring
+/// an anchor is the treatment of last resort for an immutable citation, never an alternative to
+/// repairing a mutable one, and a token that becomes repairable must leave this list.
+///
+/// Declaring survives garbage collection: a dangling object that is pruned is counted through the
+/// `missing_objects` intersection rather than dropping out, so no backup ref is needed to keep
+/// these rows honest — and one was deliberately not created, since an undeclared locally
+/// resolvable backup commit is itself a refusal.
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 172;
 const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0382d-7b",
     "041ad-4e0",
@@ -206,6 +222,8 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "ae967-368",
     "af265-46a",
     "b0611-5fc",
+    "b364e-d1c",
+    "b364e-d1c9e-2497a-d1392-32163-e979a-56703-a1974",
     "b3863-54",
     "b3863-547",
     "b6b80-e98",
@@ -234,6 +252,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "d6421-8a954-f8447-b3f29-c4ca2-30ae5-d158d-56dc9",
     "d927b-7d",
     "d954a-a9f",
+    "d98ed-115c3-f7ffb-ccc01-b1edd-a044e-70a8f-ba09b",
     "dc4e8-1e6",
     "dd447-7bf",
     "df2c9-75d",
@@ -251,6 +270,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "f2190-330",
     "f2578-87",
     "f3b98-d22",
+    "f4860-03f17-73a0d-950c0-e28f3-34ff2-e00a4-8b4a9",
     "f4c22-a2d",
     "f4db9-1f6b8-90785-2e03a-988ea-0d8ca-bf5cb-812c6",
     "fbe5d-be4",
