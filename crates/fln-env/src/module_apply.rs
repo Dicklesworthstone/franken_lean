@@ -1728,8 +1728,8 @@ mod tests {
     use crate::constants::{AxiomVal, ConstantVal};
     use crate::extensions::{CheckpointSemantics, MergeSemantics, PayloadProvenance};
     use crate::modules::{
-        ArtifactEvidence, ArtifactGrade, ArtifactProducer, ModuleEpoch, ModuleGraphLimits,
-        ModuleId, ModuleRecord,
+        ArtifactEvidence, ArtifactGrade, ArtifactProducer, DirectImport, ModuleEpoch,
+        ModuleGraphLimits, ModuleId, ModuleRecord,
     };
     use crate::provenance::{
         CaptureStatus, ExtensionContribution, ModuleProvenanceLimits, PayloadTransparency,
@@ -1782,12 +1782,20 @@ mod tests {
         contributions: Vec<ExtensionContribution>,
         completeness: ProvenanceCompleteness,
     ) -> ModuleContributionRecord {
+        record_with_imports(vec![], contributions, completeness)
+    }
+
+    fn record_with_imports(
+        imports: Vec<DirectImport>,
+        contributions: Vec<ExtensionContribution>,
+        completeness: ProvenanceCompleteness,
+    ) -> ModuleContributionRecord {
         let epoch = epoch();
         ModuleContributionRecord::new(
             ModuleRecord::new(
                 ModuleId::new(name("fixture.module")),
                 true,
-                vec![],
+                imports,
                 ArtifactEvidence {
                     epoch,
                     content_digest: Digest([7; 32]),
@@ -2600,6 +2608,80 @@ mod tests {
         );
         assert!(
             !committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::CompleteInventory)
+        );
+        assert!(
+            !committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::AuthoritativeCache)
+        );
+        assert!(
+            !committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::FineInvalidation)
+        );
+        assert_eq!(base.graph().len(), 0);
+        assert_eq!(committed.state().graph().len(), 1);
+    }
+
+    #[test]
+    fn unresolved_direct_target_publishes_as_applied_incomplete_without_cache_authority() {
+        let environment = Environment::new();
+        let empty_manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let empty_graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        let base = ModuleApplyState::from_parts(environment, empty_graph, empty_manifest)
+            .expect("empty aggregate state is coherent");
+        let missing = ModuleId::new(name("fixture.unresolved"));
+        let completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
+            vec![missing.clone()],
+        );
+        let checked = preflight_module_apply(transaction(
+            record_with_imports(
+                vec![DirectImport::new(missing.clone(), false, false, false)],
+                vec![],
+                completeness.clone(),
+            ),
+            vec![],
+        ))
+        .expect("unresolved target still binds every retained payload exactly");
+        let declaration_candidate = base
+            .environment()
+            .add_decl((*checked.transaction().declarations()[0]).clone())
+            .expect("fixture declaration is unique")
+            .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+            .expect("fixture extra declaration is unique");
+        let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
+                plan.commit(&base).expect("base remains current")
+            }
+            other => panic!("expected a complete unresolved-target plan, got {other:?}"),
+        };
+        assert!(matches!(
+            committed.receipt().grade(),
+            ModuleApplyGrade::AppliedIncomplete { completeness: actual }
+                if actual == &completeness
+        ));
+        assert_eq!(
+            committed
+                .receipt()
+                .grade()
+                .completeness()
+                .missing_dependencies(),
+            &[missing]
+        );
+        assert!(
+            committed
                 .receipt()
                 .grade()
                 .grants(ProvenanceAuthority::CompleteInventory)
