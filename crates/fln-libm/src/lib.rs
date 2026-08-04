@@ -404,9 +404,13 @@ pub fn exp(x: f64) -> f64 {
     let r = (x - (k as f64) * LN2_HI) - (k as f64) * LN2_LO;
     let mut term = 1.0;
     let mut sum = 1.0;
+    let mut compensation = 0.0;
     for n in 1..=18 {
         term *= r / n as f64;
-        sum += term;
+        let adjusted = term - compensation;
+        let next = sum + adjusted;
+        compensation = (next - sum) - adjusted;
+        sum = next;
     }
     scalbn(sum, k)
 }
@@ -436,9 +440,13 @@ pub fn expm1(x: f64) -> f64 {
     if abs(x) <= 0.5 {
         let mut term = x;
         let mut sum = x;
+        let mut compensation = 0.0;
         for n in 2..=22 {
             term *= x / n as f64;
-            sum += term;
+            let adjusted = term - compensation;
+            let next = sum + adjusted;
+            compensation = (next - sum) - adjusted;
+            sum = next;
         }
         sum
     } else {
@@ -510,9 +518,13 @@ pub fn log1p(x: f64) -> f64 {
     if abs(x) <= 0.5 {
         let mut term = x;
         let mut sum = x;
+        let mut compensation = 0.0;
         for n in 2..=80 {
             term *= -x;
-            sum += term / n as f64;
+            let adjusted = term / n as f64 - compensation;
+            let next = sum + adjusted;
+            compensation = (next - sum) - adjusted;
+            sum = next;
         }
         sum
     } else {
@@ -825,6 +837,13 @@ mod tests {
     fn close(a: f64, b: f64, tolerance: f64) {
         assert!(abs(a - b) <= tolerance, "{a:?} != {b:?}");
     }
+    fn ulp_distance(a: f64, b: f64) -> u64 {
+        let ordered = |x: f64| {
+            let bits = x.to_bits();
+            if bits & SIGN == 0 { bits | SIGN } else { !bits }
+        };
+        ordered(a).abs_diff(ordered(b))
+    }
 
     #[test]
     fn special_values_and_signed_zero_are_specified() {
@@ -1076,7 +1095,7 @@ mod tests {
             (
                 0.1,
                 0x3fba_ec7b_35a0_0d3a,
-                0x3fb8_663f_793c_46c8,
+                0x3fb8_663f_793c_46c7,
                 0x3fb9_83d7_795f_413b,
             ),
             (
@@ -1192,5 +1211,59 @@ mod tests {
         same_bits(hypot(largest, smallest), largest);
         same_bits(hypot(largest, largest), f64::INFINITY);
         same_bits(hypot(-largest, largest), f64::INFINITY);
+    }
+
+    #[test]
+    fn high_precision_small_domain_table_stays_within_one_ulp() {
+        // Correctly-rounded binary64 reference values, generated at 200 decimal
+        // digits from the exact binary64 inputs.  The four points partition the
+        // cancellation-sensitive small domains on either side of zero.
+        for (input, expected_exp, expected_log1p, expected_expm1, expected_asinh, expected_atanh) in [
+            (
+                -0.5,
+                0x3fe3_68b2_fc6f_960a,
+                0xbfe6_2e42_fefa_39ef,
+                0xbfd9_2e9a_0720_d3ec,
+                0xbfde_cc2c_aec5_160a,
+                0xbfe1_93ea_7aad_030b,
+            ),
+            (
+                -0.1,
+                0x3fec_f46d_99d5_2b3a,
+                0xbfba_f8e8_210a_415e,
+                0xbfb8_5c93_3156_a62c,
+                0xbfb9_8eb9_e7e5_fc3e,
+                0xbfb9_af93_cd23_4412,
+            ),
+            (
+                0.1,
+                0x3ff1_aec7_b35a_00d4,
+                0x3fb8_663f_793c_46c7,
+                0x3fba_ec7b_35a0_0d3a,
+                0x3fb9_8eb9_e7e5_fc3e,
+                0x3fb9_af93_cd23_4412,
+            ),
+            (
+                0.5,
+                0x3ffa_6129_8e1e_069c,
+                0x3fd9_f323_ecbf_984c,
+                0x3fe4_c253_1c3c_0d38,
+                0x3fde_cc2c_aec5_160a,
+                0x3fe1_93ea_7aad_030b,
+            ),
+        ] {
+            for (actual, expected) in [
+                (exp(input), expected_exp),
+                (log1p(input), expected_log1p),
+                (expm1(input), expected_expm1),
+                (asinh(input), expected_asinh),
+                (atanh(input), expected_atanh),
+            ] {
+                assert!(
+                    ulp_distance(actual, f64::from_bits(expected)) <= 1,
+                    "input={input:?} actual={actual:?}"
+                );
+            }
+        }
     }
 }
