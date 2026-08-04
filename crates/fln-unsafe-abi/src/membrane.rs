@@ -90,7 +90,7 @@ const SMALL_PAGE_TARGET_BYTES: usize = 64 * 1024;
 /// The high bit is the page owner's token; low bits count carved blocks held
 /// by clients or deferred-free bins. Exactly one caller transitions this
 /// state to zero, and that caller reclaims the page.
-const PAGE_OWNER_TOKEN: usize = 1usize << (usize::BITS - 1);
+const PAGE_OWNER_BIT: usize = 1usize << (usize::BITS - 1);
 
 struct SmallPage {
     state: AtomicUsize,
@@ -114,7 +114,7 @@ struct SmallBins {
     owned_pages: *mut SmallPage,
 }
 
-// UNSAFE-LEDGER: FLN-UL-0202
+// UNSAFE-LEDGER: FLN-UL-0321
 #[allow(unsafe_code)]
 impl SmallBins {
     const fn new() -> Self {
@@ -296,7 +296,7 @@ fn small_page_layout(block_layout: Layout, capacity: usize) -> Layout {
 /// Allocate and initialize one class-homogeneous page. Its owner token stays
 /// with the creating thread; carved blocks keep the page alive after a
 /// cross-thread deferred free until their eventual reuse or drain.
-// UNSAFE-LEDGER: FLN-UL-0202
+// UNSAFE-LEDGER: FLN-UL-0322
 #[allow(unsafe_code)]
 unsafe fn alloc_small_page(owner_next: *mut SmallPage, class: usize) -> *mut SmallPage {
     let block_layout = small_class_layout(class);
@@ -310,7 +310,7 @@ unsafe fn alloc_small_page(owner_next: *mut SmallPage, class: usize) -> *mut Sma
             return page;
         }
         page.write(SmallPage {
-            state: AtomicUsize::new(PAGE_OWNER_TOKEN),
+            state: AtomicUsize::new(PAGE_OWNER_BIT),
             owner_next,
             next_slot: Cell::new(0),
             capacity,
@@ -326,13 +326,13 @@ unsafe fn alloc_small_page(owner_next: *mut SmallPage, class: usize) -> *mut Sma
 /// Return one carved page block. The caller that transitions the combined
 /// owner/block state to zero is the sole reclaimer, which keeps foreign-thread
 /// deferred frees from racing the creating thread's TLS destructor.
-// UNSAFE-LEDGER: FLN-UL-0202
+// UNSAFE-LEDGER: FLN-UL-0323
 #[allow(unsafe_code)]
 unsafe fn release_page_block(page: *mut SmallPage) {
     // SAFETY: every page block retains one low-bit state token until this call.
     unsafe {
         let previous = (*page).state.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous & !PAGE_OWNER_TOKEN > 0, "page block underflow");
+        debug_assert!(previous & !PAGE_OWNER_BIT > 0, "page block underflow");
         if previous == 1 {
             free_small_page(page);
         }
@@ -340,21 +340,21 @@ unsafe fn release_page_block(page: *mut SmallPage) {
 }
 
 /// Relinquish a creating thread's page-owner token after draining its bins.
-// UNSAFE-LEDGER: FLN-UL-0202
+// UNSAFE-LEDGER: FLN-UL-0324
 #[allow(unsafe_code)]
 unsafe fn release_page_owner(page: *mut SmallPage) {
     // SAFETY: each page is linked into exactly one SmallBins owner list and
     // drain visits that list exactly once.
     unsafe {
-        let previous = (*page).state.fetch_sub(PAGE_OWNER_TOKEN, Ordering::AcqRel);
-        debug_assert!(previous & PAGE_OWNER_TOKEN != 0, "page owner underflow");
-        if previous == PAGE_OWNER_TOKEN {
+        let previous = (*page).state.fetch_sub(PAGE_OWNER_BIT, Ordering::AcqRel);
+        debug_assert!(previous & PAGE_OWNER_BIT != 0, "page owner underflow");
+        if previous == PAGE_OWNER_BIT {
             free_small_page(page);
         }
     }
 }
 
-// UNSAFE-LEDGER: FLN-UL-0202
+// UNSAFE-LEDGER: FLN-UL-0325
 #[allow(unsafe_code)]
 unsafe fn free_small_page(page: *mut SmallPage) {
     // SAFETY: callers won the unique transition of the combined page state to
@@ -368,7 +368,7 @@ unsafe fn free_small_page(page: *mut SmallPage) {
 }
 
 /// Release a cached small block through its backing authority.
-// UNSAFE-LEDGER: FLN-UL-0202
+// UNSAFE-LEDGER: FLN-UL-0326
 #[allow(unsafe_code)]
 unsafe fn release_small_block(base: *mut u8) {
     // SAFETY: `base` points to the prefix of a block owned by a bin; the
