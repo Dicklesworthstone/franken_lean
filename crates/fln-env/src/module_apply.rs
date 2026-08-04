@@ -18,9 +18,9 @@ use crate::environment::{DeclarationDeltaError, Environment};
 use crate::extensions::ExtensionDescriptor;
 use crate::modules::{ArtifactEvidence, ModuleGraph, ModuleId};
 use crate::provenance::{
-    CaptureStatus, DeclarationClass, ExtensionEntryId, ModuleContributionRecord,
-    ModuleProvenanceError, ModuleProvenanceIndexes, ModuleProvenanceManifest, ModuleProvenanceRoot,
-    ProvenanceAuthority, ProvenanceCompleteness,
+    CaptureStatus, DeclarationClass, ExtensionContribution, ExtensionEntryId,
+    ModuleContributionRecord, ModuleProvenanceError, ModuleProvenanceIndexes,
+    ModuleProvenanceManifest, ModuleProvenanceRoot, ProvenanceAuthority, ProvenanceCompleteness,
 };
 
 /// Schema for the ephemeral payload envelope.  Bumping it invalidates every prepared
@@ -208,6 +208,63 @@ pub struct ModuleApplyState {
     manifest: Arc<ModuleProvenanceManifest>,
     indexes: ModuleProvenanceIndexes,
     payloads: Arc<[AppliedModulePayload]>,
+}
+
+/// A root-scoped placement fact for one committed extension range.
+///
+/// The ordered entry identities are stable content identities; the retained start is
+/// only their placement in this exact committed extension journal. This witness is a
+/// view over the canonical contribution record, never a mutable placement index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedExtensionRangeWitness {
+    provenance_root: ModuleProvenanceRoot,
+    module: ModuleId,
+    artifact: ArtifactEvidence,
+    completeness: ProvenanceCompleteness,
+    contribution_index: usize,
+    contribution: ExtensionContribution,
+}
+
+impl AppliedExtensionRangeWitness {
+    pub const fn provenance_root(&self) -> ModuleProvenanceRoot {
+        self.provenance_root
+    }
+
+    pub fn module(&self) -> &ModuleId {
+        &self.module
+    }
+
+    pub fn artifact(&self) -> &ArtifactEvidence {
+        &self.artifact
+    }
+
+    pub fn completeness(&self) -> &ProvenanceCompleteness {
+        &self.completeness
+    }
+
+    pub const fn contribution_index(&self) -> usize {
+        self.contribution_index
+    }
+
+    pub fn descriptor(&self) -> &ExtensionDescriptor {
+        self.contribution.descriptor()
+    }
+
+    pub fn start(&self) -> u64 {
+        self.contribution.start()
+    }
+
+    pub fn entry_ids(&self) -> &[ExtensionEntryId] {
+        self.contribution.entries()
+    }
+
+    pub fn source_ordinal(&self, index: usize) -> Option<u64> {
+        self.contribution.source_ordinal(index)
+    }
+
+    pub fn target_position(&self, index: usize) -> Option<u64> {
+        self.contribution.target_position(index)
+    }
 }
 
 impl ModuleApplyState {
@@ -422,6 +479,31 @@ impl ModuleApplyState {
     /// Exact Arc-backed values retained for every manifest contribution.
     pub fn applied_payloads(&self) -> &[AppliedModulePayload] {
         &self.payloads
+    }
+
+    /// Exact placement witnesses for one applied module under this committed root.
+    pub fn applied_extension_ranges(
+        &self,
+        module: &ModuleId,
+    ) -> Option<Vec<AppliedExtensionRangeWitness>> {
+        let record = self.manifest.record(module)?;
+        Some(
+            record
+                .extension_contributions()
+                .iter()
+                .enumerate()
+                .map(
+                    |(contribution_index, contribution)| AppliedExtensionRangeWitness {
+                        provenance_root: self.manifest.root(),
+                        module: module.clone(),
+                        artifact: record.module().artifact.clone(),
+                        completeness: record.completeness().clone(),
+                        contribution_index,
+                        contribution: contribution.clone(),
+                    },
+                )
+                .collect(),
+        )
     }
 
     /// Recheck the single-state invariant before a later apply plan consumes it.
@@ -2469,6 +2551,29 @@ mod tests {
         assert_ne!(
             committed.receipt().base_logical_root(),
             committed.receipt().result_logical_root()
+        );
+        let ranges = committed
+            .state()
+            .applied_extension_ranges(&contribution.module().id)
+            .expect("committed module has a range witness");
+        assert_eq!(ranges.len(), 1);
+        let range = &ranges[0];
+        assert_eq!(range.provenance_root(), committed.state().manifest().root());
+        assert_eq!(range.module(), &contribution.module().id);
+        assert_eq!(range.artifact(), &contribution.module().artifact);
+        assert_eq!(range.completeness(), contribution.completeness());
+        assert_eq!(range.contribution_index(), 0);
+        assert_eq!(range.descriptor().name, name("fixture.ext"));
+        assert_eq!(range.start(), 0);
+        assert_eq!(range.entry_ids(), &[entry]);
+        assert_eq!(range.source_ordinal(0), Some(0));
+        assert_eq!(range.target_position(0), Some(0));
+        assert!(range.target_position(1).is_none());
+        assert!(
+            committed
+                .state()
+                .applied_extension_ranges(&ModuleId::new(name("fixture.absent")))
+                .is_none()
         );
         assert!(matches!(
             classify_exact_result_retry(&checked, committed.state()),
