@@ -418,6 +418,32 @@ def fairness_order(registry, issues, now):
     return sorted(registry, key=lambda issue_id: (-ages.get(issue_id, -1), issue_id)), ages
 
 
+def next_unblocking_actions(selected, held, earliest):
+    """Turn a read-only admission decision into bounded, non-mutating operator actions."""
+    held_actions = {
+        "dependency-blocked": "complete-blocking-dependencies",
+        "incident-reservation-exhausted": "obtain-reviewed-incident-exception",
+        "verification-reservation-exhausted": "wait-for-verification-reservation",
+        "held-over-cap": "reduce-active-workstreams-to-cap",
+        "held-capacity": "wait-for-workstream-capacity",
+        "frozen-earliest-gate": "resume-after-earliest-gate-passes",
+        "held-priority-order": "await-priority-reassessment",
+    }
+    actions = []
+    for row in selected:
+        action = "continue-active" if row["status"] == "in_progress" else "claim-selected"
+        actions.append({"id": row["id"], "action": action, "reason": row["reason"]})
+    for row in held:
+        action = held_actions[row["reason"]]
+        item = {"id": row["id"], "action": action, "reason": row["reason"]}
+        if row["reason"] == "dependency-blocked":
+            item["blockers"] = row["blockers"]
+        if row["reason"] == "frozen-earliest-gate":
+            item["resume_gate"] = earliest["id"] if earliest else None
+        actions.append(item)
+    return actions
+
+
 def decide(policy, snapshot, now):
     registry, gates, active, exceptions = validate(policy, snapshot, now)
     fairness = policy.get("fairness")
@@ -498,6 +524,7 @@ def decide(policy, snapshot, now):
         else:
             common["reason"] = "held-priority-order"
             held.append(common)
+    next_actions = next_unblocking_actions(selected, held, earliest)
     state = "over_cap" if over_cap else "complete"
     return {
         "state": state,
@@ -508,6 +535,7 @@ def decide(policy, snapshot, now):
         "fairness": fairness,
         "selected": selected,
         "held": held,
+        "next_unblocking_actions": next_actions,
         "exceptions": exceptions,
     }
 
@@ -529,10 +557,14 @@ def report(policy, snapshot, decision, now):
         "evidence_gates": evidence_gates,
         **decision,
     }
-    if len(value["selected"]) > MAX_REPORT_ITEMS or len(value["held"]) > MAX_REPORT_ITEMS:
+    if (
+        len(value["selected"]) > MAX_REPORT_ITEMS
+        or len(value["held"]) > MAX_REPORT_ITEMS
+        or len(value["next_unblocking_actions"]) > MAX_REPORT_ITEMS
+    ):
         raise InputFault(
             f"report-item-limit: selected={len(value['selected'])} held={len(value['held'])} "
-            f"limit={MAX_REPORT_ITEMS}"
+            f"next_actions={len(value['next_unblocking_actions'])} limit={MAX_REPORT_ITEMS}"
         )
     return value
 
@@ -546,7 +578,8 @@ def concise(value):
     return (
         f"convergence-governance: {value['verdict']}; earliest_gate={gate}; "
         f"active_workstreams={','.join(value['active_workstreams']) or 'none'}; "
-        f"selected={bounded(value['selected'])}; held={bounded(value['held'])}"
+        f"selected={bounded(value['selected'])}; held={bounded(value['held'])}; "
+        f"next_actions={bounded(value['next_unblocking_actions'])}"
     )
 
 
@@ -604,12 +637,17 @@ def self_test():
         raise AssertionError("reordered JSON changed a semantic decision")
     selected = {row["id"]: row["reason"] for row in first_decision["selected"]}
     held = {row["id"]: row["reason"] for row in first_decision["held"]}
+    actions = {row["id"]: row for row in first_decision["next_unblocking_actions"]}
     if selected.get("ready") != "earliest-gate-ready-blocker":
         raise AssertionError("nearest ready earliest-gate blocker was not selected")
     if held.get("blocked") != "dependency-blocked":
         raise AssertionError("status-only blocking mutant survived")
     if held.get("additive") != "frozen-earliest-gate":
         raise AssertionError("failed earliest gate did not freeze additive work")
+    if actions.get("ready", {}).get("action") != "claim-selected":
+        raise AssertionError("selected work was not given a non-mutating claim action")
+    if actions.get("blocked", {}).get("blockers") != ["root"]:
+        raise AssertionError("blocked work did not retain exact next unblocking dependencies")
     for mutant, transform, token in [
         ("unknown-active", lambda rows: rows + [{"id": "unknown", "status": "in_progress"}], "active-unclassified"),
         ("cycle", lambda rows: rows, "graph-cycle"),
@@ -870,7 +908,7 @@ def self_test():
     advisory_absent = normalize_snapshot({**raw, "bv": {"state": "absent", "reason": "self-test"}})
     if decide(policy, advisory_absent, now) != first_decision:
         raise AssertionError("advisory bv absence changed an admission decision")
-    return "convergence-governance self-test: 25 named model/mutation cells passed"
+    return "convergence-governance self-test: 27 named model/mutation cells passed"
 
 
 def main(argv):
