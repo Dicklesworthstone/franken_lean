@@ -29,6 +29,7 @@ POLICY_SCHEMA = "fln.convergence-governance-policy/1"
 MAX_ISSUES = 10_000
 MAX_EDGES = 100_000
 MAX_REPORT_ITEMS = 512
+ISSUE_STATES = {"open", "in_progress", "blocked", "closed", "tombstone"}
 
 
 class InputFault(Exception):
@@ -177,6 +178,8 @@ def normalize_snapshot(raw):
             raise InputFault(f"issue-duplicate-id: {issue_id}")
         if not isinstance(status, str) or not status:
             raise InputFault(f"issue-missing-status: {issue_id}")
+        if status not in ISSUE_STATES:
+            raise InputFault(f"issue-unknown-status: {issue_id}:{status}")
         by_id[issue_id] = {key: issue[key] for key in sorted(issue)}
     normalized_edges = []
     for edge in edges:
@@ -687,6 +690,18 @@ def self_test():
     transitive_held = {row["id"]: row for row in transitive["held"]}
     if transitive_held.get("blocked", {}).get("blockers") != ["root", "upstream"]:
         raise AssertionError("transitive dependency closure was not retained in the decision record")
+    unknown_status = copy.deepcopy(first)
+    unknown_status["issues"] = [
+        {**issue, "status": "invented"} if issue["id"] == "ready" else issue
+        for issue in unknown_status["issues"]
+    ]
+    try:
+        decide(policy, normalize_snapshot(unknown_status), now)
+    except InputFault as error:
+        if "issue-unknown-status" not in str(error):
+            raise AssertionError(f"unknown status wrong refusal: {error}") from error
+    else:
+        raise AssertionError("unknown tracker status was eligible for admission")
     for mutant, transform, token in [
         ("unknown-active", lambda rows: rows + [{"id": "unknown", "status": "in_progress"}], "active-unclassified"),
         ("cycle", lambda rows: rows, "graph-cycle"),
@@ -947,7 +962,7 @@ def self_test():
     advisory_absent = normalize_snapshot({**raw, "bv": {"state": "absent", "reason": "self-test"}})
     if decide(policy, advisory_absent, now) != first_decision:
         raise AssertionError("advisory bv absence changed an admission decision")
-    return "convergence-governance self-test: 29 named model/mutation cells passed"
+    return "convergence-governance self-test: 30 named model/mutation cells passed"
 
 
 def main(argv):
