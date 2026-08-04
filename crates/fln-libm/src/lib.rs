@@ -1131,4 +1131,17 @@ mod tests {
         );
         assert_eq!(f32::sin(f32::NAN).to_bits(), 0x7fc0_0000);
     }
+
+    #[test]
+    fn binary32_facade_replays_exact_exp_log_root_and_power_vectors() {
+        let smallest = f32::from_bits(1);
+        assert_eq!(f32::exp2(-150.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(f32::exp2(-149.0).to_bits(), smallest.to_bits());
+        assert_eq!(f32::exp2(127.0).to_bits(), 0x7f00_0000);
+        assert_eq!(f32::exp2(128.0).to_bits(), f32::INFINITY.to_bits());
+        assert_eq!(f32::log2(smallest).to_bits(), (-149.0_f32).to_bits());
+        assert_eq!(f32::sqrt(4.0).to_bits(), 2.0_f32.to_bits());
+        assert_eq!(f32::cbrt(8.0).to_bits(), 2.0_f32.to_bits());
+        assert_eq!(f32::pow(2.0, 10.0).to_bits(), 1024.0_f32.to_bits());
+    }
 }
