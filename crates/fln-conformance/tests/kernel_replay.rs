@@ -1304,7 +1304,17 @@ fn decode_corpus_module(path: &Path) -> Result<(Vec<u8>, Vec<ConstantInfo>), Str
     Ok((bytes, infos))
 }
 
-fn inventory_present_oleans(root: &Path) -> Result<CorpusInventory, String> {
+fn qualify_module_name(module_prefix: Option<&str>, relative_name: String) -> String {
+    module_prefix
+        .map(|prefix| format!("{prefix}.{relative_name}"))
+        .unwrap_or(relative_name)
+}
+
+/// Inventory oleans below one library root. `module_prefix` qualifies the
+/// filesystem-relative name before it is compared against imports recorded in
+/// the olean; Mathlib's root is nested below its namespace while the Reference
+/// library root is not.
+fn inventory_oleans(root: &Path, module_prefix: Option<&str>) -> Result<CorpusInventory, String> {
     let mut paths = Vec::new();
     collect_present_oleans(root, &mut paths)?;
     paths.sort();
@@ -1314,7 +1324,8 @@ fn inventory_present_oleans(root: &Path) -> Result<CorpusInventory, String> {
     let mut aggregate = Vec::new();
     aggregate.extend_from_slice(b"fln.kernel-reference-corpus.inventory/1\0");
     for path in paths {
-        let name = module_name_from_path(root, &path)?;
+        let relative_name = module_name_from_path(root, &path)?;
+        let name = qualify_module_name(module_prefix, relative_name);
         let metadata =
             fs::metadata(&path).map_err(|error| format!("stat {}: {error}", path.display()))?;
         if metadata.len() > MAX_PINNED_OLEAN_BYTES {
@@ -1385,6 +1396,28 @@ fn inventory_present_oleans(root: &Path) -> Result<CorpusInventory, String> {
         missing_imports,
         fixture_hash: hash(Domain::Fixture, &aggregate).to_hex(),
     })
+}
+
+fn inventory_present_oleans(root: &Path) -> Result<CorpusInventory, String> {
+    inventory_oleans(root, None)
+}
+
+fn inventory_mathlib_oleans(root: &Path) -> Result<CorpusInventory, String> {
+    inventory_oleans(root, Some("Mathlib"))
+}
+
+#[test]
+fn mathlib_olean_paths_are_qualified_before_import_matching() {
+    assert_eq!(
+        qualify_module_name(Some("Mathlib"), "Algebra.Group.Defs".to_string()),
+        "Mathlib.Algebra.Group.Defs",
+        "Mathlib's olean root sits below its namespace, unlike the Reference library root"
+    );
+    assert_eq!(
+        qualify_module_name(None, "Std.Data.HashMap.Basic".to_string()),
+        "Std.Data.HashMap.Basic",
+        "the Reference library's names are already rooted at their on-disk namespace"
+    );
 }
 
 fn corpus_module_order(inventory: &CorpusInventory) -> Result<Vec<String>, String> {
@@ -3339,6 +3372,51 @@ fn whole_mathlib_corpus_resurrection_preflight() {
             panic!("whole-Mathlib corpus preflight blocked: {reason}");
         }
     }
+}
+
+/// Decode every built Mathlib module before attempting replay. This deliberately
+/// keeps the first full-corpus increment to the region-reader boundary: it
+/// establishes a pin-keyed, namespace-correct inventory and canonical order,
+/// but makes no kernel-admission claim yet.
+///
+/// Run explicitly after the preflight is ready:
+/// `cargo test --locked -p fln-conformance --test kernel_replay \
+///   whole_mathlib_corpus_resurrection_sweep -- --ignored --exact --nocapture`
+#[test]
+#[ignore = "cost: decode the full pinned Mathlib corpus; on-demand resurrection sweep for franken_lean-t6r7"]
+fn whole_mathlib_corpus_resurrection_sweep() {
+    let library = preflight_mathlib_corpus().expect("the exact built Mathlib corpus is ready");
+    let inventory = inventory_mathlib_oleans(&library).expect("decode every Mathlib olean");
+    assert!(
+        inventory.modules.len() >= 8_000,
+        "whole-Mathlib resurrection found only {} modules; a truncated corpus is not a smaller green sweep",
+        inventory.modules.len(),
+    );
+    assert!(
+        inventory.decoded != 0,
+        "whole-Mathlib resurrection decoded zero declarations"
+    );
+    assert!(
+        inventory
+            .modules
+            .keys()
+            .all(|name| name.starts_with("Mathlib.")),
+        "the Mathlib inventory must qualify module names before comparing olean imports"
+    );
+    let order = corpus_module_order(&inventory).expect("derive canonical Mathlib module order");
+    assert_eq!(
+        order.len(),
+        inventory.modules.len(),
+        "canonical order must cover every decoded Mathlib module"
+    );
+    println!(
+        "{{\"schema\":\"fln-t6r7-mathlib-resurrection/1\",\"status\":\"observed\",\"corpus_commit\":{},\"modules\":{},\"decoded\":{},\"oracle_skipped\":{},\"fixture_hash\":{}}}",
+        json_string(&suite_lock_corpus_commit()),
+        inventory.modules.len(),
+        inventory.decoded,
+        inventory.oracle_skipped,
+        json_string(&inventory.fixture_hash),
+    );
 }
 
 /// The executable corpus obligation. It remains ignored while fln-7odd is
